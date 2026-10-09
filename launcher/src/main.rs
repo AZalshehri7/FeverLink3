@@ -1,6 +1,7 @@
 //! Command line of the launcher. The real UI comes later.
 //!
 //! ```text
+//! feverlink3                        no arguments, which is what a double-click is: the menu in `wizard.rs`
 //! feverlink3 host [--port 28090] [--password P] [--name N] [--launch]
 //! feverlink3 join CODE [--password P] [--name N] [--launch]
 //! feverlink3 selftest               a host and two players over loopback, fake games, no game started
@@ -11,6 +12,8 @@
 //!
 //! `host` and `join` run until the session ends or `quit` is typed. The game is started only with `--launch`.
 //! While a host runs, these commands can be typed: `start`, `pause`, `speed N` (1 to 4), `check`, `resync`, `status`, `quit`.
+
+mod wizard;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -34,6 +37,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dry_run = args.iter().any(|a| a == "--dry-run");
     match args.first().map(String::as_str) {
+        // a double-click starts the program without arguments; the console must not close under the player's eyes
+        None => wizard::run_interactive(),
         Some("doctor") => doctor(),
         Some("install") => footprint(dry_run, false),
         Some("uninstall") => footprint(dry_run, true),
@@ -287,45 +292,9 @@ fn run_selftest() -> ExitCode {
 // doctor / install / uninstall
 // ---------------------------------------------------------------------------------------------------------------
 
+/// What is found on this machine. The text is built in `wizard.rs`, which also puts it into the diagnostics text.
 fn doctor() -> ExitCode {
-    let info = steam::discover();
-    println!("Steam:           {}", info.steam_path.as_deref().map_or("not found in the registry".into(), path_text));
-    for lib in &info.libraries {
-        println!("library:         {}", lib.display());
-    }
-    println!(
-        "game:            {}",
-        info.game_dir.as_deref().map_or("TransportFever3.exe not found in any library".into(), path_text)
-    );
-    if info.user_dirs.is_empty() {
-        println!(
-            "user folders:    none (userdata/<id>/3493540/local does not exist yet; the game creates it on first run)"
-        );
-    }
-    for u in &info.user_dirs {
-        let state = if install::mod_installed(u) { "mod installed" } else { "mod not installed" };
-        println!("user folder:     {}  ({state})", u.display());
-    }
-    if let Some(game) = &info.game_dir {
-        match install::dll_state(game) {
-            Ok(state) => println!("winhttp.dll:     {state}"),
-            Err(e) => println!("winhttp.dll:     unreadable ({e})"),
-        }
-        match install::appid_state(game) {
-            Ok(install::AppIdState::Absent) => println!("steam_appid.txt: absent"),
-            Ok(install::AppIdState::Ours) => println!("steam_appid.txt: present (3493540)"),
-            Ok(install::AppIdState::Other(c)) => println!("steam_appid.txt: present with other content {c:?}"),
-            Err(e) => println!("steam_appid.txt: unreadable ({e})"),
-        }
-        match install::recorded_launcher_path(game) {
-            Some(p) => println!("launcher path:   {}", p.display()),
-            None => println!("launcher path:   not recorded (feverlink3_path.txt absent)"),
-        }
-    }
-    let (mod_src, dll_src) = locate_payload();
-    println!("payload mod:     {}", mod_src.as_deref().map_or("not found next to this executable".into(), path_text));
-    println!("payload dll:     {}", dll_src.as_deref().map_or("not found next to this executable".into(), path_text));
-    println!("game running:    {}", if process::any_game_running() { "yes" } else { "no" });
+    print!("{}", wizard::doctor_report());
     ExitCode::SUCCESS
 }
 
@@ -382,10 +351,6 @@ fn locate_payload() -> (Option<PathBuf>, Option<PathBuf>) {
         dir = d.parent().map(Path::to_path_buf);
     }
     (mod_src, dll_src)
-}
-
-fn path_text(p: &Path) -> String {
-    p.display().to_string()
 }
 
 #[cfg(test)]
