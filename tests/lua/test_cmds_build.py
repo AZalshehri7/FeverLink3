@@ -636,6 +636,11 @@ function MAKE_API()
     for _, s in ipairs(PARTS(p).edgesAdd) do
       if #s.comp.laneConfigs == 0 then error("Unknown exception") end   -- finding from MPFever (MIT)
     end
+    if FACTORY_REJECT then
+      -- (a test makes the factory strict about what the mod rebuilds: the proposal kind tells a rebuild from the original)
+      local why = FACTORY_REJECT(PARTS(p), TYPEOF(p))
+      if why then error(why) end
+    end
     FACTORY_COUNT = FACTORY_COUNT + 1
     return { __cmd = "makeWorldBuildProposalCmd", args = a }
   end
@@ -766,6 +771,14 @@ local function conEntity(spec)
   return ce
 end
 
+-- a tool's road that takes a town building out of its way and puts it elsewhere (the building is nobody's: owner -1)
+function NATIVE_ROAD_MOVING(spec)
+  local P = NATIVE_ROAD(spec)
+  P.toAdd = { conEntity({ file = spec.moveFile, x = spec.moveTo.x, y = spec.moveTo.y, z = 0, owner = -1 }) }
+  P.toRemove = { spec.remove }
+  return P
+end
+
 -- a construction (and optionally the removal of one it replaces), as the game's own mission scripts build it
 function CON_PROPOSAL(spec)
   local sp = D("SimpleProposal")
@@ -793,6 +806,16 @@ function NATIVE_DEPOT_ON_ROAD(spec)
   sp.addedSegments = added
   P.proposal = sp
   P.toAdd = { conEntity({ file = spec.file or "depot/road_depot.con", x = spec.door.x, y = spec.door.y, z = spec.door.z, params = spec.params }) }
+  return P
+end
+
+-- a node configuration (lane connections between placeholders or segments) added to a proposal that has none
+function WITH_CFG(P, node, lanes)
+  local sp = P.proposal
+  local lcs = {}
+  for j, l in ipairs(lanes) do lcs[j] = D("LaneConnection", { segment0 = l[1], lane0 = l[2], segment1 = l[3], lane1 = l[4], withRoad = true }) end
+  sp.nodeConfigsToAdd = { D("NodeConfigAndEntity", { entity = node, comp = D("BaseNodeConfig", { laneConnections = lcs }) }) }
+  P.proposal = sp
   return P
 end
 
@@ -869,7 +892,7 @@ function WORLD_SIG()
         for j = 0, 15 do if ls.transportModes[j] then m[#m + 1] = j end end
         lanes[i] = (ls.forward and "f" or "b") .. table.concat(m, ",")
       end
-      lines[#lines + 1] = "E " .. pa .. " " .. pb .. " " .. c.roadTemplate .. " kind" .. tostring(w.KIND) .. " lanes[" .. table.concat(lanes, "|") .. "] ["
+      lines[#lines + 1] = "E " .. pa .. " " .. pb .. " " .. c.roadTemplate .. " kind" .. tostring(w.KIND) .. " t" .. c.type .. "/" .. c.typeIndex .. " lanes[" .. table.concat(lanes, "|") .. "] ["
         .. table.concat(objs, ";") .. "] " .. SER(c.edgeDecorations)
     elseif w.CONSTRUCTION then
       local c = w.CONSTRUCTION
@@ -1189,6 +1212,16 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % ea)
         self.assertEqual(self.B.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % eb)
 
+    def test_a_bridge_in_place_of_a_street_is_rebuilt_as_a_street_proposal_on_both_games(self):
+        self.start()
+        self.B.issue("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_medium_road.street_template' }; local sp = P.proposal; "
+                     "local added = sp.addedSegments; local s = added[1]; local c = s.comp; c.type = 1; c.typeIndex = 3; s.comp = c; added[1] = s; "
+                     "sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIn("E 0.00,0.00,0.00 100.00,0.00,0.00 street/new_medium_road.street_template kind0 t1/3", self.A.sig())
+        self.assertEqual(self.A.lua("#HELPER_CALLS"), 0, "not replaceSegment: that would have kept the street")
+
     # ---- constructions
 
     def test_a_station_is_placed_with_a_seed_every_game_agrees_on(self):
@@ -1257,6 +1290,56 @@ class BuildTest(unittest.TestCase):
             self.assertGreater(g.lua("FIND_CON('town/house.con')"), g.lua("FIND_CON('depot/road_depot.con')"))
             self.assertEqual(g.lua("STATE:get().bind['1:1#c1']"), g.lua("FIND_CON('depot/road_depot.con')"), "the depot's construction, not the newest one")
             self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split())
+
+    def test_node_configurations_are_dropped_when_the_factory_rejects_them_and_the_engine_makes_its_own(self):
+        self.start()
+        split = "WITH_CFG(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }, -1, { { -3, 0, -5, 0 } })"
+        self.B.issue(split)
+        self.tick(30)
+        self.assertEqual(self.A.lua("#CFG_LOG"), 1, "with the configuration when the factory takes it")
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' and #parts.cfgAdd > 0 then return 'Unknown exception' end end; CFG_LOG = {}")
+        self.B.issue(split.replace("x = 50", "x = 150").replace("edge = 110", "edge = 111") + "")
+        self.tick(30)
+        self.assertEqual(self.A.lua("#CFG_LOG"), 0, "second form: the engine makes the lane connections itself")
+        self.assertEqual(self.B.lua("#CFG_LOG"), 0)
+        self.assertSameWorld()
+        self.assertIn("(form 2)", self.A.log())
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(150, 0, 150, 80)"))
+
+    def test_placeholders_are_renumbered_as_a_script_does_when_the_factory_insists(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _, s in ipairs(parts.edgesAdd) do if s.entity == -3 then return 'numbering' end end end end")
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.assertIn("(form 4)", self.A.log())
+
+    def test_a_proposal_every_form_of_which_the_factory_rejects_refuses_the_action(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _, s in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", cb="function(d, s) NO_OK = s end")
+        self.tick(30)
+        self.assertEqual(self.A.lua("#BUILD_LOG") + self.B.lua("#BUILD_LOG"), 0)
+        self.assertTrue(any("refused the street build" in d and "no segment please" in d for _, _, d in self.relay.refused), self.relay.refused)
+
+    def test_a_road_that_moves_a_town_building_is_one_combined_proposal(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
+        self.B.issue("NATIVE_ROAD_MOVING{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 57 }")
+        self.tick(30)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("#BUILD_LOG"), 1, "one command")
+            self.assertEqual(g.lua("BUILD_LOG[1]"), "cons=1 rm=1 nodes=2 segs=1 rmsegs=0 objs=0")
+        sig = self.A.sig()
+        self.assertIn("C town/house_a.con@350.00,40.00,0.00", sig)
+        self.assertNotIn("350.00,5.00", sig)
 
     def test_a_station_gets_keys_for_its_station_and_its_group(self):
         self.start()
@@ -1528,6 +1611,7 @@ class PureBuildTest(unittest.TestCase):
             ("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2 }", "construction"),
             ("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, remove = 54 }", "construction"),
             ("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }", "withStreet"),
+            ("NATIVE_ROAD_MOVING{ %s, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 54 }" % road, "combined"),
             ("NATIVE_NODECFG{ nodes = { { node = 101, lanes = { { 110, 0, 111, 0 } } } } }", "nodecfg"),
             ("NATIVE_TERRAIN(1, 2, 3, 3)", "refused: a terrain edit: its cells cannot be read from a script, only the native module can copy them"),
             ("D('SimpleProposal')", "refused: nothing to build"),
@@ -1536,6 +1620,11 @@ class PureBuildTest(unittest.TestCase):
         ]
         for code, want in cases:
             self.assertEqual(self.ev("PLAN_OF(%s)" % code), want, code)
+        # a segment replaced by one of another kind (a bridge) is no upgrade the engine's replaceSegment can make
+        bridge = ("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_medium_road.street_template' }; local sp = P.proposal; "
+                  "local added = sp.addedSegments; local s = added[1]; local c = s.comp; c.type = 1; c.typeIndex = 3; s.comp = c; added[1] = s; "
+                  "sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % bridge), "street")
 
     def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
         def cat(code):
@@ -1581,6 +1670,30 @@ class PureBuildTest(unittest.TestCase):
         self.assertTrue(refuse("local deep = {}; local t = deep; for i = 1, 20 do t.x = {}; t = t.x end; rec.cons = { { file = 'a.con', transf = { 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1 }, params = deep } }")
                         .startswith("nil|construction 1: bad parameters"))
         self.assertTrue(refuse("rec.v = 1").startswith("table: "), "an untouched record is accepted")
+
+    def test_encode_and_decode_never_raise(self):
+        got = self.ev("(function() local M = PURE(); local hostile = setmetatable({}, { __index = function() error('boom') end }); "
+                      "local spec = M.commands.makeWorldBuildProposalCmd; "
+                      "local a, why = spec.decode({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, hostile } }, { player = 7, resolve = function() end }); "
+                      "local b, why2 = spec.encode('makeWorldBuildProposalCmd', { n = 1, hostile }, { plain = function(v) return v end, keyOf = function() return 's:1' end }); "
+                      "local c, why3 = spec.encode('makeWorldBuildProposalCmd', { n = 1, setmetatable({}, { __index = function() error('boom') end, __len = function() error('boom') end }) }, "
+                      "{ plain = error, keyOf = error }); "
+                      "return tostring(a) .. '|' .. tostring(why):sub(1, 40) .. '|' .. tostring(b) .. '|' .. tostring(c) end)()")
+        self.assertTrue(got.startswith("nil|the build record could not be read: "), got)
+        self.assertTrue(got.endswith("|nil|nil"), got)
+
+    def test_the_model_of_an_edge_object_is_named_without_the_resource_prefix_unless_the_engine_wants_it(self):
+        def model(reject):
+            return self.ev("(function() FACTORY_REJECT = %s; local P = NATIVE_SIGNAL{ edge = FIND_EDGE(0, 50, 100, 50), param = 0.6, model = '::/signal/signal_b.mdl' }; "
+                           "local ok, created = APPLY_BUILD(P); local body = CAPTURE(P, { result = created }); "
+                           "local args, why = DECODE(body); FACTORY_REJECT = nil; "
+                           "if not args then return 'refused: ' .. tostring(why) end "
+                           "return STORE(STORE(STORE(args[1]).streetProposal).edgeObjectsToAdd[1]).model end)()" % reject)
+
+        self.assertEqual(model("nil"), "signal/signal_b.mdl")
+        self.assertEqual(model("function(parts, kind) if kind == 'SimpleProposal' then for _, o in ipairs(parts.objsAdd) do if not o.model:find('^::/') then return 'prefix wanted' end end end end"),
+                         "::/signal/signal_b.mdl", "the second form keeps the name as read")
+        self.assertTrue(model("function(parts, kind) if kind == 'SimpleProposal' then return 'no' end end").startswith("refused: the engine's command factory refused the stop build"))
 
     def test_default_seed_and_name_of_a_construction(self):
         got = self.ev("(function() local body = CAPTURE(CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, z = 5, params = {}, name = '' }); "

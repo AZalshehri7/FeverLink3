@@ -680,7 +680,7 @@ end
 -- the state of one capture: how entities are keyed, what the proposal itself knows about entities it removes, and
 -- the references already made
 local function newCapture(ctx, opts)
-	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, objIndex = {} }, memo = {}, result = opts.result }
+	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {} }, memo = {}, result = opts.result }
 
 	function cap.node(id)
 		if type(id) ~= "number" then fail("a node reference is not an entity id") end
@@ -909,6 +909,7 @@ local function learnRemoved(st, names, cap)
 				if p0 and p1 then
 					cap.known.edges[id] = { p0 = p0, p1 = p1, t0 = A.xyz(get(c, "tangent0")), t1 = A.xyz(get(c, "tangent1")) }
 				end
+				cap.known.edgeTypes[id] = { ty = get(c, "type"), ti = get(c, "typeIndex"), rt = get(c, "roadType"), st = get(s, "type") }
 				for i, o in ipairs(A.list(c, "objects")) do
 					local oid = get(o, 1)
 					if type(oid) == "number" and oid >= 0 then cap.known.objIndex[oid] = { edge = id, i = i } end
@@ -957,7 +958,18 @@ local function captureRecord(proposal, cap)
 		for i, s in ipairs(A.list(st, names.rmSegs)) do rmSegIds[i] = idOf(s) end
 		indexWorldObjects(rmSegIds, cap)
 		for i, n in ipairs(A.list(st, names.nodes)) do rec.nodes[i] = readNode(n, cap) end
-		for i, id in ipairs(rmSegIds) do rec.rmSegs[i] = cap.edge(id) end
+		for i, id in ipairs(rmSegIds) do
+			-- a removed segment also says what kind of segment it was (normal, bridge, tunnel ...): a replacement by another
+			-- kind is not an upgrade the engine's replaceSegment can make
+			local ref = cap.edge(id)
+			local t = cap.known.edgeTypes[id]
+			if not t then
+				local c = A.comp(id, "BASE_EDGE")
+				if c then t = { ty = get(c, "type"), ti = get(c, "typeIndex"), rt = get(c, "roadType") } end
+			end
+			if t and type(ref) == "table" then ref.ty, ref.ti, ref.rt, ref.st = t.ty, t.ti, t.rt, t.st end
+			rec.rmSegs[i] = ref
+		end
 		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(idOf(n)) end
 		for i, s in ipairs(A.list(st, names.segs)) do rec.segs[i] = readSegment(s, cap) end
 		for i, o in ipairs(A.list(st, names.objs)) do rec.objs[i] = readEdgeObject(o, i, cap) end
@@ -1000,6 +1012,13 @@ end
 
 local function samePlace(a, b) return a and b and d3(a, b) <= TOL_NODE end
 
+-- the removed segment and the added one are of the same kind (a bridge in place of a street is no upgrade)
+local function sameKind(rm, s)
+	local c = s.c or {}
+	local function same(a, b) return a == nil or b == nil or a == b end
+	return same(rm.ty, c.type) and same(rm.ti, c.typeIndex) and same(rm.rt, c.roadType) and same(rm.st, s.type)
+end
+
 -- the added segments that each replace one removed segment between the same nodes, nothing else changed
 local function upgradeSteps(rec)
 	local nCons, nRem, nNodes, nSegs, nRmNodes, nRmSegs, nObjs, nRmObjs = counts(rec)
@@ -1011,7 +1030,7 @@ local function upgradeSteps(rec)
 		if not a then return nil end
 		local match
 		for j, rm in ipairs(rec.rmSegs) do
-			if not used[j] and ((samePlace(rm.p0, a) and samePlace(rm.p1, b)) or (samePlace(rm.p0, b) and samePlace(rm.p1, a))) then
+			if not used[j] and sameKind(rm, s) and ((samePlace(rm.p0, a) and samePlace(rm.p1, b)) or (samePlace(rm.p0, b) and samePlace(rm.p1, a))) then
 				match = j
 				break
 			end
@@ -1052,7 +1071,8 @@ local function isStopShape(rec)
 	return nCons + nRem + nNodes + nRmNodes == 0 and nSegs == 1 and nRmSegs == 1 and nObjs + nRmObjs > 0
 end
 
--- The shape of a record: construction, withStreet, bulldoze, upgrade, removal, stop, street, nodecfg, or nil and why not.
+-- The shape of a record: construction, withStreet, combined, bulldoze, upgrade, removal, stop, street, nodecfg, or nil
+-- and why not.
 local function classify(rec)
 	local nCons, nRem, nNodes, nSegs, nRmNodes, nRmSegs, nObjs, nRmObjs, nCfg, nRmCfg = counts(rec)
 	local street = nNodes + nSegs + nRmNodes + nRmSegs + nObjs + nRmObjs + nCfg + nRmCfg
@@ -1063,11 +1083,16 @@ local function classify(rec)
 	if nCons + nRem > 0 then
 		if street == 0 then return "construction" end
 		-- the segments a construction brings with it belong to it; its own script makes them
-		local own = true
-		for _, s in ipairs(rec.segs) do if not isConstructionSegment(s) then own = false end end
-		if own and nRmSegs == 0 and nObjs + nRmObjs == 0 then return "construction" end
+		local own, foreign = 0, 0
+		for _, s in ipairs(rec.segs) do
+			if isConstructionSegment(s) then own = own + 1 else foreign = foreign + 1 end
+		end
+		if foreign == 0 and nRmSegs == 0 and nObjs + nRmObjs == 0 then return "construction" end
 		if nCons == 0 then return "bulldoze" end
-		return "withStreet"
+		-- a depot or station against a street: street first, construction second; a road that only moves town buildings
+		-- is one proposal
+		if own > 0 then return "withStreet" end
+		return "combined"
 	end
 	if upgradeSteps(rec) then return "upgrade" end
 	if removalList(rec) then return "removal" end
@@ -1131,7 +1156,8 @@ end
 
 -- One segment to add. `placeholder` is the id the segment gets (a negative number); objects the segment already carries
 -- are named by rank on a removed segment and mapped to this game's objects.
-local function newSegmentAndEntity(s, R, notes, placeholder, lanesFrom)
+local function newSegmentAndEntity(s, R, notes, placeholder, form)
+	form = form or {}
 	local se = A.new("SegmentAndEntity")
 	req(se, "entity", placeholder or R.edgeOr(s.id))
 	if s.type ~= nil then req(se, "type", s.type) end
@@ -1153,7 +1179,7 @@ local function newSegmentAndEntity(s, R, notes, placeholder, lanesFrom)
 	if s.lanes then
 		lanes = A.rebuildLanes(s.lanes)
 	else
-		lanes = lanesFrom or A.templateLanes(sc.roadTemplate)
+		lanes = A.templateLanes(sc.roadTemplate)
 	end
 	if not lanes then fail("no lanes for street template " .. tostring(sc.roadTemplate)) end
 	req(c, "laneConfigs", lanes)
@@ -1161,28 +1187,34 @@ local function newSegmentAndEntity(s, R, notes, placeholder, lanesFrom)
 	for i, o in ipairs(s.objects or {}) do objects[i] = { R.objOr(o[1]), o[2] } end
 	if #objects > 0 then req(c, "objects", objects) end
 	req(se, "comp", c)
-	if s.prec then
-		local st = se.streetEdge
-		opt(notes, st, "precedenceNode0", s.prec[1] or 2)
-		opt(notes, st, "precedenceNode1", s.prec[2] or 2)
-		opt(notes, se, "streetEdge", st)
-	end
-	if s.owner ~= nil then
-		local po = A.new("PlayerOwned")
-		req(po, "player", R.owner(s.owner))
-		opt(notes, se, "playerOwned", po)
+	if form.owner ~= false then
+		if s.prec then
+			local st = se.streetEdge
+			opt(notes, st, "precedenceNode0", s.prec[1] or 2)
+			opt(notes, st, "precedenceNode1", s.prec[2] or 2)
+			opt(notes, se, "streetEdge", st)
+		end
+		if s.owner ~= nil then
+			local po = A.new("PlayerOwned")
+			req(po, "player", R.owner(s.owner))
+			opt(notes, se, "playerOwned", po)
+		end
 	end
 	return se
 end
 
-local function newEdgeObject(o, R, edgeId, notes)
+-- The model of an edge object is named without the resource prefix "::/" in a proposal (finding from MPFever (MIT)); the
+-- name read from a created object may carry it. The raw name is the second form.
+local function newEdgeObject(o, R, edgeId, notes, form)
+	form = form or {}
 	local eo = A.new("EdgeObject")
 	req(eo, "edgeEntity", edgeId)
-	req(eo, "model", o.model)
+	req(eo, "model", form.rawModel and o.model or (o.model:gsub("^::/", "")))
 	req(eo, "param", o.param or 0.5)
 	req(eo, "left", o.left == true)
 	req(eo, "oneWay", o.oneWay == true)
-	req(eo, "playerEntity", R.owner(o.owner == nil and "player" or o.owner))
+	local owner = R.owner(o.owner == nil and "player" or o.owner)
+	if form.owner == false then opt(notes, eo, "playerEntity", owner) else req(eo, "playerEntity", owner) end
 	opt(notes, eo, "name", o.name or "")
 	return eo
 end
@@ -1217,9 +1249,42 @@ local function withStreet(sp, fn)
 	sp.streetProposal = ssp
 end
 
--- The street half of a record as a SimpleProposal. `drop` leaves out the segments a construction brings with it.
+-- The record with its placeholders renumbered the way a script proposal numbers them: nodes and segments each from -1 in
+-- list order (a tool numbers all new entities in one sequence).
+local function renumbered(rec)
+	local nodeMap, segMap, kn, ks = {}, {}, 0, 0
+	for _, n in ipairs(rec.nodes) do
+		if type(n.id) == "number" and n.id < 0 then kn = kn + 1; nodeMap[n.id] = -kn end
+	end
+	for _, s in ipairs(rec.segs) do
+		if type(s.id) == "number" and s.id < 0 then ks = ks + 1; segMap[s.id] = -ks end
+	end
+	local function mapN(v) if type(v) == "number" and nodeMap[v] then return nodeMap[v] end return v end
+	local function mapS(v) if type(v) == "number" and segMap[v] then return segMap[v] end return v end
+	local function copy(t, fn) local o = {}; for k, v in pairs(t) do o[k] = v end; fn(o); return o end
+	local out = {}
+	for k, v in pairs(rec) do out[k] = v end
+	out.nodes, out.segs, out.objs, out.ncfg = {}, {}, {}, {}
+	for i, n in ipairs(rec.nodes) do out.nodes[i] = copy(n, function(o) o.id = mapN(n.id) end) end
+	for i, s in ipairs(rec.segs) do out.segs[i] = copy(s, function(o) o.id, o.n0, o.n1 = mapS(s.id), mapN(s.n0), mapN(s.n1) end) end
+	for i, e in ipairs(rec.objs) do out.objs[i] = copy(e, function(o) o.edge = mapS(e.edge) end) end
+	for i, c in ipairs(rec.ncfg) do
+		out.ncfg[i] = copy(c, function(o)
+			o.node = mapN(c.node)
+			o.lc, o.cw = {}, {}
+			for j, l in ipairs(c.lc or {}) do o.lc[j] = copy(l, function(x) x.s0, x.s1 = mapS(l.s0), mapS(l.s1) end) end
+			for j, x in ipairs(c.cw or {}) do o.cw[j] = mapS(x) end
+		end)
+	end
+	return out
+end
+
+-- The street half of a record as a SimpleProposal. opts (a form, see FORMS): drop leaves out the segments a construction
+-- brings with it; cfg = false leaves out the node configurations; owner = false the owner and precedence members;
+-- renumber numbers the placeholders as a script does.
 local function streetProposal(rec, R, notes, opts)
 	opts = opts or {}
+	if opts.renumber then rec = renumbered(rec) end
 	local sp = A.new("SimpleProposal")
 	local keepSeg, usedNode = {}, {}
 	for _, s in ipairs(rec.segs) do
@@ -1234,15 +1299,15 @@ local function streetProposal(rec, R, notes, opts)
 		if not opts.drop or type(n.id) ~= "number" or usedNode[n.id] then nodes[#nodes + 1] = newNodeAndEntity(n, R) end
 	end
 	for i, s in ipairs(keepSeg) do
-		edges[i] = newSegmentAndEntity(s, R, notes, type(s.id) == "number" and s.id or nil)
+		edges[i] = newSegmentAndEntity(s, R, notes, type(s.id) == "number" and s.id or nil, opts)
 	end
 	local rmNodes, rmEdges, rmObjs = {}, {}, {}
 	for i, ref in ipairs(rec.rmNodes) do rmNodes[i] = R.node(ref) end
 	for i, ref in ipairs(rec.rmSegs) do rmEdges[i] = R.edge(ref) end
 	for i, ref in ipairs(rec.rmObjs) do rmObjs[i] = R.obj(ref) end
-	for i, o in ipairs(rec.objs) do objs[i] = newEdgeObject(o, R, R.edgeOr(o.edge), notes) end
+	for i, o in ipairs(rec.objs) do objs[i] = newEdgeObject(o, R, R.edgeOr(o.edge), notes, opts) end
 	local cfgs, rmCfgs = {}, {}
-	if not opts.drop then
+	if not opts.drop and opts.cfg ~= false then
 		for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, R) end
 	end
 	for i, ref in ipairs(rec.rmNcfg) do rmCfgs[i] = R.node(ref) end
@@ -1259,18 +1324,28 @@ local function streetProposal(rec, R, notes, opts)
 	return sp
 end
 
--- The construction half of a record as a SimpleProposal (the form of the game's own mission scripts).
-local function constructionProposal(rec, R)
-	local sp = A.new("SimpleProposal")
+-- The constructions to add, the entities to remove, and the map from a removed one to what replaces it.
+local function constructionLists(rec, R)
 	local cons, rem, map = {}, {}, {}
 	for i, c in ipairs(rec.cons) do cons[i] = newConstructionEntity(c, R) end
 	for i, ref in ipairs(rec.rem) do rem[i] = R.con(ref) end
 	for _, pair in ipairs(rec.old2new) do
 		if rem[pair[1]] then map[rem[pair[1]]] = pair[2] end
 	end
+	return cons, rem, map
+end
+
+local function setConstructions(sp, rec, R)
+	local cons, rem, map = constructionLists(rec, R)
 	req(sp, "constructionsToAdd", cons)
 	req(sp, "constructionsToRemove", rem)
 	req(sp, "old2new", map)
+end
+
+-- The construction half of a record as a SimpleProposal (the form of the game's own mission scripts).
+local function constructionProposal(rec, R)
+	local sp = A.new("SimpleProposal")
+	setConstructions(sp, rec, R)
 	return sp
 end
 
@@ -1286,6 +1361,24 @@ local function part(rec, keep)
 	return out
 end
 
+-- Ways to build the proposal of a plan, tried in order until the engine's factory accepts one (a factory that rejects has
+-- no side effect, so every game goes through the same attempts: finding from MPFever (MIT), whose forms these follow). A
+-- form names what to leave out or change. A form that drops content (cfg = false) is only listed where the engine makes
+-- that content itself.
+local FORMS = {
+	street = { {}, { cfg = false }, { cfg = false, owner = false }, { cfg = false, owner = false, renumber = true } },
+	withStreet = { {}, { owner = false }, { owner = false, renumber = true } },
+	stop = { {}, { rawModel = true }, { owner = false } },
+}
+FORMS.combined = FORMS.street
+
+local function with(form, extra)
+	local o = {}
+	for k, v in pairs(form or {}) do o[k] = v end
+	for k, v in pairs(extra) do o[k] = v end
+	return o
+end
+
 PLAN.construction = function(rec, R, f, notes)
 	return commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
 end
@@ -1293,13 +1386,21 @@ end
 -- Street part first, then the construction on the street that is now cut (finding from MPFever (MIT): the engine
 -- refuses both in one proposal). The construction's own paths are left to its script; the second command ignores the
 -- non-critical collision with its own street connection.
-PLAN.withStreet = function(rec, R, f, notes)
-	local first = commandArgs(streetProposal(rec, R, notes, { drop = true }), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
+PLAN.withStreet = function(rec, R, f, notes, form)
+	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
 	local conOnly = part(rec, { "cons", "rem", "old2new" })
 	first.chain = { function()
 		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, CTX_NATIVE), true, false, f.dust)
 	end }
 	return first
+end
+
+-- Street work that also moves or replaces constructions (a road that takes town buildings out of its way and puts them
+-- elsewhere): one proposal with both parts, as MPFever rebuilt them (MIT).
+PLAN.combined = function(rec, R, f, notes, form)
+	local sp = streetProposal(rec, R, notes, form)
+	setConstructions(sp, rec, R)
+	return commandArgs(sp, newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
 end
 
 -- A bulldozing that takes constructions and street pieces: the constructions first, then the segments (the order the
@@ -1317,8 +1418,8 @@ PLAN.bulldoze = function(rec, R, f, notes)
 	return first
 end
 
-PLAN.street = function(rec, R, f, notes)
-	return commandArgs(streetProposal(rec, R, notes), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
+PLAN.street = function(rec, R, f, notes, form)
+	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
 end
 
 PLAN.nodecfg = PLAN.street
@@ -1375,12 +1476,12 @@ end
 
 -- A stop or signal: the segment is replaced by one carrying the new object; placeholders mark the new objects in its
 -- object list (finding from MPFever (MIT)).
-PLAN.stop = function(rec, R, f, notes)
+PLAN.stop = function(rec, R, f, notes, form)
+	form = form or {}
 	local s, rm = rec.segs[1], rec.rmSegs[1]
 	local edge = R.edge(rm)
 	local info = A.edgeInfo(edge)
 	if not info then fail("the segment for a stop has vanished") end
-	local objects = {}
 	local sp = A.new("SimpleProposal")
 	-- the objects already on the segment stay, then one placeholder per new object (-400000000 - k)
 	local keep = {}
@@ -1394,7 +1495,7 @@ PLAN.stop = function(rec, R, f, notes)
 		keep[#keep + 1] = { -400000000 - (i - 1), kind }
 	end
 	local seg = { id = -1, type = s.type, n0 = info.n0, n1 = info.n1, c = s.c, lanes = s.lanes, objects = {}, prec = s.prec or { 2, 2 }, owner = s.owner }
-	local e = newSegmentAndEntity(seg, R, notes, -1)
+	local e = newSegmentAndEntity(seg, R, notes, -1, form)
 	-- the segment keeps this game's own ends, tangents and positions, and carries the object list built above
 	local c = e.comp
 	req(c, "node0", info.n0); req(c, "node1", info.n1)
@@ -1405,7 +1506,7 @@ PLAN.stop = function(rec, R, f, notes)
 	req(c, "objects", keep)
 	req(e, "comp", c)
 	local eos, removeIds = {}, {}
-	for i, o in ipairs(rec.objs) do eos[i] = newEdgeObject(o, R, -1, notes) end
+	for i, o in ipairs(rec.objs) do eos[i] = newEdgeObject(o, R, -1, notes, form) end
 	for id in pairs(gone) do removeIds[#removeIds + 1] = id end
 	table.sort(removeIds)
 	local nodeCfg = {}
@@ -1430,7 +1531,12 @@ local function okRef(r, kind)
 	if type(r) ~= "table" or r.__ref ~= kind then return false end
 	if r.key ~= nil and not okText(r.key, 120) then return false end
 	if kind == "node" then return okPos(r.p) end
-	if kind == "edge" then return okPos(r.p0) and okPos(r.p1) and (r.t0 == nil or okPos(r.t0)) and (r.t1 == nil or okPos(r.t1)) end
+	if kind == "edge" then
+		for _, k in ipairs({ "ty", "ti", "rt", "st" }) do
+			if r[k] ~= nil and not isNum(r[k]) then return false end
+		end
+		return okPos(r.p0) and okPos(r.p1) and (r.t0 == nil or okPos(r.t0)) and (r.t1 == nil or okPos(r.t1))
+	end
 	if kind == "con" then return okText(r.file) and okPos(r.p) end
 	if kind == "obj" then return okRef(r.edge, "edge") and isNum(r.i) and r.i >= 1 end
 	return false
@@ -1529,7 +1635,7 @@ local function logNotes(notes, what)
 	if #notes > 0 then log(what .. ": members not set: " .. table.concat(notes, "; "):sub(1, 300)) end
 end
 
-local function encodeBuild(name, args, ctx)
+local function encodeBuildUnsafe(name, args, ctx)
 	local cap = newCapture(ctx, {})
 	local ok, rec = pcall(captureRecord, args[1], cap)
 	if not ok then return nil, tostring(rec) end
@@ -1543,6 +1649,14 @@ local function encodeBuild(name, args, ctx)
 	if not okS then return nil, "the build record is not plain data: " .. tostring(text) end
 	if #text > LIMIT.bytes then return nil, "the build is too large to send (" .. #text .. " bytes)" end
 	return body
+end
+
+-- encode and decode never raise: the interface half calls encode from inside a game window's command, and the
+-- simulation half calls decode between two actions of one step, where an error would drop the rest of the step.
+local function encodeBuild(name, args, ctx)
+	local ok, body, why = pcall(encodeBuildUnsafe, name, args, ctx)
+	if ok then return body, why end
+	return nil, "the build could not be read: " .. tostring(body)
 end
 
 -- The same capture for a proposal that does not come through a command factory: the native tools' builds, as the
@@ -1564,24 +1678,45 @@ function M.capture(proposal, flags, ctx)
 	return body
 end
 
-local function decodeBuild(body, ctx)
+local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
 	if not rec then return nil, why end
 	local plan, whyNot = classify(rec)
 	if not plan then return nil, whyNot end
 	local R = newResolver(ctx)
-	local notes = {}
 	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src }
-	local ok, args = pcall(PLAN[plan], rec, R, f, notes)
-	if not ok then return nil, tostring(args) end
-	logNotes(notes, "build " .. plan)
-	-- the factory is tried here, once, so that a proposal it rejects refuses the action on every game alike and
-	-- before anything is applied (a factory failure has no side effect: finding from MPFever (MIT))
-	local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
-	if not okF then return nil, "the engine's command factory refused the " .. plan .. " build: " .. tostring(errF):sub(1, 160) end
-	args.plan = plan
+	-- The forms of the plan are tried in order and the engine's factory is the judge, here, before anything is applied: a
+	-- proposal it rejects in every form refuses the action on every game alike.
+	local args, used, lastErr
+	for i, form in ipairs(FORMS[plan] or { {} }) do
+		local notes = {}
+		local ok, built = pcall(PLAN[plan], rec, R, f, notes, form)
+		if not ok then
+			lastErr = tostring(built)
+			-- what cannot be found is not found in any form
+			if lastErr:find("^unresolved ") or lastErr:find("^ambiguous ") then return nil, lastErr end
+		else
+			local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(built, 1, built.n)) end)
+			if okF then
+				args, used = built, i
+				logNotes(notes, "build " .. plan)
+				break
+			end
+			lastErr = "the engine's command factory refused the " .. plan .. " build: " .. tostring(errF):sub(1, 160)
+		end
+	end
+	if not args then return nil, lastErr or "no way to build it" end
+	log("build " .. plan .. (used > 1 and (" (form " .. used .. ")") or "") .. " (" .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, "
+		.. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, " .. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects"
+		.. (args.chain and (", " .. #args.chain + 1 .. " commands") or ""))
 	return args
+end
+
+local function decodeBuild(body, ctx)
+	local ok, args, why = pcall(decodeBuildUnsafe, body, ctx)
+	if ok then return args, why end
+	return nil, "the build record could not be read: " .. tostring(args)
 end
 
 -- Permissions: a proposal that only takes things away is bulldozing, anything else is building. Counts only. Segments
