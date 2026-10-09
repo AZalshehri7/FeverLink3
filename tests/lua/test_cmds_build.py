@@ -347,6 +347,7 @@ function MAKE_API()
       local px, py = pos3(p)
       local name = NAMES[t] or (t == CT.CONSTRUCTION and "CONSTRUCTION") or nil
       if not name then return out end
+      if name == "CONSTRUCTION" and OCTREE_CONS_EMPTY then return out end
       if name == "BASE_NODE" and OCTREE ~= "node" then return out end
       for e, w in pairs(WORLD) do
         local c = w[name]
@@ -435,6 +436,7 @@ end
 BUILD_MOCK2 = r'''
 -- ===== applying a proposal =====
 BUILD_LOG, BUILD_REFUSALS, FACTORY_COUNT, HELPER_CALLS, CFG_LOG, BUILD_CTX = {}, {}, 0, {}, {}, {}
+OLD2NEW_LOG, CON_OWNERS = {}, {}
 BUILD_REFUSE = nil      -- a test sets function(parts) -> message to make the engine refuse a build
 
 DEF_TEMPLATE("street/simple.street_template", "simple", { { forward = true, modes = { 2 } }, { forward = false, modes = { 2 } } })
@@ -512,6 +514,7 @@ function APPLY_BUILD(p)
   end
 
   local gone = {}
+  for old, new in pairs(P.old2new) do OLD2NEW_LOG[#OLD2NEW_LOG + 1] = tostring(old) .. "=" .. tostring(new) end
   for _, e in ipairs(P.consRem) do
     local c = STORE(WORLD[e].CONSTRUCTION)
     for _, d in ipairs(c.depots) do WORLD[d] = nil end
@@ -576,6 +579,7 @@ function APPLY_BUILD(p)
   end
   local function makeConstructions()
     for _, ce in ipairs(P.consAdd) do
+      CON_OWNERS[#CON_OWNERS + 1] = tostring(ce.playerEntity)
       local id = NEW_ENTITY(nil)
       local comp = D("ConstructionComp", { fileName = ce.fileName, transf = ce.transf, params = ce.params, name = ce.name })
       local cs = STORE(comp)
@@ -760,6 +764,23 @@ function NATIVE_SIGNAL(spec)
   local eo = D("EdgeObjectNative", { segmentEntity = -1, param = spec.param, category = kind, left = spec.left == true })
   STORE(eo)._model = spec.model or "signal/signal_a.mdl"
   sp.edgeObjectsToAdd = { eo }
+  P.proposal = sp
+  return P
+end
+
+-- a signal (or stop) bulldozed: the segment replaced by itself without the object, the object listed for removal
+function NATIVE_UNSIGNAL(spec)
+  local w = WORLD[spec.edge]
+  local c = COPY(w.BASE_EDGE)
+  local cs = STORE(c)
+  local kept = {}
+  for _, o in ipairs(cs.objects) do if o[1] ~= spec.object then kept[#kept + 1] = { o[1], o[2] } end end
+  cs.objects = kept
+  local P = D("Proposal")
+  local sp = P.proposal
+  sp.removedSegments = { D("SegmentAndEntity", { entity = spec.edge, comp = COPY(w.BASE_EDGE), type = w.KIND }) }
+  sp.addedSegments = { D("SegmentAndEntity", { entity = -1, comp = c, type = w.KIND }) }
+  sp.edgeObjectsToRemove = { spec.object }
   P.proposal = sp
   return P
 end
@@ -959,9 +980,17 @@ function COUNT(comp)
   return n
 end
 
--- the module under test, loaded alone (no bridge): returns the module and its environment
+-- the module under test, loaded alone (no bridge): returns the module and its environment. The environment is strict: a
+-- global the module reads without defining raises (a typo in a branch no test reaches would otherwise read nil).
 function LOAD_BUILD()
-  local env = setmetatable({}, { __index = _G })
+  local env = setmetatable({}, { __index = function(_, k)
+    local v = _G[k]
+    if v == nil and k ~= "FEVERLINK3_BUILD" and k ~= "FEVERLINK3_ENGINE" then error("undefined global " .. tostring(k), 2) end
+    return v
+  end, __newindex = function(t, k, v)
+    if k ~= "api" and k ~= "package" and k ~= "ug_require" then error("global assigned: " .. tostring(k), 2) end
+    rawset(t, k, v)
+  end })
   env.api = MAKE_API()
   env.package = { loaded = {} }
   env.ug_require = function(p)
@@ -1432,6 +1461,40 @@ class BuildTest(unittest.TestCase):
         self.assertSameWorld()
         self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig(), "the signal that was there stays, the new one is added")
 
+    def test_a_signal_is_bulldozed_and_the_one_the_session_added_stays(self):
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created")
+        body = self.B.lua("CAPTURE_BODY(SIGNAL_P, SIGNAL_CREATED)")
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
+        self.tick(20)
+        self.assertSameWorld()
+        self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig())
+        # the savegame's signal (rank 1 on the segment) goes, the one just added (rank 2, another id in each game) stays
+        for g in (self.A, self.B):
+            self.assertNotEqual(g.lua("FIND_EDGE(0, 50, 100, 50)"), 130, "the segment was replaced")
+        self.B.issue("NATIVE_UNSIGNAL{ edge = %d, object = 140 }" % int(self.B.lua("FIND_EDGE(0, 50, 100, 50)")))
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIn("[signal/signal_a.mdl@0.750k2]", self.A.sig())
+        self.assertNotIn("0.250", self.A.sig())
+
+    def test_old_to_new_and_owners_map_onto_this_games_entities(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
+        self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 3 } }")
+        self.tick(30)
+        cb, ca = int(self.B.lua("FIND_CON('station/rail/modular_station.con')")), int(self.A.lua("FIND_CON('station/rail/modular_station.con')"))
+        self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 5 }, remove = %d }" % cb)
+        self.B.issue("NATIVE_ROAD_MOVING{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 57 }")
+        self.tick(40)
+        self.assertSameWorld()
+        self.assertEqual(self.A.lua("OLD2NEW_LOG[1]"), "%d=0" % ca, "the host's own station id as the key")
+        self.assertEqual(self.B.lua("OLD2NEW_LOG[1]"), "%d=0" % cb)
+        for g in (self.A, self.B):
+            owners = [str(g.lua("CON_OWNERS[%d]" % i)) for i in (1, 2, 3)]
+            self.assertEqual(owners, ["7", "7", "-1"], "the player's construction is this game's player, a town building stays nobody's")
+
     def test_a_bus_stop_on_the_left_is_object_kind_zero(self):
         self.start()
         self.B.run("STOP_P = NATIVE_SIGNAL{ edge = 110, param = 0.5, left = true, kind = 0, model = 'station/street/bus_stop.mdl' }; "
@@ -1637,6 +1700,11 @@ class PureBuildTest(unittest.TestCase):
                   "local added = sp.addedSegments; local s = added[1]; local c = s.comp; c.type = 1; c.typeIndex = 3; s.comp = c; added[1] = s; "
                   "sp.addedSegments = added; P.proposal = sp; return P end)()")
         self.assertEqual(self.ev("PLAN_OF(%s)" % bridge), "street")
+        # what cannot be read about the street pieces a construction brings with it does not stop it from being copied
+        odd = ("(function() local P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }; local sp = P.proposal; "
+               "local added = sp.addedSegments; local s = added[3]; local c = s.comp; c.node1 = 99999; c.laneConfigs = {}; c.objects = { { 123456, 1 } }; s.comp = c; "
+               "added[3] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % odd), "withStreet")
 
     def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
         def cat(code):
@@ -1771,6 +1839,11 @@ class PureBuildTest(unittest.TestCase):
                       "local okFile, whyFile = pcall(R.con, { __ref = 'con', file = 'depot.con', p = { x = 500, y = 200, z = 5 } }); "
                       "return a .. ',' .. b .. ',' .. tostring(okFile) end)()")
         self.assertEqual(got, "54,54,false")
+
+    def test_constructions_are_found_by_place_when_the_octree_has_nothing_for_them(self):
+        got = self.ev("(function() OCTREE_CONS_EMPTY = true; local M = PURE(); local R = M.resolver({ resolve = function() return nil end }); "
+                      "local e = R.con({ __ref = 'con', file = 'station.con', p = { x = -40.5, y = 12, z = 0 } }); OCTREE_CONS_EMPTY = nil; return e end)()")
+        self.assertEqual(got, 56)
 
     def test_an_object_is_named_by_its_rank_on_its_segment(self):
         got = self.ev("(function() local M = PURE(); local R = M.resolver({ resolve = function() return nil end }); "

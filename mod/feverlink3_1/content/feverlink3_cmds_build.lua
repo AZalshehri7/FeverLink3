@@ -786,11 +786,31 @@ local function readNode(n, cap)
 	return { id = cap.node(id), pos = copyXYZ(pos) }
 end
 
+-- The street segments a construction brings with it (the entrance of a depot or street station, the paths of a rail
+-- station) have templates of their own; the construction's script makes them, so a record does not need their detail
+-- (finding from MPFever (MIT)).
+local function ownTemplate(template)
+	local tpl = tostring(template or "")
+	return tpl:find("/constructions/", 1, true) ~= nil or tpl:find("simple.street_template", 1, true) ~= nil
+end
+
 -- one segment to add (SegmentAndEntity): everything the rebuild needs, from members read by name
 local function readSegment(s, cap)
 	local c = get(s, "comp")
 	if c == nil then fail("a segment to add has no component") end
 	local template = get(c, "roadTemplate")
+	if ownTemplate(template) then
+		-- noted, not described: what cannot be read about it must not stop the construction from being copied
+		local function nodeRef(k)
+			local ok, r = pcall(cap.node, get(c, k))
+			if ok then return r end
+			return -2147483647
+		end
+		return {
+			id = cap.edge(get(s, "entity")), type = get(s, "type"), n0 = nodeRef("node0"), n1 = nodeRef("node1"), objects = {},
+			c = { roadTemplate = template, type = get(c, "type"), typeIndex = get(c, "typeIndex"), roadType = get(c, "roadType"), roadStyle = get(c, "roadStyle") },
+		}
+	end
 	local lanes = A.list(c, "laneConfigs")
 	-- lanes travel only when they are not the lanes of the street template (tram tracks on a road, platform lanes of a
 	-- stop): the template's own are used otherwise
@@ -995,8 +1015,7 @@ end
 -- arguments of the engine command (and, for plans that need more than one command, a chain of further ones).
 
 local function isConstructionSegment(s)
-	local tpl = tostring(s.c and s.c.roadTemplate or "")
-	return tpl:find("/constructions/", 1, true) ~= nil or tpl:find("simple.street_template", 1, true) ~= nil
+	return ownTemplate(s.c and s.c.roadTemplate)
 end
 
 local function counts(rec)

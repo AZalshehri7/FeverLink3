@@ -95,6 +95,8 @@ rmNodes[], rmSegs[] (+ ty, ti, rt, st: the kind of the removed segment), objs[],
 terrain    { x0, y0, w, h }   a marker; the cells are not carried
 ```
 
+The street pieces a construction brings with it (templates under `/constructions/`, or `simple.street_template`) are recorded **lightly** (template, kind, end nodes if readable): the construction's own script makes them, and what cannot be read about them must not stop the construction from being copied.
+
 `context` is `false` (the original had none), `{ align, cleanup, buildings, fields }`, or `{ native = true }` (a tool's build: the plan's default is used).
 
 `classify(record)` picks the plan from the record's shape; `decode` runs it:
@@ -134,6 +136,8 @@ The key is `s:<id>` for an entity of the savegame, `<sender>:<seq>#c<i>` (constr
 Resolving on the applying game: the key is used **only if the entity it names lies where the reference says** (0.5 m; construction 1.0 m); otherwise the place is searched (nodes 1.0 m, constructions 3.0 m, segments by their end nodes, tangents break ties). Nothing found: `unresolved <what>`; two equally good: `ambiguous <what>`. Either refuses the **whole action** (`action_refused`) rather than apply it with a wrong id.
 
 Nodes are looked up by the octree on BASE_NODE if it answers, else on the ends of BASE_EDGE, else a full scan of the street graph (BASE_NODE and BASE_EDGE cannot be walked with `forEachEntityWithComponent`: finding from MPFever). The first lookup probes which works and logs `references: nodes are looked up by ...`.
+
+`ARCHITECTURE.md` section 6 says roads match "within 1.5 m, else split edge or create node". The mod searches within 1.0 m and **never creates or splits on its own**: a node it cannot find refuses the action. (A tool's proposal already contains the split it made; creating another would be a second guess.)
 
 Nothing from the wire is trusted: `normalise` checks version, list sizes (200 constructions, 4000 nodes or segments ...), types, finite numbers, file names (`.con`), text length, parameter depth. `encode` and `decode` never raise.
 
