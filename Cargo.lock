@@ -264,6 +264,8 @@ version = "0.1.0"
 dependencies = [
  "feverlink3_core",
  "feverlink3_launcher",
+ "rand",
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 

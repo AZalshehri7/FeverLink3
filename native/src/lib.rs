@@ -38,6 +38,13 @@ mod entry {
     /// the game to be further along are installed from a thread started here (later stage).
     #[no_mangle]
     pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
+        // Nothing may unwind into the loader. With `panic = "unwind"` a panic is stopped here; with `abort` (the
+        // release profile, see docs/SECURITY.md) the panic hook installed by `attach` has written it to the log.
+        let _ = std::panic::catch_unwind(|| attach(reason));
+        TRUE
+    }
+
+    fn attach(reason: u32) {
         if reason == DLL_PROCESS_ATTACH {
             let launched = std::env::var_os(SESSION_DIR_VAR);
             let live = launched.is_none() && is_game_process();
@@ -53,6 +60,7 @@ mod entry {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 log::init(path);
+                log::install_panic_hook();
                 log::line(&format!("FeverLink3 native {} loaded", env!("CARGO_PKG_VERSION")));
                 match game_build() {
                     Some(ts) => match build_table::select(ts) {
@@ -73,7 +81,6 @@ mod entry {
                 }
             }
         }
-        TRUE
     }
 
     /// True when the host executable is the game: the proxy sits in the game folder, but be exact.

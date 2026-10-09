@@ -31,7 +31,8 @@ impl Pattern {
     }
 
     pub fn matches_at(&self, hay: &[u8], at: usize) -> bool {
-        hay.len() >= at + self.0.len() && self.0.iter().zip(&hay[at..]).all(|(p, b)| p.is_none_or(|x| x == *b))
+        at.checked_add(self.0.len()).is_some_and(|end| end <= hay.len())
+            && self.0.iter().zip(&hay[at..]).all(|(p, b)| p.is_none_or(|x| x == *b))
     }
 
     /// Every offset where the pattern matches.
@@ -56,7 +57,7 @@ impl Pattern {
     /// accepted when it still matches and is the only match within `hint ± radius`.
     pub fn find_near(&self, hay: &[u8], hint: usize, radius: usize) -> Result<usize, usize> {
         let lo = hint.saturating_sub(radius);
-        let hi = (hint + radius).min(hay.len());
+        let hi = hint.saturating_add(radius).min(hay.len());
         if lo >= hi {
             return self.find_unique(hay);
         }

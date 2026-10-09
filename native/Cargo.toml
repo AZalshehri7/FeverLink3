@@ -25,3 +25,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 # The release profile is the workspace's, in the root Cargo.toml.
+
+[dev-dependencies]
+# The seeded generators of tests/robustness.rs and the log tests (versions as in the launcher; see launcher/Cargo.toml).
+rand = "0.8"
+tempfile = "~3.10"
