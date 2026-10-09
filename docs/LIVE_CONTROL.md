@@ -44,7 +44,7 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 
 | Kind | Payload | State | Effect |
 |---|---|---|---|
-| `host` | `{name?, port?, password?}` | `idle`, `failed` | Listens and becomes `hosting`. `name`: display name, trimmed, at most 24 characters, default the status `name`. `port`: TCP port, `0` for any free one, default 28090. `password`: lobby password, empty or absent for none; the join code alone is then not enough, so give the password separately. Fails to `failed` with `message` when the port cannot be bound. |
+| `host` | `{transport, name?, port?, password?}` | `idle`, `failed` | Becomes `hosting`. **`transport` must be `"tcp"`** for now, the direct developer transport (same PC or LAN): any other value, or none, fails to `failed` with a message that hosting over Steam is not finished (the Steam transport plugs in here). `name`: display name, trimmed, at most 24 characters, default the status `name`. `port`: TCP port, `0` for any free one, default 28090. `password`: lobby password, empty or absent for none; the join code alone is then not enough, so give the password separately. Fails to `failed` with `message` when the port cannot be bound. |
 | `join` | `{code, name?, password?}` | `idle`, `failed` | Becomes `joining` (up to 5 s per address in the code), then `joined`. Fails to `failed` with `message`: not a valid join code, cannot reach the host, or the host's reject (wrong code or password, other version, session full, ...). `password` must equal the host's. |
 | `leave` | `{}` | any | Stops hosting, or leaves the session (a player says goodbye first, so the host frees its slot at once), cancels a `join` in progress, clears `result`, writes `role=idle`. State `idle`. |
 | `start` | `{}` | `hosting` | Starts the session: every game is held at the time all of them share, and a checksum round is requested. Speed stays 0 until `speed` or a player's speed request. |
@@ -94,11 +94,9 @@ changed.
 | `steam` | table | always | The Steam networking probe, below. |
 | `message` | string | `failed` | Why: what went wrong, in words for the player. |
 | `code` | string | `hosting` | The join code to give to the other players. |
-| `endpoints` | list of string | `hosting` | The `ip:port` addresses inside the code, the public one first. |
+| `endpoints` | list of string | `hosting` | The `ip:port` addresses inside the code: this PC's local addresses (the direct developer transport). |
 | `password` | boolean | `hosting` | A lobby password is set. |
 | `capacity` | number | `hosting` | Most games in the session, the host's included (8). |
-| `public` | string | `hosting`, once found | The internet address, `ip:port`. |
-| `lookup` | string | `hosting` | How the public address was found, or why not (router forwarding advice). |
 | `me` | number | `hosting`, `joined`, `joining` with a session | This game's player id: 0 for the host, the id the host assigned for a player; absent before the welcome and while reconnecting. |
 | `players` | list of table | `hosting`, `joined`, `joining` with a session | Everyone the session knows, by id, the host first, **away players included**. Fields below. Empty before the welcome. |
 | `permissions` | table | same | What players may do. On the host the setting it enforces, on a player what the host last announced. Fields below. |
@@ -140,7 +138,7 @@ The Steam networking probe behind the connection test; `launcher/src/steamnet.rs
 
 | Field | Type | Meaning |
 |---|---|---|
-| `state` | string | `not available` (no Steam in this process), `waiting for Steam`, `ready`, or an error text. |
+| `state` | string | `looking for Steam...` (the controller looks for the Steam API again every 2 s for about 5 minutes when it was not loaded yet), `not available` (it never was), `waiting for Steam`, `ready`, or an error text. |
 | `id` | string | This account's Steam ID (digits), once Steam answered. |
 | `events` | list of string | The latest events, newest last, at most 8. |
 | `pings` | number | Pings other players sent to this account. |
@@ -155,7 +153,7 @@ The Steam networking probe behind the connection test; `launcher/src/steamnet.rs
 | `joining`, connecting | none |
 | `joining`, after the connection or during an outage | `me` (absent while reconnecting), `players`, `permissions`, `started`, `speed`, and `reconnecting`, `attempts` during an outage |
 | `joined` | `me`, `players`, `permissions`, `started`, `speed` |
-| `hosting` | `code`, `endpoints`, `password`, `capacity`, `public`, `lookup`, `me`, `players`, `permissions`, `started`, `speed`, `resync` |
+| `hosting` | `code`, `endpoints`, `password`, `capacity`, `me`, `players`, `permissions`, `started`, `speed`, `resync` |
 | `failed` | `message` |
 
 A joined session that ends by itself (the host removed this player or rejected it, or the launcher gave up
@@ -168,7 +166,7 @@ with the reason `bad-proof` (wrong code or password), `version`, `full` (with th
 A host with one player who is away, after the host restricted building:
 
 ```lua
-{["capacity"]=8,["code"]="AFVM...",["endpoints"]={[1]="192.168.0.141:28090"},["lookup"]="...",["me"]=0,
+{["capacity"]=8,["code"]="AFVM...",["endpoints"]={[1]="192.168.0.141:28090"},["me"]=0,
  ["name"]="Pat",["password"]=false,
  ["permissions"]={["build"]="hostOnly",["bulldoze"]="everyone",["other"]="everyone",["speed"]="everyone",
                   ["spend"]={["only"]={[1]=1}}},
