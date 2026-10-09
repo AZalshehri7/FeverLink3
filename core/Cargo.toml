@@ -20,7 +20,13 @@ hmac = "0.13.0"
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 sha2 = "0.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# float_roundtrip: a double parses back to exactly the value that was printed. The default parser can be one unit in
+# the last place off, and the Authority values (money) the host sends travel as JSON doubles.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 base64 = "0.23.1"
 # 0.2 links bcrypt through an ordinary import library, which both the GNU and the MSVC toolchains have.
 getrandom = "0.2.16"
+
+[dev-dependencies]
+# Seeded generators for the randomised robustness tests; already in the workspace through the launcher.
+rand = "0.8"
