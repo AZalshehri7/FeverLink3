@@ -441,7 +441,7 @@ local function installWrap()
 		orig.event = api.cmd.makeScriptingSendEventCmd
 		orig.factory = {}
 		for name in pairs(L.COMMANDS) do
-			-- a build without this factory may refuse the lookup instead of answering nil (MPFever looked each one up guarded)
+			-- a build without this factory may refuse the lookup instead of answering nil (MPFever (MIT) looked each one up guarded)
 			local okf, f = pcall(function() return api.cmd[name] end)
 			if okf then orig.factory[name] = f end
 		end

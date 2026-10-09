@@ -9,10 +9,10 @@
 -- that must be checked on the receiving game before the command is rebuilt there.
 --
 -- Argument shapes are read from the call sites in the game's own scripts (base/content/*.zip). The handling of engine
--- objects is a finding from MPFever (MIT, verified in the game there): they are userdata that list their members
--- under __members, vectors read as x/y/z, lists by # and [i]; a new object comes from api.type.<Name>.new() and is
--- filled member by member. Everything that touches the engine sits in the adapters (A): one place to change when a
--- build differs, one place for the tests to mock.
+-- objects is a finding from MPFever (MIT), which ran it in the game: they are userdata that list their members under
+-- __members, vectors read as x/y/z, lists by # and [i]; a new object comes from api.type.<Name>.new() and is filled
+-- member by member, and some properties hand out copies. Everything that touches the engine sits in the adapters (A):
+-- one place to change when a build differs, one place for the tests to mock.
 --
 -- Two rules keep a wrong guess from becoming a silent divergence. A command is rebuilt on the sending game before it
 -- is shipped (a dry run), and an engine object must come back from that rebuild equal to what was read; if not, the
@@ -140,7 +140,8 @@ function A.positionOf(con)
 	return { x = x, y = y, z = z or 0 }
 end
 
--- every entity with a component (forEachEntityWithComponent refuses some component types, hence the second way)
+-- every entity with a component (forEachEntityWithComponent refuses some component types, hence the second way:
+-- finding from MPFever (MIT))
 function A.entitiesWith(name)
 	local ids = {}
 	local ok = pcall(function()
@@ -229,7 +230,7 @@ local function marshal(v, depth)
 	if depth > 24 then return nil, "too deep" end
 	local m = A.members(v)
 	local count = m ~= nil and try(function() return #m end) or 0
-	if count > 0 then -- (an empty member list counts as none, as in MPFever's reader: a vector then reads as x, y, z)
+	if count > 0 then -- (an empty member list counts as none, as in MPFever's reader (MIT): a vector then reads as x, y, z)
 		local out = {}
 		for i = 1, count do
 			local k = m[i]
@@ -305,7 +306,7 @@ local function fill(obj, tree, typeName, where, skipped, failed)
 					local cur = obj[k]
 					if cur == nil then error("no such member", 0) end
 					fill(cur, mv, ft.inplace, at, skipped, failed)
-					-- some properties hand out copies (MPFever): the filled one is written back; where it is the object itself
+					-- some properties hand out copies (finding from MPFever (MIT)): the filled one is written back; where it is the object itself
 					-- (the game's own makePart fills `part.part` in place) the write changes nothing, and a refusal is harmless
 					pcall(function() obj[k] = cur end)
 					return
