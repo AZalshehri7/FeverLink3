@@ -24,6 +24,7 @@ use crate::crypto::SessionKey;
 /// per extension: u8 tag, u16 length, `length` value bytes
 ///   tag 1, relays: u8 count (1..4), per relay: u8 family (4 | 6 | 1), address bytes, u16 port
 ///                  (family 4: 4 bytes, 6: 16 bytes, 1: u8 length and that many bytes of DNS name)
+///   tag 2, Steam ID: u64 big endian, not 0
 ///   any other tag: skipped by the decoder, so a field added later does not break the codes of this build
 /// --
 /// 4    check = first 4 bytes of SHA-256 of everything before
@@ -42,6 +43,9 @@ pub struct JoinCode {
     pub endpoints: Vec<SocketAddr>,
     /// Relay servers, in the order a joiner should try them after the direct endpoints.
     pub relays: Vec<RelayAddr>,
+    /// The host's Steam ID (64 bits): a joiner connects to it through Steam's peer-to-peer networking, which needs
+    /// no open port on either side. `None` for a code that only has direct endpoints.
+    pub steam_id: Option<u64>,
     pub secret: [u8; SessionKey::SECRET_SIZE],
 }
 
@@ -260,6 +264,8 @@ impl JoinCode {
     pub const MAX_EXTENSIONS: usize = 8;
     /// Extension tag of the relay list.
     const EXT_RELAYS: u8 = 1;
+    /// Extension tag of the host's Steam ID.
+    const EXT_STEAM: u8 = 2;
     const CHECK_SIZE: usize = 4;
     const MIN_BYTES: usize = 1 + 4 + SessionKey::SECRET_SIZE + 1 + Self::CHECK_SIZE;
 
@@ -276,7 +282,14 @@ impl JoinCode {
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).min(u64::from(u32::MAX))
                 as u32
         });
-        Ok(Self { version: Self::VERSION_BASIC, created, endpoints: endpoints.to_vec(), relays: Vec::new(), secret })
+        Ok(Self {
+            version: Self::VERSION_BASIC,
+            created,
+            endpoints: endpoints.to_vec(),
+            relays: Vec::new(),
+            steam_id: None,
+            secret,
+        })
     }
 
     /// The same code with this relay list (replacing any). An empty list gives a version 1 code again.
@@ -289,6 +302,14 @@ impl JoinCode {
         Ok(self)
     }
 
+    /// The same code with the host's Steam ID, so a joiner can connect through Steam. 0 is not a Steam ID and gives
+    /// no field.
+    pub fn with_steam_id(mut self, steam_id: u64) -> Self {
+        self.steam_id = (steam_id != 0).then_some(steam_id);
+        self.version = self.wire_version();
+        self
+    }
+
     /// The optional fields as `(tag, value)`, in tag order. A field added later is one more entry here and one
     /// more arm in [`JoinCode::try_decode`].
     fn extensions(&self) -> Vec<(u8, Vec<u8>)> {
@@ -299,6 +320,9 @@ impl JoinCode {
                 relay.write(&mut value);
             }
             out.push((Self::EXT_RELAYS, value));
+        }
+        if let Some(id) = self.steam_id {
+            out.push((Self::EXT_STEAM, id.to_be_bytes().to_vec()));
         }
         out
     }
@@ -386,6 +410,7 @@ impl JoinCode {
             endpoints.push(SocketAddr::new(ip, r.u16()?));
         }
         let mut relays = Vec::new();
+        let mut steam_id = None;
         if version == Self::VERSION_EXTENDED {
             let count = usize::from(r.u8()?);
             if count == 0 || count > Self::MAX_EXTENSIONS {
@@ -409,13 +434,20 @@ impl JoinCode {
                         return None;
                     }
                 }
+                if tag == Self::EXT_STEAM {
+                    let id = u64::from_be_bytes(value.take(8)?.try_into().ok()?);
+                    if steam_id.is_some() || id == 0 || !value.done() {
+                        return None;
+                    }
+                    steam_id = Some(id);
+                }
                 // any other tag belongs to a later build: its bytes are skipped
             }
         }
         if !r.done() {
             return None;
         }
-        Some(Self { version, created, endpoints, relays, secret })
+        Some(Self { version, created, endpoints, relays, steam_id, secret })
     }
 }
 
