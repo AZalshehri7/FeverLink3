@@ -434,6 +434,8 @@ pub fn run_host(config: HostConfig) -> io::Result<SessionHandle> {
     let mut host = HostSession::new(key, &name, clock_fn(), options);
     link.write_identity(HostSession::HOST_ID, host.host_name(), Role::Host.as_str())?;
     let shared = Shared::new(Status::new(Role::Host, host.host_name()), echo_log);
+    // the first status already lists the host's own game
+    refresh_host_status(&host, &shared);
     shared.log(format!("listening on {local_addr}"));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {

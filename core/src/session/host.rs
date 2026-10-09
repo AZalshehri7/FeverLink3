@@ -408,6 +408,12 @@ impl HostSession {
             self.reject(connection, "full", Some("no ids left"));
             return;
         }
+        // game-side code does not panic: with no random source there is no token to give, so no join
+        let mut token = [0u8; 16];
+        if getrandom::getrandom(&mut token).is_err() {
+            self.reject(connection, "malformed", Some("the host has no source of random numbers"));
+            return;
+        }
 
         // ids only grow and are never given to anyone else: entity keys are `<sender>:<seq>` and nonces are
         // `<sender>:<counter>`, so a reused id would repeat both
@@ -420,8 +426,6 @@ impl HostSession {
             .chain(self.identities.values().map(|i| i.name.as_str()))
             .collect();
         let name = Names::unique(&Names::sanitize(&join.name), id, taken);
-        let mut token = [0u8; 16];
-        getrandom::getrandom(&mut token).expect("operating system random source");
         self.identities.insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None });
         let info = PlayerInfo { id, name: name.clone(), ready: false };
         self.players.insert(id, info.clone());

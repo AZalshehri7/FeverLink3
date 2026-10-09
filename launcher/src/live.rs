@@ -156,6 +156,8 @@ impl Controller {
 
     /// Reads new commands, advances the state, rewrites the status file when it changed.
     pub fn step(&mut self) {
+        // first, so that a command sees the state the window last saw, not the one before a session ended
+        self.advance();
         let lines = self.commands.poll().unwrap_or_default();
         for line in lines {
             let params = luatext::lua_to_json(&line.payload)
