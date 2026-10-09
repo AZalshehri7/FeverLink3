@@ -9,7 +9,7 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] Session state machine (host and player sides) with in-memory transport tests
 - [x] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
 - [x] Core ported from C# to Rust (`core/`, crate `feverlink3_core`), same tests, one Cargo workspace with the native module
-- [ ] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
+- [x] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
 - [x] CI on every push
 
 ## 0.2 — Launcher
@@ -42,8 +42,8 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 ## 0.5 — Playing with friends
 - [ ] Lua mod on the in-game Mod Hub and, if TF3 supports it, the Steam Workshop (auto-updates for every player); first confirm its automated approval allows the mod's file link
 - [ ] Steam invites and friends-list join
-- [ ] Host permissions: who may build, bulldoze, spend, change speed
-- [ ] Reconnection and hot join
+- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core)
+- [ ] Reconnection (hot join round done in core)
 
 ## 0.6 — Companies
 - [ ] Separate companies on one map, own money and vehicles

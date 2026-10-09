@@ -10,12 +10,18 @@ use super::kind::MessageKind;
 use super::lockstep::{Lockstep, PlayerClock};
 use super::messages::{
     codec, ActionMessage, AuthorityMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
-    ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, PlayerInfo, PlayerJoinedMessage,
-    PlayerLeftMessage, RejectMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
+    ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PlayerInfo, PlayerJoinedMessage,
+    PlayerLeftMessage, RejectMessage, ReplayFailedMessage, SaveDoneMessage, SessionState, SpeedRequestMessage,
+    WelcomeMessage,
 };
 use super::names::Names;
+use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
+use super::resync::ResyncState;
 use crate::crypto::{Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
+
+mod resync_impl;
+use resync_impl::ResyncRound;
 
 /// A transport connection, numbered by the caller.
 pub type ConnectionId = u64;
@@ -26,11 +32,20 @@ pub struct HostOptions {
     pub max_players: usize,
     pub session_broadcast_seconds: f64,
     pub checksum_seconds: f64,
+    /// Start a resync round by itself when the checksum policy asks for one (default true). When false the host
+    /// only emits [`HostOutput::ResyncRequested`] and the launcher decides.
+    pub auto_resync: bool,
 }
 
 impl Default for HostOptions {
     fn default() -> Self {
-        Self { version: "0.1".to_owned(), max_players: 8, session_broadcast_seconds: 3.0, checksum_seconds: 10.0 }
+        Self {
+            version: "0.1".to_owned(),
+            max_players: 8,
+            session_broadcast_seconds: 3.0,
+            checksum_seconds: 10.0,
+            auto_resync: true,
+        }
     }
 }
 
@@ -59,6 +74,22 @@ pub enum HostOutput {
     PlayerJoined(PlayerInfo),
     PlayerLeft(PlayerInfo),
     ChecksumCompleted(ChecksumOutcome),
+    /// The checksum policy (or a replay failure) wants a resync. Always emitted; the round starts by itself only
+    /// with [`HostOptions::auto_resync`].
+    ResyncRequested {
+        reason: String,
+    },
+    /// The resync round changed state (`Idle` = finished and resumed). `detail` is for the host's UI.
+    ResyncProgress {
+        id: i32,
+        state: ResyncState,
+        detail: String,
+    },
+    /// The round gave up. The session stays paused; resume with `set_speed`.
+    ResyncFailed {
+        id: i32,
+        reason: String,
+    },
     Log(String),
 }
 
@@ -87,6 +118,12 @@ pub struct HostSession {
     players: BTreeMap<u16, PlayerInfo>,
     clocks: BTreeMap<u16, PlayerClock>,
     checksums: ChecksumRounds,
+    permissions: Permissions,
+    policy: ChecksumPolicy,
+    resync: Option<ResyncRound>,
+    resync_counter: i32,
+    last_running_speed: i32,
+    pending_new_player: bool,
     dropped_once: HashSet<String>,
     next_player_id: u16,
     checksum_n: i32,
@@ -130,6 +167,12 @@ impl HostSession {
             players,
             clocks: BTreeMap::new(),
             checksums: ChecksumRounds::new(),
+            permissions: Permissions::default(),
+            policy: ChecksumPolicy::new(ChecksumPolicyConfig::default()),
+            resync: None,
+            resync_counter: 0,
+            last_running_speed: 1,
+            pending_new_player: false,
             dropped_once: HashSet::new(),
             next_player_id: 1,
             checksum_n: 0,
@@ -158,6 +201,10 @@ impl HostSession {
 
     pub fn clocks(&self) -> &BTreeMap<u16, PlayerClock> {
         &self.clocks
+    }
+
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
     }
 
     pub fn actions_relayed(&self) -> u64 {
@@ -204,6 +251,7 @@ impl HostSession {
                 let left = PlayerLeftMessage { id, name: info.name.clone() };
                 self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
                 self.out.push(HostOutput::PlayerLeft(info));
+                self.resync_step();
             }
         }
         self.drain()
@@ -286,7 +334,9 @@ impl HostSession {
         self.send(connection, MessageKind::Welcome, &codec::encode(&welcome));
         let joined = PlayerJoinedMessage { player: info.clone() };
         self.broadcast(MessageKind::PlayerJoined, &codec::encode(&joined), Some(id));
+        self.send(connection, MessageKind::Permissions, &codec::encode(&self.permissions));
         self.out.push(HostOutput::PlayerJoined(info));
+        self.on_new_player();
     }
 
     fn reject(&mut self, connection: ConnectionId, reason: &str, detail: Option<&str>) {
@@ -338,6 +388,7 @@ impl HostSession {
                     p.ready = true;
                 }
                 self.log(format!("{} ready {}", self.name(from), String::from_utf8_lossy(payload)));
+                self.resync_step();
                 if from != Self::HOST_ID {
                     if let Some(connection) = self.connection_of(from) {
                         self.send(connection, MessageKind::Session, &codec::encode(&self.state));
@@ -348,6 +399,7 @@ impl HostSession {
             MessageKind::Clock => {
                 if let Some(m) = codec::try_decode::<ClockMessage>(payload) {
                     self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
+                    self.resync_step();
                     let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead };
                     self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
                 }
@@ -356,6 +408,12 @@ impl HostSession {
             MessageKind::Action => {
                 if let Some(mut m) = codec::try_decode::<ActionMessage>(payload) {
                     m.from = from;
+                    m.category = m.normalized_category().to_owned();
+                    m.allowed = self.permissions.allows_action(&m.category, from);
+                    if !m.allowed && self.dropped_once.insert(format!("denied/{from}/{}", m.category)) {
+                        let who = self.name(from);
+                        self.log(format!("{who} may not {}; action relayed as refused", m.category));
+                    }
                     self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
                     self.actions_relayed += 1;
                 }
@@ -373,7 +431,16 @@ impl HostSession {
 
             MessageKind::SpeedRequest => {
                 if let Some(m) = codec::try_decode::<SpeedRequestMessage>(payload) {
-                    if self.state.started {
+                    if !self.permissions.speed.allows(from) {
+                        self.dropped += 1;
+                        if self.dropped_once.insert(format!("speed/{from}")) {
+                            let who = self.name(from);
+                            self.log(format!("speed request from {who} dropped (not allowed)"));
+                        }
+                    } else if self.resync.is_some() {
+                        let who = self.name(from);
+                        self.log(format!("speed request from {who} ignored (resync in progress)"));
+                    } else if self.state.started {
                         let same = (m.speed > 0 && self.state.pause_at.is_none() && m.speed == self.state.speed)
                             || (m.speed <= 0 && self.state.pause_at.is_some());
                         if !same {
@@ -399,8 +466,20 @@ impl HostSession {
                     }
                     let expected: Vec<u16> = self.players.values().filter(|p| p.ready).map(|p| p.id).collect();
                     if let Some(outcome) = self.checksums.report(from, m, &expected) {
-                        self.out.push(HostOutput::ChecksumCompleted(outcome));
+                        self.on_checksum_outcome(outcome);
                     }
+                }
+            }
+
+            MessageKind::SaveDone => {
+                if let Some(m) = codec::try_decode::<SaveDoneMessage>(payload) {
+                    self.on_save_done(from, m);
+                }
+            }
+
+            MessageKind::ReplayFailed => {
+                if let Some(m) = codec::try_decode::<ReplayFailedMessage>(payload) {
+                    self.on_replay_failed(from, &m.detail);
                 }
             }
 
@@ -426,12 +505,18 @@ impl HostSession {
     }
 
     pub fn set_speed(&mut self, speed: i32) -> Vec<HostOutput> {
-        self.set_speed_inner(speed);
+        if self.resync.is_some() {
+            self.log("speed change ignored: resync in progress".to_owned());
+        } else {
+            self.set_speed_inner(speed);
+        }
         self.drain()
     }
 
     pub fn pause(&mut self) -> Vec<HostOutput> {
-        self.pause_inner();
+        if self.resync.is_none() {
+            self.pause_inner();
+        }
         self.drain()
     }
 
@@ -440,8 +525,21 @@ impl HostSession {
         self.drain()
     }
 
-    /// Call regularly (every 250 ms or so): periodic session broadcast and checksum rounds.
+    /// Replaces who may build, bulldoze, spend and change speed, and tells every game (kind 20). Only the host's
+    /// launcher can call this; a player cannot send the kind.
+    pub fn set_permissions(&mut self, permissions: Permissions) -> Vec<HostOutput> {
+        if permissions != self.permissions {
+            self.permissions = permissions;
+            self.log("permissions changed".to_owned());
+        }
+        self.broadcast(MessageKind::Permissions, &codec::encode(&self.permissions), None);
+        self.drain()
+    }
+
+    /// Call regularly (every 250 ms or so): periodic session broadcast, checksum rounds and the resync round's
+    /// waits and timeouts.
     pub fn tick(&mut self) -> Vec<HostOutput> {
+        self.resync_step();
         let t = self.now();
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
@@ -460,6 +558,7 @@ impl HostSession {
             return;
         }
         let speed = speed.clamp(1, 4);
+        self.last_running_speed = speed;
         self.state = SessionState { speed, pause_at: None, lead: Lockstep::lead_units(speed), ..self.state.clone() };
         self.broadcast_session();
     }

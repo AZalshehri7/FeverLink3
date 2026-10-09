@@ -246,7 +246,9 @@ pub struct ActionRefusedMessage {
 // ---- relayed
 
 /// A player action, already stamped by its originator. `body` is opaque to the protocol: the mod's own
-/// serialisation. `from` is filled in by the host on relay.
+/// serialisation. `from`, and `allowed` (the host's verdict from [`Permissions`]), are filled in by the host on
+/// relay. A forbidden action is still relayed, tagged `allowed: false`, so every mod can refuse it and the
+/// originator can roll it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionMessage {
@@ -255,11 +257,87 @@ pub struct ActionMessage {
     pub body: String,
     #[serde(default)]
     pub from: u16,
+    /// `build`, `bulldoze`, `spend` or `other`. Anything else, or nothing, counts as `other`.
+    #[serde(default = "ActionMessage::default_category")]
+    pub category: String,
+    /// Set by the host; a player's own value is overwritten.
+    #[serde(default = "ActionMessage::default_allowed")]
+    pub allowed: bool,
 }
 
 impl ActionMessage {
+    pub const CATEGORIES: [&'static str; 4] = ["build", "bulldoze", "spend", "other"];
+
     pub fn new(stamp: i64, seq: i64, body: &str) -> Self {
-        Self { stamp, seq, body: body.to_owned(), from: 0 }
+        Self { stamp, seq, body: body.to_owned(), from: 0, category: Self::default_category(), allowed: true }
+    }
+
+    pub fn with_category(mut self, category: &str) -> Self {
+        self.category = category.to_owned();
+        self
+    }
+
+    fn default_category() -> String {
+        "other".to_owned()
+    }
+
+    fn default_allowed() -> bool {
+        true
+    }
+
+    /// The category normalised to one of [`Self::CATEGORIES`].
+    pub fn normalized_category(&self) -> &'static str {
+        Self::CATEGORIES.iter().copied().find(|c| *c == self.category).unwrap_or("other")
+    }
+}
+
+// ---- permissions
+
+/// Who may do something. The host's own game is always allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlayerSet {
+    #[default]
+    Everyone,
+    HostOnly,
+    /// These player ids (and the host).
+    Only(Vec<u16>),
+}
+
+impl PlayerSet {
+    pub fn allows(&self, player: u16) -> bool {
+        player == 0
+            || match self {
+                Self::Everyone => true,
+                Self::HostOnly => false,
+                Self::Only(ids) => ids.contains(&player),
+            }
+    }
+}
+
+/// Host to all (kind 20): what players may do. Defaults to everything for everyone.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Permissions {
+    #[serde(default)]
+    pub build: PlayerSet,
+    #[serde(default)]
+    pub bulldoze: PlayerSet,
+    #[serde(default)]
+    pub spend: PlayerSet,
+    #[serde(default)]
+    pub speed: PlayerSet,
+}
+
+impl Permissions {
+    /// Whether `player` may perform an action of `category` (`other` is never restricted).
+    pub fn allows_action(&self, category: &str, player: u16) -> bool {
+        match category {
+            "build" => self.build.allows(player),
+            "bulldoze" => self.bulldoze.allows(player),
+            "spend" => self.spend.allows(player),
+            _ => true,
+        }
     }
 }
 
