@@ -34,14 +34,24 @@ impl FrameHeader {
         dst[4..12].copy_from_slice(&self.counter.to_be_bytes());
     }
 
-    /// Reads a header from the first 12 bytes of `src`. Panics when `src` is shorter.
+    /// Reads a header from the first 12 bytes of `src`; `None` when `src` is shorter. The form for bytes that came
+    /// from outside.
+    pub fn try_read(src: &[u8]) -> Option<Self> {
+        let (b, _) = src.split_first_chunk::<{ Self::SIZE }>()?;
+        Some(Self {
+            version: b[0],
+            kind: b[1],
+            sender: u16::from_be_bytes([b[2], b[3]]),
+            counter: u64::from_be_bytes([b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]]),
+        })
+    }
+
+    /// Reads a header from the first 12 bytes of `src`. Panics when `src` is shorter; use [`FrameHeader::try_read`]
+    /// for anything that is not known to be long enough.
     pub fn read(src: &[u8]) -> Self {
-        assert!(src.len() >= Self::SIZE, "header needs 12 bytes");
-        Self {
-            version: src[0],
-            kind: src[1],
-            sender: u16::from_be_bytes([src[2], src[3]]),
-            counter: u64::from_be_bytes(src[4..12].try_into().expect("8 bytes")),
+        match Self::try_read(src) {
+            Some(header) => header,
+            None => panic!("header needs 12 bytes"),
         }
     }
 
@@ -73,6 +83,9 @@ pub enum ProtocolError {
     LengthBelowHeader(u32),
     /// The length field, or a frame to encode, exceeds [`FrameCodec::MAX_FRAME_LENGTH`].
     LengthOverLimit(usize),
+    /// The length field exceeds the smaller limit the caller set for this point of the connection
+    /// ([`FrameCodec::read_limited`]).
+    OverLimit { length: usize, limit: usize },
     /// The stream ended inside a frame.
     Truncated,
     /// The stream failed.
@@ -85,6 +98,9 @@ impl fmt::Display for ProtocolError {
             Self::LengthBelowHeader(n) => write!(f, "frame length {n} is shorter than a header"),
             Self::LengthOverLimit(n) => {
                 write!(f, "frame of {n} bytes exceeds the {} byte limit", FrameCodec::MAX_FRAME_LENGTH)
+            }
+            Self::OverLimit { length, limit } => {
+                write!(f, "frame of {length} bytes exceeds the {limit} byte limit that applies here")
             }
             Self::Truncated => f.write_str("stream ended inside a frame"),
             Self::Io(e) => write!(f, "stream error: {e}"),
@@ -120,15 +136,24 @@ impl FrameCodec {
     /// Largest frame after the length field: header plus body. 1 MiB holds a 256 KiB savegame chunk with room to
     /// spare and is far above any control message.
     pub const MAX_FRAME_LENGTH: usize = 1 << 20;
+    /// Largest first frame a host reads from a connection that has not introduced itself yet. The only frame such
+    /// a connection may send is a Join (a few hundred bytes), so nobody who has not proved they hold the key can
+    /// make the host buffer more than this.
+    pub const HANDSHAKE_MAX_LENGTH: usize = 4096;
     pub const LENGTH_FIELD_SIZE: usize = 4;
 
-    fn check_length(length: u32) -> Result<usize, ProtocolError> {
-        let n = length as usize;
+    /// The length field as a byte count, if it lies between a header and `max`.
+    fn check_length(length: u32, max: usize) -> Result<usize, ProtocolError> {
+        let n = usize::try_from(length).unwrap_or(usize::MAX);
         if n < FrameHeader::SIZE {
             return Err(ProtocolError::LengthBelowHeader(length));
         }
-        if n > Self::MAX_FRAME_LENGTH {
-            return Err(ProtocolError::LengthOverLimit(n));
+        if n > max {
+            return Err(if max < Self::MAX_FRAME_LENGTH {
+                ProtocolError::OverLimit { length: n, limit: max }
+            } else {
+                ProtocolError::LengthOverLimit(n)
+            });
         }
         Ok(n)
     }
@@ -152,17 +177,18 @@ impl FrameCodec {
     /// Decodes one complete length-prefixed frame from the front of `buffer`. `Ok(None)` when the buffer does not
     /// yet hold a whole frame; otherwise the frame and the number of bytes it consumed.
     pub fn try_decode(buffer: &[u8]) -> Result<Option<(Frame, usize)>, ProtocolError> {
-        if buffer.len() < Self::LENGTH_FIELD_SIZE {
+        let Some((length_field, rest)) = buffer.split_first_chunk::<{ Self::LENGTH_FIELD_SIZE }>() else {
             return Ok(None);
-        }
-        let length = Self::check_length(u32::from_be_bytes(buffer[..4].try_into().expect("4 bytes")))?;
-        let total = Self::LENGTH_FIELD_SIZE + length;
-        if buffer.len() < total {
+        };
+        let declared = u32::from_be_bytes(*length_field);
+        let length = Self::check_length(declared, Self::MAX_FRAME_LENGTH)?;
+        let Some(frame_bytes) = rest.get(..length) else {
             return Ok(None);
-        }
-        let header = FrameHeader::read(&buffer[Self::LENGTH_FIELD_SIZE..]);
-        let body = buffer[Self::LENGTH_FIELD_SIZE + FrameHeader::SIZE..total].to_vec();
-        Ok(Some((Frame::new(header, body), total)))
+        };
+        // cannot fail once the length passed the check; the error is the check's own
+        let header = FrameHeader::try_read(frame_bytes).ok_or(ProtocolError::LengthBelowHeader(declared))?;
+        let body = frame_bytes.get(FrameHeader::SIZE..).unwrap_or_default().to_vec();
+        Ok(Some((Frame::new(header, body), Self::LENGTH_FIELD_SIZE + length)))
     }
 
     pub fn write<W: Write + ?Sized>(stream: &mut W, frame: &Frame) -> Result<(), ProtocolError> {
@@ -173,6 +199,13 @@ impl FrameCodec {
     /// Reads one frame. `Ok(None)` on a clean end of stream (no byte of a next frame read); an error on a bad
     /// length or a stream that ends inside a frame.
     pub fn read<R: Read + ?Sized>(stream: &mut R) -> Result<Option<Frame>, ProtocolError> {
+        Self::read_limited(stream, Self::MAX_FRAME_LENGTH)
+    }
+
+    /// As [`FrameCodec::read`], but a frame longer than `max_length` (header included, at most
+    /// [`FrameCodec::MAX_FRAME_LENGTH`]) is refused before anything is allocated. For a peer that has not proved
+    /// anything yet: see [`FrameCodec::HANDSHAKE_MAX_LENGTH`].
+    pub fn read_limited<R: Read + ?Sized>(stream: &mut R, max_length: usize) -> Result<Option<Frame>, ProtocolError> {
         let mut len_buf = [0u8; Self::LENGTH_FIELD_SIZE];
         let got = read_up_to(stream, &mut len_buf)?;
         if got == 0 {
@@ -181,11 +214,12 @@ impl FrameCodec {
         if got < Self::LENGTH_FIELD_SIZE {
             return Err(ProtocolError::Truncated);
         }
-        let length = Self::check_length(u32::from_be_bytes(len_buf))?;
+        let declared = u32::from_be_bytes(len_buf);
+        let length = Self::check_length(declared, max_length.min(Self::MAX_FRAME_LENGTH))?;
         let mut rest = vec![0u8; length];
         stream.read_exact(&mut rest)?;
-        let header = FrameHeader::read(&rest);
-        rest.drain(..FrameHeader::SIZE);
+        let header = FrameHeader::try_read(&rest).ok_or(ProtocolError::LengthBelowHeader(declared))?;
+        rest.drain(..FrameHeader::SIZE.min(rest.len()));
         Ok(Some(Frame::new(header, rest)))
     }
 }

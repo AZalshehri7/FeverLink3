@@ -2,12 +2,20 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use sha2::Sha256;
 
-use crate::protocol::{Frame, FrameHeader};
+use crate::protocol::{Frame, FrameCodec, FrameHeader};
+
+/// Fills `buf` from the operating system's random source. The one primitive of the crate that can fail for reasons
+/// outside the program: callers in the game process refuse the operation (no session, no connection) instead of
+/// panicking.
+pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    getrandom::getrandom(buf).map_err(|e| io::Error::other(format!("the operating system's random source failed: {e}")))
+}
 
 /// The one symmetric key of a session, derived from the join code's secret and the optional lobby password.
 ///
@@ -15,7 +23,8 @@ use crate::protocol::{Frame, FrameHeader};
 /// set, else `ikm = secret`; `key = HKDF-SHA256(ikm, salt = "FeverLink3 v1", info = "session", 32)`.
 ///
 /// The stretching makes a leaked code without its password expensive to brute-force. No forward secrecy: the key
-/// lives for the session, as the architecture document states.
+/// lives for the session, as the architecture document states. A secret is used for one session only: a second
+/// session under the same key would restart the host's frame counter and reuse nonces.
 #[derive(Clone)]
 pub struct SessionKey {
     key: [u8; Self::KEY_SIZE],
@@ -29,11 +38,17 @@ impl SessionKey {
     const SALT: &'static [u8] = b"FeverLink3 v1";
     const INFO: &'static [u8] = b"session";
 
-    /// 16 random bytes for a new session. Panics only if the operating system's random source fails.
-    pub fn new_secret() -> [u8; Self::SECRET_SIZE] {
+    /// 16 random bytes for a new session. An error only if the operating system's random source fails.
+    pub fn try_new_secret() -> io::Result<[u8; Self::SECRET_SIZE]> {
         let mut secret = [0u8; Self::SECRET_SIZE];
-        getrandom::getrandom(&mut secret).expect("operating system random source");
-        secret
+        random_bytes(&mut secret)?;
+        Ok(secret)
+    }
+
+    /// As [`SessionKey::try_new_secret`], for tests and tools; panics if the random source fails. Code that runs in
+    /// the game process uses the fallible form.
+    pub fn new_secret() -> [u8; Self::SECRET_SIZE] {
+        Self::try_new_secret().expect("operating system random source")
     }
 
     /// `None` and `Some("")` both mean no password.
@@ -46,6 +61,7 @@ impl SessionKey {
             ikm.extend_from_slice(&stretched);
         }
         let mut key = [0u8; Self::KEY_SIZE];
+        // cannot fail: HKDF-SHA256 yields up to 255 × 32 bytes and 32 are asked for
         hkdf::Hkdf::<Sha256>::new(Some(Self::SALT), &ikm)
             .expand(Self::INFO, &mut key)
             .expect("32 bytes is a valid HKDF output length");
@@ -90,9 +106,39 @@ impl fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
+/// Why [`Sealer::try_seal`] produced no frame. None of these happens with the messages of this protocol; they exist
+/// so that the session code can drop a message instead of panicking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SealError {
+    /// The payload does not fit in one frame ([`Sealer::MAX_PAYLOAD`]).
+    TooLong(usize),
+    /// 2^64 - 1 frames were sealed under this sender id; one more would reuse a nonce.
+    CounterExhausted,
+    /// The cipher refused the message (it only does so beyond 2^36 bytes).
+    Cipher,
+}
+
+impl fmt::Display for SealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong(n) => {
+                write!(f, "payload of {n} bytes does not fit in a frame (at most {})", Sealer::MAX_PAYLOAD)
+            }
+            Self::CounterExhausted => f.write_str("the frame counter is exhausted"),
+            Self::Cipher => f.write_str("the cipher refused the message"),
+        }
+    }
+}
+
+impl std::error::Error for SealError {}
+
 /// Seals outgoing frames for one sender: AES-256-GCM, 16-byte tag, nonce = `u32 sender ‖ u64 counter`. The counter
-/// starts at 1 and only grows, so a nonce is never reused under a key as long as every sender id is unique in the
-/// session, which the host guarantees by assigning them.
+/// starts at 1 and only grows.
+///
+/// A nonce must never be used twice under one key, so: the host assigns every sender id once and never takes one
+/// back (a player who reconnects is a new sender); a new session has a new secret, hence a new key; a sealer that
+/// would run out of counters refuses instead of wrapping. Code that wants to give an id to a second `Sealer` has to
+/// continue the first one's counter.
 pub struct Sealer {
     aes: Aes256Gcm,
     sender: u16,
@@ -102,9 +148,17 @@ pub struct Sealer {
 impl Sealer {
     pub const NONCE_SIZE: usize = 12;
     pub const TAG_SIZE: usize = 16;
+    /// The longest payload that still fits in a frame once header and tag are added.
+    pub const MAX_PAYLOAD: usize = FrameCodec::MAX_FRAME_LENGTH - FrameHeader::SIZE - Self::TAG_SIZE;
 
     pub fn new(key: &SessionKey, sender: u16) -> Self {
         Self { aes: cipher(key), sender, counter: 0 }
+    }
+
+    /// A sealer for a sender id that was already used under this key: its first frame is numbered
+    /// `last_counter + 1`. The only correct way to give an id to a second `Sealer`.
+    pub fn resume(key: &SessionKey, sender: u16, last_counter: u64) -> Self {
+        Self { aes: cipher(key), sender, counter: last_counter }
     }
 
     pub fn sender(&self) -> u16 {
@@ -115,16 +169,28 @@ impl Sealer {
         self.counter
     }
 
-    pub fn seal(&mut self, kind: u8, plaintext: &[u8]) -> Frame {
-        self.counter += 1;
+    /// Seals `plaintext` as the next frame of this sender, or says why it cannot. Nothing leaves the sealer on an
+    /// error, so a refused message costs no nonce that was ever visible on the wire.
+    pub fn try_seal(&mut self, kind: u8, plaintext: &[u8]) -> Result<Frame, SealError> {
+        if plaintext.len() > Self::MAX_PAYLOAD {
+            return Err(SealError::TooLong(plaintext.len()));
+        }
+        self.counter = self.counter.checked_add(1).ok_or(SealError::CounterExhausted)?;
         let header = FrameHeader::new(FrameHeader::CURRENT_VERSION, kind, self.sender, self.counter);
         let nonce = nonce(self.sender, self.counter);
         let aad = header.to_bytes();
-        let body = self
-            .aes
-            .encrypt((&nonce).into(), Payload { msg: plaintext, aad: &aad })
-            .expect("AES-GCM encryption cannot fail for an in-memory message");
-        Frame::new(header, body)
+        let body =
+            self.aes.encrypt((&nonce).into(), Payload { msg: plaintext, aad: &aad }).map_err(|_| SealError::Cipher)?;
+        Ok(Frame::new(header, body))
+    }
+
+    /// As [`Sealer::try_seal`], for tests and tools. Panics where `try_seal` refuses: with a payload over
+    /// [`Sealer::MAX_PAYLOAD`], or after 2^64 - 1 frames. The session state machines use `try_seal`.
+    pub fn seal(&mut self, kind: u8, plaintext: &[u8]) -> Frame {
+        match self.try_seal(kind, plaintext) {
+            Ok(frame) => frame,
+            Err(e) => panic!("cannot seal a frame: {e}"),
+        }
     }
 }
 
@@ -135,7 +201,8 @@ impl fmt::Debug for Sealer {
 }
 
 /// Opens incoming frames from any sender and refuses replays. A frame is authenticated before its counter is
-/// recorded, so a forged frame cannot poison the window.
+/// recorded, and before its sender gets a window at all, so a forged frame can neither poison a window nor make the
+/// opener grow: it holds one 16-byte window per sender that ever sent an authentic frame.
 pub struct Opener {
     aes: Aes256Gcm,
     windows: HashMap<u16, ReplayWindow>,
@@ -154,8 +221,12 @@ impl Opener {
         if frame.body.len() < Sealer::TAG_SIZE {
             return Err(OpenError::TooShort);
         }
-        let window = self.windows.entry(h.sender).or_default();
-        if !window.is_fresh(h.counter) {
+        // a sender seen for the first time has an empty window: look, do not insert, until the tag has verified
+        let fresh = self
+            .windows
+            .get(&h.sender)
+            .map_or_else(|| ReplayWindow::new().is_fresh(h.counter), |w| w.is_fresh(h.counter));
+        if !fresh {
             return Err(OpenError::Replay);
         }
         let nonce = nonce(h.sender, h.counter);
@@ -164,7 +235,7 @@ impl Opener {
             .aes
             .decrypt((&nonce).into(), Payload { msg: &frame.body, aad: &aad })
             .map_err(|_| OpenError::Tamper)?;
-        window.accept(h.counter).expect("freshness was checked above");
+        self.windows.entry(h.sender).or_default().accept(h.counter)?;
         Ok(plaintext)
     }
 }
@@ -176,6 +247,7 @@ impl fmt::Debug for Opener {
 }
 
 fn cipher(key: &SessionKey) -> Aes256Gcm {
+    // cannot fail: the key is exactly the 32 bytes AES-256 takes
     Aes256Gcm::new_from_slice(key.key()).expect("32-byte key")
 }
 

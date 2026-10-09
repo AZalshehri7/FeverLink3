@@ -53,6 +53,10 @@ const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 impl JoinCode {
     pub const CURRENT_VERSION: u8 = 1;
     pub const MAX_ENDPOINTS: usize = 8;
+    /// Longest text [`JoinCode::try_decode`] looks at. The longest valid code (eight IPv6 endpoints) is 286
+    /// characters; dashes and spaces for readability add a quarter. The text comes from a paste box, so it is
+    /// bounded before anything is allocated for it.
+    pub const MAX_TEXT_LENGTH: usize = 1024;
     const CHECK_SIZE: usize = 4;
     const MIN_BYTES: usize = 1 + 4 + SessionKey::SECRET_SIZE + 1 + Self::CHECK_SIZE;
 
@@ -73,12 +77,15 @@ impl JoinCode {
     }
 
     pub fn encode(&self) -> String {
-        let mut body = Vec::with_capacity(Self::MIN_BYTES + self.endpoints.len() * 19);
+        // the fields are public, so a hand-built value can hold more than a code can carry: keep the first ones
+        // rather than write a code that nobody can read back
+        let endpoints = self.endpoints.get(..Self::MAX_ENDPOINTS).unwrap_or(&self.endpoints);
+        let mut body = Vec::with_capacity(Self::MIN_BYTES + endpoints.len() * 19);
         body.push(self.version);
         body.extend_from_slice(&self.created.to_be_bytes());
         body.extend_from_slice(&self.secret);
-        body.push(self.endpoints.len() as u8);
-        for ep in &self.endpoints {
+        body.push(endpoints.len() as u8);
+        for ep in endpoints {
             match ep.ip() {
                 IpAddr::V4(a) => {
                     body.push(4);
@@ -99,7 +106,7 @@ impl JoinCode {
     /// Parses a code typed or pasted by a player. `None` for anything that is not a valid code of a version this
     /// build understands; never panics on bad input.
     pub fn try_decode(text: &str) -> Option<Self> {
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || text.len() > Self::MAX_TEXT_LENGTH {
             return None;
         }
         let bytes = base32_decode(text)?;
@@ -178,7 +185,8 @@ pub fn base32_encode(data: &[u8]) -> String {
 /// Lenient RFC 4648 base32 decoding: case, dashes, spaces and `=` padding are ignored. `None` on any other
 /// character or when the trailing bits are not zero padding.
 pub fn base32_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 5 / 8);
+    // the capacity is a guess from untrusted text: never let it be more than a join code needs
+    let mut out = Vec::with_capacity((text.len().saturating_mul(5) / 8).min(JoinCode::MAX_TEXT_LENGTH));
     let mut buffer: u32 = 0;
     let mut bits = 0;
     for ch in text.chars() {
