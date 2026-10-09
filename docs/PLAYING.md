@@ -1,17 +1,21 @@
 # Playing FeverLink3 (test version 0.2.0-test1)
 
-FeverLink3 lets two or more people play the same Transport Fever 3 world together, each on their own PC. One player hosts, the others join with a code. This is an early test build: expect rough edges, read "What works and what does not (yet)" before you invite anyone, and tell the maintainer (Discord `azalshehri`) what happens.
+FeverLink3 lets two or more people play the same Transport Fever 3 world together, each on their own PC: one player hosts, the others join with a code. **This first test build has one job: to find out whether two players can reach each other through Steam** (the connection test in section 3). Hosting and joining a game over that connection arrive in the next test build, so the window's **Host a game** button will tell you that it is not finished yet. Expect rough edges, and tell the maintainer (Discord `azalshehri`) what happens.
+
+Players are connected through Steam's own peer-to-peer networking. By design that means no port forwarding, no router settings, no VPN and nothing to open in the firewall. Whether this holds on real home connections is exactly what this build is testing; until two different accounts have connected, please do not assume it works over the internet.
 
 Last updated: 2026-10-10. FeverLink3 is an unofficial community project. It is not made, endorsed or supported by Urban Games or Paradox Interactive.
 
 ## What you need
 
 - Windows 10 or 11 (64-bit) and Transport Fever 3 on Steam. Every player needs their own copy of the game, started through Steam, with Steam running and logged in.
-- **The same game version as the host.** This test build was made for game build 40420 (shown at the bottom right of the main menu). Ask the host which build they run.
+- **The same game version as the other player.** This test build was made for game build 40420 (shown at the bottom right of the main menu).
 - This folder, unzipped anywhere (for example the Desktop). Nothing is installed system-wide.
-- Back up your savegames before the first session. During a session FeverLink3 makes every game load the host's world, and it writes files named `feverlink3-resync-<number>.sav` into your Transport Fever 3 save folder.
+- Back up your savegames before the first real session (next test build). Sessions will make every game load the host's world and will write files named `feverlink3-resync-<number>.sav` into your Transport Fever 3 save folder.
 
 ## 1. Install (once per PC)
+
+`feverlink3.exe` is a testing tool for this phase. The plan is that the mod reaches players from the in-game Mod Hub or from Nexus Mods like any other mod, with the native module (`winhttp.dll`) delivered separately for now. Neither is available yet, and whether the Mod Hub accepts the mod is still being checked (`docs/WORKSHOP.md`).
 
 1. Close Transport Fever 3.
 2. Unzip `FeverLink3-<version>.zip`.
@@ -41,63 +45,43 @@ To remove everything later, close the game and run `feverlink3 uninstall`.
 Start Transport Fever 3 from **Steam as usual**. No extra program needs to run.
 
 - Starting a new game: on the settings page open the **Add Mods** tab, click **Activate** under *FeverLink3 Multiplayer*, then Start Game. (Menu names as of build 40420. If you cannot find the mod, run `feverlink3 doctor` and check that it says "mod installed".)
+- In the game, click **FeverLink3** in the bar at the bottom of the screen (next to the item counters). A window called *FeverLink3 Multiplayer* opens.
 - The mod does nothing until you host or join: without a session, the game plays as it always does.
-- Players who join do not need to prepare a world: the host's world is meant to be sent to them (see "What works" below, this step is not verified yet).
+- If the window says "The FeverLink3 module is not running", close the game, run `feverlink3 install` again, and start the game from Steam. If it says "looking for Steam..." for more than a minute, make sure the game was started from Steam.
 
-## 3. Host
+## 3. The Steam connection test (this test build)
 
-1. In the game, click **FeverLink3** in the bar at the bottom of the screen (next to the item counters). A window called *FeverLink3 Multiplayer* opens.
-2. Check **Your name**. It starts as your Windows user name and the other players will see it. Change it if you prefer.
-3. Click **Host a game**. The window says "You are hosting" and shows a **join code**.
-4. Click into the code field, press `Ctrl+A`, then `Ctrl+C`, and send the code to your friends (chat, Discord). The code is the key to your session: anyone who has it can join, so send it only to people you want to play with. Click **Stop hosting** when you are done.
-5. Press **Start the session**, then let your friends join. Each friend who joins is meant to get a copy of your world, and the game reloads for them.
-6. If someone's world looks different or out of date, press **Sync everyone to my world** (it appears once the session is started).
+This build proves that two players can reach each other through Steam. In the window, under **Steam connection test**:
 
-## 4. Join
+1. Your **Steam ID** is shown (17 digits). Send it to the other player; they send you theirs. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
+2. Paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**.
+3. Within about 20 seconds the window shows a line like `Test: connected, answers 6, last round trip 40 ms, direct` (or `through a Steam relay`, which means Steam used its own relay servers). The other player's window shows `Pings received from other players`.
 
-Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod.
+Both directions are worth trying (A tests B, then B tests A). Both players need to be in the game with Steam running when the test starts. If it says `failed`, or nothing happens after a minute, send the maintainer a screenshot and the log files below, and say in which countries you and the other player live (the country is enough).
 
-1. Start the game (any world, a new game is fine) with the mod activated, and click **FeverLink3** in the bar at the bottom.
-2. Paste the host's code into the field **paste the join code here** and press **Join**.
-3. The window shows "Connecting to the host..." and then "Connected". Wait for the host to start the session. The host's world is then sent to you and your game loads it. This is expected to take up to a minute; it is one of the steps that has not been verified between two real games yet.
-4. If the window says "Could not connect", read the message, check that the whole code was pasted, and ask the host to check that they are still hosting. **Leave** disconnects you.
+## 4. Hosting and joining (next test build)
 
-## How the players are connected
+Hosting and joining a game with a join code will travel over the same Steam connection. They arrive in the next test build; until then **Host a game** answers "Hosting over Steam is not finished in this build yet". The flow will be: the host clicks **Host a game**, copies the join code and sends it to a friend, who pastes it into **paste the join code here** and presses **Join**; the host's world is then sent to the friend and loads. There will be nothing to forward, open or configure.
 
-FeverLink3 connects the players' games through Steam's own peer-to-peer networking, using the Steam program that is already running for Transport Fever 3. By design there is nothing for you to set up: no address to type and nothing to configure. The join code is all your friend needs. Steam picks the route between the two games; if it cannot connect them directly it can use its own relay servers. A relay server operated by this project is being built as a second fallback. Whether this works on real home connections is exactly what the first two-account tests will show (see the status below).
-
-Status, stated plainly:
-
-- **Proven so far:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered.
-- **Being tested:** a connection between two *different* Steam accounts on two PCs. That first test is still to come. Until it has been done, please do not assume that a session over the internet will work.
-- **Being built:** the relay server fallback.
-
-### Help us test the connection
-
-While you are not hosting or joined, the window has a section called **Steam connection test**:
-
-1. Each of the two testers opens the window. It shows "Your Steam ID". Send yours to the other tester. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
-2. Paste the other tester's Steam ID into **paste the other player's Steam ID** and press **Test the connection**.
-3. Wait up to a minute. The window shows a line like `Test: connected, answers 6, last round trip 40 ms, direct` (or `through a Steam relay`). Send that line, and a note of where each of you lives (country is enough), to the maintainer.
-
-Both testers need to be in the game with Steam running when the test starts.
+Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod. Treat a join code like a password for that session.
 
 ## What works and what does not (yet)
 
 **Verified in the real game by the maintainer on 2026-10-09 (game build 40420):**
 
 - The mod loads and the in-game window opens from a button in the bottom bar.
-- "Host a game" starts a session inside the game and shows a join code.
-- A second client (a test client, not a second copy of the game) can join that session by its code.
+- With an earlier build of the window, whose Host button used a direct connection (since taken out of the window), hosting showed a join code and a second client (a test client, not a second copy of the game) could join that session by its code.
 - The game's own save and load functions can be driven by the mod, and after a reload the mod finds its session files again.
-- The game can open a Steam peer-to-peer listener (2026-10-10: and connect to its own Steam ID, 6 pings answered).
+- The game can open a Steam peer-to-peer listener.
+
+**Proven on 2026-10-10:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered.
 
 **Not verified yet:**
 
-- Building together: the mod captures some player actions (buying vehicles, creating lines, putting vehicles on lines) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
-- Sending the host's world to a second real game, and loading it there.
+- The Steam connection between two different accounts on two PCs (the test in section 3 is for this).
+- Hosting and joining over Steam, and sending the host's world to a second real game and loading it there.
 - Joining from a second real copy of the game, on another PC or Steam account.
-- The Steam connection between two different accounts.
+- Building together: the mod captures player actions (buying vehicles, creating lines, putting vehicles on lines, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
 - The native hooks that would hold construction commands back so every game builds at the same moment: not part of this version.
 
 **Not built yet:** separate companies, reconnecting after a connection loss while the game keeps running, a dedicated server.

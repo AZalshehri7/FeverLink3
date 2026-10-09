@@ -38,9 +38,11 @@ feverlink3 doctor | install [--dry-run] | uninstall [--dry-run]
 ```
 
 - **`host` and `join` are development and test commands, not how players connect.** They run the same session
-  code over a plain TCP transport so that the protocol, the file link and the resync round can be exercised on one
-  PC or one local network without the game. Players host and join from the in-game window, and the connection
-  between their games goes through Steam networking (`docs/PLAYING.md`).
+  code over a plain TCP transport (the developer transport, same PC or same local network) so that the protocol,
+  the file link and the resync round can be exercised without the game. Players connect through the in-game window
+  over Steam's peer-to-peer networking (`docs/PLAYING.md`); carrying whole sessions over that connection is still
+  being wired in, and until then the window's Host button says so (it only starts a TCP host when asked for the
+  `tcp` transport by name, which the tests do).
 - `host` listens on `0.0.0.0:<port>` (default 28090), prints the join code and the endpoints in it, and keeps
   running. The endpoints are this PC's local-network IPv4 addresses (the interface the OS would use towards the
   internet, plus what the machine name resolves to); nothing is looked up on the internet, so the code is only
@@ -189,11 +191,13 @@ edited while the game is closed.
 
 ## Live mode (inside the game)
 
-`live.rs` is what lets a player host or join from the in-game window without a terminal. The native module
-(`winhttp.dll`) calls `live::spawn()` from `DllMain` when the host process is `TransportFever3.exe` and
-`FEVERLINK3_SESSION_DIR` is not set (a game started by the `--launch` option of the command line keeps using that
-variable instead). `spawn` starts one thread named `feverlink3-live` that steps a `Controller` every 100 ms and
-never returns an error to the game: whatever fails there must not stop the game from starting.
+`live.rs` is the session controller that runs inside the game, so that a player needs no terminal: the in-game
+window drives it. The native module (`winhttp.dll`) calls `live::spawn()` from `DllMain` when the host process is
+`TransportFever3.exe` and `FEVERLINK3_SESSION_DIR` is not set (a game started by the `--launch` option of the
+command line keeps using that variable instead). `spawn` starts one thread named `feverlink3-live` that steps a
+`Controller` every 100 ms and never returns an error to the game: whatever fails there must not stop the game from
+starting. The part of the window that works end to end today is the Steam connection test; carrying whole sessions
+over Steam is still being wired in (see "Commands").
 
 - **The folder is fixed:** `%LOCALAPPDATA%\FeverLink3\live\`, so the mod finds it without an environment variable.
   Every file in it is deleted when the controller starts, so each game start begins clean. The native module's own
@@ -202,16 +206,21 @@ never returns an error to the game: whatever fails there must not stop the game 
   the id the host assigned. The mod becomes active when the role is `host` or `player`, without reloading the game.
 - **Commands.** The window (the Lua mod) appends file-link lines to `ctl_cmd.log`: `host`, `join`, `leave`,
   `start`, `pause`, `speed`, `check`, `resync` and `steamtest`. The payload is a Lua literal table (`host`:
-  `{name}`; `join`: `{name, code}`; `speed`: `{n}` clamped to 1 to 4; `steamtest`: `{id}`). `host` and `join` are
-  accepted only while idle or after a failure; the other session commands only while hosting.
+  `{name, transport}`; `join`: `{name, code}`; `speed`: `{n}` clamped to 1 to 4; `steamtest`: `{id}`). `host` and
+  `join` are accepted only while idle or after a failure; the other session commands only while hosting. **`host`
+  starts a session only with `transport = "tcp"`, the developer transport that the tests use; without it the
+  controller answers `failed` with "Hosting over Steam is not finished in this build yet; the Steam connection
+  test below works"**, which is what the window's **Host a game** button shows until the Steam transport is wired
+  in. A host's join code is made from the machine's local-network addresses and the session secret.
 - **Status.** The controller rewrites `ctl_status.txt`, one Lua literal table, whenever something changed (its
   `version` counter moves only then): `state` (`idle`, `hosting`, `joining`, `joined`, `failed`), the join `code`,
   `players`, `started`, `speed`, `resync` progress, a `message` after a failure, and the state of the Steam probe.
 - **Sessions.** Hosting and joining call the same `run_host` / `run_player` as the command line, so the protocol,
   the file link and the tests are the same code. The controller finds the `save` folders of the Steam users
   (`steam::discover`) for the resync round. A join runs on its own thread because connecting can take seconds.
-- **Steam probe.** `steamnet.rs` is loaded when the process has `steam_api64.dll` loaded (otherwise the window
-  reports "not available"). It is a connectivity probe only, with no session traffic yet.
+- **Steam probe.** `steamnet.rs` is loaded when the process has `steam_api64.dll` loaded; if it is not loaded yet
+  at start, the lookup is repeated every 2 s for about five minutes (the window shows "looking for Steam..."), then
+  the window reports "not available". It is a connectivity probe only, with no session traffic yet.
 - **A panic aborts the game** (the workspace release profile has `panic = "abort"`). The controller code returns
   errors instead of panicking; see the open point in `docs/ARCHITECTURE.md` section 12.
 
@@ -278,14 +287,16 @@ As of 2026-10-10, with what has and has not been run in the real game kept apart
   temporary folders), the resync round and savegame transfer (`tests/resync.rs`, a multi-chunk save over loopback),
   permissions, the live-mode controller (driven through files), update verification (`update.rs`), and the release
   zip and manifest (`tools/release`).
-- **Run in the real game (2026-10-09/10):** the live-mode controller starts inside the game, hosting from the window
-  shows a join code, a second client can join that session, and the Steam probe listens (and, inside one process,
-  reached its own Steam ID). See `docs/ROADMAP.md` for the dated list.
+- **Run in the real game (2026-10-09/10):** the live-mode controller starts inside the game; on 2026-10-09, with the
+  TCP host that the window started then, hosting showed a join code and a second client could join that session
+  (the window's Host button no longer starts a TCP host, see "Live mode"); the Steam probe listens and, inside one
+  process, reached its own Steam ID (6 pings answered). See `docs/ROADMAP.md` for the dated list.
 - **Not verified in the real game:** the savegame transfer and the resync load between two real games, the
   reconnect, permissions in the window, and any connection between two different Steam accounts.
 - **Not written yet:** the network fetch of the updater (the signature, hash, version and file-swap logic exist) and
   a real release signing key (the key in the repository is a placeholder whose private half is public, see
-  `docs/RELEASING.md`); the guided installer; the relay fallback; the Steam connection as the session transport.
+  `docs/RELEASING.md`); the guided installer; the Steam connection as the session transport (hosting and joining
+  over Steam).
 
 The release zip holds `feverlink3.exe`, `winhttp.dll` and `mod/feverlink3_1/` side by side; in a source tree
 `main.rs` finds them by walking up from the executable's folder (`mod/feverlink3_1/`, and `winhttp.dll` or

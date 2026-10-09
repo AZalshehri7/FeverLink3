@@ -209,7 +209,7 @@ fn host(args: &[String]) -> Result<(), String> {
     for ep in &endpoints {
         println!("  endpoint {ep}");
     }
-    println!("Players across the internet need your public address with port {bound} forwarded; it is not looked up.");
+    println!("Direct TCP is the developer transport (same PC or LAN). Players on other networks join through the in-game window, over Steam.");
     println!("Session folder: {}", session_dir.display());
     if o.launch {
         start_game(Role::Host, 0, &name, &session_dir)?;
