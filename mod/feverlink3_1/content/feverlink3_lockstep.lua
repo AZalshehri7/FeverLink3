@@ -163,7 +163,13 @@ L.COMMANDS = {
 -- { commands = { <api.cmd function name> = spec } }. A spec has the fields above and may carry two functions for
 -- arguments the generic path cannot carry (engine userdata such as proposals):
 --   spec.encode(name, args, ctx) -> body | nil, reason      (same contract as L.encodeCommand)
---   spec.decode(body, ctx)       -> { n = count, ... } | nil, reason
+--   spec.decode(body, ctx)       -> { n = count, ..., chain = { ... } } | nil, reason
+-- and these optional ones:
+--   spec.category                a name, or a function (name, args) -> name when it depends on the command's content
+--   args.chain (from decode)     further commands of the same action: argument lists or functions that make them
+--                                (see L.sendNow, L.runChained)
+--   spec.bindsComp, spec.bind    keys for entities the action created, beyond the single one spec.creates names
+--                                (see L.bindsComp, L.bindMap)
 function L.registerCommands(commands)
 	for name, spec in pairs(commands or {}) do L.COMMANDS[name] = spec end
 end
@@ -238,6 +244,70 @@ function L.newestEntity(before, after)
 	return created
 end
 
+-- Every entity in `after` that was not in `before`, ascending.
+function L.newEntities(before, after)
+	local seen, out = {}, {}
+	for _, e in ipairs(before) do seen[e] = true end
+	for _, e in ipairs(after) do
+		if not seen[e] then out[#out + 1] = e end
+	end
+	table.sort(out)
+	return out
+end
+
+-- Actions of more than one engine command (a depot needs its street part built before the depot itself): a schema's
+-- decode may put further commands in args.chain, each an argument list or a function that makes one when its turn comes.
+-- sendNow sends them one after the other at once (the simulation state runs a command as it is sent); runChained does
+-- it through callbacks (the interface state), stopping at the first that fails, and hands the last result to done.
+function L.sendNow(args, send)
+	send(args)
+	for _, entry in ipairs(args.chain or {}) do
+		local nextArgs = entry
+		if type(entry) == "function" then nextArgs = entry() end
+		if type(nextArgs) ~= "table" then error("a further command of the action could not be made") end
+		send(nextArgs)
+	end
+end
+
+function L.runChained(args, send, done)
+	local chain = args.chain or {}
+	local function step(a, i)
+		send(a, function(data, success, entities)
+			if i >= #chain or not success then return done(data, success, entities) end
+			local entry = chain[i + 1]
+			local ok, nextArgs = pcall(function()
+				if type(entry) == "function" then return entry() end
+				return entry
+			end)
+			if ok and type(nextArgs) == "table" then
+				local okS = pcall(step, nextArgs, i + 1)
+				if okS then return end
+			end
+			return done(data, false, {})
+		end)
+	end
+	step(args, 0)
+end
+
+-- Keys for entities an action created. A schema names the component whose new entities to look for (spec.bindsComp, a
+-- name or a function of the body) and maps them to keys (spec.bind(body, key, made) -> { [key] = entity }, complete).
+function L.bindsComp(spec, body)
+	local c = spec.bindsComp
+	if type(c) == "function" then
+		local ok, v = pcall(c, body)
+		c = ok and v or nil
+	end
+	if type(c) == "string" then return c end
+	return nil
+end
+
+function L.bindMap(spec, body, key, made)
+	if not spec.bind then return {}, true end
+	local ok, map, complete = pcall(spec.bind, body, key, made)
+	if not ok or type(map) ~= "table" then return {}, false end
+	return map, complete ~= false
+end
+
 -- ------------------------------------------------------------------ permissions
 
 -- The host grants each player a set of categories: build, bulldoze, spend (vehicle purchases), other. A command
@@ -245,9 +315,17 @@ end
 -- command that stays native is still checked. Anything unrecognised is "other".
 L.CATEGORIES = { "build", "bulldoze", "spend", "other" }
 
-function L.categoryOf(name)
+function L.categoryOf(name, args)
 	local spec = L.COMMANDS[name]
-	if spec and spec.category then return spec.category end
+	if spec and spec.category then
+		-- a schema may decide per command (a proposal that only removes things is bulldozing): spec.category(name, args)
+		if type(spec.category) == "function" then
+			local ok, c = pcall(spec.category, name, args)
+			if ok and type(c) == "string" then return c end
+			return "other"
+		end
+		return spec.category
+	end
 	local n = tostring(name):lower()
 	if n:find("bulldoze", 1, true) or n:find("remove", 1, true) or n:find("demolish", 1, true) then return "bulldoze" end
 	if n:find("buy", 1, true) or n:find("purchase", 1, true) then return "spend" end
