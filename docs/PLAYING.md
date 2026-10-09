@@ -55,6 +55,8 @@ Start Transport Fever 3 from **Steam as usual**. No extra program needs to run.
 
 ## 4. Join
 
+Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod.
+
 1. Start the game (any world, a new game is fine) with the mod activated, and click **FeverLink3** in the bar at the bottom.
 2. Paste the host's code into the field **paste the join code here** and press **Join**.
 3. The window shows "Connecting to the host..." and then "Connected". Wait for the host to start the session. The host's world is then sent to you and your game loads it. This is expected to take up to a minute; it is one of the steps that has not been verified between two real games yet.
