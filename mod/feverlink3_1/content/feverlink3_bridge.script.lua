@@ -30,7 +30,10 @@ if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverlink3_cmds_company" }) do
 	local okM, M = pcall(ug_require, name .. ".lua")
 	if not okM then okM, M = pcall(ug_require, "feverlink3_1::/" .. name .. ".lua") end
-	if okM and type(M) == "table" then L.registerCommands(M.commands) end
+	if okM and type(M) == "table" then
+		L.registerCommands(M.commands)
+		if M.events then L.registerEvents(M.events) end
+	end
 end
 
 local STEP = L.STEP
@@ -97,20 +100,18 @@ local engine = {
 	end,
 	entitiesWith = entitiesWith,
 
-	-- Books `amount` as a journal entry on the player's account: how a game's balance is brought to the host's
-	-- value (finding from MPFever (MIT): JournalEntry with time -1 and category OTHER through
-	-- makeJournalBookAssetCmd).
-	bookJournal = function(amount)
+	-- Books `amount` as a journal entry of the given type (OTHER, LOAN...) on the player's account: how a game's
+	-- balance is brought to the host's value (finding from MPFever (MIT): JournalEntry with time -1 and category OTHER
+	-- through makeJournalBookAssetCmd). Sent with the game's own sendCommand, so it is never replicated.
+	bookJournal = function(amount, kind)
 		local entry = api.type.JournalEntry.new()
 		entry.amount = amount
 		entry.time = -1
-		entry.category.type = api.type.JournalEntry.Type.OTHER
+		entry.category.type = api.type.JournalEntry.Type[kind or "OTHER"]
 		local send = O.sendCommand or api.cmd.sendCommand
 		send(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry))
 	end,
-	-- No loan command is known for TF3 yet (nothing in MPFever): absent, so a loan difference is logged, not
-	-- corrected. A build that has one can supply it through FEVERLINK3_ENGINE.adjustLoan(delta).
-	adjustLoan = nil,
+	-- adjustLoan is defined below the table (it uses the account reader above).
 
 	-- Save and load go through the application object, which exists in the interface state (finding from
 	-- MPFever (MIT): app.saveGame(name, callback, false, true); a savegame is found with
@@ -134,6 +135,33 @@ local engine = {
 		return false, "savegame '" .. tostring(name) .. "' not found"
 	end,
 }
+
+-- Moves the loan by `delta` without moving the balance. TF3 keeps no loan command: the loan is a game script
+-- (game_mechanics/finance/loan.script.tl) and the only thing that changes an account's loan is a journal entry of
+-- category LOAN. The script pays a loan out with one (+amount) and takes its repayment with one (-amount), so such an
+-- entry moves the balance by the same amount; the sum is booked back as OTHER to leave the balance alone. That a LOAN
+-- entry of +x raises the reported loan by x is read from the script, not measured: should a correction move the loan
+-- the wrong way, the next one notices and this switches itself off instead of doubling the error every round.
+do
+	local last, off = nil, false
+	local logEngine = C.logger("engine")
+	engine.adjustLoan = function(delta)
+		if off then error("loan correction is off: the loan moved the wrong way after the last one") end
+		local _, loan = engine.account()
+		if last and type(loan) == "number" and type(last.loan) == "number" then
+			local moved = loan - last.loan
+			if moved * last.delta < 0 and math.abs(moved) >= math.abs(last.delta) / 2 then
+				off = true
+				local why = "loan correction is off: the loan moved by " .. moved .. " after a correction of " .. last.delta
+				logEngine(why .. " (a LOAN journal entry is assumed to raise the loan by its amount; see docs/COVERAGE_OPS.md)")
+				error(why)
+			end
+		end
+		engine.bookJournal(delta, "LOAN")
+		engine.bookJournal(-delta, "OTHER")
+		last = { delta = delta, loan = loan }
+	end
+end
 
 -- The test harness (or a game build with other accessors) replaces any of the above through a global table.
 do
@@ -206,11 +234,15 @@ end
 
 local function simAdvanceWatches(st, now)
 	if #st.watches == 0 then return end
+	-- an entity bound to one key is not there for the next watch: five vehicles bought in one step appear together
+	local claimed = {}
+	for _, e in pairs(st.bind) do claimed[e] = true end
 	local keep = {}
 	for _, w in ipairs(st.watches) do
 		w.steps = w.steps + 1
-		local created = L.newestEntity(w.before, engine.entitiesWith(w.comp))
+		local created = L.claimEntity(w.before, engine.entitiesWith(w.comp), claimed)
 		if created then
+			claimed[created] = true
 			st.bind[w.key] = created
 			st.results[#st.results + 1] = { key = w.key, at = w.at, success = true, data = { [w.result] = created }, entities = { { created, 0 } } }
 			logSim("action " .. w.key .. " created entity " .. created .. " (" .. w.comp .. ")")
@@ -363,7 +395,9 @@ local function guiApplyNow(it, now)
 	local cmd = (O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(args, 1, args.n))
 	O.sendCommand(cmd, function(data, success, entities)
 		if spec.creates and success then
-			local e = type(data) == "table" and data[spec.result] or nil
+			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
+			local okd, e = pcall(function() return data[spec.result] end)
+			if not okd then e = nil end
 			if e == nil and type(entities) == "table" and entities[1] then e = entities[1][1] end
 			if e ~= nil then
 				G.bind[it.key] = e
@@ -389,7 +423,8 @@ local function shipLocal(tag, cb)
 	G.seq = G.seq + 1
 	local at = L.stampFor(G.session, now)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
-	send("action", { stamp = at, seq = G.seq, body = C.serialize(body) })
+	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
+	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args) })
 	if cb then G.pending[it.key] = cb end
 	logGui("action " .. it.key .. " " .. tag.name .. " stamped " .. at .. " (now " .. now .. ")")
 	route(it)
@@ -405,7 +440,11 @@ local function installWrap()
 		orig.setSpeed = api.cmd.makeGameSetSpeedCmd
 		orig.event = api.cmd.makeScriptingSendEventCmd
 		orig.factory = {}
-		for name in pairs(L.COMMANDS) do orig.factory[name] = api.cmd[name] end
+		for name in pairs(L.COMMANDS) do
+			-- a build without this factory may refuse the lookup instead of answering nil (MPFever (MIT) looked each one up guarded)
+			local okf, f = pcall(function() return api.cmd[name] end)
+			if okf then orig.factory[name] = f end
+		end
 	end
 	O.sendCommand, O.setSpeed, O.event, O.factory = orig.sendCommand, orig.setSpeed, orig.event, orig.factory
 	local wrapped = 0
@@ -437,7 +476,7 @@ local function installWrap()
 				send("speed_request", { speed = tag.args[1] })
 				return
 			end
-			local category = L.categoryOf(tag.name)
+			local category = L.categoryOf(tag.name, tag.args)
 			if not L.permitted(G.perms, category) then
 				-- cancelled before stamping: nothing is sent to the other games, the window learns it failed
 				logGui("command " .. tag.name .. " refused: not allowed to " .. category)
@@ -447,7 +486,8 @@ local function installWrap()
 			end
 			local ok, err = shipLocal(tag, cb)
 			if ok then return end
-			logGui("command " .. tag.name .. " sent natively: " .. tostring(err))
+			-- an event nobody replicates (notifications, tutorial steps...) is the normal case, not worth a line each
+			if category ~= "local" then logGui("command " .. tag.name .. " sent natively: " .. tostring(err)) end
 			return O.sendCommand(cmd, cb, progress)
 		end
 	end)

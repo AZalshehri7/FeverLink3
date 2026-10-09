@@ -26,8 +26,11 @@ impl SessionKey {
     pub const KEY_SIZE: usize = 32;
     pub const PASSWORD_ITERATIONS: u32 = 600_000;
 
+    pub const ROOM_ID_SIZE: usize = 16;
+
     const SALT: &'static [u8] = b"FeverLink3 v1";
     const INFO: &'static [u8] = b"session";
+    const ROOM_INFO: &'static [u8] = b"relay room";
 
     /// 16 random bytes for a new session. Panics only if the operating system's random source fails.
     pub fn new_secret() -> [u8; Self::SECRET_SIZE] {
@@ -55,6 +58,19 @@ impl SessionKey {
     /// 32 key bytes. Treat as secret; never log.
     pub fn key(&self) -> &[u8; Self::KEY_SIZE] {
         &self.key
+    }
+
+    /// The name of a session on a relay server (`docs/RELAY.md`): `HKDF-SHA256(secret, salt = "FeverLink3 v1",
+    /// info = "relay room", 16 bytes)`. Everyone who holds the join code derives the same 128 bits, so the code
+    /// does not have to carry them, and the relay never learns the secret: HKDF with another info label is a
+    /// one-way function of it, independent of the session key. It needs the secret only, not the lobby password,
+    /// because the joiner knows the code before it knows whether a password is wanted.
+    pub fn relay_room_id(secret: &[u8; Self::SECRET_SIZE]) -> [u8; Self::ROOM_ID_SIZE] {
+        let mut id = [0u8; Self::ROOM_ID_SIZE];
+        hkdf::Hkdf::<Sha256>::new(Some(Self::SALT), secret)
+            .expand(Self::ROOM_INFO, &mut id)
+            .expect("16 bytes is a valid HKDF output length");
+        id
     }
 }
 
