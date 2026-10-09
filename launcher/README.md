@@ -81,7 +81,8 @@ Under the checks, **Next step** says the first thing to do in a sentence.
 **The installed version.** The install writes nothing that says which version it is (the footprint is fixed, see
 *Install footprint*). The launcher carries `feverlink3-launcher-version=<version>` in its data, and
 `feverlink3_path.txt` names the launcher that installed; if that file still exists, the wizard reads the marker from
-it. Otherwise the line says "version not recorded" and the comparison says only that the files differ.
+it. Otherwise the line says "version not known" and the comparison says only that the files differ. (A launcher on a
+network share is not read: with the share gone, Windows can take half a minute to say so.)
 
 **Failures** are explained in plain words (`wizard/problems.rs`): the game is running, Steam or the game is missing,
 the folder is incomplete or zipped, another mod's `winhttp.dll` is in the way, files are in use, Windows refused

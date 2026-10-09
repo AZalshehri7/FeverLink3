@@ -494,6 +494,16 @@ mod tests {
     }
 
     #[test]
+    fn an_input_that_ends_at_a_question_is_a_no() {
+        let pc = Pc::new();
+        drive(&pc, "1\n\n0\n");
+        let out = drive(&pc, "2\n");
+        assert!(out.contains("Type y and press Enter to continue"), "{out}");
+        assert!(out.contains("Nothing was changed."), "{out}");
+        assert!(pc.game().join(install::DLL_NAME).is_file(), "nothing was removed");
+    }
+
+    #[test]
     fn uninstall_is_refused_while_the_game_runs() {
         let pc = Pc::new();
         drive(&pc, "1\n\n0\n");

@@ -161,7 +161,8 @@ fn installed_text(f: &Facts) -> String {
             )
         }
         InstallState::Complete { version: None } => {
-            "installed, version not recorded (the folder that installed it is gone)".to_owned()
+            "installed, but its version is not known (the folder it was installed from is gone, or too old to say)"
+                .to_owned()
         }
         InstallState::NotInstalled => "not installed".to_owned(),
         InstallState::Partial { .. } => "only partly installed".to_owned(),
@@ -429,7 +430,7 @@ mod tests {
         assert!(text.contains("but the mod and the native module (winhttp.dll) differ from"), "{text}");
         let unknown = verdict(None);
         assert!(unknown.contains("installed version is not known"), "{unknown}");
-        assert!(unknown.contains("version not recorded"), "{unknown}");
+        assert!(unknown.contains("its version is not known"), "{unknown}");
 
         let helpers =
             comparison_lines(&with_plan(installed_facts(), vec![step(Item::PathFile, Outcome::Done, "updated")]))

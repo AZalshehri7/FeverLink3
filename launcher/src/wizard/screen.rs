@@ -114,7 +114,7 @@ fn installed_check(f: &Facts) -> Check {
         InstallState::Unknown => check(Status::Note, LABEL, "unknown (there is no game folder to look in)"),
         InstallState::NotInstalled => check(Status::Note, LABEL, "not installed yet"),
         InstallState::Complete { version: Some(v) } => check(Status::Good, LABEL, format!("installed (version {v})")),
-        InstallState::Complete { version: None } => check(Status::Good, LABEL, "installed (version not recorded)"),
+        InstallState::Complete { version: None } => check(Status::Good, LABEL, "installed (version not known)"),
         InstallState::Partial { native_module, mods, users } => {
             check(Status::Warn, LABEL, format!("only partly installed: {}", partial_text(native_module, mods, users)))
         }
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(line(&installed_facts()), format!("installed (version {})", own_version()));
         let mut unknown_version = installed_facts();
         unknown_version.installed_version = None;
-        assert_eq!(line(&unknown_version), "installed (version not recorded)");
+        assert_eq!(line(&unknown_version), "installed (version not known)");
         let mut partial = installed_facts();
         partial.users[0].mod_installed = false;
         assert_eq!(
