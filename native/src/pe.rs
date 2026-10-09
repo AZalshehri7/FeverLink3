@@ -93,7 +93,7 @@ pub mod test_image {
         let opt_size = 240u16;
         v.extend_from_slice(&opt_size.to_le_bytes());
         v.extend_from_slice(&0x22u16.to_le_bytes()); // characteristics
-        // optional header (PE32+), 240 bytes
+                                                     // optional header (PE32+), 240 bytes
         let opt_start = v.len();
         v.resize(opt_start + opt_size as usize, 0);
         v[opt_start..opt_start + 2].copy_from_slice(&0x20bu16.to_le_bytes());

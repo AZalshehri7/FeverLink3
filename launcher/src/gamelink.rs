@@ -100,11 +100,7 @@ pub fn parse_line(text: &str) -> Option<Line> {
 /// Makes a session or player name safe as a folder-name prefix: ASCII letters, digits, `-` and `_` only,
 /// at most 24 characters, never empty.
 pub fn folder_safe(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(24)
-        .collect();
+    let s: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(24).collect();
     if s.is_empty() {
         "session".to_string()
     } else {
@@ -361,7 +357,10 @@ mod tests {
         assert_eq!(text.matches('\n').count(), 1, "payload stays on one line");
         assert!(text.ends_with('\n'));
         assert_eq!(parse_line(&text), Some(l));
-        assert_eq!(parse_line("12\thello\thost\t\n"), Some(Line { seq: 12, kind: "hello".into(), from: "host".into(), payload: String::new() }));
+        assert_eq!(
+            parse_line("12\thello\thost\t\n"),
+            Some(Line { seq: 12, kind: "hello".into(), from: "host".into(), payload: String::new() })
+        );
         assert_eq!(parse_line("3\tclock\t0\tpayload\twith\ttabs\r\n").unwrap().payload, "payload\twith\ttabs");
     }
 

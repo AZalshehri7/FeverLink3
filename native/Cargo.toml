@@ -1,10 +1,12 @@
 [package]
 name = "feverlink3_native"
-version = "0.1.0"
-edition = "2021"
-publish = false
 description = "FeverLink3 native module: a winhttp.dll proxy the game loads itself; command capture and determinism patches"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lib]
 # cdylib: the DLL the game loads. rlib: the pure modules (scanner, PE parser, detour maths, build table) for tests
@@ -20,10 +22,4 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemServices",
 ] }
 
-[profile.release]
-opt-level = "z"
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-debug = false
+# The release profile is the workspace's, in the root Cargo.toml.

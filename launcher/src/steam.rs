@@ -406,7 +406,10 @@ mod tests {
 
     #[test]
     fn registry_path_is_normalised() {
-        assert_eq!(normalize_steam_path("c:/program files (x86)/steam"), PathBuf::from(r"c:\program files (x86)\steam"));
+        assert_eq!(
+            normalize_steam_path("c:/program files (x86)/steam"),
+            PathBuf::from(r"c:\program files (x86)\steam")
+        );
         assert_eq!(normalize_steam_path(r"C:\Steam\"), PathBuf::from(r"C:\Steam"));
     }
 }

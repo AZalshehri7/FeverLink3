@@ -31,7 +31,7 @@ impl Pattern {
     }
 
     pub fn matches_at(&self, hay: &[u8], at: usize) -> bool {
-        hay.len() >= at + self.0.len() && self.0.iter().zip(&hay[at..]).all(|(p, b)| p.map_or(true, |x| x == *b))
+        hay.len() >= at + self.0.len() && self.0.iter().zip(&hay[at..]).all(|(p, b)| p.is_none_or(|x| x == *b))
     }
 
     /// Every offset where the pattern matches.

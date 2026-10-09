@@ -32,9 +32,14 @@ fn doctor() -> ExitCode {
     for lib in &info.libraries {
         println!("library:         {}", lib.display());
     }
-    println!("game:            {}", info.game_dir.as_deref().map_or("TransportFever3.exe not found in any library".into(), path_text));
+    println!(
+        "game:            {}",
+        info.game_dir.as_deref().map_or("TransportFever3.exe not found in any library".into(), path_text)
+    );
     if info.user_dirs.is_empty() {
-        println!("user folders:    none (userdata/<id>/3493540/local does not exist yet; the game creates it on first run)");
+        println!(
+            "user folders:    none (userdata/<id>/3493540/local does not exist yet; the game creates it on first run)"
+        );
     }
     for u in &info.user_dirs {
         let state = if install::mod_installed(u) { "mod installed" } else { "mod not installed" };
@@ -78,7 +83,8 @@ fn footprint(dry_run: bool, remove: bool) -> ExitCode {
     } else {
         let (mod_src, dll_src) = locate_payload();
         let launcher = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("FeverLink3.exe"));
-        let payload = Payload { mod_source: mod_src.as_deref(), native_dll: dll_src.as_deref(), launcher_path: &launcher };
+        let payload =
+            Payload { mod_source: mod_src.as_deref(), native_dll: dll_src.as_deref(), launcher_path: &launcher };
         install::install(game_dir, &info.user_dirs, payload, dry_run)
     };
     print!("{report}");
@@ -102,7 +108,9 @@ fn locate_payload() -> (Option<PathBuf>, Option<PathBuf>) {
             mod_src = Some(d.join("mod").join(MOD_ID));
         }
         if dll_src.is_none() {
-            for candidate in [d.join("winhttp.dll"), d.join("native").join("target").join("release").join("feverlink3_native.dll")] {
+            for candidate in
+                [d.join("winhttp.dll"), d.join("native").join("target").join("release").join("feverlink3_native.dll")]
+            {
                 if candidate.is_file() {
                     dll_src = Some(candidate);
                     break;

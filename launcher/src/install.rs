@@ -242,7 +242,9 @@ fn install_mod(report: &mut Report, user_dirs: &[PathBuf], source: Option<&Path>
             Item::Mod,
             "",
             Outcome::Skipped,
-            format!("no Steam user folder userdata/<id>/{APP_ID}/local exists; start the game once, then install again"),
+            format!(
+                "no Steam user folder userdata/<id>/{APP_ID}/local exists; start the game once, then install again"
+            ),
         );
         return;
     }
@@ -268,9 +270,12 @@ fn install_appid(report: &mut Report, game_dir: &Path, dry_run: bool) {
             report.record(Item::AppIdFile, &path, "created", result);
         }
         Ok(AppIdState::Ours) => report.push(Item::AppIdFile, &path, Outcome::Skipped, "already present"),
-        Ok(AppIdState::Other(content)) => {
-            report.push(Item::AppIdFile, &path, Outcome::Skipped, format!("already present with content {content:?}; left alone"))
-        }
+        Ok(AppIdState::Other(content)) => report.push(
+            Item::AppIdFile,
+            &path,
+            Outcome::Skipped,
+            format!("already present with content {content:?}; left alone"),
+        ),
         Err(e) => report.push(Item::AppIdFile, &path, Outcome::Failed, format!("could not read: {e}")),
     }
 }
@@ -293,7 +298,10 @@ fn install_dll(report: &mut Report, game_dir: &Path, source: Option<&Path>, dry_
             Item::NativeDll,
             src,
             Outcome::Failed,
-            format!("the shipped module lacks the marker {:?}; refusing to install an unidentifiable DLL", String::from_utf8_lossy(NATIVE_MARKER)),
+            format!(
+                "the shipped module lacks the marker {:?}; refusing to install an unidentifiable DLL",
+                String::from_utf8_lossy(NATIVE_MARKER)
+            ),
         );
         return;
     }
@@ -325,9 +333,8 @@ fn install_dll(report: &mut Report, game_dir: &Path, source: Option<&Path>, dry_
     let result = if dry_run {
         Ok(())
     } else {
-        fs::write(&dst, &src_bytes).map_err(|e| {
-            io::Error::new(e.kind(), format!("{e} (is the game running? close it and install again)"))
-        })
+        fs::write(&dst, &src_bytes)
+            .map_err(|e| io::Error::new(e.kind(), format!("{e} (is the game running? close it and install again)")))
     };
     report.record(Item::NativeDll, &dst, verb, result);
 }

@@ -51,7 +51,10 @@ pub fn check_prologue(found: &[u8], expected: &[u8]) -> Result<(), DetourError> 
         return Err(DetourError::PrologueTooShort(expected.len()));
     }
     if found.len() < expected.len() || &found[..expected.len()] != expected {
-        return Err(DetourError::UnexpectedBytes { expected: expected.to_vec(), found: found[..found.len().min(expected.len())].to_vec() });
+        return Err(DetourError::UnexpectedBytes {
+            expected: expected.to_vec(),
+            found: found[..found.len().min(expected.len())].to_vec(),
+        });
     }
     Ok(())
 }
@@ -82,7 +85,8 @@ pub unsafe fn install(target: *mut u8, hook: usize, expected: &[u8]) -> Result<D
     let patch = patch_bytes(hook as u64, expected.len())?;
     let tramp = trampoline_bytes(expected, target as u64);
 
-    let mem = unsafe { VirtualAlloc(core::ptr::null(), tramp.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+    let mem = unsafe { VirtualAlloc(core::ptr::null(), tramp.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) }
+        as *mut u8;
     if mem.is_null() {
         return Err(DetourError::Memory(unsafe { GetLastError() }));
     }
@@ -99,7 +103,11 @@ pub unsafe fn install(target: *mut u8, hook: usize, expected: &[u8]) -> Result<D
     // The padding first, the jump last: a thread arriving between the two writes still sees a valid prologue
     // start or a complete jump, never half a jump.
     unsafe {
-        core::ptr::copy_nonoverlapping(patch.as_ptr().add(JMP_ABS_LEN), target.add(JMP_ABS_LEN), patch.len() - JMP_ABS_LEN);
+        core::ptr::copy_nonoverlapping(
+            patch.as_ptr().add(JMP_ABS_LEN),
+            target.add(JMP_ABS_LEN),
+            patch.len() - JMP_ABS_LEN,
+        );
         core::ptr::copy_nonoverlapping(patch.as_ptr(), target, JMP_ABS_LEN);
         VirtualProtect(target as *const _, patch.len(), prev, &mut prev);
     }

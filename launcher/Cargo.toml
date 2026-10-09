@@ -1,10 +1,12 @@
-﻿[package]
+[package]
 name = "feverlink3_launcher"
-version = "0.1.0"
-edition = "2021"
-publish = false
 description = "FeverLink3 launcher: Windows platform layer (Steam discovery, game-side install, file link, game start)"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lib]
 path = "src/lib.rs"

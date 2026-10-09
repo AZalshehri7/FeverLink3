@@ -1,6 +1,6 @@
 # Wire protocol
 
-Protocol version 1. Implemented in `src/FeverLink3.Core` (`Protocol/`, `Crypto/`, `Session/`); every rule here has a test in `tests/FeverLink3.Core.Tests`.
+Protocol version 1. Implemented in the `feverlink3_core` crate, `core/src` (`protocol.rs`, `crypto.rs`, `lobby.rs`, `session/`); every rule here has a test in `core/tests`.
 
 ## Frame
 

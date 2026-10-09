@@ -8,6 +8,7 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] Join codes: base32, version, addresses, secret, checksum
 - [x] Session state machine (host and player sides) with in-memory transport tests
 - [x] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
+- [x] Core ported from C# to Rust (`core/`, crate `feverlink3_core`), same tests, one Cargo workspace with the native module
 - [ ] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
 - [x] CI on every push
 
@@ -17,7 +18,7 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] Savegame transfer with SHA-256, streamed from disk
 - [ ] Session clock, speed, pause, checksum rounds, resync round
 - [ ] `--selftest` over loopback
-- [ ] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256
+- [ ] Packaging: single static exe, portable zip, reproducible release job with SHA-256
 - [ ] In-app updater with Ed25519-signed releases; version carried in the join code
 - [ ] First-run install and one-button uninstall of the game-side pieces
 - [ ] Project site on GitHub Pages (`docs/`): download, how to play, known issues, privacy

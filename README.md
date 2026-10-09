@@ -28,26 +28,29 @@ If you are the author of either and want the wording changed, open an issue.
 
 | Folder | Role | Language |
 |---|---|---|
-| `src/FeverLink3.Core` | Protocol: framing, sealed channel, join codes, session model. No game or UI code. | C# (.NET 10) |
-| `src/FeverLink3.Launcher` | Windows launcher: lobby, game start, save transfer, resync. *(planned)* | C# |
+| `core/` | Crate `feverlink3_core`. Protocol: framing, sealed channel, join codes, session model. No game or UI code. Tests in `core/tests`. | Rust |
+| `launcher/` | `FeverLink3.exe`: lobby, game start, save transfer, resync. *(planned)* | Rust |
 | `native/` | Proxy DLL the game loads itself: command capture and hold, determinism patches. Skeleton: proxy, PE parsing, scanner, detour maths, build table. | Rust |
 | `mod/feverlink3_1/` | Game-script mod: lockstep core (stamping, barrier, pause, queue, deterministic random, checksums), file link, command capture. In-game UI and native-build replay *(planned)*. See `mod/README.md`. | Lua |
-| `tests/` | `FeverLink3.Core.Tests` (xunit); `native/` has `cargo test`; `tests/lua/` runs two mocked games through the real mod with lupa | C#, Rust, Python |
+| `tools/addr/` | Address tool: finds the hook sites in a game executable and prints a build-table row. See `tools/addr/README.md`. | Python |
+| `tests/lua/` | Two mocked games running the real mod through lupa; `core/tests/` and the native crate run under `cargo test --workspace` | Python, Rust |
 | `docs/` | Architecture, roadmap, protocol notes | |
+
+The repository is one Cargo workspace (`core`, `native`). Lua lockstep tests with lupa are planned alongside the mod.
 
 ## Building
 
-Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download) and, for the native module, [stable Rust](https://rustup.rs).
+Requires [stable Rust](https://rustup.rs). No other SDK.
 
 ```
-dotnet build && dotnet test
-cd native && cargo test && cargo build --release
+cargo test --workspace
+cargo build --release -p feverlink3_native     # target/release/feverlink3_native.dll -> ship as winhttp.dll
 pip install lupa && python -I tests/lua/test_lockstep.py
 ```
 
 ## Contributing
 
-Issues and pull requests are welcome. Read `docs/ARCHITECTURE.md` first; design changes go through an issue before code. Every change to `FeverLink3.Core` needs a test.
+Issues and pull requests are welcome. Read `docs/ARCHITECTURE.md` first; design changes go through an issue before code. Every change to `core/` needs a test.
 
 ## Contact
 

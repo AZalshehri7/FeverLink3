@@ -45,7 +45,9 @@ mod entry {
                 match game_build() {
                     Some(ts) => match build_table::select(ts) {
                         Some(b) => log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name)),
-                        None => log::line(&format!("unknown game build (timestamp {ts:#x}): hooks off, mod runs degraded")),
+                        None => {
+                            log::line(&format!("unknown game build (timestamp {ts:#x}): hooks off, mod runs degraded"))
+                        }
                     },
                     None => log::line("could not read the game's PE header"),
                 }

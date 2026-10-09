@@ -15,13 +15,14 @@ Transport Fever 3 imports `WINHTTP.dll`, and Windows looks for it in the game fo
 
 ## Build
 
+From the repository root (one Cargo workspace with `core/`):
+
 ```
-cd native
-cargo test                       # pure modules, any host
-cargo build --release            # target/release/feverlink3_native.dll -> ship as winhttp.dll
+cargo test -p feverlink3_native                # pure modules, any host
+cargo build --release -p feverlink3_native     # target/release/feverlink3_native.dll -> ship as winhttp.dll
 ```
 
-Toolchain: stable Rust. Either `x86_64-pc-windows-msvc` (needs the Visual Studio linker) or `x86_64-pc-windows-gnu` (self-contained, used on machines without Visual Studio). CI builds the msvc one.
+Toolchain: stable Rust. Either `x86_64-pc-windows-msvc` (needs the Visual Studio linker) or `x86_64-pc-windows-gnu` (self-contained, used on machines without Visual Studio). CI builds the msvc one. The release profile lives in the root `Cargo.toml`.
 
 ## Activation
 

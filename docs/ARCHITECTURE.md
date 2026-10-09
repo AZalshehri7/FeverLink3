@@ -20,7 +20,7 @@ Lockstep is the only model that fits, and it is the one both prior projects (TpF
  Player PC                                            Player PC
  +--------------------------------+                   +---------------------+
  |  Transport Fever 3             |                   |  Transport Fever 3  |
- |   +-- native module (C++)      |                   |   ...               |
+ |   +-- native module (Rust)     |                   |   ...               |
  |   |    capture, hold, release  |                   +---------------------+
  |   +-- Lua mod                  |     sealed TCP              |
  |        stamp, replay, checksum |<---------+                  |
@@ -35,8 +35,8 @@ Lockstep is the only model that fits, and it is the one both prior projects (TpF
 |---|---|---|
 | **Native module** (Rust) | Loaded by the game via a DLL it imports. Hooks the engine's command list to capture tool commands before they apply, hold them until their stamp, and release them. Applies determinism patches (single-worker script pool). Copies data a script cannot read (terrain cells). | Open sockets. Decide anything about the session. Run when no FeverLink3 session is active. |
 | **Lua mod** (Lua) | Game-script side. Stamps local actions, ships them to the launcher, applies remote actions at their step, computes world checksums, saves and loads for resync, draws the in-game UI (players, chat, status). | Trust anything from the file link without checking the sender id the launcher attached. |
-| **Launcher** (`FeverLink3.exe`, C#) | Starts the game with the session environment. Hosts or joins a session. Owns the session clock, speed and pause. Relays commands in one order to everyone. Collects checksums and runs resync. Transfers savegames. | Interpret game commands. |
-| **Core library** (C#) | Everything in the launcher that has no Windows, UI or game dependency: framing, crypto, join codes, session state machine, message types. Fully unit-tested. | Reference WinForms, the registry, Steam or the filesystem layout. |
+| **Launcher** (`FeverLink3.exe`, Rust) | Starts the game with the session environment. Hosts or joins a session. Owns the session clock, speed and pause. Relays commands in one order to everyone. Collects checksums and runs resync. Transfers savegames. | Interpret game commands. |
+| **Core library** (`feverlink3_core`, Rust) | Everything in the launcher that has no Windows, UI or game dependency: framing, crypto, join codes, session state machine, message types. Fully unit-tested. | Reference the UI toolkit, the registry, Steam or the filesystem layout. |
 
 The launcher and the game talk through files in a per-session folder, as the two prior projects do: it needs no process injection and survives either side restarting. Every line carries a monotonically increasing sequence number so a reader never re-dispatches history after a truncation.
 
@@ -44,7 +44,7 @@ The launcher and the game talk through files in a per-session folder, as the two
 
 Threat: an outsider who learns the host's address, or a player who is not the host, must not be able to control the session.
 
-- **The join code is the credential.** It carries a 16-byte random session secret. The session key is `HKDF-SHA256(ikm, salt = "FeverLink3 v1", info = "session")` with `ikm = secret`, or, when the host set a lobby password, `ikm = secret ‖ PBKDF2-HMAC-SHA256(password, salt = secret, 600 000 iterations)`. The stretching makes a leaked code without its password expensive to brute-force. (`src/FeverLink3.Core/Crypto/SessionKey.cs`)
+- **The join code is the credential.** It carries a 16-byte random session secret. The session key is `HKDF-SHA256(ikm, salt = "FeverLink3 v1", info = "session")` with `ikm = secret`, or, when the host set a lobby password, `ikm = secret ‖ PBKDF2-HMAC-SHA256(password, salt = secret, 600 000 iterations)`. The stretching makes a leaked code without its password expensive to brute-force. (`core/src/crypto.rs`)
 - **Sealed frames.** Every frame is `AES-256-GCM(key, nonce, plaintext, aad = header)`. Nonce = 4-byte sender id ‖ 8-byte counter, never reused: the sender id is assigned by the host at join and the counter only grows. Receivers keep a 64-frame replay window per sender.
 - **Host decides who speaks.** The host rewrites the sender id on everything it relays. A player may send only the kinds in the *player allow-list* (hello, clock, action, action result, checksum, speed request, chat). Everything else from a player is dropped and logged once.
 - **Players listen to the host only** for control (session state, checksum requests, authority values, resync). Other players reach them only through kinds the host relays.
@@ -113,7 +113,7 @@ The native module is written in Rust (`native/`): the hooking core is `unsafe` i
 
 ## 10. Testing
 
-- `FeverLink3.Core`: xunit, every public type. Property-style tests for framing and sealing round trips.
+- `feverlink3_core`: `cargo test`, every public type. Property-style tests for framing and sealing round trips. The session state machines return their outgoing events from every call, so host and players are wired together in memory with a clock the test moves.
 - Lua mod: two mocked games running the real Lua through lupa, host relay mocked; checks same actions at same steps, id translation, pause, late actions.
 - Launcher: protocol state machine tests with in-memory transports; a `--selftest` that runs host + player over loopback.
 - CI runs all of it on every push. Game-in-the-loop tests are manual and documented.
@@ -122,7 +122,7 @@ The native module is written in Rust (`native/`): the hooking core is `unsafe` i
 
 No installer. A release is one zip: `FeverLink3.exe`, the proxy DLL, the mod folder and a README. The player extracts it anywhere and runs the exe.
 
-- **Self-contained launcher.** Published as a .NET 10 self-contained single-file executable, so nothing has to be installed on the player's PC. The size cost (about 60 MB) is accepted; targeting the in-box .NET Framework would lose AES-GCM and the modern APIs the core depends on.
+- **Self-contained launcher.** A single Rust executable of a few megabytes, statically linked: no runtime to install on the player's PC, nothing to download first, and the same crypto crates as the core.
 - **First run installs the game-side pieces**, nothing else: the proxy DLL into the game folder, the mod into the user mods folder, and the file that lets a Steam-started game find the launcher. An *Uninstall* button removes exactly those. No registry, no admin rights.
 - **Reproducible releases.** Every release is a tag built by GitHub Actions; the zip's SHA-256 is in the release notes. Nothing is built on a developer's PC.
 - **In-app updates.** The launcher checks GitHub Releases, downloads the zip, verifies an Ed25519 signature (public key embedded, private key kept offline by the maintainer) and replaces itself. Files the launcher downloads carry no mark-of-the-web, so Windows SmartScreen appears once per PC, at the very first run, and never for updates. The join code carries the host's version; a player on another version is offered the update before joining.

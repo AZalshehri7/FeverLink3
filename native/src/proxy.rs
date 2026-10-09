@@ -55,7 +55,12 @@ fn real_proc(name: &'static [u8]) -> *mut c_void {
 }
 
 macro_rules! relay {
-    ($name:ident ( $($arg:ident : $ty:ty),* ) -> $ret:ty, $fail:expr) => {
+    ($name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty, $fail:expr) => {
+        /// Relay to the system `winhttp.dll` function of the same name.
+        ///
+        /// # Safety
+        /// Called by the game with the arguments of the real WinHTTP function; they are passed through untouched,
+        /// so the same preconditions as the Windows API apply.
         #[no_mangle]
         pub unsafe extern "system" fn $name($($arg: $ty),*) -> $ret {
             type F = unsafe extern "system" fn($($ty),*) -> $ret;
@@ -75,17 +80,55 @@ macro_rules! relay {
     };
 }
 
-relay!(WinHttpOpen(agent: Lpcwstr, access: Dword, proxy: Lpcwstr, bypass: Lpcwstr, flags: Dword) -> Hinternet, null_mut());
+relay!(
+    WinHttpOpen(agent: Lpcwstr, access: Dword, proxy: Lpcwstr, bypass: Lpcwstr, flags: Dword) -> Hinternet,
+    null_mut()
+);
 relay!(WinHttpConnect(session: Hinternet, server: Lpcwstr, port: Word, reserved: Dword) -> Hinternet, null_mut());
-relay!(WinHttpOpenRequest(connect: Hinternet, verb: Lpcwstr, object: Lpcwstr, version: Lpcwstr, referrer: Lpcwstr, accept: *mut Lpcwstr, flags: Dword) -> Hinternet, null_mut());
+relay!(
+    WinHttpOpenRequest(
+        connect: Hinternet,
+        verb: Lpcwstr,
+        object: Lpcwstr,
+        version: Lpcwstr,
+        referrer: Lpcwstr,
+        accept: *mut Lpcwstr,
+        flags: Dword,
+    ) -> Hinternet,
+    null_mut()
+);
 relay!(WinHttpSetOption(h: Hinternet, option: Dword, buffer: *mut c_void, len: Dword) -> Bool, 0);
 relay!(WinHttpReadData(h: Hinternet, buffer: *mut c_void, to_read: Dword, read: *mut Dword) -> Bool, 0);
-relay!(WinHttpSetStatusCallback(h: Hinternet, callback: *mut c_void, flags: Dword, reserved: DwordPtr) -> *mut c_void, usize::MAX as *mut c_void);
+relay!(
+    WinHttpSetStatusCallback(h: Hinternet, callback: *mut c_void, flags: Dword, reserved: DwordPtr) -> *mut c_void,
+    usize::MAX as *mut c_void
+);
 relay!(WinHttpCloseHandle(h: Hinternet) -> Bool, 0);
 relay!(WinHttpWriteData(h: Hinternet, buffer: *const c_void, to_write: Dword, written: *mut Dword) -> Bool, 0);
 relay!(WinHttpQueryDataAvailable(h: Hinternet, available: *mut Dword) -> Bool, 0);
 relay!(WinHttpSetTimeouts(h: Hinternet, resolve: i32, connect: i32, send: i32, receive: i32) -> Bool, 0);
-relay!(WinHttpQueryHeaders(h: Hinternet, level: Dword, name: Lpcwstr, buffer: *mut c_void, len: *mut Dword, index: *mut Dword) -> Bool, 0);
+relay!(
+    WinHttpQueryHeaders(
+        h: Hinternet,
+        level: Dword,
+        name: Lpcwstr,
+        buffer: *mut c_void,
+        len: *mut Dword,
+        index: *mut Dword,
+    ) -> Bool,
+    0
+);
 relay!(WinHttpAddRequestHeaders(h: Hinternet, headers: Lpcwstr, len: Dword, modifiers: Dword) -> Bool, 0);
-relay!(WinHttpSendRequest(h: Hinternet, headers: Lpcwstr, headers_len: Dword, optional: *mut c_void, optional_len: Dword, total_len: Dword, context: DwordPtr) -> Bool, 0);
+relay!(
+    WinHttpSendRequest(
+        h: Hinternet,
+        headers: Lpcwstr,
+        headers_len: Dword,
+        optional: *mut c_void,
+        optional_len: Dword,
+        total_len: Dword,
+        context: DwordPtr,
+    ) -> Bool,
+    0
+);
 relay!(WinHttpReceiveResponse(h: Hinternet, reserved: *mut c_void) -> Bool, 0);

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["core", "native", "launcher"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+authors = ["FeverLink3 contributors"]
+repository = "https://github.com/AZalshehri7/FeverLink3"
+
+# Shared by every crate. Tuned for the native DLL: smallest code, one codegen unit, no unwinding tables, stripped.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
