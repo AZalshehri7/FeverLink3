@@ -9,9 +9,10 @@ companies (`makeEntitySetPlayerCmd`, `makeGameAddPlayerCmd`, company levels and 
 ## Where the list comes from
 
 `base/tealdef` declares no `api.cmd.*`: the engine's own API is not in it. The list of factories is MPFever's
-(`C.FACTORIES`, MIT, 54 names, found by probing the engine); the argument shapes, result fields and who calls what are
-read from the call sites in the game's own scripts (`base/content/*.zip`, build 40420). Where a shape is only known
-from one call site the table says so. `tealdef/scripts/journal.d.tl` gives the journal enums, `tealdef/game_mechanics/finance`
+(`C.FACTORIES`, MIT, 55 names, found by probing the engine; the 45 the game's own scripts call are all among them);
+the argument shapes, result fields and who calls what are read from the call sites in the game's own scripts
+(`base/content/*.zip`, build 40420). Where a shape is only known from one call site the table says so. Every one of the
+55 is named below. `tealdef/scripts/journal.d.tl` gives the journal enums, `tealdef/game_mechanics/finance`
 the loan records.
 
 ## How a replicated command behaves
