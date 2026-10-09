@@ -37,8 +37,15 @@ do
 	C.IO = ok and type(v) == "table" and v or nil
 end
 -- without the session folder (game not started by FeverLink3.exe) the mod does nothing
-C.ACTIVE = C.DIR ~= nil and C.DIR ~= "" and C.PLAYER_ID ~= nil and C.IO ~= nil
-print("[feverlink3] common loaded: active=" .. tostring(C.ACTIVE) .. " io=" .. tostring(C.IO ~= nil) .. " id=" .. tostring(C.PLAYER_ID))
+C.LIVE = false -- the native module hosts the session itself: files live in a fixed folder and identity.txt says who we are
+if C.DIR == nil or C.DIR == "" then
+	local base = os.getenv("LOCALAPPDATA")
+	if base ~= nil and base ~= "" then
+		C.DIR = base .. BS .. "FeverLink3" .. BS .. "live"
+		C.LIVE = true
+	end
+end
+C.ACTIVE = (not C.LIVE) and C.DIR ~= nil and C.DIR ~= "" and C.PLAYER_ID ~= nil and C.IO ~= nil
 
 local SEP = (C.DIR and C.DIR:find("/", 1, true) and not C.DIR:find(BS, 1, true)) and "/" or BS
 function C.path(fileName)
@@ -80,12 +87,35 @@ function C.readFile(path)
 	return s
 end
 
+-- Live mode: identity.txt (id, name, role) is written by the native module; the mod becomes active when the role is
+-- host or player, without a reload. Cheap to call every frame: the file is read at most once a second.
+function C.poll(force)
+	if not C.LIVE or C.ACTIVE then return C.ACTIVE end
+	local now = os.clock()
+	if not force and C.lastPoll and now - C.lastPoll < 1 then return false end
+	C.lastPoll = now
+	local text = C.readFile(C.path("identity.txt"))
+	if not text then return false end
+	local id = tonumber(text:match("id=(%d+)"))
+	local name = text:match("name=([^" .. CR .. NL .. "]*)")
+	local role = text:match("role=([%a]+)")
+	if id and (role == "host" or role == "player") then
+		C.PLAYER_ID = id
+		C.PLAYER_NAME = (name ~= nil and name ~= "") and name or ("player " .. tostring(id))
+		C.ACTIVE = C.IO ~= nil
+		print("[feverlink3] session found: id=" .. tostring(id) .. " role=" .. role)
+	end
+	return C.ACTIVE
+end
+C.poll(true)
+print("[feverlink3] common loaded: active=" .. tostring(C.ACTIVE) .. " live=" .. tostring(C.LIVE) .. " io=" .. tostring(C.IO ~= nil) .. " id=" .. tostring(C.PLAYER_ID))
+
 -- a logger writing "<clock> [<tag>] <message>" lines to mod.log in the session folder (and to the game's own log)
 function C.logger(tag)
 	return function(msg)
 		local line = "[FeverLink3 " .. tag .. "] " .. tostring(msg)
 		pcall(function() if debugPrint then debugPrint(line) end end)
-		if C.ACTIVE then
+		if C.DIR and C.IO then
 			pcall(C.appendFile, C.path(C.LOG), os.date("%H:%M:%S") .. " " .. line .. NL)
 		end
 	end

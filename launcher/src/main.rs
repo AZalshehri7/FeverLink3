@@ -369,9 +369,7 @@ fn locate_payload() -> (Option<PathBuf>, Option<PathBuf>) {
             mod_src = Some(d.join("mod").join(MOD_ID));
         }
         if dll_src.is_none() {
-            for candidate in
-                [d.join("winhttp.dll"), d.join("target").join("release").join("feverlink3_native.dll")]
-            {
+            for candidate in [d.join("winhttp.dll"), d.join("target").join("release").join("feverlink3_native.dll")] {
                 if candidate.is_file() {
                     dll_src = Some(candidate);
                     break;

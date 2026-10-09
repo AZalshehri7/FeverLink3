@@ -20,6 +20,7 @@
 
 pub mod gamelink;
 pub mod install;
+pub mod live;
 pub mod luatext;
 pub mod net;
 pub mod process;

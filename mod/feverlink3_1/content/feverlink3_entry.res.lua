@@ -1,11 +1,12 @@
--- Registers the in-game window (feverlink3_ui.script.lua) on the game's mod entry point, which is mounted once for the
--- whole UI session (format and finding from MPFever (MIT): mpfever_entry.res.lua). Untested in a game.
+-- Puts the FeverLink3 button in the game bar (the bottom bar's info display), which opens the window of
+-- feverlink3_ui.script.lua. The plugin format is the one of the game's own bar plugins
+-- (gui/game_bar/game_bar_display_transported_plugin); the earlier ModEntryPointExtension is internal and hidden.
 function data()
 	return {
-		type = "react-plugin ::ModEntryPointExtension",
+		type = "react-plugin ::GameBarInfoDisplayExtension",
 		data = {
-			filePath = "feverlink3_1::/feverlink3_ui.script@FeverLink3Entry",
-			order = 1000,
+			filePath = "feverlink3_1::/feverlink3_ui.script@FeverLink3Bar",
+			priority = -2, -- negative: left of the default entries
 		},
 	}
 end

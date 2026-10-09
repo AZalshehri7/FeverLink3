@@ -261,6 +261,8 @@ dependencies = [
 name = "feverlink3_native"
 version = "0.1.0"
 dependencies = [
+ "feverlink3_core",
+ "feverlink3_launcher",
  "windows-sys 0.59.0",
 ]
 

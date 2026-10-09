@@ -217,6 +217,7 @@ local function simAdvanceWatches(st, now)
 end
 
 local function update(userParams, state, dt)
+	C.poll()
 	if not C.ACTIVE then return end
 	if not SIM.rng then
 		SIM.rng = L.newRandom(engine.gameTime)
@@ -250,6 +251,7 @@ end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
 local function handleEvent(userParams, state, src, id, name, param)
+	C.poll()
 	if not C.ACTIVE or id ~= "feverlink3" then return end
 	local ok, err = pcall(function()
 		local st = simState(state)
@@ -609,6 +611,7 @@ local function serviceWindow()
 end
 
 local function guiUpdate(userParams, state, guiState)
+	C.poll()
 	if not C.ACTIVE then return end
 	G.frames = G.frames + 1
 	if not G.started then
