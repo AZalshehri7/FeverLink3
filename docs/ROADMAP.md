@@ -8,7 +8,7 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] Join codes: base32, version, addresses, secret, checksum
 - [ ] Session state machine (host and player sides) with in-memory transport tests
 - [ ] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
-- [ ] CI on every push
+- [x] CI on every push
 
 ## 0.2 — Launcher
 - [ ] Host / join by code over TCP, player allow-list, sender-id rewrite
