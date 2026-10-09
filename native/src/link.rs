@@ -1040,6 +1040,48 @@ mod tests {
         assert_eq!(EventWriter::line(9, &Event::Pong { n: 4 }), "9\tpong\tnative\t{[\"n\"]=4}\n");
     }
 
+    /// The lines the module writes, as the Lua test `tests/lua/test_native_link.py` also holds them: each side
+    /// is pinned to the same text, so neither can drift from the other.
+    #[test]
+    fn golden_lines_shared_with_the_lua_test() {
+        let ready = Event::Ready {
+            build: "40420".into(),
+            version: "0.1.0".into(),
+            hooks: vec!["apply_command".into(), "command_list_add".into()],
+            poolpatch: true,
+            clock: false,
+            kinds: vec![("build_proposal".into(), 52)],
+            sites: 12,
+        };
+        assert_eq!(
+            EventWriter::line(1, &ready),
+            "1\tready\tnative\t{[\"build\"]=\"40420\",[\"clock\"]=false,[\"hooks\"]={[1]=\"apply_command\",[2]=\"command_list_add\"},\
+             [\"kinds\"]={[\"build_proposal\"]=52},[\"poolpatch\"]=true,[\"sites\"]=12,[\"version\"]=\"0.1.0\"}\n"
+        );
+        let holding = Event::Holding { on: true, kinds: vec!["build_proposal".into()], reason: "hold_on" };
+        assert_eq!(
+            EventWriter::line(2, &holding),
+            "2\tholding\tnative\t{[\"kinds\"]={[1]=\"build_proposal\"},[\"on\"]=true,[\"reason\"]=\"hold_on\"}\n"
+        );
+        let audit = Event::Audit {
+            counts: vec![(17, 4), (52, 2)],
+            total: 6,
+            unreadable: 0,
+            adds: AddCounts { tool: 2, other: 5, unknown: 0 },
+            sites: vec![(0, 2)],
+        };
+        assert_eq!(
+            EventWriter::line(3, &audit),
+            "3\taudit\tnative\t{[\"adds\"]={[\"other\"]=5,[\"tool\"]=2,[\"unknown\"]=0},[\"counts\"]={[17]=4,[52]=2},\
+             [\"sites\"]={[0]=2},[\"total\"]=6,[\"unreadable\"]=0}\n"
+        );
+        let error = Event::Error { place: "release".into(), detail: "no held command 9".into() };
+        assert_eq!(
+            EventWriter::line(4, &error),
+            "4\terror\tnative\t{[\"detail\"]=\"no held command 9\",[\"where\"]=\"release\"}\n"
+        );
+    }
+
     #[test]
     fn writer_numbers_events_and_continues_after_a_restart() {
         let dir = TempDir::new("writer");
