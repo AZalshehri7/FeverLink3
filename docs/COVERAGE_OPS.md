@@ -168,6 +168,12 @@ loan, and it was a placeholder:
   host. Adding parts changes `test_checksum_rounds` in `test_lockstep.py`, which fixes the set of part names.
 - **N8. Scale.** Finding a construction by file and position walks all constructions (a few thousand to a few hundred
   thousand with town buildings) and only happens when its key did not fit.
+- **N9. Chatty windows.** The time-of-day slider sends a command and an event for every step of a drag, and a rename
+  field may send one command per edit. Each is an action: a line on the file link, a log line, a queue entry. If it
+  costs, coalesce in the module (keep the last one per target and stamp).
+- **N10. One purchase per step.** MPFever applies at most one vehicle purchase per game and step; this module applies
+  them all and tells them apart by creation order (V7). If the engine turns out to create vehicles in an order that
+  differs from the order of the commands, that is where it shows.
 
 ## Needs game verification
 
