@@ -29,7 +29,7 @@ The module is inert unless the launcher started the game with `FEVERLINK3_SESSIO
 
 ## Adding a game build
 
-1. Run the address tool (`tools/`, to come) against the new `TransportFever3.exe`. It finds the hook sites by signature, extracts the prologue bytes, checks they are whole, position-independent instructions, and prints a `BuildAddrs` row.
+1. Run the address tool (`tools/addr/find_sites.py`, see its README) against the new `TransportFever3.exe`. It finds the hook sites by signature and by anchors (string references, callers' idiom), extracts the prologue bytes, checks they are whole, position-independent instructions, and prints a `BuildAddrs` row with a confidence per site.
 2. Paste the row into `build_table::BUILDS`. Nothing else in the module changes.
 3. Verify the import table still lists only the WinHTTP functions in `proxy.rs`; add any new one.
 
