@@ -1,10 +1,11 @@
-﻿# Playing FeverLink3 (test version)
+# Playing FeverLink3 (test version)
 
-FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. This is an early test build: expect rough edges, and tell the host's contact (Discord `azalshehri`) what happens.
+FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. Players connect to each other **through Steam's peer-to-peer networking**: no port forwarding, no router settings, no VPN, nothing to open in the firewall. This is an early test build: expect rough edges, and tell the host's contact (Discord `azalshehri`) what happens.
 
 ## What you need
 
 - Windows 10 or 11, and Transport Fever 3 on Steam, **the same game version as the host** (the host says which; the test build was made for build 40420, shown at the bottom right of the main menu).
+- Steam running and logged in (it is, if you start the game from Steam).
 - This folder (unzipped anywhere, for example the Desktop). Nothing is installed system-wide.
 
 ## 1. Install (once)
@@ -27,37 +28,27 @@ It prints four `DONE` / `SKIP` lines: the mod into your Transport Fever 3 user f
 
 ## 2. Start the game
 
-Start Transport Fever 3 from **Steam as usual** (no extra program needs to run), or choose `4` in the FeverLink3 window.
+Start Transport Fever 3 from **Steam as usual** (no extra program needs to run), or choose `4` in the FeverLink3 window. Start a new game: on the settings page open the **Add Mods** tab, click **Activate** under *FeverLink3 Multiplayer*, then Start Game. In the game, click **FeverLink3** in the bar at the bottom of the screen to open the window.
 
-- Starting a new game: on the settings page open the **Add Mods** tab, click **Activate** under *FeverLink3 Multiplayer*, then Start Game.
-- Players who join do not need to prepare a world: the host's world is sent to you.
+## 3. The Steam connection test (this test build)
 
-## 3. Host
+This build proves that two players can reach each other through Steam. In the window, under **Steam connection test**:
 
-1. In the game, click **FeverLink3** in the bar at the bottom of the screen (next to the item counters). A window opens.
-2. Click **Host a game**.
-3. The window shows a **join code**. Click into the code field, press `Ctrl+A`, `Ctrl+C`, and send it to your friends (chat, Discord).
-4. Press **Start the session**, then let your friends join. Each friend who joins gets a copy of your world and the game reloads for them.
-5. If someone's world looks different or is out of date, press **Sync everyone to my world**.
+1. Your **Steam ID** is shown (17 digits). Send it to the other player; they send you theirs.
+2. Paste the other player's Steam ID into the field and press **Test the connection**.
+3. Within about 20 seconds the window shows `Test: connected, answers N, last round trip X ms` and whether the route is `direct` or `through a Steam relay`. The other player sees `Pings received from other players`.
 
-**Playing over the internet:** the host's PC must be reachable. FeverLink3 asks your router to open port 28090 by itself (UPnP) and shows your internet address in the window. If the window says automatic forwarding failed, either forward TCP port **28090** to your PC in the router's settings, or use a VPN such as Tailscale and give your friends the address it shows. Playing on the same home network needs nothing.
+Both directions are worth trying (A tests B, then B tests A). If it says `failed`, or nothing happens after a minute, send the host a screenshot and the log files below.
 
-## 4. Join
+## 4. Hosting and joining (next test build)
 
-1. Start the game (any world, a new game is fine) and click **FeverLink3** in the bottom bar.
-2. Paste the host's code into **join code**, press **Join**.
-3. Wait: the host's world arrives and your game loads it. This takes up to a minute.
-4. If the host set a password, it is asked for in the window (future version: for now ask the host to leave it empty).
-
-## What works and what does not (yet)
-
-Tested: hosting, joining, the player list, sending the world from host to player. Being tested now: building together, vehicles, money, keeping both games identical. Not done: several companies, reconnecting after a connection loss, a dedicated server.
+Hosting and joining a game with a join code travel over the same Steam connection. They arrive in the next test build. The flow will be: the host clicks **Host a game** and sends the code, the friend pastes it and presses **Join**, the host's world is sent to the friend and loads. Nothing about ports or routers is needed.
 
 ## If something goes wrong
 
-The easiest way: double-click `feverlink3.exe`, type `6` and press Enter, then paste (`Ctrl+V`) into your message to the host. The text holds what FeverLink3 found on your PC and the end of the two logs; your Windows user name is replaced by `<user>` and join codes are left out. It can still hold folder names and network addresses.
+The easiest way: double-click `feverlink3.exe`, type `6` and press Enter, then paste (`Ctrl+V`) into your message to the host. The text holds what FeverLink3 found on your PC and the end of the two logs; your Windows user name is replaced by `<user>` and join codes are left out. It can still hold folder names.
 
-Or send the host these files (they hold no personal data besides your Windows user name and addresses):
+Or send the host these files (they hold no personal data besides your Windows user name):
 
 - `%LOCALAPPDATA%\FeverLink3\native.log`
 - `%LOCALAPPDATA%\FeverLink3\live\mod.log` and `ctl_status.txt`
