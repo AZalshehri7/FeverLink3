@@ -15,9 +15,9 @@ u64  counter     per sender, starts at 1, strictly increasing
 
 A length outside the bounds closes the connection before anything is allocated.
 
-**Sealed frames** (everything except the three handshake kinds): `body = AES-256-GCM(key, nonce, payload) ‖ 16-byte tag`, with the 12 header bytes as additional authenticated data and `nonce = u32(sender) ‖ u64(counter)`. A receiver keeps a 64-frame replay window per sender and records a counter only after the tag verified, so a forged frame cannot burn a counter.
+**Sealed frames** (everything except the three handshake kinds): `body = AES-256-GCM(key, nonce, payload) ‖ 16-byte tag`, with the 12 header bytes as additional authenticated data and `nonce = u32(sender) ‖ u64(counter)`. A receiver keeps a 64-frame replay window per sender and records a counter, and makes the sender's window, only after the tag verified, so a forged frame can neither burn a counter nor grow the receiver. A sender id belongs to one connection for the whole session (the host never gives one twice, a player who reconnects is a new sender) and its counter never restarts, so a nonce is never used twice under a key; a secret is used for one session only. A payload that does not fit a frame (more than `1 048 576 - 12 - 16` bytes) is not sent.
 
-**Payloads** are UTF-8 JSON, camelCase, nulls omitted, byte arrays base64. Unknown fields are ignored; a change of meaning needs a new kind.
+**Payloads** are UTF-8 JSON, camelCase, nulls omitted, byte arrays base64, doubles in their shortest exact form (a parser must give back the same double: `serde_json` needs `float_roundtrip` for that). Unknown fields are ignored; a change of meaning needs a new kind.
 
 ## Key
 
@@ -54,6 +54,10 @@ Reject reasons: `bad-proof` (wrong key or password), `version` (detail names bot
 
 After Welcome the player seals with its assigned id. The host checks that the sender id in every frame equals the id bound to that connection; a mismatch is dropped. A player accepts sealed frames from sender 0 only.
 
+A player answers a Challenge only if its nonce is 16 bytes and the protocol number is its own. It honours a Reject only while it is still joining (a Reject is unsealed: anyone on the path can write one), and a second Welcome on a connection is dropped (it would replace the player's sealer and restart its counter).
+
+Before a connection has joined, the host reads its first frame with a limit of 4096 bytes (`FrameCodec::HANDSHAKE_MAX_LENGTH`), closes it if no accepted Join arrived within 15 s of opening, and holds at most 32 such connections at once. The transport adds its own limits (64 connections, 16 per address, a 10 s write timeout, 1000 frames and 4 MiB per second per connection); see `docs/SECURITY.md`, section 6.
+
 ## Who may send what
 
 | Kind | Value | Direction | Payload |
@@ -83,6 +87,13 @@ After Welcome the player seals with its assigned id. The host checks that the se
 | Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name}` (set by the host) |
 
 A player may send kinds 30 to 36, 50 and 51. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
+
+What the host does with the content of those kinds, beyond decoding them (a message that does not decode is ignored, as always):
+
+- **Clock** with `t` outside `0..=2^50` or `speed` outside `0..=16` is dropped, counted and logged once per player: the host builds every stamp and pause from the clocks it holds.
+- **Action** with a `body` over 256 KiB is dropped; **Chat** text is cut to 500 characters.
+- **ChecksumReport** with more than 128 parts, or a part name or hash over 128 characters, or more than 128 `authority` entries, is ignored.
+- Text a player chose (Hello, ReplayFailed, the version of a Join) is cut before it reaches a log line or a Reject.
 
 ## Session rules
 

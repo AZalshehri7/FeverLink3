@@ -34,7 +34,7 @@ If you are the author of either and want the wording changed, open an issue.
 | `mod/feverlink3_1/` | Game-script mod: lockstep core (stamping, barrier, pause, queue, deterministic random, checksums), file link, command capture. In-game UI and native-build replay *(planned)*. See `mod/README.md`. | Lua |
 | `tools/addr/` | Address tool: finds the hook sites in a game executable and prints a build-table row. See `tools/addr/README.md`. | Python |
 | `tests/lua/` | Two mocked games running the real mod through lupa; `core/tests/` and the native crate run under `cargo test --workspace` | Python, Rust |
-| `docs/` | Architecture, roadmap, protocol notes | |
+| `docs/` | Architecture, roadmap, protocol notes, security review | |
 
 The repository is one Cargo workspace (`core`, `native`). Lua lockstep tests with lupa are planned alongside the mod.
 

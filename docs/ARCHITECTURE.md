@@ -50,6 +50,7 @@ Threat: an outsider who learns the host's address, or a player who is not the ho
 - **Players listen to the host only** for control (session state, checksum requests, authority values, resync). Other players reach them only through kinds the host relays.
 - **Savegames are verified.** A transfer announces the SHA-256 of the file; the receiver checks every chunk's bounds and the final hash before writing. A savegame is code (`.sav.lua` runs on load), so joining a session means trusting the host as you trust a mod author. Say so in the UI.
 - **Limits.** No forward secrecy: the key lives for the session. A hostile *player* holds the session key and can forge frames as another player at the transport level; the host's sender-id rewrite and allow-list are what contain them. This is the TpF2 Multiplayer model and it is the right trade-off for groups of friends.
+- **Strangers and floods.** The host's port is open to the internet, so what an unauthenticated peer can cost is bounded (connections, a join deadline, a 4 KiB first frame, write timeouts) and so is what a joined player can make the host hold or relay (rates, sizes, clock values). The numbers and the review are in `docs/SECURITY.md`.
 
 ## 4. Wire protocol
 
@@ -147,5 +148,8 @@ in-game window.
 - Verified in game build 40420 on 2026-10-09: the button and window appear, "Host a game" opens the listener inside
   the game process and the window shows the join code. Joining from a second game, saves and the native hooks are not
   yet verified.
-- Open point: a panic in the controller aborts the game (the workspace builds with `panic = "abort"`). The controller
-  code returns errors instead of panicking; a `catch_unwind` guard needs the profile to unwind for the native crate.
+- Panics: the workspace builds with `panic = "abort"`, so a panic in the controller or a session thread ends the game
+  (after writing its message to `native.log`). Measured, `panic = "unwind"` makes the DLL 297 KB (36 %) bigger, more
+  than the 150 KB allowed, so the profile stays and the panics that input can reach were removed instead; the thread
+  roots already run through `launcher::guard::guarded`, which contains a panic the day the profile unwinds. See
+  `docs/SECURITY.md`, section 5, for the table and the audit.

@@ -8,7 +8,7 @@ title: FeverLink3
 
 > **Pre-alpha.** Nothing here plays a game yet. This page will carry the download, the how-to-play guide and the known issues once the first playable version exists. Until then, the repository is where things happen.
 
-[Source on GitHub](https://github.com/AZalshehri7/FeverLink3) · [Roadmap](ROADMAP.html) · [Architecture](ARCHITECTURE.html) · [Protocol](PROTOCOL.html)
+[Source on GitHub](https://github.com/AZalshehri7/FeverLink3) · [Roadmap](ROADMAP.html) · [Architecture](ARCHITECTURE.html) · [Protocol](PROTOCOL.html) · [Security](SECURITY.html)
 
 ## How it will work
 

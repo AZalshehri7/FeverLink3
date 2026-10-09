@@ -18,10 +18,43 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release -p feverlink3_native
       - run: Get-Item target/release/feverlink3_native.dll | Select-Object Name, Length
+      - name: DLL size in the job summary
+        shell: pwsh
+        run: |
+          # The shipped DLL (panic = "abort") and the same code with unwinding, in another target folder so the
+          # artifact below is untouched: what panic = "unwind" would cost is on every run (docs/SECURITY.md, section 5).
+          $abort = (Get-Item target/release/feverlink3_native.dll).Length
+          $env:CARGO_PROFILE_RELEASE_PANIC = 'unwind'
+          cargo build --release -p feverlink3_native --target-dir target/unwind
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item Env:CARGO_PROFILE_RELEASE_PANIC
+          $unwind = (Get-Item target/unwind/release/feverlink3_native.dll).Length
+          $extra = $unwind - $abort
+          @(
+            '### feverlink3_native.dll (release, windows-latest)',
+            '',
+            '| panic | bytes | KiB |',
+            '|---|---:|---:|',
+            ('| abort (shipped) | {0:N0} | {1:N1} |' -f $abort, ($abort / 1KB)),
+            ('| unwind | {0:N0} | {1:N1} |' -f $unwind, ($unwind / 1KB)),
+            ('| difference | {0:N0} (+{1:N1} %) | {2:N1} |' -f $extra, (100 * $extra / $abort), ($extra / 1KB))
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
           name: winhttp-dll
           path: target/release/feverlink3_native.dll
+
+  # RustSec advisories against Cargo.lock. The action is pinned to the commit of its v2.0.0 tag.
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   lua:
     runs-on: windows-latest

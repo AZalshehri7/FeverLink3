@@ -11,6 +11,7 @@ Transport Fever 3 imports `WINHTTP.dll`, and Windows looks for it in the game fo
 - The pure parts, which are most of the module, are unit-tested on any machine: PE parsing (`pe.rs`), signature scanning (`scan.rs`), detour byte maths (`detour.rs`), the build table (`build_table.rs`).
 - Memory safety where it matters most: the terrain-cell codec and the control-file parsing (to come) handle data from other players.
 - Small output. Release profile: `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`, stripped.
+- A panic still leaves a trace: `log::install_panic_hook` writes its message, thread and place to `native.log` before the process ends, and `native.log` stops growing at 2 MiB.
 - The unsafe surface is three places: the relays, `detour::install` and the entry point. Each `unsafe` block has a `SAFETY` comment.
 
 ## Build
@@ -36,7 +37,7 @@ The module is inert unless the launcher started the game with `FEVERLINK3_SESSIO
 
 ## Size
 
-The skeleton links Rust's `std` for `Vec`, `String` and file logging. Measured release build: about 900 KB on the GNU target, which statically links the MinGW C runtime; the MSVC build in CI is the reference figure. The planned optimisation, once the hook set is known, is `#![no_std]` + `alloc` with a `HeapAlloc`-backed allocator and a panic handler that logs and aborts: that removes the runtime and lands in the tens of kilobytes. The pure modules already avoid anything `std`-only, so the switch is mechanical.
+The skeleton links Rust's `std` for `Vec`, `String` and file logging. Measured release build with the MSVC toolchain (the reference figure, printed by CI in the job summary): 819 200 bytes with `panic = "abort"`; about 900 KB on the GNU target, which statically links the MinGW C runtime. With `panic = "unwind"` the same code is 1 116 672 bytes (+297 KB, +36 %), which is why the profile stays on abort; `docs/SECURITY.md` section 5 has the numbers and the audit. The planned optimisation, once the hook set is known, is `#![no_std]` + `alloc` with a `HeapAlloc`-backed allocator and a panic handler that logs and aborts: that removes the runtime and lands in the tens of kilobytes. The pure modules already avoid anything `std`-only, so the switch is mechanical.
 
 ## Status
 
