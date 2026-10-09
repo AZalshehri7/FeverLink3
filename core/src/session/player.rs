@@ -1,9 +1,14 @@
 use std::fmt;
+use std::time::Instant;
 
 use super::host::HostSession;
 use super::kind::MessageKind;
-use super::messages::{codec, ChallengeMessage, JoinMessage, RejectMessage, SessionState, WelcomeMessage};
+use super::messages::{
+    codec, ChallengeMessage, JoinMessage, Permissions, RejectMessage, ResyncChunkMessage, ResyncLoadMessage,
+    SessionState, WelcomeMessage,
+};
 use super::names::Names;
+use super::resync::IncomingSave;
 use crate::crypto::{Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
 
@@ -18,8 +23,18 @@ pub enum PlayerState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerOutput {
     SendToHost(Frame),
-    DeliverToLocalGame { kind: MessageKind, payload: Vec<u8> },
+    DeliverToLocalGame {
+        kind: MessageKind,
+        payload: Vec<u8>,
+    },
     Welcomed(WelcomeMessage),
+    /// A savegame sent by the host arrived complete and its SHA-256 matches. The launcher writes it to disk; the
+    /// ResyncLoad that follows names it.
+    SaveReceived {
+        id: i32,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
     Rejected(RejectMessage),
     Log(String),
 }
@@ -40,6 +55,9 @@ pub struct PlayerSession {
     assigned_name: Option<String>,
     host_name: Option<String>,
     session: Option<SessionState>,
+    permissions: Permissions,
+    incoming: IncomingSave,
+    now: Box<dyn Fn() -> f64 + Send>,
     dropped: u64,
     out: Vec<PlayerOutput>,
 }
@@ -56,7 +74,14 @@ impl fmt::Debug for PlayerSession {
 }
 
 impl PlayerSession {
+    /// Uses the process's monotonic clock for transfer timeouts.
     pub fn new(key: SessionKey, name: &str, version: &str) -> Self {
+        let start = Instant::now();
+        Self::with_clock(key, name, version, Box::new(move || start.elapsed().as_secs_f64()))
+    }
+
+    /// `now` returns seconds on any monotonic clock; tests inject theirs.
+    pub fn with_clock(key: SessionKey, name: &str, version: &str, now: Box<dyn Fn() -> f64 + Send>) -> Self {
         Self {
             opener: Opener::new(&key),
             key,
@@ -68,6 +93,9 @@ impl PlayerSession {
             assigned_name: None,
             host_name: None,
             session: None,
+            permissions: Permissions::default(),
+            incoming: IncomingSave::new(),
+            now,
             dropped: 0,
             out: Vec::new(),
         }
@@ -94,6 +122,24 @@ impl PlayerSession {
     /// The last session state the host sent.
     pub fn session(&self) -> Option<&SessionState> {
         self.session.as_ref()
+    }
+
+    /// What the host last said players may do.
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
+    }
+
+    /// Call now and then: forgets a savegame transfer that has not finished within 10 minutes.
+    pub fn tick(&mut self) -> Vec<PlayerOutput> {
+        self.expire_transfer();
+        self.drain()
+    }
+
+    fn expire_transfer(&mut self) {
+        let now = (self.now)();
+        if let Some(id) = self.incoming.expire(now) {
+            self.log(format!("unfinished save transfer {id} forgotten after 10 minutes"));
+        }
     }
 
     /// Frames and local messages refused so far.
@@ -188,7 +234,51 @@ impl PlayerSession {
                 self.session = Some(s);
             }
         }
+        if kind == MessageKind::Permissions {
+            match codec::try_decode::<Permissions>(&plain) {
+                Some(p) => self.permissions = p,
+                None => {
+                    self.drop(kind_byte, "malformed permissions".to_owned());
+                    return;
+                }
+            }
+        }
+        if kind == MessageKind::ResyncChunk {
+            self.receive_chunk(&plain);
+            return;
+        }
+        if kind == MessageKind::ResyncLoad {
+            match codec::try_decode::<ResyncLoadMessage>(&plain) {
+                Some(m) if self.incoming.has(m.id, &m.sha256) => {}
+                Some(m) => {
+                    self.drop(kind_byte, format!("load of save {} that was not received intact", m.id));
+                    return;
+                }
+                None => {
+                    self.drop(kind_byte, "malformed load".to_owned());
+                    return;
+                }
+            }
+        }
         self.out.push(PlayerOutput::DeliverToLocalGame { kind, payload: plain });
+    }
+
+    fn receive_chunk(&mut self, plain: &[u8]) {
+        let kind = MessageKind::ResyncChunk.into();
+        let Some(m) = codec::try_decode::<ResyncChunkMessage>(plain) else {
+            self.drop(kind, "malformed chunk".to_owned());
+            return;
+        };
+        self.expire_transfer();
+        let now = (self.now)();
+        match self.incoming.accept(now, m) {
+            Ok(Some(save)) => {
+                self.log(format!("save {} received ({} bytes)", save.id, save.bytes.len()));
+                self.out.push(PlayerOutput::SaveReceived { id: save.id, sha256: save.sha256, bytes: save.bytes });
+            }
+            Ok(None) => {}
+            Err(err) => self.drop(kind, err.to_string()),
+        }
     }
 
     /// A message from this player's game, sealed and sent to the host. Dropped (and counted) before the welcome:

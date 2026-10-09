@@ -140,7 +140,12 @@ impl Harness {
                 HostOutput::DeliverToLocalGame { kind, payload } => self.host_game.push((kind, payload)),
                 HostOutput::Log(line) => self.host_log.push(line),
                 HostOutput::ChecksumCompleted(o) => self.outcomes.push(o),
-                HostOutput::Received { .. } | HostOutput::PlayerJoined(_) | HostOutput::PlayerLeft(_) => {}
+                HostOutput::Received { .. }
+                | HostOutput::PlayerJoined(_)
+                | HostOutput::PlayerLeft(_)
+                | HostOutput::ResyncRequested { .. }
+                | HostOutput::ResyncProgress { .. }
+                | HostOutput::ResyncFailed { .. } => {}
             }
         }
     }
@@ -157,7 +162,7 @@ impl Harness {
                 }
                 PlayerOutput::Log(line) => self.players.get_mut(&c).unwrap().log.push(line),
                 PlayerOutput::Rejected(r) => self.players.get_mut(&c).unwrap().reject = Some(r),
-                PlayerOutput::Welcomed(_) => {}
+                PlayerOutput::Welcomed(_) | PlayerOutput::SaveReceived { .. } => {}
             }
         }
     }

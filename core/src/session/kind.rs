@@ -18,6 +18,7 @@ pub enum MessageKind {
     ResyncSave = 17,
     ResyncChunk = 18,
     ResyncLoad = 19,
+    Permissions = 20,
 
     // ---- player -> host, sealed
     Hello = 30,
@@ -65,6 +66,7 @@ impl MessageKind {
             17 => ResyncSave,
             18 => ResyncChunk,
             19 => ResyncLoad,
+            20 => Permissions,
             30 => Hello,
             31 => Clock,
             32 => SpeedRequest,
