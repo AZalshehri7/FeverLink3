@@ -8,6 +8,7 @@ TestResults/
 
 # native build output
 native/target/
+launcher/target/
 
 # release packaging
 release/
