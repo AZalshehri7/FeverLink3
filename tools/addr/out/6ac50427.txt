@@ -97,6 +97,189 @@ site script_pool  [patch]
   derived signature: unique after 3 instructions (22 bytes, one instruction of margin)
     83 F8 08 0F 8D ?? ?? ?? ?? C7 44 24 20 01 00 00 00 E8 ?? ?? ?? ??
 ====================================================================================================
+site command_move  [call]
+  what: Command::Command(Command&&): moves the 0x38-byte command (payload pointer, vector, weak progress, result byte) and empties the source
+  - known table (MPFever BUILDS[]) has 0x9d0430 for timestamp 0x6ac50427; seed bytes match there
+  - signature matches once in .text: 0x9d0430 (derived from this very build: a consistency check, not independent evidence)
+  - 1 call(s) inside command_list_add match (the call right before `add qword [list+8], 0x38` that appends the command to the queue vector): 0x9d0430
+  RVA 0x9d0430  (VA 0x1409d0430)
+  located by: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored inside command_list_add
+  confidence: high
+  MPFever table says 0x9d0430: AGREES
+  no unwind-table entry: a leaf function (no stack frame), which is normal for a small helper
+  prologue (minimal >= 16 bytes on an instruction boundary): 16 bytes
+    009d0430  48 8b 02                     mov rax, qword ptr [rdx]
+    009d0433  45 33 d2                     xor r10d, r10d
+    009d0436  4c 89 12                     mov qword ptr [rdx], r10
+    009d0439  48 89 01                     mov qword ptr [rcx], rax
+    009d043c  48 8b 42 08                  mov rax, qword ptr [rdx + 8]
+  call site: never hooked or patched, so relative operands do not matter; the native module compares these bytes with the ones in memory before it calls the function
+  bytes: 48 8B 02 45 33 D2 4C 89 12 48 89 01 48 8B 42 08
+  derived signature: unique after 4 instructions (16 bytes, one instruction of margin)
+    48 8B 02 45 33 D2 4C 89 12 48 89 01 48 8B 42 08
+====================================================================================================
+site command_destroy  [call]
+  what: Command::~Command(): releases the weak progress pointer, the vector and the payload (0x9c0 bytes, variant index at +0x9b8)
+  - known table (MPFever BUILDS[]) has 0x9d0670 for timestamp 0x6ac50427; seed bytes match there
+  - signature matches once in .text: 0x9d0670 (derived from this very build: a consistency check, not independent evidence)
+  - 2 call(s) inside command_list_add match (`mov rcx,r15; call X; nop`, which Add runs on its moved-from `cmd` argument): 0x9d0670
+  RVA 0x9d0670  (VA 0x1409d0670)
+  located by: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored inside command_list_add
+  confidence: high
+  MPFever table says 0x9d0670: AGREES
+  enclosing function (unwind table): 0x9d0670..0x9d071e
+  prologue (minimal >= 16 bytes on an instruction boundary): 16 bytes
+    009d0670  40 53                        push rbx
+    009d0672  48 83 ec 20                  sub rsp, 0x20
+    009d0676  48 8b d9                     mov rbx, rcx
+    009d0679  48 8b 49 28                  mov rcx, qword ptr [rcx + 0x28]
+    009d067d  48 85 c9                     test rcx, rcx
+  call site: never hooked or patched, so relative operands do not matter; the native module compares these bytes with the ones in memory before it calls the function
+  bytes: 40 53 48 83 EC 20 48 8B D9 48 8B 49 28 48 85 C9
+  derived signature: unique after 13 instructions (46 bytes, one instruction of margin)
+    40 53 48 83 EC 20 48 8B D9 48 8B 49 28 48 85 C9 74 ?? B8 ?? ?? ?? ?? F0 0F C1 41 0C 83 F8 01 75 ?? 48 8B 01 FF 50 08 48 8B 4B 08 48 85 C9
+====================================================================================================
+site handle_destroy  [call]
+  what: destructor of the 16-byte handle Add writes through `out`; a zeroed handle is a no-op
+  - known table (MPFever BUILDS[]) has 0x3040c90 for timestamp 0x6ac50427; seed bytes match there
+  - signature matches once in .text: 0x3040c90 (derived from this very build: a consistency check, not independent evidence)
+  - 45 caller(s) of command_list_add are followed by `lea rcx; call` (every caller of Add destroys the handle with `lea rcx,[..]; call X` straight after the call): 0x3040c90 x45
+  RVA 0x3040c90  (VA 0x143040c90)
+  located by: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from what the callers of command_list_add call next
+  confidence: high
+  MPFever table says 0x3040c90: AGREES
+  enclosing function (unwind table): 0x3040c90..0x3040cd4
+  prologue (minimal >= 16 bytes on an instruction boundary): 18 bytes
+    03040c90  40 53                        push rbx
+    03040c92  48 83 ec 20                  sub rsp, 0x20
+    03040c96  48 8b 19                     mov rbx, qword ptr [rcx]
+    03040c99  48 85 db                     test rbx, rbx
+    03040c9c  74 30                        je 0x143040cce
+    03040c9e  48 8b 4b 08                  mov rcx, qword ptr [rbx + 8]
+  call site: never hooked or patched, so relative operands do not matter; the native module compares these bytes with the ones in memory before it calls the function
+  bytes: 40 53 48 83 EC 20 48 8B 19 48 85 DB 74 30 48 8B 4B 08
+  derived signature: unique after 14 instructions (49 bytes, one instruction of margin)
+    40 53 48 83 EC 20 48 8B 19 48 85 DB 74 ?? 48 8B 4B 08 48 85 C9 74 ?? B8 ?? ?? ?? ?? F0 0F C1 41 0C 83 F8 01 75 ?? 48 8B 01 FF 50 10 BA 10 00 00 00
+====================================================================================================
+kind byte offset in a payload: apply_command reads 0x9b8, command_destroy reads 0x9b8
+  AGREE: kind_offset = 0x9b8
+sizeof(Command): CommandList::Add advances the queue vector by 0x38 bytes per command (the module's buffers hold 0x40)
+
+command kinds: dispatcher 0x9d8a00 (called by apply_command), jump table 0x9da19c, 64 cases (kind -1 is 'none'); the name is the profiler tag the case starts with or the first string its handler references
+  kind  -1  -                                            case 0x9da0e9  handler 0x34a350
+  kind   0  AnimalSetState                               case 0x9d8a54  handler 0x55b50
+  kind   1  AnimalSpawnAt                                case 0x9d8ba1  handler 0x55b50
+  kind   2  CreateIndustryExtendProposal                 case 0x9d8c1e  handler 0x9dae20
+  kind   3  CustomEntityDestroy                          case 0x9d8c2e  handler 0x9db420
+  kind   4  CustomEntityCreate                           case 0x9d8c3e  handler 0x9db140
+  kind   5  CustomEntityUpdateState                      case 0x9d8c4e  handler 0x55b50
+  kind   6  CustomEntityUpdateTransformation             case 0x9d8d48  handler 0x9db5f0
+  kind   7  CustomVehicleCreateOrUpdate                  case 0x9d8d58  handler 0x9db8b0
+  kind   8  EntitySetColor                               case 0x9d8d68  handler 0x9dbd90
+  kind   9  EntitySetEmissions                           case 0x9d8d78  handler 0x9dbf00
+  kind  10  EntitySetName                                case 0x9d8d88  handler 0x9dc0c0
+  kind  11  EntitySetPlayer                              case 0x9d8d98  handler 0x9dc820
+  kind  12  GameAddPlayer                                case 0x9d8da8  handler 0x55b50
+  kind  13  GameSave                                     case 0x9d8e1c  handler 0x9dca00
+  kind  14  GameSetCalendarSpeed                         case 0x9d8e2c  handler 0x55b50
+  kind  15  GameSetDate                                  case 0x9d8e5c  handler 0x55b50
+  kind  16  GameSetCloudCoverage                         case 0x9d8ecd  handler 0x55b50
+  kind  17  GameSetSpeed                                 case 0x9d8f8a  handler 0x55b50
+  kind  18  GameSetTimeOfDay                             case 0x9d8fba  handler 0x55b50
+  kind  19  IndustrySetDespawnTime                       case 0x9d8fea  handler 0x55b50
+  kind  20  IndustrySetManualDevelopment                 case 0x9d90ca  handler 0x55b50
+  kind  21  JournalBookAsset                             case 0x9d91aa  handler 0x55b50
+  kind  22  JournalClearAll                              case 0x9d926f  handler 0x55b50
+  kind  23  LogBookValue                                 case 0x9d931f  handler 0x9dd140
+  kind  24  LineCreate                                   case 0x9d932f  handler 0x9dd340
+  kind  25  LineDestroy                                  case 0x9d933f  handler 0x9dd590
+  kind  26  LineUpdate                                   case 0x9d934f  handler 0x9dd810
+  kind  27  ScriptingSendEvent                           case 0x9d935f  handler 0x55b50
+  kind  28  StockListDiscardCargo                        case 0x9d93ca  handler 0x55b50
+  kind  29  StockListSetModifiers                        case 0x9d9445  handler 0x55b50
+  kind  30  StockListSetStocksCargoType                  case 0x9d9533  handler 0x9de7d0
+  kind  31  TownAutoDetectConnections                    case 0x9d9543  handler 0x55b50
+  kind  32  TownConnectWithIndustries                    case 0x9d956c  handler 0x9dfd60
+  kind  33  TownCreate                                   case 0x9d957c  handler 0x9e03f0
+  kind  34  TownDestroy                                  case 0x9d958c  handler 0x55b50
+  kind  35  TownDevelopAt                                case 0x9d9624  handler 0x9e0590
+  kind  36  TownCustomDistributionWeightsUpdate          case 0x9d9634  handler 0x55b50
+  kind  37  TownSetDevelopmentActive                     case 0x9d9707  handler 0x55b50
+  kind  38  TownSetInitialLandUseCapacities              case 0x9d97c3  handler 0x55b50
+  kind  39  TownUpdateCargoNeeds                         case 0x9d9886  handler 0x9e0f00
+  kind  40  TownUpdateSize                               case 0x9d9896  handler 0x9e12b0
+  kind  41  TownBuildingSetBlockedDevelopment            case 0x9d98a6  handler 0x55b50
+  kind  42  VehicleBuy                                   case 0x9d9991  handler 0x55b50
+  kind  43  VehicleReplace                               case 0x9d9a82  handler 0x9e1490
+  kind  44  VehicleReverse                               case 0x9d9a92  handler 0x55b50
+  kind  45  VehicleSell                                  case 0x9d9b3b  handler 0x9e1920
+  kind  46  VehicleSendToDepot                           case 0x9d9b4b  handler 0x9e2380
+  kind  47  VehicleSetLine                               case 0x9d9b5b  handler 0x9e2640
+  kind  48  VehicleSetManualDeparture                    case 0x9d9b6b  handler 0x55b50
+  kind  49  VehicleSetModifiers                          case 0x9d9c15  handler 0x55b50
+  kind  50  VehicleSetStoppedByUser                      case 0x9d9cbf  handler 0x9e2740
+  kind  51  VehicleTryToDepart                           case 0x9d9ccf  handler 0x55b50
+  kind  52  WorldBuildProposal                           case 0x9d9d0c  handler 0x9e2900
+  kind  53  changeWind                                   case 0x9d9d1c  handler 0x55b50
+  kind  54  WorldReplaceTerrain                          case 0x9d9d4b  handler 0x55b50
+  kind  55  WorldSetBulldozable                          case 0x9d9e04  handler 0x55b50
+  kind  56  -                                            case 0x9d9f19  handler 0x9daca0
+  kind  57  GamePerformSimulationSteps                   case 0x9d9f29  handler 0x55b50
+  kind  58  MaintenanceCostUpdate                        case 0x9d9f4b  handler 0x9ddd30
+  kind  59  Debug::SimPersonSetState                     case 0x9d9f5b  handler 0x9ddee0
+  kind  60  Debug::SimPersonSetHappiness                 case 0x9d9f6b  handler 0x55b50
+  kind  61  -                                            case 0x9da008  handler 0x9ded60
+  kind  62  -                                            case 0x9da018
+  verified: build_proposal = kind 52 (its case is named by the string 'WorldBuildProposal')
+
+direct callers of command_list_add: 45 (the hold list marks the interface's construction tools)
+       return 0x01202b2  in 0x1201e0..0x1202f7  -
+       return 0x04acfb7  in 0x4acd60..0x4ad00c  -
+       return 0x04ad2ed  in 0x4ad010..0x4ad342  -
+       return 0x04ad76e  in 0x4ad350..0x4ad7f7  -
+       return 0x04ae490  in 0x4add90..0x4ae535  -
+  HOLD return 0x04d396f  in 0x4d3590..0x4d3a6d  UI::Bulldozer::Apply, Bulldozer.cpp
+       return 0x04f9bfc  in 0x4f9b70..0x4f9d11  -
+       return 0x04fa123  in 0x4f9d20..0x4fa19e  UI::CameraAction::Play, CameraAction.cpp
+       return 0x04fb257  in 0x4fae60..0x4fb776  UI::CameraAction::Record, CameraAction.cpp
+       return 0x04fe625  in 0x4fe310..0x4fe668  -
+       return 0x04fe928  in 0x4fe820..0x4fe947  -
+       return 0x04febf1  in 0x4feb30..0x4fee61  -
+  HOLD return 0x051b56c  in 0x51b010..0x51b944  UI::ConstructionBuilder::MousePressed, ConstructionBuilder.cpp
+  HOLD return 0x0528504  in 0x528180..0x52882b  -
+  HOLD return 0x0537ee5  in 0x537600..0x53899b  UI::LaneModifier::Apply, LaneModifier.cpp
+  HOLD return 0x0538649  in 0x537600..0x53899b  UI::LaneModifier::Apply, LaneModifier.cpp
+  HOLD return 0x05387cd  in 0x537600..0x53899b  UI::LaneModifier::Apply, LaneModifier.cpp
+  HOLD return 0x0542eba  in 0x5429c0..0x54310a  UI::ModuleBuilder::MousePressed, ModuleBuilder.cpp
+       return 0x0548f7a  in 0x548e50..0x549003  -
+  HOLD return 0x05891b4  in 0x588c60..0x5893e0  UI::StreetBuilder::UpdateEngine, StreetBuilder.cpp
+  HOLD return 0x05948dd  in 0x594340..0x594b3b  -
+       return 0x05a5c8f  in 0x5a5040..0x5a60e2  ResTypeRep<struct transport::Economy,int>::FindExisting
+  HOLD return 0x05bf08d  in 0x5bec60..0x5bf29a  UI::TrackModifier::Build, GetProposalStatus() == TrackModifier::ProposalStatus::Valid, TrackModifier.cpp
+       return 0x05f4969  in 0x5f4900..0x5f497f  -
+       return 0x0656a64  in 0x6568b0..0x656a97  -
+       return 0x065937a  in 0x659190..0x6593c7  -
+       return 0x0661381  in 0x6612c0..0x6613d5  -
+       return 0x0664332  in 0x664280..0x664348  -
+       return 0x06645d7  in 0x6644f0..0x6645f1  -
+       return 0x069a903  in 0x69a210..0x69aaf3  UI::CMenuUI::SwitchToGameUI::<lambda_1>::operator (), MenuUI.cpp
+       return 0x06aaaa9  in 0x6aa9d0..0x6aaaee  -
+       return 0x0723073  in 0x722fa0..0x72308b  -
+       return 0x0727aaa  in 0x727910..0x727ae7  -
+       return 0x0729fca  in 0x729990..0x72a07b  -
+       return 0x072a3b6  in 0x72a080..0x72a423  debug_main_util.cpp
+       return 0x072a7a3  in 0x72a430..0x72a810  debug_main_util.cpp
+       return 0x072bf68  in 0x72b9c0..0x72c390  -
+       return 0x072d709  in 0x72d570..0x72d746  -
+       return 0x07369e3  in 0x736980..0x7369f9  -
+       return 0x078736a  in 0x787210..0x7873a6  -
+       return 0x0b9d936  in 0xb9d750..0xb9d9a0  -
+       return 0x0db1d31  in 0xdb1910..0xdb1ec1  -
+       return 0x27cb762  in 0x27cb680..0x27cb7ad  -
+  HOLD return 0x28a3024  in 0x28a2d50..0x28a30f2  BuiltinEntityWindow.cpp
+  HOLD return 0x28a3871  in 0x28a35a0..0x28a3932  -
+hold list: all 12 entries are direct calls to command_list_add (MPFever's list, MIT, dkdknight)
+====================================================================================================
 BuildAddrs row for native/src/build_table.rs
 
     // TransportFever3.exe build 40420: PE timestamp 0x6ac50427, linked 2026-10-06 14:22:31 UTC.
@@ -110,7 +293,19 @@ BuildAddrs row for native/src/build_table.rs
         // apply_command: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from string reference; confidence high
         apply_command: Some(HookSite { rva: 0x9e33b0, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x54] }),
         // script_pool: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from string reference; confidence high (patch site)
-        script_pool: Some(HookSite { rva: 0xab00fc, prologue: &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xE8, 0xBE, 0x24, 0x5A, 0x02] }),
+        script_pool: Some(PatchSite { rva: 0xab00fc, expected: &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xE8, 0xBE, 0x24, 0x5A, 0x02], replacement: &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x0F, 0x1F, 0x00] }),
+        // command_move: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored inside command_list_add; confidence high
+        command_move: Some(CallSite { rva: 0x9d0430, prologue: &[0x48, 0x8B, 0x02, 0x45, 0x33, 0xD2, 0x4C, 0x89, 0x12, 0x48, 0x89, 0x01, 0x48, 0x8B, 0x42, 0x08] }),
+        // command_destroy: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored inside command_list_add; confidence high
+        command_destroy: Some(CallSite { rva: 0x9d0670, prologue: &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x8B, 0x49, 0x28, 0x48, 0x85, 0xC9] }),
+        // handle_destroy: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from what the callers of command_list_add call next; confidence high
+        handle_destroy: Some(CallSite { rva: 0x3040c90, prologue: &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19, 0x48, 0x85, 0xDB, 0x74, 0x30, 0x48, 0x8B, 0x4B, 0x08] }),
+        // ui_add_sites: return addresses of the construction tools' calls to command_list_add that may be held
+        ui_add_sites: &[0x4d396f, 0x51b56c, 0x528504, 0x537ee5, 0x538649, 0x5387cd, 0x542eba, 0x5891b4, 0x5948dd, 0x5bf08d, 0x28a3024, 0x28a3871],
+        // kind_offset: the command kind byte inside a payload, read by apply_command and command_destroy
+        kind_offset: Some(0x9b8),
+        // kinds: command kinds the control link may name; the dispatcher case is named by its handler's string
+        kinds: &[("build_proposal", 52)],
     },
 
 Generic signatures (wildcards for build-dependent displacements, immediates and branch targets); paste into
@@ -121,5 +316,11 @@ SITES[...].signature in find_sites.py so the next build can be found without the
     48 89 5C 24 18 48 89 74 24 20 55 57 41 54 41 56 41 57 48 8D 6C 24 C9 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 2F 4C 8B F2 4C 8B F9
   script_pool:
     83 F8 08 0F 8D ?? ?? ?? ?? C7 44 24 20 01 00 00 00 E8 ?? ?? ?? ??
+  command_move:
+    48 8B 02 45 33 D2 4C 89 12 48 89 01 48 8B 42 08
+  command_destroy:
+    40 53 48 83 EC 20 48 8B D9 48 8B 49 28 48 85 C9 74 ?? B8 ?? ?? ?? ?? F0 0F C1 41 0C 83 F8 01 75 ?? 48 8B 01 FF 50 08 48 8B 4B 08 48 85 C9
+  handle_destroy:
+    40 53 48 83 EC 20 48 8B 19 48 85 DB 74 ?? 48 8B 4B 08 48 85 C9 74 ?? B8 ?? ?? ?? ?? F0 0F C1 41 0C 83 F8 01 75 ?? 48 8B 01 FF 50 10 BA 10 00 00 00
 
 all sites located with medium or high confidence
