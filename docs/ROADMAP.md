@@ -36,7 +36,7 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 ## 0.4 — Everything a player does
 - [ ] Constructions against streets, upgrades, signals, decorations, terrain
 - [ ] Lines, vehicle orders, renames, colours
-- [ ] In-game player list and chat
+- [x] In-game player list and chat (mod side; needs a game run)
 - [ ] 3 to 8 players
 
 ## 0.5 — Playing with friends

@@ -22,12 +22,17 @@ if not okC then C = ug_require("feverlink3_1::/feverlink3_common.lua") end
 local okL, L = pcall(ug_require, "feverlink3_lockstep.lua")
 if not okL then L = ug_require("feverlink3_1::/feverlink3_lockstep.lua") end
 
+local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
+if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
+
 local STEP = L.STEP
 local RESULT_KEEP = 60
 local WATCH_STEPS = 10
 local unpack = table.unpack or unpack
 
 -- ================================================================== engine accessor
+
+local O = {} -- the game's own command functions, before wrapping (filled by installWrap)
 
 -- Every engine read the core needs, in one table so the tests can mock it. The functions below are the TF3 API
 -- surface this mod relies on (names from MPFever's use of the API, MIT): GAME_TIME and GAME_SPEED are components
@@ -83,7 +88,52 @@ local engine = {
 		return out
 	end,
 	entitiesWith = entitiesWith,
+
+	-- Books `amount` as a journal entry on the player's account: how a game's balance is brought to the host's
+	-- value (finding from MPFever (MIT): JournalEntry with time -1 and category OTHER through
+	-- makeJournalBookAssetCmd).
+	bookJournal = function(amount)
+		local entry = api.type.JournalEntry.new()
+		entry.amount = amount
+		entry.time = -1
+		entry.category.type = api.type.JournalEntry.Type.OTHER
+		local send = O.sendCommand or api.cmd.sendCommand
+		send(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry))
+	end,
+	-- No loan command is known for TF3 yet (nothing in MPFever): absent, so a loan difference is logged, not
+	-- corrected. A build that has one can supply it through FEVERLINK3_ENGINE.adjustLoan(delta).
+	adjustLoan = nil,
+
+	-- Save and load go through the application object, which exists in the interface state (finding from
+	-- MPFever (MIT): app.saveGame(name, callback, false, true); a savegame is found with
+	-- app.findAllSavegames(app.SaveGameNamespace.getSavegame()) and loaded with app.loadGame(id, false)).
+	saveGame = function(name, done)
+		local ok, err = pcall(app.saveGame, name, function() done(true) end, false, true)
+		if not ok then done(false, tostring(err)) end
+	end,
+	loadGame = function(name)
+		local ns = app.SaveGameNamespace.getSavegame()
+		for _, s in ipairs(app.findAllSavegames(ns) or {}) do
+			if s.saveName == name then
+				local id = api.type.SavegameId.new()
+				id.path = s.path
+				id.saveGameName = s.saveName
+				id.saveGameNamespace = ns
+				app.loadGame(id, false)
+				return true
+			end
+		end
+		return false, "savegame '" .. tostring(name) .. "' not found"
+	end,
 }
+
+-- The test harness (or a game build with other accessors) replaces any of the above through a global table.
+do
+	local okE, override = pcall(function() return FEVERLINK3_ENGINE end)
+	if okE and type(override) == "table" then
+		for k, v in pairs(override) do engine[k] = v end
+	end
+end
 
 local function checksumParts()
 	return L.checksumParts(engine, C.hashValue)
@@ -184,7 +234,7 @@ local function update(userParams, state, dt)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" then
 				local parts, t = checksumParts()
-				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts }
+				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountSnapshot(engine) }
 			elseif it.kind == "action" then
 				simApplyAction(st, it, now)
 			end
@@ -218,6 +268,10 @@ end
 local logGui = C.logger("gui")
 local G = {
 	started = false, frames = 0,
+	perms = L.newPermissions(),
+	hud = nil, hudWritten = { version = nil }, uiReader = nil,
+	accountAt = {},           -- checksum round n -> this game's account at that round
+	loading = false,          -- a resync load was started: the rest of this batch of lines belongs to the reloaded game
 	session = L.newSession(), peers = {},
 	reader = nil, writer = nil,
 	seq = 0,                  -- local action sequence (the `seq` of this player's actions)
@@ -227,7 +281,6 @@ local G = {
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
 }
-local O = {} -- the game's own command functions, before wrapping
 
 -- The originals are kept in package.loaded so a savegame reload (which re-runs this file in the same Lua state)
 -- finds them instead of wrapping the wrapper (finding from MPFever (MIT)).
@@ -273,11 +326,19 @@ end
 
 -- Applies a due item from the interface state (the game is stopped at a pause). Callbacks are allowed here, so
 -- the engine's own result binds the created entity and answers the originator.
+-- A finished checksum round: remembered (the host's authority is measured against it) and sent. The host's report
+-- carries its account as `authority`; the players apply it when it comes back as an `authority` line.
+local function reportRound(n, t, parts, account)
+	G.reportsSent[n] = true
+	G.accountAt[n] = account
+	G.accountAt[n - 40] = nil
+	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil })
+end
+
 local function guiApplyNow(it, now)
 	if it.kind == "checksum" then
 		local parts, t = checksumParts()
-		send("checksum_report", { n = it.n, time = t, parts = parts })
-		G.reportsSent[it.n] = true
+		reportRound(it.n, t, parts, L.accountSnapshot(engine))
 		return
 	end
 	if it.lateSteps and it.lateSteps > 0 then logGui("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now) end
@@ -366,6 +427,14 @@ local function installWrap()
 				send("speed_request", { speed = tag.args[1] })
 				return
 			end
+			local category = L.categoryOf(tag.name)
+			if not L.permitted(G.perms, category) then
+				-- cancelled before stamping: nothing is sent to the other games, the window learns it failed
+				logGui("command " .. tag.name .. " refused: not allowed to " .. category)
+				send("action_refused", { seq = 0, detail = "permission denied: " .. category })
+				if cb then pcall(cb, {}, false, {}) end
+				return
+			end
 			local ok, err = shipLocal(tag, cb)
 			if ok then return end
 			logGui("command " .. tag.name .. " sent natively: " .. tostring(err))
@@ -378,6 +447,7 @@ end
 local H = {}
 
 H.session = function(rec, p)
+	Hud.setSession(G.hud, p)
 	if L.applySession(G.session, p) then
 		logGui("session: started=" .. tostring(G.session.started) .. " speed=" .. G.session.speed .. " pauseAt=" .. tostring(G.session.pauseAt) .. " lead=" .. tostring(G.session.lead))
 	end
@@ -389,9 +459,70 @@ end
 
 H.player_left = function(rec, p)
 	if type(p) == "table" and p.id ~= nil then L.removePeer(G.peers, p.id) end
+	Hud.playerLeft(G.hud, p)
+end
+
+H.player_joined = function(rec, p)
+	Hud.playerJoined(G.hud, p)
+end
+
+H.welcome = function(rec, p)
+	Hud.applyWelcome(G.hud, p)
+end
+
+-- The host's grant for this player: which categories of local action are allowed.
+H.permissions = function(rec, p)
+	if L.applyPermissions(G.perms, p) then
+		logGui("permissions: build=" .. tostring(G.perms.build) .. " bulldoze=" .. tostring(G.perms.bulldoze) .. " spend=" .. tostring(G.perms.spend) .. " other=" .. tostring(G.perms.other))
+	end
+end
+
+-- Host authority at a checkpoint: this game's money is corrected to the host's values, measured at the same round.
+H.authority = function(rec, p)
+	if C.PLAYER_ID == 0 or type(p) ~= "table" or type(p.values) ~= "table" then return end
+	local own = G.accountAt[p.n]
+	if not own then logGui("authority for round " .. tostring(p.n) .. " skipped: no account recorded for it"); return end
+	local applied, failed = L.applyAuthority(engine, own, p.values)
+	if applied.balance then logGui("host authority: balance corrected by " .. applied.balance .. " (round " .. tostring(p.n) .. ")") end
+	if applied.loan then logGui("host authority: loan corrected by " .. applied.loan .. " (round " .. tostring(p.n) .. ")") end
+	for _, name in ipairs(failed) do logGui("host authority: " .. name .. " differs but this build cannot correct it") end
+end
+
+H.resync_save = function(rec, p)
+	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_save"); return end
+	logGui("resync: saving the game as '" .. p.name .. "'")
+	engine.saveGame(p.name, function(ok, err)
+		logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
+		send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil })
+	end)
+end
+
+-- Loading restarts the scripts, and with them this reader. The sequence of this very line is written to the cursor
+-- file first, so the reloaded mod resumes after it and nothing already dispatched is dispatched again; its hello
+-- (sent by the normal start-up) tells the host this game is back.
+H.resync_load = function(rec, p)
+	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_load"); return end
+	logGui("resync: loading '" .. p.name .. "'")
+	C.writeFile(C.path(C.CURSOR), string.format("%d %d", rec.seq, G.uiReader.lastSeq))
+	Hud.writeSnapshot(C, G.hud, { version = nil })
+	local ok, err = engine.loadGame(p.name)
+	if ok then
+		G.loading = true
+	else
+		C.writeFile(C.path(C.CURSOR), "")
+		logGui("resync: load failed: " .. tostring(err))
+		send("replay_failed", { detail = "resync_load failed: " .. tostring(err) })
+	end
 end
 
 H.action = function(rec, p)
+	if type(p) == "table" and p.allowed == false then
+		-- the host relayed an action its sender had no permission for: it is not applied here, and since the
+		-- sender's game may have run it, this game asks for a resync
+		logGui("action " .. tostring(rec.from) .. ":" .. tostring(p.seq) .. " relayed with allowed=false: not applied, requesting a resync")
+		send("replay_failed", { detail = "action " .. tostring(rec.from) .. ":" .. tostring(p.seq) .. " was not allowed" })
+		return
+	end
 	local it, err = L.actionItem(p, rec.from, C.parse)
 	if not it then logGui("action from " .. tostring(rec.from) .. " dropped: " .. tostring(err)); return end
 	if type(p.from) == "number" and p.from ~= rec.from then logGui("action payload claims sender " .. p.from .. ", launcher says " .. tostring(rec.from)) end
@@ -405,12 +536,18 @@ H.checksum_request = function(rec, p)
 end
 
 H.chat = function(rec, p)
-	if type(p) == "table" then logGui("chat " .. tostring(p.name or rec.from) .. ": " .. tostring(p.text)) end
+	if type(p) == "table" then
+		logGui("chat " .. tostring(p.name or rec.from) .. ": " .. tostring(p.text))
+		Hud.addChat(G.hud, p.name, p.text, p.from or rec.from)
+	end
 end
 
 local function readLink()
 	for _, rec in ipairs(C.readerPoll(G.reader)) do
-		if rec.from ~= 0 and rec.kind ~= "action" then
+		if G.loading then
+			-- a resync load is under way: the reloaded game reads these lines again from the cursor
+			break
+		elseif rec.from ~= 0 and rec.kind ~= "action" then
 			logGui("line " .. rec.seq .. " kind " .. rec.kind .. " from " .. tostring(rec.from) .. " ignored: only the host controls the session")
 		else
 			local h = H[rec.kind]
@@ -445,14 +582,30 @@ local function collectFromSim(state)
 	end
 	for _, r in ipairs(st.reports or {}) do
 		if not G.reportsSent[r.n] then
-			G.reportsSent[r.n] = true
-			send("checksum_report", { n = r.n, time = r.time, parts = r.parts })
+			reportRound(r.n, r.time, r.parts, r.account)
 		end
 	end
 	if (st.late or 0) > G.lateSeen then
 		G.lateSeen = st.late
 		logGui("the simulation applied an action late (" .. st.late .. " so far)")
 	end
+end
+
+-- The window's side of the hand-off: chat typed there arrives as records in ui_out.log, the model goes back as a
+-- snapshot file. Throttled: a few frames apart is plenty for a chat box.
+local function serviceWindow()
+	if G.frames % 3 ~= 0 then return end
+	for _, rec in ipairs(C.readerPoll(G.uiReader)) do
+		if rec.kind == "chat" then
+			local p = C.parse(rec.payload)
+			local text = type(p) == "table" and Hud.cleanText(p.text) or nil
+			if text then
+				send("chat", { text = text })
+				Hud.addChat(G.hud, C.PLAYER_NAME, text, C.PLAYER_ID)   -- the host does not echo a message to its sender
+			end
+		end
+	end
+	Hud.writeSnapshot(C, G.hud, G.hudWritten)
 end
 
 local function guiUpdate(userParams, state, guiState)
@@ -462,6 +615,19 @@ local function guiUpdate(userParams, state, guiState)
 		G.started = true
 		G.reader = C.newReader(C.path(C.TO_GAME))
 		G.writer = C.newWriter(C.path(C.FROM_GAME), C.PLAYER_ID)
+		G.hud = Hud.new(C.PLAYER_ID, C.PLAYER_NAME)
+		G.uiReader = C.newReader(C.path(Hud.OUTBOX))
+		-- after a resync load: resume the link after the line that asked for it, and keep the window's roster and chat
+		local cursor, uiCursor = (C.readFile(C.path(C.CURSOR)) or ""):match("^(%d+) (%d+)")
+		cursor, uiCursor = tonumber(cursor), tonumber(uiCursor)
+		if cursor and cursor > 0 then
+			G.reader.lastSeq = cursor
+			G.uiReader.lastSeq = uiCursor or 0
+			C.writeFile(C.path(C.CURSOR), "")
+			local restored = Hud.fromSnapshot(C.parse(C.readFile(C.path(Hud.SNAPSHOT)) or ""))
+			if restored and restored.selfId == C.PLAYER_ID then G.hud = restored end
+			logGui("reloaded after a resync: link resumes after line " .. string.format("%d", cursor))
+		end
 		installWrap()
 		pcall(function() guiState:subscribeToAllEvents() end)
 		setSpeed(0)
@@ -470,6 +636,7 @@ local function guiUpdate(userParams, state, guiState)
 	end
 	local ok, err = pcall(function()
 		readLink()
+		serviceWindow()
 		collectFromSim(state)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
