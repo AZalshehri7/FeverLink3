@@ -69,6 +69,7 @@ local function D(typeName, init)
     __newindex = function(_, k, v)
       if not def.set[k] then error("no writable member '" .. tostring(k) .. "' in " .. typeName, 2) end
       if typeName == "LaneConfig" and k == "transportModes" and LANE_SHIFT ~= 0 then
+        -- a write at index k lands at k - shift, index 0 wraps to the end (finding from MPFever (MIT))
         local shifted = {}
         for j = 0, 15 do shifted[(j - LANE_SHIFT) % 16] = v[j] end
         v = shifted
@@ -222,6 +223,16 @@ function SAVE_WORLD()
   ADD_NODE(120, 0, 50, 0); ADD_NODE(121, 100, 50, 0)
   ADD_EDGE(130, 120, 121, 1, "track/standard.street_template")
   ADD_OBJECT(140, 130, "signal/signal_a.mdl", 0.25, 2)
+  -- the lockstep harness's two constructions get full transforms (the engine's Mat4f always has 16 entries)
+  WORLD[54].CONSTRUCTION = CON_COMP("depot.con", 100, 200, 5, { depots = { 55 } })
+  WORLD[56].CONSTRUCTION = CON_COMP("station.con", -40.5, 12, 0)
+end
+
+function CON_COMP(file, x, y, z, extra)
+  local m = D("Mat4f")
+  local s = STORE(m)
+  s[13], s[14], s[15] = x, y, z
+  return D("ConstructionComp", { fileName = file, transf = m, depots = extra and extra.depots or {}, stations = extra and extra.stations or {} })
 end
 
 local function EDGES_AT(n)
@@ -331,7 +342,7 @@ function MAKE_API()
   E.system.stationGroupSystem = { getStationGroup = function(st) local w = WORLD[st]; return w and w.GROUP or -1 end }
   E.util.octree = {
     findEntitiesInCircle = function(p, r, t)
-      if t == CT.BASE_NODE and OCTREE == "none" then error("octree: component not indexed") end
+      if (t == CT.BASE_NODE or t == CT.BASE_EDGE) and OCTREE == "none" then error("octree: component not indexed") end
       local out = {}
       local px, py = pos3(p)
       local name = NAMES[t] or (t == CT.CONSTRUCTION and "CONSTRUCTION") or nil
@@ -404,9 +415,26 @@ function MAKE_API()
 end
 '''
 
+BUILD_MOCK3 = r'''
+-- after the harness: constructions that appear one step late, and a town building that grows in the same step
+local BASE_SIMSTEP = SIMSTEP
+function SIMSTEP()
+  if GAME.deferredCons then
+    local list = GAME.deferredCons
+    GAME.deferredCons = nil
+    for _, f in ipairs(list) do f() end
+  end
+  if GROW_TOWN then
+    GROW_TOWN = nil
+    NEW_ENTITY({ CONSTRUCTION = CON_COMP("town/house.con", 5000, 5000, 0) })
+  end
+  BASE_SIMSTEP()
+end
+'''
+
 BUILD_MOCK2 = r'''
 -- ===== applying a proposal =====
-BUILD_LOG, BUILD_REFUSALS, FACTORY_COUNT, HELPER_CALLS = {}, {}, 0, {}
+BUILD_LOG, BUILD_REFUSALS, FACTORY_COUNT, HELPER_CALLS, CFG_LOG, BUILD_CTX = {}, {}, 0, {}, {}, {}
 BUILD_REFUSE = nil      -- a test sets function(parts) -> message to make the engine refuse a build
 
 DEF_TEMPLATE("street/simple.street_template", "simple", { { forward = true, modes = { 2 } }, { forward = false, modes = { 2 } } })
@@ -540,18 +568,33 @@ function APPLY_BUILD(p)
     cs.objects = list
   end
   for o in pairs(gone) do WORLD[o] = nil end
-  for _, ce in ipairs(P.consAdd) do
-    local id = NEW_ENTITY(nil)
-    local comp = D("ConstructionComp", { fileName = ce.fileName, transf = ce.transf, params = ce.params, name = ce.name })
-    local cs = STORE(comp)
-    if ce.fileName:find("depot") then cs.depots = { NEW_ENTITY({ VEHICLE_DEPOT = {} }) } end
-    if ce.fileName:find("station") then
-      local st = NEW_ENTITY({ STATION = {} })
-      WORLD[st].GROUP = NEW_ENTITY({ STATION_GROUP = {} })
-      cs.stations = { st }
+  for _, n in ipairs(P.cfgAdd) do
+    local c = n.comp
+    local lcs = {}
+    for i, l in ipairs(c.laneConnections) do lcs[i] = l.segment0 .. ">" .. l.segment1 end
+    CFG_LOG[#CFG_LOG + 1] = { node = nodeMap[n.entity] or n.entity, lanes = lcs, crosswalks = #c.crosswalks, dss = c.doubleSlipSwitch }
+  end
+  local function makeConstructions()
+    for _, ce in ipairs(P.consAdd) do
+      local id = NEW_ENTITY(nil)
+      local comp = D("ConstructionComp", { fileName = ce.fileName, transf = ce.transf, params = ce.params, name = ce.name })
+      local cs = STORE(comp)
+      if ce.fileName:find("depot") then cs.depots = { NEW_ENTITY({ VEHICLE_DEPOT = {} }) } end
+      if ce.fileName:find("station") then
+        local st = NEW_ENTITY({ STATION = {} })
+        WORLD[st].GROUP = NEW_ENTITY({ STATION_GROUP = {} })
+        cs.stations = { st }
+      end
+      WORLD[id] = { CONSTRUCTION = comp }
+      created[#created + 1] = id
     end
-    WORLD[id] = { CONSTRUCTION = comp }
-    created[#created + 1] = id
+  end
+  -- a test can have the engine create constructions one step after the command that built them (as it does vehicles)
+  if DEFER_CONS and GAME.inUpdate and #P.consAdd > 0 then
+    GAME.deferredCons = GAME.deferredCons or {}
+    GAME.deferredCons[#GAME.deferredCons + 1] = makeConstructions
+  else
+    makeConstructions()
   end
   return true, created
 end
@@ -571,6 +614,10 @@ function EXECUTE(cmd, cb)
     local ents = {}
     for i, e in ipairs(res) do ents[i] = { e, 0 } end
     GAME.applied[#GAME.applied + 1] = { name = name, time = GAME.time, args = a }
+    local c = a[2]
+    BUILD_CTX[#BUILD_CTX + 1] = c and (string.format("align=%s cleanup=%s buildings=%s fields=%s player=%s ie=%s pi=%s", tostring(c.checkTerrainAlignment),
+      tostring(c.cleanupStreetGraph), tostring(c.gatherBuildings), tostring(c.gatherFields), tostring(c.player), tostring(a[3]), tostring(a[4])))
+      or ("nil ie=" .. tostring(a[3]) .. " pi=" .. tostring(a[4]))
     BUILD_LOG[#BUILD_LOG + 1] = SUMMARY(a[1])
     if cb then cb({ resultEntities = ents, resultProposalData = { errorState = { messages = {} } } }, true, ents) end
   else
@@ -696,15 +743,16 @@ function NATIVE_SIGNAL(spec)
   local w = WORLD[spec.edge]
   local c = COPY(w.BASE_EDGE)
   local cs = STORE(c)
+  local kind = spec.kind or 2        -- 0 a stop on the left, 1 on the right, 2 a signal
   local objs = {}
   for i, o in ipairs(cs.objects) do objs[i] = { o[1], o[2] } end
-  objs[#objs + 1] = { -400000000, 2 }
+  objs[#objs + 1] = { -400000000, kind }
   cs.objects = objs
   local P = D("Proposal")
   local sp = P.proposal
   sp.removedSegments = { D("SegmentAndEntity", { entity = spec.edge, comp = COPY(w.BASE_EDGE), type = w.KIND }) }
   sp.addedSegments = { D("SegmentAndEntity", { entity = -1, comp = c, type = w.KIND }) }
-  local eo = D("EdgeObjectNative", { segmentEntity = -1, param = spec.param, category = 2, left = spec.left == true })
+  local eo = D("EdgeObjectNative", { segmentEntity = -1, param = spec.param, category = kind, left = spec.left == true })
   STORE(eo)._model = spec.model or "signal/signal_a.mdl"
   sp.edgeObjectsToAdd = { eo }
   P.proposal = sp
@@ -748,6 +796,35 @@ function NATIVE_DEPOT_ON_ROAD(spec)
   return P
 end
 
+-- lane connections and crosswalks of nodes: spec.nodes = { { node = id, lanes = { { seg0, lane0, seg1, lane1 } }, crosswalks = { seg } } }
+function NATIVE_NODECFG(spec)
+  local P = D("Proposal")
+  local sp = P.proposal
+  local cfgs = {}
+  for i, n in ipairs(spec.nodes) do
+    local lcs = {}
+    for j, l in ipairs(n.lanes or {}) do lcs[j] = D("LaneConnection", { segment0 = l[1], lane0 = l[2], segment1 = l[3], lane1 = l[4], withRoad = true }) end
+    local comp = D("BaseNodeConfig", { laneConnections = lcs, crosswalks = n.crosswalks or {}, trafficLightPreference = n.pref or 0, doubleSlipSwitch = n.dss == true })
+    cfgs[i] = D("NodeConfigAndEntity", { entity = n.node, comp = comp })
+  end
+  sp.nodeConfigsToAdd = cfgs
+  P.proposal = sp
+  return P
+end
+
+function CONTEXT(align, cleanup, buildings, fields)
+  return D("Context", { player = 7, checkTerrainAlignment = align, cleanupStreetGraph = cleanup, gatherBuildings = buildings, gatherFields = fields })
+end
+
+-- what the module makes of a proposal that a tool applied natively (the body for an action line), as a string
+function CAPTURE_BODY(P, created)
+  local M, env = LOAD_BUILD()
+  local C = env.ug_require("feverlink3_common.lua")
+  local body, why = M.capture(P, { result = created })
+  if not body then return nil, why end
+  return C.serialize(body)
+end
+
 function NATIVE_TERRAIN(x0, y0, w, h)
   local P = D("Proposal")
   local t = P.terrain
@@ -785,7 +862,15 @@ function WORLD_SIG()
         objs[#objs + 1] = oc.edgeObjectConstruction .. "@" .. string.format("%.3f", oc.param) .. "k" .. tostring(o[2])
       end
       table.sort(objs)
-      lines[#lines + 1] = "E " .. pa .. " " .. pb .. " " .. c.roadTemplate .. " kind" .. tostring(w.KIND) .. " lanes" .. #c.laneConfigs .. " [" .. table.concat(objs, ";") .. "] " .. SER(c.edgeDecorations)
+      local lanes = {}
+      for i, l in ipairs(c.laneConfigs) do
+        local ls = STORE(l)
+        local m = {}
+        for j = 0, 15 do if ls.transportModes[j] then m[#m + 1] = j end end
+        lanes[i] = (ls.forward and "f" or "b") .. table.concat(m, ",")
+      end
+      lines[#lines + 1] = "E " .. pa .. " " .. pb .. " " .. c.roadTemplate .. " kind" .. tostring(w.KIND) .. " lanes[" .. table.concat(lanes, "|") .. "] ["
+        .. table.concat(objs, ";") .. "] " .. SER(c.edgeDecorations)
     elseif w.CONSTRUCTION then
       local c = w.CONSTRUCTION
       local isDouble = getmetatable(c) ~= nil
@@ -827,6 +912,22 @@ function FIND_CON(file)
     if c and getmetatable(c) and STORE(c).fileName == file and (best == nil or e > best) then best = e end
   end
   return best
+end
+
+-- the newest depot the session built (the savegame's depot is 55)
+function FIND_DEPOT()
+  local best
+  for e, w in pairs(WORLD) do
+    if w.VEHICLE_DEPOT and e >= 1000 and (best == nil or e > best) then best = e end
+  end
+  return best
+end
+
+function BOUND_KEYS()
+  local ks = {}
+  for k in pairs((STATE:get() or {}).bind or {}) do ks[#ks + 1] = k end
+  table.sort(ks)
+  return table.concat(ks, " ")
 end
 
 function COUNT(comp)
@@ -877,6 +978,7 @@ class BuildGame(T.Game):
         self.L.execute(BUILD_MOCK)
         self.L.execute(BUILD_MOCK2)
         self.L.execute(T.HARNESS)
+        self.L.execute(BUILD_MOCK3)
         self.L.execute("SAVE_WORLD()")
 
     def sig(self):
@@ -885,12 +987,23 @@ class BuildGame(T.Game):
     def lua(self, expr):
         return self.L.eval(expr)
 
+    def run(self, statements):
+        self.L.execute(statements)
+
     def issue(self, proposal, ctx="nil", ie="false", pi="true", cb="function() end"):
         """Send a build from the interface state, as a game window or script would."""
         self.send_gui("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(%s, %s, %s, %s), %s)" % (proposal, ctx, ie, pi, cb))
 
     def shipped(self):
-        return [l for l in self.lines(self.from_game) if l.split(TAB)[1] == "action"]
+        """The body of every action this game sent, as the text of its serialised table."""
+        out = []
+        for l in self.lines(self.from_game):
+            parts = l.split(TAB, 3)
+            if parts[1] == "action":
+                p = lupa.LuaRuntime(unpack_returned_tuples=True).execute(T.COMMON_SRC).parse(parts[3])
+                p = p[0] if isinstance(p, tuple) else p
+                out.append(str(p.body))
+        return out
 
 
 class BuildTest(unittest.TestCase):
@@ -944,8 +1057,713 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(len(shipped), 1)
         for ident in (na, nb, self.B.lua("FIND_EDGE(300, 0, 400, 0)"), self.A.lua("FIND_EDGE(300, 0, 400, 0)")):
             self.assertNotIn(str(int(ident)), shipped[0], "no session entity id on the wire")
+        self.assertNotIn("userdata", shipped[0])
         self.assertEqual(self.A.lua("BUILD_LOG[1]"), self.B.lua("BUILD_LOG[1]"))
 
+    def test_a_second_build_attaches_to_a_node_the_first_one_created(self):
+        self.start()
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(30)
+        nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
+        na = int(self.A.lua("FIND_NODE(400, 0, 0)"))
+        self.assertNotEqual(na, nb)
+        self.B.issue("SIMPLE_ROAD{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(400, 0, 500, 100)"), "the second road starts at the first one's end node on the host too")
+        self.assertEqual(self.A.lua("#EDGES_AT(FIND_NODE(400, 0, 0))"), 2, "one node, two roads")
+        shipped = self.B.shipped()
+        self.assertEqual(len(shipped), 2)
+        self.assertIn('["__ref"]="node"', shipped[1])
+        self.assertIn('["key"]="s:%d"' % nb, shipped[1], "the id only travels as a key, next to the place it must lie at")
+        self.assertIn('["p"]={["x"]=400,["y"]=0,["z"]=0}', shipped[1])
+        self.assertEqual(shipped[1].count(str(nb)), 1, "once, inside the key")
+
+    def test_a_key_that_names_another_entity_is_not_trusted(self):
+        self.start()
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(30)
+        nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
+        # on the host the same id means a node elsewhere: the key resolves, but not where the reference says
+        self.A.run("ADD_NODE(%d, 999, 999, 0)" % nb)
+        self.B.issue("SIMPLE_ROAD{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
+        self.tick(30)
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(400, 0, 500, 100)"), "found by place, not by the id")
+        self.assertEqual(self.A.lua("#EDGES_AT(%d)" % nb), 0, "the node that happened to carry the id was left alone")
+
+    def test_an_unresolvable_reference_refuses_the_action_on_the_game_that_lacks_the_place(self):
+        self.start()
+        self.tick(5)
+        self.A.run("WORLD[111] = nil; WORLD[102] = nil")   # the host's copy of the road lost its end
+        self.B.issue("SIMPLE_ROAD{ nodeA = 102, b = { x = 300, y = 100, z = 0 } }")
+        self.tick(30)
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 0, "the host built nothing on a node it does not have")
+        self.assertEqual(self.B.lua("#BUILD_LOG"), 1)
+        self.assertTrue(any("unresolved node at 200.000,0.000,0.000" in d for _, _, d in self.relay.refused), self.relay.refused)
+
+    def test_two_nodes_equally_near_make_a_reference_ambiguous_and_refuse(self):
+        self.start()
+        self.tick(5)
+        self.A.run("WORLD[102] = nil; WORLD[111] = nil; ADD_NODE(2001, 200.3, 0, 0); ADD_NODE(2002, 199.7, 0, 0)")
+        self.B.issue("SIMPLE_ROAD{ nodeA = 102, b = { x = 300, y = 100, z = 0 } }")
+        self.tick(30)
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 0)
+        self.assertTrue(any("ambiguous node" in d for _, _, d in self.relay.refused), self.relay.refused)
+
+    # ---- what the tools hand over
+
+    def test_a_tool_junction_splits_a_segment_and_adds_a_branch(self):
+        self.start()
+        self.B.issue("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }", ie="false", pi="true")
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIsNone(self.A.lua("FIND_EDGE(0, 0, 100, 0)"), "the old segment is gone")
+        for ends in ("0, 0, 50, 0", "50, 0, 100, 0", "50, 0, 50, 80"):
+            self.assertIsNotNone(self.A.lua("FIND_EDGE(%s)" % ends))
+        self.assertEqual(self.A.lua("#EDGES_AT(FIND_NODE(50, 0, 0))"), 3)
+        self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=false buildings=true fields=true player=7 ie=false pi=true",
+                         "a tool's build is rebuilt with the context the tools use")
+
+    def test_a_script_context_and_flags_are_reproduced(self):
+        self.start()
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", ctx="CONTEXT(true, true, false, true)", ie="true", pi="false")
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
+        self.tick(40)
+        self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=true buildings=false fields=true player=7 ie=true pi=false")
+        self.assertEqual(self.A.lua("BUILD_CTX[2]"), "nil ie=false pi=true", "no context stays no context")
+        self.assertEqual(self.B.lua("BUILD_CTX[1]"), self.A.lua("BUILD_CTX[1]"))
+
+    def test_upgrade_of_segments_the_session_built(self):
+        self.start()
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(30)
+        eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
+        ea = int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.assertNotEqual(ea, eb)
+        self.B.issue("NATIVE_UPGRADE{ edges = { %d }, template = 'street/new_small_road.street_template', deco = { { 12, true } } }" % eb)
+        self.tick(40)
+        self.assertSameWorld()
+        sig = self.A.sig()
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00 street/new_small_road.street_template", sig)
+        self.assertIn("{1={1=12,2=true}}", sig, "the decoration came along")
+        self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "replaceSegment %d" % ea, "each game upgraded its own segment")
+        self.assertEqual(self.B.lua("HELPER_CALLS[#HELPER_CALLS]"), "replaceSegment %d" % eb)
+
+    def test_upgrading_several_segments_chains_one_command_each(self):
+        self.start()
+        self.B.issue("NATIVE_UPGRADE{ edges = { 110, 111 }, template = 'street/new_small_road.street_template' }")
+        self.tick(40)
+        self.assertSameWorld()
+        self.assertEqual(self.A.lua("#HELPER_CALLS"), 2)
+        self.assertEqual(self.A.lua("BUILD_LOG[1]"), "cons=0 rm=0 nodes=0 segs=1 rmsegs=1 objs=0")
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 2)
+        self.assertEqual(self.A.sig().count("new_small_road"), 2)
+
+    def test_custom_lanes_survive_a_write_shift_of_transport_modes(self):
+        self.start()
+        self.A.run("LANE_SHIFT = 1")
+        self.B.run("LANE_SHIFT = 1")
+        self.B.issue("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }\n"
+                     "  local sp = P.proposal; local added = sp.addedSegments; local s = added[1]; local c = s.comp\n"
+                     "  local lanes = c.laneConfigs; lanes[3] = D('LaneConfig', { forward = true, speed = 9, width = 2, height = 0, offset = 0 })\n"
+                     "  local tm = {}; for j = 0, 15 do tm[j] = (j == 4 or j == 15) end\n"
+                     "  local l = lanes[3]; l.transportModes = tm; lanes[3] = l\n"
+                     "  c.laneConfigs = lanes; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp\n"
+                     "  return P end)()")
+        self.tick(40)
+        self.assertSameWorld("the lanes carry the same modes on both games")
+        # the originator's engine stored the shifted write (4 -> 3, 15 -> 14); the replay compensates with the measured shift
+        self.assertIn("f3,14", self.A.sig())
+        self.assertIn("f3,14", self.B.sig())
+
+    def test_bulldozing_a_session_built_segment_uses_the_engines_removal(self):
+        self.start()
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(30)
+        eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
+        ea = int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb)
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % ea)
+        self.assertEqual(self.B.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % eb)
+
+    # ---- constructions
+
+    def test_a_station_is_placed_with_a_seed_every_game_agrees_on(self):
+        self.start()
+        self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 3 } }")
+        self.tick(30)
+        self.assertSameWorld()
+        sig = self.A.sig()
+        self.assertIn("C station/rail/modular_station.con@300.00,200.00,0.00", sig)
+        self.assertIn("length=3", sig)
+        self.assertIn("seed=2700", sig, "7x + 3y + z of where it stands, as the game's own scripts derive it")
+        self.assertEqual(self.A.lua("BUILD_LOG[1]"), "cons=1 rm=0 nodes=0 segs=0 rmsegs=0 objs=0")
+        self.assertIn("s1", sig.split("station/rail/modular_station.con")[1].splitlines()[0], "the station came with its station")
+
+    def test_a_construction_is_replaced_then_bulldozed_by_the_place_it_stands(self):
+        self.start()
+        self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 3 } }")
+        self.tick(30)
+        cb = int(self.B.lua("FIND_CON('station/rail/modular_station.con')"))
+        ca = int(self.A.lua("FIND_CON('station/rail/modular_station.con')"))
+        self.assertNotEqual(ca, cb)
+        self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 5 }, remove = %d }" % cb)
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIn("length=5", self.A.sig())
+        self.assertNotIn("length=3", self.A.sig())
+        cb = int(self.B.lua("FIND_CON('station/rail/modular_station.con')"))
+        self.B.issue("CON_REMOVE{ cons = { %d } }" % cb)
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertNotIn("modular_station", self.A.sig())
+
+    def test_a_vehicle_is_bought_at_a_depot_the_session_built(self):
+        self.start()
+        self.B.issue("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 500, y = 100 }")
+        self.tick(30)
+        for g in (self.A, self.B):
+            keys = str(g.lua("BOUND_KEYS()")).split()
+            self.assertIn("1:1#c1", keys)
+            self.assertIn("1:1#c1/d1", keys, "the depot has a key of its own")
+        depot_b, depot_a = int(self.B.lua("FIND_DEPOT()")), int(self.A.lua("FIND_DEPOT()"))
+        self.assertNotEqual(depot_a, depot_b)
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, %d, { vehicles = {} }), function(d, s) BUY_OK = s end)" % depot_b)
+        self.tick(40)
+        self.assertTrue(self.B.lua("BUY_OK == true"))
+        self.assertEqual(self.A.lua("GAME.applied[#GAME.applied].name"), "makeVehicleBuyCmd")
+        self.assertEqual(self.A.lua("GAME.applied[#GAME.applied].args[2]"), depot_a, "each game bought at its own depot")
+        self.assertEqual(self.B.lua("GAME.applied[#GAME.applied].args[2]"), depot_b)
+        self.assertIn('"1:1#c1/d1"', self.B.shipped()[1].replace("\\", ""))
+
+    def test_keys_are_found_when_the_depot_appears_a_step_late_next_to_a_town_building(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("DEFER_CONS = true")
+        self.B.issue("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 500, y = 100 }")
+        for _ in range(60):
+            self.tick(1)
+            if self.A.lua("#BUILD_LOG") == 1 and self.B.lua("#BUILD_LOG") == 1:
+                break
+        self.assertEqual(self.A.lua("COUNT('VEHICLE_DEPOT')"), 1, "the engine has not created the depot yet: it comes with the next step")
+        for g in (self.A, self.B):
+            g.run("GROW_TOWN = true")      # a town building appears in the step the depot does, and has the higher id
+        self.tick(6)
+        for g in (self.A, self.B):
+            self.assertIsNotNone(g.lua("FIND_CON('town/house.con')"))
+            self.assertGreater(g.lua("FIND_CON('town/house.con')"), g.lua("FIND_CON('depot/road_depot.con')"))
+            self.assertEqual(g.lua("STATE:get().bind['1:1#c1']"), g.lua("FIND_CON('depot/road_depot.con')"), "the depot's construction, not the newest one")
+            self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split())
+
+    def test_a_station_gets_keys_for_its_station_and_its_group(self):
+        self.start()
+        self.B.issue("CON_PROPOSAL{ file = 'station/bus/bus_station.con', x = 100, y = 300 }")
+        self.tick(30)
+        keys = str(self.A.lua("BOUND_KEYS()")).split()
+        self.assertEqual([k for k in keys if k.startswith("1:1#")], ["1:1#c1", "1:1#c1/g1", "1:1#c1/s1"])
+
+    def test_a_depot_against_a_road_is_built_in_two_commands_street_first(self):
+        self.start()
+        self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
+                     cb="function(d, s, e) DEPOT_OK = s end")
+        self.tick(40)
+        self.assertTrue(self.B.lua("DEPOT_OK == true"))
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("BUILD_LOG[1]"), "cons=0 rm=0 nodes=1 segs=2 rmsegs=1 objs=0", "the street part first, without the entrance")
+            self.assertEqual(g.lua("BUILD_LOG[2]"), "cons=1 rm=0 nodes=0 segs=0 rmsegs=0 objs=0")
+            self.assertEqual(g.lua("BUILD_CTX[1]"), "align=true cleanup=false buildings=true fields=true player=7 ie=false pi=true")
+            self.assertEqual(g.lua("BUILD_CTX[2]"), "align=true cleanup=false buildings=true fields=true player=7 ie=true pi=false")
+        sig = self.A.sig()
+        self.assertIn("C depot/road_depot.con@50.00,-30.00,0.00", sig)
+        self.assertEqual(sig.count("\nE ") + sig.startswith("E "), 4, "130, 111 and the two halves of 110 - the entrance was left to the depot's script")
+        self.assertIn("1:1#c1/d1", str(self.A.lua("BOUND_KEYS()")).split())
+
+    def test_a_depot_built_while_paused_runs_its_commands_through_callbacks(self):
+        self.start(speed=2)
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40)
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
+        self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
+                     cb="function(d, s, e) PAUSED_OK = s end")
+        self.tick(10)
+        self.assertTrue(self.B.lua("PAUSED_OK == true"))
+        self.assertSameWorld()
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 2)
+        self.assertIn("1:1#c1/d1", str(self.A.lua("BOUND_KEYS()")).split())
+        self.assertIn("1:1#c1/d1", str(self.B.lua("BOUND_KEYS()")).split())
+
+    def test_a_refused_second_command_stops_the_chain_and_tells_the_window(self):
+        self.start(speed=2)
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40)
+        for g in (self.A, self.B):
+            g.run("BUILD_REFUSE = function(parts) if #parts.consAdd > 0 then return 'Collision' end end")
+        self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
+                     cb="function(d, s, e) PAUSED_OK = s end")
+        self.tick(10)
+        self.assertTrue(self.B.lua("PAUSED_OK == false"), "the window learns the build failed")
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 1, "only the street part ran")
+        self.assertEqual(self.A.lua("BUILD_REFUSALS[1]"), "Collision")
+        self.assertIn("REFUSED", self.B.log())
+
+    # ---- signals and stops
+
+    def test_a_signal_captured_before_the_build_ran_has_no_model_and_stays_native(self):
+        self.start()
+        self.B.issue("NATIVE_SIGNAL{ edge = 130, param = 0.75 }")
+        self.tick(30)
+        self.assertIn("an edge object has no model", self.B.log())
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 0, "not shipped: the model is only known after the build")
+        self.assertEqual(self.B.lua("#BUILD_LOG"), 1, "the player's own build went through natively")
+
+    def test_a_signal_captured_after_the_build_ran_is_replayed_on_the_peer(self):
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created")
+        body = self.B.lua("CAPTURE_BODY(SIGNAL_P, SIGNAL_CREATED)")
+        self.assertIsInstance(body, str, body)
+        self.assertIn("rmSegs", body)
+        self.assertIn("signal/signal_a.mdl", body, "the model was read from the object the engine created")
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
+        self.tick(20)
+        self.assertSameWorld()
+        self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig(), "the signal that was there stays, the new one is added")
+
+    def test_a_bus_stop_on_the_left_is_object_kind_zero(self):
+        self.start()
+        self.B.run("STOP_P = NATIVE_SIGNAL{ edge = 110, param = 0.5, left = true, kind = 0, model = 'station/street/bus_stop.mdl' }; "
+                   "local ok, created = APPLY_BUILD(STOP_P); STOP_CREATED = created")
+        body = self.B.lua("CAPTURE_BODY(STOP_P, STOP_CREATED)")
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
+        self.tick(20)
+        self.assertSameWorld()
+        self.assertIn("station/street/bus_stop.mdl@0.500k0", self.A.sig())
+
+    # ---- node configurations
+
+    def test_lane_connections_and_crosswalks_follow_the_segments_the_session_built(self):
+        self.start()
+        self.B.issue("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }")
+        self.tick(30)
+
+        def edge(game, *p):
+            return int(game.lua("FIND_EDGE(%s)" % ", ".join(str(x) for x in p)))
+
+        eb1, eb2, eb3 = edge(self.B, 0, 0, 50, 0), edge(self.B, 50, 0, 100, 0), edge(self.B, 50, 0, 50, 80)
+        jb = int(self.B.lua("FIND_NODE(50, 0, 0)"))
+        self.B.issue("NATIVE_NODECFG{ nodes = { { node = %d, lanes = { { %d, 0, %d, 1 } }, crosswalks = { %d }, dss = true } } }" % (jb, eb1, eb3, eb2))
+        self.tick(30)
+        ea1, ea3 = edge(self.A, 0, 0, 50, 0), edge(self.A, 50, 0, 50, 80)
+        self.assertNotEqual(ea1, eb1)
+        self.assertEqual(self.A.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (ea1, ea3), "the host's configuration names the host's segments")
+        self.assertEqual(self.B.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (eb1, eb3))
+        self.assertEqual(self.A.lua("CFG_LOG[1].crosswalks"), 1)
+        self.assertTrue(self.A.lua("CFG_LOG[1].dss"))
+        self.assertEqual(self.A.lua("CFG_LOG[1].node"), int(self.A.lua("FIND_NODE(50, 0, 0)")))
+
+    # ---- terrain
+
+    def test_a_terrain_edit_stays_native(self):
+        self.start()
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeWorldReplaceTerrainCmd(1, 2, 'seed', 3, false))")
+        self.B.issue("NATIVE_TERRAIN(10, 20, 12, 12)")
+        self.tick(30)
+        self.assertEqual(self.A.applied(), [])
+        self.assertEqual(len(self.B.applied()), 2)
+        self.assertEqual(self.B.shipped(), [])
+        self.assertIn("terrain cells cannot be read or written from a script", self.B.log())
+        self.assertIn("a terrain edit: its cells cannot be read from a script", self.B.log())
+
+    def test_a_terrain_grid_riding_with_a_road_is_not_copied_but_the_road_is(self):
+        self.start()
+        self.B.issue("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; "
+                     "local t = P.terrain; t.baseHeightMod = D('GridVec2f', { x0 = 1, y0 = 2, width = 8, height = 8 }); P.terrain = t; return P end)()")
+        self.tick(30)
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.assertIn("a terrain edit of 8x8 cells comes with this build: the cells are not copied", self.B.log())
+
+    # ---- permissions
+
+    def test_bulldozing_and_building_are_separate_permissions(self):
+        self.start()
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(30)
+        eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"bulldoze": False}))
+        self.tick(2)
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb, cb="function(d, s) DOZE_OK = s end")
+        self.tick(20)
+        self.assertTrue(self.B.lua("DOZE_OK == false"))
+        self.assertIn((1, 0, "permission denied: bulldoze"), self.relay.refused)
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"), "nothing was bulldozed")
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
+        self.tick(30)
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 100, 400, 100)"), "building is still allowed")
+        # the other way round: bulldozing allowed, building denied; replacing a segment is building, removing a construction is bulldozing
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"bulldoze": True, "build": False}))
+        self.tick(2)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 200, z = 0 }, b = { x = 400, y = 200, z = 0 } }", cb="function(d, s) BUILD_OK = s end")
+        self.B.issue("NATIVE_UPGRADE{ edges = { %d }, template = 'street/new_small_road.street_template' }" % eb, cb="function(d, s) UP_OK = s end")
+        self.tick(20)
+        self.assertTrue(self.B.lua("BUILD_OK == false"))
+        self.assertTrue(self.B.lua("UP_OK == false"), "an upgrade replaces segments: it is building")
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb)
+        self.tick(30)
+        self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+
+    # ---- wire safety
+
+    def test_a_hostile_record_is_refused_without_harm(self):
+        self.start()
+        ident = "{" + ",".join("[%d]=%d" % (i, 1 if i in (1, 6, 11, 16) else 0) for i in range(1, 17)) + "}"
+        wrap = '{["fn"]="makeWorldBuildProposalCmd",["args"]={["n"]=5,[1]=%s,[2]=false,[3]=false,[4]=true,[5]=false}}'
+        cases = [
+            ("version 7", wrap % '{["v"]=7}'),
+            ("bad file name", wrap % ('{["v"]=1,["cons"]={[1]={["file"]="evil.lua",["transf"]=%s}}}' % ident)),
+            ("too large", wrap % ('{["v"]=1,["nodes"]={' + ",".join('[%d]={["id"]=-1,["pos"]={["x"]=0,["y"]=0,["z"]=0}}' % i for i in range(1, 4100)) + "}}")),
+            ("bad entry", wrap % '{["v"]=1,["nodes"]={[1]={["id"]=-1,["pos"]={["x"]=(0/0),["y"]=0,["z"]=0}}}}'),
+            ("not a list", wrap % '{["v"]=1,["segs"]=7}'),
+            ("nothing to build", wrap % '{["v"]=1}'),
+        ]
+        for i, (_, body) in enumerate(cases, 1):
+            self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + (6 + i) * STEP, "seq": 10 + i, "body": body, "from": 1}))
+        self.tick(30)
+        details = [d for _, _, d in self.relay.refused]
+        for want in ("build record version 7", "bad file name", "build record too large", "bad entry", "is not a list", "nothing to build"):
+            self.assertTrue(any(want in d for d in details), "%s not in %s" % (want, details))
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 0)
+        self.assertEqual(self.A.speed(), 1, "the game carries on")
+        self.assertFalse(self.A.reload_pending())
+
+
+# ---------------------------------------------------------------- the module without a bridge
+
+PURE_LUA = r'''
+function PURE()
+  local M, env = LOAD_BUILD()
+  local C = env.ug_require("feverlink3_common.lua")
+  local ctx = { plain = C.plain, keyOf = function(e) return "s:" .. e end }
+  return M, C, ctx, env
+end
+
+function CAPTURE(P, flags)
+  local M, C, ctx = PURE()
+  return M.capture(P, flags or {}, ctx)
+end
+
+function PLAN_OF(P)
+  local body, why = CAPTURE(P)
+  if not body then return "refused: " .. tostring(why) end
+  local M = PURE()
+  return M.classify(body.args[1])
+end
+
+-- a record that went over the wire and back
+function WIRE_RECORD(P, flags)
+  local M, C, ctx = PURE()
+  local body, why = M.capture(P, flags or {}, ctx)
+  if not body then return nil, why end
+  return C.parse(C.serialize(body)), M, C
+end
+
+function DECODE(body, resolve)
+  local M = PURE()
+  local ctx = { player = 7, resolve = resolve or function(key) local n = tostring(key):match("^s:(%d+)$"); return n and tonumber(n) or nil end }
+  return M.commands.makeWorldBuildProposalCmd.decode(body, ctx)
+end
+'''
+
+
+class PureBuildTest(unittest.TestCase):
+    """The build schema alone, in a mocked world, without the bridge."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="feverlink3-")
+        # a session folder of its own: the module logs, and must not touch anything outside this test
+        self.saved_env = {k: os.environ.get(k) for k in ("FEVERLINK3_SESSION_DIR", "FEVERLINK3_PLAYER_ID", "FEVERLINK3_PLAYER_NAME")}
+        os.environ.update(FEVERLINK3_SESSION_DIR=self.tmp, FEVERLINK3_PLAYER_ID="1", FEVERLINK3_PLAYER_NAME="pure")
+        self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        g = self.L.globals()
+        g.COMMON_SRC = T.COMMON_SRC
+        cmds = self.L.table()
+        for stem, src in T.CMDS_SRC.items():
+            cmds[stem] = src
+        g.CMDS_SRC = cmds
+        self.L.execute(T.MOCK % dict(t0=T.T0, first=70000))
+        self.L.execute(BUILD_MOCK)
+        self.L.execute(BUILD_MOCK2)
+        self.L.execute("SAVE_WORLD()")
+        self.L.execute(PURE_LUA)
+
+    def tearDown(self):
+        for k, v in self.saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def ev(self, code):
+        return self.L.eval(code)
+
+    def test_the_plan_chosen_for_each_shape_of_build(self):
+        road = "a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }"
+        cases = [
+            ("SIMPLE_ROAD{ %s }" % road, "street"),
+            ("NATIVE_ROAD{ %s }" % road, "street"),
+            ("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }", "street"),
+            ("NATIVE_UPGRADE{ edges = { 110, 111 }, template = 'street/new_small_road.street_template' }", "upgrade"),
+            ("NATIVE_BULLDOZE{ edges = { 110 } }", "removal"),
+            ("NATIVE_BULLDOZE{ cons = { 54 } }", "construction"),
+            ("NATIVE_BULLDOZE{ edges = { 110 }, cons = { 54 } }", "bulldoze"),
+            ("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2 }", "construction"),
+            ("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, remove = 54 }", "construction"),
+            ("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }", "withStreet"),
+            ("NATIVE_NODECFG{ nodes = { { node = 101, lanes = { { 110, 0, 111, 0 } } } } }", "nodecfg"),
+            ("NATIVE_TERRAIN(1, 2, 3, 3)", "refused: a terrain edit: its cells cannot be read from a script, only the native module can copy them"),
+            ("D('SimpleProposal')", "refused: nothing to build"),
+            ("NATIVE_SIGNAL{ edge = 130, param = 0.5 }", "refused: an edge object has no model (captured before the build ran?)"),
+            ("5", "refused: not a proposal (neither streetProposal nor proposal / toAdd found)"),
+        ]
+        for code, want in cases:
+            self.assertEqual(self.ev("PLAN_OF(%s)" % code), want, code)
+
+    def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
+        def cat(code):
+            return self.ev("(function() local M = PURE(); return M.commands.makeWorldBuildProposalCmd.category('makeWorldBuildProposalCmd', { n = 4, %s }) end)()" % code)
+
+        for code in ("SIMPLE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }", "NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }",
+                     "NATIVE_SIGNAL{ edge = 130, param = 0.5 }", "CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2 }",
+                     "CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, remove = 54 }", "NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }",
+                     "7"):
+            self.assertEqual(cat(code), "build", code)
+        for code in ("NATIVE_BULLDOZE{ edges = { 110 } }", "CON_REMOVE{ cons = { 54 } }", "NATIVE_BULLDOZE{ cons = { 54 } }", "NATIVE_BULLDOZE{ edges = { 110 }, cons = { 54 } }"):
+            self.assertEqual(cat(code), "bulldoze", code)
+        self.assertEqual(self.ev("PURE().commands.makeWorldReplaceTerrainCmd.category"), "build")
+
+    def test_a_record_is_plain_data_that_survives_the_wire(self):
+        for code in ("SIMPLE_ROAD{ a = { x = 300.123456789, y = 0, z = 0.5 }, b = { x = 400, y = 0, z = 0 } }", "NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template', deco = { { 12, true } } }",
+                     "CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1.25, y = 2, params = { a = 1, b = { c = 'x' } } }"):
+            self.assertTrue(self.ev("(function() local M, C, ctx = PURE(); local body = CAPTURE(%s); local text = C.serialize(body); "
+                                    "return text == C.serialize(C.parse(text)) and not text:find('userdata') and #text end)()" % code), code)
+        # a position keeps every digit
+        self.assertEqual(self.ev("(function() local rec = WIRE_RECORD(SIMPLE_ROAD{ a = { x = 300.123456789, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }); "
+                                 "return rec.args[1].nodes[1].pos.x end)()"), 300.123456789)
+
+    def test_a_proposal_that_is_not_plain_data_cannot_go_on_the_wire(self):
+        self.assertEqual(self.ev("(function() local P = CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, params = { f = print } }; "
+                                 "local body, why = CAPTURE(P); return tostring(body) .. ':' .. tostring(why):sub(1, 60) end)()").split(":")[0], "nil")
+
+    def test_normalise_refuses_what_it_cannot_trust(self):
+        def refuse(mutation):
+            return self.ev("(function() local rec, M = WIRE_RECORD(SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }); rec = rec.args[1]; "
+                           "%s; local ok, why = M.normalise(rec); return tostring(ok) .. '|' .. tostring(why) end)()" % mutation)
+
+        self.assertTrue(refuse("rec.v = 2").startswith("nil|build record version 2"))
+        self.assertTrue(refuse("rec.segs[1].c.roadTemplate = 7").startswith("nil|segment 1: bad roadTemplate"))
+        self.assertTrue(refuse("rec.segs[1].n0 = 5").startswith("nil|segment 1: bad entry"), "an existing node must be a reference")
+        self.assertTrue(refuse("rec.nodes[1].pos.x = 1/0").startswith("nil|node 1: bad entry"))
+        self.assertTrue(refuse("rec.segs[1].objects = { { 7, 1 } }").startswith("nil|segment 1: bad object"))
+        self.assertTrue(refuse("rec.segs[1].lanes = 'x'").startswith("nil|segment 1: bad lanes"))
+        self.assertTrue(refuse("rec.segs[1].owner = 'root'").startswith("nil|segment 1: bad owner"))
+        self.assertTrue(refuse("rec.cons = { { file = 'a.con', transf = {1} } }").startswith("nil|construction 1: bad transform"))
+        self.assertTrue(refuse("rec.rem = { 54 }").startswith("nil|removed construction 1: bad reference"))
+        self.assertTrue(refuse("rec.segs[1].c.deco = { f = print }").startswith("nil|segment 1: bad decorations"))
+        self.assertTrue(refuse("local deep = {}; local t = deep; for i = 1, 20 do t.x = {}; t = t.x end; rec.cons = { { file = 'a.con', transf = { 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1 }, params = deep } }")
+                        .startswith("nil|construction 1: bad parameters"))
+        self.assertTrue(refuse("rec.v = 1").startswith("table: "), "an untouched record is accepted")
+
+    def test_default_seed_and_name_of_a_construction(self):
+        got = self.ev("(function() local body = CAPTURE(CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, z = 5, params = {}, name = '' }); "
+                      "body.args[1].cons[1].name = nil; local args = DECODE(body); local ce = STORE(args[1]).constructionsToAdd[1]; "
+                      "return STORE(ce).params.seed .. '|' .. STORE(ce).name .. '|' .. STORE(ce).playerEntity end)()")
+        self.assertEqual(got, "2705|modular_station|7", "7x + 3y + z; the file's base name; the local player")
+
+    def test_the_captured_context_and_flags_travel(self):
+        self.assertEqual(self.ev("(function() local body = CAPTURE(SIMPLE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }, "
+                                 "{ ctx = CONTEXT(true, false, true, false), ignoreErrors = true, playerInitiated = false }); local a = body.args; "
+                                 "return tostring(a[2].align) .. tostring(a[2].cleanup) .. tostring(a[2].buildings) .. tostring(a[2].fields) .. '|' .. tostring(a[3]) .. tostring(a[4]) end)()"),
+                         "truefalsetruefalse|truefalse")
+        self.assertEqual(self.ev("(function() local body = CAPTURE(NATIVE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }); "
+                                 "return tostring(body.args[2].native) .. tostring(body.args[3]) .. tostring(body.args[4]) end)()"), "truefalsetrue",
+                         "a tool's build has no context a script can see: the plan's default is used, flags as the tools build")
+        self.assertEqual(self.ev("tostring(CAPTURE(SIMPLE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }).args[2])"), "false")
+
+    def test_custom_lanes_travel_only_when_they_are_not_the_templates(self):
+        base = "NATIVE_UPGRADE{ edges = { 110 }, template = 'street/tram_road.street_template' }"
+        self.assertEqual(self.ev("tostring(WIRE_RECORD(%s).args[1].segs[1].lanes)" % base), "nil")
+        custom = ("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }; local sp = P.proposal; "
+                  "local added = sp.addedSegments; local s = added[1]; local c = s.comp; local lanes = c.laneConfigs; lanes[3] = D('LaneConfig', { forward = true }); "
+                  "c.laneConfigs = lanes; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.assertEqual(self.ev("#WIRE_RECORD(%s).args[1].segs[1].lanes" % custom), 3)
+
+    def test_nodes_are_found_whichever_way_the_octree_answers(self):
+        modes = {"node": "octree-node", "edge": "octree-edge", "none": "scan"}
+        for i, (octree, want) in enumerate(modes.items()):
+            x = 1000 + 100 * i
+            got = self.ev("(function() OCTREE = '%s'; local M = PURE(); APPLY_BUILD(SIMPLE_ROAD{ a = { x = %d, y = 500, z = 0 }, b = { x = %d, y = 500, z = 0 } }); "
+                          "local R = M.resolver({ resolve = function() return nil end }); local n = R.node({ __ref = 'node', p = { x = %d, y = 500, z = 0 } }); "
+                          "local e = R.edge({ __ref = 'edge', p0 = { x = %d, y = 500, z = 0 }, p1 = { x = %d, y = 500, z = 0 } }); "
+                          "return M.adapter.nodeMode .. ':' .. tostring(n == FIND_NODE(%d, 500, 0)) .. ':' .. tostring(e == FIND_EDGE(%d, 500, %d, 500)) end)()"
+                          % (octree, x, x + 50, x + 50, x + 50, x, x + 50, x, x + 50))
+            self.assertEqual(got, "%s:true:true" % want, octree)
+
+    def test_a_segment_is_found_whichever_way_round_it_is_described(self):
+        got = self.ev("(function() local M = PURE(); local R = M.resolver({ resolve = function() return nil end }); "
+                      "local e = R.edge({ __ref = 'edge', p0 = { x = 100, y = 0, z = 0 }, p1 = { x = 0, y = 0, z = 0 }, t0 = { x = -100, y = 0, z = 0 }, t1 = { x = -100, y = 0, z = 0 } }); "
+                      "return e end)()")
+        self.assertEqual(got, 110)
+
+    def test_two_segments_between_the_same_nodes_are_told_apart_by_their_tangents_or_refused(self):
+        setup = ("ADD_NODE(3000, 3000, 0, 0); ADD_NODE(3001, 3100, 0, 0); "
+                 "ADD_EDGE(3010, 3000, 3001, 0, 'street/new_medium_road.street_template', { tangent0 = V(100, 0, 0), tangent1 = V(100, 0, 0) }); "
+                 "ADD_EDGE(3011, 3000, 3001, 0, 'street/new_medium_road.street_template', { tangent0 = V(70, 70, 0), tangent1 = V(70, -70, 0) })")
+        self.L.execute(setup)
+        res = self.ev("(function() local M = PURE(); local R = M.resolver({ resolve = function() return nil end }); "
+                      "local function ref(t0, t1) return { __ref = 'edge', p0 = { x = 3000, y = 0, z = 0 }, p1 = { x = 3100, y = 0, z = 0 }, t0 = t0, t1 = t1 } end; "
+                      "local a = R.edge(ref({ x = 100, y = 0, z = 0 }, { x = 100, y = 0, z = 0 })); "
+                      "local b = R.edge(ref({ x = 70, y = 70, z = 0 }, { x = 70, y = -70, z = 0 })); "
+                      "local ok, why = pcall(R.edge, { __ref = 'edge', p0 = { x = 3000, y = 0, z = 0 }, p1 = { x = 3100, y = 0, z = 0 } }); "
+                      "return a .. ',' .. b .. ',' .. tostring(ok) .. ',' .. tostring(why) end)()")
+        self.assertEqual(res.split(",")[:3], ["3010", "3011", "false"])
+        self.assertIn("ambiguous segment", res)
+
+    def test_a_construction_is_found_by_file_and_place_and_not_by_a_wrong_key(self):
+        got = self.ev("(function() local M = PURE(); "
+                      "local R = M.resolver({ resolve = function(k) return 54 end }); "
+                      "local a = R.con({ __ref = 'con', key = 's:54', file = 'depot.con', p = { x = 100, y = 200, z = 5 } }); "
+                      "local R2 = M.resolver({ resolve = function(k) return 56 end }); "
+                      "local b = R2.con({ __ref = 'con', key = 's:56', file = 'depot.con', p = { x = 100.4, y = 200, z = 5 } }); "
+                      "local okFile, whyFile = pcall(R.con, { __ref = 'con', file = 'depot.con', p = { x = 500, y = 200, z = 5 } }); "
+                      "return a .. ',' .. b .. ',' .. tostring(okFile) end)()")
+        self.assertEqual(got, "54,54,false")
+
+    def test_an_object_is_named_by_its_rank_on_its_segment(self):
+        got = self.ev("(function() local M = PURE(); local R = M.resolver({ resolve = function() return nil end }); "
+                      "local edge = { __ref = 'edge', p0 = { x = 0, y = 50, z = 0 }, p1 = { x = 100, y = 50, z = 0 } }; "
+                      "local o = R.obj({ __ref = 'obj', edge = edge, i = 1 }); local ok, why = pcall(R.obj, { __ref = 'obj', edge = edge, i = 2 }); "
+                      "return o .. ',' .. tostring(ok) .. ',' .. tostring(why) end)()")
+        self.assertTrue(got.startswith("140,false,"), got)
+        self.assertIn("unresolved object 2 of segment", got)
+
+    def test_keys_go_to_the_constructions_that_match_not_to_decoys(self):
+        self.L.execute("APPLY_BUILD(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 500, y = 100 }); APPLY_BUILD(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 900, y = 900 })")
+        got = self.ev("(function() local M, C, ctx = PURE(); local body = CAPTURE(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 500, y = 100 }); "
+                      "local made = {}; for e, w in pairs(WORLD) do if w.CONSTRUCTION and e >= 1000 then made[#made + 1] = e end end; table.sort(made); "
+                      "local map, complete = M.commands.makeWorldBuildProposalCmd.bind(body, '1:7', made); "
+                      "local keys = {}; for k in pairs(map) do keys[#keys + 1] = k end; table.sort(keys); "
+                      "local none, completeNone = M.commands.makeWorldBuildProposalCmd.bind(body, '1:8', {}); "
+                      "return table.concat(keys, ' ') .. '|' .. tostring(complete) .. '|' .. tostring(next(none)) .. '|' .. tostring(completeNone) .. '|' .. "
+                      "tostring(map['1:7#c1'] == FIND_CON('depot/road_depot.con') - 1 or map['1:7#c1']) end)()")
+        keys, complete, none, complete_none, _ = got.split("|")
+        self.assertEqual(keys, "1:7#c1 1:7#c1/d1")
+        self.assertEqual((complete, none, complete_none), ("true", "nil", "false"))
+
+    def test_tool_events_are_logged_once_per_kind_and_a_capture_is_summarised(self):
+        said = self.ev("(function() local M = PURE(); local said = {}; local function say(m) said[#said + 1] = m end; "
+                       "local P = SIMPLE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }; "
+                       "M.onToolEvent('streetBuilder', 'builder.proposalCreate', { P }, say); M.onToolEvent('streetBuilder', 'builder.proposalCreate', { P }, say); "
+                       "M.onToolEvent('streetBuilder', 'builder.proposalApply', { P, nil, {} }, say); "
+                       "M.onToolEvent('streetBuilder', 'builder.proposalApply', { D('SimpleProposal') }, say); "
+                       "return table.concat(said, '#') end)()")
+        parts = said.split("#")
+        self.assertEqual(parts[0], "tool event streetBuilder/builder.proposalCreate")
+        self.assertEqual(parts[1], "tool event streetBuilder/builder.proposalApply")
+        self.assertTrue(parts[2].startswith("tool build streetBuilder/builder.proposalApply: street, 0+0 constructions, 2+0 nodes, 1+0 segments, 0+0 objects"), parts[2])
+        self.assertTrue(any(p.startswith("segment members: node0,node1") for p in parts), parts)
+        self.assertTrue(any(p.startswith("node members: position") for p in parts))
+        self.assertTrue(any("not capturable: nothing to build" in p for p in parts))
+
+    def test_engine_values_dump_to_plain_data(self):
+        got = self.ev("(function() local M = PURE(); local A = M.adapter; local m = D('Mat4f'); STORE(m)[13] = 5; "
+                      "local v = A.dump(V(1, 2, 3)); local mm = A.dump(m); "
+                      "local P = NATIVE_BULLDOZE{ cons = { 54, 56 } }; local l = A.list(P, 'toRemove'); "
+                      "return v.x .. v.y .. v.z .. '|' .. #mm .. '|' .. mm[13] .. '|' .. #l .. '|' .. tostring(A.isObject(V(1, 2, 3))) .. tostring(A.isObject({})) end)()")
+        self.assertEqual(got, "123|16|5|2|truefalse")
+
+    def test_the_lane_write_shift_is_measured_and_compensated(self):
+        for shift in (0, 1):
+            got = self.ev("(function() LANE_SHIFT = %d; local M = PURE(); local A = M.adapter; local measured = A.laneShift(); "
+                          "local lanes = A.rebuildLanes({ { forward = true, speed = 5, width = 2, height = 0, offset = 0, modes = { 0, 3, 15 } } }); "
+                          "local back = A.readLane(lanes[1]); LANE_SHIFT = 0; return measured .. '|' .. table.concat(back.modes, ',') end)()" % shift)
+            self.assertEqual(got, "%d|0,3,15" % shift, "shift %d" % shift)
+
+
+# ---------------------------------------------------------------- the additions to the lockstep module
+
+
+class LockstepAdditionsTest(unittest.TestCase):
+    def setUp(self):
+        self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        self.K = self.L.execute(T.LOCKSTEP_SRC)
+
+    def test_a_schema_can_decide_the_category_per_command(self):
+        got = self.L.eval("""function(K)
+          K.registerCommands({
+            byContent = { category = function(name, args) return args and args[1] and "bulldoze" or "build" end },
+            broken = { category = function() error("boom") end },
+            notAName = { category = function() return 7 end },
+            fixed = { category = "spend" },
+          })
+          return K.categoryOf("byContent", { true }) .. K.categoryOf("byContent", { false }) .. K.categoryOf("byContent") ..
+                 K.categoryOf("broken", {}) .. K.categoryOf("notAName", {}) .. K.categoryOf("fixed") .. K.categoryOf("makeSomethingBuyCmd")
+        end""")(self.K)
+        self.assertEqual(got, "bulldozebuildbuild" + "other" + "other" + "spend" + "spend")
+
+    def test_commands_of_one_action_are_sent_in_order(self):
+        got = self.L.eval("""function(K)
+          local sent = {}
+          local args = { n = 1, "first", chain = { { n = 1, "second" }, function() return { n = 1, "third" } end } }
+          K.sendNow(args, function(a) sent[#sent + 1] = a[1] end)
+          local ok, err = pcall(K.sendNow, { n = 1, "x", chain = { function() return nil end } }, function(a) sent[#sent + 1] = a[1] end)
+          return table.concat(sent, ",") .. "|" .. tostring(ok) .. "|x" .. (#sent == 4 and "sent" or "")
+        end""")(self.K)
+        self.assertTrue(got.startswith("first,second,third,x|false|"), got)
+
+    def test_chained_commands_wait_for_each_result_and_stop_at_a_failure(self):
+        got = self.L.eval("""function(K)
+          local log = {}
+          local function run(args, outcomes)
+            local i = 0
+            local result
+            K.runChained(args, function(a, cb) i = i + 1; log[#log + 1] = a[1]; cb({ id = a[1] }, outcomes[i] ~= false, { { i, 0 } }) end,
+              function(data, success, entities) result = tostring(data and data.id) .. ":" .. tostring(success) end)
+            return result
+          end
+          local r1 = run({ n = 1, "a", chain = { { n = 1, "b" }, function() return { n = 1, "c" } end } }, {})
+          local r2 = run({ n = 1, "d", chain = { { n = 1, "e" }, { n = 1, "f" } } }, { true, false })
+          local r3 = run({ n = 1, "g", chain = { function() return nil end } }, {})
+          local r4 = run({ n = 1, "h", chain = { function() error("no") end } }, {})
+          local r5 = run({ n = 1, "j" }, {})
+          return table.concat(log, "") .. "|" .. r1 .. "|" .. r2 .. "|" .. r3 .. "|" .. r4 .. "|" .. r5
+        end""")(self.K)
+        self.assertEqual(got, "abcdegh" + "j" + "|c:true|e:false|g:false|h:false|j:true")
+
+    def test_new_entities_are_the_ones_that_were_not_there_before_in_order(self):
+        got = self.L.eval("function(K) return table.concat(K.newEntities({ 5, 3 }, { 9, 3, 5, 7, 4 }), ',') end")(self.K)
+        self.assertEqual(got, "4,7,9")
+
+    def test_binding_hooks_are_optional_and_cannot_break_the_apply(self):
+        got = self.L.eval("""function(K)
+          local spec = { bindsComp = function(body) return body.cons and "CONSTRUCTION" or nil end,
+                         bind = function(body, key, made) return { [key .. "#c1"] = made[1] }, #made > 0 end }
+          local a = K.bindsComp(spec, { cons = {} }) .. "," .. tostring(K.bindsComp(spec, {})) .. "," .. tostring(K.bindsComp({}, {})) .. "," .. K.bindsComp({ bindsComp = "LINE" }, {})
+          local map, complete = K.bindMap(spec, {}, "1:2", { 77 })
+          local none, incomplete = K.bindMap(spec, {}, "1:2", {})
+          local bad, badComplete = K.bindMap({ bind = function() error("boom") end }, {}, "1:2", {})
+          local plain, plainComplete = K.bindMap({}, {}, "1:2", {})
+          return a .. "|" .. map["1:2#c1"] .. tostring(complete) .. "|" .. tostring(next(none)) .. tostring(incomplete) .. "|" .. tostring(next(bad)) .. tostring(badComplete) .. "|" .. tostring(next(plain)) .. tostring(plainComplete)
+        end""")(self.K)
+        self.assertEqual(got, "CONSTRUCTION,nil,nil,LINE|77true|nilfalse|nilfalse|niltrue")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

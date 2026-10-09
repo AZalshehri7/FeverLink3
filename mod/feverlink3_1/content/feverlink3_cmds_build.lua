@@ -194,7 +194,7 @@ function A.dump(v, depth)
 	local t = type(v)
 	if t == "nil" or t == "boolean" or t == "number" or t == "string" then return v end
 	if depth > 12 then return nil end
-	if t == "table" and not A.isObject(v) then
+	if t == "table" and getmetatable(v) == nil then
 		local out = {}
 		for k, x in pairs(v) do
 			if type(k) == "number" or type(k) == "string" then out[k] = A.dump(x, depth + 1) end
@@ -470,7 +470,8 @@ function A.rebuildLanes(plainLanes)
 		for _, j in ipairs(m.modes or {}) do on[j] = true end
 		pcall(function()
 			local tm = lc.transportModes
-			for j = 0, 15 do tm[j + shift] = on[j] == true end
+			-- a write at k lands at k - shift, and index 0 wraps to the end: so mode j is written at (j + shift) mod 16
+			for j = 0, 15 do tm[(j + shift) % 16] = on[j] == true end
 			lc.transportModes = tm
 		end)
 		out[i] = lc
@@ -744,13 +745,24 @@ local function newCapture(ctx, opts)
 	return cap
 end
 
+local function containsUnknown(t, depth)
+	if type(t) ~= "table" or depth > 12 then return false end
+	for k, v in pairs(t) do
+		if k == "__unknown" or containsUnknown(v, depth + 1) then return true end
+	end
+	return false
+end
+
+-- A construction's parameters as a plain copy. A table is copied as it is (functions and userdata in it raise); a value
+-- the engine hands over as an object is read out member by member first.
 local function plainParams(v, cap)
 	if v == nil then return {} end
-	if type(v) ~= "table" and not A.isObject(v) then fail("construction parameters are not a table") end
-	local plain = A.dump(v)
-	local ok, err = pcall(cap.plain or C.plain, plain)
-	if not ok then fail("construction parameters cannot be replicated: " .. tostring(err)) end
-	return plain
+	local plain = v
+	if type(v) ~= "table" or getmetatable(v) ~= nil then plain = A.dump(v) end
+	if type(plain) ~= "table" or containsUnknown(plain, 0) then fail("construction parameters cannot be replicated: they hold a value that is not plain data") end
+	local ok, copy = pcall(cap.plain or C.plain, plain)
+	if not ok then fail("construction parameters cannot be replicated: " .. tostring(copy)) end
+	return copy
 end
 
 local function readConstruction(ce, cap)
@@ -1685,11 +1697,20 @@ function M.onToolEvent(id, name, param, say)
 	else
 		say("tool build " .. key .. " not capturable: " .. tostring(why))
 	end
+	-- the members of the first segment, node and edge object of the proposal, to compare with the ones this module reads
 	pcall(function()
-		local first = A.list(get(proposal, "proposal") or {}, "addedSegments")[1]
-		local c = first and get(first, "comp")
+		local st = get(proposal, "proposal") or get(proposal, "streetProposal") or {}
+		local seg = A.list(st, "addedSegments")[1] or A.list(st, "edgesToAdd")[1]
+		local c = seg and get(seg, "comp")
 		local m = c and A.members(c)
 		if m then say("segment members: " .. table.concat(m, ",")) end
+		local node = A.list(st, "addedNodes")[1] or A.list(st, "nodesToAdd")[1]
+		m = node and A.members(get(node, "comp"))
+		if m then say("node members: " .. table.concat(m, ",")) end
+		local eo = A.list(st, "edgeObjectsToAdd")[1]
+		if eo then
+			say("edge object: members " .. table.concat(A.members(eo) or {}, ",") .. " value " .. C.serialize(A.dump(eo)):sub(1, 300))
+		end
 	end)
 end
 
