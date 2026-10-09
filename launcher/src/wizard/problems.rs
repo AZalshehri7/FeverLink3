@@ -303,6 +303,11 @@ mod tests {
                 assert!(message.contains(word), "{problem:?}: {message:?} lacks {word:?}");
             }
             assert!(message.is_ascii() || matches!(problem, Problem::Other(_)), "{message}");
+            // players connect through Steam: no message may send anybody to a router, a VPN or UPnP
+            let lower = message.to_lowercase();
+            for banned in ["forward", "upnp", "router", "vpn"] {
+                assert!(!lower.contains(banned), "{problem:?} mentions {banned}: {message}");
+            }
         }
     }
 

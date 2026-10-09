@@ -560,6 +560,18 @@ mod tests {
         assert_eq!(redact_join_codes(""), "");
     }
 
+    /// What a host makes today: no endpoints at all, the host's Steam ID as an extension of the code.
+    #[test]
+    fn a_join_code_that_carries_a_steam_id_is_taken_out_too() {
+        let code = JoinCode::create(&[], [9u8; SessionKey::SECRET_SIZE], Some(1_700_000_000))
+            .unwrap()
+            .with_steam_id(76_561_198_000_000_000)
+            .encode();
+        assert!(JoinCode::try_decode(&code).is_some(), "the fixture is a real code: {code}");
+        assert!(code.len() >= MIN_JOIN_CODE_CHARS);
+        assert_eq!(redact_join_codes(&format!("host code {code}.")), "host code <join code removed>.");
+    }
+
     #[test]
     fn text_that_only_looks_like_a_join_code_is_kept() {
         let code = join_code_text();

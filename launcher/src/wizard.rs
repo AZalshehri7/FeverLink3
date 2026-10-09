@@ -191,8 +191,8 @@ fn action_diagnostics(sys: &dyn System, out: &mut dyn Write) -> io::Result<()> {
             )?;
             say(
                 out,
-                "Your Windows user name is shown as <user>. The text still holds folder names, and the logs can hold \
-                 network addresses; read it first if you like.",
+                "Your Windows user name is shown as <user>. The text still holds folder names and whatever the logs \
+                 say; read it first if you like.",
             )
         }
         Err(e) => {
@@ -681,5 +681,58 @@ mod tests {
         assert!(out.contains("== feverlink3 doctor =="), "the text is on the screen: {out}");
         assert!(out.matches("----------------------------------------").count() == 2, "{out}");
         assert!(pc.calls().is_empty());
+    }
+
+    /// Players connect through Steam: nothing the wizard says may send them to a router, a VPN or UPnP.
+    #[test]
+    fn nothing_the_wizard_says_talks_about_forwarding_routers_or_vpns() {
+        let everything = "1\n\n2\ny\n\n3\n\n4\n\n5\n\n6\n\n1\n\n0\n";
+        let mut scenes: Vec<String> = Vec::new();
+
+        let fresh = Pc::new();
+        fs::create_dir_all(fresh.local()).unwrap();
+        scenes.push(drive(&fresh, everything));
+
+        let running = Pc::new();
+        running.running.set(true);
+        scenes.push(drive(&running, everything));
+
+        let mut no_steam = Pc::new();
+        no_steam.steam = None;
+        no_steam.game = None;
+        scenes.push(drive(&no_steam, everything));
+
+        let mut no_game = Pc::new();
+        no_game.game = None;
+        scenes.push(drive(&no_game, everything));
+
+        let mut incomplete = Pc::new();
+        incomplete.payload = (None, None);
+        scenes.push(drive(&incomplete, everything));
+
+        let mut no_user_folder = Pc::new();
+        no_user_folder.users.clear();
+        scenes.push(drive(&no_user_folder, everything));
+
+        let mut zipped = Pc::new();
+        zipped.exe = PathBuf::from("C:/Users/Ann/AppData/Local/Temp/Temp1_FeverLink3.zip/feverlink3.exe");
+        scenes.push(drive(&zipped, everything));
+
+        let foreign = Pc::new();
+        fs::write(foreign.game().join(install::DLL_NAME), b"MZ another mod's proxy").unwrap();
+        scenes.push(drive(&foreign, everything));
+
+        let broken = Pc::new();
+        broken.clipboard_fails.set(true);
+        fs::create_dir_all(broken.game().join(install::DLL_NAME)).unwrap();
+        scenes.push(drive(&broken, everything));
+
+        for scene in &scenes {
+            let lower = scene.to_lowercase();
+            for word in ["forward", "upnp", "router", "vpn"] {
+                assert!(!lower.contains(word), "{word} is in\n{scene}");
+            }
+        }
+        assert!(scenes.iter().all(|s| s.contains("What would you like to do?")), "every scene ran");
     }
 }
