@@ -55,7 +55,7 @@ Written on 2026-10-10 from public pages read that day (the list, with addresses,
 
 > Subject: Question about a PC-only multiplayer mod with a native component (FeverLink3)
 >
-> Hello Urban Games team, I am the author of FeverLink3, an open-source (MIT) cooperative multiplayer mod for Transport Fever 3 (https://github.com/AZalshehri7/FeverLink3). It has a normal Lua mod and a small Windows DLL that the game loads from its own folder as `winhttp.dll` (it forwards the game's 14 WinHTTP imports unchanged; the page https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md explains it in plain words). We would like to do this the way you prefer and have a few questions:
+> Hello Urban Games team, I am the author of FeverLink3, an open-source (MIT) cooperative multiplayer mod for Transport Fever 3 (https://github.com/AZalshehri7/FeverLink3). It has a normal Lua mod and a small Windows DLL that the game loads from its own folder as `winhttp.dll` (it passes the game's 14 WinHTTP imports through unchanged; the page https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md explains it in plain words). We would like to do this the way you prefer and have a few questions:
 > 1. May a mod that only works with a separate, manually installed PC component be listed in the Mod Hub if the description says so clearly, or should it stay outside the Hub?
 > 2. Can a mod be marked PC-only so it is not offered on consoles?
 > 3. Our window script reads and writes plain text files in `%LOCALAPPDATA%` through `package.loaded.io`, because the `io` global is not available to UI scripts. Is that acceptable, or will it be blocked? Is there an official way for a script to exchange data with an external program?
