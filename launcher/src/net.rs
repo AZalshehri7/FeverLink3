@@ -4,8 +4,8 @@
 //! [`crate::session`]) owns the protocol state machine and sees every event in one order.
 //!
 //! - [`HostNet`] listens on one thread, numbers each accepted connection, and runs one reader thread per
-//!   connection. Frames are read with [`FrameCodec`]; writes go through a per-connection `Mutex<BufWriter>`, so any
-//!   thread may send and two frames never interleave.
+//!   connection. Frames are decoded with [`FrameCodec`] from the bytes as they arrive; writes go through a
+//!   per-connection `Mutex<TcpStream>`, so any thread may send and two frames never interleave.
 //! - [`ClientNet`] connects to the endpoints of a join code in order, 5 s each, and runs one reader thread.
 //!
 //! A connection ends when the peer closes it, a read or write fails, the codec rejects what it reads (length
@@ -15,12 +15,18 @@
 //!
 //! A host listens on a port the whole internet can reach, so its limits ([`NetLimits`]) are what strangers cost:
 //! connections are capped in total and per address, the first frame of a connection is read with a small size
-//! limit (a stranger's only valid first frame is a Join), and a write that makes no progress ends the connection
-//! instead of stopping the session thread that does the writing. A stranger that opens a connection and says
-//! nothing is closed by the session itself (`HostSession::HANDSHAKE_SECONDS`).
+//! limit (a stranger's only valid first frame is a Join), and a write that does not finish in time ends the
+//! connection instead of stopping the session thread that does the writing. A stranger that opens a connection and
+//! says nothing is closed by the session itself (`HostSession::HANDSHAKE_SECONDS`).
+//!
+//! The sockets are non-blocking and polled, not blocking with `SO_RCVTIMEO` / `SO_SNDTIMEO`. Two reasons, both
+//! measured on Windows: shutting a socket down from another thread does not wake a blocked read when the peer is
+//! silent (the reader thread and its socket would outlive every close), and a read that times out at the moment data
+//! arrives can fail with `ERROR_IO_PENDING` (997), which Microsoft documents as "the socket state is indeterminate"
+//! and which ended a healthy connection about once in three thousand timeouts in a test.
 
 use std::collections::HashMap;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -37,8 +43,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a host spends on connections it has not been asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetLimits {
-    /// A write that cannot make progress for this long closes the connection. The session thread does all the
-    /// writing, so a peer that stops reading must not be able to hold it.
+    /// A frame has this long to be written, plus a second for every 32 KiB of it, or the connection is closed. The
+    /// session thread does all the writing, so a peer that stops reading, or reads a byte at a time, must not be
+    /// able to hold it.
     pub write_timeout: Duration,
     /// Connections open at once, handshakes included. The game has eight seats; the rest is room for a rejoin that
     /// overlaps its dead connection and for strangers knocking.
@@ -149,23 +156,33 @@ pub enum NetEvent {
 /// One TCP connection: its writer, a handle to shut it down, and the flag that makes closing idempotent.
 #[derive(Debug)]
 struct Link {
-    writer: Mutex<BufWriter<TcpStream>>,
+    writer: Mutex<TcpStream>,
     stream: TcpStream,
     closed: AtomicBool,
     /// The peer's address, for the per-address limit.
     ip: Option<IpAddr>,
+    write_timeout: Duration,
 }
+
+/// A reader or writer that finds nothing to do naps this long, doubling up to [`NAP_MAX`] while it stays idle.
+const NAP_MIN: Duration = Duration::from_micros(200);
+const NAP_MAX: Duration = Duration::from_millis(5);
+/// A frame is given at least this much time per byte to be written, on top of the write timeout: a link slower than
+/// 32 KiB/s cannot take a savegame, and a peer that drips its reads is cut off in bounded time.
+const MIN_WRITE_RATE: u64 = 32 * 1024;
 
 impl Link {
     fn new(stream: TcpStream, write_timeout: Duration) -> io::Result<Arc<Link>> {
         stream.set_nodelay(true)?;
-        stream.set_write_timeout(Some(write_timeout))?;
         let ip = stream.peer_addr().ok().map(|a| a.ip());
-        let writer = Mutex::new(BufWriter::new(stream.try_clone()?));
-        Ok(Arc::new(Link { writer, stream, closed: AtomicBool::new(false), ip }))
+        let writer = stream.try_clone()?;
+        // the mode belongs to the socket, but set it on every handle so that nothing depends on that
+        stream.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Ok(Arc::new(Link { writer: Mutex::new(writer), stream, closed: AtomicBool::new(false), ip, write_timeout }))
     }
 
-    /// Encodes and writes one frame, flushed. Any failure closes the connection and is returned.
+    /// Encodes and writes one frame. Any failure closes the connection and is returned.
     fn send(&self, frame: &Frame) -> io::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "connection closed"));
@@ -173,8 +190,9 @@ impl Link {
         let bytes =
             FrameCodec::encode_frame(frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let result = {
-            let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-            w.write_all(&bytes).and_then(|()| w.flush())
+            let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+            let allowed = self.write_timeout + Duration::from_secs(bytes.len() as u64 / MIN_WRITE_RATE);
+            write_all_within(&mut writer, &bytes, allowed, &self.closed)
         };
         if result.is_err() {
             self.close();
@@ -190,19 +208,48 @@ impl Link {
     }
 }
 
-/// How often a blocked read wakes to look at the `closed` flag. Shutting a socket down from another thread does not
-/// reliably wake a read on Windows, and a peer that says nothing and never closes would hold the reader thread (and
-/// its socket) for ever, so every reader polls.
-const READ_POLL: Duration = Duration::from_millis(250);
+/// Writes all of `bytes` to a non-blocking stream within `allowed`, napping while the peer's buffer is full. The
+/// time is for the whole frame, not per write call: a peer that takes a byte at a time does not hold the thread.
+fn write_all_within(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    allowed: Duration,
+    closed: &AtomicBool,
+) -> io::Result<()> {
+    let deadline = Instant::now() + allowed;
+    let mut nap = NAP_MIN;
+    while !bytes.is_empty() {
+        if closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "connection closed"));
+        }
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                bytes = bytes.get(n..).unwrap_or_default();
+                nap = NAP_MIN;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "the peer does not read fast enough"));
+                }
+                thread::sleep(nap);
+                nap = (nap * 2).min(NAP_MAX);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 
 /// Reads frames until the connection ends, then reports `Closed`. Runs on its own thread. The first frame may be at
 /// most `policy.first_frame` bytes long; after it the protocol's own limit applies; frames are passed on no faster
 /// than the policy's rates.
 ///
 /// The bytes of a frame are collected as they arrive and the length field is checked as soon as it has, so what the
-/// reader holds is what the peer really sent (never what it announced), and a read that times out loses nothing.
+/// reader holds is what the peer really sent, never what it announced.
 fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, policy: ReadPolicy) {
-    let mut stream = match link.stream.try_clone().and_then(|s| s.set_read_timeout(Some(READ_POLL)).map(|()| s)) {
+    let mut stream = match link.stream.try_clone().and_then(|s| s.set_nonblocking(true).map(|()| s)) {
         Ok(s) => s,
         Err(e) => {
             link.close();
@@ -213,6 +260,7 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, policy: Rea
     let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 16 * 1024]);
     let mut limit = policy.first_frame;
     let mut throttle = Throttle::new(&policy, Instant::now());
+    let mut nap = NAP_MIN;
     let reason = 'read: loop {
         // every frame the buffer holds already, in order
         let mut start = 0;
@@ -225,7 +273,7 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, policy: Rea
                         // while it waits it reads nothing: the sender is slowed by TCP, not by a growing queue
                         let mut wait = throttle.admit(used, Instant::now());
                         while !wait.is_zero() && !link.closed.load(Ordering::Acquire) {
-                            let step = wait.min(READ_POLL);
+                            let step = wait.min(NAP_MAX);
                             thread::sleep(step);
                             wait -= step;
                         }
@@ -254,12 +302,16 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, policy: Rea
         match stream.read(&mut chunk) {
             Ok(0) if buf.is_empty() => break "closed by the peer".to_string(),
             Ok(0) => break ProtocolError::Truncated.to_string(),
-            Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-                ) => {}
+            Ok(n) => {
+                buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                nap = NAP_MIN;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // nothing to read: look at the closed flag again soon, less often the longer it stays quiet
+                thread::sleep(nap);
+                nap = (nap * 2).min(NAP_MAX);
+            }
             Err(e) => {
                 break if link.closed.load(Ordering::Acquire) { "closed locally".to_string() } else { e.to_string() }
             }
@@ -693,12 +745,13 @@ mod tests {
         let _silent = TcpStream::connect(host.local_addr()).unwrap(); // never reads
         let NetEvent::Opened { conn, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
 
-        let big = frame(11, &vec![1u8; 900_000]);
-        let started = std::time::Instant::now();
+        // 100 KB frames are allowed 0.3 s and 3 s more; the socket buffers hold a few megabytes before they block
+        let big = frame(11, &vec![1u8; 100_000]);
+        let started = Instant::now();
         let mut longest = Duration::ZERO;
         let mut failed = false;
-        for _ in 0..400 {
-            let before = std::time::Instant::now();
+        for _ in 0..4000 {
+            let before = Instant::now();
             if host.send(conn, &big).is_err() {
                 failed = true;
                 longest = before.elapsed();
@@ -706,8 +759,8 @@ mod tests {
             }
         }
         assert!(failed, "buffers are finite: the writes must end in an error");
-        assert!(longest < Duration::from_secs(5), "the failing write took {longest:?}");
-        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(longest < Duration::from_secs(8), "the failing write took {longest:?}");
+        assert!(started.elapsed() < Duration::from_secs(60));
         // the connection was closed by the failed write
         loop {
             match hrx.recv_timeout(WAIT).unwrap() {
@@ -720,6 +773,75 @@ mod tests {
             }
         }
         assert!(host.send(conn, &big).is_err());
+    }
+
+    #[test]
+    fn a_busy_connection_delivers_every_frame_intact_and_in_order_both_ways() {
+        // polling sockets with partial writes: both ends send at once, sizes from nothing to 300 KB
+        let limits = NetLimits { frames_per_second: 0, bytes_per_second: 0, ..NetLimits::default() };
+        let (htx, hrx) = mpsc::channel();
+        let host = Arc::new(HostNet::bind_with(loopback(), htx, limits).unwrap());
+        let (ctx, crx) = mpsc::channel();
+        let client = Arc::new(ClientNet::connect(&[host.local_addr()], 1, ctx).unwrap());
+        assert!(matches!(hrx.recv_timeout(WAIT).unwrap(), NetEvent::Opened { conn: 1, .. }));
+        assert!(matches!(crx.recv_timeout(WAIT).unwrap(), NetEvent::Opened { conn: 1, .. }));
+
+        const N: u64 = 1200;
+        let body = |i: u64| -> Vec<u8> {
+            let len = (i * 7919 % 3000) as usize + if i.is_multiple_of(25) { 300_000 } else { 0 };
+            (0..len).map(|k| (i as usize).wrapping_add(k) as u8).collect()
+        };
+        let (h, c) = (Arc::clone(&host), Arc::clone(&client));
+        let from_host = thread::spawn(move || {
+            (1..=N).for_each(|i| h.send(1, &Frame::new(FrameHeader::new(1, 11, 0, i), body(i))).unwrap())
+        });
+        let from_client = thread::spawn(move || {
+            (1..=N).for_each(|i| c.send(&Frame::new(FrameHeader::new(1, 30, 1, i), body(i))).unwrap())
+        });
+        for (name, rx) in [("host", &hrx), ("client", &crx)] {
+            for i in 1..=N {
+                match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+                    NetEvent::Frame { frame, .. } => {
+                        assert_eq!(frame.header.counter, i, "{name} received frame out of order");
+                        assert!(frame.body == body(i), "{name} received frame {i} damaged");
+                    }
+                    other => panic!("{name}: {other:?}"),
+                }
+            }
+        }
+        from_host.join().unwrap();
+        from_client.join().unwrap();
+    }
+
+    #[test]
+    fn a_peer_that_reads_a_few_bytes_at_a_time_does_not_hold_the_writer_either() {
+        let limits = NetLimits { write_timeout: Duration::from_millis(300), ..NetLimits::default() };
+        let (htx, hrx) = mpsc::channel();
+        let host = HostNet::bind_with(loopback(), htx, limits).unwrap();
+        let mut dripper = TcpStream::connect(host.local_addr()).unwrap();
+        let NetEvent::Opened { conn, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                // progress, but never enough: a few bytes every 100 ms
+                let mut byte = [0u8; 8];
+                while !stop.load(Ordering::Relaxed) {
+                    if dripper.read(&mut byte).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            })
+        };
+        let big = frame(11, &vec![1u8; 100_000]);
+        let started = Instant::now();
+        let failed = (0..4000).any(|_| host.send(conn, &big).is_err());
+        assert!(failed, "a drip is not a reader");
+        assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+        stop.store(true, Ordering::Relaxed);
+        host.close(conn);
+        let _ = reader.join();
     }
 
     #[test]
