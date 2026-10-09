@@ -27,8 +27,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::{
-    end_reason_text, identity_bytes, parse_connection_info, parse_status_event, state, StatusEvent, CALLBACK_MIN_SIZE,
-    CONNECTION_INFO_SIZE,
+    end_reason_text, identity_bytes, parse_connection_info, parse_real_time_status, parse_status_event, state,
+    StatusEvent, CALLBACK_MIN_SIZE, CONNECTION_INFO_SIZE, REAL_TIME_STATUS_BUFFER,
 };
 
 /// A Steam connection or listen socket handle (`HSteamNetConnection`, `HSteamListenSocket`); 0 is invalid.
@@ -84,6 +84,7 @@ pub(super) struct Located {
 type LocateFn = Box<dyn Fn() -> Located + Send + Sync>;
 type CallbackFn = unsafe extern "C" fn(*mut c_void);
 type SetConfigFn = unsafe extern "C" fn(*mut c_void, i32, i32, isize, i32, *const c_void) -> bool;
+type RealTimeStatusFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, *mut c_void) -> i32;
 
 /// The Steam functions the core uses (the flat API of `steam_api64.dll`, `steamnetworkingsockets_flat.h`).
 pub(super) struct Api {
@@ -104,17 +105,23 @@ pub(super) struct Api {
     pub release_message: unsafe extern "C" fn(*mut c_void),
     pub close: unsafe extern "C" fn(*mut c_void, u32, i32, *const c_char, bool) -> bool,
     pub connection_info: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> bool,
+    /// `GetConnectionRealTimeStatus` (ping, quality, send rate); a missing export only means no ping.
+    pub real_time_status: Option<RealTimeStatusFn>,
 }
 
 /// How the poller paces itself, and what it asks Steam for. The defaults are what the game uses.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// Sleep between poll cycles while there is a listen socket or a connection ("a few milliseconds").
+    /// Sleep between poll cycles while there is a listen socket or a connection. Every message waits for the next
+    /// cycle, so this is the latency the core adds; the probe's 100 ms polling read as 199 ms on a real relay link.
     pub active: Duration,
     /// Sleep between poll cycles while there is nothing to serve.
     pub idle: Duration,
     /// How often to look for Steam's interfaces until they exist.
     pub locate: Duration,
+    /// How often an open connection's route and ping are measured again. Steam may move a relayed connection to a
+    /// direct path after it opened, so the route is never settled.
+    pub link_every: Duration,
     /// `TimeoutInitial`: how long Steam keeps looking for a route before it fails a new connection. Its own default
     /// is 10 s; a route through the relays can take longer, so the transports' connect timeout is the limit instead.
     pub initial_timeout_ms: i32,
@@ -126,9 +133,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            active: Duration::from_millis(4),
+            active: Duration::from_millis(2),
             idle: Duration::from_millis(100),
             locate: Duration::from_millis(250),
+            link_every: Duration::from_secs(1),
             initial_timeout_ms: 45_000,
             send_rate: 1 << 20,
         }
@@ -289,6 +297,21 @@ impl Route {
     }
 }
 
+/// What the core last measured about an open connection (every [`Config::link_every`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinkSnapshot {
+    /// Where the packets go now; Steam may switch a relayed connection to a direct path later.
+    pub route: Route,
+    /// Steam's own round-trip estimate in ms, `None` while it has none.
+    pub ping_ms: Option<u32>,
+    /// Packets delivered end to end in order, 0 to 1.
+    pub quality: f32,
+    /// The rate Steam sends at, in bytes per second; 0 when Steam did not say.
+    pub send_rate: u32,
+    /// Reliable bytes queued and not yet on the wire.
+    pub pending: u32,
+}
+
 /// What the core knows about Steam, readable without touching Steam.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoreStatus {
@@ -374,6 +397,15 @@ struct Tracked {
     /// Steam reported it connected.
     open: bool,
     remote: Option<u64>,
+    /// The latest measurement of an open connection, and when the next one is due.
+    link: Option<LinkSnapshot>,
+    link_due: Instant,
+}
+
+impl Tracked {
+    fn new(owner: Arc<dyn Owner>, incoming: bool, remote: Option<u64>) -> Tracked {
+        Tracked { owner, incoming, open: false, remote, link: None, link_due: Instant::now() }
+    }
 }
 
 #[derive(Default)]
@@ -531,8 +563,51 @@ impl Shared {
                 }
             }
         }
+        self.refresh_links(sockets);
         out.append(&mut lock(&self.local));
         out
+    }
+
+    /// Measures the route and the ping of the open connections whose turn has come. It never stops: Steam may move
+    /// a relayed connection to a direct path some time after it opened.
+    fn refresh_links(&self, sockets: *mut c_void) {
+        let now = Instant::now();
+        let due: Vec<Handle> =
+            lock(&self.registry).conns.iter().filter(|(_, t)| t.open && now >= t.link_due).map(|(&h, _)| h).collect();
+        for conn in due {
+            let snapshot = self.sample(sockets, conn);
+            if let Some(t) = lock(&self.registry).conns.get_mut(&conn) {
+                t.link_due = now + self.config.link_every;
+                t.link = snapshot.or(t.link);
+            }
+        }
+    }
+
+    /// One measurement: the route from the connection info, the ping and send rate from the real-time status.
+    fn sample(&self, sockets: *mut c_void, conn: Handle) -> Option<LinkSnapshot> {
+        let mut info = [0u8; CONNECTION_INFO_SIZE];
+        // SAFETY: info is CONNECTION_INFO_SIZE bytes, the size of SteamNetConnectionInfo_t; the iface lock is held.
+        let known = unsafe { (self.api.connection_info)(sockets, conn, info.as_mut_ptr().cast()) };
+        let route =
+            if parse_connection_info(known.then_some(&info[..])?)?.relayed { Route::Relayed } else { Route::Direct };
+        let real = self.api.real_time_status.and_then(|status| {
+            let mut buf = [0u8; REAL_TIME_STATUS_BUFFER];
+            // SAFETY: buf is larger than SteamNetConnectionRealTimeStatus_t; no lanes are asked for (0 and null), as
+            // the header allows; the iface lock is held.
+            let code = unsafe { status(sockets, conn, buf.as_mut_ptr().cast(), 0, std::ptr::null_mut()) };
+            if code == result::OK {
+                parse_real_time_status(&buf)
+            } else {
+                None
+            }
+        });
+        Some(LinkSnapshot {
+            route,
+            ping_ms: real.and_then(|r| r.ping_ms),
+            quality: real.map_or(1.0, |r| r.quality_local),
+            send_rate: real.map_or(0, |r| r.send_rate),
+            pending: real.map_or(0, |r| r.pending_reliable),
+        })
     }
 
     /// Looks for Steam's interfaces; on success asks for relay access, registers the global callback and applies
@@ -623,7 +698,7 @@ impl Shared {
                     // SAFETY: e.conn is a handle Steam just reported; the iface lock is held.
                     let accepted = unsafe { (self.api.accept)(sockets, e.conn) };
                     if accepted == result::OK {
-                        reg.conns.insert(e.conn, Tracked { owner, incoming: true, open: false, remote: e.remote });
+                        reg.conns.insert(e.conn, Tracked::new(owner, true, e.remote));
                     } else {
                         // SAFETY: as above.
                         unsafe { (self.api.close)(sockets, e.conn, 0, std::ptr::null(), false) };
@@ -862,9 +937,7 @@ impl CoreRef {
         if conn == 0 {
             return Err(CoreError::Refused("Steam could not start the connection".into()));
         }
-        lock(&self.0.registry)
-            .conns
-            .insert(conn, Tracked { owner, incoming: false, open: false, remote: Some(remote) });
+        lock(&self.0.registry).conns.insert(conn, Tracked::new(owner, false, Some(remote)));
         drop(iface);
         self.0.wake();
         Ok(conn)
@@ -953,6 +1026,13 @@ impl CoreRef {
         }
         let info = parse_connection_info(&info)?;
         Some(if info.relayed { Route::Relayed } else { Route::Direct })
+    }
+
+    /// The latest measurement of an open connection: route, ping, send rate. It comes from the poller's periodic
+    /// sampling, so this costs no call into Steam; `None` until the first sample (one poll cycle after the open)
+    /// and for a connection the core does not track.
+    pub fn link(&self, conn: Handle) -> Option<LinkSnapshot> {
+        lock(&self.0.registry).conns.get(&conn).and_then(|t| t.link)
     }
 
     /// Listen sockets and connections the core tracks now.
@@ -1094,6 +1174,7 @@ mod win {
                 release_message: sym!("SteamAPI_SteamNetworkingMessage_t_Release"),
                 close: sym!("SteamAPI_ISteamNetworkingSockets_CloseConnection"),
                 connection_info: sym!("SteamAPI_ISteamNetworkingSockets_GetConnectionInfo"),
+                real_time_status: symbol(module, "SteamAPI_ISteamNetworkingSockets_GetConnectionRealTimeStatus\0"),
             })
         }
     }
@@ -1608,6 +1689,65 @@ mod tests {
         assert_eq!(p.host_core.handle().route(p.host_conn), Some(Route::Relayed));
         assert_eq!(p.host_core.handle().route(999_999), None);
         assert_eq!(Route::Relayed.text(), "through a Steam relay");
+    }
+
+    /// Polls the core's cached measurement of `conn` until `done` accepts it.
+    fn wait_link(core: &CoreRef, conn: Handle, what: &str, done: impl Fn(&LinkSnapshot) -> bool) -> LinkSnapshot {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(link) = core.link(conn).filter(|l| done(l)) {
+                return link;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}: {:?}", core.link(conn));
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_ping_and_the_route_of_an_open_connection_are_measured_and_kept_current() {
+        let p = Pair::new();
+        let guest = p.guest_core.handle();
+        // the first sample follows the open; the fake reports 30 ms and a direct path
+        let first = wait_link(&guest, p.guest_conn, "the first sample", |_| true);
+        assert_eq!((first.route, first.ping_ms), (Route::Direct, Some(30)));
+        assert!(first.quality > 0.9 && first.quality <= 1.0, "{first:?}");
+        assert_eq!(first.pending, 0);
+        // the tuned send rate is what Steam reports: this is how the real game shows the tuning took effect
+        assert_eq!(first.send_rate, Config::default().send_rate as u32);
+        assert_eq!(guest.link(999_999), None, "nothing is known about a connection nobody tracks");
+
+        // the path changes under the connection: a relay at first, then Steam finds a direct route
+        p.guest.set_ping(180);
+        p.guest.set_relay(0x646162);
+        let relayed = wait_link(&guest, p.guest_conn, "the relay to show", |l| l.route == Route::Relayed);
+        assert_eq!(relayed.ping_ms, Some(180));
+        p.guest.set_relay(0);
+        p.guest.set_ping(35);
+        let upgraded = wait_link(&guest, p.guest_conn, "the upgrade to a direct path", |l| l.route == Route::Direct);
+        wait_link(&guest, p.guest_conn, "the new ping", |l| l.ping_ms == Some(35));
+        assert_eq!(upgraded.route, Route::Direct);
+
+        // Steam has no estimate yet: no ping rather than a made-up one
+        p.guest.set_ping(-1);
+        wait_link(&guest, p.guest_conn, "no estimate", |l| l.ping_ms.is_none());
+        // a closed connection has no measurement any more
+        assert!(guest.close(p.guest_conn));
+        assert_eq!(guest.link(p.guest_conn), None);
+    }
+
+    #[test]
+    fn without_tuning_the_report_shows_steams_default_send_rate() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        a.refuse_config();
+        let (core_a, core_b) = (a.core(), b.core());
+        let (server, client) = (Recorder::new(), Recorder::new());
+        core_b.handle().listen(0, server).expect("listen");
+        let conn = core_a.handle().connect(b.steam_id(), 0, client.clone()).expect("connect");
+        client.wait_opened("the open");
+        let link = wait_link(&core_a.handle(), conn, "a sample", |_| true);
+        assert_eq!(link.send_rate, 262_144, "Steam's own default");
+        let link = wait_link(&core_b.handle(), b.connections()[0], "a sample", |_| true);
+        assert_eq!(link.send_rate, Config::default().send_rate as u32);
     }
 
     #[test]

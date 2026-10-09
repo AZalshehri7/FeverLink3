@@ -381,8 +381,14 @@ impl Controller {
                 "pongs": t.pongs,
                 "rtt": t.last_rtt_ms,
                 "route": t.route,
+                "ping": t.ping_ms,
             });
         }
+        v["peers"] = json!(r
+            .peers
+            .iter()
+            .map(|p| json!({ "id": p.steam_id.map(|id| id.to_string()), "route": p.route, "ping": p.ping_ms }))
+            .collect::<Vec<_>>());
         v
     }
 
@@ -456,6 +462,12 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
     if let Some(r) = &s.resync {
         v["resync"] = json!(r);
     }
+    // ping and route per connection, for transports that measure them (Steam)
+    v["links"] = json!(s
+        .links
+        .iter()
+        .map(|l| json!({ "conn": l.conn, "ping": l.ping_ms, "route": l.route }))
+        .collect::<Vec<_>>());
 }
 
 /// Writes through a temporary file and a rename; when the rename is refused (the mod has the file open) the

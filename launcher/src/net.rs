@@ -53,6 +53,51 @@ pub struct ConnectContext<'a> {
     pub progress: &'a mut dyn FnMut(&str),
 }
 
+/// What a transport measured about one connection, for the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkInfo {
+    pub conn: ConnectionId,
+    /// Round trip in ms as the transport measures it; `None` when it does not (yet).
+    pub ping_ms: Option<u32>,
+    /// How the connection travels (`direct`, `through a Steam relay`); `None` when the transport does not say.
+    /// Steam can move a relayed connection to a direct path later, so this is re-measured.
+    pub route: Option<String>,
+}
+
+/// What the host session needs from a listening transport. Its events come back on the channel the transport was
+/// built with, as [`NetEvent`]s; the rules at the top of this file (a connection's `Closed` exactly once and last,
+/// no frames after `close`) hold for every implementation. [`HostNet`] is TCP,
+/// [`crate::steam_transport::SteamHostNet`] is Steam.
+pub trait HostTransport: Send + 'static {
+    /// Writes a frame to one connection. An error means the connection is gone or was just closed because of this
+    /// write, or the frame cannot be sent at all.
+    fn send(&self, conn: ConnectionId, frame: &Frame) -> io::Result<()>;
+    /// Closes one connection. Frames already written are delivered first; `Closed` follows.
+    fn close(&self, conn: ConnectionId);
+    /// The socket address it listens on, for transports that have one.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// Where it listens, for the log.
+    fn describe(&self) -> String;
+    /// What it measured about each open connection (ping, route); empty for a transport that measures nothing.
+    fn links(&self) -> Vec<LinkInfo> {
+        Vec::new()
+    }
+}
+
+/// What a player session needs from its connection to the host ([`ClientNet`] or
+/// [`crate::steam_transport::SteamClientNet`]).
+pub trait ClientTransport: Send + 'static {
+    fn send(&self, frame: &Frame) -> io::Result<()>;
+    /// Where it is connected to, for the log.
+    fn describe(&self) -> String;
+    /// What it measured about the connection to the host (ping, route), `None` for a transport that measures nothing.
+    fn link(&self) -> Option<LinkInfo> {
+        None
+    }
+}
+
 /// One TCP connection: its writer, a handle to shut it down, and the flag that makes closing idempotent.
 #[derive(Debug)]
 struct Link {
@@ -207,6 +252,24 @@ impl Drop for HostNet {
     }
 }
 
+impl HostTransport for HostNet {
+    fn send(&self, conn: ConnectionId, frame: &Frame) -> io::Result<()> {
+        HostNet::send(self, conn, frame)
+    }
+
+    fn close(&self, conn: ConnectionId) {
+        HostNet::close(self, conn);
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        Some(self.local_addr)
+    }
+
+    fn describe(&self) -> String {
+        self.local_addr.to_string()
+    }
+}
+
 fn accept_loop(
     listener: &TcpListener,
     links: &Mutex<HashMap<ConnectionId, Arc<Link>>>,
@@ -306,6 +369,16 @@ impl ClientNet {
 impl Drop for ClientNet {
     fn drop(&mut self) {
         self.link.close();
+    }
+}
+
+impl ClientTransport for ClientNet {
+    fn send(&self, frame: &Frame) -> io::Result<()> {
+        ClientNet::send(self, frame)
+    }
+
+    fn describe(&self) -> String {
+        self.peer.to_string()
     }
 }
 

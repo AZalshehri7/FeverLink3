@@ -69,6 +69,12 @@ struct Machine {
     relay_inits: usize,
     /// The biggest message this machine handed to Steam.
     largest_sent: usize,
+    /// Sends Steam answered with "limit exceeded" (the peer had not read enough yet).
+    full_sends: usize,
+    /// What `GetConnectionRealTimeStatus` reports as the ping.
+    ping_ms: i32,
+    /// The send rate in force: Steam's default until `SetConfigValue` changes it.
+    send_rate: i32,
 }
 
 struct Listen {
@@ -261,6 +267,10 @@ unsafe extern "C" fn set_config(
     // SAFETY: the caller passes a pointer to one int32 for data type 1 (Int32), as SetConfigValue requires.
     let number = unsafe { *(arg as *const i32) };
     machine.config.push((value, scope, data_type, number));
+    // k_ESteamNetworkingConfig_SendRateMin / SendRateMax set the rate connections send at
+    if scope == 1 && (value == 10 || value == 11) {
+        machine.send_rate = number;
+    }
     true
 }
 
@@ -429,6 +439,9 @@ unsafe extern "C" fn send(
     }
     let Some(peer) = c.peer.filter(|p| m.conns.contains_key(p)) else { return 3 };
     if m.inbox_bytes(peer) + len > SEND_BUFFER {
+        if let Some(mm) = m.machines.get_mut(&machine) {
+            mm.full_sends += 1;
+        }
         return 25;
     }
     // SAFETY: the caller passes len readable bytes.
@@ -541,6 +554,35 @@ unsafe extern "C" fn connection_info(sockets: *mut c_void, conn: u32, out: *mut 
     true
 }
 
+unsafe extern "C" fn real_time_status(
+    sockets: *mut c_void,
+    conn: u32,
+    out: *mut c_void,
+    lanes: i32,
+    lane_status: *mut c_void,
+) -> i32 {
+    // the core asks for no lane data
+    if lanes != 0 || !lane_status.is_null() {
+        return 8;
+    }
+    let m = model();
+    let Some(c) = m.conns.get(&conn).filter(|c| c.machine == machine_of(sockets)) else { return 3 };
+    let Some(machine) = m.machines.get(&c.machine) else { return 3 };
+    let pending = c.peer.map_or(0, |p| m.inbox_bytes(p)) as i32;
+    // SteamNetConnectionRealTimeStatus_t: state 0, ping 4, quality local 8, quality remote 12, send rate 32,
+    // pending unreliable 36, pending reliable 40; 120 bytes in all
+    let mut b = [0u8; 120];
+    b[0..4].copy_from_slice(&c.state.to_le_bytes());
+    b[4..8].copy_from_slice(&machine.ping_ms.to_le_bytes());
+    b[8..12].copy_from_slice(&0.99f32.to_le_bytes());
+    b[12..16].copy_from_slice(&0.98f32.to_le_bytes());
+    b[32..36].copy_from_slice(&machine.send_rate.to_le_bytes());
+    b[40..44].copy_from_slice(&pending.to_le_bytes());
+    // SAFETY: the caller passes a buffer of at least sizeof(SteamNetConnectionRealTimeStatus_t) bytes.
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out as *mut u8, b.len()) };
+    1
+}
+
 fn locate(machine: usize) -> Located {
     let m = model();
     let Some(mm) = m.machines.get(&machine) else {
@@ -577,6 +619,7 @@ pub fn fast() -> Config {
         active: Duration::from_millis(1),
         idle: Duration::from_millis(5),
         locate: Duration::from_millis(5),
+        link_every: Duration::from_millis(20),
         ..Config::default()
     }
 }
@@ -611,6 +654,9 @@ impl FakeMachine {
                 accepts: 0,
                 relay_inits: 0,
                 largest_sent: 0,
+                full_sends: 0,
+                ping_ms: 30,
+                send_rate: 262_144,
             },
         );
         FakeMachine { id }
@@ -644,6 +690,7 @@ impl FakeMachine {
             release_message,
             close,
             connection_info,
+            real_time_status: Some(real_time_status),
         }
     }
 
@@ -684,6 +731,11 @@ impl FakeMachine {
     /// A relay point other than 0 makes this machine's connections report a relayed route.
     pub fn set_relay(&self, pop: u32) {
         self.with(|m| m.relay_pop = pop);
+    }
+
+    /// The ping Steam reports for this machine's connections; a negative number is "no estimate yet".
+    pub fn set_ping(&self, ms: i32) {
+        self.with(|m| m.ping_ms = ms);
     }
 
     /// The application stops reading: receives return nothing, so the peer's send buffer fills.
@@ -758,6 +810,11 @@ impl FakeMachine {
     /// Size in bytes of the biggest message this machine sent.
     pub fn largest_sent(&self) -> usize {
         self.with(|m| m.largest_sent)
+    }
+
+    /// How many sends of this machine found the send buffer full.
+    pub fn full_sends(&self) -> usize {
+        self.with(|m| m.full_sends)
     }
 
     /// Messages handed to this machine's core and not released.

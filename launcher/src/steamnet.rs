@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use steam_core::{
-    global, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, Owner, Route, SendOutcome, SteamCore,
-    MAX_MESSAGE,
+    global, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, LinkSnapshot, Owner, Route, SendOutcome,
+    SteamCore, MAX_MESSAGE,
 };
 
 // ---- layouts of the Steam structures (Steamworks SDK, `#pragma pack(8)`); pure, tested
@@ -169,6 +169,45 @@ pub fn relay_pop(info: &[u8]) -> u32 {
     le_u32(info, INFO_POP_RELAY).unwrap_or(0)
 }
 
+/// Bytes to give `GetConnectionRealTimeStatus`: the structure is 120 bytes, the buffer leaves room for growth.
+pub const REAL_TIME_STATUS_BUFFER: usize = 256;
+/// Offsets inside `SteamNetConnectionRealTimeStatus_t`.
+const RT_STATE: usize = 0;
+const RT_PING: usize = 4;
+const RT_QUALITY_LOCAL: usize = 8;
+const RT_QUALITY_REMOTE: usize = 12;
+const RT_SEND_RATE: usize = 32;
+const RT_PENDING_RELIABLE: usize = 40;
+
+/// What `GetConnectionRealTimeStatus` says about a connection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RealTime {
+    pub state: i32,
+    /// Steam's round-trip estimate in ms (`m_nPing`); `None` while it has none (Steam reports a negative number).
+    pub ping_ms: Option<u32>,
+    /// Packets delivered end to end in order, as measured here and as the other side reports, 0 to 1.
+    pub quality_local: f32,
+    pub quality_remote: f32,
+    /// The rate Steam sends at, bytes per second (`m_nSendRateBytesPerSecond`); it shows whether the send-rate
+    /// tuning took effect (Steam's default is 262 144).
+    pub send_rate: u32,
+    /// Reliable bytes queued and not yet on the wire.
+    pub pending_reliable: u32,
+}
+
+/// Reads a `SteamNetConnectionRealTimeStatus_t`. `None` when the buffer is too short.
+pub fn parse_real_time_status(buf: &[u8]) -> Option<RealTime> {
+    let float_at = |at: usize| le_u32(buf, at).map(f32::from_bits);
+    Some(RealTime {
+        state: le_i32(buf, RT_STATE)?,
+        ping_ms: u32::try_from(le_i32(buf, RT_PING)?).ok(),
+        quality_local: float_at(RT_QUALITY_LOCAL)?,
+        quality_remote: float_at(RT_QUALITY_REMOTE)?,
+        send_rate: u32::try_from(le_i32(buf, RT_SEND_RATE)?).unwrap_or(0),
+        pending_reliable: u32::try_from(le_i32(buf, RT_PENDING_RELIABLE)?).unwrap_or(0),
+    })
+}
+
 /// A sentence for one of Steam's connection end reasons (`ESteamNetConnectionEnd`), the number always included so
 /// a log line can be looked up in `steamnetworkingtypes.h`.
 pub fn end_reason_text(code: i32) -> String {
@@ -225,6 +264,8 @@ pub struct Report {
     pub test: Option<TestReport>,
     /// Pings other players sent us.
     pub pings_received: u32,
+    /// Players connected to our probe now, with the route and ping Steam measured.
+    pub peers: Vec<PeerReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,8 +273,20 @@ pub struct TestReport {
     pub target: u64,
     pub state: String,
     pub pongs: u32,
+    /// The probe's own round trip: ping to pong, as seen by the polling on both ends.
     pub last_rtt_ms: Option<u64>,
+    /// `direct` or `through a Steam relay`, measured again every second (Steam can upgrade a relay to a direct path).
     pub route: String,
+    /// Steam's own round-trip estimate for the connection, without the probe's polling.
+    pub ping_ms: Option<u32>,
+}
+
+/// A player who connected to our probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReport {
+    pub steam_id: Option<u64>,
+    pub route: String,
+    pub ping_ms: Option<u32>,
 }
 
 /// Parses the Steam ID a player pasted: digits only (the 17-digit `steamID64`).
@@ -284,13 +337,22 @@ struct TestConn {
     next_ping: Instant,
     sent: u32,
     route: String,
+    ping_ms: Option<u32>,
     state: String,
+}
+
+/// A player connected to the probe's listen socket.
+struct Peer {
+    conn: Handle,
+    steam_id: Option<u64>,
+    link: Option<LinkSnapshot>,
 }
 
 #[derive(Default)]
 struct ProbeState {
     events: Events,
     test: Option<TestConn>,
+    peers: Vec<Peer>,
     pings_received: u32,
 }
 
@@ -307,7 +369,7 @@ impl ProbeService {
 }
 
 impl Owner for ProbeService {
-    fn opened(&self, conn: Handle, _incoming: bool, _remote: Option<u64>) {
+    fn opened(&self, conn: Handle, _incoming: bool, remote: Option<u64>) {
         let route = self.core.route(conn).map_or("unknown", Route::text);
         let mut state = lock(&self.state);
         if let Some(t) = state.test.as_mut().filter(|t| t.conn == conn) {
@@ -317,6 +379,7 @@ impl Owner for ProbeService {
             t.next_ping = Instant::now();
             state.events.push("test connection established".into());
         } else {
+            state.peers.push(Peer { conn, steam_id: remote, link: None });
             state.events.push("a player connected".into());
         }
     }
@@ -352,6 +415,7 @@ impl Owner for ProbeService {
 
     fn closed(&self, conn: Handle, end: End) {
         let mut state = lock(&self.state);
+        state.peers.retain(|p| p.conn != conn);
         let ours = Self::is_test(&state, conn);
         if end.cause == Cause::Local {
             // we closed it: a replaced test, or the probe going away
@@ -438,7 +502,36 @@ impl Probe {
                 }
             }
         }
+        self.refresh_links();
         self.drive_test();
+    }
+
+    /// Takes the core's latest route and ping of the test connection and of the players connected to us. The core
+    /// measures again every second, so a relay that Steam upgrades to a direct path shows up here.
+    fn refresh_links(&self) {
+        let handles: Vec<Handle> = {
+            let state = lock(&self.service.state);
+            let test = state.test.iter().filter(|t| t.connected).map(|t| t.conn);
+            test.chain(state.peers.iter().map(|p| p.conn)).collect()
+        };
+        let links: Vec<(Handle, Option<LinkSnapshot>)> = handles.into_iter().map(|h| (h, self.core.link(h))).collect();
+        let mut state = lock(&self.service.state);
+        for (conn, link) in links {
+            let Some(link) = link else { continue };
+            if let Some(peer) = state.peers.iter_mut().find(|p| p.conn == conn) {
+                peer.link = Some(link);
+            }
+            if let Some(t) = state.test.as_mut().filter(|t| t.conn == conn) {
+                t.ping_ms = link.ping_ms;
+                let route = link.route.text();
+                if t.route != route {
+                    let change =
+                        format!("route changed: {} -> {route}", if t.route.is_empty() { "unknown" } else { &t.route });
+                    t.route = route.to_string();
+                    state.events.push(change);
+                }
+            }
+        }
     }
 
     fn drive_test(&self) {
@@ -481,6 +574,7 @@ impl Probe {
                     next_ping: Instant::now(),
                     sent: 0,
                     route: String::new(),
+                    ping_ms: None,
                     state: "connecting".into(),
                 });
             }
@@ -500,8 +594,18 @@ impl Probe {
                 pongs: t.pongs,
                 last_rtt_ms: t.last_rtt_ms,
                 route: t.route.clone(),
+                ping_ms: t.ping_ms,
             }),
             pings_received: state.pings_received,
+            peers: state
+                .peers
+                .iter()
+                .map(|p| PeerReport {
+                    steam_id: p.steam_id,
+                    route: p.link.map_or_else(String::new, |l| l.route.text().to_string()),
+                    ping_ms: p.link.and_then(|l| l.ping_ms),
+                })
+                .collect(),
         }
     }
 }
@@ -597,6 +701,35 @@ mod tests {
         info[INFO_FLAGS..][..4].copy_from_slice(&INFO_FLAG_RELAYED.to_le_bytes());
         assert!(parse_connection_info(&info).unwrap().relayed);
         assert_eq!(parse_connection_info(&info[..CONNECTION_INFO_SIZE - 1]), None);
+    }
+
+    #[test]
+    fn the_real_time_status_is_read_at_the_documented_offsets() {
+        // SteamNetConnectionRealTimeStatus_t: state 0, ping 4, quality local 8 and remote 12, send rate 32,
+        // pending reliable 40 (steamnetworkingtypes.h)
+        let mut b = [0u8; REAL_TIME_STATUS_BUFFER];
+        b[0..4].copy_from_slice(&3i32.to_le_bytes());
+        b[4..8].copy_from_slice(&87i32.to_le_bytes());
+        b[8..12].copy_from_slice(&0.75f32.to_le_bytes());
+        b[12..16].copy_from_slice(&0.5f32.to_le_bytes());
+        b[32..36].copy_from_slice(&1_048_576i32.to_le_bytes());
+        b[40..44].copy_from_slice(&350_000i32.to_le_bytes());
+        assert_eq!(
+            parse_real_time_status(&b),
+            Some(RealTime {
+                state: 3,
+                ping_ms: Some(87),
+                quality_local: 0.75,
+                quality_remote: 0.5,
+                send_rate: 1_048_576,
+                pending_reliable: 350_000
+            })
+        );
+        // Steam reports a negative ping while it has no estimate
+        b[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(parse_real_time_status(&b).map(|r| r.ping_ms), Some(None));
+        assert_eq!(parse_real_time_status(&b[..40]), None);
+        assert_eq!(parse_real_time_status(&[]), None);
     }
 
     #[test]

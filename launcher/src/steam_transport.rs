@@ -35,7 +35,11 @@ use std::time::{Duration, Instant};
 use feverlink3_core::protocol::{Frame, FrameCodec};
 use feverlink3_core::session::ConnectionId;
 
-use crate::net::{ConnectContext, NetEvent};
+use feverlink3_core::crypto::SessionKey;
+
+use crate::gamelink;
+use crate::net::{ClientTransport, ConnectContext, HostTransport, LinkInfo, NetEvent};
+use crate::session::{self, HostConfig, PlayerConfig, SessionHandle};
 use crate::steamnet::{self, CoreRef, End, Handle, Owner, Route, MAX_MESSAGE};
 
 /// The virtual port sessions use; the probe has 1.
@@ -121,6 +125,16 @@ fn decode(data: &[u8]) -> Result<Frame, String> {
         Ok(Some((_, used))) => Err(format!("{} bytes follow the frame in one message", data.len() - used)),
         Ok(None) => Err(format!("message of {} bytes is shorter than the frame it announces", data.len())),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The core's latest measurement of one connection, in the transport-neutral form the session reports.
+fn link_info(core: &CoreRef, link: &Link) -> LinkInfo {
+    let snapshot = core.link(link.handle);
+    LinkInfo {
+        conn: link.conn,
+        ping_ms: snapshot.and_then(|s| s.ping_ms),
+        route: snapshot.map(|s| s.route.text().to_string()),
     }
 }
 
@@ -324,6 +338,16 @@ impl SteamHostNet {
     /// The route of one connection ("direct" or "through a Steam relay").
     pub fn route(&self, conn: ConnectionId) -> Option<Route> {
         self.core.route(self.link(conn)?.handle)
+    }
+
+    /// The latest ping and route of every open connection. Steam measures again every second, so a relayed
+    /// connection that Steam moves to a direct path shows as direct a moment later.
+    pub fn links(&self) -> Vec<LinkInfo> {
+        let links: Vec<Arc<Link>> =
+            lock(&self.shared.links).by_conn.values().filter(|l| !l.is_closed()).cloned().collect();
+        let mut infos: Vec<LinkInfo> = links.iter().map(|l| link_info(&self.core, l)).collect();
+        infos.sort_by_key(|i| i.conn);
+        infos
     }
 
     /// Stops listening and closes every connection. Idempotent; also done on drop.
@@ -560,6 +584,11 @@ impl SteamClientNet {
         self.core.route(self.link.handle)
     }
 
+    /// The latest ping and route of the connection to the host (measured again every second).
+    pub fn link_info(&self) -> LinkInfo {
+        link_info(&self.core, &self.link)
+    }
+
     /// Changes how long a send waits for room in Steam's send buffer.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
         self.send_timeout = timeout;
@@ -578,6 +607,84 @@ impl Drop for SteamClientNet {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+impl HostTransport for SteamHostNet {
+    fn send(&self, conn: ConnectionId, frame: &Frame) -> io::Result<()> {
+        SteamHostNet::send(self, conn, frame)
+    }
+
+    fn close(&self, conn: ConnectionId) {
+        SteamHostNet::close(self, conn);
+    }
+
+    fn describe(&self) -> String {
+        match self.endpoint() {
+            Some(endpoint) => format!("Steam (Steam ID {endpoint}, virtual port {VIRTUAL_PORT})"),
+            None => format!("Steam (virtual port {VIRTUAL_PORT})"),
+        }
+    }
+
+    fn links(&self) -> Vec<LinkInfo> {
+        SteamHostNet::links(self)
+    }
+}
+
+impl ClientTransport for SteamClientNet {
+    fn send(&self, frame: &Frame) -> io::Result<()> {
+        SteamClientNet::send(self, frame)
+    }
+
+    fn describe(&self) -> String {
+        format!("Steam ID {}", self.endpoint)
+    }
+
+    fn link(&self) -> Option<LinkInfo> {
+        Some(self.link_info())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sessions over Steam
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Hosts a session over Steam with the process's Steam core (listening on [`VIRTUAL_PORT`]); `config.bind` is not
+/// used. Everything else is [`session::run_host`].
+pub fn run_steam_host(config: HostConfig) -> io::Result<SessionHandle> {
+    session::run_host_over(config, SteamHostNet::listen)
+}
+
+/// The connection step of a player session over Steam, for [`session::run_player_over`]: every attempt, the first
+/// and each reconnect, connects to `host` on `core`.
+pub fn steam_connector(
+    core: CoreRef,
+    host: SteamEndpoint,
+) -> impl FnMut(ConnectContext<'_>) -> io::Result<Box<dyn ClientTransport>> + Send + 'static {
+    move |ctx| SteamClientNet::connect_with(&core, host, ctx).map(|net| Box::new(net) as Box<dyn ClientTransport>)
+}
+
+/// Joins the session of `host` over Steam with the process's Steam core. The first attempt waits up to
+/// `config.connect_timeout` (use [`steam_player_config`]: finding a route takes 10 to 20 s) and tells `progress`
+/// what it is doing ("finding a route"); reconnects are the session's, as for TCP.
+pub fn run_steam_player(
+    config: PlayerConfig,
+    host: SteamEndpoint,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<SessionHandle> {
+    let core = steamnet::global().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Steam networking is not available (is the game running through Steam?)",
+        )
+    })?;
+    session::run_player_over(config, steam_connector(core, host), progress)
+}
+
+/// A player configuration for a Steam session: no endpoints, [`CONNECT_TIMEOUT`] to find a route.
+pub fn steam_player_config(name: &str, key: SessionKey, link: gamelink::Session) -> PlayerConfig {
+    let mut config = PlayerConfig::new(Vec::new(), name, key, link);
+    config.connect_timeout = CONNECT_TIMEOUT;
+    config
 }
 
 impl fmt::Debug for SteamClientNet {
@@ -601,6 +708,9 @@ impl fmt::Debug for SteamHostNet {
 }
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::steamnet::fake::FakeMachine;
@@ -620,23 +730,33 @@ mod tests {
         rx.recv_timeout(WAIT).expect("an event")
     }
 
+    /// An event in a line, without the bytes of a big frame.
+    fn brief(event: &NetEvent) -> String {
+        match event {
+            NetEvent::Frame { conn, frame } => {
+                format!("Frame on {conn}: kind {}, {} body bytes", frame.header.kind, frame.body.len())
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
     fn next_frame(rx: &Receiver<NetEvent>, conn: ConnectionId) -> Frame {
         match next(rx) {
             NetEvent::Frame { conn: c, frame } if c == conn => frame,
-            other => panic!("expected a frame on {conn}, got {other:?}"),
+            other => panic!("expected a frame on {conn}, got {}", brief(&other)),
         }
     }
 
     fn next_closed(rx: &Receiver<NetEvent>, conn: ConnectionId) -> String {
         match next(rx) {
             NetEvent::Closed { conn: c, reason } if c == conn => reason,
-            other => panic!("expected the end of {conn}, got {other:?}"),
+            other => panic!("expected the end of {conn}, got {}", brief(&other)),
         }
     }
 
     fn quiet(rx: &Receiver<NetEvent>) {
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(150)) {
-            panic!("expected silence, got {event:?}");
+            panic!("expected silence, got {}", brief(&event));
         }
     }
 
@@ -1202,7 +1322,15 @@ mod tests {
         assert!(reason.starts_with("write failed:"), "{reason}");
         assert!(guest.net.send(&chunk).is_err());
         host.machine.stall_receive(false);
-        assert!(next_closed(&host.rx, 1).contains("closed by the other side"));
+        // the frame that did get through may still be read before the host sees the end; the end is what counts
+        let reason = loop {
+            match next(&host.rx) {
+                NetEvent::Frame { conn: 1, .. } => {}
+                NetEvent::Closed { conn: 1, reason } => break reason,
+                other => panic!("unexpected {}", brief(&other)),
+            }
+        };
+        assert!(reason.contains("closed by the other side"), "{reason}");
     }
 
     #[test]
@@ -1215,6 +1343,41 @@ mod tests {
         assert_eq!(net.connection_count(), 0);
         drop(net);
         assert_eq!(machine.connections().len(), 0);
+    }
+
+    #[test]
+    fn the_transports_report_ping_and_route_per_connection() {
+        let (host, guest) = pair();
+        host.machine.set_ping(44);
+        guest.machine.set_ping(61);
+        guest.machine.set_relay(0x646162);
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + WAIT;
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        until("the host's view", &|| {
+            let links = host.net.links();
+            links.len() == 1 && links[0].ping_ms == Some(44) && links[0].route.as_deref() == Some("direct")
+        });
+        until("the guest's view", &|| {
+            let link = guest.net.link_info();
+            link.ping_ms == Some(61) && link.route.as_deref() == Some("through a Steam relay")
+        });
+        // the session sees the same through the transport traits
+        let as_host: &dyn HostTransport = &host.net;
+        let as_guest: &dyn ClientTransport = &guest.net;
+        assert_eq!(as_host.links().iter().map(|l| l.conn).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(as_guest.link().map(|l| l.conn), Some(7));
+        assert!(as_host.describe().starts_with("Steam (Steam ID 7656119"), "{}", as_host.describe());
+        assert_eq!(as_guest.describe(), format!("Steam ID {}", host.endpoint()));
+        assert_eq!(as_host.local_addr(), None);
+        // a closed connection is no longer listed
+        host.net.close(1);
+        next_closed(&host.rx, 1);
+        assert!(host.net.links().is_empty());
     }
 
     #[test]
