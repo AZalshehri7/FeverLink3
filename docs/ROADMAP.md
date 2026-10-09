@@ -96,7 +96,9 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 
 - [x] Native module skeleton in Rust: winhttp proxy, PE parsing, signature scanner, detour maths, build table, `cargo test`
 - [x] Address tool (`tools/addr`): finds hook sites in a game executable and prints a build-table row; first run against build 40420 in `tools/addr/out/6ac50427.txt`
-- [ ] Native module: command-list hook, hold/release, single-worker script pool *(native hooks)*. The detour code and the build table row exist and are tested; nothing is installed in the game yet (P10)
+- [~] Native module logic *(native hooks)*, off unless switched on: counters on the simulation's command application, hold/release hook on the command list with the control file (`native_ctl.log` / `native_events.log`), single-worker script pool patch; installed all-or-none from `DllMain` behind `FEVERLINK3_HOOKS` / `FEVERLINK3_HOLD` / `FEVERLINK3_POOLPATCH`; tested on fake game functions, never run in the real game (`docs/NATIVE_LINK.md`)
+- [ ] Native module verified in the game: counters, hold/release with each construction tool, pool patch (`docs/NATIVE_LINK.md` section 8; P10)
+- [ ] Lua mod strict mode: `hold_on`, ping, match `held`, stop at the stamp, `release` + trigger command, `cancel`, `hold_off` before a resync (`docs/NATIVE_LINK.md` section 7)
 - [ ] Native module size: `no_std` + `alloc` with a HeapAlloc allocator once the hook set is fixed
 - [~] Lua mod: stamping, barrier, replay, checksums, deterministic random. All of it runs in the two-game lupa test; in the real game the mod loads, the window opens, and save/load work (P1 to P3); replaying commands between two real games is not verified (P9)
 - [x] Lua lockstep test with lupa
