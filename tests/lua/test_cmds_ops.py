@@ -20,6 +20,7 @@ import re
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +33,7 @@ lupa = T.lupa
 # ---------------------------------------------------------------- the mock
 
 OPS_PRELUDE = r'''
-OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false, player = 7, strictCmd = false }
+OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false, player = 7, strictCmd = false, userdataResults = false }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
 MODELS = { "vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl" }
@@ -449,7 +450,12 @@ function EXECUTE(cmd, cb)
   end
   rec.entity = created
   if not rec.silent then GAME.applied[#GAME.applied + 1] = rec end
-  if cb then cb(type(data) == "table" and data or {}, true, rec.entity and { { rec.entity, 0 } } or {}) end
+  if cb then
+    local result, entities = type(data) == "table" and data or {}, rec.entity and { { rec.entity, 0 } } or {}
+    -- as the real engine does: the result of a purchase is userdata (VehicleBuyCommandData) and lists no entity
+    if OPS.userdataResults and rec.entity then result, entities = PYDATA(rec.entity), {} end
+    cb(result, true, entities)
+  end
 end
 
 -- ---- what two games must agree on, without any entity id in it
@@ -531,6 +537,11 @@ class OpsGame(T.Game):
         finally:
             T.HARNESS = saved
         self.L.execute("OPS.player = %d; MODEL_OFFSET = %d; BUILD_SAVEGAME()" % (player_entity, model_offset))
+
+    def userdata_results(self):
+        """From now on the engine answers a creating command with userdata and no entity list (a Python object seen from Lua)."""
+        self.L.globals().PYDATA = lambda e: types.SimpleNamespace(resultVehicleEntity=int(e), resultEntity=int(e))
+        self.L.execute("OPS.userdataResults = true")
 
     def snapshot(self):
         return str(self.L.eval("SNAPSHOT()"))
@@ -665,6 +676,28 @@ class VehicleTest(OpsBase):
         self.assertNotIn("bus_red", snap)
         self.assertIn("bus_blue", snap)
         self.assertEqual(self.A.balance(), 1000000 - 2 * 10000 + 5000, "a sale returns half")
+
+    def test_a_purchase_during_a_pause_binds_the_vehicle_although_the_engine_answers_with_userdata(self):
+        self.start(speed=2)
+        for g in (self.A, self.B):
+            g.userdata_results()
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40)
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt), "both stopped at the pause")
+        self.B.send_gui(buy("BUY", BUS_RED))
+        self.tick(8)
+        self.agree()
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
+        self.assertIn("applied during the pause", self.B.log())
+        v = int(self.B.L.eval("BUY[2]"))   # the window read its vehicle from the userdata result
+        # a later command names the vehicle by the key the purchase bound, not by an id the host does not have
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetStoppedByUserCmd(%d, true))" % v)
+        self.tick(8)
+        self.agree()
+        self.assertEqual(self.A.snapshot().count("stopped=true"), 1)
 
     def test_a_purchase_the_account_cannot_pay_fails_for_that_vehicle_only(self):
         self.start()

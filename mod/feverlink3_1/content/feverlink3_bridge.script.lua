@@ -395,7 +395,9 @@ local function guiApplyNow(it, now)
 	local cmd = (O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(args, 1, args.n))
 	O.sendCommand(cmd, function(data, success, entities)
 		if spec.creates and success then
-			local e = type(data) == "table" and data[spec.result] or nil
+			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
+			local okd, e = pcall(function() return data[spec.result] end)
+			if not okd then e = nil end
 			if e == nil and type(entities) == "table" and entities[1] then e = entities[1][1] end
 			if e ~= nil then
 				G.bind[it.key] = e
