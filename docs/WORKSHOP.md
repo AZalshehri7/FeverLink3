@@ -4,7 +4,7 @@ Written on 2026-10-10 from public pages read that day (the list, with addresses,
 
 ## The short answer
 
-1. **Transport Fever 3 has no Steam Workshop.** The developers' support page says: "the Steam Workshop would undermine this single-destination approach to modding so we are not including it in the game." An earlier developer blog (episode 5) had called it "not yet confirmed"; the support page is the later and firmer statement. The old roadmap item "Mod Hub and, if TF3 supports it, the Steam Workshop" can therefore not be done as written.
+1. **Transport Fever 3 has no Steam Workshop.** The developers' support page says: "the Steam Workshop would undermine this single-destination approach to modding so we are not including it in the game." The developer blog (episode 5) says the Workshop is "not yet confirmed" and would be decided after the Mod Hub matches its functions. We could not establish which of the two pages is newer, but the game's Steam store page (read on 2026-10-10) lists Single-player, Steam Achievements, Includes level editor and Family Sharing as features, does not list Steam Workshop, and speaks of an in-game mod browser. The plan therefore assumes there is no Workshop for the game. The old roadmap item "Mod Hub and, if TF3 supports it, the Steam Workshop" can therefore not be done as written.
 2. **The official channel is the in-game Mod Hub, built on mod.io.** Mods are uploaded from the game (from the `staging_area` folder of the user data) or on mod.io, pass an automatic validation for PC and console, and are shared for every platform from one library. A separate Curated Mods Program exists; its entry conditions (10 published mods, 100,000 downloads in total, a record of well-rated mods) are not something this project meets.
 3. **A mod that ships a native DLL for the game folder does not fit that channel.** A Mod Hub mod is a folder under the user mods folder (`mods/<author>_<modname>/` with `mod.json`, `_metadata/` and `content/`); nothing in that structure puts a file into the game folder, and the published rules are about game resources and scripts. The wiki's technical requirements add: "Only the official Transport Fever 3 scripting API may be used" and "Executable files such as batch files and shell scripts are not allowed". mod.io's own documentation says its schema check flags archive, DLL and executable types and lets each game decide whether to block the upload or send it to the game's admin. None of these pages says "DLLs are rejected" in so many words, so the exact outcome is unconfirmed, but every sign points the same way.
 4. **The practical plan: ship the whole thing outside the Hub** (GitHub Releases, then Nexus Mods, and the German transportfever.net file base that the official wiki itself names as an example of other hosts), and **ask Urban Games** whether a Hub listing of a Lua-only part is welcome at all. The questions are drafted below.
@@ -74,7 +74,8 @@ These are recommendations; they are not made here because this work is documenta
 
 ## Sources (all read on 2026-10-10)
 
-- Support FAQ on mods and Steam Workshop: https://www.transportfever3.com/support/
+- Support FAQ on mods, multiplayer and Steam Workshop: https://www.transportfever3.com/support/
+- The game's Steam store page: https://store.steampowered.com/app/3493540/Transport_Fever_3/
 - Curated Mods Program: https://www.transportfever3.com/curated-mods-program/
 - Dev blog, episode 5: https://www.transportfever3.com/news/dev-blog-episode-5-highlights/
 - Modding manual, publishing a mod (old revision): https://wiki.transportfever3.com/doku.php?id=modding:general:publishing
@@ -87,6 +88,7 @@ These are recommendations; they are not made here because this work is documenta
 
 ## What we could not confirm
 
+- Whether a Steam Workshop integration is added later (re-check the store page's feature list before a release).
 - Whether the Mod Hub's automatic validation rejects a DLL, or `package.loaded.io` use, outright, or sends it to human review.
 - Whether a PC-only flag exists, and whether the Hub accepts a mod that needs an external download.
 - The current text of the wiki pages (the copies we could read are marked "old revision").
