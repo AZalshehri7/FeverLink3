@@ -21,10 +21,12 @@ feverlink3_launcher = { path = "../launcher" }
 serde_json = "1.0.151"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ] }
 
 # The release profile is the workspace's, in the root Cargo.toml.

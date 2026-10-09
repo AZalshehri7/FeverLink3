@@ -18,12 +18,15 @@ pub mod counters;
 pub mod detour;
 pub mod hold;
 pub mod link;
+pub mod patch;
 pub mod pe;
 pub mod plan;
 pub mod scan;
 
 #[cfg(windows)]
 pub mod log;
+#[cfg(windows)]
+pub mod mem;
 #[cfg(windows)]
 pub mod proxy;
 
