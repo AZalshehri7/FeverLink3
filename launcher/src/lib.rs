@@ -30,7 +30,6 @@ pub mod session;
 pub mod steam;
 pub mod steamnet;
 pub mod update;
-pub mod upnp;
 
 /// Steam app id of Transport Fever 3.
 pub const APP_ID: &str = "3493540";

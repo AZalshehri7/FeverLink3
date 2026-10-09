@@ -7,13 +7,14 @@
 -- report for the window, and builds the attribution so that real per-player companies are a mode of the same code
 -- (mode "separate", off until docs/COMPANIES.md section 8 has been run in a game).
 --
--- Returns { commands = { <api.cmd function name> = spec, ... }, company = Co }.
+-- Returns { commands = { <api.cmd function name> = spec, ... }, events = { <id> = { <name> = handler } }, company = Co }.
 --   commands  registered by the bridge in L.COMMANDS (feverlink3_lockstep.lua documents the spec fields):
 --               makeGameAddPlayerCmd     the engine command that adds a player entity, bound to the key of its action
 --               makeEntitySetPlayerCmd   moves an entity to another player (host only)
 --               feverlink3Company        a mod-level action (spec.virtual: no engine command) carrying one registry
 --                                        operation: found, bind, assign, join, leave, rename, open, remove, mode,
 --                                        limit, perm, reset, pay
+--   events    Companies/applyLevel (feverlink3_lockstep.lua, L.registerEvents)
 --   company   the registry, attribution, ledger and report functions the bridge calls. Pure Lua 5.2: nothing here
 --             touches the engine at load time; the few engine reads and bookings sit in Co.extendEngine.
 --
@@ -150,12 +151,21 @@ end
 
 -- "makeVehicleBuyCmd" -> "vehicle buy" when the table below has no better words for it
 local LABELS = {
-	makeVehicleBuyCmd = "vehicles bought", makeVehicleSellCmd = "vehicles sold", makeLineCreateCmd = "lines created",
-	makeLineDestroyCmd = "lines deleted", makeLineUpdateCmd = "lines edited", makeVehicleSetLineCmd = "vehicles put on a line",
-	makeWorldBuildProposalCmd = "builds", makeGameAddPlayerCmd = "companies founded", makeEntitySetPlayerCmd = "owners changed",
+	makeVehicleBuyCmd = "vehicles bought", makeVehicleSellCmd = "vehicles sold", makeVehicleReplaceCmd = "vehicles replaced",
+	makeLineCreateCmd = "lines created", makeLineDestroyCmd = "lines deleted", makeLineUpdateCmd = "lines edited",
+	makeVehicleSetLineCmd = "vehicles put on a line", makeWorldBuildProposalCmd = "builds",
+	makeGameAddPlayerCmd = "companies founded", makeEntitySetPlayerCmd = "owners changed",
+	makeEntitySetNameCmd = "renames", makeEntitySetColorCmd = "recolours", makeJournalBookAssetCmd = "journal bookings",
+	-- events are counted as "event <id>/<name>" (the bridge names them so)
+	["event Loan/Obtain"] = "loans taken", ["event Loan/Repay"] = "loans repaid",
+	["event Subvention/onAccept"] = "subsidies accepted", ["event Subvention/onDecline"] = "subsidies declined",
+	["event Companies/startMarketingCampaign"] = "marketing campaigns", ["event Companies/spawnIndustry"] = "prospections",
+	["event Companies/MakeGreen"] = "industries greened", ["event Companies/applyLevel"] = "company levels applied",
 }
 local function labelOf(fn)
 	if LABELS[fn] then return LABELS[fn] end
+	local event = tostring(fn):match("^event (.+)$")
+	if event then return (event:gsub("/", " ")) end
 	local words = tostring(fn):gsub("^make", ""):gsub("Cmd$", ""):gsub("(%u)", " %1"):gsub("^%s+", "")
 	return words:lower()
 end
@@ -515,12 +525,30 @@ end
 
 -- ------------------------------------------------------------------ ledger and admission
 
+-- The name the ledger and the limit know a command by: its function, or for an event (one engine command carries dozens
+-- of them) "event <id>/<name>". `args` is the argument list, as shipped or as decoded: the id is at [2], the name at [3].
+function Co.nameOf(fn, args)
+	if fn == "makeScriptingSendEventCmd" and type(args) == "table" then
+		return "event " .. tostring(args[2]) .. "/" .. tostring(args[3])
+	end
+	return fn
+end
+
+-- Not stopped by a spending limit: repaying a loan gives money back, it does not spend any. (A forbidden category
+-- still stops it.)
+local LIMIT_FREE = { ["event Loan/Repay"] = true }
+
+function Co.freeOfLimit(fn, args)
+	return LIMIT_FREE[Co.nameOf(fn, args)] == true
+end
+
 -- May this player's next action of this category go ahead? A category the host forbade never may. Spending limits apply
--- to building and buying; selling, bulldozing and everything else always may. Pure on the registry, so the originator's
--- pre-check and every game's check at the stamp agree.
-function Co.gate(co, from, category, at)
+-- to building and buying (not to what is `free` of them, see Co.freeOfLimit); selling, bulldozing and everything else
+-- always may. Pure on the registry, so the originator's pre-check and every game's check at the stamp agree.
+function Co.gate(co, from, category, at, free)
 	local forbidden = co.denied and co.denied[from]
 	if forbidden and forbidden[category] then return false, "not allowed to " .. category end
+	if free then return true end
 	local lim = co.limits[from]
 	if not lim or lim.amount == nil then return true end
 	if category ~= "build" and category ~= "spend" then return true end
@@ -587,7 +615,7 @@ function Co.beforeApply(ctx, it, spec, args, category)
 	local co = ctx.co
 	if type(co) ~= "table" or it.from == nil then return true end
 	if not spec.virtual then
-		local ok, why = Co.gate(co, it.from, category, it.at)
+		local ok, why = Co.gate(co, it.from, category, it.at, Co.freeOfLimit(it.body.fn, args))
 		if not ok then
 			Co.refuse(co, it.from, why)
 			return false, why
@@ -604,6 +632,14 @@ function Co.beforeApply(ctx, it, spec, args, category)
 	return true
 end
 
+-- What the ledger is told about an applied action. An event (a loan, marketing, a level...) has no cost of its own: a
+-- game script handles it, not the engine at once, so what the account did meanwhile is not its cost.
+function Co.info(it, spec, category, cost)
+	local name = Co.nameOf(it.body.fn, it.body.args)
+	if name ~= it.body.fn then cost = nil end
+	return { fn = name, category = category, cost = cost, created = spec.creates and { key = it.key, kind = spec.creates } or nil }
+end
+
 -- After the engine command went out: the ledger. Mod-level actions are not counted.
 function Co.afterApply(ctx, it, spec, info)
 	local co = ctx.co
@@ -612,14 +648,14 @@ function Co.afterApply(ctx, it, spec, info)
 end
 
 -- Runs the effects of an operation: the journal entries of a payment between companies. ctx.resolve turns a
--- company's entity key into this game's entity; engine.bookJournalFor(entity, amount) books it. Returns how many
+-- company's entity key into this game's entity; engine.bookJournalFor(entity, amount, kind) books it. Returns how many
 -- entries went in and the list of what could not (the games are then no longer identical in money: logged).
 function Co.runEffects(ctx, fx, engine)
 	local done, failed = 0, {}
 	for _, p in ipairs(fx and fx.postings or {}) do
 		local c = ctx.co.companies[p.company]
 		local e = c and c.entity and ctx.resolve(c.entity) or nil
-		local ok = e ~= nil and engine.bookJournalFor ~= nil and pcall(engine.bookJournalFor, e, p.amount, p.memo)
+		local ok = e ~= nil and engine.bookJournalFor ~= nil and pcall(engine.bookJournalFor, e, p.amount, p.kind)
 		if ok then
 			done = done + 1
 		else
@@ -774,8 +810,11 @@ end
 --                               mpfever_bridge.script.lua:3076); its result is not published.
 --   balanceOf(entity)           the account balance of a player entity; nil when infinite or unreadable
 --                               (api.engine.util.finance.getPlayersBalance, gui.zip!gui/game_bar/game_bar.tl:220)
---   bookJournalFor(entity, n)   one journal entry on that player's account (the game bar's balance edit does the same;
---                               finding from MPFever (MIT): JournalEntry with time -1 and category OTHER)
+--   bookJournalFor(entity, n, kind)  one journal entry of type `kind` (default OTHER) on that player's account, like the
+--                               bridge's bookJournal(amount, kind) does for the savegame's player (the game bar's balance
+--                               edit does the same; finding from MPFever (MIT): JournalEntry with time -1 and category
+--                               OTHER). Sent with the game's own sendCommand: the operations module owns
+--                               makeJournalBookAssetCmd, and a booking made here is never a player's action.
 --   lineResult(entity, t0, t1)  income minus running costs of a line between two game times
 --                               (api.engine.util.finance.calculateBalance, gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:626)
 --   yearLength()                the game's year in game-time units (api.util.getDefaultYearDuration), for monthly limits
@@ -822,11 +861,11 @@ function Co.extendEngine(engine, deps)
 		engine.balanceOf = function(entity) return api.engine.util.finance.getPlayersBalance(entity) end
 	end
 	if engine.bookJournalFor == nil then
-		engine.bookJournalFor = function(entity, amount)
+		engine.bookJournalFor = function(entity, amount, kind)
 			local entry = api.type.JournalEntry.new()
 			entry.amount = amount
 			entry.time = -1
-			entry.category.type = api.type.JournalEntry.Type.OTHER
+			entry.category.type = api.type.JournalEntry.Type[kind or "OTHER"]
 			local send = (deps.sender and deps.sender()) or api.cmd.sendCommand
 			send(api.cmd.makeJournalBookAssetCmd(entity, entry))
 		end
@@ -947,4 +986,11 @@ commands.feverlink3Company = {
 	end,
 }
 
-return { commands = commands, company = Co }
+-- Events (feverlink3_lockstep.lua, L.registerEvents). The company window sends Companies/applyLevel when the player opens a
+-- rank they have earned (game_mechanics/company/company.tl:422) and the progression script of every game must apply it, so
+-- it is replicated. Marketing, prospecting and greening (the permits) are the operations module's events.
+local events = {
+	Companies = { applyLevel = { category = "other" } },
+}
+
+return { commands = commands, events = events, company = Co }

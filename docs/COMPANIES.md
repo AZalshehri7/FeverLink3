@@ -56,7 +56,7 @@ Sources, cited as `where:line`:
 | `makeEntitySetPlayerCmd(entity, player)` | argument 2 | see 1.3 |
 | `makeWorldBuildProposalCmd(proposal, context, ...)` | `context.player`, `proposal...playerEntity` | `gui.zip!gui/entity_window/bridge_and_tunnel.tl:187-188`; `mission.zip!mission/mission_framework/mission_framework_util_entity.tl:83-95`; MPFever `mpfever_bridge.script.lua:3063-3128` |
 
-The mod's schema (`feverlink3_lockstep.lua`, `L.COMMANDS`) already marks the player argument of the first two, so a captured command travels with `{__ref = "player"}` and each game substitutes its own player entity. That substitution is the hook for attribution (section 3.3).
+The mod's schemas mark the player argument of these commands, the generic ones in `feverlink3_lockstep.lua` (`L.COMMANDS`) and the codecs of the operations module (`feverlink3_cmds_ops.lua`, which also owns `makeEntitySetNameCmd`, `makeEntitySetColorCmd` and `makeJournalBookAssetCmd` and the events with a `companyEntity`), so a captured command travels with `{__ref = "player"}` and each game substitutes its own player entity. That substitution is the hook for attribution (section 3.3).
 
 ### 1.5 Money and the "company" of the game
 
@@ -130,7 +130,7 @@ One registry, two modes. Nothing is stored anywhere but the game-script state of
 | `assign` | `player`, `company`? | host | Puts a player in a company; no `company` takes them out. |
 | `join` | `company` | anyone if the company is `open`; host and owner always | The sender joins. |
 | `leave` | | anyone | The sender leaves. |
-| `rename` | `company`, `name` | host, owner | Registry label only (the player entity's own name is `makeEntitySetNameCmd`). |
+| `rename` | `company`, `name` | host, owner | Registry label only. The player entity's own name is the operations module's `makeEntitySetNameCmd`, which the company window sends with the player as `{__ref = "player"}`: in separate mode that is the sender's company. |
 | `open` | `company`, `open` | host, owner | Whether players may `join` on their own. |
 | `remove` | `company` | host | Removes it from the registry; members are taken out; the player entity stays in the game. |
 | `mode` | `mode` = `shared` or `separate`, `experimental` | host | `separate` needs `experimental = true` and a player entity on every company. |
@@ -139,7 +139,7 @@ One registry, two modes. Nothing is stored anywhere but the game-script state of
 | `reset` | `player`? | host | Clears what is counted against the limit (one player or all); the history stays. |
 | `pay` | `to`, `amount`, `memo`?, `from`? | anyone; `from` (charge someone else: a fee) host only | A payment from the sender to another player: ledger entries (`paid`, `received`) and, in separate mode between two different companies that both have an entity, a journal entry of `-amount` on one account and `+amount` on the other. |
 
-Engine commands the module registers: `makeGameAddPlayerCmd(name, colour)` (host only; colour is a `Vec3f`, sent as `{r, g, b}` and rebuilt on every game) and `makeEntitySetPlayerCmd(entity, player | -1)` (host only; both arguments travel as entity keys).
+Engine commands the module registers: `makeGameAddPlayerCmd(name, colour)` (host only; colour is a `Vec3f`, sent as `{r, g, b}` and rebuilt on every game) and `makeEntitySetPlayerCmd(entity, player | -1)` (host only; both arguments travel as entity keys). The one event it registers is `Companies` / `applyLevel` (the company window applies a rank the player has earned, `game_mechanics.zip!game_mechanics/company/company.tl:422`), because the progression script of every game must apply it. Names, colours, journal bookings, loans, marketing, prospecting and greening are the operations module's (`docs/COVERAGE_OPS.md`); they follow the sender's company through the same `ctx.player`.
 
 ### 3.3 Attribution
 
@@ -153,11 +153,13 @@ Per player (by sender id, created on first use): how many actions of each catego
 
 The cost of an action is the difference of the acting company's account across the engine command (`engine.balanceOf`), measured where the command runs: inside the simulation update on every game, or in the command's callback when the interface half applies it during a pause (nothing else moves the account then). If the account cannot be read (infinite money, a build where the call differs) the action is counted and no money is booked. Whether the engine books a purchase inside the same update is not known (E8); the ledger's counts do not depend on it.
 
+An event (a loan, a marketing campaign, a level...) is counted under the name `event <id>/<name>` and books no money: a game script handles it later, so what the account does meanwhile is not its cost. Its category is the operations module's (loans, marketing, prospecting and greening are `spend`).
+
 "Earned" is not stored. The window gets, for each player, the engine's balance of the lines that player created (`engine.lineResult`, every few seconds): income minus running costs, which is what the line window calls Balance. `net` is that, plus refunds, minus spending.
 
 ### 3.5 Limits
 
-A limit stops a player's next building (`build`) and buying (`spend`) once what they have spent in the period reaches the amount. It is soft by one action: the check happens before an action, so the action that crosses the amount goes through. Bulldozing, selling, and everything of category `other` are never stopped. Only the host sets limits; by default there are none.
+A limit stops a player's next building (`build`) and buying (`spend`) once what they have spent in the period reaches the amount. It is soft by one action: the check happens before an action, so the action that crosses the amount goes through. Bulldozing, selling, and everything of category `other` are never stopped, nor is repaying a loan (`Loan` / `Repay`, `Co.freeOfLimit`). Taking a loan, a marketing campaign, prospecting and greening are `spend` events and are stopped like a purchase. Only the host sets limits; by default there are none.
 
 A category the host forbade with `perm` is refused by the same two checks, before any limit is looked at (`not allowed to spend`).
 
@@ -176,7 +178,7 @@ Other areas register their commands in `feverlink3_cmds_*.lua`. To follow the se
 1. In a decode hook, `ctx.player` is the entity the acting player's commands apply to. Use it for every owner: `Context.player`, `ConstructionEntity.playerEntity`, `EdgeObject.playerEntity`, `PlayerOwned.player`, `makeJournalBookAssetCmd`'s player. Never `api.engine.util.getPlayer()`: on the originator it is the local player, and in separate mode it is the local company, neither of which is the sender's company on the other games.
 2. In an encode hook, write the player entity as `{__ref = "player"}` and any other owner as an entity reference by key (`ctx.keyOf`). A hook that only copies plain data needs nothing.
 3. Also available to a decode hook: `ctx.from` (sender id), `ctx.at` (stamp), `ctx.key` (action key), `ctx.co` (the registry: read it, do not change it).
-4. `spec.category` decides which launcher grant and which `perm` apply (all four categories can be forbidden) and whether the spending limit does (only `build` and `spend`).
+4. `spec.category` (or `spec.categoryFor(args)`, for an event) decides which launcher grant and which `perm` apply (all four categories can be forbidden) and whether the spending limit does (only `build` and `spend`). The operations module's codecs already follow points 1 and 2 (`PLAYER` writes and reads `{__ref = "player"}` through `ctx.player`); nothing in them changes for companies.
 5. The ledger and the cost need no code in the hook: every replicated command is counted and measured by the bridge. A spec that must change the registry sets `spec.apply(ctx, it, args)` (and `spec.virtual = true` when there is no engine command).
 
 ## 4. Adapters
@@ -186,7 +188,7 @@ The engine calls the company code makes, all in `Co.extendEngine`, all added to 
 | Adapter | Default | The game's own use of it | Used for | Experiment |
 |---|---|---|---|---|
 | `balanceOf(entity)` | `api.engine.util.finance.getPlayersBalance(entity)`, nil = infinite | `gui.zip!gui/game_bar/game_bar.tl:220` | cost of an action | E8 |
-| `bookJournalFor(entity, n)` | `makeJournalBookAssetCmd(entity, entry{amount, time -1, OTHER})` through the original `sendCommand` | `gui.zip!gui/game_bar/game_bar.tl:229-234` | payments between companies | E2 |
+| `bookJournalFor(entity, n, kind)` | `makeJournalBookAssetCmd(entity, entry{amount, time -1, type kind or OTHER})` through the original `sendCommand`, as the bridge's `bookJournal(amount, kind)` does for the savegame's player; never replicated | `gui.zip!gui/game_bar/game_bar.tl:229-234` | payments between companies | E2 |
 | `lineResult(entity, t0, t1)` | `finance.calculateBalance({entity}, t0, t1, true)` | `gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:621-627` | "earned" in the report | E9 |
 | `yearLength()` | `api.util.getDefaultYearDuration()` | same file, line 625 | monthly presets in the page | |
 | `setLocalCompany(entity)` | replaces `api.engine.util.getPlayer` (nil restores the original, kept in `package.loaded`) | none: this is the experiment | separate mode only | E6 |
@@ -197,7 +199,7 @@ The engine calls the company code makes, all in `Co.extendEngine`, all added to 
 
 | File | Role |
 |---|---|
-| `mod/feverlink3_1/content/feverlink3_cmds_company.lua` | The module: `commands` (registered in `L.COMMANDS`) and `company` (`Co`, the functions the bridge calls). Pure Lua except `Co.extendEngine`. |
+| `mod/feverlink3_1/content/feverlink3_cmds_company.lua` | The module: `commands` (registered in `L.COMMANDS`), `events` (`Companies` / `applyLevel`) and `company` (`Co`, the functions the bridge calls). Pure Lua except `Co.extendEngine`. |
 | `mod/feverlink3_1/content/feverlink3_lockstep.lua` | `spec.virtual` and `spec.apply` documented; `decodeCommand` honours `ctx.refuse`. |
 | `mod/feverlink3_1/content/feverlink3_bridge.script.lua` | Hunks marked `companies`: the context of an action, the guarded calls around the engine command, the registry in the state and its mirror, the replay of pause-time actions, the pre-check, the factory of mod-level actions, `companies.txt`, the window records, the local-company switch. |
 | `tests/lua/test_cmds_company.py` | 24 unit tests of the module and 25 tests of two mocked games (more than one player entity, per-player accounts, ownership, pauses, reloads, forged actions, faults in the company layer). They also pass on Lua 5.3, 5.4 and LuaJIT 2.1 (run by hand with lupa's other runtimes; CI runs the harness' 5.2). |
@@ -251,7 +253,7 @@ Shared mode:
 Separate mode:
 
 - Per-company money is not compared or corrected: `balance` and `loan` are the savegame's player's. A company's accounts can drift without a resync noticing. Needs one `authority` value per company (the protocol carries a name-to-number map, so no Rust change) and `bookJournalFor` to correct them.
-- The simulation scripts serve one company: loans (one table), subsidies, rank and XP, permits, prospecting, marketing, the ticket-price multiplier (section 1.5). A second company has rank 0 in every window that shows it.
+- The simulation scripts serve one company: loans (one table, booked to the savegame's player whoever asks), subsidies, rank and XP (`Companies` / `applyLevel` applies the level of the savegame's player), permits, prospecting, marketing, the ticket-price multiplier (section 1.5). A second company has rank 0 in every window that shows it.
 - Headquarters: `PLAYER.headquarters` is per player; nothing builds or moves one.
 - The native build tools presumably take the owner of what they build from the engine's own local player (E5, E6); the construction schema must set the owners from `ctx.player` (3.7) or new roads belong to the wrong company.
 - Station access: a line cannot use a station group another company owns (section 1.3). Shared stations must be owned by nobody or by the line's company. Fees for using someone else's infrastructure need usage detection and are not attempted; `pay` is the manual form.

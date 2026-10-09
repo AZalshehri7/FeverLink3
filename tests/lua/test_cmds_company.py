@@ -347,6 +347,37 @@ class CompanyUnit(unittest.TestCase):
         self.must(0, op="perm", player=1, category="spend", allowed=True)
         self.assertEqual(self.reg()["denied"], {}, "nothing left of the denial")
 
+    def test_events_are_named_by_id_and_name_and_repaying_a_loan_is_free_of_the_limit(self):
+        co, Co = self.co, self.Co
+        obtain = self.lua(["", "Loan", "Obtain", {}])
+        repay = self.lua(["", "Loan", "Repay", {}])
+        self.assertEqual(Co.nameOf("makeVehicleBuyCmd", None), "makeVehicleBuyCmd")
+        self.assertEqual(Co.nameOf("makeScriptingSendEventCmd", obtain), "event Loan/Obtain")
+        self.assertTrue(Co.freeOfLimit("makeScriptingSendEventCmd", repay))
+        self.assertFalse(Co.freeOfLimit("makeScriptingSendEventCmd", obtain))
+        self.assertFalse(Co.freeOfLimit("makeVehicleBuyCmd", repay), "only the event of that name")
+        self.must(0, op="limit", player=1, amount=100)
+        Co.record(co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 500}))
+        self.assertFalse(pair(Co.gate(co, 1, "spend", 0, Co.freeOfLimit("makeScriptingSendEventCmd", obtain)))[0])
+        self.assertTrue(allowed(Co.gate(co, 1, "spend", 0, Co.freeOfLimit("makeScriptingSendEventCmd", repay))))
+        # a category the host forbade still stops it
+        self.must(0, op="perm", player=1, category="spend", allowed=False)
+        self.assertFalse(pair(Co.gate(co, 1, "spend", 0, True))[0])
+        # the ledger names an event and books no money for it
+        it = self.lua({"key": "1:3", "body": {"fn": "makeScriptingSendEventCmd", "args": ["", "Loan", "Obtain", {}]}})
+        info = to_py(Co.info(it, self.lua({}), "spend", 5000))
+        self.assertEqual((info["fn"], info["category"], info.get("cost")), ("event Loan/Obtain", "spend", None))
+        it = self.lua({"key": "1:4", "body": {"fn": "makeVehicleBuyCmd", "args": [1, 2, {}]}})
+        info = to_py(Co.info(it, self.lua({"creates": "TRANSPORT_VEHICLE"}), "spend", 5000))
+        self.assertEqual((info["fn"], info["cost"], info["created"]), ("makeVehicleBuyCmd", 5000, {"key": "1:4", "kind": "TRANSPORT_VEHICLE"}))
+        # the report says it in words
+        Co.record(co, 1, 0, self.lua({"fn": "event Loan/Obtain", "category": "spend"}))
+        Co.record(co, 1, 0, self.lua({"fn": "event GameTime/SetMode", "category": "other"}))
+        st = to_py(Co.status(co, self.lua({"self": 1})))
+        labels = [m["label"] for m in [p for p in st["players"].values() if p["id"] == 1][0]["made"].values()]
+        self.assertEqual(sorted(labels), ["GameTime SetMode", "loans taken", "vehicles bought"])
+        self.assertEqual(to_py(self.M.events), {"Companies": {"applyLevel": {"category": "other"}}})
+
     def test_a_cost_the_engine_could_not_tell_is_counted_without_money(self):
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend"}))
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": float("nan")}))
@@ -389,12 +420,12 @@ class CompanyUnit(unittest.TestCase):
         self.must(0, op="found", name="One", entity="s:7")
         self.must(0, op="found", name="Two", entity="0:2")
         booked = self.L.eval("{}")
-        engine = self.L.eval("function(booked) return { bookJournalFor = function(e, n, memo) booked[#booked + 1] = e .. ':' .. n .. ':' .. tostring(memo) end } end")(booked)
+        engine = self.L.eval("function(booked) return { bookJournalFor = function(e, n, kind) booked[#booked + 1] = e .. ':' .. n .. ':' .. tostring(kind) end } end")(booked)
         ctx = self.L.table_from({"co": self.co, "resolve": self.resolver({"s:7": 7, "0:2": 52001})})
-        fx = self.lua({"postings": [{"company": "c2", "amount": -2500, "memo": "fee"}, {"company": "c1", "amount": 2500, "memo": "fee"}]})
+        fx = self.lua({"postings": [{"company": "c2", "amount": -2500, "memo": "fee", "kind": "OTHER"}, {"company": "c1", "amount": 2500}]})
         done, failed = self.Co.runEffects(ctx, fx, engine)
         self.assertEqual(int(done), 2)
-        self.assertEqual([booked[i] for i in (1, 2)], ["52001:-2500:fee", "7:2500:fee"])
+        self.assertEqual([booked[i] for i in (1, 2)], ["52001:-2500:OTHER", "7:2500:nil"], "the entry type goes along, the adapter's default is OTHER")
         # an entity this game does not know, or an engine that refuses: counted as failed, the rest still goes in
         ctx2 = self.L.table_from({"co": self.co, "resolve": self.resolver({"s:7": 7})})
         done, failed = self.Co.runEffects(ctx2, fx, engine)
@@ -637,6 +668,7 @@ START_BALANCE = 0
 INFINITE = false
 LINE_RESULT = {}
 JOURNALS = {}
+EVENTS = {}      -- "<id>/<name>@<time>" of every event sent to the game scripts (not the mod's own)
 WORLD[7].PLAYER = { headquarters = -1 }
 
 local function allocate(comps)
@@ -652,6 +684,7 @@ end
 local baseExecute = EXECUTE
 function EXECUTE(cmd, cb)
   local name, a = cmd.__cmd, cmd.args
+  if name == "makeScriptingSendEventCmd" and a[2] ~= "feverlink3" then EVENTS[#EVENTS + 1] = a[2] .. "/" .. a[3] .. "@" .. GAME.time end
   if name == "makeGameAddPlayerCmd" then
     local e = allocate({ PLAYER = { headquarters = -1 }, NAME = a[1], COLOR = a[2] })
     ACCOUNTS[e] = { balance = START_BALANCE, loan = 0 }
@@ -949,6 +982,42 @@ class CompanyGameTest(unittest.TestCase):
         self.assertGreater(reg["rev"], 10, "something happened")
         self.assertFalse(self.log_has("company layer failed"))
         self.assertFalse(self.log_has("LATE"))
+
+    def test_events_are_counted_loans_follow_the_limit_but_repaying_does_not_and_local_ones_stay_local(self):
+        self.start()
+        self.tick(10)
+        self.assertTrue(self.op(self.A, op="limit", player=1, amount=1))
+        self.assertTrue(self.buy(self.B))
+        # a loan is a `spend` event: over the limit it is stopped where it is issued
+        self.B.send_gui('LOAN = nil; api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { { type = "Small" }, { amount = 1000 } }), function(d, s) LOAN = s end)')
+        self.tick(15)
+        self.assertEqual(self.B.ev("LOAN"), False)
+        self.assertEqual(self.both("#EVENTS"), (0, 0))
+        # repaying it is not
+        self.B.send_gui('REPAY = nil; api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Repay", { { type = "Small" }, { amount = 1000 } }), function(d, s) REPAY = s end)')
+        self.tick(15)
+        self.assertEqual(self.B.ev("REPAY"), True)
+        # the company page's level event is replicated; a notification is nobody's business but this game's
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Companies", "applyLevel", { level = 3 }))')
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Notifications", "add", { type = "x" }))')
+        self.tick(15)
+
+        def events(game):
+            joined = game.ev('table.concat(EVENTS, ",")')
+            return joined.split(",") if joined else []
+
+        host, client = events(self.A), events(self.B)
+        self.assertEqual([e.split("@")[0] for e in host], ["Loan/Repay", "Companies/applyLevel"])
+        self.assertEqual(host, [e for e in client if not e.startswith("Notifications/")], "both games' scripts got them at the same times")
+        self.assertTrue(any(e.startswith("Notifications/add@") for e in client), "the client's own game got its notification")
+        self.assertFalse(any(e.startswith("Notifications/") for e in host), "the host never saw it")
+        self.assertSameRegistry()
+        led = self.A.registry()["ledger"][1]
+        self.assertEqual(led["made"], {"makeVehicleBuyCmd": 1, "event Loan/Repay": 1, "event Companies/applyLevel": 1})
+        self.assertEqual((led["n"], led["gross"]), ({"spend": 2, "other": 1}, {"spend": 30000}), "no money was booked for an event")
+        status = self.B.status()
+        labels = sorted(m["label"] for m in row(status, 1)["made"].values())
+        self.assertEqual(labels, ["company levels applied", "loans repaid", "vehicles bought"])
 
     def test_a_forged_action_beyond_the_limit_is_refused_by_every_game_alike(self):
         self.start()
