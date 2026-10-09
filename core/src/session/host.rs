@@ -84,7 +84,9 @@ pub enum HostOutput {
         connection: ConnectionId,
         frame: Frame,
     },
-    /// The caller must close this connection (after a reject).
+    /// The caller must close this connection, after the frames already sent to it: the host rejected it, removed
+    /// its player, cut it off for silence or flooding, or a returning player took its place. No `Closed` event
+    /// needs to be reported back; the host has already forgotten the connection.
     CloseConnection(ConnectionId),
     /// A message for the host's own game.
     DeliverToLocalGame {
