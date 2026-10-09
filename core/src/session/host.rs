@@ -17,7 +17,7 @@ use super::messages::{
 use super::names::Names;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
 use super::resync::ResyncState;
-use crate::crypto::{Opener, Sealer, SessionKey};
+use crate::crypto::{random_bytes, Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
 
 mod resync_impl;
@@ -98,6 +98,8 @@ struct Connection {
     id: ConnectionId,
     nonce: [u8; 16],
     player: Option<u16>,
+    /// Host time (seconds) at which the connection opened: one that has not joined in time is closed.
+    opened: f64,
 }
 
 /// The host side of a session, as a state machine with no I/O: connections are integers the caller owns, frames
@@ -151,6 +153,19 @@ impl HostSession {
     pub const HOST_ID: u16 = 0;
     pub const UNASSIGNED: u16 = 0xFFFF;
     pub const PROTOCOL_VERSION: i32 = FrameHeader::CURRENT_VERSION as i32;
+    /// Bytes of the random nonce in a Challenge.
+    pub const NONCE_SIZE: usize = 16;
+    /// A connection that has not sent an accepted Join this long after it opened is closed (seconds on the host's
+    /// clock). The handshake takes milliseconds; the limit is what a connection that opens and goes silent costs.
+    pub const HANDSHAKE_SECONDS: f64 = 15.0;
+    /// Connections waiting to introduce themselves at once. The next one is closed on arrival, so a flood of
+    /// connections cannot grow the host's tables.
+    pub const MAX_PENDING: usize = 32;
+    /// Longest `body` of an Action a player may send (bytes). Real bodies are a few hundred; the limit keeps one
+    /// player from making the host relay and write a megabyte for everyone, repeatedly.
+    pub const MAX_ACTION_BODY: usize = 256 * 1024;
+    /// Messages and drop reasons logged once are remembered up to this many; then the memory is cleared.
+    const MAX_REMEMBERED: usize = 1024;
 
     /// `now` returns seconds on any monotonic clock.
     pub fn new(key: SessionKey, host_name: &str, now: Box<dyn Fn() -> f64 + Send>, options: HostOptions) -> Self {
@@ -231,9 +246,17 @@ impl HostSession {
     // ---------------------------------------------------------------- connections
 
     pub fn connection_opened(&mut self, connection: ConnectionId) -> Vec<HostOutput> {
-        let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce).expect("operating system random source");
-        self.connections.insert(connection, Connection { id: connection, nonce, player: None });
+        if self.connections.values().filter(|c| c.player.is_none()).count() >= Self::MAX_PENDING {
+            self.refuse(connection, "too many connections waiting to join");
+            return self.drain();
+        }
+        let mut nonce = [0u8; Self::NONCE_SIZE];
+        if let Err(e) = random_bytes(&mut nonce) {
+            self.refuse(connection, &format!("no challenge could be made ({e})"));
+            return self.drain();
+        }
+        let opened = self.now();
+        self.connections.insert(connection, Connection { id: connection, nonce, player: None, opened });
         let challenge = ChallengeMessage {
             nonce: nonce.to_vec(),
             protocol: Self::PROTOCOL_VERSION,
@@ -241,6 +264,15 @@ impl HostSession {
         };
         self.send_unsealed(connection, MessageKind::Challenge, codec::encode(&challenge));
         self.drain()
+    }
+
+    /// Closes a connection that was never entered in the tables.
+    fn refuse(&mut self, connection: ConnectionId, why: &str) {
+        self.dropped += 1;
+        if self.first_time(format!("refuse/{why}")) {
+            self.log(format!("connection {connection} refused: {why}"));
+        }
+        self.out.push(HostOutput::CloseConnection(connection));
     }
 
     pub fn connection_closed(&mut self, connection: ConnectionId) -> Vec<HostOutput> {
@@ -273,7 +305,9 @@ impl HostSession {
             }
             Some(player) => {
                 if frame.header.sender != player {
-                    let why = format!("sender id {} on the connection of player {player}", frame.header.sender);
+                    // the id the frame claims is left out: it is the sender's to choose, and it would make every
+                    // forged frame a new line of the log
+                    let why = format!("sender id is not the one of the connection (player {player})");
                     self.drop(connection, kind_byte, why);
                     return self.drain();
                 }
@@ -296,11 +330,13 @@ impl HostSession {
             return;
         };
         if join.version != self.options.version {
-            let detail = format!("host runs {}, you run {}", self.options.version, join.version);
+            let detail = format!("host runs {}, you run {}", self.options.version, clip(&join.version, 32));
             self.reject(connection, "version", Some(&detail));
             return;
         }
-        let nonce = self.connections[&connection].nonce;
+        let Some(nonce) = self.connections.get(&connection).map(|c| c.nonce) else {
+            return;
+        };
         if !Self::verify_proof(&self.key, &nonce, &join.name, &join.proof) {
             self.reject(connection, "bad-proof", None);
             return;
@@ -366,9 +402,19 @@ impl HostSession {
     fn drop(&mut self, connection: ConnectionId, kind: u8, why: String) {
         self.dropped += 1;
         let kind = kind_name(kind);
-        if self.dropped_once.insert(format!("{connection}/{kind}/{why}")) {
+        if self.first_time(format!("{connection}/{kind}/{why}")) {
             self.log(format!("connection {connection}: {kind} dropped ({why})"));
         }
+    }
+
+    /// True the first time `key` is asked about: how a line that a misbehaving peer could cause for every frame
+    /// gets logged once. The memory is bounded; when it is full it is cleared, so a flood of different keys repeats
+    /// a few lines but never grows the host.
+    fn first_time(&mut self, key: String) -> bool {
+        if self.dropped_once.len() >= Self::MAX_REMEMBERED {
+            self.dropped_once.clear();
+        }
+        self.dropped_once.insert(key)
     }
 
     // ---------------------------------------------------------------- the host's own game
@@ -387,7 +433,9 @@ impl HostSession {
                 if let Some(p) = self.players.get_mut(&from) {
                     p.ready = true;
                 }
-                self.log(format!("{} ready {}", self.name(from), String::from_utf8_lossy(payload)));
+                // the payload is the player's: a few bytes of it are enough for a log line
+                let shown = String::from_utf8_lossy(payload.get(..160).unwrap_or(payload));
+                self.log(format!("{} ready {}", self.name(from), clip(&shown, 120)));
                 self.resync_step();
                 if from != Self::HOST_ID {
                     if let Some(connection) = self.connection_of(from) {
@@ -398,19 +446,37 @@ impl HostSession {
 
             MessageKind::Clock => {
                 if let Some(m) = codec::try_decode::<ClockMessage>(payload) {
-                    self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
-                    self.resync_step();
-                    let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead };
-                    self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
+                    if !PlayerClock::plausible(m.t, m.speed) {
+                        // a clock that is not a game time would stamp every game's next action into the far future
+                        self.dropped += 1;
+                        if self.first_time(format!("clock/{from}")) {
+                            self.log(format!("clock of {} dropped (t {}, speed {})", self.name(from), m.t, m.speed));
+                        }
+                    } else {
+                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
+                        self.resync_step();
+                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead };
+                        self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
+                    }
                 }
             }
 
             MessageKind::Action => {
-                if let Some(mut m) = codec::try_decode::<ActionMessage>(payload) {
+                let decoded = codec::try_decode::<ActionMessage>(payload);
+                if decoded.as_ref().is_some_and(|m| m.body.len() > Self::MAX_ACTION_BODY) {
+                    self.dropped += 1;
+                    if self.first_time(format!("bigaction/{from}")) {
+                        self.log(format!(
+                            "action of {} dropped (body over {} bytes)",
+                            self.name(from),
+                            Self::MAX_ACTION_BODY
+                        ));
+                    }
+                } else if let Some(mut m) = decoded {
                     m.from = from;
                     m.category = m.normalized_category().to_owned();
                     m.allowed = self.permissions.allows_action(&m.category, from);
-                    if !m.allowed && self.dropped_once.insert(format!("denied/{from}/{}", m.category)) {
+                    if !m.allowed && self.first_time(format!("denied/{from}/{}", m.category)) {
                         let who = self.name(from);
                         self.log(format!("{who} may not {}; action relayed as refused", m.category));
                     }
@@ -433,7 +499,7 @@ impl HostSession {
                 if let Some(m) = codec::try_decode::<SpeedRequestMessage>(payload) {
                     if !self.permissions.speed.allows(from) {
                         self.dropped += 1;
-                        if self.dropped_once.insert(format!("speed/{from}")) {
+                        if self.first_time(format!("speed/{from}")) {
                             let who = self.name(from);
                             self.log(format!("speed request from {who} dropped (not allowed)"));
                         }
@@ -457,7 +523,9 @@ impl HostSession {
             }
 
             MessageKind::ChecksumReport => {
-                if let Some(m) = codec::try_decode::<ChecksumReportMessage>(payload) {
+                // a report that is not the size of a world's hashes is treated like one that does not decode
+                if let Some(m) = codec::try_decode::<ChecksumReportMessage>(payload).filter(ChecksumRounds::acceptable)
+                {
                     if from == Self::HOST_ID {
                         if let Some(authority) = m.authority.as_ref().filter(|a| !a.is_empty()) {
                             let msg = AuthorityMessage { n: m.n, values: authority.clone() };
@@ -541,6 +609,7 @@ impl HostSession {
     pub fn tick(&mut self) -> Vec<HostOutput> {
         self.resync_step();
         let t = self.now();
+        self.expire_pending(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
@@ -551,6 +620,24 @@ impl HostSession {
             self.request_checksum_inner();
         }
         self.drain()
+    }
+
+    /// Closes the connections that opened more than [`HostSession::HANDSHAKE_SECONDS`] ago and have not joined.
+    fn expire_pending(&mut self, now: f64) {
+        let stale: Vec<ConnectionId> = self
+            .connections
+            .values()
+            .filter(|c| c.player.is_none() && now - c.opened >= Self::HANDSHAKE_SECONDS)
+            .map(|c| c.id)
+            .collect();
+        for connection in stale {
+            self.connections.remove(&connection);
+            self.dropped += 1;
+            if self.first_time("handshake-timeout".to_owned()) {
+                self.log(format!("connection {connection} closed: no join within {} s", Self::HANDSHAKE_SECONDS));
+            }
+            self.out.push(HostOutput::CloseConnection(connection));
+        }
     }
 
     fn set_speed_inner(&mut self, speed: i32) {
@@ -596,7 +683,7 @@ impl HostSession {
 
     /// A stamp every game reaches after receiving a message sent now.
     pub fn future_stamp(&self) -> i64 {
-        Lockstep::round_up_to_step((self.max_clock() + Lockstep::lead_units(self.state.speed.max(1))) as f64)
+        Lockstep::round_up_to_step(self.max_clock().saturating_add(Lockstep::lead_units(self.state.speed.max(1))) as f64)
     }
 
     fn broadcast_session(&mut self) {
@@ -624,8 +711,16 @@ impl HostSession {
     }
 
     fn send(&mut self, connection: ConnectionId, kind: MessageKind, payload: &[u8]) {
-        let frame = self.sealer.seal(kind.into(), payload);
-        self.out.push(HostOutput::SendToConnection { connection, frame });
+        match self.sealer.try_seal(kind.into(), payload) {
+            Ok(frame) => self.out.push(HostOutput::SendToConnection { connection, frame }),
+            // a relayed message that grew past the frame limit when the host added its fields, say
+            Err(e) => {
+                self.dropped += 1;
+                if self.first_time(format!("seal/{kind:?}")) {
+                    self.log(format!("{kind:?} not sent to connection {connection}: {e}"));
+                }
+            }
+        }
     }
 
     fn send_unsealed(&mut self, connection: ConnectionId, kind: MessageKind, payload: Vec<u8>) {
@@ -644,4 +739,14 @@ impl HostSession {
 
 fn kind_name(kind: u8) -> String {
     MessageKind::from_u8(kind).map_or_else(|| kind.to_string(), |k| format!("{k:?}"))
+}
+
+/// At most `max` characters of `text`, with `...` where something was cut: for text a peer chose that goes into a
+/// log line or a reject.
+fn clip(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if out.len() < text.len() {
+        out.push_str("...");
+    }
+    out
 }

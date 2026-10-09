@@ -134,33 +134,37 @@ impl IncomingSave {
         if m.data.is_empty() || m.data.len() > ResyncLimits::CHUNK_SIZE {
             return Err(ChunkError::BadSize(m.data.len()));
         }
-        match &self.current {
+        let t = match &mut self.current {
             Some(t) if t.id == m.id => {
                 if t.count != count || t.sha256 != sha {
                     return Err(ChunkError::Inconsistent);
                 }
+                t
             }
-            _ => {
-                self.current = Some(Transfer {
-                    id: m.id,
-                    count,
-                    sha256: sha,
-                    chunks: vec![None; count],
-                    received: 0,
-                    started: now,
-                });
-            }
-        }
-        let t = self.current.as_mut().expect("set above");
-        if t.chunks[index].is_none() {
-            t.chunks[index] = Some(m.data);
+            slot => slot.insert(Transfer {
+                id: m.id,
+                count,
+                sha256: sha,
+                chunks: vec![None; count],
+                received: 0,
+                started: now,
+            }),
+        };
+        if let Some(slot) = t.chunks.get_mut(index).filter(|slot| slot.is_none()) {
+            *slot = Some(m.data);
             t.received += 1;
         }
         if t.received < t.count {
             return Ok(None);
         }
-        let t = self.current.take().expect("present");
-        let bytes: Vec<u8> = t.chunks.into_iter().flatten().flatten().collect();
+        let Some(t) = self.current.take() else {
+            return Ok(None);
+        };
+        // one allocation of the right size: the save can be hundreds of megabytes
+        let mut bytes = Vec::with_capacity(t.chunks.iter().flatten().map(Vec::len).sum());
+        for chunk in t.chunks.into_iter().flatten() {
+            bytes.extend_from_slice(&chunk);
+        }
         if sha256_hex(&bytes) != t.sha256 {
             return Err(ChunkError::HashMismatch);
         }

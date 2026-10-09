@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{HostOutput, HostSession};
+use super::{clip, HostOutput, HostSession};
 use crate::session::checksum::ChecksumOutcome;
 use crate::session::kind::MessageKind;
 use crate::session::messages::{
@@ -219,7 +219,7 @@ impl HostSession {
     pub(super) fn on_save_done(&mut self, from: u16, m: SaveDoneMessage) {
         let Some((state, id)) = self.resync.as_ref().map(|r| (r.state, r.id)) else { return };
         if from != Self::HOST_ID {
-            if self.dropped_once.insert(format!("savedone/{from}")) {
+            if self.first_time(format!("savedone/{from}")) {
                 let who = self.name(from);
                 self.log(format!("SaveDone from {who} ignored (only the host's game saves)"));
             }
@@ -351,7 +351,7 @@ impl HostSession {
 
     pub(super) fn on_replay_failed(&mut self, from: u16, detail: &str) {
         let who = self.name(from);
-        self.log(format!("replay failed on {who}: {detail}"));
+        self.log(format!("replay failed on {who}: {}", clip(detail, 200)));
         if self.resync.is_some() || !self.state.started {
             return;
         }

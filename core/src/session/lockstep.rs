@@ -9,7 +9,8 @@ impl Lockstep {
     pub const UNITS_PER_SECOND: f64 = 1000.0;
 
     pub fn round_up_to_step(t: f64) -> i64 {
-        (t / Self::STEP as f64).ceil() as i64 * Self::STEP
+        // `as` saturates for huge or NaN input; the product must not wrap on top of that
+        ((t / Self::STEP as f64).ceil() as i64).saturating_mul(Self::STEP)
     }
 
     /// Steps a stamp must lie ahead of the fastest clock so that every game receives the message before reaching
@@ -29,6 +30,17 @@ pub struct PlayerClock {
 }
 
 impl PlayerClock {
+    /// Latest game time the host believes a game's clock can show (about 35 000 years of play).
+    pub const MAX_TIME: i64 = 1 << 50;
+    /// Fastest game speed the host believes a clock can report.
+    pub const MAX_SPEED: i32 = 16;
+
+    /// Whether a reported clock can be a real game's: the host builds every stamp and pause from these values,
+    /// so a player must not be able to put an absurd one in.
+    pub fn plausible(t: i64, speed: i32) -> bool {
+        (0..=Self::MAX_TIME).contains(&t) && (0..=Self::MAX_SPEED).contains(&speed)
+    }
+
     pub fn estimate(&self, now: f64) -> f64 {
         self.t as f64 + (now - self.at).max(0.0) * f64::from(self.speed) * Lockstep::UNITS_PER_SECOND
     }

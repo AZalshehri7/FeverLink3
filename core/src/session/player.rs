@@ -160,7 +160,12 @@ impl PlayerSession {
         let kind_byte = frame.header.kind;
         let kind = MessageKind::from_u8(kind_byte);
         let sender = frame.header.sender;
-        if kind == Some(MessageKind::Reject) && sender == HostSession::UNASSIGNED {
+        // a Reject is unsealed, so anyone on the path can write one: it only counts while we are still asking to
+        // join, where dropping the connection would do the same harm. Once welcomed, it must not end a session.
+        if kind == Some(MessageKind::Reject)
+            && sender == HostSession::UNASSIGNED
+            && self.state == PlayerState::Connecting
+        {
             let r = codec::try_decode::<RejectMessage>(&frame.body)
                 .unwrap_or_else(|| RejectMessage::new("malformed", None));
             self.state = PlayerState::Rejected;
@@ -178,6 +183,10 @@ impl PlayerSession {
             };
             if ch.protocol != HostSession::PROTOCOL_VERSION {
                 self.drop(kind_byte, format!("protocol {}", ch.protocol));
+                return;
+            }
+            if ch.nonce.len() != HostSession::NONCE_SIZE {
+                self.drop(kind_byte, "challenge nonce of the wrong size".to_owned());
                 return;
             }
             let proof = HostSession::proof(&self.key, &ch.nonce, &self.name).to_vec();
@@ -204,6 +213,12 @@ impl PlayerSession {
         };
 
         if kind == MessageKind::Welcome {
+            // one Welcome per connection: a second would replace the sealer and restart its counter, which reuses
+            // nonces under the same key
+            if self.state == PlayerState::Joined {
+                self.drop(kind_byte, "second welcome".to_owned());
+                return;
+            }
             let Some(w) = codec::try_decode::<WelcomeMessage>(&plain) else {
                 self.drop(kind_byte, "malformed welcome".to_owned());
                 return;
@@ -284,11 +299,14 @@ impl PlayerSession {
     /// A message from this player's game, sealed and sent to the host. Dropped (and counted) before the welcome:
     /// the game should not be running before the host has accepted us.
     pub fn local_game_message(&mut self, kind: MessageKind, payload: &[u8]) -> Vec<PlayerOutput> {
-        match self.sealer.as_mut().filter(|_| self.state == PlayerState::Joined) {
-            Some(sealer) => {
-                let frame = sealer.seal(kind.into(), payload);
-                self.out.push(PlayerOutput::SendToHost(frame));
-            }
+        match self
+            .sealer
+            .as_mut()
+            .filter(|_| self.state == PlayerState::Joined)
+            .map(|s| s.try_seal(kind.into(), payload))
+        {
+            Some(Ok(frame)) => self.out.push(PlayerOutput::SendToHost(frame)),
+            Some(Err(e)) => self.drop(kind.into(), format!("not sent: {e}")),
             None => self.drop(kind.into(), "not joined".to_owned()),
         }
         self.drain()
