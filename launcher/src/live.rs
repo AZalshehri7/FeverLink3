@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::lobby::JoinCode;
@@ -35,6 +35,10 @@ use crate::{luatext, net, resync, steam, steamnet};
 pub const CMD_FILE: &str = "ctl_cmd.log";
 /// The controller's state, rewritten by the controller.
 pub const STATUS_FILE: &str = "ctl_status.txt";
+/// The Steam API is looked up again every couple of seconds (for about five minutes) when it was not there yet.
+const STEAM_LOAD_EVERY: Duration = Duration::from_secs(2);
+const STEAM_LOAD_ATTEMPTS: u32 = 150;
+
 /// The port a host listens on unless the window asks for another.
 pub const DEFAULT_PORT: u16 = 28090;
 
@@ -78,6 +82,9 @@ pub struct Controller {
     commands: Tail,
     state: State,
     steam: Option<steamnet::Probe>,
+    /// How often and when the Steam API was looked for: it may not be loaded yet when the controller starts.
+    steam_attempts: u32,
+    steam_last_try: Instant,
     steam_note: Option<String>,
     published: String,
     version: u64,
@@ -103,6 +110,8 @@ impl Controller {
             commands,
             state: State::Idle,
             steam: steamnet::Probe::load(),
+            steam_attempts: 1,
+            steam_last_try: Instant::now(),
             steam_note: None,
             published: String::new(),
             version: 0,
@@ -121,6 +130,14 @@ impl Controller {
             self.command(&line.kind, &params);
         }
         self.advance();
+        if self.steam.is_none()
+            && self.steam_attempts < STEAM_LOAD_ATTEMPTS
+            && self.steam_last_try.elapsed() >= STEAM_LOAD_EVERY
+        {
+            self.steam = steamnet::Probe::load();
+            self.steam_attempts += 1;
+            self.steam_last_try = Instant::now();
+        }
         if let Some(probe) = &mut self.steam {
             probe.poll();
         }
@@ -330,7 +347,9 @@ impl Controller {
 
     fn steam_json(&self) -> Value {
         let Some(probe) = &self.steam else {
-            return json!({ "state": "not available", "note": self.steam_note });
+            let state =
+                if self.steam_attempts < STEAM_LOAD_ATTEMPTS { "looking for Steam..." } else { "not available" };
+            return json!({ "state": state, "note": self.steam_note });
         };
         let r = probe.report();
         let mut v = json!({
