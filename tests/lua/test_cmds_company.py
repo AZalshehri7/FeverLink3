@@ -897,6 +897,59 @@ class CompanyGameTest(unittest.TestCase):
         self.assertSameRegistry()
         self.assertEqual(self.A.registry()["ledger"][1]["gross"]["spend"], 90000)
 
+    def test_operations_and_actions_at_one_stamp_apply_in_the_same_order_everywhere(self):
+        self.start()
+        self.tick(10)
+        # issued in the same tick, so stamped alike: the host's operation (sender 0) is applied before the client's purchase
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.feverlink3Company({ op = "limit", player = 1, amount = 1 }))')
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, { vehicles = {} }), function(d, s) SAME_BUY = s end)")
+        self.tick(20)
+        self.assertSameRegistry()
+        reg = self.A.registry()
+        self.assertEqual(reg["limits"], {1: {"amount": 1}})
+        self.assertEqual(reg["ledger"][1]["gross"], {"spend": 30000}, "nothing was spent yet when the purchase was checked")
+        self.assertEqual(self.A.applied(), self.B.applied())
+        self.assertFalse(self.buy(self.B), "and now the limit holds")
+
+    def test_mixed_traffic_leaves_both_games_with_the_same_registry_and_ledger(self):
+        import random
+        rnd = random.Random(20261010)
+        self.start()
+        self.tick(10)
+        self.assertTrue(self.op(self.A, op="found", name="Ironworks", open=True))
+        self.assertTrue(self.op(self.A, op="found", name="Bakery", open=True))
+        self.assertTrue(self.op(self.A, op="limit", player=1, amount=30000))      # one purchase fills it, until the host resets or lifts it
+        from_host = [
+            lambda: 'api.cmd.feverlink3Company({ op = "limit", player = 1, amount = %d })' % rnd.choice([1, 1, 25000, 70000]),
+            lambda: 'api.cmd.feverlink3Company({ op = "limit", player = 1 })',
+            lambda: 'api.cmd.feverlink3Company({ op = "perm", player = 1, category = "%s", allowed = %s })' % (rnd.choice(["build", "spend", "spend", "bulldoze"]), rnd.choice(["true", "false", "false"])),
+            lambda: 'api.cmd.feverlink3Company({ op = "assign", player = 1, company = "%s" })' % rnd.choice(["c1", "c2"]),
+            lambda: 'api.cmd.feverlink3Company({ op = "reset" })',
+            lambda: 'api.cmd.feverlink3Company({ op = "pay", to = 1, amount = %d, from = 0 })' % rnd.randint(1, 900),
+            lambda: 'api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, { vehicles = {} })',
+        ]
+        from_client = [
+            lambda: 'api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, { vehicles = {} })',
+            lambda: 'api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, api.engine.util.getPlayer(), { stops = {} })',
+            lambda: 'api.cmd.feverlink3Company({ op = "pay", to = 0, amount = %d })' % rnd.randint(1, 900),
+            lambda: 'api.cmd.feverlink3Company({ op = "join", company = "%s" })' % rnd.choice(["c1", "c2"]),
+            lambda: 'api.cmd.feverlink3Company({ op = "leave" })',
+            lambda: 'api.cmd.feverlink3Company({ op = "limit", player = 1, amount = 5 })',
+        ]
+        for _ in range(20):
+            for game, pool in ((self.A, from_host), (self.B, from_client)):
+                if rnd.random() < 0.7:
+                    game.send_gui("api.cmd.sendCommand(%s)" % rnd.choice(pool)())
+            self.tick(rnd.choice([3, 6, 10]))
+        self.tick(40)
+        self.assertSameRegistry()
+        self.assertEqual(self.A.applied(), self.B.applied())
+        self.assertEqual(self.both("ACCOUNT.balance")[0], self.both("ACCOUNT.balance")[1])
+        reg = self.A.registry()
+        self.assertGreater(reg["rev"], 10, "something happened")
+        self.assertFalse(self.log_has("company layer failed"))
+        self.assertFalse(self.log_has("LATE"))
+
     def test_a_forged_action_beyond_the_limit_is_refused_by_every_game_alike(self):
         self.start()
         self.tick(10)

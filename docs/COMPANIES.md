@@ -165,7 +165,7 @@ The check is made twice, and both read only the registry: by the originator righ
 
 ### 3.6 Checksums, resync, hot join
 
-- Once anything was configured or recorded, the checksum report has a part `companies` (hash of `Co.digest`): mode, companies, members, limits, and per player the counts, payments and refusals. Measured money (`gross`, `refund`) is left out because a measurement is not a command; a game that measures differently must not cause a resync every time. Until the first action is recorded there is no part, so the report is what it was before this layer existed.
+- Once anything was configured or recorded, the checksum report has a part `companies` (hash of `Co.digest`): mode, companies, members, limits, forbidden categories, and per player the counts, payments and refusals. Measured money (`gross`, `refund`) is left out because a measurement is not a command; a game that measures differently must not cause a resync every time. Until the first action is recorded there is no part, so the report is what it was before this layer existed.
 - The registry is part of the script state, so a resync (everyone loads the host's save) and a hot join carry it along. After a reload the interface half starts a new mirror from the state.
 - Not compared: the accounts of companies other than the savegame's player (`balance` and `loan` read the savegame's player on purpose, also while a local company is set). The host's money authority corrects that account only. Per-company authority is open (section 7).
 
