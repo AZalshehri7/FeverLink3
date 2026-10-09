@@ -968,6 +968,19 @@ mod tests {
     }
 
     #[test]
+    fn the_host_holds_a_slot_longer_than_a_player_keeps_trying() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = gamelink::Session::create_under(dir.path(), "p").unwrap();
+        let key = SessionKey::derive(&SessionKey::new_secret(), None);
+        let config = PlayerConfig::new(Vec::new(), "p", key, link);
+        let held = HostOptions::default().reconnect_window_seconds;
+        assert!(
+            held > config.reconnect_window.as_secs_f64(),
+            "a player must not find its slot gone while it still tries"
+        );
+    }
+
+    #[test]
     fn lines_translate_both_ways() {
         let (name, from, lua) =
             to_game_line(MessageKind::Action, br#"{"stamp":400,"seq":2,"body":"x","from":3}"#).unwrap();
