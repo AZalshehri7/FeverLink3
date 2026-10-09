@@ -10,7 +10,8 @@
 //! - `native.log`: the native module's log (written by the module, not here).
 //!
 //! Every line of the two logs is `seq<TAB>kind<TAB>from<TAB>payload\n`, with `seq` strictly increasing within
-//! one file and the payload on one line (`\n`, `\r`, `\t` and `\` are escaped, see [`escape`]). A reader keeps the
+//! one file and the payload on one line, verbatim (the mod writes Lua literal syntax that is already one line, and
+//! its reader does not unescape; see [`format_line`]). A reader keeps the
 //! last `seq` it dispatched and ignores anything at or below it, so a truncated or rewritten file never replays
 //! history. A writer that restarts has to continue from the highest `seq` already in the file, which is why
 //! [`Session::open`] reads it back.
@@ -39,45 +40,14 @@ pub struct Line {
     pub payload: String,
 }
 
-/// Escapes a payload onto one line: `\` → `\\`, newline → `\n`, carriage return → `\r`, tab → `\t`.
-pub fn escape(payload: &str) -> String {
-    let mut out = String::with_capacity(payload.len());
-    for c in payload.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Reverses [`escape`]. An unknown escape keeps its character; a trailing lone `\` is dropped.
-pub fn unescape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some(other) => out.push(other),
-            None => {}
-        }
-    }
-    out
-}
-
-/// Formats a line, including the trailing newline. `kind` and `from` must not contain tabs or newlines; any
-/// found are replaced by spaces rather than corrupting the file.
+/// Formats a line, including the trailing newline. The payload travels verbatim: the mod's reader does not
+/// unescape anything and its serialiser already keeps a payload on one line (control characters inside strings
+/// are written as `\n`, `\t`, `\ddd`), so an escaping layer here would corrupt every string. `kind` and `from`
+/// must not contain tabs or line breaks; any found are replaced by spaces, and so are line breaks in the payload
+/// (a guard against a caller bug, they cannot occur in serialiser output) rather than corrupting the file.
 pub fn format_line(line: &Line) -> String {
-    format!("{}\t{}\t{}\t{}\n", line.seq, clean_field(&line.kind), clean_field(&line.from), escape(&line.payload))
+    let payload: String = line.payload.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    format!("{}\t{}\t{}\t{}\n", line.seq, clean_field(&line.kind), clean_field(&line.from), payload)
 }
 
 fn clean_field(s: &str) -> String {
@@ -93,7 +63,7 @@ pub fn parse_line(text: &str) -> Option<Line> {
     let seq = parts.next()?.trim().parse().ok()?;
     let kind = parts.next()?.to_string();
     let from = parts.next()?.to_string();
-    let payload = unescape(parts.next()?);
+    let payload = parts.next()?.to_string();
     Some(Line { seq, kind, from, payload })
 }
 
@@ -351,12 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn line_round_trip_with_escapes() {
-        let l = Line { seq: 7, kind: "chat".into(), from: "3".into(), payload: "a\tb\nc\\d\re {\"x\":1}".into() };
+    fn line_round_trip_keeps_the_payload_verbatim() {
+        let l = Line { seq: 7, kind: "chat".into(), from: "3".into(), payload: r#"{["t"]="a\"b\\n\009"}"#.into() };
         let text = format_line(&l);
         assert_eq!(text.matches('\n').count(), 1, "payload stays on one line");
-        assert!(text.ends_with('\n'));
+        assert!(text.contains(r#"{["t"]="a\"b\\n\009"}"#), "no escaping layer");
         assert_eq!(parse_line(&text), Some(l));
+        let raw = Line { seq: 8, kind: "x".into(), from: "0".into(), payload: "a\nb\rc".into() };
+        assert_eq!(parse_line(&format_line(&raw)).unwrap().payload, "a b c", "stray line breaks cannot split a line");
         assert_eq!(
             parse_line("12\thello\thost\t\n"),
             Some(Line { seq: 12, kind: "hello".into(), from: "host".into(), payload: String::new() })
@@ -369,8 +341,6 @@ mod tests {
         assert_eq!(parse_line(""), None);
         assert_eq!(parse_line("x\tkind\tfrom\tpayload"), None);
         assert_eq!(parse_line("1\tkind\tfrom"), None);
-        assert_eq!(unescape("trailing\\"), "trailing");
-        assert_eq!(unescape("\\q"), "q");
     }
 
     #[test]

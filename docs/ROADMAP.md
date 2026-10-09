@@ -13,11 +13,11 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] CI on every push
 
 ## 0.2 — Launcher
-- [ ] Host / join by code over TCP, player allow-list, sender-id rewrite
+- [x] Host / join by code over TCP, player allow-list, sender-id rewrite
 - [ ] Game launch with session environment, file link with sequence numbers
 - [ ] Savegame transfer with SHA-256, streamed from disk
 - [ ] Session clock, speed, pause, checksum rounds, resync round
-- [ ] `--selftest` over loopback
+- [x] `--selftest` over loopback
 - [ ] Packaging: single static exe, portable zip, reproducible release job with SHA-256
 - [ ] In-app updater with Ed25519-signed releases; version carried in the join code
 - [ ] First-run install and one-button uninstall of the game-side pieces

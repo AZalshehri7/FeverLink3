@@ -176,7 +176,9 @@ dependencies = [
 name = "feverlink3_launcher"
 version = "0.1.0"
 dependencies = [
+ "feverlink3_core",
  "rand",
+ "serde_json",
  "tempfile",
  "winreg",
 ]
