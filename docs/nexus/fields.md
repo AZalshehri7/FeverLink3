@@ -126,7 +126,7 @@ Hello,
 I would like to publish FeverLink3 Multiplayer for Transport Fever 3 on Nexus Mods. It is an open-source (MIT) cooperative multiplayer mod, so network access is its function: the native module (a winhttp.dll that the game loads from its own folder) connects the players' games to each other through Steam's peer-to-peer networking, and later through a relay server run by the project.
 
 Per your file submission guidelines I am contacting you first, with the reasoning and the source:
-- Source code: https://github.com/AZalshehri7/FeverLink3 (folders native/ and launcher/ for the DLL).
+- Source code: https://github.com/AZalshehri7/FeverLink3 (folders native/ and launcher/ for the DLL). It is a fresh implementation that builds on two earlier MIT-licensed projects, TpF2 Multiplayer by silver2127 and MPFever by dkdknight (arthur), both credited in the README and on the page.
 - What the DLL does and does not do, file by file, and how to verify it: https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md
 - Network use: player-to-player traffic through Steam's networking only (optional relay later). No auto-update, no analytics, no telemetry, no advertising, no account, no download of code.
 - The release is built by GitHub Actions from a tag; the zip, its SHA-256 and a manifest are on the GitHub release page. The files are not code-signed yet.

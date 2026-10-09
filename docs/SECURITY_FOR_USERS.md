@@ -91,8 +91,8 @@ What FeverLink3 uses to connect players, in this version:
 
 - **Steam networking (primary).** The DLL asks the Steam library that the game already runs for a peer-to-peer connection to the other player's Steam ID. Steam finds the route between the two PCs and may relay the traffic through its own servers. The sockets belong to Steam's library and use Steam's ports; FeverLink3 does not open a listening port of its own for this. Nothing about it needs to be configured by the player.
 - **A relay server operated by the project (fallback, being built).** If Steam cannot connect two games, a relay will carry the traffic: an outgoing connection from each game to the relay. It is not in this version. When it exists, its address will be listed here, and it will only carry the encrypted session frames.
-- **Status of both, plainly:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered (2026-10-10). A connection between two different Steam accounts has not been tested yet; the relay is not finished.
-- **The host does not open an inbound TCP port in normal use.** The command-line development launcher (`feverlink3.exe host`, not used by the in-game window) is the only part that listens on a TCP port, on a port you choose, and only if you type that command yourself.
+- **Status of both, plainly:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered (2026-10-10). A connection between two different Steam accounts, and a whole session carried over it, has not been tested yet; the relay is not finished.
+- **The host does not open an inbound TCP port in normal use.** The command-line development launcher (`feverlink3.exe host`, not used by the in-game window) is the only part that listens on a TCP port (default 28090, or the port you give it), and only if you type that command yourself.
 - **Nothing else leaves the PC.** No analytics, no advertising, no update check, no account.
 
 What the other players receive: the display name you chose (it starts as your Windows user name, so change it if you prefer), your game actions, world checksums, chat lines, and, if you host, the world itself. A player who tests the connection by Steam ID shares that Steam ID with the person they test with.
@@ -106,7 +106,7 @@ With the game running, in PowerShell:
 ```powershell
 $p = (Get-Process TransportFever3).Id
 Get-NetTCPConnection -OwningProcess $p -State Listen      # listening TCP sockets of the game: expect none from FeverLink3
-Get-NetUDPEndpoint   -OwningProcess $p                    # UDP sockets (Steam's networking library uses these)
+Get-NetUDPEndpoint   -OwningProcess $p                    # UDP sockets of the game (these may include Steam's networking sockets)
 Get-NetTCPConnection -OwningProcess $p -State Established # outgoing TCP connections (the game and Steam have their own)
 ```
 
@@ -140,7 +140,7 @@ As a player:
 
 1. Do not turn your antivirus off. Compare the file's hash with the release (above).
 2. If the hash matches and you trust the project: restore the file (Windows Security, Virus and threat protection, Protection history, pick the item, Actions, Restore or Allow) and, if it comes back, add an exclusion for that one file instead of a whole folder. If you do not trust it, run `feverlink3 uninstall`.
-3. Report the false positive, so it is fixed for everyone. The project can only ask for a re-analysis of files it can send; your report with the exact detection name helps.
+3. Report the false positive, so it is fixed for everyone. A report that names the exact detection and carries the file's SHA-256 is the most useful, and vendors take more notice when several people report the same file.
 
 Things in the file that make heuristics suspicious, so you know what to expect: it is a proxy DLL next to a program, it is not signed, it carries no version information, it is new and few people have it (reputation systems distrust rare files), it starts a thread, reads the Steam path from the registry, and uses networking.
 

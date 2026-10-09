@@ -116,4 +116,6 @@ Paste `%LOCALAPPDATA%\FeverLink3` into the Explorer address bar to open the fold
 - **The game does not start after the install:** close Steam's launch attempt and run `feverlink3 uninstall` (or delete `winhttp.dll` from the game folder). Tell the maintainer your game build and Windows version. Known causes to check: a game update (the module can only be used with the game builds it was made for), an antivirus that blocked the file, Windows 11 Smart App Control, or another mod that also uses `winhttp.dll`.
 - **Your antivirus complains about `winhttp.dll`:** the file is a small, open-source proxy that Windows loads for the game. `docs/SECURITY_FOR_USERS.md` explains exactly what it does, how to verify it with a hash, and how to report a false positive.
 
+FeverLink3 builds on two earlier MIT-licensed projects, credited in the README: TpF2 Multiplayer by silver2127 (https://silver2127.github.io/tpf2-multiplayer/) and MPFever by dkdknight / arthur (https://github.com/dkdknight/MPFever).
+
 Contact: Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues

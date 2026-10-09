@@ -78,6 +78,8 @@ Draft text for the description:
 >
 > The DLL is a proxy: it passes the 14 WinHTTP functions that the game imports to the system library unchanged, and starts the session controller. It does not inject into other processes, persist, collect data or download code. The page https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md lists everything it does and does not do and how to verify and remove it. The installer changes only the game folder and the user's game data folder, prints every change, supports `--dry-run`, and has an uninstall command.
 >
+> It is a fresh implementation that builds on the published ideas and findings of two earlier MIT-licensed projects, TpF2 Multiplayer (silver2127) and MPFever (dkdknight), which are credited in the README and in THIRD_PARTY_NOTICES.md.
+>
 > The project started in October 2026 and is maintained by one person. We apply because an unsigned DLL in a game folder triggers SmartScreen, Windows 11 Smart App Control and antivirus heuristics for our users.
 >
 > Repository: https://github.com/AZalshehri7/FeverLink3 - Releases: https://github.com/AZalshehri7/FeverLink3/releases - Licence: MIT.

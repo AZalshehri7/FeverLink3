@@ -142,6 +142,10 @@ The hole-punching, STUN and relay items that used to be listed here are replaced
 - [ ] Players join and leave a world that runs for days
 - [ ] Linux / Proton package for cheap hosting
 
+## Credits
+
+FeverLink3 is a fresh implementation that builds on two earlier MIT-licensed projects: [TpF2 Multiplayer](https://silver2127.github.io/tpf2-multiplayer/) by silver2127 (Transport Fever 2) and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight / arthur (Transport Fever 3). Their licences are in `THIRD_PARTY_NOTICES.md`.
+
 ## What gates the first release
 
 `v0.2.0-test1` is published only when the owner decides, and after:
