@@ -77,6 +77,7 @@ local function setup(react, builtin)
 		local typed = react.useState("")
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
+		local steamIn = react.useState("")
 		react.onStepTimer(function()
 			local a = poll()
 			local b = pollCtl()
@@ -105,6 +106,28 @@ local function setup(react, builtin)
 			add(text("Or join a friend"))
 			add(field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end))
 			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end))
+
+			-- Steam connection test: can two players reach each other through Steam, without any router setup?
+			local st = ctl.steam
+			add(gap())
+			add(text("Steam connection test", "font-scale-title-3"))
+			if st and st.id then
+				add(text("Your Steam ID (send it to a friend, who pastes it below):", "font-scale-body"))
+				add(field("your Steam ID", tostring(st.id), function() end, true))
+			else
+				add(text("Steam: " .. tostring(st and st.state or "unknown"), "font-scale-body"))
+			end
+			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
+			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
+			if st and st.note then add(text(tostring(st.note), "font-scale-body")) end
+			if st and st.test then
+				local t = st.test
+				local line = "Test: " .. tostring(t.state) .. ", answers " .. tostring(t.pongs)
+				if t.rtt then line = line .. ", last round trip " .. tostring(t.rtt) .. " ms" end
+				if t.route and t.route ~= "" then line = line .. ", " .. tostring(t.route) end
+				add(text(line, "font-scale-body"))
+			end
+			if st and st.pings and st.pings > 0 then add(text("Pings received from other players: " .. tostring(st.pings), "font-scale-body")) end
 		elseif state == "hosting" then
 			add(text("You are hosting", "font-scale-title-2"))
 			add(text("Send this join code to the other players (click it, Ctrl+A, Ctrl+C):"))

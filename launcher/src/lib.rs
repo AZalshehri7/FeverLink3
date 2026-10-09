@@ -28,6 +28,7 @@ pub mod resync;
 pub mod selftest;
 pub mod session;
 pub mod steam;
+pub mod steamnet;
 pub mod update;
 pub mod upnp;
 

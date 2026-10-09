@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle};
-use crate::{luatext, net, resync, steam, upnp};
+use crate::{luatext, net, resync, steam, steamnet, upnp};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
@@ -97,6 +97,8 @@ pub struct Controller {
     save_dirs: Vec<PathBuf>,
     commands: Tail,
     state: State,
+    steam: Option<steamnet::Probe>,
+    steam_note: Option<String>,
     published: String,
     version: u64,
 }
@@ -120,6 +122,8 @@ impl Controller {
             save_dirs,
             commands,
             state: State::Idle,
+            steam: steamnet::Probe::load(),
+            steam_note: None,
             published: String::new(),
             version: 0,
         };
@@ -137,6 +141,9 @@ impl Controller {
             self.command(&line.kind, &params);
         }
         self.advance();
+        if let Some(probe) = &mut self.steam {
+            probe.poll();
+        }
         self.publish();
     }
 
@@ -145,6 +152,14 @@ impl Controller {
             "host" => self.host(params),
             "join" => self.join(params),
             "leave" => self.leave(),
+            "steamtest" => {
+                let id = params.get("id").and_then(Value::as_str).and_then(steamnet::parse_steam_id);
+                match (&mut self.steam, id) {
+                    (Some(probe), Some(id)) => probe.test(id),
+                    (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),
+                    (None, _) => self.steam_note = Some("Steam networking is not available in this game".into()),
+                }
+            }
             "start" | "pause" | "speed" | "check" | "resync" => {
                 if let State::Hosting(h) = &self.state {
                     let handle = &h.handle;
@@ -294,6 +309,7 @@ impl Controller {
     /// The status as the window reads it, without the version counter.
     fn status_json(&self) -> Value {
         let mut v = json!({ "state": "idle", "name": self.default_name });
+        v["steam"] = self.steam_json();
         match &self.state {
             State::Idle => {}
             State::Failed(why) => {
@@ -344,6 +360,30 @@ impl Controller {
         if write_replacing(&self.dir.join(STATUS_FILE), &lua).is_ok() {
             self.published = text;
         }
+    }
+
+    fn steam_json(&self) -> Value {
+        let Some(probe) = &self.steam else {
+            return json!({ "state": "not available", "note": self.steam_note });
+        };
+        let r = probe.report();
+        let mut v = json!({
+            "state": r.state,
+            "id": r.steam_id.map(|id| id.to_string()),
+            "events": r.events,
+            "pings": r.pings_received,
+            "note": self.steam_note,
+        });
+        if let Some(t) = r.test {
+            v["test"] = json!({
+                "target": t.target.to_string(),
+                "state": t.state,
+                "pongs": t.pongs,
+                "rtt": t.last_rtt_ms,
+                "route": t.route,
+            });
+        }
+        v
     }
 
     /// For tests: the current state's name.
