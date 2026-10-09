@@ -513,6 +513,29 @@ impl Event {
         }
     }
 
+    /// A line for the module's own log, for a person reading it; `None` for events only the mod needs.
+    pub fn log_line(&self) -> Option<String> {
+        Some(match self {
+            Event::Ready { build, hooks, poolpatch, clock, .. } => format!(
+                "event ready: build {build}, hooks [{}], poolpatch {}, game clock {}",
+                hooks.join(", "),
+                if *poolpatch { "applied" } else { "off" },
+                if *clock { "yes" } else { "no" }
+            ),
+            Event::Held { id, kind, site, .. } => {
+                format!("event held: command {id}, kind {kind}, from tool site {site:#x}")
+            }
+            Event::Released { id, reason, .. } => format!("event released: command {id} ({reason})"),
+            Event::Dropped { id, reason } => format!("event dropped: command {id} ({reason})"),
+            Event::Applied { id, ok } => format!("event applied: command {id}, accepted by the engine: {ok}"),
+            Event::Holding { on, kinds, reason } => {
+                format!("event holding {} ({reason}) [{}]", if *on { "on" } else { "off" }, kinds.join(", "))
+            }
+            Event::Error { place, detail } => format!("event error [{place}]: {detail}"),
+            Event::Audit { .. } | Event::Pong { .. } => return None,
+        })
+    }
+
     pub fn payload(&self) -> String {
         let v = match self {
             Event::Ready { build, version, hooks, poolpatch, clock, kinds, sites } => Lua::map([

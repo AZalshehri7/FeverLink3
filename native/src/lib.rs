@@ -24,11 +24,17 @@ pub mod plan;
 pub mod scan;
 
 #[cfg(windows)]
+pub mod engine;
+#[cfg(windows)]
 pub mod log;
 #[cfg(windows)]
 pub mod mem;
 #[cfg(windows)]
 pub mod proxy;
+#[cfg(windows)]
+pub mod runtime;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod selftest;
 
 /// Environment variable the launcher sets on the game process. Absent: the module is a plain proxy.
 pub const SESSION_DIR_VAR: &str = "FEVERLINK3_SESSION_DIR";

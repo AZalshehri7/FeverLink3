@@ -278,6 +278,7 @@ mod fake_game {
     use super::*;
     use crate::mem::pages::Pages;
     use crate::mem::protection_of;
+    use crate::selftest::{SUM5, SUM5_PROLOGUE, TOOL, TOOL_RETURN};
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, PAGE_READONLY};
 
@@ -291,37 +292,6 @@ mod fake_game {
         0x5D, // pop rbp
         0xC3, // ret
     ];
-
-    /// `fn(a, b, c, d, e) -> a + b + c + d + e` with `e` on the stack, like `CommandList::Add`'s fifth argument. The
-    /// first 16 bytes build the frame; `e` is read after them, through the `rbp` they set up.
-    const SUM5: &[u8] = &[
-        0x55, // push rbp
-        0x48, 0x89, 0xE5, // mov rbp, rsp
-        0x48, 0x89, 0xC8, // mov rax, rcx
-        0x48, 0x01, 0xD0, // add rax, rdx
-        0x4C, 0x01, 0xC0, // add rax, r8
-        0x4C, 0x01, 0xC8, // add rax, r9
-        0x48, 0x03, 0x45, 0x30, // add rax, [rbp+0x30]
-        0x5D, // pop rbp
-        0xC3, // ret
-    ];
-    const SUM5_PROLOGUE: usize = 16;
-
-    /// A caller of a five-argument function, like a construction tool calling `CommandList::Add`:
-    /// `fn(callee) -> callee(1, 2, 3, 4, 5)`. The return address of its `call` is at offset [`TOOL_RETURN`].
-    const TOOL: [u8; 45] = [
-        0x48, 0x83, 0xEC, 0x38, // sub rsp, 0x38
-        0x48, 0x89, 0xC8, // mov rax, rcx
-        0xB9, 0x01, 0, 0, 0, // mov ecx, 1
-        0xBA, 0x02, 0, 0, 0, // mov edx, 2
-        0x41, 0xB8, 0x03, 0, 0, 0, // mov r8d, 3
-        0x41, 0xB9, 0x04, 0, 0, 0, // mov r9d, 4
-        0x48, 0xC7, 0x44, 0x24, 0x20, 0x05, 0, 0, 0, // mov qword [rsp+0x20], 5
-        0xFF, 0xD0, // call rax
-        0x48, 0x83, 0xC4, 0x38, // add rsp, 0x38
-        0xC3, // ret
-    ];
-    const TOOL_RETURN: usize = 40;
 
     type Sum = extern "system" fn(u64, u64) -> u64;
     type Sum5 = extern "system" fn(u64, u64, u64, u64, u64) -> u64;
