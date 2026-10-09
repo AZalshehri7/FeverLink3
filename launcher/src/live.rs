@@ -162,7 +162,12 @@ impl Controller {
             "join" => self.join(params),
             "leave" => self.leave(),
             "steamtest" => {
-                let id = params.get("id").and_then(Value::as_str).and_then(steamnet::parse_steam_id);
+                let text = params.get("id").and_then(Value::as_str).unwrap_or("").trim();
+                // the window has no button for the transport self-check: typing `loop` where the Steam ID goes starts it
+                if text.eq_ignore_ascii_case("loop") {
+                    return self.steam_loop();
+                }
+                let id = steamnet::parse_steam_id(text);
                 match (&mut self.steam, id) {
                     (Some(probe), Some(id)) => probe.test(id),
                     (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),
@@ -668,7 +673,9 @@ mod tests {
             w.status()["steam"]["note"].as_str().is_some_and(|n| n.contains("not available"))
         }));
         assert_eq!(w.status()["steam"]["state"], "not available");
+        // `loop` in the Steam ID field of the test starts the same check; a real ID is a normal test
         w.send("steamtest", "{[\"id\"]=\"76561198869158889\"}");
+        w.send("steamtest", "{[\"id\"]=\" Loop \"}");
         c.step();
         assert_eq!(w.status()["steam"]["state"], "not available");
     }

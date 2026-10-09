@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn a_savegame_chunk_fits_in_a_steam_message_with_room_to_spare() {
         let biggest = largest_chunk_frame();
-        assert!(biggest > 349_000, "base64 of 256 KiB is about 350 KB: {biggest}");
+        assert_eq!(biggest, 349_704, "the worst case the docs and the self-check quote");
         assert!(biggest + 100_000 < MAX_MESSAGE, "{biggest} bytes against Steam's {MAX_MESSAGE}");
         // Steam's message limit is the tighter of the two
         const { assert!(MAX_MESSAGE < FrameCodec::LENGTH_FIELD_SIZE + FrameCodec::MAX_FRAME_LENGTH) };
