@@ -49,7 +49,8 @@ pub struct ChallengeMessage {
     pub version: String,
 }
 
-/// Connection to host: display name and `HMAC-SHA256(sessionKey, nonce ‖ UTF8(name))`.
+/// Connection to host: display name and `HMAC-SHA256(sessionKey, nonce ‖ UTF8(name))`. A player whose connection
+/// dropped adds `resume` to ask for its old id and slot back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinMessage {
@@ -57,6 +58,25 @@ pub struct JoinMessage {
     pub version: String,
     #[serde(with = "base64_bytes")]
     pub proof: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeClaim>,
+}
+
+impl JoinMessage {
+    pub fn new(name: &str, version: &str, proof: Vec<u8>) -> Self {
+        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None }
+    }
+}
+
+/// "I am player `id`": `HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ u16 id ‖ UTF8(name))` with the token from
+/// the player's earlier welcome and the nonce of this connection's challenge. The token itself never travels again,
+/// and a claim cannot be replayed on another connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeClaim {
+    pub id: u16,
+    #[serde(with = "base64_bytes")]
+    pub mac: Vec<u8>,
 }
 
 /// Host to a connection it will close. Reasons: `bad-proof`, `version`, `full`, `malformed`.
@@ -109,6 +129,36 @@ pub struct WelcomeMessage {
     pub version: String,
     pub players: Vec<PlayerInfo>,
     pub session: SessionState,
+    /// What this player needs to get its id and slot back after a lost connection. Read by the player's session
+    /// layer only; it is not passed on to the game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeGrant>,
+    /// The player came back with a valid claim and holds the id it had before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resumed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The secret that lets a player come back as itself. Sealed inside the welcome, so only holders of the session key
+/// see it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeGrant {
+    #[serde(with = "base64_bytes")]
+    pub token: Vec<u8>,
+    /// Which use of this id this is: 0 for the first connection, one more for each return. The player's frame
+    /// counters start at `epoch << 40`, so a nonce is never used twice under the session key and the host's replay
+    /// window sees the new connection's frames as newer than the old one's.
+    pub epoch: u32,
+}
+
+impl std::fmt::Debug for ResumeGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeGrant").field("token", &"..").field("epoch", &self.epoch).finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +172,9 @@ pub struct PlayerJoinedMessage {
 pub struct PlayerLeftMessage {
     pub id: u16,
     pub name: String,
+    /// The connection was lost and the host holds the slot for a return; the player is not gone for good.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub away: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,7 +226,24 @@ pub struct ResyncLoadMessage {
     pub sha256: String,
 }
 
+/// Host to one player (kind 21): answer with a [`PongMessage`] carrying the same `n`. `rtt` is what the host last
+/// measured for every player, in milliseconds, so each player can show everyone's round-trip time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PingMessage {
+    pub n: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rtt: BTreeMap<u16, f64>,
+}
+
 // ---- player -> host
+
+/// Answer to a [`PingMessage`] (kind 37), sent by the player's session layer, not by its game.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PongMessage {
+    pub n: u32,
+}
 
 /// The game has loaded a savegame and runs the mod. `time` is its game time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +375,10 @@ pub enum PlayerSet {
 }
 
 impl PlayerSet {
+    pub fn is_everyone(&self) -> bool {
+        matches!(self, Self::Everyone)
+    }
+
     pub fn allows(&self, player: u16) -> bool {
         player == 0
             || match self {
@@ -327,16 +401,20 @@ pub struct Permissions {
     pub spend: PlayerSet,
     #[serde(default)]
     pub speed: PlayerSet,
+    /// Actions of category `other` (renames, colours, line and vehicle settings). Left out of the message while it
+    /// is `everyone`.
+    #[serde(default, skip_serializing_if = "PlayerSet::is_everyone")]
+    pub other: PlayerSet,
 }
 
 impl Permissions {
-    /// Whether `player` may perform an action of `category` (`other` is never restricted).
+    /// Whether `player` may perform an action of `category`; any category but the first three counts as `other`.
     pub fn allows_action(&self, category: &str, player: u16) -> bool {
         match category {
             "build" => self.build.allows(player),
             "bulldoze" => self.bulldoze.allows(player),
             "spend" => self.spend.allows(player),
-            _ => true,
+            _ => self.other.allows(player),
         }
     }
 }

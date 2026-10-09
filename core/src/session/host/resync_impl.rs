@@ -102,15 +102,16 @@ impl HostSession {
         self.resync_step();
     }
 
-    pub(super) fn on_new_player(&mut self) {
+    /// A player joined (`new player`) or came back (`player returned`): a started session gets a round for it.
+    pub(super) fn on_new_player(&mut self, reason: &'static str) {
         if !self.state.started {
             return;
         }
         match &self.resync {
-            None => self.begin_resync("new player"),
+            None => self.begin_resync(reason),
             Some(r) if r.participants.is_some() => {
-                self.pending_new_player = true;
-                self.log("new player waits for the next resync round".to_owned());
+                self.pending_new_player = Some(reason);
+                self.log(format!("{reason} waits for the next resync round"));
             }
             Some(_) => {}
         }
@@ -390,8 +391,8 @@ impl HostSession {
     }
 
     fn start_pending(&mut self) {
-        if std::mem::take(&mut self.pending_new_player) {
-            self.begin_resync("new player");
+        if let Some(reason) = self.pending_new_player.take() {
+            self.begin_resync(reason);
         }
     }
 

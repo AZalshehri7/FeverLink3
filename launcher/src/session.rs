@@ -885,8 +885,14 @@ mod tests {
                 assert_eq!(message_kind_for(r.name), Some(r.kind));
             }
         }
+        // pings, pongs, leaving and being removed are the session layer's own talk: the game never sees them
+        let session_layer = [MessageKind::Ping, MessageKind::Pong, MessageKind::Leave, MessageKind::Kicked];
         for k in MessageKind::FROM_PLAYER {
-            assert!(LINE_KINDS.iter().any(|r| r.kind == k && r.from_game), "{k:?} has a line kind");
+            assert_eq!(!session_layer.contains(&k), LINE_KINDS.iter().any(|r| r.kind == k && r.from_game), "{k:?}");
+        }
+        for k in session_layer {
+            assert!(LINE_KINDS.iter().all(|r| r.kind != k), "{k:?} has no line kind");
+            assert!(to_game_line(k, b"{}").is_none(), "{k:?} is never written to the game");
         }
         // nothing a player could not send, and nothing unsealed
         for r in LINE_KINDS.iter().filter(|r| r.from_game) {
