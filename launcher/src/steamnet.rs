@@ -279,6 +279,9 @@ pub struct TestReport {
     pub route: String,
     /// Steam's own round-trip estimate for the connection, without the probe's polling.
     pub ping_ms: Option<u32>,
+    /// The rate Steam sends at, bytes per second: 1 048 576 when the send-rate tuning took effect, Steam's own
+    /// 262 144 when it did not.
+    pub send_rate: Option<u32>,
 }
 
 /// A player who connected to our probe.
@@ -287,6 +290,7 @@ pub struct PeerReport {
     pub steam_id: Option<u64>,
     pub route: String,
     pub ping_ms: Option<u32>,
+    pub send_rate: Option<u32>,
 }
 
 /// Parses the Steam ID a player pasted: digits only (the 17-digit `steamID64`).
@@ -338,6 +342,7 @@ struct TestConn {
     sent: u32,
     route: String,
     ping_ms: Option<u32>,
+    send_rate: Option<u32>,
     state: String,
 }
 
@@ -523,6 +528,7 @@ impl Probe {
             }
             if let Some(t) = state.test.as_mut().filter(|t| t.conn == conn) {
                 t.ping_ms = link.ping_ms;
+                t.send_rate = Some(link.send_rate).filter(|rate| *rate > 0);
                 let route = link.route.text();
                 if t.route != route {
                     let change =
@@ -575,6 +581,7 @@ impl Probe {
                     sent: 0,
                     route: String::new(),
                     ping_ms: None,
+                    send_rate: None,
                     state: "connecting".into(),
                 });
             }
@@ -595,6 +602,7 @@ impl Probe {
                 last_rtt_ms: t.last_rtt_ms,
                 route: t.route.clone(),
                 ping_ms: t.ping_ms,
+                send_rate: t.send_rate,
             }),
             pings_received: state.pings_received,
             peers: state
@@ -604,6 +612,7 @@ impl Probe {
                     steam_id: p.steam_id,
                     route: p.link.map_or_else(String::new, |l| l.route.text().to_string()),
                     ping_ms: p.link.and_then(|l| l.ping_ms),
+                    send_rate: p.link.map(|l| l.send_rate).filter(|rate| *rate > 0),
                 })
                 .collect(),
         }
@@ -869,6 +878,7 @@ mod tests {
         });
         let tested = probe_a.report();
         let test = tested.test.expect("a test");
+        assert_eq!(test.send_rate, Some(Config::default().send_rate as u32), "the tuned send rate is in force");
         assert_eq!((test.state.as_str(), test.route.as_str()), ("connected", "direct"));
         assert!(test.last_rtt_ms.is_some_and(|ms| ms < 1000), "{test:?}");
         assert!(tested.events.iter().any(|e| e == "test connection established"), "{:?}", tested.events);
@@ -882,7 +892,12 @@ mod tests {
         assert_eq!(answered.pings_received, 1);
         assert_eq!(
             answered.peers,
-            vec![PeerReport { steam_id: Some(a.steam_id()), route: "direct".into(), ping_ms: Some(95) }]
+            vec![PeerReport {
+                steam_id: Some(a.steam_id()),
+                route: "direct".into(),
+                ping_ms: Some(95),
+                send_rate: Some(Config::default().send_rate as u32),
+            }]
         );
         assert!(answered.events.iter().any(|e| e == "a player connected"));
         assert!(answered.events.iter().any(|e| e == "received a ping, answered"));

@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle};
-use crate::{luatext, net, resync, steam, steamnet, upnp};
+use crate::{luatext, net, resync, steam, steam_transport, steamnet, upnp};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
@@ -90,6 +90,13 @@ impl Hosting {
     }
 }
 
+/// The Steam transport self-check (`steamloop`): it runs on a thread of its own and leaves its lines here.
+#[derive(Default)]
+struct LoopCheck {
+    running: bool,
+    checks: Vec<steam_transport::Check>,
+}
+
 /// The controller. [`Controller::step`] is called every ~100 ms by [`spawn`], or by a test.
 pub struct Controller {
     dir: PathBuf,
@@ -99,6 +106,7 @@ pub struct Controller {
     state: State,
     steam: Option<steamnet::Probe>,
     steam_note: Option<String>,
+    steam_loop: Arc<Mutex<LoopCheck>>,
     published: String,
     version: u64,
 }
@@ -124,6 +132,7 @@ impl Controller {
             state: State::Idle,
             steam: steamnet::Probe::load(),
             steam_note: None,
+            steam_loop: Arc::default(),
             published: String::new(),
             version: 0,
         };
@@ -160,6 +169,7 @@ impl Controller {
                     (None, _) => self.steam_note = Some("Steam networking is not available in this game".into()),
                 }
             }
+            "steamloop" => self.steam_loop(),
             "start" | "pause" | "speed" | "check" | "resync" => {
                 if let State::Hosting(h) = &self.state {
                     let handle = &h.handle;
@@ -177,6 +187,26 @@ impl Controller {
             }
             _ => {}
         }
+    }
+
+    /// Starts the Steam transport self-check on a thread of its own, unless one is running.
+    fn steam_loop(&mut self) {
+        let Some(core) = self.steam.as_ref().and(steamnet::global()) else {
+            self.steam_note = Some("Steam networking is not available in this game".into());
+            return;
+        };
+        {
+            let mut state = self.steam_loop.lock().unwrap_or_else(|p| p.into_inner());
+            if state.running {
+                return;
+            }
+            *state = LoopCheck { running: true, checks: Vec::new() };
+        }
+        let shared = Arc::clone(&self.steam_loop);
+        thread::spawn(move || {
+            let checks = steam_transport::loopback_check(&core);
+            *shared.lock().unwrap_or_else(|p| p.into_inner()) = LoopCheck { running: false, checks };
+        });
     }
 
     fn name_from(&self, params: &Value) -> String {
@@ -382,13 +412,24 @@ impl Controller {
                 "rtt": t.last_rtt_ms,
                 "route": t.route,
                 "ping": t.ping_ms,
+                "rate": t.send_rate,
             });
         }
         v["peers"] = json!(r
             .peers
             .iter()
-            .map(|p| json!({ "id": p.steam_id.map(|id| id.to_string()), "route": p.route, "ping": p.ping_ms }))
+            .map(|p| json!({
+                "id": p.steam_id.map(|id| id.to_string()),
+                "route": p.route,
+                "ping": p.ping_ms,
+                "rate": p.send_rate,
+            }))
             .collect::<Vec<_>>());
+        let looped = self.steam_loop.lock().unwrap_or_else(|p| p.into_inner());
+        if looped.running || !looped.checks.is_empty() {
+            let checks = looped.checks.iter().map(|c| json!({ "name": c.name, "ok": c.ok, "detail": c.detail }));
+            v["loop"] = json!({ "running": looped.running, "checks": checks.collect::<Vec<_>>() });
+        }
         v
     }
 
@@ -615,6 +656,21 @@ mod tests {
         w.send("host", "{[\"port\"]=0}");
         c.step();
         assert_eq!(w.status()["code"], code);
+    }
+
+    #[test]
+    fn the_steam_commands_say_so_when_the_game_has_no_steam() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
+        let mut w = Window::new(t.path());
+        w.send("steamloop", "{}");
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || {
+            w.status()["steam"]["note"].as_str().is_some_and(|n| n.contains("not available"))
+        }));
+        assert_eq!(w.status()["steam"]["state"], "not available");
+        w.send("steamtest", "{[\"id\"]=\"76561198869158889\"}");
+        c.step();
+        assert_eq!(w.status()["steam"]["state"], "not available");
     }
 
     #[test]

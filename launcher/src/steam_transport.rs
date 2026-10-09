@@ -707,6 +707,9 @@ impl fmt::Debug for SteamHostNet {
     }
 }
 
+mod selfcheck;
+pub use selfcheck::{loopback_check, Check};
+
 #[cfg(test)]
 mod session_tests;
 
