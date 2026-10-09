@@ -1,4 +1,8 @@
 title: FeverLink3
-description: Cooperative multiplayer for Transport Fever 3
+description: Cooperative multiplayer for Transport Fever 3 (early test build, open source)
 theme: jekyll-theme-cayman
 show_downloads: false
+lang: en
+# Listing material for maintainers (paste-ready store text, publishing checklist); not part of the public site.
+exclude:
+  - nexus
