@@ -6,8 +6,9 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] Length-prefixed framing with size limit
 - [x] Sealed channel: AES-256-GCM, HKDF session key, replay window
 - [x] Join codes: base32, version, addresses, secret, checksum
-- [ ] Session state machine (host and player sides) with in-memory transport tests
-- [ ] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
+- [x] Session state machine (host and player sides) with in-memory transport tests
+- [x] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
+- [ ] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
 - [x] CI on every push
 
 ## 0.2 — Launcher
@@ -19,12 +20,14 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256
 - [ ] In-app updater with Ed25519-signed releases; version carried in the join code
 - [ ] First-run install and one-button uninstall of the game-side pieces
+- [ ] Project site on GitHub Pages (`docs/`): download, how to play, known issues, privacy
 
 ## 0.3 — Game side
 - [ ] Native module: build table, command-list hook, hold/release, single-worker script pool
 - [ ] Lua mod: stamping, barrier, replay, checksums, deterministic random
 - [ ] Lua lockstep test with lupa
 - [ ] First playable: two players, shared company, roads and vehicles
+- [ ] First public release: GitHub Releases zip, Nexus Mods listing, site updated
 
 ## 0.4 — Everything a player does
 - [ ] Constructions against streets, upgrades, signals, decorations, terrain
