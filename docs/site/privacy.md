@@ -14,16 +14,18 @@ Nothing. The program does not report to the project: no telemetry, no crash repo
 
 ## What other players receive in a session
 
+Sessions over Steam arrive in the next test build; this is what they are designed to share.
+
 - The display name you use. It starts as your Windows user name; the window has a name field, so change it before hosting or joining if you prefer another.
 - Your game actions, world checksums and chat lines.
 - If you host: your world, as a savegame, when a player joins or you press "Sync everyone to my world".
 - If you use the Steam connection test: the Steam ID you paste or share. A Steam ID identifies your Steam account. Share it only with the person you are testing with.
 
-Everything in a session is encrypted and authenticated with a key derived from the join code. Anyone who has the join code can join, so treat it like a password for that session.
+A join code contains the session secret, the time it was made and how to reach the host (for sessions over Steam, the host's Steam ID). Everything in a session is encrypted and authenticated with a key derived from the secret in the code. Anyone who has the join code can join, so treat it like a password for that session.
 
 ## What the connection reveals
 
-Players are connected through Steam's peer-to-peer networking. Steam decides whether two games talk directly or through its relay servers; Steam's own documentation says that relayed connections do not reveal the players' IP addresses to each other, and a direct connection, like any direct connection between two computers, does. The in-game connection test shows which route was used ("direct" or "through a Steam relay"). Steam sees which Steam IDs connect to each other, as it does for any Steam game. This is being tested; the first two-account test is still to come. A relay server operated by the project is being built as a fallback; when it exists, this page will say what it can and cannot see.
+Players are connected through Steam's peer-to-peer networking. Steam decides whether two games talk directly or through its relay servers; Steam's own documentation says that relayed connections do not reveal the players' IP addresses to each other, and a direct connection, like any direct connection between two computers, does. The in-game connection test shows which route was used ("direct" or "through a Steam relay"). Steam sees which Steam IDs connect to each other, as it does for any Steam game. This is being tested; the first two-account test is still to come. If the project ever adds a server of its own to the path, this page will say so and say what it can and cannot see.
 
 ## Websites
 

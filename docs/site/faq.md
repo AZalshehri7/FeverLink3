@@ -11,8 +11,11 @@ Last updated 2026-10-10, for the test build 0.2.0-test1. [Back to the start page
 **What is FeverLink3?**
 An unofficial, open-source (MIT) mod for Transport Fever 3 that aims to let several players build in one world at the same time, each in their own copy of the game. It is an early test build.
 
+**What is the first test build for?**
+It has one job: to find out whether two players can reach each other through Steam. Its in-game window has a Steam connection test, which two testers run against each other. Hosting and joining a game over that connection come in the next test build, and building together after that.
+
 **Does it work?**
-Partly, and we say exactly which part. Verified in the real game (build 40420, 2026-10-09): the mod loads, its window opens from a button in the bottom bar, "Host a game" starts a session inside the game and shows a join code, a test client (not a second copy of the game) can join by the code, and the mod can drive the game's own save and load. On 2026-10-10 the game also opened a Steam peer-to-peer connection to its own Steam ID inside one process and 6 pings were answered. Not verified yet: building together between two real games, sending the world to a second real game, joining from a second real copy of the game, and the Steam connection between two different accounts. See the [status page](status.html).
+Partly, and we say exactly which part. Verified in the real game (build 40420, 2026-10-09): the mod loads, its window opens from a button in the bottom bar, and the mod can drive the game's own save and load. With an earlier build of the window, whose Host button used a direct connection (since taken out of the window), hosting showed a join code and a test client (not a second copy of the game) could join. On 2026-10-10 the game opened a Steam peer-to-peer connection to its own Steam ID inside one process and 6 pings were answered. Not verified yet: the Steam connection between two different accounts, hosting and joining over Steam (not finished), building together between two real games, sending the world to a second real game, and joining from a second real copy of the game. See the [status page](status.html).
 
 **Who makes it? Is it official?**
 It is made by Abdulaziz Alshehri (Discord `azalshehri`). It is not made, endorsed or supported by Urban Games or Paradox Interactive.
@@ -32,13 +35,13 @@ No. For Transport Fever 2 see TpF2 Multiplayer above.
 Windows 10 or 11 (64-bit); Transport Fever 3 on Steam, one copy per player, started through Steam with Steam running; the same game version as the host (the test build was made for build 40420). Consoles, macOS and Linux are not supported: the native part is a Windows DLL.
 
 **How do the players connect?**
-Through Steam's peer-to-peer networking, with a relay server as a fallback that is being built. The join code is all a friend needs, and by design nothing has to be set up. This is being tested: inside one game it is proven, between two different Steam accounts it has not been tried yet, so nobody should assume it works over the internet today. If you want to help, [Playing FeverLink3](../PLAYING.html) describes the in-game connection test.
+Through Steam's peer-to-peer networking. The join code is all a friend needs, and by design nothing has to be set up. This is being tested: inside one game it is proven, between two different Steam accounts it has not been tried yet, so nobody should assume it works over the internet today. If you want to help, [Playing FeverLink3](../PLAYING.html) describes the in-game connection test.
 
 **How many players?**
 The design is for several players. Only two-person tests are planned first, and none has been done between two real games yet.
 
 **Does everyone need the mod?**
-Yes, every player installs it. A player who joins does not need to prepare a world: the host's world is meant to be sent to them (not verified yet).
+Yes, every player installs it. A player who joins will not need to prepare a world: the host's world is meant to be sent to them (hosting and joining over Steam are the next test build).
 
 **Can I use other mods?**
 Not tested. All games must run the same simulation, so every player should have the same mods as the host.
@@ -75,10 +78,10 @@ Join only people you know. Your game loads the host's world, and a Transport Fev
 ## Getting it
 
 **Where do I download it?**
-From the [GitHub releases page](https://github.com/AZalshehri7/FeverLink3/releases). The first test build, 0.2.0-test1, is a pre-release. A Nexus Mods page is planned.
+From the [GitHub releases page](https://github.com/AZalshehri7/FeverLink3/releases). The first test build, 0.2.0-test1, is a pre-release containing a testing installer, the native module and the mod. A Nexus Mods page is planned.
 
-**Why is it not on the Steam Workshop or the in-game Mod Hub?**
-Transport Fever 3 has no Steam Workshop (the developers' support page says so). Its in-game Mod Hub runs on mod.io, and the published mod rules allow only the official scripting API and no executable files, so a mod that needs a native DLL is not expected to fit. [The plan](../WORKSHOP.html) lists the options and the open questions.
+**Will it come to the in-game Mod Hub or the Steam Workshop?**
+Transport Fever 3 has no Steam Workshop (the developers' support page says so). The plan is to offer the mod in the game's own Mod Hub (which runs on mod.io) and on Nexus Mods like any other mod, with the native module as a separate download for now, and the installer then only for testing. Whether the Mod Hub accepts a mod that needs a separate native component is still being checked: its published rules allow only the official scripting API and no executable files. [The plan](../WORKSHOP.html) lists the options and the open questions.
 
 **How do I uninstall?**
 Close the game and run `feverlink3 uninstall`. The steps, including the optional clean-up of logs and sync files, are in [Playing FeverLink3](../PLAYING.html) and in the security page.

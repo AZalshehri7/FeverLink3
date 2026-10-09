@@ -6,7 +6,8 @@ files, the game process, and the network. The protocol itself (framing, sealing,
 core crate; this crate moves bytes between sockets, the state machines and the game's files.
 
 The crate has two faces. The `feverlink3` executable is the installer (`install`, `uninstall`, `doctor`) and a
-development tool (`host`, `join`, `selftest`). The same library also runs **inside the game process**: the native
+development tool (`host`, `join`, `selftest`); it stays a testing tool, because the end state is the mod coming
+from the in-game Mod Hub or Nexus Mods with the native module delivered separately (`docs/WORKSHOP.md`). The same library also runs **inside the game process**: the native
 module (`winhttp.dll`, crate `feverlink3_native`) links it and calls [`live::spawn`](src/live.rs), which is how a
 player hosts or joins from the in-game window without any terminal (see "Live mode" below). The in-game window
 itself is the Lua mod's (`mod/feverlink3_1`); this crate has no window of its own, and a guided installer is a

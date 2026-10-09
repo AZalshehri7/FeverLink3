@@ -61,7 +61,7 @@ Both directions are worth trying (A tests B, then B tests A). Both players need 
 
 ## 4. Hosting and joining (next test build)
 
-Hosting and joining a game with a join code will travel over the same Steam connection. They arrive in the next test build; until then **Host a game** answers "Hosting over Steam is not finished in this build yet". The flow will be: the host clicks **Host a game**, copies the join code and sends it to a friend, who pastes it into **paste the join code here** and presses **Join**; the host's world is then sent to the friend and loads. There will be nothing to forward, open or configure.
+Hosting and joining a game with a join code will travel over the same Steam connection. They arrive in the next test build; until then **Host a game** answers that hosting over Steam is not finished in this build yet. The flow will be: the host clicks **Host a game**, copies the join code and sends it to a friend, who pastes it into **paste the join code here** and presses **Join**; the host's world is then sent to the friend and loads. There will be nothing to forward, open or configure.
 
 Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod. Treat a join code like a password for that session.
 

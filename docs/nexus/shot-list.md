@@ -22,13 +22,13 @@ For the person who drives the game. Each entry says what to capture, the exact s
 
 | ID | Title | Can be captured today? |
 |---|---|---|
-| S01 | Cover image: the hosting window over a town | yes |
+| S01 | Cover image: the window with the connection test result, over a town | yes |
 | S02 | Main menu with the game build number | yes |
 | S03 | The mod in the mod list, activated | yes |
 | S04 | The FeverLink3 button in the bottom bar | yes |
 | S05 | The window before a session (host, join, Steam test) | yes |
-| S06 | The window while hosting | yes |
-| S07 | GIF: open the window, host, copy the code | yes |
+| S06 | The window after pressing Host a game: the "not finished" answer | yes, optional (honest about the scope) |
+| S07 | GIF: open the window and run the connection test against your own Steam ID | yes |
 | S08 | Steam connection test against your own Steam ID | yes (one game, own ID; say so) |
 | S09 | `feverlink3 doctor` | yes |
 | S10 | `feverlink3 install` | yes |
@@ -36,16 +36,17 @@ For the person who drives the game. Each entry says what to capture, the exact s
 | S12 | The SmartScreen prompt and "Run anyway" | yes, needs a browser download |
 | S13 | `native.log` | yes |
 | S14 | `feverlink3 uninstall` | yes |
-| S15 | Two players in one session | **blocked: needs two real games (P8)** |
+| S15 | Two players in one session | **blocked: needs hosting over Steam (P7) and two real games (P8)** |
 | S16 | GIF: a road built in one game appears in the other | **blocked: needs command replication (P9)** |
-| S17 | Steam connection test between two accounts | **blocked: needs the first two-account test (P6)** |
+| S17 | Steam connection test between two accounts | **blocked: needs the first two-account test (P6); this is the headline picture of the page** |
 
 ## S01 - Cover image
 
 - **Purpose:** the thumbnail. Name: `nexus-01-cover.png`, 1920x1080.
-- **Steps:** start a new game with the mod activated (setup above). Move the camera over a town with some roads so the picture is not empty. Click **FeverLink3** in the bottom bar, click **Host a game**, wait for "You are hosting" and the join code to appear, drag the window to a side so it does not hide the town. Take the screenshot with the bar and the window visible. Then press **Stop hosting**.
-- **Hide:** the join code (it is a live credential until you press Stop hosting).
-- **Caption:** "The FeverLink3 window while hosting a game (test build 0.2.0-test1)."
+- **Steps:** start a new game with the mod activated (setup above). Move the camera over a town with some roads so the picture is not empty. Click **FeverLink3** in the bottom bar and run the Steam connection test as in S08 so that the result line is showing. Drag the window to a side so it does not hide the town. Take the screenshot with the bar and the window visible.
+- **Hide:** both Steam ID fields.
+- **Caption:** "The FeverLink3 window with the Steam connection test (test build 0.2.0-test1, tested against my own Steam ID)."
+- **Replace later:** when S17 (the test between two accounts) exists, use it as the cover instead.
 
 ## S02 - The game build
 
@@ -70,20 +71,21 @@ For the person who drives the game. Each entry says what to capture, the exact s
 - **Purpose:** the first thing a player sees. Name: `nexus-05-window-idle.png`.
 - **Steps:** click the button. The window shows "Play together: one player hosts, the others join with the host's code.", the field *Your name*, **Host a game**, the field "paste the join code here" with **Join**, and the *Steam connection test* section. Capture the whole window.
 - **Hide:** the Steam ID in the *Your Steam ID* field.
-- **Caption:** "Before a session: host a game, or paste a join code. The Steam connection test below is for testers."
+- **Caption:** "Before a session: the Steam connection test is what this build is for. Hosting and joining come in the next test build."
 
-## S06 - The window while hosting
+## S06 - The window after pressing Host a game (optional)
 
-- **Purpose:** what hosting looks like. Name: `nexus-06-window-hosting.png`.
-- **Steps:** from S05, click **Host a game**. The window shows "You are hosting", the join code field, *Players* with your name and "(host)", and the buttons **Start the session** and **Stop hosting**. Capture the whole window. Then press **Stop hosting**.
-- **Hide:** the join code. If the window shows any other address line, do not publish this picture: the page does not describe it, and it should be reported to the maintainer.
-- **Caption:** "Hosting: the join code is what a friend needs. Only share it with people you want to play with."
+- **Purpose:** be honest about the scope of the test build. Name: `nexus-06-host-not-finished.png`.
+- **Steps:** from S05, click **Host a game**. The window shows "Could not connect:" with the message that hosting over Steam is not finished in this build yet. Capture the whole window.
+- **Hide:** the Steam ID field.
+- **Caption:** "In this build the Host button says that hosting over Steam is not finished yet. The connection test below it works."
+- **If the window shows a join code instead,** the build is not the one this page describes: do not publish this picture, and report it to the maintainer.
 
-## S07 - GIF: host a game
+## S07 - GIF: run the connection test
 
-- **Purpose:** the whole host flow in one loop. Name: `nexus-07-host.gif`.
-- **Steps:** start recording on the game view with the bar visible. Click **FeverLink3**. Click **Host a game**. When the code appears, click into the code field and press Ctrl+A, then Ctrl+C. Stop recording about two seconds later. Blur the code in every frame, or crop the frame so that the code field is outside the picture.
-- **Caption:** "Open the window, click Host a game, copy the join code."
+- **Purpose:** the whole test flow in one loop. Name: `nexus-07-steam-test.gif`.
+- **Steps:** start recording on the game view with the bar visible. Click **FeverLink3**. In *Steam connection test*, click into the Steam ID field, press Ctrl+A, then Ctrl+C; click into **paste the other player's Steam ID**, press Ctrl+V, click **Test the connection**. Keep recording until the result line shows (about 15 seconds), then stop. Blur both Steam ID fields in every frame, or crop the frames so that they are outside the picture.
+- **Caption:** "Run the Steam connection test: copy your Steam ID, paste the other player's, press Test the connection. (Recorded against my own Steam ID.)"
 
 ## S08 - Steam connection test, own ID
 
@@ -135,7 +137,7 @@ For the person who drives the game. Each entry says what to capture, the exact s
 
 ## S15 - Two players in one session (BLOCKED)
 
-- **Needs:** two real copies of the game connected (P8), the host's world loaded on the second.
+- **Needs:** hosting and joining over Steam (P7), and two real copies of the game connected with the host's world loaded on the second (P8).
 - **When unblocked:** capture the *joined* window ("Connected", "Wait for the host to start the session.", *Players* with both names) and the host's window showing both names. Name: `nexus-15-two-players.png`. Hide join codes and Steam IDs. Caption: "A second player has joined" and nothing about building together.
 
 ## S16 - GIF: a road built in one game appears in the other (BLOCKED)

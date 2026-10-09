@@ -4,19 +4,18 @@ Status as of 2026-10-10. The project started on 2026-10-09, so everything marked
 
 ## Where things stand
 
-FeverLink3 is an early test build. It is not yet a playable multiplayer game. The line between "written and tested without the game", "run in the real game" and "proven between two real games" is kept sharp on purpose.
+FeverLink3 is an early test build. It is not yet a playable multiplayer game. The first test build, `0.2.0-test1`, has one job: to find out whether two players can reach each other through Steam. Hosting and joining over that connection are the next test build. The line between "written and tested without the game", "run in the real game" and "proven between two real games" is kept sharp on purpose.
 
 **Verified in the real game (Transport Fever 3 build 40420, 2026-10-09):**
 
 - The mod loads, and its window opens from a button in the bottom bar.
-- "Host a game" in the window starts a session inside the game process and shows a join code.
-- A second client (a test client, not a second copy of the game) can join that session by its code.
+- With an earlier build of the window, whose Host button used a direct connection (since taken out of the window, kept as a developer transport), hosting started a session inside the game process and showed a join code, and a second client (a test client, not a second copy of the game) joined that session by its code.
 - The mod can drive the game's own `app.saveGame` / `app.loadGame`, and after a reload it resumes its file link to the session.
 - The Steam peer-to-peer probe listens inside the game.
 
 **Proven on 2026-10-10:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered.
 
-**Not verified yet:** building together (command replication between two real games), savegame transfer between two real games, the native command hooks (not enabled in the code yet), joining from a second real copy of the game, a Steam connection between two different accounts, the relay fallback.
+**Not verified yet:** a Steam connection between two different accounts (the test of `0.2.0-test1`), hosting and joining over Steam (not finished), building together (command replication between two real games), savegame transfer between two real games, the native command hooks (not enabled in the code yet), and joining from a second real copy of the game.
 
 ### Proof milestones
 
@@ -25,12 +24,12 @@ Each one is a thing that has to be seen working before the matching claim may ap
 | # | Milestone | State |
 |---|---|---|
 | P1 | The mod loads in the real game and the window opens | verified 2026-10-09 |
-| P2 | Host from the window, a test client joins by the code | verified 2026-10-09 |
+| P2 | Host from the window, a test client joins by the code (earlier build, direct connection, since taken out of the window) | verified 2026-10-09 |
 | P3 | Save and load driven by the mod, file link resumes after the reload | verified 2026-10-09 |
 | P4 | The Steam peer-to-peer listener starts inside the game | verified 2026-10-09 |
 | P5 | Steam peer-to-peer to the game's own Steam ID, one process, 6 pings answered | proven 2026-10-10 |
-| P6 | Steam peer-to-peer between two different Steam accounts on two PCs | being tested, first run still to come |
-| P7 | Relay fallback connects two games when Steam peer-to-peer does not | being built |
+| P6 | Steam peer-to-peer between two different Steam accounts on two PCs | being tested: this is what `0.2.0-test1` is for, the first run is still to come |
+| P7 | Hosting and joining over Steam: a session carried over the Steam connection | not yet, the next test build |
 | P8 | Two real games in one session, the host's world reaches the joiner and loads | not yet |
 | P9 | A road built in one game appears in the other (command replication, Lua path) | not yet |
 | P10 | Construction held and released at the same step by the native hooks | not yet |
@@ -45,15 +44,15 @@ Each one is a thing that has to be seen working before the matching claim may ap
 ### Timeline
 
 - **2026-10-09:** project skeleton and design; protocol core and its tests; session state machines; native module skeleton in Rust; Lua mod with lockstep core and a two-game lupa test; address tool and its first run on build 40420; launcher platform layer; release pipeline and update verification; resync round, checksum policy, hot join and permissions in the core; launcher TCP host/join; first run of the mod in the real game; live mode (the session runs inside the game, driven by the in-game window).
-- **2026-10-10:** Steam peer-to-peer probe, first one-process connection to the game's own Steam ID; plug-in point in the mod for command schemas; CI runs every Lua test; documentation and listing material (this document set).
+- **2026-10-10:** Steam peer-to-peer probe, first one-process connection to the game's own Steam ID; the window became Steam-first and the connection research was written down (`docs/research/P2P_CONNECTIVITY.md`); the join code can carry the host's Steam ID; plug-in point in the mod for command schemas and the schemas for everyday operations (vehicles, lines, names, bookings, events) with their tests (`docs/COVERAGE_OPS.md`); CI runs every Lua test; documentation and listing material (this document set).
 
 ## Workstreams
 
-Work after 2026-10-10 runs in parallel workstreams. Each one owns a part of the stages below and writes its own document in `docs/` as it merges (for example `RELAY.md`, `LIVE_CONTROL.md`, `COMPANIES.md`, `COVERAGE_*.md`, `NATIVE_LINK.md`, `SECURITY.md`).
+Work after 2026-10-10 runs in parallel workstreams. Each one owns a part of the stages below and writes its own document in `docs/` as it merges (for example `LIVE_CONTROL.md`, `COMPANIES.md`, `COVERAGE_*.md`, `NATIVE_LINK.md`, `SECURITY.md`).
 
 | Workstream | Covers | Stages |
 |---|---|---|
-| Relay and connection | Steam peer-to-peer as the way players reach each other (primary); the relay server fallback; the first cross-account test; session traffic over either path. Replaces the hole-punching item that used to sit in 0.8. | 0.2, 0.3 |
+| Connection (Steam peer-to-peer) | Steam peer-to-peer as the way players reach each other: the first cross-account test (P6), then hosting and joining carried over it (P7), and what the window shows when it fails. Other transports only if Steam proves not to be enough (research notes: `docs/research/P2P_CONNECTIVITY.md`). Replaces the hole-punching item that used to sit in 0.8. | 0.2, 0.3 |
 | Session robustness and reconnect | A player who drops comes back without losing the world; hot join; host leaving; timeouts; what the window shows when something fails. | 0.2, 0.5 |
 | Construction and operations replication | Roads, tracks, stations, signals, terrain, bulldozing; vehicles, lines, orders, renames; coverage tables of which engine commands are replicated and how. | 0.3, 0.4 |
 | Companies | Separate companies on one map, own money and vehicles, station access, shared infrastructure rules. | 0.6, 0.7 |
@@ -75,9 +74,9 @@ Work after 2026-10-10 runs in parallel workstreams. Each one owns a part of the 
 
 ## 0.2 — Launcher, connection and the first test release
 
-First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater skips pre-releases by default).
+First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater skips pre-releases by default). Its job is the Steam connection test between two accounts (P6); the zip holds a testing installer, the native module and the mod.
 
-- [x] Host / join by code, player allow-list, sender-id rewrite. The transport used so far is plain TCP, kept as a development and test transport; the way players connect is the Steam item below.
+- [x] Host / join by code, player allow-list, sender-id rewrite. The transport used so far is plain TCP, kept as a development and test transport (the window's Host button no longer starts it); the way players connect is the Steam item below.
 - [~] Game launch with session environment, file link with sequence numbers (command line `--launch`; unit-tested, not the path the in-game window uses)
 - [~] Savegame transfer with SHA-256, streamed from disk (tested over loopback; not between two real games)
 - [~] Session clock, speed, pause, checksum rounds, resync round (core state machines and loopback tests)
@@ -85,8 +84,8 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 - [x] Command-line install, uninstall and doctor: `feverlink3 install`, `uninstall`, `doctor`, each with `--dry-run` where it changes things
 - [ ] Guided installer (wizard) that replaces the terminal commands *(launcher wizard)*
 - [x] Live mode: the session controller runs inside the game, driven by the in-game window (verified in the real game 2026-10-09, see P1 to P4)
-- [~] Players connect through Steam peer-to-peer *(relay and connection)*: the listener starts and the game connected to its own Steam ID (P5); the connection between two different accounts (P6) is the next test; session traffic does not run over it yet
-- [ ] Relay server fallback *(relay and connection)*
+- [~] Players connect through Steam peer-to-peer *(connection)*: the listener starts and the game connected to its own Steam ID (P5); the connection between two different accounts (P6) is the test of `0.2.0-test1`; session traffic does not run over it yet (P7)
+- [~] The join code carries the host's Steam ID *(connection)*: the code format and its tests are in the core; the in-game controller does not write it yet
 - [~] Reconnect after a dropped connection *(session robustness)*: the player side retries for five minutes and the host treats the return as a hot join (loopback tests); not run between two real games
 - [x] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256 (job and `tools/release` done; the first tagged release is not cut yet)
 - [~] In-app updater with Ed25519-signed releases: signature, hash, version and file-swap logic are done and tested in `launcher/src/update.rs`; the network fetch is not written, and the public key in the repository is a placeholder whose private half is public, so no release may be signed with it *(hardening)*
@@ -113,8 +112,8 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 
 ## 0.5 — Playing with friends
 
-- [ ] Distribution beyond GitHub and Nexus Mods. **Transport Fever 3 has no Steam Workshop** (the developers' support page says it is not included); its in-game Mod Hub runs on mod.io, and the published mod rules allow only the official scripting API and no executable files, so a mod that ships a native DLL is not expected to pass. The sources, the likely blockers and the cleanest alternatives are in `docs/WORKSHOP.md`
-- [ ] Steam invitations and friends-list join *(relay and connection)*
+- [ ] Distribution: the mod in the game's own Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now; the installer stays a testing tool. **Transport Fever 3 has no Steam Workshop** (the developers' support page says it is not included). Whether the Mod Hub accepts a mod that needs a separate native component is being checked: its published rules allow only the official scripting API and no executable files. The sources, the likely blockers and the steps are in `docs/WORKSHOP.md`
+- [ ] Steam invitations and friends-list join *(connection)*
 - [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core; the window has no control for it yet)
 - [ ] Hot join of a running game and reconnection that keeps the player's place *(session robustness)*; the hot-join round exists in the core and is tested over loopback
 
@@ -133,7 +132,7 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 - [ ] Optional public game list
 - [ ] Code signing: apply to the SignPath Foundation once a release exists in the form that is to be signed (their rule), not later than the first playable release; plan, checklist and the alternatives in `docs/SIGNING.md` *(hardening)*
 
-The hole-punching, STUN and relay items that used to be listed here are replaced by Steam peer-to-peer plus the relay fallback, which moved to 0.2 because players should never have to configure anything to connect.
+The hole-punching and STUN items that used to be listed here are replaced by Steam peer-to-peer, which moved to 0.2 because players should never have to configure anything to connect.
 
 ## 1.0 — Dedicated server
 

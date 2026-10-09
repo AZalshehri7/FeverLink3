@@ -15,7 +15,7 @@ FeverLink3 Multiplayer
 ## Summary (short description)
 
 ```
-Early test of open-source co-op multiplayer for Transport Fever 3: several players, one world, joined with a code. Experimental: building together is not verified yet.
+Early test of open-source co-op multiplayer for Transport Fever 3. This first build only tests the Steam connection between two players; hosting and joining come next.
 ```
 
 (167 characters. Check the form for the limit.)
@@ -38,15 +38,17 @@ If the form accepts only numbers and dots, use `0.2.0` and keep `test1` in the f
 
 ## Main file
 
-- File name on the upload: `FeverLink3-0.2.0-test1.zip` (the zip from the GitHub release, unchanged, so that its SHA-256 matches the release notes).
+- File name on the upload: `FeverLink3-0.2.0-test1.zip` (the zip from the GitHub release, unchanged, so that its SHA-256 matches the release notes). It holds the testing installer, the native module and the mod.
 - Category: Main files.
 - File description (keep under 255 characters; the limit is reported by users, not published):
 
 ```
-FeverLink3 0.2.0-test1: installer (feverlink3.exe), winhttp.dll and the mod. Windows, Steam, game build 40420. Experimental, unsigned. SHA-256 is in the release notes on GitHub.
+FeverLink3 0.2.0-test1: testing installer (feverlink3.exe), winhttp.dll and the mod. Windows, Steam, game build 40420. Experimental, unsigned. SHA-256 is in the release notes on GitHub.
 ```
 
-(177 characters.)
+(185 characters.)
+
+**Owner decision, 2026-10-10:** the end state is the mod offered in the game's Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now, and the installer kept for testing. When the packaging changes, upload two files instead of this one: the mod (the `mod/feverlink3_1` folder, as a zip) as the main file, and the native module (`winhttp.dll` with a short text on where it goes and the hash) as a second file, and rewrite the Installation section of the description to match. Do not announce the Mod Hub listing before the Hub has accepted the mod (`docs/WORKSHOP.md`).
 
 ## Requirements tab
 
@@ -85,14 +87,14 @@ Not affiliated with Urban Games or Paradox Interactive. Much of the code and doc
 ## Changelog tab (version 0.2.0-test1)
 
 ```
-First public test build.
-- In-game window (button in the bottom bar): host a game, join with a code, player list, chat, sync button.
-- Lockstep core: actions applied at the same step on every game, world checksums, repair by loading the host's savegame, permissions model.
+First public test build. Its job is the Steam connection test between two players.
+- In-game window (button in the bottom bar) with a Steam connection test: your Steam ID, test the connection to another player's Steam ID, result with round-trip time and route.
+- Hosting and joining over Steam are not finished in this build: the Host button says so.
+- For later builds, tested with simulated games only: lockstep core (actions applied at the same step on every game, world checksums, repair by loading the host's savegame, permissions model, command schemas for everyday operations).
 - Encrypted sessions (AES-256-GCM, key from the join code).
-- Native module winhttp.dll: passes the game's 14 WinHTTP functions through, runs the session controller inside the game. No game hooks in this version.
-- Steam peer-to-peer connection test in the window. Between two accounts: still being tested. Relay: being built.
-- Installer: feverlink3 install / uninstall / doctor, with --dry-run.
-- Unsigned. Seen working in the real game (build 40420): window, hosting, a test client joining, save/load. Not verified: building together, world transfer between two real games, two accounts over Steam.
+- Native module winhttp.dll: passes the game's 14 WinHTTP functions through, runs the in-game controller. No game hooks in this version.
+- Testing installer: feverlink3 install / uninstall / doctor, with --dry-run.
+- Unsigned. Seen working in the real game (build 40420): window, Steam connection to the game's own Steam ID, save/load. Not verified: the Steam connection between two accounts, hosting and joining over Steam, building together, world transfer between two real games.
 ```
 
 If more landed before the tag, add only what has been seen working, with the same wording rules as the description.
@@ -101,7 +103,7 @@ If more landed before the tag, add only what has been seen working, with the sam
 
 ```
 Known issues of 0.2.0-test1
-- Not a finished multiplayer game: building together, world transfer and the Steam connection between two accounts are not verified yet.
+- Not a finished multiplayer game: this build tests the Steam connection only. Hosting and joining over Steam, building together, world transfer and the Steam connection between two accounts are not verified yet.
 - Game build 40420 only. After a game update, if the game does not start, run feverlink3 uninstall and tell us your build.
 - Unsigned: SmartScreen/antivirus may warn. Windows 11 Smart App Control may block the DLL (untested).
 - Not compatible with MPFever or any other winhttp.dll mod.
@@ -123,12 +125,12 @@ Subject: Request before publishing: multiplayer mod with a native component that
 
 Hello,
 
-I would like to publish FeverLink3 Multiplayer for Transport Fever 3 on Nexus Mods. It is an open-source (MIT) cooperative multiplayer mod, so network access is its function: the native module (a winhttp.dll that the game loads from its own folder) connects the players' games to each other through Steam's peer-to-peer networking, and later through a relay server run by the project.
+I would like to publish FeverLink3 Multiplayer for Transport Fever 3 on Nexus Mods. It is an open-source (MIT) cooperative multiplayer mod, so network access is its function: the native module (a winhttp.dll that the game loads from its own folder) connects the players' games to each other through Steam's peer-to-peer networking.
 
 Per your file submission guidelines I am contacting you first, with the reasoning and the source:
 - Source code: https://github.com/AZalshehri7/FeverLink3 (folders native/ and launcher/ for the DLL). It is a fresh implementation that builds on two earlier MIT-licensed projects, TpF2 Multiplayer by silver2127 and MPFever by dkdknight (arthur), both credited in the README and on the page.
 - What the DLL does and does not do, file by file, and how to verify it: https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md
-- Network use: player-to-player traffic through Steam's networking only (optional relay later). No auto-update, no analytics, no telemetry, no advertising, no account, no download of code.
+- Network use: player-to-player traffic through Steam's networking only; no server of the project is involved. No auto-update, no analytics, no telemetry, no advertising, no account, no download of code.
 - The release is built by GitHub Actions from a tag; the zip, its SHA-256 and a manifest are on the GitHub release page. The files are not code-signed yet.
 - The page states plainly what is verified in the real game and what is not (it is an experimental test build).
 - Another experimental multiplayer mod with a native component is already listed for this game, so I assume this kind of mod is acceptable; please tell me if you need anything changed.

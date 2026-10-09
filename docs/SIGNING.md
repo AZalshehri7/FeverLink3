@@ -12,7 +12,7 @@ The release has two programs that Windows and security products look at: `feverl
 
 What signing does not do: it does not switch SmartScreen off at once (reputation is built from downloads over time, for a new publisher too), and it does not stop every antivirus false positive. It makes the publisher visible, ties later builds to the same identity, and is the route that Microsoft's SmartScreen documentation points to.
 
-What would be signed: the two PE files, `feverlink3.exe` and `winhttp.dll`, before they go into the zip. A zip cannot carry an Authenticode signature. The release manifest already has its own Ed25519 signature for the in-app updater (`docs/RELEASING.md`); that is separate and stays.
+What would be signed: the two PE files, `feverlink3.exe` and `winhttp.dll`, before they go into the zip. A zip cannot carry an Authenticode signature. In the end state the installer is only a testing tool and the native module is delivered separately (`docs/WORKSHOP.md`), so `winhttp.dll` is the file that matters most for players, and the one the game loads by itself. The release manifest already has its own Ed25519 signature for the in-app updater (`docs/RELEASING.md`); that is separate and stays.
 
 ## The options
 

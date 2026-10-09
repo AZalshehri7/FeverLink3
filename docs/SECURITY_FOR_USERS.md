@@ -6,7 +6,7 @@ For players, and for anyone reading an antivirus report about FeverLink3. Writte
 
 - FeverLink3 puts one DLL named `winhttp.dll` in the Transport Fever 3 game folder. Windows loads it automatically when the game starts, because the game imports `WINHTTP.dll` and Windows looks in the game's own folder before the system folder.
 - The DLL passes the 14 WinHTTP functions the game uses to the real Windows file, unchanged. The game's own web traffic is not read or modified.
-- Besides that, inside the game it does three things: it writes a small log, it reads the game's build number from the game's own memory, and it starts one thread that runs the multiplayer session when the player clicks Host or Join in the in-game window. In any other program it does nothing but pass calls through.
+- Besides that, inside the game it does three things: it writes a small log, it reads the game's build number from the game's own memory, and it starts one thread that runs the Steam connection test and, in later test builds, the multiplayer session that the player starts from the in-game window. In any other program it does nothing but pass calls through.
 - It does not inject into other programs, does not start with Windows, does not need administrator rights, sends no telemetry, and does not download or run programs.
 - It is **not code-signed yet**. That is why Windows shows a warning the first time, and why some antivirus programs may look at it. The sections below explain how to verify the file, how to remove it, and how to report a false positive.
 
@@ -45,7 +45,7 @@ The thread (`launcher/src/live.rs`) wakes every 100 milliseconds and:
 - Writes its answer to another text file (`ctl_status.txt`) that the window shows. Both files are in `%LOCALAPPDATA%\FeverLink3\live\`, which is emptied at every game start.
 - At start it reads (does not write) the Windows registry values that tell where Steam is installed (`HKCU\Software\Valve\Steam\SteamPath`, falling back to `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath`), then Steam's `libraryfolders.vdf` and the names of the folders under `userdata`, so that it knows where the game and its saves are.
 - Looks up Steam's networking functions by name inside `steam_api64.dll`, the library the game has already loaded, and opens a Steam peer-to-peer listener. In this version that listener is opened when the game starts, not only when you host; it accepts incoming Steam connections and answers messages that start with `ping ` with a `pong`, and ignores all other data. This only happens when Steam is running; the DLL does not start Steam.
-- Only when the player clicks Host or Join does it start a session. A session talks to the other players (see "Network" below), and exchanges text files with the Lua mod in the game. In a world sync the host's game saves a file named `feverlink3-resync-<number>.sav` in the game's save folder; the DLL sends it to the other players, and a joining player's copy is written to the same folder. The receiver checks the SHA-256 of the whole file before writing it.
+- Only when the player starts or joins a session from the window does it run one (in this test build the window's Host button answers that hosting over Steam is not finished). A session talks to the other players (see "Network" below), and exchanges text files with the Lua mod in the game. In a world sync the host's game saves a file named `feverlink3-resync-<number>.sav` in the game's save folder; the DLL sends it to the other players, and a joining player's copy is written to the same folder. The receiver checks the SHA-256 of the whole file before writing it.
 
 ### 4. What it does not do
 
@@ -90,14 +90,14 @@ Later versions are planned to install two inline hooks in the game's own code, t
 What FeverLink3 uses to connect players, in this version:
 
 - **Steam networking (primary).** The DLL asks the Steam library that the game already runs for a peer-to-peer connection to the other player's Steam ID. Steam finds the route between the two PCs and may relay the traffic through its own servers. The sockets belong to Steam's library and use Steam's ports; FeverLink3 does not open a listening port of its own for this. Nothing about it needs to be configured by the player.
-- **A relay server operated by the project (fallback, being built).** If Steam cannot connect two games, a relay will carry the traffic: an outgoing connection from each game to the relay. It is not in this version. When it exists, its address will be listed here, and it will only carry the encrypted session frames.
-- **Status of both, plainly:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered (2026-10-10). A connection between two different Steam accounts, and a whole session carried over it, has not been tested yet; the relay is not finished.
+- **Status, plainly:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered (2026-10-10). A connection between two different Steam accounts, and a whole session carried over it, has not been tested yet; the first is what this test build is for.
+- **No server of the project is involved.** The path between two players is Steam's. If that ever changes, this page will say what is added and what it can see.
 - **The host does not open an inbound TCP port in normal use.** The command-line development launcher (`feverlink3.exe host`, not used by the in-game window) is the only part that listens on a TCP port (default 28090, or the port you give it), and only if you type that command yourself.
-- **Nothing else leaves the PC.** No analytics, no advertising, no update check, no account.
+- **Nothing else leaves the PC.** No analytics, no advertising, no update check, no account, no web requests of its own.
 
 What the other players receive: the display name you chose (it starts as your Windows user name, so change it if you prefer), your game actions, world checksums, chat lines, and, if you host, the world itself. A player who tests the connection by Steam ID shares that Steam ID with the person they test with.
 
-How the session traffic is protected: every frame is encrypted and authenticated by FeverLink3 itself (AES-256-GCM, a key derived with HKDF from the secret inside the join code, a replay window per sender), independent of the path it travels on. The host decides who may send what. Anyone who has the join code can join, so treat the code like a password for that session. The details are in `docs/PROTOCOL.md` and section 3 of `docs/ARCHITECTURE.md`.
+How the session traffic is protected: every frame is encrypted and authenticated by FeverLink3 itself (AES-256-GCM, a key derived with HKDF from the secret inside the join code, a replay window per sender), independent of the path it travels on. The host decides who may send what. Anyone who has the join code can join, so treat the code like a password for that session. A join code holds the session secret, the time it was made and how to reach the host (for sessions over Steam, the host's Steam ID; for the developer transport, the host's local-network addresses). The details are in `docs/PROTOCOL.md` and section 3 of `docs/ARCHITECTURE.md`.
 
 ### Check it yourself
 

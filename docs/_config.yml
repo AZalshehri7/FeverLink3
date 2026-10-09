@@ -3,6 +3,9 @@ description: Cooperative multiplayer for Transport Fever 3 (early test build, op
 theme: jekyll-theme-cayman
 show_downloads: false
 lang: en
-# Listing material for maintainers (paste-ready store text, publishing checklist); not part of the public site.
+# Not part of the public site: listing material for maintainers (paste-ready store text, publishing checklist),
+# internal research notes, and design notes for transports that are not announced.
 exclude:
   - nexus
+  - research
+  - RELAY.md

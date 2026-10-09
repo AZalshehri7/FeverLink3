@@ -4,15 +4,19 @@ Maintainer notes for publishing FeverLink3 on Nexus Mods (the game has a page at
 
 | File | What it is |
 |---|---|
-| `description.bbcode.txt` | The long description in Nexus BBCode, ready to paste into the Description box (about 14,000 characters; tags checked for balance) |
+| `description.bbcode.txt` | The long description in Nexus BBCode, ready to paste into the Description box (about 15,600 characters; tags checked for balance) |
 | `description.md` | The same text in Markdown, for GitHub or another host |
 | `fields.md` | Every other form field as paste-ready text: name, summary, version, file description, requirements, permissions and credits, changelog, pinned post, and the message to Nexus staff |
 | `shot-list.md` | The screenshots and GIFs to capture, with exact steps, what to hide, captions, and which ones are blocked |
 
+## What the listing says `0.2.0-test1` is
+
+Following the owner's decisions of 2026-10-10: the first test build is the **Steam connection test** (two testers exchange Steam IDs in the window and read the result); hosting and joining over Steam are "the next test build" (in the code, the window's Host button answers that hosting over Steam is not finished); the zip holds a testing installer, the native module and the mod; the end state is the mod offered in the game's Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now. The description says all of this and promises nothing beyond it. If the build you tag does more (hosting over Steam works, for example), rewrite the sections "What this test build does" and "Status" first.
+
 ## The rules the text follows
 
 1. **Only what has been seen working.** The status block lists what was seen in the real game (build 40420, 2026-10-09 and 2026-10-10) and what was not. A claim moves from "not verified" to "seen working" only after it has been seen, with the date. The proof milestones are in `docs/ROADMAP.md`.
-2. **The connection is described as Steam peer-to-peer, "being tested".** Proven so far: inside one game, a connection to its own Steam ID (6 pings answered). The first test between two different Steam accounts is still to come; until it has been done the text must never say that it works over the internet. The relay is "being built". The text asks the player to do nothing to connect except share and paste the join code.
+2. **The connection is described as Steam peer-to-peer, "being tested".** Proven so far: inside one game, a connection to its own Steam ID (6 pings answered). The first test between two different Steam accounts is what `0.2.0-test1` is for; until it has been done the text must never say that it works over the internet. Hosting and joining over Steam are "the next test build". No other transport is announced (the owner has parked any server of the project; do not mention one). The text asks the player to do nothing to connect except share and paste the join code.
 3. **Both predecessors are credited** wherever the project is described: TpF2 Multiplayer by silver2127 and MPFever by dkdknight (arthur), both MIT.
 4. **Nexus's own rules are respected**: an executable that connects to the internet needs the staff's go-ahead with reasons and source code (message drafted in `fields.md`); AI-assisted work must be tagged and disclosed (see step 1 below); claims must be accurate.
 
@@ -41,15 +45,15 @@ Maintainer notes for publishing FeverLink3 on Nexus Mods (the game has a page at
 
 ## Claims to re-check against the tagged code
 
-The listing and the user security page make these statements. Each one is true of the code only if the check gives the expected result. Claims 1 and 2 depend on the connection work (Steam peer-to-peer and the relay) having replaced the older development transport in the in-game path; check them first. If a check fails, the sentence is false: change the code, or change the sentences in `description.*`, `docs/SECURITY_FOR_USERS.md`, `docs/PLAYING.md`, `docs/site/privacy.md` and `docs/site/faq.md` before anything is published.
+The listing and the user security page make these statements. Each one is true of the code only if the check gives the expected result. Claims 1 and 2 depend on the in-game path not using the development transport (plain TCP, only started when the window asks for `transport = "tcp"`); check them first. If a check fails, the sentence is false: change the code, or change the sentences in `description.*`, `docs/SECURITY_FOR_USERS.md`, `docs/PLAYING.md`, `docs/site/privacy.md` and `docs/site/faq.md` before anything is published.
 
 | # | Claim | Check | Expected |
 |---|---|---|---|
 | 1 | The host does not open an inbound TCP port in normal use | With the game running and hosting: `Get-NetTCPConnection -OwningProcess (Get-Process TransportFever3).Id -State Listen`. In the source: where `TcpListener::bind` is reachable from `live::spawn` | no listening TCP socket owned by the game process; no call path from `live::spawn` to `TcpListener::bind` |
-| 2 | Nothing else leaves the PC besides the player-to-player path (and the optional relay) | `Select-String -Path launcher\src\*.rs -Pattern "ipify\|checkip\|icanhazip\|M-SEARCH\|PortMapping"`, and the outgoing connections listed by `Get-NetTCPConnection -OwningProcess ... -State Established` while hosting | no matches reachable from `live::spawn`; only the game's and Steam's own connections |
+| 2 | Nothing else leaves the PC besides the player-to-player path through Steam | `Select-String -Path launcher\src\*.rs -Pattern "ipify\|checkip\|icanhazip\|M-SEARCH\|PortMapping"`, and the outgoing connections listed by `Get-NetTCPConnection -OwningProcess ... -State Established` while hosting | no matches reachable from `live::spawn`; only the game's and Steam's own connections |
 | 3 | The Steam listener answers `ping ` messages only and ignores other data | read `launcher/src/steamnet.rs` (`reply_for`, `receive`) | unchanged, or update `docs/SECURITY_FOR_USERS.md` |
-| 4 | The relay is "being built" | `docs/RELAY.md`, the code | if it ships: its address and what it sees go into `docs/SECURITY_FOR_USERS.md` and `docs/site/privacy.md` |
-| 5 | Steam between two accounts is "being tested" | the result of the first run (P6) | change the wording everywhere once it has been done, in either direction |
+| 4 | No server of the project is involved in the connection | `Select-String -Path launcher\src\*.rs,native\src\*.rs -Pattern "RelayAddr\|relay::"` | no use outside tests. If a server of the project is ever added to the path, `docs/SECURITY_FOR_USERS.md`, `docs/site/privacy.md` and the listing must say so first |
+| 5 | Steam between two accounts is "being tested" | the result of the first run (P6) | change the wording everywhere once it has been done, in either direction; hosting and joining stay "the next test build" until P7 |
 | 6 | The DLL passes 14 WinHTTP functions through | `Select-String -Path native\src\proxy.rs -Pattern "^relay!"` gives 14 lines; the address tool's report for the supported build says the lists are identical | 14, identical |
 | 7 | This version installs no hooks into the game | `Select-String -Path native\src\*.rs -Pattern "detour::install"` outside tests | no call. If hooks land, rewrite the sections "What may change" and "Known gaps" and the changelog |
 | 8 | Only game build 40420 is known | `native/src/build_table.rs`, `BUILDS` | one row |
