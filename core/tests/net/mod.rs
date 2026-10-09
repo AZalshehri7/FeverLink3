@@ -63,6 +63,8 @@ pub struct Net {
     pub reachable: BTreeSet<ConnectionId>,
     /// Unsealed frames the host sent to connections that are not peers of this harness (raw connections).
     pub raw: BTreeMap<ConnectionId, Vec<Frame>>,
+    /// (sender, counter) of every frame a player's session sealed, in order, whether or not it got through.
+    pub uplink: Vec<(u16, u64)>,
     next_connection: ConnectionId,
 }
 
@@ -87,6 +89,7 @@ impl Net {
             peers: BTreeMap::new(),
             reachable: BTreeSet::new(),
             raw: BTreeMap::new(),
+            uplink: Vec::new(),
             next_connection: 0,
         }
     }
@@ -294,6 +297,9 @@ impl Net {
         for o in outs {
             match o {
                 PlayerOutput::SendToHost(frame) => {
+                    if frame.header.sender != HostSession::UNASSIGNED {
+                        self.uplink.push((frame.header.sender, frame.header.counter));
+                    }
                     if !self.reachable.contains(&c) {
                         continue;
                     }
