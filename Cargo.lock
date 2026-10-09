@@ -247,6 +247,7 @@ name = "feverlink3_launcher"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "feverlink3_core",
  "rand",
  "serde",
  "serde_json",
