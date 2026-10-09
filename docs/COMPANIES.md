@@ -42,7 +42,7 @@ Sources, cited as `where:line`:
 | `-1` removes the owner. | `mission.zip!mission/mission_savegame_util.tl:25, 36` |
 | New constructions take their owner from `ConstructionEntity.playerEntity` of the proposal (`-1` = nobody). | `mission.zip!mission/mission_framework/mission_framework_util_entity.tl:89, 110`; `mission.zip!mission/tasks/utility/substitute_constructions.tl:64` |
 | The engine filters by owner: `api.engine.system.lineSystem.getLinesForPlayer(player)` and `api.engine.getEntitiesWithComponent(comp, { requireOwnedByPlayer = player })`. | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:150, 1358-1364` |
-| The windows know three ownership states: `None`, `Player` (owned by `getPlayer()`), `Foreign` (owned by anyone else). A foreign line or station shows no controls. | `tealdef/gui/entity_window/eow_extension_util.d.tl:18-22`; `gui.zip!gui/entity_window/eow_extension_util.tl:5-17`; `gui.zip!gui/entity_window/line/line_eow.script.tl:691-693` |
+| The windows know three ownership states: `None`, `Player` (owned by `getPlayer()`), `Foreign` (owned by anyone else). Foreign vehicles and warehouses are not modifiable, and panels such as a line's income graph are hidden for them. | `tealdef/gui/entity_window/eow_extension_util.d.tl:18-22`; `gui.zip!gui/entity_window/eow_extension_util.tl:5-17`; `gui.zip!gui/entity_window/vehicle/vehicle.tl:377`; `gui.zip!gui/entity_window/warehouse/warehouse.tl:38`; `gui.zip!gui/entity_window/line/line_eow.script.tl:691-693` |
 | The line editor ignores a click on a station group owned by someone else; stations owned by nobody (`-1`) or by the player are usable. So infrastructure shared between companies has to be unowned, or owned by whoever builds the line. | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:295, 531`; `gui.zip!gui/statistics/statistic_stations.tl:264`; `scripts.zip!scripts/entity_util.tl:83-86` |
 | A vehicle can only be bought in a depot the buyer owns (the window offers only `requireOwnedByPlayer` depots). The engine's own rule is not visible in the scripts. | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:1358-1364` |
 
@@ -56,13 +56,13 @@ Sources, cited as `where:line`:
 | `makeEntitySetPlayerCmd(entity, player)` | argument 2 | see 1.3 |
 | `makeWorldBuildProposalCmd(proposal, context, ...)` | `context.player`, `proposal...playerEntity` | `gui.zip!gui/entity_window/bridge_and_tunnel.tl:187-188`; `mission.zip!mission/mission_framework/mission_framework_util_entity.tl:83-95`; MPFever `mpfever_bridge.script.lua:3063-3128` |
 
-The mod's schema (`feverlink3_lockstep.lua`, `L.COMMANDS`) already marks the player argument of the first two, so a captured command travels with `{__ref = "player"}` and each game substitutes its own player entity. That substitution is the hook for attribution (section 4.2).
+The mod's schema (`feverlink3_lockstep.lua`, `L.COMMANDS`) already marks the player argument of the first two, so a captured command travels with `{__ref = "player"}` and each game substitutes its own player entity. That substitution is the hook for attribution (section 3.3).
 
 ### 1.5 Money and the "company" of the game
 
 | Fact | Evidence |
 |---|---|
-| The account is a component of the player entity (`balance`, `loan`). `api.engine.util.finance.getPlayersBalance(player)` returns the balance, or nil for infinite money (sandbox). | `game_mechanics.zip!game_mechanics/finance/account.tl:14-17`; `gui.zip!gui/game_bar/game_bar.tl:216-236` |
+| The account is a component of the player entity (`balance`, `loan`). `api.engine.util.finance.getPlayersBalance(player)` returns the balance, or nil for infinite money (sandbox). | `game_mechanics.zip!game_mechanics/finance/account.tl:14-17`; `gui.zip!gui/game_bar/game_bar.tl:216-236`; the ACCOUNT component with `balance` and `loan`: `MPFever/mod/mpfever_1/content/mpfever_bridge.script.lua:146, 190` |
 | Lines, vehicles and constructions have a balance of their own: `finance.calculateBalance({entities}, fromTime, toTime, true)` is what the line window, the vehicle window and the statistics use for "Balance". `finance.calculateEarnings(player)` is the bar's "Earnings". `headquarters.getCompaniesValue()` gives balance, assets and debt. | `gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:621-627`; `gui.zip!gui/statistics/statistic_lines.tl:289-294`; `gui.zip!gui/game_bar/game_bar_display_earnings_plugin/game_bar_display_earnings.script.tl:10-12`; `game_mechanics.zip!game_mechanics/finance/finances_charts.tl:262` |
 | A journal entry has `time` (`-1` = now), `amount` and a category; the game bar edits the balance with one `OTHER` entry. Categories: LOAN, INTEREST, CONSTRUCTION, ACQUISITION, MAINTENANCE, INCOME, OTHER, SUBSIDY. | `tealdef/scripts/journal.d.tl:3-69`; `gui.zip!gui/game_bar/game_bar.tl:229-234` |
 | "Company" in the game means progression: rank, permits, prospecting, marketing, greenifying. The state is keyed by player entity (`CompaniesState.companyStates[].companyEntity`, `CompaniesGrowthState.companyState : {Entity : CompanyData}`), and a PLAYER-component loop was written and commented out. | `tealdef/game_mechanics/company/company.d.tl:3-22`; `tealdef/game_mechanics/company/company_progression_util.d.tl:3-11`; `game_mechanics.zip!game_mechanics/company/company.script.tl:284-285`; `game_mechanics.zip!game_mechanics/company/company_util.tl:254-271` |
@@ -135,6 +135,7 @@ One registry, two modes. Nothing is stored anywhere but the game-script state of
 | `remove` | `company` | host | Removes it from the registry; members are taken out; the player entity stays in the game. |
 | `mode` | `mode` = `shared` or `separate`, `experimental` | host | `separate` needs `experimental = true` and a player entity on every company. |
 | `limit` | `player`, `amount`?, `per`? | host | Spending limit; no `amount` removes it. `per` is the period in game-time units (see 3.5). Counting starts from zero. |
+| `perm` | `player`, `category`, `allowed` | host | Forbids (`allowed = false`) or allows one category of action (`build`, `bulldoze`, `spend`, `other`) for one player. Every game checks it at the stamp, in addition to the grant the launcher sends to the player (`docs/PROTOCOL.md`, Permissions); company operations are never blocked by it. |
 | `reset` | `player`? | host | Clears what is counted against the limit (one player or all); the history stays. |
 | `pay` | `to`, `amount`, `memo`?, `from`? | anyone; `from` (charge someone else: a fee) host only | A payment from the sender to another player: ledger entries (`paid`, `received`) and, in separate mode between two different companies that both have an entity, a journal entry of `-amount` on one account and `+amount` on the other. |
 
@@ -158,6 +159,8 @@ The cost of an action is the difference of the acting company's account across t
 
 A limit stops a player's next building (`build`) and buying (`spend`) once what they have spent in the period reaches the amount. It is soft by one action: the check happens before an action, so the action that crosses the amount goes through. Bulldozing, selling, and everything of category `other` are never stopped. Only the host sets limits; by default there are none.
 
+A category the host forbade with `perm` is refused by the same two checks, before any limit is looked at (`not allowed to spend`).
+
 The check is made twice, and both read only the registry: by the originator right before it stamps (so the window hears about it at once: callback `false`, `action_refused {seq = 0, detail}`, nothing shipped), and by every game at the stamp (so an action a modified client sends anyway is refused everywhere; its own game then differs from the others and is repaired by the normal resync). The period is a game-time length in the stamp's units (`status.yearLength / 12` is a month): periods are `floor(stamp / per)`, so every game puts an action in the same period whatever its own clock says.
 
 ### 3.6 Checksums, resync, hot join
@@ -173,7 +176,7 @@ Other areas register their commands in `feverlink3_cmds_*.lua`. To follow the se
 1. In a decode hook, `ctx.player` is the entity the acting player's commands apply to. Use it for every owner: `Context.player`, `ConstructionEntity.playerEntity`, `EdgeObject.playerEntity`, `PlayerOwned.player`, `makeJournalBookAssetCmd`'s player. Never `api.engine.util.getPlayer()`: on the originator it is the local player, and in separate mode it is the local company, neither of which is the sender's company on the other games.
 2. In an encode hook, write the player entity as `{__ref = "player"}` and any other owner as an entity reference by key (`ctx.keyOf`). A hook that only copies plain data needs nothing.
 3. Also available to a decode hook: `ctx.from` (sender id), `ctx.at` (stamp), `ctx.key` (action key), `ctx.co` (the registry: read it, do not change it).
-4. `spec.category` decides which permission and which limit apply: `build` and `spend` are limited, `bulldoze` and `other` are not.
+4. `spec.category` decides which launcher grant and which `perm` apply (all four categories can be forbidden) and whether the spending limit does (only `build` and `spend`).
 5. The ledger and the cost need no code in the hook: every replicated command is counted and measured by the bridge. A spec that must change the registry sets `spec.apply(ctx, it, args)` (and `spec.virtual = true` when there is no engine command).
 
 ## 4. Adapters
@@ -197,13 +200,13 @@ The engine calls the company code makes, all in `Co.extendEngine`, all added to 
 | `mod/feverlink3_1/content/feverlink3_cmds_company.lua` | The module: `commands` (registered in `L.COMMANDS`) and `company` (`Co`, the functions the bridge calls). Pure Lua except `Co.extendEngine`. |
 | `mod/feverlink3_1/content/feverlink3_lockstep.lua` | `spec.virtual` and `spec.apply` documented; `decodeCommand` honours `ctx.refuse`. |
 | `mod/feverlink3_1/content/feverlink3_bridge.script.lua` | Hunks marked `companies`: the context of an action, the guarded calls around the engine command, the registry in the state and its mirror, the replay of pause-time actions, the pre-check, the factory of mod-level actions, `companies.txt`, the window records, the local-company switch. |
-| `tests/lua/test_cmds_company.py` | 22 unit tests of the module and 22 tests of two mocked games (more than one player entity, per-player accounts, ownership, pauses, reloads, forged actions). |
+| `tests/lua/test_cmds_company.py` | 24 unit tests of the module and 25 tests of two mocked games (more than one player entity, per-player accounts, ownership, pauses, reloads, forged actions, faults in the company layer). They also pass on Lua 5.3, 5.4 and LuaJIT 2.1 (run by hand with lupa's other runtimes; CI runs the harness' 5.2). |
 
 ## 6. The window
 
 ### 6.1 Reading: `companies.txt`
 
-The interface half writes `companies.txt` into the session folder (next to `hud_state.txt`) whenever the registry or the roster changed, and every few seconds while a player has created lines (their results move with the game). The content is one Lua literal produced by `C.serialize`; read it like the snapshot: `C.parse(C.readFile(C.path("companies.txt")))`. Arrays are tables with keys 1..n. Every field below can be nil unless it says otherwise.
+The interface half writes `companies.txt` into the session folder (next to `hud_state.txt`) whenever the registry or the roster changed, and every few seconds while a player has created lines (their results move with the game). The content is one Lua literal produced by `C.serialize`; read it like the snapshot: `C.parse(C.readFile(C.path("companies.txt")))`, and read it again on the next poll when it does not parse (the file was caught half written). Arrays are tables with keys 1..n. Every field below can be nil unless it says otherwise.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -213,7 +216,7 @@ The interface half writes `companies.txt` into the session folder (next to `hud_
 | `isHost` | boolean | Show the host's controls. |
 | `hostEntityKey` | string | Key of the savegame's player entity (`"s:7"`): the `entity` for the host's own company when switching to separate mode. |
 | `yearLength` | number | The game's year in game-time units; a month is a twelfth. For `limit.per`. |
-| `perms` | table | What the host allows this player: `build`, `bulldoze`, `spend`, `other` (booleans). |
+| `perms` | table | What the host allows this player: `build`, `bulldoze`, `spend`, `other` (booleans). The mod knows only its own grant; the grants of the others are the host launcher's (`docs/PROTOCOL.md`, Permissions). |
 | `openCompanies` | array of string | Keys of the companies this player may `join`. |
 | `warnings` | array of string | Ready-made lines: a player reached or nears (80%) the spending limit. |
 | `lines` | array of string | One report line per player, e.g. `Alice (you): 1 built, 1 bought; spent 48,000; lines 800; limit 50,000, used 48,000`. |
@@ -222,7 +225,7 @@ The interface half writes `companies.txt` into the session folder (next to `hud_
 
 Company row: `key`, `name`, `color` (`{r, g, b}` 0..1), `entity` (key or nil), `bound` (has an entity), `open`, `owner` (id), `members` (array of ids), `spent` and `refunded` (sums over the members), `you` (this player is a member).
 
-Player row: `id`, `name` (roster name, else `player <id>`), `you`, `company` (key or nil), `built`, `bought`, `bulldozed`, `other` (counts of applied actions by category `build`, `spend`, `bulldoze`, `other`), `spent` (`{build, spend, other, bulldoze}` money), `total`, `refunded`, `paid`, `received`, `earned` (result of the lines the player created, or nil when no line could be read), `net` (`earned + refunded - total`, nil with `earned`), `refused` (count) and `lastRefusal` (text), `limit` (`{amount, per}` or nil) and, only with a limit, `used` (spent in the current period), `remaining` and `blocked`, `made` (array of `{fn, label, n}`: how many of each command, with a readable label such as `vehicles bought`).
+Player row: `id`, `name` (roster name, else `player <id>`), `you`, `present` (in the roster: a player who left stays in the report), `company` (key or nil), `built`, `bought`, `bulldozed`, `other` (counts of applied actions by category `build`, `spend`, `bulldoze`, `other`), `spent` (`{build, spend, other, bulldoze}` money), `total`, `refunded`, `paid`, `received`, `earned` (result of the lines the player created, or nil when no line could be read), `net` (`earned + refunded - total`, nil with `earned`), `refused` (count) and `lastRefusal` (text), `denied` (array of the categories the host forbade, only when there are any), `limit` (`{amount, per}` or nil) and, only with a limit, `used` (spent in the current period), `remaining` and `blocked`, `made` (array of `{fn, label, n}`: how many of each command, with a readable label such as `vehicles bought`).
 
 ### 6.2 Writing: `company` records in `ui_out.log`
 
@@ -275,6 +278,17 @@ Run in the interface Lua state of a single-player game (callbacks are allowed th
 | E11 | Save with P2, its vehicles and a registry, load | PLAYER entities and owners intact; `companies.txt` shows the same registry | That the savegame carries the script state. |
 | E12 | Move a line with its vehicles, stations and station groups to P2 (the recipe of `transfer_ownership_util.tl:15-33`) | The line window's ownership state for P1; P2's vehicles keep running | `makeEntitySetPlayerCmd` as a way to hand assets over. |
 
+What `mod.log` says while the layer runs (both halves write it):
+
+| Line | Meaning |
+|---|---|
+| `company: company c1 (Mill) founded` / `... added as player entity 0:3` | A registry operation or `makeGameAddPlayerCmd` registered a company (the key `0:3` is bound to each game's own entity by the next line, `action 0:3 created entity <id> (PLAYER)`). |
+| `action <key> refused: <reason>` | An operation or a spending limit refused it, on this game; every game logs the same. |
+| `command <name> refused: spending limit reached (...)` / `not allowed to <category>` | The originator's pre-check; nothing was shipped. |
+| `local company: entity <id>` / `local company: the game's own player` | `syncLocalCompany` switched the windows (separate mode only). `(could not be set)` if the assignment failed (E6). |
+| `company: could not book a journal entry of ...` | A payment between companies did not go in on this game (E2); the games now differ in money. |
+| `company layer failed: ...` / `company layer failed in <part>: ...` | A fault in the company code. The action went ahead without its ledger line; frame faults are logged once. Report it. |
+
 ## 9. Decisions for the owner
 
 1. **Ship shared first** (this work), keep separate mode hidden: the window must not offer `mode = separate` until E1-E7 have passed. If you would rather not carry the unverified part, delete the `separate` branches of `OPS.mode`, `Co.actor` and `syncLocalCompany` (about sixty lines); the registry, ledger and limits do not depend on them.
@@ -283,4 +297,5 @@ Run in the interface Lua state of a single-player game (callbacks are allowed th
 4. **Fees:** manual (`pay`, and the host charging a player). Automatic fees for using another company's station or road need an engine read nobody has made (which vehicle used which station) and a rate table; not started.
 5. **What the report shows:** counts and money per player, and the result of their lines. If E8 fails, the report shows counts only until a cost source is chosen.
 6. **Enforcement stays in the games, not in the launcher.** Moving it into the host means the Rust core learning the registry; the current model (every game refuses at the stamp, a cheater diverges and is resynced) needed no protocol change.
-7. **The numbering bug after a reload** (end of section 7) is outside this work; it affects every command's callback, not only companies.
+7. **Two layers of permission.** The launcher's grant (`build`, `bulldoze`, `spend`, `speed`; checked by the player's own game) stays as it is; `perm` adds a grant every game checks at the stamp, which the in-game window can set today. Keep both, or let the window drive only `perm` and retire the launcher's.
+8. **The numbering bug after a reload** (end of section 7) is outside this work; it affects every command's callback, not only companies.

@@ -13,7 +13,7 @@
 --               makeEntitySetPlayerCmd   moves an entity to another player (host only)
 --               feverlink3Company        a mod-level action (spec.virtual: no engine command) carrying one registry
 --                                        operation: found, bind, assign, join, leave, rename, open, remove, mode,
---                                        limit, reset, pay
+--                                        limit, perm, reset, pay
 --   company   the registry, attribution, ledger and report functions the bridge calls. Pure Lua 5.2: nothing here
 --             touches the engine at load time; the few engine reads and bookings sit in Co.extendEngine.
 --
@@ -31,7 +31,8 @@ Co.COMPANIES_MAX = 16
 Co.MADE_MAX = 400 -- entities remembered with their creator; the oldest go first
 Co.PLAYER_MAX = 65534
 Co.AMOUNT_MAX = 1e12
-Co.OPS = { "found", "bind", "assign", "join", "leave", "rename", "open", "remove", "mode", "limit", "reset", "pay" }
+Co.OPS = { "found", "bind", "assign", "join", "leave", "rename", "open", "remove", "mode", "limit", "perm", "reset", "pay" }
+local CATEGORIES = { build = true, bulldoze = true, spend = true, other = true } -- as feverlink3_lockstep.lua names them
 
 local PALETTE = {
 	{ 0.2, 0.45, 0.85 }, { 0.85, 0.25, 0.25 }, { 0.2, 0.7, 0.35 }, { 0.95, 0.7, 0.15 },
@@ -66,11 +67,19 @@ local function money(n)
 end
 Co.money = money
 
--- Text typed by a player: control characters out, trimmed, at most `max` bytes. nil when nothing is left.
+-- Text typed by a player: control characters out, trimmed, at most `max` bytes (never cutting a UTF-8 character in
+-- two: names are often not ASCII). nil when nothing is left.
 local function clean(s, max)
 	if type(s) ~= "string" then return nil end
 	s = s:gsub("[%c]", " "):gsub("^%s+", ""):gsub("%s+$", "")
-	if #s > max then s = s:sub(1, max) end
+	if #s > max then
+		local cut = max
+		while cut > 0 do
+			local b = s:byte(cut + 1)
+			if b >= 0x80 and b < 0xC0 then cut = cut - 1 else break end
+		end
+		s = s:sub(1, cut):gsub("%s+$", "")
+	end
 	if #s == 0 then return nil end
 	return s
 end
@@ -160,11 +169,12 @@ end
 --   companies  key -> { key, name, color = {r,g,b}, entity = entity key | nil, owner = player id, open = bool }
 --   members    player id -> company key
 --   limits     player id -> { amount, per }   spending cap, per = length of the period in game-time units (nil: for good)
+--   denied     player id -> { category = true }   what the host forbade this player (build, bulldoze, spend, other)
 --   ledger     player id -> see ledgerOf
 --   made       entity key -> { kind, by, at }  what each player created (component name, sender id, stamp)
 --   rev        counts every change; the window and the interface mirror compare it
 function Co.new()
-	return { v = Co.VERSION, rev = 0, mode = "shared", serial = 0, companies = {}, members = {}, limits = {}, ledger = {}, made = {}, nmade = 0 }
+	return { v = Co.VERSION, rev = 0, mode = "shared", serial = 0, companies = {}, members = {}, limits = {}, denied = {}, ledger = {}, made = {}, nmade = 0 }
 end
 
 local function bump(co)
@@ -414,6 +424,30 @@ OPS.limit = function(co, ctx, op)
 	return true
 end
 
+-- perm { player, category, allowed }: the host forbids (allowed = false) or allows one category of action for one player.
+-- Every game checks it at the stamp, besides the grant the launcher sends to the player (docs/PROTOCOL.md, Permissions);
+-- company operations are never blocked by it.
+OPS.perm = function(co, ctx, op)
+	local ok, why = needHost(ctx)
+	if not ok then return nil, why end
+	if not isId(op.player) then return nil, "bad player" end
+	if not CATEGORIES[op.category] then return nil, "unknown category" end
+	if type(op.allowed) ~= "boolean" then return nil, "allowed is true or false" end
+	co.denied = co.denied or {}
+	local row = co.denied[op.player]
+	if (row ~= nil and row[op.category] == true) == (not op.allowed) then return true end   -- nothing to change
+	if op.allowed then
+		row[op.category] = nil
+		if next(row) == nil then co.denied[op.player] = nil end
+	else
+		row = row or {}
+		row[op.category] = true
+		co.denied[op.player] = row
+	end
+	bump(co)
+	return true
+end
+
 -- reset { player? }: the host clears the spending counted against the limit (one player, or everyone).
 OPS.reset = function(co, ctx, op)
 	local ok, why = needHost(ctx)
@@ -481,10 +515,12 @@ end
 
 -- ------------------------------------------------------------------ ledger and admission
 
--- May this player's next action of this category go ahead? Spending limits apply to building and buying; selling,
--- bulldozing and everything else always may. Pure on the registry, so the originator's pre-check and every game's
--- check at the stamp agree.
+-- May this player's next action of this category go ahead? A category the host forbade never may. Spending limits apply
+-- to building and buying; selling, bulldozing and everything else always may. Pure on the registry, so the originator's
+-- pre-check and every game's check at the stamp agree.
 function Co.gate(co, from, category, at)
+	local forbidden = co.denied and co.denied[from]
+	if forbidden and forbidden[category] then return false, "not allowed to " .. category end
 	local lim = co.limits[from]
 	if not lim or lim.amount == nil then return true end
 	if category ~= "build" and category ~= "spend" then return true end
@@ -605,7 +641,7 @@ function Co.digest(co)
 	for id, led in pairs(co.ledger) do
 		players[id] = { n = led.n, made = led.made, paid = led.paid, received = led.received, refused = led.refused }
 	end
-	return { mode = co.mode, serial = co.serial, companies = co.companies, members = co.members, limits = co.limits, players = players }
+	return { mode = co.mode, serial = co.serial, companies = co.companies, members = co.members, limits = co.limits, denied = co.denied, players = players }
 end
 
 -- The result of the lines each player created, from the engine's balance of every line: resultOf(lineKey) -> number|nil.
@@ -639,6 +675,7 @@ local function describe(row)
 	end
 	if row.paid > 0 or row.received > 0 then parts[#parts + 1] = "paid " .. money(row.paid) .. ", received " .. money(row.received) end
 	if row.blocked then parts[#parts + 1] = "BLOCKED" end
+	if row.denied then parts[#parts + 1] = "not allowed to " .. table.concat(row.denied, ", ") end
 	return table.concat(parts, "; ")
 end
 
@@ -662,19 +699,27 @@ function Co.status(co, view)
 	for id in pairs(co.members) do ids[id] = true end
 	for id in pairs(co.ledger) do ids[id] = true end
 	for id in pairs(co.limits) do ids[id] = true end
+	for id in pairs(co.denied or {}) do ids[id] = true end
 	if view.self ~= nil then ids[view.self] = true end
 	local byCompany = {}
 	for _, id in ipairs(sortedKeys(ids)) do
 		local led = co.ledger[id] or { n = {}, gross = {}, refund = 0, made = {}, paid = 0, received = 0, per = { idx = 0, gross = 0 }, refused = 0 }
 		local lim = co.limits[id]
 		local row = {
-			id = id, name = names[id] or ("player " .. fmt0(id)), you = id == view.self, company = co.members[id],
+			id = id, name = names[id] or ("player " .. fmt0(id)), you = id == view.self, present = names[id] ~= nil, company = co.members[id],
 			built = led.n.build or 0, bulldozed = led.n.bulldoze or 0, bought = led.n.spend or 0, other = led.n.other or 0,
 			spent = { build = led.gross.build or 0, spend = led.gross.spend or 0, other = led.gross.other or 0, bulldoze = led.gross.bulldoze or 0 },
 			refunded = led.refund, paid = led.paid, received = led.received, earned = earned[id],
 			refused = led.refused, lastRefusal = led.last, made = {},
 		}
 		row.total = row.spent.build + row.spent.spend + row.spent.other + row.spent.bulldoze
+		local forbidden = co.denied and co.denied[id]
+		if forbidden then
+			row.denied = {}
+			for _, category in ipairs({ "build", "bulldoze", "spend", "other" }) do
+				if forbidden[category] then row.denied[#row.denied + 1] = category end
+			end
+		end
 		if row.earned ~= nil then row.net = row.earned + row.refunded - row.total end
 		if lim and lim.amount ~= nil then
 			row.limit = { amount = lim.amount, per = lim.per }
@@ -725,9 +770,12 @@ end
 --   setLocalCompany(entity)     separate mode, EXPERIMENTAL: makes this game's windows act as that player entity by
 --                               replacing api.engine.util.getPlayer (nil puts the game's own back). Returns whether
 --                               getPlayer then says so. Nobody has shown that the windows follow (section 8, E6).
+--                               The replacement is what MPFever's company probe tried (finding from MPFever (MIT),
+--                               mpfever_bridge.script.lua:3076); its result is not published.
 --   balanceOf(entity)           the account balance of a player entity; nil when infinite or unreadable
 --                               (api.engine.util.finance.getPlayersBalance, gui.zip!gui/game_bar/game_bar.tl:220)
---   bookJournalFor(entity, n)   one journal entry on that player's account (the game bar's balance edit does the same)
+--   bookJournalFor(entity, n)   one journal entry on that player's account (the game bar's balance edit does the same;
+--                               finding from MPFever (MIT): JournalEntry with time -1 and category OTHER)
 --   lineResult(entity, t0, t1)  income minus running costs of a line between two game times
 --                               (api.engine.util.finance.calculateBalance, gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:626)
 --   yearLength()                the game's year in game-time units (api.util.getDefaultYearDuration), for monthly limits
@@ -823,7 +871,8 @@ end
 
 local commands = {}
 
--- makeGameAddPlayerCmd(name, colour): adds a player entity. The entity is created by the engine on every game and
+-- makeGameAddPlayerCmd(name, colour): adds a player entity (the game's own mission code calls it that way; finding from
+-- MPFever (MIT): its company probe does too). The entity is created by the engine on every game and
 -- found by the bridge's watch (spec.creates), which binds the action's key to it; the registry entry is made by the
 -- same action (apply), so the company and its entity key exist together. Host only.
 commands.makeGameAddPlayerCmd = {

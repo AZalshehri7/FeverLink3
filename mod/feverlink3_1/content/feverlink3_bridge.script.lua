@@ -153,8 +153,9 @@ end
 -- `co` is the company registry of the half that asks; its digest is a part of its own once anything was configured or recorded
 local function checksumParts(co)
 	local parts, t = L.checksumParts(engine, C.hashValue)
-	local digest = Co and Co.digest(co)
-	if digest ~= nil then parts.companies = C.hashValue(digest) end
+	local okD, digest = false, nil
+	if Co then okD, digest = pcall(Co.digest, co) end
+	if okD and digest ~= nil then parts.companies = C.hashValue(digest) end
 	return parts, t
 end
 
@@ -185,7 +186,7 @@ end
 local function actionCtx(it, co, resolve)
 	local ctx = { player = engine.canonicalPlayer and engine.canonicalPlayer() or engine.player(), resolve = resolve, co = co }
 	if it then ctx.from, ctx.at, ctx.key = it.from, it.at, it.key end
-	if Co then Co.actor(ctx) end
+	if Co then pcall(Co.actor, ctx) end
 	return ctx
 end
 
@@ -394,6 +395,8 @@ local G = {
 	co = nil,                 -- companies: mirror of the simulation's registry; ahead of it while a pause applies actions
 	localCompany = nil,       -- the player entity this game's windows act as (separate mode only)
 	coWritten = nil,          -- stamp of the last companies.txt
+	coFault = nil,            -- the last fault of the company layer in a frame (logged once, not every frame)
+	wrapped = false,          -- api.cmd.sendCommand was wrapped: commands are held, stamped and shipped
 	tags = setmetatable({}, { __mode = "k" }),  -- command object -> { name, args }
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
@@ -415,6 +418,20 @@ end
 local function send(kind, payload)
 	local ok, err = C.writerSend(G.writer, kind, payload)
 	if not ok then logGui("cannot send " .. kind .. ": " .. tostring(err)) end
+end
+
+-- companies: the frames that carry the company layer also pace the game and answer the host, so a fault in it is logged
+-- once and skipped, never allowed to end the frame.
+local function coGuard(what, fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then
+		local text = what .. ": " .. tostring(err)
+		if G.coFault ~= text then
+			G.coFault = text
+			logGui("company layer failed in " .. text)
+		end
+	end
+	return ok
 end
 
 local function toSim(name, param)
@@ -593,8 +610,9 @@ local function installWrap()
 				return
 			end
 			-- companies: the player's spending limit, checked at once so the window hears about it; every game checks again at the stamp
-			if Co and G.co then
-				local okG, why = Co.gate(G.co, C.PLAYER_ID, category, engine.gameTime())
+			local okP, okG, why = true, true, nil
+			if Co and G.co then okP, okG, why = pcall(Co.gate, G.co, C.PLAYER_ID, category, engine.gameTime()) end
+			if okP then
 				if not okG then
 					logGui("command " .. tag.name .. " refused: " .. tostring(why))
 					send("action_refused", { seq = 0, detail = why })
@@ -614,6 +632,7 @@ local function installWrap()
 			return O.sendCommand(cmd, cb, progress)
 		end
 	end)
+	G.wrapped = oks
 	logGui("wrapped " .. wrapped .. " command factories" .. (oks and "" or "; sendCommand is read-only, commands stay native"))
 end
 
@@ -738,7 +757,9 @@ local function collectFromSim(state)
 	local ok, st = pcall(function() return state:get() end)
 	if not ok or type(st) ~= "table" then return end
 	-- companies: the mirror takes the state's registry when that is newer; during a pause it is ahead of the state
-	if Co and type(st.co) == "table" and (G.co == nil or (st.co.rev or 0) > (G.co.rev or 0)) then G.co = C.plain(st.co) end
+	if Co and type(st.co) == "table" and (G.co == nil or (st.co.rev or 0) > (G.co.rev or 0)) then
+		coGuard("mirror", function() G.co = C.plain(st.co) end)
+	end
 	for key, e in pairs(st.bind or {}) do
 		if G.bind[key] ~= e then G.bind[key] = e; G.rev[e] = key end
 	end
@@ -809,13 +830,19 @@ local function serviceWindow()
 			end
 		elseif rec.kind == "company" and Co then
 			-- an operation typed in the company page (Co.windowCommand), sent like any command the player issues
-			local p = C.parse(rec.payload)
-			local cmd = type(p) == "table" and Co.windowCommand(p, api) or nil
-			if cmd then api.cmd.sendCommand(cmd) end
+			coGuard("window record", function()
+				local p = C.parse(rec.payload)
+				local cmd = type(p) == "table" and Co.windowCommand(p, api) or nil
+				if cmd and G.wrapped then
+					api.cmd.sendCommand(cmd)
+				elseif cmd then
+					logGui("company action not sent: sendCommand is not wrapped, it would apply on this game alone")
+				end
+			end)
 		end
 	end
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
-	writeCompanies()
+	coGuard("page", writeCompanies)
 end
 
 -- companies: in separate mode (experimental, docs/COMPANIES.md section 8) this game's windows act as the player's own
@@ -868,7 +895,7 @@ local function guiUpdate(userParams, state, guiState)
 		readLink()
 		serviceWindow()
 		collectFromSim(state)
-		syncLocalCompany()
+		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
 		setSpeed(L.pace(G.session, G.peers, now, ahead))

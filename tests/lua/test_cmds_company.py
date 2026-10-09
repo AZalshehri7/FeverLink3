@@ -36,14 +36,16 @@ STEP = tl.STEP
 
 
 def to_py(v):
-    """A Lua value as plain Python: tables become dicts keyed by int/str, everything else is unchanged."""
+    """A Lua value as plain Python: tables become dicts keyed by int/str (numbers first, in order: the order Lua
+    iterates a table in is not the same on every Lua), everything else is unchanged."""
     if lupa.lua_type(v) == "table":
-        out = {}
+        items = []
         for k, x in v.items():
             if isinstance(k, float) and k == int(k):
                 k = int(k)
-            out[k] = to_py(x)
-        return out
+            items.append((k, to_py(x)))
+        items.sort(key=lambda kv: (0, kv[0], "") if isinstance(kv[0], (int, float)) and not isinstance(kv[0], bool) else (1, 0, str(kv[0])))
+        return dict(items)
     return v
 
 
@@ -58,6 +60,11 @@ def row(status, player_id):
         if r["id"] == player_id:
             return r
     raise KeyError(player_id)
+
+
+def allowed(result):
+    """Whether a Co.gate result says yes. lupa returns a bare true for yes and a tuple (false, why) for no, which is truthy."""
+    return pair(result)[0] is True
 
 
 def lit(v):
@@ -197,6 +204,15 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual(self.must(0, op="found", name="x" * 200)["company"], "c17")
         self.assertEqual(len(self.reg()["companies"]["c17"]["name"]), 40)
 
+    def test_names_are_cut_on_a_character_boundary(self):
+        # Arabic, two bytes a character: 20 characters make 40 bytes. Euro signs, three bytes: 13 characters make 39.
+        self.must(0, op="found", name="\u0634\u0631\u0643\u0629" * 12)
+        self.must(0, op="found", name="\u20ac" * 20)
+        self.must(0, op="found", name="x" * 39 + "\u0634")           # the second byte of the last character would not fit
+        names = [self.reg()["companies"]["c%d" % i]["name"] for i in (1, 2, 3)]     # raises on bytes that are not UTF-8
+        self.assertEqual(names, ["\u0634\u0631\u0643\u0629" * 5, "\u20ac" * 13, "x" * 39])
+        self.assertTrue(all(len(n.encode("utf-8")) <= 40 for n in names))
+
     def test_mode_switch_needs_the_hosts_confirmation_and_an_entity_per_company(self):
         self.must(0, op="found", name="One", entity="s:7")
         self.must(0, op="found", name="Two")
@@ -273,9 +289,9 @@ class CompanyUnit(unittest.TestCase):
         ok, why = Co.gate(co, 1, "spend", 0)
         self.assertFalse(ok)
         self.assertIn("60,000 of 50,000", why)
-        self.assertTrue(Co.gate(co, 1, "bulldoze", 0), "bulldozing is never stopped")
-        self.assertTrue(Co.gate(co, 1, "other", 0))
-        self.assertTrue(Co.gate(co, 0, "spend", 0), "a player without a limit is free")
+        self.assertTrue(allowed(Co.gate(co, 1, "bulldoze", 0)), "bulldozing is never stopped")
+        self.assertTrue(allowed(Co.gate(co, 1, "other", 0)))
+        self.assertTrue(allowed(Co.gate(co, 0, "spend", 0)), "a player without a limit is free")
         # money that comes back is not counted against the limit, and is kept apart
         Co.record(co, 1, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "bulldoze", "cost": -4000}))
         led = self.reg()["ledger"][1]
@@ -287,15 +303,49 @@ class CompanyUnit(unittest.TestCase):
         Co.record(co, 1, 0, self.lua({"fn": "x", "category": "build", "cost": 70000}))
         self.assertFalse(Co.gate(co, 1, "build", 0)[0])
         self.must(0, op="limit", player=1)
-        self.assertTrue(Co.gate(co, 1, "build", 0))
+        self.assertTrue(allowed(Co.gate(co, 1, "build", 0)))
         self.assertNotIn(1, self.reg()["limits"])
         # a limit per period: the count restarts when the period changes, by the stamp and not by the clock of a game
         self.must(0, op="limit", player=1, amount=50000, per=1000, at=2500)
         Co.record(co, 1, 2600, self.lua({"fn": "x", "category": "build", "cost": 50000}))
         self.assertFalse(Co.gate(co, 1, "build", 2900)[0])
-        self.assertTrue(Co.gate(co, 1, "build", 3000), "the next period starts at 3000")
+        self.assertTrue(allowed(Co.gate(co, 1, "build", 3000)), "the next period starts at 3000")
         Co.record(co, 1, 3100, self.lua({"fn": "x", "category": "build", "cost": 10000}))
         self.assertEqual(self.reg()["ledger"][1]["per"], {"idx": 3, "gross": 10000})
+
+    def test_a_category_the_host_forbade_never_goes_ahead(self):
+        co, Co = self.co, self.Co
+        self.refused(1, "only the host", op="perm", player=1, category="build", allowed=False)
+        self.refused(0, "unknown category", op="perm", player=1, category="fly", allowed=False)
+        self.refused(0, "true or false", op="perm", player=1, category="build")
+        self.refused(0, "bad player", op="perm", player=-1, category="build", allowed=False)
+        self.must(0, op="perm", player=1, category="build", allowed=False)
+        self.must(0, op="perm", player=1, category="spend", allowed=False)
+        ok, why = pair(Co.gate(co, 1, "build", 0))
+        self.assertFalse(ok)
+        self.assertEqual(why, "not allowed to build")
+        self.assertFalse(pair(Co.gate(co, 1, "spend", 0))[0])
+        self.assertTrue(allowed(Co.gate(co, 1, "bulldoze", 0)))
+        self.assertTrue(allowed(Co.gate(co, 1, "other", 0)))
+        self.assertTrue(allowed(Co.gate(co, 2, "build", 0)), "other players are not affected")
+        self.assertEqual(self.reg()["denied"], {1: {"build": True, "spend": True}})
+        rev = self.reg()["rev"]
+        self.must(0, op="perm", player=1, category="build", allowed=False)       # already so: nothing changes
+        self.must(0, op="perm", player=2, category="build", allowed=True)        # never forbidden: nothing changes
+        self.assertEqual(self.reg()["rev"], rev)
+        # it shows in the page, and a limit does not undo it
+        st = to_py(self.Co.status(self.co, self.lua({"self": 0, "names": {0: "Boss", 1: "Alice"}})))
+        alice = [p for p in st["players"].values() if p["id"] == 1][0]
+        self.assertEqual(alice["denied"], {1: "build", 2: "spend"})
+        self.assertIn("not allowed to build, spend", [l for l in st["lines"].values() if l.startswith("Alice")][0])
+        boss = [p for p in st["players"].values() if p["id"] == 0][0]
+        self.assertNotIn("denied", boss)
+        self.must(0, op="limit", player=1, amount=1000000)
+        self.assertFalse(pair(Co.gate(co, 1, "build", 0))[0])
+        self.must(0, op="perm", player=1, category="build", allowed=True)
+        self.assertTrue(allowed(Co.gate(co, 1, "build", 0)))
+        self.must(0, op="perm", player=1, category="spend", allowed=True)
+        self.assertEqual(self.reg()["denied"], {}, "nothing left of the denial")
 
     def test_a_cost_the_engine_could_not_tell_is_counted_without_money(self):
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend"}))
@@ -407,12 +457,14 @@ class CompanyUnit(unittest.TestCase):
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeLineCreateCmd", "category": "build", "cost": 3000}))
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "build", "cost": 20000}))
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "bulldoze", "cost": -1500}))
+        self.Co.record(self.co, 5, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 10}))     # left the session
         view = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice", 2: "Carol"}, "now": 0, "earned": {1: 800}, "hostEntityKey": "s:7",
                          "yearLength": 96000, "perms": {"build": True, "bulldoze": False, "spend": True, "other": True}})
         st = to_py(self.Co.status(self.co, view))
         self.assertEqual((st["yearLength"], st["perms"]["bulldoze"], st["perms"]["build"]), (96000, False, True))
         self.assertEqual((st["mode"], st["self"], st["isHost"], st["hostEntityKey"], st["openCompanies"]), ("shared", 1, False, "s:7", {1: "c1"}))
-        self.assertEqual([p["id"] for p in st["players"].values()], [0, 1, 2])
+        self.assertEqual([p["id"] for p in st["players"].values()], [0, 1, 2, 5])
+        self.assertEqual([p["present"] for p in st["players"].values()], [True, True, True, False], "a player who left stays in the report")
         boss, alice, carol = st["players"][1], st["players"][2], st["players"][3]
         self.assertEqual((alice["name"], alice["you"], alice["company"], alice["bought"], alice["built"], alice["total"]), ("Alice", True, "c1", 1, 1, 48000))
         self.assertEqual((alice["limit"]["amount"], alice["used"], alice["remaining"], alice["blocked"]), (50000, 48000, 2000, False))
@@ -521,8 +573,7 @@ class CompanyUnit(unittest.TestCase):
         """)
         engine = L.eval("""{ player = function() return api.engine.util.getPlayer() end,
                              account = function() return api.engine.util.getPlayer() * 10, 3 end,
-                             bookJournal = function(n) BOOKED_ON = api.engine.util.getPlayer() end,
-                             broken = function() error('boom') end }""")
+                             bookJournal = function(n) BOOKED_ON = api.engine.util.getPlayer() end }""")
         sent = L.eval("{}")
         deps = L.eval("function(sent) return { sender = function() return function(c) sent[#sent + 1] = c end end } end")(sent)
         self.Co.extendEngine(engine, deps)
@@ -543,6 +594,13 @@ class CompanyUnit(unittest.TestCase):
         engine.bookJournal(5)
         self.assertEqual(L.eval("BOOKED_ON"), 7)
         self.assertEqual(L.eval("api.engine.util.getPlayer()"), 52001, "and the windows' player is put back")
+        # even when the money code fails: the error goes on, the windows' player is put back first
+        failing = L.eval("{ account = function() error('boom') end }")
+        self.Co.extendEngine(failing, None)
+        failing.localCompanyActive = True
+        with self.assertRaises(lupa.LuaError):
+            failing.account()
+        self.assertEqual(L.eval("api.engine.util.getPlayer()"), 52001)
         self.assertTrue(engine.setLocalCompany(None))
         self.assertEqual(L.eval("api.engine.util.getPlayer()"), 7)
         self.assertEqual(engine.canonicalPlayer(), 7)
@@ -735,23 +793,23 @@ class CompanyGameTest(unittest.TestCase):
 
     # ---- scenario helpers
 
-    def op(self, game, ticks=30, **fields):
+    def op(self, game, ticks=15, **fields):
         """A registry operation issued from `game`'s interface, as the company page does; returns its callback result."""
         game.send_gui("LAST_OP = nil; api.cmd.sendCommand(api.cmd.feverlink3Company(%s), function(d, s) LAST_OP = s end)" % lit(fields))
         self.tick(ticks)
         return game.ev("LAST_OP")
 
-    def buy(self, game, ticks=40):
+    def buy(self, game, ticks=15):
         game.send_gui("LAST_BUY = nil; api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, { vehicles = {} }), function(d, s) LAST_BUY = s end)")
         self.tick(ticks)
         return game.ev("LAST_BUY")
 
-    def line(self, game, ticks=40):
+    def line(self, game, ticks=15):
         game.send_gui('LAST_LINE = nil; api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, api.engine.util.getPlayer(), { stops = {} }), function(d, s) LAST_LINE = s end)')
         self.tick(ticks)
         return game.ev("LAST_LINE")
 
-    def add_company(self, name="Ironworks", ticks=30):
+    def add_company(self, name="Ironworks", ticks=15):
         self.A.send_gui('api.cmd.sendCommand(api.cmd.makeGameAddPlayerCmd(%s, api.type.Vec3f.new(0.9, 0.2, 0.2)))' % tl.lua_str(name))
         self.tick(ticks)
 
@@ -789,18 +847,18 @@ class CompanyGameTest(unittest.TestCase):
         self.tick(10)
         self.relay.pump()
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
-        self.tick(40)
+        self.tick(20)
         self.assertEqual(set(self.relay.reports[1][0][1]), {"time", "balance", "loan", "constructions", "lines"}, "pristine: no part")
         self.buy(self.B)
         self.relay.checksum_request(2, self.relay.future_stamp(), False)
-        self.tick(40)
+        self.tick(20)
         pa, pb = self.relay.reports[2][0][1], self.relay.reports[2][1][1]
         self.assertIn("companies", pa)
         self.assertEqual(pa["companies"], pb["companies"])
         # a registry that differs on one game is named
         self.B.L.execute("local st = STATE:get(); st.co.limits[3] = { amount = 5 }; STATE:set(st)")
         self.relay.checksum_request(3, self.relay.future_stamp(), False)
-        self.tick(40)
+        self.tick(20)
         pa, pb = self.relay.reports[3][0][1], self.relay.reports[3][1][1]
         self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"companies"})
 
@@ -851,13 +909,39 @@ class CompanyGameTest(unittest.TestCase):
         payload = self.relay.ser({"stamp": stamp, "seq": 9, "body": body, "from": 1})
         self.relay.send(self.A, "action", 1, payload)
         self.relay.send(self.B, "action", 1, payload)   # the originator's own copy is not relayed back; both get it here for the test
-        self.tick(30)
+        self.tick(20)
         self.assertEqual(len(self.A.applied()), before, "the host did not apply it")
         self.assertEqual(len(self.B.applied()), before, "nor did the client")
         self.assertSameRegistry()
         led = self.A.registry()["ledger"][1]
         self.assertEqual(led["refused"], 1, "each game refused it once, and the registry (identical on both) counts it once")
         self.assertIn("spending limit reached", led["last"])
+
+    def test_a_category_the_host_forbade_stops_the_player_at_the_originator_and_on_every_game(self):
+        self.start()
+        self.tick(10)
+        self.assertTrue(self.op(self.A, op="perm", player=1, category="spend", allowed=False))
+        self.assertSameRegistry()
+        shipped = len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"])
+        self.assertFalse(self.buy(self.B), "buying is forbidden: the window hears about it at once")
+        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]), shipped)
+        self.assertTrue(any("not allowed to spend" in why for (_, _, why) in self.relay.refused), self.relay.refused)
+        self.assertTrue(self.line(self.B), "building is not")
+        # a client that sends it anyway is refused by every game
+        body = self.relay.C.serialize(self.relay.C.parse(
+            '{["fn"]="makeVehicleBuyCmd",["args"]={["n"]=3,[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={}}}'))
+        payload = self.relay.ser({"stamp": self.A.time() + 5 * STEP, "seq": 9, "body": body, "from": 1})
+        self.relay.send(self.A, "action", 1, payload)
+        self.relay.send(self.B, "action", 1, payload)
+        self.tick(20)
+        self.assertEqual(self.both("#GAME.applied"), (1, 1), "only the line was built")
+        self.assertSameRegistry()
+        led = self.A.registry()["ledger"][1]
+        self.assertEqual((led["refused"], led["last"]), (1, "not allowed to spend"))
+        # allowed again
+        self.assertTrue(self.op(self.A, op="perm", player=1, category="spend", allowed=True))
+        self.assertTrue(self.buy(self.B))
+        self.assertSameRegistry()
 
     def test_only_the_host_can_set_limits_and_found_companies(self):
         self.start()
@@ -919,7 +1003,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual((self.A.ev("STATE:get().bind['0:1']"), self.B.ev("STATE:get().bind['0:1']")), (ea, eb))
         # a client cannot add players: every game refuses, no entity appears
         self.B.send_gui('api.cmd.sendCommand(api.cmd.makeGameAddPlayerCmd("Mine", api.type.Vec3f.new(1, 1, 1)))')
-        self.tick(30)
+        self.tick(20)
         self.assertEqual(self.both("#GAME.applied"), (1, 1))
         self.assertEqual(len(self.A.registry()["companies"]), 1)
 
@@ -964,7 +1048,7 @@ class CompanyGameTest(unittest.TestCase):
         payload = self.relay.ser({"stamp": stamp, "seq": 4, "body": body, "from": 2})
         self.relay.send(self.A, "action", 2, payload)
         self.relay.send(self.B, "action", 2, payload)
-        self.tick(30)
+        self.tick(20)
         self.assertEqual(self.A.ev("GAME.applied[#GAME.applied].args[1]"), 7)
         self.assertEqual(self.B.ev("GAME.applied[#GAME.applied].args[1]"), 7)
 
@@ -1039,7 +1123,7 @@ class CompanyGameTest(unittest.TestCase):
         self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 5000")        # the savegame's player drifts on the client
         self.relay.pump()
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
-        self.tick(40)
+        self.tick(20)
         pa_, pb_ = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
         self.assertIn("balance", {k for k in pa_ if pa_[k] != pb_[k]})
         self.relay.send_authority(1)
@@ -1152,7 +1236,9 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.line(self.B))
         self.A.L.execute("LINE_RESULT[%d] = 1700" % self.A.ev("GAME.applied[1].entity"))
         self.B.L.execute("LINE_RESULT[%d] = 1700" % self.B.ev("GAME.applied[1].entity"))
-        self.tick(300)           # the earnings of lines are read again every few seconds
+        for game in (self.A, self.B):          # the page is written again when the roster changes (and every few seconds)
+            self.relay.send(game, "player_joined", 0, self.relay.ser({"player": {"id": 9, "name": "dave", "ready": True}}))
+        self.tick(4)
         for game in (self.A, self.B):
             st = game.status()
             self.assertEqual(row(st, 1)["earned"], 1700)
@@ -1162,11 +1248,11 @@ class CompanyGameTest(unittest.TestCase):
         self.start()
         self.tick(10)
         self.assertTrue(self.A.ui_company(op="found", name="Ironworks", open=True))
-        self.tick(30)
+        self.tick(20)
         self.assertEqual(sorted(self.A.registry()["companies"]), ["c1"])
         self.assertSameRegistry()
         self.assertTrue(self.B.ui_company(op="join", company="c1"))
-        self.tick(30)
+        self.tick(20)
         self.assertEqual(self.A.registry()["members"], {1: "c1"})
         self.assertSameRegistry()
         # a record the module does not know is ignored, one that is no table too
@@ -1174,10 +1260,24 @@ class CompanyGameTest(unittest.TestCase):
         self.tick(10)
         # "add" is the engine command that adds a player
         self.assertTrue(self.A.ui_company(op="add", name="Mill", color=[0.1, 0.2, 0.3]))
-        self.tick(30)
+        self.tick(20)
         self.assertEqual(self.A.registry()["companies"]["c2"]["name"], "Mill")
         self.assertEqual(self.both("#GAME.applied"), (1, 1))
         self.assertSameRegistry()
+
+    def test_window_records_are_dropped_when_commands_cannot_be_held(self):
+        # an api whose command table refuses assignment: nothing is wrapped, so an operation or a new player would apply
+        # on this game alone; the record is dropped and the log says why
+        self.B.L.execute("local real = GUI_API.cmd; GUI_API.cmd = setmetatable({}, { __index = real, __newindex = function() error('read-only') end })")
+        self.start()
+        self.tick(10)
+        self.assertIn("sendCommand is read-only", self.B.log())
+        self.assertTrue(self.B.ui_company(op="add", name="Mill"))
+        self.assertTrue(self.B.ui_company(op="leave"))
+        self.tick(10)
+        self.assertIn("company action not sent", self.B.log())
+        self.assertEqual(self.B.ev("#GAME.applied"), 0, "no player was added on this game alone")
+        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]), 0)
 
     def test_a_fault_in_the_company_layer_never_loses_the_players_action(self):
         self.start()
@@ -1187,6 +1287,18 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.buy(self.B))
         self.assertEqual(self.A.applied(), self.B.applied(), "the purchase went through on both")
         self.assertIn("company layer failed", self.B.log())
+
+    def test_a_fault_while_writing_the_page_neither_stops_the_game_nor_fills_the_log(self):
+        self.start()
+        self.tick(10)
+        self.assertTrue(self.op(self.A, op="found", name="Ironworks"))
+        # garbage in the registry of one game, with a newer revision so that the interface half copies it
+        self.B.L.execute("local st = STATE:get(); st.co.made = 5; st.co.rev = st.co.rev + 1; STATE:set(st)")
+        before = self.B.time()
+        self.tick(20)
+        self.assertGreater(self.B.time(), before + 10 * STEP, "the game keeps pacing and answering the host")
+        self.assertEqual(self.B.log().count("company layer failed in page"), 1, "logged once, not every frame")
+        self.assertTrue(self.buy(self.B), "and the player's actions still go through")
 
     def test_a_forged_company_action_with_a_bad_shape_is_refused_everywhere(self):
         self.start()
