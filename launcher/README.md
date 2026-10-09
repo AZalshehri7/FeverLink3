@@ -70,7 +70,7 @@ Under the checks, **Next step** says the first thing to do in a sentence.
 
 | Key | What it does |
 |---|---|
-| `1` | Install or repair: `install::install`, after the checks of `plan_install` (Steam, game, a complete folder, game closed, no foreign `winhttp.dll`). It asks first when this folder is older than what is installed |
+| `1` | Install or repair: `install::install`, after the checks of `plan_install` (Steam, game, a complete folder, game closed, a `winhttp.dll` that can be read and is not another mod's: a locked one stops the install before anything changes). It asks first when this folder is older than what is installed |
 | `2` | Uninstall: `install::uninstall`, after a yes/no question (default no) |
 | `3` | This folder against the installed files, no network: the **dry run** of `install::install` is the comparison (what it would change is what differs), so the answer and a real install cannot disagree. Says newer, older, same or not installed |
 | `4` | `steam.exe -applaunch 3493540` from the Steam folder; refuses when the game already runs |

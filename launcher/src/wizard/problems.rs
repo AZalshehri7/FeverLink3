@@ -117,7 +117,7 @@ fn os_error_code(text: &str) -> Option<u32> {
 /// Sorts the failure text of an install step into a [`Problem`]. The report only keeps the error as text, so the
 /// operating system's code is read from it first (the words are translated, the code is not), then the words
 /// `install.rs` itself uses.
-fn classify_reason(item: Item, reason: &str, path: &Path) -> Problem {
+pub(super) fn classify_reason(item: Item, reason: &str, path: &Path) -> Problem {
     match os_error_code(reason) {
         // sharing violation, lock violation, "the file has a user-mapped section open"
         Some(32 | 33 | 1224) => return Problem::FilesInUse(path.to_path_buf()),

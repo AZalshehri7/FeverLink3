@@ -9,7 +9,7 @@ use feverlink3_launcher::install::{self, Item, Outcome};
 use feverlink3_launcher::APP_ID;
 
 use super::facts::{folder_dir, installed_state, package_state, Facts, InstallState, Package};
-use super::problems::{failure_problems, Problem};
+use super::problems::{classify_reason, failure_problems, Problem};
 use super::versions::{own_version, version_order};
 
 const RELEASES_URL: &str = "https://github.com/AZalshehri7/FeverLink3/releases";
@@ -39,8 +39,14 @@ pub(super) fn plan_install(f: &Facts) -> Result<InstallPlan<'_>, Problem> {
     if f.game_running {
         return Err(Problem::GameRunning);
     }
-    if installed_state(f) == InstallState::ForeignDll {
-        return Err(Problem::ForeignDll(game_dir.join(install::DLL_NAME)));
+    match installed_state(f) {
+        InstallState::ForeignDll => return Err(Problem::ForeignDll(game_dir.join(install::DLL_NAME))),
+        // not knowing whether the module there is ours, nothing is installed next to it: the cause (in use, no
+        // permission) is told instead of leaving half an install behind
+        InstallState::Unreadable(why) => {
+            return Err(classify_reason(Item::NativeDll, &why, &game_dir.join(install::DLL_NAME)));
+        }
+        _ => {}
     }
     match (f.payload_mod.as_deref(), f.payload_dll.as_deref()) {
         (Some(mod_source), Some(native_dll)) => Ok(InstallPlan { game_dir, mod_source, native_dll }),
@@ -167,7 +173,8 @@ fn installed_text(f: &Facts) -> String {
         InstallState::NotInstalled => "not installed".to_owned(),
         InstallState::Partial { .. } => "only partly installed".to_owned(),
         InstallState::ForeignDll => "another program's winhttp.dll is in the game folder".to_owned(),
-        InstallState::Unknown => "unknown (there is no game folder to look in)".to_owned(),
+        InstallState::NoGameFolder => "unknown (there is no game folder to look in)".to_owned(),
+        InstallState::Unreadable(_) => "unknown (winhttp.dll in the game folder cannot be read)".to_owned(),
     }
 }
 
@@ -258,6 +265,20 @@ mod tests {
         assert!(matches!(
             blocked(|f| f.game_files.as_mut().unwrap().dll = Ok(DllState::Foreign)),
             Problem::ForeignDll(path) if path.ends_with("winhttp.dll")
+        ));
+        // a winhttp.dll that cannot be read is not installed over: the reason is told, nothing is half done
+        assert!(matches!(
+            blocked(|f| f.game_files.as_mut().unwrap().dll =
+                Err("The process cannot access the file because it is being used by another process. (os error 32)".into())),
+            Problem::FilesInUse(path) if path.ends_with("winhttp.dll")
+        ));
+        assert!(matches!(
+            blocked(|f| f.game_files.as_mut().unwrap().dll = Err("Access is denied. (os error 5)".into())),
+            Problem::PermissionDenied(path) if path.ends_with("winhttp.dll")
+        ));
+        assert!(matches!(
+            blocked(|f| f.game_files.as_mut().unwrap().dll = Err("something odd".into())),
+            Problem::Other(text) if text.contains("something odd")
         ));
         // Steam wins over the game, the game over the folder, the folder over the running game
         let mut everything_wrong = base_facts();

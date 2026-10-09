@@ -37,7 +37,7 @@ use feverlink3_launcher::install::{self, Payload};
 
 use diagnostics::{build_diagnostics, doctor_text, read_logs};
 use facts::{gather, installed_state, Facts, InstallState};
-use menu::{parse_choice, Choice, Typed};
+use menu::{answer, parse_choice, Choice, Typed};
 use plans::{comparison_lines, plan_install, plan_logs, plan_start, plan_uninstall};
 use problems::{summarize_install, summarize_uninstall, Summary};
 use screen::{render_screen, Status};
@@ -64,7 +64,7 @@ fn confirm(input: &mut dyn BufRead, out: &mut dyn Write, question: &str) -> io::
     writeln!(out, "{question}")?;
     write!(out, "Type y and press Enter to continue, or just press Enter to cancel: ")?;
     out.flush()?;
-    Ok(read_line(input)?.is_some_and(|line| matches!(line.trim().to_lowercase().as_str(), "y" | "yes")))
+    Ok(read_line(input)?.is_some_and(|line| matches!(answer(&line).to_lowercase().as_str(), "y" | "yes")))
 }
 
 /// The ending of an install or uninstall, tagged like the checks so that success and trouble look different.
@@ -359,7 +359,7 @@ mod tests {
         // the next screen knows
         let second_screen = &out[out.find("Press Enter").unwrap()..];
         assert!(second_screen.contains(&format!("installed (version {})", own_version())), "{second_screen}");
-        assert!(second_screen.contains("Next step: choose 4"), "{second_screen}");
+        assert!(second_screen.contains("Next step: Choose 4"), "{second_screen}");
     }
 
     #[test]
@@ -383,6 +383,30 @@ mod tests {
         assert!(out.contains("FeverLink3 is installed."), "{out}");
         assert_eq!(fs::read_to_string(pc.installed_mod().join("content").join("a.lua")).unwrap(), "a");
         assert!(pc.game().join(install::APPID_FILE).is_file());
+    }
+
+    /// A real sharing violation, as Windows gives it while another program holds the file (the game, or a virus
+    /// scan): the operating system's own error reaches the explanation, and nothing is left half installed.
+    #[cfg(windows)]
+    #[test]
+    fn a_winhttp_dll_held_by_another_program_stops_the_install_in_plain_words() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let pc = Pc::new();
+        let dll = pc.game().join(install::DLL_NAME);
+        fs::write(&dll, b"MZ an older module of ours: feverlink3_native").unwrap();
+        // share_mode(0): nobody else may open the file, not even to read it
+        let _held = fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&dll).unwrap();
+        let out = drive(&pc, "1\n\n0\n");
+        assert!(out.contains("A file is in use by another program"), "{out}");
+        assert!(
+            out.contains("[??]  FeverLink3         unknown: winhttp.dll in the game folder cannot be read"),
+            "{out}"
+        );
+        assert!(!out.contains("Installing FeverLink3"), "nothing is started: {out}");
+        assert!(!pc.installed_mod().exists(), "no half install");
+        assert!(!pc.game().join(install::PATH_FILE).exists());
+        assert!(!pc.game().join(install::APPID_FILE).exists());
     }
 
     #[test]
@@ -455,16 +479,28 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_write_is_explained_in_plain_words() {
+    fn a_failing_step_is_listed_and_explained_in_plain_words() {
         let pc = Pc::new();
-        // a folder where the DLL belongs makes the step fail, as a lock or a permission problem would
+        // a file where the mods folder belongs: the dry run cannot tell, the real install fails at that step
+        fs::write(pc.users[0].join("mods"), "not a folder").unwrap();
+        let out = drive(&pc, "1\n\n0\n");
+        assert!(out.contains("FAILED mod"), "the report lists the failed step: {out}");
+        assert!(out.contains("[!!] FeverLink3 could not be installed completely."), "{out}");
+        assert!(out.contains("Something unexpected went wrong: mod: "), "an explanation follows: {out}");
+        assert!(pc.game().join(install::DLL_NAME).is_file(), "the steps that could be done were done");
+    }
+
+    #[test]
+    fn a_winhttp_dll_that_cannot_be_read_stops_the_install_before_anything_changes() {
+        let pc = Pc::new();
+        // a folder where the module belongs cannot be read as a file: access is denied
         fs::create_dir_all(pc.game().join(install::DLL_NAME)).unwrap();
         let out = drive(&pc, "1\n\n0\n");
-        assert!(out.contains("FAILED"), "the report lists the failed step: {out}");
-        assert!(out.contains("[!!] FeverLink3 could not be installed completely."), "{out}");
-        let explained = out.contains("Windows did not allow FeverLink3 to change")
-            || out.contains("Something unexpected went wrong: winhttp.dll");
-        assert!(explained, "a plain-language explanation follows: {out}");
+        assert!(out.contains("Windows did not allow FeverLink3 to change"), "{out}");
+        assert!(out.contains("winhttp.dll"), "{out}");
+        assert!(!out.contains("Installing FeverLink3"), "{out}");
+        assert!(!pc.installed_mod().exists(), "no half install");
+        assert!(!pc.game().join(install::PATH_FILE).exists());
     }
 
     #[test]
@@ -491,6 +527,18 @@ mod tests {
 
         let again = drive(&pc, "2\nyes\n\n0\n");
         assert!(again.contains("FeverLink3 was not installed. Nothing was removed."), "{again}");
+    }
+
+    #[test]
+    fn piped_input_that_starts_with_a_byte_order_mark_works() {
+        // PowerShell and Notepad write one in front of the first line of a file or a pipe
+        let pc = Pc::new();
+        let out = drive(&pc, "\u{FEFF}1\n\n2\ny\n\n0\n");
+        assert!(!out.contains("is not on the menu"), "{out}");
+        assert!(out.contains("[ok] FeverLink3 is installed."), "{out}");
+        assert!(out.contains("[ok] FeverLink3 was removed."), "{out}");
+        let answered = drive(&pc, "1\n\n\u{FEFF}2\n\u{FEFF}y\n\n0\n");
+        assert!(answered.contains("[ok] FeverLink3 was removed."), "a marked answer counts as a yes: {answered}");
     }
 
     #[test]

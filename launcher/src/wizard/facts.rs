@@ -108,8 +108,11 @@ fn read_game_files(game_dir: &Path) -> GameFiles {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum InstallState {
-    /// No game folder to look in, or its files could not be read.
-    Unknown,
+    /// No game folder to look in.
+    NoGameFolder,
+    /// The game folder is there but its `winhttp.dll` cannot be read (in use, or no permission): the operating
+    /// system's text. Whether it is ours is not known, so nothing is installed over it.
+    Unreadable(String),
     NotInstalled,
     /// The native module and the mod for every Steam user; the version that put them there, when it is known.
     Complete {
@@ -125,12 +128,12 @@ pub(super) enum InstallState {
 }
 
 pub(super) fn installed_state(f: &Facts) -> InstallState {
-    let Some(files) = &f.game_files else { return InstallState::Unknown };
+    let Some(files) = &f.game_files else { return InstallState::NoGameFolder };
     let native_module = match &files.dll {
         Ok(DllState::Foreign) => return InstallState::ForeignDll,
         Ok(DllState::Ours) => true,
         Ok(DllState::Absent) => false,
-        Err(_) => return InstallState::Unknown,
+        Err(why) => return InstallState::Unreadable(why.clone()),
     };
     let users = f.users.len();
     let mods = f.users.iter().filter(|u| u.mod_installed).count();
@@ -222,11 +225,11 @@ mod tests {
 
         let mut unreadable = base_facts();
         unreadable.game_files.as_mut().unwrap().dll = Err("denied".into());
-        assert_eq!(installed_state(&unreadable), InstallState::Unknown);
+        assert_eq!(installed_state(&unreadable), InstallState::Unreadable("denied".into()));
 
         let mut no_game = base_facts();
         no_game.game_files = None;
-        assert_eq!(installed_state(&no_game), InstallState::Unknown);
+        assert_eq!(installed_state(&no_game), InstallState::NoGameFolder);
 
         let mut no_user_folder = installed_facts();
         no_user_folder.users.clear();
@@ -312,7 +315,7 @@ mod tests {
         let f = gather(&pc);
         assert!(f.steam_path.is_none() && f.game_dir.is_none() && f.steam_exe.is_none() && f.plan.is_none());
         assert_eq!(f.build, BuildCheck::NoGame);
-        assert_eq!(installed_state(&f), InstallState::Unknown);
+        assert_eq!(installed_state(&f), InstallState::NoGameFolder);
 
         let no_exe = Pc::new();
         fs::remove_file(no_exe.steam.clone().unwrap().join("steam.exe")).unwrap();

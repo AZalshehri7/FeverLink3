@@ -33,10 +33,16 @@ pub(super) enum Typed {
     Unknown(String),
 }
 
+/// What the player typed: the line without its line break and the spaces around it, and without the byte order mark
+/// that a file piped in from Notepad or PowerShell starts with (a console never sends one).
+pub(super) fn answer(line: &str) -> &str {
+    line.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+}
+
 /// Reads one typed line: the menu keys, `q`, `quit` and `exit` for leaving, a trailing `.` or `)` ignored, digits
 /// from Arabic and full-width keyboard layouts accepted. Never fails; unknown text is handed back.
 pub(super) fn parse_choice(line: &str) -> Typed {
-    let text = line.trim();
+    let text = answer(line);
     if text.is_empty() {
         return Typed::Nothing;
     }
@@ -104,6 +110,16 @@ mod tests {
         for other in ["7", "10", "-1", "install", "1 2"] {
             assert_eq!(parse_choice(other), Typed::Unknown(other.to_owned()), "{other}");
         }
+    }
+
+    #[test]
+    fn a_byte_order_mark_in_front_of_piped_input_is_not_part_of_the_answer() {
+        assert_eq!(answer("\u{FEFF}1\r\n"), "1");
+        assert_eq!(answer("\u{FEFF} y \r\n"), "y");
+        assert_eq!(answer("  \u{FEFF}\r\n"), "");
+        assert_eq!(parse_choice("\u{FEFF}1\r\n"), Typed::Choice(Choice::Install));
+        assert_eq!(parse_choice("\u{FEFF}\n"), Typed::Nothing);
+        assert_eq!(parse_choice("\u{FEFF}hello"), Typed::Unknown("hello".to_owned()));
     }
 
     #[test]

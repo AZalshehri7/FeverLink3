@@ -1,11 +1,11 @@
 //! The checks screen: six lines about this PC, the next step, and the whole screen the menu loop draws.
 
-use feverlink3_launcher::install;
+use feverlink3_launcher::install::{self, Item};
 
 use super::facts::{folder_dir, installed_state, package_state, Facts, InstallState, Package};
 use super::menu::menu_lines;
 use super::plans::{compare, Comparison};
-use super::problems::{Problem, STEAM_URL};
+use super::problems::{classify_reason, Problem, STEAM_URL};
 use super::versions::{own_version, BuildCheck};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,12 @@ fn partial_text(native_module: bool, mods: usize, users: usize) -> &'static str 
 fn installed_check(f: &Facts) -> Check {
     const LABEL: &str = "FeverLink3";
     match installed_state(f) {
-        InstallState::Unknown => check(Status::Note, LABEL, "unknown (there is no game folder to look in)"),
+        InstallState::NoGameFolder => check(Status::Note, LABEL, "unknown (there is no game folder to look in)"),
+        InstallState::Unreadable(why) => check(
+            Status::Warn,
+            LABEL,
+            format!("unknown: winhttp.dll in the game folder cannot be read ({why}) - is the game running?"),
+        ),
         InstallState::NotInstalled => check(Status::Note, LABEL, "not installed yet"),
         InstallState::Complete { version: Some(v) } => check(Status::Good, LABEL, format!("installed (version {v})")),
         InstallState::Complete { version: None } => check(Status::Good, LABEL, "installed (version not known)"),
@@ -153,16 +158,19 @@ fn next_step(f: &Facts) -> String {
     let Some(game_dir) = &f.game_dir else { return Problem::GameMissing.message() };
     match installed_state(f) {
         InstallState::ForeignDll => Problem::ForeignDll(game_dir.join(install::DLL_NAME)).message(),
+        InstallState::Unreadable(why) => {
+            classify_reason(Item::NativeDll, &why, &game_dir.join(install::DLL_NAME)).message()
+        }
         InstallState::Complete { .. } if f.game_running => {
             "Transport Fever 3 is running: in the game, click FeverLink3 in the bar at the bottom of the screen.".into()
         }
         InstallState::Complete { .. } if matches!(compare(f), Ok(Comparison::Differs(_))) => {
-            "this folder holds different files than the installed ones. Choose 3 to compare them or 1 to update; \
+            "This folder holds different files than the installed ones. Choose 3 to compare them or 1 to update; \
              otherwise choose 4 to start Transport Fever 3."
                 .into()
         }
         InstallState::Complete { .. } => {
-            "choose 4 to start Transport Fever 3, then click FeverLink3 in the bar at the bottom of the game.".into()
+            "Choose 4 to start Transport Fever 3, then click FeverLink3 in the bar at the bottom of the game.".into()
         }
         state => match package_state(f) {
             Package::TemporaryFolder => Problem::TemporaryFolder.message(),
@@ -170,12 +178,12 @@ fn next_step(f: &Facts) -> String {
                 Problem::PackageIncomplete { mod_missing, dll_missing }.message()
             }
             Package::Complete if f.game_running => {
-                "close Transport Fever 3, then choose 1 to install FeverLink3.".into()
+                "Close Transport Fever 3, then choose 1 to install FeverLink3.".into()
             }
             Package::Complete if matches!(state, InstallState::Partial { .. }) => {
-                "choose 1 to finish installing FeverLink3.".into()
+                "Choose 1 to finish installing FeverLink3.".into()
             }
-            Package::Complete => "choose 1 to install FeverLink3.".into(),
+            Package::Complete => "Choose 1 to install FeverLink3.".into(),
         },
     }
 }
@@ -268,6 +276,25 @@ mod tests {
         let mut foreign = base_facts();
         foreign.game_files.as_mut().unwrap().dll = Ok(DllState::Foreign);
         assert_eq!(installed_check(&foreign).status, Status::Bad);
+        let mut no_game = base_facts();
+        no_game.game_files = None;
+        assert_eq!(line(&no_game), "unknown (there is no game folder to look in)");
+    }
+
+    #[test]
+    fn a_winhttp_dll_that_cannot_be_read_is_said_so_and_explained() {
+        let mut locked = base_facts();
+        locked.game_files.as_mut().unwrap().dll =
+            Err("The process cannot access the file because it is being used by another process. (os error 32)".into());
+        let check = installed_check(&locked);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.text.contains("winhttp.dll in the game folder cannot be read"), "{}", check.text);
+        assert!(check.text.contains("(os error 32)") && check.text.contains("is the game running?"), "{}", check.text);
+        assert!(!check.text.contains("no game folder"), "the folder is there: {}", check.text);
+        // what to do next is the plain explanation of the cause, not "choose 1"
+        let next = next_step(&locked);
+        assert!(next.starts_with("A file is in use by another program"), "{next}");
+        assert!(next.contains("winhttp.dll"), "{next}");
     }
 
     #[test]
@@ -302,8 +329,8 @@ mod tests {
     #[test]
     fn next_step_names_the_first_thing_to_do() {
         let next = |f: &Facts| next_step(f);
-        assert_eq!(next(&base_facts()), "choose 1 to install FeverLink3.");
-        assert!(next(&installed_facts()).starts_with("choose 4 to start Transport Fever 3"));
+        assert_eq!(next(&base_facts()), "Choose 1 to install FeverLink3.");
+        assert!(next(&installed_facts()).starts_with("Choose 4 to start Transport Fever 3"));
 
         let mut no_steam = base_facts();
         no_steam.steam_path = None;
@@ -314,14 +341,14 @@ mod tests {
 
         let mut running = base_facts();
         running.game_running = true;
-        assert_eq!(next(&running), "close Transport Fever 3, then choose 1 to install FeverLink3.");
+        assert_eq!(next(&running), "Close Transport Fever 3, then choose 1 to install FeverLink3.");
         let mut playing = installed_facts();
         playing.game_running = true;
         assert!(next(&playing).contains("click FeverLink3 in the bar at the bottom"));
 
         let mut partial = base_facts();
         partial.game_files.as_mut().unwrap().dll = Ok(DllState::Ours);
-        assert_eq!(next(&partial), "choose 1 to finish installing FeverLink3.");
+        assert_eq!(next(&partial), "Choose 1 to finish installing FeverLink3.");
 
         let mut incomplete = base_facts();
         incomplete.payload_mod = None;
@@ -345,7 +372,7 @@ mod tests {
         let screen = render_screen(&base_facts());
         assert!(screen.starts_with(&format!("FeverLink3 {} - cooperative multiplayer", own_version())));
         let order: Vec<usize> =
-            ["Checking this PC...", "[ok]  Steam", "Next step: choose 1", "What would you like to do?"]
+            ["Checking this PC...", "[ok]  Steam", "Next step: Choose 1", "What would you like to do?"]
                 .iter()
                 .map(|part| screen.find(part).unwrap_or_else(|| panic!("{part} is on the screen")))
                 .collect();
