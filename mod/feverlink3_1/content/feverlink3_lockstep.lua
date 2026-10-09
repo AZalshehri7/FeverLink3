@@ -195,7 +195,9 @@ L.EVENT_SPEC = {
 		if not h then return nil, "event " .. tostring(args[2]) .. "/" .. tostring(args[3]) .. " is not replicated" end
 		local param, why
 		if h.encode then
-			param, why = h.encode(args[4], ctx)
+			-- a handler that raises must not throw into the window that sent the event
+			local ok, p1, p2 = pcall(h.encode, args[4], ctx)
+			if ok then param, why = p1, p2 else why = "encode failed: " .. tostring(p1) end
 		else
 			local ok, copy = pcall(ctx.plain, args[4])
 			if ok then param = copy else why = copy end
@@ -208,7 +210,11 @@ L.EVENT_SPEC = {
 		local h = eventHandler(a[2], a[3])
 		if not h then return nil, "event " .. tostring(a[2]) .. "/" .. tostring(a[3]) .. " is unknown here" end
 		local param, why = a[4], nil
-		if h.decode then param, why = h.decode(a[4], ctx) end
+		if h.decode then
+			-- nor may one stop the simulation on an event another player sent
+			local ok, p1, p2 = pcall(h.decode, a[4], ctx)
+			if ok then param, why = p1, p2 else param, why = nil, "decode failed: " .. tostring(p1) end
+		end
 		if why ~= nil then return nil, "event " .. tostring(a[2]) .. "/" .. tostring(a[3]) .. ": " .. tostring(why) end
 		return { n = 4, a[1], a[2], a[3], param }
 	end,

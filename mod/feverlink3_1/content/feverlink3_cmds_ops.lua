@@ -698,13 +698,25 @@ local JOURNAL = {
 
 -- ================================================================== commands
 
+-- A codec or handler that fails with an error answers "nil, reason" instead: an encode that raised would throw into
+-- the window that sent the command, a decode that raised on a body another player sent would stop the simulation half
+-- and make it try the same action again at every step.
+local function guarded(what, f)
+	return function(...)
+		local r = { pcall(f, ...) }
+		if not r[1] then return nil, what .. " failed: " .. tostring(r[2]) end
+		if r[3] ~= nil then return r[2], r[3] end
+		return r[2]
+	end
+end
+
 -- command{ name, category, args = { codec, ... }, creates, result }: argument i without a codec travels as a plain
 -- value. `creates` and `result` are the lockstep core's: the component of the entity the command creates and the
 -- field of the callback data that names it.
 local function command(def)
 	local codecs = def.args or {}
 	local spec = { category = def.category, creates = def.creates, result = def.result }
-	spec.encode = function(name, args, ctx)
+	spec.encode = guarded("encode", function(name, args, ctx)
 		local n = args.n or #args
 		local st = newState()
 		local out = { n = n }
@@ -714,8 +726,8 @@ local function command(def)
 			out[i] = w
 		end
 		return { fn = name, args = out }
-	end
-	spec.decode = function(body, ctx)
+	end)
+	spec.decode = guarded("decode", function(body, ctx)
 		local a = body.args
 		if type(a) ~= "table" then return nil, "malformed body" end
 		local n = a.n or #a
@@ -726,7 +738,7 @@ local function command(def)
 			out[i] = v
 		end
 		return out
-	end
+	end)
 	M.commands[def.name] = spec
 	return spec
 end
@@ -780,7 +792,7 @@ command{ name = "makeTownUpdateCargoNeedsCmd", category = "other", args = { TOWN
 local function fieldEvent(category, fields)
 	return {
 		category = category,
-		encode = function(param, ctx)
+		encode = guarded("encode", function(param, ctx)
 			local tree, why = marshal(param)
 			if type(tree) ~= "table" then return nil, why or "no parameters" end
 			local st = newState()
@@ -792,8 +804,8 @@ local function fieldEvent(category, fields)
 				end
 			end
 			return tree
-		end,
-		decode = function(param, ctx)
+		end),
+		decode = guarded("decode", function(param, ctx)
 			if type(param) ~= "table" then return nil, "malformed parameters" end
 			local tree = copy(param)
 			for field, kind in pairs(fields) do
@@ -804,7 +816,7 @@ local function fieldEvent(category, fields)
 				end
 			end
 			return tree
-		end,
+		end),
 	}
 end
 
@@ -812,13 +824,13 @@ end
 local function plainEvent(category, check)
 	local h = { category = category }
 	if check then
-		h.encode = function(param)
+		h.encode = guarded("encode", function(param)
 			local tree, why = marshal(param)
 			if tree == nil and why then return nil, why end
 			local veto = check(tree)
 			if veto then return nil, veto end
 			return tree
-		end
+		end)
 	end
 	return h
 end

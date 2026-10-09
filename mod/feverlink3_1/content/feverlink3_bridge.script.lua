@@ -484,7 +484,8 @@ local function installWrap()
 			end
 			local ok, err = shipLocal(tag, cb)
 			if ok then return end
-			logGui("command " .. tag.name .. " sent natively: " .. tostring(err))
+			-- an event nobody replicates (notifications, tutorial steps...) is the normal case, not worth a line each
+			if category ~= "local" then logGui("command " .. tag.name .. " sent natively: " .. tostring(err)) end
 			return O.sendCommand(cmd, cb, progress)
 		end
 	end)

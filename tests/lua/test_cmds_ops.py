@@ -1019,6 +1019,7 @@ class PermissionTest(OpsBase):
         self.settle()
         self.assertTrue(self.B.L.eval("LOAN_OK == false and SELL_OK == false and NAME_OK == false"), "the windows are told no")
         self.assertTrue(self.B.L.eval("NOTE_OK == true"))
+        self.assertNotIn("Notifications", self.B.log(), "an event nobody replicates is not worth a log line each")
         self.assertEqual(self.B.actions_shipped(), [])
         self.assertEqual(self.A.applied(), [])
         self.assertEqual(self.B.applied(), ["event:Notifications/dismiss@%d" % int(self.B.L.eval("GAME.applied[1].time"))])
@@ -1285,6 +1286,32 @@ class ModuleTest(unittest.TestCase):
                        "return args[2] end")(enc)
         self.assertEqual(dec, 90010, "game A's depot, found through A's building")
 
+    def test_garbage_from_another_player_is_refused_and_never_raises(self):
+        # a body that makes the codec raise would stop the simulation half and be retried at every step
+        dctx = self.L.eval("{ player = 7, resolve = function(k) return tonumber(k:match('%d+')) end }")
+        buy = self.ops.commands.makeVehicleBuyCmd
+        for text, expect in [
+            ("{ fn = 'x', args = { n = 3, 'me', 5, 'config' } }", "malformed player reference"),
+            ("{ fn = 'x', args = { n = 3, { __ref = 'player' }, { __ref = 'entity', key = 's:55', at = { con = { key = 's:59', f = 'station2.con',"
+             " p = { x = 'far' } }, i = 1 } }, {} } }", "decode failed"),
+            ("{ fn = 'x', args = { n = 3, { __ref = 'player' }, { __ref = 'entity', key = 's:55' }, 'config' } }", "malformed TransportVehicleConfig"),
+            ("{ fn = 'x', args = { n = 3, { __ref = 'player' }, { __ref = 'entity', key = 's:55' }, { vehicles = 7 } } }", "argument 3"),
+        ]:
+            out = buy.decode(self.L.eval(text), dctx)
+            self.assertEqual(out[0], None, text)
+            self.assertIn(expect, out[1], text)
+        # the same for an event: a position that is not a position
+        spec = self.K.COMMANDS.makeScriptingSendEventCmd
+        out = spec.decode(self.L.eval("{ fn = 'x', args = { n = 4, '', 'Companies', 'MakeGreen', { constructionEntity = "
+                                      "{ __ref = 'entity', key = 's:81', f = 'industry/coal.con', p = { x = {} } } } } }"), dctx)
+        self.assertEqual(out[0], None)
+        self.assertIn("failed", out[1])
+        # and an encode that raises answers "native" instead of throwing into the window
+        weird = self.L.eval("{ n = 3, 7, 55, setmetatable({}, { __pairs = function() error('boom') end }) }")
+        out = buy.encode("makeVehicleBuyCmd", weird, self.L.eval(CTX))
+        self.assertEqual(out[0], None)
+        self.assertIn("encode failed", out[1])
+
     def test_a_date_is_read_by_its_fields(self):
         class Date:   # userdata with no member list: the game's calendar widget reads year, month and day
             year, month, day = 1925, 6, 1
@@ -1309,7 +1336,7 @@ class ModuleTest(unittest.TestCase):
         self.assertEqual((back[2].amount, back[2].category.type, back[2].category.construction), (-300, 4, 4))
         junk = self.L.eval("(function() local e = GUI_API.type.JournalEntry.new() e.amount = 1 e.category.type = 99 return e end)()")
         out = spec.encode("makeJournalBookAssetCmd", self.L.eval("function(e) return { n = 3, 7, e } end")(junk), ctx)
-        self.assertEqual(out[0], None)
+        self.assertEqual(out, (None, "argument 2: a journal category this module does not know"))
 
 
 if __name__ == "__main__":
