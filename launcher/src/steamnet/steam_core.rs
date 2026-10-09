@@ -115,6 +115,9 @@ pub struct Config {
     /// Sleep between poll cycles while there is a listen socket or a connection. Every message waits for the next
     /// cycle, so this is the latency the core adds; the probe's 100 ms polling read as 199 ms on a real relay link.
     pub active: Duration,
+    /// Sleep between poll cycles while there are listen sockets but no connection (the probe listens all game
+    /// long). A peer connecting waits at most this long to be accepted; Steam allows a second or two.
+    pub listening: Duration,
     /// Sleep between poll cycles while there is nothing to serve.
     pub idle: Duration,
     /// How often to look for Steam's interfaces until they exist.
@@ -134,6 +137,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             active: Duration::from_millis(2),
+            listening: Duration::from_millis(20),
             idle: Duration::from_millis(100),
             locate: Duration::from_millis(250),
             link_every: Duration::from_secs(1),
@@ -488,27 +492,28 @@ impl Shared {
         self.wake.notify_all();
     }
 
-    /// Waits between two poll cycles. While there is something to serve this is a plain short sleep (waiting on a
-    /// condition variable is only as precise as the system timer tick on Windows); with nothing to serve the poller
-    /// sleeps longer and a new listen socket or connection wakes it.
-    fn nap(&self, busy: bool) {
-        if busy {
+    /// Waits between two poll cycles. With a connection it is a plain short sleep (waiting on a condition variable
+    /// is only as precise as the system timer tick on Windows, and a message waits for the next cycle). With only
+    /// listen sockets, or nothing at all, the poller sleeps longer, and a new listen socket, connection or close
+    /// wakes it: the probe's listen socket stays open for the whole game and must cost next to nothing.
+    fn nap(&self) {
+        let (listeners, conns) = {
+            let reg = lock(&self.registry);
+            (reg.listeners.len(), reg.conns.len())
+        };
+        if conns > 0 {
             thread::sleep(self.config.active);
             return;
         }
+        let rest = if listeners > 0 { self.config.listening } else { self.config.idle };
         let guard = lock(&self.woken);
         let (mut guard, _) =
-            self.wake.wait_timeout_while(guard, self.config.idle, |woken| !*woken).unwrap_or_else(|p| p.into_inner());
+            self.wake.wait_timeout_while(guard, rest, |woken| !*woken).unwrap_or_else(|p| p.into_inner());
         *guard = false;
     }
 
     fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
-    }
-
-    fn busy(&self) -> bool {
-        let reg = lock(&self.registry);
-        !reg.listeners.is_empty() || !reg.conns.is_empty()
     }
 
     fn run(self: &Arc<Self>) {
@@ -518,7 +523,7 @@ impl Shared {
             for notice in self.cycle() {
                 notice.dispatch();
             }
-            self.nap(self.busy());
+            self.nap();
         }
     }
 
@@ -1748,6 +1753,33 @@ mod tests {
         assert_eq!(link.send_rate, 262_144, "Steam's own default");
         let link = wait_link(&core_b.handle(), b.connections()[0], "a sample", |_| true);
         assert_eq!(link.send_rate, Config::default().send_rate as u32);
+    }
+
+    #[test]
+    fn the_poller_idles_with_nothing_to_serve_and_runs_every_few_ms_with_a_connection() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        let (core_a, core_b) = (a.core_with(Config::default()), b.core_with(Config::default()));
+        for core in [&core_a, &core_b] {
+            core.handle().wait_ready(Instant::now() + WAIT, &|| false).expect("ready");
+        }
+        // polls in 400 ms, counted by the pumps of the callbacks
+        let polls = |machine: &FakeMachine| {
+            let before = machine.callback_runs();
+            thread::sleep(Duration::from_millis(400));
+            machine.callback_runs() - before
+        };
+        let idle = polls(&a);
+        let (server, client) = (Recorder::new(), Recorder::new());
+        core_a.handle().listen(0, server).expect("listen");
+        let listening = polls(&a);
+        let conn = core_b.handle().connect(a.steam_id(), 0, client.clone()).expect("connect");
+        client.wait_opened("the open");
+        let connected = polls(&a);
+        core_b.handle().close(conn);
+        assert!(idle * 2 < listening, "idle {idle}, listening {listening}");
+        assert!(listening * 2 < connected, "listening {listening}, connected {connected}");
+        // 2 ms is the pace of a connection; even a busy machine gets well past a hundred cycles in 400 ms
+        assert!(connected > 100, "{connected}");
     }
 
     #[test]

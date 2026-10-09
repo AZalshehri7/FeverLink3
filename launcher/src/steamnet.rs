@@ -623,7 +623,9 @@ impl Drop for Probe {
 
 #[cfg(test)]
 mod tests {
+    use super::fake::FakeMachine;
     use super::*;
+    use std::thread;
 
     #[test]
     fn identity_has_the_steam_layout() {
@@ -780,5 +782,230 @@ mod tests {
         assert_eq!(e.0.len(), 8);
         assert_eq!(e.0.front().map(String::as_str), Some("e4"));
         assert_eq!(e.0.back().map(String::as_str), Some("e11"));
+    }
+
+    // ---- the probe on the core, against the in-memory Steam
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Calls `step` (which polls the probes and says whether it is done) every few ms until it holds.
+    fn until(what: &str, mut step: impl FnMut() -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !step() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn without_steam_in_the_process_there_is_no_probe() {
+        // a test run has no steam_api64.dll: the live controller then reports "not available"
+        assert!(Probe::load().is_none());
+    }
+
+    #[test]
+    fn the_probe_waits_for_steam_then_listens_on_virtual_port_one() {
+        let machine = FakeMachine::new();
+        machine.set_ready(false);
+        let core = machine.core_with(super::fake::fast());
+        let mut probe = Probe::on(core.handle());
+        until("the interface diagnostics", || {
+            probe.poll();
+            probe.report().events.iter().any(|e| e.starts_with("Steam interfaces: hsteamuser 0"))
+        });
+        let waiting = probe.report();
+        assert_eq!((waiting.state.as_str(), waiting.steam_id), ("waiting for Steam", None));
+        assert_eq!(machine.listeners(), 0);
+
+        machine.set_ready(true);
+        until("the listen socket", || {
+            probe.poll();
+            probe.report().state == "ready"
+        });
+        let ready = probe.report();
+        assert_eq!(ready.steam_id, Some(machine.steam_id()));
+        assert_eq!(machine.listeners(), 1);
+        assert!(ready.events.iter().any(|e| e == "listening for Steam connections"), "{:?}", ready.events);
+        assert!(ready.events.iter().any(|e| e.starts_with("Steam is ready: tuned")), "{:?}", ready.events);
+        assert_eq!((ready.test, ready.peers, ready.pings_received), (None, Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_probe_and_a_session_listener_share_one_core_on_different_virtual_ports() {
+        let machine = FakeMachine::new();
+        let core = machine.core();
+        let mut probe = Probe::on(core.handle());
+        until("the probe", || {
+            probe.poll();
+            probe.report().state == "ready"
+        });
+        // the session transport listens on virtual port 0 of the same core while the probe holds port 1
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let net = crate::steam_transport::SteamHostNet::listen_on(&core.handle(), tx, WAIT, 8).expect("listen");
+        assert_eq!(machine.listeners(), 2);
+        assert_eq!(PROBE_PORT, 1);
+        drop(net);
+        assert_eq!(machine.listeners(), 1);
+    }
+
+    #[test]
+    fn a_friends_test_reaches_the_probe_and_is_answered() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        let (core_a, core_b) = (a.core(), b.core());
+        let (mut probe_a, mut probe_b) = (Probe::on(core_a.handle()), Probe::on(core_b.handle()));
+        until("both probes", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().state == "ready" && probe_b.report().state == "ready"
+        });
+        a.set_ping(87);
+        b.set_ping(95);
+        probe_a.test(b.steam_id());
+        assert_eq!(probe_a.report().test.map(|t| (t.target, t.state)), Some((b.steam_id(), "connecting".to_string())));
+        until("a pong", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1 && t.ping_ms == Some(87))
+        });
+        let tested = probe_a.report();
+        let test = tested.test.expect("a test");
+        assert_eq!((test.state.as_str(), test.route.as_str()), ("connected", "direct"));
+        assert!(test.last_rtt_ms.is_some_and(|ms| ms < 1000), "{test:?}");
+        assert!(tested.events.iter().any(|e| e == "test connection established"), "{:?}", tested.events);
+
+        // the other side counted the ping and lists the friend with the route and ping Steam measured
+        until("the peer's view", || {
+            probe_b.poll();
+            probe_b.report().peers.first().is_some_and(|p| p.ping_ms == Some(95))
+        });
+        let answered = probe_b.report();
+        assert_eq!(answered.pings_received, 1);
+        assert_eq!(
+            answered.peers,
+            vec![PeerReport { steam_id: Some(a.steam_id()), route: "direct".into(), ping_ms: Some(95) }]
+        );
+        assert!(answered.events.iter().any(|e| e == "a player connected"));
+        assert!(answered.events.iter().any(|e| e == "received a ping, answered"));
+
+        // testing again replaces the connection; the old one disappears from the other side
+        probe_a.test(b.steam_id());
+        until("the second test", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1) && probe_b.report().peers.len() == 1
+        });
+        assert_eq!(probe_b.report().pings_received, 2);
+        assert!(b.connections().len() == 1 && a.connections().len() == 1);
+    }
+
+    #[test]
+    fn the_probe_tests_the_own_account_inside_one_process() {
+        let machine = FakeMachine::new();
+        let core = machine.core();
+        let mut probe = Probe::on(core.handle());
+        until("the listen socket", || {
+            probe.poll();
+            probe.report().state == "ready"
+        });
+        probe.test(machine.steam_id());
+        until("a pong from ourselves", || {
+            probe.poll();
+            let report = probe.report();
+            report.test.is_some_and(|t| t.pongs >= 1) && report.peers.len() == 1
+        });
+        assert_eq!(probe.report().peers[0].steam_id, Some(machine.steam_id()));
+    }
+
+    #[test]
+    fn a_test_that_cannot_connect_says_why() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        let (core_a, _core_b) = (a.core(), b.core());
+        let mut probe = Probe::on(core_a.handle());
+        until("the listen socket", || {
+            probe.poll();
+            probe.report().state == "ready"
+        });
+        // b runs no probe: nobody listens on virtual port 1
+        probe.test(b.steam_id());
+        until("the refusal", || {
+            probe.poll();
+            probe.report().test.is_some_and(|t| t.state.starts_with("failed"))
+        });
+        let refused = probe.report();
+        let state = refused.test.expect("a test").state;
+        assert!(state.contains("closed by the other side") && state.contains("(5001)"), "{state}");
+        assert!(refused.events.iter().any(|e| e.starts_with("connection ended: closed by the other side")));
+
+        // an account Steam cannot find
+        probe.test(76561198123456789);
+        until("the timeout", || {
+            probe.poll();
+            probe.report().test.is_some_and(|t| t.state.contains("timed out (5003)"))
+        });
+        assert_eq!(probe.report().test.map(|t| t.pongs), Some(0));
+    }
+
+    #[test]
+    fn a_test_while_steam_is_not_ready_changes_nothing() {
+        let machine = FakeMachine::new();
+        machine.set_ready(false);
+        let core = machine.core_with(super::fake::fast());
+        let mut probe = Probe::on(core.handle());
+        probe.poll();
+        probe.test(76561198000000001);
+        assert_eq!(probe.report().test, None);
+    }
+
+    #[test]
+    fn the_route_is_measured_again_and_a_change_is_reported() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        a.set_relay(0x646162);
+        let (core_a, core_b) = (a.core(), b.core());
+        let (mut probe_a, mut probe_b) = (Probe::on(core_a.handle()), Probe::on(core_b.handle()));
+        until("both probes", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().state == "ready" && probe_b.report().state == "ready"
+        });
+        probe_a.test(b.steam_id());
+        until("the relayed route", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.route == "through a Steam relay" && t.pongs >= 1)
+        });
+        // Steam finds a direct path some time after the connection opened
+        a.set_relay(0);
+        until("the upgrade", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.route == "direct")
+        });
+        let events = probe_a.report().events;
+        assert!(events.iter().any(|e| e == "route changed: through a Steam relay -> direct"), "{events:?}");
+    }
+
+    #[test]
+    fn dropping_the_probe_closes_its_listener_and_its_test() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        let (core_a, core_b) = (a.core(), b.core());
+        let (mut probe_a, mut probe_b) = (Probe::on(core_a.handle()), Probe::on(core_b.handle()));
+        until("both probes", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().state == "ready" && probe_b.report().state == "ready"
+        });
+        probe_a.test(b.steam_id());
+        until("the test connection", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1)
+        });
+        drop(probe_a);
+        assert_eq!(a.listeners(), 0);
+        until("the other side to notice", || {
+            probe_b.poll();
+            probe_b.report().peers.is_empty()
+        });
+        assert!(a.connections().is_empty());
     }
 }

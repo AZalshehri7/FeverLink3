@@ -71,6 +71,8 @@ struct Machine {
     largest_sent: usize,
     /// Sends Steam answered with "limit exceeded" (the peer had not read enough yet).
     full_sends: usize,
+    /// Calls of `RunCallbacks`: how often the core polls.
+    callback_runs: usize,
     /// What `GetConnectionRealTimeStatus` reports as the ping.
     ping_ms: i32,
     /// The send rate in force: Steam's default until `SetConfigValue` changes it.
@@ -279,6 +281,7 @@ unsafe extern "C" fn run_callbacks(sockets: *mut c_void) {
         let mut m = model();
         m.tick();
         let Some(machine) = m.machines.get_mut(&machine_of(sockets)) else { return };
+        machine.callback_runs += 1;
         match machine.callback {
             Some(cb) => (Some(cb), machine.events.drain(..).collect::<Vec<_>>()),
             None => (None, Vec::new()),
@@ -617,6 +620,7 @@ fn locate(machine: usize) -> Located {
 pub fn fast() -> Config {
     Config {
         active: Duration::from_millis(1),
+        listening: Duration::from_millis(2),
         idle: Duration::from_millis(5),
         locate: Duration::from_millis(5),
         link_every: Duration::from_millis(20),
@@ -655,6 +659,7 @@ impl FakeMachine {
                 relay_inits: 0,
                 largest_sent: 0,
                 full_sends: 0,
+                callback_runs: 0,
                 ping_ms: 30,
                 send_rate: 262_144,
             },
@@ -815,6 +820,11 @@ impl FakeMachine {
     /// How many sends of this machine found the send buffer full.
     pub fn full_sends(&self) -> usize {
         self.with(|m| m.full_sends)
+    }
+
+    /// How many times the core has pumped this machine's callbacks (once per poll cycle).
+    pub fn callback_runs(&self) -> usize {
+        self.with(|m| m.callback_runs)
     }
 
     /// Messages handed to this machine's core and not released.
