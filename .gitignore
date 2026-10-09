@@ -1,0 +1,23 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+
+# native build output
+native/out/
+
+# release packaging
+release/
+
+# runtime
+logs/
+*.log
+__pycache__/
+*.pyc
+
+# editors
+.idea/
+*.swp

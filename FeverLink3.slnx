@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FeverLink3.Core/FeverLink3.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FeverLink3.Core.Tests/FeverLink3.Core.Tests.csproj" />
+  </Folder>
+</Solution>
