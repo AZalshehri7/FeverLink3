@@ -14,6 +14,11 @@
 //! While a host runs, these commands can be typed: `start`, `pause`, `speed N` (1 to 4), `check`, `resync`, `status`, `quit`.
 
 mod wizard;
+// shared with build.rs, which writes the icon, version information and manifest of this executable; the tests of
+// that code run here
+#[cfg(test)]
+#[path = "../resources/winres.rs"]
+mod winres;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

@@ -302,11 +302,12 @@ fn own_version() -> &'static str {
     marker().strip_prefix(MARKER_PREFIX).and_then(|v| v.strip_suffix('\0')).unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
-/// The version a launcher's bytes announce: the first marker whose text parses as a version. The scan constant
-/// itself appears in the launcher too, followed by something else, so every occurrence is tried.
-fn find_version_marker(bytes: &[u8]) -> Option<String> {
+/// Every version a launcher's bytes announce: the text after each occurrence of the marker prefix that parses as a
+/// version. The scan constant itself appears in the launcher too, followed by something else, so every occurrence
+/// is tried.
+fn version_markers(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
     let prefix = MARKER_PREFIX.as_bytes();
-    bytes.windows(prefix.len()).enumerate().filter(|(_, window)| *window == prefix).find_map(|(at, _)| {
+    bytes.windows(prefix.len()).enumerate().filter(move |(_, window)| *window == prefix).filter_map(move |(at, _)| {
         let rest = bytes.get(at.checked_add(prefix.len())?..)?;
         let len = rest
             .iter()
@@ -319,6 +320,11 @@ fn find_version_marker(bytes: &[u8]) -> Option<String> {
         }
         Version::parse(text).ok().map(|_| text.to_owned())
     })
+}
+
+/// The first version a launcher's bytes announce.
+fn find_version_marker(bytes: &[u8]) -> Option<String> {
+    version_markers(bytes).next()
 }
 
 /// The version of the launcher recorded at install time, or `None` when that file is gone or unmarked. A record
@@ -2116,9 +2122,14 @@ mod tests {
         assert_eq!(own_version(), env!("CARGO_PKG_VERSION"));
         assert!(VERSION_MARKER.starts_with(MARKER_PREFIX));
         assert!(Version::parse(own_version()).is_ok());
-        // what another launcher's wizard would find by reading this very program's file
+        // what another launcher's wizard would find by reading this very program's file. A test build also holds
+        // the sample markers of the tests above, so the real one is looked for among all of them.
         let bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
-        assert_eq!(find_version_marker(&bytes), Some(own_version().to_owned()));
+        assert!(
+            version_markers(&bytes).any(|v| v == own_version()),
+            "{:?}",
+            version_markers(&bytes).collect::<Vec<_>>()
+        );
     }
 
     #[test]
