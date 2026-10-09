@@ -1,0 +1,20 @@
+# Cargo build output (one workspace target folder)
+target/
+
+# release packaging
+release/
+
+# runtime
+logs/
+*.log
+__pycache__/
+*.pyc
+.venv/
+
+# editors
+.idea/
+.vs/
+*.swp
+
+# agent worktrees and local tool state
+.claude/

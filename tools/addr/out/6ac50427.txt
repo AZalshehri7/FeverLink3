@@ -1,0 +1,125 @@
+FeverLink3 address tool: tools/addr/find_sites.py
+executable       TransportFever3.exe (69,755,832 bytes)
+PE TimeDateStamp 0x6ac50427  (2026-10-06 14:22:31 UTC)
+image base       0x140000000
+.text            RVA 0x1000  size 0x366ba8c (57,064,076 bytes)
+version resource none (the executable carries no VS_VERSIONINFO)
+game build       40420  (string next to 'transportfever3' in .rdata)
+unwind table     117,331 functions
+
+WINHTTP.dll imports
+  WinHttpOpenRequest
+  WinHttpSetOption
+  WinHttpReadData
+  WinHttpSetStatusCallback
+  WinHttpCloseHandle
+  WinHttpWriteData
+  WinHttpQueryDataAvailable
+  WinHttpSetTimeouts
+  WinHttpQueryHeaders
+  WinHttpConnect
+  WinHttpOpen
+  WinHttpAddRequestHeaders
+  WinHttpSendRequest
+  WinHttpReceiveResponse
+  14 imported, 14 relayed by native/src/proxy.rs
+  OK: import list and proxy relays are identical
+
+known builds (MPFever BUILDS[], MIT, dkdknight): 0x6ab69fe5, 0x6ac50427
+this build is IN the known table; RVAs are cross-checked against it
+
+====================================================================================================
+site command_list_add  [detour]
+  what: CommandList::Add(list, out, cmd, done, progress): every engine command enters the queue here
+  - known table (MPFever BUILDS[]) has 0x9d4040 for timestamp 0x6ac50427; seed bytes match there
+  - signature matches once in .text: 0x9d4040 (derived from this very build: a consistency check, not independent evidence)
+  - caller idiom (UI tools' `make_cmd; CommandList::Add(list, &out, cmd, done, progress)` argument idiom): 32 call sites, 0x9d4040 x31, 0x938bd0 x1
+  RVA 0x9d4040  (VA 0x1409d4040)
+  located by: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from callers' idiom
+  confidence: high
+  MPFever table says 0x9d4040: AGREES
+  enclosing function (unwind table): 0x9d4040..0x9d439d
+  prologue (minimal >= 14 bytes on an instruction boundary): 18 bytes
+    009d4040  40 55                        push rbp
+    009d4042  53                           push rbx
+    009d4043  56                           push rsi
+    009d4044  57                           push rdi
+    009d4045  41 54                        push r12
+    009d4047  41 55                        push r13
+    009d4049  41 56                        push r14
+    009d404b  41 57                        push r15
+    009d404d  48 8d 6c 24 98               lea rbp, [rsp - 0x68]
+  detour safety: OK (no rip-relative operand, no relative jump/call)
+  bytes: 40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 98
+  derived signature: unique after 14 instructions (45 bytes, one instruction of margin)
+    40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 98 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 50 49 8B F1 4D 8B F8
+====================================================================================================
+site apply_command  [detour]
+  what: the simulation thread's "Apply Command" task: the commands one simulation iteration applies
+  - known table (MPFever BUILDS[]) has 0x9e33b0 for timestamp 0x6ac50427; seed bytes match there
+  - signature matches once in .text: 0x9e33b0 (derived from this very build: a consistency check, not independent evidence)
+  - anchor string b'Simulation Thread: Apply Command\x00' referenced at 0x9e33e5 -> function(s) 0x9e33b0..0x9e371e
+  RVA 0x9e33b0  (VA 0x1409e33b0)
+  located by: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from string reference
+  confidence: high
+  MPFever table says 0x9e33b0: AGREES
+  enclosing function (unwind table): 0x9e33b0..0x9e371e
+  prologue (minimal >= 14 bytes on an instruction boundary): 14 bytes
+    009e33b0  48 89 5c 24 18               mov qword ptr [rsp + 0x18], rbx
+    009e33b5  48 89 74 24 20               mov qword ptr [rsp + 0x20], rsi
+    009e33ba  55                           push rbp
+    009e33bb  57                           push rdi
+    009e33bc  41 54                        push r12
+  detour safety: OK (no rip-relative operand, no relative jump/call)
+  bytes: 48 89 5C 24 18 48 89 74 24 20 55 57 41 54
+  derived signature: unique after 13 instructions (50 bytes, one instruction of margin)
+    48 89 5C 24 18 48 89 74 24 20 55 57 41 54 41 56 41 57 48 8D 6C 24 C9 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 2F 4C 8B F2 4C 8B F9
+====================================================================================================
+site script_pool  [patch]
+  what: game-script update's thread pool construction: `cmp eax,8 / jge shared-pool / threads=1 / call hardware_concurrency`; patched to always build the dedicated pool with one worker
+  - known table (MPFever BUILDS[]) has 0xab00fc for timestamp 0x6ac50427; seed bytes match there
+  - signature matches once in .text: 0xab00fc (derived from this very build: a consistency check, not independent evidence)
+  - anchor string b'GameScriptSystem Pool\x00' referenced at 0xab0189 -> function(s) 0xab0050..0xab02c2
+  - seed pattern found once inside the anchored function: 0xab00fc
+  RVA 0xab00fc  (VA 0x140ab00fc)
+  located by: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from string reference
+  confidence: high
+  MPFever table says 0xab00fc: AGREES
+  enclosing function (unwind table): 0xab0050..0xab02c2
+  patch region (exactly 22 bytes on an instruction boundary): 22 bytes
+    00ab00fc  83 f8 08                     cmp eax, 8
+    00ab00ff  0f 8d 25 01 00 00            jge 0x140ab022a
+    00ab0105  c7 44 24 20 01 00 00 00      mov dword ptr [rsp + 0x20], 1
+    00ab010d  e8 be 24 5a 02               call 0x1430525d0
+  detour safety: UNSAFE as a detour: relative branch: jge 0x140ab022a; relative branch: call 0x1430525d0
+    (patch site: these bytes are rewritten in place, never relocated to a trampoline, so relative operands are expected here; the table records them only to verify the build before patching)
+  bytes: 83 F8 08 0F 8D 25 01 00 00 C7 44 24 20 01 00 00 00 E8 BE 24 5A 02
+  derived signature: unique after 3 instructions (22 bytes, one instruction of margin)
+    83 F8 08 0F 8D ?? ?? ?? ?? C7 44 24 20 01 00 00 00 E8 ?? ?? ?? ??
+====================================================================================================
+BuildAddrs row for native/src/build_table.rs
+
+    // TransportFever3.exe build 40420: PE timestamp 0x6ac50427, linked 2026-10-06 14:22:31 UTC.
+    // sites located with findings from MPFever (MIT, dkdknight)
+    // Generated by tools/addr/find_sites.py; do not edit by hand.
+    BuildAddrs {
+        timestamp: 0x6ac50427,
+        name: "40420",
+        // command_list_add: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from callers' idiom; confidence high
+        command_list_add: Some(HookSite { rva: 0x9d4040, prologue: &[0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C, 0x24, 0x98] }),
+        // apply_command: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from string reference; confidence high
+        apply_command: Some(HookSite { rva: 0x9e33b0, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x54] }),
+        // script_pool: known RVA for this timestamp (seed verified) + signature unique in .text (self-check) + anchored from string reference; confidence high (patch site)
+        script_pool: Some(HookSite { rva: 0xab00fc, prologue: &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xE8, 0xBE, 0x24, 0x5A, 0x02] }),
+    },
+
+Generic signatures (wildcards for build-dependent displacements, immediates and branch targets); paste into
+SITES[...].signature in find_sites.py so the next build can be found without the hint RVA:
+  command_list_add:
+    40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 98 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 50 49 8B F1 4D 8B F8
+  apply_command:
+    48 89 5C 24 18 48 89 74 24 20 55 57 41 54 41 56 41 57 48 8D 6C 24 C9 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 2F 4C 8B F2 4C 8B F9
+  script_pool:
+    83 F8 08 0F 8D ?? ?? ?? ?? C7 44 24 20 01 00 00 00 E8 ?? ?? ?? ??
+
+all sites located with medium or high confidence

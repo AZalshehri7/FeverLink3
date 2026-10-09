@@ -1,0 +1,25 @@
+[package]
+name = "feverlink3_native"
+description = "FeverLink3 native module: a winhttp.dll proxy the game loads itself; command capture and determinism patches"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib: the DLL the game loads. rlib: the pure modules (scanner, PE parser, detour maths, build table) for tests
+# and for the address-finding tool.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+] }
+
+# The release profile is the workspace's, in the root Cargo.toml.

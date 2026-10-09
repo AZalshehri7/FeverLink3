@@ -1,0 +1,25 @@
+[package]
+name = "feverlink3_launcher"
+description = "FeverLink3 launcher: Windows platform layer (Steam discovery, game-side install, file link, game start)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "feverlink3"
+path = "src/main.rs"
+
+[dependencies]
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[dev-dependencies]
+tempfile = "~3.10"
