@@ -36,8 +36,11 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
 - **Engine objects** (vehicle configuration, line, colour, date, journal entry) are read through their member lists,
   rebuilt with `api.type.<Name>.new()` and filled member by member (findings from MPFever, MIT). The sender rebuilds
   every object before shipping it and compares it with what it read; a difference keeps the command native and
-  `mod.log` names the member (`sent natively: argument 3: does not rebuild equal at TransportVehicleConfig.vehicles.1.x`).
-  Members the engine refuses with "read only" are left to it and noted once.
+  `mod.log` names the member and, when the engine refused to set it, quotes the engine
+  (`sent natively: argument 3: does not rebuild equal at TransportVehicleConfig.vehicles.1.x (the engine refused: ...)`).
+  Members the engine refuses as "read only" are left to it and noted once; any other refusal is tolerated when the
+  member comes out equal anyway (noted) and is the reason the command stays native when it does not. The receiving game
+  does the same check on what it rebuilds, so a body that does not fit the engine's object is refused, not applied half built.
 - **Model resources** travel by name beside the id (`modelRep.getName` / `find`, both used by the game's achievement
   script); the receiver uses its own id and notes it when the two differ.
 - **Permission category.** The mod now sends the category with every action (the host's grants only ever saw `other`

@@ -33,7 +33,8 @@ lupa = T.lupa
 # ---------------------------------------------------------------- the mock
 
 OPS_PRELUDE = r'''
-OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false, player = 7, strictCmd = false, userdataResults = false }
+OPS = { priceBuy = 10000, loanSign = 1, drop = nil, refuse = nil, replaceKeepsEntity = false, player = 7, strictCmd = false,
+  userdataResults = false }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
 MODELS = { "vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl" }
@@ -60,6 +61,7 @@ function NEW(typeName)
       if not member[k] then error("no member '" .. tostring(k) .. "' in " .. typeName) end
       if def.readonly and def.readonly[k] then error("member '" .. k .. "' is read only") end
       if OPS.drop == k then return end   -- an engine that quietly ignores a member
+      if OPS.refuse == k then error("cannot set " .. k) end   -- one that refuses it, not as "read only"
       data[k] = v
     end,
     __tostring = function() return "<" .. typeName .. ">" end,
@@ -896,6 +898,24 @@ class LineTest(OpsBase):
         self.assertIn("does not rebuild equal at Line.stops.1.maxWaitingTime", self.B.log())
         self.assertEqual(self.A.count("LINE"), 1)
 
+    def test_a_member_the_engine_refuses_is_tolerated_when_it_comes_out_equal_and_named_when_it_does_not(self):
+        self.start()
+        # refused, but the default is what the stop had anyway: nothing is lost, and the log says it happened
+        self.B.send_gui('local line = BUILD_LINE(api, { stops = { { group = 58 }, { group = 61 } } })\n'
+                        'OPS.refuse = "loadMode"\n'
+                        'api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Line 3", api.type.Vec3f.new(0, 0, 1), api.engine.util.getPlayer(), line))')
+        self.settle()
+        self.agree()
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
+        self.assertIn("a member the engine refused came out equal anyway: Line.stops[1].loadMode", self.B.log())
+        # refused, and the stop had another load mode: the object does not come back equal, so it stays native and says why
+        self.B.L.execute("OPS.refuse = nil")
+        self.B.send_gui(LINE_2.replace("Line 2", "Line 4").replace(
+            "api.cmd.sendCommand(api.cmd.makeLineCreateCmd", "OPS.refuse = 'loadMode'\napi.cmd.sendCommand(api.cmd.makeLineCreateCmd"))
+        self.settle()
+        self.assertEqual(len(self.B.actions_shipped()), 1, "only the first line was shipped")
+        self.assertIn("does not rebuild equal at Line.stops.1.loadMode (the engine refused: Line.stops[1].loadMode:", self.B.log())
+
     def test_read_only_members_are_left_to_the_engine_and_noted_once(self):
         self.start()
         self.B.send_gui(LINE_2)
@@ -1189,10 +1209,10 @@ class ModuleTest(unittest.TestCase):
         self.assertTrue(skipped["vehicleInfo"], "the derived member was skipped, not set")
         # a member the object does not have is an error that names the path
         bad = self.L.eval("{ stops = { { stationGroup = 58, nonsense = 1 } } }")
-        with self.assertRaises(lupa.LuaError) as raised:
-            I.rebuild("Line", bad, "Line", self.L.table())
-        self.assertIn("Line.stops[1].nonsense:", str(raised.exception))
-        self.assertIn("no member 'nonsense' in LineStop", str(raised.exception))
+        failed = self.L.table()
+        I.rebuild("Line", bad, "Line", self.L.table(), failed)
+        self.assertIn("Line.stops[1].nonsense:", failed["nonsense"])
+        self.assertIn("no member 'nonsense' in LineStop", failed["nonsense"])
 
     def test_contained_finds_what_a_rebuild_lost(self):
         contained = self.ops.internals.contained

@@ -288,7 +288,11 @@ local SCHEMA = {
 
 local rebuild
 
-local function fill(obj, tree, typeName, where, skipped)
+-- Sets the members of `obj` from `tree`. A member the engine calls read-only is left to it (`skipped`, and not
+-- compared afterwards). Any other refusal does not stop the rebuild: it is kept in `failed` (member name -> reason),
+-- and the comparison with what was read decides whether it mattered, so a member the engine will not take but which
+-- comes out the same costs nothing, and one that does not names itself with the engine's own words.
+local function fill(obj, tree, typeName, where, skipped, failed)
 	local schema = SCHEMA[typeName] or {}
 	for k, mv in pairs(tree) do
 		local ft = schema[k]
@@ -300,7 +304,7 @@ local function fill(obj, tree, typeName, where, skipped)
 				if type(ft) == "table" and ft.inplace then
 					local cur = obj[k]
 					if cur == nil then error("no such member", 0) end
-					fill(cur, mv, ft.inplace, at, skipped)
+					fill(cur, mv, ft.inplace, at, skipped, failed)
 					-- some properties hand out copies (MPFever): the filled one is written back; where it is the object itself
 					-- (the game's own makePart fills `part.part` in place) the write changes nothing, and a refusal is harmless
 					pcall(function() obj[k] = cur end)
@@ -308,23 +312,20 @@ local function fill(obj, tree, typeName, where, skipped)
 				end
 				local val = mv
 				if type(ft) == "string" then
-					val = rebuild(ft, mv, at, skipped)
+					val = rebuild(ft, mv, at, skipped, failed)
 				elseif type(ft) == "table" and ft.list then
 					val = {}
-					for i = 1, #mv do val[i] = rebuild(ft.list, mv[i], at .. "[" .. i .. "]", skipped) end
+					for i = 1, #mv do val[i] = rebuild(ft.list, mv[i], at .. "[" .. i .. "]", skipped, failed) end
 				end
 				obj[k] = val
 			end)
 			if not ok then
 				local msg = tostring(err)
 				if msg:lower():find("read[ %-]?only") then
-					-- a member the engine derives: nothing to set, nothing to compare afterwards
 					skipped[k] = true
 					note("read-only member '" .. tostring(k) .. "' of " .. typeName .. " is left to the engine")
-				elseif msg:find(at, 1, true) == 1 then
-					error(msg, 0) -- a deeper level already named the path
-				else
-					error(at .. ": " .. msg, 0)
+				elseif failed[k] == nil then
+					failed[k] = at .. ": " .. msg
 				end
 			end
 		end
@@ -333,12 +334,12 @@ local function fill(obj, tree, typeName, where, skipped)
 end
 
 -- Builds the engine object of `typeName` from a tree. Where the engine has no such type the tree itself stands in.
-rebuild = function(typeName, tree, where, skipped)
+rebuild = function(typeName, tree, where, skipped, failed)
 	if type(tree) ~= "table" then return tree end
 	local obj = A.new(typeName, tree)
 	if obj == nil then return tree end
 	if CTOR_ARGS[typeName] then return obj end
-	return fill(obj, tree, typeName, where or typeName, skipped or {})
+	return fill(obj, tree, typeName, where or typeName, skipped or {}, failed or {})
 end
 
 -- Every member of `a` is in `b` with the same value (b may have more: defaults, derived members). Members the
@@ -529,16 +530,29 @@ local VEHICLES = listArg("vehicle")
 local function objectArg(typeName, wireOf, treeOf, read)
 	read = read or marshal
 	local codec = {}
+	-- The receiving side: the object is rebuilt and read back, and what it holds must be what was shipped, so a body
+	-- that does not fit the engine's object (garbage, or a member this build refuses) is refused instead of applied
+	-- half built. Returns the object, then (for the dry run) what was read back and the notes of the rebuild.
 	codec.dec = function(ctx, w)
 		if w == nil then return nil end -- an argument the caller left out
 		if type(w) ~= "table" then return nil, "malformed " .. typeName end
 		local tree, why = treeOf(ctx, copy(w))
 		if tree == nil then return nil, why end
-		local skipped = {}
-		local ok, obj = pcall(rebuild, typeName, tree, typeName, skipped)
+		local skipped, failed = {}, {}
+		local ok, obj = pcall(rebuild, typeName, tree, typeName, skipped, failed)
 		if not ok then return nil, tostring(obj) end
-		return obj, nil, skipped
+		local again, why2 = read(obj)
+		if again == nil then return nil, "does not read back: " .. tostring(why2) end
+		local same, path = contained(tree, again, typeName, skipped)
+		if not same then
+			local first = next(failed)
+			return nil, "does not rebuild equal at " .. path .. (first and (" (the engine refused: " .. failed[first] .. ")") or "")
+		end
+		for _, msg in pairs(failed) do note("a member the engine refused came out equal anyway: " .. msg) end
+		return obj, nil, again, skipped
 	end
+	-- The sending side: the dry run is the receiving side's work on the wire form, plus a comparison of what comes out
+	-- with what the window's own object held (the translations of ids and names must lead back to the same values).
 	codec.enc = function(ctx, v, st)
 		if v == nil then return nil end
 		local tree, why = read(v)
@@ -546,10 +560,8 @@ local function objectArg(typeName, wireOf, treeOf, read)
 		local wire = copy(tree)
 		wire, why = wireOf(ctx, st, wire)
 		if wire == nil then return nil, why end
-		local obj, why2, skipped = codec.dec(dryCtx(st), wire)
-		if obj == nil then return nil, "does not rebuild: " .. tostring(why2) end
-		local again, why3 = read(obj)
-		if again == nil then return nil, "does not read back: " .. tostring(why3) end
+		local obj, why2, again, skipped = codec.dec(dryCtx(st), wire)
+		if obj == nil then return nil, why2 end
 		local same, path = contained(tree, again, typeName, skipped)
 		if not same then return nil, "does not rebuild equal at " .. path end
 		return wire
