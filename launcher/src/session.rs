@@ -14,10 +14,11 @@
 //! that long.
 //!
 //! The player side reconnects: when the connection drops it tells the game `session started=false`, then tries
-//! every [`PlayerConfig::reconnect_interval`] (5 s) for [`PlayerConfig::reconnect_window`] (5 minutes). The host
-//! assigns a fresh id to the new connection and sends a new welcome; hot join of a running game is a later stage
-//! (`docs/ROADMAP.md` 0.5), so the game is only told the session is not running until the host's state says it
-//! is.
+//! every [`PlayerConfig::reconnect_interval`] (5 s) for [`PlayerConfig::reconnect_window`] (5 minutes). Each attempt
+//! asks for the id and slot the host gave in the first welcome (the [`ResumeTicket`]), so a player that is back
+//! inside the host's window is the same player, with the same permissions; the host then runs a hot-join round and
+//! the welcome tells the game the session state again. A player that stops on purpose says goodbye first, and the
+//! host frees its slot at once instead of holding it.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -31,8 +32,9 @@ use std::time::{Duration, Instant};
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::session::{
-    codec, ChecksumOutcome, HostOptions, HostOutput, HostSession, Lockstep, MessageKind, PeerClockMessage, Permissions,
-    PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession, PlayerState, ResyncLimits, ResyncState, SessionState,
+    codec, ChecksumOutcome, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep, MessageKind,
+    PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession, PlayerState,
+    ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState,
 };
 
 use crate::gamelink::{self, Line};
@@ -196,6 +198,12 @@ pub struct Status {
     pub dropped: u64,
     /// Host: the state of the resync round last reported (`None` before the first).
     pub resync: Option<String>,
+    /// Everyone the session knows, by id, the host's own game (id 0) first: connected players with their round-trip
+    /// time to the host, and players whose connection dropped and whose slot is held for a return (`Away`). A
+    /// player's view is what the host last told it.
+    pub roster: Vec<RosterEntry>,
+    /// What players may do: the host's own setting, or what the host last announced to this player.
+    pub permissions: Permissions,
 }
 
 impl Status {
@@ -217,6 +225,8 @@ impl Status {
             actions_relayed: 0,
             dropped: 0,
             resync: None,
+            roster: Vec::new(),
+            permissions: Permissions::default(),
         }
     }
 }
@@ -232,6 +242,9 @@ pub enum Command {
     Resync,
     /// Replace the host's permissions; broadcast to every player.
     SetPermissions(Permissions),
+    /// Remove a player from the session, or release the slot held for one that dropped. The player is told it was
+    /// removed and does not reconnect. The host's own id is refused.
+    Kick(u16),
 }
 
 #[derive(Debug)]
@@ -465,6 +478,7 @@ fn host_loop(
                 Command::Checksum => host.request_checksum(),
                 Command::Resync => host.start_resync("manual"),
                 Command::SetPermissions(p) => host.set_permissions(p),
+                Command::Kick(id) => host.kick(id),
             });
         }
         for (kind, payload) in read_from_game(link, shared) {
@@ -593,6 +607,8 @@ fn refresh_host_status(host: &HostSession, shared: &Shared) {
         s.session = Some(host.state().clone());
         s.actions_relayed = host.actions_relayed();
         s.dropped = host.dropped();
+        s.roster = host.roster();
+        s.permissions = host.permissions().clone();
     });
 }
 
@@ -652,7 +668,7 @@ pub fn run_player(config: PlayerConfig) -> io::Result<SessionHandle> {
     let thread = {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("feverlink3-player".into()).spawn(move || {
-            let mut state = PlayerLoop { config, player, net: Some(first), generation: 1, net_tx };
+            let mut state = PlayerLoop { config, player, net: Some(first), generation: 1, net_tx, ticket: None };
             state.run(&net_rx, &cmd_rx, &shared);
             state.net = None;
             shared.update(|s| {
@@ -672,6 +688,8 @@ struct PlayerLoop {
     /// Id of the current connection attempt; events of older ones are stale.
     generation: u64,
     net_tx: Sender<NetEvent>,
+    /// What the host's welcome granted: the next connection asks for the same id and slot with it.
+    ticket: Option<ResumeTicket>,
 }
 
 impl PlayerLoop {
@@ -754,7 +772,44 @@ impl PlayerLoop {
                     s.session = Some(session.clone());
                 }
                 s.clocks = clocks.iter().map(|(&id, &t)| ClockInfo { id, t, speed: None }).collect();
+                // while a new connection has no welcome yet, the last roster stays: no empty list in between
+                if self.player.state() == PlayerState::Joined {
+                    let roster = self.player.roster();
+                    s.players = roster
+                        .iter()
+                        .filter(|e| e.state == ConnectionState::Connected)
+                        .map(|e| PlayerInfo { id: e.id, name: e.name.clone(), ready: e.ready })
+                        .collect();
+                    s.roster = roster;
+                    s.permissions = self.player.permissions().clone();
+                }
             });
+        }
+        self.say_goodbye(net_rx);
+    }
+
+    /// The session was stopped by its owner: tell the host this player leaves on purpose, so it frees the slot at
+    /// once instead of holding it for a return. Waits briefly for the host to close the connection, which shows the
+    /// message arrived; the socket is not torn down with it still in flight.
+    fn say_goodbye(&mut self, net_rx: &Receiver<NetEvent>) {
+        if self.player.state() != PlayerState::Joined {
+            return;
+        }
+        let Some(net) = &self.net else { return };
+        for output in self.player.leave() {
+            if let PlayerOutput::SendToHost(frame) = output {
+                if net.send(&frame).is_err() {
+                    return;
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match net_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(NetEvent::Closed { conn, .. }) if conn == self.generation => return,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
     }
 
@@ -772,7 +827,11 @@ impl PlayerLoop {
         ) {
             Ok(net) => {
                 shared.log(format!("reconnected to {} (attempt {})", net.peer(), retry.attempts));
-                self.player = PlayerSession::new(self.config.key.clone(), &self.config.name, &self.config.version);
+                let (key, name, version) = (self.config.key.clone(), &self.config.name, &self.config.version);
+                self.player = match self.ticket.clone() {
+                    Some(ticket) => PlayerSession::resuming(key, name, version, ticket),
+                    None => PlayerSession::new(key, name, version),
+                };
                 self.net = Some(net);
                 shared.update(|s| {
                     s.reconnecting = false;
@@ -816,6 +875,7 @@ impl PlayerLoop {
                     write_to_game(&mut self.config.link, shared, kind, &payload, me);
                 }
                 PlayerOutput::Welcomed(welcome) => {
+                    self.ticket = self.player.ticket().cloned();
                     let name = self.player.assigned_name().unwrap_or(&self.config.name).to_owned();
                     if let Err(e) = self.config.link.write_identity(welcome.you, &name, Role::Player.as_str()) {
                         shared.log(format!("cannot write identity.txt: {e}"));

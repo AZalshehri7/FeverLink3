@@ -6,8 +6,9 @@
 //!
 //! - the folder is fixed, `%LOCALAPPDATA%\FeverLink3\live`, so the mod finds it without an environment variable;
 //! - the window appends commands to `ctl_cmd.log` (`host`, `join`, `leave`, `start`, `pause`, `speed`, `check`,
-//!   `resync`; the payload is a Lua literal table, the line format is the file link's);
+//!   `resync`, `kick`, `permissions`; the payload is a Lua literal table, the line format is the file link's);
 //! - the controller answers by rewriting `ctl_status.txt` (one Lua literal table) whenever something changed;
+//!   `docs/LIVE_CONTROL.md` lists every command and every field;
 //! - the session itself is the same [`run_host`] / [`run_player`] the launcher uses, linked to the game through the
 //!   same `to_game.log` / `from_game.log`, and `identity.txt` says who the game is (role `idle` until a session
 //!   exists, then `host` or `player` with the id the host assigned).
@@ -25,11 +26,11 @@ use std::time::Duration;
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::lobby::JoinCode;
-use feverlink3_core::session::HostOptions;
+use feverlink3_core::session::{ConnectionState, HostOptions, Permissions, PlayerSet, RosterEntry};
 use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
-use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle};
+use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle, Status};
 use crate::{luatext, net, resync, steam, steamnet, upnp};
 
 /// The window's commands, appended by the mod.
@@ -63,6 +64,8 @@ struct Public {
 
 struct Hosting {
     handle: SessionHandle,
+    /// What the window last set; each `permissions` command changes only the keys it names.
+    permissions: Permissions,
     secret: [u8; SessionKey::SECRET_SIZE],
     port: u16,
     lan: Vec<SocketAddr>,
@@ -90,15 +93,26 @@ impl Hosting {
     }
 }
 
+/// How the last command that can fail ended; the window shows `message` and tells its own command by `seq`.
+#[derive(Debug, Clone)]
+struct CommandResult {
+    seq: u64,
+    kind: String,
+    ok: bool,
+    message: String,
+}
+
 /// The controller. [`Controller::step`] is called every ~100 ms by [`spawn`], or by a test.
 pub struct Controller {
     dir: PathBuf,
     default_name: String,
     save_dirs: Vec<PathBuf>,
+    host_options: HostOptions,
     commands: Tail,
     state: State,
     steam: Option<steamnet::Probe>,
     steam_note: Option<String>,
+    result: Option<CommandResult>,
     published: String,
     version: u64,
 }
@@ -120,15 +134,24 @@ impl Controller {
             dir,
             default_name,
             save_dirs,
+            host_options: HostOptions::default(),
             commands,
             state: State::Idle,
             steam: steamnet::Probe::load(),
             steam_note: None,
+            result: None,
             published: String::new(),
             version: 0,
         };
         c.publish();
         Ok(c)
+    }
+
+    /// The options every game this controller hosts will use (player limit, flood limit, ping and reconnect timing).
+    /// The defaults are what a player gets; tests shorten the timings.
+    pub fn with_host_options(mut self, options: HostOptions) -> Controller {
+        self.host_options = options;
+        self
     }
 
     /// Reads new commands, advances the state, rewrites the status file when it changed.
@@ -138,7 +161,7 @@ impl Controller {
             let params = luatext::lua_to_json(&line.payload)
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                 .unwrap_or(Value::Null);
-            self.command(&line.kind, &params);
+            self.command(line.seq, &line.kind, &params);
         }
         self.advance();
         if let Some(probe) = &mut self.steam {
@@ -147,11 +170,19 @@ impl Controller {
         self.publish();
     }
 
-    fn command(&mut self, kind: &str, params: &Value) {
+    fn command(&mut self, seq: u64, kind: &str, params: &Value) {
         match kind {
             "host" => self.host(params),
             "join" => self.join(params),
             "leave" => self.leave(),
+            "kick" => {
+                let outcome = self.kick(params);
+                self.note(seq, kind, outcome);
+            }
+            "permissions" => {
+                let outcome = self.set_permissions(params);
+                self.note(seq, kind, outcome);
+            }
             "steamtest" => {
                 let id = params.get("id").and_then(Value::as_str).and_then(steamnet::parse_steam_id);
                 match (&mut self.steam, id) {
@@ -177,6 +208,40 @@ impl Controller {
             }
             _ => {}
         }
+    }
+
+    /// Records how a command that can be refused ended, for the status.
+    fn note(&mut self, seq: u64, kind: &str, outcome: Result<String, String>) {
+        let (ok, message) = match outcome {
+            Ok(message) => (true, message),
+            Err(message) => (false, message),
+        };
+        self.result = Some(CommandResult { seq, kind: kind.to_owned(), ok, message });
+    }
+
+    /// `kick {id}`: removes a player, or releases the slot held for one that dropped.
+    fn kick(&self, params: &Value) -> Result<String, String> {
+        let State::Hosting(h) = &self.state else { return Err("only the host can remove a player".into()) };
+        let id = params.get("id").and_then(player_id).ok_or("kick needs the id of a player")?;
+        if id == 0 {
+            return Err("the host cannot be removed".into());
+        }
+        let status = h.handle.status();
+        let entry = status.roster.iter().find(|e| e.id == id).ok_or_else(|| format!("there is no player #{id}"))?;
+        h.handle.command(Command::Kick(id));
+        Ok(match entry.state {
+            ConnectionState::Connected => format!("{} was removed", entry.name),
+            ConnectionState::Away => format!("the slot of {} was released", entry.name),
+        })
+    }
+
+    /// `permissions {build, bulldoze, spend, speed, other}`: each key named is replaced, the others stay as they are.
+    fn set_permissions(&mut self, params: &Value) -> Result<String, String> {
+        let State::Hosting(h) = &mut self.state else { return Err("only the host can change permissions".into()) };
+        let next = permissions_with(&h.permissions, params)?;
+        h.permissions = next.clone();
+        h.handle.command(Command::SetPermissions(next));
+        Ok("permissions sent to everyone".into())
     }
 
     fn name_from(&self, params: &Value) -> String {
@@ -211,7 +276,7 @@ impl Controller {
             name,
             key,
             link,
-            options: HostOptions::default(),
+            options: self.host_options.clone(),
             save_dirs: self.save_dirs.clone(),
             echo_log: false,
         });
@@ -223,8 +288,10 @@ impl Controller {
         let lan = net::lan_endpoints(bound);
         let public = Arc::new(Mutex::new(Public::default()));
         spawn_address_lookup(bound, Arc::clone(&public));
+        self.result = None;
         let mut hosting = Hosting {
             handle,
+            permissions: Permissions::default(),
             secret,
             port: bound,
             lan,
@@ -272,6 +339,7 @@ impl Controller {
     }
 
     fn leave(&mut self) {
+        self.result = None;
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Hosting(h) => {
                 h.handle.stop();
@@ -294,6 +362,17 @@ impl Controller {
             let ip = h.public.lock().ok().and_then(|p| p.ip);
             if ip != h.public_shown {
                 h.rebuild_code(ip);
+            }
+            return;
+        }
+        if let State::Joined { handle } = &self.state {
+            // the host removed us, refused us, or we gave up reconnecting: the window must be able to start over
+            let s = handle.status();
+            if s.finished {
+                self.state = State::Failed(ended_message(&s));
+                if let Ok(link) = gamelink::Session::open(&self.dir) {
+                    let _ = link.write_identity(0, &self.default_name, "idle");
+                }
             }
             return;
         }
@@ -322,6 +401,7 @@ impl Controller {
                 v["code"] = json!(h.code);
                 v["endpoints"] = json!(h.endpoints);
                 v["password"] = json!(h.password);
+                v["capacity"] = json!(self.host_options.max_players);
                 if let Ok(p) = h.public.lock() {
                     v["public"] = json!(p.ip.map(|ip| format!("{ip}:{}", h.port)));
                     v["lookup"] = json!(if p.done { p.note.as_str() } else { "looking up your public address..." });
@@ -330,20 +410,24 @@ impl Controller {
             }
             State::Joined { handle } => {
                 let s = handle.status();
-                let state = if let Some(why) = &s.rejected {
-                    v["message"] = json!(format!("the host rejected us: {why}"));
-                    "failed"
-                } else if let Some(why) = &s.error {
-                    v["message"] = json!(why);
+                let state = if s.rejected.is_some() || s.error.is_some() {
+                    v["message"] = json!(ended_message(&s));
                     "failed"
                 } else if s.connected {
                     "joined"
                 } else {
                     "joining"
                 };
+                if s.reconnecting {
+                    v["reconnecting"] = json!(true);
+                    v["attempts"] = json!(s.reconnect_attempts);
+                }
                 v["state"] = json!(state);
                 add_session(&mut v, handle);
             }
+        }
+        if let Some(r) = &self.result {
+            v["result"] = json!({ "seq": r.seq, "kind": r.kind, "ok": r.ok, "message": r.message });
         }
         v
     }
@@ -448,13 +532,141 @@ fn lookup_address(port: u16) -> (Option<Ipv4Addr>, String, Option<upnp::Mapping>
 fn add_session(v: &mut Value, handle: &SessionHandle) {
     let s = handle.status();
     v["me"] = json!(s.my_id);
-    v["players"] = json!(s.players.iter().map(|p| json!({ "id": p.id, "name": p.name })).collect::<Vec<_>>());
+    v["players"] = json!(players_json(&s));
+    v["permissions"] = permissions_json(&s.permissions);
     if let Some(sess) = &s.session {
         v["started"] = json!(sess.started);
         v["speed"] = json!(sess.speed);
     }
     if let Some(r) = &s.resync {
         v["resync"] = json!(r);
+    }
+}
+
+/// Every player of the session, away ones included. Before the first roster exists, the plain player list.
+fn players_json(s: &Status) -> Vec<Value> {
+    if s.roster.is_empty() {
+        return s
+            .players
+            .iter()
+            .map(|p| json!({ "id": p.id, "name": p.name, "role": role_of(p.id), "state": "connected", "ready": p.ready }))
+            .collect();
+    }
+    s.roster.iter().map(player_json).collect()
+}
+
+fn role_of(id: u16) -> &'static str {
+    if id == 0 {
+        "host"
+    } else {
+        "player"
+    }
+}
+
+fn player_json(e: &RosterEntry) -> Value {
+    json!({
+        "id": e.id,
+        "name": e.name,
+        "role": e.role(),
+        "state": e.state.as_str(),
+        "ready": e.ready,
+        "rtt": e.rtt_ms.map(rtt_shown),
+    })
+}
+
+/// A round-trip time as the window sees it, in whole milliseconds, rounded to 5 ms below 20 ms, 10 ms below 100 ms and
+/// 25 ms above, so that the status file is not rewritten at every ping for a value that wobbles by a millisecond.
+fn rtt_shown(ms: f64) -> u32 {
+    let step = if ms < 20.0 {
+        5.0
+    } else if ms < 100.0 {
+        10.0
+    } else {
+        25.0
+    };
+    ((ms.max(0.0) / step).round() * step) as u32
+}
+
+fn permissions_json(p: &Permissions) -> Value {
+    json!({
+        "build": set_json(&p.build),
+        "bulldoze": set_json(&p.bulldoze),
+        "spend": set_json(&p.spend),
+        "speed": set_json(&p.speed),
+        "other": set_json(&p.other),
+    })
+}
+
+fn set_json(set: &PlayerSet) -> Value {
+    match set {
+        PlayerSet::Everyone => json!("everyone"),
+        PlayerSet::HostOnly => json!("hostOnly"),
+        PlayerSet::Only(ids) => json!({ "only": ids }),
+    }
+}
+
+/// A player id from a command: a whole number that fits 16 bits (the Lua side may write it as `2.0`).
+fn player_id(v: &Value) -> Option<u16> {
+    let n = v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64))?;
+    u16::try_from(n).ok()
+}
+
+/// One permission value: `"everyone"`, `"hostOnly"` or `{only = {ids}}`.
+fn player_set(v: &Value) -> Result<PlayerSet, String> {
+    match v {
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "everyone" => Ok(PlayerSet::Everyone),
+            "hostonly" | "host_only" | "host-only" => Ok(PlayerSet::HostOnly),
+            _ => Err(format!("{s:?} is not everyone, hostOnly or {{only = ids}}")),
+        },
+        Value::Object(map) => {
+            let mut ids = match map.get("only") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|i| player_id(i).ok_or_else(|| format!("{i} is not a player id")))
+                    .collect::<Result<Vec<u16>, String>>()?,
+                // an empty Lua table has no way to say it is a list
+                Some(Value::Object(o)) if o.is_empty() => Vec::new(),
+                _ => return Err("only needs a list of player ids".into()),
+            };
+            ids.sort_unstable();
+            ids.dedup();
+            Ok(PlayerSet::Only(ids))
+        }
+        _ => Err("must be everyone, hostOnly or {only = ids}".into()),
+    }
+}
+
+/// `current` with every key `params` names replaced. At least one key is required.
+fn permissions_with(current: &Permissions, params: &Value) -> Result<Permissions, String> {
+    let mut next = current.clone();
+    let mut named = 0;
+    for (name, slot) in [
+        ("build", &mut next.build),
+        ("bulldoze", &mut next.bulldoze),
+        ("spend", &mut next.spend),
+        ("speed", &mut next.speed),
+        ("other", &mut next.other),
+    ] {
+        if let Some(v) = params.get(name).filter(|v| !v.is_null()) {
+            *slot = player_set(v).map_err(|why| format!("{name}: {why}"))?;
+            named += 1;
+        }
+    }
+    if named == 0 {
+        return Err("name at least one of build, bulldoze, spend, speed, other".into());
+    }
+    Ok(next)
+}
+
+/// Why a joined session is over, in words for the window. `kicked` and `flood` are the host ending it on purpose.
+fn ended_message(s: &Status) -> String {
+    match (&s.rejected, &s.error) {
+        (Some(why), _) if why.starts_with("kicked") => "the host removed you from the session".to_owned(),
+        (Some(why), _) if why.starts_with("flood") => format!("the host disconnected you: {why}"),
+        (Some(why), _) => format!("the host rejected us: {why}"),
+        (None, Some(why)) => why.clone(),
+        (None, None) => "the session ended".to_owned(),
     }
 }
 
@@ -614,5 +826,289 @@ mod tests {
         c.step();
         c.step();
         assert_eq!(w.status()["version"].as_u64().unwrap(), v1);
+    }
+
+    // ---------------------------------------------------------------- host controls
+
+    /// A host controller that is hosting and a player controller that is idle, each with a folder of its own. The
+    /// last value is the player's `join` payload, with the host's address replaced by loopback.
+    fn start_pair(root: &Path, options: HostOptions) -> (Controller, Controller, Window, Window, String) {
+        let (hd, pd) = (root.join("host"), root.join("player"));
+        let mut host = Controller::new(hd.clone(), "Host".into(), Vec::new()).unwrap().with_host_options(options);
+        let player = Controller::new(pd.clone(), "Pat".into(), Vec::new()).unwrap();
+        let (mut hw, pw) = (Window::new(&hd), Window::new(&pd));
+        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0}");
+        assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
+        let code = hw.status()["code"].as_str().expect("a join code").to_owned();
+        let mut decoded = JoinCode::try_decode(&code).expect("a decodable code");
+        let port = decoded.endpoints.first().map_or(0, SocketAddr::port);
+        decoded.endpoints = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        (host, player, hw, pw, format!("{{[\"code\"]=\"{}\"}}", decoded.encode()))
+    }
+
+    fn quick() -> HostOptions {
+        HostOptions { ping_seconds: 0.2, ..HostOptions::default() }
+    }
+
+    /// `{only = {}}` as the status file hands it back: Lua cannot tell an empty list from an empty object.
+    fn only_nobody(v: &Value) -> bool {
+        match &v["only"] {
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn the_status_lists_every_player_with_role_state_and_round_trip_and_kick_removes_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut host, mut player, mut hw, mut pw, join) = start_pair(root.path(), quick());
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        assert!(
+            until(&mut [&mut host, &mut player], Duration::from_secs(10), || {
+                let st = hw.status();
+                st["players"].as_array().is_some_and(|p| p.len() == 2 && p[1]["rtt"].is_number())
+            }),
+            "{:?}",
+            hw.status()
+        );
+
+        let st = hw.status();
+        assert_eq!(st["capacity"], 8);
+        let players = st["players"].as_array().unwrap();
+        let field = |i: usize, key: &str| players[i][key].clone();
+        assert_eq!((field(0, "id"), field(0, "name"), field(0, "role")), (json!(0), json!("Hosty"), json!("host")));
+        assert_eq!((field(0, "state"), field(0, "rtt")), (json!("connected"), json!(0)));
+        assert_eq!((field(1, "id"), field(1, "name"), field(1, "role")), (json!(1), json!("Pat"), json!("player")));
+        assert_eq!(field(1, "state"), json!("connected"));
+        assert!(field(1, "rtt").as_u64().is_some_and(|ms| ms < 100), "loopback is quick: {st}");
+
+        // the player sees the same list, with the host's round-trip value for itself
+        assert!(
+            until(&mut [&mut host, &mut player], Duration::from_secs(10), || {
+                let ps = pw.status();
+                ps["players"].as_array().is_some_and(|p| p.len() == 2 && p.iter().all(|e| e["rtt"].is_number()))
+            }),
+            "{:?}",
+            pw.status()
+        );
+        assert_eq!(pw.status()["players"][0]["role"], "host");
+
+        // refusals say why and change nothing
+        for (payload, wanted) in
+            [("{[\"id\"]=0}", "cannot be removed"), ("{[\"id\"]=42}", "no player #42"), ("{}", "needs the id")]
+        {
+            hw.send("kick", payload);
+            let seq = hw.seq - 1;
+            assert!(
+                until(&mut [&mut host, &mut player], Duration::from_secs(5), || hw.status()["result"]["seq"] == seq)
+            );
+            let r = hw.status()["result"].clone();
+            assert_eq!((r["ok"].clone(), r["kind"].clone()), (json!(false), json!("kick")));
+            assert!(r["message"].as_str().unwrap().contains(wanted), "{r}");
+        }
+        assert_eq!(hw.status()["players"].as_array().unwrap().len(), 2);
+
+        // the real one
+        hw.send("kick", "{[\"id\"]=1}");
+        let seq = hw.seq - 1;
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || {
+            hw.status()["players"].as_array().is_some_and(|p| p.len() == 1) && pw.status()["state"] == "failed"
+        }));
+        let r = hw.status()["result"].clone();
+        assert_eq!((r["ok"].clone(), r["seq"].clone()), (json!(true), json!(seq)));
+        assert!(r["message"].as_str().unwrap().contains("Pat was removed"), "{r}");
+        assert!(pw.status()["message"].as_str().unwrap().contains("removed you"), "{:?}", pw.status());
+        assert!(fs::read_to_string(root.path().join("player").join("identity.txt")).unwrap().contains("role=idle"));
+
+        // a removed window is not stuck: it can join again, and gets a new id
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        assert_eq!(pw.status()["me"], 2);
+    }
+
+    #[test]
+    fn only_a_host_can_kick_or_set_permissions() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
+        let mut w = Window::new(t.path());
+        for (kind, payload) in [("kick", "{[\"id\"]=1}"), ("permissions", "{[\"build\"]=\"hostOnly\"}")] {
+            w.send(kind, payload);
+            let seq = w.seq - 1;
+            assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+            let r = w.status()["result"].clone();
+            assert_eq!((r["ok"].clone(), r["kind"].clone()), (json!(false), json!(kind)));
+            assert!(r["message"].as_str().unwrap().contains("only the host"), "{r}");
+        }
+    }
+
+    #[test]
+    fn permissions_change_only_the_keys_named_and_reach_the_player_as_booleans() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut host, mut player, mut hw, mut pw, join) = start_pair(root.path(), quick());
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        let everyone = json!({"build": "everyone", "bulldoze": "everyone", "spend": "everyone", "speed": "everyone", "other": "everyone"});
+        assert_eq!(hw.status()["permissions"], everyone);
+
+        hw.send("permissions", "{[\"build\"]=\"hostOnly\",[\"spend\"]={[\"only\"]={[1]=1,[2]=1}}}");
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || hw.status()["permissions"]["build"]
+            == "hostOnly"));
+        let p = hw.status()["permissions"].clone();
+        assert_eq!(p["spend"], json!({"only": [1]}), "ids are sorted and without repeats");
+        assert_eq!(
+            (p["bulldoze"].clone(), p["speed"].clone(), p["other"].clone()),
+            (json!("everyone"), json!("everyone"), json!("everyone"))
+        );
+        assert_eq!(hw.status()["result"]["ok"], true);
+
+        // another command names other keys: the first one's stay
+        hw.send("permissions", "{[\"bulldoze\"]=\"hostOnly\",[\"other\"]={[\"only\"]={}},[\"speed\"]=\"hostOnly\"}");
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || hw.status()["permissions"]
+            ["bulldoze"]
+            == "hostOnly"));
+        let p = hw.status()["permissions"].clone();
+        assert_eq!((p["build"].clone(), p["speed"].clone()), (json!("hostOnly"), json!("hostOnly")));
+        assert!(only_nobody(&p["other"]), "{p}");
+
+        // what the player's game was told: its own view of the sets
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || only_nobody(
+            &pw.status()["permissions"]["other"]
+        )));
+        let told = fs::read_to_string(root.path().join("player").join("to_game.log")).unwrap();
+        let last = told.lines().rev().find(|l| l.contains("\tpermissions\t")).expect("a permissions line");
+        for (key, allowed) in [("build", false), ("bulldoze", false), ("spend", true), ("other", false)] {
+            assert!(last.contains(&format!("[\"{key}\"]={allowed}")), "{key}: {last}");
+        }
+
+        // refusals change nothing
+        for (payload, wanted) in [
+            ("{[\"build\"]=\"nobody\"}", "build"),
+            ("{}", "at least one"),
+            ("{[\"spend\"]={[\"only\"]=\"x\"}}", "spend"),
+        ] {
+            hw.send("permissions", payload);
+            let seq = hw.seq - 1;
+            assert!(
+                until(&mut [&mut host, &mut player], Duration::from_secs(5), || hw.status()["result"]["seq"] == seq)
+            );
+            let r = hw.status()["result"].clone();
+            assert_eq!(r["ok"], false);
+            assert!(r["message"].as_str().unwrap().contains(wanted), "{r}");
+        }
+        assert_eq!(hw.status()["permissions"]["spend"], json!({"only": [1]}));
+    }
+
+    #[test]
+    fn leaving_frees_the_slot_at_once_and_the_host_lists_no_ghost() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut host, mut player, hw, mut pw, join) = start_pair(root.path(), quick());
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        // the player says goodbye on its way out; the host frees the slot at once and lists nobody else
+        pw.send("leave", "{}");
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(5), || pw.status()["state"] == "idle"));
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || hw.status()["players"]
+            .as_array()
+            .is_some_and(|p| p.len() == 1)));
+        assert!(
+            !hw.status()["players"].as_array().unwrap().iter().any(|p| p["state"] == "away"),
+            "a leaver is gone, not away"
+        );
+    }
+
+    #[test]
+    fn the_capacity_in_the_status_follows_the_host_options() {
+        let root = tempfile::tempdir().unwrap();
+        let (_host, _player, hw, _pw, _join) = start_pair(root.path(), HostOptions { max_players: 3, ..quick() });
+        assert_eq!(hw.status()["capacity"], 3);
+    }
+
+    // ---------------------------------------------------------------- the pieces
+
+    #[test]
+    fn a_player_entry_has_the_fields_the_window_reads() {
+        let away = RosterEntry { id: 2, name: "Bob".into(), ready: false, state: ConnectionState::Away, rtt_ms: None };
+        assert_eq!(
+            player_json(&away),
+            json!({"id": 2, "name": "Bob", "role": "player", "state": "away", "ready": false, "rtt": null})
+        );
+        let host =
+            RosterEntry { id: 0, name: "H".into(), ready: true, state: ConnectionState::Connected, rtt_ms: Some(0.0) };
+        assert_eq!(player_json(&host)["role"], "host");
+        assert_eq!(player_json(&host)["rtt"], 0);
+        // the Lua side never sees a null
+        let lua = luatext::json_to_lua(&serde_json::to_vec(&player_json(&away)).unwrap()).unwrap();
+        assert!(!lua.contains("rtt") && lua.contains("[\"state\"]=\"away\""), "{lua}");
+    }
+
+    #[test]
+    fn round_trip_times_are_rounded_so_a_wobble_does_not_rewrite_the_status() {
+        let shown: Vec<u32> = [0.0, 0.4, 2.6, 7.4, 19.9, 23.0, 26.0, 99.0, 104.0, 112.4, 180.0, 1234.0]
+            .into_iter()
+            .map(rtt_shown)
+            .collect();
+        assert_eq!(vec![0, 0, 5, 5, 20, 20, 30, 100, 100, 100, 175, 1225], shown);
+        assert_eq!(rtt_shown(-3.0), 0);
+    }
+
+    #[test]
+    fn permission_values_come_in_three_shapes() {
+        assert_eq!(player_set(&json!("everyone")), Ok(PlayerSet::Everyone));
+        assert_eq!(player_set(&json!("hostOnly")), Ok(PlayerSet::HostOnly));
+        assert_eq!(player_set(&json!("HOSTONLY")), Ok(PlayerSet::HostOnly));
+        assert_eq!(player_set(&json!({"only": [3, 1, 3]})), Ok(PlayerSet::Only(vec![1, 3])));
+        assert_eq!(
+            player_set(&json!({"only": [2.0]})),
+            Ok(PlayerSet::Only(vec![2])),
+            "a Lua number may be written 2.0"
+        );
+        assert_eq!(player_set(&json!({"only": []})), Ok(PlayerSet::Only(vec![])));
+        assert_eq!(
+            player_set(&json!({"only": {}})),
+            Ok(PlayerSet::Only(vec![])),
+            "an empty Lua table is an object here"
+        );
+        for bad in [
+            json!("nobody"),
+            json!(7),
+            json!(true),
+            json!({}),
+            json!({"only": "x"}),
+            json!({"only": [-1]}),
+            json!({"only": [70000]}),
+            json!({"only": ["a"]}),
+            json!({"only": [1.5]}),
+        ] {
+            assert!(player_set(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn permissions_with_replaces_only_what_is_named() {
+        let current = Permissions { build: PlayerSet::HostOnly, ..Permissions::default() };
+        let next = permissions_with(&current, &json!({"spend": "hostOnly", "extra": 1})).unwrap();
+        assert_eq!(
+            next,
+            Permissions { build: PlayerSet::HostOnly, spend: PlayerSet::HostOnly, ..Permissions::default() }
+        );
+        let reset = permissions_with(&current, &json!({"build": "everyone"})).unwrap();
+        assert_eq!(reset, Permissions::default());
+        assert!(permissions_with(&current, &json!({})).is_err());
+        assert!(permissions_with(&current, &Value::Null).is_err());
+        assert!(permissions_with(&current, &json!({"build": null})).is_err(), "nil names nothing");
+        let err = permissions_with(&current, &json!({"speed": "everyone", "bulldoze": "maybe"})).unwrap_err();
+        assert!(err.starts_with("bulldoze:"), "{err}");
+    }
+
+    #[test]
+    fn player_ids_from_commands() {
+        assert_eq!(player_id(&json!(3)), Some(3));
+        assert_eq!(player_id(&json!(3.0)), Some(3));
+        assert_eq!(player_id(&json!(65535)), Some(65535));
+        for bad in [json!(65536), json!(-1), json!(1.5), json!("1"), Value::Null] {
+            assert_eq!(player_id(&bad), None, "{bad}");
+        }
     }
 }
