@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use feverlink3_core::protocol::{Frame, FrameCodec, ProtocolError};
 use feverlink3_core::session::ConnectionId;
@@ -48,6 +48,12 @@ pub struct NetLimits {
     /// Longest first frame (header included) a connection may send before it has sent one: the only frame a
     /// stranger can usefully send is a Join of a few hundred bytes.
     pub first_frame: usize,
+    /// Frames per second one connection may deliver, on average (twice that in a burst); 0 = no limit. A peer that
+    /// sends more is read more slowly, and TCP slows its sender in turn: a flood costs the flooder its own bandwidth
+    /// and leaves the session thread, and the queue in front of it, alone. A real player sends tens per second.
+    pub frames_per_second: u32,
+    /// The same for bytes per second (0 = no limit).
+    pub bytes_per_second: u32,
 }
 
 impl Default for NetLimits {
@@ -57,7 +63,75 @@ impl Default for NetLimits {
             max_connections: 64,
             max_per_address: 16,
             first_frame: FrameCodec::HANDSHAKE_MAX_LENGTH,
+            frames_per_second: 1000,
+            bytes_per_second: 4 << 20,
         }
+    }
+}
+
+/// How the reader of one connection treats what arrives: the part of [`NetLimits`] a reader needs.
+#[derive(Debug, Clone, Copy)]
+struct ReadPolicy {
+    first_frame: usize,
+    frames_per_second: u32,
+    bytes_per_second: u32,
+}
+
+impl ReadPolicy {
+    fn of(limits: &NetLimits) -> Self {
+        Self {
+            first_frame: limits.first_frame,
+            frames_per_second: limits.frames_per_second,
+            bytes_per_second: limits.bytes_per_second,
+        }
+    }
+
+    /// For a connection to a host: what a host sends is the protocol's business (a savegame is megabytes).
+    fn unlimited() -> Self {
+        Self { first_frame: FrameCodec::MAX_FRAME_LENGTH, frames_per_second: 0, bytes_per_second: 0 }
+    }
+}
+
+/// Token bucket over frames and bytes. [`Throttle::admit`] says how long to wait before the next frame is passed on.
+#[derive(Debug)]
+struct Throttle {
+    frames: f64,
+    bytes: f64,
+    frame_rate: f64,
+    byte_rate: f64,
+    last: Instant,
+}
+
+impl Throttle {
+    /// The longest a single frame is made to wait: a throttled peer is slowed, not frozen.
+    const MAX_WAIT: Duration = Duration::from_secs(1);
+
+    fn new(policy: &ReadPolicy, now: Instant) -> Option<Throttle> {
+        if policy.frames_per_second == 0 && policy.bytes_per_second == 0 {
+            return None;
+        }
+        let (frame_rate, byte_rate) = (f64::from(policy.frames_per_second), f64::from(policy.bytes_per_second));
+        // a full bucket holds two seconds of the rate
+        Some(Throttle { frames: 2.0 * frame_rate, bytes: 2.0 * byte_rate, frame_rate, byte_rate, last: now })
+    }
+
+    fn admit(&mut self, frame_bytes: usize, now: Instant) -> Duration {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        let mut wait = 0.0f64;
+        if self.frame_rate > 0.0 {
+            self.frames = (self.frames + elapsed * self.frame_rate).min(2.0 * self.frame_rate) - 1.0;
+            if self.frames < 0.0 {
+                wait = wait.max(-self.frames / self.frame_rate);
+            }
+        }
+        if self.byte_rate > 0.0 {
+            self.bytes = (self.bytes + elapsed * self.byte_rate).min(2.0 * self.byte_rate) - frame_bytes as f64;
+            if self.bytes < 0.0 {
+                wait = wait.max(-self.bytes / self.byte_rate);
+            }
+        }
+        Duration::from_secs_f64(wait).min(Self::MAX_WAIT)
     }
 }
 
@@ -122,11 +196,12 @@ impl Link {
 const READ_POLL: Duration = Duration::from_millis(250);
 
 /// Reads frames until the connection ends, then reports `Closed`. Runs on its own thread. The first frame may be at
-/// most `first_frame` bytes long; after it the protocol's own limit applies.
+/// most `policy.first_frame` bytes long; after it the protocol's own limit applies; frames are passed on no faster
+/// than the policy's rates.
 ///
 /// The bytes of a frame are collected as they arrive and the length field is checked as soon as it has, so what the
 /// reader holds is what the peer really sent (never what it announced), and a read that times out loses nothing.
-fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, first_frame: usize) {
+fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, policy: ReadPolicy) {
     let mut stream = match link.stream.try_clone().and_then(|s| s.set_read_timeout(Some(READ_POLL)).map(|()| s)) {
         Ok(s) => s,
         Err(e) => {
@@ -136,7 +211,8 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, first_frame
         }
     };
     let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 16 * 1024]);
-    let mut limit = first_frame;
+    let mut limit = policy.first_frame;
+    let mut throttle = Throttle::new(&policy, Instant::now());
     let reason = 'read: loop {
         // every frame the buffer holds already, in order
         let mut start = 0;
@@ -145,6 +221,15 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, first_frame
                 Ok(Some((frame, used))) => {
                     start += used;
                     limit = FrameCodec::MAX_FRAME_LENGTH;
+                    if let Some(throttle) = throttle.as_mut() {
+                        // while it waits it reads nothing: the sender is slowed by TCP, not by a growing queue
+                        let mut wait = throttle.admit(used, Instant::now());
+                        while !wait.is_zero() && !link.closed.load(Ordering::Acquire) {
+                            let step = wait.min(READ_POLL);
+                            thread::sleep(step);
+                            wait -= step;
+                        }
+                    }
                     if link.closed.load(Ordering::Acquire) {
                         break 'read "closed locally".to_string();
                     }
@@ -189,11 +274,11 @@ fn spawn_reader(
     link: Arc<Link>,
     tx: Sender<NetEvent>,
     role: &str,
-    first_frame: usize,
+    policy: ReadPolicy,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("feverlink3-{role}-read-{conn}"))
-        .spawn(move || read_loop(conn, &link, &tx, first_frame))
+        .spawn(move || read_loop(conn, &link, &tx, policy))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -325,7 +410,7 @@ fn accept_loop(
                 if tx.send(NetEvent::Opened { conn, peer: Some(peer) }).is_err() {
                     return;
                 }
-                if spawn_reader(conn, link, tx.clone(), "host", limits.first_frame).is_err() {
+                if spawn_reader(conn, link, tx.clone(), "host", ReadPolicy::of(&limits)).is_err() {
                     let _ = tx.send(NetEvent::Closed { conn, reason: "cannot start reader thread".into() });
                 }
             }
@@ -370,7 +455,7 @@ impl ClientNet {
                     let link = Link::new(stream, NetLimits::default().write_timeout)?;
                     tx.send(NetEvent::Opened { conn, peer: Some(ep) })
                         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session ended"))?;
-                    spawn_reader(conn, Arc::clone(&link), tx, "client", FrameCodec::MAX_FRAME_LENGTH)?;
+                    spawn_reader(conn, Arc::clone(&link), tx, "client", ReadPolicy::unlimited())?;
                     return Ok(ClientNet { conn, peer: ep, link });
                 }
                 Err(e) => last = io::Error::new(e.kind(), format!("{ep}: {e}")),
@@ -635,6 +720,66 @@ mod tests {
             }
         }
         assert!(host.send(conn, &big).is_err());
+    }
+
+    #[test]
+    fn the_throttle_lets_a_burst_through_then_spaces_frames_and_forgives_idle_time() {
+        let t0 = Instant::now();
+        let policy = ReadPolicy { first_frame: 4096, frames_per_second: 100, bytes_per_second: 0 };
+        let mut throttle = Throttle::new(&policy, t0).unwrap();
+        // two seconds' worth is free
+        for _ in 0..200 {
+            assert_eq!(throttle.admit(50, t0), Duration::ZERO);
+        }
+        // then each frame waits its turn, a hundredth of a second after the one before
+        assert!((throttle.admit(50, t0).as_secs_f64() - 0.01).abs() < 1e-9);
+        assert!((throttle.admit(50, t0).as_secs_f64() - 0.02).abs() < 1e-9);
+        // time passes: the debt is paid and the bucket refills, to two seconds' worth at most
+        let later = t0 + Duration::from_secs(60);
+        for _ in 0..200 {
+            assert_eq!(throttle.admit(50, later), Duration::ZERO);
+        }
+        assert!(throttle.admit(50, later) > Duration::ZERO);
+
+        // bytes: a bucket of 2000 at 1000 per second; a frame of 1500 bytes is free once, then costs a second
+        let policy = ReadPolicy { first_frame: 4096, frames_per_second: 0, bytes_per_second: 1000 };
+        let mut throttle = Throttle::new(&policy, t0).unwrap();
+        assert_eq!(throttle.admit(1500, t0), Duration::ZERO);
+        assert!((throttle.admit(1500, t0).as_secs_f64() - 1.0).abs() < 1e-9);
+        // and nothing waits longer than the cap, whatever the debt
+        assert_eq!(throttle.admit(1 << 20, t0), Throttle::MAX_WAIT);
+        assert!(Throttle::new(&ReadPolicy::unlimited(), t0).is_none());
+    }
+
+    #[test]
+    fn a_peer_that_sends_faster_than_the_limit_is_slowed_not_dropped() {
+        let limits = NetLimits { frames_per_second: 50, bytes_per_second: 0, ..NetLimits::default() };
+        let (htx, hrx) = mpsc::channel();
+        let host = HostNet::bind_with(loopback(), htx, limits).unwrap();
+        let mut raw = TcpStream::connect(host.local_addr()).unwrap();
+        let NetEvent::Opened { conn, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+        let one = FrameCodec::encode_frame(&frame(30, b"x")).unwrap();
+        let started = Instant::now();
+        // the whole flood in one write: 160 frames, of which 100 are the burst
+        raw.write_all(&one.repeat(160)).unwrap();
+        for n in 1..=160 {
+            match hrx.recv_timeout(WAIT).unwrap() {
+                NetEvent::Frame { conn: c, .. } => assert_eq!(c, conn, "frame {n}"),
+                other => panic!("frame {n}: {other:?}"),
+            }
+        }
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(900), "60 frames over the burst at 50 a second take a second: {took:?}");
+        assert!(took < Duration::from_secs(4), "{took:?}");
+        // a polite peer on the same host is not held up
+        let (ctx, _crx) = mpsc::channel();
+        let polite = ClientNet::connect(&[host.local_addr()], 9, ctx).unwrap();
+        let NetEvent::Opened { conn: polite_id, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+        polite.send(&frame(30, b"hi")).unwrap();
+        match hrx.recv_timeout(Duration::from_millis(500)).unwrap() {
+            NetEvent::Frame { conn, .. } => assert_eq!(conn, polite_id),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

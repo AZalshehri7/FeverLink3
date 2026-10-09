@@ -159,7 +159,7 @@ fn mutate(r: &mut StdRng, bytes: &mut Vec<u8>) {
             }
             6 if !bytes.is_empty() => {
                 let i = r.gen_range(0..bytes.len());
-                bytes[i] = [b'"', b'{', b'}', b'[', b']', b',', b':', b'\\', b'0', b'-'][r.gen_range(0..10)];
+                bytes[i] = b"\"{}[],:\\0-"[r.gen_range(0..10)];
             }
             _ => bytes.extend(random_bytes(r, 8)),
         }

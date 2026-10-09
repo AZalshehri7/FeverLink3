@@ -153,8 +153,7 @@ fn mutate(r: &mut StdRng, bytes: &mut Vec<u8>) {
             }
             6 if !bytes.is_empty() => {
                 let i = r.gen_range(0..bytes.len());
-                bytes[i] =
-                    [b'"', b'{', b'}', b'[', b']', b',', b'=', b'\\', b'0', b'-', b'(', b')'][r.gen_range(0..12)];
+                bytes[i] = b"\"{}[],=\\0-()"[r.gen_range(0..12)];
             }
             _ => bytes.extend(random_bytes(r, 8)),
         }
@@ -637,10 +636,9 @@ fn the_controller_survives_whatever_is_in_the_command_file() {
     let mut controller = Controller::new(dir.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
     let kinds =
         ["join", "leave", "start", "pause", "speed", "check", "resync", "steamtest", "host_not", "", "JOIN", "x\u{0}y"];
-    let mut seq = 0u64;
     let mut file = OpenOptions::new().create(true).append(true).open(dir.path().join(CMD_FILE)).unwrap();
     for i in 0..iters(400) {
-        seq += 1;
+        let seq = i as u64 + 1;
         let code = match r.gen_range(0..4) {
             0 => random_text(&mut r, 100),
             1 => "A".repeat(r.gen_range(0..5000)),
