@@ -42,7 +42,7 @@ means harm (section 4), and not a defence against a program already running as t
 | Nonce reuse | Sender ids are assigned once and never taken back, a reconnecting player is a new sender, every session has a new secret, a `Sealer` that would run out of counters refuses instead of wrapping, and a second Welcome cannot replace a player's sealer | `hardening_tests::no_nonce_is_used_twice...`, `a_second_welcome_does_not_restart...`, `wire_limits_tests::the_sealer_refuses...` |
 | Speaking as another player or the host | The host checks the frame's sender id against the connection before it opens the frame; it fills `from`, `name`, `category` and `allowed` itself; a player may send only kinds 30 to 36, 50 and 51 | `session_tests`, `hardening_tests`, `robustness_tests::a_hostile_joined_player...` |
 | A stranger holding the host's resources | 64 connections, 16 per address, 32 waiting to join at once, a join within 15 s, a first frame of at most 4 KiB, a write that must finish in 10 s plus 1 s per 32 KiB, sockets that are polled so that a close takes effect in 5 ms (a blocked read on a silent peer outlived every shutdown, and a read with a timeout failed with `ERROR_IO_PENDING` about once in 3000 timeouts when data arrived as it expired: both measured) | `net::tests`, `hardening_tests::the_host_closes_connections_that_never_join...` |
-| A player flooding the host | 1000 frames and 4 MiB per second per connection (the reader waits, TCP slows the sender); messages that are too big are dropped: Action body 256 KiB, checksum report 128 parts of 128 characters | `net::tests::a_peer_that_sends_faster...`, `hardening_tests` |
+| A player flooding the host | 1000 frames and 1 MiB per second per connection (the reader waits, TCP slows the sender); messages that are too big are dropped: Action body 256 KiB, checksum report 128 parts of 128 characters | `net::tests::a_peer_that_sends_faster...`, `hardening_tests` |
 | A player lying about time | A Clock outside `0..=2^50`, or with a speed outside `0..=16`, is dropped; the stamp arithmetic saturates | `hardening_tests::clocks_that_are_not_game_times_are_dropped` |
 | Memory that grows with what a peer chooses | Log-once memory is cleared at 1024 keys and keyed by reasons, not by the peer's values; peer text is clipped before it reaches a log line (120 to 2000 characters); the host keeps 20 checksum rounds | `hardening_tests::the_log_does_not_grow...`, `robustness_tests` (tracking allocator) |
 | An injected `Reject` ending a session | A Reject is unsealed, so a player honours it only while it is still joining | `hardening_tests::an_injected_reject...` |
@@ -167,7 +167,7 @@ recurse).
 | Time to join; connections waiting to join | 15 s; 32 | `HostSession::HANDSHAKE_SECONDS`, `MAX_PENDING` |
 | Connections open; per address | 64; 16 | `NetLimits` |
 | Time to write one frame | 10 s, plus 1 s per 32 KiB of it | `NetLimits::write_timeout` |
-| Rate per connection | 1000 frames and 4 MiB per second, burst of two seconds | `NetLimits` |
+| Rate per connection | 1000 frames and 1 MiB per second, burst of two seconds | `NetLimits` |
 | Action body; chat text; display name | 256 KiB; 500 characters; 24 characters | `HostSession::MAX_ACTION_BODY`, `Names` |
 | Checksum report | 128 parts, 128 characters each, 20 rounds kept | `ChecksumRounds` |
 | Game clock | `0..2^50`, speed `0..16` | `PlayerClock::plausible` |
@@ -201,6 +201,7 @@ recurse).
 | F14 | Hot-join resync rounds ignore the cooldown, and ids are not recycled: a code holder can disrupt a session by joining repeatedly | Accepted; the host needs a way to remove a player first |
 | F15 | The window's commands (with the password) stay in `ctl_cmd.log` until the next game start | Accepted; the folder is the user's own |
 | F16 | Found while fixing F2: the first fix used `SO_RCVTIMEO` to wake the reader, and on Windows a read that times out as data arrives can fail with `ERROR_IO_PENDING` (997), which ends a healthy connection (measured: twice in about 6400 timeouts, in four runs of 30 to 60 s with data landing as the timeout expired) | Fixed before it shipped: non-blocking sockets, polled; a test sends 1200 frames of up to 300 KB both ways at once and checks every byte |
+| F17 | `to_game.log` is append-only for the whole session and never rotated: tens of megabytes an hour in play, and a hostile joiner adds up to 1 MiB a second (the connection rate) of relayed actions to the host's disk | Open: needs a rotation both sides of the file link agree on (a change in the mod); the rate limit bounds it meanwhile |
 
 Not found: timing differences in the proof check (constant time), id spoofing (the sender is checked against the
 connection before the frame is opened and again against the allow-list), nonce reuse across reconnects (ids are

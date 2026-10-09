@@ -71,7 +71,7 @@ impl Default for NetLimits {
             max_per_address: 16,
             first_frame: FrameCodec::HANDSHAKE_MAX_LENGTH,
             frames_per_second: 1000,
-            bytes_per_second: 4 << 20,
+            bytes_per_second: 1 << 20,
         }
     }
 }

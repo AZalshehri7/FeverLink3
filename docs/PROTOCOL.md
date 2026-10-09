@@ -56,7 +56,7 @@ After Welcome the player seals with its assigned id. The host checks that the se
 
 A player answers a Challenge only if its nonce is 16 bytes and the protocol number is its own. It honours a Reject only while it is still joining (a Reject is unsealed: anyone on the path can write one), and a second Welcome on a connection is dropped (it would replace the player's sealer and restart its counter).
 
-Before a connection has joined, the host reads its first frame with a limit of 4096 bytes (`FrameCodec::HANDSHAKE_MAX_LENGTH`), closes it if no accepted Join arrived within 15 s of opening, and holds at most 32 such connections at once. The transport adds its own limits (64 connections, 16 per address, a 10 s write timeout, 1000 frames and 4 MiB per second per connection); see `docs/SECURITY.md`, section 6.
+Before a connection has joined, the host reads its first frame with a limit of 4096 bytes (`FrameCodec::HANDSHAKE_MAX_LENGTH`), closes it if no accepted Join arrived within 15 s of opening, and holds at most 32 such connections at once. The transport adds its own limits (64 connections, 16 per address, a 10 s write timeout, 1000 frames and 1 MiB per second per connection); see `docs/SECURITY.md`, section 6.
 
 ## Who may send what
 

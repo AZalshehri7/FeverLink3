@@ -70,7 +70,7 @@ One thread owns each session's state machine; everything else only feeds it even
   5 ms), because on Windows a blocking read with a timeout can fail with `ERROR_IO_PENDING` and a shutdown does not
   wake a read on a silent peer. A host refuses connections beyond 64 (16 per address), reads the first frame of a
   connection with a 4 KiB limit, cuts a frame write off after 10 s plus 1 s per 32 KiB, and reads a connection that
-  sends more than 1000 frames or 4 MiB a second more slowly (`NetLimits`). The state machine closes a connection
+  sends more than 1000 frames or 1 MiB a second more slowly (`NetLimits`). The state machine closes a connection
   that has not joined within 15 s. `docs/SECURITY.md` has the reasons and the numbers.
 - **Reconnecting (player).** When the connection drops after the player was accepted, the session thread writes a
   `session` line with `started=false` to the game, then tries again every 5 s for 5 minutes with a fresh
