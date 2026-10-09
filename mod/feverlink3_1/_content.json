@@ -6,6 +6,7 @@
         "feverlink3_common.lua",
         "feverlink3_entry.res.lua",
         "feverlink3_hud.lua",
+        "feverlink3_icon.tga",
         "feverlink3_lockstep.lua",
         "feverlink3_ui.script.lua"
     ]

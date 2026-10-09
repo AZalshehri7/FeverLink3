@@ -15,6 +15,7 @@ pub struct Inputs {
     pub native_dll: PathBuf,
     pub mod_dir: PathBuf,
     pub readme: PathBuf,
+    pub guide: PathBuf,
     pub license: PathBuf,
     pub notices: PathBuf,
 }
@@ -26,6 +27,7 @@ impl Inputs {
             native_dll: root.join("target/release/feverlink3_native.dll"),
             mod_dir: root.join("mod/feverlink3_1"),
             readme: root.join("README.md"),
+            guide: root.join("docs/PLAYING.md"),
             license: root.join("LICENSE"),
             notices: root.join("THIRD_PARTY_NOTICES.md"),
         }
@@ -68,6 +70,7 @@ pub fn package(inputs: &Inputs, version: &str, out: &Path) -> Result<Built, Stri
         ("feverlink3.exe".into(), read(&inputs.exe)?),
         ("winhttp.dll".into(), read(&inputs.native_dll)?),
         ("README.txt".into(), read(&inputs.readme)?),
+        ("HOW-TO-PLAY.txt".into(), read(&inputs.guide)?),
         ("LICENSE".into(), read(&inputs.license)?),
         ("THIRD_PARTY_NOTICES.md".into(), read(&inputs.notices)?),
     ];
@@ -120,6 +123,7 @@ mod tests {
         w("target/release/feverlink3.exe", "exe");
         w("target/release/feverlink3_native.dll", "dll");
         w("README.md", "readme");
+        w("docs/PLAYING.md", "guide");
         w("LICENSE", "mit");
         w("THIRD_PARTY_NOTICES.md", "notices");
         w("mod/feverlink3_1/mod.json", "{}");
@@ -148,6 +152,7 @@ mod tests {
             "FeverLink3-1.2.3/feverlink3.exe",
             "FeverLink3-1.2.3/winhttp.dll",
             "FeverLink3-1.2.3/README.txt",
+            "FeverLink3-1.2.3/HOW-TO-PLAY.txt",
             "FeverLink3-1.2.3/LICENSE",
             "FeverLink3-1.2.3/THIRD_PARTY_NOTICES.md",
             "FeverLink3-1.2.3/mod/feverlink3_1/mod.json",

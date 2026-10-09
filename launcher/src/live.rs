@@ -16,9 +16,10 @@
 
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle};
-use crate::{luatext, net, resync, steam};
+use crate::{luatext, net, resync, steam, upnp};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
@@ -45,10 +46,48 @@ pub fn live_dir() -> Option<PathBuf> {
 
 enum State {
     Idle,
-    Hosting { handle: SessionHandle, code: String, endpoints: Vec<String>, password: bool },
+    Hosting(Box<Hosting>),
     Joining { rx: Receiver<Result<SessionHandle, String>> },
     Joined { handle: SessionHandle },
     Failed(String),
+}
+
+/// What the background address lookup found for a host.
+#[derive(Default)]
+struct Public {
+    done: bool,
+    ip: Option<Ipv4Addr>,
+    note: String,
+    mapping: Option<upnp::Mapping>,
+}
+
+struct Hosting {
+    handle: SessionHandle,
+    secret: [u8; SessionKey::SECRET_SIZE],
+    port: u16,
+    lan: Vec<SocketAddr>,
+    code: String,
+    endpoints: Vec<String>,
+    password: bool,
+    public: Arc<Mutex<Public>>,
+    public_shown: Option<Ipv4Addr>,
+}
+
+impl Hosting {
+    /// The code with the public address first (when known), then the local ones.
+    fn rebuild_code(&mut self, public: Option<Ipv4Addr>) {
+        let mut endpoints: Vec<SocketAddr> = Vec::new();
+        if let Some(ip) = public {
+            endpoints.push(SocketAddr::from((ip, self.port)));
+        }
+        let room = JoinCode::MAX_ENDPOINTS.saturating_sub(endpoints.len());
+        endpoints.extend(self.lan.iter().take(room));
+        if let Ok(code) = JoinCode::create(&endpoints, self.secret, None) {
+            self.code = code.encode();
+            self.endpoints = endpoints.iter().map(ToString::to_string).collect();
+        }
+        self.public_shown = public;
+    }
 }
 
 /// The controller. [`Controller::step`] is called every ~100 ms by [`spawn`], or by a test.
@@ -107,7 +146,8 @@ impl Controller {
             "join" => self.join(params),
             "leave" => self.leave(),
             "start" | "pause" | "speed" | "check" | "resync" => {
-                if let State::Hosting { handle, .. } = &self.state {
+                if let State::Hosting(h) = &self.state {
+                    let handle = &h.handle;
                     match kind {
                         "start" => handle.command(Command::Start),
                         "pause" => handle.command(Command::Pause),
@@ -165,16 +205,26 @@ impl Controller {
             Err(e) => return self.state = State::Failed(format!("cannot listen on port {port}: {e}")),
         };
         let bound = handle.local_addr().map_or(port, |a| a.port());
-        let endpoints = net::lan_endpoints(bound);
-        match JoinCode::create(&endpoints, secret, None) {
-            Ok(code) => {
-                let endpoints = endpoints.iter().map(ToString::to_string).collect();
-                self.state = State::Hosting { handle, code: code.encode(), endpoints, password: password.is_some() };
-            }
-            Err(e) => {
-                handle.stop();
-                self.state = State::Failed(format!("cannot make a join code: {e}"));
-            }
+        let lan = net::lan_endpoints(bound);
+        let public = Arc::new(Mutex::new(Public::default()));
+        spawn_address_lookup(bound, Arc::clone(&public));
+        let mut hosting = Hosting {
+            handle,
+            secret,
+            port: bound,
+            lan,
+            code: String::new(),
+            endpoints: Vec::new(),
+            password: password.is_some(),
+            public,
+            public_shown: None,
+        };
+        hosting.rebuild_code(None);
+        if hosting.code.is_empty() {
+            hosting.handle.stop();
+            self.state = State::Failed("cannot make a join code".into());
+        } else {
+            self.state = State::Hosting(Box::new(hosting));
         }
     }
 
@@ -208,7 +258,15 @@ impl Controller {
 
     fn leave(&mut self) {
         match std::mem::replace(&mut self.state, State::Idle) {
-            State::Hosting { handle, .. } | State::Joined { handle } => handle.stop(),
+            State::Hosting(h) => {
+                h.handle.stop();
+                let mapping = h.public.lock().ok().and_then(|p| p.mapping.clone());
+                if let Some(m) = mapping {
+                    let port = h.port;
+                    thread::spawn(move || upnp::unmap_port(&m, port));
+                }
+            }
+            State::Joined { handle } => handle.stop(),
             _ => {}
         }
         if let Ok(link) = gamelink::Session::open(&self.dir) {
@@ -217,6 +275,13 @@ impl Controller {
     }
 
     fn advance(&mut self) {
+        if let State::Hosting(h) = &mut self.state {
+            let ip = h.public.lock().ok().and_then(|p| p.ip);
+            if ip != h.public_shown {
+                h.rebuild_code(ip);
+            }
+            return;
+        }
         let State::Joining { rx } = &self.state else { return };
         match rx.try_recv() {
             Ok(Ok(handle)) => self.state = State::Joined { handle },
@@ -236,12 +301,16 @@ impl Controller {
                 v["message"] = json!(why);
             }
             State::Joining { .. } => v["state"] = json!("joining"),
-            State::Hosting { handle, code, endpoints, password } => {
+            State::Hosting(h) => {
                 v["state"] = json!("hosting");
-                v["code"] = json!(code);
-                v["endpoints"] = json!(endpoints);
-                v["password"] = json!(password);
-                add_session(&mut v, handle);
+                v["code"] = json!(h.code);
+                v["endpoints"] = json!(h.endpoints);
+                v["password"] = json!(h.password);
+                if let Ok(p) = h.public.lock() {
+                    v["public"] = json!(p.ip.map(|ip| format!("{ip}:{}", h.port)));
+                    v["lookup"] = json!(if p.done { p.note.as_str() } else { "looking up your public address..." });
+                }
+                add_session(&mut v, &h.handle);
             }
             State::Joined { handle } => {
                 let s = handle.status();
@@ -286,6 +355,53 @@ impl Controller {
             Some("failed") => "failed",
             _ => "idle",
         }
+    }
+}
+
+/// Maps the port on the router and finds the public address, off the controller's thread: both can take seconds.
+fn spawn_address_lookup(port: u16, public: Arc<Mutex<Public>>) {
+    thread::spawn(move || {
+        let outcome = lookup_address(port);
+        if let Ok(mut p) = public.lock() {
+            *p = Public { done: true, ip: outcome.0, note: outcome.1, mapping: outcome.2 };
+        }
+    });
+}
+
+fn lookup_address(port: u16) -> (Option<Ipv4Addr>, String, Option<upnp::Mapping>) {
+    let Some(local) = upnp::local_ipv4() else {
+        return (None, "no network connection found".into(), None);
+    };
+    match upnp::map_port(local, port, "FeverLink3") {
+        Ok(mapping) => match mapping.external_ip {
+            Some(ip) if !upnp::is_private(ip) => {
+                (Some(ip), "the router forwarded the port automatically".into(), Some(mapping))
+            }
+            Some(_) => {
+                let found = upnp::public_ip_lookup().ok();
+                let note =
+                    "the router is behind another router: forward the port on that one, or use a VPN such as Tailscale";
+                (found, note.into(), Some(mapping))
+            }
+            None => match upnp::public_ip_lookup() {
+                Ok(ip) => (Some(ip), "the router forwarded the port automatically".into(), Some(mapping)),
+                Err(e) => {
+                    (None, format!("the port is forwarded, but the public address is unknown ({e})"), Some(mapping))
+                }
+            },
+        },
+        Err(why) => match upnp::public_ip_lookup() {
+            Ok(ip) => (
+                Some(ip),
+                format!("automatic forwarding failed ({why}): forward TCP port {port} to this PC on your router"),
+                None,
+            ),
+            Err(e) => (
+                None,
+                format!("no public address found ({e}); players outside your network need a VPN such as Tailscale"),
+                None,
+            ),
+        },
     }
 }
 
