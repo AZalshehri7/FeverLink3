@@ -32,8 +32,9 @@ use crate::engine::{self, AddArgs, AddFn, EngineFns, Held};
 use crate::hold::{Action, Admit, HoldConfig, HoldMachine};
 use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
 
-/// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns.
-pub type ApplyFn = unsafe extern "system" fn(sim: *mut u8, cmd: *mut u8) -> u64;
+/// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
+/// so declared as one that may unwind.
+pub type ApplyFn = unsafe extern "system-unwind" fn(sim: *mut u8, cmd: *mut u8) -> u64;
 
 /// How often the audit event is written when the counts changed.
 pub const AUDIT_INTERVAL_MS: u64 = 30_000;
@@ -445,7 +446,7 @@ mod tests {
         unsafe { core::ptr::write_bytes(cmd, 0, COMMAND_SIZE) };
     }
     unsafe extern "system" fn e_handle(_h: *mut u8) {}
-    unsafe extern "system" fn e_add(
+    unsafe extern "system-unwind" fn e_add(
         _list: *mut u8,
         out: *mut u8,
         cmd: *mut u8,
@@ -461,7 +462,7 @@ mod tests {
         note(format!("add kind {kind} tag {}", unsafe { *((payload + 8) as *const u8) }));
         out
     }
-    unsafe extern "system" fn e_apply(_sim: *mut u8, cmd: *mut u8) -> u64 {
+    unsafe extern "system-unwind" fn e_apply(_sim: *mut u8, cmd: *mut u8) -> u64 {
         let payload = unsafe { *(cmd as *const usize) };
         if payload == 0 {
             return 1;

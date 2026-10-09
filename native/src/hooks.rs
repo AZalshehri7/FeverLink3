@@ -40,8 +40,9 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// What is installed, kept for the life of the process.
 static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
 
-/// The function the game's `CommandList::Add` is made to jump to.
-unsafe extern "system" fn add_hook(
+/// The function the game's `CommandList::Add` is made to jump to. Declared as one that may unwind: a C++ exception
+/// from the engine can pass through it, and the machine-level ABI is the same.
+unsafe extern "system-unwind" fn add_hook(
     list: *mut u8,
     out: *mut u8,
     cmd: *mut u8,
@@ -57,8 +58,8 @@ unsafe extern "system" fn add_hook(
     }
 }
 
-/// The function the game's command application is made to jump to.
-unsafe extern "system" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
+/// The function the game's command application is made to jump to (may unwind, like `add_hook`).
+unsafe extern "system-unwind" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
     match RUNTIME.get() {
         // SAFETY: the arguments of the live call this function was jumped to from.
         Some(rt) => unsafe { rt.on_apply(sim, cmd) },

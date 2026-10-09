@@ -41,9 +41,14 @@ pub type CommandMove = unsafe extern "system" fn(dst: *mut u8, src: *mut u8) -> 
 pub type CommandDestroy = unsafe extern "system" fn(cmd: *mut u8);
 /// The destructor of the handle `Add` writes through `out`.
 pub type HandleDestroy = unsafe extern "system" fn(handle: *mut u8);
-/// `CommandList::Add`.
-pub type AddFn =
-    unsafe extern "system" fn(list: *mut u8, out: *mut u8, cmd: *mut u8, done: *mut u8, progress: *mut u8) -> *mut u8;
+/// `CommandList::Add`. A C++ function, so declared as one that may unwind.
+pub type AddFn = unsafe extern "system-unwind" fn(
+    list: *mut u8,
+    out: *mut u8,
+    cmd: *mut u8,
+    done: *mut u8,
+    progress: *mut u8,
+) -> *mut u8;
 type DeleteThis = unsafe extern "system" fn(this: *mut u8, dealloc: bool);
 type MoveThis = unsafe extern "system" fn(this: *mut u8, to: *mut u8) -> *mut u8;
 
@@ -298,7 +303,7 @@ mod tests {
         log(format!("destroy handle empty={}", unsafe { *(h as *const u64) } == 0));
     }
 
-    unsafe extern "system" fn fake_add(
+    unsafe extern "system-unwind" fn fake_add(
         list: *mut u8,
         out: *mut u8,
         cmd: *mut u8,
