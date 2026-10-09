@@ -297,7 +297,7 @@ fn run_selftest() -> ExitCode {
 // doctor / install / uninstall
 // ---------------------------------------------------------------------------------------------------------------
 
-/// What is found on this machine. The text is built in `wizard.rs`, which also puts it into the diagnostics text.
+/// What is found on this machine. The text is built by the `wizard` module, which also puts it into its diagnostics.
 fn doctor() -> ExitCode {
     print!("{}", wizard::doctor_report());
     ExitCode::SUCCESS
