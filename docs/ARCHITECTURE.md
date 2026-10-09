@@ -117,3 +117,14 @@ The native module recognises the game build by its PE timestamp and looks addres
 - Lua mod: two mocked games running the real Lua through lupa, host relay mocked; checks same actions at same steps, id translation, pause, late actions.
 - Launcher: protocol state machine tests with in-memory transports; a `--selftest` that runs host + player over loopback.
 - CI runs all of it on every push. Game-in-the-loop tests are manual and documented.
+
+## 11. Distribution
+
+No installer. A release is one zip: `FeverLink3.exe`, the proxy DLL, the mod folder and a README. The player extracts it anywhere and runs the exe.
+
+- **Self-contained launcher.** Published as a .NET 10 self-contained single-file executable, so nothing has to be installed on the player's PC. The size cost (about 60 MB) is accepted; targeting the in-box .NET Framework would lose AES-GCM and the modern APIs the core depends on.
+- **First run installs the game-side pieces**, nothing else: the proxy DLL into the game folder, the mod into the user mods folder, and the file that lets a Steam-started game find the launcher. An *Uninstall* button removes exactly those. No registry, no admin rights.
+- **Reproducible releases.** Every release is a tag built by GitHub Actions; the zip's SHA-256 is in the release notes. Nothing is built on a developer's PC.
+- **In-app updates.** The launcher checks GitHub Releases, downloads the zip, verifies an Ed25519 signature (public key embedded, private key kept offline by the maintainer) and replaces itself. Files the launcher downloads carry no mark-of-the-web, so Windows SmartScreen appears once per PC, at the very first run, and never for updates. The join code carries the host's version; a player on another version is offered the update before joining.
+- **Code signing** is the only thing that removes the first-run warning. Apply to the SignPath Foundation (free for open-source projects) once 0.3 is playable; the CI builds and release history are their prerequisites. Paid certificates only if that fails.
+- **No injection.** The proxy DLL is loaded by the game itself. It is small, unobfuscated, and documented in plain words in the README, because antivirus heuristics and players' trust both depend on that.

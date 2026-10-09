@@ -16,6 +16,9 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] Savegame transfer with SHA-256, streamed from disk
 - [ ] Session clock, speed, pause, checksum rounds, resync round
 - [ ] `--selftest` over loopback
+- [ ] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256
+- [ ] In-app updater with Ed25519-signed releases; version carried in the join code
+- [ ] First-run install and one-button uninstall of the game-side pieces
 
 ## 0.3 — Game side
 - [ ] Native module: build table, command-list hook, hold/release, single-worker script pool
@@ -38,7 +41,17 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] Separate companies on one map, own money and vehicles
 - [ ] Station access permissions, shared infrastructure rules
 
-## Later
-- UDP hole punching, relay fallback, public game list
-- Dedicated server
-- Linux / Proton
+## 0.7 — Mixed modes
+- [ ] Several players per company, joining and leaving companies
+- [ ] Shared infrastructure rules and fees
+
+## 0.8 — Reach
+- [ ] UDP hole punching, STUN, relay fallback
+- [ ] Optional public game list
+- [ ] Code signing through SignPath (apply once 0.3 is playable)
+
+## 1.0 — Dedicated server
+- [ ] Headless host role: a game copy running the mod permanently, no window
+- [ ] Persistence by autosave; joining is the hot-join round from the server's save
+- [ ] Players join and leave a world that runs for days
+- [ ] Linux / Proton package for cheap hosting
