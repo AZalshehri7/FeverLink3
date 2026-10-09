@@ -65,8 +65,8 @@ pub struct Runtime {
     base: usize,
     engine: Option<EngineFns>,
     log: fn(&str),
-    hooks: Vec<&'static str>,
-    poolpatch: bool,
+    /// Which hooks and patches ended up installed, for the `ready` event.
+    installed: Mutex<(Vec<&'static str>, bool)>,
     version: &'static str,
     start: Instant,
     /// Added to the real time, for the tests.
@@ -111,8 +111,7 @@ impl Runtime {
             base: init.base,
             engine: init.engine,
             log: init.log,
-            hooks: init.hooks,
-            poolpatch: init.poolpatch,
+            installed: Mutex::new((init.hooks, init.poolpatch)),
             version: init.version,
             start: Instant::now(),
             skew_ms: AtomicU64::new(0),
@@ -132,6 +131,16 @@ impl Runtime {
 
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// Records what the installation really did; the `ready` event is written afterwards.
+    pub fn set_installed(&self, hooks: Vec<&'static str>, poolpatch: bool) {
+        *lock(&self.installed) = (hooks, poolpatch);
+    }
+
+    /// The unhooked functions the hooks call: (`Add`, `Apply`); 0 where not published.
+    pub fn original_addresses(&self) -> (usize, usize) {
+        (self.orig_add.load(Acquire), self.orig_apply.load(Acquire))
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -193,11 +202,12 @@ impl Runtime {
     pub fn open_link(&self, dir: &Path) -> std::io::Result<()> {
         let reader = CtlReader::starting_at_end(dir.join(CTL_FILE))?;
         let mut events = EventWriter::open(dir)?;
+        let (hooks, poolpatch) = lock(&self.installed).clone();
         let ready = Event::Ready {
             build: self.build.name.to_string(),
             version: self.version.to_string(),
-            hooks: self.hooks.iter().map(|h| h.to_string()).collect(),
-            poolpatch: self.poolpatch,
+            hooks: hooks.iter().map(|h| h.to_string()).collect(),
+            poolpatch,
             clock: self.clock.is_some(),
             kinds: self.build.kinds.iter().map(|(n, k)| (n.to_string(), *k)).collect(),
             sites: self.build.ui_add_sites.len(),

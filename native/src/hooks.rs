@@ -1,0 +1,709 @@
+//! The unsafe edge of the module: the two functions the game's code is made to jump to, the installation of every
+//! piece with its rollback, and the service thread (`docs/NATIVE_LINK.md` section 2).
+//!
+//! Nothing here decides anything: [`plan::plan`] decides what to install from the switches, the build table and
+//! the bytes in memory, [`execute`] carries the plan out, and [`Runtime`] does the work while the game runs. What
+//! this module adds is the order of things and the way back:
+//!
+//! 1. The pool patch is made first and is independent of the rest.
+//! 2. Every detour is *prepared* (prologue verified once more, trampoline built) before any is written.
+//! 3. The trampolines are published to the runtime, and only then are the jumps written, so a hook can never run
+//!    before it knows what to call.
+//! 4. If writing any jump fails, every jump already written is taken out again, newest first. The module then runs
+//!    without hooks, which is the game as shipped.
+//!
+//! All of this happens in `DllMain`, while the process is still starting and no thread is inside the functions
+//! being patched. After that the module never rewrites game code again: a misbehaving mod is handled by the
+//! hooks passing everything through (holding off, silence), not by uninstalling.
+
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+
+use windows_sys::Win32::System::LibraryLoader::{
+    GetModuleHandleExW, GetModuleHandleW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+};
+
+use crate::build_table::{BuildAddrs, Rva};
+use crate::detour::{hook_caller, Detour};
+use crate::engine::{AddArgs, EngineFns};
+use crate::hold::HoldConfig;
+use crate::mem;
+use crate::patch::AppliedPatch;
+use crate::plan::{self, Feature, HookConfig, Image, Plan, Skip, Step};
+use crate::runtime::{Init, Runtime};
+#[cfg(target_arch = "x86_64")]
+use crate::selftest;
+
+/// The live runtime the two hook functions work on. Set before any jump is written.
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+/// What is installed, kept for the life of the process.
+static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
+
+/// The function the game's `CommandList::Add` is made to jump to.
+unsafe extern "system" fn add_hook(
+    list: *mut u8,
+    out: *mut u8,
+    cmd: *mut u8,
+    done: *mut u8,
+    progress: *mut u8,
+) -> *mut u8 {
+    // first, before anything can change the frames above us: the return address of the call that got here
+    let caller = hook_caller();
+    match RUNTIME.get() {
+        // SAFETY: the arguments of the live call this function was jumped to from.
+        Some(rt) => unsafe { rt.on_add(AddArgs { list, out, cmd, done, progress }, caller) },
+        None => out,
+    }
+}
+
+/// The function the game's command application is made to jump to.
+unsafe extern "system" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
+    match RUNTIME.get() {
+        // SAFETY: the arguments of the live call this function was jumped to from.
+        Some(rt) => unsafe { rt.on_apply(sim, cmd) },
+        None => 0,
+    }
+}
+
+/// Where the jumps lead.
+#[derive(Debug, Clone, Copy)]
+pub struct Targets {
+    pub apply: usize,
+    pub add: usize,
+}
+
+/// A view of this process's image for the planner.
+struct ProcessImage {
+    base: usize,
+}
+
+impl Image for ProcessImage {
+    fn read(&self, rva: Rva, len: usize) -> Option<Vec<u8>> {
+        let at = self.base.checked_add(rva as usize)?;
+        // SAFETY: the range is checked to be committed and readable before it is read.
+        unsafe { mem::read(at as *const u8, len) }.ok()
+    }
+}
+
+/// What an installation left in place.
+#[derive(Default)]
+pub struct Installed {
+    detours: Vec<(&'static str, Detour)>,
+    patch: Option<AppliedPatch>,
+}
+
+impl Installed {
+    pub fn hook_names(&self) -> Vec<&'static str> {
+        self.detours.iter().map(|(n, _)| *n).collect()
+    }
+
+    pub fn poolpatch(&self) -> bool {
+        self.patch.as_ref().is_some_and(AppliedPatch::is_applied)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.detours.is_empty() && self.patch.is_none()
+    }
+
+    /// Takes everything out again, newest first: the jumps, then the patch.
+    ///
+    /// For the moment right after installing (a later piece failed) and for tests. A running game must not have
+    /// its code rewritten under it; see the module documentation.
+    ///
+    /// # Safety
+    /// No thread may be inside the first bytes of a hooked function or inside the patched region.
+    pub unsafe fn uninstall_all(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some((name, mut d)) = self.detours.pop() {
+            match unsafe { d.uninstall() } {
+                Ok(()) => lines.push(format!("hooks: {name}: jump removed, original bytes restored")),
+                Err(e) => lines.push(format!("hooks: {name}: jump NOT removed: {e}")),
+            }
+        }
+        if let Some(mut p) = self.patch.take() {
+            match unsafe { p.restore() } {
+                Ok(()) => lines.push("hooks: script_pool: original bytes restored".to_string()),
+                Err(e) => lines.push(format!("hooks: script_pool: original bytes NOT restored: {e}")),
+            }
+        }
+        lines
+    }
+}
+
+/// A point in [`execute`] that a test can act at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Every detour is prepared and the trampolines are published; no jump is written yet.
+    Prepared,
+}
+
+/// Carries a plan out. Returns what is in place and the lines for the log.
+///
+/// # Safety
+/// `base` is the address of the image the plan was made for, and no thread is executing inside the functions or
+/// the region to be rewritten (the module calls this from `DllMain`).
+pub unsafe fn execute(
+    plan: &Plan,
+    base: usize,
+    rt: &Runtime,
+    targets: &Targets,
+    observer: &mut dyn FnMut(Stage),
+) -> (Installed, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut inst = Installed::default();
+
+    // 1. the pool patch, independent of the detours
+    for step in &plan.steps {
+        if let Step::Patch { name, rva, expected, replacement, .. } = step {
+            let at = (base + *rva as usize) as *mut u8;
+            match unsafe { AppliedPatch::apply(at, expected, replacement) } {
+                Ok(p) => {
+                    lines.push(format!(
+                        "hooks: {name}: applied, {} bytes at rva {rva:#x}, page protection {}",
+                        expected.len(),
+                        if p.protection_restored() { "restored" } else { "NOT restored" }
+                    ));
+                    inst.patch = Some(p);
+                }
+                Err(e) => lines.push(format!("hooks: {name}: NOT applied: {e}")),
+            }
+        }
+    }
+
+    // 2. prepare every detour: nothing is written to the game yet
+    let mut prepared: Vec<(&'static str, usize, Detour)> = Vec::new();
+    for step in &plan.steps {
+        if let Step::Detour { feature, name, rva, expected } = step {
+            let at = (base + *rva as usize) as *mut u8;
+            let hook = if *feature == Feature::Counters { targets.apply } else { targets.add };
+            match unsafe { Detour::prepare(at, expected) } {
+                Ok(d) => prepared.push((name, hook, d)),
+                Err(e) => lines.push(format!("hooks: {name}: NOT installed, prologue check failed: {e}")),
+            }
+        }
+    }
+
+    // 3. publish the trampolines before any jump exists
+    let original_of = |wanted: &str| {
+        prepared.iter().find(|(n, _, _)| *n == wanted).map(|(_, _, d)| d.original() as usize).unwrap_or(0)
+    };
+    rt.set_original_addresses(original_of("command_list_add"), original_of("apply_command"));
+    observer(Stage::Prepared);
+
+    // 4. write the jumps; if one fails, take the others out again
+    let mut written: Vec<(&'static str, Detour)> = Vec::new();
+    let mut failure = None;
+    for (name, hook, mut d) in prepared {
+        match unsafe { d.commit(hook) } {
+            Ok(()) => {
+                lines.push(format!("hooks: {name}: jump written, original reachable at {:#x}", d.original() as usize));
+                written.push((name, d));
+            }
+            Err(e) => {
+                failure = Some(format!("hooks: {name}: jump NOT written: {e}"));
+                break;
+            }
+        }
+    }
+    if let Some(why) = failure {
+        lines.push(why);
+        let mut undo = Installed { detours: written, patch: None };
+        lines.push("hooks: rolling back the jumps already written".to_string());
+        lines.extend(unsafe { undo.uninstall_all() });
+    } else {
+        inst.detours = written;
+    }
+    (inst, lines)
+}
+
+/// Where the module reads the control file and writes the events.
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub dir: PathBuf,
+    /// The folder belongs to the in-process session controller, which clears it when it starts.
+    pub live: bool,
+}
+
+/// Plans the installation on this process's image and drops what the start-up self-test does not vouch for.
+pub fn plan_for_process(build: &BuildAddrs, cfg: HookConfig, base: usize, log: fn(&str)) -> Plan {
+    let mut p = plan::plan(build, cfg, &ProcessImage { base });
+    if !p.steps.iter().any(|s| matches!(s, Step::Detour { .. })) {
+        return p;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let report = selftest::run();
+        let mut drop_all = false;
+        let mut drop_hold = false;
+        match &report.mechanics {
+            Ok(()) => log("hooks: self-test: detour, trampoline and stack argument work in this binary"),
+            Err(e) => {
+                log(&format!("hooks: self-test FAILED, no jump will be written: {e}"));
+                drop_all = true;
+            }
+        }
+        match &report.caller {
+            Ok(()) => log("hooks: self-test: the hook identifies the call site of a detoured function"),
+            Err(e) => {
+                log(&format!("hooks: self-test: the call site was not identified, hold hook off: {e}"));
+                drop_hold = true;
+            }
+        }
+        let why = |f: Feature| match f {
+            Feature::Hold => "start-up self-test of caller identification failed",
+            _ => "start-up self-test of the detour machinery failed",
+        };
+        let mut skipped = Vec::new();
+        p.steps.retain(|s| {
+            let remove =
+                matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && *feature == Feature::Hold));
+            if remove {
+                skipped.push(Skip { feature: s.feature(), name: s.name(), reason: why(s.feature()).to_string() });
+            }
+            !remove
+        });
+        p.skipped.extend(skipped);
+        if !p.has(Feature::Hold) {
+            p.engine = None;
+        }
+    }
+    p
+}
+
+/// Reads the switches from the environment and installs what they ask for.
+pub fn attach_from_env(build: &'static BuildAddrs, link: Option<Link>, log: fn(&str)) {
+    let cfg = HookConfig::from_lookup(|name| std::env::var(name).ok());
+    attach(build, cfg, link, log);
+}
+
+/// Installs what `cfg` asks for on this build, checks it, and starts the service thread. Never panics and never
+/// leaves a half-installed state: anything in doubt is logged and skipped.
+pub fn attach(build: &'static BuildAddrs, cfg: HookConfig, link: Option<Link>, log: fn(&str)) {
+    if !cfg.any() {
+        return;
+    }
+    // SAFETY: the base of this process's own executable.
+    let base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+    if base == 0 {
+        log("hooks: cannot find the game's image: nothing installed");
+        return;
+    }
+    attach_at(base, build, cfg, link, log);
+}
+
+/// [`attach`] for an image at `base`.
+fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Option<Link>, log: fn(&str)) {
+    let since = SystemTime::now();
+    log(&format!("hooks: switches {}", cfg.describe()));
+    let plan = plan_for_process(build, cfg, base, log);
+    for l in plan.report() {
+        log(&l);
+    }
+    if plan.steps.is_empty() {
+        log("hooks: nothing to install");
+        return;
+    }
+
+    let engine = match (plan.has(Feature::Hold), plan.engine, plan.kind_offset) {
+        // SAFETY: the plan verified the prologues of the three helpers against the image.
+        (true, Some(e), Some(k)) => {
+            Some(unsafe { EngineFns::at(base, e.command_move, e.command_destroy, e.handle_destroy, k) })
+        }
+        _ => None,
+    };
+    let planned: Vec<&'static str> =
+        plan.steps.iter().filter(|s| matches!(s, Step::Detour { .. })).map(Step::name).collect();
+    let rt = Runtime::new(Init {
+        build,
+        base,
+        hold: HoldConfig::default(),
+        engine,
+        log,
+        hooks: planned,
+        poolpatch: false,
+        version: env!("CARGO_PKG_VERSION"),
+    });
+    if RUNTIME.set(rt).is_err() {
+        log("hooks: already attached");
+        return;
+    }
+    let Some(rt) = RUNTIME.get() else { return };
+    let targets = Targets { apply: apply_hook as *const () as usize, add: add_hook as *const () as usize };
+    // SAFETY: called from DllMain, before the game runs the functions being patched.
+    let (installed, lines) = unsafe { execute(&plan, base, rt, &targets, &mut |_| {}) };
+    for l in lines {
+        log(&l);
+    }
+    rt.set_installed(installed.hook_names(), installed.poolpatch());
+    let anything = !installed.is_empty();
+    let hooked = !installed.hook_names().is_empty();
+    if let Ok(mut slot) = INSTALLED.lock() {
+        *slot = Some(installed);
+    }
+    if !anything {
+        log("hooks: nothing is installed");
+        return;
+    }
+    pin_module();
+    log(&format!(
+        "hooks: installed {}",
+        if hooked {
+            "(jumps in place; they pass everything through until the mod switches holding on)"
+        } else {
+            "(patch only)"
+        }
+    ));
+    if let Some(link) = link {
+        spawn_service(rt, link, since, log);
+    } else {
+        log("hooks: no session folder: counters only in memory, no control link");
+    }
+}
+
+/// Keeps this DLL loaded for the life of the process: the hooks point into it, so it must never be unloaded.
+fn pin_module() {
+    let mut module = core::ptr::null_mut();
+    let anchor = add_hook as *const () as *const u16;
+    // SAFETY: FROM_ADDRESS with the address of a function in this DLL; PIN makes the load count permanent.
+    let ok = unsafe {
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, anchor, &mut module)
+    };
+    if ok == 0 {
+        crate::log::line("hooks: could not pin the module in memory");
+    }
+}
+
+/// The service thread: opens the control link once the session folder is ready, then pumps every 20 ms.
+fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&str)) {
+    let spawned = std::thread::Builder::new().name("feverlink3-native".into()).spawn(move || {
+        if link.live {
+            // the in-process controller clears the folder when it starts and then writes identity.txt: wait for
+            // a file newer than this process, or the first events would be deleted under us
+            let identity = link.dir.join("identity.txt");
+            let fresh = |p: &PathBuf| {
+                std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t + Duration::from_secs(1) >= since)
+            };
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while !fresh(&identity) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if !fresh(&identity) {
+                log("link: the session controller did not announce itself within 120 s; opening the folder anyway");
+            }
+        }
+        if let Err(e) = rt.open_link(&link.dir) {
+            log(&format!("link: cannot open {}: {e}", link.dir.display()));
+            return;
+        }
+        loop {
+            rt.pump();
+            std::thread::park_timeout(Duration::from_millis(20));
+        }
+    });
+    match spawned {
+        Ok(handle) => rt.set_waker(handle.thread().clone()),
+        Err(e) => log(&format!("link: cannot start the service thread: {e}")),
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use crate::build_table::{CallSite, HookSite, PatchSite};
+    use crate::mem::pages::Pages;
+    use crate::selftest::{SUM5, SUM5_PROLOGUE};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+
+    /// `fn(a, b) -> a + b + 5`, a 14-byte prologue: stands in for the apply function.
+    const SUM: [u8; 16] =
+        [0x55, 0x48, 0x89, 0xE5, 0x48, 0x89, 0xC8, 0x48, 0x01, 0xD0, 0x48, 0x83, 0xC0, 0x05, 0x5D, 0xC3];
+    const APPLY_RVA: u32 = 0x100;
+    const ADD_RVA: u32 = 0x200;
+    const POOL_RVA: u32 = 0x300;
+    const MOVE_RVA: u32 = 0x400;
+    const POOL_BEFORE: &[u8] = &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00];
+    const POOL_AFTER: &[u8] = &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00];
+
+    fn fake_build() -> &'static BuildAddrs {
+        static APPLY: HookSite = HookSite { rva: APPLY_RVA, prologue: &SUM };
+        let add: &'static HookSite = Box::leak(Box::new(HookSite { rva: ADD_RVA, prologue: &SUM5[..SUM5_PROLOGUE] }));
+        let helper: &'static CallSite = Box::leak(Box::new(CallSite {
+            rva: MOVE_RVA,
+            prologue: &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97],
+        }));
+        let pool: &'static PatchSite =
+            Box::leak(Box::new(PatchSite { rva: POOL_RVA, expected: POOL_BEFORE, replacement: POOL_AFTER }));
+        Box::leak(Box::new(BuildAddrs {
+            timestamp: 9,
+            name: "fake",
+            command_list_add: Some(add.clone()),
+            apply_command: Some(APPLY.clone()),
+            script_pool: Some(pool.clone()),
+            command_move: Some(helper.clone()),
+            command_destroy: Some(helper.clone()),
+            handle_destroy: Some(helper.clone()),
+            ui_add_sites: &[0x500],
+            kind_offset: Some(0x9b8),
+            kinds: &[("build_proposal", 52)],
+        }))
+    }
+
+    /// A fake game image: one executable page with the fake functions at their RVAs; `base` is the page.
+    fn fake_game() -> Pages {
+        let g = Pages::new(&[PAGE_EXECUTE_READ]);
+        g.fill(APPLY_RVA as usize, &SUM);
+        g.fill(ADD_RVA as usize, SUM5);
+        g.fill(POOL_RVA as usize, POOL_BEFORE);
+        g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
+        g
+    }
+
+    fn quiet(_: &str) {}
+
+    fn runtime(build: &'static BuildAddrs, base: usize) -> Runtime {
+        Runtime::new(Init {
+            build,
+            base,
+            hold: HoldConfig::default(),
+            engine: None,
+            log: quiet,
+            hooks: vec![],
+            poolpatch: false,
+            version: "test",
+        })
+    }
+
+    fn everything() -> HookConfig {
+        HookConfig { hooks: true, hold: true, poolpatch: true }
+    }
+
+    // the hooks of these tests: they only prove that the game's functions lead to them and that the published
+    // trampolines reach the originals
+    static APPLY_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static ADD_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+
+    extern "system" fn test_apply(a: u64, b: u64) -> u64 {
+        HITS.fetch_add(1, SeqCst);
+        let original: extern "system" fn(u64, u64) -> u64 =
+            unsafe { core::mem::transmute(APPLY_ORIGINAL.load(SeqCst)) };
+        original(a, b) * 10
+    }
+
+    extern "system" fn test_add(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+        HITS.fetch_add(100, SeqCst);
+        let original: extern "system" fn(u64, u64, u64, u64, u64) -> u64 =
+            unsafe { core::mem::transmute(ADD_ORIGINAL.load(SeqCst)) };
+        original(a, b, c, d, e) * 10
+    }
+
+    fn targets() -> Targets {
+        Targets { apply: test_apply as *const () as usize, add: test_add as *const () as usize }
+    }
+
+    fn apply_fn(g: &Pages) -> extern "system" fn(u64, u64) -> u64 {
+        unsafe { core::mem::transmute(g.at(APPLY_RVA as usize)) }
+    }
+
+    fn add_fn(g: &Pages) -> extern "system" fn(u64, u64, u64, u64, u64) -> u64 {
+        unsafe { core::mem::transmute(g.at(ADD_RVA as usize)) }
+    }
+
+    // the tests of one process share the statics above: run them one at a time
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_full_installation_hooks_both_functions_and_patches_the_pool_and_comes_out_again() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, everything(), &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 3, "{:?}", plan.report());
+
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        let (add_orig, apply_orig) = rt.original_addresses();
+        APPLY_ORIGINAL.store(apply_orig, SeqCst);
+        ADD_ORIGINAL.store(add_orig, SeqCst);
+        assert_ne!((add_orig, apply_orig), (0, 0), "{lines:?}");
+        assert_eq!(inst.hook_names(), ["apply_command", "command_list_add"]);
+        assert!(inst.poolpatch());
+        assert!(lines.iter().any(|l| l.contains("script_pool: applied")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("apply_command: jump written")), "{lines:?}");
+
+        HITS.store(0, SeqCst);
+        assert_eq!(
+            apply_fn(&game)(1, 2),
+            80,
+            "the game's apply function leads to the hook, whose original still works"
+        );
+        assert_eq!(add_fn(&game)(1, 2, 3, 4, 5), 150);
+        assert_eq!(HITS.load(SeqCst), 101);
+        assert_eq!(game.bytes(POOL_RVA as usize, POOL_AFTER.len()), POOL_AFTER);
+        assert_eq!(game.protection(0), PAGE_EXECUTE_READ);
+
+        let undone = unsafe { inst.uninstall_all() };
+        assert_eq!(undone.len(), 3, "{undone:?}");
+        assert!(inst.is_empty());
+        assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM, "byte for byte as the game shipped it");
+        assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5);
+        assert_eq!(game.bytes(POOL_RVA as usize, POOL_BEFORE.len()), POOL_BEFORE);
+        assert_eq!(apply_fn(&game)(1, 2), 8);
+        assert_eq!(add_fn(&game)(1, 2, 3, 4, 5), 15);
+        assert_eq!(game.protection(0), PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn the_counters_alone_touch_only_the_apply_function() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, HookConfig { hooks: true, ..Default::default() }, &ProcessImage { base });
+        let (mut inst, _) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(inst.hook_names(), ["apply_command"]);
+        assert!(!inst.poolpatch());
+        assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5, "the add function is untouched");
+        assert_eq!(game.bytes(POOL_RVA as usize, POOL_BEFORE.len()), POOL_BEFORE, "and so is the pool region");
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM);
+    }
+
+    #[test]
+    fn a_failure_while_writing_the_jumps_takes_the_written_ones_out_again() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, everything(), &ProcessImage { base });
+        // something else patches the add function after it was prepared and before its jump is written
+        let (add_bytes, stray) = (game.at(ADD_RVA as usize), [0xE9, 1, 2, 3, 4]);
+        let (inst, lines) = unsafe {
+            execute(&plan, base, &rt, &targets(), &mut |stage| {
+                assert_eq!(stage, Stage::Prepared);
+                crate::mem::write_code(add_bytes, &[(0, &stray)]).unwrap();
+            })
+        };
+        assert!(inst.detours.is_empty(), "no jump is left: the game runs as shipped");
+        assert!(lines.iter().any(|l| l.contains("command_list_add: jump NOT written")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("rolling back")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("apply_command: jump removed")), "{lines:?}");
+        assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM, "the apply function that had its jump written is restored");
+        assert_eq!(game.bytes(ADD_RVA as usize, 5), stray, "and the stranger's change is not touched");
+        assert!(inst.poolpatch(), "the pool patch is independent and stays");
+        assert_eq!(apply_fn(&game)(1, 2), 8);
+    }
+
+    #[test]
+    fn a_prologue_that_changed_since_planning_skips_that_detour_only() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, everything(), &ProcessImage { base });
+        game.fill(APPLY_RVA as usize + 4, &[0x90]); // after the plan was made
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(inst.hook_names(), ["command_list_add"]);
+        assert!(lines.iter().any(|l| l.contains("apply_command: NOT installed")), "{lines:?}");
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5);
+    }
+
+    #[test]
+    fn a_pool_region_that_is_not_the_expected_one_is_not_patched() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, HookConfig { poolpatch: true, ..Default::default() }, &ProcessImage { base });
+        game.fill(POOL_RVA as usize + 2, &[0xFF]);
+        let before = game.bytes(POOL_RVA as usize, POOL_BEFORE.len());
+        let (inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(inst.is_empty());
+        assert!(lines.iter().any(|l| l.contains("script_pool: NOT applied")), "{lines:?}");
+        assert_eq!(game.bytes(POOL_RVA as usize, POOL_BEFORE.len()), before);
+    }
+
+    #[test]
+    fn an_empty_plan_changes_nothing() {
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, HookConfig::default(), &ProcessImage { base });
+        let (inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(inst.is_empty() && lines.is_empty());
+        assert_eq!(rt.original_addresses(), (0, 0));
+    }
+
+    #[test]
+    fn the_real_build_row_finds_nothing_to_install_in_another_program() {
+        // this test executable is not the game: whatever the 40420 row says, no byte matches, so nothing is planned
+        let build = crate::build_table::select(0x6ac5_0427).unwrap();
+        let base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+        let plan = plan_for_process(build, everything(), base, quiet);
+        assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+        assert!(!plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn attach_installs_reports_and_counts_end_to_end() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // before attach() the runtime does not exist: the add hook hands back `out`, the apply hook returns 0
+        assert!(RUNTIME.get().is_none());
+        let mut out = [0u8; 16];
+        let (n, p) = (core::ptr::null_mut(), core::ptr::null_mut());
+        assert_eq!(unsafe { add_hook(n, out.as_mut_ptr(), n, p, n) }, out.as_mut_ptr());
+        assert_eq!(unsafe { apply_hook(n, n) }, 0);
+
+        // then the whole thing on a fake game: counters and the pool patch, with a session folder
+        let dir = crate::testutil::TempDir::new("attach");
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true };
+        let link = Some(Link { dir: dir.path().to_path_buf(), live: false });
+        attach_at(base, build, cfg, link, quiet);
+        let rt = RUNTIME.get().expect("attach set the runtime");
+
+        // the game's apply function now leads to the real hook, which counts the command and calls the original
+        let mut payload = vec![0u8; 0x9c0];
+        payload[0x9b8] = 52;
+        let mut command = vec![0u8; 0x40];
+        command[..8].copy_from_slice(&(payload.as_ptr() as usize).to_ne_bytes());
+        let cmd = command.as_mut_ptr() as u64;
+        assert_eq!(apply_fn(&game)(1, cmd), 1 + cmd + 5, "the original's result, through the trampoline");
+        assert_eq!(apply_fn(&game)(1, 2), 8, "and a command that cannot be read is passed on as well");
+        match rt.counters().snapshot() {
+            crate::link::Event::Audit { counts, total, unreadable, .. } => {
+                assert_eq!((counts, total, unreadable), (vec![(52, 1)], 2, 1));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(game.bytes(POOL_RVA as usize, POOL_AFTER.len()), POOL_AFTER, "the pool region is patched");
+        assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5, "the command list is not hooked: hold is off");
+
+        // the service thread opens the link and tells the mod what is active
+        let events = dir.path().join(crate::link::EVENTS_FILE);
+        let started = Instant::now();
+        let ready = loop {
+            let lines = crate::link::CtlReader::new(events.clone()).poll().lines;
+            if let Some(l) = lines.into_iter().find(|l| l.kind == "ready") {
+                break l.payload;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "no ready event");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(ready.contains("[1]=\"apply_command\"") && !ready.contains("command_list_add"), "{ready}");
+        assert!(ready.contains("\"poolpatch\"]=true"), "{ready}");
+        assert!(ready.contains("\"build\"]=\"fake\""), "{ready}");
+
+        // put the game back (what a rollback would do) and check it is as shipped
+        let mut inst = INSTALLED.lock().unwrap_or_else(|p| p.into_inner()).take().expect("kept");
+        assert_eq!(inst.hook_names(), ["apply_command"]);
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM);
+        assert_eq!(game.bytes(POOL_RVA as usize, POOL_BEFORE.len()), POOL_BEFORE);
+        assert_eq!(apply_fn(&game)(1, 2), 8);
+    }
+}

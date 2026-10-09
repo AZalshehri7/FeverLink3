@@ -3,13 +3,16 @@
 //! Built as `winhttp.dll` and placed in the game folder, where Transport Fever 3 loads it itself because it
 //! imports `WINHTTP.dll` and Windows searches the application folder first. Every WinHTTP function is passed
 //! unchanged to the system library ([`proxy`]). The module does nothing else unless the launcher started the
-//! game with `FEVERLINK3_SESSION_DIR` set; then it recognises the game build ([`build_table`]), installs the hooks
-//! that let construction commands run at the same game time on every game, and talks to the Lua mod through
-//! files in that folder.
+//! game with `FEVERLINK3_SESSION_DIR` set (or the game itself hosts the session); then it recognises the game
+//! build ([`build_table`]) and, only for the switches the environment sets to `1` (`FEVERLINK3_HOOKS`,
+//! `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, see [`plan`]), installs the pieces that let construction commands
+//! run at the same game time on every game ([`hooks`]), and talks to the Lua mod through two files in the
+//! session folder ([`link`]). `docs/NATIVE_LINK.md` is the design.
 //!
-//! The pure parts (PE header parsing, signature scanning, detour byte maths, the build table) have no Windows
-//! dependency and are unit-tested with `cargo test`. The unsafe parts are confined to [`proxy`], [`detour::install`]
-//! and the entry point.
+//! The pure parts (PE header parsing, signature scanning, detour byte maths, the build table, the control-file
+//! codec, the hold/release state machine, the counters, the install plan) have no Windows dependency and are
+//! unit-tested with `cargo test`. The unsafe parts are confined to [`proxy`], [`mem`], [`detour`], [`patch`],
+//! [`engine`], [`hooks`] and the entry point; they are tested on fake game functions in executable memory.
 
 #![cfg_attr(not(test), deny(unsafe_op_in_unsafe_fn))]
 
@@ -25,6 +28,8 @@ pub mod scan;
 
 #[cfg(windows)]
 pub mod engine;
+#[cfg(windows)]
+pub mod hooks;
 #[cfg(windows)]
 pub mod log;
 #[cfg(windows)]
@@ -78,8 +83,9 @@ mod entry {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
-    /// Called by the loader under the loader lock: only cheap, non-blocking work belongs here. Hooks that need
-    /// the game to be further along are installed from a thread started here (later stage).
+    /// Called by the loader under the loader lock: only cheap, non-blocking work belongs here. The hooks are
+    /// written here on purpose: the process is still starting, so no thread is inside the functions being patched,
+    /// which no later moment can promise. What waits (the control link) is done by a thread started from here.
     #[no_mangle]
     pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
         if reason == DLL_PROCESS_ATTACH {
@@ -100,7 +106,19 @@ mod entry {
                 log::line(&format!("FeverLink3 native {} loaded", env!("CARGO_PKG_VERSION")));
                 match game_build() {
                     Some(ts) => match build_table::select(ts) {
-                        Some(b) => log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name)),
+                        Some(b) => {
+                            log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name));
+                            // off unless FEVERLINK3_HOOKS / FEVERLINK3_POOLPATCH say 1; done here, in the quiet
+                            // moment before the game runs the code that is patched
+                            let link = match &launched {
+                                Some(dir) => Some(hooks::Link { dir: std::path::PathBuf::from(dir), live: false }),
+                                None if live => {
+                                    feverlink3_launcher::live::live_dir().map(|dir| hooks::Link { dir, live: true })
+                                }
+                                None => None,
+                            };
+                            hooks::attach_from_env(b, link, log::line);
+                        }
                         None => {
                             log::line(&format!("unknown game build (timestamp {ts:#x}): hooks off, mod runs degraded"))
                         }
