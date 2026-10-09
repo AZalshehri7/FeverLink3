@@ -1,86 +1,326 @@
 # Native module and mod: the control link
 
-Status: **design, to be agreed before code.** Nothing here is implemented. It describes what the native module (Rust, `native/`) does inside the game and how it talks to the Lua mod.
+Status: **implemented and tested without the game, not yet run in the game.** Everything below that says "verified"
+means verified by tests or by the address tool on the executable on disk; what only a running game can confirm is
+listed in section 8, with the log lines to look for. The module is off unless an environment variable switches
+a piece on (section 2).
 
 ## 1. What the native module is for
 
-Lua alone can observe and issue engine commands, but it cannot stop a command the player's tool has already queued. Lockstep needs exactly that for construction tools: the originator's game must not apply a build until its stamp, like every other game. The module therefore does three narrow things, and only inside a FeverLink3 session:
+Lua alone can observe and issue engine commands, but it cannot stop a command the player's tool has already queued.
+Lockstep needs exactly that for construction tools: the originator's game must not apply a build until its stamp,
+like every other game. The module therefore does three narrow things, and only inside a FeverLink3 session:
 
-1. **Hold** a command at the point where the engine adds it to its command list, and **release** it later at an exact game time (strict mode, `docs/ARCHITECTURE.md` section 6).
-2. **Count** commands as the simulation applies them, so the launcher can compare games (the command audit) and the mod knows when a held command has actually run.
+1. **Hold** a command at the point where the engine adds it to its command list, and **release** it later, when the
+   mod says (strict mode, `docs/ARCHITECTURE.md` section 6).
+2. **Count** commands as the simulation applies them, so the launcher can compare games (the command audit) and the
+   mod knows when a held command has actually run.
 3. **Determinism patch**: make the game-script update use one worker (section 7 of the architecture).
 
-Everything else, including deciding what to hold, stays in the mod. The module contains no session logic and no networking.
+Everything else, including deciding what to hold, stays in the mod. The module contains no session logic and no
+networking.
 
-## 2. Activation and safety rules
+## 2. Switches and safety rules
 
-- Inert unless `FEVERLINK3_SESSION_DIR` is set (already implemented).
-- Hooks are installed only when the game's PE timestamp is in `build_table::BUILDS`. Unknown build: no hooks, one log line, the mod runs in degraded mode and says so in its window.
-- Every byte patch verifies the exact bytes it expects first; a mismatch means no patch for that site and a log line. Detours write padding before the jump (implemented in `detour.rs`).
-- Held commands are never lost: on shutdown, on session end, and when the control file disappears, every held command is released immediately in order, so a crash of the launcher cannot freeze a player's tools.
-- A command whose kind the module does not recognise is never held.
-- Solo play (no session) is bit-for-bit stock behaviour.
+Nothing is installed unless the environment says so, and each piece has its own switch. The values are exactly `1`;
+anything else (unset, empty, `0`, `true`) is off. Try them in this order:
+
+| Order | Environment | What it installs | Risk |
+|---|---|---|---|
+| 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
+| 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
+| 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
+
+`FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
+The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
+in-game session controller's folder), as before.
+
+Rules the code keeps:
+
+- **Fail-open.** Any doubt means nothing is installed and the reason is logged: an unknown build; a site the table
+  lacks; bytes in memory that differ from the table (each piece is compared with what is really there); a
+  start-up self-test that fails; a jump that cannot be written. The game then runs as shipped.
+- **Installed in `DllMain`, never later.** The process is still starting, so no thread is inside the functions
+  being patched; the module never rewrites game code again after that. A misbehaving mod is handled by the hooks
+  passing everything through (holding off, silence), not by uninstalling.
+- **Detours are written all or none.** Every detour is prepared (prologue verified, trampoline built) before any
+  jump is written; the trampolines are published to the runtime before the first jump exists; if writing any jump
+  fails, the jumps already written are taken out again, newest first. The padding is written before the jump.
+  Memory protection is lifted region by region and put back to each region's own earlier value.
+- **A self-test runs first, in the shipped binary.** The module hooks a small function of its own the same way and
+  checks arguments (one on the stack), the result, the trampoline and the identified call site. The shipped DLL is
+  built for size with link-time optimisation, which `cargo test` does not exercise; if the self-test fails, the hooks
+  that depend on it are not installed.
+- **Nothing the module does can hang the game.** The hooks never wait for a lock (a busy state means "call the
+  original"), never do file I/O on the simulation thread, and the module is pinned in memory so a hook never points
+  into an unloaded DLL. Held commands cannot be held forever (section 4).
+- **Panics.** The workspace builds with `panic = "abort"`, so a panic inside the game would kill it. The game-side
+  code returns errors; it indexes only fixed arrays by bounded values and reads foreign memory only after asking the
+  OS whether it is readable.
+- **Unknown kinds are never held.** A command is held only if its kind is in the set the mod named, the build table
+  knows the kind, *and* it was added from one of the construction tools' call sites (section 4).
+- **Solo play is stock behaviour.** With holding off, the hooks count and call the original.
 
 ## 3. The control link
 
-Two append-only text files in the session folder, same shape as the launcher link (`seq<TAB>kind<TAB>payload`, one line per message, monotonically increasing `seq`, readers keep the last `seq` seen and never re-dispatch):
+Two append-only text files in the session folder, in exactly the shape of the launcher link
+(`docs/ARCHITECTURE.md` section 2): one record per line, `seq<TAB>kind<TAB>from<TAB>payload`, the payload one line
+of Lua literal syntax as `C.serialize` writes it, `seq` strictly increasing, a reader keeping the last `seq` it
+dispatched and never dispatching a lower one. Because the shape is the same, the mod needs no new code to use it:
+`C.newWriter(path, id)` / `C.writerSend` for `native_ctl.log`, `C.newReader` / `C.readerPoll` / `C.parse` for
+`native_events.log`. (The first draft of this document sketched JSON with three columns; the implementation reuses
+the launcher link's format instead, which `tests/lua/test_native_link.py` and `native/src/link.rs` pin from both sides.)
 
-| File | Writer | Reader |
-|---|---|---|
-| `native_ctl.log` | the mod | the module |
-| `native_events.log` | the module | the mod |
+| File | Writer | Reader | `from` column |
+|---|---|---|---|
+| `native_ctl.log` | the mod | the module | the mod's player id |
+| `native_events.log` | the module | the mod | `native` |
 
-The module polls `native_ctl.log` from the interface thread at most every 20 ms (a cheap `GetFileAttributesEx` size check; the file is only opened when it grew), instead of reading it on every command as earlier designs did.
+The folder is the session folder: `FEVERLINK3_SESSION_DIR` when the launcher started the game, otherwise the live
+folder `%LOCALAPPDATA%\FeverLink3\live`. In live mode the in-process controller clears that folder when it starts;
+the module waits for the controller's fresh `identity.txt` before it creates its events file, so the first events
+are not deleted.
+
+Reading is bounded and tolerant: a line longer than 8 KiB is thrown away, at most 64 KiB are taken per poll,
+a partial last line waits for its newline, a truncated or rewritten file is read again from its top with the `seq`
+filter keeping history out, and a file that disappears releases everything (below). **When the link opens, whatever
+`native_ctl.log` already holds is history and is not acted on**, so lines from an earlier run can never hold or
+release anything; a mod must write its first line after it has seen `ready`.
 
 ### Mod to module (`native_ctl.log`)
 
 | Kind | Payload | Meaning |
 |---|---|---|
-| `hold_on` | `{ "kinds": [..] }` | Start holding commands of these kinds (names from the module's kind table, e.g. `build_proposal`). |
-| `hold_off` | `{}` | Stop holding; release everything now, in order. |
-| `release` | `{ "id": n, "at": gameTime }` | Release held command `id` when the simulation reaches `at`; `at = 0` means now. |
-| `cancel` | `{ "id": n }` | Drop held command `id` (the originator's game was told "refused"). |
-| `terrain_apply` | `{ "id": n, "stamp": t }` | Apply the staged terrain edit `id` at `stamp` (stage 0.4). |
-| `ping` | `{ "n": n }` | Liveness; the module answers with `pong`. |
+| `hold_on` | `{kinds = {"build_proposal"}}` | Start holding commands of these kinds (names from the build's kind table; 1 to 16 names). Unknown names are reported as an `error` and ignored. |
+| `hold_off` | `{}` | Stop holding; every held command is released at the next `Add`, in order. |
+| `release` | `{id = n, at = gameTime}` | Release held command `n`. `at = 0` (or missing) means at the next `Add`. See "game time" below. |
+| `cancel` | `{id = n}` | Destroy held command `n` instead of releasing it. |
+| `terrain_apply` | `{id = n, stamp = t}` | Reserved for stage 0.4. Parsed, answered with an `error`, otherwise ignored. |
+| `ping` | `{n = k}` | Liveness; answered with `pong`, and counts as a sign of life. |
+
+Every valid line proves the mod is alive. A malformed or unknown line is answered with an `error` event and does not
+count.
 
 ### Module to mod (`native_events.log`)
 
 | Kind | Payload | Meaning |
 |---|---|---|
-| `ready` | `{ "build": "40420", "hooks": [..], "version": ".." }` | Written once at start: which hooks are active. The mod uses it to choose strict or degraded mode. |
-| `held` | `{ "id": n, "kind": "build_proposal", "time": gameTime }` | A command was held. The mod learns the proposal content from its own `onPreBuildProposal` capture and matches by order and time. |
-| `released` | `{ "id": n, "time": gameTime }` | The command was handed to the engine. |
-| `applied` | `{ "id": n, "time": gameTime, "ok": bool }` | The simulation applied it (or refused). |
-| `audit` | `{ "counts": { kind: n } }` | Per-kind counts of commands the simulation applied, every 30 s. |
-| `pong` | `{ "n": n }` | |
-| `error` | `{ "where": "..", "detail": ".." }` | A patch failed or an invariant broke; hooks affected are listed. |
+| `ready` | `{build, version, hooks = {..}, poolpatch, clock, kinds = {name = byte}, sites}` | Written once, when the link opens: what is installed. `clock` is false in every build so far (below). The mod chooses strict or degraded mode from `hooks`. |
+| `holding` | `{on, kinds = {..}, reason}` | Holding was switched on (`hold_on`) or off (`hold_off`, `silence`, `control_gone`). *(Added to the first draft: the mod learns of an implicit switch-off.)* |
+| `held` | `{id, kind, site, ms}` | A command was captured. `site` is the RVA of the tool's call, `ms` the module's uptime. The mod matches it to its own capture by order and time. |
+| `released` | `{id, reason, ms}` | The command was handed back to the engine. `reason`: `release`, `hold_off`, `silence`, `timeout`, `control_gone`. |
+| `dropped` | `{id, reason}` | The command was destroyed (`cancel`). *(Added.)* |
+| `applied` | `{id, ok}` | The simulation applied a command the module had released; `ok` is the engine's verdict byte. |
+| `audit` | `{counts = {[kind] = n}, total, unreadable, adds = {tool, other, unknown}, sites = {[i] = n}}` | Cumulative counts of commands the simulation applied by kind byte, and of commands added to the list by where they came from; `sites` counts per construction-tool call site. Written at most every 30 s and only if the counts changed. |
+| `pong` | `{n}` | |
+| `error` | `{where, detail}` | A problem the mod should know of. At most 6 per 10 s; the next one says how many were held back. |
+
+The module writes the same events, one line each (not `pong`, not the audit's numbers), to its own `native.log` in a
+form for people (section 8).
 
 ## 4. Hold and release, step by step
 
-1. The player confirms a build. The engine calls `CommandList::Add(list, handle_out, command, on_done, on_progress)` on the interface thread.
-2. The detour inspects the command's kind. If it is in the held set and the session is active, it moves the command and its callbacks into a bounded ring (64 entries), returns an empty handle to the caller so the tool believes the build is pending, and appends `held`.
-3. The mod, in its next frame, stamps the action, ships it to the others, and writes `release {id, at}` for the originator.
-4. When the simulation reaches `at`, the module re-issues the command through the original `Add` (via the trampoline), so the engine runs its normal path, and appends `released`, then `applied` when the simulation reports the result.
-5. Peers rebuild the same action from the shipped description at the same `at` through ordinary Lua `sendCommand`; their module holds nothing for it.
+1. The player confirms a build. A construction tool calls `CommandList::Add(list, out, cmd, done, progress)` on the
+   interface thread.
+2. The hook finds out who called: the return address, which it asks the OS to unwind to. It is looked up in the build
+   table's list of **construction-tool call sites** (`ui_add_sites`: bulldozer, street, track, construction, module and
+   lane tools, the street-terminal tool and the entity window's builtins; 12 in build 40420). It reads the command's
+   kind byte. If holding is on, the kind is in the held set, the caller is a tool site and the ring has room, the
+   command is **held**: the engine's own move constructor moves it, the `std::function` callback and the progress
+   pointer move with it, and the caller is left an empty handle, which it destroys as it would any handle. The hook
+   returns without queueing anything. The module reports `held`.
+3. The mod, in its next frame, stamps the action and ships it to the others. At the stamp it writes `release`
+   for the originator and then **sends any harmless command through the normal path** (a script event such as
+   `O.event("feverlink3", "feverlink3", "nop", {})`). That command is the trigger: see below.
+4. The next call to `Add`, any caller, finds the `release` line (the hook looks at the control file itself: a
+   metadata call, and a read only if the file grew), takes the entries that are due out of the ring and **hands them
+   back to the engine through the unhooked `Add`**, with the destructors a tool would run after its own call. Only
+   then does the call that arrived continue. The module reports `released`, and `applied` when the simulation's hook
+   sees the same command (by its payload pointer) and the engine accepted or refused it.
+5. Peers rebuild the same action from the shipped description at the same stamp through ordinary Lua `sendCommand`;
+   their module holds nothing for it, because the mod's own commands do not come from a tool site.
 
-Bounds: the ring is bounded (a 65th simultaneous hold is released immediately and logged as `error`); a held command older than 30 s of real time is released automatically. Memory of released entries is freed.
+**Why tool sites and not only kinds.** Several callers add `WorldBuildProposal` commands, and not all of them
+survive a delay: the mod's own `sendCommand` waits for the result through its callback, and the terrain tool crashed
+when its edit was held (both findings from MPFever, MIT). So holding is by kind *and* by call site, and the list
+in the build table is the one MPFever proved in play, with the terrain tool left out. The address tool checks that
+every entry is a direct call to `CommandList::Add` and names the source file each caller's function mentions.
+
+**Why a trigger.** `Add` is the only function that runs on the thread the engine queues commands on, so the module
+hands commands back from there and nowhere else (a second thread calling `Add` could race the engine's queue). The
+cost is that a release waits for the next `Add`. The mod sends one itself, as above, and if `released` does not
+come it sends another.
+
+**Game time.** The design said `release` waits "until the simulation reaches `at`". The module cannot read the game
+time (the offset of the clock inside the simulation is not known; `ready` says `clock = false`), so a scheduled
+release is due at the next `Add` whatever `at` says. That is the right reading for a mod that has already stopped
+the game at the stamp, which is how MPFever's mod works: every game pauses at the stamp, the originator releases,
+the others replay. The scheduling by `(at, id)` is implemented and tested, so a build whose clock is found only
+needs a reader function.
+
+**Order.** Entries leave in `(at, id)` order; a `hold_off` sends everything back in id order. One consequence to
+design around: only commands of the held kinds are delayed, so a tool that issues a held command and then a command
+of another kind in the same click gets them applied in the opposite order.
+
+**Bounds, and why nothing can be held forever.**
+
+- The ring holds 64 commands. The 65th passes through untouched and an `error` is reported.
+- **Silence.** After 10 s without a valid line from the mod, holding switches itself off (an `error` and a `holding`
+  with `reason = silence`) and every held command goes back at the next `Add`. A mod that holds must write something
+  at least every 5 s; a `ping` is enough.
+- **Age.** A command held for 30 s is released on its own (`reason = timeout`), whatever the mod says.
+- **Control file gone.** If `native_ctl.log` disappears, holding switches off and everything goes back.
+- If nothing calls `Add` for a long time the commands stay in the ring, which blocks nothing: the game runs, the
+  tool just has not finished. At the player's next action everything goes back first. At process exit nothing is
+  released (the engine is going away).
 
 ## 5. Threading
 
-`Add` runs on the interface thread and the simulation applies on its own thread, as observed by the earlier project (`finding from MPFever (MIT)`). The module follows the same split: the ring and its counters are owned by the interface thread; the only values the simulation thread touches are `current game time` (a relaxed atomic written by the apply hook) and the per-kind counters (atomics). No locks are taken inside either hook.
+| Where | What it may do |
+|---|---|
+| The `Add` hook (interface thread) | The only place the engine is touched: capture, release, discard. Takes the state with a bounded `try_lock` and calls the original at once if it is busy. Looks at the control file itself when it has work (a metadata call, a read only if the file grew) and does no other file I/O. |
+| The apply hook (simulation thread) | Relaxed atomics only: the per-kind counter, the watch for released commands and a lock-free queue of verdicts. No lock, no file, no allocation. |
+| The service thread (`feverlink3-native`, every 20 ms) | Reads the control file, advances the state machine's time (silence, age), writes the events and the audit. Never calls the engine. |
+
+The ring is owned by the state machine behind one mutex; the counters and the watch are lock-free. The earlier draft
+said "no locks in either hook"; the `Add` hook uses a lock it never waits for.
 
 ## 6. What is verified without the game
 
-- The build table row and every patch's expected bytes against the executable on disk (the address tool).
-- Detour byte maths, trampoline layout, prologue checks (`cargo test`).
-- The control-file parser, the ring buffer behaviour, ordering and bounds, as pure modules (`cargo test`).
+- **The build table row against the executable on disk** (address tool, committed report
+  `tools/addr/out/6ac50427.txt`): the three hook sites, the three engine helpers (found by how `CommandList::Add`
+  uses them), the command-kind byte offset (read in two functions that agree), sizeof(Command), the 12 tool call
+  sites (each a direct call to `CommandList::Add`), and kind 52 as `WorldBuildProposal` (the dispatcher case whose
+  handler names that string). A test compares the table with the report.
+- **The pure parts** (`cargo test`): the control-file codec and reader, the hold/release state machine (including a
+  randomised run that checks no command is lost, repeated or overfills the ring), the counters and the audit, the
+  watch for released commands (with a stress test that found and fixed a slot-reuse race), the install plan and the
+  switches.
+- **The mechanics on fake game functions** in executable memory (machine code written by hand, called through
+  function pointers, Rust functions as hooks): detours that preserve a stack argument and a frame set up by the
+  stolen bytes; identification of the call site of a detoured function; uninstall byte for byte; a write across
+  pages with different protections; refusal of changed, missing or unreadable memory; the in-place patch and its
+  restore; the whole installation, its rollback after a failure in the middle, and `attach()` itself.
+- **The engine handling** against a fake engine and a fake `std::function` with the same layout: capture, release,
+  discard, null and empty arguments.
+- **The runtime** against that fake engine and real files: hold, release in order, filters by caller and kind,
+  `hold_off`, silence, cancel, vanished file, full ring, a busy state, the applied verdict, bad lines.
+- **The link text**, from both sides, against the mod's own Lua helpers (`tests/lua/test_native_link.py`).
 
-## 7. What needs a game run
+## 7. The mod's side of the contract
 
-Whether the held command's callbacks survive being delayed; whether the tools tolerate an empty handle; the exact engine kind values for each tool; the effect of the one-worker pool patch. Each is a numbered checklist item in `docs/ROADMAP.md` stage 0.3 and is tested with two real games before the stage closes.
+The Lua mod is unchanged by this work. To use strict mode it has to: read `ready` and fall back to degraded mode if
+`command_list_add` is not in `hooks`; write `hold_on` after `ready`; ping at least every 5 s while holding; match
+each `held` to its own capture (by order and time); announce, stamp and ship the action; stop every game at the stamp;
+write `release` and then send a harmless command, repeating that until `released` arrives; write `cancel` for an
+action the host refused; write `hold_off` before a resync reload (a reload while commands are held is not tested).
 
-## 8. Open questions for review
+## 8. NEEDS GAME VERIFICATION
 
-1. Is a 20 ms poll of the control file acceptable, or should the mod signal through a named event object? (Files first; revisit if latency shows in play.)
-2. Which command kinds are held in the first playable: builds only, or also vehicle purchases? (Proposal: builds and bulldoze only; purchases and lines go through Lua `sendCommand` in the mod, which needs no hold.)
-3. Should `hold_off` be implicit when `native_ctl.log` has no new line for 10 s? (Proposal: yes, with an `error` event.)
+Everything below needs a running game. Try the stages in order; stop at the first surprise and read the logs. The
+module's log is `native.log` (next to the session folder in a launcher session, `%LOCALAPPDATA%\FeverLink3\native.log`
+in live mode); the events are in `native_events.log` in the session folder. To drive the control file by hand without
+the mod (live mode shown; numbers must grow, start at 1):
+
+```powershell
+function ctl($seq, $kind, $payload) {
+  Add-Content -Encoding ascii "$env:LOCALAPPDATA\FeverLink3\live\native_ctl.log" ("{0}`t{1}`t0`t{2}" -f $seq, $kind, $payload)
+}
+ctl 1 hold_on '{["kinds"]={[1]="build_proposal"}}'
+ctl 2 release '{["id"]=1}'
+ctl 3 hold_off '{}'
+```
+
+### Stage 1: the counters (`FEVERLINK3_HOOKS=1`)
+
+Expected in `native.log`, in this order:
+
+```
+hooks: switches hooks=on hold=off poolpatch=off
+hooks: self-test: detour, trampoline and stack argument work in this binary
+hooks: self-test: the hook identifies the call site of a detoured function
+hooks: apply_command: 14 bytes at rva 0x9e33b0 match the build table
+hooks: apply_command: jump written, original reachable at 0x...
+hooks: installed (jumps in place; they pass everything through until the mod switches holding on)
+link: opened ... (control file from seq 0, events from seq 1)
+event ready: build 40420, hooks [apply_command], poolpatch off, game clock no
+```
+
+Then play: build a road, buy a vehicle, press the speed buttons, wait 30 s. Expect
+`audit: N command(s) applied, kind 17 x.., kind 42 x.., kind 52 (build_proposal) x..; added by tools 0, others 0, unknown 0`.
+The kind names are in `tools/addr/out/6ac50427.txt` (17 `GameSetSpeed`, 42 `VehicleBuy`, 52 `WorldBuildProposal`, 27
+`ScriptingSendEvent`, ...). Questions this answers: does the game start and run normally with a detour on the
+apply function; is the kind byte offset right (`unreadable` stays 0, counts are plausible); does building a road
+count as kind 52. If the game does not start or crashes, the `native.log` ends at the last line before the crash.
+Any `hooks: SKIPPED` line says why a piece was left out (a changed prologue means another build).
+
+### Stage 2: hold and release (`FEVERLINK3_HOOKS=1 FEVERLINK3_HOLD=1`)
+
+Additionally in `native.log`: `hooks: command_list_add: 18 bytes at rva 0x9d4040 match the build table`,
+`hooks: command_list_add: jump written, ...`, and the `ready` event lists `[apply_command, command_list_add]`.
+
+- **A. Call sites.** Without any `hold_on`, build with the street, track, bulldozer, station and lane tools and wait
+  for the audit: `added by tools N ... tool site i xK`. The index `i` is the position in the table's list: 0
+  bulldozer, 1 construction builder, 2 an unnamed tool, 3 to 5 lane modifier, 6 module builder, 7 street builder,
+  8 street-terminal tool, 9 track modifier, 10 and 11 entity window. Each tool should land on its own index. A tool
+  that lands on `others` is not in the list.
+- **B. Hold.** Write `hold_on`. Expect `event holding on (hold_on) [build_proposal]`. Build one road segment: nothing
+  is built, the game stays responsive, and `event held: command 1, kind 52, from tool site 0x5891b4` appears. This
+  answers: do the tools tolerate an empty handle and a callback that does not fire; does the street builder wait
+  or hang.
+- **C. Release.** Write `release` for the id, then do anything that issues a command; building another piece
+  always does (the new command is itself held, but the one that is due goes back first). Expect `event released: command 1 (release)`, the
+  road appears, and `event applied: command 1, accepted by the engine: true` within a second. No `applied` within
+  60 s gives `event error [applied]: command 1 was released but never seen being applied`: the payload pointer is
+  not stable between `Add` and `Apply`, and the verdict must come another way.
+- **D. Silence.** Hold a command, write nothing for 10 s. Expect `event error [hold]: silence: holding is off, 1 held
+  command(s) go back to the engine` and `event holding off (silence) []`; the next action builds the held road first.
+- **E. Cancel.** `cancel` instead of `release`: `event dropped: command 1 (cancel)`, nothing is built, the tool is
+  usable afterwards (the callback was destroyed, not called, and a tool might wait for it).
+- **F. Each tool.** Hold and release with every tool of the list, one at a time, once with two commands held
+  (released in id order). A crash here is the most likely failure and names the tool; remove its site from
+  `ui_add_sites` in the address tool's list and rerun the tool.
+- **G. Not held.** The terrain tool and a vehicle purchase must not be held with `hold_on` as above.
+- **H. Reload while held.** Hold a command and load a savegame: the command's list pointer is stale. Expected to be
+  unsafe; the mod must `hold_off` first (an item for the mod's resync code).
+
+### Stage 3: the pool patch (`FEVERLINK3_POOLPATCH=1`)
+
+Expect:
+
+```
+hooks: switches hooks=off hold=off poolpatch=on
+hooks: script_pool: 22 bytes at rva 0xab00fc match the build table
+hooks: script_pool: applied, 22 bytes at rva 0xab00fc, page protection restored
+hooks: installed (patch only)
+```
+
+Questions: does the game start and the scripts run (towns, industries); is the pool really one worker (two games on
+a CPU with 8 or more threads stay in step over a long run, which MPFever reported for this patch); the CPU load of
+the game-script update.
+
+### Not testable offline, for completeness
+
+- `Command::Command(Command&&)`, `~Command()` and the handle destructor behave as their code reads (the move
+  semantics of the fake engine are those of the disassembly, not the engine).
+- `_Move` is slot 1 of the `std::function` implementation's vtable (slot 4, `_Delete_this`, is confirmed by
+  `CommandList::Add` itself).
+- Calling the unhooked `Add` from inside another `Add`'s hook, with a command taken from an earlier call.
+- That `Add` is only ever called on one thread while holding is on. If the engine adds commands from two threads, a
+  release could overlap another thread's `Add`; the counters (`added by ...`) and the `held` events carry no thread id,
+  so look for crashes at release first.
+
+## 9. Open questions from the first draft, with the recommended default
+
+1. **Is a 20 ms poll of the control file acceptable, or should the mod signal through a named event object?**
+   Files, as built. The service thread polls every 20 ms and the `Add` hook checks the file itself when it has
+   work, so a release needs no wait for the poll. Revisit only if latency shows in play; the release is bound to the
+   next `Add` anyway, which a named event could not change.
+2. **Which command kinds are held in the first playable: builds only, or also vehicle purchases?** Builds and
+   bulldoze only: kind 52 (`WorldBuildProposal`, which bulldozing also issues) from the 12 tool call sites.
+   Purchases (kind 42) and lines (24 to 26, 47) go through Lua `sendCommand`, which waits for results and so cannot
+   be held, and need no hold. The terrain tool stays unheld until its edit can be copied.
+3. **Should `hold_off` be implicit when `native_ctl.log` has no new line for 10 s?** Yes, as built, with an `error`
+   and a `holding` event. A hold that depends on a mod that has stopped talking is the one way this module could
+   freeze a player's tools, so silence switches it off, and the 30 s age limit and the vanished-file rule back that
+   up.

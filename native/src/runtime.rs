@@ -212,7 +212,10 @@ impl Runtime {
             kinds: self.build.kinds.iter().map(|(n, k)| (n.to_string(), *k)).collect(),
             sites: self.build.ui_add_sites.len(),
         };
-        events.append(&[ready])?;
+        events.append(std::slice::from_ref(&ready))?;
+        if let Some(line) = ready.log_line() {
+            self.say(&line);
+        }
         self.say(&format!(
             "link: opened {} (control file from seq {}, events from seq {})",
             dir.display(),

@@ -30,7 +30,7 @@ If you are the author of either and want the wording changed, open an issue.
 |---|---|---|
 | `core/` | Crate `feverlink3_core`. Protocol: framing, sealed channel, join codes, session model. No game or UI code. Tests in `core/tests`. | Rust |
 | `launcher/` | `FeverLink3.exe`: lobby, game start, save transfer, resync. *(planned)* | Rust |
-| `native/` | Proxy DLL the game loads itself: command capture and hold, determinism patches. Skeleton: proxy, PE parsing, scanner, detour maths, build table. | Rust |
+| `native/` | Proxy DLL the game loads itself: command counters, capture and hold, determinism patch, the control link to the mod. All off unless switched on by environment variables, tested on fake game functions, not yet run in the game. See `docs/NATIVE_LINK.md`. | Rust |
 | `mod/feverlink3_1/` | Game-script mod: lockstep core (stamping, barrier, pause, queue, deterministic random, checksums), file link, command capture. In-game UI and native-build replay *(planned)*. See `mod/README.md`. | Lua |
 | `tools/addr/` | Address tool: finds the hook sites in a game executable and prints a build-table row. See `tools/addr/README.md`. | Python |
 | `tests/lua/` | Two mocked games running the real mod through lupa; `core/tests/` and the native crate run under `cargo test --workspace` | Python, Rust |
