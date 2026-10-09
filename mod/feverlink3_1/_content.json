@@ -3,6 +3,9 @@
     "files": [
         "feverlink3.gs.lua",
         "feverlink3_bridge.script.lua",
+        "feverlink3_cmds_build.lua",
+        "feverlink3_cmds_company.lua",
+        "feverlink3_cmds_ops.lua",
         "feverlink3_common.lua",
         "feverlink3_entry.res.lua",
         "feverlink3_hud.lua",

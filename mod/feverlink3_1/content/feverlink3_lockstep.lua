@@ -159,6 +159,15 @@ L.COMMANDS = {
 	makeVehicleSetLineCmd = { entity = { 1, 2 }, category = "other" },
 }
 
+-- Other areas keep their schemas in modules of their own (feverlink3_cmds_*.lua, loaded by the bridge); each returns
+-- { commands = { <api.cmd function name> = spec } }. A spec has the fields above and may carry two functions for
+-- arguments the generic path cannot carry (engine userdata such as proposals):
+--   spec.encode(name, args, ctx) -> body | nil, reason      (same contract as L.encodeCommand)
+--   spec.decode(body, ctx)       -> { n = count, ... } | nil, reason
+function L.registerCommands(commands)
+	for name, spec in pairs(commands or {}) do L.COMMANDS[name] = spec end
+end
+
 function L.keyFor(rev, e)
 	return rev[e] or ("s:" .. tostring(e))
 end
@@ -175,6 +184,7 @@ end
 function L.encodeCommand(name, args, ctx)
 	local spec = L.COMMANDS[name]
 	if not spec then return nil, "no replication schema for " .. tostring(name) end
+	if spec.encode then return spec.encode(name, args, ctx) end
 	local n = args.n or #args
 	local out = { n = n }
 	for i = 1, n do
@@ -200,6 +210,7 @@ function L.decodeCommand(body, ctx)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return nil, "malformed body" end
 	local spec = L.COMMANDS[body.fn]
 	if not spec then return nil, "unknown command " .. tostring(body.fn) end
+	if spec.decode then return spec.decode(body, ctx) end
 	local n = body.args.n or #body.args
 	local args = { n = n }
 	for i = 1, n do

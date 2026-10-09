@@ -347,7 +347,11 @@ mod win {
         fn setup(&mut self) {
             // SAFETY: see load_api; the accessors return null until Steam is initialised.
             unsafe {
-                let user = (self.api.user_accessor)();
+                let huser = (self.api.hsteamuser)();
+                let mut user = (self.api.user_accessor)();
+                if user.is_null() && huser != 0 {
+                    user = (self.api.find_interface)(huser, c"SteamUser023".as_ptr());
+                }
                 if self.steam_id.is_none() && !user.is_null() {
                     let id = (self.api.get_steam_id)(user);
                     if id != 0 {
@@ -356,7 +360,6 @@ mod win {
                 }
                 let mut sockets = (self.api.sockets_accessor)();
                 let mut utils = (self.api.utils_accessor)();
-                let huser = (self.api.hsteamuser)();
                 if sockets.is_null() && huser != 0 {
                     // what the SDK's inline accessors do: ask the client for the interface by version name
                     sockets = (self.api.find_interface)(huser, c"SteamNetworkingSockets012".as_ptr());

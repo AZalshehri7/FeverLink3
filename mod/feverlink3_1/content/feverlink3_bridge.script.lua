@@ -25,6 +25,14 @@ if not okL then L = ug_require("feverlink3_1::/feverlink3_lockstep.lua") end
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
 if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 
+-- Command schemas of the other areas (construction, operations, companies): one module each, all optional. A module
+-- that is missing or fails to load is skipped; the commands it would have carried stay native.
+for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverlink3_cmds_company" }) do
+	local okM, M = pcall(ug_require, name .. ".lua")
+	if not okM then okM, M = pcall(ug_require, "feverlink3_1::/" .. name .. ".lua") end
+	if okM and type(M) == "table" then L.registerCommands(M.commands) end
+end
+
 local STEP = L.STEP
 local RESULT_KEEP = 60
 local WATCH_STEPS = 10
