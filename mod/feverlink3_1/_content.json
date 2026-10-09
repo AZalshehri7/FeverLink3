@@ -1,0 +1,9 @@
+{
+    "archives": null,
+    "files": [
+        "feverlink3.gs.lua",
+        "feverlink3_bridge.script.lua",
+        "feverlink3_common.lua",
+        "feverlink3_lockstep.lua"
+    ]
+}

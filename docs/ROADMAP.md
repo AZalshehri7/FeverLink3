@@ -27,8 +27,8 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] Address tool (`tools/addr`): finds hook sites in a game executable and prints a build-table row; first run against build 40420 in `tools/addr/out/6ac50427.txt`
 - [ ] Native module: command-list hook, hold/release, single-worker script pool
 - [ ] Native module size: `no_std` + `alloc` with a HeapAlloc allocator once the hook set is fixed
-- [ ] Lua mod: stamping, barrier, replay, checksums, deterministic random
-- [ ] Lua lockstep test with lupa
+- [ ] Lua mod: stamping, barrier, replay, checksums, deterministic random (core, file link and window commands done; native-build replay and in-game UI open)
+- [x] Lua lockstep test with lupa
 - [ ] First playable: two players, shared company, roads and vehicles
 - [ ] First public release: GitHub Releases zip, Nexus Mods listing, site updated
 

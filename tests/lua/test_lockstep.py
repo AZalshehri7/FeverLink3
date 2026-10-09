@@ -1,0 +1,664 @@
+"""Lockstep test for the FeverLink3 Lua mod: two mocked Transport Fever 3 games run the real mod files through
+lupa (Lua 5.2), with a mocked host relay standing in for FeverLink3.exe.
+
+Each game has two Lua environments, as the engine has two Lua states: the simulation half (update, handleEvent)
+and the interface half (guiUpdate), sharing one mocked world but not their module locals nor their `api.cmd`
+table. The mocked engine reproduces what matters for lockstep:
+  * entity ids allocated during the session differ between the games (the client allocates 1000 higher), ids
+    loaded from the savegame do not;
+  * commands sent from the interface state run on the engine's thread at the next simulation tick, with their
+    callback; commands sent from inside the simulation update run at once and may not carry a callback;
+  * a bought vehicle appears one step after its command.
+
+Run:  python -I tests/lua/test_lockstep.py        (or: python -m unittest discover -s tests/lua)
+Set FEVERLINK3_TEST_VERBOSE=1 to print both games' mod.log on failure.
+"""
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+
+import lupa.lua52 as lupa
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+TAB = "\t"
+STEP = 200
+T0 = 18600
+
+
+def read_text(path):
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def read_src(name):
+    return read_text(os.path.join(CONTENT, name))
+
+
+COMMON_SRC = read_src("feverlink3_common.lua")
+LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
+BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
+
+# ---------------------------------------------------------------- mocked engine (one per game)
+
+MOCK = r'''
+GAME = { time = %(t0)d, speed = 1, applied = {}, guiQueue = {}, inUpdate = false, nextEntity = %(first)d, deferred = {} }
+WORLD = {
+  [7]  = { PLAYER = {} },
+  [54] = { CONSTRUCTION = { fileName = "depot.con", transf = { [13] = 100, [14] = 200, [15] = 5 } } },
+  [55] = { VEHICLE_DEPOT = {} },
+  [56] = { CONSTRUCTION = { fileName = "station.con", transf = { [13] = -40.5, [14] = 12, [15] = 0 } } },
+}
+ACCOUNT = { balance = 1000000, loan = 250000 }
+local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8 }
+local NAMEOF = {}
+for k, v in pairs(CT) do NAMEOF[v] = k end
+
+local function newEntity(comps)
+  GAME.nextEntity = GAME.nextEntity + 1
+  WORLD[GAME.nextEntity] = comps
+  return GAME.nextEntity
+end
+
+local function idsWith(name)
+  local ids = {}
+  for e, w in pairs(WORLD) do if w[name] then ids[#ids + 1] = e end end
+  table.sort(ids)
+  return ids
+end
+
+local function mk(name)
+  return function(...) return { __cmd = name, args = { n = select("#", ...), ... } } end
+end
+
+-- the engine applying a command (on its own thread: between frames, before the steps of a tick)
+function EXECUTE(cmd, cb)
+  local name, a = cmd.__cmd, cmd.args
+  if name == "makeGameSetSpeedCmd" then
+    GAME.speed = a[1]
+    if cb then cb({}, true, {}) end
+    return
+  end
+  if name == "makeScriptingSendEventCmd" then
+    SIM_EVENT(a[1], a[2], a[3], a[4])
+    if cb then cb({}, true, {}) end
+    return
+  end
+  local rec = { name = name, time = GAME.time, args = a }
+  local created = nil
+  if name == "makeVehicleBuyCmd" then
+    assert(a[1] == 7, "player entity expected, got " .. tostring(a[1]))
+    assert(WORLD[a[2]] and WORLD[a[2]].VEHICLE_DEPOT, "no depot " .. tostring(a[2]))
+    GAME.nextEntity = GAME.nextEntity + 1
+    created = GAME.nextEntity
+    if GAME.inUpdate then
+      GAME.deferred[#GAME.deferred + 1] = created   -- the vehicle entity appears at the next step
+    else
+      WORLD[created] = { TRANSPORT_VEHICLE = {} }
+    end
+  elseif name == "makeLineCreateCmd" then
+    assert(a[3] == 7, "player entity expected, got " .. tostring(a[3]))
+    created = newEntity({ LINE = { stops = {} } })
+  elseif name == "makeVehicleSetLineCmd" then
+    assert(WORLD[a[1]] and WORLD[a[1]].TRANSPORT_VEHICLE, "no vehicle " .. tostring(a[1]))
+    assert(WORLD[a[2]] and WORLD[a[2]].LINE, "no line " .. tostring(a[2]))
+  else
+    error("unknown command " .. tostring(name))
+  end
+  rec.entity = created
+  GAME.applied[#GAME.applied + 1] = rec
+  if cb then cb(created and { resultVehicleEntity = created, resultEntity = created } or {}, true, created and { { created, 0 } } or {}) end
+end
+
+function MAKE_API()
+  local cmd = {
+    sendCommand = function(c, cb, progress)
+      if GAME.inUpdate then
+        -- finding from MPFever (MIT): callbacks are refused inside the simulation update
+        if cb then error("Callbacks are currently disallowed") end
+        EXECUTE(c, nil)
+        return
+      end
+      GAME.guiQueue[#GAME.guiQueue + 1] = { c, cb }
+    end,
+  }
+  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd" }) do
+    cmd[n] = mk(n)
+  end
+  return {
+    cmd = cmd,
+    type = { ComponentType = CT },
+    engine = {
+      getComponent = function(e, t)
+        if t == CT.GAME_TIME then return { gameTime = GAME.time } end
+        if t == CT.GAME_SPEED then return { speedup = GAME.speed } end
+        if t == CT.ACCOUNT then return ACCOUNT end
+        local w = WORLD[e]
+        return w and w[NAMEOF[t]] or nil
+      end,
+      entityExists = function(e) return WORLD[e] ~= nil end,
+      util = { getWorld = function() return 1 end, getPlayer = function() return 7 end },
+      forEachEntityWithComponent = function(fn, t) for _, e in ipairs(idsWith(NAMEOF[t])) do fn(e) end end,
+      system = { lineSystem = { getLines = function() return idsWith("LINE") end } },
+    },
+  }
+end
+
+debugPrint = function() end
+'''
+
+# ---------------------------------------------------------------- the mod, loaded twice (two Lua states)
+
+HARNESS = r'''
+local function deepcopy(v)
+  if type(v) ~= "table" then return v end
+  local out = {}
+  for k, x in pairs(v) do out[deepcopy(k)] = deepcopy(x) end
+  return out
+end
+
+-- the game-script state: written by the simulation half, readable from both (copies: no shared references)
+local STORED = nil
+STATE = {
+  get = function(self) return deepcopy(STORED) end,
+  set = function(self, v) STORED = deepcopy(v) end,
+  subscribeToAllEvents = function() end,
+}
+GSTATE = { subscribeToAllEvents = function() end }
+
+function LOAD_HALF(label)
+  local env = setmetatable({}, { __index = _G })
+  env.api = MAKE_API()
+  env.package = { loaded = {} }
+  env.ug_require = function(p)
+    if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
+    error("no module " .. tostring(p))
+  end
+  assert(load(BRIDGE_SRC, "=bridge-" .. label, "t", env))()
+  return env.data(), env
+end
+
+SIM, SIM_ENV = LOAD_HALF("sim")
+GUI, GUI_ENV = LOAD_HALF("gui")
+GUI_API = GUI_ENV.api
+
+function SIM_EVENT(src, id, name, param) SIM.handleEvent(nil, STATE, src, id, name, param) end
+function FRAME() GUI.guiUpdate(nil, STATE, GSTATE) end
+function SIMSTEP()
+  local q = GAME.guiQueue
+  GAME.guiQueue = {}
+  for _, c in ipairs(q) do EXECUTE(c[1], c[2]) end
+  for _ = 1, GAME.speed do
+    for _, e in ipairs(GAME.deferred) do WORLD[e] = { TRANSPORT_VEHICLE = {} } end
+    GAME.deferred = {}
+    GAME.time = GAME.time + 200
+    GAME.inUpdate = true
+    SIM.update(nil, STATE, 0.2)
+    GAME.inUpdate = false
+  end
+end
+function APPLIED()
+  local r = {}
+  for i, a in ipairs(GAME.applied) do r[i] = a.name .. "@" .. a.time end
+  return table.concat(r, ",")
+end
+'''
+
+
+class Game:
+    def __init__(self, label, player_id, tmp, first_entity):
+        self.label, self.id = label, player_id
+        self.dir = os.path.join(tmp, label)
+        os.makedirs(self.dir)
+        self.to_game = os.path.join(self.dir, "to_game.log")
+        self.from_game = os.path.join(self.dir, "from_game.log")
+        os.environ.update(FEVERLINK3_SESSION_DIR=self.dir, FEVERLINK3_PLAYER_ID=str(player_id), FEVERLINK3_PLAYER_NAME=label)
+        self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        g = self.L.globals()
+        g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC
+        self.L.execute(MOCK % dict(t0=T0, first=first_entity))
+        self.L.execute(HARNESS)
+
+    def frame(self):
+        self.L.execute("FRAME()")
+
+    def step(self):
+        self.L.execute("SIMSTEP()")
+
+    def time(self):
+        return int(self.L.eval("GAME.time"))
+
+    def speed(self):
+        return int(self.L.eval("GAME.speed"))
+
+    def applied(self):
+        s = self.L.eval("APPLIED()")
+        return s.split(",") if s else []
+
+    def send_gui(self, lua_call):
+        """Issue a command from the interface state, as a game window would."""
+        self.L.execute("local api = GUI_API; " + lua_call)
+
+    def log(self):
+        return read_text(os.path.join(self.dir, "mod.log"))
+
+    def lines(self, path):
+        return read_text(path).splitlines()
+
+
+class Relay:
+    """Stand-in for FeverLink3.exe: owns the session, relays actions with the origin filled in, broadcasts
+    session state and peer clocks, collects checksum reports. Uses the mod's own common module to read and
+    write link lines."""
+
+    def __init__(self, games):
+        self.games = games
+        self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        self.C = self.L.execute(COMMON_SRC)
+        self.readers = {g.id: self.C.newReader(g.from_game) for g in games}
+        self.seq = {g.id: 0 for g in games}
+        self.history = {g.id: [] for g in games}
+        self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
+        self.started, self.speed, self.pauseAt = False, 0, None
+
+    # launcher -> mod
+    def send(self, g, kind, frm, payload):
+        self.seq[g.id] += 1
+        line = self.C.formatLine(self.seq[g.id], kind, frm, payload)
+        self.history[g.id].append(line)
+        with open(g.to_game, "a", encoding="utf-8", newline="") as f:
+            f.write(line)
+
+    def ser(self, d):
+        return self.C.serialize(self.L.table_from(d))
+
+    def broadcast(self, kind, payload, exclude=None):
+        for g in self.games:
+            if g is not exclude:
+                self.send(g, kind, 0, payload)
+
+    @property
+    def lead(self):
+        return 200 * (4 + 2 * max(self.speed, 0))
+
+    def session(self):
+        d = {"started": self.started, "speed": self.speed, "lead": self.lead}
+        if self.pauseAt is not None:
+            d["pauseAt"] = self.pauseAt
+        self.broadcast("session", self.ser(d))
+
+    def future_stamp(self):
+        t = max(self.clocks.values())
+        return -(-(t + self.lead) // STEP) * STEP
+
+    def checksum_request(self, n, at, paused):
+        self.broadcast("checksum_request", self.ser({"n": n, "at": at, "paused": paused}))
+
+    def rewrite_history(self, g, drop=1):
+        """Truncate the game's to_game.log and write its history again without the first `drop` lines (a
+        launcher compacting the file): the file gets shorter, the remaining lines keep their sequence numbers."""
+        with open(g.to_game, "w", encoding="utf-8", newline="") as f:
+            f.write("".join(self.history[g.id][drop:]))
+
+    # mod -> launcher
+    def pump(self):
+        for g in self.games:
+            for rec in self.C.readerPoll(self.readers[g.id]).values():
+                p = self.C.parse(rec.payload)
+                if isinstance(p, tuple):
+                    p = p[0]
+                if rec.kind == "clock":
+                    self.clocks[g.id], self.aheads[g.id] = int(p.t), int(p.ahead)
+                    self.broadcast("peerclock", self.ser({"from": g.id, "t": int(p.t), "ahead": int(p.ahead)}), exclude=g)
+                elif rec.kind == "action":
+                    p["from"] = g.id
+                    payload = self.C.serialize(p)
+                    for o in self.games:
+                        if o is not g:
+                            self.send(o, "action", g.id, payload)
+                elif rec.kind == "hello":
+                    self.hello[g.id] = int(p.time)
+                elif rec.kind == "checksum_report":
+                    self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
+                elif rec.kind == "speed_request":
+                    self.speed_requests.append(int(p.speed))
+
+
+class LockstepTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="feverlink3-")
+        self.A = Game("host", 0, self.tmp, 50000)
+        self.B = Game("client", 1, self.tmp, 51000)
+        self.relay = Relay([self.A, self.B])
+
+    def tearDown(self):
+        if os.environ.get("FEVERLINK3_TEST_VERBOSE"):
+            print("\n--- host mod.log ---\n" + self.A.log() + "\n--- client mod.log ---\n" + self.B.log())
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def tick(self, n=1, lag_b=False):
+        """One tick: a few interface frames with relay pumps, then one engine tick per game (the client skips
+        every third tick when lagging)."""
+        for i in range(n):
+            for _ in range(4):
+                for g in (self.A, self.B):
+                    g.frame()
+                self.relay.pump()
+            self.A.step()
+            if not (lag_b and i % 3 == 0):
+                self.B.step()
+
+    def start(self, speed=1):
+        self.tick(5)
+        self.relay.started, self.relay.speed = True, speed
+        self.relay.session()
+        self.tick(5)
+
+    def log_has(self, text):
+        return text in self.A.log() or text in self.B.log()
+
+    # ---- scenarios
+
+    def test_hold_at_save_time_before_start(self):
+        self.tick(15)
+        self.assertEqual((self.A.time(), self.B.time()), (T0, T0), "both games hold at the save time")
+        self.assertEqual((self.A.speed(), self.B.speed()), (0, 0))
+        self.assertEqual(self.relay.hello, {0: T0, 1: T0}, "both games said hello with the save time")
+
+    def test_barrier_keeps_games_within_ahead(self):
+        self.start()
+        self.tick(30, lag_b=True)
+        self.assertGreater(self.A.time(), T0)
+        self.assertGreater(self.B.time(), T0)
+        gaps = []
+        for _ in range(30):
+            self.tick(1, lag_b=True)
+            gaps.append((self.A.time() - self.B.time()) // STEP)
+        ahead = self.relay.aheads[0]
+        self.assertTrue(all(-ahead <= g <= ahead for g in gaps), "gaps in steps %s exceed ahead=%d" % (gaps, ahead))
+        self.assertGreater(max(gaps), 0, "the client did lag behind at some point: %s" % gaps)
+
+    def test_client_action_applied_on_both_at_the_same_stamp(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s, e) BUY_CB = { s, d and d.resultVehicleEntity } end)')
+        self.assertTrue(self.B.L.eval("BUY_CB == nil"), "the depot window waits for the real result")
+        self.tick(40, lag_b=True)
+        a, b = self.A.applied(), self.B.applied()
+        self.assertEqual(len(a), 1, a)
+        self.assertEqual(a, b, "same action at the same stamp on both games")
+        stamp = int(a[0].split("@")[1])
+        self.assertEqual(stamp % STEP, 0)
+        va, vb = self.A.L.eval("GAME.applied[1].entity"), self.B.L.eval("GAME.applied[1].entity")
+        self.assertNotEqual(va, vb, "the vehicle has different ids in the two games")
+        self.assertTrue(self.B.L.eval("BUY_CB ~= nil and BUY_CB[1] == true and BUY_CB[2] == %d" % vb), "the client's callback got its local vehicle id")
+        shipped = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]
+        self.assertEqual(len(shipped), 1)
+        self.assertIn('s:55', shipped[0], "the depot travels as a savegame key")
+        self.assertNotIn(str(vb), shipped[0])
+
+        # a line, then the vehicle assigned to it: both references are translated on the host
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Line 1", { x = 1, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) LINE_CB = { s, e and e[1] and e[1][1] } end)')
+        self.tick(40, lag_b=True)
+        lb = self.B.L.eval("LINE_CB and LINE_CB[2]")
+        la = self.A.L.eval("GAME.applied[2].entity")
+        self.assertTrue(lb and la and lb != la)
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, %d, 0), function(d, s) SET_CB = s end)" % (vb, lb))
+        self.tick(40, lag_b=True)
+        sa = self.A.L.eval("GAME.applied[3].args[1] .. ',' .. GAME.applied[3].args[2]")
+        sb = self.B.L.eval("GAME.applied[3].args[1] .. ',' .. GAME.applied[3].args[2]")
+        self.assertEqual(sa, "%d,%d" % (va, la), "host used its own vehicle and line ids")
+        self.assertEqual(sb, "%d,%d" % (vb, lb), "client used its own vehicle and line ids")
+        self.assertEqual(self.A.applied(), self.B.applied())
+        self.assertTrue(self.B.L.eval("SET_CB == true"))
+        self.assertFalse(self.log_has("LATE"), "no late action")
+
+    def test_unresolvable_reference_is_refused_not_applied(self):
+        self.start()
+        self.tick(10)
+        self.B.L.execute("WORLD[9999] = { VEHICLE_DEPOT = {} }")   # a depot that exists in the client game only
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 9999, { vehicles = {} }), function(d, s) BAD_CB = s end)')
+        self.tick(40)
+        self.assertEqual(len(self.A.applied()), 0, "the host did not buy in a depot it does not have")
+        self.assertEqual(len(self.B.applied()), 1)
+        self.assertIn("refused", self.A.log())
+        self.assertTrue(any(l.split(TAB)[1] == "action_refused" for l in self.A.lines(self.A.from_game)))
+
+    def test_pause_stamp_stops_both_exactly_and_action_during_pause(self):
+        self.start(speed=2)
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40, lag_b=True)
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt), "both stopped at the pause stamp")
+        self.assertEqual((self.A.speed(), self.B.speed()), (0, 0))
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s, e) BUY_CB = { s, d and d.resultVehicleEntity } end)')
+        self.tick(8)
+        expected = "makeVehicleBuyCmd@%d" % self.relay.pauseAt
+        self.assertEqual(self.A.applied(), [expected])
+        self.assertEqual(self.B.applied(), [expected], "applied at the pause time on the client too")
+        va = self.A.L.eval("GAME.applied[1].entity")
+        self.assertTrue(self.A.L.eval("BUY_CB ~= nil and BUY_CB[1] == true and BUY_CB[2] == %d" % va))
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt), "still paused")
+        # resume at x2
+        paused_at = self.relay.pauseAt
+        self.relay.pauseAt, self.relay.speed = None, 2
+        self.relay.session()
+        self.tick(20)
+        self.assertGreater(self.A.time(), paused_at)
+        self.assertEqual(self.A.speed(), 2)
+        # the vehicle bought during the pause is known to the simulation half too: assign it to a new line
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) LINE_CB = e[1][1] end)')
+        self.tick(30)
+        la = self.A.L.eval("LINE_CB")
+        self.A.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, %d, 0), function() end)" % (va, la))
+        self.tick(30)
+        self.assertEqual(self.A.applied(), self.B.applied())
+        self.assertEqual(self.B.L.eval("GAME.applied[3].args[1]"), self.B.L.eval("GAME.applied[1].entity"))
+
+    def test_checksum_rounds(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        at = self.relay.future_stamp()
+        self.relay.checksum_request(1, at, False)
+        self.tick(40, lag_b=True)
+        self.assertIn(0, self.relay.reports.get(1, {}))
+        self.assertIn(1, self.relay.reports.get(1, {}))
+        (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
+        self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
+        self.assertEqual(pa, pb, "identical worlds give identical parts")
+        self.assertEqual(set(pa), {"time", "balance", "loan", "constructions", "lines"})
+        # paused round: the games are stopped, the interface half answers
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40, lag_b=True)
+        self.assertEqual(self.A.time(), self.relay.pauseAt)
+        self.relay.checksum_request(2, self.relay.pauseAt, True)
+        self.tick(5)
+        self.assertEqual(self.relay.reports[2][0], self.relay.reports[2][1])
+        self.assertEqual(self.relay.reports[2][0][0], self.relay.pauseAt)
+        # one account differs: only the balance part differs
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 1000")
+        self.relay.checksum_request(3, self.relay.pauseAt, True)
+        self.tick(5)
+        pa, pb = self.relay.reports[3][0][1], self.relay.reports[3][1][1]
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance"})
+        self.assertEqual(pa["loan"], pb["loan"])
+
+    def test_truncated_to_game_log_does_not_reapply(self):
+        self.start()
+        self.tick(10)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(40)
+        self.assertEqual(len(self.A.applied()), 1)
+        before = self.A.applied()
+        self.relay.rewrite_history(self.A)
+        self.assertTrue(any(l.split(TAB)[1] == "action" for l in self.A.lines(self.A.to_game)), "the old action line is still in the file")
+        self.tick(20)
+        self.assertEqual(self.A.applied(), before, "re-written history was not dispatched again")
+        # new lines after the truncation still arrive
+        self.relay.speed = 2
+        self.relay.session()
+        self.tick(10)
+        self.assertEqual(self.A.speed(), 2)
+
+    def test_late_action_is_applied_and_logged(self):
+        self.start()
+        self.tick(10)
+        body = self.relay.C.serialize(self.relay.C.parse(
+            '{["fn"]="makeVehicleBuyCmd",["args"]={["n"]=3,[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={}}}'))
+        stamp = self.A.time() - 2 * STEP
+        payload = self.relay.ser({"stamp": stamp, "seq": 7, "body": body, "from": 1})
+        self.relay.send(self.A, "action", 1, payload)
+        self.tick(5)
+        self.assertEqual(len(self.A.applied()), 1)
+        self.assertIn("LATE", self.A.log())
+
+    def test_speed_button_becomes_a_request(self):
+        self.start()
+        self.A.send_gui("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(3))")
+        self.tick(3)
+        self.assertEqual(self.relay.speed_requests, [3])
+        self.assertEqual(self.A.speed(), 1, "the local engine speed stays the session's")
+
+
+class PureTest(unittest.TestCase):
+    """The common module and the core, without any game."""
+
+    def setUp(self):
+        os.environ.pop("FEVERLINK3_SESSION_DIR", None)
+        self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        self.C = self.L.execute(COMMON_SRC)
+        self.K = self.L.execute(LOCKSTEP_SRC)
+
+    def test_serialize_is_order_independent_and_round_trips(self):
+        a = self.L.eval('(function() local t = {} t.b = 1 t.a = { 3, 2, x = "q\\t\\"z" } t[1] = 0.1 t[2] = true return t end)()')
+        b = self.L.eval('(function() local t = { [2] = true, [1] = 0.1 } t.a = { x = "q\\t\\"z", 3, 2 } t.b = 1 return t end)()')
+        sa, sb = self.C.serialize(a), self.C.serialize(b)
+        self.assertEqual(sa, sb)
+        self.assertEqual(sa, '{[1]=0.10000000000000001,[2]=true,["a"]={[1]=3,[2]=2,["x"]="q\\t\\"z"},["b"]=1}')
+        self.assertNotIn("\n", sa)
+        back = self.C.parse(sa)
+        self.assertEqual(self.C.serialize(back), sa)
+        self.assertEqual(self.C.serialize(self.C.parse(self.C.serialize(-0.0))), "0")
+        self.assertEqual(self.C.serialize(2 ** 60), "1.152921504606847e+18")
+        r = self.C.parse("os.exit()")   # no globals in the payload environment: nil plus a reason
+        self.assertIsNone(r[0] if isinstance(r, tuple) else r)
+        with self.assertRaises(lupa.LuaError):
+            self.C.serialize(self.L.eval("print"))
+
+    def test_fnv1a_known_vectors(self):
+        self.assertEqual(int(self.C.fnv1a("")), 0x811C9DC5)
+        self.assertEqual(int(self.C.fnv1a("a")), 0xE40C292C)
+        self.assertEqual(int(self.C.fnv1a("foobar")), 0xBF9CF968)
+        self.assertEqual(self.C.hashValue(self.L.table_from({"x": 1})), self.C.hashValue(self.L.table_from({"x": 1})))
+
+    def test_reader_tracks_sequence_and_partial_lines(self):
+        r = self.C.newReader("unused")
+        recs = self.C.readerFeed(r, "1\tsession\t0\t{}\n2\taction\t5\t{[\"stamp\"]=1}\n3\tclo")
+        self.assertEqual([x.kind for x in recs.values()], ["session", "action"])
+        self.assertEqual(recs[2]["from"], 5)
+        self.assertEqual(int(r.lastSeq), 2)
+        recs = self.C.readerFeed(r, "ck\t0\t{}\r\n")
+        self.assertEqual([x.kind for x in recs.values()], ["clock"])
+        # history re-written after a truncation: nothing below lastSeq is dispatched
+        recs = self.C.readerFeed(r, "1\tsession\t0\t{}\n2\taction\t5\t{}\n3\tclock\t0\t{}\n4\tsession\t0\t{}\n")
+        self.assertEqual([int(x.seq) for x in recs.values()], [4])
+        self.assertEqual(int(r.dropped), 3)
+
+    def test_writer_continues_sequence_from_file(self):
+        tmp = tempfile.mkdtemp(prefix="feverlink3-")
+        try:
+            p = os.path.join(tmp, "from_game.log")
+            w = self.C.newWriter(p, 3)
+            self.assertTrue(self.C.writerSend(w, "hello", self.L.table_from({"time": 1})))
+            self.assertTrue(self.C.writerSend(w, "clock", self.L.table_from({"t": 1})))
+            w2 = self.C.newWriter(p, 3)
+            self.C.writerSend(w2, "clock", self.L.table_from({"t": 2}))
+            lines = read_text(p).splitlines()
+            self.assertEqual([l.split(TAB)[0] for l in lines], ["1", "2", "3"])
+            self.assertEqual(lines[2], '3\tclock\t3\t{["t"]=2}')
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_pace_and_stamps(self):
+        K, L = self.K, self.L
+        s = K.newSession()
+        peers = L.table()
+        self.assertEqual(K.pace(s, peers, 1000, 3), 0, "not started: hold")
+        K.applySession(s, L.table_from({"started": True, "speed": 2, "lead": 1200}))
+        self.assertEqual(K.pace(s, peers, 1000, 3), 2)
+        K.applyPeerClock(peers, L.table_from({"from": 1, "t": 1000, "ahead": 3}), 0)
+        self.assertEqual(K.pace(s, peers, 1400, 3), 1, "one step of room left: run one step")
+        self.assertEqual(K.pace(s, peers, 1600, 3), 0, "at the barrier: hold")
+        self.assertEqual(K.pace(s, peers, 1800, 3), 0, "past the barrier: hold")
+        K.applyPeerClock(peers, L.table_from({"from": 0, "t": 0, "ahead": 3}), 0)
+        self.assertEqual(K.pace(s, peers, 1400, 3), 1, "own clock relayed back is ignored")
+        K.applySession(s, L.table_from({"started": True, "speed": 4, "pauseAt": 1400, "lead": 1200}))
+        self.assertEqual(K.pace(s, peers, 1000, 3), 2, "batch shortened to land on the pause")
+        self.assertEqual(K.pace(s, peers, 1400, 3), 0)
+        self.assertEqual(K.stampFor(s, 1400), 1400, "stopped at the pause: the stamp is the pause time")
+        self.assertEqual(K.stampFor(s, 1000), 2200)
+        self.assertEqual(K.stampFor(s, 1050), 2400, "rounded up to a step")
+        self.assertEqual(K.stampFor(s, 1000, 2000), 3000, "a game may raise the lead")
+        self.assertEqual(K.stampFor(s, 1000, 400), 2200, "never lower it")
+
+    def test_queue_order_and_late(self):
+        K, L = self.K, self.L
+        q = L.table()
+        for at, frm, seq, kind in [(600, 2, 1, "action"), (600, 1, 9, "action"), (400, 3, 1, "action"), (600, 0, 0, "checksum"), (800, 1, 1, "action"), (600, 1, 2, "action")]:
+            K.enqueue(q, L.table_from({"kind": kind, "at": at, "from": frm, "seq": seq}))
+        due = K.takeDue(q, 600)
+        order = [(x.kind, int(x.at), int(x["from"]), int(x.seq), int(x.lateSteps)) for x in due.values()]
+        self.assertEqual(order, [("action", 400, 3, 1, 1), ("checksum", 600, 0, 0, 0), ("action", 600, 1, 2, 0), ("action", 600, 1, 9, 0), ("action", 600, 2, 1, 0)])
+        self.assertEqual(len(q), 1)
+        self.assertEqual(int(q[1].at), 800)
+
+    def test_random_is_deterministic_per_step(self):
+        K, L = self.K, self.L
+        rng1 = K.newRandom(L.eval("function() return %d end" % 1000))
+        rng2 = K.newRandom(L.eval("function() return %d end" % 1000))
+        seq1 = [K.randomDraw(rng1) for _ in range(5)] + [K.randomDraw(rng1, 6) for _ in range(5)] + [K.randomDraw(rng1, 10, 20) for _ in range(5)]
+        for _ in range(3):
+            K.randomDraw(rng2)   # a game that drew more earlier...
+        rng2.t = None            # ...is reseeded by the step change
+        seq2 = [K.randomDraw(rng2) for _ in range(5)] + [K.randomDraw(rng2, 6) for _ in range(5)] + [K.randomDraw(rng2, 10, 20) for _ in range(5)]
+        self.assertEqual(seq1, seq2)
+        self.assertTrue(all(0 <= x < 1 for x in seq1[:5]))
+        self.assertTrue(all(1 <= x <= 6 and x == int(x) for x in seq1[5:10]))
+        self.assertTrue(all(10 <= x <= 20 for x in seq1[10:]))
+        self.assertGreater(len(set(seq1[:5])), 3)
+        rng3 = K.newRandom(L.eval("function() return 1200 end"))
+        self.assertNotEqual(K.randomDraw(rng3), seq1[0], "another step draws other numbers")
+
+    def test_encode_decode_commands(self):
+        K, L = self.K, self.L
+        rev = L.table_from({50001: "1:1"})
+        ctx = L.table_from({"plain": self.C.plain, "keyOf": L.eval("function(e) return (%s)[e] or ('s:' .. e) end" % "({[50001]='1:1'})")})
+        args = L.eval("{ n = 3, 7, 55, { vehicles = {} } }")
+        body = K.encodeCommand("makeVehicleBuyCmd", args, ctx)
+        self.assertEqual(self.C.serialize(body), '{["args"]={[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={["vehicles"]={}},["n"]=3},["fn"]="makeVehicleBuyCmd"}')
+        body2 = K.encodeCommand("makeVehicleSetLineCmd", L.eval("{ n = 3, 50001, 60, 0 }"), ctx)
+        self.assertIn('"1:1"', self.C.serialize(body2))
+        dctx = L.table_from({"player": 7, "resolve": L.eval("function(k) if k == '1:1' then return 70001 end if k == 's:60' then return 60 end end")})
+        out = K.decodeCommand(body2, dctx)
+        self.assertEqual([int(out[i]) for i in (1, 2, 3)], [70001, 60, 0])
+        out, err = K.decodeCommand(K.encodeCommand("makeVehicleSetLineCmd", L.eval("{ n = 3, 99, 60, 0 }"), ctx), dctx)
+        self.assertIsNone(out)
+        self.assertIn("unresolved", err)
+        res, err = K.encodeCommand("makeVehicleBuyCmd", L.eval("{ n = 3, 7, 55, { f = print } }"), ctx)
+        self.assertIsNone(res)
+        self.assertIn("cannot be replicated", err)
+        res, err = K.encodeCommand("makeTerrainCmd", L.eval("{ n = 0 }"), ctx)
+        self.assertIsNone(res)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
