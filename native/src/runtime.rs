@@ -213,16 +213,17 @@ impl Runtime {
             kinds: self.build.kinds.iter().map(|(n, k)| (n.to_string(), *k)).collect(),
             sites: self.build.ui_add_sites.len(),
         };
+        let first_seq = events.next_seq();
         events.append(std::slice::from_ref(&ready))?;
-        if let Some(line) = ready.log_line() {
-            self.say(&line);
-        }
         self.say(&format!(
             "link: opened {} (control file from seq {}, events from seq {})",
             dir.display(),
             reader.last_seq(),
-            events.next_seq()
+            first_seq
         ));
+        if let Some(line) = ready.log_line() {
+            self.say(&line);
+        }
         *lock(&self.reader) = Some(reader);
         *lock(&self.writer) = Some(Writer { events, failed_logged: false });
         Ok(())

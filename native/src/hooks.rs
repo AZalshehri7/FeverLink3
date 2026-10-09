@@ -16,7 +16,7 @@
 //! being patched. After that the module never rewrites game code again: a misbehaving mod is handled by the
 //! hooks passing everything through (holding off, silence), not by uninstalling.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -229,47 +229,49 @@ pub struct Link {
 /// Plans the installation on this process's image and drops what the start-up self-test does not vouch for.
 pub fn plan_for_process(build: &BuildAddrs, cfg: HookConfig, base: usize, log: fn(&str)) -> Plan {
     let mut p = plan::plan(build, cfg, &ProcessImage { base });
-    if !p.steps.iter().any(|s| matches!(s, Step::Detour { .. })) {
-        return p;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let report = selftest::run();
-        let mut drop_all = false;
-        let mut drop_hold = false;
-        match &report.mechanics {
-            Ok(()) => log("hooks: self-test: detour, trampoline and stack argument work in this binary"),
-            Err(e) => {
-                log(&format!("hooks: self-test FAILED, no jump will be written: {e}"));
-                drop_all = true;
-            }
-        }
-        match &report.caller {
-            Ok(()) => log("hooks: self-test: the hook identifies the call site of a detoured function"),
-            Err(e) => {
-                log(&format!("hooks: self-test: the call site was not identified, hold hook off: {e}"));
-                drop_hold = true;
-            }
-        }
-        let why = |f: Feature| match f {
-            Feature::Hold => "start-up self-test of caller identification failed",
-            _ => "start-up self-test of the detour machinery failed",
-        };
-        let mut skipped = Vec::new();
-        p.steps.retain(|s| {
-            let remove =
-                matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && *feature == Feature::Hold));
-            if remove {
-                skipped.push(Skip { feature: s.feature(), name: s.name(), reason: why(s.feature()).to_string() });
-            }
-            !remove
-        });
-        p.skipped.extend(skipped);
-        if !p.has(Feature::Hold) {
-            p.engine = None;
-        }
+    if p.steps.iter().any(|s| matches!(s, Step::Detour { .. })) {
+        #[cfg(target_arch = "x86_64")]
+        apply_selftest(&mut p, &selftest::run(), log);
     }
     p
+}
+
+/// Takes out of the plan what a failed start-up self-test does not vouch for: every detour if the machinery
+/// itself failed, the hold hook if only the call-site identification failed. The pool patch needs neither.
+#[cfg(target_arch = "x86_64")]
+fn apply_selftest(p: &mut Plan, report: &selftest::Report, log: fn(&str)) {
+    let mut drop_all = false;
+    let mut drop_hold = false;
+    match &report.mechanics {
+        Ok(()) => log("hooks: self-test: detour, trampoline and stack argument work in this binary"),
+        Err(e) => {
+            log(&format!("hooks: self-test FAILED, no jump will be written: {e}"));
+            drop_all = true;
+        }
+    }
+    match &report.caller {
+        Ok(()) => log("hooks: self-test: the hook identifies the call site of a detoured function"),
+        Err(e) => {
+            log(&format!("hooks: self-test: the call site was not identified, hold hook off: {e}"));
+            drop_hold = true;
+        }
+    }
+    let why = |f: Feature| match f {
+        Feature::Hold => "start-up self-test of caller identification failed",
+        _ => "start-up self-test of the detour machinery failed",
+    };
+    let mut skipped = Vec::new();
+    p.steps.retain(|s| {
+        let remove = matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && *feature == Feature::Hold));
+        if remove {
+            skipped.push(Skip { feature: s.feature(), name: s.name(), reason: why(s.feature()).to_string() });
+        }
+        !remove
+    });
+    p.skipped.extend(skipped);
+    if !p.has(Feature::Hold) {
+        p.engine = None;
+    }
 }
 
 /// Reads the switches from the environment and installs what they ask for.
@@ -347,18 +349,20 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         return;
     }
     pin_module();
-    log(&format!(
-        "hooks: installed {}",
-        if hooked {
-            "(jumps in place; they pass everything through until the mod switches holding on)"
-        } else {
-            "(patch only)"
-        }
-    ));
+    log(&installed_line(hooked));
     if let Some(link) = link {
         spawn_service(rt, link, since, log);
     } else {
         log("hooks: no session folder: counters only in memory, no control link");
+    }
+}
+
+/// The line that says the installation is done.
+fn installed_line(jumps: bool) -> String {
+    if jumps {
+        "hooks: installed (jumps in place; they pass everything through until the mod switches holding on)".into()
+    } else {
+        "hooks: installed (patch only)".into()
     }
 }
 
@@ -375,6 +379,25 @@ fn pin_module() {
     }
 }
 
+/// True when `path` exists and was last written no earlier than a second before `since`.
+fn written_since(path: &Path, since: SystemTime) -> bool {
+    std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|t| t + Duration::from_secs(1) >= since)
+}
+
+/// Waits until `path` has been written at or after `since`; `false` if `timeout` passes first.
+fn wait_until_written(path: &Path, since: SystemTime, timeout: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if written_since(path, since) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// The service thread: opens the control link once the session folder is ready, then pumps every 20 ms.
 fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&str)) {
     let spawned = std::thread::Builder::new().name("feverlink3-native".into()).spawn(move || {
@@ -382,14 +405,7 @@ fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&s
             // the in-process controller clears the folder when it starts and then writes identity.txt: wait for
             // a file newer than this process, or the first events would be deleted under us
             let identity = link.dir.join("identity.txt");
-            let fresh = |p: &PathBuf| {
-                std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t + Duration::from_secs(1) >= since)
-            };
-            let deadline = Instant::now() + Duration::from_secs(120);
-            while !fresh(&identity) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !fresh(&identity) {
+            if !wait_until_written(&identity, since, Duration::from_secs(120), Duration::from_millis(100)) {
                 log("link: the session controller did not announce itself within 120 s; opening the folder anyway");
             }
         }
@@ -648,6 +664,111 @@ mod tests {
         assert!(!plan.skipped.is_empty());
     }
 
+    fn step_names(p: &Plan) -> Vec<&'static str> {
+        p.steps.iter().map(Step::name).collect()
+    }
+
+    #[test]
+    fn a_failed_detour_self_test_keeps_every_jump_out_but_not_the_pool_patch() {
+        let (build, game) = (fake_build(), fake_game());
+        let mut p = plan::plan(build, everything(), &ProcessImage { base: game.base as usize });
+        assert_eq!(step_names(&p), ["apply_command", "command_list_add", "script_pool"]);
+        assert!(p.engine.is_some());
+        let report = selftest::Report { mechanics: Err("no executable memory".into()), caller: Err("not run".into()) };
+        apply_selftest(&mut p, &report, quiet);
+        assert_eq!(
+            step_names(&p),
+            ["script_pool"],
+            "the pool patch needs neither detours nor call-site identification"
+        );
+        assert!(p.engine.is_none());
+        let skipped: Vec<_> = p.skipped.iter().map(|s| (s.feature, s.name)).collect();
+        assert_eq!(skipped, [(Feature::Counters, "apply_command"), (Feature::Hold, "command_list_add")]);
+        assert!(p.skipped.iter().all(|s| s.reason.contains("self-test")));
+    }
+
+    #[test]
+    fn a_failed_call_site_self_test_keeps_only_the_hold_hook_out() {
+        let (build, game) = (fake_build(), fake_game());
+        let mut p = plan::plan(build, everything(), &ProcessImage { base: game.base as usize });
+        let report = selftest::Report { mechanics: Ok(()), caller: Err("found 0x1, expected 0x2".into()) };
+        apply_selftest(&mut p, &report, quiet);
+        assert_eq!(step_names(&p), ["apply_command", "script_pool"]);
+        assert!(p.engine.is_none(), "without the hook the engine helpers are not wanted");
+        assert_eq!(p.skipped.len(), 1);
+        assert_eq!((p.skipped[0].feature, p.skipped[0].name), (Feature::Hold, "command_list_add"));
+        assert!(p.skipped[0].reason.contains("caller identification"), "{}", p.skipped[0].reason);
+    }
+
+    #[test]
+    fn a_passed_self_test_changes_nothing() {
+        let (build, game) = (fake_build(), fake_game());
+        let mut p = plan::plan(build, everything(), &ProcessImage { base: game.base as usize });
+        let before = p.clone();
+        apply_selftest(&mut p, &selftest::Report { mechanics: Ok(()), caller: Ok(()) }, quiet);
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn the_installed_line_says_whether_there_are_jumps() {
+        assert_eq!(
+            installed_line(true),
+            "hooks: installed (jumps in place; they pass everything through until the mod switches holding on)"
+        );
+        assert_eq!(installed_line(false), "hooks: installed (patch only)");
+    }
+
+    #[test]
+    fn a_stale_identity_file_is_not_the_controllers_announcement() {
+        let dir = crate::testutil::TempDir::new("fresh-stale");
+        let path = dir.path().join("identity.txt");
+        std::fs::write(&path, "id=0\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        let since = SystemTime::now();
+        assert!(!written_since(&path, since), "left over from an earlier run");
+        let started = Instant::now();
+        assert!(!wait_until_written(&path, since, Duration::from_millis(150), Duration::from_millis(10)));
+        assert!(started.elapsed() >= Duration::from_millis(140), "it waited the whole time");
+        assert!(!written_since(&dir.path().join("missing.txt"), since));
+    }
+
+    #[test]
+    fn a_file_written_after_the_start_is_the_announcement_even_if_it_comes_late() {
+        let dir = crate::testutil::TempDir::new("fresh-late");
+        let path = dir.path().join("identity.txt");
+        let since = SystemTime::now();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                std::fs::write(path, "id=0\n").unwrap();
+            })
+        };
+        let started = Instant::now();
+        assert!(wait_until_written(&path, since, Duration::from_secs(10), Duration::from_millis(10)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        writer.join().unwrap();
+    }
+
+    /// The log lines of the attach test, in the order they were written.
+    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn capture(line: &str) {
+        LOGGED.lock().unwrap_or_else(|p| p.into_inner()).push(line.to_string());
+    }
+
+    /// Asserts that `expected` (each a substring) appear in `lines` in this order.
+    fn assert_in_order(lines: &[String], expected: &[&str]) {
+        let mut from = 0;
+        for want in expected {
+            match lines[from..].iter().position(|l| l.contains(want)) {
+                Some(i) => from += i + 1,
+                None => panic!("`{want}` not found (in order) in {lines:#?}"),
+            }
+        }
+    }
+
     #[test]
     fn attach_installs_reports_and_counts_end_to_end() {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -664,7 +785,7 @@ mod tests {
         let base = game.base as usize;
         let cfg = HookConfig { hooks: true, hold: false, poolpatch: true };
         let link = Some(Link { dir: dir.path().to_path_buf(), live: false });
-        attach_at(base, build, cfg, link, quiet);
+        attach_at(base, build, cfg, link, capture);
         let rt = RUNTIME.get().expect("attach set the runtime");
 
         // the game's apply function now leads to the real hook, which counts the command and calls the original
@@ -695,6 +816,30 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "no ready event");
             std::thread::sleep(Duration::from_millis(20));
         };
+        // the log lines docs/NATIVE_LINK.md section 8 tells a person to look for
+        let logged = loop {
+            let lines = LOGGED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if lines.iter().any(|l| l.starts_with("event ready:")) {
+                break lines;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "no ready line in the log");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_in_order(
+            &logged,
+            &[
+                "hooks: switches hooks=on hold=off poolpatch=on",
+                "hooks: self-test: detour, trampoline and stack argument work in this binary",
+                "hooks: self-test: the hook identifies the call site of a detoured function",
+                "hooks: apply_command: 16 bytes at rva 0x100 match the build table",
+                "hooks: script_pool: 8 bytes at rva 0x300 match the build table",
+                "hooks: script_pool: applied, 8 bytes at rva 0x300, page protection restored",
+                "hooks: apply_command: jump written, original reachable at 0x",
+                "hooks: installed (jumps in place; they pass everything through until the mod switches holding on)",
+                "link: opened ",
+                "event ready: build fake, hooks [apply_command], poolpatch applied, game clock no",
+            ],
+        );
         assert!(ready.contains("[1]=\"apply_command\"") && !ready.contains("command_list_add"), "{ready}");
         assert!(ready.contains("\"poolpatch\"]=true"), "{ready}");
         assert!(ready.contains("\"build\"]=\"fake\""), "{ready}");

@@ -293,6 +293,8 @@ hooks: switches hooks=off hold=off poolpatch=on
 hooks: script_pool: 22 bytes at rva 0xab00fc match the build table
 hooks: script_pool: applied, 22 bytes at rva 0xab00fc, page protection restored
 hooks: installed (patch only)
+link: opened ... (control file from seq 0, events from seq 1)
+event ready: build 40420, hooks [], poolpatch applied, game clock no
 ```
 
 Questions: does the game start and the scripts run (towns, industries); is the pool really one worker (two games on

@@ -378,6 +378,23 @@ mod tests {
     }
 
     #[test]
+    fn the_report_lines_are_the_ones_the_docs_quote() {
+        let b = select(0x6ac5_0427).unwrap();
+        let p = plan(b, cfg(true, true, true), &image_of_40420());
+        assert_eq!(
+            p.report(),
+            [
+                "hooks: apply_command: 14 bytes at rva 0x9e33b0 match the build table",
+                "hooks: command_list_add: 18 bytes at rva 0x9d4040 match the build table",
+                "hooks: script_pool: 22 bytes at rva 0xab00fc match the build table",
+            ]
+        );
+        let none = plan(b, cfg(true, true, true), &BytesImage::zeroed(0, 0x0400_0000));
+        assert!(none.report().iter().all(|l| l.starts_with("hooks: SKIPPED ")), "{:?}", none.report());
+        assert!(none.report()[0].starts_with("hooks: SKIPPED apply_command (counters): bytes at rva 0x9e33b0 are 00"));
+    }
+
+    #[test]
     fn hold_without_hooks_does_nothing_and_says_so() {
         let b = select(0x6ac5_0427).unwrap();
         let p = plan(b, cfg(false, true, false), &image_of_40420());

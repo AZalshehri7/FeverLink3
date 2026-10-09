@@ -1028,6 +1028,51 @@ mod tests {
     }
 
     #[test]
+    fn events_have_a_line_for_people_and_the_docs_quote_them() {
+        // docs/NATIVE_LINK.md section 8 quotes these lines; the ones only the mod needs have none
+        let ready = Event::Ready {
+            build: "40420".into(),
+            version: "0.1.0".into(),
+            hooks: vec!["apply_command".into(), "command_list_add".into()],
+            poolpatch: false,
+            clock: false,
+            kinds: vec![],
+            sites: 12,
+        };
+        assert_eq!(
+            ready.log_line().unwrap(),
+            "event ready: build 40420, hooks [apply_command, command_list_add], poolpatch off, game clock no"
+        );
+        let line = |e: Event| e.log_line().unwrap();
+        assert_eq!(
+            line(Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 5 }),
+            "event held: command 1, kind 52, from tool site 0x4d396f"
+        );
+        assert_eq!(line(Event::Released { id: 1, reason: "release", ms: 5 }), "event released: command 1 (release)");
+        assert_eq!(line(Event::Dropped { id: 1, reason: "cancel" }), "event dropped: command 1 (cancel)");
+        assert_eq!(line(Event::Applied { id: 1, ok: true }), "event applied: command 1, accepted by the engine: true");
+        assert_eq!(
+            line(Event::Holding { on: true, kinds: vec!["build_proposal".into()], reason: "hold_on" }),
+            "event holding on (hold_on) [build_proposal]"
+        );
+        assert_eq!(
+            line(Event::Holding { on: false, kinds: vec![], reason: "silence" }),
+            "event holding off (silence) []"
+        );
+        assert_eq!(
+            line(Event::Error { place: "hold".into(), detail: "silence: holding is off".into() }),
+            "event error [hold]: silence: holding is off"
+        );
+        assert_eq!(Event::Pong { n: 1 }.log_line(), None);
+        assert_eq!(
+            Event::Audit { counts: vec![], total: 0, unreadable: 0, adds: AddCounts::default(), sites: vec![] }
+                .log_line(),
+            None,
+            "the audit has its own line (counters::audit_log_line)"
+        );
+    }
+
+    #[test]
     fn golden_event_lines() {
         assert_eq!(
             EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120 }),
