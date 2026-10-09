@@ -154,9 +154,9 @@ end
 -- the same id everywhere; finding from MPFever (MIT): ids allocated during the session differ between games, ids
 -- loaded from the save do not). `player` arguments are replaced by each game's own player entity.
 L.COMMANDS = {
-	makeVehicleBuyCmd = { player = { 1 }, entity = { 2 }, creates = "TRANSPORT_VEHICLE", result = "resultVehicleEntity" },
-	makeLineCreateCmd = { player = { 3 }, creates = "LINE", result = "resultEntity" },
-	makeVehicleSetLineCmd = { entity = { 1, 2 } },
+	makeVehicleBuyCmd = { player = { 1 }, entity = { 2 }, creates = "TRANSPORT_VEHICLE", result = "resultVehicleEntity", category = "spend" },
+	makeLineCreateCmd = { player = { 3 }, creates = "LINE", result = "resultEntity", category = "build" },
+	makeVehicleSetLineCmd = { entity = { 1, 2 }, category = "other" },
 }
 
 function L.keyFor(rev, e)
@@ -225,6 +225,89 @@ function L.newestEntity(before, after)
 		if not seen[e] and (created == nil or e > created) then created = e end
 	end
 	return created
+end
+
+-- ------------------------------------------------------------------ permissions
+
+-- The host grants each player a set of categories: build, bulldoze, spend (vehicle purchases), other. A command
+-- belongs to the category its COMMANDS entry names; a command without an entry is classified by its name, so a
+-- command that stays native is still checked. Anything unrecognised is "other".
+L.CATEGORIES = { "build", "bulldoze", "spend", "other" }
+
+function L.categoryOf(name)
+	local spec = L.COMMANDS[name]
+	if spec and spec.category then return spec.category end
+	local n = tostring(name):lower()
+	if n:find("bulldoze", 1, true) or n:find("remove", 1, true) or n:find("demolish", 1, true) then return "bulldoze" end
+	if n:find("buy", 1, true) or n:find("purchase", 1, true) then return "spend" end
+	if n:find("construct", 1, true) or n:find("build", 1, true) or n:find("create", 1, true) then return "build" end
+	return "other"
+end
+
+-- Everything is allowed until the host says otherwise.
+function L.newPermissions()
+	return { build = true, bulldoze = true, spend = true, other = true }
+end
+
+-- Applies a `permissions` payload {build=bool, bulldoze=bool, spend=bool, other=bool}. Only an explicit false
+-- denies; a missing key keeps what the player had. Returns true when anything changed.
+function L.applyPermissions(perms, p)
+	if type(p) ~= "table" then return false end
+	local changed = false
+	for _, cat in ipairs(L.CATEGORIES) do
+		if type(p[cat]) == "boolean" and perms[cat] ~= p[cat] then
+			perms[cat] = p[cat]
+			changed = true
+		end
+	end
+	return changed
+end
+
+function L.permitted(perms, category)
+	return perms[category] ~= false
+end
+
+-- ------------------------------------------------------------------ host authority (money)
+
+-- The account as the checksum round saw it: what the host's report carries as `authority`, and what a player keeps
+-- per round to measure its difference against at the same game time.
+function L.accountSnapshot(engine)
+	local ok, balance, loan = pcall(engine.account)
+	if not ok then return nil end
+	return { balance = balance, loan = loan }
+end
+
+-- Differences host - own for the values both sides have (balance rounded to whole money units, as a journal entry
+-- holds them). Zero differences are left out.
+function L.authorityDeltas(own, host)
+	local out = {}
+	if type(own) ~= "table" or type(host) ~= "table" then return out end
+	if type(own.balance) == "number" and type(host.balance) == "number" then
+		local d = math.floor(host.balance - own.balance + 0.5)
+		if d ~= 0 then out.balance = d end
+	end
+	if type(own.loan) == "number" and type(host.loan) == "number" then
+		local d = host.loan - own.loan
+		if d ~= 0 then out.loan = d end
+	end
+	return out
+end
+
+-- Brings this game's account to the host's values: engine.bookJournal(amount) books the balance difference as a
+-- journal entry, engine.adjustLoan(delta) moves the loan (absent on a build where no way is known: reported as
+-- unavailable). Returns the deltas applied and the names that could not be corrected.
+function L.applyAuthority(engine, own, host)
+	local deltas = L.authorityDeltas(own, host)
+	local applied, failed = {}, {}
+	if deltas.balance then
+		local ok = engine.bookJournal and pcall(engine.bookJournal, deltas.balance)
+		if ok then applied.balance = deltas.balance else failed[#failed + 1] = "balance" end
+	end
+	if deltas.loan then
+		local ok = engine.adjustLoan and pcall(engine.adjustLoan, deltas.loan)
+		if ok then applied.loan = deltas.loan else failed[#failed + 1] = "loan" end
+	end
+	return applied, failed
 end
 
 -- ------------------------------------------------------------------ deterministic random (section 7)

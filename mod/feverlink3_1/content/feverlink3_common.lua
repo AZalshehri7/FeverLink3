@@ -43,12 +43,23 @@ end
 C.TO_GAME = "to_game.log"
 C.FROM_GAME = "from_game.log"
 C.LOG = "mod.log"
+C.CURSOR = "resync_cursor.txt" -- written before a resync load: the sequence the reloaded mod resumes after
 
 -- ------------------------------------------------------------------ files and logging
 
 function C.appendFile(path, text)
 	if not C.IO then return false end
 	local f = C.IO.open(path, "ab")
+	if not f then return false end
+	f:write(text)
+	f:close()
+	return true
+end
+
+-- Replaces the file's content (snapshots, cursors): not for the append-only link files.
+function C.writeFile(path, text)
+	if not C.IO then return false end
+	local f = C.IO.open(path, "wb")
 	if not f then return false end
 	f:write(text)
 	f:close()
