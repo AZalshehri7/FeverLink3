@@ -34,8 +34,7 @@ fn a_dropped_player_comes_back_as_itself_with_its_permissions_and_is_brought_up_
     let addr = host.local_addr().unwrap();
     let proxy = Proxy::start(addr);
 
-    // a second between her attempts leaves the test time to look at the outage before she is back
-    let (alice, mut alice_game) = start_player_with(root.path(), &key, "Alice", proxy.addr, Duration::from_secs(1));
+    let (alice, mut alice_game) = start_player(root.path(), &key, "Alice", proxy.addr);
     assert!(alice.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
     let (bob, mut bob_game) = start_player(root.path(), &key, "Bob", addr);
     assert!(bob.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
@@ -54,13 +53,17 @@ fn a_dropped_player_comes_back_as_itself_with_its_permissions_and_is_brought_up_
         assert!(wait_games(WAIT, &mut games, |gs| gs.iter().all(|g| g.saw("session", "[\"started\"]=true"))));
     }
 
-    // her link is cut: the host keeps her place and tells the others she is away
+    // her link is cut and stays down while the test looks at the outage: the host keeps her place and tells the others
+    // she is away
+    proxy.refuse(true);
     proxy.cut();
     assert!(wait(WAIT, || away(&host, a_id)), "{:?}", host.status().roster);
     assert!(wait(WAIT, || away(&bob, a_id)), "Bob is told too: {:?}", bob.status().roster);
     assert_eq!(2, host.status().players.len(), "away is not connected");
+    assert!(alice.status().reconnecting, "her launcher is trying");
 
-    // her launcher tries again by itself and is the same player
+    // the link is back: her launcher tries again by itself and is the same player
+    proxy.refuse(false);
     assert!(alice.wait_for(WAIT, |s| s.connected && !s.reconnecting && s.my_id == Some(a_id)), "{:?}", alice.status());
     assert!(alice.status().reconnect_attempts >= 1);
 

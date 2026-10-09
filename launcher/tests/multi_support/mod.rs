@@ -188,6 +188,7 @@ pub struct Proxy {
     pairs: Arc<Mutex<Vec<(TcpStream, TcpStream)>>>,
     stop: Arc<AtomicBool>,
     swallow: Arc<AtomicBool>,
+    refuse: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -199,12 +200,18 @@ impl Proxy {
         let pairs: Arc<Mutex<Vec<(TcpStream, TcpStream)>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let swallow = Arc::new(AtomicBool::new(false));
+        let refuse = Arc::new(AtomicBool::new(false));
         let thread = {
             let (pairs, stop, swallow) = (Arc::clone(&pairs), Arc::clone(&stop), Arc::clone(&swallow));
+            let refuse = Arc::clone(&refuse);
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((client, _)) => {
+                            if refuse.load(Ordering::Acquire) {
+                                let _ = client.shutdown(Shutdown::Both);
+                                continue;
+                            }
                             let _ = client.set_nonblocking(false);
                             let Ok(host) = TcpStream::connect(target) else { continue };
                             let _ = (client.set_nodelay(true), host.set_nodelay(true));
@@ -222,7 +229,13 @@ impl Proxy {
                 }
             })
         };
-        Proxy { addr, pairs, stop, swallow, thread: Some(thread) }
+        Proxy { addr, pairs, stop, swallow, refuse, thread: Some(thread) }
+    }
+
+    /// While on, a new connection is accepted and closed at once: a player trying again finds nobody home, so a test
+    /// can look at the outage for as long as it likes.
+    pub fn refuse(&self, on: bool) {
+        self.refuse.store(on, Ordering::Release);
     }
 
     /// While on, everything either side sends is read and thrown away: the link looks alive and says nothing, as a
