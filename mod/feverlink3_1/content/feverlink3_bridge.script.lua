@@ -788,7 +788,7 @@ local function writeCompanies()
 	end)
 	local okY, year = pcall(engine.yearLength)
 	local view = {
-		self = C.PLAYER_ID, names = names, now = now, earned = earned, yearLength = okY and year or nil,
+		self = C.PLAYER_ID, names = names, now = now, earned = earned, yearLength = okY and year or nil, perms = G.perms,
 		hostEntityKey = L.keyFor(G.rev, engine.canonicalPlayer and engine.canonicalPlayer() or engine.player()),
 	}
 	local okS, text = pcall(function() return C.serialize(Co.status(G.co, view)) end)
@@ -844,6 +844,8 @@ local function guiUpdate(userParams, state, guiState)
 		G.writer = C.newWriter(C.path(C.FROM_GAME), C.PLAYER_ID)
 		G.hud = Hud.new(C.PLAYER_ID, C.PLAYER_NAME)
 		G.co = Co and Co.new() or nil
+		-- companies: a reload runs this file again in the same Lua state, so an override of the previous run may still be in place
+		if Co and engine.setLocalCompany then engine.setLocalCompany(nil) end
 		G.uiReader = C.newReader(C.path(Hud.OUTBOX))
 		-- after a resync load: resume the link after the line that asked for it, and keep the window's roster and chat
 		local cursor, uiCursor = (C.readFile(C.path(C.CURSOR)) or ""):match("^(%d+) (%d+)")

@@ -644,7 +644,8 @@ end
 
 -- The model of the window's company page (docs/COMPANIES.md section 6 lists every field).
 -- view = { self = id, names = { [id] = name }, now = game time, earned = { [id] = money } (Co.earned),
---          hostEntityKey = key of the savegame's player entity, yearLength = the game's year in game-time units }
+--          hostEntityKey = key of the savegame's player entity, yearLength = the game's year in game-time units,
+--          perms = what the host allows this player (build, bulldoze, spend, other) }
 function Co.status(co, view)
 	co = type(co) == "table" and co or Co.new()
 	view = view or {}
@@ -653,7 +654,8 @@ function Co.status(co, view)
 	local now = tonumber(view.now) or 0
 	local out = {
 		version = co.rev, mode = co.mode, self = view.self, isHost = view.self == 0, hostEntityKey = view.hostEntityKey,
-		yearLength = view.yearLength, companies = {}, players = {}, lines = {}, warnings = {}, openCompanies = {},
+		yearLength = view.yearLength, perms = view.perms and copy(view.perms) or nil,
+		companies = {}, players = {}, lines = {}, warnings = {}, openCompanies = {},
 	}
 	local ids = {}
 	for id in pairs(names) do ids[id] = true end
@@ -734,8 +736,19 @@ end
 -- deps.sender() -> the original api.cmd.sendCommand (the bridge's wrapped one would capture the booking as a player action).
 function Co.extendEngine(engine, deps)
 	deps = deps or {}
+	-- The game's own getPlayer, kept in package.loaded: a savegame reload runs this file again in the same Lua state,
+	-- and an override of the previous run must not be taken for the original (finding from MPFever (MIT), as for api.cmd).
 	local realGetPlayer = nil
-	pcall(function() realGetPlayer = api.engine.util.getPlayer end)
+	pcall(function()
+		local store = package.loaded["feverlink3_orig_player"]
+		if type(store) ~= "table" then
+			store = {}
+			package.loaded["feverlink3_orig_player"] = store
+		end
+		if store.getPlayer == nil then store.getPlayer = api.engine.util.getPlayer end
+		realGetPlayer = store.getPlayer
+	end)
+	if realGetPlayer == nil then pcall(function() realGetPlayer = api.engine.util.getPlayer end) end
 	if engine.canonicalPlayer == nil then
 		engine.canonicalPlayer = function()
 			if engine.localCompanyActive and realGetPlayer then return realGetPlayer() end
@@ -746,7 +759,7 @@ function Co.extendEngine(engine, deps)
 		engine.setLocalCompany = function(entity)
 			local ok = pcall(function()
 				if entity == nil then
-					api.engine.util.getPlayer = realGetPlayer
+					if realGetPlayer then api.engine.util.getPlayer = realGetPlayer end
 					engine.localCompanyActive = nil
 				else
 					api.engine.util.getPlayer = function() return entity end

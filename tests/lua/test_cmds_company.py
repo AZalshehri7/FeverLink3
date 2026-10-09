@@ -407,8 +407,10 @@ class CompanyUnit(unittest.TestCase):
         self.Co.record(self.co, 1, 0, self.lua({"fn": "makeLineCreateCmd", "category": "build", "cost": 3000}))
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "build", "cost": 20000}))
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "bulldoze", "cost": -1500}))
-        view = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice", 2: "Carol"}, "now": 0, "earned": {1: 800}, "hostEntityKey": "s:7"})
+        view = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice", 2: "Carol"}, "now": 0, "earned": {1: 800}, "hostEntityKey": "s:7",
+                         "yearLength": 96000, "perms": {"build": True, "bulldoze": False, "spend": True, "other": True}})
         st = to_py(self.Co.status(self.co, view))
+        self.assertEqual((st["yearLength"], st["perms"]["bulldoze"], st["perms"]["build"]), (96000, False, True))
         self.assertEqual((st["mode"], st["self"], st["isHost"], st["hostEntityKey"], st["openCompanies"]), ("shared", 1, False, "s:7", {1: "c1"}))
         self.assertEqual([p["id"] for p in st["players"].values()], [0, 1, 2])
         boss, alice, carol = st["players"][1], st["players"][2], st["players"][3]
@@ -437,10 +439,6 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual([self.Co.money(n) for n in (0, 5, 999, 1000, 1234567, -45000.4, 3e9)], ["0", "5", "999", "1,000", "1,234,567", "-45,000", "3,000,000,000"])
 
     # ---- command specs
-
-    def specs(self, extra_api=True):
-        env = self.L.eval("function(src) return setmetatable({}, { __index = _G }) end")(None)
-        return env
 
     def test_command_codecs(self):
         L = self.L
@@ -548,6 +546,16 @@ class CompanyUnit(unittest.TestCase):
         self.assertTrue(engine.setLocalCompany(None))
         self.assertEqual(L.eval("api.engine.util.getPlayer()"), 7)
         self.assertEqual(engine.canonicalPlayer(), 7)
+        # a savegame reload runs the mod again in the same Lua state: the override of the previous run is not taken for the
+        # game's own function, and the first thing the new run does is put the game's own back
+        self.assertTrue(engine.setLocalCompany(52001))
+        again = L.eval("{ player = function() return api.engine.util.getPlayer() end }")
+        self.Co.extendEngine(again, None)
+        self.assertEqual(L.eval("api.engine.util.getPlayer()"), 52001, "still overridden until the new run says otherwise")
+        self.assertTrue(again.setLocalCompany(None))
+        self.assertEqual(L.eval("api.engine.util.getPlayer()"), 7)
+        self.assertEqual(again.canonicalPlayer(), 7)
+        self.assertTrue(engine.setLocalCompany(None))
         # an engine that already has an accessor keeps it
         mine = L.eval("{ balanceOf = function() return 1 end }")
         self.Co.extendEngine(mine, None)
