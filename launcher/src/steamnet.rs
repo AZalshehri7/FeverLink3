@@ -192,6 +192,10 @@ mod win {
     use std::ffi::{c_char, c_void};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    /// Connections accepted at once. Anyone who knows the account's Steam ID can connect, and nothing here needs more
+    /// than a friend or two.
+    const MAX_INCOMING: usize = 16;
+
     #[link(name = "kernel32")]
     extern "system" {
         fn GetModuleHandleA(name: *const u8) -> *mut c_void;
@@ -224,7 +228,8 @@ mod win {
     /// # Safety
     /// `module` must be a loaded module and `T` the exact type of the export.
     unsafe fn symbol<T: Copy>(module: *mut c_void, name: &str) -> Option<T> {
-        assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
+        // checked when this is compiled for a `T`, not when it runs: a wrong type is a build error
+        const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<*mut c_void>()) };
         let p = unsafe { GetProcAddress(module, name.as_ptr()) };
         if p.is_null() {
             return None;
@@ -280,10 +285,10 @@ mod win {
         // SAFETY: Steam passes a SteamNetConnectionStatusChangedCallback_t, CALLBACK_MIN_SIZE bytes long.
         let bytes = unsafe { std::slice::from_raw_parts(callback as *const u8, CALLBACK_MIN_SIZE) };
         if let Some(event) = parse_status_event(bytes) {
-            if let Ok(mut q) = QUEUE.lock() {
-                if q.len() < 256 {
-                    q.push(event);
-                }
+            // a poisoned lock still holds a usable queue; dropping events silently would hide every connection
+            let mut q = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+            if q.len() < 256 {
+                q.push(event);
             }
         }
     }
@@ -410,7 +415,7 @@ mod win {
             // SAFETY: sockets is Steam's singleton; handles passed below came from Steam.
             unsafe {
                 (self.api.run_callbacks)(self.sockets);
-                let events: Vec<StatusEvent> = QUEUE.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+                let events: Vec<StatusEvent> = std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|p| p.into_inner()));
                 for e in events {
                     self.on_event(e);
                 }
@@ -426,9 +431,15 @@ mod win {
             let ours = self.test.as_ref().is_some_and(|t| t.conn == e.conn);
             match e.state {
                 state::CONNECTING if e.listen_socket != 0 && e.listen_socket == self.listen => {
-                    let result = unsafe { (self.api.accept)(self.sockets, e.conn) };
-                    self.events.push(format!("a player is connecting (accept result {result})"));
-                    self.incoming.push(e.conn);
+                    if self.incoming.len() >= MAX_INCOMING {
+                        // anyone who knows this account's Steam ID can open a connection: do not keep one for each
+                        unsafe { (self.api.close)(self.sockets, e.conn, 0, std::ptr::null(), false) };
+                        self.events.push("a connection was refused: too many at once".into());
+                    } else {
+                        let result = unsafe { (self.api.accept)(self.sockets, e.conn) };
+                        self.events.push(format!("a player is connecting (accept result {result})"));
+                        self.incoming.push(e.conn);
+                    }
                 }
                 state::CONNECTED => {
                     if ours {
@@ -496,13 +507,13 @@ mod win {
                     if data.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(data, len) }.to_vec() };
                 unsafe { (self.api.release_message)(message) };
                 if let Some(reply) = reply_for(&payload) {
-                    self.pings_received += 1;
+                    self.pings_received = self.pings_received.saturating_add(1);
                     self.events.push("received a ping, answered".into());
                     unsafe { self.send(conn, &reply) };
                 } else if let Some(sent) = pong_id(&payload) {
                     if let Some(t) = &mut self.test {
                         if t.conn == conn {
-                            t.pongs += 1;
+                            t.pongs = t.pongs.saturating_add(1);
                             t.last_rtt_ms = Some(now_ms().saturating_sub(sent));
                         }
                     }

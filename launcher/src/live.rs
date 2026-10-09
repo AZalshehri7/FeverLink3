@@ -29,6 +29,7 @@ use feverlink3_core::session::HostOptions;
 use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
+use crate::guard;
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle};
 use crate::{luatext, net, resync, steam, steamnet, upnp};
 
@@ -147,6 +148,13 @@ impl Controller {
         self.publish();
     }
 
+    /// After a panic in [`Controller::step`]: stops whatever session runs and shows the reason in the window, so the
+    /// next request starts afresh. What the step had half done is thrown away, not trusted.
+    pub fn recover(&mut self, why: &str) {
+        let _ = guard::guarded(|| self.leave());
+        self.state = State::Failed(format!("internal error: {why}"));
+    }
+
     fn command(&mut self, kind: &str, params: &Value) {
         match kind {
             "host" => self.host(params),
@@ -200,7 +208,10 @@ impl Controller {
         let port =
             params.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_PORT);
         let password = params.get("password").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_owned);
-        let secret = SessionKey::new_secret();
+        let secret = match SessionKey::try_new_secret() {
+            Ok(secret) => secret,
+            Err(e) => return self.state = State::Failed(format!("cannot make a session secret: {e}")),
+        };
         let key = SessionKey::derive(&secret, password.as_deref());
         let link = match gamelink::Session::open(&self.dir) {
             Ok(l) => l,
@@ -258,7 +269,7 @@ impl Controller {
         let (dir, save_dirs) = (self.dir.clone(), self.save_dirs.clone());
         let (tx, rx) = mpsc::channel();
         // run_player connects before it returns (5 s per endpoint at most): off the controller's thread
-        thread::spawn(move || {
+        let connect = move || {
             let result = gamelink::Session::open(&dir)
                 .map_err(|e| format!("cannot open the session folder: {e}"))
                 .and_then(|link| {
@@ -267,18 +278,24 @@ impl Controller {
                     session::run_player(config).map_err(|e| format!("cannot reach the host: {e}"))
                 });
             let _ = tx.send(result);
-        });
-        self.state = State::Joining { rx };
+        };
+        self.state = match thread::Builder::new().name("feverlink3-join".into()).spawn(connect) {
+            Ok(_) => State::Joining { rx },
+            Err(e) => State::Failed(format!("cannot start the connection: {e}")),
+        };
     }
 
     fn leave(&mut self) {
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Hosting(h) => {
                 h.handle.stop();
-                let mapping = h.public.lock().ok().and_then(|p| p.mapping.clone());
+                let mapping = lock_public(&h.public).mapping.clone();
                 if let Some(m) = mapping {
                     let port = h.port;
-                    thread::spawn(move || upnp::unmap_port(&m, port));
+                    // best effort, off the controller's thread (the router may take seconds to answer)
+                    let _ = thread::Builder::new()
+                        .name("feverlink3-unmap".into())
+                        .spawn(move || upnp::unmap_port(&m, port));
                 }
             }
             State::Joined { handle } => handle.stop(),
@@ -291,7 +308,7 @@ impl Controller {
 
     fn advance(&mut self) {
         if let State::Hosting(h) = &mut self.state {
-            let ip = h.public.lock().ok().and_then(|p| p.ip);
+            let ip = lock_public(&h.public).ip;
             if ip != h.public_shown {
                 h.rebuild_code(ip);
             }
@@ -322,7 +339,8 @@ impl Controller {
                 v["code"] = json!(h.code);
                 v["endpoints"] = json!(h.endpoints);
                 v["password"] = json!(h.password);
-                if let Ok(p) = h.public.lock() {
+                {
+                    let p = lock_public(&h.public);
                     v["public"] = json!(p.ip.map(|ip| format!("{ip}:{}", h.port)));
                     v["lookup"] = json!(if p.done { p.note.as_str() } else { "looking up your public address..." });
                 }
@@ -400,12 +418,20 @@ impl Controller {
 
 /// Maps the port on the router and finds the public address, off the controller's thread: both can take seconds.
 fn spawn_address_lookup(port: u16, public: Arc<Mutex<Public>>) {
-    thread::spawn(move || {
+    let shared = Arc::clone(&public);
+    let lookup = move || {
         let outcome = lookup_address(port);
-        if let Ok(mut p) = public.lock() {
-            *p = Public { done: true, ip: outcome.0, note: outcome.1, mapping: outcome.2 };
-        }
-    });
+        *lock_public(&shared) = Public { done: true, ip: outcome.0, note: outcome.1, mapping: outcome.2 };
+    };
+    if thread::Builder::new().name("feverlink3-lookup".into()).spawn(lookup).is_err() {
+        let note = "the address lookup could not start; give players this PC's address by hand".to_owned();
+        *lock_public(&public) = Public { done: true, ip: None, note, mapping: None };
+    }
+}
+
+/// The lookup's result. A lookup that panicked while writing it leaves the data readable: use what is there.
+fn lock_public(public: &Mutex<Public>) -> std::sync::MutexGuard<'_, Public> {
+    public.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn lookup_address(port: u16) -> (Option<Ipv4Addr>, String, Option<upnp::Mapping>) {
@@ -482,10 +508,17 @@ pub fn spawn() -> Option<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("feverlink3-live".into())
         .spawn(move || {
-            let save_dirs = resync::save_dirs(&steam::discover().user_dirs);
-            let Ok(mut controller) = Controller::new(dir, default_name(), save_dirs) else { return };
+            let started = guard::guarded(|| {
+                let save_dirs = resync::save_dirs(&steam::discover().user_dirs);
+                Controller::new(dir, default_name(), save_dirs)
+            });
+            let Ok(Ok(mut controller)) = started else { return };
             loop {
-                controller.step();
+                // a panic in a step (only survivable when the build unwinds, see `guard`) stops the session and shows
+                // in the window; the controller goes on
+                if let Err(why) = guard::guarded(|| controller.step()) {
+                    controller.recover(&why);
+                }
                 thread::sleep(Duration::from_millis(100));
             }
         })
@@ -603,6 +636,23 @@ mod tests {
         w.send("host", "{[\"port\"]=0}");
         c.step();
         assert_eq!(w.status()["code"], code);
+    }
+
+    #[test]
+    fn a_controller_that_recovers_from_a_panic_has_stopped_its_session_and_can_host_again() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
+        let mut w = Window::new(t.path());
+        w.send("host", "{[\"port\"]=0}");
+        assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
+        c.recover("boom");
+        c.step();
+        let status = w.status();
+        assert_eq!(status["state"], "failed");
+        assert!(status["message"].as_str().unwrap().contains("boom"), "{status}");
+        assert!(fs::read_to_string(t.path().join("identity.txt")).unwrap().contains("role=idle"));
+        w.send("host", "{[\"port\"]=0}");
+        assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
     }
 
     #[test]

@@ -276,8 +276,11 @@ pub fn run() -> Result<Report, String> {
     }
     ensure(&mut report, host.status().players.len() == 3, "the other players are still listed")?;
     ensure(&mut report, players.iter().all(|(h, _)| h.status().connected), "the other players are still connected")?;
-    players[1].1.write("action", "{[\"body\"]=\"after\",[\"seq\"]=2,[\"stamp\"]=2800}").map_err(io)?;
-    let from_bob = "\"after\"";
+    players[1]
+        .1
+        .write("action", "{[\"body\"]=\"{[\\\"fn\\\"]=\\\"after\\\"}\",[\"seq\"]=2,[\"stamp\"]=2800}")
+        .map_err(io)?;
+    let from_bob = "after";
     ensure(
         &mut report,
         players[0].1.wait_for("action", from_bob, WAIT).is_some(),

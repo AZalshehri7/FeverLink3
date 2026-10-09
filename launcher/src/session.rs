@@ -36,6 +36,7 @@ use feverlink3_core::session::{
 };
 
 use crate::gamelink::{self, Line};
+use crate::guard;
 use crate::luatext;
 use crate::net::{ClientNet, HostNet, NetEvent, CONNECT_TIMEOUT};
 use crate::process::Role;
@@ -47,6 +48,8 @@ pub const TICK: Duration = Duration::from_millis(250);
 const POLL: Duration = Duration::from_millis(20);
 /// How many log lines a handle keeps.
 const LOG_KEEP: usize = 500;
+/// Longest log line kept, in characters.
+const LOG_LINE_MAX: usize = 2000;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Kind mapping
@@ -105,15 +108,15 @@ pub fn message_kind_for(line_kind: &str) -> Option<MessageKind> {
 
 /// A message for the game as a file-link line: `(kind, from, payload)`. `from` is the origin player for actions
 /// (the host filled it into the payload), else `0`, because the mod accepts everything but actions from `0` only.
-/// `None` when the kind does not go to the game or the payload is not JSON.
+/// `None` when the kind does not go to the game, the payload is not JSON, or it is an action whose body is not a
+/// Lua literal: the mod `load`s the body, which would run a call or a loop another player put there.
 pub fn to_game_line(kind: MessageKind, payload: &[u8]) -> Option<(&'static str, String, String)> {
     let name = line_kind_for(kind)?;
     let lua = luatext::json_to_lua(payload)?;
     let from = if kind == MessageKind::Action {
-        serde_json::from_slice::<serde_json::Value>(payload)
-            .ok()
-            .and_then(|v| v.get("from").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0)
+        let value = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
+        value.get("body").and_then(serde_json::Value::as_str).filter(|body| luatext::is_literal(body))?;
+        value.get("from").and_then(serde_json::Value::as_u64).unwrap_or(0)
     } else {
         0
     };
@@ -261,7 +264,8 @@ impl Shared {
         if logs.len() >= LOG_KEEP {
             logs.remove(0);
         }
-        logs.push(text.to_owned());
+        // a line can carry text a peer chose; the ring keeps 500 of them, so each is cut to a screenful
+        logs.push(text.chars().take(LOG_LINE_MAX).collect());
     }
 
     fn update(&self, f: impl FnOnce(&mut Status)) {
@@ -367,7 +371,9 @@ fn write_to_game(link: &mut gamelink::Session, shared: &Shared, kind: MessageKin
                 shared.log(format!("cannot write to_game.log: {e}"));
             }
         }
-        None => shared.log(format!("{line_kind}: payload is not JSON, not given to the game")),
+        None => shared.log(format!(
+            "{line_kind}: payload is not JSON, or not a Lua literal where one is needed; not given to the game"
+        )),
     }
 }
 
@@ -426,7 +432,12 @@ pub fn run_host(config: HostConfig) -> io::Result<SessionHandle> {
     let thread = {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("feverlink3-host".into()).spawn(move || {
-            host_loop(&net, &net_rx, &cmd_rx, &mut host, &mut link, &save_dirs, &shared);
+            let outcome =
+                guard::guarded(|| host_loop(&net, &net_rx, &cmd_rx, &mut host, &mut link, &save_dirs, &shared));
+            if let Err(why) = outcome {
+                shared.log(format!("the host session stopped: {why}"));
+                shared.update(|s| s.error = Some(format!("internal error: {why}")));
+            }
             drop(net);
             shared.update(|s| {
                 s.finished = true;
@@ -653,7 +664,10 @@ pub fn run_player(config: PlayerConfig) -> io::Result<SessionHandle> {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("feverlink3-player".into()).spawn(move || {
             let mut state = PlayerLoop { config, player, net: Some(first), generation: 1, net_tx };
-            state.run(&net_rx, &cmd_rx, &shared);
+            if let Err(why) = guard::guarded(|| state.run(&net_rx, &cmd_rx, &shared)) {
+                shared.log(format!("the player session stopped: {why}"));
+                shared.update(|s| s.error = Some(format!("internal error: {why}")));
+            }
             state.net = None;
             shared.update(|s| {
                 s.finished = true;
@@ -902,13 +916,32 @@ mod tests {
     #[test]
     fn lines_translate_both_ways() {
         let (name, from, lua) =
-            to_game_line(MessageKind::Action, br#"{"stamp":400,"seq":2,"body":"x","from":3}"#).unwrap();
+            to_game_line(MessageKind::Action, br#"{"stamp":400,"seq":2,"body":"{}","from":3}"#).unwrap();
         assert_eq!((name, from.as_str()), ("action", "3"));
-        assert_eq!(lua, r#"{["body"]="x",["from"]=3,["seq"]=2,["stamp"]=400}"#);
+        assert_eq!(lua, r#"{["body"]="{}",["from"]=3,["seq"]=2,["stamp"]=400}"#);
         let (name, from, _) = to_game_line(MessageKind::Chat, br#"{"text":"hi","from":3,"name":"B"}"#).unwrap();
         assert_eq!((name, from.as_str()), ("chat", "0"), "the mod takes chat from the host only");
         assert!(to_game_line(MessageKind::Hello, b"{}").is_none());
         assert!(to_game_line(MessageKind::Session, b"nope").is_none());
+
+        // an action body is Lua that the mod loads: only a literal gets to it
+        let action = |body: &str| {
+            to_game_line(
+                MessageKind::Action,
+                &serde_json::to_vec(&serde_json::json!({ "stamp": 1, "seq": 1, "body": body })).unwrap(),
+            )
+        };
+        assert!(action(r#"{["fn"]="build",["at"]={[1]=1.5,[2]=(0/0)}}"#).is_some());
+        for hostile in
+            ["(function() while true do end end)()", r#"("x"):rep(1e9)"#, "x", "", "{} or f()", "{[1]=print()}"]
+        {
+            assert!(action(hostile).is_none(), "{hostile:?}");
+        }
+        assert!(
+            to_game_line(MessageKind::Action, br#"{"stamp":1,"seq":1}"#).is_none(),
+            "no body, nothing for the mod to load"
+        );
+        assert!(to_game_line(MessageKind::Action, br#"{"stamp":1,"seq":1,"body":5}"#).is_none());
 
         let line =
             Line { seq: 1, kind: "hello".into(), from: "5".into(), payload: r#"{["time"]=1200,["name"]="x"}"#.into() };

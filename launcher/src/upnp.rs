@@ -13,6 +13,10 @@ const SSDP_ADDR: &str = "239.255.255.250:1900";
 const SERVICES: [&str; 2] =
     ["urn:schemas-upnp-org:service:WANIPConnection:1", "urn:schemas-upnp-org:service:WANPPPConnection:1"];
 const IO_TIMEOUT: Duration = Duration::from_secs(4);
+/// A whole HTTP exchange takes no longer than this, however slowly the other side drips its answer.
+const HTTP_DEADLINE: Duration = Duration::from_secs(10);
+/// The most of an answer that is read (a device description is a few kilobytes).
+const MAX_RESPONSE: usize = 256 * 1024;
 /// A mapping lives two hours unless it is renewed or removed.
 const LEASE_SECONDS: u32 = 7200;
 
@@ -24,7 +28,7 @@ pub struct Mapping {
     pub service: String,
 }
 
-/// The `LOCATION:` header of an SSDP response.
+/// The `LOCATION:` header of an SSDP response, if it points at a device on a private network.
 pub fn parse_location(response: &str) -> Option<String> {
     response
         .lines()
@@ -32,7 +36,21 @@ pub fn parse_location(response: &str) -> Option<String> {
             let (k, v) = l.split_once(':')?;
             k.trim().eq_ignore_ascii_case("location").then(|| v.trim().to_owned())
         })
-        .filter(|l| l.starts_with("http://"))
+        .filter(|l| is_lan_url(l))
+}
+
+/// Whether `url` is `http://` to an IPv4 address on a private network (or link-local, or shared address space),
+/// and nothing else: no name, no user, no loopback, no address on the internet. Where a router is. Any device on the
+/// LAN can answer the discovery request and choose the URLs that are fetched and posted to afterwards; this keeps
+/// it from sending the game process to a host of its own choosing.
+pub fn is_lan_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    };
+    host.parse::<Ipv4Addr>().is_ok_and(|ip| is_private(ip) && !ip.is_loopback())
 }
 
 /// The control URL of the first WAN connection service in a device description, and the service type it is for.
@@ -58,16 +76,22 @@ fn tag(text: &str, name: &str) -> Option<String> {
 }
 
 fn absolute(url: &str, base: &str) -> Option<String> {
-    if url.starts_with("http://") {
-        return Some(url.to_owned());
-    }
-    let rest = base.strip_prefix("http://")?;
-    let authority = rest.split('/').next()?;
-    Some(format!("http://{authority}/{}", url.trim_start_matches('/')))
+    let full = if url.starts_with("http://") {
+        url.to_owned()
+    } else {
+        let rest = base.strip_prefix("http://")?;
+        let authority = rest.split('/').next()?;
+        format!("http://{authority}/{}", url.trim_start_matches('/'))
+    };
+    is_lan_url(&full).then_some(full)
 }
 
-/// `(host:port, path)` of an `http://` URL.
+/// `(host:port, path)` of an `http://` URL. `None` for anything with a space or a control character in it: the
+/// parts go into a request line and a header, where a line break would start a new header.
 pub fn split_url(url: &str) -> Option<(String, String)> {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
     let rest = url.strip_prefix("http://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -112,8 +136,21 @@ fn http(method: &str, url: &str, headers: &[(&str, String)], body: &str) -> Resu
     }
     request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
     stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
-    let mut raw = Vec::new();
-    let _ = stream.take(256 * 1024).read_to_end(&mut raw);
+    // read until the end, the size limit or the deadline: a device that sends a byte every few seconds would
+    // otherwise keep the lookup thread for ever (the timeout above is per read)
+    let deadline = Instant::now() + HTTP_DEADLINE;
+    let (mut raw, mut chunk) = (Vec::new(), [0u8; 8192]);
+    while raw.len() < MAX_RESPONSE {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        stream.set_read_timeout(Some(left.min(IO_TIMEOUT))).ok();
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => raw.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+        }
+    }
     let text = String::from_utf8_lossy(&raw).into_owned();
     let status = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("no HTTP status")?;
     let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
@@ -254,6 +291,51 @@ mod tests {
         let absolute = DESCRIPTION.replace("/ctl/IPConn", "http://10.0.0.1:49152/ctl");
         assert_eq!(parse_control_url(&absolute, "http://192.168.0.1:5000/x").unwrap().0, "http://10.0.0.1:49152/ctl");
         assert!(parse_control_url("<root/>", "http://a/").is_none());
+    }
+
+    #[test]
+    fn only_urls_on_the_private_network_are_followed() {
+        for good in [
+            "http://192.168.0.1:5000/rootDesc.xml",
+            "http://10.0.0.1/",
+            "http://172.16.5.5:80",
+            "http://100.64.0.1:1/x?y#z",
+        ] {
+            assert!(is_lan_url(good), "{good}");
+        }
+        for bad in [
+            "http://8.8.8.8/",
+            "http://203.0.113.9:80/ctl",
+            "http://router.local/",
+            "http://evil.example/192.168.0.1",
+            "http://192.168.0.1@evil.example/",
+            "http://user@192.168.0.1/",
+            "http://127.0.0.1:8080/",
+            "http://0.0.0.0/",
+            "http://[fe80::1]/",
+            "https://192.168.0.1/",
+            "http://192.168.0.1.evil.example/",
+            "http://192.168.0.256/",
+            "ftp://192.168.0.1/",
+            "192.168.0.1",
+            "",
+        ] {
+            assert!(!is_lan_url(bad), "{bad}");
+        }
+        // a device on the LAN that answers discovery cannot point the lookups outside
+        let hostile = "HTTP/1.1 200 OK\r\nLOCATION: http://203.0.113.9/desc.xml\r\n\r\n";
+        assert_eq!(parse_location(hostile), None);
+        let xml = DESCRIPTION.replace("/ctl/IPConn", "http://203.0.113.9:49152/ctl");
+        assert!(parse_control_url(&xml, "http://192.168.0.1:5000/x").is_none());
+        assert!(parse_control_url(DESCRIPTION, "http://203.0.113.9/x").is_none(), "nor can the base be elsewhere");
+    }
+
+    #[test]
+    fn a_url_cannot_smuggle_a_header_into_the_request() {
+        assert_eq!(split_url("http://192.168.0.1/a\r\nX-Evil: 1"), None);
+        assert_eq!(split_url("http://192.168.0.1/a b"), None);
+        assert_eq!(split_url("http://192.168.0.1/\u{0}"), None);
+        assert!(split_url("http://192.168.0.1:5000/ctl/IPConn?x=1").is_some());
     }
 
     #[test]

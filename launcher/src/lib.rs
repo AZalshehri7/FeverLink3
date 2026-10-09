@@ -19,6 +19,7 @@
 //! transformation is a pure function over its inputs so the tests run on a machine without Steam or the game.
 
 pub mod gamelink;
+pub mod guard;
 pub mod install;
 pub mod live;
 pub mod luatext;
