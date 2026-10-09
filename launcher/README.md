@@ -66,6 +66,12 @@ One thread owns each session's state machine; everything else only feeds it even
   a frame), a peer that closes, or `close()` all end the connection the same way: the socket is shut down, the
   reader thread ends and sends `Closed` exactly once, last. The state machine then removes the player and
   broadcasts `PlayerLeft`. A bad connection never touches another.
+- **Sockets and limits.** Sockets are non-blocking and polled (a reader or writer with nothing to do naps 0.2 to
+  5 ms), because on Windows a blocking read with a timeout can fail with `ERROR_IO_PENDING` and a shutdown does not
+  wake a read on a silent peer. A host refuses connections beyond 64 (16 per address), reads the first frame of a
+  connection with a 4 KiB limit, cuts a frame write off after 10 s plus 1 s per 32 KiB, and reads a connection that
+  sends more than 1000 frames or 4 MiB a second more slowly (`NetLimits`). The state machine closes a connection
+  that has not joined within 15 s. `docs/SECURITY.md` has the reasons and the numbers.
 - **Reconnecting (player).** When the connection drops after the player was accepted, the session thread writes a
   `session` line with `started=false` to the game, then tries again every 5 s for 5 minutes with a fresh
   `PlayerSession` (new challenge, new counters); `status().reconnecting` is true meanwhile. The host sees a new
@@ -112,6 +118,10 @@ Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
 - A game can only send the kinds marked "from game" (exactly the player allow-list). A line of any other kind,
   such as `session`, is logged and dropped: a game cannot speak for the host. A payload that is not valid literal
   syntax is logged and dropped.
+- An `action` goes to the game only if its `body` is itself a Lua literal (`luatext::is_literal`): the mod `load`s the
+  body, and a `load` runs calls and loops even in an empty environment. Anything else is logged and dropped.
+- A line is at most 4 MiB, a poll reads at most 8 MiB, a `seq` is at most 2^53, and the Lua text reader stops at
+  4 MiB, 250 000 values and 48 levels; a longer line is dropped whole.
 - The `from` column of a line from the game is not used. The state machine knows who the game is: the host's own
   game is player 0 and trusted like the host; a player's frames are sealed with the id the host assigned, and the
   host checks it against the connection and fills `from` into relayed actions and chat, whatever the payload

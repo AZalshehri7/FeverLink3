@@ -71,7 +71,7 @@ means harm (section 4), and not a defence against a program already running as t
   with a nonce it used before, which exposes the XOR of two of that player's messages to whoever recorded both.
   Closing it needs one change to the handshake: the player contributes a random value that goes into the Join and
   into the key of that connection (protocol version 2). It is deferred on purpose, because the roster and relay work
-  changes the same code; see the open points below.
+  changes the same code; see F13 in section 7.
 - **The host is trusted by its players.** The host decides the session state, orders every action, can send any
   action as any player (`from` is its to fill), and sends the savegame that every game loads, and a savegame is code
   (`.sav.lua` runs on load). Joining a session is trusting its host as one trusts the author of a mod.
@@ -148,7 +148,9 @@ through `launcher::guard::guarded` (the controller's step, the host and player s
 own `catch_unwind`), which does nothing under `abort` and, with `unwind`, turns a panic into a log line, a stopped
 session (`Controller::recover`, `Status::error`) and a controller that carries on; it is tested, because tests
 always unwind. Switching to unwind is one line (`panic = "unwind"` in the root `Cargo.toml`); the cost is the table
-above.
+above. One loose end for that day: the window shows a player session's `Status::error`, but not yet that a host
+session's thread ended.
+
 The roadmap's plan to shrink the DLL to tens of kilobytes with `no_std` has no unwinding at all, which makes the
 removal of panics the only containment that carries over.
 
@@ -164,7 +166,7 @@ recurse).
 | First frame of a connection that has not joined | 4096 bytes | `FrameCodec::HANDSHAKE_MAX_LENGTH`, `NetLimits::first_frame` |
 | Time to join; connections waiting to join | 15 s; 32 | `HostSession::HANDSHAKE_SECONDS`, `MAX_PENDING` |
 | Connections open; per address | 64; 16 | `NetLimits` |
-| Write that makes no progress | 10 s | `NetLimits::write_timeout` |
+| Time to write one frame | 10 s, plus 1 s per 32 KiB of it | `NetLimits::write_timeout` |
 | Rate per connection | 1000 frames and 4 MiB per second, burst of two seconds | `NetLimits` |
 | Action body; chat text; display name | 256 KiB; 500 characters; 24 characters | `HostSession::MAX_ACTION_BODY`, `Names` |
 | Checksum report | 128 parts, 128 characters each, 20 rounds kept | `ChecksumRounds` |
@@ -192,7 +194,7 @@ recurse).
 | F7 | An unsealed Reject ended a joined session for good (no reconnect after a reject) | Fixed |
 | F8 | A second Welcome would have replaced the sealer and restarted its counter | Fixed |
 | F9 | `Tail` read whole files and copied an unfinished line on every poll; a `seq` of `u64::MAX` ended the numbering | Fixed |
-| F10 | VDF parser recursion overflowed the stack on a file of nested `{` | Fixed (outside the listed scope, six lines) |
+| F10 | VDF parser recursion overflowed the stack: a file of 200 000 `{` ended the process (confirmed on the original code) | Fixed |
 | F11 | UPnP followed any URL a LAN device gave | Fixed |
 | F12 | serde_json's default float parser can be 1 ulp off | Fixed (`float_roundtrip`) |
 | F13 | Frames and a Welcome can be replayed into a new connection by someone on its path (section 4) | **Open: protocol version 2, owner's decision** |
