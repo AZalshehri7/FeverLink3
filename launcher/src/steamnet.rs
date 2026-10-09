@@ -1,18 +1,35 @@
-//! Steam peer-to-peer connectivity probe.
+//! Steam peer-to-peer connectivity.
 //!
 //! Steam can connect two players by Steam ID, punching through NATs and falling back to its own relays (Steam
-//! Datagram Relay), without any port forwarding and without a server of ours. This module checks that the game's
-//! own `steam_api64.dll` can do that for us: it listens on a P2P virtual port, answers every ping, and can ping a
-//! friend's Steam ID and report the round trip. It carries no session traffic yet; the aim is to find out, on real
-//! machines, whether the transport is usable before it is built into the session.
+//! Datagram Relay), without any port forwarding and without a server of ours. The functions come from the *flat*
+//! Steam API (`SteamAPI_ISteamNetworkingSockets_*`), looked up by name in the `steam_api64.dll` the game has already
+//! loaded, so no Steam SDK is linked and nothing runs unless the game has Steam loaded.
 //!
-//! The functions come from the *flat* Steam API (`SteamAPI_ISteamNetworkingSockets_*`), looked up by name in the
-//! already loaded `steam_api64.dll`, so no Steam SDK is linked and nothing runs unless the game has Steam loaded.
-//! Every structure layout used (identity, connection info, status-changed callback, message) is written down as
-//! offsets next to a pure parser with tests, because getting one wrong is a silent crash.
+//! - This file holds the layouts of the Steam structures the code reads and writes (as offsets next to pure parsers
+//!   with tests, because getting one wrong is a silent crash), the ping protocol, and the [`Probe`]: a service that
+//!   listens on virtual port 1, answers every ping, and can ping a friend's Steam ID and report the round trip. It
+//!   carries no session traffic; it shows, on real machines, whether Steam can connect two players.
+//! - [`SteamCore`] (in `steam_core.rs`) owns the interfaces, the one global callback and the one poller thread that
+//!   every Steam user in the process shares. The probe is one of its owners; the session transport
+//!   ([`crate::steam_transport`], virtual port 0) is another.
+//!
+//! The layouts were checked against `steamnetworkingtypes.h` of ValveSoftware/GameNetworkingSockets on 2026-10-10
+//! and the pieces the probe uses were proven in the game on 2026-10-09.
+
+mod steam_core;
+
+/// An in-memory Steam for the tests of this module and of the transport.
+#[cfg(test)]
+pub(crate) mod fake;
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub use steam_core::{
+    global, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, Owner, Route, SendOutcome, SteamCore,
+    MAX_MESSAGE,
+};
 
 // ---- layouts of the Steam structures (Steamworks SDK, `#pragma pack(8)`); pure, tested
 
@@ -32,22 +49,42 @@ pub fn identity_bytes(steam_id: u64) -> [u8; IDENTITY_SIZE] {
 
 /// The Steam ID in an identity buffer, `None` for another identity type.
 pub fn steam_id_of(identity: &[u8]) -> Option<u64> {
-    if identity.len() < 16 || i32::from_le_bytes(identity[0..4].try_into().ok()?) != IDENTITY_TYPE_STEAMID {
+    if le_i32(identity, 0)? != IDENTITY_TYPE_STEAMID {
         return None;
     }
-    Some(u64::from_le_bytes(identity[8..16].try_into().ok()?))
+    Some(u64::from_le_bytes(identity.get(8..16)?.try_into().ok()?))
 }
 
 /// Size of `SteamNetConnectionInfo_t`.
 pub const CONNECTION_INFO_SIZE: usize = 696;
-/// Offsets inside `SteamNetConnectionInfo_t`.
+/// Offsets inside `SteamNetConnectionInfo_t` (the identity of the peer is at 0).
 const INFO_LISTEN_SOCKET: usize = 144;
 const INFO_POP_RELAY: usize = 172;
 const INFO_STATE: usize = 176;
 const INFO_END_REASON: usize = 180;
+/// `m_szEndDebug`, 128 bytes.
+const INFO_END_DEBUG: usize = 184;
+const END_DEBUG_SIZE: usize = 128;
+/// `m_nFlags`; bit 16 is `k_nSteamNetworkConnectionInfoFlags_Relayed`.
+const INFO_FLAGS: usize = 440;
+const INFO_FLAG_RELAYED: u32 = 16;
 /// `SteamNetConnectionStatusChangedCallback_t`: connection handle, then the info (8-aligned), then the old state.
 const CALLBACK_INFO: usize = 8;
 const CALLBACK_MIN_SIZE: usize = CALLBACK_INFO + CONNECTION_INFO_SIZE + 4;
+
+fn le_u32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
+}
+
+fn le_i32(b: &[u8], at: usize) -> Option<i32> {
+    le_u32(b, at).map(|v| v as i32)
+}
+
+/// Text up to the first NUL, lossy, at most `bytes.len()` long.
+fn c_text(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(bytes.get(..end).unwrap_or_default()).trim().to_string()
+}
 
 /// Connection states (`ESteamNetworkingConnectionState`).
 pub mod state {
@@ -59,8 +96,42 @@ pub mod state {
     pub const PROBLEM_DETECTED_LOCALLY: i32 = 5;
 }
 
+/// What `GetConnectionInfo` (or the info inside a status callback) says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnInfo {
+    /// The peer's Steam ID, `None` when Steam does not know it (yet) or the identity is not a Steam ID.
+    pub remote: Option<u64>,
+    /// The listen socket the connection arrived on, 0 for one we opened.
+    pub listen_socket: u32,
+    /// The relay point (0 when the route is direct).
+    pub relay_pop: u32,
+    pub state: i32,
+    pub end_reason: i32,
+    /// Steam's own text for why the connection ended; for logs, not for players.
+    pub end_debug: String,
+    /// Through a relay, by the relay point or by Steam's flag.
+    pub relayed: bool,
+}
+
+/// Reads a `SteamNetConnectionInfo_t`. `None` when the buffer is shorter than the structure.
+pub fn parse_connection_info(info: &[u8]) -> Option<ConnInfo> {
+    if info.len() < CONNECTION_INFO_SIZE {
+        return None;
+    }
+    let relay_pop = le_u32(info, INFO_POP_RELAY)?;
+    Some(ConnInfo {
+        remote: steam_id_of(info),
+        listen_socket: le_u32(info, INFO_LISTEN_SOCKET)?,
+        relay_pop,
+        state: le_i32(info, INFO_STATE)?,
+        end_reason: le_i32(info, INFO_END_REASON)?,
+        end_debug: c_text(info.get(INFO_END_DEBUG..INFO_END_DEBUG + END_DEBUG_SIZE)?),
+        relayed: relay_pop != 0 || le_u32(info, INFO_FLAGS)? & INFO_FLAG_RELAYED != 0,
+    })
+}
+
 /// What the status-changed callback reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusEvent {
     pub conn: u32,
     pub state: i32,
@@ -68,6 +139,10 @@ pub struct StatusEvent {
     /// The listen socket the connection arrived on, 0 for one we opened.
     pub listen_socket: u32,
     pub end_reason: i32,
+    /// The peer's Steam ID when the callback names one.
+    pub remote: Option<u64>,
+    /// Steam's text for why the connection ended.
+    pub end_debug: String,
 }
 
 /// Reads the callback structure. `None` when it is too short or holds a state Steam does not define.
@@ -75,15 +150,15 @@ pub fn parse_status_event(buf: &[u8]) -> Option<StatusEvent> {
     if buf.len() < CALLBACK_MIN_SIZE {
         return None;
     }
-    let u32_at = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-    let i32_at = |o: usize| u32_at(o) as i32;
-    let info = CALLBACK_INFO;
+    let info = parse_connection_info(buf.get(CALLBACK_INFO..CALLBACK_INFO + CONNECTION_INFO_SIZE)?)?;
     let event = StatusEvent {
-        conn: u32_at(0),
-        state: i32_at(info + INFO_STATE),
-        old_state: i32_at(info + CONNECTION_INFO_SIZE),
-        listen_socket: u32_at(info + INFO_LISTEN_SOCKET),
-        end_reason: i32_at(info + INFO_END_REASON),
+        conn: le_u32(buf, 0)?,
+        state: info.state,
+        old_state: le_i32(buf, CALLBACK_INFO + CONNECTION_INFO_SIZE)?,
+        listen_socket: info.listen_socket,
+        end_reason: info.end_reason,
+        remote: info.remote,
+        end_debug: info.end_debug,
     };
     let valid = |s: i32| (-1..=5).contains(&s);
     (valid(event.state) && valid(event.old_state)).then_some(event)
@@ -91,15 +166,35 @@ pub fn parse_status_event(buf: &[u8]) -> Option<StatusEvent> {
 
 /// The relay point of a connection (0 when the route is direct), from a `GetConnectionInfo` buffer.
 pub fn relay_pop(info: &[u8]) -> u32 {
-    if info.len() < INFO_POP_RELAY + 4 {
-        return 0;
-    }
-    u32::from_le_bytes([
-        info[INFO_POP_RELAY],
-        info[INFO_POP_RELAY + 1],
-        info[INFO_POP_RELAY + 2],
-        info[INFO_POP_RELAY + 3],
-    ])
+    le_u32(info, INFO_POP_RELAY).unwrap_or(0)
+}
+
+/// A sentence for one of Steam's connection end reasons (`ESteamNetConnectionEnd`), the number always included so
+/// a log line can be looked up in `steamnetworkingtypes.h`.
+pub fn end_reason_text(code: i32) -> String {
+    let what = match code {
+        0 => return "no reason given".to_string(),
+        1000..=1999 => "closed by the other side's program",
+        2000..=2999 => "the other side's program failed",
+        3001 => "Steam is in offline mode",
+        3002..=3004 => "Steam network configuration problem",
+        3005 => "this account may not connect",
+        3006 | 4007 => "no public address for a direct connection",
+        3000..=3999 => "local network or Steam problem",
+        4001 => "the other side stopped answering",
+        4002 | 4003 => "the other side failed to authenticate",
+        4006 => "the other side runs an incompatible Steam version",
+        4000..=4999 => "problem on the other side",
+        5003 => "timed out",
+        5005 => "no connection to Steam",
+        5006 => "no Steam relay available",
+        5008 => "Steam could not arrange the connection with the other side",
+        5009 => "a NAT or firewall blocked the connection",
+        5010 => "the other side does not know this connection",
+        5000..=5999 => "Steam networking problem",
+        _ => "unknown reason",
+    };
+    format!("{what} ({code})")
 }
 
 // ---- the ping protocol
@@ -160,426 +255,264 @@ impl Events {
     }
 }
 
-/// Status events from Steam's callback, queued for the thread that owns the probe.
-static QUEUE: Mutex<Vec<StatusEvent>> = Mutex::new(Vec::new());
+// ---- the probe
 
-#[cfg(windows)]
-pub use win::Probe;
+/// The virtual port the probe listens on and tests; the session transport uses 0.
+pub const PROBE_PORT: i32 = 1;
+/// Pings sent per test, one every [`PING_EVERY`].
+const PROBE_PINGS: u32 = 20;
+const PING_EVERY: Duration = Duration::from_secs(2);
+/// A refused listen socket is tried again after this long.
+const LISTEN_RETRY: Duration = Duration::from_secs(5);
+/// Longest ping the probe answers.
+const PING_LIMIT: usize = 4096;
 
-#[cfg(not(windows))]
-pub use other::Probe;
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
-#[cfg(not(windows))]
-mod other {
-    use super::Report;
-    /// Steam networking is only driven on Windows.
-    pub struct Probe;
-    impl Probe {
-        pub fn load() -> Option<Probe> {
-            None
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+struct TestConn {
+    conn: Handle,
+    target: u64,
+    connected: bool,
+    pongs: u32,
+    last_rtt_ms: Option<u64>,
+    next_ping: Instant,
+    sent: u32,
+    route: String,
+    state: String,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    events: Events,
+    test: Option<TestConn>,
+    pings_received: u32,
+}
+
+/// The probe's side of the core: what happens to its connections, on the poller thread.
+struct ProbeService {
+    core: CoreRef,
+    state: Mutex<ProbeState>,
+}
+
+impl ProbeService {
+    fn is_test(state: &ProbeState, conn: Handle) -> bool {
+        state.test.as_ref().is_some_and(|t| t.conn == conn)
+    }
+}
+
+impl Owner for ProbeService {
+    fn opened(&self, conn: Handle, _incoming: bool, _remote: Option<u64>) {
+        let route = self.core.route(conn).map_or("unknown", Route::text);
+        let mut state = lock(&self.state);
+        if let Some(t) = state.test.as_mut().filter(|t| t.conn == conn) {
+            t.connected = true;
+            t.state = "connected".into();
+            t.route = route.into();
+            t.next_ping = Instant::now();
+            state.events.push("test connection established".into());
+        } else {
+            state.events.push("a player connected".into());
         }
-        pub fn poll(&mut self) {}
-        pub fn test(&mut self, _steam_id: u64) {}
-        pub fn report(&self) -> Report {
-            Report::default()
+    }
+
+    fn progress(&self, conn: Handle, step: i32) {
+        let mut state = lock(&self.state);
+        if let Some(t) = state.test.as_mut().filter(|t| t.conn == conn) {
+            if step == self::state::FINDING_ROUTE {
+                t.state = "finding a route".into();
+            }
+        }
+    }
+
+    fn message(&self, conn: Handle, data: &[u8]) {
+        if data.len() > PING_LIMIT {
+            return;
+        }
+        if let Some(reply) = reply_for(data) {
+            {
+                let mut state = lock(&self.state);
+                state.pings_received += 1;
+                state.events.push("received a ping, answered".into());
+            }
+            // a full send buffer only loses one pong; the pinger asks again
+            let _ = self.core.send(conn, &reply);
+        } else if let Some(sent) = pong_id(data) {
+            if let Some(t) = lock(&self.state).test.as_mut().filter(|t| t.conn == conn) {
+                t.pongs += 1;
+                t.last_rtt_ms = Some(now_ms().saturating_sub(sent));
+            }
+        }
+    }
+
+    fn closed(&self, conn: Handle, end: End) {
+        let mut state = lock(&self.state);
+        let ours = Self::is_test(&state, conn);
+        if end.cause == Cause::Local {
+            // we closed it: a replaced test, or the probe going away
+            return;
+        }
+        state.events.push(format!("connection ended: {}", end.describe()));
+        if ours {
+            if let Some(t) = state.test.as_mut() {
+                t.connected = false;
+                t.state = format!("failed: {}", end.describe());
+            }
         }
     }
 }
 
-#[cfg(windows)]
-mod win {
-    use super::*;
-    use std::ffi::{c_char, c_void};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+/// The Steam connection probe: listens on [`PROBE_PORT`], answers pings and tests a friend's Steam ID. The window
+/// calls [`Probe::poll`] every 100 ms; everything else happens on the core's thread.
+pub struct Probe {
+    core: CoreRef,
+    service: Arc<ProbeService>,
+    listener: Option<Handle>,
+    steam_id: Option<u64>,
+    state: String,
+    started: Instant,
+    last_note: String,
+    next_listen: Instant,
+}
 
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetModuleHandleA(name: *const u8) -> *mut c_void;
-        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+impl Probe {
+    /// `None` when the process has no Steam API loaded (a test run, a game started without Steam).
+    pub fn load() -> Option<Probe> {
+        global().map(Probe::on)
     }
 
-    /// The flat API functions the probe uses, looked up once.
-    struct Api {
-        sockets_accessor: unsafe extern "C" fn() -> *mut c_void,
-        utils_accessor: unsafe extern "C" fn() -> *mut c_void,
-        user_accessor: unsafe extern "C" fn() -> *mut c_void,
-        get_steam_id: unsafe extern "C" fn(*mut c_void) -> u64,
-        init_relay: unsafe extern "C" fn(*mut c_void),
-        set_status_callback: unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void)) -> bool,
-        run_callbacks: unsafe extern "C" fn(*mut c_void),
-        create_listen: unsafe extern "C" fn(*mut c_void, i32, i32, *const c_void) -> u32,
-        connect_p2p: unsafe extern "C" fn(*mut c_void, *const c_void, i32, i32, *const c_void) -> u32,
-        accept: unsafe extern "C" fn(*mut c_void, u32) -> i32,
-        send: unsafe extern "C" fn(*mut c_void, u32, *const c_void, u32, i32, *mut i64) -> i32,
-        receive: unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void, i32) -> i32,
-        release_message: unsafe extern "C" fn(*mut c_void),
-        close: unsafe extern "C" fn(*mut c_void, u32, i32, *const c_char, bool) -> bool,
-        connection_info: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> bool,
-        hsteamuser: unsafe extern "C" fn() -> i32,
-        find_interface: unsafe extern "C" fn(i32, *const c_char) -> *mut c_void,
-    }
-
-    /// A function pointer `T` (an `extern "C" fn` type) from a NUL-terminated export name.
-    ///
-    /// # Safety
-    /// `module` must be a loaded module and `T` the exact type of the export.
-    unsafe fn symbol<T: Copy>(module: *mut c_void, name: &str) -> Option<T> {
-        assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
-        let p = unsafe { GetProcAddress(module, name.as_ptr()) };
-        if p.is_null() {
-            return None;
-        }
-        // SAFETY: T is a function pointer type, the same size as a pointer (asserted above).
-        Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&p) })
-    }
-
-    fn load_api() -> Option<Api> {
-        // SAFETY: GetModuleHandleA/GetProcAddress with NUL-terminated names; the signatures below are the flat API's
-        // (steam_api_flat.h of the Steamworks SDK) and every function is called only while Steam is initialised.
-        unsafe {
-            let module = GetModuleHandleA(c"steam_api64.dll".as_ptr().cast());
-            if module.is_null() {
-                return None;
-            }
-            macro_rules! sym {
-                ($name:literal) => {
-                    match symbol(module, concat!($name, "\0")) {
-                        Some(f) => f,
-                        None => return None,
-                    }
-                };
-            }
-            Some(Api {
-                sockets_accessor: sym!("SteamAPI_SteamNetworkingSockets_SteamAPI_v012"),
-                utils_accessor: sym!("SteamAPI_SteamNetworkingUtils_SteamAPI_v004"),
-                user_accessor: sym!("SteamAPI_SteamUser_v023"),
-                get_steam_id: sym!("SteamAPI_ISteamUser_GetSteamID"),
-                init_relay: sym!("SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess"),
-                set_status_callback: sym!(
-                    "SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_SteamNetConnectionStatusChanged"
-                ),
-                run_callbacks: sym!("SteamAPI_ISteamNetworkingSockets_RunCallbacks"),
-                create_listen: sym!("SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P"),
-                connect_p2p: sym!("SteamAPI_ISteamNetworkingSockets_ConnectP2P"),
-                accept: sym!("SteamAPI_ISteamNetworkingSockets_AcceptConnection"),
-                send: sym!("SteamAPI_ISteamNetworkingSockets_SendMessageToConnection"),
-                receive: sym!("SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection"),
-                release_message: sym!("SteamAPI_SteamNetworkingMessage_t_Release"),
-                close: sym!("SteamAPI_ISteamNetworkingSockets_CloseConnection"),
-                connection_info: sym!("SteamAPI_ISteamNetworkingSockets_GetConnectionInfo"),
-                hsteamuser: sym!("SteamAPI_GetHSteamUser"),
-                find_interface: sym!("SteamInternal_FindOrCreateUserInterface"),
-            })
+    /// A probe on a given core (the tests use a fake one).
+    pub fn on(core: CoreRef) -> Probe {
+        let service = Arc::new(ProbeService { core: core.clone(), state: Mutex::new(ProbeState::default()) });
+        Probe {
+            core,
+            service,
+            listener: None,
+            steam_id: None,
+            state: "waiting for Steam".into(),
+            started: Instant::now(),
+            last_note: String::new(),
+            next_listen: Instant::now(),
         }
     }
 
-    unsafe extern "C" fn on_status_changed(callback: *mut c_void) {
-        if callback.is_null() {
+    fn event(&self, text: String) {
+        lock(&self.service.state).events.push(text);
+    }
+
+    /// One step: notice that Steam is ready, open the listen socket, send the next ping of a running test.
+    pub fn poll(&mut self) {
+        let status = self.core.status();
+        self.steam_id = status.steam_id.or(self.steam_id);
+        if !status.ready {
+            if self.last_note != status.note {
+                self.event(status.note.clone());
+                self.last_note = status.note.clone();
+            }
+            if self.started.elapsed() > Duration::from_secs(120) {
+                self.state = "Steam networking is not available (is the game running through Steam?)".into();
+            }
             return;
         }
-        // SAFETY: Steam passes a SteamNetConnectionStatusChangedCallback_t, CALLBACK_MIN_SIZE bytes long.
-        let bytes = unsafe { std::slice::from_raw_parts(callback as *const u8, CALLBACK_MIN_SIZE) };
-        if let Some(event) = parse_status_event(bytes) {
-            if let Ok(mut q) = QUEUE.lock() {
-                if q.len() < 256 {
-                    q.push(event);
-                }
-            }
+        if self.last_note != status.note {
+            self.event(format!("Steam is ready: {}", status.note));
+            self.last_note = status.note;
         }
-    }
-
-    struct TestConn {
-        conn: u32,
-        target: u64,
-        connected: bool,
-        pongs: u32,
-        last_rtt_ms: Option<u64>,
-        next_ping: Instant,
-        sent: u32,
-        route: String,
-        state: String,
-    }
-
-    pub struct Probe {
-        api: Api,
-        sockets: *mut c_void,
-        utils: *mut c_void,
-        listen: u32,
-        steam_id: Option<u64>,
-        state: String,
-        events: Events,
-        /// Connections that arrived on our listen socket.
-        incoming: Vec<u32>,
-        test: Option<TestConn>,
-        pings_received: u32,
-        started: Instant,
-        last_seen: String,
-    }
-
-    // SAFETY: the raw pointers are Steam's singletons, valid for the process lifetime and used from the one
-    // controller thread that owns the probe.
-    unsafe impl Send for Probe {}
-
-    fn now_ms() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-    }
-
-    impl Probe {
-        /// `None` when the process has no Steam API loaded (a test run, a game started without Steam).
-        pub fn load() -> Option<Probe> {
-            let api = load_api()?;
-            Some(Probe {
-                api,
-                sockets: std::ptr::null_mut(),
-                utils: std::ptr::null_mut(),
-                listen: 0,
-                steam_id: None,
-                state: "waiting for Steam".into(),
-                events: Events::default(),
-                incoming: Vec::new(),
-                test: None,
-                pings_received: 0,
-                started: Instant::now(),
-                last_seen: String::new(),
-            })
-        }
-
-        fn setup(&mut self) {
-            // SAFETY: see load_api; the accessors return null until Steam is initialised.
-            unsafe {
-                let huser = (self.api.hsteamuser)();
-                let mut user = (self.api.user_accessor)();
-                if user.is_null() && huser != 0 {
-                    user = (self.api.find_interface)(huser, c"SteamUser023".as_ptr());
-                }
-                if self.steam_id.is_none() && !user.is_null() {
-                    let id = (self.api.get_steam_id)(user);
-                    if id != 0 {
-                        self.steam_id = Some(id);
-                    }
-                }
-                let mut sockets = (self.api.sockets_accessor)();
-                let mut utils = (self.api.utils_accessor)();
-                if sockets.is_null() && huser != 0 {
-                    // what the SDK's inline accessors do: ask the client for the interface by version name
-                    sockets = (self.api.find_interface)(huser, c"SteamNetworkingSockets012".as_ptr());
-                }
-                if utils.is_null() && huser != 0 {
-                    utils = (self.api.find_interface)(huser, c"SteamNetworkingUtils004".as_ptr());
-                }
-                if sockets.is_null() || utils.is_null() {
-                    let seen = format!(
-                        "hsteamuser {huser}, user {} sockets {} utils {}",
-                        if user.is_null() { "null" } else { "ok" },
-                        if sockets.is_null() { "null" } else { "ok" },
-                        if utils.is_null() { "null" } else { "ok" }
-                    );
-                    if self.last_seen != seen {
-                        self.events.push(format!("Steam interfaces: {seen}"));
-                        self.last_seen = seen;
-                    }
-                    if self.started.elapsed() > Duration::from_secs(120) {
-                        self.state = "Steam networking is not available (is the game running through Steam?)".into();
-                    }
-                    return;
-                }
-                self.sockets = sockets;
-                self.utils = utils;
-                (self.api.init_relay)(utils);
-                if !(self.api.set_status_callback)(utils, on_status_changed) {
-                    self.events.push("could not register the connection callback".into());
-                }
-                self.listen = (self.api.create_listen)(sockets, 0, 0, std::ptr::null());
-                if self.listen == 0 {
-                    self.state = "could not open the Steam listen socket".into();
-                } else {
+        if self.listener.is_none() && Instant::now() >= self.next_listen {
+            self.next_listen = Instant::now() + LISTEN_RETRY;
+            let owner: Arc<dyn Owner> = self.service.clone();
+            match self.core.listen(PROBE_PORT, owner) {
+                Ok(listener) => {
+                    self.listener = Some(listener);
                     self.state = "ready".into();
-                    self.events.push("listening for Steam connections".into());
+                    self.event("listening for Steam connections".into());
+                }
+                Err(e) => {
+                    self.state = "could not open the Steam listen socket".into();
+                    self.event(e.to_string());
                 }
             }
         }
+        self.drive_test();
+    }
 
-        /// One step: run Steam's callbacks, accept arrivals, answer pings, drive the outgoing test.
-        pub fn poll(&mut self) {
-            if self.sockets.is_null() {
-                self.setup();
-                if self.sockets.is_null() {
-                    return;
+    fn drive_test(&self) {
+        let due = {
+            let mut state = lock(&self.service.state);
+            match state.test.as_mut() {
+                Some(t) if t.connected && t.sent < PROBE_PINGS && Instant::now() >= t.next_ping => {
+                    t.sent += 1;
+                    t.next_ping = Instant::now() + PING_EVERY;
+                    Some((t.conn, format!("ping {}", now_ms())))
                 }
+                _ => None,
             }
-            // SAFETY: sockets is Steam's singleton; handles passed below came from Steam.
-            unsafe {
-                (self.api.run_callbacks)(self.sockets);
-                let events: Vec<StatusEvent> = QUEUE.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
-                for e in events {
-                    self.on_event(e);
-                }
-                let conns: Vec<u32> = self.incoming.iter().copied().chain(self.test.as_ref().map(|t| t.conn)).collect();
-                for conn in conns {
-                    self.receive(conn);
-                }
-                self.drive_test();
-            }
+        };
+        if let Some((conn, message)) = due {
+            let _ = self.core.send(conn, message.as_bytes());
         }
+    }
 
-        unsafe fn on_event(&mut self, e: StatusEvent) {
-            let ours = self.test.as_ref().is_some_and(|t| t.conn == e.conn);
-            match e.state {
-                state::CONNECTING if e.listen_socket != 0 && e.listen_socket == self.listen => {
-                    let result = unsafe { (self.api.accept)(self.sockets, e.conn) };
-                    self.events.push(format!("a player is connecting (accept result {result})"));
-                    self.incoming.push(e.conn);
-                }
-                state::CONNECTED => {
-                    if ours {
-                        let route = unsafe { self.route(e.conn) };
-                        if let Some(t) = &mut self.test {
-                            t.connected = true;
-                            t.state = "connected".into();
-                            t.route = route;
-                            t.next_ping = Instant::now();
-                        }
-                        self.events.push("test connection established".into());
-                    } else {
-                        self.events.push("a player connected".into());
-                    }
-                }
-                state::FINDING_ROUTE if ours => {
-                    if let Some(t) = &mut self.test {
-                        t.state = "finding a route".into();
-                    }
-                }
-                state::CLOSED_BY_PEER | state::PROBLEM_DETECTED_LOCALLY => {
-                    let why =
-                        if e.state == state::CLOSED_BY_PEER { "closed by the other side" } else { "problem detected" };
-                    self.events.push(format!("connection ended: {why} (reason {})", e.end_reason));
-                    if ours {
-                        if let Some(t) = &mut self.test {
-                            t.connected = false;
-                            t.state = format!("failed: {why}, reason {}", e.end_reason);
-                        }
-                    }
-                    self.incoming.retain(|c| *c != e.conn);
-                    unsafe { (self.api.close)(self.sockets, e.conn, 0, std::ptr::null(), false) };
-                }
-                _ => {}
-            }
+    /// Starts (or restarts) the outgoing test towards `steam_id`.
+    pub fn test(&mut self, steam_id: u64) {
+        if !self.core.status().ready {
+            return;
         }
-
-        unsafe fn route(&self, conn: u32) -> String {
-            let mut info = [0u8; CONNECTION_INFO_SIZE];
-            if unsafe { (self.api.connection_info)(self.sockets, conn, info.as_mut_ptr().cast()) } {
-                if relay_pop(&info) != 0 {
-                    "through a Steam relay".into()
-                } else {
-                    "direct".into()
-                }
-            } else {
-                "unknown".into()
-            }
+        // the state stays locked across connect(): the core may report the connection the moment it exists
+        let mut state = lock(&self.service.state);
+        if let Some(old) = state.test.take() {
+            self.core.close(old.conn);
         }
-
-        unsafe fn receive(&mut self, conn: u32) {
-            let mut messages = [std::ptr::null_mut::<c_void>(); 8];
-            let n = unsafe { (self.api.receive)(self.sockets, conn, messages.as_mut_ptr(), 8) };
-            for &message in messages.iter().take(n.max(0) as usize) {
-                if message.is_null() {
-                    continue;
-                }
-                // SAFETY: SteamNetworkingMessage_t starts with m_pData (pointer) and m_cbSize (int at offset 8).
-                let (data, len) = unsafe {
-                    let p = *(message as *const *const u8);
-                    let l = *((message as *const u8).add(8) as *const i32);
-                    (p, l.clamp(0, 4096) as usize)
-                };
-                let payload =
-                    if data.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(data, len) }.to_vec() };
-                unsafe { (self.api.release_message)(message) };
-                if let Some(reply) = reply_for(&payload) {
-                    self.pings_received += 1;
-                    self.events.push("received a ping, answered".into());
-                    unsafe { self.send(conn, &reply) };
-                } else if let Some(sent) = pong_id(&payload) {
-                    if let Some(t) = &mut self.test {
-                        if t.conn == conn {
-                            t.pongs += 1;
-                            t.last_rtt_ms = Some(now_ms().saturating_sub(sent));
-                        }
-                    }
-                }
-            }
-        }
-
-        unsafe fn send(&self, conn: u32, payload: &[u8]) {
-            // flag 8 = k_nSteamNetworkingSend_Reliable
-            unsafe {
-                (self.api.send)(
-                    self.sockets,
+        let owner: Arc<dyn Owner> = self.service.clone();
+        match self.core.connect(steam_id, PROBE_PORT, owner) {
+            Ok(conn) => {
+                state.events.push(format!("connecting to Steam ID {steam_id}"));
+                state.test = Some(TestConn {
                     conn,
-                    payload.as_ptr().cast(),
-                    payload.len() as u32,
-                    8,
-                    std::ptr::null_mut(),
-                )
-            };
+                    target: steam_id,
+                    connected: false,
+                    pongs: 0,
+                    last_rtt_ms: None,
+                    next_ping: Instant::now(),
+                    sent: 0,
+                    route: String::new(),
+                    state: "connecting".into(),
+                });
+            }
+            Err(e) => state.events.push(format!("could not start the test connection: {e}")),
         }
+    }
 
-        unsafe fn drive_test(&mut self) {
-            let Some(t) = &mut self.test else { return };
-            if t.connected && t.sent < 20 && Instant::now() >= t.next_ping {
-                let message = format!("ping {}", now_ms());
-                let conn = t.conn;
-                t.sent += 1;
-                t.next_ping = Instant::now() + Duration::from_secs(2);
-                unsafe { self.send(conn, message.as_bytes()) };
-            }
+    pub fn report(&self) -> Report {
+        let state = lock(&self.service.state);
+        Report {
+            steam_id: self.steam_id,
+            state: self.state.clone(),
+            events: state.events.0.iter().cloned().collect(),
+            test: state.test.as_ref().map(|t| TestReport {
+                target: t.target,
+                state: t.state.clone(),
+                pongs: t.pongs,
+                last_rtt_ms: t.last_rtt_ms,
+                route: t.route.clone(),
+            }),
+            pings_received: state.pings_received,
         }
+    }
+}
 
-        /// Starts (or restarts) the outgoing test towards `steam_id`.
-        pub fn test(&mut self, steam_id: u64) {
-            if self.sockets.is_null() {
-                return;
-            }
-            if let Some(old) = self.test.take() {
-                // SAFETY: a handle we got from ConnectP2P.
-                unsafe { (self.api.close)(self.sockets, old.conn, 0, std::ptr::null(), false) };
-            }
-            let identity = identity_bytes(steam_id);
-            // SAFETY: identity is IDENTITY_SIZE bytes in the layout ConnectP2P reads.
-            let conn =
-                unsafe { (self.api.connect_p2p)(self.sockets, identity.as_ptr().cast(), 0, 0, std::ptr::null()) };
-            if conn == 0 {
-                self.events.push("could not start the test connection".into());
-                return;
-            }
-            self.events.push(format!("connecting to Steam ID {steam_id}"));
-            self.test = Some(TestConn {
-                conn,
-                target: steam_id,
-                connected: false,
-                pongs: 0,
-                last_rtt_ms: None,
-                next_ping: Instant::now(),
-                sent: 0,
-                route: String::new(),
-                state: "connecting".into(),
-            });
+impl Drop for Probe {
+    fn drop(&mut self) {
+        if let Some(listener) = self.listener.take() {
+            self.core.close_listener(listener);
         }
-
-        pub fn report(&self) -> Report {
-            Report {
-                steam_id: self.steam_id,
-                state: self.state.clone(),
-                events: self.events.0.iter().cloned().collect(),
-                test: self.test.as_ref().map(|t| TestReport {
-                    target: t.target,
-                    state: t.state.clone(),
-                    pongs: t.pongs,
-                    last_rtt_ms: t.last_rtt_ms,
-                    route: t.route.clone(),
-                }),
-                pings_received: self.pings_received,
-            }
+        if let Some(t) = lock(&self.service.state).test.take() {
+            self.core.close(t.conn);
         }
     }
 }
@@ -598,6 +531,7 @@ mod tests {
         assert!(b[16..].iter().all(|x| *x == 0));
         assert_eq!(steam_id_of(&[0u8; 136]), None);
         assert_eq!(steam_id_of(&[0u8; 4]), None);
+        assert_eq!(steam_id_of(&[]), None);
     }
 
     fn callback(conn: u32, state: i32, old: i32, listen: u32, reason: i32) -> Vec<u8> {
@@ -616,14 +550,53 @@ mod tests {
         let b = callback(77, state::CONNECTING, state::NONE, 5, 0);
         assert_eq!(
             parse_status_event(&b),
-            Some(StatusEvent { conn: 77, state: 1, old_state: 0, listen_socket: 5, end_reason: 0 })
+            Some(StatusEvent {
+                conn: 77,
+                state: 1,
+                old_state: 0,
+                listen_socket: 5,
+                end_reason: 0,
+                remote: None,
+                end_debug: String::new()
+            })
         );
         let closed = callback(9, state::CLOSED_BY_PEER, state::CONNECTED, 0, 1002);
         let e = parse_status_event(&closed).unwrap();
         assert_eq!((e.state, e.old_state, e.end_reason), (4, 3, 1002));
         // too short, or a state Steam does not define
         assert_eq!(parse_status_event(&b[..100]), None);
+        assert_eq!(parse_status_event(&[]), None);
         assert_eq!(parse_status_event(&callback(1, 99, 0, 0, 0)), None);
+    }
+
+    #[test]
+    fn the_callback_names_the_peer_and_carries_steams_explanation() {
+        let mut b = callback(5, state::CLOSED_BY_PEER, state::CONNECTED, 0, 1000);
+        b[CALLBACK_INFO..CALLBACK_INFO + IDENTITY_SIZE].copy_from_slice(&identity_bytes(76561198000000042));
+        let text = b"The remote host closed the connection\0garbage after the NUL";
+        b[CALLBACK_INFO + INFO_END_DEBUG..][..text.len()].copy_from_slice(text);
+        let e = parse_status_event(&b).unwrap();
+        assert_eq!(e.remote, Some(76561198000000042));
+        assert_eq!(e.end_debug, "The remote host closed the connection");
+    }
+
+    #[test]
+    fn the_connection_info_is_read_at_the_documented_offsets() {
+        let mut info = [0u8; CONNECTION_INFO_SIZE];
+        info[..IDENTITY_SIZE].copy_from_slice(&identity_bytes(76561198000000007));
+        info[INFO_LISTEN_SOCKET..][..4].copy_from_slice(&12u32.to_le_bytes());
+        info[INFO_STATE..][..4].copy_from_slice(&3i32.to_le_bytes());
+        let direct = parse_connection_info(&info).unwrap();
+        assert_eq!(direct.remote, Some(76561198000000007));
+        assert_eq!((direct.listen_socket, direct.state, direct.relay_pop), (12, 3, 0));
+        assert!(!direct.relayed);
+        // a relay point or Steam's own flag both mean relayed
+        info[INFO_POP_RELAY..][..4].copy_from_slice(&0x646162u32.to_le_bytes());
+        assert!(parse_connection_info(&info).unwrap().relayed);
+        info[INFO_POP_RELAY..][..4].copy_from_slice(&0u32.to_le_bytes());
+        info[INFO_FLAGS..][..4].copy_from_slice(&INFO_FLAG_RELAYED.to_le_bytes());
+        assert!(parse_connection_info(&info).unwrap().relayed);
+        assert_eq!(parse_connection_info(&info[..CONNECTION_INFO_SIZE - 1]), None);
     }
 
     #[test]
@@ -633,6 +606,16 @@ mod tests {
         info[INFO_POP_RELAY..][..4].copy_from_slice(&0x646162u32.to_le_bytes());
         assert_eq!(relay_pop(&info), 0x646162);
         assert_eq!(relay_pop(&[0u8; 10]), 0);
+    }
+
+    #[test]
+    fn end_reasons_read_as_sentences_that_keep_the_code() {
+        assert_eq!(end_reason_text(0), "no reason given");
+        assert_eq!(end_reason_text(1000), "closed by the other side's program (1000)");
+        assert_eq!(end_reason_text(5003), "timed out (5003)");
+        assert_eq!(end_reason_text(5009), "a NAT or firewall blocked the connection (5009)");
+        assert_eq!(end_reason_text(4321), "problem on the other side (4321)");
+        assert_eq!(end_reason_text(-7), "unknown reason (-7)");
     }
 
     #[test]

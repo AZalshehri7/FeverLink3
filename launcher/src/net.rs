@@ -39,6 +39,20 @@ pub enum NetEvent {
     Closed { conn: ConnectionId, reason: String },
 }
 
+/// What a connection attempt is given besides its target, for transports where finding the other side can take
+/// long (a Steam route through the relays takes 10 to 20 s): where its events go, how long it may take, a way to
+/// ask it to stop, and a way for it to say what it is doing ("finding a route"). TCP ignores the last two.
+pub struct ConnectContext<'a> {
+    /// The id the connection's events carry.
+    pub conn: ConnectionId,
+    pub tx: Sender<NetEvent>,
+    pub timeout: Duration,
+    /// Polled while waiting; true means give up now.
+    pub cancelled: &'a dyn Fn() -> bool,
+    /// Called with a short status text each time it changes.
+    pub progress: &'a mut dyn FnMut(&str),
+}
+
 /// One TCP connection: its writer, a handle to shut it down, and the flag that makes closing idempotent.
 #[derive(Debug)]
 struct Link {
