@@ -133,15 +133,6 @@ local function setup(react, builtin)
 			add(text("Send this join code to the other players (click it, Ctrl+A, Ctrl+C):"))
 			add(field("join code", tostring(ctl.code or ""), function() end, true))
 			if ctl.password then add(text("They also need the password.")) end
-			if ctl.public then
-				add(text("Internet address: " .. tostring(ctl.public), "font-scale-body"))
-			end
-			if ctl.lookup and ctl.lookup ~= "" then add(text(tostring(ctl.lookup), "font-scale-body")) end
-			local where = {}
-			for _, ep in ipairs(ctl.endpoints or {}) do
-				if ep ~= ctl.public then where[#where + 1] = tostring(ep) end
-			end
-			if #where > 0 then add(text("Also reachable inside your network / VPN: " .. table.concat(where, "  /  "), "font-scale-body")) end
 			add(gap())
 			add(text("Players", "font-scale-title-3"))
 			for _, p in ipairs(ctl.players or {}) do
