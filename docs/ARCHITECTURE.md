@@ -90,7 +90,7 @@ Three modes, from TpF2 Multiplayer, chosen per action kind:
 
 Rules: never cancel a command that nothing will replay (solo play stays stock); never cancel a command that cannot be fully decoded (losing the player's action is worse than a visible divergence); the wire never carries engine entity ids.
 
-Entity references: roads as node positions (match within 1.5 m, else split edge or create node); constructions as file + transform + parameters; vehicles and lines as `<sender>:<seq>` keys bound on every game when the entity appears, or `s:<id>` for entities from the savegame.
+Entity references: roads as node positions (match within 1.5 m, else split edge or create node); constructions as file + transform + parameters; vehicles and lines as `<sender>:<seq>` keys bound on every game when the entity appears, or `s:<id>` for entities from the savegame. Whatever a game resolves from a key is checked (it exists, it is of the expected kind): an action that fails the check is refused, never applied to whatever shares the id. Depots and station groups also carry the building that owns them and their place in it, because their own id is not bound to a key (`docs/COVERAGE_OPS.md`).
 
 ## 7. Determinism
 

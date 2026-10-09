@@ -1920,17 +1920,16 @@ class LockstepAdditionsTest(unittest.TestCase):
         self.K = self.L.execute(T.LOCKSTEP_SRC)
 
     def test_a_schema_can_decide_the_category_per_command(self):
+        # categoryFor is the lockstep core's own hook (main); the build schema uses it for "a proposal that only removes"
         got = self.L.eval("""function(K)
           K.registerCommands({
-            byContent = { category = function(name, args) return args and args[1] and "bulldoze" or "build" end },
-            broken = { category = function() error("boom") end },
-            notAName = { category = function() return 7 end },
+            byContent = { category = "build", categoryFor = function(args) return args[1] and "bulldoze" or nil end },
             fixed = { category = "spend" },
           })
           return K.categoryOf("byContent", { true }) .. K.categoryOf("byContent", { false }) .. K.categoryOf("byContent") ..
-                 K.categoryOf("broken", {}) .. K.categoryOf("notAName", {}) .. K.categoryOf("fixed") .. K.categoryOf("makeSomethingBuyCmd")
+                 K.categoryOf("fixed") .. K.categoryOf("makeSomethingBuyCmd")
         end""")(self.K)
-        self.assertEqual(got, "bulldozebuildbuild" + "other" + "other" + "spend" + "spend")
+        self.assertEqual(got, "bulldozebuildbuild" + "spend" + "spend")
 
     def test_commands_of_one_action_are_sent_in_order(self):
         got = self.L.eval("""function(K)

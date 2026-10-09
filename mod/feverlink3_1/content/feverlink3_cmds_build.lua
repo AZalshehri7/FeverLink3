@@ -1742,7 +1742,7 @@ end
 -- Permissions: a proposal that only takes things away is bulldozing, anything else is building. Counts only. Segments
 -- the engine re-adds when it merges what a bulldozing leaves are fewer than the ones removed; an upgrade replaces as
 -- many as it removes.
-local function categoryOf(name, args)
+local function categoryFor(args)
 	local ok, c = pcall(function()
 		local p = args and args[1]
 		local flavor = flavorOf(p)
@@ -1810,7 +1810,8 @@ local function bindCreated(body, key, made)
 end
 
 M.commands.makeWorldBuildProposalCmd = {
-	category = categoryOf,
+	category = "build",
+	categoryFor = categoryFor,
 	encode = encodeBuild,
 	decode = decodeBuild,
 	bindsComp = bindsComp,
