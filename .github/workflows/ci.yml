@@ -31,4 +31,4 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install lupa
-      - run: python -I tests/lua/test_lockstep.py
+      - run: python -I -m unittest discover -s tests/lua -p "test_*.py"
