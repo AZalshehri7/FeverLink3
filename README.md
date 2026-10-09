@@ -30,18 +30,18 @@ If you are the author of either and want the wording changed, open an issue.
 |---|---|---|
 | `src/FeverLink3.Core` | Protocol: framing, sealed channel, join codes, session model. No game or UI code. | C# (.NET 10) |
 | `src/FeverLink3.Launcher` | Windows launcher: lobby, game start, save transfer, resync. *(planned)* | C# |
-| `native/` | Proxy DLL the game loads itself: command capture and hold, determinism patches. *(planned)* | C++ |
+| `native/` | Proxy DLL the game loads itself: command capture and hold, determinism patches. Skeleton: proxy, PE parsing, scanner, detour maths, build table. | Rust |
 | `mod/feverlink3_1/` | Game-script mod: stamping, replay, checksums, in-game UI. *(planned)* | Lua |
-| `tests/` | `FeverLink3.Core.Tests` (xunit); Lua lockstep tests with lupa *(planned)* | C#, Python |
+| `tests/` | `FeverLink3.Core.Tests` (xunit); `native/` has `cargo test`; Lua lockstep tests with lupa *(planned)* | C#, Rust, Python |
 | `docs/` | Architecture, roadmap, protocol notes | |
 
 ## Building
 
-Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download).
+Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download) and, for the native module, [stable Rust](https://rustup.rs).
 
 ```
-dotnet build
-dotnet test
+dotnet build && dotnet test
+cd native && cargo test && cargo build --release
 ```
 
 ## Contributing

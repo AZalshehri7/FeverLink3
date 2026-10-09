@@ -7,7 +7,7 @@ obj/
 TestResults/
 
 # native build output
-native/out/
+native/target/
 
 # release packaging
 release/

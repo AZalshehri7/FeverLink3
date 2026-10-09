@@ -23,7 +23,10 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] Project site on GitHub Pages (`docs/`): download, how to play, known issues, privacy
 
 ## 0.3 — Game side
-- [ ] Native module: build table, command-list hook, hold/release, single-worker script pool
+- [x] Native module skeleton in Rust: winhttp proxy, PE parsing, signature scanner, detour maths, build table, `cargo test`
+- [ ] Address tool: finds hook sites in a game executable and prints a build-table row
+- [ ] Native module: command-list hook, hold/release, single-worker script pool
+- [ ] Native module size: `no_std` + `alloc` with a HeapAlloc allocator once the hook set is fixed
 - [ ] Lua mod: stamping, barrier, replay, checksums, deterministic random
 - [ ] Lua lockstep test with lupa
 - [ ] First playable: two players, shared company, roads and vehicles

@@ -33,10 +33,10 @@ Lockstep is the only model that fits, and it is the one both prior projects (TpF
 
 | Component | Responsibility | Must not |
 |---|---|---|
-| **Native module** | Loaded by the game via a DLL it imports. Hooks the engine's command list to capture tool commands before they apply, hold them until their stamp, and release them. Applies determinism patches (single-worker script pool). Copies data a script cannot read (terrain cells). | Open sockets. Decide anything about the session. Run when no FeverLink3 session is active. |
-| **Lua mod** | Game-script side. Stamps local actions, ships them to the launcher, applies remote actions at their step, computes world checksums, saves and loads for resync, draws the in-game UI (players, chat, status). | Trust anything from the file link without checking the sender id the launcher attached. |
-| **Launcher** (`FeverLink3.exe`) | Starts the game with the session environment. Hosts or joins a session. Owns the session clock, speed and pause. Relays commands in one order to everyone. Collects checksums and runs resync. Transfers savegames. | Interpret game commands. |
-| **Core library** | Everything in the launcher that has no Windows, UI or game dependency: framing, crypto, join codes, session state machine, message types. Fully unit-tested. | Reference WinForms, the registry, Steam or the filesystem layout. |
+| **Native module** (Rust) | Loaded by the game via a DLL it imports. Hooks the engine's command list to capture tool commands before they apply, hold them until their stamp, and release them. Applies determinism patches (single-worker script pool). Copies data a script cannot read (terrain cells). | Open sockets. Decide anything about the session. Run when no FeverLink3 session is active. |
+| **Lua mod** (Lua) | Game-script side. Stamps local actions, ships them to the launcher, applies remote actions at their step, computes world checksums, saves and loads for resync, draws the in-game UI (players, chat, status). | Trust anything from the file link without checking the sender id the launcher attached. |
+| **Launcher** (`FeverLink3.exe`, C#) | Starts the game with the session environment. Hosts or joins a session. Owns the session clock, speed and pause. Relays commands in one order to everyone. Collects checksums and runs resync. Transfers savegames. | Interpret game commands. |
+| **Core library** (C#) | Everything in the launcher that has no Windows, UI or game dependency: framing, crypto, join codes, session state machine, message types. Fully unit-tested. | Reference WinForms, the registry, Steam or the filesystem layout. |
 
 The launcher and the game talk through files in a per-session folder, as the two prior projects do: it needs no process injection and survives either side restarting. Every line carries a monotonically increasing sequence number so a reader never re-dispatches history after a truncation.
 
@@ -109,7 +109,7 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 
 ## 9. Game builds
 
-The native module recognises the game build by its PE timestamp and looks addresses up in one table per build. Every address lives in that table, nowhere else, and every patch verifies the bytes it expects before writing. An unknown build means: hooks off, mod runs in degraded mode, clear message to the player. The tooling that produces a table row from a game executable is published in `tools/` so anyone can add a build.
+The native module is written in Rust (`native/`): the hooking core is `unsafe` in any language, so the gain is in everything around it, which is pure, tested with `cargo test` on any machine, and compiled to a small stripped DLL. It recognises the game build by its PE timestamp and looks addresses up in one table per build (`build_table.rs`). Every address lives in that table, nowhere else, and every detour verifies the exact prologue bytes it expects before writing; the padding is written before the jump so a thread never sees half a jump. An unknown build means: hooks off, mod runs in degraded mode, clear message to the player. The tooling that produces a table row from a game executable is published in `tools/` so anyone can add a build.
 
 ## 10. Testing
 

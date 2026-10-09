@@ -21,3 +21,19 @@ jobs:
         with:
           name: test-results
           path: '**/TestResults/*.trx'
+
+  native:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release
+      - run: Get-Item target/release/feverlink3_native.dll | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winhttp-dll
+          path: native/target/release/feverlink3_native.dll
