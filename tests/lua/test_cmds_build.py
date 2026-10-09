@@ -1341,6 +1341,17 @@ class BuildTest(unittest.TestCase):
         self.assertIn("C town/house_a.con@350.00,40.00,0.00", sig)
         self.assertNotIn("350.00,5.00", sig)
 
+    def test_a_road_that_only_demolishes_town_buildings_still_builds_the_road(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
+        self.B.issue("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; P.toRemove = { 57 }; return P end)()")
+        self.tick(30)
+        self.assertSameWorld()
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"), "the road is there")
+        self.assertNotIn("town/house_a.con", self.A.sig(), "and the house is gone")
+        self.assertEqual(self.A.lua("#BUILD_LOG"), 1, "one proposal")
+
     def test_a_station_gets_keys_for_its_station_and_its_group(self):
         self.start()
         self.B.issue("CON_PROPOSAL{ file = 'station/bus/bus_station.con', x = 100, y = 300 }")
@@ -1612,6 +1623,7 @@ class PureBuildTest(unittest.TestCase):
             ("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, remove = 54 }", "construction"),
             ("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }", "withStreet"),
             ("NATIVE_ROAD_MOVING{ %s, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 54 }" % road, "combined"),
+            ("(function() local P = NATIVE_ROAD{ %s }; P.toRemove = { 54 }; return P end)()" % road, "combined"),
             ("NATIVE_NODECFG{ nodes = { { node = 101, lanes = { { 110, 0, 111, 0 } } } } }", "nodecfg"),
             ("NATIVE_TERRAIN(1, 2, 3, 3)", "refused: a terrain edit: its cells cannot be read from a script, only the native module can copy them"),
             ("D('SimpleProposal')", "refused: nothing to build"),
@@ -1789,12 +1801,27 @@ class PureBuildTest(unittest.TestCase):
                        "M.onToolEvent('streetBuilder', 'builder.proposalApply', { D('SimpleProposal') }, say); "
                        "return table.concat(said, '#') end)()")
         parts = said.split("#")
-        self.assertEqual(parts[0], "tool event streetBuilder/builder.proposalCreate")
-        self.assertEqual(parts[1], "tool event streetBuilder/builder.proposalApply")
-        self.assertTrue(parts[2].startswith("tool build streetBuilder/builder.proposalApply: street, 0+0 constructions, 2+0 nodes, 1+0 segments, 0+0 objects"), parts[2])
+        self.assertEqual(parts.count("tool event streetBuilder/builder.proposalCreate"), 1, "each kind of event once")
+        self.assertEqual(parts.count("tool event streetBuilder/builder.proposalApply"), 1)
+        self.assertTrue(any(p.startswith("tool build streetBuilder/builder.proposalApply: street, 0+0 constructions, 2+0 nodes, 1+0 segments, 0+0 objects") for p in parts), parts)
         self.assertTrue(any(p.startswith("segment members: node0,node1") for p in parts), parts)
         self.assertTrue(any(p.startswith("node members: position") for p in parts))
         self.assertTrue(any("not capturable: nothing to build" in p for p in parts))
+
+    def test_previews_of_a_tool_are_rebuilt_as_a_dry_run_and_the_result_logged(self):
+        said = self.ev("(function() local M = PURE(); local said = {}; local function say(m) said[#said + 1] = m end; "
+                       "for i = 1, 12 do M.onToolEvent('streetBuilder', 'builder.proposalCreate', { NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }, {} }, say) end; "
+                       "M.onToolEvent('streetTerminalBuilder', 'builder.proposalCreate', { NATIVE_SIGNAL{ edge = 130, param = 0.5 }, {} }, say); "
+                       "M.onToolEvent('bulldozer', 'builder.proposalCreate', { NATIVE_BULLDOZE{ edges = { 110 } }, {} }, say); "
+                       "M.onToolEvent('constructionBuilder', 'builder.proposalCreate', { NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }, {} }, say); "
+                       "return table.concat(said, '#') end)()")
+        lines = said.split("#")
+        previews = [l for l in lines if l.startswith("tool preview streetBuilder: street rebuilds (")]
+        self.assertEqual(len(previews), 2, "two per tool and plan, not one per frame")
+        self.assertTrue(previews[0].endswith(" bytes)"), previews[0])
+        self.assertIn("tool preview streetTerminalBuilder: not capturable: an edge object has no model (captured before the build ran?)", lines)
+        self.assertTrue(any(l.startswith("tool preview bulldozer: removal rebuilds (") for l in lines), lines)
+        self.assertTrue(any(l.startswith("tool preview constructionBuilder: withStreet rebuilds (") for l in lines), lines)
 
     def test_engine_values_dump_to_plain_data(self):
         got = self.ev("(function() local M = PURE(); local A = M.adapter; local m = D('Mat4f'); STORE(m)[13] = 5; "

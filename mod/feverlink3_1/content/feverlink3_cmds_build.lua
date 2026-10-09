@@ -1072,7 +1072,7 @@ local function isStopShape(rec)
 end
 
 -- The shape of a record: construction, withStreet, combined, bulldoze, upgrade, removal, stop, street, nodecfg, or nil
--- and why not.
+-- and why not. (Every case that has something to add to the street is a plan that adds it.)
 local function classify(rec)
 	local nCons, nRem, nNodes, nSegs, nRmNodes, nRmSegs, nObjs, nRmObjs, nCfg, nRmCfg = counts(rec)
 	local street = nNodes + nSegs + nRmNodes + nRmSegs + nObjs + nRmObjs + nCfg + nRmCfg
@@ -1088,10 +1088,11 @@ local function classify(rec)
 			if isConstructionSegment(s) then own = own + 1 else foreign = foreign + 1 end
 		end
 		if foreign == 0 and nRmSegs == 0 and nObjs + nRmObjs == 0 then return "construction" end
-		if nCons == 0 then return "bulldoze" end
-		-- a depot or station against a street: street first, construction second; a road that only moves town buildings
-		-- is one proposal
-		if own > 0 then return "withStreet" end
+		-- constructions taken away with segments, and nothing new but what the engine re-adds when it merges: a bulldozing
+		if nCons == 0 and nNodes == 0 and nObjs == 0 and nRmSegs > 0 then return "bulldoze" end
+		-- a depot or station against a street: street first, construction second; any other mixture (a road that takes
+		-- town buildings out of its way, with or without putting them elsewhere) is one proposal
+		if nCons > 0 and own > 0 then return "withStreet" end
 		return "combined"
 	end
 	if upgradeSteps(rec) then return "upgrade" end
@@ -1808,11 +1809,37 @@ M.commands.makeWorldReplaceTerrainCmd = {
 
 local seenEvents = {}
 local probes = 0
+local previews = {}
+
+-- A preview of a tool's build, captured, sent through the wire form and rebuilt as a peer would (the engine's factory is
+-- called, nothing is sent): says whether it rebuilds and how long that took. A few per tool and plan; the world is still
+-- as the tool saw it, so references resolve.
+local function previewRebuild(id, proposal, say)
+	local started = os.clock()
+	local body, why = M.capture(proposal, {})
+	if not body then
+		local key = tostring(id) .. " refused " .. tostring(why)
+		if not previews[key] then
+			previews[key] = 1
+			say("tool preview " .. tostring(id) .. ": not capturable: " .. tostring(why))
+		end
+		return
+	end
+	local plan = classify(body.args[1])
+	local key = tostring(id) .. " " .. tostring(plan)
+	previews[key] = (previews[key] or 0) + 1
+	if previews[key] > 2 then return end
+	local wire = C.parse(C.serialize(body))
+	local ctx = { player = A.player(), resolve = function(k) local n = tostring(k):match("^s:(%d+)$"); return n and tonumber(n) or nil end }
+	local args, err = decodeBuild(wire, ctx)
+	say("tool preview " .. tostring(id) .. ": " .. tostring(plan) .. (args and " rebuilds" or (" does NOT rebuild: " .. tostring(err)))
+		.. string.format(" (%.1f ms, %d bytes)", (os.clock() - started) * 1000, #C.serialize(body)))
+end
 
 -- Called by the bridge for the engine's tool events (id = the tool: streetBuilder, trackBuilder, constructionBuilder,
 -- streetTerminalBuilder, bulldozer ..., name = builder.proposalCreate / builder.proposalApply, param = { proposal, data,
--- result }). Logs each kind once and, for the first few applied builds, what a capture of them would be, so that the
--- adapter can be checked against a real proposal.
+-- result }). Logs each kind once; for the first previews of each tool whether they rebuild; for the first few applied
+-- builds what a capture of them is, so that the adapter can be checked against real proposals.
 function M.onToolEvent(id, name, param, say)
 	say = say or log
 	local key = tostring(id) .. "/" .. tostring(name)
@@ -1820,7 +1847,14 @@ function M.onToolEvent(id, name, param, say)
 		seenEvents[key] = true
 		say("tool event " .. key)
 	end
-	if name ~= "builder.proposalApply" or probes >= 6 or type(param) ~= "table" then return end
+	if type(param) ~= "table" then return end
+	if name == "builder.proposalCreate" then
+		local n = (previews[tostring(id)] or 0) + 1
+		previews[tostring(id)] = n
+		if n <= 8 then previewRebuild(id, param[1] or param.proposal, say) end
+		return
+	end
+	if name ~= "builder.proposalApply" or probes >= 6 then return end
 	probes = probes + 1
 	local proposal, result = param[1] or param.proposal, param[3] or param.result
 	local body, why = M.capture(proposal, { result = result })
