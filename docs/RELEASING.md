@@ -1,0 +1,46 @@
+# Releasing FeverLink3
+
+A release is a git tag built by GitHub Actions (`.github/workflows/release.yml`). Nothing is built or uploaded from a developer's PC.
+
+## Cut a release
+
+1. Make sure `main` is green in CI and `docs/ROADMAP.md` is current.
+2. Set the version (`[workspace.package] version` in `Cargo.toml`) and commit.
+3. Tag and push: `git tag v0.3.0` then `git push origin v0.3.0`. A tag with a dash (`v0.3.0-rc.1`) becomes a GitHub pre-release, which the updater skips by default.
+4. The job runs `cargo test --workspace`, `cargo build --release`, then `feverlink3_release package`, signs the manifest if the secret `FEVERLINK3_SIGNING_KEY` is set, and creates the release with these assets:
+   - `FeverLink3-<version>.zip`: the portable folder (`feverlink3.exe`, `winhttp.dll`, `mod/feverlink3_1/`, `README.txt`, `LICENSE`, `THIRD_PARTY_NOTICES.md`)
+   - `FeverLink3-<version>.zip.sha256`
+   - `manifest.json`: version, every file with size and SHA-256, and the zip's SHA-256
+   - `manifest.json.sig`: Ed25519 signature over the exact bytes of `manifest.json` (hex)
+
+   The zip SHA-256 is also in the release notes. A build without the secret is published unsigned and says so; the in-app updater refuses it.
+
+The zip is reproducible: entries are sorted, timestamps are fixed to 1980-01-01 and permissions are fixed, so the same inputs give the same bytes.
+
+## The signing key
+
+The public key is embedded in the launcher (`UPDATE_PUBLIC_KEY_HEX` in `launcher/src/update.rs`). The private key signs `manifest.json` and nothing else.
+
+**The value in the repository is a placeholder** whose private half is public (it is in the unit tests). Before the first release:
+
+1. On an offline machine: `cargo run --release -p feverlink3_release -- keygen --out <folder outside the repo>`. This writes `feverlink3_release.key` (64 hex characters, secret) and `feverlink3_release.pub`.
+2. Put the `.pub` value into `UPDATE_PUBLIC_KEY_HEX`, and replace `TEST_SEED_HEX` in the update tests with a fresh throwaway test seed (and its public key into the test constant) so the tests never use the real key.
+3. Store the `.key` contents as the repository secret `FEVERLINK3_SIGNING_KEY`, and keep an offline backup (password manager plus a printed or USB copy). The key is never committed; `.gitignore` excludes `*.key`.
+4. If the key leaks or is lost, ship a new launcher with a new public key by a normal manual download: old launchers cannot be moved to a new key by an update.
+
+To sign by hand: `feverlink3_release sign --key <file> --manifest manifest.json` writes `manifest.json.sig` next to it.
+
+## Verify a download by hand
+
+PowerShell, in the folder with the files:
+
+```powershell
+(Get-FileHash FeverLink3-0.3.0.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content FeverLink3-0.3.0.zip.sha256
+```
+
+The two values must be equal, and equal to the SHA-256 in the release notes. The same hash is the `zip_sha256` field of `manifest.json`. The signature check is done by the launcher's updater (public key embedded in the exe); a hand check of `manifest.json.sig` needs an Ed25519 tool and the public key published on the project site.
+
+## SmartScreen
+
+The exe is not code-signed yet, so the first run on a PC shows "Windows protected your PC" (More info, then Run anyway). This appears once per PC at the first run of a browser-downloaded file. Files the launcher downloads itself for updates carry no mark-of-the-web, so updates do not trigger it. Code signing is the only real fix; the plan (SignPath Foundation, once 0.3 is playable) is in `docs/ARCHITECTURE.md` section 11.

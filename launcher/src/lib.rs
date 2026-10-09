@@ -8,6 +8,7 @@
 //! - [`gamelink`]: the file link with one game instance: a per-session folder, `to_game.log` written by the
 //!   launcher, `from_game.log` tailed by it, every line carrying a sequence number so history is never dispatched
 //!   twice.
+//! - [`update`]: update decision, signature and hash checks and the file-swap plan, over bytes (no network yet).
 //! - [`process`]: starting `TransportFever3.exe` with the session environment.
 //!
 //! No networking and no UI: the protocol lives in the core crate, the lobby in a later stage. Every path and text
@@ -17,6 +18,7 @@ pub mod gamelink;
 pub mod install;
 pub mod process;
 pub mod steam;
+pub mod update;
 
 /// Steam app id of Transport Fever 3.
 pub const APP_ID: &str = "3493540";
