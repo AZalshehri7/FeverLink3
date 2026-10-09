@@ -177,11 +177,18 @@ impl FrameCodec {
     /// Decodes one complete length-prefixed frame from the front of `buffer`. `Ok(None)` when the buffer does not
     /// yet hold a whole frame; otherwise the frame and the number of bytes it consumed.
     pub fn try_decode(buffer: &[u8]) -> Result<Option<(Frame, usize)>, ProtocolError> {
+        Self::try_decode_limited(buffer, Self::MAX_FRAME_LENGTH)
+    }
+
+    /// As [`FrameCodec::try_decode`], but a length field over `max_length` is refused as soon as its four bytes
+    /// are in the buffer, before any of the frame has to arrive: the form for a reader that fills a buffer from a
+    /// socket and so holds only what the peer has really sent.
+    pub fn try_decode_limited(buffer: &[u8], max_length: usize) -> Result<Option<(Frame, usize)>, ProtocolError> {
         let Some((length_field, rest)) = buffer.split_first_chunk::<{ Self::LENGTH_FIELD_SIZE }>() else {
             return Ok(None);
         };
         let declared = u32::from_be_bytes(*length_field);
-        let length = Self::check_length(declared, Self::MAX_FRAME_LENGTH)?;
+        let length = Self::check_length(declared, max_length.min(Self::MAX_FRAME_LENGTH))?;
         let Some(frame_bytes) = rest.get(..length) else {
             return Ok(None);
         };

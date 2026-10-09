@@ -12,21 +12,54 @@
 //! outside the protocol's bounds, truncated frame), or the owner calls `close`. Whatever the cause, the reader
 //! thread reports [`NetEvent::Closed`] exactly once, last. After `close` or a failed write no more frames are
 //! delivered for that connection.
+//!
+//! A host listens on a port the whole internet can reach, so its limits ([`NetLimits`]) are what strangers cost:
+//! connections are capped in total and per address, the first frame of a connection is read with a small size
+//! limit (a stranger's only valid first frame is a Join), and a write that makes no progress ends the connection
+//! instead of stopping the session thread that does the writing. A stranger that opens a connection and says
+//! nothing is closed by the session itself (`HostSession::HANDSHAKE_SECONDS`).
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io::{self, BufWriter, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use feverlink3_core::protocol::{Frame, FrameCodec};
+use feverlink3_core::protocol::{Frame, FrameCodec, ProtocolError};
 use feverlink3_core::session::ConnectionId;
 
 /// How long [`ClientNet::connect`] waits for each endpoint.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a host spends on connections it has not been asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetLimits {
+    /// A write that cannot make progress for this long closes the connection. The session thread does all the
+    /// writing, so a peer that stops reading must not be able to hold it.
+    pub write_timeout: Duration,
+    /// Connections open at once, handshakes included. The game has eight seats; the rest is room for a rejoin that
+    /// overlaps its dead connection and for strangers knocking.
+    pub max_connections: usize,
+    /// Connections one address may hold open. Friends behind one router share an address, so this is about seats.
+    pub max_per_address: usize,
+    /// Longest first frame (header included) a connection may send before it has sent one: the only frame a
+    /// stranger can usefully send is a Join of a few hundred bytes.
+    pub first_frame: usize,
+}
+
+impl Default for NetLimits {
+    fn default() -> Self {
+        Self {
+            write_timeout: Duration::from_secs(10),
+            max_connections: 64,
+            max_per_address: 16,
+            first_frame: FrameCodec::HANDSHAKE_MAX_LENGTH,
+        }
+    }
+}
 
 /// What the sockets tell the session thread.
 #[derive(Debug)]
@@ -45,13 +78,17 @@ struct Link {
     writer: Mutex<BufWriter<TcpStream>>,
     stream: TcpStream,
     closed: AtomicBool,
+    /// The peer's address, for the per-address limit.
+    ip: Option<IpAddr>,
 }
 
 impl Link {
-    fn new(stream: TcpStream) -> io::Result<Arc<Link>> {
+    fn new(stream: TcpStream, write_timeout: Duration) -> io::Result<Arc<Link>> {
         stream.set_nodelay(true)?;
+        stream.set_write_timeout(Some(write_timeout))?;
+        let ip = stream.peer_addr().ok().map(|a| a.ip());
         let writer = Mutex::new(BufWriter::new(stream.try_clone()?));
-        Ok(Arc::new(Link { writer, stream, closed: AtomicBool::new(false) }))
+        Ok(Arc::new(Link { writer, stream, closed: AtomicBool::new(false), ip }))
     }
 
     /// Encodes and writes one frame, flushed. Any failure closes the connection and is returned.
@@ -79,28 +116,67 @@ impl Link {
     }
 }
 
-/// Reads frames until the connection ends, then reports `Closed`. Runs on its own thread.
-fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>) {
-    let mut reader = BufReader::new(match link.stream.try_clone() {
+/// How often a blocked read wakes to look at the `closed` flag. Shutting a socket down from another thread does not
+/// reliably wake a read on Windows, and a peer that says nothing and never closes would hold the reader thread (and
+/// its socket) for ever, so every reader polls.
+const READ_POLL: Duration = Duration::from_millis(250);
+
+/// Reads frames until the connection ends, then reports `Closed`. Runs on its own thread. The first frame may be at
+/// most `first_frame` bytes long; after it the protocol's own limit applies.
+///
+/// The bytes of a frame are collected as they arrive and the length field is checked as soon as it has, so what the
+/// reader holds is what the peer really sent (never what it announced), and a read that times out loses nothing.
+fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, first_frame: usize) {
+    let mut stream = match link.stream.try_clone().and_then(|s| s.set_read_timeout(Some(READ_POLL)).map(|()| s)) {
         Ok(s) => s,
         Err(e) => {
+            link.close();
             let _ = tx.send(NetEvent::Closed { conn, reason: format!("cannot read: {e}") });
             return;
         }
-    });
-    let reason = loop {
-        match FrameCodec::read(&mut reader) {
-            Ok(Some(frame)) => {
-                if link.closed.load(Ordering::Acquire) {
-                    break "closed locally".to_string();
+    };
+    let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 16 * 1024]);
+    let mut limit = first_frame;
+    let reason = 'read: loop {
+        // every frame the buffer holds already, in order
+        let mut start = 0;
+        loop {
+            match FrameCodec::try_decode_limited(buf.get(start..).unwrap_or_default(), limit) {
+                Ok(Some((frame, used))) => {
+                    start += used;
+                    limit = FrameCodec::MAX_FRAME_LENGTH;
+                    if link.closed.load(Ordering::Acquire) {
+                        break 'read "closed locally".to_string();
+                    }
+                    if tx.send(NetEvent::Frame { conn, frame }).is_err() {
+                        break 'read "session ended".to_string();
+                    }
                 }
-                if tx.send(NetEvent::Frame { conn, frame }).is_err() {
-                    break "session ended".to_string();
+                Ok(None) => break,
+                Err(e) => {
+                    break 'read if link.closed.load(Ordering::Acquire) {
+                        "closed locally".to_string()
+                    } else {
+                        e.to_string()
+                    }
                 }
             }
-            Ok(None) => break "closed by the peer".to_string(),
+        }
+        buf.drain(..start.min(buf.len()));
+        if link.closed.load(Ordering::Acquire) {
+            break "closed locally".to_string();
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) if buf.is_empty() => break "closed by the peer".to_string(),
+            Ok(0) => break ProtocolError::Truncated.to_string(),
+            Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) => {}
             Err(e) => {
-                break if link.closed.load(Ordering::Acquire) { "closed locally".to_string() } else { e.to_string() };
+                break if link.closed.load(Ordering::Acquire) { "closed locally".to_string() } else { e.to_string() }
             }
         }
     };
@@ -108,8 +184,16 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>) {
     let _ = tx.send(NetEvent::Closed { conn, reason });
 }
 
-fn spawn_reader(conn: ConnectionId, link: Arc<Link>, tx: Sender<NetEvent>, role: &str) -> io::Result<JoinHandle<()>> {
-    thread::Builder::new().name(format!("feverlink3-{role}-read-{conn}")).spawn(move || read_loop(conn, &link, &tx))
+fn spawn_reader(
+    conn: ConnectionId,
+    link: Arc<Link>,
+    tx: Sender<NetEvent>,
+    role: &str,
+    first_frame: usize,
+) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("feverlink3-{role}-read-{conn}"))
+        .spawn(move || read_loop(conn, &link, &tx, first_frame))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -123,29 +207,41 @@ pub struct HostNet {
     links: Arc<Mutex<HashMap<ConnectionId, Arc<Link>>>>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+    refused: Arc<AtomicU64>,
 }
 
 impl HostNet {
-    /// Binds `addr` (port 0 picks a free one, see [`HostNet::local_addr`]) and starts accepting. Connection ids
-    /// start at 1 and are never reused. Events go to `tx`.
+    /// Binds `addr` (port 0 picks a free one, see [`HostNet::local_addr`]) and starts accepting, within the default
+    /// [`NetLimits`]. Connection ids start at 1 and are never reused. Events go to `tx`.
     pub fn bind(addr: SocketAddr, tx: Sender<NetEvent>) -> io::Result<HostNet> {
+        Self::bind_with(addr, tx, NetLimits::default())
+    }
+
+    /// As [`HostNet::bind`] with other limits.
+    pub fn bind_with(addr: SocketAddr, tx: Sender<NetEvent>, limits: NetLimits) -> io::Result<HostNet> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let links: Arc<Mutex<HashMap<ConnectionId, Arc<Link>>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicU64::new(0));
         let accept = {
-            let (links, stop) = (Arc::clone(&links), Arc::clone(&stop));
+            let (links, stop, refused) = (Arc::clone(&links), Arc::clone(&stop), Arc::clone(&refused));
             thread::Builder::new()
                 .name("feverlink3-accept".into())
-                .spawn(move || accept_loop(&listener, &links, &stop, &tx))?
+                .spawn(move || accept_loop(&listener, &links, &stop, &tx, limits, &refused))?
         };
-        Ok(HostNet { local_addr, links, stop, accept: Some(accept) })
+        Ok(HostNet { local_addr, links, stop, accept: Some(accept), refused })
     }
 
     /// The address actually bound.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Connections turned away so far because a limit of [`NetLimits`] was reached.
+    pub fn refused_count(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
     }
 
     /// Writes a frame to one connection. An error means the connection is gone or was just closed because of
@@ -198,6 +294,8 @@ fn accept_loop(
     links: &Mutex<HashMap<ConnectionId, Arc<Link>>>,
     stop: &AtomicBool,
     tx: &Sender<NetEvent>,
+    limits: NetLimits,
+    refused: &AtomicU64,
 ) {
     let next_id = AtomicU64::new(1);
     while !stop.load(Ordering::Acquire) {
@@ -207,17 +305,27 @@ fn accept_loop(
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
-                let Ok(link) = Link::new(stream) else { continue };
+                let admitted = {
+                    let mut map = links.lock().unwrap_or_else(|p| p.into_inner());
+                    map.retain(|_, l| !l.closed.load(Ordering::Acquire));
+                    let same_address = map.values().filter(|l| l.ip == Some(peer.ip())).count();
+                    map.len() < limits.max_connections && same_address < limits.max_per_address
+                };
+                if !admitted {
+                    // dropping the stream closes it: no thread, no table entry, nothing for the session to see
+                    refused.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let Ok(link) = Link::new(stream, limits.write_timeout) else { continue };
                 let conn = next_id.fetch_add(1, Ordering::Relaxed);
                 {
                     let mut map = links.lock().unwrap_or_else(|p| p.into_inner());
-                    map.retain(|_, l| !l.closed.load(Ordering::Acquire));
                     map.insert(conn, Arc::clone(&link));
                 }
                 if tx.send(NetEvent::Opened { conn, peer: Some(peer) }).is_err() {
                     return;
                 }
-                if spawn_reader(conn, link, tx.clone(), "host").is_err() {
+                if spawn_reader(conn, link, tx.clone(), "host", limits.first_frame).is_err() {
                     let _ = tx.send(NetEvent::Closed { conn, reason: "cannot start reader thread".into() });
                 }
             }
@@ -259,10 +367,10 @@ impl ClientNet {
         for &ep in endpoints {
             match TcpStream::connect_timeout(&ep, timeout) {
                 Ok(stream) => {
-                    let link = Link::new(stream)?;
+                    let link = Link::new(stream, NetLimits::default().write_timeout)?;
                     tx.send(NetEvent::Opened { conn, peer: Some(ep) })
                         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session ended"))?;
-                    spawn_reader(conn, Arc::clone(&link), tx, "client")?;
+                    spawn_reader(conn, Arc::clone(&link), tx, "client", FrameCodec::MAX_FRAME_LENGTH)?;
                     return Ok(ClientNet { conn, peer: ep, link });
                 }
                 Err(e) => last = io::Error::new(e.kind(), format!("{ep}: {e}")),
@@ -423,6 +531,110 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(host.connection_count(), 1);
+    }
+
+    #[test]
+    fn the_first_frame_is_read_with_the_small_limit_and_later_ones_with_the_big_one() {
+        let (htx, hrx) = mpsc::channel();
+        let host = HostNet::bind(loopback(), htx).unwrap();
+
+        // a stranger announcing a first frame of 5000 bytes is closed before the host reads it
+        let mut stranger = TcpStream::connect(host.local_addr()).unwrap();
+        let NetEvent::Opened { conn: stranger_id, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+        stranger.write_all(&5000u32.to_be_bytes()).unwrap();
+        match hrx.recv_timeout(WAIT).unwrap() {
+            NetEvent::Closed { conn, reason } => {
+                assert_eq!(conn, stranger_id);
+                assert!(reason.contains("exceeds"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // a peer whose first frame is small may then send big ones
+        let (ctx, _crx) = mpsc::channel();
+        let client = ClientNet::connect(&[host.local_addr()], 1, ctx).unwrap();
+        let NetEvent::Opened { conn: client_id, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+        client.send(&frame(2, b"join")).unwrap();
+        client.send(&frame(30, &vec![7u8; 200_000])).unwrap();
+        for expected in [4usize, 200_000] {
+            match hrx.recv_timeout(WAIT).unwrap() {
+                NetEvent::Frame { conn, frame } => assert_eq!((conn, frame.body.len()), (client_id, expected)),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn connections_over_the_limits_are_turned_away_without_a_trace() {
+        let limits = NetLimits { max_connections: 3, max_per_address: 2, ..NetLimits::default() };
+        let (htx, hrx) = mpsc::channel();
+        let host = HostNet::bind_with(loopback(), htx, limits).unwrap();
+        let first = TcpStream::connect(host.local_addr()).unwrap();
+        let second = TcpStream::connect(host.local_addr()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(hrx.recv_timeout(WAIT).unwrap(), NetEvent::Opened { .. }));
+        }
+        // the same address a third time: refused, and the refused socket sees the close
+        let mut third = TcpStream::connect(host.local_addr()).unwrap();
+        third.set_read_timeout(Some(WAIT)).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(matches!(third.read(&mut buf), Ok(0) | Err(_)));
+        assert_eq!(host.refused_count(), 1);
+        assert!(hrx.recv_timeout(Duration::from_millis(200)).is_err(), "no event for a refused connection");
+        assert_eq!(host.connection_count(), 2);
+        // a closed connection makes room again
+        drop(first);
+        drop(second);
+        let deadline = std::time::Instant::now() + WAIT;
+        while host.connection_count() > 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _again = TcpStream::connect(host.local_addr()).unwrap();
+        loop {
+            match hrx.recv_timeout(WAIT).unwrap() {
+                NetEvent::Opened { .. } => break,
+                NetEvent::Closed { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(host.refused_count(), 1);
+    }
+
+    #[test]
+    fn a_peer_that_stops_reading_is_cut_off_instead_of_stopping_the_writer() {
+        let limits = NetLimits { write_timeout: Duration::from_millis(300), ..NetLimits::default() };
+        let (htx, hrx) = mpsc::channel();
+        let host = HostNet::bind_with(loopback(), htx, limits).unwrap();
+        let _silent = TcpStream::connect(host.local_addr()).unwrap(); // never reads
+        let NetEvent::Opened { conn, .. } = hrx.recv_timeout(WAIT).unwrap() else { panic!("opened") };
+
+        let big = frame(11, &vec![1u8; 900_000]);
+        let started = std::time::Instant::now();
+        let mut longest = Duration::ZERO;
+        let mut failed = false;
+        for _ in 0..400 {
+            let before = std::time::Instant::now();
+            if host.send(conn, &big).is_err() {
+                failed = true;
+                longest = before.elapsed();
+                break;
+            }
+        }
+        assert!(failed, "buffers are finite: the writes must end in an error");
+        assert!(longest < Duration::from_secs(5), "the failing write took {longest:?}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // the connection was closed by the failed write
+        loop {
+            match hrx.recv_timeout(WAIT).unwrap() {
+                NetEvent::Closed { conn: c, .. } => {
+                    assert_eq!(c, conn);
+                    break;
+                }
+                NetEvent::Frame { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(host.send(conn, &big).is_err());
     }
 
     #[test]
