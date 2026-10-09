@@ -96,16 +96,20 @@ guide events and the like are per-game state and intentionally local.
 | `makeAnimalSetStateCmd`, `makeAnimalSpawnAtCmd`, `makeIndustrySetManualDevelopmentCmd`, `makeJournalClearAllCmd`, `makeStockListSetModifiersCmd`, `makeStockListSetStocksCargoTypeCmd`, `makeTownDevelopAtCmd`, `makeWorldChangeWindCmd` | engine factories with no call site in the base scripts (`makeStockListSetStocksCargoTypeCmd` is commented out in `entity_window_util.tl`) | revisit if a mod calls them |
 | `api.cmd.debug.*` (`makeStockSetCargoAmountCmd`, `makeSimPersonSetStateCmd`, `makeMaintenanceCostUpdateCmd`) | debug panel | not replicated |
 
-TF3 has no per-vehicle orders or timetables: waiting times, load modes, cargo filters and the reservation priority are
-fields of the line's stops and travel in `makeLineCreateCmd` / `makeLineUpdateCmd`. Cargo and passenger routing is a
-consequence of lines and stations, not a command. There is no settings command; difficulty is fixed at game creation.
+The base windows have no per-vehicle orders or timetables: waiting times, load modes, cargo filters and the reservation
+priority are fields of the line's stops and travel in `makeLineCreateCmd` / `makeLineUpdateCmd`. Cargo and passenger
+routing is a consequence of lines and stations, not a command. No settings command appears in the base scripts; the
+only "settings" that reach the engine from a window are the calendar and weather ones above.
 
 ## Shared with the other modules
 
 `L.registerCommands` replaces a spec of the same name, and the bridge loads build, then ops, then company. Names this
 module registers that another module may want too: `makeEntitySetNameCmd` (the company's name), `makeEntitySetColorCmd`,
 `makeJournalBookAssetCmd`. A module that registers one of them replaces this module's spec; give it the same
-argument handling (references checked, objects rebuilt) or leave it out. Events do not collide: register them through
+argument handling (references checked, objects rebuilt) or leave it out. "Own company" (`{ __ref = "player" }`) means
+the player entity of the game that applies the action, which is right while all players share one company; separate
+companies (roadmap 0.6) need the company module to say whose company a name, a purchase or a booking belongs to.
+Events do not collide: register them through
 the `events` table of the module (`{ Companies = { applyLevel = {...} } }`) and they are added to the others'. A
 module that registers `makeScriptingSendEventCmd` as a command would replace the dispatcher and silence every event;
 `events` is the way.
@@ -166,12 +170,17 @@ loan, and it was a placeholder:
 None of this has run in the game. Each item says what to do and what to compare; `mod.log` is in
 `%LOCALAPPDATA%\FeverLink3\live` (one per game; do not read them while a game is writing, copy first).
 
-1. **V1. Engine objects.** Two games in a session, the client buys one bus in a depot of the savegame. Client log: an
-   `action <id>:<n> makeVehicleBuyCmd stamped ...` line, and **no** `sent natively: argument 3: ...` line. Host log:
-   `action <id>:<n> makeVehicleBuyCmd applied at t=<T>` and `created entity <id> (TRANSPORT_VEHICLE)`, `<T>` equal to the
-   step in the client's log. Both vehicle lists show the bus; the money in the top bar is the same. If the client says
-   `sent natively`, the text after it names the member (`does not rebuild equal at ...`, or the engine's own message):
-   that is what to fix in the schema or the read-only rule.
+**One game is enough for most of it.** A host with no other player still captures, encodes (including the dry run that
+rebuilds every engine object), stamps and applies its own commands at their stamp, so the codec guesses (V1, V2, V4's
+hint, V5, V6, V8, V9, V12, V13) show up as a `sent natively` line or as an `applied` / `created entity` line in its own
+`mod.log`. Items that need a second game say so (V3, V10, and the "same on both" comparisons).
+
+1. **V1. Engine objects.** In a session (host alone is enough), buy one bus in a depot of the savegame. Log: an
+   `action <id>:<n> makeVehicleBuyCmd stamped ...` line, then `applied at t=<T>` and `created entity <id>
+   (TRANSPORT_VEHICLE)` a step or two later, and **no** `sent natively: argument 3: ...` line. With a second game: the
+   other game's log shows the same `<T>`, both vehicle lists show the bus, the money in the top bar is the same. If a
+   game says `sent natively`, the text after it names the member (`does not rebuild equal at ...`, or the engine's own
+   message): that is what to fix in the schema or the read-only rule.
 2. **V2. Read-only members.** `[FeverLink3 ops] read-only member 'x' of Line is left to the engine` lines list what the
    engine derives. Expected for a few members, not for `stops`, `vehicles` or `purchaseTime`.
 3. **V3. Model ids.** After V1, `[FeverLink3 ops] model <name> is <n> here and <m> on the sending game` in the host log
@@ -189,12 +198,14 @@ None of this has run in the game. Each item says what to do and what to compare;
    `makeVehicleReplaceCmd`, one line in the module).
 7. **V7. Several purchases in one step.** Clone a vehicle five times (the window sends five purchases). Five new vehicles on
    both; sell the third one: the same one disappears on both (compare names or positions in the list).
-8. **V8. Loans.** Take a loan on the client, with the game running and again paused. Both games: the same balance and
-   loan in the next `checksum_report` (parts `balance` and `loan`), `action ... event` lines in both logs, the
-   repayment window shows the same obtained loan. This also verifies the assumption behind `adjustLoan`: a loan taken
-   raises both the balance and the account's loan by its amount (read the two values before and after in the finance
-   window or the next report). Then repay it. To see `adjustLoan` itself, a divergence has to be forced (not possible
-   without a debug tool); the unit tests cover it with a mock.
+8. **V8. Loans.** Take a loan, with the game running and again paused (host alone is enough for the first half). Log:
+   `action <id>:<n> makeScriptingSendEventCmd stamped ...` and `applied`, no `sent natively`; the finance window shows
+   the obtained loan. With a second game both show the same balance and loan in the next report (parts `balance` and
+   `loan` equal in the two `checksum_report` lines of `from_game.log`). This also verifies the assumption behind
+   `adjustLoan`: in the host's `checksum_report` lines the `authority` field holds the real `balance` and `loan`;
+   two reports on either side of the loan must differ by the loan's amount in **both** numbers (+amount each; the
+   money spent meanwhile moves only the balance, so take the loan with nothing else running). Then repay it: both go
+   back down. `adjustLoan` itself only runs when a divergence is found; the unit tests cover it with a mock.
 9. **V9. Marketing and money.** Start a marketing campaign on a town from the client: both balances drop by the same
    cost, once. `from_game.log` of the client holds two `action` lines (the event and the journal booking).
 10. **V10. Permissions.** The host revokes `spend` for the client in the window. The client's purchase, loan and campaign
@@ -204,7 +215,9 @@ None of this has run in the game. Each item says what to do and what to compare;
 11. **V11. Calendar.** Change the calendar speed and the time of day on the client; the date and the sky agree on both
     after a minute. Switch time of day to Local on the client: the log says it is not replicated.
 12. **V12. Towns and industries.** Greenify an industry, set a town rating sensitivity, accept a subsidy, toggle
-    historic preservation on a building, from the client; the host shows the same industry/town state.
+    historic preservation on a building; the other game shows the same industry/town state. If the historic
+    preservation click ends in `sent natively: argument 1: cannot refer to entity <n> as a construction`, a town
+    building is not a construction entity in this build and its reference needs the building's own component.
 13. **V13. Sale and rename.** Sell a bus from the client, rename a station group and the company from the host: same
     result on both; the company name is the same although the two games' player entities differ.
 14. **V14. Time cost.** Note any frame hitch when an action is applied, in particular after N8 (an industry or building
