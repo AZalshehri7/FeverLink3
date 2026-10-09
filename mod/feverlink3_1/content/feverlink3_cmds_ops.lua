@@ -228,9 +228,10 @@ local function marshal(v, depth)
 	depth = depth or 0
 	if depth > 24 then return nil, "too deep" end
 	local m = A.members(v)
-	if m ~= nil then
+	local count = m ~= nil and try(function() return #m end) or 0
+	if count > 0 then -- (an empty member list counts as none, as in MPFever's reader: a vector then reads as x, y, z)
 		local out = {}
-		for i = 1, #m do
+		for i = 1, count do
 			local k = m[i]
 			local ok, x = pcall(function() return v[k] end)
 			if ok and type(x) ~= "function" then
@@ -300,6 +301,9 @@ local function fill(obj, tree, typeName, where, skipped)
 					local cur = obj[k]
 					if cur == nil then error("no such member", 0) end
 					fill(cur, mv, ft.inplace, at, skipped)
+					-- some properties hand out copies (MPFever): the filled one is written back; where it is the object itself
+					-- (the game's own makePart fills `part.part` in place) the write changes nothing, and a refusal is harmless
+					pcall(function() obj[k] = cur end)
 					return
 				end
 				local val = mv

@@ -28,7 +28,6 @@ sys.path.insert(0, HERE)  # python -I does not put the script's folder on the pa
 import test_lockstep as T  # noqa: E402  (the harness; imported, never edited)
 
 lupa = T.lupa
-OPS_SRC = T.CMDS_SRC["feverlink3_cmds_ops"]
 
 # ---------------------------------------------------------------- the mock
 
@@ -39,11 +38,10 @@ MODEL_OFFSET = 0
 MODELS = { "vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl" }
 OPS_ENGINE = {}            -- what the harness hands the bridge as FEVERLINK3_ENGINE: nothing, so its own adapters run
 FAILED, PENDING, LOANS = {}, {}, { obtained = {} }
-EVENTS_SEEN, TOWNS_STATE, GREEN, MARKETING, SUBS, NOTES = {}, {}, {}, {}, {}, {}
+TOWNS_STATE, GREEN, MARKETING, SUBS, NOTES = {}, {}, {}, {}, {}
 
 local function modelId(name) for i, n in ipairs(MODELS) do if n == name then return 100 + i + MODEL_OFFSET end end end
 local function modelName(id) return MODELS[id - 100 - MODEL_OFFSET] end
-MODEL_ID = modelId
 
 -- ---- engine objects
 local TYPES
@@ -549,9 +547,6 @@ class OpsGame(T.Game):
     def loan(self):
         return int(self.L.eval("ACCOUNT.loan"))
 
-    def failed(self):
-        return str(self.L.eval("table.concat(FAILED, ' | ')"))
-
     def actions_shipped(self):
         return [l for l in self.lines(self.from_game) if l.split(T.TAB)[1] == "action"]
 
@@ -598,9 +593,6 @@ class OpsBase(unittest.TestCase):
         if isinstance(p, tuple):
             p = p[0]
         return str(p.body), p
-
-    def both_logs(self):
-        return self.A.log() + self.B.log()
 
 
 class StrictLookupTest(OpsBase):
@@ -1135,6 +1127,10 @@ class ModuleTest(unittest.TestCase):
             x, y, z = 1.5, 2.5, 3.5
 
         t = marshal(Vector())
+        self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
+        listed = Vector()   # a member list that is empty (or that cannot be counted) does not hide the coordinates
+        setattr(listed, "__members", [])
+        t = marshal(listed)
         self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
 
     def test_marshal_refuses_what_cannot_travel_and_says_what(self):
