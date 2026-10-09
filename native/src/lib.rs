@@ -39,8 +39,20 @@ mod entry {
     #[no_mangle]
     pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
         if reason == DLL_PROCESS_ATTACH {
-            if let Some(dir) = std::env::var_os(SESSION_DIR_VAR) {
-                log::init(std::path::PathBuf::from(dir).join("native.log"));
+            let launched = std::env::var_os(SESSION_DIR_VAR);
+            let live = launched.is_none() && is_game_process();
+            let log_path = match &launched {
+                Some(dir) => Some(std::path::PathBuf::from(dir).join("native.log")),
+                None if live => {
+                    feverlink3_launcher::live::live_dir().and_then(|d| d.parent().map(|p| p.join("native.log")))
+                }
+                None => None,
+            };
+            if let Some(path) = log_path {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                log::init(path);
                 log::line(&format!("FeverLink3 native {} loaded", env!("CARGO_PKG_VERSION")));
                 match game_build() {
                     Some(ts) => match build_table::select(ts) {
@@ -51,9 +63,25 @@ mod entry {
                     },
                     None => log::line("could not read the game's PE header"),
                 }
+                if live {
+                    // not started by the launcher executable: the session runs in this process, driven by the mod's window
+                    log::line(if feverlink3_launcher::live::spawn().is_some() {
+                        "live session controller started"
+                    } else {
+                        "live session controller could not start"
+                    });
+                }
             }
         }
         TRUE
+    }
+
+    /// True when the host executable is the game: the proxy sits in the game folder, but be exact.
+    fn is_game_process() -> bool {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.eq_ignore_ascii_case(feverlink3_launcher::GAME_EXE)))
+            .unwrap_or(false)
     }
 
     /// The link timestamp of the running executable, which identifies the game build.

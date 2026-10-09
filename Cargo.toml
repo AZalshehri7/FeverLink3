@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "native", "launcher"]
+members = ["core", "native", "launcher", "tools/release"]
 
 [workspace.package]
 version = "0.1.0"

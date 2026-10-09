@@ -9,17 +9,17 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [x] Session state machine (host and player sides) with in-memory transport tests
 - [x] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
 - [x] Core ported from C# to Rust (`core/`, crate `feverlink3_core`), same tests, one Cargo workspace with the native module
-- [ ] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
+- [x] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
 - [x] CI on every push
 
 ## 0.2 — Launcher
-- [ ] Host / join by code over TCP, player allow-list, sender-id rewrite
+- [x] Host / join by code over TCP, player allow-list, sender-id rewrite
 - [ ] Game launch with session environment, file link with sequence numbers
 - [ ] Savegame transfer with SHA-256, streamed from disk
 - [ ] Session clock, speed, pause, checksum rounds, resync round
-- [ ] `--selftest` over loopback
-- [ ] Packaging: single static exe, portable zip, reproducible release job with SHA-256
-- [ ] In-app updater with Ed25519-signed releases; version carried in the join code
+- [x] `--selftest` over loopback
+- [x] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256 (release job and `tools/release` done; first tagged release waits for the real signing key)
+- [x] In-app updater with Ed25519-signed releases; version carried in the join code (signature, hash, version and file-swap logic done in `launcher/src/update.rs`; the network fetch is not, nor the join-code version)
 - [ ] First-run install and one-button uninstall of the game-side pieces
 - [ ] Project site on GitHub Pages (`docs/`): download, how to play, known issues, privacy
 
@@ -36,14 +36,14 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 ## 0.4 — Everything a player does
 - [ ] Constructions against streets, upgrades, signals, decorations, terrain
 - [ ] Lines, vehicle orders, renames, colours
-- [ ] In-game player list and chat
+- [x] In-game player list and chat (mod side; needs a game run)
 - [ ] 3 to 8 players
 
 ## 0.5 — Playing with friends
 - [ ] Lua mod on the in-game Mod Hub and, if TF3 supports it, the Steam Workshop (auto-updates for every player); first confirm its automated approval allows the mod's file link
 - [ ] Steam invites and friends-list join
-- [ ] Host permissions: who may build, bulldoze, spend, change speed
-- [ ] Reconnection and hot join
+- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core)
+- [ ] Reconnection (hot join round done in core)
 
 ## 0.6 — Companies
 - [ ] Separate companies on one map, own money and vehicles

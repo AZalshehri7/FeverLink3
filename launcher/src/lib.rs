@@ -8,15 +8,27 @@
 //! - [`gamelink`]: the file link with one game instance: a per-session folder, `to_game.log` written by the
 //!   launcher, `from_game.log` tailed by it, every line carrying a sequence number so history is never dispatched
 //!   twice.
+//! - [`update`]: update decision, signature and hash checks and the file-swap plan, over bytes (no network yet).
 //! - [`process`]: starting `TransportFever3.exe` with the session environment.
 //!
-//! No networking and no UI: the protocol lives in the core crate, the lobby in a later stage. Every path and text
+//! - [`net`], [`session`], [`luatext`]: TCP transport, the session threads that wire the core crate's state
+//!   machines to sockets and to the game's files, and the payload translation between them.
+//! - [`selftest`]: a host and two players with fake games over loopback.
+//!
+//! No UI: the window comes in a later stage. The protocol lives in the core crate. Every path and text
 //! transformation is a pure function over its inputs so the tests run on a machine without Steam or the game.
 
 pub mod gamelink;
 pub mod install;
+pub mod live;
+pub mod luatext;
+pub mod net;
 pub mod process;
+pub mod resync;
+pub mod selftest;
+pub mod session;
 pub mod steam;
+pub mod update;
 
 /// Steam app id of Transport Fever 3.
 pub const APP_ID: &str = "3493540";

@@ -1,0 +1,24 @@
+[package]
+name = "feverlink3_release"
+description = "FeverLink3 release tool: reproducible portable zip, manifest with SHA-256, Ed25519 keygen and signing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "feverlink3_release"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+getrandom = "0.2.16"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "~3.10"

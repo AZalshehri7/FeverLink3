@@ -28,6 +28,10 @@ STEP = 200
 T0 = 18600
 
 
+def lua_str(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def read_text(path):
     if not os.path.exists(path):
         return ""
@@ -42,6 +46,7 @@ def read_src(name):
 COMMON_SRC = read_src("feverlink3_common.lua")
 LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
+HUD_SRC = read_src("feverlink3_hud.lua")
 
 # ---------------------------------------------------------------- mocked engine (one per game)
 
@@ -54,6 +59,22 @@ WORLD = {
   [56] = { CONSTRUCTION = { fileName = "station.con", transf = { [13] = -40.5, [14] = 12, [15] = 0 } } },
 }
 ACCOUNT = { balance = 1000000, loan = 250000 }
+JOURNAL = {}
+-- the application object: saving calls back one tick later, loading is a reload the test performs (RELOAD)
+SAVES = { { saveName = "hostsave", path = "/saves/hostsave.sav" } }
+SAVED, LOADED, SAVE_FAIL, SAVE_CBS, RELOAD_PENDING = {}, nil, false, {}, false
+app = {
+  SaveGameNamespace = { getSavegame = function() return 1 end },
+  saveGame = function(name, cb, a, b)
+    assert(a == false and b == true, "save flags as in MPFever")
+    if SAVE_FAIL then error("disk full") end
+    SAVED[#SAVED + 1] = name
+    SAVES[#SAVES + 1] = { saveName = name, path = "/saves/" .. name .. ".sav" }
+    SAVE_CBS[#SAVE_CBS + 1] = cb
+  end,
+  findAllSavegames = function(ns) assert(ns == 1); return SAVES end,
+  loadGame = function(id, flag) assert(id.saveGameNamespace == 1 and id.path); LOADED = id.saveGameName; RELOAD_PENDING = true end,
+}
 local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8 }
 local NAMEOF = {}
 for k, v in pairs(CT) do NAMEOF[v] = k end
@@ -85,6 +106,13 @@ function EXECUTE(cmd, cb)
   end
   if name == "makeScriptingSendEventCmd" then
     SIM_EVENT(a[1], a[2], a[3], a[4])
+    if cb then cb({}, true, {}) end
+    return
+  end
+  if name == "makeJournalBookAssetCmd" then
+    assert(a[1] == 7, "player entity expected")
+    ACCOUNT.balance = ACCOUNT.balance + a[2].amount
+    JOURNAL[#JOURNAL + 1] = a[2].amount
     if cb then cb({}, true, {}) end
     return
   end
@@ -126,12 +154,16 @@ function MAKE_API()
       GAME.guiQueue[#GAME.guiQueue + 1] = { c, cb }
     end,
   }
-  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd" }) do
+  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd" }) do
     cmd[n] = mk(n)
   end
   return {
     cmd = cmd,
-    type = { ComponentType = CT },
+    type = {
+      ComponentType = CT,
+      JournalEntry = { new = function() return { category = {} } end, Type = { OTHER = 1 } },
+      SavegameId = { new = function() return {} end },
+    },
     engine = {
       getComponent = function(e, t)
         if t == CT.GAME_TIME then return { gameTime = GAME.time } end
@@ -174,9 +206,11 @@ function LOAD_HALF(label)
   local env = setmetatable({}, { __index = _G })
   env.api = MAKE_API()
   env.package = { loaded = {} }
+  env.FEVERLINK3_ENGINE = { adjustLoan = function(d) ACCOUNT.loan = ACCOUNT.loan + d end }   -- the injected loan accessor
   env.ug_require = function(p)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
+    if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
     error("no module " .. tostring(p))
   end
   assert(load(BRIDGE_SRC, "=bridge-" .. label, "t", env))()
@@ -187,9 +221,45 @@ SIM, SIM_ENV = LOAD_HALF("sim")
 GUI, GUI_ENV = LOAD_HALF("gui")
 GUI_API = GUI_ENV.api
 
+-- a savegame reload: the scripts start again (fresh Lua states), the world and the session folder stay
+function RELOAD()
+  RELOAD_PENDING = false
+  GAME.guiQueue = {}
+  SIM, SIM_ENV = LOAD_HALF("sim")
+  GUI, GUI_ENV = LOAD_HALF("gui")
+  GUI_API = GUI_ENV.api
+end
+
+-- the window's side (feverlink3_ui.script.lua minus the drawing): read the snapshot, queue a chat line
+function UI_ENV_NEW()
+  local env = setmetatable({}, { __index = _G })
+  env.package = { loaded = {} }
+  env.ug_require = function(p)
+    if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    error("no module " .. tostring(p))
+  end
+  env.C, env.Hud = env.ug_require("feverlink3_common"), env.ug_require("feverlink3_hud")
+  return env
+end
+function UI_SEND(text)
+  local e = UI_ENV_NEW()
+  UI_OUTBOX = UI_OUTBOX or e.Hud.newOutbox(e.C)
+  return e.Hud.sendChat(e.C, UI_OUTBOX, text)
+end
+function UI_VIEW()
+  local e = UI_ENV_NEW()
+  local m = e.Hud.readSnapshot(e.C, nil)
+  if not m then return nil end
+  return e.Hud.statusText(m) .. "|" .. e.Hud.rosterText(m) .. "|" .. table.concat(e.Hud.chatLines(m, 15), ";")
+end
+
 function SIM_EVENT(src, id, name, param) SIM.handleEvent(nil, STATE, src, id, name, param) end
 function FRAME() GUI.guiUpdate(nil, STATE, GSTATE) end
 function SIMSTEP()
+  local cbs = SAVE_CBS
+  SAVE_CBS = {}
+  for _, cb in ipairs(cbs) do cb() end
   local q = GAME.guiQueue
   GAME.guiQueue = {}
   for _, c in ipairs(q) do EXECUTE(c[1], c[2]) end
@@ -217,12 +287,31 @@ class Game:
         os.makedirs(self.dir)
         self.to_game = os.path.join(self.dir, "to_game.log")
         self.from_game = os.path.join(self.dir, "from_game.log")
-        os.environ.update(FEVERLINK3_SESSION_DIR=self.dir, FEVERLINK3_PLAYER_ID=str(player_id), FEVERLINK3_PLAYER_NAME=label)
+        self.use_env()
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
-        g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC
+        g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
         self.L.execute(MOCK % dict(t0=T0, first=first_entity))
         self.L.execute(HARNESS)
+
+    def use_env(self):
+        """The mod reads its environment when its files load: make it this game's."""
+        os.environ.update(FEVERLINK3_SESSION_DIR=self.dir, FEVERLINK3_PLAYER_ID=str(self.id), FEVERLINK3_PLAYER_NAME=self.label)
+
+    def reload(self):
+        self.use_env()
+        self.L.execute("RELOAD()")
+
+    def reload_pending(self):
+        return bool(self.L.eval("RELOAD_PENDING"))
+
+    def ui_send(self, text):
+        self.use_env()
+        return bool(self.L.eval("UI_SEND(%s)" % lua_str(text)))
+
+    def ui_view(self):
+        self.use_env()
+        return self.L.eval("UI_VIEW()")
 
     def frame(self):
         self.L.execute("FRAME()")
@@ -264,6 +353,7 @@ class Relay:
         self.seq = {g.id: 0 for g in games}
         self.history = {g.id: [] for g in games}
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
+        self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
         self.started, self.speed, self.pauseAt = False, 0, None
 
     # launcher -> mod
@@ -274,8 +364,15 @@ class Relay:
         with open(g.to_game, "a", encoding="utf-8", newline="") as f:
             f.write(line)
 
+    def lua(self, v):
+        if isinstance(v, dict):
+            return self.L.table_from({k: self.lua(x) for k, x in v.items()})
+        if isinstance(v, list):
+            return self.L.table_from([self.lua(x) for x in v])
+        return v
+
     def ser(self, d):
-        return self.C.serialize(self.L.table_from(d))
+        return self.C.serialize(self.lua(d))
 
     def broadcast(self, kind, payload, exclude=None):
         for g in self.games:
@@ -298,6 +395,13 @@ class Relay:
 
     def checksum_request(self, n, at, paused):
         self.broadcast("checksum_request", self.ser({"n": n, "at": at, "paused": paused}))
+
+    def send_authority(self, n):
+        """The host's authority values of round n, to every other game (what the core does after a round)."""
+        payload = self.ser({"n": n, "values": self.authority[n]})
+        for g in self.games:
+            if g.id != 0:
+                self.send(g, "authority", 0, payload)
 
     def rewrite_history(self, g, drop=1):
         """Truncate the game's to_game.log and write its history again without the first `drop` lines (a
@@ -323,8 +427,24 @@ class Relay:
                             self.send(o, "action", g.id, payload)
                 elif rec.kind == "hello":
                     self.hello[g.id] = int(p.time)
+                    self.hellos.append(g.id)
+                elif rec.kind == "save_done":
+                    self.saves_done.append((g.id, int(p.id), bool(p.ok), p.detail))
+                elif rec.kind == "replay_failed":
+                    self.replay_failed.append((g.id, str(p.detail)))
+                elif rec.kind == "action_refused":
+                    self.refused.append((g.id, int(p.seq), str(p.detail)))
+                elif rec.kind == "chat":
+                    self.chats.append((g.id, str(p.text)))
+                    # the host fills in the sender and relays to everyone but the origin, as a line from 0
+                    out = self.ser({"text": str(p.text), "from": g.id, "name": g.label})
+                    for o in self.games:
+                        if o is not g:
+                            self.send(o, "chat", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
+                    if g.id == 0 and p.authority is not None:
+                        self.authority[int(p.n)] = {k: v for k, v in p.authority.items()}
                 elif rec.kind == "speed_request":
                     self.speed_requests.append(int(p.speed))
 
@@ -529,6 +649,188 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.A.speed(), 1, "the local engine speed stays the session's")
 
 
+    # ---- host authority
+
+    def test_authority_corrects_balance_and_loan_at_the_checkpoint(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 5000; ACCOUNT.loan = ACCOUNT.loan - 1000")
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        pa, pb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "loan"})
+        self.assertEqual(self.relay.authority[1], {"balance": 1000000, "loan": 250000}, "the host's report carries its account")
+        # the world moves on before the correction arrives: it is measured against the round, not against now
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance - 300")
+        self.relay.send_authority(1)
+        self.tick(6)
+        self.assertEqual(self.B.L.eval("ACCOUNT.balance"), 1000000 - 300, "balance moved by the round's difference (-5000) only")
+        self.assertEqual(self.B.L.eval("ACCOUNT.loan"), 250000)
+        self.assertEqual(self.B.L.eval("JOURNAL[1]"), -5000, "booked as one journal entry for the delta")
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 1)
+        self.assertEqual(self.A.L.eval("#JOURNAL"), 0, "the host's own game is never corrected")
+        self.assertEqual(self.B.applied(), [], "a journal entry is not a replicated action")
+        # the next round is identical
+        self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 300")
+        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertEqual(self.relay.reports[2][0][1], self.relay.reports[2][1][1], "worlds identical after the correction")
+        self.assertIn("balance corrected by -5000", self.B.log())
+
+    def test_authority_without_a_recorded_round_is_skipped(self):
+        self.start()
+        self.tick(5)
+        self.relay.authority[9] = {"balance": 1, "loan": 2}
+        self.relay.send_authority(9)
+        self.tick(5)
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 0)
+        self.assertIn("skipped", self.B.log())
+
+    # ---- resync
+
+    def test_resync_save_then_save_done(self):
+        self.start()
+        self.tick(5)
+        self.relay.send(self.A, "resync_save", 0, self.relay.ser({"id": 7, "name": "resync_7"}))
+        self.tick(4)
+        self.assertEqual(self.A.L.eval("SAVED[1]"), "resync_7")
+        self.assertEqual(self.relay.saves_done, [(0, 7, True, None)])
+        # a failing save reports ok = false with the reason
+        self.A.L.execute("SAVE_FAIL = true")
+        self.relay.send(self.A, "resync_save", 0, self.relay.ser({"id": 8, "name": "resync_8"}))
+        self.tick(4)
+        self.assertEqual(self.relay.saves_done[1][:3], (0, 8, False))
+        self.assertIn("disk full", self.relay.saves_done[1][3])
+
+    def test_resync_load_reloads_says_hello_and_dispatches_nothing_again(self):
+        self.start()
+        self.tick(10)
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(40)
+        before = self.B.applied()
+        self.assertEqual(len(before), 1, "the client applied the host's action once")
+        self.assertEqual(self.relay.hellos.count(1), 1)
+        lines_before = len(self.B.lines(self.B.to_game))
+        self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 3, "name": "hostsave", "sha256": "00"}))
+        self.B.frame()
+        self.assertEqual(self.B.L.eval("LOADED"), "hostsave")
+        self.assertTrue(self.B.reload_pending())
+        self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "%d 0" % (lines_before + 1))
+        # a line queued behind the load in the same file is not dispatched by the old scripts
+        self.relay.send(self.B, "session", 0, self.relay.ser({"started": True, "speed": 3, "lead": 2000}))
+        self.B.frame()
+        self.assertEqual(self.B.speed(), 1)
+        self.B.reload()
+        self.tick(10)
+        self.assertEqual(self.relay.hellos.count(1), 2, "the reloaded mod reports hello again")
+        self.assertEqual(self.B.applied(), before, "nothing the file already held was dispatched again")
+        self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "", "the cursor is used once")
+        self.assertIn("reloaded after a resync", self.B.log())
+        # the line behind the load was kept for the reloaded game, and new lines still arrive
+        self.assertIn("speed=3", self.B.log())
+        self.relay.speed = 2
+        self.relay.started = True
+        self.relay.session()
+        self.tick(5)
+        self.assertEqual(self.B.speed(), 2)
+        # the writer continued its sequence: the launcher saw no restart
+        seqs = [int(l.split(TAB)[0]) for l in self.B.lines(self.B.from_game)]
+        self.assertEqual(seqs, sorted(set(seqs)))
+
+    def test_resync_load_of_an_unknown_save_fails_without_reloading(self):
+        self.start()
+        self.tick(5)
+        self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 4, "name": "nope", "sha256": "00"}))
+        self.tick(3)
+        self.assertFalse(self.B.reload_pending())
+        self.assertEqual(len(self.relay.replay_failed), 1)
+        self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "")
+        self.tick(3)
+        self.assertEqual(self.B.speed(), 1, "the game keeps reading its link")
+
+    # ---- permissions
+
+    def test_denied_category_is_refused_before_stamping(self):
+        self.start()
+        self.tick(10)
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"build": False, "spend": True}))
+        self.tick(2)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function(d, s) LINE_OK = s end)')
+        self.tick(30)
+        self.assertTrue(self.B.L.eval("LINE_OK == false"), "the window got a failed result")
+        self.assertEqual(self.A.applied(), [])
+        self.assertEqual(self.B.applied(), [], "not even applied locally")
+        self.assertFalse(any(l.split(TAB)[1] == "action" for l in self.B.lines(self.B.from_game)), "nothing stamped or shipped")
+        self.assertEqual(self.relay.refused, [(1, 0, "permission denied: build")])
+        # spending is still allowed
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(40)
+        self.assertEqual(len(self.A.applied()), 1)
+        self.assertEqual(self.A.applied(), self.B.applied())
+        # revoked later, granted again later
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"spend": False}))
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"build": True}))
+        self.tick(3)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(30)
+        self.assertEqual(len(self.A.applied()), 1, "the second purchase was refused")
+        self.assertEqual(self.relay.refused[-1][2], "permission denied: spend")
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function() end)')
+        self.tick(40)
+        self.assertEqual(len(self.A.applied()), 2, "building works again")
+
+    def test_relayed_action_not_allowed_requests_a_resync(self):
+        self.start()
+        self.tick(10)
+        body = self.relay.C.serialize(self.relay.C.parse(
+            '{["fn"]="makeVehicleBuyCmd",["args"]={["n"]=3,[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={}}}'))
+        stamp = self.A.time() + 5 * STEP
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": stamp, "seq": 4, "body": body, "from": 1, "allowed": False}))
+        self.tick(15)
+        self.assertEqual(self.A.applied(), [], "an action the sender was not allowed to make is not applied")
+        self.assertEqual(len(self.relay.replay_failed), 1)
+        self.assertEqual(self.relay.replay_failed[0][0], 0)
+        self.assertIn("1:4", self.relay.replay_failed[0][1])
+        self.assertIn("allowed=false", self.A.log())
+
+    # ---- window
+
+    def test_roster_status_and_chat(self):
+        self.start(speed=2)
+        self.relay.send(self.B, "welcome", 0, self.relay.ser({"you": 1, "hostName": "host", "version": "0.1", "players": [{"id": 1, "name": "client", "ready": True}, {"id": 2, "name": "carol", "ready": False}], "session": {}}))
+        self.tick(4)
+        view = self.B.ui_view()
+        self.assertIsNotNone(view)
+        status, roster, chat = str(view).split("|")
+        self.assertEqual(status, "Running x2 - 3 players")
+        self.assertEqual(roster, "host [host], client (you), carol")
+        self.relay.send(self.B, "player_joined", 0, self.relay.ser({"player": {"id": 3, "name": "dave", "ready": False}}))
+        self.relay.send(self.B, "player_left", 0, self.relay.ser({"id": 2, "name": "carol"}))
+        self.tick(4)
+        self.assertEqual(str(self.B.ui_view()).split("|")[1], "host [host], client (you), dave")
+        # pause shows in the status
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(4)
+        self.assertTrue(str(self.B.ui_view()).startswith("Paused"))
+        # typed in the window of B: a chat line to the host, relayed to A, shown in both
+        self.assertTrue(self.B.ui_send("hello team\t!"))
+        self.assertFalse(self.B.ui_send("   "), "empty text is not sent")
+        self.tick(4)
+        self.assertEqual(self.relay.chats, [(1, "hello team !")])
+        self.assertEqual(str(self.B.ui_view()).split("|")[2], "client: hello team !", "own message shown without an echo from the host")
+        self.assertEqual(str(self.A.ui_view()).split("|")[2], "client: hello team !")
+        # a reload keeps the roster and the chat of the window
+        self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 1, "name": "hostsave", "sha256": "00"}))
+        self.B.frame()
+        self.B.reload()
+        self.tick(4)
+        view = str(self.B.ui_view()).split("|")
+        self.assertEqual(view[1], "host [host], client (you), dave")
+        self.assertEqual(view[2], "client: hello team !")
+
+
 class PureTest(unittest.TestCase):
     """The common module and the core, without any game."""
 
@@ -537,6 +839,7 @@ class PureTest(unittest.TestCase):
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         self.C = self.L.execute(COMMON_SRC)
         self.K = self.L.execute(LOCKSTEP_SRC)
+        self.H = self.L.execute(HUD_SRC)
 
     def test_serialize_is_order_independent_and_round_trips(self):
         a = self.L.eval('(function() local t = {} t.b = 1 t.a = { 3, 2, x = "q\\t\\"z" } t[1] = 0.1 t[2] = true return t end)()')
@@ -637,6 +940,67 @@ class PureTest(unittest.TestCase):
         self.assertGreater(len(set(seq1[:5])), 3)
         rng3 = K.newRandom(L.eval("function() return 1200 end"))
         self.assertNotEqual(K.randomDraw(rng3), seq1[0], "another step draws other numbers")
+
+    def test_permissions_categories_and_authority_pure(self):
+        K, L = self.K, self.L
+        self.assertEqual([K.categoryOf(n) for n in ("makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd")], ["spend", "build", "other"])
+        self.assertEqual([K.categoryOf(n) for n in ("makeBulldozeProposalCmd", "makeRemoveEntityCmd", "makeConstructionCmd", "makeBuyVehicle", "makeSetNameCmd")],
+                         ["bulldoze", "bulldoze", "build", "spend", "other"])
+        perms = K.newPermissions()
+        self.assertTrue(all(K.permitted(perms, c) for c in ("build", "bulldoze", "spend", "other")))
+        self.assertTrue(K.applyPermissions(perms, L.table_from({"build": False, "other": "no", "junk": False})))
+        self.assertFalse(K.permitted(perms, "build"))
+        self.assertTrue(K.permitted(perms, "other"), "only an explicit boolean changes a grant")
+        self.assertFalse(K.applyPermissions(perms, L.table_from({"build": False})), "no change reported when nothing changed")
+        self.assertTrue(K.applyPermissions(perms, L.table_from({"build": True})))
+        self.assertTrue(K.permitted(perms, "build"))
+        d = K.authorityDeltas(L.table_from({"balance": 100.4, "loan": 50}), L.table_from({"balance": 200, "loan": 50}))
+        self.assertEqual((d.balance, d.loan), (100, None))
+        booked = []
+        eng = L.table_from({"bookJournal": L.eval("function(a) BOOKED = a end"), "adjustLoan": None})
+        applied, failed = K.applyAuthority(eng, L.table_from({"balance": 1, "loan": 5}), L.table_from({"balance": 11, "loan": 9}))
+        self.assertEqual(applied.balance, 10)
+        self.assertEqual(list(failed.values()), ["loan"], "a build without a loan accessor reports it cannot correct the loan")
+
+    def test_hud_model(self):
+        H, L = self.H, self.L
+        h = H.new(1, "me")
+        self.assertEqual(H.statusText(h), "Waiting for the host to start - 1 player")
+        H.setSession(h, L.table_from({"started": True, "speed": 1}))
+        H.playerJoined(h, L.table_from({"player": L.table_from({"id": 0, "name": "boss", "ready": True})}))
+        self.assertEqual(H.statusText(h), "Running x1 - 2 players")
+        self.assertEqual(H.rosterText(h), "boss [host], me (you)")
+        H.setSession(h, L.table_from({"started": True, "speed": 2, "pauseAt": 4000}))
+        self.assertTrue(H.statusText(h).startswith("Paused"))
+        v = h.version
+        H.setSession(h, L.table_from({"started": True, "speed": 2, "pauseAt": 4000}))
+        self.assertEqual(h.version, v, "an unchanged session does not bump the version")
+        H.playerLeft(h, L.table_from({"id": 1, "name": "me"}))
+        self.assertEqual(H.rosterText(h), "boss [host], me (you)", "a game never removes itself")
+        H.playerLeft(h, L.table_from({"id": 0, "name": "boss"}))
+        self.assertEqual(H.rosterText(h), "me (you)")
+        self.assertEqual(H.cleanText("  a\tb\nc  "), "a b c")
+        self.assertIsNone(H.cleanText("   "))
+        self.assertIsNone(H.cleanText(5))
+        self.assertEqual(len(H.cleanText("x" * 900)), 500)
+
+    def test_hud_history_is_bounded_and_snapshot_round_trips(self):
+        H, L = self.H, self.L
+        h = H.new(2, "me")
+        for i in range(1, 251):
+            H.addChat(h, "bob", "m%d" % i, 3)
+        self.assertEqual(len(h.history), 200)
+        self.assertEqual(h.history[1].text, "m51")
+        self.assertEqual(h.history[200].text, "m250")
+        self.assertEqual(H.chatLines(h, 2)[2], "bob: m250")
+        self.assertFalse(H.addChat(h, "bob", "  ", 3))
+        snap = H.snapshot(h)
+        back = H.fromSnapshot(self.C.parse(self.C.serialize(snap)))
+        self.assertEqual(back.version, h.version)
+        self.assertEqual(len(back.history), 200)
+        self.assertEqual(back.history[200].text, "m250")
+        self.assertEqual(H.rosterText(back), "me (you)")
+        self.assertIsNone(H.fromSnapshot(L.table_from({"version": 1})))
 
     def test_encode_decode_commands(self):
         K, L = self.K, self.L

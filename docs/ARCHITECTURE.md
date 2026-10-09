@@ -128,3 +128,24 @@ No installer. A release is one zip: `FeverLink3.exe`, the proxy DLL, the mod fol
 - **In-app updates.** The launcher checks GitHub Releases, downloads the zip, verifies an Ed25519 signature (public key embedded, private key kept offline by the maintainer) and replaces itself. Files the launcher downloads carry no mark-of-the-web, so Windows SmartScreen appears once per PC, at the very first run, and never for updates. The join code carries the host's version; a player on another version is offered the update before joining.
 - **Code signing** is the only thing that removes the first-run warning. Apply to the SignPath Foundation (free for open-source projects) once 0.3 is playable; the CI builds and release history are their prerequisites. Paid certificates only if that fails.
 - **No injection.** The proxy DLL is loaded by the game itself. It is small, unobfuscated, and documented in plain words in the README, because antivirus heuristics and players' trust both depend on that.
+
+## 12. Live mode: the session runs inside the game
+
+The terminal launcher is a development tool. A player installs, starts Transport Fever 3 from Steam and uses the
+in-game window.
+
+- `winhttp.dll` (the native module) starts `launcher::live::spawn()` on a thread when the process is the game and
+  `FEVERLINK3_SESSION_DIR` is not set. The controller owns the same `run_host` / `run_player` sessions the launcher
+  binary starts, so the protocol, the file link and the tests are the same code.
+- The folder is fixed: `%LOCALAPPDATA%\FeverLink3\live`. The mod finds it without an environment variable. The
+  controller clears it at every game start.
+- The window (a button in the game bar, `GameBarInfoDisplayExtension`) appends commands to `ctl_cmd.log`
+  (`host`, `join`, `leave`, `start`, `pause`, `speed`, `check`, `resync`) and reads the controller's answer from
+  `ctl_status.txt`. The controller writes `identity.txt` (`role=idle|host|player`); the mod becomes active when the
+  role is `host` or `player`, without reloading the game.
+- The Lua UI state has no `io` global; the mod takes `package.loaded.io` (finding from MPFever, MIT).
+- Verified in game build 40420 on 2026-10-09: the button and window appear, "Host a game" opens the listener inside
+  the game process and the window shows the join code. Joining from a second game, saves and the native hooks are not
+  yet verified.
+- Open point: a panic in the controller aborts the game (the workspace builds with `panic = "abort"`). The controller
+  code returns errors instead of panicking; a `catch_unwind` guard needs the profile to unwind for the native crate.

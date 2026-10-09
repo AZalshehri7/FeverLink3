@@ -1,0 +1,68 @@
+name: Release
+
+# A release is a tag built here, never on a developer's PC. See docs/RELEASING.md.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      SIGNING_KEY: ${{ secrets.FEVERLINK3_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          cargo run --release -p feverlink3_release -- package --version $version --out dist
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Sign manifest
+        if: ${{ env.SIGNING_KEY != '' }}
+        shell: pwsh
+        run: |
+          # The key is written to the runner's temp folder, used once and deleted.
+          $keyFile = Join-Path $env:RUNNER_TEMP 'feverlink3_release.key'
+          Set-Content -NoNewline -Path $keyFile -Value $env:SIGNING_KEY
+          try {
+            cargo run --release -p feverlink3_release -- sign --key $keyFile --manifest dist/manifest.json
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          } finally {
+            Remove-Item -Force $keyFile
+          }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $zip = "FeverLink3-$version.zip"
+          $sha = (Get-Content "dist/$zip.sha256").Split(' ')[0]
+          $signed = Test-Path dist/manifest.json.sig
+          $sigLine = if ($signed) { "The manifest is signed with Ed25519 (manifest.json.sig)." } else { "This build is UNSIGNED: the signing key was not configured, so the in-app updater will refuse it." }
+          $notes = @"
+          FeverLink3 $version
+
+          SHA-256 of ${zip}:
+
+          ``$sha``
+
+          $sigLine Verify by hand: see docs/RELEASING.md.
+          "@
+          Set-Content -Path notes.md -Value $notes
+          $assets = @("dist/$zip", "dist/$zip.sha256", "dist/manifest.json")
+          if ($signed) { $assets += "dist/manifest.json.sig" }
+          $extra = @(); if ("$version" -match '-') { $extra += '--prerelease' }
+          gh release create "${{ github.ref_name }}" @assets --title "FeverLink3 $version" --notes-file notes.md @extra
+          if ($LASTEXITCODE -ne 0) { exit 1 }
