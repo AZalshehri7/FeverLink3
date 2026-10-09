@@ -25,7 +25,7 @@ Files in `feverlink3_1/content/`:
 | `feverlink3_common.lua` | Environment, deterministic serialisation, FNV-1a hash, link reader and writer. Pure Lua 5.2. |
 | `feverlink3_lockstep.lua` | The lockstep core: session, peers, pacing, stamps, queue, command encoding, deterministic random, checksum parts. Pure functions over state tables. |
 | `feverlink3_hud.lua` | The window's model: player roster, bounded chat history (200), status text, and the two file hand-offs below. Pure Lua, tested. |
-| `feverlink3_ui.lua` | The window itself, drawn with the game's react toolkit. **Engine-bound and untested** (never run in a game). |
+| `feverlink3_ui.script.lua` | The window itself, drawn with the game's react toolkit. **Engine-bound and untested** (never run in a game). |
 | `feverlink3_entry.res.lua` | Registers the window on the game's mod entry point (react-plugin). Untested. |
 | `feverlink3_bridge.script.lua` | Glue to the engine: the real `api.*` accessor, the two script halves, the `sendCommand` wrap. Thin. |
 

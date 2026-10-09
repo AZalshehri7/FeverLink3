@@ -2,7 +2,7 @@
 -- small file hand-offs between the bridge (which owns the file link) and the window (which lives in the UI):
 --   hud_state.txt   bridge -> window: a versioned snapshot, rewritten when something changed
 --   ui_out.log      window -> bridge: appended records "seq <TAB> chat <TAB> 0 <TAB> {text=...}", one writer only
--- No engine calls here; the drawing is in feverlink3_ui.lua. Everything in this file is tested by
+-- No engine calls here; the drawing is in feverlink3_ui.script.lua. Everything in this file is tested by
 -- tests/lua/test_lockstep.py.
 
 local H = {}

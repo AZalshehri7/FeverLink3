@@ -30,10 +30,15 @@ if C.PLAYER_NAME == nil or C.PLAYER_NAME == "" then C.PLAYER_NAME = "player " ..
 -- the game may run scripts with a reduced standard library: take io only if it is there
 do
 	local ok, v = pcall(function() return io end)
+	if not (ok and type(v) == "table") then
+		-- the game removes the io global but leaves the module loaded (finding from MPFever (MIT): package.loaded.io)
+		ok, v = pcall(function() return package.loaded["io"] end)
+	end
 	C.IO = ok and type(v) == "table" and v or nil
 end
 -- without the session folder (game not started by FeverLink3.exe) the mod does nothing
 C.ACTIVE = C.DIR ~= nil and C.DIR ~= "" and C.PLAYER_ID ~= nil and C.IO ~= nil
+print("[feverlink3] common loaded: active=" .. tostring(C.ACTIVE) .. " io=" .. tostring(C.IO ~= nil) .. " id=" .. tostring(C.PLAYER_ID))
 
 local SEP = (C.DIR and C.DIR:find("/", 1, true) and not C.DIR:find(BS, 1, true)) and "/" or BS
 function C.path(fileName)

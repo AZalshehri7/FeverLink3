@@ -98,15 +98,20 @@ do
 	local okR, react = pcall(ug_require, "::/gui/main/react.lua")
 	local okB, builtin = pcall(ug_require, "::/gui/main/builtin.lua")
 	local okE, entry = pcall(ug_require, "::/gui/main/mod_entry_point.tl")
-	if C.ACTIVE and okR and okB and okE and entry and entry.ModEntryPointExtension then
-		local okS, recipeFn = pcall(setup, react, builtin)
+	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
+	if okR and okB and okE and entry and entry.ModEntryPointExtension then
+		local okS, recipeFn = pcall(function()
+			if C.ACTIVE then return setup(react, builtin) end
+			-- not started by the launcher: an empty, invisible entry so the game has a recipe to mount
+			return function() return builtin.BoxLayout { children = {} } end
+		end)
 		if okS then
 			local okP, recipe = pcall(react.RegisterPluginRecipe, entry.ModEntryPointExtension, "FeverLink3Entry", recipeFn)
-			if okP then M.FeverLink3Entry = recipe else log("entry registration failed: " .. tostring(recipe)) end
+			if okP then M.FeverLink3Entry = recipe else print("[feverlink3] entry registration failed: " .. tostring(recipe)) end
 		else
-			log("window setup failed: " .. tostring(recipeFn))
+			print("[feverlink3] window setup failed: " .. tostring(recipeFn))
 		end
-	elseif C.ACTIVE then
+	else
 		log("UI unavailable: react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
 	end
 end

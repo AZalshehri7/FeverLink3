@@ -230,7 +230,7 @@ function RELOAD()
   GUI_API = GUI_ENV.api
 end
 
--- the window's side (feverlink3_ui.lua minus the drawing): read the snapshot, queue a chat line
+-- the window's side (feverlink3_ui.script.lua minus the drawing): read the snapshot, queue a chat line
 function UI_ENV_NEW()
   local env = setmetatable({}, { __index = _G })
   env.package = { loaded = {} }
