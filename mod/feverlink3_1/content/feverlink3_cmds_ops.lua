@@ -453,6 +453,9 @@ local function encodeRef(ctx, st, e, kind)
 		r.f, r.p = A.fileOf(e), A.positionOf(e)
 	else
 		r.at = describe(ctx, st, e, kind)
+		-- the entity belongs to a building made in the session: its own id is then not one the other games share, and
+		-- the building's key and the entity's place in it are its name
+		if r.at and not tostring(r.at.con.key):match("^s:") then r.key = nil end
 	end
 	-- the dry run: the reference must lead back to this very entity; a hint that misleads is dropped
 	if decodeRef(dryCtx(st), r, kind) ~= e and r.at then
@@ -474,8 +477,14 @@ local PLAIN = {
 
 local function entityArg(kind)
 	return {
-		enc = function(ctx, v, st) return encodeRef(ctx, st, v, kind) end,
-		dec = function(ctx, w) return decodeRef(ctx, w, kind) end,
+		enc = function(ctx, v, st)
+			if v == nil then return nil end
+			return encodeRef(ctx, st, v, kind)
+		end,
+		dec = function(ctx, w)
+			if w == nil then return nil end
+			return decodeRef(ctx, w, kind)
+		end,
 	}
 end
 
@@ -515,6 +524,7 @@ local VEHICLES = listArg("vehicle")
 local function objectArg(typeName, wireOf, treeOf)
 	local codec = {}
 	codec.dec = function(ctx, w)
+		if w == nil then return nil end -- an argument the caller left out
 		if type(w) ~= "table" then return nil, "malformed " .. typeName end
 		local tree, why = treeOf(ctx, copy(w))
 		if tree == nil then return nil, why end
@@ -649,6 +659,7 @@ local function journalWire(entry)
 end
 
 local function journalEntry(w)
+	if w == nil then return nil end
 	if type(w) ~= "table" then return nil, "malformed journal entry" end
 	local entry = try(function() return api.type.JournalEntry.new() end)
 	if entry == nil then return w end -- no engine type here: the plain table stands in

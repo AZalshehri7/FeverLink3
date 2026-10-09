@@ -33,7 +33,7 @@ OPS_SRC = T.CMDS_SRC["feverlink3_cmds_ops"]
 # ---------------------------------------------------------------- the mock
 
 OPS_PRELUDE = r'''
-OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false }
+OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false, player = 7 }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
 MODELS = { "vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl" }
@@ -84,6 +84,7 @@ TYPES = {
     init = function() return { load = {}, maxLoad = {}, forceUnload = false, destroyForConfigChange = false, destroyForRefresh = false } end },
   StationTerminal = { members = { "station", "terminal" }, init = function() return { station = 0, terminal = 0 } end },
   Vec3f = { members = { "x", "y", "z" }, init = function() return { x = 0, y = 0, z = 0 } end },
+  Date = { members = { "year", "month", "day" }, init = function() return { year = 1900, month = 1, day = 1 } end },
 }
 
 local function vec(x, y, z) local o = NEW("Vec3f"); o.x, o.y, o.z = x, y, z; return o end
@@ -143,15 +144,17 @@ function BUILD_LINE(api, spec)
   return line
 end
 
--- ---- the savegame both games start from (identical ids), built once the model offset is known
+-- ---- the savegame both games start from (identical ids), built once the model offset and the player are known
 function BUILD_SAVEGAME()
+  WORLD[OPS.player] = WORLD[OPS.player] or { PLAYER = {} }
   WORLD[54].CONSTRUCTION.depots = { 55 }
   WORLD[54].CONSTRUCTION.stations = {}
   WORLD[56].CONSTRUCTION.stations = { 57 }
   WORLD[56].CONSTRUCTION.depots = {}
   WORLD[57] = { STATION = {} }
   WORLD[58] = { STATION_GROUP = { stations = { 57 } }, NAME = { name = "Central" } }
-  WORLD[59] = { CONSTRUCTION = { fileName = "station2.con", transf = { [13] = 300, [14] = -20, [15] = 1 }, stations = { 60 }, depots = {} } }
+  WORLD[59] = { CONSTRUCTION = { fileName = "station2.con", transf = { [13] = 300, [14] = -20, [15] = 1 }, stations = { 60 }, depots = { 62 } } }
+  WORLD[62] = { VEHICLE_DEPOT = {} }
   WORLD[60] = { STATION = {} }
   WORLD[61] = { STATION_GROUP = { stations = { 60 } }, NAME = { name = "North" } }
   local api = MAKE_API()
@@ -160,7 +163,8 @@ function BUILD_SAVEGAME()
   WORLD[71] = { LINE = BUILD_LINE(api, { priority = 1.0, stops = { { group = 58 }, { group = 61 } } }), NAME = { name = "Line 1" },
     COLOR = { color = vec(1, 0, 0) } }
   WORLD[80] = { TOWN = {}, NAME = { name = "Springfield" } }
-  WORLD[81] = { CONSTRUCTION = { fileName = "industry/coal.con", transf = { [13] = 500, [14] = 600, [15] = 0 } }, INDUSTRY = {} }
+  WORLD[81] = { CONSTRUCTION = { fileName = "industry/coal.con", transf = { [13] = 500, [14] = 600, [15] = 0 } }, INDUSTRY = {},
+    NAME = { name = "Coal Mine" } }
   setmetatable(WORLD, { __newindex = function(t, k, v)
     local p = PENDING[k]
     if p then
@@ -186,6 +190,7 @@ function MAKE_API()
     if name then local w = WORLD[e]; return w and w[name] or nil end
     return base_get(e, t)
   end
+  api.engine.util.getPlayer = function() return OPS.player end   -- the games' own player entities need not be the same
   for _, n in ipairs({ "makeVehicleSellCmd", "makeVehicleReplaceCmd", "makeVehicleSendToDepotCmd", "makeVehicleReverseCmd",
       "makeVehicleSetStoppedByUserCmd", "makeVehicleTryToDepartCmd", "makeLineUpdateCmd", "makeLineDestroyCmd",
       "makeEntitySetNameCmd", "makeEntitySetColorCmd", "makeGameSetCalendarSpeedCmd", "makeGameSetDateCmd",
@@ -202,6 +207,7 @@ function MAKE_API()
     StopConfig = { new = function() return NEW("StopConfig") end } }
   t.StationTerminal = { new = function(s, tm) local o = NEW("StationTerminal"); o.station = s or 0; o.terminal = tm or 0; return o end }
   t.Vec3f = { new = function(x, y, z) return vec(x or 0, y or 0, z or 0) end }
+  t.Date = { new = function(y, m, d) local o = NEW("Date"); o.year, o.month, o.day = y, m, d; return o end }
   t.JournalEntry = {
     new = function() return { category = {} } end,
     Type = { OTHER = 1, LOAN = JOURNAL_LOAN, INTEREST = 3, CONSTRUCTION = 4, ACQUISITION = 5, MAINTENANCE = 6, INCOME = 7, SUBSIDY = 8 },
@@ -261,7 +267,7 @@ end
 
 OPS_EXEC = {}
 OPS_EXEC.makeVehicleBuyCmd = function(a)
-  if a[1] ~= 7 then return false, "player entity expected, got " .. tostring(a[1]) end
+  if a[1] ~= OPS.player then return false, "player entity expected, got " .. tostring(a[1]) end
   if not (WORLD[a[2]] and WORLD[a[2]].VEHICLE_DEPOT) then return false, "no depot " .. tostring(a[2]) end
   if not charge(a[3]) then return false, "not enough money" end
   local created = createVehicle({ config = a[3], line = -1, userStopped = false, state = "IN_DEPOT" })
@@ -310,7 +316,7 @@ OPS_EXEC.makeVehicleTryToDepartCmd = function(a)
   return true
 end
 OPS_EXEC.makeLineCreateCmd = function(a)
-  if a[3] ~= 7 then return false, "player entity expected" end
+  if a[3] ~= OPS.player then return false, "player entity expected" end
   local comp = a[4]
   for i = 1, #comp.stops do
     local g = comp.stops[i].stationGroup
@@ -351,7 +357,7 @@ OPS_EXEC.makeEntitySetColorCmd = function(a)
   return true
 end
 OPS_EXEC.makeJournalBookAssetCmd = function(a, rec)
-  assert(a[1] == 7, "player entity expected")
+  assert(a[1] == OPS.player, "player entity expected")
   local e = a[2]
   ACCOUNT.balance = ACCOUNT.balance + e.amount
   if e.category.type == JOURNAL_LOAN then ACCOUNT.loan = ACCOUNT.loan + OPS.loanSign * e.amount end
@@ -481,7 +487,7 @@ function SNAPSHOT()
     if w.TOWN and w.TOWN.developmentActive ~= nil then rows[#rows + 1] = "development " .. nameOf(e) .. "=" .. tostring(w.TOWN.developmentActive) end
   end
   table.sort(rows)
-  rows[#rows + 1] = "company " .. nameOf(7)
+  rows[#rows + 1] = "company " .. nameOf(OPS.player)
   rows[#rows + 1] = "account " .. tostring(ACCOUNT.balance) .. "/" .. tostring(ACCOUNT.loan)
   rows[#rows + 1] = "loans " .. table.concat(LOANS.obtained, ",")
   rows[#rows + 1] = "events " .. table.concat(TOWNS_STATE, ",") .. "|" .. table.concat(MARKETING, ",") .. "|" .. table.concat(GREEN, ",") ..
@@ -514,14 +520,14 @@ OPS_HARNESS = OPS_PRELUDE + _ENGINE_LINE.sub("env.FEVERLINK3_ENGINE = OPS_ENGINE
 class OpsGame(T.Game):
     """A game of the lockstep harness with the operations mock added; the client's model ids are 100 higher."""
 
-    def __init__(self, label, player_id, tmp, first_entity, model_offset):
+    def __init__(self, label, player_id, tmp, first_entity, model_offset, player_entity=7):
         saved = T.HARNESS
         T.HARNESS = OPS_HARNESS  # Game.__init__ runs it between the base mock and the mod; restored below
         try:
             super().__init__(label, player_id, tmp, first_entity)
         finally:
             T.HARNESS = saved
-        self.L.execute("MODEL_OFFSET = %d; BUILD_SAVEGAME()" % model_offset)
+        self.L.execute("OPS.player = %d; MODEL_OFFSET = %d; BUILD_SAVEGAME()" % (player_entity, model_offset))
 
     def snapshot(self):
         return str(self.L.eval("SNAPSHOT()"))
@@ -548,8 +554,9 @@ class OpsGame(T.Game):
 class OpsBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-ops-")
-        self.A = OpsGame("host", 0, self.tmp, 50000, 0)
-        self.B = OpsGame("client", 1, self.tmp, 51000, 100)
+        # the client's model ids are 100 higher and its player entity is another one
+        self.A = OpsGame("host", 0, self.tmp, 50000, 0, 7)
+        self.B = OpsGame("client", 1, self.tmp, 51000, 100, 17)
         self.relay = T.Relay([self.A, self.B])
 
     def tearDown(self):
@@ -726,6 +733,26 @@ class VehicleTest(OpsBase):
         self.assertEqual(len(self.A.applied()), before)
         self.assertEqual(len(self.B.applied()), before)
 
+    def test_a_model_the_other_game_does_not_have_is_refused_there(self):
+        self.start()
+        self.B.L.execute("MODELS[4] = 'vehicle/mod_bus.mdl'")   # installed on the client only
+        self.B.send_gui(buy("BUY", '{ model = "vehicle/mod_bus.mdl" }'))
+        self.settle()
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 1, "the host does not buy a vehicle it cannot build")
+        self.assertIn("model vehicle/mod_bus.mdl is not installed here", self.A.log())
+        self.assertTrue(any(l.split(T.TAB)[1] == "action_refused" for l in self.A.lines(self.A.from_game)))
+
+    def test_a_configuration_the_engine_does_not_take_back_equal_stays_native(self):
+        self.start()
+        # an engine that quietly ignores purchaseTime when it is set on a rebuilt part (after the window built its own)
+        self.B.send_gui('local cfg = BUILD_CONFIG(api, { purchaseTime = 18000, parts = { %s } })\n'
+                        'OPS.drop = "purchaseTime"\n'
+                        'api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(api.engine.util.getPlayer(), 55, cfg))' % BUS_RED)
+        self.settle()
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertIn("does not rebuild equal at TransportVehicleConfig.vehicles.1.purchaseTime", self.B.log())
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 1)
+
     def test_unknown_or_wrong_kind_references_are_refused_and_stay_native(self):
         self.start()
         # a vehicle that only the client has: the sender applies it, the host refuses it, nobody applies it to a stranger
@@ -740,6 +767,517 @@ class VehicleTest(OpsBase):
         self.settle()
         self.assertIn("sent natively: argument 2: cannot refer to entity 70 as a line", self.B.log())
         self.assertEqual(len(self.B.actions_shipped()), 1, "only the first command was shipped")
+
+
+LINE_2 = """local line = BUILD_LINE(api, { priority = 2.0, customFilters = true, stops = {
+    { group = 58, station = 0, terminal = 0, min = 30, max = 90, extra = 10, mode = 1,
+      load = { true, false, true }, maxLoad = { 1, 0.5, 1 }, alt = { { 0, 1 } } },
+    { group = 61, station = 0, terminal = 0 } } })
+api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Line 2", api.type.Vec3f.new(0.2, 0.8, 0.1), api.engine.util.getPlayer(), line),
+    function(d, s, e) MADE = { s, e and e[1] and e[1][1] } end)"""
+
+
+class LineTest(OpsBase):
+    def test_two_players_create_edit_rename_colour_and_destroy_a_line(self):
+        self.start()
+        self.B.send_gui(LINE_2)
+        self.settle()
+        self.agree("the line has the same stops, waiting times, filters and colour in both games")
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
+        snap = self.A.snapshot()
+        for needle in ("line Line 2", "prio=2", "filters=true", "minWaitingTime=30", "maxAdditionalWaitingTime=10",
+                       "stationGroup=Central", "stationGroup=North", "x=0.2"):
+            self.assertIn(needle, snap)
+        self.assertTrue(self.B.L.eval("MADE[1] == true and MADE[2] ~= nil"), "the client's window got the line it made")
+        self.assertNotEqual(int(self.B.L.eval("MADE[2]")), self.A.find("LINE", "Line 2"), "the two games number it differently")
+
+        # the host acts on the client's line: rename, recolour, give it a third stop and a new priority
+        line_a = self.A.find("LINE", "Line 2")
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(%d, "Express"))\n'
+                        'api.cmd.sendCommand(api.cmd.makeEntitySetColorCmd(%d, api.type.Vec3f.new(0.5, 0.5, 0.9)))' % (line_a, line_a))
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(%d, BUILD_LINE(api, { priority = 3.0,'
+                        ' stops = { { group = 61 }, { group = 58 }, { group = 61, min = 5 } } })))' % line_a)
+        self.settle()
+        self.agree()
+        snap = self.A.snapshot()
+        self.assertIn("line Express", snap)
+        self.assertNotIn("Line 2", snap)
+        self.assertIn("prio=3", snap)
+        self.assertIn("x=0.5", snap)
+
+        # the client assigns the saved vehicle to it: the line is named by its key, not by an id
+        line_b = self.B.find("LINE", "Express")
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(70, %d, 2))" % line_b)
+        self.settle()
+        self.agree()
+        self.assertIn("line=Express stop=2", self.A.snapshot())
+        # a line with a vehicle on it cannot be destroyed, in either game; without the vehicle it can
+        self.A.send_gui("api.cmd.sendCommand(api.cmd.makeLineDestroyCmd(%d))" % line_a)
+        self.settle()
+        self.agree("the engine refused it in both games")
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSellCmd({ 70 }))\n"
+                        "api.cmd.sendCommand(api.cmd.makeLineDestroyCmd(%d))" % line_b)
+        self.settle()
+        self.agree()
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (1, 1))
+
+    def test_the_company_and_a_station_group_are_renamed_everywhere(self):
+        self.start()
+        # the client's player entity is 17, the host's 7: the name belongs to the company, whichever id it has
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(api.engine.util.getPlayer(), "Rails Inc"))\n'
+                        'api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(58, "Central Station"))')
+        self.settle()
+        self.agree()
+        self.assertEqual(str(self.A.L.eval("WORLD[7].NAME.name")), "Rails Inc")
+        self.assertEqual(str(self.B.L.eval("WORLD[17].NAME.name")), "Rails Inc")
+        self.assertIn("named Central Station", self.A.snapshot())
+
+    def test_a_line_with_waypoints_is_not_replicated_and_says_why(self):
+        self.start()
+        self.B.send_gui(LINE_2.replace("{ group = 61, station = 0, terminal = 0 }", "{ group = 61, waypoints = { { tag = 1 } } }"))
+        self.settle()
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (1, 2), "native on the sender only: a visible divergence")
+        self.assertIn("sent natively: argument 4: stop 2 has waypoints (not replicated yet)", self.B.log())
+        self.assertEqual(self.B.actions_shipped(), [])
+
+    def test_an_object_the_engine_does_not_take_back_equal_is_not_replicated(self):
+        self.start()
+        # an engine that quietly ignores maxWaitingTime when it is set on a rebuilt stop
+        self.B.send_gui(LINE_2.replace("local line = BUILD_LINE", "local line = BUILD_LINE", 1).replace(
+            "api.cmd.sendCommand(api.cmd.makeLineCreateCmd", "OPS.drop = 'maxWaitingTime'\napi.cmd.sendCommand(api.cmd.makeLineCreateCmd"))
+        self.settle()
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertIn("does not rebuild equal at Line.stops.1.maxWaitingTime", self.B.log())
+        self.assertEqual(self.A.count("LINE"), 1)
+
+    def test_read_only_members_are_left_to_the_engine_and_noted_once(self):
+        self.start()
+        self.B.send_gui(LINE_2)
+        self.settle()
+        self.agree()
+        self.assertIn("read-only member 'vehicleInfo' of Line is left to the engine", self.B.log())
+        # once per Lua state (the window's dry run, the simulation's replay), not once per use
+        self.assertLessEqual(self.B.log().count("read-only member 'vehicleInfo'"), 2)
+        # the member is read and shipped like any other; the receiver skips what its engine will not let it set
+        body, _ = self.wire(self.B.actions_shipped()[0])
+        self.assertIn("vehicleInfo", body)
+
+
+class FinanceTest(OpsBase):
+    OFFER = '{ type = "Medium", amount = 20000000, duration = 3000, percentage = 0.06, birthDay = 100 }'
+    FRESH = '{ type = "Medium", amount = 24000000, duration = 3000, percentage = 0.07, birthDay = 5000 }'
+
+    def event(self, game, ident, name, param, var="EV"):
+        game.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "%s", "%s", %s), function(d, s) %s = s end)'
+                      % (ident, name, param, var))
+
+    def test_a_loan_is_an_event_every_game_replays_and_money_agrees(self):
+        self.start()
+        self.event(self.B, "Loan", "Obtain", "{ %s, %s }" % (self.FRESH, self.OFFER))
+        self.assertTrue(self.B.L.eval("EV == nil"))
+        self.settle()
+        self.agree()
+        self.assertEqual((self.A.balance(), self.A.loan()), (1000000 + 20000000, 250000 + 20000000))
+        self.assertIn("loans Medium:20000000", self.A.snapshot())
+        self.assertTrue(self.B.L.eval("EV == true"), "the window is told the event was applied")
+        body, p = self.wire(self.B.actions_shipped()[0])
+        self.assertEqual(p.category, "spend")
+        self.assertNotIn("makeLoan", body)
+        # repaying: the parameter has no first element, only the loan; the hole survives the trip
+        self.event(self.A, "Loan", "Repay", "{ nil, %s }" % self.OFFER)
+        self.settle()
+        self.agree()
+        self.assertEqual((self.A.balance(), self.A.loan()), (1000000, 250000))
+        self.assertEqual(self.A.applied(), self.B.applied())
+
+    def test_marketing_campaign_and_its_cost_are_two_replicated_commands(self):
+        self.start()
+        # the marketing tool sends the event and, in its callback, books the cost as a journal entry
+        self.B.send_gui('local town = 80\n'
+                        'api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Companies", "startMarketingCampaign", {\n'
+                        '  townEntity = town, companyEntity = api.engine.util.getPlayer(),\n'
+                        '  marketingParams = { durationMs = 60000, lineCostFactor = 0.5 }, permitKey = "marketing.res" }),\n'
+                        '  function()\n'
+                        '    local entry = api.type.JournalEntry.new()\n'
+                        '    entry.amount = -12000000; entry.time = -1; entry.category.type = api.type.JournalEntry.Type.OTHER\n'
+                        '    api.cmd.sendCommand(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry, api.type.Vec3f.new(0, 0, 0)))\n'
+                        '  end)')
+        self.settle(60)
+        self.agree("the campaign runs in both games and both paid for it")
+        self.assertIn("Springfield:marketing.res", self.A.snapshot())
+        self.assertEqual(self.A.balance(), 1000000 - 12000000)
+        lines = self.B.actions_shipped()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual([self.wire(l)[1].category for l in lines], ["spend", "spend"])
+
+    def test_a_balance_edit_from_the_money_widget_reaches_the_other_game(self):
+        self.start()
+        self.A.send_gui('local entry = api.type.JournalEntry.new()\n'
+                        'entry.amount = 5000; entry.time = -1; entry.category.type = api.type.JournalEntry.Type.OTHER\n'
+                        'api.cmd.sendCommand(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry))')
+        self.settle()
+        self.agree()
+        self.assertEqual(self.B.balance(), 1005000)
+        # a booking nobody could rebuild stays native: a category this module does not know
+        self.A.send_gui('local entry = api.type.JournalEntry.new()\n'
+                        'entry.amount = 1; entry.time = -1; entry.category.type = 99\n'
+                        'api.cmd.sendCommand(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry))')
+        self.settle()
+        self.assertIn("sent natively: argument 2: a journal category this module does not know", self.A.log())
+        self.assertEqual(self.B.balance(), 1005000)
+
+    def drift_round(self, n):
+        self.relay.checksum_request(n, self.relay.future_stamp(), False)
+        self.tick(40)
+        self.relay.send_authority(n)
+        self.tick(8)
+
+    def test_loan_drift_is_corrected_with_a_loan_entry_and_its_counter_entry(self):
+        self.start()
+        self.tick(10)
+        self.relay.pump()
+        self.B.L.execute("ACCOUNT.loan = ACCOUNT.loan - 1000")
+        self.drift_round(1)
+        self.assertEqual(self.B.loan(), 250000, "the loan is the host's again")
+        self.assertEqual(self.B.balance(), 1000000, "and the balance was left alone")
+        self.assertEqual(str(self.B.L.eval("table.concat(JOURNAL, ',')")), "1000,-1000", "a LOAN entry and its counter entry")
+        self.assertIn("host authority: loan corrected by 1000", self.B.log())
+        self.assertEqual(self.B.applied(), [], "corrections are not replicated actions")
+
+    def test_a_correction_that_moves_the_loan_the_wrong_way_switches_itself_off(self):
+        self.start()
+        self.tick(10)
+        self.relay.pump()
+        # an engine whose LOAN entries lower the reported loan: the first correction makes the difference bigger
+        self.B.L.execute("OPS.loanSign = -1; ACCOUNT.loan = ACCOUNT.loan - 1000")
+        self.drift_round(1)
+        self.assertEqual(self.B.loan(), 250000 - 2000)
+        self.drift_round(2)
+        self.assertEqual(self.B.loan(), 250000 - 2000, "no second attempt: the error is not doubled again")
+        self.assertIn("loan correction is off: the loan moved by -1000 after a correction of 1000", self.B.log())
+        self.assertIn("host authority: loan differs but this build cannot correct it", self.B.log())
+        self.assertEqual(str(self.B.L.eval("table.concat(JOURNAL, ',')")), "1000,-1000")
+
+
+class PermissionTest(OpsBase):
+    # in an order that keeps the entities they name alive until their turn
+    CASES = [
+        ("buy", buy("X", BUS_RED), "spend"),
+        ("setline", "api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(70, 71, 0))", "other"),
+        ("reverse", "api.cmd.sendCommand(api.cmd.makeVehicleReverseCmd(70))", "other"),
+        ("linecreate", LINE_2, "build"),
+        ("lineupdate", "api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, BUILD_LINE(api, { stops = { { group = 58 } } })))", "build"),
+        ("rename", 'api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(71, "Renamed"))', "other"),
+        ("loan", 'api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { nil, { type = "Small", amount = 5000000 } }))', "spend"),
+        ("subsidy", 'api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Subvention", "onAccept", { uid = 3 }))', "other"),
+        ("timeofday", "api.cmd.sendCommand(api.cmd.makeGameSetTimeOfDayCmd(3600))", "other"),
+        ("sell", "api.cmd.sendCommand(api.cmd.makeVehicleSellCmd({ 70 }))", "bulldoze"),
+        ("linedestroy", "api.cmd.sendCommand(api.cmd.makeLineDestroyCmd(71))", "bulldoze"),
+    ]
+
+    def test_every_replicated_command_ships_the_category_the_host_checks(self):
+        self.start()
+        for name, code, category in self.CASES:
+            before = len(self.B.actions_shipped())
+            self.B.send_gui(code)
+            self.settle(12)
+            shipped = self.B.actions_shipped()
+            self.assertEqual(len(shipped), before + 1, name)
+            self.assertEqual(self.wire(shipped[-1])[1].category, category, name)
+
+    def test_a_denied_category_cancels_before_stamping_but_other_events_pass(self):
+        self.start()
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"spend": False, "bulldoze": False, "other": False}))
+        self.tick(3)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { nil, { type = "Small", amount = 5000000 } }),'
+                        ' function(d, s) LOAN_OK = s end)\n'
+                        'api.cmd.sendCommand(api.cmd.makeVehicleSellCmd({ 70 }), function(d, s) SELL_OK = s end)\n'
+                        'api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(71, "No"), function(d, s) NAME_OK = s end)')
+        # an event the mod does not replicate is not a grant's business: it runs, natively, on this game only
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Notifications", "dismiss", { id = 4 }), function(d, s) NOTE_OK = s end)')
+        self.settle()
+        self.assertTrue(self.B.L.eval("LOAN_OK == false and SELL_OK == false and NAME_OK == false"), "the windows are told no")
+        self.assertTrue(self.B.L.eval("NOTE_OK == true"))
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertEqual(self.A.applied(), [])
+        self.assertEqual(self.B.applied(), ["event:Notifications/dismiss@%d" % int(self.B.L.eval("GAME.applied[1].time"))])
+        self.assertEqual([r[2] for r in self.relay.refused], ["permission denied: spend", "permission denied: bulldoze", "permission denied: other"])
+        # granted again, the loan goes through
+        self.relay.send(self.B, "permissions", 0, self.relay.ser({"spend": True}))
+        self.tick(3)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { nil, { type = "Small", amount = 5000000 } }))')
+        self.settle()
+        self.assertEqual(self.A.loan(), 250000 + 5000000)
+
+
+class TownTest(OpsBase):
+    def test_town_company_and_subsidy_events_reach_every_game(self):
+        self.start()
+        self.B.send_gui('local c = api.cmd\n'
+                        'c.sendCommand(c.makeScriptingSendEventCmd("", "Towns", "setTownRatingSensitivity", { townEntity = 80, rating = "noise", sensitivity = 3 }))\n'
+                        'c.sendCommand(c.makeScriptingSendEventCmd("", "Companies", "MakeGreen", { companyEntity = api.engine.util.getPlayer(), constructionEntity = 81, permitKey = "green.res" }))\n'
+                        'c.sendCommand(c.makeScriptingSendEventCmd("", "Subvention", "onAccept", { uid = 12 }))\n'
+                        'c.sendCommand(c.makeTownSetDevelopmentActiveCmd(80, false))\n'
+                        'c.sendCommand(c.makeStockListDiscardCargoCmd(81, { 0, 1 }, 1.0))')
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Towns", "resetTownRatingSensitivity", { townEntity = 80 }))')
+        self.settle()
+        self.agree()
+        snap = self.A.snapshot()
+        for needle in ("Springfield:noise=3", "Springfield:reset", "industry/coal.con", "accept 12", "development Springfield=false",
+                       "Coal Mine;"):
+            self.assertIn(needle, snap)
+        self.assertEqual(self.A.applied(), self.B.applied())
+
+    def test_an_industry_a_game_script_made_is_found_by_file_and_position(self):
+        self.start()
+        # each game's scripts made the same oil rig in the session; the ids are not the same
+        self.A.L.execute("WORLD[90100] = { CONSTRUCTION = { fileName = 'industry/oil.con', transf = { [13] = 900, [14] = 100, [15] = 0 } }, INDUSTRY = {} }")
+        self.B.L.execute("WORLD[90200] = { CONSTRUCTION = { fileName = 'industry/oil.con', transf = { [13] = 900.4, [14] = 100, [15] = 0 } }, INDUSTRY = {} }")
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Companies", "MakeGreen", { companyEntity = api.engine.util.getPlayer(), constructionEntity = 90200 }))')
+        self.settle()
+        self.assertEqual(str(self.A.L.eval("GREEN[1]")), "industry/oil.con")
+        self.assertEqual(str(self.B.L.eval("GREEN[1]")), "industry/oil.con")
+        # one that exists only in the client's game is refused by the host, not applied to another industry
+        self.B.L.execute("WORLD[90300] = { CONSTRUCTION = { fileName = 'industry/oil.con', transf = { [13] = -500, [14] = 100, [15] = 0 } }, INDUSTRY = {} }")
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Companies", "MakeGreen", { companyEntity = api.engine.util.getPlayer(), constructionEntity = 90300 }))')
+        self.settle()
+        self.assertEqual(int(self.A.L.eval("#GREEN")), 1)
+        self.assertIn("unresolved construction reference s:90300", self.A.log())
+
+    def test_a_town_building_the_town_grew_is_found_the_same_way(self):
+        self.start()
+        self.A.L.execute("WORLD[90100] = { CONSTRUCTION = { fileName = 'house/h1.con', transf = { [13] = 10, [14] = 20, [15] = 0 } }, TOWN_BUILDING = {} }")
+        self.B.L.execute("WORLD[90200] = { CONSTRUCTION = { fileName = 'house/h1.con', transf = { [13] = 10, [14] = 20, [15] = 0 } }, TOWN_BUILDING = {} }")
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeTownBuildingSetBlockedDevelopmentCmd(90200, true))")
+        self.settle()
+        self.assertEqual(self.A.L.eval("WORLD[90100].blocked"), True)
+
+
+class WorldSettingsTest(OpsBase):
+    def test_calendar_weather_and_time_of_day_are_set_on_every_game(self):
+        self.start()
+        self.B.send_gui('local c = api.cmd\n'
+                        'c.sendCommand(c.makeGameSetTimeOfDayCmd(43200))\n'
+                        'c.sendCommand(c.makeScriptingSendEventCmd("", "GameTime", "OnManualGameTimeChanged", 43200))\n'
+                        'c.sendCommand(c.makeScriptingSendEventCmd("", "GameTime", "SetMode", { mode = "Dynamic" }))\n'
+                        'c.sendCommand(c.makeGameSetCalendarSpeedCmd(60000))\n'
+                        'c.sendCommand(c.makeGameSetCloudCoverageCmd(0.5))\n'
+                        'c.sendCommand(c.makeGameSetDateCmd(api.type.Date.new(1925, 6, 1)))\n'
+                        'c.sendCommand(c.makeScriptingSendEventCmd("", "CloudCoverage", "SetMode", { weatherMode = "Constant" }))')
+        self.settle()
+        self.agree()
+        self.assertIn("world 60000 43200 0.5 Dynamic 43200 Constant", self.A.snapshot())
+        self.assertEqual(int(self.A.L.eval("GAME.date.year")), 1925)
+
+    def test_the_local_time_of_day_mode_follows_each_machines_clock_and_is_not_replicated(self):
+        self.start()
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "GameTime", "SetMode", { mode = "Local" }))')
+        self.settle()
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertIn("the Local time-of-day mode follows each machine's clock", self.B.log())
+        self.assertEqual(str(self.B.L.eval("GAME.timeMode")), "Local", "it still runs, on the game that asked")
+        self.assertEqual(self.A.L.eval("GAME.timeMode"), None)
+
+
+CTX = "{ keyOf = function(e) return 's:' .. e end, plain = function(v) return v end }"
+
+
+class ModuleTest(unittest.TestCase):
+    """The module and the lockstep additions on their own, inside one mocked game (no session running)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="feverlink3-ops-")
+        self.G = OpsGame("solo", 0, self.tmp, 50000, 0, 7)
+        self.L = self.G.L
+        self.ops = self.L.eval("GUI_ENV.ug_require('feverlink3_cmds_ops.lua')")
+        self.K = self.L.eval("GUI_ENV.ug_require('feverlink3_lockstep.lua')")
+        self.K.registerCommands(self.ops.commands)
+        self.K.registerEvents(self.ops.events)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- reading and rebuilding engine objects
+
+    def test_marshal_reads_plain_values_engine_objects_and_userdata(self):
+        marshal = self.ops.internals.marshal
+        t = marshal(self.L.eval("{ a = 1, b = { 2, 3 }, c = 'x', d = true }"))
+        self.assertEqual((t["a"], t["b"][1], t["b"][2], t["c"], t["d"]), (1, 2, 3, "x", True))
+        cfg = self.L.eval("BUILD_CONFIG(GUI_API, { purchaseTime = 7, parts = { { model = 'vehicle/truck.mdl', color = { 1, 0, 0 } } } })")
+        t = marshal(cfg)
+        self.assertEqual(t["vehicles"][1]["purchaseTime"], 7)
+        self.assertEqual(t["vehicles"][1]["part"]["color"]["x"], 1)
+        self.assertEqual(t["vehicles"][1]["part"]["modelId"], 103)
+
+        class Vector:   # what the game hands out for a vector is userdata: x, y, z, no member list
+            x, y, z = 1.5, 2.5, 3.5
+
+        t = marshal(Vector())
+        self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
+
+    def test_marshal_refuses_what_cannot_travel_and_says_what(self):
+        marshal = self.ops.internals.marshal
+
+        class Opaque:
+            pass
+
+        self.assertEqual(marshal(Opaque())[0], None)
+        self.assertIn("cannot read", marshal(Opaque())[1])
+        self.assertEqual(marshal(self.L.eval("{ f = print }")), (None, "f: a function cannot be replicated"))
+        self.assertIn("keyed by a boolean", marshal(self.L.eval("{ [true] = 1 }"))[1])
+        self.assertIn("too deep", marshal(self.L.eval("(function() local t = {} t.t = t return t end)()"))[1])
+
+    def test_rebuild_makes_an_equal_object_skips_read_only_members_and_names_a_failing_one(self):
+        I = self.ops.internals
+        tree = I.marshal(self.L.eval("BUILD_LINE(GUI_API, { priority = 2.5, stops = { { group = 58, min = 9, alt = { { 1, 2 } } } } })"))
+        skipped = self.L.table()
+        obj = I.rebuild("Line", tree, "Line", skipped)
+        self.assertEqual(str(self.L.eval("tostring")(obj)), "<Line>", "an engine object, not the plain table")
+        again = I.marshal(obj)
+        self.assertIs(I.contained(tree, again, "Line", skipped), True)
+        self.assertTrue(skipped["vehicleInfo"], "the derived member was skipped, not set")
+        # a member the object does not have is an error that names the path
+        bad = self.L.eval("{ stops = { { stationGroup = 58, nonsense = 1 } } }")
+        with self.assertRaises(lupa.LuaError) as raised:
+            I.rebuild("Line", bad, "Line", self.L.table())
+        self.assertIn("Line.stops[1].nonsense:", str(raised.exception))
+        self.assertIn("no member 'nonsense' in LineStop", str(raised.exception))
+
+    def test_contained_finds_what_a_rebuild_lost(self):
+        contained = self.ops.internals.contained
+        lua = self.L.eval
+        self.assertIs(contained(lua("{ a = 1, b = { 2, 3 } }"), lua("{ a = 1, b = { 2, 3 }, extra = 9 }"), "t", lua("{}")), True)
+        self.assertEqual(contained(lua("{ a = 1 }"), lua("{ a = 2 }"), "t", lua("{}")), (False, "t.a"))
+        self.assertEqual(contained(lua("{ a = 1 }"), lua("{}"), "t", lua("{}")), (False, "t.a"))
+        self.assertEqual(contained(lua("{ b = { 2, 3 } }"), lua("{ b = { 2 } }"), "t", lua("{}")), (False, "t.b#"))
+        self.assertIs(contained(lua("{ a = 1 }"), lua("{ a = 2 }"), "t", lua("{ a = true }")), True, "a skipped member is not compared")
+        self.assertIs(contained(lua("{ a = 0.1 }"), lua("{ a = 0.1000000001 }"), "t", lua("{}")), True, "floats compare with a tolerance")
+
+    # ---- permission categories and the event registry
+
+    def test_every_command_and_event_has_the_category_the_host_checks(self):
+        want = {
+            "spend": ["makeVehicleBuyCmd", "makeVehicleReplaceCmd", "makeJournalBookAssetCmd"],
+            "bulldoze": ["makeVehicleSellCmd", "makeLineDestroyCmd"],
+            "build": ["makeLineCreateCmd", "makeLineUpdateCmd"],
+            "other": ["makeVehicleSetLineCmd", "makeVehicleSendToDepotCmd", "makeVehicleReverseCmd", "makeVehicleSetStoppedByUserCmd",
+                      "makeEntitySetNameCmd", "makeEntitySetColorCmd", "makeGameSetCalendarSpeedCmd", "makeGameSetDateCmd",
+                      "makeGameSetTimeOfDayCmd", "makeGameSetCloudCoverageCmd", "makeStockListDiscardCargoCmd",
+                      "makeTownBuildingSetBlockedDevelopmentCmd", "makeTownSetDevelopmentActiveCmd", "makeVehicleTryToDepartCmd"],
+        }
+        for category, names in want.items():
+            for name in names:
+                self.assertEqual(self.K.categoryOf(name), category, name)
+        registered = set(str(k) for k in self.ops.commands.keys())
+        self.assertTrue(registered >= {n for names in want.values() for n in names})
+        # events: by their arguments
+        ev = lambda i, n: self.L.eval("{ n = 4, '', '%s', '%s', {} }" % (i, n))   # noqa: E731
+        self.assertEqual(self.K.categoryOf("makeScriptingSendEventCmd", ev("Loan", "Obtain")), "spend")
+        self.assertEqual(self.K.categoryOf("makeScriptingSendEventCmd", ev("Companies", "MakeGreen")), "spend")
+        self.assertEqual(self.K.categoryOf("makeScriptingSendEventCmd", ev("Subvention", "onAccept")), "other")
+        self.assertEqual(self.K.categoryOf("makeScriptingSendEventCmd", ev("Notifications", "dismiss")), "local")
+        perms = self.K.newPermissions()
+        self.K.applyPermissions(perms, self.L.eval("{ build = false, bulldoze = false, spend = false, other = false }"))
+        self.assertTrue(self.K.permitted(perms, "local"), "no grant covers an event nobody replicates")
+        self.assertFalse(self.K.permitted(perms, "spend"))
+
+    def test_modules_register_events_side_by_side(self):
+        self.K.registerEvents(self.L.eval("{ Mine = { One = { category = 'build' } } }"))
+        self.K.registerEvents(self.L.eval("{ Loan = { Extra = { category = 'bulldoze' } }, Mine = { Two = { category = 'spend' } } }"))
+        cat = lambda i, n: self.K.categoryOf("makeScriptingSendEventCmd", self.L.eval("{ n = 4, '', '%s', '%s', {} }" % (i, n)))   # noqa: E731
+        self.assertEqual([cat("Loan", "Obtain"), cat("Loan", "Extra"), cat("Mine", "One"), cat("Mine", "Two")],
+                         ["spend", "bulldoze", "build", "spend"], "the later registrations added, none replaced")
+
+    def test_the_event_dispatcher_encodes_registered_events_and_refuses_the_rest(self):
+        spec = self.K.COMMANDS.makeScriptingSendEventCmd
+        ctx = self.L.eval(CTX)
+        args = self.L.eval("{ n = 4, '', 'Companies', 'MakeGreen', { companyEntity = 7, constructionEntity = 81, permitKey = 'k' } }")
+        body = spec.encode("makeScriptingSendEventCmd", args, ctx)
+        self.assertEqual(body.fn, "makeScriptingSendEventCmd")
+        self.assertEqual(body.args[2], "Companies")
+        self.assertEqual(body.args[4].companyEntity["__ref"], "player")   # (a bare .__ref would be name-mangled inside a class)
+        self.assertEqual(body.args[4].constructionEntity.f, "industry/coal.con")
+        out = spec.encode("makeScriptingSendEventCmd", self.L.eval("{ n = 4, '', 'Notifications', 'add', {} }"), ctx)
+        self.assertEqual(out[0], None)
+        self.assertIn("Notifications/add is not replicated", out[1])
+        dctx = self.L.eval("{ player = 7, resolve = function(k) if k == 's:81' then return 81 end end }")
+        back = spec.decode(body, dctx)
+        self.assertEqual((back[2], back[3], back[4].constructionEntity, back[4].companyEntity), ("Companies", "MakeGreen", 81, 7))
+        # an event whose entity this game cannot find is refused with the reason, not applied to something else
+        lost = self.L.eval("{ fn = 'makeScriptingSendEventCmd', args = { n = 4, '', 'Companies', 'MakeGreen', { constructionEntity = "
+                           "{ __ref = 'entity', key = 's:9999', f = 'industry/none.con', p = { x = 1, y = 1, z = 0 } } } } }")
+        refused = spec.decode(lost, self.L.eval("{ player = 7, resolve = function(k) end }"))
+        self.assertEqual(refused[0], None)
+        self.assertIn("constructionEntity: unresolved construction reference s:9999", refused[1])
+
+    def test_claim_entity_serves_creations_in_order(self):
+        claim = self.K.claimEntity
+        lua = self.L.eval
+        self.assertEqual(claim(lua("{ 1, 2 }"), lua("{ 1, 2, 7, 5, 6 }"), lua("{}")), 5)
+        self.assertEqual(claim(lua("{ 1, 2 }"), lua("{ 1, 2, 7, 5, 6 }"), lua("{ [5] = true }")), 6)
+        self.assertEqual(claim(lua("{ 1, 2 }"), lua("{ 1, 2, 5 }"), lua("{ [5] = true }")), None)
+        self.assertEqual(claim(lua("{ 1, 2 }"), lua("{ 1, 2, 5 }"), None), 5)
+
+    # ---- references
+
+    def test_legacy_bodies_of_the_generic_schema_still_decode(self):
+        spec = self.ops.commands.makeVehicleBuyCmd
+        body = self.L.eval("{ fn = 'makeVehicleBuyCmd', args = { n = 3, { __ref = 'player' }, { __ref = 'entity', key = 's:55' }, {} } }")
+        args = spec.decode(body, self.L.eval("{ player = 7, resolve = function(k) if k == 's:55' then return 55 end end }"))
+        self.assertEqual((args[1], args[2], args.n), (7, 55, 3))
+
+    def test_a_hint_about_the_owning_building_beats_a_stale_key_and_a_wrong_one_is_ignored(self):
+        spec = self.ops.commands.makeVehicleReverseCmd
+        # the key says vehicle 70, the line argument is not a vehicle: kind checks
+        out = spec.decode(self.L.eval("{ fn = 'x', args = { n = 1, { __ref = 'entity', key = 's:71' } } }"),
+                          self.L.eval("{ player = 7, resolve = function(k) return tonumber(k:match('%d+')) end }"))
+        self.assertEqual(out[0], None)
+        self.assertIn("vehicle s:71 does not exist here", out[1])
+        # depots: the building (key and file) and the place in it name depot 62, whatever the key says
+        depot = self.ops.commands.makeVehicleBuyCmd
+        resolve = "function(k) return tonumber(k:match('%d+')) end"
+        dctx = self.L.eval("{ player = 7, resolve = %s }" % resolve)
+        hinted = self.L.eval("{ fn = 'x', args = { n = 3, { __ref = 'player' }, { __ref = 'entity', key = 's:55', at = { con = { key = 's:59', f = 'station2.con' }, i = 1 } }, {} } }")
+        self.assertEqual(depot.decode(hinted, dctx)[2], 62)
+        wrong_file = self.L.eval("{ fn = 'x', args = { n = 3, { __ref = 'player' }, { __ref = 'entity', key = 's:55', at = { con = { key = 's:59', f = 'other.con' }, i = 1 } }, {} } }")
+        self.assertEqual(depot.decode(wrong_file, dctx)[2], 55, "a hint that does not fit is ignored, the key stands")
+
+    def test_a_depot_nobody_bound_is_found_through_the_building_that_has_it(self):
+        # each game's player built the same depot in the session: other ids, but the building has a key on both
+        a = OpsGame("a", 0, self.tmp, 60000, 0, 7)
+        b = OpsGame("b", 1, self.tmp, 61000, 100, 17)
+        a.L.execute("WORLD[90001] = { CONSTRUCTION = { fileName = 'depot2.con', transf = { [13] = 5, [14] = 6, [15] = 0 }, depots = { 90010 }, stations = {} } }; "
+                    "WORLD[90010] = { VEHICLE_DEPOT = {} }")
+        b.L.execute("WORLD[91001] = { CONSTRUCTION = { fileName = 'depot2.con', transf = { [13] = 5, [14] = 6, [15] = 0 }, depots = { 91010 }, stations = {} } }; "
+                    "WORLD[91010] = { VEHICLE_DEPOT = {} }")
+        enc = b.L.eval("function() local ops = GUI_ENV.ug_require('feverlink3_cmds_ops.lua') "
+                       "local C = GUI_ENV.ug_require('feverlink3_common.lua') "
+                       "local ctx = { plain = C.plain, keyOf = function(e) if e == 91001 then return '1:7' end return 's:' .. e end } "
+                       "local body = ops.commands.makeVehicleBuyCmd.encode('makeVehicleBuyCmd', { n = 3, 17, 91010, BUILD_CONFIG(GUI_API, { parts = { { model = 'vehicle/truck.mdl' } } }) }, ctx) "
+                       "return C.serialize(body) end")()
+        self.assertIn('1:7', enc)
+        self.assertNotIn("91010", enc, "the depot's own id is not offered as a name: it is not one the other game has")
+        dec = a.L.eval("function(text) local ops = GUI_ENV.ug_require('feverlink3_cmds_ops.lua') "
+                       "local C = GUI_ENV.ug_require('feverlink3_common.lua') "
+                       "local body = C.parse(text) "
+                       "local args = ops.commands.makeVehicleBuyCmd.decode(body, { player = 7, resolve = function(k) if k == '1:7' then return 90001 end end }) "
+                       "return args[2] end")(enc)
+        self.assertEqual(dec, 90010, "game A's depot, found through A's building")
+
+    def test_journal_entries_keep_their_sub_category_and_unknown_ones_are_refused(self):
+        spec = self.ops.commands.makeJournalBookAssetCmd
+        ctx = self.L.eval(CTX)
+        entry = self.L.eval("(function() local e = GUI_API.type.JournalEntry.new() e.amount = -300 e.time = -1 "
+                            "e.category.type = GUI_API.type.JournalEntry.Type.CONSTRUCTION "
+                            "e.category.construction = GUI_API.type.JournalEntry.Construction.STATION return e end)()")
+        body = spec.encode("makeJournalBookAssetCmd", self.L.eval("function(e) return { n = 3, 7, e } end")(entry), ctx)
+        self.assertEqual((body.args[2].amount, body.args[2].type, body.args[2].sub), (-300, "CONSTRUCTION", "STATION"))
+        back = spec.decode(body, self.L.eval("{ player = 7, resolve = function() end }"))
+        self.assertEqual((back[2].amount, back[2].category.type, back[2].category.construction), (-300, 4, 4))
+        junk = self.L.eval("(function() local e = GUI_API.type.JournalEntry.new() e.amount = 1 e.category.type = 99 return e end)()")
+        out = spec.encode("makeJournalBookAssetCmd", self.L.eval("function(e) return { n = 3, 7, e } end")(junk), ctx)
+        self.assertEqual(out[0], None)
 
 
 if __name__ == "__main__":

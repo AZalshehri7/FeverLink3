@@ -144,6 +144,7 @@ local engine = {
 -- the wrong way, the next one notices and this switches itself off instead of doubling the error every round.
 do
 	local last, off = nil, false
+	local logEngine = C.logger("engine")
 	engine.adjustLoan = function(delta)
 		if off then error("loan correction is off: the loan moved the wrong way after the last one") end
 		local _, loan = engine.account()
@@ -151,7 +152,9 @@ do
 			local moved = loan - last.loan
 			if moved * last.delta < 0 and math.abs(moved) >= math.abs(last.delta) / 2 then
 				off = true
-				error("loan correction is off: the loan moved by " .. moved .. " after a correction of " .. last.delta)
+				local why = "loan correction is off: the loan moved by " .. moved .. " after a correction of " .. last.delta
+				logEngine(why .. " (a LOAN journal entry is assumed to raise the loan by its amount; see docs/COVERAGE_OPS.md)")
+				error(why)
 			end
 		end
 		engine.bookJournal(delta, "LOAN")
