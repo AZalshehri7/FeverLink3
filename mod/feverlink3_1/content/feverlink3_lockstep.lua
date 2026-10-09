@@ -160,12 +160,72 @@ L.COMMANDS = {
 }
 
 -- Other areas keep their schemas in modules of their own (feverlink3_cmds_*.lua, loaded by the bridge); each returns
--- { commands = { <api.cmd function name> = spec } }. A spec has the fields above and may carry two functions for
--- arguments the generic path cannot carry (engine userdata such as proposals):
+-- { commands = { <api.cmd function name> = spec }, events = { <id> = { <name> = handler } } }. A spec has the fields
+-- above and may carry two functions for arguments the generic path cannot carry (engine userdata such as proposals):
 --   spec.encode(name, args, ctx) -> body | nil, reason      (same contract as L.encodeCommand)
 --   spec.decode(body, ctx)       -> { n = count, ... } | nil, reason
+-- and one for a permission category that depends on the arguments:
+--   spec.categoryFor(args)       -> category | nil          (nil: the spec's own category)
 function L.registerCommands(commands)
 	for name, spec in pairs(commands or {}) do L.COMMANDS[name] = spec end
+end
+
+-- Events. makeScriptingSendEventCmd(src, id, name, param) is one engine command for dozens of unrelated messages to
+-- game scripts (loans, subsidies, town and company actions, but also notifications and tutorial steps). It has ONE
+-- spec, here, and the modules register the (id, name) pairs they replicate, so none of them replaces the others':
+--   handler.category                    permission category of the event
+--   handler.encode(param, ctx)          -> plain param | nil, reason   (default: a plain deep copy)
+--   handler.decode(param, ctx)          -> param | nil, reason         (default: the shipped value)
+-- An event nobody registered stays native and is never refused: its category is "local", which no grant covers.
+L.EVENTS = {}
+
+local function eventHandler(id, name)
+	local byName = L.EVENTS[id]
+	return byName and byName[name] or nil
+end
+
+L.EVENT_SPEC = {
+	category = "other",
+	categoryFor = function(args)
+		local h = eventHandler(args[2], args[3])
+		return h and h.category or "local"
+	end,
+	encode = function(name, args, ctx)
+		local h = eventHandler(args[2], args[3])
+		if not h then return nil, "event " .. tostring(args[2]) .. "/" .. tostring(args[3]) .. " is not replicated" end
+		local param, why
+		if h.encode then
+			-- a handler that raises must not throw into the window that sent the event
+			local ok, p1, p2 = pcall(h.encode, args[4], ctx)
+			if ok then param, why = p1, p2 else why = "encode failed: " .. tostring(p1) end
+		else
+			local ok, copy = pcall(ctx.plain, args[4])
+			if ok then param = copy else why = copy end
+		end
+		if why ~= nil then return nil, "event " .. tostring(args[2]) .. "/" .. tostring(args[3]) .. ": " .. tostring(why) end
+		return { fn = name, args = { n = 4, args[1], args[2], args[3], param } }
+	end,
+	decode = function(body, ctx)
+		local a = body.args
+		local h = eventHandler(a[2], a[3])
+		if not h then return nil, "event " .. tostring(a[2]) .. "/" .. tostring(a[3]) .. " is unknown here" end
+		local param, why = a[4], nil
+		if h.decode then
+			-- nor may one stop the simulation on an event another player sent
+			local ok, p1, p2 = pcall(h.decode, a[4], ctx)
+			if ok then param, why = p1, p2 else param, why = nil, "decode failed: " .. tostring(p1) end
+		end
+		if why ~= nil then return nil, "event " .. tostring(a[2]) .. "/" .. tostring(a[3]) .. ": " .. tostring(why) end
+		return { n = 4, a[1], a[2], a[3], param }
+	end,
+}
+
+function L.registerEvents(events)
+	for id, byName in pairs(events or {}) do
+		L.EVENTS[id] = L.EVENTS[id] or {}
+		for name, handler in pairs(byName) do L.EVENTS[id][name] = handler end
+	end
+	L.COMMANDS.makeScriptingSendEventCmd = L.EVENT_SPEC
 end
 
 function L.keyFor(rev, e)
@@ -238,15 +298,33 @@ function L.newestEntity(before, after)
 	return created
 end
 
+-- The same when several creations may appear together (a player buying five vehicles in one go): the oldest new id
+-- that no other watch has claimed. Watches are served in the order their commands were applied, which is the same on
+-- every game, and the engine numbers entities in creation order, so the n-th command gets the n-th entity everywhere.
+function L.claimEntity(before, after, claimed)
+	local seen = {}
+	for _, e in ipairs(before) do seen[e] = true end
+	local found = nil
+	for _, e in ipairs(after) do
+		if not seen[e] and not (claimed and claimed[e]) and (found == nil or e < found) then found = e end
+	end
+	return found
+end
+
 -- ------------------------------------------------------------------ permissions
 
 -- The host grants each player a set of categories: build, bulldoze, spend (vehicle purchases), other. A command
--- belongs to the category its COMMANDS entry names; a command without an entry is classified by its name, so a
--- command that stays native is still checked. Anything unrecognised is "other".
+-- belongs to the category its COMMANDS entry names (or its categoryFor(args), for commands whose arguments decide,
+-- such as events); a command without an entry is classified by its name, so a command that stays native is still
+-- checked. Anything unrecognised is "other".
 L.CATEGORIES = { "build", "bulldoze", "spend", "other" }
 
-function L.categoryOf(name)
+function L.categoryOf(name, args)
 	local spec = L.COMMANDS[name]
+	if spec and spec.categoryFor and args then
+		local category = spec.categoryFor(args)
+		if category then return category end
+	end
 	if spec and spec.category then return spec.category end
 	local n = tostring(name):lower()
 	if n:find("bulldoze", 1, true) or n:find("remove", 1, true) or n:find("demolish", 1, true) then return "bulldoze" end

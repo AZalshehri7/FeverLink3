@@ -32,6 +32,7 @@ end
 -- the native module's state (nil until it has written the first one): true when it changed
 local function pollCtl()
 	C.poll()
+	if not U.firstSeen then U.firstSeen = os.clock() end
 	local s = C.parse(C.readFile(C.path(CTL_STATUS)) or "")
 	if type(s) ~= "table" then return false end
 	if U.ctl and U.ctl.version == s.version then return false end
@@ -88,8 +89,22 @@ local function setup(react, builtin)
 		local function add(node) rows[#rows + 1] = node end
 		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
 
-		local state = ctl and ctl.state or "starting"
-		if state == "starting" then
+		local state = ctl and ctl.state
+		if not state then
+			if not C.LIVE then
+				state = "launcher"   -- started by the feverlink3 launcher (developer mode): no in-game controller
+			elseif U.firstSeen and os.clock() - U.firstSeen > 15 then
+				state = "missing"
+			else
+				state = "starting"
+			end
+		end
+		if state == "launcher" then
+			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
+		elseif state == "missing" then
+			add(text("The FeverLink3 module is not running.", "font-scale-title-3"))
+			add(text("Close the game, run `feverlink3 install` from the FeverLink3 folder, then start the game again from Steam. If it keeps happening, send the files named in HOW-TO-PLAY.txt."))
+		elseif state == "starting" then
 			add(text("Starting the multiplayer module..."))
 		elseif state == "idle" or state == "failed" then
 			if state == "failed" then
@@ -133,15 +148,6 @@ local function setup(react, builtin)
 			add(text("Send this join code to the other players (click it, Ctrl+A, Ctrl+C):"))
 			add(field("join code", tostring(ctl.code or ""), function() end, true))
 			if ctl.password then add(text("They also need the password.")) end
-			if ctl.public then
-				add(text("Internet address: " .. tostring(ctl.public), "font-scale-body"))
-			end
-			if ctl.lookup and ctl.lookup ~= "" then add(text(tostring(ctl.lookup), "font-scale-body")) end
-			local where = {}
-			for _, ep in ipairs(ctl.endpoints or {}) do
-				if ep ~= ctl.public then where[#where + 1] = tostring(ep) end
-			end
-			if #where > 0 then add(text("Also reachable inside your network / VPN: " .. table.concat(where, "  /  "), "font-scale-body")) end
 			add(gap())
 			add(text("Players", "font-scale-title-3"))
 			for _, p in ipairs(ctl.players or {}) do
