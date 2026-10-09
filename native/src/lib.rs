@@ -14,8 +14,12 @@
 #![cfg_attr(not(test), deny(unsafe_op_in_unsafe_fn))]
 
 pub mod build_table;
+pub mod counters;
 pub mod detour;
+pub mod hold;
+pub mod link;
 pub mod pe;
+pub mod plan;
 pub mod scan;
 
 #[cfg(windows)]
@@ -25,6 +29,37 @@ pub mod proxy;
 
 /// Environment variable the launcher sets on the game process. Absent: the module is a plain proxy.
 pub const SESSION_DIR_VAR: &str = "FEVERLINK3_SESSION_DIR";
+
+/// Shared by the tests of the modules that touch files.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A fresh folder under the system temp folder, removed when dropped.
+    pub struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub fn new(tag: &str) -> TempDir {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let name = format!("fl3-native-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+            let dir = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create a temp folder");
+            TempDir(dir)
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
 
 #[cfg(windows)]
 mod entry {

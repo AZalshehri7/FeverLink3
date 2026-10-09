@@ -1,0 +1,1059 @@
+//! The control link between the Lua mod and the native module (`docs/NATIVE_LINK.md` section 3).
+//!
+//! Two append-only text files in the session folder, in exactly the shape of the launcher link
+//! (`docs/ARCHITECTURE.md` section 2): one record per line, `seq<TAB>kind<TAB>from<TAB>payload`, the payload one
+//! line of Lua literal syntax, `seq` growing by one per line, a reader keeping the last `seq` it dispatched. The
+//! mod therefore reads and writes them with the helpers it already has (`C.newWriter`, `C.newReader`, `C.parse`).
+//!
+//! - `native_ctl.log`: the mod writes, the module reads ([`CtlReader`], [`CtlMessage`]).
+//! - `native_events.log`: the module writes, the mod reads ([`EventWriter`], [`Event`]).
+//!
+//! Everything here is pure or plain file access. The reader is bounded (a line longer than [`MAX_LINE`] is thrown
+//! away, at most [`MAX_READ`] bytes are taken per poll) because the content comes from outside the process.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use feverlink3_launcher::gamelink::{self, Line};
+use feverlink3_launcher::luatext;
+use serde_json::Value;
+
+/// The mod writes, the module reads.
+pub const CTL_FILE: &str = "native_ctl.log";
+/// The module writes, the mod reads.
+pub const EVENTS_FILE: &str = "native_events.log";
+/// The `from` column of every event line.
+pub const EVENTS_FROM: &str = "native";
+/// A control line longer than this is thrown away.
+pub const MAX_LINE: usize = 8 * 1024;
+/// Most bytes read from the control file in one poll.
+pub const MAX_READ: usize = 64 * 1024;
+/// Most kind names one `hold_on` may carry.
+pub const MAX_HOLD_KINDS: usize = 16;
+/// The events file stops growing here: a mod that never reads it must not fill the disk.
+pub const MAX_EVENTS_BYTES: u64 = 8 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Mod to module
+// ---------------------------------------------------------------------------------------------------------------
+
+/// One message of `native_ctl.log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtlMessage {
+    /// Start holding commands of these kinds (names of the build's kind table).
+    HoldOn { kinds: Vec<String> },
+    /// Stop holding and release everything now, in order.
+    HoldOff,
+    /// Release held command `id` when the simulation reaches game time `at`; 0 means now.
+    Release { id: u64, at: u64 },
+    /// Drop held command `id`.
+    Cancel { id: u64 },
+    /// Apply the staged terrain edit `id` at `stamp` (stage 0.4: parsed, not acted on).
+    TerrainApply { id: u64, stamp: u64 },
+    /// Liveness; answered with `pong`.
+    Ping { n: i64 },
+}
+
+/// Why a control line could not be turned into a [`CtlMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CtlError {
+    /// A kind this module does not know.
+    UnknownKind(String),
+    /// The payload is not in the accepted Lua literal subset.
+    Malformed,
+    /// The payload parsed but a field is missing or out of range; says which.
+    BadPayload(&'static str),
+}
+
+impl std::fmt::Display for CtlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CtlError::UnknownKind(k) => write!(f, "unknown control kind {k:?}"),
+            CtlError::Malformed => f.write_str("payload is not Lua literal syntax"),
+            CtlError::BadPayload(why) => write!(f, "bad payload: {why}"),
+        }
+    }
+}
+
+/// A kind name of the control link: lower-case letters, digits and `_`, 1 to 32 characters.
+pub fn valid_kind_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+fn parse_payload(text: &str) -> Result<Value, CtlError> {
+    if text.trim().is_empty() {
+        return Ok(Value::Object(Default::default())); // a hand-written `hold_off` line may leave it out
+    }
+    let json = luatext::lua_to_json(text).ok_or(CtlError::Malformed)?;
+    serde_json::from_slice(&json).map_err(|_| CtlError::Malformed)
+}
+
+/// A whole number from 0 to 2^53 (the range a Lua double holds exactly). The mod writes integers as `%d` and
+/// anything else as `%.17g`, so a float with no fraction is accepted too.
+fn whole(v: &Value) -> Option<u64> {
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    if let Some(n) = v.as_u64() {
+        return (n as f64 <= LIMIT).then_some(n);
+    }
+    let f = v.as_f64()?;
+    ((0.0..=LIMIT).contains(&f) && f.fract() == 0.0).then_some(f as u64)
+}
+
+fn required(p: &Value, key: &str, why: &'static str) -> Result<u64, CtlError> {
+    p.get(key).and_then(whole).ok_or(CtlError::BadPayload(why))
+}
+
+fn optional(p: &Value, key: &str, why: &'static str) -> Result<u64, CtlError> {
+    match p.get(key) {
+        None => Ok(0),
+        Some(v) => whole(v).ok_or(CtlError::BadPayload(why)),
+    }
+}
+
+/// Turns one record of `native_ctl.log` into a message.
+pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
+    let p = parse_payload(&line.payload)?;
+    match line.kind.as_str() {
+        "hold_on" => {
+            let list = p.get("kinds").and_then(Value::as_array).ok_or(CtlError::BadPayload("kinds must be a list"))?;
+            if list.is_empty() || list.len() > MAX_HOLD_KINDS {
+                return Err(CtlError::BadPayload("kinds must name 1 to 16 kinds"));
+            }
+            let mut kinds = Vec::with_capacity(list.len());
+            for item in list {
+                match item.as_str().filter(|s| valid_kind_name(s)) {
+                    Some(name) => kinds.push(name.to_string()),
+                    None => return Err(CtlError::BadPayload("a kind name is not a lower-case identifier")),
+                }
+            }
+            Ok(CtlMessage::HoldOn { kinds })
+        }
+        "hold_off" => Ok(CtlMessage::HoldOff),
+        "release" => Ok(CtlMessage::Release {
+            id: required(&p, "id", "release needs a numeric id")?,
+            at: optional(&p, "at", "at must be a game time")?,
+        }),
+        "cancel" => Ok(CtlMessage::Cancel { id: required(&p, "id", "cancel needs a numeric id")? }),
+        "terrain_apply" => Ok(CtlMessage::TerrainApply {
+            id: required(&p, "id", "terrain_apply needs a numeric id")?,
+            stamp: optional(&p, "stamp", "stamp must be a game time")?,
+        }),
+        "ping" => {
+            let n = match p.get("n") {
+                None => 0,
+                Some(v) => v
+                    .as_i64()
+                    .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && f.abs() <= 9.0e15).map(|f| f as i64))
+                    .ok_or(CtlError::BadPayload("n must be a whole number"))?,
+            };
+            Ok(CtlMessage::Ping { n })
+        }
+        other => Err(CtlError::UnknownKind(other.chars().take(40).collect())),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Reading the control file
+// ---------------------------------------------------------------------------------------------------------------
+
+/// What one poll of the control file found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Poll {
+    /// New, complete, valid records in file order.
+    pub lines: Vec<Line>,
+    /// The file existed before and is gone now. Reported once.
+    pub gone: bool,
+    /// Records thrown away: longer than [`MAX_LINE`], not a link record, or a `seq` not above the last one.
+    pub discarded: usize,
+    /// A read error (the file is retried on the next poll).
+    pub error: Option<String>,
+}
+
+/// Reads new records from `native_ctl.log`: tolerates a missing file, a partial last line, truncation and a
+/// rewrite; a `seq` that is not above the last dispatched one is dropped, so history never plays twice.
+#[derive(Debug)]
+pub struct CtlReader {
+    path: PathBuf,
+    /// Bytes of the file consumed; an incomplete last line waits in `pending`.
+    offset: u64,
+    last_seq: u64,
+    pending: Vec<u8>,
+    /// In the middle of a line longer than [`MAX_LINE`]: everything up to its newline is dropped.
+    skipping: bool,
+    existed: bool,
+}
+
+impl CtlReader {
+    /// A reader that takes the file from its first byte.
+    pub fn new(path: PathBuf) -> CtlReader {
+        CtlReader { path, offset: 0, last_seq: 0, pending: Vec::new(), skipping: false, existed: false }
+    }
+
+    /// A reader that treats whatever the file holds now as history: it starts at the end and remembers the
+    /// highest `seq` in it. Used when the link opens, so lines of an earlier run are never acted on.
+    pub fn starting_at_end(path: PathBuf) -> io::Result<CtlReader> {
+        let mut r = CtlReader::new(path);
+        match fs::metadata(&r.path) {
+            Ok(m) => {
+                r.offset = m.len();
+                r.existed = true;
+                r.last_seq = tail_highest_seq(&r.path)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(r)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+
+    /// True when the file is longer than what was consumed: the cheap check (a metadata call, no open) that lets a
+    /// caller on a hot path decide whether a [`poll`](Self::poll) is worth it.
+    pub fn has_news(&self) -> bool {
+        match fs::metadata(&self.path) {
+            Ok(m) => m.len() != self.offset,
+            Err(_) => self.existed,
+        }
+    }
+
+    pub fn poll(&mut self) -> Poll {
+        let mut out = Poll::default();
+        let len = match fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if self.existed {
+                    // gone for good as far as this session goes: a fresh file starts a fresh numbering
+                    self.existed = false;
+                    self.offset = 0;
+                    self.last_seq = 0;
+                    self.pending.clear();
+                    self.skipping = false;
+                    out.gone = true;
+                }
+                return out;
+            }
+            Err(e) => {
+                out.error = Some(format!("{}: {e}", self.path.display()));
+                return out;
+            }
+        };
+        self.existed = true;
+        if len < self.offset {
+            // truncated or rewritten: read from the top again, the seq filter keeps old lines out
+            self.offset = 0;
+            self.pending.clear();
+            self.skipping = false;
+        }
+        if len == self.offset {
+            return out;
+        }
+        let mut chunk = Vec::new();
+        let read = File::open(&self.path).and_then(|mut f| {
+            f.seek(SeekFrom::Start(self.offset))?;
+            f.take(MAX_READ as u64).read_to_end(&mut chunk)
+        });
+        if let Err(e) = read {
+            out.error = Some(format!("{}: {e}", self.path.display()));
+            return out;
+        }
+        self.offset += chunk.len() as u64;
+        self.feed(&chunk, &mut out);
+        out
+    }
+
+    fn feed(&mut self, bytes: &[u8], out: &mut Poll) {
+        for &b in bytes {
+            if b == b'\n' {
+                if std::mem::take(&mut self.skipping) {
+                    self.pending.clear();
+                } else {
+                    let raw = std::mem::take(&mut self.pending);
+                    self.accept(&raw, out);
+                }
+            } else if self.skipping {
+                // the rest of an oversize line
+            } else if self.pending.len() >= MAX_LINE {
+                self.pending.clear();
+                self.skipping = true;
+                out.discarded += 1;
+            } else {
+                self.pending.push(b);
+            }
+        }
+    }
+
+    fn accept(&mut self, raw: &[u8], out: &mut Poll) {
+        let text = String::from_utf8_lossy(raw);
+        if text.trim().is_empty() {
+            return;
+        }
+        match gamelink::parse_line(&text) {
+            Some(line) if line.seq > self.last_seq => {
+                self.last_seq = line.seq;
+                out.lines.push(line);
+            }
+            _ => out.discarded += 1,
+        }
+    }
+}
+
+/// The highest `seq` among the complete records in the last [`MAX_READ`] bytes of a file; 0 when there is none.
+fn tail_highest_seq(path: &Path) -> io::Result<u64> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+    let from = len.saturating_sub(MAX_READ as u64);
+    f.seek(SeekFrom::Start(from))?;
+    let mut tail = Vec::new();
+    f.take(MAX_READ as u64).read_to_end(&mut tail)?;
+    let text = String::from_utf8_lossy(&tail);
+    let mut lines = text.split('\n');
+    if from > 0 {
+        lines.next(); // the first piece may start mid-line
+    }
+    Ok(lines.filter_map(gamelink::parse_line).map(|l| l.seq).max().unwrap_or(0))
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Module to mod
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A value in Lua literal syntax, written the way the mod's own serialiser writes it (`C.serialize`): sorted keys,
+/// integers as `%d`, strings with `\n \r \t \" \\` and `\ddd` for the other control characters. Events carry no
+/// floats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lua {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    /// `{[1]=a,[2]=b}`
+    List(Vec<Lua>),
+    /// `{["key"]=v,...}`
+    Map(BTreeMap<String, Lua>),
+    /// `{[3]=v,...}`
+    IntMap(BTreeMap<i64, Lua>),
+}
+
+impl Lua {
+    /// An unsigned count as an integer (saturating at `i64::MAX`, which no counter reaches).
+    pub fn uint(n: u64) -> Lua {
+        Lua::Int(i64::try_from(n).unwrap_or(i64::MAX))
+    }
+
+    pub fn str(s: impl Into<String>) -> Lua {
+        Lua::Str(s.into())
+    }
+
+    pub fn map<const N: usize>(entries: [(&str, Lua); N]) -> Lua {
+        Lua::Map(entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    pub fn write(&self, out: &mut String) {
+        match self {
+            Lua::Int(n) => out.push_str(&n.to_string()),
+            Lua::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Lua::Str(s) => write_string(s, out),
+            Lua::List(items) => {
+                out.push('{');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!("[{}]=", i + 1));
+                    item.write(out);
+                }
+                out.push('}');
+            }
+            Lua::Map(map) => {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('[');
+                    write_string(k, out);
+                    out.push_str("]=");
+                    v.write(out);
+                }
+                out.push('}');
+            }
+            Lua::IntMap(map) => {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!("[{k}]="));
+                    v.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        self.write(&mut s);
+        s
+    }
+}
+
+fn write_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\{:03}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Counts of the commands the interface added to the engine's list, by where they came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AddCounts {
+    /// From one of the construction-tool sites.
+    pub tool: u64,
+    /// From any other caller.
+    pub other: u64,
+    /// The caller could not be identified.
+    pub unknown: u64,
+}
+
+/// One message of `native_events.log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// Written once at start: what is active.
+    Ready {
+        build: String,
+        version: String,
+        hooks: Vec<String>,
+        poolpatch: bool,
+        /// Whether the module can read the game time (it cannot yet: a `release` at a later game time is due at once).
+        clock: bool,
+        /// Kind names the control link understands, with their kind bytes.
+        kinds: Vec<(String, u8)>,
+        /// How many construction-tool call sites the hold hook knows.
+        sites: usize,
+    },
+    /// A command was captured.
+    Held {
+        id: u64,
+        kind: u8,
+        site: u32,
+        ms: u64,
+    },
+    /// A held command was handed back to the engine (`reason` says why now).
+    Released {
+        id: u64,
+        reason: &'static str,
+        ms: u64,
+    },
+    /// A held command was destroyed instead of released.
+    Dropped {
+        id: u64,
+        reason: &'static str,
+    },
+    /// The simulation applied a command the module had released.
+    Applied {
+        id: u64,
+        ok: bool,
+    },
+    /// Cumulative counts of the commands the simulation applied, by kind byte.
+    Audit {
+        counts: Vec<(u8, u64)>,
+        total: u64,
+        unreadable: u64,
+        adds: AddCounts,
+        sites: Vec<(usize, u64)>,
+    },
+    /// Holding was switched on or off, by the mod or by the module (`reason`).
+    Holding {
+        on: bool,
+        kinds: Vec<String>,
+        reason: &'static str,
+    },
+    Pong {
+        n: i64,
+    },
+    Error {
+        place: String,
+        detail: String,
+    },
+}
+
+impl Event {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Event::Ready { .. } => "ready",
+            Event::Held { .. } => "held",
+            Event::Released { .. } => "released",
+            Event::Dropped { .. } => "dropped",
+            Event::Applied { .. } => "applied",
+            Event::Audit { .. } => "audit",
+            Event::Holding { .. } => "holding",
+            Event::Pong { .. } => "pong",
+            Event::Error { .. } => "error",
+        }
+    }
+
+    pub fn payload(&self) -> String {
+        let v = match self {
+            Event::Ready { build, version, hooks, poolpatch, clock, kinds, sites } => Lua::map([
+                ("build", Lua::str(build)),
+                ("clock", Lua::Bool(*clock)),
+                ("hooks", Lua::List(hooks.iter().map(Lua::str).collect())),
+                ("kinds", Lua::Map(kinds.iter().map(|(n, k)| (n.clone(), Lua::Int(i64::from(*k)))).collect())),
+                ("poolpatch", Lua::Bool(*poolpatch)),
+                ("sites", Lua::uint(*sites as u64)),
+                ("version", Lua::str(version)),
+            ]),
+            Event::Held { id, kind, site, ms } => Lua::map([
+                ("id", Lua::uint(*id)),
+                ("kind", Lua::Int(i64::from(*kind))),
+                ("ms", Lua::uint(*ms)),
+                ("site", Lua::Int(i64::from(*site))),
+            ]),
+            Event::Released { id, reason, ms } => {
+                Lua::map([("id", Lua::uint(*id)), ("ms", Lua::uint(*ms)), ("reason", Lua::str(*reason))])
+            }
+            Event::Dropped { id, reason } => Lua::map([("id", Lua::uint(*id)), ("reason", Lua::str(*reason))]),
+            Event::Applied { id, ok } => Lua::map([("id", Lua::uint(*id)), ("ok", Lua::Bool(*ok))]),
+            Event::Audit { counts, total, unreadable, adds, sites } => Lua::map([
+                (
+                    "adds",
+                    Lua::map([
+                        ("other", Lua::uint(adds.other)),
+                        ("tool", Lua::uint(adds.tool)),
+                        ("unknown", Lua::uint(adds.unknown)),
+                    ]),
+                ),
+                ("counts", Lua::IntMap(counts.iter().map(|(k, n)| (i64::from(*k), Lua::uint(*n))).collect())),
+                ("sites", Lua::IntMap(sites.iter().map(|(i, n)| (*i as i64, Lua::uint(*n))).collect())),
+                ("total", Lua::uint(*total)),
+                ("unreadable", Lua::uint(*unreadable)),
+            ]),
+            Event::Holding { on, kinds, reason } => Lua::map([
+                ("kinds", Lua::List(kinds.iter().map(Lua::str).collect())),
+                ("on", Lua::Bool(*on)),
+                ("reason", Lua::str(*reason)),
+            ]),
+            Event::Pong { n } => Lua::map([("n", Lua::Int(*n))]),
+            Event::Error { place, detail } => Lua::map([("detail", Lua::str(detail)), ("where", Lua::str(place))]),
+        };
+        v.text()
+    }
+}
+
+/// Appends events to `native_events.log`, continuing the numbering of whatever the file already holds.
+#[derive(Debug)]
+pub struct EventWriter {
+    path: PathBuf,
+    next_seq: u64,
+    size: u64,
+}
+
+impl EventWriter {
+    /// Opens the writer in a session folder. Nothing is created until the first [`append`](Self::append).
+    pub fn open(dir: &Path) -> io::Result<EventWriter> {
+        let path = dir.join(EVENTS_FILE);
+        let next_seq = tail_highest_seq(&path)? + 1;
+        let size = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        Ok(EventWriter { path, next_seq, size })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The `seq` the next event gets.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// The text of one event line, including the newline.
+    pub fn line(seq: u64, event: &Event) -> String {
+        gamelink::format_line(&Line {
+            seq,
+            kind: event.kind().to_string(),
+            from: EVENTS_FROM.to_string(),
+            payload: event.payload(),
+        })
+    }
+
+    /// Writes the events with one `write`, so a reader never sees half a batch's lines interleaved with another's.
+    /// The numbers are used up even when the write fails: a gap is harmless, a repeated `seq` would be dropped.
+    pub fn append(&mut self, events: &[Event]) -> io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut text = String::new();
+        for e in events {
+            text.push_str(&EventWriter::line(self.next_seq, e));
+            self.next_seq += 1;
+        }
+        if self.size + text.len() as u64 > MAX_EVENTS_BYTES {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "native_events.log reached its size limit"));
+        }
+        OpenOptions::new().create(true).append(true).open(&self.path)?.write_all(text.as_bytes())?;
+        self.size += text.len() as u64;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn line(seq: u64, kind: &str, payload: &str) -> Line {
+        Line { seq, kind: kind.into(), from: "1".into(), payload: payload.into() }
+    }
+
+    fn parse(kind: &str, payload: &str) -> Result<CtlMessage, CtlError> {
+        parse_ctl_line(&line(1, kind, payload))
+    }
+
+    // ---- control messages
+
+    #[test]
+    fn every_control_kind_parses_from_the_mods_serialiser_output() {
+        // these payloads are what C.serialize writes: sorted keys, [k]=v, integers as %d
+        assert_eq!(
+            parse("hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#),
+            Ok(CtlMessage::HoldOn { kinds: vec!["build_proposal".into()] })
+        );
+        assert_eq!(parse("hold_off", "{}"), Ok(CtlMessage::HoldOff));
+        assert_eq!(parse("release", r#"{["at"]=12000,["id"]=3}"#), Ok(CtlMessage::Release { id: 3, at: 12000 }));
+        assert_eq!(parse("cancel", r#"{["id"]=7}"#), Ok(CtlMessage::Cancel { id: 7 }));
+        assert_eq!(
+            parse("terrain_apply", r#"{["id"]=2,["stamp"]=400}"#),
+            Ok(CtlMessage::TerrainApply { id: 2, stamp: 400 })
+        );
+        assert_eq!(parse("ping", r#"{["n"]=-4}"#), Ok(CtlMessage::Ping { n: -4 }));
+    }
+
+    #[test]
+    fn lines_written_by_the_mods_own_writer_parse() {
+        // The bytes feverlink3_common.lua produces: C.newWriter(path, 1), then C.writerSend for each kind with
+        // {kinds={"build_proposal"}}, {n=3}, {id=3, at=12400}, {id=7}, {} and {id=2, stamp=400}.
+        let file = "1\thold_on\t1\t{[\"kinds\"]={[1]=\"build_proposal\"}}\n2\tping\t1\t{[\"n\"]=3}\n\
+                    3\trelease\t1\t{[\"at\"]=12400,[\"id\"]=3}\n4\tcancel\t1\t{[\"id\"]=7}\n5\thold_off\t1\t{}\n\
+                    6\tterrain_apply\t1\t{[\"id\"]=2,[\"stamp\"]=400}\n";
+        let dir = TempDir::new("mod-writer");
+        let path = dir.path().join(CTL_FILE);
+        fs::write(&path, file).unwrap();
+        let messages: Vec<_> = CtlReader::new(path).poll().lines.iter().map(|l| parse_ctl_line(l).unwrap()).collect();
+        assert_eq!(
+            messages,
+            [
+                CtlMessage::HoldOn { kinds: vec!["build_proposal".into()] },
+                CtlMessage::Ping { n: 3 },
+                CtlMessage::Release { id: 3, at: 12400 },
+                CtlMessage::Cancel { id: 7 },
+                CtlMessage::HoldOff,
+                CtlMessage::TerrainApply { id: 2, stamp: 400 },
+            ]
+        );
+    }
+
+    #[test]
+    fn hand_written_lines_are_accepted_too() {
+        assert_eq!(
+            parse("hold_on", r#"{kinds={"build_proposal","other"}}"#).unwrap(),
+            CtlMessage::HoldOn { kinds: vec!["build_proposal".into(), "other".into()] }
+        );
+        assert_eq!(parse("hold_off", ""), Ok(CtlMessage::HoldOff));
+        assert_eq!(parse("release", "{id=1}"), Ok(CtlMessage::Release { id: 1, at: 0 }), "at defaults to now");
+        assert_eq!(parse("ping", "{}"), Ok(CtlMessage::Ping { n: 0 }));
+        assert_eq!(parse("release", r#"{["id"]=1.0,["at"]=2e3}"#), Ok(CtlMessage::Release { id: 1, at: 2000 }));
+    }
+
+    #[test]
+    fn bad_payloads_are_errors_not_panics() {
+        for (kind, payload) in [
+            ("hold_on", "{}"),
+            ("hold_on", r#"{["kinds"]={}}"#),
+            ("hold_on", r#"{["kinds"]="build_proposal"}"#),
+            ("hold_on", r#"{["kinds"]={[1]=5}}"#),
+            ("hold_on", r#"{["kinds"]={[1]="Build Proposal"}}"#),
+            ("hold_on", r#"{["kinds"]={[1]=""}}"#),
+            ("release", "{}"),
+            ("release", r#"{["id"]=-1}"#),
+            ("release", r#"{["id"]=1.5}"#),
+            ("release", r#"{["id"]="1"}"#),
+            ("release", r#"{["id"]=1,["at"]=-5}"#),
+            ("release", r#"{["id"]=1e300}"#),
+            ("cancel", r#"{["id"]=true}"#),
+            ("terrain_apply", "{}"),
+            ("ping", r#"{["n"]="x"}"#),
+        ] {
+            assert!(matches!(parse(kind, payload), Err(CtlError::BadPayload(_))), "{kind} {payload}");
+        }
+        for payload in ["os.exit()", "{", "{[1]=}", "{} extra", "(0/0)"] {
+            assert_eq!(parse("hold_off", payload), Err(CtlError::Malformed), "{payload}");
+        }
+        assert_eq!(parse("explode", "{}"), Err(CtlError::UnknownKind("explode".into())));
+        let long = "x".repeat(500);
+        assert!(matches!(parse(&long, "{}"), Err(CtlError::UnknownKind(k)) if k.len() == 40));
+    }
+
+    #[test]
+    fn too_many_kinds_are_refused() {
+        let names: Vec<String> = (1..=17).map(|i| format!("[{i}]=\"k{i}\"")).collect();
+        let payload = format!("{{[\"kinds\"]={{{}}}}}", names.join(","));
+        assert!(matches!(parse("hold_on", &payload), Err(CtlError::BadPayload(_))));
+        let ok = format!("{{[\"kinds\"]={{{}}}}}", names[..16].join(","));
+        assert!(matches!(parse("hold_on", &ok), Ok(CtlMessage::HoldOn { kinds }) if kinds.len() == 16));
+    }
+
+    #[test]
+    fn kind_names() {
+        assert!(valid_kind_name("build_proposal"));
+        assert!(valid_kind_name("k2"));
+        assert!(!valid_kind_name(""));
+        assert!(!valid_kind_name("Build"));
+        assert!(!valid_kind_name("a b"));
+        assert!(!valid_kind_name(&"a".repeat(33)));
+    }
+
+    // ---- reading the file
+
+    fn append(path: &Path, text: &str) {
+        OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
+    }
+
+    fn rec(seq: u64, kind: &str, payload: &str) -> String {
+        format!("{seq}\t{kind}\t1\t{payload}\n")
+    }
+
+    #[test]
+    fn reader_returns_new_complete_lines_once() {
+        let dir = TempDir::new("reader-basic");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        assert_eq!(r.poll(), Poll::default(), "a missing file is not an event");
+        assert!(!r.has_news());
+        append(&path, &rec(1, "ping", "{}"));
+        assert!(r.has_news());
+        let p = r.poll();
+        assert_eq!(p.lines.len(), 1);
+        assert_eq!(p.lines[0].kind, "ping");
+        assert!(!r.has_news());
+        assert_eq!(r.poll(), Poll::default(), "nothing is dispatched twice");
+        append(&path, &(rec(2, "hold_off", "{}") + &rec(3, "ping", r#"{["n"]=1}"#)));
+        let kinds: Vec<_> = r.poll().lines.into_iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, ["hold_off", "ping"]);
+        assert_eq!(r.last_seq(), 3);
+    }
+
+    #[test]
+    fn a_partial_last_line_waits_for_its_newline() {
+        let dir = TempDir::new("reader-partial");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, "1\tping\t1\t{[\"n\"]");
+        assert!(r.poll().lines.is_empty());
+        append(&path, "=5}\n");
+        let p = r.poll();
+        assert_eq!(p.lines.len(), 1);
+        assert_eq!(p.lines[0].payload, r#"{["n"]=5}"#);
+    }
+
+    #[test]
+    fn crlf_lines_and_blank_lines_are_fine() {
+        let dir = TempDir::new("reader-crlf");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, "1\tping\t1\t{}\r\n\r\n2\tping\t1\t{}\r\n");
+        let p = r.poll();
+        assert_eq!(p.lines.len(), 2);
+        assert_eq!(p.discarded, 0);
+        assert_eq!(p.lines[0].payload, "{}");
+    }
+
+    #[test]
+    fn old_and_repeated_sequence_numbers_are_dropped() {
+        let dir = TempDir::new("reader-seq");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, &(rec(5, "ping", "{}") + &rec(5, "ping", "{}") + &rec(4, "ping", "{}") + &rec(6, "ping", "{}")));
+        let p = r.poll();
+        assert_eq!(p.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [5, 6]);
+        assert_eq!(p.discarded, 2);
+    }
+
+    #[test]
+    fn truncation_restarts_the_read_without_replaying_history() {
+        let dir = TempDir::new("reader-truncate");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, &(rec(1, "ping", "{}") + &rec(2, "ping", "{}") + &rec(3, "ping", "{}")));
+        assert_eq!(r.poll().lines.len(), 3);
+        fs::write(&path, rec(1, "ping", "{}") + &rec(2, "ping", "{}")).unwrap(); // shorter: rewritten history
+        let p = r.poll();
+        assert!(p.lines.is_empty());
+        assert_eq!(p.discarded, 2);
+        append(&path, &rec(4, "hold_off", "{}"));
+        assert_eq!(r.poll().lines.len(), 1, "new numbers after a rewrite are dispatched");
+    }
+
+    #[test]
+    fn a_deleted_file_is_reported_once_and_a_new_one_starts_afresh() {
+        let dir = TempDir::new("reader-gone");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, &rec(7, "ping", "{}"));
+        assert_eq!(r.poll().lines.len(), 1);
+        fs::remove_file(&path).unwrap();
+        assert!(r.has_news(), "the disappearance is news");
+        let p = r.poll();
+        assert!(p.gone);
+        assert!(!r.poll().gone, "reported once");
+        append(&path, &rec(1, "ping", "{}"));
+        assert_eq!(r.poll().lines.len(), 1, "a re-created file may restart its numbering");
+    }
+
+    #[test]
+    fn a_file_that_never_existed_is_not_gone() {
+        let dir = TempDir::new("reader-never");
+        let mut r = CtlReader::new(dir.path().join(CTL_FILE));
+        assert!(!r.poll().gone);
+    }
+
+    #[test]
+    fn oversize_lines_are_thrown_away_without_losing_the_next_ones() {
+        let dir = TempDir::new("reader-oversize");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        let huge = "x".repeat(MAX_LINE * 3);
+        append(&path, &(rec(1, "ping", "{}") + &format!("2\tping\t1\t{huge}\n") + &rec(3, "ping", "{}")));
+        let p = r.poll();
+        assert_eq!(p.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(p.discarded, 1);
+        assert!(r.pending.len() < MAX_LINE, "the buffer stays bounded");
+    }
+
+    #[test]
+    fn an_oversize_line_split_across_polls_is_still_one_discard() {
+        let dir = TempDir::new("reader-oversize-split");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, &format!("1\tping\t1\t{}", "y".repeat(MAX_LINE + 10)));
+        assert_eq!(r.poll().discarded, 1);
+        append(&path, &format!("{}\n", "z".repeat(1000)));
+        let p = r.poll();
+        assert_eq!(p.discarded, 0, "the tail of the same line is not counted again");
+        assert!(p.lines.is_empty());
+        append(&path, &rec(2, "ping", "{}"));
+        assert_eq!(r.poll().lines.len(), 1);
+    }
+
+    #[test]
+    fn a_read_is_bounded_and_resumes() {
+        let dir = TempDir::new("reader-bounded");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        let one = rec(1, "ping", "{}");
+        let n = MAX_READ / one.len() * 2 + 10;
+        let mut text = String::new();
+        for i in 1..=n as u64 {
+            text.push_str(&rec(i, "ping", "{}"));
+        }
+        fs::write(&path, &text).unwrap();
+        let first = r.poll().lines.len();
+        assert!(first > 0 && first < n, "one poll takes at most MAX_READ bytes ({first} of {n})");
+        let mut total = first;
+        while r.has_news() {
+            total += r.poll().lines.len();
+        }
+        assert_eq!(total, n);
+    }
+
+    #[test]
+    fn garbage_lines_are_counted_not_dispatched() {
+        let dir = TempDir::new("reader-garbage");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(&path, "not a record\n\u{1}\u{2}\n1\tping\t1\t{}\nnoseq\tping\t1\t{}\n");
+        let p = r.poll();
+        assert_eq!(p.lines.len(), 1);
+        assert_eq!(p.discarded, 3);
+        fs::write(&path, [0xff, 0xfe, b'\n']).unwrap(); // invalid UTF-8 never panics
+        r.poll();
+    }
+
+    #[test]
+    fn starting_at_the_end_ignores_history_but_keeps_its_numbering() {
+        let dir = TempDir::new("reader-history");
+        let path = dir.path().join(CTL_FILE);
+        append(&path, &(rec(1, "hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#) + &rec(2, "ping", "{}")));
+        let mut r = CtlReader::starting_at_end(path.clone()).unwrap();
+        assert_eq!(r.last_seq(), 2);
+        assert!(r.poll().lines.is_empty(), "an earlier run's lines are not acted on");
+        append(&path, &rec(3, "hold_off", "{}"));
+        assert_eq!(r.poll().lines.len(), 1);
+        let none = CtlReader::starting_at_end(dir.path().join("missing.log")).unwrap();
+        assert_eq!(none.last_seq(), 0);
+    }
+
+    // ---- events
+
+    #[test]
+    fn lua_literals_match_the_mods_serialiser() {
+        let v = Lua::map([
+            ("s", Lua::str("a\tb\nc\"d\\e\u{1}f é")),
+            ("n", Lua::Int(-3)),
+            ("b", Lua::Bool(false)),
+            ("l", Lua::List(vec![Lua::Int(1), Lua::str("x")])),
+            ("i", Lua::IntMap([(52, Lua::Int(9)), (3, Lua::Int(1))].into_iter().collect())),
+            ("e", Lua::Map(BTreeMap::new())),
+        ]);
+        assert_eq!(
+            v.text(),
+            "{[\"b\"]=false,[\"e\"]={},[\"i\"]={[3]=1,[52]=9},[\"l\"]={[1]=1,[2]=\"x\"},[\"n\"]=-3,\
+             [\"s\"]=\"a\\tb\\nc\\\"d\\\\e\\001f é\"}"
+        );
+        assert!(!v.text().contains(['\n', '\t', '\r']), "an event payload stays on one line");
+    }
+
+    #[test]
+    fn events_read_back_through_the_launchers_parser() {
+        // the launcher's luatext is the mod's `C.parse` in Rust: whatever it reads, the mod reads
+        let ev = Event::Ready {
+            build: "40420".into(),
+            version: "0.1.0".into(),
+            hooks: vec!["apply_command".into(), "command_list_add".into()],
+            poolpatch: false,
+            clock: false,
+            kinds: vec![("build_proposal".into(), 52)],
+            sites: 12,
+        };
+        let json: Value = serde_json::from_slice(&luatext::lua_to_json(&ev.payload()).unwrap()).unwrap();
+        assert_eq!(json["build"], "40420");
+        assert_eq!(json["hooks"], serde_json::json!(["apply_command", "command_list_add"]));
+        assert_eq!(json["kinds"]["build_proposal"], 52);
+        assert_eq!(json["clock"], false);
+        assert_eq!(json["sites"], 12);
+        assert_eq!(ev.kind(), "ready");
+    }
+
+    #[test]
+    fn every_event_has_a_kind_and_a_payload_the_mod_can_parse() {
+        let events = vec![
+            Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 1500 },
+            Event::Released { id: 1, reason: "release", ms: 2500 },
+            Event::Dropped { id: 2, reason: "cancel" },
+            Event::Applied { id: 1, ok: true },
+            Event::Audit {
+                counts: vec![(17, 4), (52, 2)],
+                total: 6,
+                unreadable: 0,
+                adds: AddCounts { tool: 2, other: 5, unknown: 0 },
+                sites: vec![(0, 2)],
+            },
+            Event::Holding { on: true, kinds: vec!["build_proposal".into()], reason: "hold_on" },
+            Event::Pong { n: 9 },
+            Event::Error { place: "release".into(), detail: "unknown id 9 \"x\"\n".into() },
+        ];
+        for ev in events {
+            let payload = ev.payload();
+            assert!(luatext::lua_to_json(&payload).is_some(), "{} payload {payload}", ev.kind());
+            assert!(!payload.contains('\n'));
+            let text = EventWriter::line(4, &ev);
+            let back = gamelink::parse_line(&text).expect("a link record");
+            assert_eq!((back.seq, back.kind.as_str(), back.from.as_str()), (4, ev.kind(), "native"));
+            assert_eq!(back.payload, payload);
+        }
+        let audit: Value = serde_json::from_slice(
+            &luatext::lua_to_json(
+                &Event::Audit {
+                    counts: vec![(17, 4), (52, 2)],
+                    total: 6,
+                    unreadable: 1,
+                    adds: AddCounts { tool: 2, other: 5, unknown: 3 },
+                    sites: vec![(0, 2)],
+                }
+                .payload(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(audit["counts"]["52"], 2);
+        assert_eq!(audit["adds"]["unknown"], 3);
+        assert_eq!(audit["unreadable"], 1);
+    }
+
+    #[test]
+    fn golden_event_lines() {
+        assert_eq!(
+            EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120 }),
+            "1\theld\tnative\t{[\"id\"]=3,[\"kind\"]=52,[\"ms\"]=120,[\"site\"]=5060975}\n"
+        );
+        assert_eq!(
+            EventWriter::line(2, &Event::Released { id: 3, reason: "silence", ms: 99 }),
+            "2\treleased\tnative\t{[\"id\"]=3,[\"ms\"]=99,[\"reason\"]=\"silence\"}\n"
+        );
+        assert_eq!(EventWriter::line(9, &Event::Pong { n: 4 }), "9\tpong\tnative\t{[\"n\"]=4}\n");
+    }
+
+    #[test]
+    fn writer_numbers_events_and_continues_after_a_restart() {
+        let dir = TempDir::new("writer");
+        let mut w = EventWriter::open(dir.path()).unwrap();
+        assert_eq!(w.next_seq(), 1);
+        assert!(!w.path().exists(), "nothing is created before the first event");
+        w.append(&[]).unwrap();
+        assert!(!w.path().exists());
+        w.append(&[Event::Pong { n: 1 }, Event::Pong { n: 2 }]).unwrap();
+        w.append(&[Event::Pong { n: 3 }]).unwrap();
+        let text = fs::read_to_string(w.path()).unwrap();
+        let seqs: Vec<u64> = text.lines().filter_map(gamelink::parse_line).map(|l| l.seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+        let again = EventWriter::open(dir.path()).unwrap();
+        assert_eq!(again.next_seq(), 4, "a new writer continues the numbering");
+    }
+
+    #[test]
+    fn a_mod_side_reader_sees_what_the_writer_wrote() {
+        // the same CtlReader logic the launcher's Tail has, run over the events file
+        let dir = TempDir::new("writer-reader");
+        let mut w = EventWriter::open(dir.path()).unwrap();
+        w.append(&[Event::Pong { n: 1 }]).unwrap();
+        let mut r = CtlReader::new(dir.path().join(EVENTS_FILE));
+        assert_eq!(r.poll().lines.len(), 1);
+        w.append(&[Event::Pong { n: 2 }]).unwrap();
+        let p = r.poll();
+        assert_eq!((p.lines.len(), p.lines[0].seq), (1, 2));
+    }
+
+    #[test]
+    fn the_events_file_has_a_size_limit() {
+        let dir = TempDir::new("writer-limit");
+        let mut w = EventWriter::open(dir.path()).unwrap();
+        w.size = MAX_EVENTS_BYTES - 10;
+        let err = w.append(&[Event::Pong { n: 1 }]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        assert!(!w.path().exists());
+    }
+}
