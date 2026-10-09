@@ -520,8 +520,10 @@ end
 local VEHICLES = listArg("vehicle")
 
 -- An engine object with its own type. `wireOf(ctx, st, tree)` turns the tree read from the object into the wire
--- form (entity ids become references), `treeOf(ctx, wire)` is its inverse; both may fail with a reason.
-local function objectArg(typeName, wireOf, treeOf)
+-- form (entity ids become references), `treeOf(ctx, wire)` is its inverse; both may fail with a reason. `read`
+-- replaces the member-list reading for an object whose fields are known (a date).
+local function objectArg(typeName, wireOf, treeOf, read)
+	read = read or marshal
 	local codec = {}
 	codec.dec = function(ctx, w)
 		if w == nil then return nil end -- an argument the caller left out
@@ -535,14 +537,14 @@ local function objectArg(typeName, wireOf, treeOf)
 	end
 	codec.enc = function(ctx, v, st)
 		if v == nil then return nil end
-		local tree, why = marshal(v)
+		local tree, why = read(v)
 		if tree == nil then return nil, why or "empty " .. typeName end
 		local wire = copy(tree)
 		wire, why = wireOf(ctx, st, wire)
 		if wire == nil then return nil, why end
 		local obj, why2, skipped = codec.dec(dryCtx(st), wire)
 		if obj == nil then return nil, "does not rebuild: " .. tostring(why2) end
-		local again, why3 = marshal(obj)
+		local again, why3 = read(obj)
 		if again == nil then return nil, "does not read back: " .. tostring(why3) end
 		local same, path = contained(tree, again, typeName, skipped)
 		if not same then return nil, "does not rebuild equal at " .. path end
@@ -611,11 +613,16 @@ local LINE = objectArg("Line",
 		return tree
 	end)
 
-local function plainObject(typeName)
-	return objectArg(typeName, function(_, _, wire) return wire end, function(_, tree) return tree end)
+local function plainObject(typeName, read)
+	return objectArg(typeName, function(_, _, wire) return wire end, function(_, tree) return tree end, read)
 end
 local VEC3 = plainObject("Vec3f")
-local DATE = plainObject("Date")
+-- a date has year, month and day (the game's calendar widget reads and builds it that way)
+local DATE = plainObject("Date", function(v)
+	local y, m, d = try(function() return v.year end), try(function() return v.month end), try(function() return v.day end)
+	if type(y) ~= "number" or type(m) ~= "number" or type(d) ~= "number" then return nil, "not a date" end
+	return { year = y, month = m, day = d }
+end)
 
 -- A journal entry (amount, time, category). The category's enum values are told apart by name, from the lists in
 -- tealdef/scripts/journal.d.tl; the sub-category is only read for the types that have one.

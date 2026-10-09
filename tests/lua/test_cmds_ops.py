@@ -33,7 +33,7 @@ OPS_SRC = T.CMDS_SRC["feverlink3_cmds_ops"]
 # ---------------------------------------------------------------- the mock
 
 OPS_PRELUDE = r'''
-OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false, player = 7 }
+OPS = { priceBuy = 10000, loanSign = 1, drop = nil, replaceKeepsEntity = false, player = 7, strictCmd = false }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
 MODELS = { "vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl" }
@@ -197,6 +197,10 @@ function MAKE_API()
       "makeGameSetTimeOfDayCmd", "makeGameSetCloudCoverageCmd", "makeStockListDiscardCargoCmd",
       "makeTownBuildingSetBlockedDevelopmentCmd", "makeTownSetDevelopmentActiveCmd" }) do
     api.cmd[n] = mk(n)
+  end
+  -- a build whose command table refuses the lookup of a factory it does not have, instead of answering nil
+  if OPS.strictCmd then
+    setmetatable(api.cmd, { __index = function(_, k) error("no command " .. tostring(k)) end })
   end
   local t = api.type
   t.TransportVehicleConfig = { new = function() return NEW("TransportVehicleConfig") end }
@@ -520,9 +524,10 @@ OPS_HARNESS = OPS_PRELUDE + _ENGINE_LINE.sub("env.FEVERLINK3_ENGINE = OPS_ENGINE
 class OpsGame(T.Game):
     """A game of the lockstep harness with the operations mock added; the client's model ids are 100 higher."""
 
-    def __init__(self, label, player_id, tmp, first_entity, model_offset, player_entity=7):
+    def __init__(self, label, player_id, tmp, first_entity, model_offset, player_entity=7, strict_cmd=False):
         saved = T.HARNESS
-        T.HARNESS = OPS_HARNESS  # Game.__init__ runs it between the base mock and the mod; restored below
+        # Game.__init__ runs it between the base mock and the mod; restored below
+        T.HARNESS = OPS_HARNESS.replace("strictCmd = false", "strictCmd = true", 1) if strict_cmd else OPS_HARNESS
         try:
             super().__init__(label, player_id, tmp, first_entity)
         finally:
@@ -552,11 +557,13 @@ class OpsGame(T.Game):
 
 
 class OpsBase(unittest.TestCase):
+    STRICT = False   # True: the games' command table raises on the lookup of a factory it does not have
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-ops-")
         # the client's model ids are 100 higher and its player entity is another one
-        self.A = OpsGame("host", 0, self.tmp, 50000, 0, 7)
-        self.B = OpsGame("client", 1, self.tmp, 51000, 100, 17)
+        self.A = OpsGame("host", 0, self.tmp, 50000, 0, 7, self.STRICT)
+        self.B = OpsGame("client", 1, self.tmp, 51000, 100, 17, self.STRICT)
         self.relay = T.Relay([self.A, self.B])
 
     def tearDown(self):
@@ -594,6 +601,19 @@ class OpsBase(unittest.TestCase):
 
     def both_logs(self):
         return self.A.log() + self.B.log()
+
+
+class StrictLookupTest(OpsBase):
+    STRICT = True
+
+    def test_a_factory_the_build_lacks_does_not_keep_the_others_from_being_wrapped(self):
+        self.start()
+        self.assertIn("wrapped ", self.B.log())
+        self.assertNotIn("frame failed", self.B.log())
+        self.B.send_gui(buy("BUY", BUS_RED))
+        self.settle()
+        self.agree()
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
 
 
 BUS_RED = '{ model = "vehicle/bus_red.mdl", color = { 0.9, 0.1, 0.1 }, compartments = 2 }'
@@ -1264,6 +1284,18 @@ class ModuleTest(unittest.TestCase):
                        "local args = ops.commands.makeVehicleBuyCmd.decode(body, { player = 7, resolve = function(k) if k == '1:7' then return 90001 end end }) "
                        "return args[2] end")(enc)
         self.assertEqual(dec, 90010, "game A's depot, found through A's building")
+
+    def test_a_date_is_read_by_its_fields(self):
+        class Date:   # userdata with no member list: the game's calendar widget reads year, month and day
+            year, month, day = 1925, 6, 1
+
+        spec = self.ops.commands.makeGameSetDateCmd
+        body = spec.encode("makeGameSetDateCmd", self.L.eval("function(d) return { n = 1, d } end")(Date()), self.L.eval(CTX))
+        self.assertEqual((body.args[1].year, body.args[1].month, body.args[1].day), (1925, 6, 1))
+        back = spec.decode(body, self.L.eval("{ player = 7, resolve = function() end }"))
+        self.assertEqual((back[1].year, back[1].month, back[1].day), (1925, 6, 1))
+        out = spec.encode("makeGameSetDateCmd", self.L.eval("{ n = 1, 'tomorrow' }"), self.L.eval(CTX))
+        self.assertEqual(out, (None, "argument 1: not a date"))
 
     def test_journal_entries_keep_their_sub_category_and_unknown_ones_are_refused(self):
         spec = self.ops.commands.makeJournalBookAssetCmd
