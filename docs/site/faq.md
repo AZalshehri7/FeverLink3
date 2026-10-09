@@ -61,7 +61,7 @@ Not yet. Separate companies are planned for 0.6 and a dedicated server for 1.0; 
 ## Safety
 
 **Is it safe? What is `winhttp.dll`?**
-It is a small open-source proxy DLL that Windows loads when the game starts. It passes the game's 14 WinHTTP functions to the real Windows file unchanged and, inside the game, runs the multiplayer session on one thread. [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html) explains every part, lists the files FeverLink3 creates, and says what is not verified.
+It is a small open-source proxy DLL that Windows loads when the game starts. It passes the game's 14 WinHTTP functions to the real Windows file unchanged and, inside the game, runs the Steam connection test (and, in later builds, the multiplayer session) on one thread. [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html) explains every part, lists the files FeverLink3 creates, and says what is not verified.
 
 **My antivirus flags it.**
 The same page tells you how to verify the file with a hash and how to report a false positive to Microsoft, Kaspersky, ESET and others. The file is not code-signed yet; the plan is to apply to a free code-signing program for open-source projects once there is a release ([plan](../SIGNING.html)).
@@ -84,7 +84,7 @@ From the [GitHub releases page](https://github.com/AZalshehri7/FeverLink3/releas
 Transport Fever 3 has no Steam Workshop (the developers' support page says so). The plan is to offer the mod in the game's own Mod Hub (which runs on mod.io) and on Nexus Mods like any other mod, with the native module as a separate download for now, and the installer then only for testing. Whether the Mod Hub accepts a mod that needs a separate native component is still being checked: its published rules allow only the official scripting API and no executable files. [The plan](../WORKSHOP.html) lists the options and the open questions.
 
 **How do I uninstall?**
-Close the game and run `feverlink3 uninstall`. The steps, including the optional clean-up of logs and sync files, are in [Playing FeverLink3](../PLAYING.html) and in the security page.
+Close the game and run `feverlink3 uninstall` ([Playing FeverLink3](../PLAYING.html)). The optional clean-up of logs and sync files is described in the [security page](../SECURITY_FOR_USERS.html).
 
 **How do I report a bug or help test?**
 Discord `azalshehri`, or [GitHub issues](https://github.com/AZalshehri7/FeverLink3/issues). Logs to attach are listed at the end of [Playing FeverLink3](../PLAYING.html).
