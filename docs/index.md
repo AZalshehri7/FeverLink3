@@ -23,6 +23,10 @@ Transport Fever 3 has no network code, so FeverLink3 keeps every copy of the wor
 
 The design follows [TpF2 Multiplayer](https://github.com/silver2127/tpf2-multiplayer) by silver2127 (Transport Fever 2) and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight (Transport Fever 3). FeverLink3 is a fresh implementation; see the [credits in the README](https://github.com/AZalshehri7/FeverLink3#credits).
 
+## Contact
+
+Discord: `azalshehri`. Bugs and requests: [GitHub issues](https://github.com/AZalshehri7/FeverLink3/issues). Want to be in the first test sessions? Message me on Discord.
+
 ## Licence
 
 MIT.

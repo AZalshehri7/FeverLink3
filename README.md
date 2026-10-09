@@ -48,6 +48,10 @@ cd native && cargo test && cargo build --release
 
 Issues and pull requests are welcome. Read `docs/ARCHITECTURE.md` first; design changes go through an issue before code. Every change to `FeverLink3.Core` needs a test.
 
+## Contact
+
+Discord: `azalshehri`. Bug reports and feature requests go to [GitHub issues](https://github.com/AZalshehri7/FeverLink3/issues); for anything else, or to join the first test sessions, message me on Discord.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

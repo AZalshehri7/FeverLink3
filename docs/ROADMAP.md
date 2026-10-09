@@ -39,6 +39,7 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] 3 to 8 players
 
 ## 0.5 — Playing with friends
+- [ ] Lua mod on the in-game Mod Hub and, if TF3 supports it, the Steam Workshop (auto-updates for every player); first confirm its automated approval allows the mod's file link
 - [ ] Steam invites and friends-list join
 - [ ] Host permissions: who may build, bulldoze, spend, change speed
 - [ ] Reconnection and hot join
