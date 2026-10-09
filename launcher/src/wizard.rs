@@ -451,7 +451,7 @@ mod tests {
         assert!(out.contains("[!!] FeverLink3 is only partly installed."), "{out}");
         assert!(out.contains("has not created its Steam user folder yet"), "{out}");
         assert!(pc.game().join(install::DLL_NAME).is_file());
-        assert!(out.contains("only partly installed (native module: yes, mod: 0 of 0"), "{out}");
+        assert!(out.contains("[??]  FeverLink3         only partly installed: the native module is there, but the game has not created its user folder yet"), "{out}");
     }
 
     #[test]
@@ -518,7 +518,7 @@ mod tests {
 
         fs::write(pc.mod_src().join("mod.json"), "{\"revision\":2}").unwrap();
         let changed = drive(&pc, "3\n\n0\n");
-        assert!(changed.contains("The version number is the same, but the mod differ"), "{changed}");
+        assert!(changed.contains("The version number is the same, but the mod differs from"), "{changed}");
         assert!(changed.contains("Choose 3 to compare"), "the screen offers it too: {changed}");
 
         let moved = {

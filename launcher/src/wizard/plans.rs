@@ -188,20 +188,24 @@ pub(super) fn comparison_lines(f: &Facts) -> Vec<String> {
         ),
         Ok(Comparison::Differs(pieces)) => {
             let what = pieces.join(" and ");
+            let differ = if pieces.len() == 1 { "differs" } else { "differ" };
             match version_order(this, f.installed_version.as_deref()) {
-                Some(Ordering::Greater) => {
-                    format!("This folder is NEWER than what is installed. Installing from it updates {what}. Choose 1 to update.")
-                }
+                Some(Ordering::Greater) => format!(
+                    "This folder is NEWER than what is installed. Installing from it updates {what}. Choose 1 to \
+                     update."
+                ),
                 Some(Ordering::Less) => format!(
-                    "This folder is OLDER than what is installed. Installing from it would replace newer files ({what}) \
-                     with older ones. Use the newer FeverLink3 folder instead."
+                    "This folder is OLDER than what is installed. Installing from it would replace newer files \
+                     ({what}) with older ones. Use the newer FeverLink3 folder instead."
                 ),
                 Some(Ordering::Equal) => format!(
-                    "The version number is the same, but {what} differ from the installed files. Choose 1 to make them match."
+                    "The version number is the same, but {what} {differ} from the installed files. Choose 1 to make \
+                     the installed files match this folder."
                 ),
                 None => format!(
                     "The installed files differ from the ones in this folder ({what}). The installed version is not \
-                     known, so it cannot be said which is newer. Choose 1 to make the installed files match this folder."
+                     known, so it cannot be said which is newer. Choose 1 to make the installed files match this \
+                     folder."
                 ),
             }
         }
@@ -417,7 +421,12 @@ mod tests {
         };
         assert!(verdict(Some("0.0.1")).contains("This folder is NEWER than what is installed"));
         assert!(verdict(Some("99.0.0")).contains("This folder is OLDER than what is installed"));
-        assert!(verdict(Some(own_version())).contains("The version number is the same, but the mod differ"));
+        assert!(verdict(Some(own_version())).contains("The version number is the same, but the mod differs from"));
+        let two = vec![step(Item::Mod, Outcome::Done, "updated"), step(Item::NativeDll, Outcome::Done, "updated")];
+        let mut both = with_plan(installed_facts(), two);
+        both.installed_version = Some(own_version().to_owned());
+        let text = comparison_lines(&both).join("\n");
+        assert!(text.contains("but the mod and the native module (winhttp.dll) differ from"), "{text}");
         let unknown = verdict(None);
         assert!(unknown.contains("installed version is not known"), "{unknown}");
         assert!(unknown.contains("version not recorded"), "{unknown}");

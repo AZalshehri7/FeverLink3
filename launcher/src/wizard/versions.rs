@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, Prefix};
 
 use feverlink3_launcher::steam;
 use feverlink3_launcher::update::Version;
@@ -120,11 +120,23 @@ fn find_version_marker(bytes: &[u8]) -> Option<String> {
     version_markers(bytes).next()
 }
 
+/// True for `\\server\share\...` (and its `\\?\UNC\` spelling): a network share.
+fn is_network_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
+}
+
 /// The version of the launcher recorded at install time, or `None` when that file is gone or unmarked. A record
-/// that names this very executable needs no reading.
+/// that names this very executable needs no reading. One on a network share is not read: when the share is gone
+/// Windows can take half a minute to say so, on every screen, and that is not worth a version number.
 pub(super) fn read_launcher_version(recorded: &Path, own_exe: &Path) -> Option<String> {
     if same_path_text(recorded, own_exe) {
         return Some(own_version().to_owned());
+    }
+    if is_network_path(recorded) {
+        return None;
     }
     let mut bytes = Vec::new();
     File::open(recorded).ok()?.take(MAX_SCAN_BYTES).read_to_end(&mut bytes).ok()?;
@@ -301,6 +313,17 @@ mod tests {
         assert_eq!(read_launcher_version(&me, &me), Some(own_version().to_owned()));
         let shouted = PathBuf::from(me.to_string_lossy().to_uppercase());
         assert_eq!(read_launcher_version(&shouted, &me), Some(own_version().to_owned()), "paths ignore case");
+    }
+
+    #[test]
+    fn a_launcher_on_a_network_share_is_not_read() {
+        for share in [r"\\server\share\FeverLink3\feverlink3.exe", r"\\?\UNC\server\share\feverlink3.exe"] {
+            assert!(is_network_path(Path::new(share)), "{share}");
+            assert_eq!(read_launcher_version(Path::new(share), Path::new(r"C:\here\feverlink3.exe")), None, "{share}");
+        }
+        for local in [r"C:\Users\Ann\feverlink3.exe", r"\\?\C:\Users\Ann\feverlink3.exe", r"feverlink3.exe", "/tmp/x"] {
+            assert!(!is_network_path(Path::new(local)), "{local}");
+        }
     }
 
     #[test]

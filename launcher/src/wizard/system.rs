@@ -42,9 +42,12 @@ pub(super) fn windows_program(relative: &[&str]) -> PathBuf {
 }
 
 /// The bytes `clip.exe` takes as Unicode text: UTF-16 little endian after a byte order mark, with Windows line
-/// breaks. Without the mark it reads the bytes in the console's code page and garbles every non-ASCII character.
+/// breaks. Without the mark it has to guess the encoding or reads the bytes in the console's code page, and either
+/// garbles non-ASCII characters. It keeps the mark as a character, U+FEFF, at the start of the clipboard text
+/// (reports of other programs that pipe text to it say so), invisible in a message but not to a program that reads
+/// the first line; the line break after it makes that first line an empty one instead of the first line of the text.
 fn clipboard_bytes(text: &str) -> Vec<u8> {
-    let windows_text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let windows_text = format!("\r\n{}", text.replace("\r\n", "\n").replace('\n', "\r\n"));
     std::iter::once(0xFEFF_u16).chain(windows_text.encode_utf16()).flat_map(u16::to_le_bytes).collect()
 }
 
@@ -117,13 +120,21 @@ impl System for RealSystem {
 mod tests {
     use super::*;
 
+    /// The bytes of a break: carriage return and line feed, as UTF-16 little endian.
+    const BREAK: [u8; 4] = [b'\r', 0, b'\n', 0];
+
     #[test]
     fn the_clipboard_gets_utf16_with_a_byte_order_mark_and_windows_line_breaks() {
-        assert_eq!(clipboard_bytes("a\nb"), [0xFF, 0xFE, b'a', 0, b'\r', 0, b'\n', 0, b'b', 0]);
+        // the mark, then one line break that keeps a leaked U+FEFF off the first line of the text, then the text
+        assert_eq!(clipboard_bytes("a\nb"), [&[0xFF, 0xFE][..], &BREAK, b"a\0", &BREAK, b"b\0"].concat());
         assert_eq!(clipboard_bytes("a\r\nb"), clipboard_bytes("a\nb"), "no doubled returns");
-        assert_eq!(clipboard_bytes(""), [0xFF, 0xFE]);
-        assert_eq!(clipboard_bytes("\u{0639}"), [0xFF, 0xFE, 0x39, 0x06]);
-        assert_eq!(clipboard_bytes("\u{1F680}"), [0xFF, 0xFE, 0x3D, 0xD8, 0x80, 0xDE], "a surrogate pair");
+        assert_eq!(clipboard_bytes(""), [&[0xFF, 0xFE][..], &BREAK].concat());
+        assert_eq!(clipboard_bytes("\u{0639}"), [&[0xFF, 0xFE][..], &BREAK, &[0x39, 0x06]].concat());
+        assert_eq!(
+            clipboard_bytes("\u{1F680}"),
+            [&[0xFF, 0xFE][..], &BREAK, &[0x3D, 0xD8, 0x80, 0xDE]].concat(),
+            "a surrogate pair"
+        );
     }
 
     #[test]

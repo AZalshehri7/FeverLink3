@@ -90,6 +90,24 @@ fn running_check(f: &Facts) -> Check {
     }
 }
 
+/// What is missing of a partial install, and what to do about it. `users` counts the Steam accounts of this PC
+/// that have a user folder for the game, `mods` those that hold the mod.
+fn partial_text(native_module: bool, mods: usize, users: usize) -> &'static str {
+    match (native_module, mods, users) {
+        (true, _, 0) => {
+            "the native module is there, but the game has not created its user folder yet: start it once from \
+             Steam, close it, then choose 1"
+        }
+        (true, 0, _) => "the native module is there, the mod is missing - choose 1 to finish",
+        (true, _, _) => "the mod is missing for some Steam accounts - choose 1 to finish",
+        (false, 0, _) => "only a helper file is left - choose 1 to finish, or 2 to remove it",
+        (false, mods, users) if mods == users => {
+            "the mod is there, the native module (winhttp.dll) is missing - choose 1 to finish"
+        }
+        (false, _, _) => "the native module and the mod for some Steam accounts are missing - choose 1 to finish",
+    }
+}
+
 fn installed_check(f: &Facts) -> Check {
     const LABEL: &str = "FeverLink3";
     match installed_state(f) {
@@ -97,14 +115,9 @@ fn installed_check(f: &Facts) -> Check {
         InstallState::NotInstalled => check(Status::Note, LABEL, "not installed yet"),
         InstallState::Complete { version: Some(v) } => check(Status::Good, LABEL, format!("installed (version {v})")),
         InstallState::Complete { version: None } => check(Status::Good, LABEL, "installed (version not recorded)"),
-        InstallState::Partial { native_module, mods, users } => check(
-            Status::Warn,
-            LABEL,
-            format!(
-                "only partly installed (native module: {}, mod: {mods} of {users} Steam users) - choose 1 to finish",
-                if native_module { "yes" } else { "no" }
-            ),
-        ),
+        InstallState::Partial { native_module, mods, users } => {
+            check(Status::Warn, LABEL, format!("only partly installed: {}", partial_text(native_module, mods, users)))
+        }
         InstallState::ForeignDll => check(
             Status::Bad,
             LABEL,
@@ -247,10 +260,33 @@ mod tests {
         assert_eq!(line(&unknown_version), "installed (version not recorded)");
         let mut partial = installed_facts();
         partial.users[0].mod_installed = false;
-        assert!(line(&partial).contains("native module: yes, mod: 0 of 1 Steam users"), "{}", line(&partial));
+        assert_eq!(
+            line(&partial),
+            "only partly installed: the native module is there, the mod is missing - choose 1 to finish"
+        );
+        assert_eq!(installed_check(&partial).status, Status::Warn);
         let mut foreign = base_facts();
         foreign.game_files.as_mut().unwrap().dll = Ok(DllState::Foreign);
         assert_eq!(installed_check(&foreign).status, Status::Bad);
+    }
+
+    #[test]
+    fn a_partial_install_says_what_is_missing() {
+        // (native module, users with the mod, users with a user folder)
+        let cases = [
+            ((true, 0, 0), "has not created its user folder yet: start it once from Steam"),
+            ((true, 0, 2), "the native module is there, the mod is missing"),
+            ((true, 1, 2), "the mod is missing for some Steam accounts"),
+            ((false, 0, 1), "only a helper file is left - choose 1 to finish, or 2 to remove it"),
+            ((false, 1, 1), "the mod is there, the native module (winhttp.dll) is missing"),
+            ((false, 2, 2), "the mod is there, the native module (winhttp.dll) is missing"),
+            ((false, 1, 2), "the native module and the mod for some Steam accounts are missing"),
+        ];
+        for ((native_module, mods, users), expected) in cases {
+            let text = partial_text(native_module, mods, users);
+            assert!(text.contains(expected), "{native_module} {mods} {users}: {text}");
+            assert!(text.contains("choose 1") || text.contains("then choose 1"), "every case names the way on: {text}");
+        }
     }
 
     #[test]
