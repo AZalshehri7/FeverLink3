@@ -31,8 +31,8 @@ If you are the author of either and want the wording changed, open an issue.
 | `src/FeverLink3.Core` | Protocol: framing, sealed channel, join codes, session model. No game or UI code. | C# (.NET 10) |
 | `src/FeverLink3.Launcher` | Windows launcher: lobby, game start, save transfer, resync. *(planned)* | C# |
 | `native/` | Proxy DLL the game loads itself: command capture and hold, determinism patches. Skeleton: proxy, PE parsing, scanner, detour maths, build table. | Rust |
-| `mod/feverlink3_1/` | Game-script mod: stamping, replay, checksums, in-game UI. *(planned)* | Lua |
-| `tests/` | `FeverLink3.Core.Tests` (xunit); `native/` has `cargo test`; Lua lockstep tests with lupa *(planned)* | C#, Rust, Python |
+| `mod/feverlink3_1/` | Game-script mod: lockstep core (stamping, barrier, pause, queue, deterministic random, checksums), file link, command capture. In-game UI and native-build replay *(planned)*. See `mod/README.md`. | Lua |
+| `tests/` | `FeverLink3.Core.Tests` (xunit); `native/` has `cargo test`; `tests/lua/` runs two mocked games through the real mod with lupa | C#, Rust, Python |
 | `docs/` | Architecture, roadmap, protocol notes | |
 
 ## Building
@@ -42,6 +42,7 @@ Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download) and, for the n
 ```
 dotnet build && dotnet test
 cd native && cargo test && cargo build --release
+pip install lupa && python -I tests/lua/test_lockstep.py
 ```
 
 ## Contributing
