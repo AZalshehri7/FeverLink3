@@ -19,6 +19,10 @@ pub enum MessageKind {
     ResyncChunk = 18,
     ResyncLoad = 19,
     Permissions = 20,
+    /// Liveness and round-trip probe; the player's session layer answers it, the game never sees it.
+    Ping = 21,
+    /// The host ended this player's session on purpose (removed, too many frames); sealed, so only the host can say it.
+    Kicked = 22,
 
     // ---- player -> host, sealed
     Hello = 30,
@@ -28,6 +32,10 @@ pub enum MessageKind {
     SaveDone = 34,
     ReplayFailed = 35,
     ActionRefused = 36,
+    /// Answer to a [`MessageKind::Ping`], from the player's session layer.
+    Pong = 37,
+    /// The player leaves on purpose: the host frees its slot at once instead of holding it for a return.
+    Leave = 38,
 
     // ---- player -> host, relayed by the host to everyone else with the origin filled in
     Action = 50,
@@ -37,7 +45,7 @@ pub enum MessageKind {
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
     /// (session state, checksum requests, authority values, resynchronisation).
-    pub const FROM_PLAYER: [MessageKind; 9] = [
+    pub const FROM_PLAYER: [MessageKind; 11] = [
         MessageKind::Hello,
         MessageKind::Clock,
         MessageKind::SpeedRequest,
@@ -45,6 +53,8 @@ impl MessageKind {
         MessageKind::SaveDone,
         MessageKind::ReplayFailed,
         MessageKind::ActionRefused,
+        MessageKind::Pong,
+        MessageKind::Leave,
         MessageKind::Action,
         MessageKind::Chat,
     ];
@@ -67,6 +77,8 @@ impl MessageKind {
             18 => ResyncChunk,
             19 => ResyncLoad,
             20 => Permissions,
+            21 => Ping,
+            22 => Kicked,
             30 => Hello,
             31 => Clock,
             32 => SpeedRequest,
@@ -74,6 +86,8 @@ impl MessageKind {
             34 => SaveDone,
             35 => ReplayFailed,
             36 => ActionRefused,
+            37 => Pong,
+            38 => Leave,
             50 => Action,
             51 => Chat,
             _ => return None,

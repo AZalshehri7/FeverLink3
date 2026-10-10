@@ -1882,6 +1882,30 @@ class PureBuildTest(unittest.TestCase):
                       "local ok, why = M.normalise(rec); return tostring(ok) .. '|' .. tostring(why) end)()")
         self.assertEqual(bad, "nil|edge object 1: bad kind")
 
+    def test_owners_follow_the_acting_player_and_another_owner_travels_as_a_key(self):
+        # docs/COMPANIES.md 3.7: a decode hook takes every owner from ctx.player, never from the local player
+        got = self.ev("""(function()
+          local M, C, ctx = PURE()
+          local function resolve(k) local n = tostring(k):match('^s:(%d+)$'); return n and tonumber(n) or nil end
+          local function wire(P) return C.parse(C.serialize(M.capture(P, { ctx = CONTEXT(true, false, true, true) }, ctx))) end
+          local function decodeWith(body, player)
+            local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = player, resolve = resolve })
+            if not args then return 'refused:' .. tostring(why) end
+            return tostring(args[2].player) .. '/' .. tostring(args[1].constructionsToAdd[1].playerEntity)
+          end
+          local own = wire(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2 })
+          local foreign = wire(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, owner = 8 })
+          local nobody = wire(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, owner = -1 })
+          local lost = wire(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, owner = 8 })
+          lost.args[1].cons[1].owner = { __ref = 'owner', key = '1:5#c1' }
+          local bad = wire(CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2 })
+          bad.args[1].cons[1].owner = { __ref = 'owner', key = 5 }
+          local ok, why = M.normalise(bad.args[1])
+          return table.concat({ decodeWith(own, 7), decodeWith(own, 99), decodeWith(foreign, 99), decodeWith(nobody, 99), decodeWith(lost, 99),
+            tostring(ok) .. ':' .. tostring(why), tostring(own.args[1].cons[1].owner), tostring(foreign.args[1].cons[1].owner.key) }, ',')
+        end)()""")
+        self.assertEqual(got, "7/7,99/99,99/8,99/-1,refused:unresolved owner 1:5#c1,nil:construction 1: bad owner,player,s:8")
+
     def test_normalise_refuses_what_it_cannot_trust(self):
         def refuse(mutation):
             return self.ev("(function() local rec, M = WIRE_RECORD(SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }); rec = rec.args[1]; "

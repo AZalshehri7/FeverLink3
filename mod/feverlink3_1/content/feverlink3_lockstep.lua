@@ -171,6 +171,12 @@ L.COMMANDS = {
 --                                (see L.sendNow, L.runChained)
 --   spec.bindsComp, spec.bind    keys for entities the action created, beyond the single one spec.creates names
 --                                (see L.bindsComp, L.bindMap)
+-- and for what is no engine command, or needs the company registry (feverlink3_cmds_company.lua, docs/COMPANIES.md):
+--   spec.virtual = true          a mod-level action: no api.cmd function. The bridge makes its factory in the interface
+--                                state and runs spec.apply on every game instead of an engine command.
+--   spec.apply(ctx, it, args) -> true, effects | nil, reason     (optional) runs on every game before the engine
+--                                command is sent; ctx.co is the company registry, ctx.from the sender id, ctx.at the
+--                                stamp, ctx.key the action key; a reason refuses the action on every game alike.
 function L.registerCommands(commands)
 	for name, spec in pairs(commands or {}) do L.COMMANDS[name] = spec end
 end
@@ -269,9 +275,12 @@ function L.encodeCommand(name, args, ctx)
 	return { fn = name, args = out }
 end
 
--- Decodes a body on the applying game. ctx.player -> entity; ctx.resolve(key) -> entity or nil. Returns the
--- argument list ({ n = count, ... }) or nil and a reason (the action is refused, never applied with a bad id).
+-- Decodes a body on the applying game. ctx.player -> entity (the acting player's company entity in a company
+-- session); ctx.resolve(key) -> entity or nil; ctx.refuse -> a reason the acting player's company cannot be resolved
+-- on this game. Returns the argument list ({ n = count, ... }) or nil and a reason (the action is refused, never
+-- applied with a bad id).
 function L.decodeCommand(body, ctx)
+	if ctx.refuse then return nil, ctx.refuse end
 	if type(body) ~= "table" or type(body.args) ~= "table" then return nil, "malformed body" end
 	local spec = L.COMMANDS[body.fn]
 	if not spec then return nil, "unknown command " .. tostring(body.fn) end

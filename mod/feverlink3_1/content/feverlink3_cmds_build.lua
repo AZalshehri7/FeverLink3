@@ -650,9 +650,16 @@ local function newResolver(ctx)
 	function R.nodeOr(v) if type(v) == "table" then return R.node(v) end return v end
 	function R.edgeOr(v) if type(v) == "table" then return R.edge(v) end return v end
 	function R.objOr(v) if type(v) == "table" then return R.obj(v) end return v end
-	-- the owner of a construction, segment or edge object
+	-- The owner of a construction, segment or edge object. "player" is the entity the acting player's commands apply to on
+	-- this game (ctx.player: in a company session the sender's company, docs/COMPANIES.md 3.7), never the local player;
+	-- another owner travels as a key; a number is "nobody" (a town building).
 	function R.owner(v)
-		if v == "player" then return A.player() end
+		if v == "player" then return ctx.player or A.player() end
+		if type(v) == "table" then
+			local e = ctx.resolve and ctx.resolve(v.key)
+			if e == nil then fail("unresolved owner " .. tostring(v.key)) end
+			return e
+		end
 		return v
 	end
 	return R
@@ -744,6 +751,8 @@ local function newCapture(ctx, opts)
 	function cap.owner(v)
 		if v == nil then return nil end
 		if v == A.player() then return "player" end
+		-- another company's entity has no id the other games share; nobody (a town building) is -1
+		if type(v) == "number" and v >= 0 and cap.keyOf then return { __ref = "owner", key = cap.keyOf(v) } end
 		return v
 	end
 
@@ -1143,12 +1152,12 @@ end
 
 -- The Context of the command: none when the original had none; the plan's default when the build comes from a native
 -- tool (whose context a script cannot see); otherwise the original's flags. Always for this game's player.
-local function newContext(c, default)
+local function newContext(c, default, R)
 	if type(c) ~= "table" then return nil end
 	local f = c.native and default or c
 	if f == nil then return nil end
 	local obj = A.new("Context")
-	req(obj, "player", A.player())
+	req(obj, "player", R.owner("player"))
 	pcall(function() obj.checkTerrainAlignment = f.align == true end)
 	pcall(function() obj.cleanupStreetGraph = f.cleanup == true end)
 	pcall(function() obj.gatherBuildings = f.buildings == true end)
@@ -1418,17 +1427,17 @@ local function with(form, extra)
 end
 
 PLAN.construction = function(rec, R, f, notes)
-	return commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
+	return commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
 end
 
 -- Street part first, then the construction on the street that is now cut (finding from MPFever (MIT): the engine
 -- refuses both in one proposal). The construction's own paths are left to its script; the second command ignores the
 -- non-critical collision with its own street connection.
 PLAN.withStreet = function(rec, R, f, notes, form)
-	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
+	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
 	local conOnly = part(rec, { "cons", "rem", "old2new" })
 	first.chain = { function()
-		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, CTX_NATIVE), true, false, f.dust)
+		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, CTX_NATIVE, R), true, false, f.dust)
 	end }
 	return first
 end
@@ -1438,26 +1447,26 @@ end
 PLAN.combined = function(rec, R, f, notes, form)
 	local sp = streetProposal(rec, R, notes, form)
 	setConstructions(sp, rec, R)
-	return commandArgs(sp, newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
+	return commandArgs(sp, newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
 end
 
 -- A bulldozing that takes constructions and street pieces: the constructions first, then the segments (the order the
 -- game's own industry removal uses).
 PLAN.bulldoze = function(rec, R, f, notes)
-	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, CTX_PLAIN), f.ie, f.pi, f.dust)
+	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
 	local list = removalList(rec)
 	if list then
 		first.chain = { function()
 			local edges = {}
 			for i, ref in ipairs(list) do edges[i] = R.edge(ref) end
-			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, CTX_TERRAIN), f.ie, f.pi, f.dust)
+			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
 		end }
 	end
 	return first
 end
 
 PLAN.street = function(rec, R, f, notes, form)
-	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, CTX_NATIVE), f.ie, f.pi, f.dust)
+	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
 end
 
 PLAN.nodecfg = PLAN.street
@@ -1467,7 +1476,7 @@ PLAN.removal = function(rec, R, f, notes)
 	for i, ref in ipairs(removalList(rec)) do edges[i] = R.edge(ref) end
 	local P = A.removeSegmentsProposal(edges)
 	if P == nil then fail("the engine made no removal proposal") end
-	return commandArgs(P, newContext(f.ctx, CTX_TERRAIN), f.ie, f.pi, f.dust)
+	return commandArgs(P, newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
 end
 
 -- Upgrades one segment per command with the engine's replaceSegment, as the upgrade tool does (finding from MPFever
@@ -1502,7 +1511,7 @@ PLAN.upgrade = function(rec, R, f, notes)
 			sp.addedSegments = list
 			P.proposal = sp
 		end
-		return commandArgs(P, newContext(f.ctx, CTX_TERRAIN), f.ie, f.pi, f.dust)
+		return commandArgs(P, newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
 	end
 	local first = stepArgs(1)
 	if #steps > 1 then
@@ -1558,7 +1567,7 @@ PLAN.stop = function(rec, R, f, notes, form)
 		if #removeIds > 0 then req(ssp, "edgeObjectsToRemove", removeIds) end
 		if #nodeCfg > 0 then opt(notes, ssp, "nodeConfigsToRemove", nodeCfg) end
 	end)
-	return commandArgs(sp, newContext(f.ctx, CTX_PLAIN), f.ie, f.pi, f.dust)
+	return commandArgs(sp, newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
 end
 
 -- ================================================================== validation (nothing from the wire is trusted)
@@ -1581,6 +1590,8 @@ local function okRef(r, kind)
 end
 local function okId(v, kind) return (isNum(v) and v < 0) or okRef(v, kind) end
 local function okList(l, max) return type(l) == "table" and #l <= max end
+-- an owner: nobody or a number from the savegame, the acting player, or another entity by key
+local function okOwner(v) return v == nil or v == "player" or isNum(v) or (type(v) == "table" and v.__ref == "owner" and okText(v.key)) end
 
 local function plainDepth(v, depth, budget)
 	local t = type(v)
@@ -1614,7 +1625,7 @@ local function normalise(rec)
 		if type(c.transf) ~= "table" or #c.transf ~= 16 then return nil, "construction " .. i .. ": bad transform" end
 		for j = 1, 16 do if not isNum(c.transf[j]) then return nil, "construction " .. i .. ": bad transform" end end
 		if c.params ~= nil and not plainDepth(c.params, 0, budget) then return nil, "construction " .. i .. ": bad parameters" end
-		if c.owner ~= nil and c.owner ~= "player" and not isNum(c.owner) then return nil, "construction " .. i .. ": bad owner" end
+		if not okOwner(c.owner) then return nil, "construction " .. i .. ": bad owner" end
 	end
 	for i, r in ipairs(rec.rem) do if not okRef(r, "con") then return nil, "removed construction " .. i .. ": bad reference" end end
 	for i, p in ipairs(rec.old2new) do
@@ -1646,7 +1657,7 @@ local function normalise(rec)
 		if s.prec ~= nil and (type(s.prec) ~= "table" or (s.prec[1] ~= nil and not isNum(s.prec[1])) or (s.prec[2] ~= nil and not isNum(s.prec[2]))) then
 			return nil, "segment " .. i .. ": bad precedence"
 		end
-		if s.owner ~= nil and s.owner ~= "player" and not isNum(s.owner) then return nil, "segment " .. i .. ": bad owner" end
+		if not okOwner(s.owner) then return nil, "segment " .. i .. ": bad owner" end
 	end
 	for i, r in ipairs(rec.rmNodes) do if not okRef(r, "node") then return nil, "removed node " .. i .. ": bad reference" end end
 	for i, r in ipairs(rec.rmSegs) do if not okRef(r, "edge") then return nil, "removed segment " .. i .. ": bad reference" end end
@@ -1654,6 +1665,7 @@ local function normalise(rec)
 		if type(o) ~= "table" or not okId(o.edge, "edge") or not okText(o.model) or not isNum(o.param) then return nil, "edge object " .. i .. ": bad entry" end
 		if o.params ~= nil and not plainDepth(o.params, 0, budget) then return nil, "edge object " .. i .. ": bad parameters" end
 		if o.kind ~= nil and not isNum(o.kind) then return nil, "edge object " .. i .. ": bad kind" end
+		if not okOwner(o.owner) then return nil, "edge object " .. i .. ": bad owner" end
 	end
 	for i, r in ipairs(rec.rmObjs) do if not okRef(r, "obj") then return nil, "removed edge object " .. i .. ": bad reference" end end
 	for i, n in ipairs(rec.ncfg) do

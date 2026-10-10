@@ -15,6 +15,7 @@ Nothing, unless the game was started by `FeverLink3.exe`: without the session fo
 - corrects money to the host (`authority` line): every checksum round the game keeps its own balance and loan; the host's report carries its values as `authority`, and when the matching `authority` line comes back a player books the balance difference as a journal entry (`makeJournalBookAssetCmd`) and moves the loan through `adjustLoan` (a `LOAN` journal entry and the same sum back as `OTHER`: TF3 has no loan command, see `docs/COVERAGE_OPS.md`). The host's own game is never corrected;
 - resyncs by savegame: `resync_save {id, name}` saves the game under that name and writes `save_done {id, name, ok, detail?}`; `resync_load {id, name}` writes the line's sequence number to `resync_cursor.txt`, then loads the named save. The reloaded scripts start the reader after that sequence (nothing is dispatched again), send `hello` again, and the window keeps its roster and chat. An unknown save name writes `replay_failed` and the game carries on;
 - enforces permissions: a `permissions` line `{build, bulldoze, spend, other}` (booleans; only an explicit `false` denies, a missing key keeps the grant, everything is allowed until the first line) gates local commands. A command belongs to one category (`makeVehicleBuyCmd` is `spend`, `makeLineCreateCmd` is `build`, `makeVehicleSetLineCmd` is `other`; other names are classed by their wording: bulldoze/remove/demolish, buy/purchase, construct/build/create, else `other`; a spec may decide from the arguments, as the events do, and the category is sent with every `action` so the host can mark what its sender had no grant for). A denied command is cancelled before it is stamped: nothing is shipped or applied, its callback gets a failed result, and `action_refused {seq = 0, detail}` is written. An `action` line carrying `allowed = false` is logged and not applied, and the game writes `replay_failed` to ask for a resync;
+- keeps a registry of companies and a per-player ledger in the script state, which the savegame carries: who built, bought and got back what, a spending limit and forbidden categories per player, payments between players. The `player` argument of every replicated command follows the sender's company (today there is one shared company; separate companies exist behind the host's explicit confirmation and are unverified in a game). The checksum report gets a part `companies` once anything was recorded. Design, findings and the experiments that need the game: `docs/COMPANIES.md`;
 - shows an in-game window (status, player list, chat). `welcome`, `player_joined`, `player_left`, `session` and `chat` lines feed a model of at most 200 chat lines; a typed line becomes a `chat {text}` line.
 
 Files in `feverlink3_1/content/`:
@@ -30,6 +31,7 @@ Files in `feverlink3_1/content/`:
 | `feverlink3_bridge.script.lua` | Glue to the engine: the real `api.*` accessor, the two script halves, the `sendCommand` wrap. Thin. |
 | `feverlink3_cmds_ops.lua` | Command schemas of everyday operations: vehicles, lines, names and colours, journal bookings, calendar, town and cargo actions, and the events of loans, subsidies, marketing and greening. Coverage and open points: `docs/COVERAGE_OPS.md`. Untested in a game. |
 | `feverlink3_cmds_build.lua` | Command schema of construction (`makeWorldBuildProposalCmd`): roads, tracks, stations, depots, stops, signals, upgrades, bulldozing and node configurations, as plain build records whose entities are named by key and place; keys for what a build created (constructions, depots, stations, road-side stops and their groups). Terrain stays native. Coverage and open points: `docs/COVERAGE_BUILD.md`. Untested in a game. |
+| `feverlink3_cmds_company.lua` | Companies: the registry of companies and members agreed in lockstep (`feverlink3Company` operations, `makeGameAddPlayerCmd`, `makeEntitySetPlayerCmd`, the `Companies` / `applyLevel` event), attribution of `player` arguments to the sender's company, the ledger, limits, payments, and the data of the window's company page (`companies.txt`). Untested in a game. |
 
 ## Environment
 
@@ -55,7 +57,7 @@ seq <TAB> kind <TAB> from <TAB> payload
 
 ## Window and the bridge
 
-The window runs in the UI and does not touch the file link; two files in the session folder carry everything. `hud_state.txt` is a versioned snapshot of the roster, status and chat that the bridge rewrites when something changes (also read back after a resync reload). `ui_out.log` holds the window's typed lines as `chat` records with their own sequence; the bridge reads it, sends the `chat` line and adds the message to its own history (the host does not echo a message to its sender).
+The window runs in the UI and does not touch the file link; two files in the session folder carry everything. `hud_state.txt` is a versioned snapshot of the roster, status and chat that the bridge rewrites when something changes (also read back after a resync reload). `ui_out.log` holds the window's typed lines as `chat` records with their own sequence; the bridge reads it, sends the `chat` line and adds the message to its own history (the host does not echo a message to its sender). The company page works the same way: `companies.txt` is its snapshot (written by the bridge when the registry or the roster changed) and `company` records in `ui_out.log` are its operations (`docs/COMPANIES.md` section 6).
 
 ## Injection points
 
@@ -69,11 +71,14 @@ The bridge builds one `engine` table; a global `FEVERLINK3_ENGINE` table (set by
 
 `tests/lua/test_cmds_build.py` does the same for construction (also importing the harness): userdata mocks with copy semantics and member lists, a strict command factory, a savegame of roads, tracks, a signal, a depot and a station, the build of the same record on two games whose entity ids differ, chained commands, keys for what a build created, and the construction schema alone against hostile records.
 
+`tests/lua/test_cmds_company.py` does the same for the company layer: the module on its own (registry operations and who may do them, attribution, ledger, limits, payments, the page's data, the codecs) and two mocked games with several player entities, per-player accounts and ownership (identical registries and ledgers, `player` arguments that become each game's own company entity, limits at the originator and at the stamp, pauses, reloads, faults in the company layer, forged actions).
+
 ```
 pip install lupa
 python -I tests/lua/test_lockstep.py
 python -I tests/lua/test_cmds_ops.py
 python -I tests/lua/test_cmds_build.py
+python -I tests/lua/test_cmds_company.py
 ```
 
 The harness is Python because mlua's vendored Lua needs a C compiler, which the Rust GNU toolchain alone does not provide; the mod under test is unchanged by that choice.
