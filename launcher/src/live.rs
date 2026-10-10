@@ -424,8 +424,11 @@ impl Controller {
             Ok(l) => l,
             Err(e) => return self.state = State::Failed(format!("cannot open the session folder: {e}")),
         };
+        // `bind` = "loopback" keeps the developer transport on this PC only: no firewall prompt, no exposed port
+        let loopback = params.get("bind").and_then(Value::as_str) == Some("loopback");
+        let ip = if loopback { [127, 0, 0, 1] } else { [0, 0, 0, 0] };
         let started = session::run_host(HostConfig {
-            bind: SocketAddr::from(([0, 0, 0, 0], port)),
+            bind: SocketAddr::from((ip, port)),
             name,
             key,
             link,
@@ -443,7 +446,7 @@ impl Controller {
             handle,
             permissions: Permissions::default(),
             secret,
-            lan: net::lan_endpoints(bound),
+            lan: if loopback { vec![SocketAddr::from(([127, 0, 0, 1], bound))] } else { net::lan_endpoints(bound) },
             code: String::new(),
             endpoints: Vec::new(),
             password: password.is_some(),
@@ -913,7 +916,7 @@ mod tests {
         let mut player = Controller::new(pd.clone(), "Pat".into(), Vec::new()).unwrap();
         let (mut hw, mut pw) = (Window::new(&hd), Window::new(&pd));
 
-        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\"}");
+        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
         let status = hw.status();
         let code = status["code"].as_str().expect("a join code").to_owned();
@@ -1063,11 +1066,11 @@ mod tests {
         w.send("join", "{[\"code\"]=\"NOT-A-CODE\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["state"] == "failed"));
         assert!(w.status()["message"].as_str().unwrap().contains("not a valid join code"));
-        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
         // a second host request while hosting changes nothing
         let code = w.status()["code"].clone();
-        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         c.step();
         assert_eq!(w.status()["code"], code);
     }
@@ -1077,7 +1080,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
         let mut w = Window::new(t.path());
-        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
         c.recover("boom");
         c.step();
@@ -1085,7 +1088,7 @@ mod tests {
         assert_eq!(status["state"], "failed");
         assert!(status["message"].as_str().unwrap().contains("boom"), "{status}");
         assert!(fs::read_to_string(t.path().join("identity.txt")).unwrap().contains("role=idle"));
-        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
     }
 
@@ -1126,7 +1129,7 @@ mod tests {
         let mut host = Controller::new(hd.clone(), "Host".into(), Vec::new()).unwrap().with_host_options(options);
         let player = Controller::new(pd.clone(), "Pat".into(), Vec::new()).unwrap();
         let (mut hw, pw) = (Window::new(&hd), Window::new(&pd));
-        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\"}");
+        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
         let code = hw.status()["code"].as_str().expect("a join code").to_owned();
         let mut decoded = JoinCode::try_decode(&code).expect("a decodable code");

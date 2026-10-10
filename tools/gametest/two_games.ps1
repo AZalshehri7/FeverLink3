@@ -14,7 +14,9 @@
 param(
     [int]$LoadSeconds = 28,
     [int]$SettleSeconds = 60,
-    [switch]$NoInstall
+    [switch]$NoInstall,
+    # leave both games and the launcher running after the test (the default closes them)
+    [switch]$KeepRunning
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\ui.ps1"
@@ -24,6 +26,11 @@ $live = Join-Path $env:LOCALAPPDATA 'FeverLink3\live'
 $shots = Join-Path $env:TEMP 'fl3-gametest'
 New-Item -ItemType Directory -Force $shots | Out-Null
 
+function Close-Everything {
+    if (-not $KeepRunning) {
+        Get-Process TransportFever3, feverlink3 -ErrorAction SilentlyContinue | Stop-Process -Force
+    }
+}
 function Step($text) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $text) }
 function Send-Ctl([string]$Kind, [string]$Payload = '{}') {
     $file = Join-Path $live 'ctl_cmd.log'
@@ -68,7 +75,7 @@ try {
     Start-Sleep 5
 
     Step 'host and start the session'
-    Send-Ctl 'host' '{["port"]=28090,["transport"]="tcp"}'
+    Send-Ctl 'host' '{["port"]=28090,["transport"]="tcp",["bind"]="loopback"}'
     Wait-Until { (Read-Status) -match '\["state"\]="hosting"' } 30 'hosting'
     Send-Ctl 'start'
     Wait-Until { (Read-Status) -match '\["started"\]=true' } 30 'the session to start'
@@ -115,10 +122,12 @@ try {
     Write-Host "host logs:   $live"
     Write-Host "player logs: $($p2dir.FullName)"
     Write-Host "screenshot:  $shots\final.png"
+    Close-Everything
     exit $verdict
 }
 catch {
     Write-Host "ERROR: $_" -ForegroundColor Red
     try { Save-Screenshot (Join-Path $shots 'error.png') } catch {}
+    Close-Everything
     exit 2
 }
