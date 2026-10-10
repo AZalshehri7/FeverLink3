@@ -39,7 +39,9 @@ use feverlink3_core::session::{
 
 use crate::gamelink::{self, Line};
 use crate::luatext;
-use crate::net::{ClientNet, HostNet, NetEvent, CONNECT_TIMEOUT};
+use crate::net::{
+    ClientNet, ClientTransport, ConnectContext, HostNet, HostTransport, LinkInfo, NetEvent, CONNECT_TIMEOUT,
+};
 use crate::process::Role;
 use crate::resync;
 
@@ -198,6 +200,9 @@ pub struct Status {
     pub dropped: u64,
     /// Host: the state of the resync round last reported (`None` before the first).
     pub resync: Option<String>,
+    /// What the transport measured about each open connection: ping and route. The host has one per connection
+    /// (by connection id), a player one to the host; empty for a transport that measures nothing (TCP).
+    pub links: Vec<LinkInfo>,
     /// Everyone the session knows, by id, the host's own game (id 0) first: connected players with their round-trip
     /// time to the host, and players whose connection dropped and whose slot is held for a return (`Away`). A
     /// player's view is what the host last told it.
@@ -225,6 +230,7 @@ impl Status {
             actions_relayed: 0,
             dropped: 0,
             resync: None,
+            links: Vec::new(),
             roster: Vec::new(),
             permissions: Permissions::default(),
         }
@@ -427,16 +433,26 @@ pub struct HostConfig {
 
 /// Binds the listener, writes the identity file and starts the host session thread.
 pub fn run_host(config: HostConfig) -> io::Result<SessionHandle> {
-    let HostConfig { bind, name, key, mut link, options, save_dirs, echo_log } = config;
+    let bind = config.bind;
+    run_host_over(config, move |tx| HostNet::bind(bind, tx))
+}
+
+/// As [`run_host`] over another transport. `listen` gets the sender the transport's [`NetEvent`]s must go to and
+/// returns the transport; `config.bind` is not used. The session code is the same for every transport.
+pub fn run_host_over<T: HostTransport>(
+    config: HostConfig,
+    listen: impl FnOnce(Sender<NetEvent>) -> io::Result<T>,
+) -> io::Result<SessionHandle> {
+    let HostConfig { name, key, mut link, options, save_dirs, echo_log, .. } = config;
     let (net_tx, net_rx) = mpsc::channel();
-    let net = HostNet::bind(bind, net_tx)?;
+    let net = listen(net_tx)?;
     let local_addr = net.local_addr();
     let mut host = HostSession::new(key, &name, clock_fn(), options);
     link.write_identity(HostSession::HOST_ID, host.host_name(), Role::Host.as_str())?;
     let shared = Shared::new(Status::new(Role::Host, host.host_name()), echo_log);
     // the first status already lists the host's own game
-    refresh_host_status(&host, &shared);
-    shared.log(format!("listening on {local_addr}"));
+    refresh_host_status(&host, &net, &shared);
+    shared.log(format!("listening on {}", net.describe()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {
         let shared = Arc::clone(&shared);
@@ -449,11 +465,11 @@ pub fn run_host(config: HostConfig) -> io::Result<SessionHandle> {
             });
         })?
     };
-    Ok(SessionHandle { shared, commands: cmd_tx, thread: Mutex::new(Some(thread)), local_addr: Some(local_addr) })
+    Ok(SessionHandle { shared, commands: cmd_tx, thread: Mutex::new(Some(thread)), local_addr })
 }
 
 fn host_loop(
-    net: &HostNet,
+    net: &dyn HostTransport,
     net_rx: &Receiver<NetEvent>,
     cmd_rx: &Receiver<Command>,
     host: &mut HostSession,
@@ -491,7 +507,7 @@ fn host_loop(
             outputs.extend(host.tick());
         }
         host_dispatch(outputs, host, net, link, save_dirs, shared);
-        refresh_host_status(host, shared);
+        refresh_host_status(host, net, shared);
     }
 }
 
@@ -514,7 +530,7 @@ fn host_net_event(host: &mut HostSession, event: NetEvent, shared: &Shared) -> V
 fn host_dispatch(
     outputs: Vec<HostOutput>,
     host: &mut HostSession,
-    net: &HostNet,
+    net: &dyn HostTransport,
     link: &mut gamelink::Session,
     save_dirs: &[PathBuf],
     shared: &Shared,
@@ -563,7 +579,7 @@ fn host_dispatch(
 fn stream_save(
     id: i32,
     host: &mut HostSession,
-    net: &HostNet,
+    net: &dyn HostTransport,
     link: &mut gamelink::Session,
     save_dirs: &[PathBuf],
     shared: &Shared,
@@ -602,13 +618,14 @@ fn stream_save(
     }
 }
 
-fn refresh_host_status(host: &HostSession, shared: &Shared) {
+fn refresh_host_status(host: &HostSession, net: &dyn HostTransport, shared: &Shared) {
     shared.update(|s| {
         s.players = host.players().values().cloned().collect();
         s.clocks = host.clocks().iter().map(|(&id, c)| ClockInfo { id, t: c.t, speed: Some(c.speed) }).collect();
         s.session = Some(host.state().clone());
         s.actions_relayed = host.actions_relayed();
         s.dropped = host.dropped();
+        s.links = net.links();
         s.roster = host.roster();
         s.permissions = host.permissions().clone();
     });
@@ -661,16 +678,44 @@ impl PlayerConfig {
 /// Connects (an error here is returned, not retried: a wrong code should fail fast) and starts the player
 /// session thread.
 pub fn run_player(config: PlayerConfig) -> io::Result<SessionHandle> {
+    let endpoints = config.endpoints.clone();
+    let connect = move |ctx: ConnectContext<'_>| {
+        ClientNet::connect_with_timeout(&endpoints, ctx.conn, ctx.tx, ctx.timeout)
+            .map(|net| Box::new(net) as Box<dyn ClientTransport>)
+    };
+    run_player_over(config, connect, &mut |_| {})
+}
+
+/// What connects a player to its host over some transport, now and at every reconnect. Given the id the events of
+/// the connection must carry, where they go, how long to try, whether to give up, and where to say what it is doing.
+pub type Connector = Box<dyn FnMut(ConnectContext<'_>) -> io::Result<Box<dyn ClientTransport>> + Send>;
+
+/// As [`run_player`] over another transport: `connect` makes the connection (`config.endpoints` is not used,
+/// `config.connect_timeout` is the time it may take). `progress` hears what the first attempt is doing; the
+/// attempts of a reconnect report to the session log, and stop when the session is stopped.
+pub fn run_player_over(
+    config: PlayerConfig,
+    connect: impl FnMut(ConnectContext<'_>) -> io::Result<Box<dyn ClientTransport>> + Send + 'static,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<SessionHandle> {
+    let mut connect: Connector = Box::new(connect);
     let (net_tx, net_rx) = mpsc::channel();
-    let first = ClientNet::connect_with_timeout(&config.endpoints, 1, net_tx.clone(), config.connect_timeout)?;
+    let first = connect(ConnectContext {
+        conn: 1,
+        tx: net_tx.clone(),
+        timeout: config.connect_timeout,
+        cancelled: &|| false,
+        progress,
+    })?;
     let player = PlayerSession::new(config.key.clone(), &config.name, &config.version);
     let shared = Shared::new(Status::new(Role::Player, &config.name), config.echo_log);
-    shared.log(format!("connected to {}", first.peer()));
+    shared.log(format!("connected to {}", first.describe()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("feverlink3-player".into()).spawn(move || {
-            let mut state = PlayerLoop { config, player, net: Some(first), generation: 1, net_tx, ticket: None };
+            let mut state =
+                PlayerLoop { config, player, net: Some(first), connect, generation: 1, net_tx, ticket: None };
             state.run(&net_rx, &cmd_rx, &shared);
             state.net = None;
             shared.update(|s| {
@@ -686,7 +731,8 @@ pub fn run_player(config: PlayerConfig) -> io::Result<SessionHandle> {
 struct PlayerLoop {
     config: PlayerConfig,
     player: PlayerSession,
-    net: Option<ClientNet>,
+    net: Option<Box<dyn ClientTransport>>,
+    connect: Connector,
     /// Id of the current connection attempt; events of older ones are stale.
     generation: u64,
     net_tx: Sender<NetEvent>,
@@ -781,6 +827,7 @@ impl PlayerLoop {
                     s.session = Some(session.clone());
                 }
                 s.clocks = clocks.iter().map(|(&id, &t)| ClockInfo { id, t, speed: None }).collect();
+                s.links = self.net.as_ref().and_then(|n| n.link()).into_iter().collect();
                 // while a new connection has no welcome yet, the last roster stays: no empty list in between
                 if self.player.state() == PlayerState::Joined {
                     let roster = self.player.roster();
@@ -828,14 +875,25 @@ impl PlayerLoop {
         retry.next_attempt = Instant::now() + self.config.reconnect_interval;
         shared.update(|s| s.reconnect_attempts = retry.attempts);
         self.generation += 1;
-        match ClientNet::connect_with_timeout(
-            &self.config.endpoints,
-            self.generation,
-            self.net_tx.clone(),
-            self.config.connect_timeout,
-        ) {
+        let attempt = retry.attempts;
+        let mut last_said = String::new();
+        let mut say = |text: &str| {
+            if last_said != text {
+                last_said = text.to_owned();
+                shared.log(format!("reconnect attempt {attempt}: {text}"));
+            }
+        };
+        let ctx = ConnectContext {
+            conn: self.generation,
+            tx: self.net_tx.clone(),
+            timeout: self.config.connect_timeout,
+            // a stop request must not wait for a route that takes half a minute to fail
+            cancelled: &|| shared.stopping(),
+            progress: &mut say,
+        };
+        match (self.connect)(ctx) {
             Ok(net) => {
-                shared.log(format!("reconnected to {} (attempt {})", net.peer(), retry.attempts));
+                shared.log(format!("reconnected to {} (attempt {})", net.describe(), retry.attempts));
                 let (key, name, version) = (self.config.key.clone(), &self.config.name, &self.config.version);
                 self.player = match self.ticket.clone() {
                     Some(ticket) => PlayerSession::resuming(key, name, version, ticket),

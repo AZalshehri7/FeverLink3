@@ -20,6 +20,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,9 @@ use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle, Status};
-use crate::{luatext, net, resync, steam, steamnet};
+use crate::steam_transport::SteamEndpoint;
+use crate::steamnet::CoreRef;
+use crate::{luatext, net, resync, steam, steam_transport, steamnet};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
@@ -51,8 +54,14 @@ pub fn live_dir() -> Option<PathBuf> {
 enum State {
     Idle,
     Hosting(Box<Hosting>),
-    Joining { rx: Receiver<Result<SessionHandle, String>> },
-    Joined { handle: SessionHandle },
+    /// `progress` is what the connection attempt says it is doing ("finding a route"), written by the join thread.
+    Joining {
+        rx: Receiver<Result<SessionHandle, String>>,
+        progress: Arc<Mutex<String>>,
+    },
+    Joined {
+        handle: SessionHandle,
+    },
     Failed(String),
 }
 
@@ -65,6 +74,8 @@ struct Hosting {
     code: String,
     endpoints: Vec<String>,
     password: bool,
+    /// The Steam ID the code carries: the session is hosted over Steam (no address, no port). `None` for TCP.
+    steam_id: Option<u64>,
 }
 
 impl Hosting {
@@ -75,6 +86,13 @@ impl Hosting {
             self.endpoints = self.lan.iter().map(ToString::to_string).collect();
         }
     }
+}
+
+/// The Steam transport self-check (`steamloop`): it runs on a thread of its own and leaves its lines here.
+#[derive(Default)]
+struct LoopCheck {
+    running: bool,
+    checks: Vec<steam_transport::Check>,
 }
 
 /// How the last command that can fail ended; the window shows `message` and tells its own command by `seq`.
@@ -95,10 +113,13 @@ pub struct Controller {
     commands: Tail,
     state: State,
     steam: Option<steamnet::Probe>,
+    /// The Steam core to use instead of the process's (the tests give it a fake Steam).
+    core: Option<CoreRef>,
     /// How often and when the Steam API was looked for: it may not be loaded yet when the controller starts.
     steam_attempts: u32,
     steam_last_try: Instant,
     steam_note: Option<String>,
+    steam_loop: Arc<Mutex<LoopCheck>>,
     result: Option<CommandResult>,
     published: String,
     version: u64,
@@ -108,6 +129,25 @@ impl Controller {
     /// Prepares the folder (files of an earlier run are removed), says the game is idle, starts listening for
     /// commands.
     pub fn new(dir: PathBuf, default_name: String, save_dirs: Vec<PathBuf>) -> io::Result<Controller> {
+        Self::build(dir, default_name, save_dirs, None)
+    }
+
+    /// As [`Controller::new`] with a Steam core of its own instead of the process's: for tests with a fake Steam.
+    pub fn with_core(
+        dir: PathBuf,
+        default_name: String,
+        save_dirs: Vec<PathBuf>,
+        core: CoreRef,
+    ) -> io::Result<Controller> {
+        Self::build(dir, default_name, save_dirs, Some(core))
+    }
+
+    fn build(
+        dir: PathBuf,
+        default_name: String,
+        save_dirs: Vec<PathBuf>,
+        core: Option<CoreRef>,
+    ) -> io::Result<Controller> {
         fs::create_dir_all(&dir)?;
         for entry in fs::read_dir(&dir)?.flatten() {
             if entry.path().is_file() {
@@ -124,10 +164,12 @@ impl Controller {
             host_options: HostOptions::default(),
             commands,
             state: State::Idle,
-            steam: steamnet::Probe::load(),
+            steam: core.clone().map(steamnet::Probe::on).or_else(steamnet::Probe::load),
+            core,
             steam_attempts: 1,
             steam_last_try: Instant::now(),
             steam_note: None,
+            steam_loop: Arc::default(),
             result: None,
             published: String::new(),
             version: 0,
@@ -183,13 +225,19 @@ impl Controller {
                 self.note(seq, kind, outcome);
             }
             "steamtest" => {
-                let id = params.get("id").and_then(Value::as_str).and_then(steamnet::parse_steam_id);
+                let text = params.get("id").and_then(Value::as_str).unwrap_or("").trim();
+                // the window has no button for the transport self-check: typing `loop` where the Steam ID goes starts it
+                if text.eq_ignore_ascii_case("loop") {
+                    return self.steam_loop();
+                }
+                let id = steamnet::parse_steam_id(text);
                 match (&mut self.steam, id) {
                     (Some(probe), Some(id)) => probe.test(id),
                     (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),
                     (None, _) => self.steam_note = Some("Steam networking is not available in this game".into()),
                 }
             }
+            "steamloop" => self.steam_loop(),
             "start" | "pause" | "speed" | "check" | "resync" => {
                 if let State::Hosting(h) = &self.state {
                     let handle = &h.handle;
@@ -207,6 +255,31 @@ impl Controller {
             }
             _ => {}
         }
+    }
+
+    /// The Steam core sessions use: the one given at construction, else the process's (when the game has Steam).
+    fn steam_core(&self) -> Option<CoreRef> {
+        self.core.clone().or_else(steamnet::global)
+    }
+
+    /// Starts the Steam transport self-check on a thread of its own, unless one is running.
+    fn steam_loop(&mut self) {
+        let Some(core) = self.steam.as_ref().and(self.steam_core()) else {
+            self.steam_note = Some("Steam networking is not available in this game".into());
+            return;
+        };
+        {
+            let mut state = self.steam_loop.lock().unwrap_or_else(|p| p.into_inner());
+            if state.running {
+                return;
+            }
+            *state = LoopCheck { running: true, checks: Vec::new() };
+        }
+        let shared = Arc::clone(&self.steam_loop);
+        thread::spawn(move || {
+            let checks = steam_transport::loopback_check(&core);
+            *shared.lock().unwrap_or_else(|p| p.into_inner()) = LoopCheck { running: false, checks };
+        });
     }
 
     /// Records how a command that can be refused ended, for the status.
@@ -261,15 +334,73 @@ impl Controller {
             return;
         }
         // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
-        // a relay as the fallback). Until that transport is wired in, the only one is the direct TCP transport, which
-        // is for development and tests and must be asked for by name.
-        let transport = params.get("transport").and_then(Value::as_str).unwrap_or("auto");
-        if transport != "tcp" {
-            self.state = State::Failed(
-                "Hosting over Steam is not finished in this build yet; the Steam connection test below works".into(),
-            );
-            return;
+        // a relay as the fallback). The direct TCP transport is for development and tests and must be asked for by
+        // name.
+        match params.get("transport").and_then(Value::as_str).unwrap_or("auto") {
+            "tcp" => self.host_tcp(params),
+            "steam" | "auto" => self.host_steam(params),
+            other => self.state = State::Failed(format!("unknown transport {other:?}; use \"steam\" or \"tcp\"")),
         }
+    }
+
+    /// Hosts over Steam: no address and no port. The join code carries this account's Steam ID.
+    fn host_steam(&mut self, params: &Value) {
+        let Some(core) = self.steam_core() else {
+            self.state = State::Failed("Steam networking is not available in this game".into());
+            return;
+        };
+        let status = core.status();
+        let Some(steam_id) = status.steam_id.filter(|_| status.ready) else {
+            self.state = State::Failed(format!("Steam is not ready yet ({}); try again in a moment", status.note));
+            return;
+        };
+        let name = self.name_from(params);
+        let password = params.get("password").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_owned);
+        // inside the game a panic ends the process: no random numbers is a failed host, not a crash
+        let Some(secret) = SessionKey::try_new_secret() else {
+            self.state = State::Failed("this PC has no source of random numbers to make a session key".into());
+            return;
+        };
+        let key = SessionKey::derive(&secret, password.as_deref());
+        let link = match gamelink::Session::open(&self.dir) {
+            Ok(l) => l,
+            Err(e) => return self.state = State::Failed(format!("cannot open the session folder: {e}")),
+        };
+        let config = HostConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)), // not used by Steam
+            name,
+            key,
+            link,
+            options: self.host_options.clone(),
+            save_dirs: self.save_dirs.clone(),
+            echo_log: false,
+        };
+        let handle = match steam_transport::run_steam_host_on(&core, config) {
+            Ok(h) => h,
+            Err(e) => return self.state = State::Failed(format!("cannot host over Steam: {e}")),
+        };
+        let code = match JoinCode::create(&[], secret, None) {
+            Ok(code) => code.with_steam_id(steam_id).encode(),
+            Err(e) => {
+                handle.stop();
+                return self.state = State::Failed(format!("cannot make a join code: {e}"));
+            }
+        };
+        self.result = None;
+        self.state = State::Hosting(Box::new(Hosting {
+            handle,
+            permissions: Permissions::default(),
+            secret,
+            lan: Vec::new(),
+            code,
+            endpoints: Vec::new(),
+            password: password.is_some(),
+            steam_id: Some(steam_id),
+        }));
+    }
+
+    /// Hosts over direct TCP (developer transport): the join code lists the machine's local addresses.
+    fn host_tcp(&mut self, params: &Value) {
         let name = self.name_from(params);
         let port =
             params.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_PORT);
@@ -307,6 +438,7 @@ impl Controller {
             code: String::new(),
             endpoints: Vec::new(),
             password: password.is_some(),
+            steam_id: None,
         };
         hosting.make_code();
         if hosting.code.is_empty() {
@@ -331,18 +463,32 @@ impl Controller {
         let key = SessionKey::derive(&code.secret, password.as_deref());
         let (dir, save_dirs) = (self.dir.clone(), self.save_dirs.clone());
         let (tx, rx) = mpsc::channel();
-        // run_player connects before it returns (5 s per endpoint at most): off the controller's thread
+        let progress = Arc::new(Mutex::new(String::new()));
+        let (core, said) = (self.steam_core(), Arc::clone(&progress));
+        // run_player connects before it returns (5 s per TCP endpoint, up to 30 s for a Steam route): off the
+        // controller's thread
         thread::spawn(move || {
             let result = gamelink::Session::open(&dir)
                 .map_err(|e| format!("cannot open the session folder: {e}"))
-                .and_then(|link| {
-                    let mut config = PlayerConfig::new(code.endpoints.clone(), &name, key, link);
-                    config.save_dirs = save_dirs;
-                    session::run_player(config).map_err(|e| format!("cannot reach the host: {e}"))
+                .and_then(|link| match code.steam_id {
+                    // a code with a Steam ID is joined over Steam, whatever else it lists
+                    Some(id) => {
+                        let core = core.ok_or("Steam networking is not available in this game")?;
+                        let mut config = steam_transport::steam_player_config(&name, key, link);
+                        config.save_dirs = save_dirs;
+                        let mut say = |text: &str| *said.lock().unwrap_or_else(|p| p.into_inner()) = text.to_owned();
+                        steam_transport::run_steam_player_on(&core, config, SteamEndpoint(id), &mut say)
+                            .map_err(|e| format!("cannot reach the host over Steam: {e}"))
+                    }
+                    None => {
+                        let mut config = PlayerConfig::new(code.endpoints.clone(), &name, key, link);
+                        config.save_dirs = save_dirs;
+                        session::run_player(config).map_err(|e| format!("cannot reach the host: {e}"))
+                    }
                 });
             let _ = tx.send(result);
         });
-        self.state = State::Joining { rx };
+        self.state = State::Joining { rx, progress };
     }
 
     fn leave(&mut self) {
@@ -369,7 +515,7 @@ impl Controller {
             }
             return;
         }
-        let State::Joining { rx } = &self.state else { return };
+        let State::Joining { rx, .. } = &self.state else { return };
         match rx.try_recv() {
             Ok(Ok(handle)) => self.state = State::Joined { handle },
             Ok(Err(why)) => self.state = State::Failed(why),
@@ -388,12 +534,21 @@ impl Controller {
                 v["state"] = json!("failed");
                 v["message"] = json!(why);
             }
-            State::Joining { .. } => v["state"] = json!("joining"),
+            State::Joining { progress, .. } => {
+                v["state"] = json!("joining");
+                // what the connection attempt is doing: "contacting the host", "finding a route", ...
+                let said = progress.lock().unwrap_or_else(|p| p.into_inner());
+                if !said.is_empty() {
+                    v["progress"] = json!(*said);
+                }
+            }
             State::Hosting(h) => {
                 v["state"] = json!("hosting");
                 v["code"] = json!(h.code);
                 v["endpoints"] = json!(h.endpoints);
                 v["password"] = json!(h.password);
+                v["transport"] = json!(if h.steam_id.is_some() { "steam" } else { "tcp" });
+                v["steamid"] = json!(h.steam_id.map(|id| id.to_string()));
                 v["capacity"] = json!(self.host_options.max_players);
                 add_session(&mut v, &h.handle);
             }
@@ -456,7 +611,24 @@ impl Controller {
                 "pongs": t.pongs,
                 "rtt": t.last_rtt_ms,
                 "route": t.route,
+                "ping": t.ping_ms,
+                "rate": t.send_rate,
             });
+        }
+        v["peers"] = json!(r
+            .peers
+            .iter()
+            .map(|p| json!({
+                "id": p.steam_id.map(|id| id.to_string()),
+                "route": p.route,
+                "ping": p.ping_ms,
+                "rate": p.send_rate,
+            }))
+            .collect::<Vec<_>>());
+        let looped = self.steam_loop.lock().unwrap_or_else(|p| p.into_inner());
+        if looped.running || !looped.checks.is_empty() {
+            let checks = looped.checks.iter().map(|c| json!({ "name": c.name, "ok": c.ok, "detail": c.detail }));
+            v["loop"] = json!({ "running": looped.running, "checks": checks.collect::<Vec<_>>() });
         }
         v
     }
@@ -485,6 +657,12 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
     if let Some(r) = &s.resync {
         v["resync"] = json!(r);
     }
+    // ping and route per connection, for transports that measure them (Steam)
+    v["links"] = json!(s
+        .links
+        .iter()
+        .map(|l| json!({ "conn": l.conn, "ping": l.ping_ms, "route": l.route }))
+        .collect::<Vec<_>>());
 }
 
 /// Every player of the session, away ones included. Before the first roster exists, the plain player list.
@@ -652,6 +830,8 @@ pub fn spawn() -> Option<thread::JoinHandle<()>> {
 mod tests {
     use super::*;
     use crate::gamelink::Line;
+    use crate::steamnet::fake::FakeMachine;
+    use crate::steamnet::SteamCore;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::time::Instant;
@@ -744,6 +924,118 @@ mod tests {
         assert!(fs::read_to_string(hd.join("identity.txt")).unwrap().contains("role=idle"));
     }
 
+    /// A controller on a fake Steam machine of its own, with its window.
+    struct SteamPc {
+        machine: FakeMachine,
+        _core: SteamCore,
+        controller: Controller,
+        window: Window,
+        dir: PathBuf,
+    }
+
+    fn steam_pc(root: &Path, name: &str) -> SteamPc {
+        let machine = FakeMachine::new();
+        let core = machine.core();
+        let dir = root.join(name);
+        let controller = Controller::with_core(dir.clone(), name.into(), Vec::new(), core.handle()).unwrap();
+        SteamPc { machine, _core: core, controller, window: Window::new(&dir), dir }
+    }
+
+    #[test]
+    fn hosting_and_joining_over_steam_needs_no_address_and_no_port() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut host, mut guest) = (steam_pc(root.path(), "host"), steam_pc(root.path(), "guest"));
+        // the default transport is Steam, and the probe runs on the same fake Steam
+        host.window.send("host", "{[\"name\"]=\"Hosty\"}");
+        assert!(
+            until(&mut [&mut host.controller], Duration::from_secs(10), || host.window.status()["state"] == "hosting")
+        );
+        let status = host.window.status();
+        assert_eq!(status["transport"], "steam");
+        assert_eq!(status["steamid"], host.machine.steam_id().to_string());
+        // an empty list comes back from the Lua table as an empty table, not necessarily as an array
+        assert!(status["endpoints"].as_array().is_none_or(Vec::is_empty), "no address, no port: {status:?}");
+        let code = status["code"].as_str().expect("a join code").to_owned();
+        let decoded = JoinCode::try_decode(&code).expect("a decodable code");
+        assert_eq!((decoded.steam_id, decoded.endpoints.is_empty()), (Some(host.machine.steam_id()), true));
+        assert!(fs::read_to_string(host.dir.join("identity.txt")).unwrap().contains("role=host"));
+
+        host.machine.set_route_delay(Duration::from_millis(400));
+        guest.window.send("join", &format!("{{[\"code\"]=\"{code}\"}}"));
+        // while the route is searched the window can say so
+        let mut seen = Vec::new();
+        assert!(until(&mut [&mut host.controller, &mut guest.controller], Duration::from_secs(15), || {
+            let status = guest.window.status();
+            if let Some(text) = status["progress"].as_str() {
+                if seen.last().map(String::as_str) != Some(text) {
+                    seen.push(text.to_owned());
+                }
+            }
+            status["state"] == "joined"
+        }));
+        assert!(seen.iter().any(|t| t == "finding a route"), "{seen:?}");
+        assert!(fs::read_to_string(guest.dir.join("identity.txt")).unwrap().contains("role=player"));
+        assert!(until(&mut [&mut host.controller, &mut guest.controller], Duration::from_secs(10), || {
+            host.window.status()["players"].as_array().is_some_and(|p| p.len() == 2)
+        }));
+
+        // ping and route of the connection are in both windows' status
+        let measured = |w: &Window| {
+            w.status()["links"]
+                .as_array()
+                .is_some_and(|l| l.len() == 1 && l[0]["ping"] == 30 && l[0]["route"] == "direct")
+        };
+        assert!(until(&mut [&mut host.controller, &mut guest.controller], Duration::from_secs(10), || {
+            measured(&host.window) && measured(&guest.window)
+        }));
+
+        guest.window.send("leave", "{}");
+        assert!(until(&mut [&mut host.controller, &mut guest.controller], Duration::from_secs(5), || {
+            guest.window.status()["state"] == "idle"
+        }));
+        host.window.send("leave", "{}");
+        assert!(until(&mut [&mut host.controller], Duration::from_secs(5), || host.window.status()["state"] == "idle"));
+    }
+
+    #[test]
+    fn hosting_over_steam_waits_for_steam_and_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let mut pc = steam_pc(root.path(), "host");
+        pc.machine.set_ready(false);
+        // wait until the core has noticed that Steam is not there
+        thread::sleep(Duration::from_millis(100));
+        pc.window.send("host", "{}");
+        assert!(until(&mut [&mut pc.controller], Duration::from_secs(5), || pc.window.status()["state"] == "failed"));
+        let message = pc.window.status()["message"].as_str().unwrap().to_owned();
+        assert!(message.contains("Steam is not ready yet"), "{message}");
+        // Steam comes up: the same request now works
+        pc.machine.set_ready(true);
+        let ready = Instant::now() + Duration::from_secs(5);
+        while !pc._core.handle().status().ready && Instant::now() < ready {
+            thread::sleep(Duration::from_millis(10));
+        }
+        pc.window.send("host", "{}");
+        assert!(until(&mut [&mut pc.controller], Duration::from_secs(10), || pc.window.status()["state"] == "hosting"));
+    }
+
+    #[test]
+    fn an_unknown_transport_and_a_steam_code_without_steam_fail_with_a_message() {
+        let root = tempfile::tempdir().unwrap();
+        let mut c = Controller::new(root.path().join("a"), "Pat".into(), Vec::new()).unwrap();
+        let mut w = Window::new(&root.path().join("a"));
+        w.send("host", "{[\"transport\"]=\"carrier pigeon\"}");
+        c.step();
+        assert!(w.status()["message"].as_str().unwrap().contains("unknown transport"));
+        // a code that names a Steam ID cannot be joined where there is no Steam
+        let code = JoinCode::create(&[], [7; 16], None).unwrap().with_steam_id(76561198000000001).encode();
+        w.send("join", &format!("{{[\"code\"]=\"{code}\"}}"));
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || {
+            w.status()["message"].as_str().is_some_and(|m| m.contains("Steam networking is not available"))
+        }));
+        assert_eq!(w.status()["state"], "failed");
+        assert!(w.status()["message"].as_str().unwrap().contains("Steam networking is not available"));
+    }
+
     #[test]
     fn a_bad_code_fails_with_a_message_and_the_window_can_try_again() {
         let t = tempfile::tempdir().unwrap();
@@ -759,6 +1051,23 @@ mod tests {
         w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
         c.step();
         assert_eq!(w.status()["code"], code);
+    }
+
+    #[test]
+    fn the_steam_commands_say_so_when_the_game_has_no_steam() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
+        let mut w = Window::new(t.path());
+        w.send("steamloop", "{}");
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || {
+            w.status()["steam"]["note"].as_str().is_some_and(|n| n.contains("not available"))
+        }));
+        assert_eq!(w.status()["steam"]["state"], "looking for Steam...");
+        // `loop` in the Steam ID field of the test starts the same check; a real ID is a normal test
+        w.send("steamtest", "{[\"id\"]=\"76561198869158889\"}");
+        w.send("steamtest", "{[\"id\"]=\" Loop \"}");
+        c.step();
+        assert_eq!(w.status()["steam"]["state"], "looking for Steam...");
     }
 
     #[test]
