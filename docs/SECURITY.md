@@ -29,7 +29,7 @@ means harm (section 4), and not a defence against a program already running as t
 | **C. Joiner** with the code (and the password) | Send every message kind a player may send (section 3), with any content, as fast as the host will read | Pass as the host or another player, change the session state or permissions, send a host-only kind |
 | **D. Malicious host**, seen by a joiner | Everything: it decides the state, relays the actions, sends the savegame, and a savegame runs code when it loads | (nothing is contained: section 4) |
 | **E. Relay operator, or someone who connects to a relay** | The operator is attacker B for every room (headers, IP addresses, the room name, cutting and delaying); anyone can send the relay's messages to it | Read or alter a payload (the relay never has the key; the room name is `HKDF(secret, "relay room")`, which says nothing about the key). Make a *game* do anything: a relay message is parsed by `RelayCodec`, which allocates nothing for an announced length and refuses over 1 MiB + 16 bytes |
-| **F. Steam user** who knows an account's Steam ID | Open a Steam connection to the probe and send `ping` | Reach the session (the probe carries none) |
+| **F. Steam user** who knows an account's Steam ID | Open a Steam connection to the probe (16 at a time) or to the host's session listener (64 at a time) and send frames; Steam says whose account it is | Get past the handshake without the code, reach more than the session's limits allow, or reach the session through the probe (it carries none) |
 | **G. Same-user program** | Anything the user can do, including the mod's files and the game folder | (out of scope) |
 
 ## 3. What is protected, and how
@@ -38,11 +38,12 @@ means harm (section 4), and not a defence against a program already running as t
 |---|---|---|
 | Joining without the code | The key is `HKDF(secret [‖ PBKDF2(password)])`. A Join carries `HMAC(key, nonce ‖ name)` over a per-connection random nonce; the check is constant time (`verify_slice`). A password adds 600 000 PBKDF2 iterations for anyone who has the code but not the password. | `session_tests`, `sealed_channel_tests` |
 | Reading or altering a frame | AES-256-GCM; the 12 header bytes are the additional data, so kind, sender and counter cannot change either | `sealed_channel_tests`, `robustness_tests::the_opener_accepts_exactly_what_a_sealer_made...` |
-| Replaying a frame | 64-frame replay window per sender; a counter is recorded only after the tag verified, and a sender gets a window only then, so forged frames can neither burn a counter nor grow the opener | `sealed_channel_tests`, `wire_limits_tests::forged_frames_leave_the_opener_empty`, `robustness_tests::the_replay_window_agrees_with_a_model...` |
-| Nonce reuse | Sender ids are assigned once and never taken back, a reconnecting player is a new sender, every session has a new secret, a `Sealer` that would run out of counters refuses instead of wrapping, and a second Welcome cannot replace a player's sealer | `hardening_tests::no_nonce_is_used_twice...`, `a_second_welcome_does_not_restart...`, `wire_limits_tests::the_sealer_refuses...` |
+| Replaying a frame | 64-frame replay window per sender; a counter is recorded only after the tag verified, and a sender gets a window only then, so forged frames can neither burn a counter nor grow the opener. A player refuses host frames numbered at or below its Welcome's, and a Welcome that does not carry the nonce of this connection's challenge | `sealed_channel_tests`, `wire_limits_tests::forged_frames_leave_the_opener_empty`, `robustness_tests::the_replay_window_agrees_with_a_model...`, `reconnect_tests` |
+| Nonce reuse | Every session has a new secret; a sender id given out again (a player coming back inside the host's 330 s window) starts a new epoch, and its counter starts at `epoch << 40`, above everything an earlier use of the id can reach; epochs run to 2^24 and then the id is not reused; a `Sealer` that would run out of counters refuses instead of wrapping; a second Welcome cannot replace a player's sealer. Open: a replayed Challenge and Welcome (section 4) | `hardening_tests::no_nonce_is_used_twice...`, `a_second_welcome_does_not_restart...`, `reconnect_tests::every_return_uses_a_later_epoch`, `wire_limits_tests::the_sealer_refuses...` |
+| Taking over a held slot | Only the holder of the player's resume token: the claim is `HMAC(token, "FeverLink3 resume" ‖ nonce ‖ id ‖ name)` over this connection's nonce, checked in constant time; the token is 16 random bytes sent once, sealed inside the Welcome; a wrong or missing claim is a plain join under a new id and never touches the held slot | `reconnect_tests`, `robustness_tests::a_join_that_claims_an_old_slot_gets_it_only_with_the_token` |
 | Speaking as another player or the host | The host checks the frame's sender id against the connection before it opens the frame; it fills `from`, `name`, `category` and `allowed` itself; a player may send only kinds 30 to 36, 50 and 51 | `session_tests`, `hardening_tests`, `robustness_tests::a_hostile_joined_player...` |
-| A stranger holding the host's resources | 64 connections, 16 per address, 32 waiting to join at once, a join within 15 s, a first frame of at most 4 KiB, a write that must finish in 10 s plus 1 s per 32 KiB, sockets that are polled so that a close takes effect in 5 ms (a blocked read on a silent peer outlived every shutdown, and a read with a timeout failed with `ERROR_IO_PENDING` about once in 3000 timeouts when data arrived as it expired: both measured) | `net::tests`, `hardening_tests::the_host_closes_connections_that_never_join...` |
-| A player flooding the host | 1000 frames and 1 MiB per second per connection (the reader waits, TCP slows the sender); messages that are too big are dropped: Action body 256 KiB, checksum report 128 parts of 128 characters | `net::tests::a_peer_that_sends_faster...`, `hardening_tests` |
+| A stranger holding the host's resources | 64 connections (TCP: 16 per address; Steam: 64 in all, the next one is closed), 32 waiting to join at once (`HostSession::MAX_PENDING`), a join within 10 s (`handshake_timeout_seconds`; the host does not count a stall of its own as a stranger's silence), a first TCP frame of at most 4 KiB, a write that must finish in 10 s plus 1 s per 32 KiB, TCP sockets that are polled so that a close takes effect in 5 ms (a blocked read on a silent peer outlived every shutdown, and a read with a timeout failed with `ERROR_IO_PENDING` about once in 3000 timeouts when data arrived as it expired: both measured). One Steam message is one frame, cut at Steam's 512 KiB | `net::tests`, `steam_transport::tests`, `hardening_tests::the_host_closes_connections_that_never_join...`, `liveness_tests` |
+| A player flooding the host | Per connection, on every transport: 500 frames a second (burst 2000) and 2 MiB a second (burst 8 MiB, a frame costs its header and body), then the connection is refused with `flood`; on TCP also the reader waits at 1000 frames and 1 MiB a second. Messages that are too big are dropped: Action body 256 KiB, checksum report 128 parts of 128 characters. The byte budget is what stops 256 KiB actions at 500 a second (128 MB/s into the host's disk) over the Steam transport, which has no throttle of its own | `limits_tests`, `hardening_tests::a_connection_over_its_byte_budget...`, `net::tests::a_peer_that_sends_faster...` |
 | A player lying about time | A Clock outside `0..=2^50`, or with a speed outside `0..=16`, is dropped; the stamp arithmetic saturates | `hardening_tests::clocks_that_are_not_game_times_are_dropped` |
 | Memory that grows with what a peer chooses | Log-once memory is cleared at 1024 keys and keyed by reasons, not by the peer's values; peer text is clipped before it reaches a log line (120 to 2000 characters); the host keeps 20 checksum rounds | `hardening_tests::the_log_does_not_grow...`, `robustness_tests` (tracking allocator) |
 | An injected `Reject` ending a session | A Reject is unsealed, so a player honours it only while it is still joining | `hardening_tests::an_injected_reject...` |
@@ -67,15 +68,16 @@ means harm (section 4), and not a defence against a program already running as t
   passwords offline, 600 000 PBKDF2 iterations at a time.
 - **A network observer or relay can drop, delay or cut anything**, and can read the headers (who sends which kind
   how often). It cannot read or change a payload.
-- **Frames of a recorded connection can be replayed into a new connection by someone on its path.** Sealed frames
-  are bound to the session key, not to the connection: a player's fresh state has an empty replay window, so a
-  recorded Welcome (which carries a sender id) or an old host frame is accepted again when an attacker who controls
-  the new connection (a relay, a man in the middle) feeds it in. The attacker still cannot read or forge anything;
-  what it can do is make a player believe an old session state, and, with a replayed Welcome, make that player seal
-  with a nonce it used before, which exposes the XOR of two of that player's messages to whoever recorded both.
-  Closing it needs one change to the handshake: the player contributes a random value that goes into the Join and
-  into the key of that connection (protocol version 2). It is deferred on purpose, because the roster and relay work
-  changes the same code; see F13 in section 7.
+- **A recorded connection can still be replayed, in full, into a new one by someone on its path.** Sealed frames
+  are bound to the session key. Since the roster work a player ties its Welcome to the nonce of this connection's
+  challenge and refuses host frames from before the Welcome, so a recorded Welcome alone no longer works. What does:
+  an attacker who controls the new connection (a relay, a man in the middle) replays the recorded *Challenge and*
+  *Welcome* together (the player's Join answers the recorded nonce, and the recorded Welcome carries that nonce). The
+  attacker still cannot read or forge anything; it can make a player believe an old session state and, because the
+  Welcome also carries the epoch the id had then, make that player seal with counters it used before, which exposes
+  the XOR of two of that player's messages to whoever recorded both. Closing it needs one change to the handshake:
+  the player contributes a random value that goes into the Join and into the key of that connection (protocol
+  version 2); see F13 in section 7.
 - **The host is trusted by its players.** The host decides the session state, orders every action, can send any
   action as any player (`from` is its to fill), and sends the savegame that every game loads, and a savegame is code
   (`.sav.lua` runs on load). Joining a session is trusting its host as one trusts the author of a mod.
@@ -83,8 +85,9 @@ means harm (section 4), and not a defence against a program already running as t
   permissions mark `allowed: false` (every game then asks for a resync), report checksums that differ (a resync after
   two rounds), send `ReplayFailed` (a resync, at most one per 120 s), request speed changes when the `speed`
   permission allows it, and join and leave again to start a *hot-join* resync round each time (that round ignores the
-  cooldown), or to use up the 65 534 sender ids of a session. The remedy is to share the code with people you trust,
-  and to stop the session when one of them is not.
+  cooldown), or to fill the table with strangers whose slots the host then holds as away for 330 s each. The remedy
+  is to share the code with people you trust, to remove a player (the host's `kick`), and to stop the session when
+  one of them is not.
 - **No forward secrecy:** the key lives as long as the session. A secret is used for one session only; it is made
   fresh for every `host`.
 - **The lobby password and the join code pass through files** in `%LOCALAPPDATA%\FeverLink3\live` (the window's
@@ -99,6 +102,7 @@ means harm (section 4), and not a defence against a program already running as t
   read no more than a few hundred bytes before it has seen a valid `Register` or `Join`, and should time out a
   connection that has not sent one: the same handshake rule as section 3, row "A stranger holding the host's
   resources".
+
 ## 5. The game process: panics, stacks and the unwind decision
 
 `TransportFever3.exe` loads `winhttp.dll` (the native module), which starts the session controller on a thread, and
@@ -130,7 +134,7 @@ native control link), Steam's structures.
    (the marker of a slot being filled) as a payload, which would have held the slot for good. Run the suites longer in
    a debug build, which is the one that checks arithmetic: `FEVERLINK3_FUZZ_SCALE=50 cargo test -p feverlink3_core
    --test robustness_tests` (and `-p feverlink3_launcher --test robustness`, `-p feverlink3_native --test robustness
-   --test hook_robustness`); another seed with `FEVERLINK3_FUZZ_SEED=n`. Ten times the default, with two other seeds,
+   --test hook_robustness`); another seed with `FEVERLINK3_FUZZ_SEED=n`. Ten times the default, with four other seeds,
    ran clean on the merged tree.
 4. A panic leaves its message in `%LOCALAPPDATA%\FeverLink3\native.log` before anything else happens
    (`native::log::install_panic_hook`), whatever the panic strategy.
@@ -153,20 +157,20 @@ profile. The workspace one is simpler, and affects only the launcher executable'
 
 | | `panic = "abort"` | `panic = "unwind"` | difference |
 |---|---:|---:|---:|
-| `main` before this review (without the hardening) | 874 496 bytes | not built | |
-| This branch (hardened, `main` merged in) | 903 168 bytes | 1 247 232 bytes | +344 064 (+38.1 %) |
+| `main` without the hardening (c6b5788) | 1 059 328 bytes | not built | |
+| This branch (hardened, `main` merged in) | 1 088 512 bytes | 1 580 032 bytes | +491 520 (+45.2 %) |
 
 The first measurement, on the tree as it was when the review began, gave 791 040 against 1 078 272 bytes (+287 232,
-+36.3 %); the hooks, the relay codec and the control link that came in with `main` add code for the unwind tables to
-describe. In the merged build the `.text` section grows by 153 KB (landing pads for every destructor, and the C++
-exception runtime that `panic_unwind` links), `.rdata` by 156 KB (exception tables), `.pdata` by 26 KB. That is more
-than twice the 150 KB the owner allowed, so **the profile stays `panic = "abort"`**. The hardening itself cost
-28 672 bytes (+3.3 %: the exact float parser, the checks, the panic hook, the guards). CI prints the release size
-in the job summary.
++36.3 %); the hooks, the relay codec, the Steam transport and the roster work that came in with `main` add code for
+the unwind tables to describe, so the cost of unwinding grows with the program. In the merged build the `.text`
+section grows by 227 KB (landing pads for every destructor, and the C++ exception runtime that `panic_unwind`
+links), `.rdata` by 216 KB (exception tables), `.pdata` by 37 KB. That is more than three times the 150 KB the owner
+allowed, so **the profile stays `panic = "abort"`**. The hardening itself cost 29 184 bytes (+2.8 %: the exact float
+parser, the checks, the byte budget, the panic hook, the guards). CI prints the release size in the job summary.
 
 What was done instead: the panics that input can reach were removed (above); every thread root that matters runs
-through `launcher::guard::guarded` (the controller's step, the host and player session threads; `DllMain` has its
-own `catch_unwind`), which does nothing under `abort` and, with `unwind`, turns a panic into a log line, a stopped
+through `launcher::guard::guarded` (the controller's step, the host and player session threads, the connection
+readers, each cycle of the shared Steam poller, the loopback check; `DllMain` has its own `catch_unwind`), which does nothing under `abort` and, with `unwind`, turns a panic into a log line, a stopped
 session (`Controller::recover`, `Status::error`) and a controller that carries on; it is tested, because tests
 always unwind. Switching to unwind is one line (`panic = "unwind"` in the root `Cargo.toml`); the cost is the table
 above. One loose end for that day: the window shows a player session's `Status::error`, but not yet that a host
@@ -185,10 +189,14 @@ recurse).
 |---|---|---|
 | Frame (after the length field) | 1 MiB | `FrameCodec::MAX_FRAME_LENGTH` |
 | First frame of a connection that has not joined | 4096 bytes | `FrameCodec::HANDSHAKE_MAX_LENGTH`, `NetLimits::first_frame` |
-| Time to join; connections waiting to join | 15 s; 32 | `HostSession::HANDSHAKE_SECONDS`, `MAX_PENDING` |
-| Connections open; per address | 64; 16 | `NetLimits` |
-| Time to write one frame | 10 s, plus 1 s per 32 KiB of it | `NetLimits::write_timeout` |
-| Rate per connection | 1000 frames and 1 MiB per second, burst of two seconds | `NetLimits` |
+| Time to join; connections waiting to join | 10 s; 32 | `HostOptions::handshake_timeout_seconds`, `HostSession::MAX_PENDING` |
+| Silence of a joined connection | 30 s (pings every 2 s) | `HostOptions::idle_timeout_seconds`, `ping_seconds` |
+| Connections open; per address (TCP) | 64; 16 | `NetLimits`, `steam_transport::MAX_CONNECTIONS` |
+| Time to write one frame (TCP) | 10 s, plus 1 s per 32 KiB of it | `NetLimits::write_timeout` |
+| Rate per connection, every transport | 500 frames a second (burst 2000); 2 MiB a second (burst 8 MiB) | `HostOptions::max_frames_per_second`, `frame_burst`, `max_bytes_per_second`, `byte_burst` |
+| Rate per connection, TCP reader | 1000 frames and 1 MiB per second, burst of two seconds | `NetLimits` |
+| Steam message | 512 KiB, one frame each | `steamnet::MAX_MESSAGE` |
+| Held slot of a player who left | 330 s; epochs per id 2^24 | `HostOptions::reconnect_window_seconds`, `Sealer::MAX_EPOCH` |
 | Action body; chat text; display name | 256 KiB; 500 characters; 24 characters | `HostSession::MAX_ACTION_BODY`, `Names` |
 | Checksum report | 128 parts, 128 characters each, 20 rounds kept | `ChecksumRounds` |
 | Game clock | `0..2^50`, speed `0..16` | `PlayerClock::plausible` |
@@ -222,16 +230,20 @@ recurse).
 | F10 | VDF parser recursion overflowed the stack: a file of 200 000 `{` ended the process (confirmed on the original code) | Fixed |
 | F11 | The UPnP client followed any URL a LAN device gave (and public-address lookups went over plain HTTP) | Gone: the product no longer does port forwarding or address lookups (`upnp.rs` was deleted on `main`) |
 | F12 | serde_json's default float parser can be 1 ulp off | Fixed (`float_roundtrip`) |
-| F13 | Frames and a Welcome can be replayed into a new connection by someone on its path (section 4) | **Open: protocol version 2, owner's decision** |
-| F14 | Hot-join resync rounds ignore the cooldown, and ids are not recycled: a code holder can disrupt a session by joining repeatedly | Accepted; the host needs a way to remove a player first |
+| F13 | A recorded connection can be replayed into a new one by someone on its path (section 4). `main` closed the half of it that needs only a recorded Welcome (the Welcome carries the challenge's nonce, host frames from before it are refused); a recorded Challenge together with its Welcome still works | **Open: protocol version 2, owner's decision** |
+| F14 | Hot-join resync rounds ignore the cooldown: a code holder can disrupt a session by joining repeatedly, and a table full of away strangers locks friends out for 330 s | Mitigated: the host can kick (and a kicked player is gone for good); the hot-join round is still not rate limited |
 | F15 | The window's commands (with the password) stay in `ctl_cmd.log` until the next game start | Accepted; the folder is the user's own |
 | F16 | Found while fixing F2: the first fix used `SO_RCVTIMEO` to wake the reader, and on Windows a read that times out as data arrives can fail with `ERROR_IO_PENDING` (997), which ends a healthy connection (measured: twice in about 6400 timeouts, in four runs of 30 to 60 s with data landing as the timeout expired) | Fixed before it shipped: non-blocking sockets, polled; a test sends 1200 frames of up to 300 KB both ways at once and checks every byte |
 | F17 | `AppliedWatch::arm` accepted `usize::MAX`, the marker of a slot being filled, as a payload: the slot stayed taken for good and, 64 of those later, the watch would have refused every released command (the payload is a pointer from the engine, so this cannot happen with real pointers, but a hook must not rely on that) | Fixed; found by the model test |
-| F18 | `to_game.log` is append-only for the whole session and never rotated: tens of megabytes an hour in play, and a hostile joiner adds up to 1 MiB a second (the connection rate) of relayed actions to the host's disk | Open: needs a rotation both sides of the file link agree on (a change in the mod); the rate limit bounds it meanwhile |
+| F18 | `to_game.log` is append-only for the whole session and never rotated: tens of megabytes an hour in play, and a hostile joiner adds up to 2 MiB a second (the byte budget) of relayed actions to the host's disk | Open: needs a rotation both sides of the file link agree on (a change in the mod); the rate limit bounds it meanwhile |
+| F19 | The Steam transport (`main`, after the review began) had no byte throttle: the frame limit alone allows 256 KiB actions at 500 a second, 128 MB/s into the host's disk and the relays to every game | Fixed: a byte budget per connection in the host state machine, so it holds for every transport |
+| F20 | The Steam probe kept every connection that was opened to it, and its counters could overflow | Fixed: 16 at a time, counters saturate; the Steam poller thread runs each cycle through `guard` |
 
 Not found: timing differences in the proof check (constant time), id spoofing (the sender is checked against the
-connection before the frame is opened and again against the allow-list), nonce reuse across reconnects (ids are
-never reused; guarded by a test that collects every `(sender, counter)` of a scenario with 40 joins and leaves),
+connection before the frame is opened and again against the allow-list), nonce reuse across reconnects (a returning
+id gets a new epoch, whose counters start above everything the old one can reach; guarded by a test that collects
+every `(sender, counter)` of a scenario with 40 joins and leaves, and by `reconnect_tests`), timing differences in the
+resume claim (constant time), a stranger taking a held slot (the claim needs the token),
 replay-window edge cases (a model of the rules is compared with the implementation on random sequences that include
 0, `u64::MAX` and the 64-frame boundary).
 
