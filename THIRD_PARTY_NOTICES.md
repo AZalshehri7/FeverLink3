@@ -1,5 +1,7 @@
 # Third-party notices
 
+FeverLink3 itself is licensed under the PolyForm Noncommercial License 1.0.0 (see LICENSE). The MIT licences below apply only to the third-party material they cover; anything adapted from those projects keeps the MIT notice that goes with it.
+
 FeverLink3 contains no code copied from the projects below at the time of writing. They are credited because their published designs, documentation and findings shaped this one, and because future commits may reuse specific tables or findings from them. Any such reuse is marked in the file that contains it and is covered by the licences reproduced here.
 
 ## TpF2 Multiplayer

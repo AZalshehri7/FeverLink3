@@ -27,10 +27,10 @@ feverlink3 selftest
 feverlink3 doctor | install [--dry-run] | uninstall [--dry-run]
 ```
 
-- `host` listens on `0.0.0.0:<port>` (default 28090), prints the join code and the endpoints in it, and keeps
-  running. The endpoints are this PC's LAN IPv4 addresses (the interface the OS would use towards the internet,
-  plus what the machine name resolves to); there is **no public-IP lookup**, so a player outside the LAN needs the
-  host's forwarded public address, which is not in the code. With `--password` the code alone is not enough: the
+- `host` is the **developer transport** (same PC or LAN): it listens on `0.0.0.0:<port>` (default 28090), prints the
+  join code and the endpoints in it, and keeps running. The endpoints are this PC's LAN IPv4 addresses. Players
+  never use it: they connect through the in-game window over Steam's peer-to-peer networking (with a relay as the
+  fallback), which needs no ports and no router settings. With `--password` the code alone is not enough: the
   key is stretched from code secret and password (`docs/PROTOCOL.md`, "Key"), so give the password separately.
   While it runs, type `start`, `pause`, `speed N` (1 to 4), `check` (checksum round now), `status` or `quit`.
 - `join CODE` connects to the endpoints of the code in order (5 s each) and fails at once if none answers. It runs
