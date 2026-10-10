@@ -247,11 +247,14 @@ line; the mod looks for the file four times a second). Then:
 
 ### One build with a native tool
 
-1. The tool event `builder.proposalApply` reaches `guiHandleEvent`. If `hold_on` has been written, `M.captureToolBuild`
-   encodes the proposal (before the engine applied anything, because the command is held) and the result waits in a list of at
-   most 6 captures, each with `os.clock()`. An entry whose capture failed is kept too, without a body, so the order stays
-   aligned. An entry older than 2 s is dropped (one log line): the build went through unheld, and the simulation half's
-   `onPreBuildProposal` capture shipped it the old way.
+1. The tool's PREVIEW event `builder.proposalCreate` reaches `guiHandleEvent` every time the proposal under the cursor changes.
+   If `hold_on` has been written, `M.captureToolBuild` encodes it and keeps only the newest (an encoding that failed replaces
+   a good older one, so a `held` is never paired with an earlier preview than the one on screen). **Why the preview and not
+   `builder.proposalApply`:** the first real test (2026-10-10) showed that the apply event only comes after the engine applied
+   the build, so for a held command it arrives after the release and every capture was too late; and a tool is blocked while its
+   command is held, so no newer preview can come after the click: the newest preview is the proposal that was clicked. The
+   preview is used for one `held` only. Two commands held in the same batch of events are both released (one preview cannot
+   tell them apart). A preview older than 30 s is not used.
 2. `held {id, kind, site, ms}` arrives. The oldest capture is paired with it. If `held` is read first (the tool event is
    dispatched later in the frame), it waits for a capture for 0.4 s and 3 frames; a capture that then turns up for a `held`
    that was already released is dropped, so that it cannot be paired with the next build.

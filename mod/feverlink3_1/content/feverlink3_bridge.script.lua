@@ -966,7 +966,7 @@ end
 -- way (replay on peers, simCaptureBuild).
 --
 -- One build with a native tool:
---   1. the tool event builder.proposalApply reaches guiHandleEvent. natCapture encodes the proposal (Build.captureToolBuild)
+--   1. the tool event builder.proposalCreate (the tool preview) reaches guiHandleEvent. natCapture encodes the proposal (Build.captureToolBuild)
 --      and keeps the result in N.caps for 2 s (a failed capture is kept too, as an entry without a body, so that the order of
 --      captures and `held` events stays aligned);
 --   2. the module holds the tool's command at CommandList::Add and writes `held {id}` to native_events.log. natPair matches it
@@ -992,6 +992,7 @@ local NAT_PING = 2.0      -- longest pause between lines written to native_ctl.l
 local NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
 local NAT_CAP_MAX = 6     -- captures kept
 local NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
+local NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
 local NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
 local NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
 local NAT_WATCHDOG = 8.0  -- no pong for this long while holding: the module is gone
@@ -1174,9 +1175,28 @@ end
 -- Pairs the oldest `held` that waits for a capture with the oldest capture, until one list is empty.
 local function natPair()
 	local N = G.nat
-	natExpire(os.clock())
-	while N.parked[1] and N.caps[1] do
+	local now = os.clock()
+	natExpire(now)
+	-- The tool's own event for an applied build (builder.proposalApply) only comes AFTER the engine applied it, so for a
+	-- command that is held it never comes before the release (seen in a real game: every capture arrived after its held
+	-- command had been given back). What is known while the command is held is the tool's latest PREVIEW (builder.proposalCreate):
+	-- the tool is blocked waiting for its command, so no newer preview can come, and the last one is the proposal that was clicked.
+	-- Two or more commands held at once cannot be told apart by one preview (a real tool is blocked after its click, so this
+	-- does not happen): give them all back rather than ship the wrong record for one of them.
+	if #N.parked > 1 and not N.caps[1] then
+		N.preview = nil
+		while N.parked[1] do
+			natSay("held " .. N.parked[1].id .. ": more than one command held at once; released (the build goes through the old way)")
+			natDecide(table.remove(N.parked, 1), nil)
+		end
+		return
+	end
+	while N.parked[1] and (N.caps[1] or (N.preview and now - N.preview.t <= NAT_PREVIEW_TTL)) do
 		local h, cap = table.remove(N.parked, 1), table.remove(N.caps, 1)
+		if not cap then
+			cap = N.preview
+			N.preview = nil
+		end
 		natDecide(h, cap)
 	end
 end
@@ -1192,13 +1212,13 @@ local function natOnHeld(N, p)
 		return
 	end
 	N.parked[#N.parked + 1] = h
-	natPair()
+	if not N.batching then natPair() end
 end
 
--- Called from guiHandleEvent for builder.proposalApply: keeps the capture for the `held` that should follow.
+-- Called from guiHandleEvent for builder.proposalCreate (the tool's preview): keeps the newest capture for the `held` that follows a click.
 local function natCapture(id, name, param)
 	local N = G.nat
-	if not N or N.dead or not N.holdSent or name ~= "builder.proposalApply" then return end
+	if not N or N.dead or not N.holdSent or name ~= "builder.proposalCreate" then return end
 	if not (Build and Build.captureToolBuild) then return end
 	local t0 = os.clock()
 	local ok, body, why, text = pcall(Build.captureToolBuild, id, name, param, {
@@ -1214,16 +1234,9 @@ local function natCapture(id, name, param)
 	end
 	cap.t = os.clock()
 	cap.ms = (cap.t - t0) * 1000
-	-- a `held` that waited in vain was released a moment ago: this capture is the one it was waiting for. Pairing it with the
-	-- next `held` instead would ship this build's record in place of the next build's.
-	while N.owed[1] and cap.t - N.owed[1] > NAT_CAP_TTL do table.remove(N.owed, 1) end
-	if N.owed[1] then
-		table.remove(N.owed, 1)
-		natSay("capture of " .. cap.tool .. " dropped: it came after its held command had been released")
-		return
-	end
-	N.caps[#N.caps + 1] = cap
-	while #N.caps > NAT_CAP_MAX do table.remove(N.caps, 1) end
+	-- only the newest preview is kept, and a preview that could not be captured replaces a good one before it: a `held`
+	-- must never be paired with the record of an older preview than the one on screen
+	N.preview = cap
 	natPair()
 end
 
@@ -1300,12 +1313,17 @@ local function natReadEvents(N)
 	if #recs == 0 then return end
 	local history = not N.read   -- the first records are what the file held before this script started: state, not news
 	N.read, N.seen = true, true
+	-- the `held` events of one batch are paired together afterwards, so that two held at once are seen as two
+	N.batching = true
 	for _, rec in ipairs(recs) do
 		local p = C.parse(rec.payload)
 		if type(p) ~= "table" then p = {} end
 		local ok, err = pcall(natEvent, N, rec, p, history)
 		if not ok then natFault("event " .. tostring(rec.kind), err) end
 	end
+	N.batching = false
+	local ok, err = pcall(natPair)
+	if not ok then natFault("pairing", err) end
 end
 
 -- Every frame (guarded by the caller). Does nothing until native_events.log has a record.
@@ -1823,7 +1841,7 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 		end
 	end
 	-- strict mode (only while the native module holds build commands): keep the build for the `held` event that follows
-	if name == "builder.proposalApply" and G.nat then
+	if name == "builder.proposalCreate" and G.nat then
 		local ok, err = pcall(natCapture, id, name, param)
 		if not ok then natFault("capture", err) end
 	end

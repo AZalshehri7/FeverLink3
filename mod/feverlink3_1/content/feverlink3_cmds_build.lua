@@ -1737,7 +1737,7 @@ end
 -- bridge keys them (see M.capture). Returns the body, nil and its serialised text (the wire form), or nil and why not. Never
 -- raises. The logging of the same events stays in M.onToolEvent.
 function M.captureToolBuild(id, name, param, ctx)
-	if name ~= "builder.proposalApply" then return nil, "not a build event: " .. tostring(name) end
+	if name ~= "builder.proposalApply" and name ~= "builder.proposalCreate" then return nil, "not a build event: " .. tostring(name) end
 	if type(param) ~= "table" then return nil, "the event carries no data" end
 	local okP, proposal = pcall(function() return param[1] or param.proposal end)
 	if not okP or proposal == nil then return nil, "the event carries no proposal" end

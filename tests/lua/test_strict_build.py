@@ -271,7 +271,8 @@ function MAKE_API()
   return api
 end
 
--- a native tool: builds the proposal, tells the interface half (the engine's tool event) and adds its command
+-- a native tool: builds the proposal, tells the interface half what it previews (builder.proposalCreate: the real tool is
+-- blocked while its command is held, and its apply event only comes after the engine applied the build) and adds its command
 TOOLS = {}
 function TOOL_MAKE(spec)
   local p = SIMPLE_ROAD(spec)
@@ -279,7 +280,7 @@ function TOOL_MAKE(spec)
   return #TOOLS
 end
 function TOOL_EVENT(i)
-  GUI.guiHandleEvent(nil, STATE, GSTATE, 0, "streetBuilder", "builder.proposalApply", { TOOLS[i].p, {}, nil })
+  GUI.guiHandleEvent(nil, STATE, GSTATE, 0, "streetBuilder", "builder.proposalCreate", { TOOLS[i].p, {}, nil })
 end
 function TOOL_ADD(i, site)
   NATIVE_ADD(TOOLS[i].cmd, nil, site)
@@ -440,16 +441,19 @@ class StrictOnTest(StrictTest):
         self.assertEqual([r["seq"] for r in self.B.action_records()], [1, 2, 3])
         self.assertEqual(self.B.native.dropped, [1, 2, 3])
 
-    def test_two_commands_held_in_one_frame_pair_with_their_captures_in_order(self):
+    def test_two_commands_held_at_once_are_all_given_back_rather_than_paired_with_one_preview(self):
+        # a real tool is blocked after its click, so this cannot happen; if it ever does, no record may be shipped for the
+        # wrong command
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))
         self.B.tool(self.road(500, 0, 600, 0))
         self.tick(20)
         self.assertSameWorld()
-        self.assertEqual(self.B.native.dropped, [1, 2])
+        self.assertEqual(sorted(self.B.native.released), [1, 2])
+        self.assertEqual(self.B.native.dropped, [])
         self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
         self.assertIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig())
-        self.assertEqual(self.A.builds(), self.B.builds())
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
 
     def test_the_held_event_read_before_the_tool_event_still_pairs(self):
         self.start()
@@ -504,7 +508,7 @@ class StrictOnTest(StrictTest):
         self.B.run("FACTORY_REJECT = nil")
         i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))
         # the tool event arrives with something that is no proposal: the capture fails, the entry keeps its place in the order
-        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalApply', { 'junk' })")
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
         self.B.L.execute("TOOL_ADD(%d, true)" % i)
         self.tick(14)
         self.assertEqual(self.B.native.released, [1])
@@ -545,18 +549,13 @@ class StrictOnTest(StrictTest):
 
     # ---- (d) a capture without a held command
 
-    def test_a_capture_that_gets_no_held_command_is_dropped_and_nothing_is_shipped_twice(self):
+    def test_a_preview_that_gets_no_held_command_ships_nothing(self):
         self.start()
-        self.B.tool(self.road(300, 0, 400, 0), add=False)   # the event only: nothing is held
-        self.tick(14)                                       # 2.8 s
-        self.assertIn("capture of streetBuilder dropped", self.B.log())
+        self.B.tool(self.road(300, 0, 400, 0), add=False)   # hovering: the preview only, nothing is held
+        self.tick(14)
         self.assertEqual(self.B.shipped_count(), 0)
         self.assertEqual(self.B.native.ctl_kinds().count("cancel"), 0)
-        # a held command that comes now has no capture to pair with: it is released, not shipped from the stale capture
-        self.B.tool(self.road(500, 0, 600, 0), event=False)
-        self.tick(14)
-        self.assertEqual(self.B.native.released, [1])
-        self.assertEqual(self.B.shipped_count(), 1)
+        self.assertEqual(self.B.native.ctl_kinds().count("release"), 0)
 
     def test_a_tool_build_the_module_did_not_hold_is_shipped_once_by_the_simulation_half(self):
         self.start()
@@ -567,8 +566,7 @@ class StrictOnTest(StrictTest):
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1), "only the old path shipped it")
         self.tick(12)
-        self.assertEqual(self.B.shipped_count(), 1, "the stale capture was dropped, not shipped")
-        self.assertIn("capture of streetBuilder dropped", self.B.log())
+        self.assertEqual(self.B.shipped_count(), 1, "the preview is not shipped on top of it")
 
     # ---- (f) pings
 
@@ -704,20 +702,31 @@ class StrictOnTest(StrictTest):
         self.assertSameWorld()
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1))
 
-    def test_a_capture_that_comes_after_its_held_command_was_released_is_not_given_to_the_next_one(self):
+    def test_a_newer_preview_that_cannot_be_captured_is_never_replaced_by_an_older_good_one(self):
+        # the newest preview is the proposal on screen: if it could not be encoded, the held command must go back, not be
+        # paired with the record of an earlier preview
         self.start()
-        i = self.B.tool(self.road(300, 0, 400, 0), event=False)
-        self.tick(4)                                   # the grace is over: released
+        self.B.tool(self.road(300, 0, 400, 0), add=False)          # a good preview
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
+        self.B.tool(self.road(500, 0, 600, 0), event=False)        # the click: its command is held, its preview is the bad one
+        self.tick(14)
         self.assertEqual(self.B.native.released, [1])
-        self.B.tool_event(i)                           # the tool event of the first build, very late
-        self.B.tool(self.road(500, 0, 600, 0), event=False)   # the next build's command is held; its own event never comes
-        self.tick(10)
-        self.assertIn("it came after its held command had been released", self.B.log())
-        self.assertEqual(self.B.native.released, [1, 2], "the second command was released as well, not paired with the stale capture")
         self.assertEqual(self.B.native.dropped, [])
         self.assertSameWorld()
-        self.assertEqual(self.B.builds_applied(), 2, "each road exactly once on the originator")
-        self.assertEqual(self.A.builds_applied(), 2)
+        self.assertIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig(), "the clicked road, not the earlier preview's")
+        self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+
+    def test_a_preview_is_used_once(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))                     # preview and click
+        self.tick(12)
+        self.assertEqual(self.B.native.dropped, [1])
+        self.B.tool(self.road(500, 0, 600, 0), event=False)        # a click with no preview of its own: the old one is spent
+        self.tick(14)
+        self.assertEqual(self.B.native.released, [2])
+        self.assertSameWorld()
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
 
     def test_a_game_without_the_module_and_one_with_it_keep_the_same_world(self):
         self.A.native.is_open = False   # the host has no module (the file stays, nothing answers); the client holds
