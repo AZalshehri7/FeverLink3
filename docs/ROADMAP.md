@@ -39,13 +39,13 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 - [ ] Constructions against streets, upgrades, signals, decorations, terrain
 - [ ] Lines, vehicle orders, renames, colours
 - [x] In-game player list and chat (mod side; needs a game run)
-- [ ] 3 to 8 players
+- [ ] 3 to 8 players (host limit of 8 games, ids, fan-out, flood limit, ping and round-trip times, a resync round and a kick with eight games: core and launcher done, tested over loopback; waits for a game run)
 
 ## 0.5 — Playing with friends
 - [ ] Lua mod on the in-game Mod Hub and, if TF3 supports it, the Steam Workshop (auto-updates for every player); first confirm its automated approval allows the mod's file link
 - [ ] Steam invites and friends-list join
-- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core)
-- [ ] Reconnection (hot join round done in core)
+- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core; the live controller takes `permissions` and `kick` commands, `docs/LIVE_CONTROL.md`; the window and the game side are open)
+- [ ] Reconnection (same id, name, slot and permissions back within 5.5 minutes, then the hot-join round: core and launcher done, tested over loopback; waits for a game run)
 
 ## 0.6 — Companies
 - [ ] Separate companies on one map, own money and vehicles
