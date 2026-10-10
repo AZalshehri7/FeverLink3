@@ -20,7 +20,7 @@ to check it. Nothing here has run between two real accounts yet.
 | `launcher/src/steamnet/fake.rs`, `steam_transport/session_tests.rs` | The in-memory Steam and the end-to-end session tests (test code only). |
 | `launcher/src/net.rs` | Additive: the `HostTransport` / `ClientTransport` traits (TCP and Steam implement them), `ConnectContext`, `LinkInfo`. |
 | `launcher/src/session.rs` | `run_host` / `run_player` became wrappers over `run_host_over` / `run_player_over`; `Status` gained `links`. |
-| `launcher/src/live.rs` | Only status keys (`peers`, `rate`, `ping`, `links`, `loop`) and the `steamloop` command. |
+| `launcher/src/live.rs` | `host` / `join` over Steam (the default; `transport = "tcp"` keeps the developer transport), status keys (`transport`, `steamid`, `progress`, `peers`, `rate`, `ping`, `links`, `loop`) and the `steamloop` command. |
 
 ## 2. The core
 
@@ -197,8 +197,9 @@ describe it; it cannot prove how the real library behaves. Do these in order; ea
    poller must not call Steam after `SteamAPI_Shutdown`; the `Steam went away` guard relies on
    `SteamAPI_GetHSteamUser` returning 0 then, which is assumed, not proven). If the game crashes on exit, report it.
 
-**C. The session over Steam** (after the orchestrator wires `run_steam_host` / `run_steam_player` into the live
-controller; use `steam_player_config` so the connect timeout is 30 s).
+**C. The session over Steam** (the live controller hosts over Steam by default and joins a code that carries a Steam
+ID over Steam; `transport = "tcp"` keeps the direct developer transport). Press *Host* on A (no port, no address
+in the code), give the code to B, press *Join* on B.
 
 1. B joins A: record the progress texts and the time from *Join* to *joined*; three tries. If a try fails after
    about 10 s with `timed out (5003)`, `TimeoutInitial` did not apply.
@@ -216,7 +217,7 @@ a full table of 8 players (needs 9 accounts; the transport and the session are t
 | Situation | What happens |
 |---|---|
 | Steam not initialised yet | The core keeps looking every 250 ms. `listen` and `connect` wait (15 s / inside the connect timeout) and then fail with `Steam networking is not ready (Steam interfaces: hsteamuser 0, user null sockets null utils null)`. After 2 minutes the note says Steam networking is not available. |
-| No `steam_api64.dll` in the process (game started without Steam, a test run) | `steamnet::global()` is `None`: `SteamHostNet::listen` fails with `Steam networking is not available (is the game running through Steam?)`; the controller reports state `not available`. Asking again later retries. |
+| No `steam_api64.dll` in the process (game started without Steam, a test run) | `steamnet::global()` is `None`: `SteamHostNet::listen` fails with `Steam networking is not available (is the game running through Steam?)`; the controller looks again every 2 s (`looking for Steam...`, `not available` after about 5 minutes). |
 | Steam shut down under the core (the game is quitting, the Steam client restarts) | Every poll cycle asks `SteamAPI_GetHSteamUser` whether Steam is still initialised (0 once it is shut down). When it is not: all connections end with `Steam went away`, listen sockets are forgotten, **no further call goes into the vanished interfaces**, and the core looks for Steam again (a restarted client brings new interfaces; the host transport must listen again). |
 | A missing optional export (`CloseListenSocket`, `SetConfigValue`, `GetConnectionRealTimeStatus`) | A listen socket leaks until the process ends / no tuning / no Steam ping. A missing required export: no Steam at all. |
 | No route to the host (firewall blocks Steam's UDP, relay network unreachable, host not running the game) | The attempt stays at `contacting the host` or `finding a route` until Steam gives up (45 s) or ours (30 s): `no route to Steam ID X after 30.0 s (last status: ...)`. Steam's reason codes are kept in the text (5003 timed out, 5009 NAT/firewall, 5006 no relay, 3001 offline mode, ...). |
@@ -265,14 +266,23 @@ let handle = steam_transport::run_steam_player(config, host, &mut |text| show(te
 ```
 
 `SteamEndpoint::format()` / `parse()` are the 17-digit text; `parse` also checks that the number is an individual
-account of the public universe, so a typo is almost never accepted. A join code that carries only a Steam ID is 56
-characters (35 bytes: version, time, secret, count, a family byte, 8 bytes of ID, checksum), three more than one IPv4
-endpoint; a code with both is possible if `JoinCode` gets an endpoint family for Steam IDs. Not done here, on purpose.
+account of the public universe, so a typo is almost never accepted. `run_steam_host_on` / `run_steam_player_on` take
+a `CoreRef` (the tests and the live controller's `Controller::with_core` give them a fake Steam).
+
+**The live controller** (`live.rs`): `host` with `transport` = `steam` (or missing, `auto`) checks that Steam is
+ready, starts `run_steam_host_on`, and publishes a code made by `JoinCode::create(&[], secret, None)` plus
+`with_steam_id(id)`: no endpoints, the host's Steam ID in extension tag 2. The status says `transport = "steam"` and
+`steamid`. `join` decodes the code; **a code with a `steam_id` is joined over Steam** (whatever endpoints it lists),
+on a thread of its own with `steam_player_config` (30 s) and `progress` in the status while it connects ("contacting
+the host", "finding a route", "connected, direct"); a code without one uses TCP as before. `transport = "tcp"` on
+`host` is the developer transport. If Steam is not loaded or not ready, hosting fails at once with a message
+(`Steam is not ready yet (...); try again in a moment`) rather than waiting; `leave` while *joining* does nothing
+(as before), the attempt ends by itself within 30 s.
 
 ## 13. Decisions for the owner
 
-1. **Join code**: a Steam endpoint family inside `JoinCode`, or a separate field; and which transport a code with both
-   a Steam ID and addresses tries first (Steam first fits the policy).
+1. **A code with both a Steam ID and addresses** (a developer could make one): the live controller joins over Steam
+   whenever the code has a Steam ID. Alternatives: try Steam, then the addresses.
 2. **Defaults**: send rate 1 MiB/s (a 10 Mbit/s uplink is about 1.2 MB/s; slower uplinks queue and lose more),
    initial timeout 45 s, connect timeout 30 s, 64 connections.
 3. **IP privacy**: leave Steam's direct routes on (faster, shows addresses to the other players) or force relay.

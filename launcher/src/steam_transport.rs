@@ -654,6 +654,13 @@ pub fn run_steam_host(config: HostConfig) -> io::Result<SessionHandle> {
     session::run_host_over(config, SteamHostNet::listen)
 }
 
+/// As [`run_steam_host`] on a given core (the tests use a fake Steam). Fails at once, without waiting for Steam, when
+/// the core is not ready.
+pub fn run_steam_host_on(core: &CoreRef, config: HostConfig) -> io::Result<SessionHandle> {
+    let core = core.clone();
+    session::run_host_over(config, move |tx| SteamHostNet::listen_on(&core, tx, Duration::ZERO, MAX_CONNECTIONS))
+}
+
 /// The connection step of a player session over Steam, for [`session::run_player_over`]: every attempt, the first
 /// and each reconnect, connects to `host` on `core`.
 pub fn steam_connector(
@@ -677,7 +684,17 @@ pub fn run_steam_player(
             "Steam networking is not available (is the game running through Steam?)",
         )
     })?;
-    session::run_player_over(config, steam_connector(core, host), progress)
+    run_steam_player_on(&core, config, host, progress)
+}
+
+/// As [`run_steam_player`] on a given core (the tests use a fake Steam).
+pub fn run_steam_player_on(
+    core: &CoreRef,
+    config: PlayerConfig,
+    host: SteamEndpoint,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<SessionHandle> {
+    session::run_player_over(config, steam_connector(core.clone(), host), progress)
 }
 
 /// A player configuration for a Steam session: no endpoints, [`CONNECT_TIMEOUT`] to find a route.
