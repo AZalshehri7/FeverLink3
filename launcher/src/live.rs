@@ -40,6 +40,9 @@ use crate::{clipboard, luatext, net, resync, steam, steam_persona, steam_transpo
 pub const CMD_FILE: &str = "ctl_cmd.log";
 /// The controller's state, rewritten by the controller.
 pub const STATUS_FILE: &str = "ctl_status.txt";
+/// The session's log lines, written by the controller (see `Controller::write_session_log`).
+pub const SESSION_LOG_FILE: &str = "session.log";
+const SESSION_LOG_MAX: u64 = 2 << 20;
 /// The Steam API is looked up again every couple of seconds (for about five minutes) when it was not there yet.
 const STEAM_LOAD_EVERY: Duration = Duration::from_secs(2);
 const STEAM_LOAD_ATTEMPTS: u32 = 150;
@@ -134,6 +137,8 @@ pub struct Controller {
     /// Puts text on the clipboard (the window's "Copy code"); the tests replace it.
     clipboard: Box<dyn Fn(&str) -> bool + Send>,
     result: Option<CommandResult>,
+    /// How many of the session's log lines were already written to `session.log`.
+    log_cursor: u64,
     published: String,
     version: u64,
 }
@@ -194,6 +199,7 @@ impl Controller {
             steam_loop: Arc::default(),
             clipboard: Box::new(clipboard::set_text),
             result: None,
+            log_cursor: 0,
             published: String::new(),
             version: 0,
         };
@@ -246,7 +252,35 @@ impl Controller {
         if let Some(probe) = &mut self.steam {
             probe.poll();
         }
+        self.write_session_log();
         self.publish();
+    }
+
+    /// Appends the session's new log lines (who joined, resync rounds, checksum differences, replay failures) to
+    /// `session.log` in the live folder. In the game process nothing reads stderr, so this file is how a problem in a
+    /// session can be looked at afterwards. It starts afresh with the controller and is cut when it gets large.
+    fn write_session_log(&mut self) {
+        let handle = match &self.state {
+            State::Hosting(h) => &h.handle,
+            State::Joined { handle } => handle,
+            _ => return,
+        };
+        let (lines, total) = handle.logs_since(self.log_cursor);
+        if lines.is_empty() {
+            self.log_cursor = total;
+            return;
+        }
+        let path = self.dir.join(SESSION_LOG_FILE);
+        if fs::metadata(&path).map(|m| m.len() > SESSION_LOG_MAX).unwrap_or(false) {
+            let _ = fs::remove_file(&path);
+        }
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            for line in &lines {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        self.log_cursor = total;
     }
 
     /// After a panic in [`Controller::step`]: stops whatever session runs and shows the reason in the window, so the

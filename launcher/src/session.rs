@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -260,6 +260,8 @@ pub enum Command {
 struct Shared {
     status: Mutex<Status>,
     logs: Mutex<Vec<String>>,
+    /// How many lines were ever logged: the ring below holds only the last ones.
+    log_total: AtomicU64,
     stop: AtomicBool,
     echo: bool,
 }
@@ -269,6 +271,7 @@ impl Shared {
         Arc::new(Shared {
             status: Mutex::new(status),
             logs: Mutex::new(Vec::new()),
+            log_total: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             echo,
         })
@@ -285,6 +288,7 @@ impl Shared {
         }
         // a line can carry text a peer chose; the ring keeps 500 of them, so each is cut to a screenful
         logs.push(text.chars().take(LOG_LINE_MAX).collect());
+        self.log_total.fetch_add(1, Ordering::AcqRel);
     }
 
     fn update(&self, f: impl FnOnce(&mut Status)) {
@@ -314,6 +318,16 @@ impl SessionHandle {
     /// The most recent log lines (up to 500), oldest first.
     pub fn logs(&self) -> Vec<String> {
         self.shared.logs.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The log lines after the first `from` ever logged (the ring may have dropped some of them), and the number logged
+    /// so far, to pass next time. Lets a caller write the log to a file without keeping its own copy.
+    pub fn logs_since(&self, from: u64) -> (Vec<String>, u64) {
+        let logs = self.shared.logs.lock().unwrap_or_else(|p| p.into_inner());
+        let total = self.shared.log_total.load(Ordering::Acquire);
+        let first_held = total.saturating_sub(logs.len() as u64);
+        let skip = from.max(first_held).saturating_sub(first_held) as usize;
+        (logs.iter().skip(skip).cloned().collect(), total)
     }
 
     /// Host: the address the listener is bound to.

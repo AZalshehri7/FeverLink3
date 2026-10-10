@@ -40,7 +40,15 @@ for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverli
 	end
 end
 
+-- The construction module captures what the native tools build (see simCaptureBuild).
+local Build = nil
+for _, M in ipairs(CMDS) do
+	if type(M.capture) == "function" then Build = M end
+end
+
 local STEP = L.STEP
+local REPLAY_STEPS = 12 -- a replayed build's engine event is expected within this many steps of the command
+local OUT_KEEP = 40
 local RESULT_KEEP = 60
 local WATCH_STEPS = 10
 local unpack = table.unpack or unpack
@@ -270,7 +278,72 @@ end
 -- Applies one due action in the simulation state. No callback here (finding from MPFever (MIT): the engine
 -- rejects callbacks from inside the simulation update), so an entity the command creates is found afterwards by
 -- comparing the entity lists (a watch), and the result reaches the originator through the state.
+-- The engine tells the game script about every build it applies (`apply_command` / `onPreBuildProposal`, just before
+-- it runs; finding from MPFever (MIT)). A replay of an action (a build rebuilt from a shipped record) must not be
+-- shipped again, so each one is counted here when it is sent and spent when its event arrives.
+local function markReplay(st, now)
+	local r = st.replay
+	if type(r) ~= "table" or now - (r.at or 0) > REPLAY_STEPS * STEP then r = { n = 0, at = now } end
+	r.n = r.n + 1
+	r.at = now
+	st.replay = r
+end
+
+local function spendReplay(st, now)
+	local r = st.replay
+	if type(r) ~= "table" or r.n <= 0 then return false end
+	if now - (r.at or 0) > REPLAY_STEPS * STEP then
+		st.replay = nil
+		return false
+	end
+	r.n = r.n - 1
+	return true
+end
+
+-- A build the player made with a native tool (roads, tracks, stations, depots, bulldozer...): the engine applies it
+-- itself, here and now. It is captured as a build record and handed to the interface half (st.out), which stamps and
+-- ships it like any other action; every OTHER game rebuilds it at the stamp.
+local function simCaptureBuild(state, param)
+	local st = simState(state)
+	local now = engine.gameTime()
+	if spendReplay(st, now) then
+		state:set(st)
+		return
+	end
+	local proposal, playerInitiated = nil, nil
+	pcall(function() proposal, playerInitiated = param[1], param[4] end)
+	if proposal == nil or playerInitiated == false or not Build then return end
+	local rev = {}
+	for key, e in pairs(st.bind) do rev[e] = key end
+	local t0 = os.clock()
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true }, {
+		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
+	})
+	if not ok then body, why = nil, tostring(body) end
+	if not body then
+		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(why))
+		return
+	end
+	body.native = true
+	local okS, text = pcall(C.serialize, body)
+	if not okS then
+		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(text))
+		return
+	end
+	st.out = st.out or {}
+	st.outSeq = (st.outSeq or 0) + 1
+	st.out[#st.out + 1] = { n = st.outSeq, at = now, body = text }
+	trim(st.out, OUT_KEEP)
+	state:set(st)
+	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, " .. string.format("%.3f", os.clock() - t0) .. " s)")
+end
+
 local function simApplyAction(st, it, now)
+	if it.body and it.body.native and it.from == C.PLAYER_ID then
+		-- the engine applied this build when its player made it; the record only exists to reach the other games
+		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
+		return
+	end
 	if it.lateSteps and it.lateSteps > 0 then
 		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
 		st.late = (st.late or 0) + 1
@@ -306,7 +379,10 @@ local function simApplyAction(st, it, now)
 	end
 	local balance0 = coBalance(ctx)
 	local ok, e = pcall(function()
-		L.sendNow(args, function(a) api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n))) end)
+		L.sendNow(args, function(a)
+			if it.body.fn == "makeWorldBuildProposalCmd" then markReplay(st, now) end
+			api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
+		end)
 	end)
 	if not ok then
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
@@ -442,12 +518,27 @@ end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
 local function handleEvent(userParams, state, src, id, name, param)
+	if id == "apply_command" and name == "onPreBuildProposal" then
+		C.poll()
+		if not C.ACTIVE then return end
+		local ok, err = pcall(simCaptureBuild, state, param)
+		if not ok then logSim("onPreBuildProposal capture failed: " .. tostring(err)) end
+		return
+	end
 	C.poll()
 	if not C.ACTIVE or id ~= "feverlink3" then return end
 	local ok, err = pcall(function()
 		local st = simState(state)
 		if name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
+		elseif name == "replay" then
+			markReplay(st, engine.gameTime())
+		elseif name == "outack" and type(param) == "table" then
+			local keep = {}
+			for _, o in ipairs(st.out or {}) do
+				if o.n > (tonumber(param.n) or 0) then keep[#keep + 1] = o end
+			end
+			st.out = keep
 		elseif name == "bind" and type(param) == "table" and param.key then
 			st.bind[param.key] = param.e
 		elseif name == "co" and Co and type(param) == "table" and type(param.it) == "table" then
@@ -480,6 +571,7 @@ local G = {
 	tags = setmetatable({}, { __mode = "k" }),  -- command object -> { name, args }
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
+	outSeen = {},             -- native builds the simulation half captured that this half already shipped
 }
 
 -- The originals are kept in package.loaded so a savegame reload (which re-runs this file in the same Lua state)
@@ -556,6 +648,7 @@ local function coToSim(it, ok, cost)
 end
 
 local function guiApplyNow(it, now)
+	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
 		local parts, t = checksumParts(G.co)
 		reportRound(it.n, t, parts, L.accountSnapshot(engine))
@@ -631,6 +724,7 @@ local function guiApplyNow(it, now)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
 	local okS, errS = pcall(L.runChained, args, function(a, cb)
+		if it.body.fn == "makeWorldBuildProposalCmd" then toSim("replay", {}) end
 		O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
 	end, finish)
 	if not okS then
@@ -644,6 +738,25 @@ end
 local function route(it)
 	local now = engine.gameTime()
 	if L.applyNow(G.session, now, it) then guiApplyNow(it, now) else toSim("queue", it) end
+end
+
+-- A build the player made with a native tool, captured by the simulation half (simCaptureBuild): stamped and shipped
+-- like any other action. The engine applied it already, so it is not queued here; the other games rebuild it at the stamp.
+local function shipNative(o)
+	local body = C.parse(o.body)
+	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
+	local rec = body.args[1]
+	local adds = 0
+	if type(rec) == "table" then
+		adds = #(rec.cons or {}) + #(rec.nodes or {}) + #(rec.segs or {}) + #(rec.objs or {})
+	end
+	local category = adds == 0 and "bulldoze" or "build"
+	local now = engine.gameTime()
+	G.seq = G.seq + 1
+	local at = L.stampFor(G.session, now)
+	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
+	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
+	return true
 end
 
 -- A command this player issued (held by the wrapped sendCommand): encode, stamp, ship, queue locally.
@@ -886,6 +999,20 @@ local function collectFromSim(state)
 	end
 	for key, e in pairs(st.bind or {}) do
 		if G.bind[key] ~= e then G.bind[key] = e; G.rev[e] = key end
+	end
+	local highest = nil
+	for _, o in ipairs(st.out or {}) do
+		if not G.outSeen[o.n] then
+			G.outSeen[o.n] = true
+			local okN, okShip, whyShip = pcall(shipNative, o)
+			if not okN then logGui("shipping a native build failed: " .. tostring(okShip))
+			elseif not okShip then logGui("a native build was not shipped: " .. tostring(whyShip)) end
+		end
+		if highest == nil or o.n > highest then highest = o.n end
+	end
+	if highest ~= nil and G.outAcked ~= highest then
+		G.outAcked = highest
+		toSim("outack", { n = highest })
 	end
 	for _, r in ipairs(st.results or {}) do
 		if not G.resultsSeen[r.key] then
