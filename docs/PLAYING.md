@@ -73,7 +73,9 @@ Press **Connection test...** in the window (under the join code field) to open t
 
 **Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
 
-**Not built yet:** separate companies (one shared company for now), a dedicated server.
+**Towns do not grow while a session runs.** The game grows a town with random choices that differ from one computer to the next, so two players' towns would drift apart, and a road or station built through a town would fail on the other computer. The mod therefore switches growth off for every town while you are hosting or joined, and switches it back on for the towns it switched off when the session ends (or when you load a save made during a session in a normal game). A town whose growth you had switched off yourself stays off.
+
+**Not built yet:** separate companies (one shared company for now), a dedicated server, towns that grow during a session.
 
 ## If something goes wrong
 

@@ -585,9 +585,69 @@ local function simAdvanceBinders(st)
 	st.binders = keep
 end
 
+-- Town growth: the engine grows a town with random choices that differ from one game to the next (the same save, run for
+-- 90 s on two games, ends with other building variants, other levels, a house on one side only; seen in the real game, and
+-- with the pollution and noise ratings neutralised as MPFever does it the worlds still drifted). A road or a station built
+-- through a town is rebuilt on the other games from the buildings it removes, so towns that differ make builds fail, money
+-- differ and resyncs repeat. TpF2's engine grows towns the same way everywhere, TF3's does not; MPFever lets its resync repair
+-- the difference. FeverLink3 keeps the towns still while a session runs (the growth switch of the town window, set by the mod on
+-- every game, the same one the window's own "town development" slider sends) and gives it back when the session is over.
+-- Only towns the mod switched off are given back, and the list is kept in the savegame's script state: a save made during a
+-- session, loaded in a plain game, grows its towns again. FEVERLINK3_TOWN_GROWTH=1 leaves the towns alone (tests).
+local TOWN_STEPS = 12                                   -- steps between two looks at the towns
+local TOWN_GROWTH = os.getenv("FEVERLINK3_TOWN_GROWTH") == "1"
+
+-- a live session is over when the controller wrote role=idle (a leave, the host closing the world...) while the world stays
+local function sessionOver()
+	if not C.LIVE then return false end
+	local text = C.readFile(C.path("identity.txt"))
+	local role = text and text:match("role=([%a]+)")
+	return role ~= "host" and role ~= "player"
+end
+
+local function simTowns(st, release)
+	st.townsHeld = st.townsHeld or {}
+	local CT = api.type.ComponentType
+	local send = api.cmd.sendCommand
+	local n = 0
+	if release then
+		for e in pairs(st.townsHeld) do
+			local t = api.engine.getComponent(e, CT.TOWN)
+			if t and not t.developmentActive then
+				pcall(send, api.cmd.makeTownSetDevelopmentActiveCmd(e, true))
+				n = n + 1
+			end
+			st.townsHeld[e] = nil
+		end
+		return n
+	end
+	api.engine.forEachEntityWithComponent(function(e)
+		local t = api.engine.getComponent(e, CT.TOWN)
+		if t and t.developmentActive then
+			pcall(send, api.cmd.makeTownSetDevelopmentActiveCmd(e, false))
+			st.townsHeld[e] = true
+			n = n + 1
+		end
+	end, CT.TOWN)
+	return n
+end
+
+-- no session here (a plain game, or the world of a finished one): the towns a session held start growing again
+local function simReleaseTowns(state)
+	local st = state:get()
+	if type(st) ~= "table" or type(st.townsHeld) ~= "table" or next(st.townsHeld) == nil then return end
+	simTowns(st, true)
+	state:set(st)
+	logSim("towns grow again: no session")
+end
+
 local function update(userParams, state, dt)
 	C.poll()
-	if not C.ACTIVE then return end
+	if not C.ACTIVE then
+		SIM.idleTick = (SIM.idleTick or 0) + 1
+		if SIM.idleTick % 60 == 0 then pcall(simReleaseTowns, state) end
+		return
+	end
 	if not SIM.rng then
 		SIM.rng = L.newRandom(engine.gameTime)
 		L.installRandom(SIM.rng)
@@ -614,6 +674,13 @@ local function update(userParams, state, dt)
 		end
 		simAdvanceWatches(st, now)
 		simAdvanceBinders(st)
+		SIM.townTick = (SIM.townTick or 0) + 1
+		if SIM.townTick % TOWN_STEPS == 0 and not TOWN_GROWTH then
+			local over = sessionOver()
+			local okT, n = pcall(simTowns, st, over)
+			if not okT then logSim("towns: " .. tostring(n))
+			elseif n and n > 0 then logSim(over and ("towns grow again: " .. n .. " given back (the session is over)") or ("towns held still: " .. n .. " (growth differs from one game to the next)")) end
+		end
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)

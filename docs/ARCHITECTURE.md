@@ -97,10 +97,12 @@ Entity references: roads as node positions (match within 1.5 m, else split edge 
 
 ## 7. Determinism
 
-The engine is deterministic given identical commands, with two known exceptions both prior projects hit:
+The engine is deterministic given identical commands, with three known exceptions (the first two both prior projects hit, the third is TF3's own):
 
 1. **Game scripts run on a thread pool** whose iteration order depends on timing on CPUs with 8 or more threads. Fix at the engine level: the native module gives the script update its own single-worker pool, as the engine itself does on small CPUs. Rendering and simulation keep every core.
 2. **`math.random` in game scripts** is seeded from wall time. The mod replaces it with a deterministic generator reseeded from game time each step.
+
+3. **Town growth** is not deterministic in the engine (measured in the real game, 2026-10-10: two games resynced to one world and left running for 90 s end with other building variants and levels in the same places, a house on one side only, and a street segment more on one side). It does not come from the game scripts (the XP part of the growth script seeds its random numbers from game time) and neutralising the pollution and noise ratings, as MPFever does at the start of a session, did not stop it. A build through a town (a road, a station) is rebuilt on the other games from the buildings it removes, so towns that differ make builds fail and the money differ. TpF2's engine grows towns identically and only counts town buildings as a check; MPFever lets its resync repair the difference. FeverLink3 switches town growth off while a session runs (`makeTownSetDevelopmentActiveCmd`, the switch of the town window, sent by the simulation half of every game; `feverlink3_bridge.script.lua`, `simTowns`) and gives it back when the session is over, or when a plain game loads a save made during one. With growth off, 150 s at 3x left both worlds identical. `FEVERLINK3_TOWN_GROWTH=1` leaves the towns alone. Growth driven by the host (capture the host's growth builds, ship them, keep the guests' growth off) is the way to bring it back; it needs the native hooks to see growth builds and is not done.
 
 Known residual drift (vehicle positions, passengers) is tolerated: it is compared, logged, and only repaired when it lasts for minutes.
 
