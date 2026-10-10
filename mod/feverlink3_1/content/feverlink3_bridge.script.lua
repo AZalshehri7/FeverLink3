@@ -27,12 +27,14 @@ if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 
 -- Command schemas of the other areas (construction, operations, companies): one module each, all optional. A module
 -- that is missing or fails to load is skipped; the commands it would have carried stay native.
+local CMDS = {}
 local Co = nil -- companies: registry, attribution, ledger (feverlink3_cmds_company.lua, docs/COMPANIES.md); nil without that module
 for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverlink3_cmds_company" }) do
 	local okM, M = pcall(ug_require, name .. ".lua")
 	if not okM then okM, M = pcall(ug_require, "feverlink3_1::/" .. name .. ".lua") end
 	if okM and type(M) == "table" then
 		L.registerCommands(M.commands)
+		CMDS[#CMDS + 1] = M
 		if M.events then L.registerEvents(M.events) end
 		if type(M.company) == "table" then Co = M.company end
 	end
@@ -199,6 +201,7 @@ local function simState(state)
 	st.refused = st.refused or {}
 	st.bind = st.bind or {}
 	st.watches = st.watches or {}
+	st.binders = st.binders or {}
 	if Co and st.co == nil then st.co = Co.new() end
 	return st
 end
@@ -295,9 +298,15 @@ local function simApplyAction(st, it, now)
 		return
 	end
 	local before = spec.creates and engine.entitiesWith(spec.creates) or nil
+	local bindComps = L.bindsComp(spec, it.body)
+	local bindBefore = nil
+	if bindComps then
+		bindBefore = {}
+		for _, comp in ipairs(bindComps) do bindBefore[comp] = engine.entitiesWith(comp) end
+	end
 	local balance0 = coBalance(ctx)
 	local ok, e = pcall(function()
-		api.cmd.sendCommand(api.cmd[it.body.fn](unpack(args, 1, args.n)))
+		L.sendNow(args, function(a) api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n))) end)
 	end)
 	if not ok then
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
@@ -306,6 +315,9 @@ local function simApplyAction(st, it, now)
 	end
 	coAfter(ctx, it, spec, category, balance0, logSim)
 	logSim("action " .. it.key .. " " .. it.body.fn .. " applied at t=" .. now)
+	if bindComps then
+		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0 }
+	end
 	if spec.creates then
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
 	else
@@ -355,6 +367,45 @@ local function simAdvanceWatches(st, now)
 	st.watches = keep
 end
 
+-- Keys for several entities an action created (the constructions of a build, their depots and stations, the stops it
+-- put on a road and their station groups): looked for on each step until the schema says it has found them all, or
+-- WATCH_STEPS have passed. What another action's keys already name is not offered again, so two builds in one step do
+-- not take each other's entities (the engine runs the commands in the order they were applied, on every game).
+local function simAdvanceBinders(st)
+	if #st.binders == 0 then return end
+	local owner = {}
+	for k, e in pairs(st.bind) do owner[e] = k end
+	local keep = {}
+	for _, b in ipairs(st.binders) do
+		b.steps = b.steps + 1
+		local mine = b.key .. "#"
+		local made, seen = {}, {}
+		for _, comp in ipairs(b.comps) do
+			for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
+				local other = owner[e]
+				if not seen[e] and (other == nil or other:sub(1, #mine) == mine) then
+					seen[e] = true
+					made[#made + 1] = e
+				end
+			end
+		end
+		table.sort(made)
+		local map, complete = L.bindMap(L.COMMANDS[b.fn], b.body, b.key, made)
+		for key, e in pairs(map) do
+			st.bind[key] = e
+			owner[e] = key
+		end
+		if complete then
+			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
+		elseif b.steps >= WATCH_STEPS then
+			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps")
+		else
+			keep[#keep + 1] = b
+		end
+	end
+	st.binders = keep
+end
+
 local function update(userParams, state, dt)
 	C.poll()
 	if not C.ACTIVE then return end
@@ -380,6 +431,7 @@ local function update(userParams, state, dt)
 			end
 		end
 		simAdvanceWatches(st, now)
+		simAdvanceBinders(st)
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)
@@ -537,8 +589,11 @@ local function guiApplyNow(it, now)
 		return
 	end
 	local balance0 = coBalance(ctx)
-	local cmd = (O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(args, 1, args.n))
-	O.sendCommand(cmd, function(data, success, entities)
+	-- what the build made is what the engine reports plus what appeared among the components the schema looks at
+	local bindComps = spec.bind and L.bindsComp(spec, it.body) or nil
+	local bindBefore = {}
+	for _, comp in ipairs(bindComps or {}) do bindBefore[comp] = engine.entitiesWith(comp) end
+	local function finish(data, success, entities)
 		if spec.creates and success then
 			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
 			local okd, e = pcall(function() return data[spec.result] end)
@@ -550,11 +605,40 @@ local function guiApplyNow(it, now)
 				toSim("bind", { key = it.key, e = e })
 			end
 		end
+		if spec.bind and success then
+			local made, seen = {}, {}
+			local function add(e)
+				if type(e) == "number" and not seen[e] then
+					seen[e] = true
+					made[#made + 1] = e
+				end
+			end
+			for _, r in ipairs(type(entities) == "table" and entities or {}) do add(type(r) == "table" and r[1] or r) end
+			for _, comp in ipairs(bindComps or {}) do
+				for _, e in ipairs(L.newEntities(bindBefore[comp] or {}, engine.entitiesWith(comp))) do add(e) end
+			end
+			table.sort(made)
+			for sub, e in pairs((L.bindMap(spec, it.body, it.key, made))) do
+				G.bind[sub] = e
+				G.rev[e] = sub
+				toSim("bind", { key = sub, e = e })
+			end
+		end
 		-- the game is paused, so nothing else moved the account since the command went out
 		coToSim(it, success, success and coAfter(ctx, it, spec, category, balance0, logGui) or nil)
 		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now .. (success and "" or " REFUSED"))
 		deliverResult(it.key, data, success, entities)
-	end)
+	end
+	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
+	local okS, errS = pcall(L.runChained, args, function(a, cb)
+		O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
+	end, finish)
+	if not okS then
+		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
+		send("action_refused", { seq = it.seq, from = it.from, detail = tostring(errS) })
+		deliverResult(it.key, nil, false, {})
+		coToSim(it)
+	end
 end
 
 local function route(it)
@@ -948,8 +1032,17 @@ local function guiUpdate(userParams, state, guiState)
 	if not ok then logGui("frame failed: " .. tostring(err)) end
 end
 
+-- The engine's tool events (builder.proposalCreate / builder.proposalApply, id = the tool): the construction schema logs
+-- what it sees and what it would capture, so that the first game run shows the real shapes (finding from MPFever (MIT):
+-- these events reach guiHandleEvent). Nothing is replicated from them yet.
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
-	-- nothing yet: tool events are not needed for the replication modes implemented here
+	if not C.ACTIVE or type(name) ~= "string" or not name:find("^builder%.") then return end
+	for _, M in ipairs(CMDS) do
+		if type(M.onToolEvent) == "function" then
+			local ok, err = pcall(M.onToolEvent, id, name, param, logGui)
+			if not ok then logGui("tool event handler failed: " .. tostring(err)) end
+		end
+	end
 end
 
 function data()

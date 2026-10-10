@@ -30,6 +30,7 @@ Files in `feverlink3_1/content/`:
 | `feverlink3_entry.res.lua` | Registers the window on the game's mod entry point (react-plugin). Untested. |
 | `feverlink3_bridge.script.lua` | Glue to the engine: the real `api.*` accessor, the two script halves, the `sendCommand` wrap. Thin. |
 | `feverlink3_cmds_ops.lua` | Command schemas of everyday operations: vehicles, lines, names and colours, journal bookings, calendar, town and cargo actions, and the events of loans, subsidies, marketing and greening. Coverage and open points: `docs/COVERAGE_OPS.md`. Untested in a game. |
+| `feverlink3_cmds_build.lua` | Command schema of construction (`makeWorldBuildProposalCmd`): roads, tracks, stations, depots, stops, signals, upgrades, bulldozing and node configurations, as plain build records whose entities are named by key and place; keys for what a build created (constructions, depots, stations, road-side stops and their groups). Terrain stays native. Coverage and open points: `docs/COVERAGE_BUILD.md`. Untested in a game. |
 | `feverlink3_cmds_company.lua` | Companies: the registry of companies and members agreed in lockstep (`feverlink3Company` operations, `makeGameAddPlayerCmd`, `makeEntitySetPlayerCmd`, the `Companies` / `applyLevel` event), attribution of `player` arguments to the sender's company, the ledger, limits, payments, and the data of the window's company page (`companies.txt`). Untested in a game. |
 
 ## Environment
@@ -68,12 +69,15 @@ The bridge builds one `engine` table; a global `FEVERLINK3_ENGINE` table (set by
 
 `tests/lua/test_cmds_ops.py` builds on that harness (imports it, does not edit it) for the operations schemas: engine objects with member lists, model ids that differ between the two games, a small savegame of depots, station groups, a line, a vehicle, a town and an industry, the engine's rules for the commands, and an id-independent snapshot the two games must agree on.
 
+`tests/lua/test_cmds_build.py` does the same for construction (also importing the harness): userdata mocks with copy semantics and member lists, a strict command factory, a savegame of roads, tracks, a signal, a depot and a station, the build of the same record on two games whose entity ids differ, chained commands, keys for what a build created, and the construction schema alone against hostile records.
+
 `tests/lua/test_cmds_company.py` does the same for the company layer: the module on its own (registry operations and who may do them, attribution, ledger, limits, payments, the page's data, the codecs) and two mocked games with several player entities, per-player accounts and ownership (identical registries and ledgers, `player` arguments that become each game's own company entity, limits at the originator and at the stamp, pauses, reloads, faults in the company layer, forged actions).
 
 ```
 pip install lupa
 python -I tests/lua/test_lockstep.py
 python -I tests/lua/test_cmds_ops.py
+python -I tests/lua/test_cmds_build.py
 python -I tests/lua/test_cmds_company.py
 ```
 
