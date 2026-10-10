@@ -65,4 +65,4 @@ Discord: `azalshehri`. Bugs and requests: [GitHub issues](https://github.com/AZa
 
 ## Licence
 
-MIT.
+[PolyForm Noncommercial 1.0.0](https://github.com/AZalshehri7/FeverLink3/blob/main/LICENSE): free for noncommercial use. Commercial use needs a separate license: message `azalshehri` on Discord.

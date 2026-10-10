@@ -81,4 +81,4 @@ Discord: `azalshehri`. Bug reports and feature requests go to [GitHub issues](ht
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+FeverLink3 is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE): you may use, study, modify and share it for any noncommercial purpose, keeping the copyright notice. **Commercial use needs a separate commercial license**; contact me on Discord (`azalshehri`). The few parts adapted from TpF2 Multiplayer and MPFever stay under their own MIT licences, reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
