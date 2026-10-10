@@ -250,7 +250,7 @@ pub fn run() -> Result<Report, String> {
     {
         let (mut raw, challenge) = raw_challenge(addr)?;
         let proof = HostSession::proof(&wrong_key, &challenge.nonce, "Raw").to_vec();
-        let join = JoinMessage { name: "Raw".into(), version: HostOptions::default().version, proof };
+        let join = JoinMessage::new("Raw", &HostOptions::default().version, proof);
         let header =
             FrameHeader::new(FrameHeader::CURRENT_VERSION, MessageKind::Join.into(), HostSession::UNASSIGNED, 0);
         FrameCodec::write(&mut raw, &Frame::new(header, codec::encode(&join))).map_err(|e| e.to_string())?;

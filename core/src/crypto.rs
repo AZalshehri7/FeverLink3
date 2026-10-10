@@ -2,20 +2,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use sha2::Sha256;
 
 use crate::protocol::{Frame, FrameCodec, FrameHeader};
-
-/// Fills `buf` from the operating system's random source. The one primitive of the crate that can fail for reasons
-/// outside the program: callers in the game process refuse the operation (no session, no connection) instead of
-/// panicking.
-pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
-    getrandom::getrandom(buf).map_err(|e| io::Error::other(format!("the operating system's random source failed: {e}")))
-}
 
 /// The one symmetric key of a session, derived from the join code's secret and the optional lobby password.
 ///
@@ -41,17 +33,18 @@ impl SessionKey {
     const INFO: &'static [u8] = b"session";
     const ROOM_INFO: &'static [u8] = b"relay room";
 
-    /// 16 random bytes for a new session. An error only if the operating system's random source fails.
-    pub fn try_new_secret() -> io::Result<[u8; Self::SECRET_SIZE]> {
-        let mut secret = [0u8; Self::SECRET_SIZE];
-        random_bytes(&mut secret)?;
-        Ok(secret)
-    }
-
     /// As [`SessionKey::try_new_secret`], for tests and tools; panics if the random source fails. Code that runs in
     /// the game process uses the fallible form.
     pub fn new_secret() -> [u8; Self::SECRET_SIZE] {
         Self::try_new_secret().expect("operating system random source")
+    }
+
+    /// As [`SessionKey::new_secret`], but `None` when the random source fails instead of a panic: for code that runs
+    /// inside the game, where a panic ends the process.
+    pub fn try_new_secret() -> Option<[u8; Self::SECRET_SIZE]> {
+        let mut secret = [0u8; Self::SECRET_SIZE];
+        getrandom::getrandom(&mut secret).ok()?;
+        Some(secret)
     }
 
     /// `None` and `Some("")` both mean no password.
@@ -151,10 +144,10 @@ impl std::error::Error for SealError {}
 /// Seals outgoing frames for one sender: AES-256-GCM, 16-byte tag, nonce = `u32 sender ‖ u64 counter`. The counter
 /// starts at 1 and only grows.
 ///
-/// A nonce must never be used twice under one key, so: the host assigns every sender id once and never takes one
-/// back (a player who reconnects is a new sender); a new session has a new secret, hence a new key; a sealer that
-/// would run out of counters refuses instead of wrapping. Code that wants to give an id to a second `Sealer` has to
-/// continue the first one's counter.
+/// A nonce must never be used twice under one key, so: a new session has a new secret, hence a new key; a sender id
+/// that is given out again (a player coming back inside the host's window) gets a new epoch, which starts its
+/// counter above everything an earlier use of the id can reach ([`Sealer::with_epoch`]); a sealer that would run
+/// out of counters refuses instead of wrapping.
 pub struct Sealer {
     aes: Aes256Gcm,
     sender: u16,
@@ -166,15 +159,31 @@ impl Sealer {
     pub const TAG_SIZE: usize = 16;
     /// The longest payload that still fits in a frame once header and tag are added.
     pub const MAX_PAYLOAD: usize = FrameCodec::MAX_FRAME_LENGTH - FrameHeader::SIZE - Self::TAG_SIZE;
+    /// A sender's counter lives in `epoch << EPOCH_SHIFT ..`: the low 40 bits count frames, the high 24 are the epoch.
+    pub const EPOCH_SHIFT: u32 = 40;
+    /// The largest epoch; a sender id that has been used this many times is not reused.
+    pub const MAX_EPOCH: u32 = (1 << 24) - 1;
 
     pub fn new(key: &SessionKey, sender: u16) -> Self {
         Self { aes: cipher(key), sender, counter: 0 }
     }
 
-    /// A sealer for a sender id that was already used under this key: its first frame is numbered
-    /// `last_counter + 1`. The only correct way to give an id to a second `Sealer`.
+    /// A sealer that continues a sender's counter exactly: its first frame is numbered `last_counter + 1`. For tests
+    /// and tools (a forger, a model of a peer); the state machines give a returning player's id a new epoch with
+    /// [`Sealer::with_epoch`] instead.
     pub fn resume(key: &SessionKey, sender: u16, last_counter: u64) -> Self {
         Self { aes: cipher(key), sender, counter: last_counter }
+    }
+
+    /// A sealer for a sender id that may have been used before under this key (a player coming back). Its counter
+    /// starts at `epoch << 40`, above every counter an earlier epoch can reach, so no nonce repeats and the receiver's
+    /// replay window sees the new frames as newer. `None` when `epoch` is over [`Sealer::MAX_EPOCH`].
+    pub fn with_epoch(key: &SessionKey, sender: u16, epoch: u32) -> Option<Self> {
+        (epoch <= Self::MAX_EPOCH).then(|| Self {
+            aes: cipher(key),
+            sender,
+            counter: u64::from(epoch) << Self::EPOCH_SHIFT,
+        })
     }
 
     pub fn sender(&self) -> u16 {

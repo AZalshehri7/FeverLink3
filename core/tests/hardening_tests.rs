@@ -48,18 +48,25 @@ fn the_host_closes_connections_that_never_join_and_keeps_the_ones_that_did() {
     for i in 0..5 {
         h.host.connection_opened(1000 + i);
     }
-    h.advance(HostSession::HANDSHAKE_SECONDS - 1.0);
-    assert!(h.host.tick().iter().all(|o| !matches!(o, HostOutput::CloseConnection(_))), "not yet");
-    h.advance(2.0);
-    let closed: Vec<ConnectionId> = h
-        .host
-        .tick()
-        .iter()
-        .filter_map(|o| match o {
-            HostOutput::CloseConnection(c) => Some(*c),
-            _ => None,
-        })
-        .collect();
+    // the host is ticked every second: a longer gap would be taken for a stall of the host and forgiven
+    let limit = HostOptions::default().handshake_timeout_seconds;
+    let mut closed: Vec<ConnectionId> = Vec::new();
+    for second in 1..=(limit as u32 + 2) {
+        h.advance(1.0);
+        let outs = h.host.tick();
+        let now_closed: Vec<ConnectionId> = outs
+            .iter()
+            .filter_map(|o| match o {
+                HostOutput::CloseConnection(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        if f64::from(second) < limit {
+            assert!(now_closed.is_empty(), "not yet, at second {second}");
+        }
+        closed.extend(now_closed);
+    }
+    closed.sort_unstable();
     assert_eq!(closed, (1000..1005).collect::<Vec<_>>());
     assert!(h.host.players().len() == 2 && h.routable.contains(&player), "the joined player stays");
     h.advance(600.0);
@@ -81,8 +88,10 @@ fn the_host_refuses_connections_beyond_the_pending_limit_and_takes_new_ones_when
     assert!(outs.iter().any(|o| matches!(o, HostOutput::CloseConnection(9999))), "refused");
     assert!(!outs.iter().any(|o| matches!(o, HostOutput::SendToConnection { .. })), "no challenge for it");
     assert_eq!(h.p(player).session.state(), PlayerState::Joined);
-    h.advance(HostSession::HANDSHAKE_SECONDS + 1.0);
-    h.host.tick();
+    for _ in 0..(HostOptions::default().handshake_timeout_seconds as u32 + 1) {
+        h.advance(1.0);
+        h.host.tick();
+    }
     let outs = h.host.connection_opened(10_000);
     assert!(outs.iter().any(|o| matches!(o, HostOutput::SendToConnection { .. })), "room again");
 }
@@ -148,7 +157,9 @@ fn checksum_reports_that_are_not_the_size_of_a_world_are_ignored() {
 
 #[test]
 fn the_log_does_not_grow_with_what_a_peer_chooses() {
-    let mut h = Harness::new();
+    // this is about memory, not rates: the frame limit would end the connection after its burst
+    let mut h =
+        Harness::with(HostOptions { max_frames_per_second: 0, max_bytes_per_second: 0, ..HostOptions::default() });
     let a = h.connect("A");
     let logged_before = h.host_log.len();
     // 5000 frames that claim 5000 different senders, all over A's connection
@@ -210,6 +221,9 @@ fn a_second_welcome_does_not_restart_the_players_counter() {
         version: "0.1".into(),
         players: vec![],
         session: SessionState { started: false, speed: 0, pause_at: None, lead: 1200 },
+        nonce: vec![],
+        resume: None,
+        resumed: false,
     };
     let frame = sealed(&h, HostSession::HOST_ID, 100_000, MessageKind::Welcome, &json(&welcome));
     let session = &mut h.players.get_mut(&c).unwrap().session;
@@ -294,4 +308,41 @@ fn no_nonce_is_used_twice_however_players_come_and_go() {
     assert!(host_frames > 100, "the scenario sent a real number of frames");
     let player_frames = seen.iter().filter(|(s, _)| *s != HostSession::HOST_ID).count();
     assert!(player_frames > 100);
+}
+
+#[test]
+fn a_connection_over_its_byte_budget_is_closed_and_the_others_are_not() {
+    // few big frames do what many small ones are stopped from doing: a stranger's disk and CPU are the cost
+    let options = HostOptions { max_bytes_per_second: 10_000, byte_burst: 40_000, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(2, 1, options);
+    let (flooder, other) = (ids[0], ids[1]);
+    let chat = json(&ChatMessage::new(&"x".repeat(5_000)));
+    let mut sent = 0;
+    while h.routable.contains(&flooder) && sent < 100 {
+        h.player_game(flooder, MessageKind::Chat, &chat);
+        sent += 1;
+    }
+    assert!(!h.routable.contains(&flooder), "closed");
+    assert!((6..=10).contains(&sent), "after about 40 000 bytes at once, not after {sent} frames");
+    assert!(h.host_log.iter().any(|l| l.contains("bytes per second")), "{:?}", h.host_log);
+    assert!(h.routable.contains(&other), "nobody else is touched");
+}
+
+#[test]
+fn traffic_inside_the_byte_rate_is_never_refused_and_zero_turns_it_off() {
+    let options = HostOptions { max_bytes_per_second: 10_000, byte_burst: 40_000, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(1, 1, options);
+    let chat = json(&ChatMessage::new(&"x".repeat(5_000)));
+    for _ in 0..60 {
+        h.player_game(ids[0], MessageKind::Chat, &chat);
+        h.advance(1.0); // 5 000 bytes a second against 10 000
+    }
+    assert!(h.routable.contains(&ids[0]));
+
+    let off = HostOptions { max_bytes_per_second: 0, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(1, 1, off);
+    for _ in 0..200 {
+        h.player_game(ids[0], MessageKind::Chat, &chat);
+    }
+    assert!(h.routable.contains(&ids[0]), "no byte limit, and 200 frames are inside the frame limit");
 }

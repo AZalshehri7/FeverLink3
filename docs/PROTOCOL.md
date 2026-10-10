@@ -44,15 +44,16 @@ One IPv4 endpoint gives 53 characters. Anything that fails the check or the shap
 
 ```
 host   → conn    Challenge  { nonce: 16 bytes, protocol: 1, version: "0.1" }      unsealed, sender 65535
-conn   → host    Join       { name, version, proof }                               unsealed, sender 65535
+conn   → host    Join       { name, version, proof, resume? }                      unsealed, sender 65535
                  proof = HMAC-SHA256(key, nonce ‖ UTF8(name))
-host   → conn    Welcome    { you, hostName, version, players[], session }         sealed, sender 0
+                 resume = { id, mac }, from a player coming back (see Reconnect)
+host   → conn    Welcome    { you, hostName, version, players[], session, resume?, resumed? }  sealed, sender 0
    or            Reject     { reason, detail? }  then the host closes the connection  unsealed
 ```
 
-Reject reasons: `bad-proof` (wrong key or password), `version` (detail names both versions), `full`, `malformed`.
+Reject reasons: `bad-proof` (wrong key or password), `version` (detail names both versions), `full` (detail: `8 players`, and how many of them are away and holding their slot), `malformed`, `flood` (too many frames, see Limits), `timeout` (the handshake did not finish in time).
 
-After Welcome the player seals with its assigned id. The host checks that the sender id in every frame equals the id bound to that connection; a mismatch is dropped. A player accepts sealed frames from sender 0 only.
+After Welcome the player seals with its assigned id. The host checks that the sender id in every frame equals the id bound to that connection; a mismatch is dropped. A player accepts sealed frames from sender 0 only. An unsealed Reject is honoured only before the Welcome; afterwards the host ends a session with the sealed Kicked (see Leave and removal), because anyone on the path can write an unsealed frame.
 
 A player answers a Challenge only if its nonce is 16 bytes and the protocol number is its own. It honours a Reject only while it is still joining (a Reject is unsealed: anyone on the path can write one), and a second Welcome on a connection is dropped (it would replace the player's sealer and restart its counter).
 
@@ -63,19 +64,21 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
 | Challenge | 1 | host → connection | `{nonce, protocol, version}` |
-| Join | 2 | connection → host | `{name, version, proof}` |
+| Join | 2 | connection → host | `{name, version, proof, resume?: {id, mac}}` |
 | Reject | 3 | host → connection | `{reason, detail?}` |
-| Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session}` |
+| Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session, resume?: {token, epoch}, resumed?}` |
 | Session | 11 | host → all | `{started, speed, pauseAt?, lead}` |
 | PeerClock | 12 | host → all but origin | `{from, t, ahead}` |
 | PlayerJoined | 13 | host → all but the joiner | `{player: {id, name, ready}}` |
-| PlayerLeft | 14 | host → all | `{id, name}` |
+| PlayerLeft | 14 | host → all | `{id, name, away?}` (`away` = the connection dropped and the slot is held) |
 | ChecksumRequest | 15 | host → all | `{n, at, paused}` |
 | Authority | 16 | host → players | `{n, values: {name: number}}` |
 | ResyncSave | 17 | host → its own game | `{id, name}` |
 | ResyncChunk | 18 | host → players | `{id, index, count, sha256, data}` |
 | ResyncLoad | 19 | host → all | `{id, name, sha256}` |
-| Permissions | 20 | host → all | `{build, bulldoze, spend, speed}`, each `"everyone"`, `"hostOnly"` or `{"only": [ids]}` |
+| Permissions | 20 | host → all | `{build, bulldoze, spend, speed, other?}`, each `"everyone"`, `"hostOnly"` or `{"only": [ids]}` |
+| Ping | 21 | host → player | `{n, rtt?: {id: ms}}`, answered by the player's session layer; never given to the game |
+| Kicked | 22 | host → player | `{reason, detail?}` (the shape of Reject), sealed: the host ended this player's session |
 | Hello | 30 | game → host | `{time, save?}` |
 | Clock | 31 | game → host | `{t, speed, ahead}` |
 | SpeedRequest | 32 | game → host | `{speed}` 0 = pause |
@@ -83,10 +86,12 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | SaveDone | 34 | host's game → host | `{id, ok, detail?}` |
 | ReplayFailed | 35 | game → host | `{detail}` |
 | ActionRefused | 36 | game → host | `{seq, detail}` |
+| Pong | 37 | player → host | `{n}`, sent by the player's session layer, not by its game |
+| Leave | 38 | player → host | `{}`: the player goes on purpose |
 | Action | 50 | game → host → all but origin | `{stamp, seq, body, category?, from, allowed}` (`from` and `allowed` set by the host; `category` is `build`, `bulldoze`, `spend` or `other`, default `other`) |
 | Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name}` (set by the host) |
 
-A player may send kinds 30 to 36, 50 and 51. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
+A player may send kinds 30 to 38, 50 and 51. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
 
 What the host does with the content of those kinds, beyond decoding them (a message that does not decode is ignored, as always):
 
@@ -105,7 +110,7 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 - **SpeedRequest** from a player allowed by the `speed` permission is obeyed while the session is started, no resync round is running and the value differs; from any other player it is dropped (see Permissions).
 - **Checksum rounds**: every 10 s while running, the host sends `{n, at, paused}`. When `paused`, `at` is the latest time any game stopped at. Every game that said Hello must report; the round completes when they all have, compares the per-part hashes, and reports the differing parts with each game's value. Values from the host's report under `authority` are relayed to the players as Authority, which they apply to themselves (money correction). Rounds older than 20 are forgotten.
 - **Actions** are relayed in the order the host received them, to every game but the origin, with `from` and `allowed` filled in by the host. The body is the mod's own serialisation and is opaque here.
-- **Leaving**: a closed connection removes the player and its clock and broadcasts PlayerLeft.
+- **Leaving**: a closed connection takes the player out of the game at once: its clock is dropped and PlayerLeft goes to everyone, with `away: true` because the host holds the slot for a return (see Reconnect). A player that says Leave first is gone for good (`away` left out).
 
 ## Resync round
 
@@ -138,7 +143,7 @@ Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused:
 
 ## Hot join
 
-`PlayerJoined` while the session is started starts a round with reason `new player`; the joiner is a participant, so it receives the save and says Hello after loading it. If a round is already running and has not yet announced its file (Pausing, Saving, Transferring before `resync_file_ready`), the joiner simply takes part in it. If the file has been announced (Transferring after the announcement, Loading, Verifying) the joiner is remembered and a new round `new player` starts when the running one ends, whether it succeeded or failed. A hot-join round ignores the cooldown. Before `start` a join starts nothing.
+`PlayerJoined` while the session is started starts a round with reason `new player` (`player returned` when the joiner is a player coming back, see Reconnect); the joiner is a participant, so it receives the save and says Hello after loading it. If a round is already running and has not yet announced its file (Pausing, Saving, Transferring before `resync_file_ready`), the joiner simply takes part in it. If the file has been announced (Transferring after the announcement, Loading, Verifying) the joiner is remembered and a new round `new player` starts when the running one ends, whether it succeeded or failed. A hot-join round ignores the cooldown. Before `start` a join starts nothing.
 
 ## Resync policy
 
@@ -163,11 +168,59 @@ Kind 20, host → all, sent whenever the host calls `set_permissions` and to eve
 {"build": "everyone", "bulldoze": "hostOnly", "spend": {"only": [1, 3]}, "speed": "everyone"}
 ```
 
-Each field is a `PlayerSet`: `"everyone"`, `"hostOnly"` or `{"only": [ids]}`; a missing field means everyone. The host's own game (id 0) is allowed in every set. Players cannot send kind 20 (dropped). A player stores the last message so its mod can refuse locally and roll back.
+Each field is a `PlayerSet`: `"everyone"`, `"hostOnly"` or `{"only": [ids]}`; a missing field means everyone. `other` (renames, colours, line and vehicle settings: the actions of category `other`) is written only while it restricts something, so the message of a host that never touches it is unchanged. The host's own game (id 0) is allowed in every set. Players cannot send kind 20 (dropped). A player stores the last message so its mod can refuse locally and roll back.
 
 **Speed** is enforced by the host: a SpeedRequest from a player not in `speed` is dropped, counted, and logged once per player. **Build, bulldoze and spend** are not dropped by the host; see below.
 
-**Action category and verdict.** An Action gains `category`: `"build"`, `"bulldoze"`, `"spend"` or `"other"` (default `"other"`; any other value counts as `"other"`). On relay the host overwrites `category` with the normalised value and sets `allowed: bool` from the permissions (`other` is always allowed). The action is relayed to everyone either way, so every mod sees the same stream and the originating mod, which knows the permissions, can refuse the action and roll back its own change. The host logs the first forbidden action per player and category.
+**Action category and verdict.** An Action gains `category`: `"build"`, `"bulldoze"`, `"spend"` or `"other"` (default `"other"`; any other value counts as `"other"`). On relay the host overwrites `category` with the normalised value and sets `allowed: bool` from the permissions (`other` is allowed unless the `other` set says otherwise). The action is relayed to everyone either way, so every mod sees the same stream and the originating mod, which knows the permissions, can refuse the action and roll back its own change. The host logs the first forbidden action per player and category.
+
+## Players and slots
+
+A session has at most `max_players` games, **the host's own included**: the default 8 is the host and seven players. Ids are handed out from 1 in the order players join and are **never given to anyone else**, not even after the player left: entity keys are `<sender>:<seq>` and frame nonces are `<sender>:<counter>`, so a reused id would repeat both. After 65 534 joins in one session the host answers `full` (`no ids left`). Display names are unique, case-insensitive; a clash becomes `name#id`, and the name of a player who is away still counts as taken.
+
+A slot is held for every player that is connected or away. When a held slot is released (the window ran out, or the host's `kick`) the others get PlayerLeft without `away`, so no one keeps a ghost. A player who comes back to a session that has not started keeps the `ready` it had (its game was not reloaded); in a started session the hot-join round reloads it and it says Hello again. A joiner finding all `max_players` slots held is rejected with `full`; the detail counts the away ones, since they may return.
+
+## Reconnect
+
+A player whose connection dropped and that returns within the window gets its **id, name, slot and permissions** back (permissions are sets of ids, so keeping the id keeps them).
+
+```
+first Welcome   resume = { token: 16 random bytes, epoch: 0 }       sealed, so only holders of the session key see it
+drop            the host takes the player out of the game, holds the slot, broadcasts PlayerLeft { away: true }
+new connection  Join { name, version, proof, resume: { id, mac } }
+                mac = HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ u16 id ‖ UTF8(name))
+host            token valid, slot held (or still bound to a connection the host has not noticed is dead) →
+                Welcome { you: id, ..., resume: { token, epoch: epoch + 1 }, resumed: true }
+                PlayerJoined to the others, Permissions to the returner, and in a started session a hot-join round
+                (reason `player returned`); the returner is not ready until it says Hello after loading the save
+                anything else → a plain join, a new id, `resumed` left out
+```
+
+- The **window** is `reconnect_window_seconds` (330 s: the launcher retries for 300 s, plus a margin). After it the slot is released and the player is gone; `0` holds nothing.
+- The token never travels again: the claim is an HMAC over this connection's challenge nonce, so a captured Join is worth nothing on another connection and the host's `bad-proof` check fails first. A claim that does not hold (the slot expired, was released, or the id and token are not a pair this host gave) is not an error: it is a plain join with a new id, and a guess leaves the real slot alone. A host started again has a new secret, so a player of the old session fails the proof (`bad-proof`) and nothing carries over: **a session key never outlives its host**, which is also what keeps the `(sender, counter)` nonces unique across hosts.
+- **Replays.** The welcome carries the nonce of the challenge it answers (`nonce`); a player drops a welcome that names another, so a welcome captured on an earlier connection and played again cannot hand it an id and an epoch whose counters were used before. A player also answers one challenge per connection, and drops any host frame whose counter is at or below the welcome's: the host seals one counter stream, so such a frame was sealed before this connection began (a fresh replay window cannot know that). A host that predates `nonce` sends none, and the check is then skipped.
+- A return takes over a connection the host still believes in (a pulled cable or a sleeping PC is noticed late): the old one is closed, the others see PlayerLeft(away) and PlayerJoined.
+- **Frame counters.** The sender id is reused, so its counter must not start again at 1: nonce reuse under one key breaks AES-GCM, and the host's replay window would refuse the frames. The counter of a connection starts at `epoch << 40`; the epoch is 0 for the first connection of an id and one more for each return (at most 2²⁴ − 1), so every nonce is used once and the first frame of the new connection is newer than anything the old one sent. The player's launcher keeps `{id, token}`; the epoch comes in the Welcome.
+- The game never sees the token: the launcher removes `resume` from the welcome it writes to `to_game.log`. It does see `resumed: true`.
+- A player that stops on purpose sends Leave first (below), so the slot is not held.
+
+## Leave and removal
+
+- **Leave** (38, player → host, sealed): the player goes on purpose. The host closes the connection, frees the slot at once and broadcasts PlayerLeft without `away`.
+- **Kicked** (22, host → player, sealed): the host ended the session of this player. Reasons: `kicked` (the host's `kick`), `flood` (Limits). The player's session layer reports it like a Reject (`PlayerOutput::Rejected`), so the launcher does not reconnect. Sealed, because an unsealed Reject is only honoured before the Welcome. The player's slot is **not** held: it may join again with the code like anyone else.
+- **Kick** is the host's call (`HostSession::kick(id)`): a connected player is sent Kicked, disconnected and removed; for a player who is away it releases the held slot; the host's own id is refused.
+
+## Ping and round-trip time
+
+Every `ping_seconds` (2 s) the host sends each connected player `Ping { n, rtt? }`. The player's session layer answers at once with `Pong { n }`; neither reaches the game. The host measures `now − time the ping n was sent` on its own clock, keeps up to 8 unanswered pings per player (an older unanswered one is forgotten when a later one is answered) and smooths the samples: the first sets the value, each later one moves it a quarter of the way. `rtt` in a Ping is the smoothed value in milliseconds, one decimal, of every connected player the host has measured, so every player can show everyone's round-trip time. The host's own game is 0. A Pong with an `n` that was not sent, or was already answered, is ignored.
+
+## Limits
+
+- **Frames per second.** Every connection has a token bucket: `max_frames_per_second` (500) refilled per second, `frame_burst` (2000) held at most; every frame received on the connection takes one token, whatever it is (an unintroduced connection included). The frame that finds the bucket empty is dropped and counted and the connection is ended with reason `flood` and detail `more than N frames per second`: an unsealed Reject before the join, a sealed Kicked after it. The player loses its slot. A game that sends a clock line per rendered frame (240 a second) and a long road's worth of actions at once stays far inside; `0` turns the limit off. The host's own game is never limited. Over TCP the refusal is best effort: a peer that keeps writing while the host closes may see a reset instead.
+- **Silence.** A joined connection from which nothing arrived for `idle_timeout_seconds` (30 s) is closed by the host; its slot is held like any dropped connection's. Pings keep a healthy one far inside the limit, and any frame counts, so a game that only sends clocks needs no pong. Turning the pings off turns this off, since a quiet lobby is not a dead connection. 
+- **A host that was away.** A call into the host more than 5 s after the previous one means the host itself was stalled (its process suspended, its thread stuck in a write to a peer that stopped reading), and the frames of every connection are read in one go afterwards. The host then forgives the stall: nobody is timed out for the silence, the frame budgets are full again and not enforced for as long as the stall lasted (at most 60 s) while the backlog is read, the slots held for players who dropped keep their whole window, and the pings sent before it are forgotten, so no round-trip time measures it.
+- **Reports.** A ChecksumReport counts only from a game that said Hello since its last load; one from a game that did not (a returner still running its old world) is ignored, logged once. A report that completes a round is not the only way a round completes: when the game a round was waiting for leaves, a round that has every other report is completed then.
+- **Handshake.** A connection that has not completed the handshake `handshake_timeout_seconds` (10 s) after it was accepted gets Reject `timeout` and is closed.
 
 ## Not yet specified
 

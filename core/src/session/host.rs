@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 
 use hmac::digest::KeyInit;
@@ -7,17 +7,19 @@ use sha2::Sha256;
 
 use super::checksum::{ChecksumOutcome, ChecksumRounds};
 use super::kind::MessageKind;
+use super::limits::RateLimiter;
 use super::lockstep::{Lockstep, PlayerClock};
 use super::messages::{
     codec, ActionMessage, AuthorityMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
-    ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PlayerInfo, PlayerJoinedMessage,
-    PlayerLeftMessage, RejectMessage, ReplayFailedMessage, SaveDoneMessage, SessionState, SpeedRequestMessage,
-    WelcomeMessage,
+    ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo,
+    PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant,
+    SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
 };
 use super::names::Names;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
 use super::resync::ResyncState;
-use crate::crypto::{random_bytes, Opener, Sealer, SessionKey};
+use super::roster::{ConnectionState, RosterEntry};
+use crate::crypto::{Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
 
 mod resync_impl;
@@ -29,12 +31,37 @@ pub type ConnectionId = u64;
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostOptions {
     pub version: String,
+    /// Most games in the session, the host's own included: 8 means the host and seven players. A slot held for a
+    /// player who dropped counts.
     pub max_players: usize,
     pub session_broadcast_seconds: f64,
     pub checksum_seconds: f64,
     /// Start a resync round by itself when the checksum policy asks for one (default true). When false the host
     /// only emits [`HostOutput::ResyncRequested`] and the launcher decides.
     pub auto_resync: bool,
+    /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
+    /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
+    pub max_frames_per_second: u32,
+    /// Frames a connection may send at once before the rate above applies.
+    pub frame_burst: u32,
+    /// Bytes per second one connection may send, on average (a frame costs its header and body), with the same
+    /// consequence as the frame rate. A player's traffic is small (actions, clocks, reports); the limit is what a
+    /// stranger holding the code costs in host CPU, memory and, for relayed actions, disk. 0 turns it off.
+    pub max_bytes_per_second: u32,
+    /// Bytes a connection may send at once before the rate above applies.
+    pub byte_burst: u32,
+    /// How long a player's id, slot and permissions are held after its connection dropped. A player that comes back
+    /// within it, with the token from its welcome, gets them back. The launcher retries for 300 s, so this adds a
+    /// margin. 0 holds nothing.
+    pub reconnect_window_seconds: f64,
+    /// Seconds between pings: the round-trip time of every player, and proof that its launcher is alive.
+    pub ping_seconds: f64,
+    /// A joined connection that sent nothing for this long is closed (its slot is held like any dropped one). 0 turns
+    /// it off, and so does turning the pings off: a quiet lobby is not a dead connection. Pings keep a healthy
+    /// connection well inside it.
+    pub idle_timeout_seconds: f64,
+    /// A connection that has not completed the handshake after this long is closed. 0 turns it off.
+    pub handshake_timeout_seconds: f64,
 }
 
 impl Default for HostOptions {
@@ -45,6 +72,14 @@ impl Default for HostOptions {
             session_broadcast_seconds: 3.0,
             checksum_seconds: 10.0,
             auto_resync: true,
+            max_frames_per_second: 500,
+            frame_burst: 2000,
+            max_bytes_per_second: 2 << 20,
+            byte_burst: 8 << 20,
+            reconnect_window_seconds: 330.0,
+            ping_seconds: 2.0,
+            idle_timeout_seconds: 30.0,
+            handshake_timeout_seconds: 10.0,
         }
     }
 }
@@ -57,7 +92,9 @@ pub enum HostOutput {
         connection: ConnectionId,
         frame: Frame,
     },
-    /// The caller must close this connection (after a reject).
+    /// The caller must close this connection, after the frames already sent to it: the host rejected it, removed
+    /// its player, cut it off for silence or flooding, or a returning player took its place. No `Closed` event
+    /// needs to be reported back; the host has already forgotten the connection.
     CloseConnection(ConnectionId),
     /// A message for the host's own game.
     DeliverToLocalGame {
@@ -98,8 +135,33 @@ struct Connection {
     id: ConnectionId,
     nonce: [u8; 16],
     player: Option<u16>,
-    /// Host time (seconds) at which the connection opened: one that has not joined in time is closed.
+    /// Host time the connection was accepted: a handshake that drags on is cut.
     opened: f64,
+    /// Host time of the last frame from it, whatever it was.
+    last_heard: f64,
+    limiter: RateLimiter,
+    /// The byte budget: a frame costs its header and body, so a few large frames cannot do what many small ones are
+    /// stopped from doing.
+    bytes: RateLimiter,
+}
+
+/// What the host keeps of a joined player beyond its connection: the secret that lets it come back as itself, and how
+/// often its id was used (the epoch of its frame counters).
+struct Identity {
+    name: String,
+    token: [u8; 16],
+    epoch: u32,
+    /// Host time the connection was lost; `None` while the player is connected.
+    away_since: Option<f64>,
+    /// The game had said hello when the connection dropped. A player coming back to a session that has not started
+    /// keeps it: its game was not reloaded.
+    ready: bool,
+}
+
+impl fmt::Debug for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity").field("name", &self.name).field("epoch", &self.epoch).finish_non_exhaustive()
+    }
 }
 
 /// The host side of a session, as a state machine with no I/O: connections are integers the caller owns, frames
@@ -117,15 +179,31 @@ pub struct HostSession {
     sealer: Sealer,
     opener: Opener,
     connections: BTreeMap<ConnectionId, Connection>,
+    /// The games that are connected now: the host's own (id 0) and every player with a live connection.
     players: BTreeMap<u16, PlayerInfo>,
+    /// Every player but the host that holds a slot, connected or away, by id.
+    identities: BTreeMap<u16, Identity>,
     clocks: BTreeMap<u16, PlayerClock>,
+    /// Smoothed round-trip time per connected player, milliseconds.
+    rtt_ms: BTreeMap<u16, f64>,
+    /// Pings sent and not yet answered, per player, oldest first: (n, host time sent).
+    pings: BTreeMap<u16, VecDeque<(u32, f64)>>,
+    ping_n: u32,
+    last_ping: f64,
+    /// Host time of the last call that paces the host (a frame, a tick).
+    last_call: f64,
+    /// Until this host time the host is catching up after being away: what its connections sent meanwhile is not
+    /// counted against them.
+    stall_until: f64,
     checksums: ChecksumRounds,
     permissions: Permissions,
     policy: ChecksumPolicy,
     resync: Option<ResyncRound>,
     resync_counter: i32,
     last_running_speed: i32,
-    pending_new_player: bool,
+    /// A player joined while a round was already past the point of taking it in: the reason of the round to start
+    /// when that one ends.
+    pending_new_player: Option<&'static str>,
     dropped_once: HashSet<String>,
     next_player_id: u16,
     checksum_n: i32,
@@ -155,9 +233,6 @@ impl HostSession {
     pub const PROTOCOL_VERSION: i32 = FrameHeader::CURRENT_VERSION as i32;
     /// Bytes of the random nonce in a Challenge.
     pub const NONCE_SIZE: usize = 16;
-    /// A connection that has not sent an accepted Join this long after it opened is closed (seconds on the host's
-    /// clock). The handshake takes milliseconds; the limit is what a connection that opens and goes silent costs.
-    pub const HANDSHAKE_SECONDS: f64 = 15.0;
     /// Connections waiting to introduce themselves at once. The next one is closed on arrival, so a flood of
     /// connections cannot grow the host's tables.
     pub const MAX_PENDING: usize = 32;
@@ -180,14 +255,21 @@ impl HostSession {
             now,
             connections: BTreeMap::new(),
             players,
+            identities: BTreeMap::new(),
             clocks: BTreeMap::new(),
+            rtt_ms: BTreeMap::new(),
+            pings: BTreeMap::new(),
+            ping_n: 0,
+            last_ping: f64::NEG_INFINITY,
+            last_call: f64::NEG_INFINITY,
+            stall_until: f64::NEG_INFINITY,
             checksums: ChecksumRounds::new(),
             permissions: Permissions::default(),
             policy: ChecksumPolicy::new(ChecksumPolicyConfig::default()),
             resync: None,
             resync_counter: 0,
             last_running_speed: 1,
-            pending_new_player: false,
+            pending_new_player: None,
             dropped_once: HashSet::new(),
             next_player_id: 1,
             checksum_n: 0,
@@ -250,13 +332,22 @@ impl HostSession {
             self.refuse(connection, "too many connections waiting to join");
             return self.drain();
         }
+        let now = self.now();
         let mut nonce = [0u8; Self::NONCE_SIZE];
-        if let Err(e) = random_bytes(&mut nonce) {
-            self.refuse(connection, &format!("no challenge could be made ({e})"));
+        if getrandom::getrandom(&mut nonce).is_err() {
+            // game-side code does not panic: with no random numbers there is no challenge to give
+            self.log(format!("connection {connection} refused: the host has no source of random numbers"));
+            let why = RejectMessage::new("malformed", Some("the host has no source of random numbers"));
+            self.send_unsealed(connection, MessageKind::Reject, codec::encode(&why));
+            self.out.push(HostOutput::CloseConnection(connection));
             return self.drain();
         }
-        let opened = self.now();
-        self.connections.insert(connection, Connection { id: connection, nonce, player: None, opened });
+        let limiter = RateLimiter::new(self.options.max_frames_per_second, self.options.frame_burst, now);
+        let bytes = RateLimiter::new(self.options.max_bytes_per_second, self.options.byte_burst, now);
+        self.connections.insert(
+            connection,
+            Connection { id: connection, nonce, player: None, opened: now, last_heard: now, limiter, bytes },
+        );
         let challenge = ChallengeMessage {
             nonce: nonce.to_vec(),
             protocol: Self::PROTOCOL_VERSION,
@@ -275,27 +366,42 @@ impl HostSession {
         self.out.push(HostOutput::CloseConnection(connection));
     }
 
+    /// The transport lost a connection. A joined player's slot is held for [`HostOptions::reconnect_window_seconds`]
+    /// so it can come back as itself; the others are told it is away.
     pub fn connection_closed(&mut self, connection: ConnectionId) -> Vec<HostOutput> {
         if let Some(Connection { player: Some(id), .. }) = self.connections.remove(&connection) {
-            if let Some(info) = self.players.remove(&id) {
-                self.clocks.remove(&id);
-                self.log(format!("{} left", info.name));
-                let left = PlayerLeftMessage { id, name: info.name.clone() };
-                self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
-                self.out.push(HostOutput::PlayerLeft(info));
-                self.resync_step();
-            }
+            self.remove_player(id, true);
         }
         self.drain()
     }
 
     pub fn frame_received(&mut self, connection: ConnectionId, frame: &Frame) -> Vec<HostOutput> {
-        let Some(c) = self.connections.get(&connection) else {
+        let now = self.now();
+        self.note_time(now);
+        let forgiven = now < self.stall_until;
+        let Some(c) = self.connections.get_mut(&connection) else {
             return self.drain();
         };
+        c.last_heard = now;
+        let player = c.player;
+        let cost = (FrameHeader::SIZE + frame.body.len()).try_into().unwrap_or(u32::MAX);
+        let over_frames = !forgiven && !c.limiter.allow(now);
+        let over_bytes = !forgiven && !c.bytes.allow_cost(now, cost);
+        if over_frames || over_bytes {
+            self.dropped += 1;
+            let who = player.map_or_else(|| format!("connection {connection}"), |id| self.name(id));
+            let detail = if over_frames {
+                format!("more than {} frames per second", self.options.max_frames_per_second)
+            } else {
+                format!("more than {} bytes per second", self.options.max_bytes_per_second)
+            };
+            self.log(format!("{who} sent {detail}; the connection is closed"));
+            self.expel(connection, "flood", &detail);
+            return self.drain();
+        }
         let kind_byte = frame.header.kind;
         let kind = MessageKind::from_u8(kind_byte);
-        match c.player {
+        match player {
             None => {
                 if kind != Some(MessageKind::Join) {
                     self.drop(connection, kind_byte, "not introduced".to_owned());
@@ -341,8 +447,25 @@ impl HostSession {
             self.reject(connection, "bad-proof", None);
             return;
         }
-        if self.players.len() > self.options.max_players {
-            let detail = format!("{} players", self.options.max_players);
+        if let Some(claim) = &join.resume {
+            if self.resume(connection, &nonce, &join, claim) {
+                return;
+            }
+            // the usual outcome after the host was restarted; also what a guessed id gets
+            self.log(format!("connection {connection}: no slot #{} to give back; joining as a new player", claim.id));
+        }
+        self.admit(connection, &join);
+    }
+
+    /// A player joining for the first time (or whose claim to an old slot did not hold).
+    fn admit(&mut self, connection: ConnectionId, join: &JoinMessage) {
+        // every player but the host holds an identity, connected or away: the slot of one that may come back counts
+        if 1 + self.identities.len() >= self.options.max_players {
+            let away = self.identities.values().filter(|i| i.away_since.is_some()).count();
+            let mut detail = format!("{} players", self.options.max_players);
+            if away > 0 {
+                detail.push_str(&format!(", {away} of them away and holding their slot"));
+            }
             self.reject(connection, "full", Some(&detail));
             return;
         }
@@ -350,29 +473,89 @@ impl HostSession {
             self.reject(connection, "full", Some("no ids left"));
             return;
         }
+        // game-side code does not panic: with no random source there is no token to give, so no join
+        let mut token = [0u8; 16];
+        if getrandom::getrandom(&mut token).is_err() {
+            self.reject(connection, "malformed", Some("the host has no source of random numbers"));
+            return;
+        }
 
+        // ids only grow and are never given to anyone else: entity keys are `<sender>:<seq>` and nonces are
+        // `<sender>:<counter>`, so a reused id would repeat both
         let id = self.next_player_id;
         self.next_player_id += 1;
-        let name = Names::unique(&Names::sanitize(&join.name), id, self.players.values().map(|p| p.name.as_str()));
+        let taken: Vec<&str> = self
+            .players
+            .values()
+            .map(|p| p.name.as_str())
+            .chain(self.identities.values().map(|i| i.name.as_str()))
+            .collect();
+        let name = Names::unique(&Names::sanitize(&join.name), id, taken);
+        self.identities.insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false });
         let info = PlayerInfo { id, name: name.clone(), ready: false };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
             c.player = Some(id);
         }
         self.log(format!("{name} joined (connection {connection})"));
+        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch: 0 }, false);
+    }
+
+    /// A player coming back. True when `claim` proves it holds the token of a slot this host still keeps, and the
+    /// player now has it again. See `docs/PROTOCOL.md`, "Reconnect".
+    fn resume(&mut self, connection: ConnectionId, nonce: &[u8; 16], join: &JoinMessage, claim: &ResumeClaim) -> bool {
+        let id = claim.id;
+        let Some(identity) = self.identities.get(&id) else { return false };
+        if identity.epoch >= Sealer::MAX_EPOCH
+            || !Self::verify_resume(&identity.token, nonce, id, &join.name, &claim.mac)
+        {
+            return false;
+        }
+        // the old connection may not have been noticed as lost yet (a cable pulled, a sleeping PC): the new one wins
+        if let Some(old) = self.connection_of(id) {
+            let name = self.name(id);
+            self.log(format!("{name} is back on connection {connection}; the old connection {old} is closed"));
+            self.connections.remove(&old);
+            self.out.push(HostOutput::CloseConnection(old));
+            self.remove_player(id, true);
+        }
+        let Some(identity) = self.identities.get_mut(&id) else { return false };
+        identity.epoch += 1;
+        identity.away_since = None;
+        let (name, token, epoch) = (identity.name.clone(), identity.token, identity.epoch);
+        // before the start nothing is reloaded for the returner, so it is as ready as it was; in a started session the
+        // hot-join round reloads it and it says hello again
+        let ready = identity.ready && !self.state.started;
+        let info = PlayerInfo { id, name: name.clone(), ready };
+        self.players.insert(id, info.clone());
+        if let Some(c) = self.connections.get_mut(&connection) {
+            c.player = Some(id);
+        }
+        self.log(format!("{name} is back (connection {connection}), slot #{id}"));
+        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch }, true);
+        true
+    }
+
+    /// The welcome, the others told, the permissions, and for a started session the hot-join round.
+    fn greet(&mut self, connection: ConnectionId, info: PlayerInfo, grant: ResumeGrant, resumed: bool) {
+        let id = info.id;
+        let nonce = self.connections.get(&connection).map(|c| c.nonce.to_vec()).unwrap_or_default();
         let welcome = WelcomeMessage {
             you: id,
             host_name: self.host_name.clone(),
             version: self.options.version.clone(),
             players: self.players.values().cloned().collect(),
             session: self.state.clone(),
+            nonce,
+            resume: Some(grant),
+            resumed,
         };
         self.send(connection, MessageKind::Welcome, &codec::encode(&welcome));
         let joined = PlayerJoinedMessage { player: info.clone() };
         self.broadcast(MessageKind::PlayerJoined, &codec::encode(&joined), Some(id));
         self.send(connection, MessageKind::Permissions, &codec::encode(&self.permissions));
         self.out.push(HostOutput::PlayerJoined(info));
-        self.on_new_player();
+        self.on_new_player(if resumed { "player returned" } else { "new player" });
     }
 
     fn reject(&mut self, connection: ConnectionId, reason: &str, detail: Option<&str>) {
@@ -395,6 +578,25 @@ impl HostSession {
     fn proof_mac(key: &SessionKey, nonce: &[u8], name: &str) -> Hmac<Sha256> {
         let mut mac = Hmac::<Sha256>::new_from_slice(key.key()).expect("HMAC takes any key length");
         mac.update(nonce);
+        mac.update(name.as_bytes());
+        mac
+    }
+
+    /// What a returning player sends to claim its old slot: `HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ id ‖
+    /// name)`. The token never travels again, and the nonce makes a claim good for one connection only.
+    pub fn resume_proof(token: &[u8], nonce: &[u8], id: u16, name: &str) -> [u8; 32] {
+        Self::resume_mac(token, nonce, id, name).finalize().into_bytes().into()
+    }
+
+    fn verify_resume(token: &[u8], nonce: &[u8], id: u16, name: &str, mac: &[u8]) -> bool {
+        Self::resume_mac(token, nonce, id, name).verify_slice(mac).is_ok()
+    }
+
+    fn resume_mac(token: &[u8], nonce: &[u8], id: u16, name: &str) -> Hmac<Sha256> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(token).expect("HMAC takes any key length");
+        mac.update(b"FeverLink3 resume");
+        mac.update(nonce);
+        mac.update(&id.to_be_bytes());
         mac.update(name.as_bytes());
         mac
     }
@@ -532,9 +734,16 @@ impl HostSession {
                             self.broadcast(MessageKind::Authority, &codec::encode(&msg), Some(Self::HOST_ID));
                         }
                     }
-                    let expected: Vec<u16> = self.players.values().filter(|p| p.ready).map(|p| p.id).collect();
-                    if let Some(outcome) = self.checksums.report(from, m, &expected) {
-                        self.on_checksum_outcome(outcome);
+                    if self.players.get(&from).is_some_and(|p| p.ready) {
+                        let expected = self.expected_reporters();
+                        if let Some(outcome) = self.checksums.report(from, m, &expected) {
+                            self.on_checksum_outcome(outcome);
+                        }
+                    } else if self.dropped_once.insert(format!("unready-report/{from}")) {
+                        // a game that has not said hello since its last load has no world to compare yet; counted, it could
+                        // fail the verification of a round it was never part of
+                        let who = self.name(from);
+                        self.log(format!("checksum report from {who} ignored: no hello since its last load"));
                     }
                 }
             }
@@ -549,6 +758,22 @@ impl HostSession {
                 if let Some(m) = codec::try_decode::<ReplayFailedMessage>(payload) {
                     self.on_replay_failed(from, &m.detail);
                 }
+            }
+
+            MessageKind::Pong if from != Self::HOST_ID => {
+                if let Some(m) = codec::try_decode::<PongMessage>(payload) {
+                    self.on_pong(from, m.n);
+                }
+            }
+
+            MessageKind::Leave if from != Self::HOST_ID => {
+                let who = self.name(from);
+                self.log(format!("{who} leaves the session"));
+                if let Some(connection) = self.connection_of(from) {
+                    self.connections.remove(&connection);
+                    self.out.push(HostOutput::CloseConnection(connection));
+                }
+                self.remove_player(from, false);
             }
 
             _ => {}
@@ -607,9 +832,11 @@ impl HostSession {
     /// Call regularly (every 250 ms or so): periodic session broadcast, checksum rounds and the resync round's
     /// waits and timeouts.
     pub fn tick(&mut self) -> Vec<HostOutput> {
-        self.resync_step();
         let t = self.now();
-        self.expire_pending(t);
+        self.note_time(t);
+        self.resync_step();
+        self.watch_connections(t);
+        self.ping_players(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
@@ -620,24 +847,6 @@ impl HostSession {
             self.request_checksum_inner();
         }
         self.drain()
-    }
-
-    /// Closes the connections that opened more than [`HostSession::HANDSHAKE_SECONDS`] ago and have not joined.
-    fn expire_pending(&mut self, now: f64) {
-        let stale: Vec<ConnectionId> = self
-            .connections
-            .values()
-            .filter(|c| c.player.is_none() && now - c.opened >= Self::HANDSHAKE_SECONDS)
-            .map(|c| c.id)
-            .collect();
-        for connection in stale {
-            self.connections.remove(&connection);
-            self.dropped += 1;
-            if self.first_time("handshake-timeout".to_owned()) {
-                self.log(format!("connection {connection} closed: no join within {} s", Self::HANDSHAKE_SECONDS));
-            }
-            self.out.push(HostOutput::CloseConnection(connection));
-        }
     }
 
     fn set_speed_inner(&mut self, speed: i32) {
@@ -689,6 +898,234 @@ impl HostSession {
     fn broadcast_session(&mut self) {
         self.broadcast(MessageKind::Session, &codec::encode(&self.state), None);
         self.last_session_broadcast = self.now();
+    }
+
+    // ---------------------------------------------------------------- who is here
+
+    /// Every player the host knows, by id: its own game, the connected players, and those whose connection dropped
+    /// and whose slot is held for a return.
+    pub fn roster(&self) -> Vec<RosterEntry> {
+        let mut out = Vec::with_capacity(1 + self.identities.len());
+        if let Some(host) = self.players.get(&Self::HOST_ID) {
+            out.push(RosterEntry {
+                id: host.id,
+                name: host.name.clone(),
+                ready: host.ready,
+                state: ConnectionState::Connected,
+                rtt_ms: Some(0.0),
+            });
+        }
+        for (&id, identity) in &self.identities {
+            let here = self.players.get(&id);
+            out.push(RosterEntry {
+                id,
+                name: here.map_or_else(|| identity.name.clone(), |p| p.name.clone()),
+                ready: here.is_some_and(|p| p.ready),
+                state: if here.is_some() { ConnectionState::Connected } else { ConnectionState::Away },
+                rtt_ms: if here.is_some() { self.rtt_ms.get(&id).copied() } else { None },
+            });
+        }
+        out
+    }
+
+    /// A connected player's round-trip time to the host in milliseconds, smoothed; `None` before its first answer.
+    /// The host's own game is 0.
+    pub fn rtt_ms(&self, player: u16) -> Option<f64> {
+        if player == Self::HOST_ID {
+            Some(0.0)
+        } else {
+            self.rtt_ms.get(&player).copied()
+        }
+    }
+
+    /// Removes a player on the host's decision: a connected player is told (sealed `Kicked`, reason `kicked`),
+    /// disconnected and loses its slot; the slot of a player who is away is released. The host's own game cannot be
+    /// removed. The player may join again with the join code like anyone else.
+    pub fn kick(&mut self, player: u16) -> Vec<HostOutput> {
+        if player == Self::HOST_ID {
+            self.log("the host cannot be removed".to_owned());
+        } else if let Some(connection) = self.connection_of(player) {
+            let who = self.name(player);
+            self.log(format!("{who} was removed by the host"));
+            self.expel(connection, "kicked", "removed by the host");
+        } else if self.identities.contains_key(&player) {
+            self.release_slot(player, |name| format!("the slot of {name} was released by the host"));
+        } else {
+            self.log(format!("there is no player #{player} to remove"));
+        }
+        self.drain()
+    }
+
+    /// Takes a player out of the game. `hold` keeps its id, slot and token for [`HostOptions::reconnect_window_seconds`]
+    /// (the connection dropped); without it the slot is freed (the player left, or the host removed it).
+    fn remove_player(&mut self, id: u16, hold: bool) {
+        let Some(info) = self.players.remove(&id) else { return };
+        let now = self.now();
+        self.clocks.remove(&id);
+        self.rtt_ms.remove(&id);
+        self.pings.remove(&id);
+        let hold = hold && self.options.reconnect_window_seconds > 0.0;
+        match self.identities.get_mut(&id) {
+            Some(identity) if hold => {
+                identity.away_since = Some(now);
+                identity.ready = info.ready;
+            }
+            _ => {
+                self.identities.remove(&id);
+            }
+        }
+        let tail = if hold { "; the slot is held for a return" } else { "" };
+        self.log(format!("{} left{tail}", info.name));
+        let left = PlayerLeftMessage { id, name: info.name.clone(), away: hold };
+        self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
+        self.out.push(HostOutput::PlayerLeft(info));
+        // a resync round counts on the games it sent the save to; this one is gone, and if it returns it is a joiner
+        self.forget_participant(id);
+        // a checksum round that waited for this game's report alone is complete now
+        let expected = self.expected_reporters();
+        for outcome in self.checksums.finished(&expected) {
+            self.on_checksum_outcome(outcome);
+        }
+        self.resync_step();
+    }
+
+    /// Frees the slot held for a player who is away, and tells the others it is gone for good (they had it as away).
+    /// `why` makes the log line from the player's name.
+    fn release_slot(&mut self, id: u16, why: impl FnOnce(&str) -> String) {
+        let Some(identity) = self.identities.remove(&id) else { return };
+        self.log(why(&identity.name));
+        let left = PlayerLeftMessage { id, name: identity.name, away: false };
+        self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
+    }
+
+    /// The games a checksum round waits for: those that said hello since their last load.
+    fn expected_reporters(&self) -> Vec<u16> {
+        self.players.values().filter(|p| p.ready).map(|p| p.id).collect()
+    }
+
+    /// Ends a connection by the host's decision and says why. A joined player gets a sealed `Kicked` and loses its
+    /// slot; a connection that never joined gets the unsealed `Reject`.
+    fn expel(&mut self, connection: ConnectionId, reason: &str, detail: &str) {
+        let Some(c) = self.connections.remove(&connection) else { return };
+        let message = codec::encode(&RejectMessage::new(reason, Some(detail)));
+        match c.player {
+            Some(id) => {
+                self.send(connection, MessageKind::Kicked, &message);
+                self.out.push(HostOutput::CloseConnection(connection));
+                self.remove_player(id, false);
+            }
+            None => {
+                self.send_unsealed(connection, MessageKind::Reject, message);
+                self.out.push(HostOutput::CloseConnection(connection));
+            }
+        }
+    }
+
+    /// Longest gap between two calls into the host that still counts as the host paying attention. Anything longer
+    /// means the host itself was away (its process suspended, its thread stuck in a write to a peer that stopped
+    /// reading): nobody could be heard meanwhile, and what the connections sent is only now being read.
+    const STALL_SECONDS: f64 = 5.0;
+    /// How long at most the frames of a stalled host's backlog are forgiven for.
+    const STALL_GRACE_MAX: f64 = 60.0;
+
+    /// Notes that the host runs now. After a gap of more than [`Self::STALL_SECONDS`] it forgives what the stall did:
+    /// every connection counts as just heard from, the frame budgets are full again and not enforced while the backlog
+    /// is read, the slots held for players who dropped keep their whole window, and the pings sent before the stall
+    /// are forgotten (their answers would measure the stall, not the player).
+    fn note_time(&mut self, now: f64) {
+        let gap = now - self.last_call;
+        self.last_call = now;
+        if !gap.is_finite() || gap <= Self::STALL_SECONDS {
+            return;
+        }
+        self.stall_until = now + gap.min(Self::STALL_GRACE_MAX);
+        for c in self.connections.values_mut() {
+            c.last_heard = now;
+            if c.player.is_none() {
+                c.opened = now;
+            }
+            c.limiter.refill(now);
+            c.bytes.refill(now);
+        }
+        for identity in self.identities.values_mut() {
+            if let Some(since) = identity.away_since.as_mut() {
+                *since += gap;
+            }
+        }
+        self.pings.clear();
+    }
+
+    /// Closes connections that went quiet or never finished the handshake, and frees the slots whose players did
+    /// not come back in time.
+    fn watch_connections(&mut self, t: f64) {
+        let handshake = self.options.handshake_timeout_seconds;
+        let idle = if self.options.ping_seconds > 0.0 { self.options.idle_timeout_seconds } else { 0.0 };
+        let overdue: Vec<(ConnectionId, Option<u16>)> = self
+            .connections
+            .values()
+            .filter(|c| match c.player {
+                Some(_) => idle > 0.0 && t - c.last_heard >= idle,
+                None => handshake > 0.0 && t - c.opened >= handshake,
+            })
+            .map(|c| (c.id, c.player))
+            .collect();
+        for (connection, player) in overdue {
+            match player {
+                Some(id) => {
+                    let who = self.name(id);
+                    self.log(format!("{who} timed out: nothing heard for {idle:.0} s"));
+                    self.connections.remove(&connection);
+                    self.out.push(HostOutput::CloseConnection(connection));
+                    self.remove_player(id, true);
+                }
+                None => self.reject(connection, "timeout", Some("the handshake did not finish in time")),
+            }
+        }
+        let window = self.options.reconnect_window_seconds;
+        let gone: Vec<u16> = self
+            .identities
+            .iter()
+            .filter(|(_, i)| i.away_since.is_some_and(|since| t - since >= window))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in gone {
+            self.release_slot(id, |name| format!("{name} did not come back within {window:.0} s; the slot is free"));
+        }
+    }
+
+    /// Every `ping_seconds`: a ping to each connected player, carrying the round-trip times known so far.
+    fn ping_players(&mut self, t: f64) {
+        let every = self.options.ping_seconds;
+        if every <= 0.0 || t - self.last_ping < every {
+            return;
+        }
+        self.last_ping = t;
+        self.ping_n = self.ping_n.wrapping_add(1);
+        let n = self.ping_n;
+        let rtt: BTreeMap<u16, f64> = self.rtt_ms.iter().map(|(&id, &ms)| (id, (ms * 10.0).round() / 10.0)).collect();
+        let payload = codec::encode(&PingMessage { n, rtt });
+        let targets: Vec<(ConnectionId, u16)> =
+            self.connections.values().filter_map(|c| c.player.map(|id| (c.id, id))).collect();
+        for (connection, player) in targets {
+            self.send(connection, MessageKind::Ping, &payload);
+            let queue = self.pings.entry(player).or_default();
+            queue.push_back((n, t));
+            while queue.len() > 8 {
+                queue.pop_front();
+            }
+        }
+    }
+
+    fn on_pong(&mut self, from: u16, n: u32) {
+        let now = self.now();
+        let Some(queue) = self.pings.get_mut(&from) else { return };
+        let Some(at) = queue.iter().position(|&(k, _)| k == n) else { return };
+        let sent = queue[at].1;
+        // older pings that were never answered are not going to be
+        queue.drain(..=at);
+        let sample = ((now - sent) * 1000.0).max(0.0);
+        let smoothed = self.rtt_ms.get(&from).map_or(sample, |old| old * 0.75 + sample * 0.25);
+        self.rtt_ms.insert(from, smoothed);
     }
 
     // ---------------------------------------------------------------- sending

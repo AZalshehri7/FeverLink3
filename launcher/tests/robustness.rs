@@ -506,6 +506,19 @@ fn steam_structures_of_any_size_and_content_are_read_or_refused() {
         }
         full.truncate(r.gen_range(0..708));
         assert!(steamnet::parse_status_event(&full).is_none());
+        // the connection info and the real-time status, which the shared core reads on every poll
+        let info = random_bytes(&mut r, 900);
+        match steamnet::parse_connection_info(&info) {
+            Some(parsed) => {
+                assert!(info.len() >= steamnet::CONNECTION_INFO_SIZE);
+                assert!(parsed.end_debug.len() <= 128 * 3, "the end text is cut to its 128-byte field");
+            }
+            None => assert!(info.len() < steamnet::CONNECTION_INFO_SIZE),
+        }
+        let status = random_bytes(&mut r, 300);
+        // the last field read ends at byte 44; anything shorter is refused, anything else is read
+        assert_eq!(steamnet::parse_real_time_status(&status).is_some(), status.len() >= 44);
+        assert!(steamnet::end_reason_text(r.gen()).len() < 200);
         // identities and Steam IDs
         let id: u64 = r.gen();
         assert_eq!(steamnet::steam_id_of(&steamnet::identity_bytes(id)), Some(id));

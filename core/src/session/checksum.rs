@@ -74,6 +74,19 @@ impl ChecksumRounds {
         Some(Self::compare(n, &round))
     }
 
+    /// Rounds that have a report from every one of `expected` although the last report did not just arrive: the game
+    /// they were still waiting for left. Each is removed and compared, oldest first. A round no one reported to waits.
+    pub fn finished(&mut self, expected: &[u16]) -> Vec<ChecksumOutcome> {
+        let mut done: Vec<i32> = self
+            .rounds
+            .iter()
+            .filter(|(_, round)| !round.is_empty() && expected.iter().all(|id| round.contains_key(id)))
+            .map(|(&n, _)| n)
+            .collect();
+        done.sort_unstable();
+        done.into_iter().filter_map(|n| self.rounds.remove(&n).map(|round| Self::compare(n, &round))).collect()
+    }
+
     pub fn compare(n: i32, reports: &BTreeMap<u16, ChecksumReportMessage>) -> ChecksumOutcome {
         let reporters: Vec<u16> = reports.keys().copied().collect();
         let parts: BTreeSet<&str> = reports.values().flat_map(|r| r.parts.keys().map(String::as_str)).collect();

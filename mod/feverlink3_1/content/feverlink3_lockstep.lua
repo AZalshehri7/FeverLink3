@@ -163,9 +163,20 @@ L.COMMANDS = {
 -- { commands = { <api.cmd function name> = spec }, events = { <id> = { <name> = handler } } }. A spec has the fields
 -- above and may carry two functions for arguments the generic path cannot carry (engine userdata such as proposals):
 --   spec.encode(name, args, ctx) -> body | nil, reason      (same contract as L.encodeCommand)
---   spec.decode(body, ctx)       -> { n = count, ... } | nil, reason
--- and one for a permission category that depends on the arguments:
---   spec.categoryFor(args)       -> category | nil          (nil: the spec's own category)
+--   spec.decode(body, ctx)       -> { n = count, ..., chain = { ... } } | nil, reason
+-- and these optional ones:
+--   spec.categoryFor(args)       -> category | nil          (a permission category that depends on the arguments;
+--                                                            nil: the spec's own category)
+--   args.chain (from decode)     further commands of the same action: argument lists or functions that make them
+--                                (see L.sendNow, L.runChained)
+--   spec.bindsComp, spec.bind    keys for entities the action created, beyond the single one spec.creates names
+--                                (see L.bindsComp, L.bindMap)
+-- and for what is no engine command, or needs the company registry (feverlink3_cmds_company.lua, docs/COMPANIES.md):
+--   spec.virtual = true          a mod-level action: no api.cmd function. The bridge makes its factory in the interface
+--                                state and runs spec.apply on every game instead of an engine command.
+--   spec.apply(ctx, it, args) -> true, effects | nil, reason     (optional) runs on every game before the engine
+--                                command is sent; ctx.co is the company registry, ctx.from the sender id, ctx.at the
+--                                stamp, ctx.key the action key; a reason refuses the action on every game alike.
 function L.registerCommands(commands)
 	for name, spec in pairs(commands or {}) do L.COMMANDS[name] = spec end
 end
@@ -264,9 +275,12 @@ function L.encodeCommand(name, args, ctx)
 	return { fn = name, args = out }
 end
 
--- Decodes a body on the applying game. ctx.player -> entity; ctx.resolve(key) -> entity or nil. Returns the
--- argument list ({ n = count, ... }) or nil and a reason (the action is refused, never applied with a bad id).
+-- Decodes a body on the applying game. ctx.player -> entity (the acting player's company entity in a company
+-- session); ctx.resolve(key) -> entity or nil; ctx.refuse -> a reason the acting player's company cannot be resolved
+-- on this game. Returns the argument list ({ n = count, ... }) or nil and a reason (the action is refused, never
+-- applied with a bad id).
 function L.decodeCommand(body, ctx)
+	if ctx.refuse then return nil, ctx.refuse end
 	if type(body) ~= "table" or type(body.args) ~= "table" then return nil, "malformed body" end
 	local spec = L.COMMANDS[body.fn]
 	if not spec then return nil, "unknown command " .. tostring(body.fn) end
@@ -296,6 +310,77 @@ function L.newestEntity(before, after)
 		if not seen[e] and (created == nil or e > created) then created = e end
 	end
 	return created
+end
+
+-- Every entity in `after` that was not in `before`, ascending.
+function L.newEntities(before, after)
+	local seen, out = {}, {}
+	for _, e in ipairs(before) do seen[e] = true end
+	for _, e in ipairs(after) do
+		if not seen[e] then out[#out + 1] = e end
+	end
+	table.sort(out)
+	return out
+end
+
+-- Actions of more than one engine command (a depot needs its street part built before the depot itself): a schema's
+-- decode may put further commands in args.chain, each an argument list or a function that makes one when its turn comes.
+-- sendNow sends them one after the other at once (the simulation state runs a command as it is sent); runChained does
+-- it through callbacks (the interface state), stopping at the first that fails, and hands the last result to done.
+function L.sendNow(args, send)
+	send(args)
+	for _, entry in ipairs(args.chain or {}) do
+		local nextArgs = entry
+		if type(entry) == "function" then nextArgs = entry() end
+		if type(nextArgs) ~= "table" then error("a further command of the action could not be made") end
+		send(nextArgs)
+	end
+end
+
+function L.runChained(args, send, done)
+	local chain = args.chain or {}
+	local function step(a, i)
+		send(a, function(data, success, entities)
+			if i >= #chain or not success then return done(data, success, entities) end
+			local entry = chain[i + 1]
+			local ok, nextArgs = pcall(function()
+				if type(entry) == "function" then return entry() end
+				return entry
+			end)
+			if ok and type(nextArgs) == "table" then
+				local okS = pcall(step, nextArgs, i + 1)
+				if okS then return end
+			end
+			return done(data, false, {})
+		end)
+	end
+	step(args, 0)
+end
+
+-- Keys for entities an action created. A schema names the components whose new entities to look for (spec.bindsComp: a
+-- name, a list of names, or a function of the body that returns either) and maps the new entities of all of them,
+-- ascending, to keys (spec.bind(body, key, made) -> { [key] = entity }, complete). L.bindsComp returns the list or nil.
+function L.bindsComp(spec, body)
+	local c = spec.bindsComp
+	if type(c) == "function" then
+		local ok, v = pcall(c, body)
+		c = ok and v or nil
+	end
+	if type(c) == "string" then return { c } end
+	if type(c) ~= "table" then return nil end
+	local list = {}
+	for _, name in ipairs(c) do
+		if type(name) == "string" then list[#list + 1] = name end
+	end
+	if #list == 0 then return nil end
+	return list
+end
+
+function L.bindMap(spec, body, key, made)
+	if not spec.bind then return {}, true end
+	local ok, map, complete = pcall(spec.bind, body, key, made)
+	if not ok or type(map) ~= "table" then return {}, false end
+	return map, complete ~= false
 end
 
 -- The same when several creations may appear together (a player buying five vehicles in one go): the oldest new id

@@ -544,6 +544,10 @@ fn decode_every_message_type(bytes: &[u8]) {
         Permissions,
         PlayerSet,
         ChatMessage,
+        ResumeClaim,
+        ResumeGrant,
+        PingMessage,
+        PongMessage,
     );
 }
 
@@ -594,7 +598,9 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             name: random_text(rr, 30),
             version: random_text(rr, 10),
             proof: random_bytes(rr, 40),
+            resume: rr.gen_bool(0.5).then(|| ResumeClaim { id: rr.gen(), mac: random_bytes(rr, 40) }),
         });
+        round_trip(ResumeGrant { token: random_bytes(rr, 40), epoch: rr.gen() });
         round_trip(RejectMessage {
             reason: random_text(rr, 10),
             detail: rr.gen_bool(0.5).then(|| random_text(rr, 30)),
@@ -607,9 +613,17 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             version: random_text(rr, 6),
             players: (0..rr.gen_range(0..5)).map(|_| player_info(rr)).collect(),
             session: session_state(rr),
+            nonce: random_bytes(rr, 40),
+            resume: rr.gen_bool(0.5).then(|| ResumeGrant { token: random_bytes(rr, 40), epoch: rr.gen() }),
+            resumed: rr.gen(),
         });
         round_trip(PlayerJoinedMessage { player: player_info(rr) });
-        round_trip(PlayerLeftMessage { id: rr.gen(), name: random_text(rr, 20) });
+        round_trip(PlayerLeftMessage { id: rr.gen(), name: random_text(rr, 20), away: rr.gen() });
+        round_trip(PingMessage {
+            n: rr.gen(),
+            rtt: (0..rr.gen_range(0..6)).map(|_| (rr.gen(), finite_f64(rr))).collect(),
+        });
+        round_trip(PongMessage { n: rr.gen() });
         round_trip(PeerClockMessage { from: rr.gen(), t: rr.gen(), ahead: rr.gen() });
         round_trip(ChecksumRequestMessage { n: rr.gen(), at: rr.gen(), paused: rr.gen() });
         round_trip(AuthorityMessage {
@@ -656,6 +670,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             bulldoze: player_set(rr),
             spend: player_set(rr),
             speed: player_set(rr),
+            other: player_set(rr),
         });
         round_trip(ChatMessage {
             text: random_text(rr, 60),
@@ -673,6 +688,9 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             version: "0.1".into(),
             players: vec![PlayerInfo { id: 3, name: "A".into(), ready: true }],
             session: SessionState { started: true, speed: 2, pause_at: Some(4000), lead: 1600 },
+            nonce: vec![7; 16],
+            resume: Some(ResumeGrant { token: vec![9; 16], epoch: 3 }),
+            resumed: true,
         });
         mutate(&mut r, &mut damaged);
         decode_every_message_type(&damaged);
@@ -766,7 +784,9 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
 #[test]
 fn a_hostile_joined_player_cannot_panic_or_bloat_the_host() {
     let mut r = rng(9);
-    let (mut h, ids) = Harness::running(3, 2, HostOptions::default());
+    // the rate limits would end the hostile connection after its burst; they have their own tests
+    let unlimited = HostOptions { max_frames_per_second: 0, max_bytes_per_second: 0, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(3, 2, unlimited);
     let victim = ids[0];
     let mut hostile = Hostile { connection: ids[2], id: h.p(ids[2]).session.id().unwrap(), counter: 5000 };
     let others = [ids[0], ids[1]];
@@ -807,7 +827,7 @@ fn a_hostile_joined_player_cannot_panic_or_bloat_the_host() {
     let before = h.p(others[1]).count(MessageKind::Action);
     h.player_game(victim, MessageKind::Action, &json(&ActionMessage::new(1_000_000, 1, "{}")));
     assert_eq!(h.p(others[1]).count(MessageKind::Action), before + 1);
-    assert_eq!(h.host.players().len(), 4);
+    assert!(h.host.players().len() >= 3, "only the hostile player may be gone: a Leave is allowed from a player");
     assert!(h.host.dropped() > 0);
 }
 
@@ -867,6 +887,47 @@ fn the_hosts_own_game_and_the_connection_table_survive_random_calls() {
 }
 
 #[test]
+fn a_join_that_claims_an_old_slot_gets_it_only_with_the_token() {
+    // anybody with the code can say "I am player 3"; only the holder of player 3's token is believed
+    let mut r = rng(24);
+    let (mut h, ids) = Harness::running(3, 1, HostOptions::default());
+    let before: Vec<(u16, String)> = h.host.players().iter().map(|(id, p)| (*id, p.name.clone())).collect();
+    for i in 0..iters(300) {
+        let connection = 50_000 + i as u64;
+        let outs = h.host.connection_opened(connection);
+        let nonce = outs
+            .iter()
+            .find_map(|o| match o {
+                HostOutput::SendToConnection { frame, .. } if frame.header.kind == u8::from(MessageKind::Challenge) => {
+                    codec::try_decode::<ChallengeMessage>(&frame.body)
+                }
+                _ => None,
+            })
+            .expect("a challenge")
+            .nonce;
+        let name = format!("X{i}");
+        let proof = HostSession::proof(&h.key, &nonce, &name).to_vec();
+        let mut join = JoinMessage::new(&name, "0.1", proof);
+        let claimed = if r.gen_bool(0.7) { before[r.gen_range(0..before.len())].0 } else { r.gen() };
+        join.resume = Some(ResumeClaim { id: claimed, mac: random_bytes(&mut r, 40) });
+        let header =
+            FrameHeader::new(FrameHeader::CURRENT_VERSION, MessageKind::Join.into(), HostSession::UNASSIGNED, 0);
+        let outs = h.host.frame_received(connection, &Frame::new(header, codec::encode(&join)));
+        h.pump_host(outs);
+        // whatever became of the stranger, nobody it named was replaced or disconnected
+        for (id, name) in &before {
+            assert_eq!(h.host.players().get(id).map(|p| p.name.as_str()), Some(name.as_str()), "player {id}");
+        }
+        assert!(ids.iter().all(|c| h.routable.contains(c)), "no connection of the honest players was closed");
+        // a stranger who joined as a new player and left is held as away, until the table is full: after that the
+        // joins are refused, and the check above still holds
+        let closed = h.host.connection_closed(connection);
+        h.pump_host(closed);
+    }
+    assert!(h.host.players().len() <= HostOptions::default().max_players);
+}
+
+#[test]
 fn a_player_survives_a_hostile_host() {
     let mut r = rng(11);
     let mut h = Harness::running(1, 1, HostOptions::default()).0;
@@ -883,12 +944,15 @@ fn a_player_survives_a_hostile_host() {
         MessageKind::ResyncChunk,
         MessageKind::ResyncLoad,
         MessageKind::Permissions,
+        MessageKind::Ping,
         MessageKind::Action,
         MessageKind::Chat,
     ];
     let mut counter = 1_000_000u64;
     for i in 0..iters(3000) {
         let kind: u8 = if r.gen_bool(0.1) { r.gen() } else { host_kinds[r.gen_range(0..host_kinds.len())].into() };
+        // a sealed Kicked is the host ending the session on purpose: that is the one thing a host may do to a player
+        let kind = if kind == u8::from(MessageKind::Kicked) { u8::from(MessageKind::Chat) } else { kind };
         let payload = match r.gen_range(0..4) {
             0 => random_bytes(&mut r, 300),
             1 => serde_json::to_vec(&json_value(&mut r, 0)).unwrap(),

@@ -153,6 +153,65 @@ pub enum NetEvent {
     Closed { conn: ConnectionId, reason: String },
 }
 
+/// What a connection attempt is given besides its target, for transports where finding the other side can take
+/// long (a Steam route through the relays takes 10 to 20 s): where its events go, how long it may take, a way to
+/// ask it to stop, and a way for it to say what it is doing ("finding a route"). TCP ignores the last two.
+pub struct ConnectContext<'a> {
+    /// The id the connection's events carry.
+    pub conn: ConnectionId,
+    pub tx: Sender<NetEvent>,
+    pub timeout: Duration,
+    /// Polled while waiting; true means give up now.
+    pub cancelled: &'a dyn Fn() -> bool,
+    /// Called with a short status text each time it changes.
+    pub progress: &'a mut dyn FnMut(&str),
+}
+
+/// What a transport measured about one connection, for the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkInfo {
+    pub conn: ConnectionId,
+    /// Round trip in ms as the transport measures it; `None` when it does not (yet).
+    pub ping_ms: Option<u32>,
+    /// How the connection travels (`direct`, `through a Steam relay`); `None` when the transport does not say.
+    /// Steam can move a relayed connection to a direct path later, so this is re-measured.
+    pub route: Option<String>,
+}
+
+/// What the host session needs from a listening transport. Its events come back on the channel the transport was
+/// built with, as [`NetEvent`]s; the rules at the top of this file (a connection's `Closed` exactly once and last,
+/// no frames after `close`) hold for every implementation. [`HostNet`] is TCP,
+/// [`crate::steam_transport::SteamHostNet`] is Steam.
+pub trait HostTransport: Send + 'static {
+    /// Writes a frame to one connection. An error means the connection is gone or was just closed because of this
+    /// write, or the frame cannot be sent at all.
+    fn send(&self, conn: ConnectionId, frame: &Frame) -> io::Result<()>;
+    /// Closes one connection. Frames already written are delivered first; `Closed` follows.
+    fn close(&self, conn: ConnectionId);
+    /// The socket address it listens on, for transports that have one.
+    fn local_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// Where it listens, for the log.
+    fn describe(&self) -> String;
+    /// What it measured about each open connection (ping, route); empty for a transport that measures nothing.
+    fn links(&self) -> Vec<LinkInfo> {
+        Vec::new()
+    }
+}
+
+/// What a player session needs from its connection to the host ([`ClientNet`] or
+/// [`crate::steam_transport::SteamClientNet`]).
+pub trait ClientTransport: Send + 'static {
+    fn send(&self, frame: &Frame) -> io::Result<()>;
+    /// Where it is connected to, for the log.
+    fn describe(&self) -> String;
+    /// What it measured about the connection to the host (ping, route), `None` for a transport that measures nothing.
+    fn link(&self) -> Option<LinkInfo> {
+        None
+    }
+}
+
 /// One TCP connection: its writer, a handle to shut it down, and the flag that makes closing idempotent.
 #[derive(Debug)]
 struct Link {
@@ -328,9 +387,13 @@ fn spawn_reader(
     role: &str,
     policy: ReadPolicy,
 ) -> io::Result<JoinHandle<()>> {
-    thread::Builder::new()
-        .name(format!("feverlink3-{role}-read-{conn}"))
-        .spawn(move || read_loop(conn, &link, &tx, policy))
+    thread::Builder::new().name(format!("feverlink3-{role}-read-{conn}")).spawn(move || {
+        // a reader that panics must still close its connection and say so: the session waits for the last event
+        if let Err(why) = crate::guard::guarded(|| read_loop(conn, &link, &tx, policy)) {
+            link.close();
+            let _ = tx.send(NetEvent::Closed { conn, reason: format!("the reader stopped: {why}") });
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -423,6 +486,24 @@ impl HostNet {
 impl Drop for HostNet {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+impl HostTransport for HostNet {
+    fn send(&self, conn: ConnectionId, frame: &Frame) -> io::Result<()> {
+        HostNet::send(self, conn, frame)
+    }
+
+    fn close(&self, conn: ConnectionId) {
+        HostNet::close(self, conn);
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        Some(self.local_addr)
+    }
+
+    fn describe(&self) -> String {
+        self.local_addr.to_string()
     }
 }
 
@@ -537,6 +618,16 @@ impl ClientNet {
 impl Drop for ClientNet {
     fn drop(&mut self) {
         self.link.close();
+    }
+}
+
+impl ClientTransport for ClientNet {
+    fn send(&self, frame: &Frame) -> io::Result<()> {
+        ClientNet::send(self, frame)
+    }
+
+    fn describe(&self) -> String {
+        self.peer.to_string()
     }
 }
 
@@ -914,15 +1005,17 @@ mod tests {
     #[test]
     fn connect_tries_endpoints_in_order_and_reports_failure() {
         let (tx, _rx) = mpsc::channel();
-        let dead = {
-            let l = TcpListener::bind(loopback()).unwrap();
-            l.local_addr().unwrap()
-        };
+        // A dead address that stays dead: the port is held by a listener for the whole test (a port that was only
+        // freed could be taken by a test running in parallel), and the address is another loopback address than the
+        // one the listener is bound to, where nothing listens.
+        let holder = TcpListener::bind(loopback()).unwrap();
+        let dead = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), holder.local_addr().unwrap().port()));
         assert!(ClientNet::connect(&[dead], 1, tx.clone()).is_err());
         assert!(ClientNet::connect(&[], 1, tx.clone()).is_err());
         let (htx, _hrx) = mpsc::channel();
         let host = HostNet::bind(loopback(), htx).unwrap();
         let ok = ClientNet::connect(&[dead, host.local_addr()], 2, tx).unwrap();
         assert_eq!(ok.peer(), host.local_addr());
+        drop(holder);
     }
 }
