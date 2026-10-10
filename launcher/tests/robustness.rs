@@ -1,6 +1,6 @@
 //! Randomised robustness tests for the launcher's parsers and the file link: random and mutated input to the Lua
-//! text reader and writer, the log lines and the tail that reads them from a file the game writes, the UPnP and
-//! Steam parsers, the VDF reader and the live controller's command file. Nothing may panic, nothing may allocate
+//! text reader and writer, the log lines and the tail that reads them from a file the game writes, the Steam
+//! parsers, the VDF reader and the live controller's command file. Nothing may panic, nothing may allocate
 //! absurd amounts, and what is valid must round-trip.
 //!
 //! Seeded, so a failure repeats; `FEVERLINK3_FUZZ_SCALE=50` runs every test 50 times longer and
@@ -10,16 +10,15 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use feverlink3_core::session::MessageKind;
 use feverlink3_launcher::gamelink::{self, Line, Tail};
 use feverlink3_launcher::live::{Controller, CMD_FILE};
+use feverlink3_launcher::luatext;
 use feverlink3_launcher::session::{from_game_line, to_game_line, LINE_KINDS};
 use feverlink3_launcher::steam::parse_vdf;
 use feverlink3_launcher::steamnet;
-use feverlink3_launcher::{luatext, upnp};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
@@ -477,82 +476,6 @@ fn an_action_body_reaches_the_game_only_as_a_literal() {
         let payload = serde_json::to_vec(&json!({ "stamp": 1, "seq": 1, "from": 2, "body": body })).unwrap();
         let delivered = to_game_line(MessageKind::Action, &payload).is_some();
         assert_eq!(delivered, luatext::is_literal(&body), "iteration {i}: {body:?}");
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------- UPnP
-
-fn xml_like(r: &mut StdRng) -> String {
-    const PIECES: [&str; 28] = [
-        "<root>",
-        "</root>",
-        "<service>",
-        "</service>",
-        "<serviceType>",
-        "</serviceType>",
-        "<controlURL>",
-        "</controlURL>",
-        "urn:schemas-upnp-org:service:WANIPConnection:1",
-        "urn:schemas-upnp-org:service:WANPPPConnection:1",
-        "/ctl/IPConn",
-        "http://192.168.0.1:5000/x",
-        "http://203.0.113.9/",
-        "<NewExternalIPAddress>",
-        "</NewExternalIPAddress>",
-        "203.0.113.9",
-        "999.1.1.1",
-        "\r\n",
-        "LOCATION: ",
-        "Location:http://10.0.0.1/d.xml",
-        "é",
-        "日本",
-        "😀",
-        "<",
-        ">",
-        "/",
-        ":",
-        "http://",
-    ];
-    (0..r.gen_range(0..30)).map(|_| PIECES[r.gen_range(0..PIECES.len())]).collect()
-}
-
-#[test]
-fn router_answers_of_any_shape_are_read_or_refused() {
-    let mut r = rng(8);
-    for i in 0..iters(6000) {
-        let text = match r.gen_range(0..3) {
-            0 => xml_like(&mut r),
-            1 => random_text(&mut r, 120),
-            _ => {
-                let mut b = xml_like(&mut r).into_bytes();
-                mutate(&mut r, &mut b);
-                String::from_utf8_lossy(&b).into_owned()
-            }
-        };
-        let base =
-            ["http://192.168.0.1:5000/rootDesc.xml", "http://203.0.113.9/x", "http://router/", "", text.as_str()]
-                [r.gen_range(0..5)];
-        if let Some(location) = upnp::parse_location(&text) {
-            assert!(upnp::is_lan_url(&location), "iteration {i}: {location}");
-        }
-        if let Some((control, service)) = upnp::parse_control_url(&text, base) {
-            assert!(upnp::is_lan_url(&control), "iteration {i}: {control}");
-            assert!(service.starts_with("urn:schemas-upnp-org:service:WAN"));
-        }
-        let _ = upnp::parse_external_ip(&text);
-        if let Some((authority, path)) = upnp::split_url(&text) {
-            assert!(!authority.contains(char::is_whitespace) && !path.contains(char::is_control), "iteration {i}");
-        }
-        let _ = upnp::is_lan_url(&text);
-    }
-    // addresses: the rule agrees with the standard library's notion of private for every address of a sample
-    for _ in 0..iters(20_000) {
-        let ip = Ipv4Addr::from(r.gen::<u32>());
-        let o = ip.octets();
-        let expected =
-            ip.is_private() || ip.is_loopback() || ip.is_link_local() || (o[0] == 100 && (64..128).contains(&o[1]));
-        assert_eq!(upnp::is_private(ip), expected, "{ip}");
-        assert_eq!(upnp::is_lan_url(&format!("http://{ip}:80/x")), expected && !ip.is_loopback(), "{ip}");
     }
 }
 

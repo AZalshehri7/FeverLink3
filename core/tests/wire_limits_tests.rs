@@ -4,7 +4,7 @@
 use std::io::Cursor;
 
 use feverlink3_core::crypto::{Opener, SealError, Sealer, SessionKey};
-use feverlink3_core::lobby::{base32_decode, JoinCode};
+use feverlink3_core::lobby::{base32_decode, JoinCode, RelayAddr};
 use feverlink3_core::protocol::{Frame, FrameCodec, FrameHeader, ProtocolError};
 
 const SECRET: [u8; 16] = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
@@ -95,9 +95,41 @@ fn join_code_text_is_bounded_before_it_is_decoded() {
 }
 
 #[test]
-fn an_encoded_code_never_holds_more_endpoints_than_a_code_can_carry() {
+fn an_encoded_code_never_holds_more_endpoints_or_relays_than_a_code_can_carry() {
     let endpoints: Vec<std::net::SocketAddr> = (0..20).map(|i| format!("10.0.0.{i}:28090").parse().unwrap()).collect();
-    let code = JoinCode { version: 1, created: 5, endpoints, secret: SECRET };
+    let relays: Vec<RelayAddr> = (0..10).map(|i| RelayAddr::new(&format!("10.1.0.{i}"), 28100).unwrap()).collect();
+    // the fields are public, so a value can be built that `create` and `with_relays` would have refused
+    let code =
+        JoinCode { version: 2, created: 5, endpoints, relays, steam_id: Some(76561198000000000), secret: SECRET };
     let back = JoinCode::try_decode(&code.encode()).expect("the code reads back");
     assert_eq!(back.endpoints.len(), JoinCode::MAX_ENDPOINTS);
+    assert_eq!(back.relays.len(), JoinCode::MAX_RELAYS);
+    assert_eq!(back.steam_id, Some(76561198000000000));
+}
+
+#[test]
+fn the_longest_possible_code_still_fits_the_text_limit_with_its_dashes() {
+    let endpoints: Vec<std::net::SocketAddr> =
+        (0..JoinCode::MAX_ENDPOINTS).map(|i| format!("[2001:db8::{i:x}]:28090").parse().unwrap()).collect();
+    // names as long as a name may be (100 characters in labels of at most 63)
+    let relays: Vec<RelayAddr> = (0..JoinCode::MAX_RELAYS)
+        .map(|i| {
+            let name = format!(
+                "{}.{}.relay{i}.{}",
+                "a".repeat(63),
+                "b".repeat(20),
+                "c".repeat(RelayAddr::MAX_NAME_LEN - 63 - 20 - 6 - 3)
+            );
+            assert_eq!(name.len(), RelayAddr::MAX_NAME_LEN);
+            RelayAddr::new(&name, 28100).expect("a name of the longest allowed size")
+        })
+        .collect();
+    let code =
+        JoinCode::create(&endpoints, SECRET, Some(1)).unwrap().with_relays(&relays).unwrap().with_steam_id(1 << 56);
+    let text = code.encode();
+    assert!(text.len() <= 976, "{}", text.len());
+    let typed: String =
+        text.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join("-");
+    assert!(typed.len() < JoinCode::MAX_TEXT_LENGTH, "{}", typed.len());
+    assert_eq!(JoinCode::try_decode(&typed), Some(code));
 }

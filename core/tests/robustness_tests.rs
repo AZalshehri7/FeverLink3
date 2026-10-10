@@ -12,11 +12,15 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::io::{self, Cursor, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use common::*;
 use feverlink3_core::crypto::{OpenError, Opener, ReplayWindow, Sealer, SessionKey};
-use feverlink3_core::lobby::{base32_decode, base32_encode, JoinCode};
+use feverlink3_core::lobby::{base32_decode, base32_encode, JoinCode, RelayAddr};
 use feverlink3_core::protocol::{Frame, FrameCodec, FrameHeader};
+use feverlink3_core::relay::{
+    CloseReason, ErrorCode, ReadStep, RelayCodec, RelayError, RelayMessage, RelayReader, Timing,
+};
 use feverlink3_core::session::*;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -24,6 +28,7 @@ use rand::{Rng, SeedableRng};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 // ------------------------------------------------------------------------------------------ memory measurement
 
@@ -1074,4 +1079,444 @@ fn text_a_player_chooses_is_clipped_before_it_reaches_the_host_log() {
     assert!(h.host_log.iter().all(|l| l.chars().count() < 600));
     let unique: HashSet<&String> = h.host_log.iter().collect();
     assert!(!unique.is_empty());
+}
+
+// ------------------------------------------------------------------------- join code extensions and relay names
+
+fn random_label(r: &mut StdRng, max: usize) -> String {
+    let n = r.gen_range(1..=max);
+    (0..n)
+        .map(|k| {
+            let edge = k == 0 || k + 1 == n;
+            let pool: &[u8] =
+                if edge { b"abcdefghijklmnopqrstuvwxyz0123456789" } else { b"abcdefghijklmnopqrstuvwxyz0123456789-" };
+            char::from(pool[r.gen_range(0..pool.len())])
+        })
+        .collect()
+}
+
+fn random_relay(r: &mut StdRng) -> RelayAddr {
+    let port: u16 = r.gen_range(1..=u16::MAX);
+    match r.gen_range(0..3) {
+        0 => RelayAddr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(r.gen::<u32>())), port)),
+        1 => RelayAddr::from(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(r.gen::<u128>())), port)),
+        _ => loop {
+            // up to three labels; one that ends in digits only is not a name, so that draw is made again
+            let name = (0..r.gen_range(1..4)).map(|_| random_label(r, 20)).collect::<Vec<_>>().join(".");
+            if let Some(addr) = RelayAddr::new(&name, port) {
+                return addr;
+            }
+        },
+    }
+}
+
+/// A join code with every optional part that a code can have, in random amounts.
+fn random_code(r: &mut StdRng) -> JoinCode {
+    let endpoints: Vec<SocketAddr> =
+        (0..r.gen_range(0..=JoinCode::MAX_ENDPOINTS)).map(|_| random_endpoint(r)).collect();
+    let mut code = JoinCode::create(&endpoints, r.gen(), Some(r.gen())).unwrap();
+    if r.gen_bool(0.7) {
+        let relays: Vec<RelayAddr> = (0..r.gen_range(1..=JoinCode::MAX_RELAYS)).map(|_| random_relay(r)).collect();
+        code = code.with_relays(&relays).unwrap();
+    }
+    if r.gen_bool(0.6) {
+        code = code.with_steam_id(r.gen_range(1..=u64::MAX));
+    }
+    code
+}
+
+/// The text of a code whose body is `body`: the checksum an attacker can always compute is computed, so what is
+/// tested is the parser of the structure, not the typing check.
+fn seal_body(mut body: Vec<u8>) -> String {
+    let check = Sha256::digest(&body);
+    body.extend_from_slice(&check[..4]);
+    base32_encode(&body)
+}
+
+/// A code body that follows the layout often enough to get deep into it and breaks it at random places.
+fn structured_code_body(r: &mut StdRng) -> Vec<u8> {
+    let mut b = vec![[1u8, 2, 2, 2, 3, 0, 255][r.gen_range(0..7)]];
+    b.extend(r.gen::<u32>().to_be_bytes());
+    b.extend(r.gen::<[u8; 16]>());
+    let endpoints = [0u8, 1, 1, 2, 8, 9, 255][r.gen_range(0..7)];
+    b.push(endpoints);
+    for _ in 0..endpoints.min(10) {
+        let family = [4u8, 4, 6, 6, 1, 0, 255][r.gen_range(0..7)];
+        b.push(family);
+        let len = match family {
+            4 => 4,
+            6 => 16,
+            _ => r.gen_range(0..20),
+        };
+        b.extend((0..len).map(|_| r.gen::<u8>()));
+        b.extend(r.gen::<u16>().to_be_bytes());
+    }
+    if r.gen_bool(0.85) {
+        let count = [0u8, 1, 2, 2, 3, 8, 9, 255][r.gen_range(0..8)];
+        b.push(count);
+        for _ in 0..count.min(10) {
+            let tag = [1u8, 1, 2, 2, 3, 99, 0, 255][r.gen_range(0..8)];
+            let value: Vec<u8> = match tag {
+                1 => {
+                    let n = [0u8, 1, 2, 4, 5, 255][r.gen_range(0..6)];
+                    let mut v = vec![n];
+                    for _ in 0..n.min(6) {
+                        let family = [4u8, 6, 1, 1, 7][r.gen_range(0..5)];
+                        v.push(family);
+                        let len = match family {
+                            4 => 4,
+                            6 => 16,
+                            _ => r.gen_range(0..110),
+                        };
+                        if family == 1 {
+                            v.push(len as u8);
+                            v.extend((0..len).map(|_| b"abcxyz019-."[r.gen_range(0..11)]));
+                        } else {
+                            v.extend((0..len).map(|_| r.gen::<u8>()));
+                        }
+                        v.extend(r.gen::<u16>().to_be_bytes());
+                    }
+                    v
+                }
+                2 => {
+                    let mut v = r.gen::<u64>().to_be_bytes().to_vec();
+                    if r.gen_bool(0.2) {
+                        v.truncate(r.gen_range(0..8));
+                    }
+                    if r.gen_bool(0.1) {
+                        v = vec![0; 8];
+                    }
+                    v
+                }
+                _ => random_bytes(r, 40),
+            };
+            b.push(tag);
+            // the length is usually the true one
+            let declared = if r.gen_bool(0.85) { value.len() as u16 } else { r.gen_range(0..300) };
+            b.extend(declared.to_be_bytes());
+            b.extend(value);
+        }
+    }
+    if r.gen_bool(0.15) {
+        b.extend(random_bytes(r, 10));
+    }
+    b
+}
+
+#[test]
+fn join_codes_with_relays_and_a_steam_id_round_trip() {
+    let mut r = rng(17);
+    for i in 0..iters(1500) {
+        let code = random_code(&mut r);
+        let text = code.encode();
+        assert!(text.len() <= 976, "iteration {i}: {} characters", text.len());
+        assert_eq!(JoinCode::try_decode(&text).as_ref(), Some(&code), "iteration {i}");
+        // a code is version 1 exactly when nothing needs version 2, so that older builds can still read it
+        assert_eq!(code.version, if code.relays.is_empty() && code.steam_id.is_none() { 1 } else { 2 });
+        assert_eq!(code.relay_room(), SessionKey::relay_room_id(&code.secret));
+        // typed in groups with dashes, in lower case
+        let typed: String =
+            text.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).to_lowercase()).collect::<Vec<_>>().join("-");
+        assert_eq!(JoinCode::try_decode(&typed).as_ref(), Some(&code), "iteration {i}");
+    }
+}
+
+#[test]
+fn relay_addresses_print_back_to_themselves_and_text_of_any_kind_is_read_or_refused() {
+    let mut r = rng(18);
+    for i in 0..iters(3000) {
+        let relay = random_relay(&mut r);
+        assert_eq!(RelayAddr::parse(&relay.to_string(), None).as_ref(), Some(&relay), "iteration {i}: {relay}");
+        assert_eq!(RelayAddr::new(&relay.host(), relay.port()).as_ref(), Some(&relay), "iteration {i}");
+        assert_eq!(relay.socket_addr().map(|a| a.port()).unwrap_or(relay.port()), relay.port());
+
+        let text = match r.gen_range(0..4) {
+            0 => random_text(&mut r, 60),
+            1 => String::from_utf8_lossy(&random_bytes(&mut r, 60)).into_owned(),
+            2 => (0..r.gen_range(0..12))
+                .map(|_| {
+                    ["[", "]", ":", ".", "a", "1", "-", "::", "65535", "0", " ", "é", "999", "example", "com"]
+                        [r.gen_range(0..15)]
+                })
+                .collect(),
+            _ => format!("{}:{}", random_label(&mut r, 70), r.gen::<u32>()),
+        };
+        for default_port in [None, Some(28100)] {
+            if let Some(parsed) = RelayAddr::parse(&text, default_port) {
+                assert!(parsed.port() != 0, "{text:?}");
+                assert_eq!(RelayAddr::parse(&parsed.to_string(), None), Some(parsed), "{text:?}");
+            }
+        }
+        let _ = RelayAddr::new(&text, r.gen());
+    }
+}
+
+#[test]
+fn join_code_structure_after_a_valid_checksum_is_read_or_refused_and_what_is_read_can_be_written() {
+    let mut r = rng(19);
+    let mut accepted = 0;
+    for i in 0..iters(10_000) {
+        let body = if r.gen_bool(0.6) {
+            structured_code_body(&mut r)
+        } else {
+            // a valid code with its bytes damaged under a fresh checksum
+            let mut body = base32_decode(&random_code(&mut r).encode()).unwrap();
+            body.truncate(body.len() - 4);
+            mutate(&mut r, &mut body);
+            body
+        };
+        let text = seal_body(body);
+        let (decoded, peak) = peak_of(|| JoinCode::try_decode(&text));
+        assert!(peak <= 16 * 1024, "iteration {i}: {peak} bytes for {} characters", text.len());
+        if let Some(code) = decoded {
+            accepted += 1;
+            assert!(code.endpoints.len() <= JoinCode::MAX_ENDPOINTS && code.relays.len() <= JoinCode::MAX_RELAYS);
+            assert!(code.steam_id != Some(0) && (code.version == 1 || code.version == 2));
+            assert!(code.version == 2 || (code.relays.is_empty() && code.steam_id.is_none()));
+            assert!(code.relays.iter().all(|relay| relay.port() != 0));
+            // what was read can be written, and read again as the same thing; a field of a later build is not kept
+            let again = JoinCode::try_decode(&code.encode()).unwrap_or_else(|| panic!("iteration {i}: {code:?}"));
+            assert_eq!(
+                (again.created, &again.endpoints, &again.relays, again.steam_id, again.secret),
+                (code.created, &code.endpoints, &code.relays, code.steam_id, code.secret),
+                "iteration {i}"
+            );
+        }
+    }
+    assert!(
+        accepted > iters(10_000) / 50,
+        "the generator reaches valid codes often enough to mean something: {accepted}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------ relay messages
+
+fn random_frame_bytes(r: &mut StdRng) -> Vec<u8> {
+    FrameCodec::encode_frame(&Frame::new(random_header(r), random_bytes(r, 400))).unwrap()
+}
+
+fn random_relay_message(r: &mut StdRng) -> RelayMessage {
+    match r.gen_range(0..11) {
+        0 => RelayMessage::Register { version: r.gen(), room: r.gen() },
+        1 => RelayMessage::Join { version: r.gen(), room: r.gen() },
+        2 => RelayMessage::Registered(Timing { ping_secs: r.gen(), idle_secs: r.gen() }),
+        3 => RelayMessage::Joined(Timing { ping_secs: r.gen(), idle_secs: r.gen() }),
+        4 => RelayMessage::Error { code: ErrorCode(r.gen()), text: random_text(r, 300) },
+        5 => RelayMessage::Ping(r.gen()),
+        6 => RelayMessage::Pong(r.gen()),
+        7 => RelayMessage::Data(random_frame_bytes(r)),
+        8 => RelayMessage::HostData { vconn: r.gen(), frame: random_frame_bytes(r) },
+        9 => RelayMessage::Open { vconn: r.gen() },
+        _ => RelayMessage::Close { vconn: r.gen(), reason: CloseReason(r.gen()) },
+    }
+}
+
+/// The message as it comes back from the wire: an error text is cut to 200 bytes at a character boundary.
+fn as_received(message: &RelayMessage) -> RelayMessage {
+    match message {
+        RelayMessage::Error { code, text } => {
+            let mut end = text.len().min(RelayCodec::MAX_ERROR_TEXT);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            RelayMessage::Error { code: *code, text: text[..end].to_owned() }
+        }
+        other => other.clone(),
+    }
+}
+
+/// A stream that gives a few bytes at a time and sometimes says it would block, like a socket with a timeout.
+struct Stutter {
+    data: Vec<u8>,
+    at: usize,
+    rng: StdRng,
+}
+
+impl Read for Stutter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.at < self.data.len() && self.rng.gen_bool(0.3) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let n = self.rng.gen_range(1..=7).min(buf.len()).min(self.data.len() - self.at);
+        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn relay_messages_round_trip_whole_and_through_a_reader_that_stutters() {
+    let mut r = rng(20);
+    for i in 0..iters(800) {
+        let messages: Vec<RelayMessage> = (0..r.gen_range(1..7)).map(|_| random_relay_message(&mut r)).collect();
+        let mut wire = Vec::new();
+        for m in &messages {
+            let one = RelayCodec::encode(m).unwrap_or_else(|e| panic!("iteration {i}: {m:?}: {e}"));
+            let (back, used) = RelayCodec::try_decode(&one).unwrap().expect("a whole message");
+            assert_eq!((&back, used), (&as_received(m), one.len()), "iteration {i}");
+            assert!(
+                RelayCodec::try_decode(&one[..one.len() - 1]).unwrap().is_none(),
+                "one byte short is not a message"
+            );
+            assert!(!m.summary().is_empty());
+            wire.extend_from_slice(&one);
+        }
+        let expected: Vec<RelayMessage> = messages.iter().map(as_received).collect();
+
+        // all at once
+        let (mut rest, mut got) = (&wire[..], Vec::new());
+        while let Some((m, used)) = RelayCodec::try_decode(rest).unwrap() {
+            got.push(m);
+            rest = &rest[used..];
+        }
+        assert_eq!((got, rest.len()), (expected.clone(), 0), "iteration {i}");
+
+        // through a reader that never gives more than a few bytes and keeps saying "not yet"
+        let mut stream = Stutter { data: wire, at: 0, rng: StdRng::seed_from_u64(i as u64) };
+        let (mut reader, mut got) = (RelayReader::new(), Vec::new());
+        loop {
+            match reader.read_message(&mut stream) {
+                Ok(Some(m)) => got.push(m),
+                Ok(None) => break,
+                Err(e) if e.is_timeout() => {}
+                Err(e) => panic!("iteration {i}: {e}"),
+            }
+        }
+        assert_eq!(got, expected, "iteration {i}");
+        assert_eq!(reader.buffered(), 0);
+    }
+}
+
+fn read_everything(bytes: &[u8]) -> (Vec<RelayMessage>, Option<RelayError>) {
+    let (mut reader, mut cursor, mut got) = (RelayReader::new(), Cursor::new(bytes.to_vec()), Vec::new());
+    loop {
+        match reader.step(&mut cursor) {
+            Ok(ReadStep::Message(m)) => got.push(m),
+            Ok(ReadStep::More) => {}
+            Ok(ReadStep::End) => return (got, None),
+            Err(e) => return (got, Some(e)),
+        }
+    }
+}
+
+#[test]
+fn relay_messages_of_any_shape_are_read_or_refused_and_a_length_costs_nothing_until_the_bytes_come() {
+    let mut r = rng(21);
+    for i in 0..iters(5000) {
+        let bytes = match r.gen_range(0..5) {
+            0 => random_bytes(&mut r, 300),
+            1 => {
+                let mut b = RelayCodec::encode(&random_relay_message(&mut r)).unwrap();
+                mutate(&mut r, &mut b);
+                b
+            }
+            2 => {
+                // a length field at its limits, with next to nothing behind it
+                let length = [
+                    0u32,
+                    1,
+                    2,
+                    17,
+                    RelayCodec::MAX_LENGTH as u32,
+                    RelayCodec::MAX_LENGTH as u32 + 1,
+                    u32::MAX,
+                    1 << 31,
+                ][r.gen_range(0..8)];
+                let mut b = length.to_be_bytes().to_vec();
+                b.push([1u8, 2, 5, 16, 17, 18, 19, 200][r.gen_range(0..8)]);
+                b.extend(random_bytes(&mut r, 20));
+                b
+            }
+            3 => {
+                // data messages whose frame inside is wrong in each way a frame can be
+                let mut frame = random_frame_bytes(&mut r);
+                match r.gen_range(0..4) {
+                    0 => frame.truncate(r.gen_range(0..frame.len())),
+                    1 => frame.extend(random_bytes(&mut r, 8)),
+                    2 => frame[..4].copy_from_slice(&r.gen::<u32>().to_be_bytes()),
+                    _ => frame.clear(),
+                }
+                let mut b = ((frame.len() + 1) as u32).to_be_bytes().to_vec();
+                b.push(16);
+                b.extend(frame);
+                b
+            }
+            _ => (0..r.gen_range(1..4))
+                .flat_map(|_| RelayCodec::encode(&random_relay_message(&mut r)).unwrap())
+                .collect(),
+        };
+        let (decoded, peak) = peak_of(|| RelayCodec::try_decode(&bytes));
+        assert!(peak <= bytes.len() + 4096, "iteration {i}: decode held {peak} for {} bytes", bytes.len());
+        let ((messages, error), peak) = peak_of(|| read_everything(&bytes));
+        // the reader reserves what the message in progress needs, a quarter MiB at most per read, and no more
+        assert!(
+            peak <= 2 * bytes.len() + 600 * 1024,
+            "iteration {i}: the reader held {peak} for {} bytes",
+            bytes.len()
+        );
+        if let Ok(Some((first, _))) = &decoded {
+            assert_eq!(messages.first(), Some(first), "iteration {i}: the reader and the decoder agree");
+        }
+        // what came out can be sent again, and what is received then is stable
+        for m in &messages {
+            let again = RelayCodec::encode(m).unwrap_or_else(|e| panic!("iteration {i}: {m:?}: {e}"));
+            let (back, _) = RelayCodec::try_decode(&again).unwrap().expect("a whole message");
+            assert_eq!(back, as_received(m), "iteration {i}");
+        }
+        if let Some(e) = error {
+            assert!(!e.to_string().is_empty() && !e.is_timeout());
+            let _ = e.code();
+        }
+    }
+}
+
+#[test]
+fn a_frame_inside_a_data_message_is_checked_and_only_a_whole_frame_passes() {
+    let mut r = rng(22);
+    for i in 0..iters(4000) {
+        let valid = random_frame_bytes(&mut r);
+        let bytes = match r.gen_range(0..3) {
+            0 => valid.clone(),
+            1 => random_bytes(&mut r, 100),
+            _ => {
+                let mut b = valid.clone();
+                mutate(&mut r, &mut b);
+                b
+            }
+        };
+        match RelayCodec::decode_frame(&bytes) {
+            Ok(frame) => assert_eq!(FrameCodec::encode_frame(&frame).unwrap(), bytes, "iteration {i}"),
+            Err(e) => assert!(!e.to_string().is_empty()),
+        }
+        // the two ways of making a data message give the same bytes
+        let frame = FrameCodec::try_decode(&valid).unwrap().unwrap().0;
+        assert_eq!(
+            RelayCodec::encode_data(&frame).unwrap(),
+            RelayCodec::encode(&RelayMessage::Data(valid.clone())).unwrap()
+        );
+        let vconn: u32 = r.gen();
+        assert_eq!(
+            RelayCodec::encode_host_data(vconn, &frame).unwrap(),
+            RelayCodec::encode(&RelayMessage::HostData { vconn, frame: valid }).unwrap()
+        );
+    }
+    for code in 0..=u8::MAX {
+        assert!(!ErrorCode(code).name().is_empty() && !CloseReason(code).name().is_empty());
+    }
+}
+
+#[test]
+fn relay_rooms_depend_on_the_secret_alone_and_say_nothing_about_the_key() {
+    let mut r = rng(23);
+    let mut seen = HashSet::new();
+    for _ in 0..iters(2000) {
+        let secret: [u8; 16] = r.gen();
+        let room = SessionKey::relay_room_id(&secret);
+        assert_eq!(room, SessionKey::relay_room_id(&secret));
+        assert!(seen.insert(room), "two secrets with one room");
+        for password in [None, Some("pw")] {
+            let key = SessionKey::derive(&secret, password);
+            assert_ne!(&room[..], &key.key()[..SessionKey::ROOM_ID_SIZE], "the room is not a part of the key");
+        }
+    }
 }
