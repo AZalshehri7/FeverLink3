@@ -16,6 +16,10 @@
 --   * anything else, and everything while no session is on: untouched.
 -- Entity ids never travel; the keys of entities created in the session come from binds.txt, which the bridge writes.
 --
+-- Credit: wrapping the engine's command functions in the interface state, keeping the command objects in a weak table, and
+-- keeping the originals in package.loaded follow MPFever's UI hook (mpfever_ui.script.lua, MIT); that a command is recorded
+-- here and the game applies it natively (replay on peers) is this project's choice, where MPFever holds the command.
+--
 -- With FEVERLINK3_DEV=1 every command function of api.cmd is traced into dev_trace.txt (name and arguments), which is how
 -- the real shape of what the game's windows issue is learned without guessing.
 

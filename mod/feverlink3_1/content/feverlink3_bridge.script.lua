@@ -316,6 +316,7 @@ end
 -- Applies one due action in the simulation state. No callback here (finding from MPFever (MIT): the engine
 -- rejects callbacks from inside the simulation update), so an entity the command creates is found afterwards by
 -- comparing the entity lists (a watch), and the result reaches the originator through the state.
+-- (The replay marks below follow the counter MPFever keeps for the same purpose in captureNativeBuild, MIT.)
 -- The engine tells the game script about every build it applies (`apply_command` / `onPreBuildProposal`, just before
 -- it runs; finding from MPFever (MIT)). A replay of an action (a build rebuilt from a shipped record) must not be
 -- shipped again, so each one is counted here when it is sent and spent when its event arrives.
