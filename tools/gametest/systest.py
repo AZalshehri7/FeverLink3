@@ -116,12 +116,50 @@ def resume(speed=1):
     ask("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(%d)); return 'resume asked'" % speed)
 
 
+def session_lines():
+    """The host's session log (resync rounds, checksum differences): a list of lines."""
+    path = os.path.join(HOST.dir, "session.log")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read().splitlines()
+
+
+def resyncs(lines=None):
+    return sum(1 for l in (session_lines() if lines is None else lines) if " started: " in l and l.startswith("resync "))
+
+
+def differing(lines=None):
+    """How many checksum rounds differed (a resync repairs a mismatch, so a passing comparison after one proves nothing)."""
+    return sum(1 for l in (session_lines() if lines is None else lines) if l.startswith("checksum ") and " differs in " in l)
+
+
+_marks = {"lines": 0}
+
+
+def mark():
+    _marks["lines"] = len(session_lines())
+
+
+def since_mark():
+    return session_lines()[_marks["lines"]:]
+
+
 def check(label, settle=3.0):
-    """Waits a moment for replays to land, freezes, compares, resumes. Returns (ok, problems)."""
+    """Waits a moment for replays to land, freezes, compares, resumes. Returns (ok, problems).
+
+    Fails also when a resync round started or a checksum round differed since the last mark(): the games' own checks agreed
+    with the comparison or they did not, and a resync would have hidden a difference."""
     time.sleep(settle)
     a, b = freeze()
     problems = diff(a, b)
+    new = since_mark()
+    if resyncs(new):
+        problems.append("a resync round ran during this scenario (it repairs, and so hides, a difference)")
+    if differing(new):
+        problems.append("%d checksum round(s) differed during this scenario: %s" % (differing(new), [l for l in new if " differs in " in l][:3]))
     resume()
+    mark()
     print(("PASS  " if not problems else "FAIL  ") + label)
     for p in problems:
         print("      " + p)

@@ -140,6 +140,23 @@ class UiHookTest(unittest.TestCase):
         self.assertEqual(1, recs[1][1]["id"])
         self.assertEqual(77, recs[1][1]["e"])
 
+    def test_a_command_the_engine_refuses_outright_is_not_recorded_and_not_sent_twice(self):
+        # seen in a real game: sendCommand raised "API is currently restricted" when called from a context that may not send;
+        # the command had been recorded already, so only the OTHER game applied it
+        self.runtime()
+        self.lua.execute("Hook.install()")
+        self.lua.execute("RAISE = true; local real = api.cmd.sendCommand; ")
+        self.lua.execute("""
+          -- the engine's own sendCommand, replaced by one that refuses (the hook keeps the original it found at install)
+          local orig = package.loaded["feverlink3_ui_orig_cmds"]
+          orig.sendCommand = function(cmd, cb, progress) ATTEMPTS = (ATTEMPTS or 0) + 1; error("API is currently restricted") end
+        """)
+        ok, err = self.lua.eval('(function() return pcall(function() api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, {} })) end) end)()')
+        self.assertFalse(ok, "the caller sees the engine's error, as without the mod")
+        self.assertIn("API is currently restricted", str(err))
+        self.assertEqual(1, int(self.lua.eval("ATTEMPTS")), "sent once, not retried by the hook")
+        self.assertEqual([], self.records(), "nothing reached the other games")
+
     def test_builds_are_left_to_the_bridge_which_sees_them_where_the_engine_applies_them(self):
         self.runtime()
         self.lua.execute("Hook.install()")

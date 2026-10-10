@@ -153,19 +153,33 @@ local function handle(tag, cmd, cb, progress, O)
 	end
 	U.seq = U.seq + 1
 	local id = U.seq
-	send("cmd", { id = id, body = text, category = category })
-	U.stats.shipped = U.stats.shipped + 1
-	log("command " .. tag.name .. " #" .. id .. " recorded (" .. #text .. " bytes, " .. category .. ")")
+	local recorded, waitingBind = false, nil
 	local function after(res, success, entities)
 		if success and spec.creates then
 			local e = nil
 			pcall(function() e = res[spec.result] end)
 			if e == nil and type(entities) == "table" and type(entities[1]) == "table" then e = entities[1][1] end
-			if type(e) == "number" then send("bind", { id = id, e = e }) end
+			if type(e) == "number" then
+				-- the bridge names the entity by the sequence number of the record it already holds: after it
+				if recorded then send("bind", { id = id, e = e }) else waitingBind = e end
+			end
 		end
+		if success == false then log("command " .. tag.name .. " #" .. id .. " was refused by the engine here after it was recorded") end
 		if cb then return cb(res, success, entities) end
 	end
-	O.sendCommand(cmd, after, progress)
+	-- Applied here first, recorded only when the engine took it: a command the engine refuses outright (an error from
+	-- sendCommand, as when it is sent from a context that may not send) must not reach the other games, which would then
+	-- be the only ones to apply it. The error goes on to the caller as it would without the mod.
+	local okSend, errSend = pcall(O.sendCommand, cmd, after, progress)
+	if not okSend then
+		U.stats.failed = U.stats.failed + 1
+		error({ engineError = errSend }, 0)   -- not a fault of the hook: the wrapper passes it on to the caller unchanged
+	end
+	send("cmd", { id = id, body = text, category = category })
+	recorded = true
+	if waitingBind then send("bind", { id = id, e = waitingBind }) end
+	U.stats.shipped = U.stats.shipped + 1
+	log("command " .. tag.name .. " #" .. id .. " recorded (" .. #text .. " bytes, " .. category .. ")")
 	return true
 end
 
@@ -217,7 +231,10 @@ function M.install()
 				if active() then
 					local okH2, handled = pcall(handle, tag, cmd, cb, progress, orig)
 					if okH2 and handled then return end
-					if not okH2 then log("command " .. tag.name .. " failed in the hook: " .. tostring(handled)) end
+					if not okH2 then
+						if type(handled) == "table" and handled.engineError ~= nil then error(handled.engineError, 0) end
+						log("command " .. tag.name .. " failed in the hook: " .. tostring(handled))
+					end
 				end
 			elseif DEV then
 				trace("sendCommand (untagged) " .. tostring(cmd))
