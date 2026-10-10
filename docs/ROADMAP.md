@@ -86,7 +86,7 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 - [x] Live mode: the session controller runs inside the game, driven by the in-game window (verified in the real game 2026-10-09, see P1 to P4)
 - [~] Players connect through Steam peer-to-peer *(connection)*: the listener starts and the game connected to its own Steam ID (P5); the connection between two different accounts (P6) is the test of `0.2.0-test1`; session traffic does not run over it yet (P7)
 - [~] The join code carries the host's Steam ID *(connection)*: the code format and its tests are in the core; the in-game controller does not write it yet
-- [~] Reconnect after a dropped connection *(session robustness)*: the player side retries for five minutes and the host treats the return as a hot join (loopback tests); not run between two real games
+- [~] Reconnect after a dropped connection *(session robustness)*: the player side retries for five minutes and, inside the host's 5.5 minute window, is the same player again (same id, slot and permissions) and gets the hot-join round; tested over loopback, not run between two real games
 - [x] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256 (job and `tools/release` done; the first tagged release is not cut yet)
 - [~] In-app updater with Ed25519-signed releases: signature, hash, version and file-swap logic are done and tested in `launcher/src/update.rs`; the network fetch is not written, and the public key in the repository is a placeholder whose private half is public, so no release may be signed with it *(hardening)*
 - [~] Project site (`docs/index.md`, `docs/site/`): written 2026-10-10; it goes live with the first tagged release, which supplies the download link
@@ -110,14 +110,14 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 - [ ] Constructions against streets, upgrades, signals, decorations, terrain
 - [ ] Lines, vehicle orders, renames, colours
 - [~] In-game player list and chat: the model and the window exist and are tested with mocks; not run with two real games
-- [ ] 3 to 8 players
+- [~] 3 to 8 players: host limit of 8 games, ids, fan-out, flood limit, ping and round-trip times, a resync round and a kick with eight games are done in the core and the launcher and tested over loopback; waits for a game run
 
 ## 0.5 — Playing with friends
 
 - [ ] Distribution: the mod in the game's own Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now; the installer stays a testing tool. **Transport Fever 3 has no Steam Workshop** (the developers' support page says it is not included). Whether the Mod Hub accepts a mod that needs a separate native component is being checked: its published rules allow only the official scripting API and no executable files. The sources, the likely blockers and the steps are in `docs/WORKSHOP.md`
 - [ ] Steam invitations and friends-list join *(connection)*
-- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core; the window has no control for it yet)
-- [ ] Hot join of a running game and reconnection that keeps the player's place *(session robustness)*; the hot-join round exists in the core and is tested over loopback
+- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core; the in-game controller takes `permissions` and `kick` commands, `docs/LIVE_CONTROL.md`; the window and the game side are open)
+- [~] Hot join of a running game and reconnection that keeps the player's place *(session robustness)*: the same id, name, slot and permissions back within 5.5 minutes, then the hot-join round; core and launcher done and tested over loopback, waits for a game run
 
 ## 0.6 — Companies *(companies)*
 

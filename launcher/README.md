@@ -154,18 +154,24 @@ One thread owns each session's state machine; everything else only feeds it even
   replaced are ignored.
 - **Closing.** A write error, a frame `FrameCodec` rejects (length under 12 or over 1 MiB, a stream ending inside
   a frame), a peer that closes, or `close()` all end the connection the same way: the socket is shut down, the
-  reader thread ends and sends `Closed` exactly once, last. The state machine then removes the player and
-  broadcasts `PlayerLeft`. A bad connection never touches another.
+  reader thread ends and sends `Closed` exactly once, last. The state machine then takes the player out of the
+  game, holds its slot for a return and broadcasts `PlayerLeft` (with `away`). A bad connection never touches
+  another.
 - **Reconnecting (player).** When the connection drops after the player was accepted, the session thread writes a
   `session` line with `started=false` to the game, then tries again every 5 s for 5 minutes with a fresh
-  `PlayerSession` (new challenge, new counters); `status().reconnecting` is true meanwhile. The host sees a new
-  player and assigns a new id, so a returning player is treated like any other joiner: in a started session the
-  host runs the hot-join round of `docs/PROTOCOL.md` for it. Keeping the old id is not done. The reconnect itself is
-  tested over loopback (the host restarts on the same port); the round that follows has not been run between two
-  real games. A reject is final and not retried. If the 5 minutes pass the
-  session ends with `status().error` set. The first connection is not retried: `join` fails at once.
+  `PlayerSession` (new challenge); `status().reconnecting` is true meanwhile. Each attempt asks for the id and slot
+  the first welcome granted (a `ResumeTicket`), so a player that is back inside the host's 330 s window is the same
+  player with the same permissions, and the host runs a hot-join round for it (`player returned`). A host that no
+  longer has the slot (window over, player removed or gone on purpose) answers with a plain join and a new id; a
+  host started again has a new secret and rejects the old player's proof, which is final. A reject, a
+  kick or a `flood` refusal is final and not retried. If the 5 minutes pass the session ends with `status().error`
+  set. The first connection is not retried: `join` fails at once. **Stopping** a session on purpose sends `Leave`
+  first and waits up to 0.5 s for the host to close, so the host frees the slot at once instead of holding it.
+  All of this is tested over loopback; the round that follows a return has not been run between two real games.
 - **Status** (`SessionHandle::status()`): role, name, own id, connected / reconnecting / attempts, reject reason,
-  error, players (id, name, ready), clocks (host: time and speed per game; player: peer clocks), session state
+  error, players (id, name, ready), roster (every player, away ones too, with connected or away and the round-trip
+  time), permissions (the host's, or what the host last announced), clocks (host: time and speed per game; player:
+  peer clocks), session state
   (started, speed, pause stamp, lead), last checksum round (`last_sync`: round, time, differing parts), actions
   relayed, frames refused.
 
@@ -201,8 +207,11 @@ and reads; the mapping of the format is described under *File link* below. Direc
 Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
 
 - Challenge, Join and Reject (1 to 3) and ResyncChunk (18) never reach the game; the launcher streams savegame
-  chunks itself.
-- A game can only send the kinds marked "from game" (exactly the player allow-list). A line of any other kind,
+  chunks itself. Ping, Kicked, Pong and Leave (21, 22, 37, 38) are the session layer's own too: the core answers a
+  ping, the launcher sends Leave when a player stops, and Kicked ends the session like a reject; none has a line
+  kind and a game cannot send them.
+- A game can only send the kinds marked "from game" (the player allow-list without Pong and Leave, which the launcher
+  sends itself). A line of any other kind,
   such as `session`, is logged and dropped: a game cannot speak for the host. A payload that is not valid literal
   syntax is logged and dropped.
 - The `from` column of a line from the game is not used. The state machine knows who the game is: the host's own
@@ -383,8 +392,10 @@ The release zip holds `feverlink3.exe`, `winhttp.dll` and `mod/feverlink3_1/` si
   to every `save` folder in `PlayerConfig::save_dirs` as `feverlink3-resync-<id>.sav`, through a temporary file and
   a rename. The `resync_load` line that follows names that file.
 - **Permissions:** the core sends set-based `Permissions` to everyone. Each launcher writes the `permissions` line
-  as the mod reads it, for its own player id: `{build, bulldoze, spend, other}` as booleans. The host is always
-  allowed. `Command::SetPermissions` changes them from the host's side; the in-game window has no control for it yet.
+  as the mod reads it, for its own player id: `{build, bulldoze, spend, other}` as booleans (`other` follows the
+  host's `other` set). The host is always allowed. `Command::SetPermissions` changes them from the host's side and
+  `Command::Kick(id)` removes a player or releases a slot held for one that dropped; `docs/LIVE_CONTROL.md` lists the
+  in-game window's side of both (the window itself has no control for them yet).
 - Host console: `resync` starts a round by hand.
 - Tested end to end over loopback in `tests/resync.rs` (a multi-chunk save arrives byte for byte, the round returns
   to `Idle` with identical checksums; permissions arrive per player).

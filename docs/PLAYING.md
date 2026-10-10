@@ -91,7 +91,9 @@ Only join people you know. When you join, your game loads the host's world, and 
 - Building together: the mod captures player actions (buying vehicles, creating lines, putting vehicles on lines, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
 - The native hooks that would hold construction commands back so every game builds at the same moment: switched off in this version, and never run in the real game.
 
-**Not built yet:** separate companies, reconnecting after a connection loss while the game keeps running, a dedicated server.
+**Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
+
+**Not built yet:** separate companies, a dedicated server.
 
 ## If something goes wrong
 

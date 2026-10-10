@@ -28,7 +28,7 @@ Written and covered by automated tests (unit tests, loopback sessions, two simul
 - stamping actions to a future step and applying them in the same order everywhere, including the schemas for everyday operations (vehicles, lines, names, bookings, events),
 - world checksums and the repair by loading the host's savegame (resync), including sending a save in chunks with a SHA-256 check,
 - permissions for building, bulldozing and spending,
-- the player-side reconnect and the hot join of a running session,
+- the player-side reconnect (the same player back within about five minutes) and the hot join of a running session, the host removing a player, and eight games in one session,
 - install and uninstall of the game-side files, release packaging, and update verification.
 
 ## Not done or not verified
