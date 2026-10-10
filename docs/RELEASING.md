@@ -43,4 +43,4 @@ The two values must be equal, and equal to the SHA-256 in the release notes. The
 
 ## SmartScreen
 
-The exe is not code-signed yet, so the first run on a PC shows "Windows protected your PC" (More info, then Run anyway). This appears once per PC at the first run of a browser-downloaded file. Files the launcher downloads itself for updates carry no mark-of-the-web, so updates do not trigger it. Code signing is the only real fix; the plan (the SignPath Foundation's free programme for open-source projects, applied for once a release exists, with the alternatives and the checklist) is in `docs/SIGNING.md`.
+The exe is not code-signed yet, so the first run on a PC shows "Windows protected your PC" (More info, then Run anyway). This appears once per PC at the first run of a browser-downloaded file. Files the launcher downloads itself for updates carry no mark-of-the-web, so updates do not trigger it. Code signing is the only real fix; the options (the SignPath Foundation's free programme probably does not accept the project's PolyForm Noncommercial licence, so a paid certificate is the realistic route), their cost and the checklist are in `docs/SIGNING.md`.

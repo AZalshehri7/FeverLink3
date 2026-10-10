@@ -126,7 +126,7 @@ For the person who drives the game. Each entry says what to capture, the exact s
 - **Purpose:** the module's own log is short and readable. Name: `nexus-13-native-log.png`.
 - **Steps:** after a game start, open `%LOCALAPPDATA%\FeverLink3\native.log` in Notepad. It holds lines such as "FeverLink3 native 0.2.0-test1 loaded", "game build 40420 (timestamp 0x6ac50427): hooks available" and "live session controller started".
 - **Hide:** nothing in the file, but check that the title bar and path do not show the user name.
-- **Caption:** "The module's whole log. 'hooks available' only means that the game build is one the module knows; this version installs no hooks."
+- **Caption:** "The module's whole log. 'hooks available' only means that the game build is one the module knows; no hooks are installed unless a developer switches them on, and they have never run in the real game."
 
 ## S14 - `feverlink3 uninstall`
 

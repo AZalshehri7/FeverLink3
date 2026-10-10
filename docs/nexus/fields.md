@@ -15,10 +15,10 @@ FeverLink3 Multiplayer
 ## Summary (short description)
 
 ```
-Early test of open-source co-op multiplayer for Transport Fever 3. This first build only tests the Steam connection between two players; hosting and joining come next.
+Early test of co-op multiplayer for Transport Fever 3, free for noncommercial use. This first build only tests the Steam connection between two players; hosting and joining come next.
 ```
 
-(167 characters. Check the form for the limit.)
+(183 characters. Check the form for the limit.)
 
 ## Version
 
@@ -64,22 +64,22 @@ Conflicts, in the notes: `MPFever and any other mod that installs its own winhtt
 
 ## Permissions and credits
 
-Nexus asks for these. The licence is MIT, which allows all of them as long as the licence notice stays with the work.
+Nexus asks for these and has no free-text licence field, so the licence goes into the permission notes and into the description ("Credits and permissions"). The licence is the PolyForm Noncommercial License 1.0.0: free for noncommercial use, commercial use only with a separate licence from the author. The answers below are the strictest reading, so that the form never promises more than the licence gives.
 
 | Form item | Answer |
 |---|---|
 | Other users' assets | The mod contains no files or assets from other authors. It reuses findings (per-build game addresses, API names) documented by MPFever, MIT, credited in the files that use them. |
-| Upload permission (other sites) | Allowed under the MIT licence; keep the licence file and the credits. |
-| Modification permission | Allowed under the MIT licence. |
-| Conversion permission | Allowed under the MIT licence. |
-| Asset use permission | Allowed under the MIT licence. |
-| Use in mods with donations / sold mods | Allowed under the MIT licence (no warranty). |
+| Upload permission (other sites) | Allowed for noncommercial purposes, with the `LICENSE` file or its web address, the "Required Notice" line and the credits kept. |
+| Modification permission | Allowed for noncommercial purposes under the same licence. |
+| Conversion permission | Allowed for noncommercial purposes under the same licence. |
+| Asset use permission | Allowed for noncommercial purposes under the same licence. |
+| Use in mods with donations / sold mods | **Not allowed** without a separate commercial licence from the author. |
 | Donation points | Off. |
 
 Credits and notes box:
 
 ```
-Author: Abdulaziz Alshehri (Discord azalshehri). Licence: MIT. Source: https://github.com/AZalshehri7/FeverLink3
+Author: Abdulaziz Alshehri (Discord azalshehri). Licence: PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/): free for noncommercial use, commercial use needs a separate licence from the author. Source: https://github.com/AZalshehri7/FeverLink3
 Credits: TpF2 Multiplayer by silver2127 (Transport Fever 2, MIT, https://silver2127.github.io/tpf2-multiplayer/) - replication modes, "no entity ids on the wire", join-code and sealed-transport trust model, host-included resync round. MPFever by dkdknight / arthur (Transport Fever 3, MIT, https://github.com/dkdknight/MPFever) - proxy-DLL approach, single-worker script pool fix, deterministic math.random, per-build game addresses and API names. Both licences are in THIRD_PARTY_NOTICES.md in the zip.
 Not affiliated with Urban Games or Paradox Interactive. Much of the code and documentation was written with Claude (Anthropic) under the maintainer's direction.
 ```
@@ -92,7 +92,7 @@ First public test build. Its job is the Steam connection test between two player
 - Hosting and joining over Steam are not finished in this build: the Host button says so.
 - For later builds, tested with simulated games only: lockstep core (actions applied at the same step on every game, world checksums, repair by loading the host's savegame, permissions model, command schemas for everyday operations).
 - Encrypted sessions (AES-256-GCM, key from the join code).
-- Native module winhttp.dll: passes the game's 14 WinHTTP functions through, runs the in-game controller. No game hooks in this version.
+- Native module winhttp.dll: passes the game's 14 WinHTTP functions through, runs the in-game controller. Its hook code is switched off by default and has never run in the real game.
 - Testing installer: feverlink3 install / uninstall / doctor, with --dry-run.
 - Unsigned. Seen working in the real game (build 40420): window, Steam connection to the game's own Steam ID, save/load. Not verified: the Steam connection between two accounts, hosting and joining over Steam, building together, world transfer between two real games.
 ```
@@ -125,7 +125,7 @@ Subject: Request before publishing: multiplayer mod with a native component that
 
 Hello,
 
-I would like to publish FeverLink3 Multiplayer for Transport Fever 3 on Nexus Mods. It is an open-source (MIT) cooperative multiplayer mod, so network access is its function: the native module (a winhttp.dll that the game loads from its own folder) connects the players' games to each other through Steam's peer-to-peer networking.
+I would like to publish FeverLink3 Multiplayer for Transport Fever 3 on Nexus Mods. It is a cooperative multiplayer mod whose source code is public (PolyForm Noncommercial License 1.0.0), so network access is its function: the native module (a winhttp.dll that the game loads from its own folder) connects the players' games to each other through Steam's peer-to-peer networking.
 
 Per your file submission guidelines I am contacting you first, with the reasoning and the source:
 - Source code: https://github.com/AZalshehri7/FeverLink3 (folders native/ and launcher/ for the DLL). It is a fresh implementation that builds on two earlier MIT-licensed projects, TpF2 Multiplayer by silver2127 and MPFever by dkdknight (arthur), both credited in the README and on the page.

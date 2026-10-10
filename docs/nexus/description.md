@@ -11,7 +11,7 @@ FeverLink3 aims to let several players build in the same Transport Fever 3 world
 - **Encrypted.** Everything between the games is encrypted and authenticated with a key derived from the join code.
 - **Connected through Steam.** The games reach each other through Steam's peer-to-peer networking, so a friend only needs the join code and, by design, nothing has to be set up. Whether that holds on real home connections is what this test build is for.
 
-It is a fresh implementation in Rust and Lua, MIT licensed, with the source on GitHub. It stands on two earlier projects that proved the approach, credited at the bottom. It is **not official**: it is not made, endorsed or supported by Urban Games or Paradox Interactive.
+It is a fresh implementation in Rust and Lua, with the source on GitHub under the PolyForm Noncommercial License (free for noncommercial use). It stands on two earlier projects that proved the approach, credited at the bottom. It is **not official**: it is not made, endorsed or supported by Urban Games or Paradox Interactive.
 
 ## What this test build does, and what it does not
 
@@ -33,7 +33,7 @@ It is a fresh implementation in Rust and Lua, MIT licensed, with the source on G
 - Hosting and joining over Steam, and sending the host's world to a second real game.
 - Building together: replicating construction and vehicle commands between two real games.
 - Joining from a second real copy of the game.
-- The native hooks that would hold construction commands back are not part of this version.
+- The native hooks that would hold construction commands back are switched off in this version and have never run in the real game.
 
 ## Requirements
 
@@ -65,7 +65,7 @@ If the window says "The FeverLink3 module is not running", close the game, run `
 
 ## The file winhttp.dll, safety and antivirus
 
-The mod ships one native file, `winhttp.dll`. The game imports that name, so Windows loads it from the game folder when the game starts. It passes the game's 14 WinHTTP functions to the real Windows file unchanged and, inside the game, runs the Steam connection test (and, in later test builds, the multiplayer session) on one thread. It does not inject into other programs, does not start with Windows, needs no administrator rights, sends no telemetry and does not download or run programs. This version installs no hooks into the game. The source is public, and the page below lists exactly what it does and does not do, which files it creates, how to check the hash, and how to report a false positive to Microsoft, Kaspersky, ESET and others.
+The mod ships one native file, `winhttp.dll`. The game imports that name, so Windows loads it from the game folder when the game starts. It passes the game's 14 WinHTTP functions to the real Windows file unchanged and, inside the game, runs the Steam connection test (and, in later test builds, the multiplayer session) on one thread. It does not inject into other programs, does not start with Windows, needs no administrator rights, sends no telemetry and does not download or run programs. By default it installs no hooks into the game: the hook code is switched off unless a developer sets environment variables, and it has never run in the real game. The source is public, and the page below lists exactly what it does and does not do, which files it creates, how to check the hash, and how to report a false positive to Microsoft, Kaspersky, ESET and others.
 
 The same loading technique is used by malware, and the file is **not code-signed yet**, so some antivirus programs may flag it. Code signing is planned. https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md
 
@@ -83,7 +83,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 ## Known issues
 
 - Not a finished multiplayer game: this build tests the Steam connection only, and everything under "Not verified yet" above.
-- The native hooks are not enabled, so construction commands are not held back to the same moment on every game yet.
+- The native hooks are switched off (only a developer can turn them on) and have never run in the real game, so construction commands are not held back to the same moment on every game yet.
 - Only game build 40420 is known. If a game update changes the web functions the game imports, the game may fail to start while `winhttp.dll` is installed; uninstalling fixes it.
 - Not code-signed: SmartScreen and some antivirus programs warn. Windows 11 Smart App Control in its "On" setting may block the unsigned DLL; this has not been tested.
 - Another mod's `winhttp.dll` conflicts with ours; the installer refuses to overwrite it.
@@ -126,7 +126,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 - Hosting and joining over Steam are not finished in this build: the Host button says so.
 - Under the window, for later builds: the lockstep core (actions stamped and applied at the same step on every game, world checksums, repair by loading the host's savegame, a permissions model, command schemas for everyday operations), tested with simulated games only.
 - Encrypted sessions (AES-256-GCM, key from the join code); the host decides who may send what.
-- Native module `winhttp.dll`: passes the game's 14 WinHTTP functions through and runs the in-game controller. No game hooks in this version.
+- Native module `winhttp.dll`: passes the game's 14 WinHTTP functions through and runs the in-game controller. Its hook code is switched off by default and has never run in the real game.
 - Command-line installer (a testing tool): `feverlink3 install`, `uninstall`, `doctor`, with `--dry-run`.
 - Unsigned. Seen working in the real game: see the status above.
 
@@ -136,7 +136,8 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 - **TpF2 Multiplayer** by silver2127 (Transport Fever 2, MIT): https://silver2127.github.io/tpf2-multiplayer/ - the replication modes, the "no entity ids on the wire" rule, the join-code and sealed-transport trust model and the host-included resync round.
 - **MPFever** by dkdknight / arthur (Transport Fever 3, MIT): https://github.com/dkdknight/MPFever - the first lockstep co-op on this game: the proxy-DLL approach, the single-worker script pool fix, deterministic `math.random`, and the per-build game addresses and API names that FeverLink3 reuses with credit in the files that contain them.
 - Both licences are reproduced in THIRD_PARTY_NOTICES.md in the zip. FeverLink3 contains no files or assets from other authors.
-- Open-source Rust libraries for cryptography, serialisation and Windows access (list in `Cargo.lock`).
+- Rust libraries for cryptography, serialisation and Windows access, under their own licences (list in `Cargo.lock`).
 - **Transport Fever 3** belongs to Urban Games and Paradox Interactive. This project is not affiliated with them.
 - **AI assistance:** much of the code and documentation was written with Claude (Anthropic) under the maintainer's direction. The claims on this page rest on the tests and real-game checks listed in the status.
-- **Permissions:** MIT licence. You may use, copy, modify, merge, publish, distribute and sell copies of FeverLink3, provided the licence notice stays with it; it comes without warranty. Uploading elsewhere, modifying and converting are allowed on the same condition. No donation points.
+- **Licence:** [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/). You may use, copy, study, modify and share FeverLink3 for any noncommercial purpose, as long as every copy keeps the line "Required Notice: Copyright (c) 2026 Abdulaziz Alshehri (https://github.com/AZalshehri7)" and comes with the licence terms or their web address (the `LICENSE` file in the zip). **Commercial use needs a separate commercial licence** from the author: ask on Discord, `azalshehri`. This is source available, not "open source" in the sense of the Open Source Initiative. The parts adapted from TpF2 Multiplayer and MPFever stay under their own MIT licences. It comes without warranty.
+- **Permissions:** uploading elsewhere, modifying and converting are allowed for noncommercial purposes under the same terms. Use in sold or monetised mods, and use in mods that ask for donation points, is not allowed without a commercial licence. No donation points on this page.

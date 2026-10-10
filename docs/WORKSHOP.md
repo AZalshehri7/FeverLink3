@@ -21,6 +21,18 @@ Decision of 2026-10-10: the end state is **the mod offered in the game's own Mod
 | `winhttp.dll` (native module and the in-game controller) | the game folder | Nexus Mods and GitHub only, as a separate file |
 | `feverlink3.exe` (testing installer, `doctor`, development commands) | anywhere | the test zip only; not part of the end state |
 
+## Licence: is a noncommercial licence allowed on these channels?
+
+Owner decision of 2026-10-10: FeverLink3 is licensed under the PolyForm Noncommercial License 1.0.0 (free for noncommercial use; commercial use needs a separate licence from the owner). The parts adapted from TpF2 Multiplayer and MPFever stay MIT (`THIRD_PARTY_NOTICES.md`). What the sources say, read on 2026-10-10:
+
+- **The Mod Hub's own rule is compatible.** The publishing page says "Mods must be non-commercial and accessible in full for free to all users" and "Do not upload contents for which you do not have copyrights or permission to distribute yourself". A noncommercial licence on a free mod fits both. Nothing on the wiki pages we could read names a required licence or forbids a particular one (the pages are marked "old revision").
+- **mod.io's terms do not forbid it.** Under clause 6.2 of the terms of use the creator "retains all rights" to the content (6.2.7) and grants mod.io and the game's administrator (here Urban Games) a "transferable, sublicensable, royalty-free, non-revocable" licence limited to providing the services (6.2.1); further rights for sale or resale are optional and revocable (6.2.2). The terms offer no licence picker and no "noncommercial" switch, so the Hub will not show or enforce the licence: it is only what the mod's own text says. Whether the Game Admin's licence interacts with a noncommercial licence in some way we cannot tell is unconfirmed.
+- **PolyForm asks for notices to travel.** Anyone who gets a copy must also get the licence terms or their web address and the "Required Notice" line. A Hub download is only the mod folder, so the description in `modinfo.json` (or `description.html`) should carry the line "Required Notice: Copyright (c) 2026 Abdulaziz Alshehri (https://github.com/AZalshehri7)" and the address https://polyformproject.org/licenses/noncommercial/1.0.0/, and say that commercial use needs a separate licence (ask on Discord, azalshehri). The Hub asks for essential files only, so a licence file inside the mod folder is not recommended.
+- **Nexus Mods** has no licence field; the permission items and the description carry it (`docs/nexus/fields.md`). Its guidelines do not forbid a noncommercial licence.
+- **Steam Workshop** is not a channel for this game, so its terms do not apply.
+
+Open question for Urban Games (question 6 below): whether they have any objection to a source-available noncommercial licence on a Hub mod.
+
 ## The likely blockers, honestly
 
 **B1. The native DLL cannot go through the Hub.** By the decision above it is delivered separately. Without it there is no session controller, no Steam networking and no connection to other players: Lua alone has no network access. Consoles cannot load native code from a mod at all.
@@ -60,6 +72,7 @@ Moving the session controller out of the DLL into the external program (the orig
 This work is documentation only, so none of these is made; each is small.
 
 - **`mod/feverlink3_1/_metadata/modinfo.json` is wrong today.** The description says the mod "does nothing unless the game was started by FeverLink3.exe" and the summary says "start the game through FeverLink3.exe". Both have been untrue since live mode, and the game shows these texts in its mod list. They should say what the mod does now (a multiplayer window and the lockstep scripts, needs the separate native module, Windows PC only) and `url` should point to the project; the wiki recommends it so that players can find the source.
+- Put the "Required Notice" line and the PolyForm licence address into the mod's description, so that the licence travels with a Hub download (see the licence section).
 - When the native module is missing, the window's message should name the download page instead of `feverlink3 install`, in the build meant for the Hub.
 - Keep the use of files in one small place with a clear comment, so that it can be replaced if the game offers an official data exchange.
 - Prepare the cover image and the English description per B6, and check the tag list.
@@ -70,12 +83,13 @@ The wiki points to the contact form on https://www.transportfever3.com/support/.
 
 > Subject: Question about a PC-only multiplayer mod with a native component (FeverLink3)
 >
-> Hello Urban Games team, I am the author of FeverLink3, an open-source (MIT) cooperative multiplayer mod for Transport Fever 3 (https://github.com/AZalshehri7/FeverLink3). It builds on two earlier MIT-licensed community projects, MPFever and TpF2 Multiplayer, which are credited in its README. It has a normal Lua mod and a small Windows DLL that the game loads from its own folder as `winhttp.dll` (it passes the game's 14 WinHTTP imports through unchanged; the page https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md explains it in plain words). We would like to do this the way you prefer and have a few questions:
+> Hello Urban Games team, I am the author of FeverLink3, a cooperative multiplayer mod for Transport Fever 3 whose source code is public under the PolyForm Noncommercial License 1.0.0, free for noncommercial use (https://github.com/AZalshehri7/FeverLink3). It builds on two earlier MIT-licensed community projects, MPFever and TpF2 Multiplayer, which are credited in its README. It has a normal Lua mod and a small Windows DLL that the game loads from its own folder as `winhttp.dll` (it passes the game's 14 WinHTTP imports through unchanged; the page https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md explains it in plain words). We would like to do this the way you prefer and have a few questions:
 > 1. May the Lua mod be listed in the Mod Hub if its description says clearly that it needs a separate, manually installed Windows component and does nothing without it, or should the whole thing stay outside the Hub?
 > 2. Can a mod be marked PC-only so it is not offered on consoles?
 > 3. Our window script reads and writes plain text files in `%LOCALAPPDATA%` through `package.loaded.io`, because the `io` global is not available to UI scripts. Is that acceptable, or will it be blocked? Is there an official way for a script to exchange data with an external program?
 > 4. We connect the players with Steam's peer-to-peer networking through the game's already loaded `steam_api64.dll`, using the game's app id. Do you or Paradox have a position on that?
 > 5. Do you have objections to a proxy DLL placed in the game folder? We can add version information and code signing.
+> 6. Do you have any objection to the mod being offered under a noncommercial source-available licence (free for everyone to use, but not to sell)?
 >
 > Thank you, <name>, Discord `azalshehri`
 
@@ -97,6 +111,7 @@ The wiki points to the contact form on https://www.transportfever3.com/support/.
 - mod.io on automated scanning: https://docs.mod.io/moderation/automated-scanning
 - mod.io terms of use: https://mod.io/legal/terms
 - Nexus Mods file submission guidelines: https://help.nexusmods.com/article/28-file-submission-guidelines
+- PolyForm Noncommercial License 1.0.0: https://polyformproject.org/licenses/noncommercial/1.0.0/
 - Nexus Mods page of the game: https://www.nexusmods.com/transportfever3
 
 ## What we could not confirm
@@ -106,3 +121,4 @@ The wiki points to the contact form on https://www.transportfever3.com/support/.
 - Whether a PC-only flag exists, and whether the Hub accepts a mod that needs an external download.
 - The current text of the wiki pages (the copies we could read are marked "old revision").
 - The licence terms of the game and the publisher on modification and on use of Steam networking by a third-party DLL.
+- Whether Urban Games has any requirement or objection about the licence of a Hub mod beyond "non-commercial and free".

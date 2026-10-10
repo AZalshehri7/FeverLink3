@@ -1,11 +1,11 @@
 # FeverLink3
 
-Cooperative multiplayer for Transport Fever 3. The goal: several players build in one world at the same time, each in their own copy of the game. Open source (MIT), Windows and Steam only, unofficial.
+Cooperative multiplayer for Transport Fever 3. The goal: several players build in one world at the same time, each in their own copy of the game. Source available under the PolyForm Noncommercial License (free for noncommercial use; see Licence below), Windows and Steam only, unofficial.
 
 **Status: early test build (0.2.0-test1), last updated 2026-10-10. It is not yet a playable multiplayer game.** The first test build has one job: to find out whether two players can reach each other through Steam. It adds a window to the game with a Steam connection test; hosting and joining a game over that connection come in the next test build. What is real and what is not:
 
 - **Verified in the real game** (build 40420, 2026-10-09): the mod loads; its window opens from a button in the bottom bar; the mod can drive the game's own save and load and picks its session files up again after a reload; the Steam peer-to-peer listener starts. With an earlier build of the window, whose Host button used a direct connection (since taken out of the window), hosting showed a join code and a second client (a test client, not a second copy of the game) could join. On 2026-10-10 the game opened a Steam peer-to-peer connection to its own Steam ID inside one process and 6 pings were answered.
-- **Not verified yet:** the Steam connection between two different accounts (the test of this build), hosting and joining over Steam (not finished), building together (replicating construction and vehicle commands between two real games), sending a savegame between two real games, the native command hooks (not enabled in this version), and joining from a second real copy of the game.
+- **Not verified yet:** the Steam connection between two different accounts (the test of this build), hosting and joining over Steam (not finished), building together (replicating construction and vehicle commands between two real games), sending a savegame between two real games, the native command hooks (switched off unless a developer turns them on; never run in the game), and joining from a second real copy of the game.
 
 Details and dates: [docs/ROADMAP.md](docs/ROADMAP.md). How to try the test build: [docs/PLAYING.md](docs/PLAYING.md). What the `winhttp.dll` file is and why antivirus programs may look at it: [docs/SECURITY_FOR_USERS.md](docs/SECURITY_FOR_USERS.md).
 

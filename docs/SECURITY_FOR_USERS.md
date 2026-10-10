@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Written on 2026-10-10 for the test build 0.2.0-test1. Everything here can be checked against the source code in this repository (MIT licence), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Written on 2026-10-10 for the test build 0.2.0-test1. Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
@@ -35,7 +35,7 @@ When Windows loads the DLL, its start routine does this and nothing else:
 3. Otherwise it creates the folder `%LOCALAPPDATA%\FeverLink3\` (or the session folder, when the development launcher started the game) and appends lines to `native.log` there: that it loaded, the game's build timestamp, and whether that build is one the module knows. The build is identified from the game's own program headers in memory (the link timestamp). Build 40420 is the only known build.
 4. Inside the game it starts one thread named `feverlink3-live`.
 
-It does not hook any function in the game or in Windows in this version. The code to do that (inline detours, with the byte patterns of build 40420) exists in `native/src/detour.rs` and `native/src/build_table.rs` and is covered by unit tests on byte arrays, but nothing in the DLL calls it. See "What may change" below.
+**By default it hooks nothing.** The DLL does contain code that can patch the game's own code in memory (inline detours and one byte patch, with the byte patterns of build 40420: `native/src/hooks.rs`, `detour.rs`, `patch.rs`, `build_table.rs`). The start routine calls it, but it returns at once unless the game was started with the environment variable `FEVERLINK3_HOOKS=1` or `FEVERLINK3_POOLPATCH=1` (and `FEVERLINK3_HOLD=1` for the second hook), each with exactly the value `1`. The installer, the window and the release do not set these variables; a player would have to set them on purpose, and this is for developers testing the hooks. That code is tested on fake game functions only and has never run in the real game. See "What may change" below.
 
 ### 3. What the thread does while the game runs
 
@@ -61,7 +61,7 @@ These are statements about the code in this repository; you can search for the c
 
 ### 5. What may change
 
-Later versions are planned to install two inline hooks in the game's own code, to hold a construction command back until every player's game can apply it at the same moment, and one small byte patch (22 bytes in build 40420) that makes the game's script system use a single worker thread so that all games run scripts in the same order. Each patch checks the exact bytes it expects before writing anything and is skipped on a game build the module does not know. Patching another program's code in memory is exactly what security products watch for, so it will be announced in the changelog and described on this page before it ships.
+The switched-off code is meant to be turned on for players in a later version: two inline hooks in the game's own code (one counts the commands the simulation applies, one can hold a construction command back until every player's game can apply it at the same moment) and one small byte patch (22 bytes in build 40420) that makes the game's script system use a single worker thread, so that all games run scripts in the same order. When a switch is on, on a known build, the module first checks the exact bytes it expects at each place, then runs a self-test of its own detour machinery (it writes a few instructions of its own into a small block of executable memory, which it allocates for the purpose and never frees, and runs them), then writes the changes all-or-none, rolls back if one fails, keeps the DLL loaded for the rest of the process, and starts a second thread that exchanges two text files with the mod (`native_ctl.log`, `native_events.log`). Every step is written to `native.log`. Patching another program's code in memory and running generated code are exactly what security products watch for, so switching this on for players will be announced in the changelog and described on this page before it ships. `docs/NATIVE_LINK.md` is the design.
 
 ### Known gaps
 
@@ -167,11 +167,11 @@ Checked on 2026-10-10 by loading or searching the vendor's own page: Microsoft, 
 | Avira | https://www.avira.com/en/analysis/submit | |
 | Panda / WatchGuard | https://www.watchguard.com/wgrd-support/security-portal/report-false-positive | |
 
-Tips that every vendor asks for: name the product and the detection, send the exact file and its SHA-256, and say what the file is. Scanning the file at https://www.virustotal.com first shows whether one engine is the outlier (an outlier is usually a heuristic false positive); note that VirusTotal shares what you upload with its partners, which is fine here because the file is open source.
+Tips that every vendor asks for: name the product and the detection, send the exact file and its SHA-256, and say what the file is. Scanning the file at https://www.virustotal.com first shows whether one engine is the outlier (an outlier is usually a heuristic false positive); note that VirusTotal shares what you upload with its partners, which is fine here because the file's source code is public.
 
 ### Text you can paste into a report
 
-> False positive: `winhttp.dll` from FeverLink3 (open source, MIT).
+> False positive: `winhttp.dll` from FeverLink3 (public source code, PolyForm Noncommercial licence).
 > File: `winhttp.dll`, SHA-256 `<paste the hash>`, from https://github.com/AZalshehri7/FeverLink3/releases (tag `<version>`).
 > What it is: a proxy DLL for the game Transport Fever 3 (Steam app 3493540). It passes the 14 WinHTTP functions the game imports to the Windows system library unchanged, and runs a multiplayer session controller in one thread inside the game. It does not inject into other processes, persist, collect data or download code. Source and a description of its behaviour: https://github.com/AZalshehri7/FeverLink3 (folders `native/` and `launcher/`, page `docs/SECURITY_FOR_USERS.md`). It is built by GitHub Actions from the tag and is not code-signed yet.
 > Detection seen: `<product and detection name>`.
@@ -185,7 +185,7 @@ Tips that every vendor asks for: name the product and the detection, send the ex
 
 ## Who you are trusting
 
-- **This project's code and release.** You can read it, build it and compare the release against the checks above.
+- **This project's code and release.** You can read it, build it for noncommercial use and compare the release against the checks above.
 - **The host of a session.** When you join, your game loads the host's savegame. A Transport Fever savegame can carry game scripts, as a mod can, so joining a session means trusting the host as you would trust a mod author. Only join people you know.
 - **Everyone who has the join code.** They can join the session and act in the world, within the permissions the host sets. Do not post a code in public, and stop hosting when you are done.
 - **Steam,** for the route between the games.

@@ -82,7 +82,7 @@ Only join people you know. When you join, your game loads the host's world, and 
 - Hosting and joining over Steam, and sending the host's world to a second real game and loading it there.
 - Joining from a second real copy of the game, on another PC or Steam account.
 - Building together: the mod captures player actions (buying vehicles, creating lines, putting vehicles on lines, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
-- The native hooks that would hold construction commands back so every game builds at the same moment: not part of this version.
+- The native hooks that would hold construction commands back so every game builds at the same moment: switched off in this version, and never run in the real game.
 
 **Not built yet:** separate companies, reconnecting after a connection loss while the game keeps running, a dedicated server.
 
@@ -98,7 +98,7 @@ Paste `%LOCALAPPDATA%\FeverLink3` into the Explorer address bar to open the fold
 
 - **The game shows a red "Reload UI" error:** note the text, send a screenshot, click *Back to Main Menu*, and run `feverlink3 uninstall` if you want to play normally again.
 - **The game does not start after the install:** close Steam's launch attempt and run `feverlink3 uninstall` (or delete `winhttp.dll` from the game folder). Tell the maintainer your game build and Windows version. Known causes to check: a game update (the module can only be used with the game builds it was made for), an antivirus that blocked the file, Windows 11 Smart App Control, or another mod that also uses `winhttp.dll`.
-- **Your antivirus complains about `winhttp.dll`:** the file is a small, open-source proxy that Windows loads for the game. `docs/SECURITY_FOR_USERS.md` explains exactly what it does, how to verify it with a hash, and how to report a false positive.
+- **Your antivirus complains about `winhttp.dll`:** the file is a small proxy, with public source code, that Windows loads for the game. `docs/SECURITY_FOR_USERS.md` explains exactly what it does, how to verify it with a hash, and how to report a false positive.
 
 FeverLink3 builds on two earlier MIT-licensed projects, credited in the README: TpF2 Multiplayer by silver2127 (https://silver2127.github.io/tpf2-multiplayer/) and MPFever by dkdknight / arthur (https://github.com/dkdknight/MPFever).
 

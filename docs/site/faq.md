@@ -9,7 +9,10 @@ Last updated 2026-10-10, for the test build 0.2.0-test1. [Back to the start page
 ## The project
 
 **What is FeverLink3?**
-An unofficial, open-source (MIT) mod for Transport Fever 3 that aims to let several players build in one world at the same time, each in their own copy of the game. It is an early test build.
+An unofficial mod for Transport Fever 3 that aims to let several players build in one world at the same time, each in their own copy of the game. It is an early test build. Its source code is public.
+
+**What is the licence? Can I use it commercially?**
+FeverLink3 is licensed under the [PolyForm Noncommercial License 1.0.0](https://github.com/AZalshehri7/FeverLink3/blob/main/LICENSE): you may use, study, modify and share it for any noncommercial purpose, keeping the copyright notice. That makes it source available, not "open source" in the sense of the Open Source Initiative. Commercial use needs a separate commercial license from the author (message `azalshehri` on Discord). The few parts adapted from TpF2 Multiplayer and MPFever stay under their own MIT licences ([notices](https://github.com/AZalshehri7/FeverLink3/blob/main/THIRD_PARTY_NOTICES.md)).
 
 **What is the first test build for?**
 It has one job: to find out whether two players can reach each other through Steam. Its in-game window has a Steam connection test, which two testers run against each other. Hosting and joining a game over that connection come in the next test build, and building together after that.
@@ -61,10 +64,10 @@ Not yet. Separate companies are planned for 0.6 and a dedicated server for 1.0; 
 ## Safety
 
 **Is it safe? What is `winhttp.dll`?**
-It is a small open-source proxy DLL that Windows loads when the game starts. It passes the game's 14 WinHTTP functions to the real Windows file unchanged and, inside the game, runs the Steam connection test (and, in later builds, the multiplayer session) on one thread. [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html) explains every part, lists the files FeverLink3 creates, and says what is not verified.
+It is a small proxy DLL, with public source code, that Windows loads when the game starts. It passes the game's 14 WinHTTP functions to the real Windows file unchanged and, inside the game, runs the Steam connection test (and, in later builds, the multiplayer session) on one thread. [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html) explains every part, lists the files FeverLink3 creates, and says what is not verified.
 
 **My antivirus flags it.**
-The same page tells you how to verify the file with a hash and how to report a false positive to Microsoft, Kaspersky, ESET and others. The file is not code-signed yet; the plan is to apply to a free code-signing program for open-source projects once there is a release ([plan](../SIGNING.html)).
+The same page tells you how to verify the file with a hash and how to report a false positive to Microsoft, Kaspersky, ESET and others. The file is not code-signed yet; code signing is planned, and [the plan](../SIGNING.html) explains the options and what they cost.
 
 **Windows says "Windows protected your PC".**
 That is SmartScreen reacting to an unsigned, new program. More info, then Run anyway. It appears once for `feverlink3.exe`.

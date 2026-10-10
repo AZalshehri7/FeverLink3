@@ -15,7 +15,7 @@ FeverLink3 is an early test build. It is not yet a playable multiplayer game. Th
 
 **Proven on 2026-10-10:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered.
 
-**Not verified yet:** a Steam connection between two different accounts (the test of `0.2.0-test1`), hosting and joining over Steam (not finished), building together (command replication between two real games), savegame transfer between two real games, the native command hooks (not enabled in the code yet), and joining from a second real copy of the game.
+**Not verified yet:** a Steam connection between two different accounts (the test of `0.2.0-test1`), hosting and joining over Steam (not finished), building together (command replication between two real games), savegame transfer between two real games, the native command hooks (in the code but switched off, never run in the game), and joining from a second real copy of the game.
 
 ### Proof milestones
 
@@ -132,7 +132,7 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 ## 0.8 — Reach
 
 - [ ] Optional public game list
-- [ ] Code signing: apply to the SignPath Foundation once a release exists in the form that is to be signed (their rule), not later than the first playable release; plan, checklist and the alternatives in `docs/SIGNING.md` *(hardening)*
+- [ ] Code signing *(hardening)*: the free SignPath Foundation programme needs an OSI-approved licence, so the project (PolyForm Noncommercial) probably does not qualify; the paid options, their cost and eligibility, and the decision for the owner are in `docs/SIGNING.md`
 
 The hole-punching and STUN items that used to be listed here are replaced by Steam peer-to-peer, which moved to 0.2 because players should never have to configure anything to connect.
 

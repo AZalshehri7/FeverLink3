@@ -4,7 +4,7 @@ title: FeverLink3
 
 # FeverLink3
 
-**Cooperative multiplayer for Transport Fever 3.** The goal: several players build in one world at the same time, each in their own copy of the game. Open source (MIT), Windows and Steam, unofficial.
+**Cooperative multiplayer for Transport Fever 3.** The goal: several players build in one world at the same time, each in their own copy of the game. Source available (PolyForm Noncommercial, free for noncommercial use), Windows and Steam, unofficial.
 
 > **Early test build, not yet a playable multiplayer game.** Last updated 2026-10-10. The first test build has one job: to find out whether two players can reach each other through Steam. Its in-game window has a Steam connection test; hosting and joining a game over that connection come in the next test build. The Steam connection between two different accounts, building together between two real games, and sending the world between two real games have **not** been verified yet. [What is verified and what is not](site/status.html).
 
@@ -42,7 +42,7 @@ Releases are published at [github.com/AZalshehri7/FeverLink3/releases](https://g
 
 **How do the players connect?** Through Steam's peer-to-peer networking. The join code is all a friend needs, and by design nothing has to be set up. This is being tested: inside one game it is proven, between two different accounts it has not been tried yet, so nobody should assume it works over the internet today.
 
-**Is the `winhttp.dll` file safe?** It is a small open-source proxy that Windows loads for the game. [This page](SECURITY_FOR_USERS.html) lists exactly what it does and does not do, how to verify it and how to report an antivirus false positive. It is not code-signed yet.
+**Is the `winhttp.dll` file safe?** It is a small proxy, with public source code, that Windows loads for the game. [This page](SECURITY_FOR_USERS.html) lists exactly what it does and does not do, how to verify it and how to report an antivirus false positive. It is not code-signed yet.
 
 **Is it official?** No. It is not made, endorsed or supported by Urban Games or Paradox Interactive.
 

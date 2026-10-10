@@ -37,7 +37,7 @@ Written and covered by automated tests (unit tests, loopback sessions, two simul
 - Hosting and joining a game over Steam (the window's Host button says so), and sending the host's world to a second real game and loading it there.
 - Joining from a second real copy of the game.
 - Building together: replicating construction and vehicle commands between two real games.
-- The native hooks that hold construction commands back so every game builds at the same moment: the code exists, nothing is switched on in this version.
+- The native hooks that hold construction commands back so every game builds at the same moment: the code exists but is switched off by default and has never run in the real game.
 - Separate companies, a guided installer, a dedicated server.
 
 ## What would change this page
