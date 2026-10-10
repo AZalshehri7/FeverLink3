@@ -159,7 +159,11 @@ The Steam networking probe behind the connection test; `launcher/src/steamnet.rs
 A joined session that ends by itself (the host removed this player or rejected it, or the launcher gave up
 reconnecting after 5 minutes) turns into `failed` with a `message`, and the window may `host` or `join` again at once.
 `message` for a removal is "the host removed you from the session"; for a rejection "the host rejected us: <reason>"
-with the reason `bad-proof` (wrong code or password), `version`, `full` (with the player limit), `flood`.
+with the reason `bad-proof` (wrong code or password), `version` or `full` (with the player limit); for flooding "the host
+disconnected you: flood (more than N frames per second)".
+
+`players` keeps a player whose connection dropped for 5.5 minutes, with `state = "away"`: a window should label or hide
+those entries, they are not at the table.
 
 ## Example
 

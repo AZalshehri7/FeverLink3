@@ -727,12 +727,19 @@ impl PlayerLoop {
                         let lost =
                             SessionState { started: false, speed: 0, pause_at: None, lead: Lockstep::lead_units(1) };
                         write_to_game(&mut self.config.link, shared, MessageKind::Session, &codec::encode(&lost), 0);
-                        shared.log(format!(
-                            "reconnecting every {} s for {} s",
-                            self.config.reconnect_interval.as_secs_f32(),
-                            self.config.reconnect_window.as_secs_f32()
-                        ));
-                        retry = Some(Retry::start(&self.config));
+                        match retry.as_mut() {
+                            // another connection of the same outage dropped before the host welcomed us: the outage's
+                            // five minutes run on, or a host that accepts and resets would keep us trying for ever
+                            Some(r) => r.next_attempt = Instant::now() + self.config.reconnect_interval,
+                            None => {
+                                shared.log(format!(
+                                    "reconnecting every {} s for {} s",
+                                    self.config.reconnect_interval.as_secs_f32(),
+                                    self.config.reconnect_window.as_secs_f32()
+                                ));
+                                retry = Some(Retry::start(&self.config));
+                            }
+                        }
                         clocks.clear();
                         shared.update(|s| {
                             s.connected = false;
@@ -751,19 +758,19 @@ impl PlayerLoop {
             if self.dispatch(outputs, &mut clocks, shared) {
                 return;
             }
-            if let Some(r) = retry.as_mut() {
-                if self.net.is_some() {
-                    retry = None;
-                } else if Instant::now() >= r.next_attempt {
-                    if self.try_reconnect(r, shared) {
-                        // a fresh state machine for the fresh connection: new nonce, new counters
-                        retry = None;
-                    } else if Instant::now() >= r.deadline {
-                        let why = format!("could not reconnect within {} s", self.config.reconnect_window.as_secs());
-                        shared.log(&why);
-                        shared.update(|s| s.error = Some(why.clone()));
-                        return;
-                    }
+            if self.net.is_some() && self.player.state() == PlayerState::Joined {
+                // welcomed: the outage is over, whatever it took
+                retry = None;
+            } else if let Some(r) = retry.as_mut() {
+                if Instant::now() >= r.deadline {
+                    let why = format!("could not reconnect within {} s", self.config.reconnect_window.as_secs());
+                    shared.log(&why);
+                    shared.update(|s| s.error = Some(why.clone()));
+                    return;
+                }
+                if self.net.is_none() && Instant::now() >= r.next_attempt {
+                    // a fresh state machine for the fresh connection: new challenge, and the ticket for the old slot
+                    self.try_reconnect(r, shared);
                 }
             }
             let joined = self.player.state() == PlayerState::Joined && self.net.is_some();
@@ -835,10 +842,8 @@ impl PlayerLoop {
                     None => PlayerSession::new(key, name, version),
                 };
                 self.net = Some(net);
-                shared.update(|s| {
-                    s.reconnecting = false;
-                    s.my_id = None;
-                });
+                // still reconnecting until the host's welcome says so
+                shared.update(|s| s.my_id = None);
                 true
             }
             Err(e) => {
@@ -883,6 +888,7 @@ impl PlayerLoop {
                         shared.log(format!("cannot write identity.txt: {e}"));
                     }
                     shared.update(|s| {
+                        s.reconnecting = false;
                         s.my_id = Some(welcome.you);
                         s.name = name;
                         s.players = welcome.players.clone();

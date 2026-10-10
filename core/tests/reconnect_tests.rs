@@ -459,6 +459,8 @@ fn ids_are_never_given_twice() {
     assert_eq!(4, n.id(d));
 }
 
+/// Two hosts with the same key: a host that is started again has a new secret and never gets here, so this models
+/// only what a claim to a slot another player holds does. (With the same key the counters of both would repeat.)
 #[test]
 fn after_a_host_restart_the_old_ticket_gives_a_new_player_and_never_somebody_elses_slot() {
     let mut old = Net::new();

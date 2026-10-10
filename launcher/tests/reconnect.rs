@@ -129,6 +129,31 @@ fn a_link_that_goes_silent_is_cut_off_by_the_host_and_the_player_returns_to_its_
     host.stop();
 }
 
+#[test]
+fn a_host_that_accepts_and_resets_does_not_keep_a_player_trying_beyond_its_window() {
+    let root = tempfile::TempDir::new().unwrap();
+    let key = key();
+    let (host, _host_game) = start_host(root.path(), &key, HostOptions::default(), Vec::new());
+    let proxy = Proxy::start(host.local_addr().unwrap());
+    let (alice, _a) = start_player_window(
+        root.path(),
+        &key,
+        "Alice",
+        proxy.addr,
+        Duration::from_millis(100),
+        Duration::from_millis(1500),
+    );
+    assert!(alice.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+
+    // every new connection is accepted and closed at once: each attempt "connects", none is welcomed
+    proxy.refuse(true);
+    proxy.cut();
+    assert!(alice.wait_for(Duration::from_secs(10), |s| s.finished), "{:?}", alice.status());
+    let error = alice.status().error.unwrap_or_default();
+    assert!(error.contains("could not reconnect within 1 s"), "{error}");
+    host.stop();
+}
+
 // ------------------------------------------------------------------ leaving and being removed
 
 #[test]

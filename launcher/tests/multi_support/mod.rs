@@ -170,13 +170,25 @@ pub fn start_player_with(
     to: SocketAddr,
     reconnect_interval: Duration,
 ) -> (SessionHandle, Game) {
+    start_player_window(root, key, name, to, reconnect_interval, Duration::from_secs(60))
+}
+
+/// As [`start_player_with`], giving up when the outage has lasted `reconnect_window`.
+pub fn start_player_window(
+    root: &Path,
+    key: &SessionKey,
+    name: &str,
+    to: SocketAddr,
+    reconnect_interval: Duration,
+    reconnect_window: Duration,
+) -> (SessionHandle, Game) {
     let link = gamelink::Session::create_under(root, name).unwrap();
     let dir = link.dir().to_path_buf();
     let saves = root.join(format!("{name}-saves"));
     let mut config = PlayerConfig::new(vec![to], name, key.clone(), link);
     config.save_dirs = vec![saves.clone()];
     config.reconnect_interval = reconnect_interval;
-    config.reconnect_window = Duration::from_secs(60);
+    config.reconnect_window = reconnect_window;
     let handle = run_player(config).unwrap();
     (handle, Game::new(&dir, &saves, false, Vec::new()))
 }

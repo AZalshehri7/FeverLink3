@@ -168,7 +168,7 @@ impl Model {
             59..=78 => {
                 self.count("time");
                 let secs = [0.2, 1.0, 1.0, 5.0, 31.0, 120.0, 400.0][self.rng.below(7) as usize];
-                self.n.run_for(secs, if secs > 30.0 { 10.0 } else { 1.0 });
+                self.n.run_for(secs, if secs > 30.0 { 4.0 } else { 1.0 });
             }
             79..=86 => {
                 self.count("talk");

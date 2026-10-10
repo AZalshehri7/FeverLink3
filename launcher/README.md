@@ -72,7 +72,8 @@ One thread owns each session's state machine; everything else only feeds it even
   `PlayerSession` (new challenge); `status().reconnecting` is true meanwhile. Each attempt asks for the id and slot
   the first welcome granted (a `ResumeTicket`), so a player that is back inside the host's 330 s window is the same
   player with the same permissions, and the host runs a hot-join round for it (`player returned`). A host that no
-  longer has the slot (restarted, window over, player removed) answers with a plain join and a new id. A reject, a
+  longer has the slot (window over, player removed or gone on purpose) answers with a plain join and a new id; a
+  host started again has a new secret and rejects the old player's proof, which is final. A reject, a
   kick or a `flood` refusal is final and not retried. If the 5 minutes pass the session ends with `status().error`
   set. The first connection is not retried: `join` fails at once. **Stopping** a session on purpose sends `Leave`
   first and waits up to 0.5 s for the host to close, so the host frees the slot at once instead of holding it.
@@ -117,7 +118,8 @@ Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
   chunks itself. Ping, Kicked, Pong and Leave (21, 22, 37, 38) are the session layer's own too: the core answers a
   ping, the launcher sends Leave when a player stops, and Kicked ends the session like a reject; none has a line
   kind and a game cannot send them.
-- A game can only send the kinds marked "from game" (exactly the player allow-list). A line of any other kind,
+- A game can only send the kinds marked "from game" (the player allow-list without Pong and Leave, which the launcher
+  sends itself). A line of any other kind,
   such as `session`, is logged and dropped: a game cannot speak for the host. A payload that is not valid literal
   syntax is logged and dropped.
 - The `from` column of a line from the game is not used. The state machine knows who the game is: the host's own
