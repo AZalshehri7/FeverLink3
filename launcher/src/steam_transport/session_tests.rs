@@ -301,12 +301,11 @@ fn the_first_connection_reports_what_it_is_doing_to_the_caller() {
 }
 
 /// Moves a savegame of `chunks` whole chunks and a bit through a resync round and checks it arrives byte for byte.
-/// With a wire delay of 100 ms or more every message is still in flight when the next chunk is ready, so Steam's
-/// 512 KiB send buffer really fills while the chunks stream, and the transport must wait for room.
-fn resync_round_moves_a_save(chunks: usize, wire_delay_ms: u64) {
+/// The player stops reading until the host has run into Steam's 512 KiB send buffer, so the transport really has to
+/// wait for room (no timing involved), then reads on.
+fn resync_round_moves_a_save(chunks: usize) {
     let save: Vec<u8> = (0..(chunks * ResyncLimits::CHUNK_SIZE + 4321)).map(|i| (i % 253) as u8).collect();
     let mut table = Table::new(HostOptions::default(), save.clone());
-    table.machine.set_wire_delay(Duration::from_millis(wire_delay_ms));
     let mut player = table.player("Pat");
     assert!(player.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()), "{:?}", player.handle.logs());
 
@@ -316,10 +315,14 @@ fn resync_round_moves_a_save(chunks: usize, wire_delay_ms: u64) {
     table.handle.command(Command::Start);
     assert!(table.handle.wait_for(WAIT, |s| s.session.as_ref().is_some_and(|x| x.started)));
 
+    player._machine.stall_receive(true);
     table.handle.command(Command::Resync);
     let done = wait(Duration::from_secs(300), || {
         table.game.step();
         player.game.step();
+        if table.machine.full_sends() > 0 {
+            player._machine.stall_receive(false);
+        }
         table.handle.status().resync.as_deref() == Some("Idle")
     });
     let logs = table.handle.logs().join("\n");
@@ -334,23 +337,21 @@ fn resync_round_moves_a_save(chunks: usize, wire_delay_ms: u64) {
     // the biggest message the host handed to Steam was a full chunk: a bit over 350 KB, inside the 512 KiB limit
     let largest = table.machine.largest_sent();
     assert!(largest > 349_000 && largest + 100_000 < MAX_MESSAGE, "largest Steam message: {largest} bytes");
-    if wire_delay_ms >= 100 {
-        assert!(table.machine.full_sends() > 0, "the send buffer filled and the transport waited");
-    }
+    assert!(table.machine.full_sends() > 0, "the send buffer filled and the transport waited");
     player.handle.stop();
     table.handle.stop();
 }
 
 #[test]
 fn a_resync_round_moves_a_multi_chunk_save_over_steam() {
-    resync_round_moves_a_save(3, 150);
+    resync_round_moves_a_save(3);
 }
 
 /// The size of the real save: about 31 MB, 119 chunks, through hashing, sealing, Steam's send buffer, reassembly
 /// and the hash check. Ten seconds in a debug build.
 #[test]
 fn a_resync_round_moves_a_savegame_of_the_real_size_over_steam() {
-    resync_round_moves_a_save(31 * 1024 * 1024 / ResyncLimits::CHUNK_SIZE, 20);
+    resync_round_moves_a_save(31 * 1024 * 1024 / ResyncLimits::CHUNK_SIZE);
 }
 
 #[test]

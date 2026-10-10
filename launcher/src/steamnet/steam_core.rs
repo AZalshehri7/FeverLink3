@@ -139,6 +139,19 @@ pub struct Config {
     pub send_rate: i32,
 }
 
+impl Config {
+    /// How long the poller sleeps between cycles with this many listen sockets and connections tracked.
+    pub fn rest(&self, listeners: usize, conns: usize) -> Duration {
+        if conns > 0 {
+            self.active
+        } else if listeners > 0 {
+            self.listening
+        } else {
+            self.idle
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Config {
         Config {
@@ -508,11 +521,11 @@ impl Shared {
             let reg = lock(&self.registry);
             (reg.listeners.len(), reg.conns.len())
         };
+        let rest = self.config.rest(listeners, conns);
         if conns > 0 {
-            thread::sleep(self.config.active);
+            thread::sleep(rest);
             return;
         }
-        let rest = if listeners > 0 { self.config.listening } else { self.config.idle };
         let guard = lock(&self.woken);
         let (mut guard, _) =
             self.wake.wait_timeout_while(guard, rest, |woken| !*woken).unwrap_or_else(|p| p.into_inner());
@@ -1837,10 +1850,20 @@ mod tests {
         client.wait_opened("the open");
         let connected = polls(&a);
         core_b.handle().close(conn);
-        assert!(idle * 2 < listening, "idle {idle}, listening {listening}");
-        assert!(listening * 2 < connected, "listening {listening}, connected {connected}");
-        // 2 ms is the pace of a connection; even a busy machine gets well past a hundred cycles in 400 ms
-        assert!(connected > 100, "{connected}");
+        // the pace is chosen by the numbers below; here only a loose check that the poller really sleeps that way
+        // (a loaded machine stretches every sleep, so no absolute rate and no tight ratio)
+        assert!(idle < connected && listening < connected, "idle {idle}, listening {listening}, connected {connected}");
+        assert!(connected >= 8, "{connected} polls in 400 ms with a connection");
+    }
+
+    #[test]
+    fn the_pace_follows_what_there_is_to_serve() {
+        let c = Config::default();
+        assert_eq!(c.rest(0, 0), Duration::from_millis(100));
+        assert_eq!(c.rest(1, 0), Duration::from_millis(20));
+        assert_eq!(c.rest(0, 1), Duration::from_millis(2));
+        assert_eq!(c.rest(2, 8), Duration::from_millis(2), "a connection decides, however many listen sockets");
+        assert!(c.active <= Duration::from_millis(5), "a message waits at most one cycle: a few ms");
     }
 
     #[test]
