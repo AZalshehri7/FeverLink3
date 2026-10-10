@@ -6,8 +6,10 @@ use std::collections::BTreeSet;
 use super::{clip, HostOutput, HostSession};
 use crate::session::checksum::ChecksumOutcome;
 use crate::session::kind::MessageKind;
+use crate::session::lockstep::Lockstep;
 use crate::session::messages::{
     codec, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage, ResyncSaveMessage, SaveDoneMessage,
+    SessionState,
 };
 use crate::session::resync::{normalize_sha256, ResyncLimits, ResyncState};
 
@@ -92,7 +94,24 @@ impl HostSession {
         self.resync_counter += 1;
         let id = self.resync_counter;
         let resume_speed = if self.state.speed > 0 { self.state.speed } else { self.last_running_speed };
-        if self.state.pause_at.is_none() {
+        if self.state.speed == 0 && self.state.pause_at.is_none() {
+            // A session that has never run holds at speed 0 with no pause stamp (the games were at different times
+            // when it started). No game would ever reach a stamp in the future, so the games may run up to it, at
+            // the speed the session resumes at. The world that everyone gets is the host's, so the stamp is
+            // counted from the host's own clock, not from the furthest game's.
+            let base = match self.clocks.get(&Self::HOST_ID) {
+                Some(c) => c.estimate(self.now()) as i64,
+                None => self.max_clock(),
+            };
+            let at = Lockstep::round_up_to_step(base.saturating_add(Lockstep::lead_units(resume_speed)) as f64);
+            self.state = SessionState {
+                speed: resume_speed,
+                pause_at: Some(at),
+                lead: Lockstep::lead_units(resume_speed),
+                ..self.state.clone()
+            };
+            self.broadcast_session();
+        } else if self.state.pause_at.is_none() {
             self.pause_inner();
         }
         let pause_at = self.state.pause_at.unwrap_or(0);

@@ -793,7 +793,13 @@ impl HostSession {
         let at = common.map_or("different times".to_owned(), |t| t.to_string());
         self.log(format!("session started with {ready} ready game(s) at {at}"));
         self.broadcast_session();
-        self.request_checksum_inner();
+        if times.len() > 1 {
+            // The games report different times, so they are not in the same world: bring everyone into the
+            // host's world now instead of waiting for the host to ask.
+            self.begin_resync("session start");
+        } else {
+            self.request_checksum_inner();
+        }
         self.drain()
     }
 

@@ -616,3 +616,73 @@ fn permissions_is_kind_20_and_only_the_host_may_send_it() {
     assert_eq!(Some(MessageKind::Permissions), MessageKind::from_u8(20));
     assert!(!MessageKind::Permissions.allowed_from_player());
 }
+
+// ------------------------------------------------------------------ starting with games at different times
+
+/// Two games that loaded different saves (the host's clock is behind the player's) and a host that presses Start.
+fn started_at_different_times() -> (Harness, ConnectionId) {
+    let mut h = Harness::with(quiet());
+    let p = h.connect("Guest");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3 }));
+    h.hello_player(p, 183_600, 0);
+    h.host_call(HostSession::start);
+    (h, p)
+}
+
+#[test]
+fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_at_once() {
+    let (mut h, p) = started_at_different_times();
+    assert_eq!(ResyncState::Pausing, h.host.resync_state());
+    let state = h.host.state().clone();
+    let pause_at = state.pause_at.expect("a pause stamp");
+    assert!(state.speed > 0, "a stopped game never reaches a stamp ahead of it, so the games may run");
+    assert!(
+        pause_at > 87_000 && pause_at < 183_600,
+        "counted from the host's clock, not the furthest game's: {pause_at}"
+    );
+    assert_eq!(0, pause_at % Lockstep::STEP);
+    assert_eq!(Some(pause_at), h.p(p).session.session().unwrap().pause_at);
+
+    // the player's game was already past the stamp and holds; the host's game runs up to the stamp and stops there
+    assert_eq!(ResyncState::Pausing, h.host.resync_state(), "the host's game is still behind the stamp");
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 1, ahead: 3 }));
+    assert_eq!(ResyncState::Pausing, h.host.resync_state(), "still running");
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 0, ahead: 3 }));
+    assert_eq!(ResyncState::Saving, h.host.resync_state());
+
+    let id = h.host.resync_id().unwrap();
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    let bytes = blob(1000);
+    h.send_file(id, &bytes);
+    assert_eq!(vec![(id, sha256_hex(&bytes), bytes.clone())], h.p(p).saves);
+    h.hello_all(pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert_eq!(pause_at, req.at);
+    report_all(&mut h, &[p], req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(1, h.host.state().speed, "the session runs afterwards");
+    assert_eq!(None, h.host.state().pause_at);
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+}
+
+#[test]
+fn starting_with_one_game_does_not_start_a_round() {
+    let mut h = Harness::with(quiet());
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3 }));
+    h.host_call(HostSession::start);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(Some(87_000), h.host.state().pause_at);
+}
+
+#[test]
+fn starting_with_games_at_the_same_time_does_not_start_a_round() {
+    let mut h = Harness::with(quiet());
+    let p = h.connect("Guest");
+    h.hello_all(10_000, 0);
+    let _ = p;
+    h.host_call(HostSession::start);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(Some(10_000), h.host.state().pause_at);
+}
