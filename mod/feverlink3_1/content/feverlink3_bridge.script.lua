@@ -632,6 +632,7 @@ local G = {
 	outSeen = {},             -- native builds the simulation half captured that this half already shipped
 	uiSeq = {},               -- id of a command record from the UI-state hook -> the sequence number it was shipped as
 	authPending = {},         -- round -> a host authority that arrived before this game reached that round
+	authLast = nil,           -- the money differences the previous round measured (a correction needs the same one twice)
 	bindsWritten = nil,       -- text of the last binds.txt (the UI-state hook reads it to name entities)
 }
 
@@ -701,7 +702,11 @@ end
 local function applyAuthority(p)
 	local own = G.accountAt[p.n]
 	if not own then return false end
-	local applied, failed = L.applyAuthority(engine, own, p.values)
+	local applied, failed, measured = L.applyAuthority(engine, own, p.values, G.authLast)
+	G.authLast = measured
+	if next(measured) ~= nil and next(applied) == nil and #failed == 0 then
+		logGui("host authority: round " .. tostring(p.n) .. " differs (balance " .. tostring(measured.balance) .. ", loan " .. tostring(measured.loan) .. "); corrected only if the next round shows the same")
+	end
 	if applied.balance then logGui("host authority: balance corrected by " .. applied.balance .. " (round " .. tostring(p.n) .. ")") end
 	if applied.loan then logGui("host authority: loan corrected by " .. applied.loan .. " (round " .. tostring(p.n) .. ")") end
 	for _, name in ipairs(failed) do logGui("host authority: " .. name .. " differs but this build cannot correct it") end

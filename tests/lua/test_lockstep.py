@@ -744,9 +744,15 @@ class LockstepTest(unittest.TestCase):
         pa, pb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
         self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "loan"})
         self.assertEqual(self.relay.authority[1], {"balance": 1000000, "loan": 250000}, "the host's report carries its account")
+        self.relay.send_authority(1)
+        self.tick(6)
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "one round alone may be an action still on its way (replay on peers)")
+        # the same difference one round later is a drift: now it is corrected
+        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
         # the world moves on before the correction arrives: it is measured against the round, not against now
         self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance - 300")
-        self.relay.send_authority(1)
+        self.relay.send_authority(2)
         self.tick(6)
         self.assertEqual(self.B.L.eval("ACCOUNT.balance"), 1000000 - 300, "balance moved by the round's difference (-5000) only")
         self.assertEqual(self.B.L.eval("ACCOUNT.loan"), 250000)
@@ -756,9 +762,9 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.B.applied(), [], "a journal entry is not a replicated action")
         # the next round is identical
         self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 300")
-        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.relay.checksum_request(3, self.relay.future_stamp(), False)
         self.tick(40, lag_b=True)
-        self.assertEqual(self.relay.reports[2][0][1], self.relay.reports[2][1][1], "worlds identical after the correction")
+        self.assertEqual(self.relay.reports[3][0][1], self.relay.reports[3][1][1], "worlds identical after the correction")
         self.assertIn("balance corrected by -5000", self.B.log())
 
     def test_authority_that_arrives_before_the_game_reaches_the_round_waits_for_it(self):
@@ -768,16 +774,37 @@ class LockstepTest(unittest.TestCase):
         self.tick(5)
         balance = int(self.B.L.eval("ACCOUNT.balance"))
         loan = int(self.B.L.eval("ACCOUNT.loan"))
-        self.relay.authority[9] = {"balance": balance + 700, "loan": loan}
-        self.relay.send_authority(9)
-        self.tick(5)
-        self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "nothing to measure against yet")
-        self.assertNotIn("skipped", self.B.log(), "it is kept, not thrown away")
-        self.relay.checksum_request(9, self.relay.future_stamp(), False)
-        self.tick(40)
-        self.assertEqual(self.B.L.eval("JOURNAL[1]"), 700, "applied as the difference once the game reached the round")
+        for n in (9, 10):   # the same difference in two rounds in a row: a drift, corrected
+            self.relay.authority[n] = {"balance": balance + 700, "loan": loan}
+            self.relay.send_authority(n)
+            self.tick(5)
+            self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "nothing to measure against yet, and nothing thrown away")
+            self.assertNotIn("skipped", self.B.log())
+            self.relay.checksum_request(n, self.relay.future_stamp(), False)
+            self.tick(40)
+        self.assertEqual(self.B.L.eval("JOURNAL[1]"), 700, "applied as the difference once the game reached the second round")
         self.assertEqual(self.B.L.eval("#JOURNAL"), 1)
         self.assertIn("balance corrected by 700", self.B.log())
+
+    def test_a_difference_that_is_gone_one_round_later_is_never_corrected(self):
+        # An action replayed on the other game reaches it a stamp's lead after the game it came from: a checksum round in
+        # between sees the effect on one side only, and the next round sees none. Correcting the first would count it twice.
+        self.start()
+        self.tick(5)
+        balance = int(self.B.L.eval("ACCOUNT.balance"))
+        loan = int(self.B.L.eval("ACCOUNT.loan"))
+        self.relay.authority[11] = {"balance": balance + 17000, "loan": loan + 17000}
+        self.relay.checksum_request(11, self.relay.future_stamp(), False)
+        self.tick(40)
+        self.relay.send_authority(11)
+        self.tick(5)
+        self.relay.authority[12] = {"balance": balance, "loan": loan}   # the action has reached this game: no difference
+        self.relay.checksum_request(12, self.relay.future_stamp(), False)
+        self.tick(40)
+        self.relay.send_authority(12)
+        self.tick(5)
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 0)
+        self.assertNotIn("corrected by", self.B.log())
 
     # ---- resync
 
@@ -1087,9 +1114,15 @@ class PureTest(unittest.TestCase):
         self.assertEqual((d.balance, d.loan), (100, None))
         booked = []
         eng = L.table_from({"bookJournal": L.eval("function(a) BOOKED = a end"), "adjustLoan": None})
-        applied, failed = K.applyAuthority(eng, L.table_from({"balance": 1, "loan": 5}), L.table_from({"balance": 11, "loan": 9}))
+        own, host = L.table_from({"balance": 1, "loan": 5}), L.table_from({"balance": 11, "loan": 9})
+        applied, failed, measured = K.applyAuthority(eng, own, host)
+        self.assertEqual((applied.balance, applied.loan, len(list(failed.values()))), (None, None, 0), "a first round only measures")
+        self.assertEqual((measured.balance, measured.loan), (10, 4))
+        applied, failed, measured = K.applyAuthority(eng, own, host, measured)
         self.assertEqual(applied.balance, 10)
         self.assertEqual(list(failed.values()), ["loan"], "a build without a loan accessor reports it cannot correct the loan")
+        applied, failed, _ = K.applyAuthority(eng, own, host, L.table_from({"balance": 200, "loan": 4}))
+        self.assertEqual(applied.balance, None, "a difference that changed since the round before is not the same one")
 
     def test_hud_model(self):
         H, L = self.H, self.L

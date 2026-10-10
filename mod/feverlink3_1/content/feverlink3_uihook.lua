@@ -187,8 +187,10 @@ function M.install()
 		end
 		wanted.sendCommand = nil
 		for name in pairs(wanted) do
+			-- in the window's Lua state the engine's command makers are callable tables, not plain functions (seen in a real
+			-- game): anything that is there is kept and called the way the windows call it
 			local okf, f = pcall(function() return api.cmd[name] end)
-			if okf and type(f) == "function" then orig.factory[name] = f end
+			if okf and f ~= nil and type(f) ~= "boolean" and type(f) ~= "number" and type(f) ~= "string" then orig.factory[name] = f end
 		end
 	end
 	U.orig = orig
