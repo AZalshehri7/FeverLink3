@@ -47,7 +47,7 @@ Each piece is checked against the bytes in memory first, installed all-or-none f
 
 ## Size
 
-The module links Rust's `std` for `Vec`, `String`, threads and file logging, and the launcher crate (for the in-game session controller) with `serde_json`. Measured release build with the MSVC toolchain (the reference figure, printed by CI in the job summary): SIZE_ABORT bytes with `panic = "abort"`. With `panic = "unwind"` the same code is SIZE_UNWIND bytes (SIZE_DIFF), which is why the profile stays on abort; `docs/SECURITY.md` section 5 has the numbers and the audit. The planned optimisation, once the hook set is known, is `#![no_std]` + `alloc` with a `HeapAlloc`-backed allocator and a panic handler that logs and aborts; the session controller's dependencies would have to move out of the DLL first.
+The module links Rust's `std` for `Vec`, `String`, threads and file logging, and the launcher crate (for the in-game session controller) with `serde_json`. Measured release build with the MSVC toolchain (the reference figure, printed by CI in the job summary): 903 168 bytes with `panic = "abort"`. With `panic = "unwind"` the same code is 1 247 232 bytes (+344 064, 38 %), which is why the profile stays on abort; `docs/SECURITY.md` section 5 has the numbers and the audit. The planned optimisation, once the hook set is known, is `#![no_std]` + `alloc` with a `HeapAlloc`-backed allocator and a panic handler that logs and aborts; the session controller's dependencies would have to move out of the DLL first.
 
 ## Status
 

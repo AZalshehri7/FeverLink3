@@ -14,7 +14,7 @@ repository = "https://github.com/AZalshehri7/FeverLink3"
 #
 # panic = "abort": a panic in the game process ends the game, after the panic hook has written the message to
 # native.log. "unwind" would let launcher::guard contain a panic in the controller or a session thread, but it makes
-# feverlink3_native.dll 297 KB (36 %) larger (MSVC, rustc 1.99: 819 200 -> 1 116 672 bytes), and Cargo takes the
+# feverlink3_native.dll 336 KB (38 %) larger (MSVC, rustc 1.99: 903 168 -> 1 247 232 bytes), and Cargo takes the
 # setting per profile, not per crate, so it cannot be had for the DLL alone without a second profile and a change to
 # the packaging. The decision and the numbers are in docs/SECURITY.md, section 5; CI prints both sizes in the job
 # summary. To try it: change the line below.
