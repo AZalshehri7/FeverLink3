@@ -1,4 +1,4 @@
-# Playing FeverLink3 (test version 0.2.0-test1)
+# Playing FeverLink3 (test version 0.2.0-test4)
 
 FeverLink3 lets two or more people play the same Transport Fever 3 world together, each on their own PC: one player hosts, the others join with a code. **This first test build has one job: to find out whether two players can reach each other through Steam** (the connection test in section 3). Hosting and joining a game over that connection arrive in the next test build, so the window's **Host a game** button will tell you that it is not finished yet. Expect rough edges, and tell the maintainer (Discord `azalshehri`) what happens.
 
@@ -56,44 +56,49 @@ Start Transport Fever 3 from **Steam as usual** (no extra program needs to run),
 - The mod does nothing until you host or join: without a session, the game plays as it always does.
 - If the window says "The FeverLink3 module is not running", close the game, install again (choice `1`), and start the game from Steam. If it says "looking for Steam..." for more than a minute, make sure the game was started from Steam.
 
-## 3. The Steam connection test (this test build)
+## 3. Hosting and joining (this test build)
 
-This build proves that two players can reach each other through Steam. In the window, under **Steam connection test**:
+Players connect to each other through Steam's peer-to-peer networking. Nothing needs to be opened on your router or firewall.
 
-1. Your **Steam ID** is shown (17 digits). Send it to the other player; they send you theirs. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
-2. Paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**.
-3. Within about 20 seconds the window shows a line like `Test: connected, answers 6, last round trip 40 ms, direct` (or `through a Steam relay`, which means Steam used its own relay servers). The other player's window shows `Pings received from other players`.
+**The host:**
 
-Both directions are worth trying (A tests B, then B tests A). Both players need to be in the game with Steam running when the test starts. If it says `failed`, or nothing happens after a minute, send the maintainer a screenshot and the log files below, and say in which countries you and the other player live (the country is enough).
+1. Start a game (a new game, or load one) with *FeverLink3 Multiplayer* activated, and click **FeverLink3** in the bottom bar.
+2. Press **Host a game**. The window shows a long **join code**. Click into the code field, press `Ctrl+A` then `Ctrl+C`, and send the code to your friend (chat, Discord). Treat it like a password for the session.
+3. Press **Start the session**. The game stops at its current moment and waits for the other player.
+4. When your friend joins, the window lists them under **Players**, and your world is sent to their game.
 
-## 4. Hosting and joining (next test build)
+**The player who joins:**
 
-Hosting and joining a game with a join code will travel over the same Steam connection. They arrive in the next test build; until then **Host a game** answers that hosting over Steam is not finished in this build yet. The flow will be: the host clicks **Host a game**, copies the join code and sends it to a friend, who pastes it into **paste the join code here** and presses **Join**; the host's world is then sent to the friend and loads. There will be nothing to forward, open or configure.
+1. Start any game with *FeverLink3 Multiplayer* activated (a new game is fine; it is replaced) and click **FeverLink3** in the bottom bar.
+2. Paste the host's code into **paste the join code here** and press **Join**. The window shows what it is doing (`contacting the host`, `finding a route`, `connected`).
+3. The host's world is sent to you (about 30 MB; it takes up to a minute or two), your game reloads into it, and the session runs on both games.
 
-Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod. Treat a join code like a password for that session.
+Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod.
+
+If joining fails, the window says why (wrong code, the host is not hosting, no route found). Send the maintainer a screenshot and the log files below.
+
+## 4. The Steam connection test (for problems)
+
+Under **Steam connection test** you can check that two players can reach each other through Steam, without hosting: your **Steam ID** (17 digits) is shown; paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**. Within about 20 seconds the window shows `connected` with the round-trip time and whether the route is `direct` or `through a Steam relay`. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
 
 ## What works and what does not (yet)
 
-**Verified in the real game by the maintainer on 2026-10-09 (game build 40420):**
+**Verified in the real game by the maintainer (game build 40420):**
 
-- The mod loads and the in-game window opens from a button in the bottom bar.
-- With an earlier build of the window, whose Host button used a direct connection (since taken out of the window), hosting showed a join code and a second client (a test client, not a second copy of the game) could join that session by its code.
-- The game's own save and load functions can be driven by the mod, and after a reload the mod finds its session files again.
-- The game can open a Steam peer-to-peer listener.
-
-**Proven on 2026-10-10:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered.
+- The mod loads, the in-game window opens from a button in the bottom bar, and **Host a game** over Steam shows a join code.
+- Two real copies of the game on one PC (joined over the developer connection, which players never use) stay in step: the host's world is sent, the second game loads it, and both report identical world checksums.
+- The game's own save and load functions can be driven by the mod.
+- **Steam peer-to-peer works between two different accounts** (2026-10-10: a friend's connection test reached the maintainer through a Steam relay), and inside one game the transport's nine self-checks pass, including a frame the size of a savegame chunk.
 
 **Not verified yet:**
 
-- The Steam connection between two different accounts on two PCs (the test in section 3 is for this).
-- Hosting and joining over Steam, and sending the host's world to a second real game and loading it there.
-- Joining from a second real copy of the game, on another PC or Steam account.
-- Building together: the mod captures player actions (buying vehicles, creating lines, putting vehicles on lines, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
+- Joining a host over Steam from a second Steam account, the world transfer over that connection, and playing together afterwards (this build is for that test).
+- Building together: the mod captures player actions (buying vehicles, creating lines, roads and rails built with the tools in some cases, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
 - The native hooks that would hold construction commands back so every game builds at the same moment: switched off in this version, and never run in the real game.
 
 **Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
 
-**Not built yet:** separate companies, a dedicated server.
+**Not built yet:** separate companies (one shared company for now), a dedicated server.
 
 ## If something goes wrong
 
