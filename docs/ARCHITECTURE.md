@@ -74,7 +74,7 @@ The *only* unsealed frames are `join` (carries a proof the sender knows the key:
 ## 5. Lockstep
 
 - **Clock.** Game time from the engine, in game-time units; one simulation step is 200 units. Every game sends its clock to the host regularly; the host relays it as a peer clock.
-- **Stamp.** A local action is stamped `now + lead`, where lead covers the round trip to the slowest peer plus a reserve for the engine's batch. The host supplies the current lead with the session state; a game may raise it, never lower it.
+- **Stamp.** A local action is stamped `now + lead`, where lead covers the one-way network time to the slowest peer, the file hand-offs and a game frame, one step for the script event that carries the action into the simulation state, and one step of margin, counted in steps at the current speed (`Lockstep::lead_for`: 3 steps on a good connection, about half a second at normal speed, longer for a slow link or a higher speed). The host measures the round trips with its pings, supplies the current lead with the session state and shortens it only after it stayed lower for eight seconds; a game may raise it, never lower it.
 - **Barrier.** No game runs more than *window* steps ahead of the slowest peer. A game that reaches the barrier sets speed 0 until the peer catches up. Pause is a stamp too: every game stops at exactly that step.
 - **Ordering.** Actions at the same stamp apply in (stamp, sender id, sequence) order on every game.
 - **Late actions** (stamp already passed when received) are applied at once and logged `LATE`; a late action at the host triggers a checksum at the next common stamp.
@@ -85,11 +85,13 @@ Three modes, from TpF2 Multiplayer, chosen per action kind:
 
 | Mode | Where the originator's game applies it | Used for |
 |---|---|---|
-| **Strict** | Held by the native module, applied at the stamp like everywhere else. Nobody's world runs ahead. | Construction tools, bulldozer, vehicle purchase, line edits, terrain |
+| **Strict** | Held by the native module, cancelled, and applied at the stamp by every game, the originator's included, through the replay path. Nobody's world runs ahead. | Construction tools, bulldozer, vehicle purchase, line edits, terrain. Built so far: the construction tools and the bulldozer, in the mod (not yet run in the game, see below) |
 | **Replay on peers** | Natively at the click; peers apply a few steps later. | Actions the native module cannot hold without crashing the tool |
 | **Poll** | Natively; the mod detects the change by scanning and ships it. | Renames, colours, settings with no command hook |
 
 Rules: never cancel a command that nothing will replay (solo play stays stock); never cancel a command that cannot be fully decoded (losing the player's action is worse than a visible divergence); the wire never carries engine entity ids.
+
+**Strict mode for the native tools, as the mod does it** (`docs/NATIVE_LINK.md` section 7; follows TpF2 Multiplayer, MIT). The mod's interface half watches `native_events.log`. When the module reports the `command_list_add` hook, the mod answers its ping, writes `hold_on` for `build_proposal` and pings every 2 s. A construction tool's confirm click then produces two things: the engine's tool event `builder.proposalApply`, which the mod encodes into a build record (the same record the Lua path ships), and the module's `held` event for the tool's command. The mod pairs them (oldest capture, within 2 s), checks that this game could rebuild the record, ships the action with a stamp, writes `cancel` for the held command, and queues the item for its own simulation half, so the originator applies it at the stamp exactly as its peers do (the company ledger and the entity keys come from that normal path). Whatever does not fit is released, and the build goes the old way (replay on peers: the engine applies it at the click, the simulation half captures it from `onPreBuildProposal`, the peers rebuild it at the stamp). Strict mode is therefore optional and switches itself off: no module, a module without the hook, a reload (`hold_off` first), the end of the session, silence, a fault. Nothing in solo play changes.
 
 Entity references: roads as node positions (match within 1.5 m, else split edge or create node); constructions as file + transform + parameters; vehicles and lines as `<sender>:<seq>` keys bound on every game when the entity appears, or `s:<id>` for entities from the savegame. Whatever a game resolves from a key is checked (it exists, it is of the expected kind): an action that fails the check is refused, never applied to whatever shares the id. Depots and station groups also carry the building that owns them and their place in it, because their own id is not bound to a key (`docs/COVERAGE_OPS.md`).
 
@@ -106,7 +108,7 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 
 - Every 10 s of real time the host names a future stamp; every game hashes its world at that stamp and reports per-part hashes (money, loans, company, towns, industries, cargo, vehicles, roads, constructions, lines, names, node configs, terrain edits).
 - **Money** is corrected in place from the host's values. **Drift parts** reload only after 5 minutes. **Everything else** reloads after two consecutive differing checks, or at once when a replay fails.
-- **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → everyone, host included, loads it → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
+- **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → every other game loads it (the host's own game keeps playing its live world; `host_reloads` turns the host's reload back on) → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
 
 ## 9. Game builds
 
@@ -144,6 +146,10 @@ in-game window.
   (`host`, `join`, `leave`, `start`, `pause`, `speed`, `check`, `resync`) and reads the controller's answer from
   `ctl_status.txt`. The controller writes `identity.txt` (`role=idle|host|player`); the mod becomes active when the
   role is `host` or `player`, without reloading the game.
+- A session ends with the world it lives in: the controller watches `from_game.log` (the mod writes to it every half
+  second while its script runs) and ends the host or player session when the game that had spoken goes silent for 8
+  seconds, except during a resync reload. A host that stops tells its players (`Kicked`, reason `ended`) so they end
+  theirs at once. `docs/LIVE_CONTROL.md`, "When the world is closed".
 - The Lua UI state has no `io` global; the mod takes `package.loaded.io` (finding from MPFever, MIT).
 - Verified in game build 40420 on 2026-10-09: the button and window appear, "Host a game" opens the listener inside
   the game process and the window shows the join code. Joining from a second game, saves and the native hooks are not

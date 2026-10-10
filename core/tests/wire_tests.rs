@@ -60,7 +60,7 @@ fn join_carries_the_claim_only_when_there_is_one() {
 
 #[test]
 fn welcome_carries_the_grant_and_says_when_it_gave_a_slot_back() {
-    let session = SessionState { started: false, speed: 0, pause_at: None, lead: 1200 };
+    let session = SessionState { started: false, speed: 0, pause_at: None, lead: 1200, resync: None };
     let host = PlayerInfo { id: 0, name: "H".into(), ready: false };
     let mut w = WelcomeMessage {
         you: 2,

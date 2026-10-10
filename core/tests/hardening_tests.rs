@@ -220,7 +220,7 @@ fn a_second_welcome_does_not_restart_the_players_counter() {
         host_name: "Hote".into(),
         version: "0.1".into(),
         players: vec![],
-        session: SessionState { started: false, speed: 0, pause_at: None, lead: 1200 },
+        session: SessionState { started: false, speed: 0, pause_at: None, lead: 1200, resync: None },
         nonce: vec![],
         resume: None,
         resumed: false,

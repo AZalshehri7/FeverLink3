@@ -102,7 +102,7 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 
 ## Session rules
 
-- **Session state** is broadcast on every change and at least every 3 s. `lead` is `200 × (4 + 2 × speed)` game-time units: what a game adds to its clock when stamping a local action.
+- **Session state** is broadcast on every change and at least every 3 s. `lead` is what a game adds to its clock when stamping a local action, in game-time units (a multiple of 200). The host computes it from the slowest connected player's measured round trip and the speed: `200 × clamp(ceil((rtt/2 + 0.06 s) × 6 × speed) + 2, 3, 24)`, where 6 is the steps a second at normal speed (measured). It lengthens at once when a player turns out to be slow and shortens only after eight seconds of the wanted lead staying lower. On a good connection that is 3 steps, about half a second at normal speed.
 - **Clock**: a game reports `{t, speed, ahead}` regularly. The host extrapolates `t + elapsed × speed × 1000` and relays it as PeerClock. Every game holds (speed 0) when it is more than `ahead` steps past the slowest peer.
 - **Stamps** are multiples of 200. A future stamp chosen by the host is `roundUp(maxClock + lead)`.
 - **Start**: `started = true`, `speed = 0`, `pauseAt` = the games' common time when they agree, and a checksum round is requested at once.
@@ -114,7 +114,7 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 
 ## Resync round
 
-A resync makes every game load the host game's save. It runs in the host's state machine (`resync_state()`: `Idle`, `Pausing`, `Saving`, `Transferring`, `Loading`, `Verifying`), is driven by incoming messages and by `tick()` with the host's clock, and has one round at a time. Each round has an id (1, 2, ...). The session must be started. Every state change is reported to the host's UI as `ResyncProgress`; the session stays paused after a failed round.
+A resync makes every other game load the host game's save (and the host's own game too when `HostOptions::host_reloads` is true, the library default; the in-game module sets it to false, see "Host that does not reload" below). It runs in the host's state machine (`resync_state()`: `Idle`, `Pausing`, `Saving`, `Transferring`, `Loading`, `Verifying`), is driven by incoming messages and by `tick()` with the host's clock, and has one round at a time. Each round has an id (1, 2, ...). The session must be started. Every state change is reported to the host's UI as `ResyncProgress`; the session stays paused after a failed round.
 
 ```
 Pausing       host sets pauseAt (the usual future stamp; a pause already in force is kept) and broadcasts Session.
@@ -123,13 +123,16 @@ Saving        host → its own game   ResyncSave { id, name: "feverlink3-resync-
               host's game → host    SaveDone { id, ok, detail? }                                   timeout 180 s
 Transferring  the launcher reads the file and calls resync_file_ready(id, sha256, len); the host
               seals ResyncChunk to every player present at that moment, one call per chunk.      timeout 600 s
-Loading       host → participants   ResyncLoad { id, name, sha256 }   (its own game included)
+Loading       host → participants   ResyncLoad { id, name, sha256 }   (its own game included when host_reloads)
               Every participant's ready flag is cleared and the stored clocks are dropped; the round
-              waits for a Hello from each.                                                        timeout 600 s
+              waits for a Hello from each. A host that does not reload keeps its ready flag and its
+              clock and sends no Hello.                                                           timeout 600 s
 Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused: true }.         timeout 120 s
               Identical: the previous speed resumes (pauseAt cleared), round Idle.
               Different: ResyncFailed, the session stays paused, round Idle.
 ```
+
+**Host that does not reload (`host_reloads = false`).** The host's game saves the world only to send it and keeps playing its live world, so the host never sees a loading screen; only the players load. The paused checksum in Verifying is then the proof that the host's live world and the players' loaded copies agree: a difference fails the round and leaves the session paused exactly as in the reloading case. The checksum covers money, loan, constructions, lines and time, not every part of the simulation, so a world with many vehicles is the place to watch for drift. `FEVERLINK3_HOST_RELOAD=1` makes the in-game module reload the host too.
 
 **Timeouts.** Pausing, Saving and Transferring end the round with `ResyncFailed` (reason names what was missing). Loading does not fail: the host logs the players that sent no Hello and continues with the ones that did. Verifying fails. Transferring and Verifying timeouts are not in the original design; they exist so a round cannot wait forever.
 
@@ -207,7 +210,8 @@ host            token valid, slot held (or still bound to a connection the host 
 ## Leave and removal
 
 - **Leave** (38, player → host, sealed): the player goes on purpose. The host closes the connection, frees the slot at once and broadcasts PlayerLeft without `away`.
-- **Kicked** (22, host → player, sealed): the host ended the session of this player. Reasons: `kicked` (the host's `kick`), `flood` (Limits). The player's session layer reports it like a Reject (`PlayerOutput::Rejected`), so the launcher does not reconnect. Sealed, because an unsealed Reject is only honoured before the Welcome. The player's slot is **not** held: it may join again with the code like anyone else.
+- **Kicked** (22, host → player, sealed): the host ended the session of this player. Reasons: `kicked` (the host's `kick`), `flood` (Limits), `ended` (the host stopped hosting or its world was closed: `HostSession::end_session` sends it to every joined player, and an unsealed Reject with the same reason to a connection that never joined, before it closes them all). The player's session layer reports it like a Reject (`PlayerOutput::Rejected`), so the launcher does not reconnect. Sealed, because an unsealed Reject is only honoured before the Welcome. The player's slot is **not** held: it may join again with the code like anyone else.
+- **End of session** is the host's call too (`HostSession::end_session()`, made when the host session stops): without it a player only sees the connection drop and tries to reconnect to a host that is gone for the whole five minutes.
 - **Kick** is the host's call (`HostSession::kick(id)`): a connected player is sent Kicked, disconnected and removed; for a player who is away it releases the held slot; the host's own id is refused.
 
 ## Ping and round-trip time

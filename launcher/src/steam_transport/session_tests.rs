@@ -361,7 +361,9 @@ fn a_player_reconnects_over_steam_after_the_host_stops_and_returns() {
     let player = table.player("Pat");
     assert!(player.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
     let Table { root, key, machine, core, handle, game: _ } = table;
-    handle.stop();
+    // the host's process dies: nobody says goodbye (a host that stops on purpose does, and its players end their session
+    // instead of reconnecting, see the test below)
+    handle.crash();
     assert!(player.handle.wait_for(WAIT, |s| s.reconnecting && !s.connected), "{:?}", player.handle.logs());
     let mut tail = Tail::new(player.game.dir.join(gamelink::TO_GAME));
     let lines = tail.poll().unwrap();
@@ -380,6 +382,18 @@ fn a_player_reconnects_over_steam_after_the_host_stops_and_returns() {
     player.handle.stop();
     host.stop();
     drop((machine, core));
+}
+
+#[test]
+fn a_host_that_stops_over_steam_tells_its_player_who_ends_its_session_instead_of_reconnecting() {
+    let table = Table::new(HostOptions::default(), Vec::new());
+    let player = table.player("Pat");
+    assert!(player.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+    table.handle.stop();
+    assert!(player.handle.wait_for(WAIT, |s| s.finished), "{:?}", player.handle.logs());
+    let s = player.handle.status();
+    assert_eq!(Some("ended (the host ended the session)".to_owned()), s.rejected);
+    assert_eq!((0, false), (s.reconnect_attempts, s.reconnecting));
 }
 
 #[test]
@@ -424,7 +438,7 @@ fn stopping_a_player_does_not_wait_for_a_route_that_never_comes() {
     assert!(player.handle.wait_for(WAIT, |s| s.connected));
     // the host disappears from the network: every attempt to reconnect hangs in "contacting the host"
     table.machine.set_reachable(false);
-    table.handle.stop();
+    table.handle.crash();
     assert!(player.handle.wait_for(WAIT, |s| s.reconnecting));
     assert!(wait(WAIT, || player.handle.logs().iter().any(|l| l.contains("reconnect attempt 1: contacting the host"))));
     let started = Instant::now();

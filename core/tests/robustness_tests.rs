@@ -581,7 +581,13 @@ fn player_info(r: &mut StdRng) -> PlayerInfo {
 }
 
 fn session_state(r: &mut StdRng) -> SessionState {
-    SessionState { started: r.gen(), speed: r.gen(), pause_at: r.gen_bool(0.5).then(|| r.gen()), lead: r.gen() }
+    SessionState {
+        started: r.gen(),
+        speed: r.gen(),
+        pause_at: r.gen_bool(0.5).then(|| r.gen()),
+        lead: r.gen(),
+        resync: None,
+    }
 }
 
 fn text_map(r: &mut StdRng) -> BTreeMap<String, String> {
@@ -687,7 +693,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             host_name: "Host".into(),
             version: "0.1".into(),
             players: vec![PlayerInfo { id: 3, name: "A".into(), ready: true }],
-            session: SessionState { started: true, speed: 2, pause_at: Some(4000), lead: 1600 },
+            session: SessionState { started: true, speed: 2, pause_at: Some(4000), lead: 1600, resync: None },
             nonce: vec![7; 16],
             resume: Some(ResumeGrant { token: vec![9; 16], epoch: 3 }),
             resumed: true,
@@ -1083,7 +1089,7 @@ fn small_pure_functions_take_any_input() {
         let clock = PlayerClock { t: r.gen(), speed: r.gen(), at: f64::from_bits(r.gen()) };
         let _ = clock.estimate(f64::from_bits(r.gen()));
         let _ = PlayerClock::plausible(r.gen(), r.gen());
-        assert!(Lockstep::lead_units(r.gen()) >= Lockstep::STEP * 6);
+        assert!(Lockstep::lead_units(r.gen()) >= Lockstep::STEP * Lockstep::MIN_LEAD_STEPS);
     }
     for kind in 0..=u8::MAX {
         if let Some(k) = MessageKind::from_u8(kind) {

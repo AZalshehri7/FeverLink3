@@ -229,6 +229,11 @@ impl PlayerSession {
         }
     }
 
+    /// Chunks received and chunks in all of the savegame being sent to this game, while one is.
+    pub fn transfer_progress(&self) -> Option<(u32, u32)> {
+        self.incoming.progress().map(|(done, all)| (done as u32, all as u32))
+    }
+
     /// Frames and local messages refused so far.
     pub fn dropped(&self) -> u64 {
         self.dropped

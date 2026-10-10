@@ -15,6 +15,14 @@ if not okC then C = ug_require("feverlink3_1::/feverlink3_common.lua") end
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
 if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 
+-- The hook that wraps the game's command functions in this Lua state (the windows' own), feverlink3_uihook.lua
+local okK, Hook = pcall(ug_require, "feverlink3_uihook.lua")
+if not okK then okK, Hook = pcall(ug_require, "feverlink3_1::/feverlink3_uihook.lua") end
+if not okK or type(Hook) ~= "table" then
+	print("[feverlink3] UI hook not loaded: " .. tostring(Hook))
+	Hook = nil
+end
+
 local log = C.logger("ui")
 local M = {}
 local U = { model = nil, outbox = nil, ctl = nil, ctlVersion = nil, cmd = nil }
@@ -45,14 +53,45 @@ local function command(kind, params)
 	return C.writerSend(U.cmd, kind, params)
 end
 
-local function send(text)
+-- ui_out.log has one writer (its sequence numbers only increase), which the hook owns when it is there
+local function outbox()
+	if Hook then return Hook.outbox() end
 	if not U.outbox then U.outbox = Hud.newOutbox(C) end
-	return Hud.sendChat(C, U.outbox, text)
+	return U.outbox
+end
+
+local function send(text)
+	return Hud.sendChat(C, outbox(), text)
 end
 
 -- ---- drawing
 
 local WIDTH = 560 -- width of the window's content
+
+-- What a sync round is doing, in words (ctl.sync = { phase, done?, total? } from the controller; absent when none runs).
+-- `host` says whose window it is: the players' games stand still while the host's world is prepared, sent and loaded, and
+-- without a word about it that looks like a hang.
+local function syncText(sync, host)
+	if type(sync) ~= "table" then return nil end
+	local pct = nil
+	if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
+		pct = math.floor(100 * sync.done / sync.total)
+	end
+	local phase = sync.phase
+	if phase == "pausing" then
+		return host and "Syncing: stopping every game at the same moment..." or "Syncing: the host is stopping every game at the same moment..."
+	elseif phase == "saving" then
+		return host and "Syncing: saving your world..." or "Syncing: the host is saving its world..."
+	elseif phase == "sending" then
+		local what = host and "Sending your world to the players" or "Receiving the host's world"
+		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...")
+	elseif phase == "loading" then
+		return host and "Syncing: the players are loading your world..." or "Syncing: loading the host's world. The game reloads and the window closes; open it again afterwards."
+	elseif phase == "verifying" then
+		return "Syncing: checking that the worlds match..."
+	end
+	return "Syncing..."
+end
 
 local function setup(react, builtin)
 	local V = builtin.type.Orientation.Vertical
@@ -60,17 +99,37 @@ local function setup(react, builtin)
 	local function text(s, class, width)
 		return builtin.TextView{ meta = { class = class or "font-scale-title-4" }, text = s, width = width or WIDTH }
 	end
-	local function gap() return text(" ", "font-scale-body") end
+	local function gap() return text(" ", "font-scale-annotation") end
+	local function heading(s) return text(s, "font-scale-title-2") end
+	local function section(s) return text(s, "font-scale-title-3") end
+	local function note(s) return text(s, "font-scale-body") end
 	local function box(orientation, children) return builtin.BoxLayout{ orientation = orientation, children = children } end
 	local function column(children) return builtin.Component{ layout = box(V, children) } end
-	local function button(label, onClick, width)
-		return builtin.Button{ meta = { class = "secondary" }, content = text(label, "font-scale-title-4", width or WIDTH), onClick = onClick }
+	-- kind: "primary" (the main action), "secondary" (default) or "negative" (stops something)
+	local function button(label, onClick, kind, width)
+		return builtin.Button{
+			meta = { class = kind or "secondary" },
+			content = text(label, "font-scale-title-4", width or WIDTH),
+			onClick = onClick,
+		}
 	end
 	local function field(placeholder, value, onTyping, displayOnly)
 		return builtin.TextInputField{
 			meta = { class = "font-scale-title-4" }, placeholderText = placeholder, value = value, onTyping = onTyping,
 			displayOnly = displayOnly, maxLength = 200,
 		}
+	end
+	-- "Anna  (host)" / "Ben  42 ms" / "Cleo  reconnecting"; width: narrower when a button sits next to the line
+	local function playerLine(p, me, width)
+		local line = "   " .. tostring(p.name)
+		if p.id == 0 then line = line .. "  (host)" end
+		if p.id == me then line = line .. "  (you)" end
+		if p.state == "away" then
+			line = line .. "  - reconnecting"
+		elseif p.rtt and p.rtt > 0 and p.id ~= me then
+			line = line .. "  - " .. tostring(p.rtt) .. " ms"
+		end
+		return text(line, nil, width)
 	end
 
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
@@ -79,7 +138,9 @@ local function setup(react, builtin)
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
+		local showTest = react.useState(false)
 		react.onStepTimer(function()
+			if Hook then Hook.devPoll() end
 			local a = poll()
 			local b = pollCtl()
 			if a or b then tick:set(tick:old() + 1) end
@@ -88,6 +149,25 @@ local function setup(react, builtin)
 		local rows = {}
 		local function add(node) rows[#rows + 1] = node end
 		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
+		-- canRemove (the host's list): a "Remove" button next to every player but the host, and under the list what the
+		-- last one did ("Pat was removed", or why it was refused)
+		local function players(me, canRemove)
+			add(section("Players"))
+			for _, p in ipairs(ctl.players or {}) do
+				if canRemove and p.id ~= 0 and p.id ~= me then
+					local id = p.id
+					add(box(H, {
+						playerLine(p, me, WIDTH - 140),
+						button("Remove", function() command("kick", { id = id }) end, "negative", 120),
+					}))
+				else
+					add(playerLine(p, me))
+				end
+			end
+			if canRemove and ctl.result and ctl.result.kind == "kick" and ctl.result.message then
+				add(note(tostring(ctl.result.message)))
+			end
+		end
 
 		local state = ctl and ctl.state
 		if not state then
@@ -102,90 +182,126 @@ local function setup(react, builtin)
 		if state == "launcher" then
 			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
 		elseif state == "missing" then
-			add(text("The FeverLink3 module is not running.", "font-scale-title-3"))
-			add(text("Close the game, run `feverlink3 install` from the FeverLink3 folder, then start the game again from Steam. If it keeps happening, send the files named in HOW-TO-PLAY.txt."))
+			add(heading("FeverLink3 is not running"))
+			add(text("The helper file winhttp.dll is not next to TransportFever3.exe. Close the game, copy winhttp.dll into the game's folder (see HOW-TO-PLAY.txt) and start the game again from Steam."))
 		elseif state == "starting" then
 			add(text("Starting the multiplayer module..."))
 		elseif state == "idle" or state == "failed" then
-			if state == "failed" then
+			add(heading("Play together"))
+			if ctl.notice then
+				-- how the last session ended by itself: the world was closed, the host ended it or removed this player
+				add(text(tostring(ctl.notice), "font-scale-title-3"))
+			elseif state == "failed" then
 				add(text("Could not connect: " .. tostring(ctl.message or "unknown problem"), "font-scale-title-3"))
-				add(gap())
 			end
-			add(text("Play together: one player hosts, the others join with the host's code."))
+			if state ~= "failed" then
+				add(note("One player hosts and sends a code; the others join with it."))
+			end
 			add(gap())
-			add(text("Your name"))
+			add(section("Your name"))
 			add(field("name", myName(), function(v) nameIn:set(v) end))
 			add(gap())
-			add(button("Host a game", function() command("host", { name = myName() }) end))
+			add(button("Host a game", function() command("host", { name = myName() }) end, "primary"))
 			add(gap())
-			add(text("Or join a friend"))
+			add(section("Join a friend's game"))
 			add(field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end))
-			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end))
+			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end, "primary"))
 
 			-- Steam connection test: can two players reach each other through Steam, without any router setup?
+			-- Folded away by default (it shows the player's Steam ID).
 			local st = ctl.steam
 			add(gap())
-			add(text("Steam connection test", "font-scale-title-3"))
+			add(button(showTest:old() and "Hide the connection test" or "Connection test...", function() showTest:set(not showTest:old()) end, "secondary"))
+			if showTest:old() then
+			add(section("Steam connection test"))
 			if st and st.id then
-				add(text("Your Steam ID (send it to a friend, who pastes it below):", "font-scale-body"))
+				add(note("Your Steam ID (send it to a friend, who pastes it below):"))
 				add(field("your Steam ID", tostring(st.id), function() end, true))
 			else
-				add(text("Steam: " .. tostring(st and st.state or "unknown"), "font-scale-body"))
+				add(note("Steam: " .. tostring(st and st.state or "unknown")))
 			end
 			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
 			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
-			if st and st.note then add(text(tostring(st.note), "font-scale-body")) end
+			if st and st.note then add(note(tostring(st.note))) end
 			if st and st.test then
 				local t = st.test
 				local line = "Test: " .. tostring(t.state) .. ", answers " .. tostring(t.pongs)
 				if t.rtt then line = line .. ", last round trip " .. tostring(t.rtt) .. " ms" end
 				if t.route and t.route ~= "" then line = line .. ", " .. tostring(t.route) end
-				add(text(line, "font-scale-body"))
+				add(note(line))
 			end
-			if st and st.pings and st.pings > 0 then add(text("Pings received from other players: " .. tostring(st.pings), "font-scale-body")) end
+			if st and st.pings and st.pings > 0 then add(note("Pings received from other players: " .. tostring(st.pings))) end
+			end
 		elseif state == "hosting" then
-			add(text("You are hosting", "font-scale-title-2"))
-			add(text("Send this join code to the other players (click it, Ctrl+A, Ctrl+C):"))
+			add(heading("You are hosting"))
+			add(note("Send this join code to the other players:"))
+			-- the game's text fields cannot copy, so the button puts the code on the clipboard (done by the module)
 			add(field("join code", tostring(ctl.code or ""), function() end, true))
-			if ctl.password then add(text("They also need the password.")) end
-			add(gap())
-			add(text("Players", "font-scale-title-3"))
-			for _, p in ipairs(ctl.players or {}) do
-				add(text("  " .. tostring(p.name) .. (p.id == 0 and "  (host)" or ""), "font-scale-title-4"))
+			add(button("Copy code", function() command("copy", {}) end, "secondary"))
+			if ctl.result and ctl.result.kind == "copy" then
+				add(note(tostring(ctl.result.ok and "Copied. Paste it into a message to your friend (Ctrl+V)." or ctl.result.message)))
 			end
+			if ctl.password then add(note("They also need the password.")) end
 			add(gap())
+			players(ctl.me, true)
+			add(gap())
+			if ctl.started and ctl.resync and ctl.resync ~= "Idle" then
+				add(note("Sending your world to the players: " .. tostring(ctl.resync)))
+			end
 			if ctl.started then
 				add(button("Sync everyone to my world", function() command("resync", {}) end))
 			end
-			add(box(H, {
-				button(ctl.started and "Pause" or "Start the session", function() command(ctl.started and "pause" or "start", {}) end, math.floor(WIDTH / 2) - 10),
-				button("Stop hosting", function() command("leave", {}) end, math.floor(WIDTH / 2) - 10),
-			}))
+			if ctl.started then
+				-- the speed buttons of the Session section pause and resume
+				add(button("Stop hosting", function() command("leave", {}) end, "negative"))
+			else
+				add(box(H, {
+					button("Start the session", function() command("start", {}) end, "primary", math.floor(WIDTH / 2) - 10),
+					button("Stop hosting", function() command("leave", {}) end, "negative", math.floor(WIDTH / 2) - 10),
+				}))
+			end
 		elseif state == "joining" then
-			add(text("Connecting to the host...", "font-scale-title-3"))
-			add(button("Cancel", function() command("leave", {}) end))
-		elseif state == "joined" then
-			add(text("Connected", "font-scale-title-2"))
-			add(text("Wait for the host to start the session."))
+			add(heading("Joining..."))
+			add(text(tostring(ctl.progress or "contacting the host"), "font-scale-title-3"))
 			add(gap())
-			add(text("Players", "font-scale-title-3"))
-			for _, p in ipairs(ctl.players or {}) do
-				add(text("  " .. tostring(p.name) .. (p.id == 0 and "  (host)" or ""), "font-scale-title-4"))
+			add(button("Cancel", function() command("leave", {}) end, "negative"))
+		elseif state == "joined" then
+			add(heading("Connected"))
+			if ctl.started then
+				add(note("The session is running. Anyone can change the speed or chat; the host can sync everyone to their world."))
+			else
+				add(note("Wait for the host to start the session. The host's world is sent to you and your game reloads into it."))
 			end
 			add(gap())
-			add(button("Leave", function() command("leave", {}) end))
+			players(ctl.me)
+			add(gap())
+			add(button("Leave the session", function() command("leave", {}) end, "primary"))
 		end
 
 		-- the game side: status and chat, once the mod is part of a session
 		local m = U.model
 		if m and C.ACTIVE then
 			add(gap())
-			add(text(Hud.statusText(m), "font-scale-body"))
-			for _, line in ipairs(Hud.chatLines(m, 12)) do add(text(line, "font-scale-body")) end
+			add(section("Session"))
+			add(note(Hud.statusText(m)))
+			for _, line in ipairs(Hud.chatLines(m, 12)) do add(note(line)) end
 			add(field("Type a message and press Send", typed:old(), function(v) typed:set(v) end))
 			add(button("Send", function()
 				if send(typed:old()) then typed:set("") end
 			end))
+		end
+		-- while a sync round runs: say so, first thing in the window
+		do
+			local st = ctl and ctl.state
+			local line = syncText(ctl and ctl.sync, st == "hosting")
+			if line then
+				table.insert(rows, 1, heading(line))
+			end
+		end
+		-- developer test button (FEVERLINK3_DEV=1 only): runs dev_click.lua from inside a click, where commands may be sent.
+		-- The first row, so that its place in the window does not depend on what the window shows.
+		if Hook and Hook.dev then
+			table.insert(rows, 1, button("DEV run", function() Hook.devClick() end, "secondary"))
 		end
 		return builtin.Window{
 			title = "FeverLink3 Multiplayer",
@@ -212,12 +328,40 @@ local function setup(react, builtin)
 		if not okO then log("cannot open the window: " .. tostring(err)) end
 	end
 	return function()
+		-- the button follows the session: it says "syncing" while a round runs, and the window opens by itself when a round
+		-- begins. Guarded: if this recipe cannot hold state in this game build, the button stays as it was.
+		local okT, tick = pcall(react.useState, 0)
+		if not okT then tick = nil end
+		if tick then
+			pcall(function()
+				react.onStepTimer(function()
+					pollCtl()
+					local want = U.ctl and U.ctl.sync ~= nil
+					local text = want and syncText(U.ctl.sync, U.ctl.state == "hosting") or nil
+					if want ~= U.syncShown or text ~= U.syncText then
+						local began = want and not U.syncShown
+						U.syncShown, U.syncText = want, text
+						tick:set(tick:old() + 1)
+						if began then pcall(open) end
+					end
+				end, 0.5)
+			end)
+		end
+		local label = "FeverLink3"
+		if U.syncShown and U.ctl and type(U.ctl.sync) == "table" then
+			local sync = U.ctl.sync
+			if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
+				label = "FeverLink3 - syncing " .. math.floor(100 * sync.done / sync.total) .. "%"
+			else
+				label = "FeverLink3 - syncing"
+			end
+		end
 		-- like the game's own icon buttons (eye, music): a default-styled button holding an auto-fitted image
 		return builtin.BoxLayout{
 			children = {
 				builtin.Button{
 					meta = { tooltip = "FeverLink3 multiplayer" },
-					content = builtin.TextView{ meta = { class = "font-scale-body" }, text = "FeverLink3" },
+					content = builtin.TextView{ meta = { class = "font-scale-body" }, text = label },
 					onClick = open,
 				},
 			},
@@ -230,6 +374,10 @@ do
 	local okB, builtin = pcall(ug_require, "::/gui/main/builtin.lua")
 	local okE, entry = pcall(ug_require, "::/gui/game_bar/game_bar_widgets.tl")
 	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
+	if Hook and C.DIR and C.IO then
+		local okI, errI = pcall(Hook.install)
+		print("[feverlink3] UI hook: " .. (okI and (errI and "installed" or "not installed") or ("failed: " .. tostring(errI))))
+	end
 	if okR and okB and okE and entry and entry.GameBarInfoDisplayExtension then
 		local okS, recipeFn = pcall(function()
 			if C.DIR and C.IO then return setup(react, builtin) end

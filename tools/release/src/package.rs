@@ -62,19 +62,35 @@ pub fn valid_version(v: &str) -> bool {
         && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
 }
 
-pub fn package(inputs: &Inputs, version: &str, out: &Path) -> Result<Built, String> {
+/// What the zip holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// A player copies `winhttp.dll` and the `mods` folder into the game's own folder; no program is shipped.
+    /// The mod sits in `mods/release/feverlink3_1`, where the game keeps its built-in mods (it loads from there:
+    /// checked in the game, build 40420).
+    Overlay,
+    /// The launcher program, the DLL and the mod folder side by side; `feverlink3.exe install` puts them in place.
+    Portable,
+}
+
+pub fn package_with(inputs: &Inputs, version: &str, out: &Path, layout: Layout) -> Result<Built, String> {
     if !valid_version(version) {
         return Err(format!("bad version {version:?} (give it without the leading v)"));
     }
     let mut files: Vec<(String, Vec<u8>)> = vec![
-        ("feverlink3.exe".into(), read(&inputs.exe)?),
         ("winhttp.dll".into(), read(&inputs.native_dll)?),
         ("README.txt".into(), read(&inputs.readme)?),
         ("HOW-TO-PLAY.txt".into(), read(&inputs.guide)?),
         ("LICENSE".into(), read(&inputs.license)?),
         ("THIRD_PARTY_NOTICES.md".into(), read(&inputs.notices)?),
     ];
-    collect_dir(&inputs.mod_dir, "mod/feverlink3_1", &mut files)?;
+    match layout {
+        Layout::Overlay => collect_dir(&inputs.mod_dir, "mods/release/feverlink3_1", &mut files)?,
+        Layout::Portable => {
+            files.push(("feverlink3.exe".into(), read(&inputs.exe)?));
+            collect_dir(&inputs.mod_dir, "mod/feverlink3_1", &mut files)?;
+        }
+    }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let folder = format!("FeverLink3-{version}");
@@ -114,6 +130,10 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn package(inputs: &Inputs, version: &str, out: &Path) -> Result<Built, String> {
+        package_with(inputs, version, out, Layout::Portable)
+    }
+
     fn fixture(root: &Path) -> Inputs {
         let w = |p: &str, c: &str| {
             let path = root.join(p);
@@ -130,6 +150,32 @@ mod tests {
         w("mod/feverlink3_1/content/b.lua", "b");
         w("mod/feverlink3_1/content/a.lua", "a");
         Inputs::from_root(root)
+    }
+
+    #[test]
+    fn the_overlay_layout_ships_no_program_and_mirrors_the_game_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let inputs = fixture(root.path());
+        let (o1, o2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let b1 = package_with(&inputs, "1.2.3", o1.path(), Layout::Overlay).unwrap();
+        let b2 = package_with(&inputs, "1.2.3", o2.path(), Layout::Overlay).unwrap();
+        let z1 = fs::read(&b1.zip_path).unwrap();
+        assert_eq!(z1, fs::read(&b2.zip_path).unwrap(), "two runs give identical zip bytes");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(z1)).unwrap();
+        let names: Vec<String> =
+            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().unwrap().to_string()).collect();
+        for want in [
+            "FeverLink3-1.2.3/winhttp.dll",
+            "FeverLink3-1.2.3/HOW-TO-PLAY.txt",
+            "FeverLink3-1.2.3/LICENSE",
+            "FeverLink3-1.2.3/mods/release/feverlink3_1/mod.json",
+            "FeverLink3-1.2.3/mods/release/feverlink3_1/content/a.lua",
+        ] {
+            assert!(names.iter().any(|n| n == want), "missing {want}");
+        }
+        assert!(!names.iter().any(|n| n.ends_with(".exe")), "no program in the overlay zip: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("/mod/")), "the mod sits under mods/release only");
+        assert_eq!(b1.manifest.files.len(), names.len());
     }
 
     #[test]

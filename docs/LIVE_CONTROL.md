@@ -46,13 +46,13 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 |---|---|---|---|
 | `host` | `{transport, name?, port?, password?}` | `idle`, `failed` | Becomes `hosting`. **`transport` must be `"tcp"`** for now, the direct developer transport (same PC or LAN): any other value, or none, fails to `failed` with a message that hosting over Steam is not finished (the Steam transport plugs in here). `name`: display name, trimmed, at most 24 characters, default the status `name`. `port`: TCP port, `0` for any free one, default 28090. `password`: lobby password, empty or absent for none; the join code alone is then not enough, so give the password separately. Fails to `failed` with `message` when the port cannot be bound. |
 | `join` | `{code, name?, password?}` | `idle`, `failed` | Becomes `joining` (up to 5 s per address in the code), then `joined`. Fails to `failed` with `message`: not a valid join code, cannot reach the host, or the host's reject (wrong code or password, other version, session full, ...). `password` must equal the host's. |
-| `leave` | `{}` | any | Stops hosting, or leaves the session (a player says goodbye first, so the host frees its slot at once), cancels a `join` in progress, clears `result`, writes `role=idle`. State `idle`. |
+| `leave` | `{}` | any | Stops hosting, or leaves the session (a player says goodbye first, so the host frees its slot at once), cancels a `join` in progress, clears `result` and `notice`, writes `role=idle`. State `idle`. A host that stops tells every connected player first (reason `ended`), so their windows show "The host ended the session" at once instead of reconnecting. |
 | `start` | `{}` | `hosting` | Starts the session: every game is held at the time all of them share, and a checksum round is requested. Speed stays 0 until `speed` or a player's speed request. |
 | `pause` | `{}` | `hosting` | Every game stops at one future step. |
 | `speed` | `{n}` | `hosting` | Runs the session at speed `n`, 1 to 4 (default 1, out of range clamped). Ignored while a resync round runs. |
 | `check` | `{}` | `hosting` | Asks every game for a world checksum now. |
-| `resync` | `{}` | `hosting` | Starts a resync round: every game, the host's included, loads the host's save. Needs a started session; ignored while a round runs. |
-| `kick` | `{id}` | `hosting` | Removes player `id`: it is told "kicked", disconnected, its slot freed, and its launcher does not reconnect. For a player who is `away` it releases the held slot. It may join again with the code like anyone else. Answers in `result`; refuses the host's own id 0, an id that is not in `players`, and a missing `id`. |
+| `resync` | `{}` | `hosting` | Starts a resync round: every other game loads the host's save (the host's own game keeps playing; set `FEVERLINK3_HOST_RELOAD=1` in the game's environment to reload it too). Needs a started session; ignored while a round runs. |
+| `kick` | `{id}` | `hosting` | Removes player `id`: it is told "kicked", disconnected, its slot freed, and its launcher does not reconnect. For a player who is `away` it releases the held slot. It may join again with the code like anyone else. Answers in `result`; refuses the host's own id 0, an id that is not in `players`, and a missing `id`. The window's **Remove** button next to each player in the host's Players list sends it and shows `result.message` under the list. |
 | `permissions` | `{build?, bulldoze?, spend?, speed?, other?}` | `hosting` | Sets who may do what and tells every game. Each value is `"everyone"`, `"hostOnly"` or `{only = {ids}}`. **Keys not named keep their value**, so a command may carry one key. At least one key is required; a value that is none of the three refuses the whole command (nothing changes) and says which key. Answers in `result`. See below. |
 | `steamtest` | `{id}` | any | Steam connection test: pings the Steam ID (17 digits, as a string) through Steam's networking. The progress is `steam.test`; a bad ID or no Steam shows in `steam.note`. |
 
@@ -93,6 +93,7 @@ changed.
 | `name` | string | always | The name the window offers before the player types one (the Windows user name). Does not change during a session; the name the host settled on is in `players`. |
 | `steam` | table | always | The Steam networking probe, below. |
 | `message` | string | `failed` | Why: what went wrong, in words for the player. |
+| `notice` | string | after a session that ended by itself | One line for the window's start screen about how the last session ended: `Your world was closed, so the session ended` (state `idle`, the heartbeat below), `The host ended the session`, `The host removed you from the session`, ... Present in `idle` after a world was closed and in `failed` after a joined session ended (`message` carries the same text in lower case, as before). The window shows it instead of "Could not connect: ..." when present. Cleared by the next `host`, `join` or `leave`. |
 | `code` | string | `hosting` | The join code to give to the other players. |
 | `endpoints` | list of string | `hosting` | The `ip:port` addresses inside the code: this PC's local addresses (the direct developer transport). |
 | `password` | boolean | `hosting` | A lobby password is set. |
@@ -147,7 +148,7 @@ The Steam networking probe behind the connection test; `launcher/src/steamnet.rs
 
 ## Which fields each state has
 
-| State | Fields besides `version`, `state`, `name`, `steam` (and `result` after a kick or permissions command) |
+| State | Fields besides `version`, `state`, `name`, `steam` (and `result` after a command, `notice` after a session that ended by itself) |
 |---|---|
 | `idle` | none |
 | `joining`, connecting | none |
@@ -156,14 +157,47 @@ The Steam networking probe behind the connection test; `launcher/src/steamnet.rs
 | `hosting` | `code`, `endpoints`, `password`, `capacity`, `me`, `players`, `permissions`, `started`, `speed`, `resync` |
 | `failed` | `message` |
 
-A joined session that ends by itself (the host removed this player or rejected it, or the launcher gave up
-reconnecting after 5 minutes) turns into `failed` with a `message`, and the window may `host` or `join` again at once.
-`message` for a removal is "the host removed you from the session"; for a rejection "the host rejected us: <reason>"
-with the reason `bad-proof` (wrong code or password), `version` or `full` (with the player limit); for flooding "the host
-disconnected you: flood (more than N frames per second)".
+A joined session that ends by itself (the host ended it, removed this player or rejected it, or the launcher gave up
+reconnecting after 5 minutes) turns into `failed` with a `message` (and a `notice`, above), and the window may `host` or
+`join` again at once. `message` for the host stopping or its world being closed is "the host ended the session"; for a
+removal "the host removed you from the session"; for a rejection "the host rejected us: <reason>" with the reason
+`bad-proof` (wrong code or password), `version` or `full` (with the player limit); for flooding "the host disconnected
+you: flood (more than N frames per second)".
 
 `players` keeps a player whose connection dropped for 5.5 minutes, with `state = "away"`: a window should label or hide
 those entries, they are not at the table.
+
+## When the world is closed: the heartbeat
+
+A session lives in the world of each game. When a player closes the save to the main menu, the mod's script is gone and
+nothing tells the controller, so the controller watches `from_game.log`: the mod appends a `clock` line to it at least
+every 30 frames (about half a second) while its script runs, even when the game is paused. A game that **has spoken in
+this session** (at least one new line since the session started) and then falls **silent for 8 seconds** has no world
+any more, and the controller ends the session by itself:
+
+- a **host** stops hosting. Every connected player is told first (the sealed `Kicked` frame with reason `ended`,
+  `docs/PROTOCOL.md`), so each player's controller ends its own session at once: `state` `failed`, `message` "the host
+  ended the session", `notice` "The host ended the session". The same happens when the window's `leave` stops hosting.
+- a **player** leaves, as with `leave`: the host frees its slot and keeps hosting.
+- the controller is `idle` again (`identity.txt` says `role=idle`) with `notice` "Your world was closed, so the session
+  ended". The window may `host` or `join` again at once; that clears the notice.
+
+What does **not** end a session:
+
+- a game that has not yet written its first line since the session started (the world may still be loading when the
+  host starts hosting; lines of an earlier session in the file do not count);
+- the silence of a **resync reload**. A resync load replaces the world and the mod is silent until the new script says
+  hello (about 30 s). On a host, a resync round that is running (`resync` is `Pausing`, `Saving`, `Transferring`,
+  `Loading` or `Verifying`; the host's game also stalls while it saves) excuses the silence; on a player, the time from
+  the host's load command to the game's next hello does (`Status::reloading` in `launcher/src/session.rs`). The silence
+  counts again from the end of the round. A round or a load that lasts more than 5 minutes no longer excuses it.
+
+`FEVERLINK3_HEARTBEAT_SECONDS` (environment of the game process, read when the controller starts) changes the 8
+seconds, for tests: a number of seconds, `0` turns the check off. `Controller::with_heartbeat` does the same from a test.
+
+The verification is by the tests in `launcher/src/live.rs` (a host and a player controller wired through loopback with
+fake games that write lines): a host whose game falls silent ends and its player is told; a player whose game falls
+silent leaves; neither ends before the first line; neither ends in a resync round or a load; both end after it.
 
 ## Example
 

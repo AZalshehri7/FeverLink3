@@ -2,7 +2,7 @@
 
 FeverLink3 itself is licensed under the PolyForm Noncommercial License 1.0.0 (see LICENSE). The MIT licences below apply only to the third-party material they cover; anything adapted from those projects keeps the MIT notice that goes with it.
 
-FeverLink3 contains no code copied from the projects below at the time of writing. They are credited because their published designs, documentation and findings shaped this one, and because future commits may reuse specific tables or findings from them. Any such reuse is marked in the file that contains it and is covered by the licences reproduced here.
+No source file of the projects below is copied into FeverLink3. Their published designs, documentation, code and findings shaped it, though, and several mechanisms are re-implemented after them in our own words and structure: the capture of native builds from the engine's build event and their replay on the other games (with the replay marks that keep a replay from being sent back), holding a construction tool's command, cancelling it and applying the build at the stamp on every game, the originator's included (strict mode, `mod/feverlink3_1/content/feverlink3_bridge.script.lua`), the hook that wraps the engine's command functions in the window's Lua state, the single-worker script pool patch, deterministic `math.random`, the savegame resync as the repair, stamping an action past the fastest clock, and the idea of correcting money from the host. The place in the code where one of these follows a project says so in its comment, and everything adapted keeps the MIT licence reproduced here.
 
 ## TpF2 Multiplayer
 

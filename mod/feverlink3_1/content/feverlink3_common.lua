@@ -39,8 +39,13 @@ end
 -- without the session folder (game not started by FeverLink3.exe) the mod does nothing
 C.LIVE = false -- the native module hosts the session itself: files live in a fixed folder and identity.txt says who we are
 if C.DIR == nil or C.DIR == "" then
+	-- FEVERLINK3_LIVE_DIR: a second game on the same PC (tests, recordings) keeps its files apart from the first's
+	local override = os.getenv("FEVERLINK3_LIVE_DIR")
 	local base = os.getenv("LOCALAPPDATA")
-	if base ~= nil and base ~= "" then
+	if override ~= nil and override ~= "" then
+		C.DIR = override
+		C.LIVE = true
+	elseif base ~= nil and base ~= "" then
 		C.DIR = base .. BS .. "FeverLink3" .. BS .. "live"
 		C.LIVE = true
 	end

@@ -1,7 +1,7 @@
 //! Release tool. Run by `.github/workflows/release.yml`; see `docs/RELEASING.md`.
 //!
 //! ```text
-//! feverlink3_release package --version V --out DIR [--root DIR]
+//! feverlink3_release package --version V --out DIR [--root DIR] [--layout overlay|portable]
 //! feverlink3_release sign    --key FILE --manifest FILE
 //! feverlink3_release keygen  --out DIR
 //! ```
@@ -40,7 +40,13 @@ fn run(args: &[String]) -> Result<(), String> {
             let out = PathBuf::from(required(rest, "--out")?);
             let root = PathBuf::from(flag(rest, "--root").unwrap_or_else(|| ".".into()));
             let inputs = package::Inputs::from_root(&root);
-            let built = package::package(&inputs, &version, &out)?;
+            // the default is what players get: no program, the files to copy into the game folder
+            let layout = match flag(rest, "--layout").as_deref() {
+                None | Some("overlay") => package::Layout::Overlay,
+                Some("portable") => package::Layout::Portable,
+                Some(other) => return Err(format!("unknown layout {other:?} (overlay or portable)")),
+            };
+            let built = package::package_with(&inputs, &version, &out, layout)?;
             println!("{}", built.zip_path.display());
             println!("sha256 {}", built.manifest.zip_sha256);
             Ok(())
@@ -58,6 +64,6 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("public key (embed in launcher/src/update.rs): {public}");
             Ok(())
         }
-        _ => Err("usage: feverlink3_release package --version V --out DIR [--root DIR] | sign --key FILE --manifest FILE | keygen --out DIR".into()),
+        _ => Err("usage: feverlink3_release package --version V --out DIR [--root DIR] [--layout overlay|portable] | sign --key FILE --manifest FILE | keygen --out DIR".into()),
     }
 }

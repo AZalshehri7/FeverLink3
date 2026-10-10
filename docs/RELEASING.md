@@ -8,7 +8,7 @@ A release is a git tag built by GitHub Actions (`.github/workflows/release.yml`)
 2. Set the version (`[workspace.package] version` in `Cargo.toml`, for example `0.2.0-test1`) and commit. The same version appears in the DLL's `native.log`.
 3. Tag and push: `git tag v0.3.0` then `git push origin v0.3.0`. A tag with a dash (`v0.3.0-rc.1`, `v0.2.0-test1`) becomes a GitHub pre-release, which the updater skips by default.
 4. The job runs `cargo test --workspace`, `cargo build --release`, then `feverlink3_release package`, signs the manifest if the secret `FEVERLINK3_SIGNING_KEY` is set, and creates the release with these assets:
-   - `FeverLink3-<version>.zip`: the portable folder (`feverlink3.exe`, `winhttp.dll`, `mod/feverlink3_1/`, `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
+   - `FeverLink3-<version>.zip`: the files to copy into the game's folder (`winhttp.dll`, `mods/release/feverlink3_1/`, no program; `feverlink3_release package --layout portable` makes the developer layout with `feverlink3.exe`), plus `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
    - `FeverLink3-<version>.zip.sha256`
    - `manifest.json`: version, every file with size and SHA-256, and the zip's SHA-256
    - `manifest.json.sig`: Ed25519 signature over the exact bytes of `manifest.json` (hex)

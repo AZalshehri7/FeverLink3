@@ -47,6 +47,7 @@ COMMON_SRC = read_src("feverlink3_common.lua")
 LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
+HOOK_SRC = read_src("feverlink3_uihook.lua")
 # the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
 CMDS_SRC = {
     os.path.splitext(f)[0]: read_src(f)
@@ -102,6 +103,8 @@ local function mk(name)
   return function(...) return { __cmd = name, args = { n = select("#", ...), ... } } end
 end
 
+EVENTS_SEEN = {}
+
 -- the engine applying a command (on its own thread: between frames, before the steps of a tick)
 function EXECUTE(cmd, cb)
   local name, a = cmd.__cmd, cmd.args
@@ -111,6 +114,7 @@ function EXECUTE(cmd, cb)
     return
   end
   if name == "makeScriptingSendEventCmd" then
+    EVENTS_SEEN[#EVENTS_SEEN + 1] = { a[2], a[3] }
     SIM_EVENT(a[1], a[2], a[3], a[4])
     if cb then cb({}, true, {}) end
     return
@@ -238,6 +242,25 @@ function RELOAD()
   GUI_API = GUI_ENV.api
 end
 
+function UI_HOOK_NEW()
+  local env = setmetatable({}, { __index = _G })
+  env.api = MAKE_API()
+  env.package = { loaded = {} }
+  env.ug_require = function(p)
+    if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
+    if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_uihook") then return assert(load(HOOK_SRC, "=uihook", "t", env))() end
+    local cmds = p:match("(feverlink3_cmds_[%w_]+)")
+    if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
+    error("no module " .. tostring(p))
+  end
+  env.HookModule = env.ug_require("feverlink3_uihook.lua")
+  env.HookModule.install()
+  UI_HOOK = env
+  return env
+end
+
 -- the window's side (feverlink3_ui.script.lua minus the drawing): read the snapshot, queue a chat line
 function UI_ENV_NEW()
   local env = setmetatable({}, { __index = _G })
@@ -249,6 +272,11 @@ function UI_ENV_NEW()
   end
   env.C, env.Hud = env.ug_require("feverlink3_common"), env.ug_require("feverlink3_hud")
   return env
+end
+function UI_SPEED(n)
+  local e = UI_ENV_NEW()
+  UI_OUTBOX = UI_OUTBOX or e.Hud.newOutbox(e.C)
+  return e.C.writerSend(UI_OUTBOX, "speed", { n = n })
 end
 function UI_SEND(text)
   local e = UI_ENV_NEW()
@@ -299,6 +327,7 @@ class Game:
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
+        g.HOOK_SRC = HOOK_SRC
         cmds = self.L.table()
         for stem, src in CMDS_SRC.items():
             cmds[stem] = src
@@ -320,6 +349,20 @@ class Game:
     def ui_send(self, text):
         self.use_env()
         return bool(self.L.eval("UI_SEND(%s)" % lua_str(text)))
+
+    def ui_speed(self, n):
+        self.use_env()
+        return bool(self.L.eval("UI_SPEED(%d)" % n))
+
+    def window(self, code):
+        """Runs `code` as a game window would: in the window state, whose api the UI hook wrapped (not the bridge's)."""
+        self.use_env()
+        self.L.execute("if not UI_HOOK then UI_HOOK_NEW() end")
+        self.L.execute("local api = UI_HOOK.api; " + code)
+
+    def events_seen(self, event_id="Loan"):
+        """How many events of that id the engine applied here (the bridge's own plumbing events do not count)."""
+        return int(self.L.eval("(function() local n = 0; for _, e in ipairs(EVENTS_SEEN) do if e[1] == %s then n = n + 1 end end; return n end)()" % lua_str(event_id)))
 
     def ui_view(self):
         self.use_env()
@@ -653,6 +696,48 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(len(self.A.applied()), 1)
         self.assertIn("LATE", self.A.log())
 
+    def test_a_command_from_a_window_state_reaches_the_other_game_once(self):
+        # The windows live in a Lua state of their own (seen in a real game: a loan taken in the window never reached the
+        # bridge's wrap). The UI hook records the command for the bridge; the game applies it natively as ever, and the
+        # other game applies it at the stamp. The originator must not apply it a second time.
+        self.start()
+        self.tick(10)
+        self.A.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, { amount = 5 } }))')
+        self.tick(60)
+        self.assertEqual(self.A.events_seen(), 1, "applied natively on the originator, once")
+        self.assertEqual(self.B.events_seen(), 1, "applied on the other game at the stamp")
+        self.assertIn("window command", self.A.log())
+
+    def test_a_command_from_a_window_state_of_the_guest_reaches_the_host(self):
+        self.start()
+        self.tick(10)
+        self.B.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, { amount = 5 } }))')
+        self.tick(60)
+        self.assertEqual(self.B.events_seen(), 1)
+        self.assertEqual(self.A.events_seen(), 1)
+
+    def test_a_window_command_leaves_every_checksum_part_equal_on_both_games(self):
+        # the originating game applies the command natively, so it must also record it in its company ledger, with the stamp the
+        # other game uses, or the games "differ in companies" after every loan, rename or purchase (seen in a real game)
+        self.start()
+        self.tick(10)
+        self.A.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, { amount = 5 } }))')
+        self.B.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Repay", { nil, { amount = 5 } }))')
+        self.tick(60)
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40)
+        pa, pb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, set(), "no part differs: " + str({k: (pa[k], pb[k]) for k in pa if pa[k] != pb[k]}))
+        self.assertIn("companies", pa)
+
+    def test_a_speed_button_in_a_window_state_is_a_request_and_not_applied_there(self):
+        self.start()
+        self.tick(5)
+        self.A.window("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(3))")
+        self.tick(5)
+        self.assertEqual(self.relay.speed_requests, [3])
+        self.assertEqual(self.A.speed(), 1, "the session's speed, not the button's")
+
     def test_speed_button_becomes_a_request(self):
         self.start()
         self.A.send_gui("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(3))")
@@ -673,9 +758,15 @@ class LockstepTest(unittest.TestCase):
         pa, pb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
         self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "loan"})
         self.assertEqual(self.relay.authority[1], {"balance": 1000000, "loan": 250000}, "the host's report carries its account")
+        self.relay.send_authority(1)
+        self.tick(6)
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "one round alone may be an action still on its way (replay on peers)")
+        # the same difference one round later is a drift: now it is corrected
+        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
         # the world moves on before the correction arrives: it is measured against the round, not against now
         self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance - 300")
-        self.relay.send_authority(1)
+        self.relay.send_authority(2)
         self.tick(6)
         self.assertEqual(self.B.L.eval("ACCOUNT.balance"), 1000000 - 300, "balance moved by the round's difference (-5000) only")
         self.assertEqual(self.B.L.eval("ACCOUNT.loan"), 250000)
@@ -685,19 +776,49 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.B.applied(), [], "a journal entry is not a replicated action")
         # the next round is identical
         self.B.L.execute("ACCOUNT.balance = ACCOUNT.balance + 300")
-        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.relay.checksum_request(3, self.relay.future_stamp(), False)
         self.tick(40, lag_b=True)
-        self.assertEqual(self.relay.reports[2][0][1], self.relay.reports[2][1][1], "worlds identical after the correction")
+        self.assertEqual(self.relay.reports[3][0][1], self.relay.reports[3][1][1], "worlds identical after the correction")
         self.assertIn("balance corrected by -5000", self.B.log())
 
-    def test_authority_without_a_recorded_round_is_skipped(self):
+    def test_authority_that_arrives_before_the_game_reaches_the_round_waits_for_it(self):
+        # Seen in a real game: the host reaches a round and sends its values at once; a game a little behind had no account
+        # of its own for that round yet, the values were thrown away every round, and money and loans never followed.
         self.start()
         self.tick(5)
-        self.relay.authority[9] = {"balance": 1, "loan": 2}
-        self.relay.send_authority(9)
+        balance = int(self.B.L.eval("ACCOUNT.balance"))
+        loan = int(self.B.L.eval("ACCOUNT.loan"))
+        for n in (9, 10):   # the same difference in two rounds in a row: a drift, corrected
+            self.relay.authority[n] = {"balance": balance + 700, "loan": loan}
+            self.relay.send_authority(n)
+            self.tick(5)
+            self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "nothing to measure against yet, and nothing thrown away")
+            self.assertNotIn("skipped", self.B.log())
+            self.relay.checksum_request(n, self.relay.future_stamp(), False)
+            self.tick(40)
+        self.assertEqual(self.B.L.eval("JOURNAL[1]"), 700, "applied as the difference once the game reached the second round")
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 1)
+        self.assertIn("balance corrected by 700", self.B.log())
+
+    def test_a_difference_that_is_gone_one_round_later_is_never_corrected(self):
+        # An action replayed on the other game reaches it a stamp's lead after the game it came from: a checksum round in
+        # between sees the effect on one side only, and the next round sees none. Correcting the first would count it twice.
+        self.start()
+        self.tick(5)
+        balance = int(self.B.L.eval("ACCOUNT.balance"))
+        loan = int(self.B.L.eval("ACCOUNT.loan"))
+        self.relay.authority[11] = {"balance": balance + 17000, "loan": loan + 17000}
+        self.relay.checksum_request(11, self.relay.future_stamp(), False)
+        self.tick(40)
+        self.relay.send_authority(11)
+        self.tick(5)
+        self.relay.authority[12] = {"balance": balance, "loan": loan}   # the action has reached this game: no difference
+        self.relay.checksum_request(12, self.relay.future_stamp(), False)
+        self.tick(40)
+        self.relay.send_authority(12)
         self.tick(5)
         self.assertEqual(self.B.L.eval("#JOURNAL"), 0)
-        self.assertIn("skipped", self.B.log())
+        self.assertNotIn("corrected by", self.B.log())
 
     # ---- resync
 
@@ -841,6 +962,20 @@ class LockstepTest(unittest.TestCase):
         view = str(self.B.ui_view()).split("|")
         self.assertEqual(view[1], "host [host], client (you), dave")
         self.assertEqual(view[2], "client: hello team !")
+
+
+    def test_speed_pressed_in_the_window_is_a_request_to_the_host(self):
+        self.start(speed=1)
+        self.assertTrue(self.B.ui_speed(3))
+        self.assertTrue(self.A.ui_speed(0))
+        self.assertTrue(self.B.ui_speed(9), "the record is written; the bridge refuses a speed it does not know")
+        self.tick(4)
+        b = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "speed_request"]
+        a = [l for l in self.A.lines(self.A.from_game) if l.split(TAB)[1] == "speed_request"]
+        self.assertEqual(len(b), 1, b)
+        self.assertIn('["speed"]=3', b[0])
+        self.assertEqual(len(a), 1, a)
+        self.assertIn('["speed"]=0', a[0])
 
 
 class PureTest(unittest.TestCase):
@@ -993,9 +1128,15 @@ class PureTest(unittest.TestCase):
         self.assertEqual((d.balance, d.loan), (100, None))
         booked = []
         eng = L.table_from({"bookJournal": L.eval("function(a) BOOKED = a end"), "adjustLoan": None})
-        applied, failed = K.applyAuthority(eng, L.table_from({"balance": 1, "loan": 5}), L.table_from({"balance": 11, "loan": 9}))
+        own, host = L.table_from({"balance": 1, "loan": 5}), L.table_from({"balance": 11, "loan": 9})
+        applied, failed, measured = K.applyAuthority(eng, own, host)
+        self.assertEqual((applied.balance, applied.loan, len(list(failed.values()))), (None, None, 0), "a first round only measures")
+        self.assertEqual((measured.balance, measured.loan), (10, 4))
+        applied, failed, measured = K.applyAuthority(eng, own, host, measured)
         self.assertEqual(applied.balance, 10)
         self.assertEqual(list(failed.values()), ["loan"], "a build without a loan accessor reports it cannot correct the loan")
+        applied, failed, _ = K.applyAuthority(eng, own, host, L.table_from({"balance": 200, "loan": 4}))
+        self.assertEqual(applied.balance, None, "a difference that changed since the round before is not the same one")
 
     def test_hud_model(self):
         H, L = self.H, self.L

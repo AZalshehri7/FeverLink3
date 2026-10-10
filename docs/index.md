@@ -6,9 +6,17 @@ title: FeverLink3
 
 **Cooperative multiplayer for Transport Fever 3.** The goal: several players build in one world at the same time, each in their own copy of the game. Source available (PolyForm Noncommercial, free for noncommercial use), Windows and Steam, unofficial.
 
-> **Early test build, not yet a playable multiplayer game.** Last updated 2026-10-10. The first test build has one job: to find out whether two players can reach each other through Steam. Its in-game window has a Steam connection test; hosting and joining a game over that connection come in the next test build. The Steam connection between two different accounts, building together between two real games, and sending the world between two real games have **not** been verified yet. [What is verified and what is not](site/status.html).
+> **Early test build, not yet a full multiplayer game.** Last updated 2026-10-10. Two real copies of the game can host and join, the host's world is sent to the guest, and speed, pause and chat from either side show in both games (see the demo below). Building together, hosting and joining over Steam between two accounts, and busy worlds with vehicles have **not** been verified yet. [What is verified and what is not](site/status.html).
 
 [Quick start](#quick-start) · [Download](#download) · [FAQ](site/faq.html) · [Status](site/status.html) · [Security and antivirus](SECURITY_FOR_USERS.html) · [Roadmap](ROADMAP.html) · [Architecture](ARCHITECTURE.html) · [Protocol](PROTOCOL.html) · [Security review](SECURITY.html) · [Source on GitHub](https://github.com/AZalshehri7/FeverLink3)
+
+## See it working
+
+Two real copies of the game side by side, each starting in its own world: the left one hosts and copies the join code, the right one pastes it and joins, the host's world is sent to the guest while the host keeps playing, then each side gives commands and the other game follows. The names are made up.
+
+![The host (left) and the guest (right): host, copy code, paste, join, start, speed, pause and chat](media/split-screen-demo.gif)
+
+Stills: [the host copies the code](media/demo-1-host-copies-code.jpg), [the guest has joined](media/demo-2-guest-joined.jpg), [the world is sent while the host keeps playing](media/demo-3-world-sent-host-keeps-playing.jpg), [the guest pauses and both games stop](media/demo-4-guest-pauses-both-stop.jpg), [chat on both sides](media/demo-5-chat-both-sides.jpg). This ran over the developer connection on one PC (two games of one Steam account cannot reach each other through Steam).
 
 ## What it is
 
@@ -25,10 +33,10 @@ The full design is in the [architecture document](ARCHITECTURE.html) and the [pr
 
 For the test build, once it is published (full guide: [Playing FeverLink3](PLAYING.html)):
 
-1. Download and unzip the release, close Transport Fever 3, double-click `feverlink3.exe` and choose `1` (install); a terminal does the same with `feverlink3 install`. Windows may warn about an unsigned program the first time: More info, then Run anyway.
-2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer*.
-3. Click **FeverLink3** in the bar at the bottom of the screen. Under **Steam connection test**, two testers send each other their Steam IDs, paste the other's ID and press **Test the connection**.
-4. Next test build: the host clicks **Host a game**, copies the join code and sends it to a friend, who pastes it and presses **Join**.
+1. Download and unzip the release, close Transport Fever 3, and copy `winhttp.dll` and the `mods` folder from the zip into the game's folder (in Steam: right-click Transport Fever 3, Manage, Browse local files). There is no installer and no program to run.
+2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer* when starting a game.
+3. Click **FeverLink3** in the bar at the bottom of the screen. The host clicks **Host a game**, presses **Copy code** and sends the code to a friend, who pastes it and presses **Join**; then the host presses **Start the session**.
+4. For connection problems the window has a **Connection test...** section.
 
 Each player needs their own copy of the game and the same game version (the test build was made for build 40420). To remove everything, close the game and run `feverlink3 uninstall`. The installer is a testing tool: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module delivered separately for now ([plan](WORKSHOP.html)).
 
@@ -38,7 +46,7 @@ Releases are published at [github.com/AZalshehri7/FeverLink3/releases](https://g
 
 ## FAQ
 
-**Does it work?** Partly. The in-game window opens, and inside one game the Steam connection test works. Hosting and joining over Steam are not finished, and playing together in two real games has not been verified. The [status page](site/status.html) lists every item with its date.
+**Does it work?** Partly. Two real copies of the game can host and join, the host's world is sent and loaded, and speed, pause and chat work from either side (a recording is above). The Steam connection between two different accounts worked in a friend's test. Building together, and hosting and joining over Steam between two accounts, have not been verified yet. The [status page](site/status.html) lists each claim with its date.
 
 **How do the players connect?** Through Steam's peer-to-peer networking. The join code is all a friend needs, and by design nothing has to be set up. This is being tested: inside one game it is proven, between two different accounts it has not been tried yet, so nobody should assume it works over the internet today.
 

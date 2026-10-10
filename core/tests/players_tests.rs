@@ -220,6 +220,26 @@ fn kicking_a_player_who_is_away_releases_its_slot() {
 }
 
 #[test]
+fn ending_the_session_tells_every_player_and_closes_every_connection() {
+    let mut n = Net::new();
+    let a = n.connect("Alice");
+    let b = n.connect("Bob");
+    n.lose(b);
+    let c = n.connect("Carl");
+    let stranger = n.open_raw();
+
+    n.host_call(|h| h.end_session());
+    for p in [a, c] {
+        let r = n.peer(p).rejected.clone().expect("told");
+        assert_eq!(("ended", Some("the host ended the session")), (r.reason.as_str(), r.detail.as_deref()));
+        assert_eq!(PlayerState::Rejected, n.peer(p).session.state());
+        assert!(n.closed.contains(&p), "connection {p} is closed");
+    }
+    assert!(n.closed.contains(&stranger), "a connection that never joined is closed too");
+    assert!(n.logged("the host ended the session"), "{:?}", n.host_log);
+}
+
+#[test]
 fn the_hosts_own_game_cannot_be_removed_and_nobody_else_is_hurt_by_a_wrong_id() {
     let mut n = Net::new();
     let a = n.connect("Alice");

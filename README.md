@@ -2,22 +2,28 @@
 
 Cooperative multiplayer for Transport Fever 3. The goal: several players build in one world at the same time, each in their own copy of the game. Source available under the PolyForm Noncommercial License (free for noncommercial use; see Licence below), Windows and Steam only, unofficial.
 
-**Status: early test build (0.2.0-test1), last updated 2026-10-10. It is not yet a playable multiplayer game.** The first test build has one job: to find out whether two players can reach each other through Steam. It adds a window to the game with a Steam connection test; hosting and joining a game over that connection come in the next test build. What is real and what is not:
+**Status: early test build (0.2.0-test5), last updated 2026-10-10. Two players can host, join and see each other's speed, pause and chat commands in two real games; building together is not verified yet.** What is real and what is not:
 
-- **Verified in the real game** (build 40420, 2026-10-09): the mod loads; its window opens from a button in the bottom bar; the mod can drive the game's own save and load and picks its session files up again after a reload; the Steam peer-to-peer listener starts. With an earlier build of the window, whose Host button used a direct connection (since taken out of the window), hosting showed a join code and a second client (a test client, not a second copy of the game) could join. On 2026-10-10 the game opened a Steam peer-to-peer connection to its own Steam ID inside one process and 6 pings were answered.
-- **Not verified yet:** the Steam connection between two different accounts (the test of this build), hosting and joining over Steam (not finished), building together (replicating construction and vehicle commands between two real games), sending a savegame between two real games, the native command hooks (switched off unless a developer turns them on; never run in the game), and joining from a second real copy of the game.
+- **Verified in the real game** (build 40420): the mod loads; its window opens from a button in the bottom bar; the Steam peer-to-peer connection works between two different accounts (a friend's test: connected, 199 ms round trip through a Steam relay); and with two real copies of the game on one PC, using the developer connection on the loopback address, a host can host a game, copy the join code, a guest can paste it and join, the host's world is sent and the guest's game loads it while the host keeps playing, and speed, pause and chat from either side show up in both games. See the demo: [docs/media/split-screen-demo.gif](docs/media/split-screen-demo.gif).
+- **Not verified yet:** hosting and joining over Steam between two accounts (the code is there, the test with a friend is pending), building together (replicating construction and vehicle commands between two real games), long sessions in a busy world with vehicles (the host-keeps-playing sync was checked on a small world with no lines), and the native command hooks (switched off unless a developer turns them on; never run in the game).
 
 Details and dates: [docs/ROADMAP.md](docs/ROADMAP.md). How to try the test build: [docs/PLAYING.md](docs/PLAYING.md). What the `winhttp.dll` file is and why antivirus programs may look at it: [docs/SECURITY_FOR_USERS.md](docs/SECURITY_FOR_USERS.md).
+
+## See it working
+
+Two real copies of the game side by side, each starting in its own world. The left one hosts, the right one joins with the copied code, the host's world is sent to the guest, then each side gives commands and the other game follows. (Recorded with `tools/gametest/demo_split.ps1`; the names are made up.)
+
+![The host (left) and the guest (right): host, copy code, paste, join, start, speed, pause and chat](docs/media/split-screen-demo.gif)
 
 ## How it works
 
 Transport Fever 3 has no network code, so FeverLink3 keeps every copy of the world identical instead of sending the world around:
 
 1. **Commands, not state.** Every player action is captured as the engine command it produces, stamped with a future simulation step, and sent to everyone. Every game, including the one where the player clicked, applies it at that step. Identical inputs on a deterministic simulation give identical worlds.
-2. **Host authority.** One game is the authority. The games compare world checksums at common steps; a lasting difference is repaired by reloading the host's savegame everywhere (the host included, so entity order matches).
+2. **Host authority.** One game is the authority. The games compare world checksums at common steps; a lasting difference is repaired by loading the host's savegame in the other games (the host keeps playing; a switch makes the host's game reload too).
 3. **Sealed transport.** A join code carries the session secret. Everything on the wire is encrypted and authenticated with a key derived from it; the host decides who speaks and what kinds of messages a player may send.
 4. **No entity ids on the wire.** Entity ids differ between games, so roads travel as positions, constructions as file plus placement, vehicles and lines as per-session keys.
-5. **Connecting the players.** The players' games reach each other through Steam's peer-to-peer networking, so a player only has to share a join code and has nothing to set up. The Steam connection is proven only inside one game so far; the first test between two different Steam accounts is what the current test build is for, and carrying whole sessions over it is the next step.
+5. **Connecting the players.** The players' games reach each other through Steam's peer-to-peer networking, so a player only has to share a join code and has nothing to set up. The Steam connection has been proven between two different accounts in the connection test; carrying whole sessions over it is the next test.
 
 The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). FeverLink3 is for Transport Fever 3 only; it does not support Transport Fever 2.
 
@@ -25,12 +31,13 @@ The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). FeverL
 
 Short version (the full guide is [docs/PLAYING.md](docs/PLAYING.md)):
 
-1. Unzip the release, close the game, double-click `feverlink3.exe` and choose `1` (install). A terminal does the same: `feverlink3 install`.
-2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer*.
-3. Click **FeverLink3** in the bar at the bottom of the screen. Under **Steam connection test**, two testers exchange their Steam IDs, paste the other's ID and press **Test the connection**.
-4. Next test build: the host clicks **Host a game** and sends the join code; a friend pastes it and presses **Join**.
+1. Unzip the release, close the game, and copy `winhttp.dll` and the `mods` folder from the zip into the game's folder (in Steam: right-click Transport Fever 3, Manage, Browse local files). There is no installer.
+2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer* when starting a game.
+3. Click **FeverLink3** in the bar at the bottom of the screen. The host clicks **Host a game**, presses **Copy code** and sends the code; a friend pastes it (Ctrl+V) and presses **Join**, and the host presses **Start the session**.
+4. For connection problems, the window has a **Connection test...** section (two players exchange Steam IDs).
 
-To remove everything: close the game and run `feverlink3 uninstall`. The installer is a testing tool: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
+To remove everything: delete `winhttp.dll` and `mods
+eleaseeverlink3_1` from the game's folder. The `feverlink3.exe` helper in this repository is a developer tool and is not in the zip: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
 
 ## Credits
 

@@ -10,7 +10,9 @@
 --     reads to_game.log, keeps session and peer clocks, paces the engine speed, sends clock lines,
 --     wraps api.cmd.sendCommand so a player's command is held, encoded and shipped as an `action`,
 --     forwards stamped items to the simulation half, applies due items itself while the game is paused,
---     hands the originator's callback the real result, writes checksum reports and refusals.
+--     hands the originator's callback the real result, writes checksum reports and refusals,
+--     strict mode (when the native module is there): has a construction tool's build held, shipped and applied at the stamp
+--     by every game, the originator's included (native_ctl.log / native_events.log, docs/NATIVE_LINK.md section 7).
 --   simulation half (update, once per step; handleEvent)
 --     keeps the queue in the game-script state, applies due items at their exact step, computes checksum
 --     parts, installs the deterministic math.random.
@@ -40,7 +42,53 @@ for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverli
 	end
 end
 
+-- The construction module captures what the native tools build (see simCaptureBuild).
+local Build = nil
+for _, M in ipairs(CMDS) do
+	if type(M.capture) == "function" then Build = M end
+end
+
+-- Developer probe (only when the game was started with FEVERLINK3_DEV=1, which a player never does): Lua text the developer
+-- drops into the session folder as dev_gui.lua / dev_sim.lua is run once in that half's Lua state (the interface state
+-- or the simulation state) and its result is appended to dev_gui_out.txt / dev_sim_out.txt. It is how the real shapes of
+-- the engine's objects are looked at without restarting the game for every question. Inert without the variable.
+local DEV = false
+pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
+
+local function devPoll(half)
+	if not DEV then return end
+	local path = C.path("dev_" .. half .. ".lua")
+	local text = C.readFile(path)
+	if type(text) ~= "string" or text == "" then return end
+	C.writeFile(path, "")
+	local lines = {}
+	local env = setmetatable({
+		api = api, C = C, L = L, Build = Build, CMDS = CMDS,
+		print = function(...)
+			local t = {}
+			for i = 1, select("#", ...) do t[#t + 1] = tostring((select(i, ...))) end
+			lines[#lines + 1] = table.concat(t, "\t")
+		end,
+	}, { __index = _G })
+	local f, err = load(text, "dev_" .. half, "t", env)
+	local out
+	if not f then
+		out = "COMPILE ERROR: " .. tostring(err)
+	else
+		local ok, res = pcall(f)
+		if ok then
+			local okS, ser = pcall(C.serialize, res)
+			out = (#lines > 0 and (table.concat(lines, "\n") .. "\n") or "") .. "RESULT: " .. (okS and ser or tostring(res))
+		else
+			out = (#lines > 0 and (table.concat(lines, "\n") .. "\n") or "") .. "ERROR: " .. tostring(res)
+		end
+	end
+	C.appendFile(C.path("dev_" .. half .. "_out.txt"), "---- t=" .. tostring(os.clock()) .. "\n" .. out .. "\n")
+end
+
 local STEP = L.STEP
+local REPLAY_STEPS = 12 -- a replayed build's engine event is expected within this many steps of the command
+local OUT_KEEP = 40
 local RESULT_KEEP = 60
 local WATCH_STEPS = 10
 local unpack = table.unpack or unpack
@@ -270,7 +318,127 @@ end
 -- Applies one due action in the simulation state. No callback here (finding from MPFever (MIT): the engine
 -- rejects callbacks from inside the simulation update), so an entity the command creates is found afterwards by
 -- comparing the entity lists (a watch), and the result reaches the originator through the state.
+-- (The replay marks below follow the counter MPFever keeps for the same purpose in captureNativeBuild, MIT.)
+-- The engine tells the game script about every build it applies (`apply_command` / `onPreBuildProposal`, just before
+-- it runs; finding from MPFever (MIT)). A replay of an action (a build rebuilt from a shipped record) must not be
+-- shipped again, so each one is counted here when it is sent and spent when its event arrives.
+local function markReplay(st, now, state)
+	local r = st.replay
+	if type(r) ~= "table" or now - (r.at or 0) > REPLAY_STEPS * STEP then r = { n = 0, at = now } end
+	r.n = r.n + 1
+	r.at = now
+	st.replay = r
+	-- The engine may announce the build while the command is still being sent (seen in a real game: the guest captured its
+	-- own replay about half the time), before this update has stored its state. Store it now, so that the event finds the mark.
+	if state then state:set(st) end
+end
+
+-- After the command went out, the event handler may have spent the mark and added to the outgoing list in the stored
+-- state: take that over, or this update's own copy would put the mark back (and swallow the next real build).
+local function takeBackEvents(st, state)
+	if not state then return end
+	local fresh = state:get()
+	if type(fresh) ~= "table" then return end
+	st.replay, st.out, st.outSeq = fresh.replay, fresh.out or st.out, fresh.outSeq or st.outSeq
+end
+
+local function spendReplay(st, now)
+	local r = st.replay
+	if type(r) ~= "table" or r.n <= 0 then return false end
+	if now - (r.at or 0) > REPLAY_STEPS * STEP then
+		st.replay = nil
+		return false
+	end
+	r.n = r.n - 1
+	return true
+end
+
+local function buildCategory(body)
+	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1] or nil
+	if type(rec) ~= "table" then return "build" end
+	-- the rule of the build module's categoryFor, counted on the record: a build that adds no construction, node or edge
+	-- object and takes something away (a construction, edge objects, or more segments than it puts back) is bulldozing
+	local adds = #(rec.cons or {}) + #(rec.nodes or {}) + #(rec.objs or {})
+	local removes = #(rec.rem or {})
+	if adds == 0 and (removes > 0 or #(rec.segs or {}) < #(rec.rmSegs or {}) or #(rec.rmObjs or {}) > 0) then return "bulldoze" end
+	return "build"
+end
+
+-- The category an action is booked under (permissions, the company ledger): for a build record it is fixed once, by the game
+-- that made the build, and travels inside the record, so that every game books it the same way. Counting it again on each
+-- game from the rebuilt proposal made the ledgers differ (a bulldozing that leaves merged road pieces was "build" on one game
+-- and "bulldoze" on the others, and the `companies` part of the checksum differed for good). Only the two build categories
+-- are taken from a record, and only for the build command; anything else is counted the usual way.
+local function actionCategory(body, args)
+	if type(body) == "table" and body.fn == "makeWorldBuildProposalCmd" and (body.category == "build" or body.category == "bulldoze") then
+		return body.category
+	end
+	return L.categoryOf(body.fn, args)
+end
+
+-- A build the player made with a native tool (roads, tracks, stations, depots, bulldozer...): the engine applies it
+-- itself, here and now. It is captured as a build record and handed to the interface half (st.out), which stamps and
+-- ships it like any other action; every OTHER game rebuilds it at the stamp.
+local function simCaptureBuild(state, param)
+	local st = simState(state)
+	local now = engine.gameTime()
+	if spendReplay(st, now) then
+		state:set(st)
+		return
+	end
+	local proposal, playerInitiated = nil, nil
+	pcall(function() proposal, playerInitiated = param[1], param[4] end)
+	if proposal == nil or playerInitiated == false or not Build then return end
+	local rev = {}
+	for key, e in pairs(st.bind) do rev[e] = key end
+	local t0 = os.clock()
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true }, {
+		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
+	})
+	if not ok then body, why = nil, tostring(body) end
+	if not body then
+		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(why))
+		-- the first few failures leave the raw proposal in a file, to see the real shapes (members of engine objects)
+		st.rawDumped = (st.rawDumped or 0) + 1
+		if st.rawDumped <= 4 and Build.adapter and Build.adapter.dump then
+			pcall(function()
+				local text = C.serialize(Build.adapter.dump(proposal))
+				C.appendFile(C.path("raw_builds.txt"), "==== t=" .. now .. " why: " .. tostring(why) .. "\n" .. text:sub(1, 60000) .. "\n")
+			end)
+		end
+		state:set(st)
+		return
+	end
+	body.native = true
+	body.category = buildCategory(body)
+	local okS, text = pcall(C.serialize, body)
+	if not okS then
+		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(text))
+		return
+	end
+	st.out = st.out or {}
+	st.outSeq = (st.outSeq or 0) + 1
+	st.out[#st.out + 1] = { n = st.outSeq, at = now, body = text }
+	trim(st.out, OUT_KEEP)
+	state:set(st)
+	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, " .. string.format("%.3f", os.clock() - t0) .. " s)")
+	-- self-check: could this record be rebuilt here, the way another game will rebuild it? Only the engine's command
+	-- factory is called, nothing is sent.
+	local okC, args, whyC = pcall(L.decodeCommand, body, simCtx(st, { from = C.PLAYER_ID, at = now, key = "self-check" }))
+	if not okC then args, whyC = nil, tostring(args) end
+	if args then
+		logSim("native build self-check: can be rebuilt (" .. tostring(args.chain and (#args.chain + 1) or 1) .. " command(s))")
+	else
+		logSim("native build self-check FAILED: " .. tostring(whyC))
+	end
+end
+
 local function simApplyAction(st, it, now)
+	if it.body and it.body.native and it.from == C.PLAYER_ID then
+		-- the engine applied this build when its player made it; the record only exists to reach the other games
+		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
+		return
+	end
 	if it.lateSteps and it.lateSteps > 0 then
 		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
 		st.late = (st.late or 0) + 1
@@ -283,7 +451,7 @@ local function simApplyAction(st, it, now)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
-	local category = L.categoryOf(it.body.fn, args)
+	local category = actionCategory(it.body, args)
 	-- companies: the spending limit and the spec's registry change come first; a mod-level action has no engine command
 	local okC, fx = coBefore(ctx, it, spec, args, category, logSim)
 	if not okC then
@@ -306,7 +474,12 @@ local function simApplyAction(st, it, now)
 	end
 	local balance0 = coBalance(ctx)
 	local ok, e = pcall(function()
-		L.sendNow(args, function(a) api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n))) end)
+		L.sendNow(args, function(a)
+			local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
+			if isBuild then markReplay(st, now, SIM.state) end
+			api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
+			if isBuild then takeBackEvents(st, SIM.state) end
+		end)
 	end)
 	if not ok then
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
@@ -333,9 +506,15 @@ local function simReplayCompany(st, param)
 	local spec = it.body and L.COMMANDS[it.body.fn]
 	if not spec then return end
 	local ctx = simCtx(st, it)
-	local args = L.decodeCommand(it.body, ctx)
-	if not args then return end
-	local category = L.categoryOf(it.body.fn, args)
+	local args, category
+	if type(param.category) == "string" and type(it.body.args) == "table" then
+		-- an action this game made itself and applied natively: the shipped arguments name it, nothing is rebuilt
+		args, category = it.body.args, param.category
+	else
+		args = L.decodeCommand(it.body, ctx)
+		if not args then return end
+		category = actionCategory(it.body, args)
+	end
 	local okC = coBefore(ctx, it, spec, args, category, logSim)
 	if okC and param.ok and not spec.virtual then
 		local ok, err = pcall(function() Co.afterApply(ctx, it, spec, Co.info(it, spec, category, param.cost)) end)
@@ -418,6 +597,9 @@ local function update(userParams, state, dt)
 		SIM.subscribed = true
 		pcall(function() state:subscribeToAllEvents() end)
 	end
+	SIM.devTick = (SIM.devTick or 0) + 1
+	if SIM.devTick % 4 == 0 then devPoll("sim") end
+	SIM.state = state
 	local ok, err = pcall(function()
 		local st = simState(state)
 		local now = engine.gameTime()
@@ -442,12 +624,35 @@ end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
 local function handleEvent(userParams, state, src, id, name, param)
+	if DEV and id == "apply_command" then
+		pcall(function()
+			local pi = nil
+			pcall(function() pi = param[4] end)
+			if pi ~= false then logSim("event apply_command/" .. tostring(name) .. " at t=" .. tostring(engine.gameTime()) .. " playerInitiated=" .. tostring(pi)) end
+		end)
+	end
+	if id == "apply_command" and name == "onPreBuildProposal" then
+		C.poll()
+		if not C.ACTIVE then return end
+		local ok, err = pcall(simCaptureBuild, state, param)
+		if not ok then logSim("onPreBuildProposal capture failed: " .. tostring(err)) end
+		return
+	end
 	C.poll()
 	if not C.ACTIVE or id ~= "feverlink3" then return end
+	if name == "nop" then return end   -- strict mode's trigger: a command that makes the native module run its queue (natTrigger)
 	local ok, err = pcall(function()
 		local st = simState(state)
 		if name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
+		elseif name == "replay" then
+			markReplay(st, engine.gameTime())
+		elseif name == "outack" and type(param) == "table" then
+			local keep = {}
+			for _, o in ipairs(st.out or {}) do
+				if o.n > (tonumber(param.n) or 0) then keep[#keep + 1] = o end
+			end
+			st.out = keep
 		elseif name == "bind" and type(param) == "table" and param.key then
 			st.bind[param.key] = param.e
 		elseif name == "co" and Co and type(param) == "table" and type(param.it) == "table" then
@@ -480,6 +685,11 @@ local G = {
 	tags = setmetatable({}, { __mode = "k" }),  -- command object -> { name, args }
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
+	outSeen = {},             -- native builds the simulation half captured that this half already shipped
+	uiSeq = {},               -- id of a command record from the UI-state hook -> the sequence number it was shipped as
+	authPending = {},         -- round -> a host authority that arrived before this game reached that round
+	authLast = nil,           -- the money differences the previous round measured (a correction needs the same one twice)
+	bindsWritten = nil,       -- text of the last binds.txt (the UI-state hook reads it to name entities)
 }
 
 -- The originals are kept in package.loaded so a savegame reload (which re-runs this file in the same Lua state)
@@ -542,20 +752,60 @@ end
 -- the engine's own result binds the created entity and answers the originator.
 -- A finished checksum round: remembered (the host's authority is measured against it) and sent. The host's report
 -- carries its account as `authority`; the players apply it when it comes back as an `authority` line.
+-- The host's money values of a checksum round, applied as the difference to this game's own at the same round. The host
+-- reaches a round and sends its values at once; a game that is a little behind has no account of its own for that round
+-- yet, so the values wait here (seen in a real game: every round was skipped, so money and loans never followed).
+local function applyAuthority(p)
+	local own = G.accountAt[p.n]
+	if not own then return false end
+	local applied, failed, measured = L.applyAuthority(engine, own, p.values, G.authLast)
+	G.authLast = measured
+	if next(measured) ~= nil and next(applied) == nil and #failed == 0 then
+		logGui("host authority: round " .. tostring(p.n) .. " differs (balance " .. tostring(measured.balance) .. ", loan " .. tostring(measured.loan) .. "); corrected only if the next round shows the same")
+	end
+	if applied.balance then logGui("host authority: balance corrected by " .. applied.balance .. " (round " .. tostring(p.n) .. ")") end
+	if applied.loan then logGui("host authority: loan corrected by " .. applied.loan .. " (round " .. tostring(p.n) .. ")") end
+	for _, name in ipairs(failed) do logGui("host authority: " .. name .. " differs but this build cannot correct it") end
+	return true
+end
+
 local function reportRound(n, t, parts, account)
 	G.reportsSent[n] = true
 	G.accountAt[n] = account
 	G.accountAt[n - 40] = nil
 	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil })
+	local waiting = G.authPending[n]
+	if waiting then
+		G.authPending[n] = nil
+		local ok, err = pcall(applyAuthority, waiting)
+		if not ok then logGui("host authority failed: " .. tostring(err)) end
+	end
 end
 
 -- companies: hands an action this half applied to the simulation half, which keeps the registry in the savegame
-local function coToSim(it, ok, cost)
+local function coToSim(it, ok, cost, category)
 	if not Co then return end
-	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost })
+	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost, category = category })
+end
+
+-- An action this game applied natively when its player made it (a build with a native tool, a command from a window): every
+-- OTHER game runs the company layer when it applies the action at its stamp (the ledger of who built and spent what is part of
+-- the checksum), so this game must run it too, with the same stamp, or its ledger is the only one without the action and the
+-- games "differ in companies" until a resync copies everything (seen in a real game: a reload every two minutes).
+local function recordOriginator(body, seq, at, category)
+	if not Co or type(body) ~= "table" then return end
+	local spec = L.COMMANDS[body.fn]
+	if not spec or spec.virtual then return end
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = body, key = L.itemKey(C.PLAYER_ID, seq) }
+	coGuard("originator ledger", function()
+		local ctx = guiCtx(it)
+		Co.afterApply(ctx, it, spec, Co.info(it, spec, category, nil))
+		coToSim(it, true, nil, category)
+	end)
 end
 
 local function guiApplyNow(it, now)
+	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
 		local parts, t = checksumParts(G.co)
 		reportRound(it.n, t, parts, L.accountSnapshot(engine))
@@ -571,7 +821,7 @@ local function guiApplyNow(it, now)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
-	local category = L.categoryOf(it.body.fn, args)
+	local category = actionCategory(it.body, args)
 	-- companies: the registry and ledger part runs here on the mirror and is replayed on the simulation state (coToSim)
 	local okC, fx = coBefore(ctx, it, spec, args, category, logGui)
 	if not okC then
@@ -631,6 +881,7 @@ local function guiApplyNow(it, now)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
 	local okS, errS = pcall(L.runChained, args, function(a, cb)
+		if it.body.fn == "makeWorldBuildProposalCmd" then toSim("replay", {}) end
 		O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
 	end, finish)
 	if not okS then
@@ -646,13 +897,57 @@ local function route(it)
 	if L.applyNow(G.session, now, it) then guiApplyNow(it, now) else toSim("queue", it) end
 end
 
+-- A build the player made with a native tool, captured by the simulation half (simCaptureBuild): stamped and shipped
+-- like any other action. The engine applied it already, so it is not queued here; the other games rebuild it at the stamp.
+-- (TpF2 Multiplayer stamps past the fastest other clock for the same reason: a game that has passed the stamp
+-- applies the action late, and the worlds fork.)
+local function stampAfterFastest(now)
+	local base = now
+	for _, pc in pairs(G.peers) do
+		if type(pc) == "table" and type(pc.t) == "number" and pc.t > base then base = pc.t end
+	end
+	return L.stampFor(G.session, base)
+end
+
+-- The permission category of a captured build record: a record that adds nothing only removes (bulldoze).
+-- (buildCategory and actionCategory are defined above the simulation half)
+
+local function shipNative(o)
+	local body = C.parse(o.body)
+	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
+	local category = buildCategory(body)
+	local now = engine.gameTime()
+	G.seq = G.seq + 1
+	local at = stampAfterFastest(now)
+	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
+	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
+	recordOriginator(body, G.seq, at, category)
+	return true
+end
+
+-- A command a window issued, recorded by the UI-state hook (feverlink3_uihook.lua), which applied it natively already:
+-- stamped and shipped; the other games apply it at the stamp.
+local function shipUiCommand(p)
+	local body = C.parse(p.body)
+	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
+	local now = engine.gameTime()
+	G.seq = G.seq + 1
+	G.uiSeq[p.id] = G.seq
+	local at = stampAfterFastest(now)
+	local category = type(p.category) == "string" and p.category or "other"
+	send("action", { stamp = at, seq = G.seq, body = p.body, category = category })
+	logGui("window command " .. tostring(body.fn) .. " " .. L.itemKey(C.PLAYER_ID, G.seq) .. " stamped " .. at .. " (now " .. now .. ")")
+	recordOriginator(body, G.seq, at, category)
+	return true
+end
+
 -- A command this player issued (held by the wrapped sendCommand): encode, stamp, ship, queue locally.
 local function shipLocal(tag, cb)
 	local body, err = L.encodeCommand(tag.name, tag.args, { plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end })
 	if not body then return false, err end
 	local now = engine.gameTime()
 	G.seq = G.seq + 1
-	local at = L.stampFor(G.session, now)
+	local at = stampAfterFastest(now)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
 	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
 	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args) })
@@ -660,6 +955,457 @@ local function shipLocal(tag, cb)
 	logGui("action " .. it.key .. " " .. tag.name .. " stamped " .. at .. " (now " .. now .. ")")
 	route(it)
 	return true
+end
+
+-- ================================================================== strict mode: the native module holds a tool's build
+--
+-- Credit: holding the command a construction tool queued, cancelling it, and letting EVERY game, the originator's included,
+-- apply the build at the stamp ("strict" replication) follows TpF2 Multiplayer (MIT). The module is native/ (docs/NATIVE_LINK.md);
+-- this is the mod's half of that contract (section 7 there). Everything here is guarded and fails open: when strict mode is not
+-- available, or anything in it is in doubt, the tool's build goes through natively and the simulation half ships it the old
+-- way (replay on peers, simCaptureBuild).
+--
+-- One build with a native tool:
+--   1. the tool event builder.proposalCreate (the tool preview) reaches guiHandleEvent. natCapture encodes the proposal (Build.captureToolBuild)
+--      and keeps the result in N.caps for 2 s (a failed capture is kept too, as an entry without a body, so that the order of
+--      captures and `held` events stays aligned);
+--   2. the module holds the tool's command at CommandList::Add and writes `held {id}` to native_events.log. natPair matches it
+--      with the oldest capture. If `held` is read first, it waits (N.parked) for the capture for a short grace;
+--   3. natDecide: the player's permission, a check that this game could rebuild the record, then the action is shipped with a
+--      stamp exactly as shipLocal does, `cancel {id}` destroys the held command (the engine never applies it) and the item is
+--      routed to this game's own queue, so the originator applies the build at the stamp through the normal replay path
+--      (simApplyAction), like every other game. No recordOriginator: the normal apply path books the company ledger;
+--   4. whatever does not fit (no usable capture, a record that cannot be rebuilt here) is released: `release {id}` lets the
+--      native build go through and the simulation half's onPreBuildProposal capture ships it the old way.
+-- A capture is never shipped without its `held`, and a held command is either cancelled-and-shipped or released, never both.
+--
+-- Switching it on (once per script start; a reloaded script starts again from the file, which keeps `ready`):
+--   native_events.log appears -> its records are read; the first batch is history (state, never news)
+--   `ready` with "command_list_add" in hooks (or no `ready` at all in a trimmed file) -> ping, wait for the `pong`
+--   `pong` -> hold_on {kinds = {"build_proposal"}} -> `holding {on = true}` -> strict mode is on
+--   while it is on: a line at least every NAT_PING seconds (the module switches holding off after 10 s of silence)
+-- Switching it off (hold_off): before a resync load, when the session ends (identity.txt says idle), when the mod is not
+-- active, on a fault, when the module stops answering, and when the module itself says `holding {on = false}` (it retries
+-- with a back-off). Without native_events.log nothing of this runs and nothing is written.
+
+local NAT_PING = 2.0      -- longest pause between lines written to native_ctl.log while holding
+local NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
+local NAT_CAP_MAX = 6     -- captures kept
+local NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
+local NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
+local NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
+local NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
+local NAT_WATCHDOG = 8.0  -- no pong for this long while holding: the module is gone
+
+local function natNew()
+	return {
+		reader = C.newReader(C.path("native_events.log")), writer = nil,
+		seen = false, read = false,   -- native_events.log has records / its first batch (history) was read
+		ready = nil, hookOk = nil,    -- the latest `ready`; true/false: command_list_add is / is not among its hooks; nil: no `ready` seen
+		pingN = 0, pingAt = -100, pingsTried = 0, pongAt = nil, watchFrom = nil, lastTick = nil, lastWrite = -100,
+		holdSent = false, holdAt = 0, active = false, activeSince = 0,
+		retryAt = nil, retries = 0, gaveUp = false,
+		caps = {}, parked = {}, awaiting = {}, shipped = {}, owed = {},
+		sessionOn = true, sessionAt = -100,
+		logWin = -100, logN = 0, logLost = 0, faults = 0, dead = false,
+	}
+end
+
+-- One line each, at most 12 per 10 s (the rest are counted): a stuck state must not fill mod.log.
+local function natSay(text)
+	local N = G.nat
+	if N then
+		local now = os.clock()
+		if now - N.logWin >= 10 then
+			if N.logLost > 0 then logGui("strict: " .. N.logLost .. " more line(s) held back in the last 10 s") end
+			N.logWin, N.logN, N.logLost = now, 0, 0
+		end
+		if N.logN >= 12 then
+			N.logLost = N.logLost + 1
+			return
+		end
+		N.logN = N.logN + 1
+	end
+	logGui("strict: " .. text)
+end
+
+local function natSend(kind, payload)
+	local N = G.nat
+	if not N then return false end
+	if not N.writer then N.writer = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID) end
+	local ok, err = C.writerSend(N.writer, kind, payload)
+	if ok then
+		N.lastWrite = os.clock()
+	else
+		natSay("cannot write native_ctl.log: " .. tostring(err))
+	end
+	return ok
+end
+
+-- The module hands a held command back (or destroys it) at the next CommandList::Add of ANY command; any command we send
+-- is one. This one does nothing in the simulation half (docs/NATIVE_LINK.md section 4, "Why a trigger").
+local function natTrigger()
+	pcall(toSim, "nop", {})
+end
+
+-- Stops strict mode: hold_off, so that every held command goes back to the engine at the next Add (and one is sent).
+local function natStop(why)
+	local N = G.nat
+	if not N then return end
+	if N.holdSent then
+		N.holdSent, N.active = false, false
+		pcall(natSend, "hold_off", {})
+		natTrigger()
+		natSay("mode off (" .. tostring(why) .. "), hold_off written")
+	end
+	N.holdSent, N.active, N.parked, N.caps, N.owed = false, false, {}, {}, {}
+end
+
+-- A fault in strict mode never reaches the bridge: it is logged, and the third one switches strict mode off for good.
+local function natFault(where, err)
+	local N = G.nat
+	if not N then return end
+	N.faults = N.faults + 1
+	natSay("fault in " .. where .. ": " .. tostring(err))
+	if N.faults >= 3 and not N.dead then
+		N.dead = true
+		pcall(natStop, "three faults")
+	end
+end
+
+local function natPing()
+	local N = G.nat
+	N.pingN = N.pingN + 1
+	N.pingAt = os.clock()
+	return natSend("ping", { n = N.pingN })
+end
+
+-- release or cancel, and make sure an Add follows: the order is only carried out at the next Add.
+local function natOrder(kind, id)
+	local N = G.nat
+	local ok = natSend(kind, { id = id })
+	if ok then
+		N.awaiting[id] = { kind = kind, t = os.clock(), tries = 0 }
+		natTrigger()
+	end
+	return ok
+end
+
+local function natSessionOn(N, now)
+	if now - N.sessionAt >= 1 then
+		N.sessionAt = now
+		local text = C.readFile(C.path("identity.txt"))
+		local role = text and text:match("role=([%a]+)") or nil
+		if role then N.sessionOn = (role == "host" or role == "player") end
+	end
+	return N.sessionOn
+end
+
+-- ---- the build of one held command
+
+local function natSite(h)
+	return type(h.site) == "number" and string.format("0x%x", h.site) or "?"
+end
+
+-- The held command `h` has the capture `cap`: ship it and cancel the command, or release it.
+local function natDecideUnsafe(h, cap)
+	local N = G.nat
+	local id = h.id
+	local function release(why)
+		natSay("held " .. id .. " (site " .. natSite(h) .. "): " .. why .. "; release written, the native build goes through")
+		natOrder("release", id)
+	end
+	if not cap then return release("no capture of a tool build") end
+	if not cap.body then return release("the capture of " .. cap.tool .. " failed (" .. tostring(cap.why) .. ")") end
+	local body, text = cap.body, cap.text
+	local category = buildCategory(body)
+	if not L.permitted(G.perms, category) then
+		-- refused before stamping, like the wrapped sendCommand: nothing was built yet, so nothing is sent to the others
+		natSay("held " .. id .. ": not allowed to " .. category .. ", cancelled")
+		send("action_refused", { seq = 0, detail = "permission denied: " .. category })
+		natOrder("cancel", id)
+		return
+	end
+	-- never cancel what this game could not rebuild itself (docs/ARCHITECTURE.md section 6)
+	local wire = C.parse(text)
+	local now = engine.gameTime()
+	local okD, args, whyD = pcall(L.decodeCommand, wire, guiCtx({ kind = "action", at = now, from = C.PLAYER_ID, seq = 0, key = "strict-check" }))
+	if not okD then args, whyD = nil, tostring(args) end
+	if not args then return release("it cannot be rebuilt here (" .. tostring(whyD) .. ")") end
+	local seq = G.seq + 1
+	local at = stampAfterFastest(now)
+	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
+	if not okS then return release("the action cannot be sent (" .. tostring(errS) .. ")") end
+	G.seq = seq
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq) }
+	local okC = natOrder("cancel", id)
+	N.shipped[id] = true
+	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), %s",
+		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now,
+		okC and "cancel written" or "CANCEL NOT WRITTEN (the build may be applied twice here)"))
+	route(it)
+end
+
+-- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): it
+-- is given back, unless the verdict was already written.
+local function natDecide(h, cap)
+	local ok, err = pcall(natDecideUnsafe, h, cap)
+	if ok then return end
+	natFault("the verdict on held " .. tostring(h.id), err)
+	local N = G.nat
+	if N and not N.awaiting[h.id] then pcall(natOrder, "release", h.id) end
+end
+
+-- Drops the captures that waited longer than NAT_CAP_TTL for their `held` (the native build went through unheld).
+local function natExpire(now)
+	local N = G.nat
+	local keep = {}
+	for _, c in ipairs(N.caps) do
+		if now - c.t > NAT_CAP_TTL then
+			if c.body then
+				natSay(string.format("capture of %s dropped: no held command within %.0f s (the native build went through, the simulation half ships it)", c.tool, NAT_CAP_TTL))
+			end
+		else
+			keep[#keep + 1] = c
+		end
+	end
+	N.caps = keep
+end
+
+-- Pairs the oldest `held` that waits for a capture with the oldest capture, until one list is empty.
+local function natPair()
+	local N = G.nat
+	local now = os.clock()
+	natExpire(now)
+	-- The tool's own event for an applied build (builder.proposalApply) only comes AFTER the engine applied it, so for a
+	-- command that is held it never comes before the release (seen in a real game: every capture arrived after its held
+	-- command had been given back). What is known while the command is held is the tool's latest PREVIEW (builder.proposalCreate):
+	-- the tool is blocked waiting for its command, so no newer preview can come, and the last one is the proposal that was clicked.
+	-- Two or more commands held at once cannot be told apart by one preview (a real tool is blocked after its click, so this
+	-- does not happen): give them all back rather than ship the wrong record for one of them.
+	if #N.parked > 1 and not N.caps[1] then
+		N.preview = nil
+		while N.parked[1] do
+			natSay("held " .. N.parked[1].id .. ": more than one command held at once; released (the build goes through the old way)")
+			natDecide(table.remove(N.parked, 1), nil)
+		end
+		return
+	end
+	while N.parked[1] and (N.caps[1] or (N.preview and now - N.preview.t <= NAT_PREVIEW_TTL)) do
+		local h, cap = table.remove(N.parked, 1), table.remove(N.caps, 1)
+		if not cap then
+			cap = N.preview
+			N.preview = nil
+		end
+		natDecide(h, cap)
+	end
+end
+
+local function natOnHeld(N, p)
+	local id = tonumber(p.id)
+	if not id then return end
+	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames }
+	if not N.holdSent then
+		-- strict mode is being switched off: the module has not caught up; give the command back
+		natSay("held " .. id .. " while strict mode is off; release written")
+		natOrder("release", id)
+		return
+	end
+	N.parked[#N.parked + 1] = h
+	if not N.batching then natPair() end
+end
+
+-- Called from guiHandleEvent for builder.proposalCreate (the tool's preview): keeps the newest capture for the `held` that follows a click.
+local function natCapture(id, name, param)
+	local N = G.nat
+	if not N or N.dead or not N.holdSent or name ~= "builder.proposalCreate" then return end
+	if not (Build and Build.captureToolBuild) then return end
+	local t0 = os.clock()
+	local ok, body, why, text = pcall(Build.captureToolBuild, id, name, param, {
+		plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end,
+	})
+	if not ok then body, why = nil, tostring(body) end
+	local cap = { tool = tostring(id), why = why }
+	if body then
+		body.category = buildCategory(body)
+		local okS, s = pcall(C.serialize, body)
+		if okS then text = s else body, cap.why = nil, tostring(s) end
+		if body then cap.body, cap.text = body, text end
+	end
+	cap.t = os.clock()
+	cap.ms = (cap.t - t0) * 1000
+	-- only the newest preview is kept, and a preview that could not be captured replaces a good one before it: a `held`
+	-- must never be paired with the record of an older preview than the one on screen
+	N.preview = cap
+	natPair()
+end
+
+-- ---- events of the module
+
+local function natEvent(N, rec, p, history)
+	local kind = rec.kind
+	local now = os.clock()
+	if kind == "ready" then
+		local hooks = {}
+		for _, h in ipairs(type(p.hooks) == "table" and p.hooks or {}) do hooks[#hooks + 1] = tostring(h) end
+		N.ready = { build = p.build, hooks = hooks }
+		N.hookOk = false
+		for _, h in ipairs(hooks) do
+			if h == "command_list_add" then N.hookOk = true end
+		end
+		-- a (new) module link: the handshake starts again
+		N.holdSent, N.active, N.pongAt, N.pingsTried, N.gaveUp, N.retryAt, N.retries = false, false, nil, 0, false, nil, 0
+		if N.hookOk then
+			natSay("native module found (build " .. tostring(p.build) .. ", hooks " .. table.concat(hooks, ",") .. ")")
+		else
+			natSay("mode is off: the native module has no command_list_add hook (hooks: " .. table.concat(hooks, ",") .. ")")
+		end
+	elseif kind == "pong" then
+		if not history then N.pongAt = now end   -- an answer from before this script started proves nothing
+	elseif kind == "holding" then
+		if p.on == true then
+			if N.holdSent and not history and not N.active then
+				N.active, N.activeSince = true, now
+				natSay("mode ON (the native module holds build commands; hold_on confirmed)")
+			end
+		elseif p.on == false and not history and p.reason ~= "hold_off" then
+			-- the module switched holding off by itself (silence, control file gone): ours to notice, and to try again later
+			if N.holdSent then
+				N.holdSent, N.active, N.parked, N.caps, N.owed = false, false, {}, {}, {}
+				N.retries = N.retries + 1
+				if N.retries > 3 then
+					N.gaveUp = true
+					natSay("mode is off: the native module switched holding off (" .. tostring(p.reason) .. ") " .. N.retries .. " times; giving up until it reports ready again")
+				else
+					N.retryAt = now + 3 * N.retries
+					natSay("mode is off: the native module switched holding off (" .. tostring(p.reason) .. "); trying again in " .. (3 * N.retries) .. " s")
+				end
+			end
+		end
+	elseif history then
+		return   -- held / released / dropped / audit of an earlier run of this script: not news
+	elseif kind == "held" then
+		natOnHeld(N, p)
+	elseif kind == "released" or kind == "dropped" then
+		local id = tonumber(p.id)
+		if id then
+			N.awaiting[id] = nil
+			for i, h in ipairs(N.parked) do
+				if h.id == id then
+					table.remove(N.parked, i)
+					break
+				end
+			end
+			if N.shipped[id] then
+				N.shipped[id] = nil
+				if kind == "released" then
+					natSay("held " .. id .. " was released by the module (" .. tostring(p.reason) .. ") after its build was shipped: the build may exist twice on this game")
+				end
+			end
+		end
+	elseif kind == "error" then
+		natSay("native module error [" .. tostring(p.where) .. "]: " .. tostring(p.detail))
+	end
+end
+
+local function natReadEvents(N)
+	local recs = C.readerPoll(N.reader)
+	if #recs == 0 then return end
+	local history = not N.read   -- the first records are what the file held before this script started: state, not news
+	N.read, N.seen = true, true
+	-- the `held` events of one batch are paired together afterwards, so that two held at once are seen as two
+	N.batching = true
+	for _, rec in ipairs(recs) do
+		local p = C.parse(rec.payload)
+		if type(p) ~= "table" then p = {} end
+		local ok, err = pcall(natEvent, N, rec, p, history)
+		if not ok then natFault("event " .. tostring(rec.kind), err) end
+	end
+	N.batching = false
+	local ok, err = pcall(natPair)
+	if not ok then natFault("pairing", err) end
+end
+
+-- Every frame (guarded by the caller). Does nothing until native_events.log has a record.
+local function natTick()
+	local N = G.nat
+	if not N or N.dead then return end
+	if not N.seen then
+		-- without the module there is no file: look for it a few times a second, not every frame
+		local t = os.clock()
+		if t < (N.probeAt or 0) then return end
+		N.probeAt = t + 0.25
+	end
+	natReadEvents(N)
+	if not N.seen then return end
+	local now = os.clock()
+	if N.lastTick and now - N.lastTick > 3 then N.watchFrom = now end   -- the game stood still (a load, a save): the module could not be answered either
+	N.lastTick = now
+	natExpire(now)
+	local usable = Build ~= nil and type(Build.captureToolBuild) == "function"
+	local reason = nil
+	if N.dead then reason = "faults"
+	elseif not usable then reason = "the build module has no tool capture"
+	elseif N.hookOk == false then reason = "the native module has no command_list_add hook"
+	elseif G.loading then reason = "a resync load is under way"
+	elseif not natSessionOn(N, now) then reason = "the session ended" end
+	if reason then
+		if N.holdSent then natStop(reason) end
+	elseif N.gaveUp then
+		-- waiting for a new `ready`
+	elseif not N.holdSent then
+		if not (N.retryAt and now < N.retryAt) then
+			if not (N.pongAt and now - N.pongAt < NAT_ALIVE) then
+				if now - N.pingAt >= 2.5 then
+					if N.pingsTried >= 6 then
+						N.gaveUp = true
+						natSay("mode is off: the native module does not answer pings; waiting for it to report ready")
+					else
+						N.pingsTried = N.pingsTried + 1
+						natPing()
+					end
+				end
+			else
+				N.pingsTried = 0
+				if natSend("hold_on", { kinds = { "build_proposal" } }) then
+					N.holdSent, N.holdAt, N.active = true, now, false
+				else
+					N.retryAt = now + 5
+				end
+			end
+		end
+	else
+		if now - N.lastWrite >= NAT_PING then natPing() end
+		if not N.active then
+			if now - N.holdAt > NAT_CONFIRM then
+				natSay("mode is off: hold_on was not confirmed within " .. NAT_CONFIRM .. " s (is the hold hook installed?)")
+				N.gaveUp = true
+				natStop("hold_on not confirmed")
+			end
+		elseif now - math.max(N.pongAt or 0, N.watchFrom or 0, N.activeSince or 0) > NAT_WATCHDOG then
+			natSay("mode is off: the native module stopped answering pings")
+			N.gaveUp = true
+			natStop("the native module stopped answering")
+		elseif N.retries > 0 and now - N.activeSince > 30 then
+			N.retries = 0
+		end
+	end
+	-- a `held` whose capture did not come: released after the grace; an order whose Add did not come: another trigger
+	while N.parked[1] and now - N.parked[1].t >= NAT_GRACE and G.frames - N.parked[1].frame >= 3 do
+		N.owed[#N.owed + 1] = now
+		natDecide(table.remove(N.parked, 1), nil)
+	end
+	for id, a in pairs(N.awaiting) do
+		if now - a.t > 0.6 * (a.tries + 1) then
+			a.tries = a.tries + 1
+			if a.tries > 5 then
+				N.awaiting[id] = nil
+				natSay(a.kind .. " of held " .. id .. " was never confirmed by the native module")
+			else
+				natTrigger()
+			end
+		end
+	end
 end
 
 -- Wraps the command factories (to know a command's name and arguments) and sendCommand (to hold it). Commands
@@ -795,13 +1541,12 @@ end
 
 -- Host authority at a checkpoint: this game's money is corrected to the host's values, measured at the same round.
 H.authority = function(rec, p)
-	if C.PLAYER_ID == 0 or type(p) ~= "table" or type(p.values) ~= "table" then return end
-	local own = G.accountAt[p.n]
-	if not own then logGui("authority for round " .. tostring(p.n) .. " skipped: no account recorded for it"); return end
-	local applied, failed = L.applyAuthority(engine, own, p.values)
-	if applied.balance then logGui("host authority: balance corrected by " .. applied.balance .. " (round " .. tostring(p.n) .. ")") end
-	if applied.loan then logGui("host authority: loan corrected by " .. applied.loan .. " (round " .. tostring(p.n) .. ")") end
-	for _, name in ipairs(failed) do logGui("host authority: " .. name .. " differs but this build cannot correct it") end
+	if C.PLAYER_ID == 0 or type(p) ~= "table" or type(p.values) ~= "table" or type(p.n) ~= "number" then return end
+	if not applyAuthority(p) then
+		-- this game has not reached the round yet: keep the values until it reports it
+		G.authPending[p.n] = p
+		G.authPending[p.n - 40] = nil
+	end
 end
 
 H.resync_save = function(rec, p)
@@ -819,6 +1564,9 @@ end
 H.resync_load = function(rec, p)
 	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_load"); return end
 	logGui("resync: loading '" .. p.name .. "'")
+	-- a reload while the native module holds commands is unsafe (docs/NATIVE_LINK.md stage 2, H): holding goes off first. The
+	-- reloaded script finds `ready` in native_events.log and switches strict mode on again.
+	pcall(natStop, "resync load")
 	C.writeFile(C.path(C.CURSOR), string.format("%d %d", rec.seq, G.uiReader.lastSeq))
 	Hud.writeSnapshot(C, G.hud, { version = nil })
 	local ok, err = engine.loadGame(p.name)
@@ -887,6 +1635,20 @@ local function collectFromSim(state)
 	for key, e in pairs(st.bind or {}) do
 		if G.bind[key] ~= e then G.bind[key] = e; G.rev[e] = key end
 	end
+	local highest = nil
+	for _, o in ipairs(st.out or {}) do
+		if not G.outSeen[o.n] then
+			G.outSeen[o.n] = true
+			local okN, okShip, whyShip = pcall(shipNative, o)
+			if not okN then logGui("shipping a native build failed: " .. tostring(okShip))
+			elseif not okShip then logGui("a native build was not shipped: " .. tostring(whyShip)) end
+		end
+		if highest == nil or o.n > highest then highest = o.n end
+	end
+	if highest ~= nil and G.outAcked ~= highest then
+		G.outAcked = highest
+		toSim("outack", { n = highest })
+	end
 	for _, r in ipairs(st.results or {}) do
 		if not G.resultsSeen[r.key] then
 			G.resultsSeen[r.key] = true
@@ -953,6 +1715,29 @@ local function serviceWindow()
 				send("chat", { text = text })
 				Hud.addChat(G.hud, C.PLAYER_NAME, text, C.PLAYER_ID)   -- the host does not echo a message to its sender
 			end
+		elseif rec.kind == "cmd" then
+			local p = C.parse(rec.payload)
+			if type(p) == "table" and type(p.body) == "string" and type(p.id) == "number" then
+				local okN, okShip, whyShip = pcall(shipUiCommand, p)
+				if not okN then logGui("shipping a window command failed: " .. tostring(okShip))
+				elseif not okShip then logGui("a window command was not shipped: " .. tostring(whyShip)) end
+			end
+		elseif rec.kind == "bind" then
+			-- the entity a window command created here, named by the key the other games give theirs
+			local p = C.parse(rec.payload)
+			local seq = type(p) == "table" and G.uiSeq[p.id] or nil
+			if seq and type(p.e) == "number" then
+				local key = L.itemKey(C.PLAYER_ID, seq)
+				G.bind[key] = p.e
+				G.rev[p.e] = key
+				toSim("bind", { key = key, e = p.e })
+			end
+		elseif rec.kind == "speed" then
+			-- a speed button of the window: the session speed is the host's to decide, so it is a request, like the
+			-- one the game's own speed buttons make (0 pauses)
+			local p = C.parse(rec.payload)
+			local n = type(p) == "table" and tonumber(p.n) or nil
+			if n and n >= 0 and n <= 4 and n == math.floor(n) then send("speed_request", { speed = n }) end
 		elseif rec.kind == "company" and Co then
 			-- an operation typed in the company page (Co.windowCommand), sent like any command the player issues
 			coGuard("window record", function()
@@ -968,6 +1753,10 @@ local function serviceWindow()
 	end
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
 	coGuard("page", writeCompanies)
+	if G.frames % 30 == 0 then
+		local okB, text = pcall(C.serialize, G.bind)
+		if okB and text ~= G.bindsWritten and C.writeFile(C.path("binds.txt"), text) then G.bindsWritten = text end
+	end
 end
 
 -- companies: in separate mode (experimental, docs/COMPANIES.md section 8) this game's windows act as the player's own
@@ -988,7 +1777,10 @@ end
 
 local function guiUpdate(userParams, state, guiState)
 	C.poll()
-	if not C.ACTIVE then return end
+	if not C.ACTIVE then
+		if G.nat and G.nat.holdSent then pcall(natStop, "the mod is not active") end
+		return
+	end
 	G.frames = G.frames + 1
 	if not G.started then
 		G.started = true
@@ -1011,15 +1803,20 @@ local function guiUpdate(userParams, state, guiState)
 			logGui("reloaded after a resync: link resumes after line " .. string.format("%d", cursor))
 		end
 		installWrap()
+		local okN, nat = pcall(natNew)
+		G.nat = okN and nat or nil
 		pcall(function() guiState:subscribeToAllEvents() end)
 		setSpeed(0)
 		send("hello", { time = engine.gameTime(), name = C.PLAYER_NAME })
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
+	if G.frames % 20 == 0 then devPoll("gui") end
 	local ok, err = pcall(function()
 		readLink()
 		serviceWindow()
 		collectFromSim(state)
+		local okT, errT = pcall(natTick)
+		if not okT then natFault("frame", errT) end
 		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
@@ -1034,7 +1831,7 @@ end
 
 -- The engine's tool events (builder.proposalCreate / builder.proposalApply, id = the tool): the construction schema logs
 -- what it sees and what it would capture, so that the first game run shows the real shapes (finding from MPFever (MIT):
--- these events reach guiHandleEvent). Nothing is replicated from them yet.
+-- these events reach guiHandleEvent). Nothing is replicated from them except in strict mode (natCapture).
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	if not C.ACTIVE or type(name) ~= "string" or not name:find("^builder%.") then return end
 	for _, M in ipairs(CMDS) do
@@ -1042,6 +1839,11 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 			local ok, err = pcall(M.onToolEvent, id, name, param, logGui)
 			if not ok then logGui("tool event handler failed: " .. tostring(err)) end
 		end
+	end
+	-- strict mode (only while the native module holds build commands): keep the build for the `held` event that follows
+	if name == "builder.proposalCreate" and G.nat then
+		local ok, err = pcall(natCapture, id, name, param)
+		if not ok then natFault("capture", err) end
 	end
 end
 

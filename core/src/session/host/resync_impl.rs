@@ -6,8 +6,10 @@ use std::collections::BTreeSet;
 use super::{clip, HostOutput, HostSession};
 use crate::session::checksum::ChecksumOutcome;
 use crate::session::kind::MessageKind;
+use crate::session::lockstep::Lockstep;
 use crate::session::messages::{
     codec, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage, ResyncSaveMessage, SaveDoneMessage,
+    SessionState,
 };
 use crate::session::resync::{normalize_sha256, ResyncLimits, ResyncState};
 
@@ -92,7 +94,20 @@ impl HostSession {
         self.resync_counter += 1;
         let id = self.resync_counter;
         let resume_speed = if self.state.speed > 0 { self.state.speed } else { self.last_running_speed };
-        if self.state.pause_at.is_none() {
+        if self.state.speed == 0 && self.state.pause_at.is_none() {
+            // A session that has never run holds at speed 0 with no pause stamp (the games were at different times
+            // when it started). No game would ever reach a stamp in the future, so the games may run up to it, at
+            // the speed the session resumes at. The world that everyone gets is the host's, so the stamp is
+            // counted from the host's own clock, not from the furthest game's.
+            let base = match self.clocks.get(&Self::HOST_ID) {
+                Some(c) => c.estimate(self.now()) as i64,
+                None => self.max_clock(),
+            };
+            let lead = self.wanted_lead(resume_speed);
+            let at = Lockstep::round_up_to_step(base.saturating_add(lead) as f64);
+            self.state = SessionState { speed: resume_speed, pause_at: Some(at), lead, ..self.state.clone() };
+            self.broadcast_session();
+        } else if self.state.pause_at.is_none() {
             self.pause_inner();
         }
         let pause_at = self.state.pause_at.unwrap_or(0);
@@ -108,6 +123,7 @@ impl HostSession {
             participants: None,
             verify_n: None,
         });
+        self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
         self.resync_step();
     }
@@ -211,6 +227,14 @@ impl HostSession {
             r.state = state;
             r.entered = now;
         }
+        self.set_resync_phase(match state {
+            ResyncState::Pausing => Some("pausing"),
+            ResyncState::Saving => Some("saving"),
+            ResyncState::Transferring => Some("sending"),
+            ResyncState::Loading => Some("loading"),
+            ResyncState::Verifying => Some("verifying"),
+            ResyncState::Idle => None,
+        });
         self.progress(detail);
     }
 
@@ -309,13 +333,24 @@ impl HostSession {
     }
 
     fn enter_loading(&mut self) {
+        let host_reloads = self.options.host_reloads;
+        if !host_reloads {
+            // the host's game keeps its live world: it is not sent the load, owes no new hello and keeps its clock
+            if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
+                participants.remove(&Self::HOST_ID);
+            }
+        }
         let Some(r) = &self.resync else { return };
         let (id, participants) = (r.id, r.participants.clone().unwrap_or_default());
         let sha256 = r.file.as_ref().map(|f| f.sha256.clone()).unwrap_or_default();
         for p in self.players.values_mut() {
-            p.ready = false;
+            p.ready = p.id == Self::HOST_ID && !host_reloads;
         }
-        self.clocks.clear();
+        if host_reloads {
+            self.clocks.clear();
+        } else {
+            self.clocks.retain(|&id, _| id == Self::HOST_ID);
+        }
         self.enter(ResyncState::Loading, format!("loading; waiting for {} game(s)", participants.len()));
         let load = ResyncLoadMessage { id, name: format!("feverlink3-resync-{id}"), sha256 };
         self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &participants);
@@ -381,6 +416,7 @@ impl HostSession {
 
     fn finish(&mut self) {
         let Some(r) = self.resync.take() else { return };
+        self.set_resync_phase(None);
         self.set_speed_inner(r.resume_speed);
         self.policy.resync_finished(self.now());
         self.out.push(HostOutput::ResyncProgress {
@@ -394,6 +430,7 @@ impl HostSession {
     /// Ends the round without resuming: the session stays paused.
     fn fail(&mut self, reason: String) {
         let Some(r) = self.resync.take() else { return };
+        self.set_resync_phase(None);
         self.log(format!("resync {} ({}) failed: {reason}", r.id, r.reason));
         self.policy.resync_finished(self.now());
         self.out.push(HostOutput::ResyncFailed { id: r.id, reason });

@@ -109,6 +109,10 @@ pub struct SessionState {
     pub pause_at: Option<i64>,
     /// Game-time units a local action is stamped ahead of now.
     pub lead: i64,
+    /// While a resync round runs, what it is doing (`pausing`, `saving`, `sending`, `loading`, `verifying`): the players'
+    /// windows say so, because their games just stand still while the host's world is prepared and sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resync: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

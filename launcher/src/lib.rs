@@ -18,6 +18,7 @@
 //! No UI: the window comes in a later stage. The protocol lives in the core crate. Every path and text
 //! transformation is a pure function over its inputs so the tests run on a machine without Steam or the game.
 
+pub mod clipboard;
 pub mod gamelink;
 pub mod guard;
 pub mod install;
@@ -29,6 +30,7 @@ pub mod resync;
 pub mod selftest;
 pub mod session;
 pub mod steam;
+pub mod steam_persona;
 pub mod steam_transport;
 pub mod steamnet;
 pub mod update;

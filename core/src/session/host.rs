@@ -39,6 +39,11 @@ pub struct HostOptions {
     /// Start a resync round by itself when the checksum policy asks for one (default true). When false the host
     /// only emits [`HostOutput::ResyncRequested`] and the launcher decides.
     pub auto_resync: bool,
+    /// Whether the host's own game loads the saved world in a resync round, like every other game (default true:
+    /// all games then start from a state that went through the same save and load). When false the host's game keeps
+    /// running its live world, only the other games load, and the paused checksum after the round says whether the
+    /// two still match (a difference fails the round and leaves the session paused, as it always does).
+    pub host_reloads: bool,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -72,6 +77,7 @@ impl Default for HostOptions {
             session_broadcast_seconds: 3.0,
             checksum_seconds: 10.0,
             auto_resync: true,
+            host_reloads: true,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,
@@ -83,6 +89,9 @@ impl Default for HostOptions {
         }
     }
 }
+
+/// How long the lead wanted by the measured delays must stay below the one in force before the lead is shortened.
+const LEAD_SHRINK_AFTER_SECONDS: f64 = 8.0;
 
 /// What the host asks its caller to do, in this order.
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +217,9 @@ pub struct HostSession {
     next_player_id: u16,
     checksum_n: i32,
     last_session_broadcast: f64,
+    /// Since when the lead wanted by the measured delays has been below the one in force (a lead only shrinks after it has
+    /// stayed lower for a while, so a single quick ping cannot make it too short).
+    lead_lower_since: Option<f64>,
     last_checksum: f64,
     host_name: String,
     state: SessionState,
@@ -274,9 +286,16 @@ impl HostSession {
             next_player_id: 1,
             checksum_n: 0,
             last_session_broadcast: f64::NEG_INFINITY,
+            lead_lower_since: None,
             last_checksum: f64::NEG_INFINITY,
             host_name,
-            state: SessionState { started: false, speed: 0, pause_at: None, lead: Lockstep::lead_units(1) },
+            state: SessionState {
+                started: false,
+                speed: 0,
+                pause_at: None,
+                lead: Lockstep::lead_units(1),
+                resync: None,
+            },
             actions_relayed: 0,
             dropped: 0,
             out: Vec::new(),
@@ -793,7 +812,13 @@ impl HostSession {
         let at = common.map_or("different times".to_owned(), |t| t.to_string());
         self.log(format!("session started with {ready} ready game(s) at {at}"));
         self.broadcast_session();
-        self.request_checksum_inner();
+        if times.len() > 1 {
+            // The games report different times, so they are not in the same world: bring everyone into the
+            // host's world now instead of waiting for the host to ask.
+            self.begin_resync("session start");
+        } else {
+            self.request_checksum_inner();
+        }
         self.drain()
     }
 
@@ -837,6 +862,7 @@ impl HostSession {
         self.resync_step();
         self.watch_connections(t);
         self.ping_players(t);
+        self.adapt_lead(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
@@ -849,13 +875,56 @@ impl HostSession {
         self.drain()
     }
 
+    /// What the resync round is doing, for the players' windows (None when no round runs). Tells everyone when it changes.
+    pub(super) fn set_resync_phase(&mut self, phase: Option<&str>) {
+        let phase = phase.map(str::to_owned);
+        if self.state.resync != phase {
+            self.state.resync = phase;
+            self.broadcast_session();
+        }
+    }
+
+    /// The slowest connected player's round trip, in milliseconds (0 while none was measured).
+    fn slowest_rtt_ms(&self) -> f64 {
+        self.rtt_ms.iter().filter(|(id, _)| self.players.contains_key(id)).map(|(_, &ms)| ms).fold(0.0, f64::max)
+    }
+
+    /// The lead the measured delays ask for at this speed.
+    pub(super) fn wanted_lead(&self, speed: i32) -> i64 {
+        Lockstep::lead_for(speed, self.slowest_rtt_ms())
+    }
+
+    /// Keeps `state.lead` in step with the measured delays: longer at once, shorter only after eight seconds of being lower.
+    fn adapt_lead(&mut self, t: f64) {
+        if !self.state.started {
+            return;
+        }
+        let want = self.wanted_lead(self.state.speed.max(1));
+        if want > self.state.lead {
+            self.state.lead = want;
+            self.lead_lower_since = None;
+            self.broadcast_session();
+        } else if want < self.state.lead {
+            let since = *self.lead_lower_since.get_or_insert(t);
+            if t - since >= LEAD_SHRINK_AFTER_SECONDS {
+                self.state.lead = want;
+                self.lead_lower_since = None;
+                self.broadcast_session();
+            }
+        } else {
+            self.lead_lower_since = None;
+        }
+    }
+
     fn set_speed_inner(&mut self, speed: i32) {
         if !self.state.started {
             return;
         }
         let speed = speed.clamp(1, 4);
         self.last_running_speed = speed;
-        self.state = SessionState { speed, pause_at: None, lead: Lockstep::lead_units(speed), ..self.state.clone() };
+        let lead = self.wanted_lead(speed);
+        self.lead_lower_since = None;
+        self.state = SessionState { speed, pause_at: None, lead, ..self.state.clone() };
         self.broadcast_session();
     }
 
@@ -892,7 +961,7 @@ impl HostSession {
 
     /// A stamp every game reaches after receiving a message sent now.
     pub fn future_stamp(&self) -> i64 {
-        Lockstep::round_up_to_step(self.max_clock().saturating_add(Lockstep::lead_units(self.state.speed.max(1))) as f64)
+        Lockstep::round_up_to_step(self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64)
     }
 
     fn broadcast_session(&mut self) {
@@ -953,6 +1022,25 @@ impl HostSession {
         } else {
             self.log(format!("there is no player #{player} to remove"));
         }
+        self.drain()
+    }
+
+    /// Ends the session on the host's decision (its owner stopped hosting, or the host's world was closed): every
+    /// joined player is told (sealed `Kicked`, reason `ended`) and its connection closed, and a connection that never
+    /// joined gets the unsealed `Reject` with the same reason. Without this a player only saw the connection drop and
+    /// tried to reconnect to nobody for five minutes. No slot is held for a return: the owner drops the session after it
+    /// has sent the outputs.
+    pub fn end_session(&mut self) -> Vec<HostOutput> {
+        let message = codec::encode(&RejectMessage::new("ended", Some("the host ended the session")));
+        for (connection, c) in std::mem::take(&mut self.connections) {
+            if c.player.is_some() {
+                self.send(connection, MessageKind::Kicked, &message);
+            } else {
+                self.send_unsealed(connection, MessageKind::Reject, message.clone());
+            }
+            self.out.push(HostOutput::CloseConnection(connection));
+        }
+        self.log("the host ended the session".to_owned());
         self.drain()
     }
 

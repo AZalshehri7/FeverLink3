@@ -616,3 +616,191 @@ fn permissions_is_kind_20_and_only_the_host_may_send_it() {
     assert_eq!(Some(MessageKind::Permissions), MessageKind::from_u8(20));
     assert!(!MessageKind::Permissions.allowed_from_player());
 }
+
+// ------------------------------------------------------------------ starting with games at different times
+
+/// Two games that loaded different saves (the host's clock is behind the player's) and a host that presses Start.
+fn started_at_different_times() -> (Harness, ConnectionId) {
+    let mut h = Harness::with(quiet());
+    let p = h.connect("Guest");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3 }));
+    h.hello_player(p, 183_600, 0);
+    h.host_call(HostSession::start);
+    (h, p)
+}
+
+#[test]
+fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_at_once() {
+    let (mut h, p) = started_at_different_times();
+    assert_eq!(ResyncState::Pausing, h.host.resync_state());
+    let state = h.host.state().clone();
+    let pause_at = state.pause_at.expect("a pause stamp");
+    assert!(state.speed > 0, "a stopped game never reaches a stamp ahead of it, so the games may run");
+    assert!(
+        pause_at > 87_000 && pause_at < 183_600,
+        "counted from the host's clock, not the furthest game's: {pause_at}"
+    );
+    assert_eq!(0, pause_at % Lockstep::STEP);
+    assert_eq!(Some(pause_at), h.p(p).session.session().unwrap().pause_at);
+
+    // the player's game was already past the stamp and holds; the host's game runs up to the stamp and stops there
+    assert_eq!(ResyncState::Pausing, h.host.resync_state(), "the host's game is still behind the stamp");
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 1, ahead: 3 }));
+    assert_eq!(ResyncState::Pausing, h.host.resync_state(), "still running");
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 0, ahead: 3 }));
+    assert_eq!(ResyncState::Saving, h.host.resync_state());
+
+    let id = h.host.resync_id().unwrap();
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    let bytes = blob(1000);
+    h.send_file(id, &bytes);
+    assert_eq!(vec![(id, sha256_hex(&bytes), bytes.clone())], h.p(p).saves);
+    h.hello_all(pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert_eq!(pause_at, req.at);
+    report_all(&mut h, &[p], req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(1, h.host.state().speed, "the session runs afterwards");
+    assert_eq!(None, h.host.state().pause_at);
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+}
+
+#[test]
+fn starting_with_one_game_does_not_start_a_round() {
+    let mut h = Harness::with(quiet());
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3 }));
+    h.host_call(HostSession::start);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(Some(87_000), h.host.state().pause_at);
+}
+
+#[test]
+fn starting_with_games_at_the_same_time_does_not_start_a_round() {
+    let mut h = Harness::with(quiet());
+    let p = h.connect("Guest");
+    h.hello_all(10_000, 0);
+    let _ = p;
+    h.host_call(HostSession::start);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(Some(10_000), h.host.state().pause_at);
+}
+
+// ------------------------------------------------------------------ a host whose game does not reload
+
+#[test]
+fn a_host_that_does_not_reload_keeps_its_world_and_only_the_players_load() {
+    let options = HostOptions { host_reloads: false, ..quiet() };
+    let (mut h, ids) = Harness::running(2, 3, options);
+    h.host_call(|host| host.start_resync("test"));
+    let pause_at = h.host.state().pause_at.expect("pause stamp");
+    let id = h.reach_transferring();
+    let bytes = blob(1000);
+    h.send_file(id, &bytes);
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(0, h.host_game_count(MessageKind::ResyncLoad), "the host's own game is not told to load");
+    for &c in &ids {
+        assert_eq!(1, h.p(c).count(MessageKind::ResyncLoad));
+    }
+    assert_eq!(1, h.ready_count(), "only the host's game is still ready; the players owe a hello");
+    assert!(h.host.players().get(&0).is_some_and(|p| p.ready));
+
+    // the players load and say hello; the host's game never does
+    for &c in &ids {
+        h.hello_player(c, pause_at, 0);
+    }
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert!(req.paused);
+    assert_eq!(pause_at, req.at);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(3, h.host.state().speed);
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+}
+
+#[test]
+fn a_host_that_does_not_reload_still_fails_the_round_when_the_worlds_differ() {
+    let options = HostOptions { host_reloads: false, ..quiet() };
+    let (mut h, ids) = Harness::running(1, 1, options);
+    h.host_call(|host| host.start_resync("test"));
+    let pause_at = h.host.state().pause_at.unwrap();
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    h.hello_player(ids[0], pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "other")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    let failures = h.failures();
+    assert_eq!(1, failures.len(), "{failures:?}");
+    assert!(failures[0].contains("roads"), "{failures:?}");
+    assert!(h.host.state().pause_at.is_some(), "the session stays paused");
+}
+
+// ------------------------------------------------------------------ what a round says about itself
+
+#[test]
+fn the_session_state_names_the_phase_of_the_round_and_every_player_is_told() {
+    let (mut h, ids) = Harness::running(2, 2, quiet());
+    let phase = |h: &Harness| h.host.state().resync.clone();
+    let told = |h: &Harness, c| h.p(c).session.session().unwrap().resync.clone();
+    assert_eq!(None, phase(&h));
+
+    h.host_call(|host| host.start_resync("test"));
+    assert_eq!(Some("pausing".to_owned()), phase(&h));
+    assert!(
+        ids.iter().all(|&c| told(&h, c) == Some("pausing".to_owned())),
+        "players' windows can say the host is preparing"
+    );
+
+    let id = h.reach_transferring();
+    assert_eq!(Some("sending".to_owned()), phase(&h));
+    assert!(ids.iter().all(|&c| told(&h, c) == Some("sending".to_owned())));
+
+    let bytes = blob(10);
+    h.send_file(id, &bytes);
+    assert_eq!(Some("loading".to_owned()), phase(&h));
+    assert!(ids.iter().all(|&c| told(&h, c) == Some("loading".to_owned())));
+
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.hello_all(pause_at, 0);
+    assert_eq!(Some("verifying".to_owned()), phase(&h));
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(None, phase(&h), "no round, no phase");
+    assert!(ids.iter().all(|&c| told(&h, c).is_none()), "and the players are told it is over");
+}
+
+#[test]
+fn a_round_that_fails_clears_the_phase_too() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    h.advance(121.0);
+    h.host_call(HostSession::tick);
+    assert_eq!(None, h.host.state().resync);
+    assert!(h.p(ids[0]).session.session().unwrap().resync.is_none());
+}
+
+#[test]
+fn a_player_counts_the_chunks_of_the_save_it_is_receiving() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let id = h.reach_transferring();
+    let bytes = blob(600 * 1024); // three chunks
+    let sha = sha256_hex(&bytes);
+    h.host_call(|host| host.resync_file_ready(id, &sha, bytes.len() as u64));
+    assert_eq!(None, h.p(ids[0]).session.transfer_progress(), "nothing yet");
+    let chunks: Vec<&[u8]> = bytes.chunks(ResyncLimits::CHUNK_SIZE).collect();
+    assert_eq!(3, chunks.len());
+    h.host_call(|host| host.resync_chunk(id, 0, chunks[0]));
+    assert_eq!(Some((1, 3)), h.p(ids[0]).session.transfer_progress());
+    h.host_call(|host| host.resync_chunk(id, 1, chunks[1]));
+    assert_eq!(Some((2, 3)), h.p(ids[0]).session.transfer_progress());
+    h.host_call(|host| host.resync_chunk(id, 2, chunks[2]));
+    assert_eq!(
+        None,
+        h.p(ids[0]).session.transfer_progress(),
+        "complete: the save is handed over and the count is gone"
+    );
+}

@@ -67,7 +67,7 @@ function L.slowestPeer(peers)
 end
 
 -- How many steps this game may run ahead of the slowest peer (the `ahead` it reports in its clock). More speed
--- means more steps per engine batch, so a little more room; always below lead (4 + 2 * speed steps).
+-- means more steps per engine batch, so a little more room; always below lead (2 + 2 * speed steps).
 function L.aheadFor(speed)
 	return 2 + math.max(1, math.min(4, speed or 1))
 end
@@ -469,9 +469,19 @@ end
 
 -- Brings this game's account to the host's values: engine.bookJournal(amount) books the balance difference as a
 -- journal entry, engine.adjustLoan(delta) moves the loan (absent on a build where no way is known: reported as
--- unavailable). Returns the deltas applied and the names that could not be corrected.
-function L.applyAuthority(engine, own, host)
-	local deltas = L.authorityDeltas(own, host)
+-- unavailable). `previous` is what the round before measured (the bridge keeps it): only a difference that is still the
+-- same one round later is corrected. With replay on peers an action reaches another game a stamp's lead after the game it
+-- came from, so a checksum round that falls in between sees its effect on one side only: a lag lasting less than a round,
+-- not a drift (the loan taken on the host showed up twice on the guest in the first real test). Returns the deltas applied,
+-- the names that could not be corrected, and every difference measured (to be passed as `previous` next round).
+function L.applyAuthority(engine, own, host, previous)
+	local measured = L.authorityDeltas(own, host)
+	local deltas = {}
+	for key, d in pairs(measured) do
+		local was = previous and previous[key]
+		local tolerance = key == "balance" and 50 or 0
+		if type(was) == "number" and math.abs(was - d) <= tolerance then deltas[key] = d end
+	end
 	local applied, failed = {}, {}
 	if deltas.balance then
 		local ok = engine.bookJournal and pcall(engine.bookJournal, deltas.balance)
@@ -481,7 +491,7 @@ function L.applyAuthority(engine, own, host)
 		local ok = engine.adjustLoan and pcall(engine.adjustLoan, deltas.loan)
 		if ok then applied.loan = deltas.loan else failed[#failed + 1] = "loan" end
 	end
-	return applied, failed
+	return applied, failed, measured
 end
 
 -- ------------------------------------------------------------------ deterministic random (section 7)
