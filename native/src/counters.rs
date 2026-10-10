@@ -225,7 +225,8 @@ impl AppliedWatch {
 
     /// Interface thread: starts watching a released command. `false` when every slot is taken.
     pub fn arm(&self, payload: usize, id: u64, now_ms: u64) -> bool {
-        if payload == 0 {
+        if payload == 0 || payload == usize::MAX {
+            // `usize::MAX` marks a slot being filled: as a payload it would hold the slot forever
             return false;
         }
         for i in 0..WATCH_SLOTS {

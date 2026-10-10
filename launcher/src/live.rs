@@ -569,7 +569,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
         let mut w = Window::new(t.path());
-        w.send("host", "{[\"port\"]=0}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
         c.recover("boom");
         c.step();
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(status["state"], "failed");
         assert!(status["message"].as_str().unwrap().contains("boom"), "{status}");
         assert!(fs::read_to_string(t.path().join("identity.txt")).unwrap().contains("role=idle"));
-        w.send("host", "{[\"port\"]=0}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
     }
 

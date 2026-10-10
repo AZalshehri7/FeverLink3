@@ -1514,7 +1514,8 @@ fn relay_rooms_depend_on_the_secret_alone_and_say_nothing_about_the_key() {
         let room = SessionKey::relay_room_id(&secret);
         assert_eq!(room, SessionKey::relay_room_id(&secret));
         assert!(seen.insert(room), "two secrets with one room");
-        for password in [None, Some("pw")] {
+        // a password costs 600 000 hash rounds per derivation: only the first few secrets get one
+        for password in [None, Some("pw")].into_iter().filter(|p| p.is_none() || seen.len() <= 3) {
             let key = SessionKey::derive(&secret, password);
             assert_ne!(&room[..], &key.key()[..SessionKey::ROOM_ID_SIZE], "the room is not a part of the key");
         }
