@@ -6,7 +6,8 @@ Status: research, design and the parts that need no unknown engine behaviour. Th
 
 Sources, cited as `where:line`:
 
-- `tealdef/...` are the Teal declarations in `<game>/base/tealdef/`.
+- `tealdef/...` are the Teal declarations in `<game>/base/tealdef/` (the game scripts' own modules).
+- `api/...` are the declarations of the engine's own API in `<game>/api/tealdef/api/`: the commands `api.cmd.*`, the components, `api.engine.util.*`. They are the authoritative signatures, each with a line of documentation. (`base/tealdef` has none of this; it was found last.)
 - `<archive>.zip!path:line` is a Teal source inside `<game>/base/content/<archive>.zip` (game build 40420). The game ships these as plain text, so they are the best description of what the scripts may call.
 - `MPFever/...` is the reference clone (MIT). Its authors explored the same question; their findings file `re/FINDINGS.txt` is not published, so only the code and the changelog line below are available.
 
@@ -15,16 +16,17 @@ Sources, cited as `where:line`:
 | Question | Answer |
 |---|---|
 | Is there more than one player (company) entity? | Yes. The game itself creates "AI players" with `api.cmd.makeGameAddPlayerCmd`: its debug panel on every open, and its mission framework whenever a mission hands a line or a building to someone else. They are ordinary entities with a PLAYER component. |
-| Can a script create one and address it? | Create: yes, `makeGameAddPlayerCmd(name, Vec3f colour)`, the new entity arrives as `resultEntity` of the command result. Address: yes, commands take it as their `player` argument (below). |
+| Can a script create one and address it? | Create: yes, `makeGameAddPlayerCmd(name, Vec3f colour)` ("when executed, a new player entity is created", `api/cmd.d.tl:688-693`), the new entity arrives as `resultEntity` of the command result (`api/cmd.d.tl:142-149`). Address: yes, commands take it as their `player` argument (below). |
 | Do commands accept a player argument? | Yes: `makeVehicleBuyCmd(player, depot, config)`, `makeLineCreateCmd(name, colour, player, line)`, `makeJournalBookAssetCmd(player, entry[, position])`, `makeEntitySetPlayerCmd(entity, player)`; build proposals carry the owner in `Context.player` and in `playerEntity` fields of their parts. |
 | Is ownership per player? | Yes. Vehicles, lines, station groups, stations, depots, constructions and street edges (with their edge objects) each have a PLAYER_OWNED component; `makeEntitySetPlayerCmd(entity, player)` moves one (`-1` clears it). The engine can filter by owner (`getLinesForPlayer`, `requireOwnedByPlayer`). |
-| Does an added player have an account? | **Unknown.** The game never reads the ACCOUNT of a player other than `getPlayer()`. MPFever's probe exists to find out; its result is not published. |
+| Does an added player have an account? | **Unknown.** The component is declared ("usually attached to the player Entity", `api/engine.d.tl:21-29`), but nothing says a created player gets one, and the game never reads the account of a player other than `getPlayer()`. MPFever's probe exists to find out; its result is not published. |
 | Can the game's windows and scripts act as a second company? | **Not from anything the shipped scripts do.** There is exactly one "local player", `api.engine.util.getPlayer()`; about a hundred call sites in the game's own scripts read it, and none sets it. MPFever tried two ways to change it (a native memory patch, a Lua override of the function); the outcome is not published. |
 
 ### 1.2 A second player entity exists and can be created
 
 | Fact | Evidence |
 |---|---|
+| Declared: `makeGameAddPlayerCmd(name : string, color : Vec3f) : Command<GameAddPlayerCommandData>`, data fields `name`, `color` and `resultEntity` ("created player entity id (result only)"). | `api/tealdef/api/cmd.d.tl:142-149, 688-693` |
 | `makeGameAddPlayerCmd("aiPlayer", api.type.Vec3f.new(1, 1, 1))`; the callback receives `GameAddPlayerCommandData` whose `resultEntity` is the new player. | `mission.zip!mission/tasks/transfer_ownership/transfer_ownership_util.tl:4-13`, declared in `tealdef/mission/tasks/transfer_ownership/transfer_ownership_util.d.tl:4` |
 | The mission task "transfer ownership" creates a fresh AI player for every line or entity it takes away from the human player, then moves the entities to it. | `mission.zip!mission/tasks/transfer_ownership/transfer_ownership.tl:11-33, 62-91`; `mission.zip!mission/tasks/vehicle_util/mission_vehicle_util.tl:16-36` |
 | The developer debug panel spawns an AI player when it opens and offers *Forsake* (give the selected entity to it), *Claim* (take it back to the human player) and *Remove* (`makeEntitySetPlayerCmd(e, -1)`). | `gui.zip!gui/debug_panel/make_entity_debug_panel.tl:271-282, 388-427` |
@@ -39,9 +41,10 @@ Sources, cited as `where:line`:
 |---|---|
 | Owner = component PLAYER_OWNED with field `player`; `isOwnedByPlayer`, `isOwnedByPlayerOrNotOwned` compare it with `getPlayer()`. | `scripts.zip!scripts/entity_util.tl:74-86`, `tealdef/scripts/entity_util.d.tl:18-20` |
 | `makeEntitySetPlayerCmd(entity, player)` changes it. A line moves with its vehicles, its station groups, their stations and the stations' constructions; a construction moves with its frozen edges (and their edge objects), depots (and the vehicles inside), stations with their station groups, industries. | `mission.zip!mission/tasks/transfer_ownership/transfer_ownership_util.tl:15-49`; `mission.zip!mission/mission_framework/mission_framework_util_entity.tl:3-60` |
+| Declared: `makeEntitySetPlayerCmd(entity, player)` "the entity is set or unset to the player" (data `entity`, `playerEntity`); `PlayerOwned { player }`: "an entity with player owner is property of the owner and can be bulldozed only by him". So in separate companies nobody can bulldoze another company's assets. | `api/tealdef/api/cmd.d.tl:132-139, 680-685`; `api/tealdef/api/engine.d.tl:854-859` |
 | `-1` removes the owner. | `mission.zip!mission/mission_savegame_util.tl:25, 36` |
 | New constructions take their owner from `ConstructionEntity.playerEntity` of the proposal (`-1` = nobody). | `mission.zip!mission/mission_framework/mission_framework_util_entity.tl:89, 110`; `mission.zip!mission/tasks/utility/substitute_constructions.tl:64` |
-| The engine filters by owner: `api.engine.system.lineSystem.getLinesForPlayer(player)` and `api.engine.getEntitiesWithComponent(comp, { requireOwnedByPlayer = player })`. | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:150, 1358-1364` |
+| The engine filters by owner: `api.engine.system.lineSystem.getLinesForPlayer(player)` and `api.engine.getEntitiesWithComponent(comp, { requireOwnedByPlayer = player })` (declared with `filterFn`). | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:150, 1358-1364`; `api/tealdef/api/engine.d.tl:1692-1713` |
 | The windows know three ownership states: `None`, `Player` (owned by `getPlayer()`), `Foreign` (owned by anyone else). Foreign vehicles and warehouses are not modifiable, and panels such as a line's income graph are hidden for them. | `tealdef/gui/entity_window/eow_extension_util.d.tl:18-22`; `gui.zip!gui/entity_window/eow_extension_util.tl:5-17`; `gui.zip!gui/entity_window/vehicle/vehicle.tl:377`; `gui.zip!gui/entity_window/warehouse/warehouse.tl:38`; `gui.zip!gui/entity_window/line/line_eow.script.tl:691-693` |
 | The line editor ignores a click on a station group owned by someone else; stations owned by nobody (`-1`) or by the player are usable. So infrastructure shared between companies has to be unowned, or owned by whoever builds the line. | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:295, 531`; `gui.zip!gui/statistics/statistic_stations.tl:264`; `scripts.zip!scripts/entity_util.tl:83-86` |
 | A vehicle can only be bought in a depot the buyer owns (the window offers only `requireOwnedByPlayer` depots). The engine's own rule is not visible in the scripts. | `gui.zip!gui/line_vehicle_mgmt/manager_window.tl:1358-1364` |
@@ -62,8 +65,8 @@ The mod's schemas mark the player argument of these commands, the generic ones i
 
 | Fact | Evidence |
 |---|---|
-| The account is a component of the player entity (`balance`, `loan`). `api.engine.util.finance.getPlayersBalance(player)` returns the balance, or nil for infinite money (sandbox). | `game_mechanics.zip!game_mechanics/finance/account.tl:14-17`; `gui.zip!gui/game_bar/game_bar.tl:216-236`; the ACCOUNT component with `balance` and `loan`: `MPFever/mod/mpfever_1/content/mpfever_bridge.script.lua:146, 190` |
-| Lines, vehicles and constructions have a balance of their own: `finance.calculateBalance({entities}, fromTime, toTime, true)` is what the line window, the vehicle window and the statistics use for "Balance". `finance.calculateEarnings(player)` is the bar's "Earnings". `headquarters.getCompaniesValue()` gives balance, assets and debt. | `gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:621-627`; `gui.zip!gui/statistics/statistic_lines.tl:289-294`; `gui.zip!gui/game_bar/game_bar_display_earnings_plugin/game_bar_display_earnings.script.tl:10-12`; `game_mechanics.zip!game_mechanics/finance/finances_charts.tl:262` |
+| The account is a component, "usually attached to the player Entity" (`Account { balance, loan }`; `api/tealdef/api/engine.d.tl:21-29`). Lines and vehicles have one too (below). `api.engine.util.finance.getPlayersBalance(player)` returns the balance, or nil for infinite money (sandbox; `api/tealdef/api/engine/util.d.tl:858-861`). | `game_mechanics.zip!game_mechanics/finance/account.tl:14-17`; `gui.zip!gui/game_bar/game_bar.tl:216-236`; the ACCOUNT component with `balance` and `loan`: `MPFever/mod/mpfever_1/content/mpfever_bridge.script.lua:146, 190` |
+| Lines, vehicles and constructions have a balance of their own: `finance.calculateBalance({entities}, fromTime, toTime, true)` is what the line window, the vehicle window and the statistics use for "Balance". `finance.calculateEarnings(player)` is the bar's "Earnings" (this year so far, `api/tealdef/api/engine/util.d.tl:849-852`); `calculateBalance` with its flag set counts only maintenance and income entries (`util.d.tl:838-848`); `calcIncomeSince(time, player)` is the income of a player since a time (`util.d.tl:862-866`). `headquarters.getCompaniesValue()` gives balance, assets and debt. | `gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:621-627`; `gui.zip!gui/statistics/statistic_lines.tl:289-294`; `gui.zip!gui/game_bar/game_bar_display_earnings_plugin/game_bar_display_earnings.script.tl:10-12`; `game_mechanics.zip!game_mechanics/finance/finances_charts.tl:262` |
 | A journal entry has `time` (`-1` = now), `amount` and a category; the game bar edits the balance with one `OTHER` entry. Categories: LOAN, INTEREST, CONSTRUCTION, ACQUISITION, MAINTENANCE, INCOME, OTHER, SUBSIDY. | `tealdef/scripts/journal.d.tl:3-69`; `gui.zip!gui/game_bar/game_bar.tl:229-234` |
 | "Company" in the game means progression: rank, permits, prospecting, marketing, greenifying. The state is keyed by player entity (`CompaniesState.companyStates[].companyEntity`, `CompaniesGrowthState.companyState : {Entity : CompanyData}`), and a PLAYER-component loop was written and commented out. | `tealdef/game_mechanics/company/company.d.tl:3-22`; `tealdef/game_mechanics/company/company_progression_util.d.tl:3-11`; `game_mechanics.zip!game_mechanics/company/company.script.tl:284-285`; `game_mechanics.zip!game_mechanics/company/company_util.tl:254-271` |
 | ...but only the local player is ever updated: XP and levels, permit cooldowns, prospecting. A player without progression state has rank 0. | `game_mechanics.zip!game_mechanics/company/company_growth.script.tl:94-110`; `game_mechanics.zip!game_mechanics/company/company_progression_util.tl:74-93`; `gui.zip!gui/construction/construction.tl:209-212` |
@@ -71,7 +74,7 @@ The mod's schemas mark the player argument of these commands, the generic ones i
 
 ### 1.6 The one local player
 
-`api.engine.util.getPlayer()` appears in at least 97 lines of the game's scripts (gui 39, game_mechanics 41, mission 15, scripts 2). The windows use it for everything that belongs to "the" player: the lines and depots lists (`manager_window.tl:150, 232, 1337, 1358, 2468`), the balance (`game_bar.tl:220`, `construction_react_util.tl:1226`, `vehicle_store_window.tl:3530`), what is owned and so editable (`entity_util.tl:78-86`), the headquarters (`view_manager_util.tl:44-46`), the company name (`company.tl:933-943`). The simulation scripts use it for loans, subsidies, company progression, notifications and marketing (`loan.script.tl:47`, `company_growth.script.tl:110, 161`, `notifications.script.tl:307-309`, `towns.script.tl:171`). Nothing in the shipped scripts assigns it, and there is no setter in the Teal declarations.
+`api.engine.util.getPlayer()` appears in at least 97 lines of the game's scripts (gui 39, game_mechanics 41, mission 15, scripts 2). The windows use it for everything that belongs to "the" player: the lines and depots lists (`manager_window.tl:150, 232, 1337, 1358, 2468`), the balance (`game_bar.tl:220`, `construction_react_util.tl:1226`, `vehicle_store_window.tl:3530`), what is owned and so editable (`entity_util.tl:78-86`), the headquarters (`view_manager_util.tl:44-46`), the company name (`company.tl:933-943`). The simulation scripts use it for loans, subsidies, company progression, notifications and marketing (`loan.script.tl:47`, `company_growth.script.tl:110, 161`, `notifications.script.tl:307-309`, `towns.script.tl:171`). Nothing in the shipped scripts assigns it, and there is no setter in the Teal declarations: the engine API declares only `getPlayer() : Engine.Entity`, "obtains the player entity" (`api/tealdef/api/engine/util.d.tl:1021-1023`). The PLAYER component declares one field, `headquarters` (`api/tealdef/api/engine.d.tl:846-853`).
 
 MPFever treated it as a field of the engine: its native module scans memory for words equal to the player's entity id and patches one at a time to the second player's id, to find the one `getPlayer()` reads (`MPFever/native/mpfever_native.cpp:394-454, 1215-1217`, `mpfever_bridge.script.lua:3142-3175`). It also tried replacing the Lua function itself while it built a proposal (`mpfever_bridge.script.lua:3076`). Neither result is published.
 
@@ -163,7 +166,7 @@ A limit stops a player's next building (`build`) and buying (`spend`) once what 
 
 A category the host forbade with `perm` is refused by the same two checks, before any limit is looked at (`not allowed to spend`).
 
-The check is made twice, and both read only the registry: by the originator right before it stamps (so the window hears about it at once: callback `false`, `action_refused {seq = 0, detail}`, nothing shipped), and by every game at the stamp (so an action a modified client sends anyway is refused everywhere; its own game then differs from the others and is repaired by the normal resync). The period is a game-time length in the stamp's units (`status.yearLength / 12` is a month): periods are `floor(stamp / per)`, so every game puts an action in the same period whatever its own clock says.
+The check is made twice, and both read only the registry: by the originator right before it stamps (so the window hears about it at once: callback `false`, `action_refused {seq = 0, detail}`, nothing shipped), and by every game at the stamp (so an action a modified client sends anyway is refused everywhere; its own game then differs from the others and is repaired by the normal resync). The period is a game-time length in the stamp's units (`status.monthLength` is a month): periods are `floor(stamp / per)`, so every game puts an action in the same period whatever its own clock says.
 
 ### 3.6 Checksums, resync, hot join
 
@@ -190,7 +193,7 @@ The engine calls the company code makes, all in `Co.extendEngine`, all added to 
 | `balanceOf(entity)` | `api.engine.util.finance.getPlayersBalance(entity)`, nil = infinite | `gui.zip!gui/game_bar/game_bar.tl:220` | cost of an action | E8 |
 | `bookJournalFor(entity, n, kind)` | `makeJournalBookAssetCmd(entity, entry{amount, time -1, type kind or OTHER})` through the original `sendCommand`, as the bridge's `bookJournal(amount, kind)` does for the savegame's player; never replicated | `gui.zip!gui/game_bar/game_bar.tl:229-234` | payments between companies | E2 |
 | `lineResult(entity, t0, t1)` | `finance.calculateBalance({entity}, t0, t1, true)` | `gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:621-627` | "earned" in the report | E9 |
-| `yearLength()` | `api.util.getDefaultYearDuration()` | same file, line 625 | monthly presets in the page | |
+| `monthLength()`, `yearLength()` | `api.util.getDefaultMonthDuration()`, `getDefaultYearDuration()` | `api/tealdef/api/util.d.tl:114-120` | monthly presets in the page | |
 | `setLocalCompany(entity)` | replaces `api.engine.util.getPlayer` (nil restores the original, kept in `package.loaded`) | none: this is the experiment | separate mode only | E6 |
 | `canonicalPlayer()` | the savegame's player, also while `setLocalCompany` is active | | `ctx.player` when nobody's company applies; the host's company key | E6 |
 | `account`, `bookJournal` (existing) | wrapped so they keep reading and booking the savegame's player while a local company is set | | checksum and host authority | E6 |
@@ -217,7 +220,7 @@ The interface half writes `companies.txt` into the session folder (next to `hud_
 | `self` | number | This player's id (0 = host). |
 | `isHost` | boolean | Show the host's controls. |
 | `hostEntityKey` | string | Key of the savegame's player entity (`"s:7"`): the `entity` for the host's own company when switching to separate mode. |
-| `yearLength` | number | The game's year in game-time units; a month is a twelfth. For `limit.per`. |
+| `monthLength`, `yearLength` | number | The game's month and year in game-time units. For `limit.per` (a monthly limit is `per = monthLength`). |
 | `perms` | table | What the host allows this player: `build`, `bulldoze`, `spend`, `other` (booleans). The mod knows only its own grant; the grants of the others are the host launcher's (`docs/PROTOCOL.md`, Permissions). |
 | `openCompanies` | array of string | Keys of the companies this player may `join`. |
 | `warnings` | array of string | Ready-made lines: a player reached or nears (80%) the spending limit. |
@@ -234,7 +237,7 @@ Player row: `id`, `name` (roster name, else `player <id>`), `you`, `present` (in
 The window appends a record of kind `company` with the operation as payload, exactly like its chat records:
 
 ```lua
-C.writerSend(outbox, "company", { op = "limit", player = 1, amount = 50000, per = status.yearLength / 12 })
+C.writerSend(outbox, "company", { op = "limit", player = 1, amount = 50000, per = status.monthLength })
 C.writerSend(outbox, "company", { op = "found", name = "Ironworks", open = true })
 C.writerSend(outbox, "company", { op = "add", name = "Mill", color = { 0.9, 0.2, 0.2 } })   -- a company with its own player entity (makeGameAddPlayerCmd)
 ```

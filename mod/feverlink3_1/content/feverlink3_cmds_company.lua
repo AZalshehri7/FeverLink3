@@ -717,7 +717,8 @@ end
 
 -- The model of the window's company page (docs/COMPANIES.md section 6 lists every field).
 -- view = { self = id, names = { [id] = name }, now = game time, earned = { [id] = money } (Co.earned),
---          hostEntityKey = key of the savegame's player entity, yearLength = the game's year in game-time units,
+--          hostEntityKey = key of the savegame's player entity, monthLength and yearLength = the game's month and year in
+--          game-time units,
 --          perms = what the host allows this player (build, bulldoze, spend, other) }
 function Co.status(co, view)
 	co = type(co) == "table" and co or Co.new()
@@ -727,7 +728,7 @@ function Co.status(co, view)
 	local now = tonumber(view.now) or 0
 	local out = {
 		version = co.rev, mode = co.mode, self = view.self, isHost = view.self == 0, hostEntityKey = view.hostEntityKey,
-		yearLength = view.yearLength, perms = view.perms and copy(view.perms) or nil,
+		monthLength = view.monthLength, yearLength = view.yearLength, perms = view.perms and copy(view.perms) or nil,
 		companies = {}, players = {}, lines = {}, warnings = {}, openCompanies = {},
 	}
 	local ids = {}
@@ -817,7 +818,8 @@ end
 --                               makeJournalBookAssetCmd, and a booking made here is never a player's action.
 --   lineResult(entity, t0, t1)  income minus running costs of a line between two game times
 --                               (api.engine.util.finance.calculateBalance, gui.zip!gui/line_vehicle_mgmt/line_react_util.tl:626)
---   yearLength()                the game's year in game-time units (api.util.getDefaultYearDuration), for monthly limits
+--   monthLength(), yearLength() the game's month and year in game-time units (api.util.getDefaultMonthDuration and
+--                               getDefaultYearDuration, declared in api/tealdef/api/util.d.tl:114-120), for monthly limits
 -- And while a local company is set, engine.account and engine.bookJournal (the money the checksum compares and the host
 -- corrects) keep reading and booking the savegame's player, not the company the windows act as.
 -- deps.sender() -> the original api.cmd.sendCommand (the bridge's wrapped one would capture the booking as a player action).
@@ -888,6 +890,9 @@ function Co.extendEngine(engine, deps)
 	end
 	if engine.lineResult == nil then
 		engine.lineResult = function(entity, from, to) return api.engine.util.finance.calculateBalance({ entity }, from, to, true) end
+	end
+	if engine.monthLength == nil then
+		engine.monthLength = function() return api.util.getDefaultMonthDuration() end
 	end
 	if engine.yearLength == nil then
 		engine.yearLength = function() return api.util.getDefaultYearDuration() end

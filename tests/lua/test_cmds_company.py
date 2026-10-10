@@ -490,9 +490,9 @@ class CompanyUnit(unittest.TestCase):
         self.Co.record(self.co, 0, 0, self.lua({"fn": "makeWorldBuildProposalCmd", "category": "bulldoze", "cost": -1500}))
         self.Co.record(self.co, 5, 0, self.lua({"fn": "makeVehicleBuyCmd", "category": "spend", "cost": 10}))     # left the session
         view = self.lua({"self": 1, "names": {0: "Boss", 1: "Alice", 2: "Carol"}, "now": 0, "earned": {1: 800}, "hostEntityKey": "s:7",
-                         "yearLength": 96000, "perms": {"build": True, "bulldoze": False, "spend": True, "other": True}})
+                         "yearLength": 96000, "monthLength": 8000, "perms": {"build": True, "bulldoze": False, "spend": True, "other": True}})
         st = to_py(self.Co.status(self.co, view))
-        self.assertEqual((st["yearLength"], st["perms"]["bulldoze"], st["perms"]["build"]), (96000, False, True))
+        self.assertEqual((st["yearLength"], st["monthLength"], st["perms"]["bulldoze"], st["perms"]["build"]), (96000, 8000, False, True))
         self.assertEqual((st["mode"], st["self"], st["isHost"], st["hostEntityKey"], st["openCompanies"]), ("shared", 1, False, "s:7", {1: "c1"}))
         self.assertEqual([p["id"] for p in st["players"].values()], [0, 1, 2, 5])
         self.assertEqual([p["present"] for p in st["players"].values()], [True, True, True, False], "a player who left stays in the report")
@@ -596,7 +596,7 @@ class CompanyUnit(unittest.TestCase):
               engine = { util = { getPlayer = REAL, finance = {
                 getPlayersBalance = function(e) if e == 99 then return nil end return e * 1000 end,
                 calculateBalance = function(list, from, to, flag) return list[1] + from + to end } } },
-              util = { getDefaultYearDuration = function() return 96000 end },
+              util = { getDefaultYearDuration = function() return 96000 end, getDefaultMonthDuration = function() return 8000 end },
               type = { JournalEntry = { new = function() return { category = {} } end, Type = { OTHER = 5 } } },
               cmd = { makeJournalBookAssetCmd = function(e, entry) return { to = e, amount = entry.amount, time = entry.time, kind = entry.category.type } end,
                       sendCommand = function(c) NATIVE_SENT = c end },
@@ -611,7 +611,7 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual(engine.balanceOf(7), 7000)
         self.assertIsNone(engine.balanceOf(99), "nil is infinite money")
         self.assertEqual(engine.lineResult(5, 10, 20), 35)
-        self.assertEqual(engine.yearLength(), 96000)
+        self.assertEqual((engine.yearLength(), engine.monthLength()), (96000, 8000))
         engine.bookJournalFor(52001, -2500)
         self.assertEqual((sent[1].to, sent[1].amount, sent[1].time, sent[1].kind), (52001, -2500, -1, 5))
         self.assertIsNone(L.eval("NATIVE_SENT"), "the booking uses the original sender, not the wrapped one")

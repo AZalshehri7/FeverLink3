@@ -848,8 +848,9 @@ local function writeCompanies()
 		return ok and v or nil
 	end)
 	local okY, year = pcall(engine.yearLength)
+	local okM, month = pcall(engine.monthLength)
 	local view = {
-		self = C.PLAYER_ID, names = names, now = now, earned = earned, yearLength = okY and year or nil, perms = G.perms,
+		self = C.PLAYER_ID, names = names, now = now, earned = earned, yearLength = okY and year or nil, monthLength = okM and month or nil, perms = G.perms,
 		hostEntityKey = L.keyFor(G.rev, engine.canonicalPlayer and engine.canonicalPlayer() or engine.player()),
 	}
 	local okS, text = pcall(function() return C.serialize(Co.status(G.co, view)) end)
