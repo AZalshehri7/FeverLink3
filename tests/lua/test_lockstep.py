@@ -716,6 +716,20 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.B.events_seen(), 1)
         self.assertEqual(self.A.events_seen(), 1)
 
+    def test_a_window_command_leaves_every_checksum_part_equal_on_both_games(self):
+        # the originating game applies the command natively, so it must also record it in its company ledger, with the stamp the
+        # other game uses, or the games "differ in companies" after every loan, rename or purchase (seen in a real game)
+        self.start()
+        self.tick(10)
+        self.A.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, { amount = 5 } }))')
+        self.B.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Repay", { nil, { amount = 5 } }))')
+        self.tick(60)
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40)
+        pa, pb = self.relay.reports[1][0][1], self.relay.reports[1][1][1]
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, set(), "no part differs: " + str({k: (pa[k], pb[k]) for k in pa if pa[k] != pb[k]}))
+        self.assertIn("companies", pa)
+
     def test_a_speed_button_in_a_window_state_is_a_request_and_not_applied_there(self):
         self.start()
         self.tick(5)

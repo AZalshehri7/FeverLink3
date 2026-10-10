@@ -319,12 +319,24 @@ end
 -- The engine tells the game script about every build it applies (`apply_command` / `onPreBuildProposal`, just before
 -- it runs; finding from MPFever (MIT)). A replay of an action (a build rebuilt from a shipped record) must not be
 -- shipped again, so each one is counted here when it is sent and spent when its event arrives.
-local function markReplay(st, now)
+local function markReplay(st, now, state)
 	local r = st.replay
 	if type(r) ~= "table" or now - (r.at or 0) > REPLAY_STEPS * STEP then r = { n = 0, at = now } end
 	r.n = r.n + 1
 	r.at = now
 	st.replay = r
+	-- The engine may announce the build while the command is still being sent (seen in a real game: the guest captured its
+	-- own replay about half the time), before this update has stored its state. Store it now, so that the event finds the mark.
+	if state then state:set(st) end
+end
+
+-- After the command went out, the event handler may have spent the mark and added to the outgoing list in the stored
+-- state: take that over, or this update's own copy would put the mark back (and swallow the next real build).
+local function takeBackEvents(st, state)
+	if not state then return end
+	local fresh = state:get()
+	if type(fresh) ~= "table" then return end
+	st.replay, st.out, st.outSeq = fresh.replay, fresh.out or st.out, fresh.outSeq or st.outSeq
 end
 
 local function spendReplay(st, now)
@@ -436,8 +448,10 @@ local function simApplyAction(st, it, now)
 	local balance0 = coBalance(ctx)
 	local ok, e = pcall(function()
 		L.sendNow(args, function(a)
-			if it.body.fn == "makeWorldBuildProposalCmd" then markReplay(st, now) end
+			local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
+			if isBuild then markReplay(st, now, SIM.state) end
 			api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
+			if isBuild then takeBackEvents(st, SIM.state) end
 		end)
 	end)
 	if not ok then
@@ -465,9 +479,15 @@ local function simReplayCompany(st, param)
 	local spec = it.body and L.COMMANDS[it.body.fn]
 	if not spec then return end
 	local ctx = simCtx(st, it)
-	local args = L.decodeCommand(it.body, ctx)
-	if not args then return end
-	local category = L.categoryOf(it.body.fn, args)
+	local args, category
+	if type(param.category) == "string" and type(it.body.args) == "table" then
+		-- an action this game made itself and applied natively: the shipped arguments name it, nothing is rebuilt
+		args, category = it.body.args, param.category
+	else
+		args = L.decodeCommand(it.body, ctx)
+		if not args then return end
+		category = L.categoryOf(it.body.fn, args)
+	end
 	local okC = coBefore(ctx, it, spec, args, category, logSim)
 	if okC and param.ok and not spec.virtual then
 		local ok, err = pcall(function() Co.afterApply(ctx, it, spec, Co.info(it, spec, category, param.cost)) end)
@@ -552,6 +572,7 @@ local function update(userParams, state, dt)
 	end
 	SIM.devTick = (SIM.devTick or 0) + 1
 	if SIM.devTick % 4 == 0 then devPoll("sim") end
+	SIM.state = state
 	local ok, err = pcall(function()
 		local st = simState(state)
 		local now = engine.gameTime()
@@ -576,6 +597,13 @@ end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
 local function handleEvent(userParams, state, src, id, name, param)
+	if DEV and id == "apply_command" then
+		pcall(function()
+			local pi = nil
+			pcall(function() pi = param[4] end)
+			logSim("event apply_command/" .. tostring(name) .. " at t=" .. tostring(engine.gameTime()) .. " playerInitiated=" .. tostring(pi))
+		end)
+	end
 	if id == "apply_command" and name == "onPreBuildProposal" then
 		C.poll()
 		if not C.ACTIVE then return end
@@ -727,9 +755,25 @@ local function reportRound(n, t, parts, account)
 end
 
 -- companies: hands an action this half applied to the simulation half, which keeps the registry in the savegame
-local function coToSim(it, ok, cost)
+local function coToSim(it, ok, cost, category)
 	if not Co then return end
-	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost })
+	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost, category = category })
+end
+
+-- An action this game applied natively when its player made it (a build with a native tool, a command from a window): every
+-- OTHER game runs the company layer when it applies the action at its stamp (the ledger of who built and spent what is part of
+-- the checksum), so this game must run it too, with the same stamp, or its ledger is the only one without the action and the
+-- games "differ in companies" until a resync copies everything (seen in a real game: a reload every two minutes).
+local function recordOriginator(body, seq, at, category)
+	if not Co or type(body) ~= "table" then return end
+	local spec = L.COMMANDS[body.fn]
+	if not spec or spec.virtual then return end
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = body, key = L.itemKey(C.PLAYER_ID, seq) }
+	coGuard("originator ledger", function()
+		local ctx = guiCtx(it)
+		Co.afterApply(ctx, it, spec, Co.info(it, spec, category, nil))
+		coToSim(it, true, nil, category)
+	end)
 end
 
 local function guiApplyNow(it, now)
@@ -851,6 +895,7 @@ local function shipNative(o)
 	local at = stampAfterFastest(now)
 	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
+	recordOriginator(body, G.seq, at, category)
 	return true
 end
 
@@ -863,8 +908,10 @@ local function shipUiCommand(p)
 	G.seq = G.seq + 1
 	G.uiSeq[p.id] = G.seq
 	local at = stampAfterFastest(now)
-	send("action", { stamp = at, seq = G.seq, body = p.body, category = type(p.category) == "string" and p.category or "other" })
+	local category = type(p.category) == "string" and p.category or "other"
+	send("action", { stamp = at, seq = G.seq, body = p.body, category = category })
 	logGui("window command " .. tostring(body.fn) .. " " .. L.itemKey(C.PLAYER_ID, G.seq) .. " stamped " .. at .. " (now " .. now .. ")")
+	recordOriginator(body, G.seq, at, category)
 	return true
 end
 
