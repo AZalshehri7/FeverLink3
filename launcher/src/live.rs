@@ -174,7 +174,13 @@ impl Controller {
             dir,
             default_name,
             save_dirs,
-            host_options: HostOptions::default(),
+            // The host's own game keeps playing in a resync round (only the other games load the saved world): the
+            // paused checksum after the round checks that they still match, and a difference fails the round as ever.
+            // FEVERLINK3_HOST_RELOAD=1 brings the old behaviour back (every game, the host's included, loads the save).
+            host_options: HostOptions {
+                host_reloads: std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "1"),
+                ..HostOptions::default()
+            },
             commands,
             state: State::Idle,
             steam: core.clone().map(steamnet::Probe::on).or_else(steamnet::Probe::load),

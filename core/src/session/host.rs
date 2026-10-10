@@ -39,6 +39,11 @@ pub struct HostOptions {
     /// Start a resync round by itself when the checksum policy asks for one (default true). When false the host
     /// only emits [`HostOutput::ResyncRequested`] and the launcher decides.
     pub auto_resync: bool,
+    /// Whether the host's own game loads the saved world in a resync round, like every other game (default true:
+    /// all games then start from a state that went through the same save and load). When false the host's game keeps
+    /// running its live world, only the other games load, and the paused checksum after the round says whether the
+    /// two still match (a difference fails the round and leaves the session paused, as it always does).
+    pub host_reloads: bool,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -72,6 +77,7 @@ impl Default for HostOptions {
             session_broadcast_seconds: 3.0,
             checksum_seconds: 10.0,
             auto_resync: true,
+            host_reloads: true,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,

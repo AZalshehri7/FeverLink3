@@ -38,15 +38,15 @@ Start Transport Fever 3 from **Steam as usual**.
 **The host:**
 
 1. Start a game (a new game, or load one) with *FeverLink3 Multiplayer* activated, and click **FeverLink3** in the bottom bar.
-2. Press **Host a game**. The window shows a long **join code**. Click into the code field, press `Ctrl+A` then `Ctrl+C`, and send the code to your friend (chat, Discord). Treat it like a password for the session.
-3. Press **Start the session**. The game stops at its current moment and waits for the other player.
-4. When your friend joins, the window lists them under **Players**, and your world is sent to their game.
+2. Press **Host a game**. The window shows a **join code**. Press **Copy code** (the code is put on your clipboard; the game's text fields cannot copy by themselves) and paste it into a message to your friend with `Ctrl+V` (chat, Discord). Treat it like a password for the session.
+3. When your friend appears under **Players**, press **Start the session**. Your world is sent to the other player, whose game reloads into it; yours keeps running without a pause or a loading screen. The games compare a checksum before the session runs, so a difference would stop it instead of going unnoticed. The same happens for a player who joins later.
+4. While you play, **Pause**, **1x**, **2x** and **3x** in the window's **Session** section change the speed in every game, and the chat line under them sends a message to the others. Every player can do both.
 
 **The player who joins:**
 
 1. Start any game with *FeverLink3 Multiplayer* activated (a new game is fine; it is replaced) and click **FeverLink3** in the bottom bar.
-2. Paste the host's code into **paste the join code here** and press **Join**. The window shows what it is doing (`contacting the host`, `finding a route`, `connected`).
-3. The host's world is sent to you (about 30 MB; it takes up to a minute or two), your game reloads into it, and the session runs on both games.
+2. Click the field **paste the join code here**, press `Ctrl+V` to paste the host's code, and press **Join**. The window shows what it is doing (`contacting the host`, `finding a route`, `connected`).
+3. Keep the window open. When the host presses **Start the session**, the host's world is sent to you (about 30 MB; it takes up to a minute or two), your game reloads into it, and the session runs on both games. Open the window again after the reload (the reload closes it).
 
 Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod.
 
@@ -54,7 +54,7 @@ If joining fails, the window says why (wrong code, the host is not hosting, no r
 
 ## 4. The Steam connection test (for problems)
 
-Under **Steam connection test** you can check that two players can reach each other through Steam, without hosting: your **Steam ID** (17 digits) is shown; paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**. Within about 20 seconds the window shows `connected` with the round-trip time and whether the route is `direct` or `through a Steam relay`. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
+Press **Connection test...** in the window (under the join code field) to open the **Steam connection test**. It checks that two players can reach each other through Steam, without hosting: your **Steam ID** (17 digits) is shown; paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**. Within about 20 seconds the window shows `connected` with the round-trip time and whether the route is `direct` or `through a Steam relay`. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
 
 ## What works and what does not (yet)
 

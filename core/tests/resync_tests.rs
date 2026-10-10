@@ -686,3 +686,54 @@ fn starting_with_games_at_the_same_time_does_not_start_a_round() {
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     assert_eq!(Some(10_000), h.host.state().pause_at);
 }
+
+// ------------------------------------------------------------------ a host whose game does not reload
+
+#[test]
+fn a_host_that_does_not_reload_keeps_its_world_and_only_the_players_load() {
+    let options = HostOptions { host_reloads: false, ..quiet() };
+    let (mut h, ids) = Harness::running(2, 3, options);
+    h.host_call(|host| host.start_resync("test"));
+    let pause_at = h.host.state().pause_at.expect("pause stamp");
+    let id = h.reach_transferring();
+    let bytes = blob(1000);
+    h.send_file(id, &bytes);
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(0, h.host_game_count(MessageKind::ResyncLoad), "the host's own game is not told to load");
+    for &c in &ids {
+        assert_eq!(1, h.p(c).count(MessageKind::ResyncLoad));
+    }
+    assert_eq!(1, h.ready_count(), "only the host's game is still ready; the players owe a hello");
+    assert!(h.host.players().get(&0).is_some_and(|p| p.ready));
+
+    // the players load and say hello; the host's game never does
+    for &c in &ids {
+        h.hello_player(c, pause_at, 0);
+    }
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert!(req.paused);
+    assert_eq!(pause_at, req.at);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(3, h.host.state().speed);
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+}
+
+#[test]
+fn a_host_that_does_not_reload_still_fails_the_round_when_the_worlds_differ() {
+    let options = HostOptions { host_reloads: false, ..quiet() };
+    let (mut h, ids) = Harness::running(1, 1, options);
+    h.host_call(|host| host.start_resync("test"));
+    let pause_at = h.host.state().pause_at.unwrap();
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    h.hello_player(ids[0], pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "other")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    let failures = h.failures();
+    assert_eq!(1, failures.len(), "{failures:?}");
+    assert!(failures[0].contains("roads"), "{failures:?}");
+    assert!(h.host.state().pause_at.is_some(), "the session stays paused");
+}

@@ -112,3 +112,26 @@ function Install-Overlay {
         if (Test-Path $old) { [IO.Directory]::Delete($old, $true) }
     }
 }
+
+# Real key presses (keybd_event with short delays; SendKeys is too quick for the game's text fields).
+Add-Type -Name Kbd -Namespace Fl3 -MemberDefinition '[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);'
+function Send-Key([int]$Vk, [bool]$Down) { [Fl3.Kbd]::keybd_event([byte]$Vk, 0, $(if ($Down) { 0 } else { 2 }), [UIntPtr]::Zero) }
+
+# Control + a key (0x56 = V pastes)
+function Send-Chord([int]$Vk) {
+    Send-Key 0x11 $true; Start-Sleep -Milliseconds 150
+    Send-Key $Vk $true; Start-Sleep -Milliseconds 150
+    Send-Key $Vk $false; Start-Sleep -Milliseconds 150
+    Send-Key 0x11 $false; Start-Sleep -Milliseconds 300
+}
+
+# Letters, digits and spaces typed one by one into whatever has the keyboard focus.
+function Send-Text([string]$Text) {
+    foreach ($ch in $Text.ToCharArray()) {
+        $shift = [char]::IsUpper($ch)
+        $vk = [int][char]::ToUpper($ch)
+        if ($shift) { Send-Key 0x10 $true; Start-Sleep -Milliseconds 40 }
+        Send-Key $vk $true; Start-Sleep -Milliseconds 60; Send-Key $vk $false; Start-Sleep -Milliseconds 60
+        if ($shift) { Send-Key 0x10 $false; Start-Sleep -Milliseconds 40 }
+    }
+}

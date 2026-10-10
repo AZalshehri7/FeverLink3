@@ -328,13 +328,24 @@ impl HostSession {
     }
 
     fn enter_loading(&mut self) {
+        let host_reloads = self.options.host_reloads;
+        if !host_reloads {
+            // the host's game keeps its live world: it is not sent the load, owes no new hello and keeps its clock
+            if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
+                participants.remove(&Self::HOST_ID);
+            }
+        }
         let Some(r) = &self.resync else { return };
         let (id, participants) = (r.id, r.participants.clone().unwrap_or_default());
         let sha256 = r.file.as_ref().map(|f| f.sha256.clone()).unwrap_or_default();
         for p in self.players.values_mut() {
-            p.ready = false;
+            p.ready = p.id == Self::HOST_ID && !host_reloads;
         }
-        self.clocks.clear();
+        if host_reloads {
+            self.clocks.clear();
+        } else {
+            self.clocks.retain(|&id, _| id == Self::HOST_ID);
+        }
         self.enter(ResyncState::Loading, format!("loading; waiting for {} game(s)", participants.len()));
         let load = ResyncLoadMessage { id, name: format!("feverlink3-resync-{id}"), sha256 };
         self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &participants);

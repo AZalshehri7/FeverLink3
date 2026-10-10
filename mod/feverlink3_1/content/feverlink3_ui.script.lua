@@ -198,10 +198,15 @@ local function setup(react, builtin)
 			if ctl.started then
 				add(button("Sync everyone to my world", function() command("resync", {}) end))
 			end
-			add(box(H, {
-				button(ctl.started and "Pause" or "Start the session", function() command(ctl.started and "pause" or "start", {}) end, "primary", math.floor(WIDTH / 2) - 10),
-				button("Stop hosting", function() command("leave", {}) end, "negative", math.floor(WIDTH / 2) - 10),
-			}))
+			if ctl.started then
+				-- the speed buttons of the Session section pause and resume
+				add(button("Stop hosting", function() command("leave", {}) end, "negative"))
+			else
+				add(box(H, {
+					button("Start the session", function() command("start", {}) end, "primary", math.floor(WIDTH / 2) - 10),
+					button("Stop hosting", function() command("leave", {}) end, "negative", math.floor(WIDTH / 2) - 10),
+				}))
+			end
 		elseif state == "joining" then
 			add(heading("Joining..."))
 			add(text(tostring(ctl.progress or "contacting the host"), "font-scale-title-3"))
@@ -209,7 +214,11 @@ local function setup(react, builtin)
 			add(button("Cancel", function() command("leave", {}) end, "negative"))
 		elseif state == "joined" then
 			add(heading("Connected"))
-			add(note("Wait for the host to start the session. The host's world is sent to you and your game reloads into it."))
+			if ctl.started then
+				add(note("The session is running. Anyone can change the speed or chat; the host can sync everyone to their world."))
+			else
+				add(note("Wait for the host to start the session. The host's world is sent to you and your game reloads into it."))
+			end
 			add(gap())
 			players(ctl.me)
 			add(gap())

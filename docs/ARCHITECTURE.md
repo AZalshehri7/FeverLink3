@@ -106,7 +106,7 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 
 - Every 10 s of real time the host names a future stamp; every game hashes its world at that stamp and reports per-part hashes (money, loans, company, towns, industries, cargo, vehicles, roads, constructions, lines, names, node configs, terrain edits).
 - **Money** is corrected in place from the host's values. **Drift parts** reload only after 5 minutes. **Everything else** reloads after two consecutive differing checks, or at once when a replay fails.
-- **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → everyone, host included, loads it → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
+- **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → every other game loads it (the host's own game keeps playing its live world; `host_reloads` turns the host's reload back on) → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
 
 ## 9. Game builds
 

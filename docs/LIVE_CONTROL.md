@@ -51,7 +51,7 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 | `pause` | `{}` | `hosting` | Every game stops at one future step. |
 | `speed` | `{n}` | `hosting` | Runs the session at speed `n`, 1 to 4 (default 1, out of range clamped). Ignored while a resync round runs. |
 | `check` | `{}` | `hosting` | Asks every game for a world checksum now. |
-| `resync` | `{}` | `hosting` | Starts a resync round: every game, the host's included, loads the host's save. Needs a started session; ignored while a round runs. |
+| `resync` | `{}` | `hosting` | Starts a resync round: every other game loads the host's save (the host's own game keeps playing; set `FEVERLINK3_HOST_RELOAD=1` in the game's environment to reload it too). Needs a started session; ignored while a round runs. |
 | `kick` | `{id}` | `hosting` | Removes player `id`: it is told "kicked", disconnected, its slot freed, and its launcher does not reconnect. For a player who is `away` it releases the held slot. It may join again with the code like anyone else. Answers in `result`; refuses the host's own id 0, an id that is not in `players`, and a missing `id`. |
 | `permissions` | `{build?, bulldoze?, spend?, speed?, other?}` | `hosting` | Sets who may do what and tells every game. Each value is `"everyone"`, `"hostOnly"` or `{only = {ids}}`. **Keys not named keep their value**, so a command may carry one key. At least one key is required; a value that is none of the three refuses the whole command (nothing changes) and says which key. Answers in `result`. See below. |
 | `steamtest` | `{id}` | any | Steam connection test: pings the Steam ID (17 digits, as a string) through Steam's networking. The progress is `steam.test`; a bad ID or no Steam shows in `steam.note`. |
