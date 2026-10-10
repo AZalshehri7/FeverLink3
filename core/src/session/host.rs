@@ -968,6 +968,25 @@ impl HostSession {
         self.drain()
     }
 
+    /// Ends the session on the host's decision (its owner stopped hosting, or the host's world was closed): every
+    /// joined player is told (sealed `Kicked`, reason `ended`) and its connection closed, and a connection that never
+    /// joined gets the unsealed `Reject` with the same reason. Without this a player only saw the connection drop and
+    /// tried to reconnect to nobody for five minutes. No slot is held for a return: the owner drops the session after it
+    /// has sent the outputs.
+    pub fn end_session(&mut self) -> Vec<HostOutput> {
+        let message = codec::encode(&RejectMessage::new("ended", Some("the host ended the session")));
+        for (connection, c) in std::mem::take(&mut self.connections) {
+            if c.player.is_some() {
+                self.send(connection, MessageKind::Kicked, &message);
+            } else {
+                self.send_unsealed(connection, MessageKind::Reject, message.clone());
+            }
+            self.out.push(HostOutput::CloseConnection(connection));
+        }
+        self.log("the host ended the session".to_owned());
+        self.drain()
+    }
+
     /// Takes a player out of the game. `hold` keeps its id, slot and token for [`HostOptions::reconnect_window_seconds`]
     /// (the connection dropped); without it the slot is freed (the player left, or the host removed it).
     fn remove_player(&mut self, id: u16, hold: bool) {

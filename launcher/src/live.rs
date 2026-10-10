@@ -13,6 +13,11 @@
 //!   same `to_game.log` / `from_game.log`, and `identity.txt` says who the game is (role `idle` until a session
 //!   exists, then `host` or `player` with the id the host assigned).
 //!
+//! A session ends when the local game's world is closed to the main menu: the mod writes to `from_game.log` while its
+//! script runs, so a game that has spoken and then falls silent for [`HEARTBEAT_SECONDS`] (and is not in the middle of
+//! a resync reload) has no world any more. A host then stops hosting and tells its players, a player leaves, and the
+//! status carries a `notice` for the window.
+//!
 //! Everything is a function of the folder's files, so the tests drive it with files and need no game.
 
 use std::fs;
@@ -22,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::lobby::JoinCode;
@@ -49,6 +54,29 @@ const STEAM_LOAD_ATTEMPTS: u32 = 150;
 
 /// The port a host listens on unless the window asks for another.
 pub const DEFAULT_PORT: u16 = 28090;
+
+/// Seconds without a line from the game, after the game had spoken, before its world counts as closed and the session
+/// ends. The mod appends a `clock` line to `from_game.log` at least every 30 frames (about half a second) while its
+/// script runs, paused or not, so eight seconds is many missed beats. `FEVERLINK3_HEARTBEAT_SECONDS` changes it for
+/// tests; `0` turns the check off.
+pub const HEARTBEAT_SECONDS: f64 = 8.0;
+/// The environment variable that changes [`HEARTBEAT_SECONDS`].
+pub const HEARTBEAT_ENV: &str = "FEVERLINK3_HEARTBEAT_SECONDS";
+/// How long a world reload (the game was told to load the host's save, or the host's resync round runs) may silence the
+/// mod before the silence counts again: a round that never ends must not keep a closed world alive for ever.
+const RELOAD_GRACE: Duration = Duration::from_secs(300);
+/// What the window shows when the heartbeat ended the session.
+pub const WORLD_CLOSED_NOTICE: &str = "Your world was closed, so the session ended";
+
+/// The heartbeat limit for an environment value: unset or not a number is [`HEARTBEAT_SECONDS`], zero or less is off
+/// (`None`).
+fn heartbeat_setting(value: Option<&str>) -> Option<Duration> {
+    match value.and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| !s.is_nan()) {
+        None => Some(Duration::from_secs_f64(HEARTBEAT_SECONDS)),
+        Some(s) if s <= 0.0 => None,
+        Some(s) => Some(Duration::from_secs_f64(s.min(3600.0))),
+    }
+}
 
 /// The folder the mod looks in when the launcher did not hand it a session folder.
 ///
@@ -114,6 +142,67 @@ struct CommandResult {
     message: String,
 }
 
+/// The pulse of the local game in a running session: whether `from_game.log` still grows.
+///
+/// The mod writes to that file while its script runs (it says hello once, then a `clock` line every half second at
+/// least) and stops when the world is closed to the main menu. The session thread reads the file's lines; this only
+/// looks at whether it changed, which is all a heartbeat needs.
+struct Pulse {
+    path: PathBuf,
+    /// Length and modification time of the file at the last look. Any change is taken as a new line.
+    mark: Option<(u64, Option<SystemTime>)>,
+    /// A line has come since the session started. Until then the world may still be loading and nothing is judged.
+    seen: bool,
+    /// When the file last changed, or when the game was last excused for a reload.
+    last: Instant,
+    /// Since when the game has been excused for a reload (the silence of a resync load).
+    excused_since: Option<Instant>,
+}
+
+impl Pulse {
+    /// Starts watching now: what the file holds already (lines of an earlier session, the first of this one racing the
+    /// controller) is the baseline, not a sign of life.
+    fn start(path: PathBuf, now: Instant) -> Pulse {
+        let mark = Pulse::look(&path);
+        Pulse { path, mark, seen: false, last: now, excused_since: None }
+    }
+
+    fn look(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+        fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+    }
+
+    /// Looks at the file at `now`. True when the game has spoken in this session and then been silent for `limit`, with
+    /// no reload to excuse the silence. `reloading` is true while the world is being replaced by a resync round
+    /// (see [`game_is_reloading`]): the mod is silent then, and the silence starts counting again when the round ends.
+    fn silent(&mut self, limit: Duration, reloading: bool, now: Instant) -> bool {
+        let mark = Pulse::look(&self.path);
+        if mark != self.mark {
+            self.mark = mark;
+            // a file that went missing is not a line; one that came back or grew is
+            if mark.is_some() {
+                self.seen = true;
+                self.last = now;
+            }
+        }
+        if reloading {
+            let since = *self.excused_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < RELOAD_GRACE {
+                self.last = now;
+            }
+        } else if self.excused_since.take().is_some() {
+            self.last = now;
+        }
+        self.seen && now.saturating_duration_since(self.last) >= limit
+    }
+}
+
+/// The local game's world is being replaced, or is about to be: it told to load a save and has not said hello since, or
+/// (host) a resync round is running, in which it saves, may stall for a while on a big map and, with
+/// `HostOptions::host_reloads`, loads too.
+fn game_is_reloading(s: &Status) -> bool {
+    s.reloading || s.resync.as_deref().is_some_and(|r| r != "Idle" && !r.starts_with("failed"))
+}
+
 /// The controller. [`Controller::step`] is called every ~100 ms by [`spawn`], or by a test.
 pub struct Controller {
     dir: PathBuf,
@@ -139,6 +228,13 @@ pub struct Controller {
     result: Option<CommandResult>,
     /// How many of the session's log lines were already written to `session.log`.
     log_cursor: u64,
+    /// One line on how the last session ended by itself (the world was closed, the host ended it, ...), for the window's
+    /// start screen. Cleared by the next `host`, `join` or `leave`.
+    notice: Option<String>,
+    /// How long the local game may be silent before its world counts as closed; `None` turns the check off.
+    heartbeat: Option<Duration>,
+    /// Watching the game of the running session; `None` outside one.
+    pulse: Option<Pulse>,
     published: String,
     version: u64,
 }
@@ -200,11 +296,21 @@ impl Controller {
             clipboard: Box::new(clipboard::set_text),
             result: None,
             log_cursor: 0,
+            notice: None,
+            heartbeat: heartbeat_setting(std::env::var(HEARTBEAT_ENV).ok().as_deref()),
+            pulse: None,
             published: String::new(),
             version: 0,
         };
         c.publish();
         Ok(c)
+    }
+
+    /// How long the local game may be silent before the session ends because its world was closed, instead of
+    /// [`HEARTBEAT_SECONDS`] (or the `FEVERLINK3_HEARTBEAT_SECONDS` value). Zero turns the check off. For tests.
+    pub fn with_heartbeat(mut self, silence: Duration) -> Controller {
+        self.heartbeat = (!silence.is_zero()).then_some(silence);
+        self
     }
 
     /// Where "Copy code" puts the join code instead of the system clipboard (tests).
@@ -232,6 +338,7 @@ impl Controller {
             self.command(line.seq, &line.kind, &params);
         }
         self.advance();
+        self.watch_game();
         if !self.name_from_steam && self.persona_attempts < 600 && self.persona_last.elapsed() >= Duration::from_secs(1)
         {
             self.persona_attempts += 1;
@@ -427,6 +534,8 @@ impl Controller {
         if !self.idle_or_failed() {
             return;
         }
+        self.notice = None;
+        self.pulse = None;
         // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
         // a relay as the fallback). The direct TCP transport is for development and tests and must be asked for by
         // name.
@@ -559,6 +668,8 @@ impl Controller {
         if !self.idle_or_failed() {
             return;
         }
+        self.notice = None;
+        self.pulse = None;
         let name = self.name_from(params);
         let password = params.get("password").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_owned);
         let text = params.get("code").and_then(Value::as_str).unwrap_or("");
@@ -602,6 +713,10 @@ impl Controller {
 
     fn leave(&mut self) {
         self.result = None;
+        self.notice = None;
+        self.pulse = None;
+        // stopping a host tells every player the host ended the session (`HostSession::end_session`); a player says
+        // goodbye so that the host frees its slot at once
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Hosting(h) => h.handle.stop(),
             State::Joined { handle } => handle.stop(),
@@ -612,12 +727,44 @@ impl Controller {
         }
     }
 
+    /// The local game stopped talking: its world was closed to the main menu. A host stops hosting (its players are told
+    /// the host ended the session) and a player leaves (the host frees its slot); the controller is idle again with a
+    /// notice for the window.
+    fn world_closed(&mut self) {
+        self.leave();
+        self.notice = Some(WORLD_CLOSED_NOTICE.to_owned());
+    }
+
+    /// The heartbeat: ends the session when the local game has spoken and then fell silent (see [`Pulse`]). Does
+    /// nothing outside a session, before the game's first line, or while the game's world is being replaced by a resync.
+    fn watch_game(&mut self) {
+        let reloading = match &self.state {
+            State::Hosting(h) => game_is_reloading(&h.handle.status()),
+            State::Joined { handle } => game_is_reloading(&handle.status()),
+            _ => {
+                self.pulse = None;
+                return;
+            }
+        };
+        let Some(limit) = self.heartbeat else { return };
+        let now = Instant::now();
+        let path = self.dir.join(gamelink::FROM_GAME);
+        let pulse = self.pulse.get_or_insert_with(|| Pulse::start(path, now));
+        if pulse.silent(limit, reloading, now) {
+            self.world_closed();
+        }
+    }
+
     fn advance(&mut self) {
         if let State::Joined { handle } = &self.state {
             // the host removed us, refused us, or we gave up reconnecting: the window must be able to start over
             let s = handle.status();
-            if s.finished {
-                self.state = State::Failed(ended_message(&s));
+            // a reject or an error is the thread's last word: it ends in the next breath, so do not show a gap
+            if s.finished || s.rejected.is_some() || s.error.is_some() {
+                let why = ended_message(&s);
+                self.notice = Some(sentence(&why));
+                self.state = State::Failed(why);
+                self.pulse = None;
                 if let Ok(link) = gamelink::Session::open(&self.dir) {
                     let _ = link.write_identity(0, &self.default_name, "idle");
                 }
@@ -664,7 +811,10 @@ impl Controller {
             State::Joined { handle } => {
                 let s = handle.status();
                 let state = if s.rejected.is_some() || s.error.is_some() {
-                    v["message"] = json!(ended_message(&s));
+                    // the next step turns this into State::Failed; the window must not see a gap
+                    let why = ended_message(&s);
+                    v["notice"] = json!(sentence(&why));
+                    v["message"] = json!(why);
                     "failed"
                 } else if s.connected {
                     "joined"
@@ -681,6 +831,9 @@ impl Controller {
         }
         if let Some(r) = &self.result {
             v["result"] = json!({ "seq": r.seq, "kind": r.kind, "ok": r.ok, "message": r.message });
+        }
+        if let Some(notice) = &self.notice {
+            v["notice"] = json!(notice);
         }
         v
     }
@@ -890,9 +1043,17 @@ fn permissions_with(current: &Permissions, params: &Value) -> Result<Permissions
     Ok(next)
 }
 
-/// Why a joined session is over, in words for the window. `kicked` and `flood` are the host ending it on purpose.
+/// `text` with its first letter capitalised: a message in the style of `ended_message` as a line of its own.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
+/// Why a joined session is over, in words for the window. `ended`, `kicked` and `flood` are the host ending it on
+/// purpose: `ended` when the host stopped hosting or its world was closed, `kicked` when it removed this player.
 fn ended_message(s: &Status) -> String {
     match (&s.rejected, &s.error) {
+        (Some(why), _) if why.starts_with("ended") => "the host ended the session".to_owned(),
         (Some(why), _) if why.starts_with("kicked") => "the host removed you from the session".to_owned(),
         (Some(why), _) if why.starts_with("flood") => format!("the host disconnected you: {why}"),
         (Some(why), _) => format!("the host rejected us: {why}"),
@@ -1268,9 +1429,19 @@ mod tests {
     /// A host controller that is hosting and a player controller that is idle, each with a folder of its own. The
     /// last value is the player's `join` payload, with the host's address replaced by loopback.
     fn start_pair(root: &Path, options: HostOptions) -> (Controller, Controller, Window, Window, String) {
+        start_pair_saving(root, options, Vec::new(), Vec::new())
+    }
+
+    /// As [`start_pair`], with the folders the host's game saves to and the player's game loads from.
+    fn start_pair_saving(
+        root: &Path,
+        options: HostOptions,
+        host_saves: Vec<PathBuf>,
+        player_saves: Vec<PathBuf>,
+    ) -> (Controller, Controller, Window, Window, String) {
         let (hd, pd) = (root.join("host"), root.join("player"));
-        let mut host = Controller::new(hd.clone(), "Host".into(), Vec::new()).unwrap().with_host_options(options);
-        let player = Controller::new(pd.clone(), "Pat".into(), Vec::new()).unwrap();
+        let mut host = Controller::new(hd.clone(), "Host".into(), host_saves).unwrap().with_host_options(options);
+        let player = Controller::new(pd.clone(), "Pat".into(), player_saves).unwrap();
         let (mut hw, pw) = (Window::new(&hd), Window::new(&pd));
         hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
         assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
@@ -1355,6 +1526,7 @@ mod tests {
         assert_eq!((r["ok"].clone(), r["seq"].clone()), (json!(true), json!(seq)));
         assert!(r["message"].as_str().unwrap().contains("Pat was removed"), "{r}");
         assert!(pw.status()["message"].as_str().unwrap().contains("removed you"), "{:?}", pw.status());
+        assert_eq!(pw.status()["notice"], "The host removed you from the session");
         assert!(fs::read_to_string(root.path().join("player").join("identity.txt")).unwrap().contains("role=idle"));
 
         // a removed window is not stuck: it can join again, and gets a new id
@@ -1460,7 +1632,420 @@ mod tests {
         assert_eq!(hw.status()["capacity"], 3);
     }
 
+    // ---------------------------------------------------------------- the world is closed
+
+    /// How long the games of these tests may be silent before their world counts as closed.
+    const BEAT: Duration = Duration::from_millis(1000);
+    const CLOCK: &str = "{[\"t\"]=18600,[\"speed\"]=0,[\"ahead\"]=3}";
+
+    /// The mod, reduced to its pulse. While its world is open it appends a `clock` line to `from_game.log` about every
+    /// 100 ms and answers a resync the way the real one does: the host's game saves, a player's game loads and is
+    /// silent until it says hello, and every checksum is the same. A closed world reads and writes nothing.
+    struct Game {
+        dir: PathBuf,
+        save_dir: PathBuf,
+        is_host: bool,
+        open: bool,
+        seq: u64,
+        to_game: Tail,
+        /// The host's game takes a save request and never answers it: the round stays in `Saving`.
+        hold_saves: bool,
+        held_save: Option<i64>,
+        /// How long a player's game is silent after it was told to load.
+        load_silence: Duration,
+        hello_at: Option<Instant>,
+        loads: u32,
+        beat_at: Instant,
+    }
+
+    impl Game {
+        fn new(dir: &Path, is_host: bool) -> Game {
+            Game {
+                dir: dir.to_path_buf(),
+                save_dir: dir.join("save"),
+                is_host,
+                open: true,
+                seq: 1,
+                to_game: Tail::new(dir.join(gamelink::TO_GAME)),
+                hold_saves: false,
+                held_save: None,
+                load_silence: Duration::from_millis(500),
+                hello_at: None,
+                loads: 0,
+                beat_at: Instant::now(),
+            }
+        }
+
+        fn say(&mut self, kind: &str, payload: &str) {
+            let line = Line { seq: self.seq, kind: kind.into(), from: "0".into(), payload: payload.into() };
+            self.seq += 1;
+            let mut f = OpenOptions::new().create(true).append(true).open(self.dir.join(gamelink::FROM_GAME)).unwrap();
+            f.write_all(gamelink::format_line(&line).as_bytes()).unwrap();
+        }
+
+        fn announce(&mut self) {
+            self.say("hello", "{[\"time\"]=18600}");
+            self.say("clock", CLOCK);
+        }
+
+        /// The save request the game took and did not answer is answered with a failure.
+        fn fail_held_save(&mut self) {
+            let id = self.held_save.take().expect("a save request is held");
+            self.say(
+                "save_done",
+                &format!("{{[\"id\"]={id},[\"name\"]=\"x\",[\"ok\"]=false,[\"detail\"]=\"disk full\"}}"),
+            );
+        }
+
+        fn step(&mut self) {
+            if !self.open {
+                return;
+            }
+            for line in self.to_game.poll().unwrap_or_default() {
+                match line.kind.as_str() {
+                    "resync_save" if self.is_host => {
+                        let name = text_after(&line.payload, "[\"name\"]=\"").unwrap();
+                        let id = number_after(&line.payload, "[\"id\"]=").unwrap();
+                        if self.hold_saves {
+                            self.held_save = Some(id);
+                        } else {
+                            fs::create_dir_all(&self.save_dir).unwrap();
+                            fs::write(self.save_dir.join(format!("{name}.sav")), b"a world").unwrap();
+                            self.say("save_done", &format!("{{[\"id\"]={id},[\"name\"]=\"{name}\",[\"ok\"]=true}}"));
+                        }
+                    }
+                    "resync_load" => {
+                        self.loads += 1;
+                        self.hello_at = Some(Instant::now() + self.load_silence);
+                    }
+                    "checksum_request" => {
+                        let n = number_after(&line.payload, "[\"n\"]=").unwrap();
+                        let at = number_after(&line.payload, "[\"at\"]=").unwrap();
+                        let parts = "{[\"roads\"]=\"r1\",[\"money\"]=\"m1\"}";
+                        self.say("checksum_report", &format!("{{[\"n\"]={n},[\"time\"]={at},[\"parts\"]={parts}}}"));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(at) = self.hello_at {
+                if Instant::now() < at {
+                    return; // loading: the world is not there
+                }
+                self.hello_at = None;
+                self.announce();
+            }
+            if self.beat_at.elapsed() >= Duration::from_millis(100) {
+                self.beat_at = Instant::now();
+                self.say("clock", CLOCK);
+            }
+        }
+    }
+
+    fn number_after(payload: &str, key: &str) -> Option<i64> {
+        let rest = &payload[payload.find(key)? + key.len()..];
+        let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '-')).unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+
+    fn text_after(payload: &str, key: &str) -> Option<String> {
+        let rest = &payload[payload.find(key)? + key.len()..];
+        Some(rest[..rest.find('"')?].to_owned())
+    }
+
+    /// As [`until`], with the games running too.
+    fn until_games(
+        controllers: &mut [&mut Controller],
+        games: &mut [&mut Game],
+        timeout: Duration,
+        mut done: impl FnMut() -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            for g in games.iter_mut() {
+                g.step();
+            }
+            for c in controllers.iter_mut() {
+                c.step();
+            }
+            if done() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    fn loopback_host_payload() -> &'static str {
+        "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}"
+    }
+
+    fn identity_of(dir: &Path) -> String {
+        fs::read_to_string(dir.join("identity.txt")).unwrap()
+    }
+
+    #[test]
+    fn a_host_whose_world_is_closed_stops_hosting_and_its_player_is_told_the_host_ended_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, player, mut hw, mut pw, join) = start_pair(root.path(), quick());
+        let (mut host, mut player) = (host.with_heartbeat(BEAT), player.with_heartbeat(BEAT));
+        let (mut hg, mut pg) =
+            (Game::new(&root.path().join("host"), true), Game::new(&root.path().join("player"), false));
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        let alive = |hw: &Window, pw: &Window| hw.status()["state"] == "hosting" && pw.status()["state"] == "joined";
+
+        // no line from either game yet: the worlds may still be loading, and nothing ends however long that takes
+        assert!(
+            !until_games(&mut [&mut host, &mut player], &mut [], 2 * BEAT, || !alive(&hw, &pw)),
+            "the session ended before its games had said anything"
+        );
+        // both games talk: still nothing ends
+        assert!(
+            !until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], 2 * BEAT, || !alive(&hw, &pw)),
+            "{:?} {:?}",
+            hw.status(),
+            pw.status()
+        );
+
+        // the host closes its world: it stops hosting, and the player (whose game goes on) is told why
+        hg.open = false;
+        assert!(
+            until_games(&mut [&mut host, &mut player], &mut [&mut pg], Duration::from_secs(10), || {
+                hw.status()["state"] == "idle" && pw.status()["state"] == "failed"
+            }),
+            "host {:?} player {:?}",
+            hw.status(),
+            pw.status()
+        );
+        assert_eq!(hw.status()["notice"], WORLD_CLOSED_NOTICE);
+        assert!(identity_of(&root.path().join("host")).contains("role=idle"));
+        let ps = pw.status();
+        assert_eq!(ps["message"], "the host ended the session", "{ps}");
+        assert_eq!(ps["notice"], "The host ended the session", "{ps}");
+        assert!(identity_of(&root.path().join("player")).contains("role=idle"));
+
+        // the window can host again at once; the old notice is gone, and the lines the game wrote before are no
+        // sign of life: nothing ends before the new session's game has said something
+        hw.send("host", loopback_host_payload());
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
+        assert!(hw.status()["notice"].is_null(), "{:?}", hw.status());
+        assert!(
+            !until_games(&mut [&mut host, &mut player], &mut [], 2 * BEAT, || hw.status()["state"] != "hosting"),
+            "an earlier session's lines ended the new one"
+        );
+    }
+
+    #[test]
+    fn a_player_whose_world_is_closed_leaves_and_the_host_goes_on() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, player, hw, mut pw, join) = start_pair(root.path(), quick());
+        let (mut host, mut player) = (host.with_heartbeat(BEAT), player.with_heartbeat(BEAT));
+        let (mut hg, mut pg) =
+            (Game::new(&root.path().join("host"), true), Game::new(&root.path().join("player"), false));
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || {
+            hw.status()["players"].as_array().is_some_and(|p| p.len() == 2)
+        }));
+        assert!(!until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], 2 * BEAT, || {
+            pw.status()["state"] != "joined"
+        }));
+
+        pg.open = false;
+        assert!(
+            until_games(&mut [&mut host, &mut player], &mut [&mut hg], Duration::from_secs(10), || {
+                pw.status()["state"] == "idle"
+            }),
+            "{:?}",
+            pw.status()
+        );
+        assert_eq!(pw.status()["notice"], WORLD_CLOSED_NOTICE);
+        assert!(identity_of(&root.path().join("player")).contains("role=idle"));
+        // the host frees the slot and keeps hosting: its own game is fine
+        assert!(until_games(&mut [&mut host, &mut player], &mut [&mut hg], Duration::from_secs(10), || {
+            hw.status()["players"].as_array().is_some_and(|p| p.len() == 1)
+        }));
+        assert!(!until_games(&mut [&mut host, &mut player], &mut [&mut hg], 2 * BEAT, || {
+            hw.status()["state"] != "hosting"
+        }));
+        assert!(hw.status()["notice"].is_null());
+    }
+
+    #[test]
+    fn a_host_in_a_resync_round_is_not_taken_for_a_closed_world_until_the_round_is_over() {
+        let t = tempfile::tempdir().unwrap();
+        let mut host = Controller::new(t.path().to_path_buf(), "Host".into(), vec![t.path().join("save")])
+            .unwrap()
+            .with_heartbeat(BEAT);
+        let mut hw = Window::new(t.path());
+        hw.send("host", loopback_host_payload());
+        assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
+        let mut hg = Game::new(t.path(), true);
+        hg.hold_saves = true;
+        hg.announce();
+        assert!(until_games(&mut [&mut host], &mut [&mut hg], Duration::from_secs(10), || {
+            hw.status()["players"][0]["ready"] == true
+        }));
+        hw.send("start", "{}");
+        hw.send("resync", "{}");
+        assert!(
+            until_games(&mut [&mut host], &mut [&mut hg], Duration::from_secs(10), || hw.status()["resync"]
+                == "Saving"),
+            "{:?}",
+            hw.status()
+        );
+        until_games(&mut [&mut host], &mut [&mut hg], Duration::from_millis(300), || false);
+        assert!(hg.held_save.is_some(), "the game took the save request");
+
+        // the game says nothing for several times the limit (a big save, a world being replaced): the round excuses it
+        hg.open = false;
+        assert!(
+            !until_games(&mut [&mut host], &mut [], 2 * BEAT, || hw.status()["state"] != "hosting"),
+            "ended during a round: {:?}",
+            hw.status()
+        );
+        assert_eq!(hw.status()["resync"], "Saving");
+
+        // the round fails: from then on the silence counts, from the end of the round
+        hg.fail_held_save();
+        assert!(until_games(&mut [&mut host], &mut [], Duration::from_secs(5), || {
+            hw.status()["resync"].as_str().is_some_and(|r| r.starts_with("failed"))
+        }));
+        assert!(
+            until_games(&mut [&mut host], &mut [], Duration::from_secs(10), || hw.status()["state"] == "idle"),
+            "{:?}",
+            hw.status()
+        );
+        assert_eq!(hw.status()["notice"], WORLD_CLOSED_NOTICE);
+    }
+
+    #[test]
+    fn a_player_whose_game_reloads_for_a_resync_stays_in_the_session_and_leaves_when_its_world_is_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let saves = (root.path().join("host-user").join("save"), root.path().join("player-user").join("save"));
+        let (host, player, mut hw, mut pw, join) =
+            start_pair_saving(root.path(), quick(), vec![saves.0.clone()], vec![saves.1.clone()]);
+        let (mut host, mut player) = (host.with_heartbeat(BEAT), player.with_heartbeat(BEAT));
+        let mut hg = Game::new(&root.path().join("host"), true);
+        hg.save_dir = saves.0.clone();
+        let mut pg = Game::new(&root.path().join("player"), false);
+        // the load takes several times the limit, as a real one takes half a minute
+        pg.load_silence = 3 * BEAT;
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        hg.announce();
+        pg.announce();
+        assert!(until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_secs(10), || {
+            hw.status()["players"].as_array().is_some_and(|p| p.len() == 2 && p.iter().all(|e| e["ready"] == true))
+        }));
+        until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_millis(500), || false);
+        hw.send("start", "{}");
+        assert!(until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_secs(10), || {
+            hw.status()["started"] == true
+        }));
+
+        hw.send("resync", "{}");
+        let mut player_left = false;
+        let done = until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_secs(60), || {
+            player_left |= pw.status()["state"] != "joined";
+            hw.status()["resync"] == "Idle"
+        });
+        assert!(done, "the round did not end: {:?} / {:?}", hw.status(), pw.status());
+        assert_eq!(pg.loads, 1, "the player's game was told to load the host's save");
+        assert!(!player_left, "the player's silence while loading ended its session");
+        assert_eq!(hw.status()["state"], "hosting");
+
+        // afterwards the pulse counts again: a player whose world is closed now leaves
+        pg.open = false;
+        assert!(
+            until_games(&mut [&mut host, &mut player], &mut [&mut hg], Duration::from_secs(10), || {
+                pw.status()["state"] == "idle"
+            }),
+            "{:?}",
+            pw.status()
+        );
+        assert_eq!(pw.status()["notice"], WORLD_CLOSED_NOTICE);
+        assert_eq!(hw.status()["state"], "hosting");
+    }
+
     // ---------------------------------------------------------------- the pieces
+
+    #[test]
+    fn the_heartbeat_setting_reads_the_environment_value() {
+        let default = Some(Duration::from_secs_f64(HEARTBEAT_SECONDS));
+        assert_eq!(heartbeat_setting(None), default);
+        assert_eq!(heartbeat_setting(Some("")), default);
+        assert_eq!(heartbeat_setting(Some("soon")), default);
+        assert_eq!(heartbeat_setting(Some("nan")), default);
+        assert_eq!(heartbeat_setting(Some(" 2.5 ")), Some(Duration::from_millis(2500)));
+        assert_eq!(heartbeat_setting(Some("0")), None, "zero turns the check off");
+        assert_eq!(heartbeat_setting(Some("-3")), None);
+        assert_eq!(heartbeat_setting(Some("1e99")), Some(Duration::from_secs(3600)), "capped, never a panic");
+    }
+
+    #[test]
+    fn the_pulse_judges_only_after_the_first_line_and_excuses_a_reload() {
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join(gamelink::FROM_GAME);
+        let limit = Duration::from_secs(8);
+        let append = |text: &str| {
+            let mut f = OpenOptions::new().create(true).append(true).open(&log).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        // lines of an earlier session are the baseline, not a sign of life
+        append("1\tclock\t0\t{}\n");
+        let t0 = Instant::now();
+        let mut pulse = Pulse::start(log.clone(), t0);
+        assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(3600)), "no verdict before the first line");
+
+        append("2\tclock\t0\t{}\n");
+        assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(100)), "a line just came");
+        assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(107)));
+        assert!(pulse.silent(limit, false, t0 + Duration::from_secs(108)), "eight seconds without a line");
+
+        // a reload (a round) excuses the silence, however long it is within the grace, and the count starts again after
+        let mut pulse = Pulse::start(log.clone(), t0);
+        append("3\tclock\t0\t{}\n");
+        assert!(!pulse.silent(limit, false, t0));
+        assert!(!pulse.silent(limit, true, t0 + Duration::from_secs(60)));
+        assert!(!pulse.silent(limit, true, t0 + Duration::from_secs(200)));
+        assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(205)), "the count starts when the round ends");
+        assert!(pulse.silent(limit, false, t0 + Duration::from_secs(213)));
+
+        // a round that never ends does not keep a closed world alive for ever
+        let mut pulse = Pulse::start(log.clone(), t0);
+        append("4\tclock\t0\t{}\n");
+        assert!(!pulse.silent(limit, true, t0));
+        assert!(!pulse.silent(limit, true, t0 + RELOAD_GRACE - Duration::from_secs(1)));
+        assert!(pulse.silent(limit, true, t0 + RELOAD_GRACE + limit));
+    }
+
+    #[test]
+    fn the_game_is_reloading_in_a_round_or_between_a_load_and_its_hello() {
+        use crate::process::Role;
+        let mut status = Status::new(Role::Host, "H");
+        assert!(!game_is_reloading(&status));
+        for round in ["Pausing", "Saving", "Transferring", "Loading", "Verifying"] {
+            status.resync = Some(round.to_owned());
+            assert!(game_is_reloading(&status), "{round}");
+        }
+        for over in ["Idle", "failed: the host's game could not save: disk full"] {
+            status.resync = Some(over.to_owned());
+            assert!(!game_is_reloading(&status), "{over}");
+        }
+        let mut player = Status::new(Role::Player, "P");
+        assert!(!game_is_reloading(&player));
+        player.reloading = true;
+        assert!(game_is_reloading(&player));
+    }
+
+    #[test]
+    fn messages_become_sentences() {
+        assert_eq!(sentence("the host ended the session"), "The host ended the session");
+        assert_eq!(sentence("Already one"), "Already one");
+        assert_eq!(sentence(""), "");
+        assert_eq!(sentence("é"), "É");
+    }
 
     #[test]
     fn a_player_entry_has_the_fields_the_window_reads() {

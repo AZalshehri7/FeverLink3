@@ -699,14 +699,23 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.relay.reports[2][0][1], self.relay.reports[2][1][1], "worlds identical after the correction")
         self.assertIn("balance corrected by -5000", self.B.log())
 
-    def test_authority_without_a_recorded_round_is_skipped(self):
+    def test_authority_that_arrives_before_the_game_reaches_the_round_waits_for_it(self):
+        # Seen in a real game: the host reaches a round and sends its values at once; a game a little behind had no account
+        # of its own for that round yet, the values were thrown away every round, and money and loans never followed.
         self.start()
         self.tick(5)
-        self.relay.authority[9] = {"balance": 1, "loan": 2}
+        balance = int(self.B.L.eval("ACCOUNT.balance"))
+        loan = int(self.B.L.eval("ACCOUNT.loan"))
+        self.relay.authority[9] = {"balance": balance + 700, "loan": loan}
         self.relay.send_authority(9)
         self.tick(5)
-        self.assertEqual(self.B.L.eval("#JOURNAL"), 0)
-        self.assertIn("skipped", self.B.log())
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 0, "nothing to measure against yet")
+        self.assertNotIn("skipped", self.B.log(), "it is kept, not thrown away")
+        self.relay.checksum_request(9, self.relay.future_stamp(), False)
+        self.tick(40)
+        self.assertEqual(self.B.L.eval("JOURNAL[1]"), 700, "applied as the difference once the game reached the round")
+        self.assertEqual(self.B.L.eval("#JOURNAL"), 1)
+        self.assertIn("balance corrected by 700", self.B.log())
 
     # ---- resync
 

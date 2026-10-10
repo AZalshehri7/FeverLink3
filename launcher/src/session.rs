@@ -212,10 +212,14 @@ pub struct Status {
     pub roster: Vec<RosterEntry>,
     /// What players may do: the host's own setting, or what the host last announced to this player.
     pub permissions: Permissions,
+    /// This game was told to load a save (a resync load) and has not said hello since: its world is being replaced and
+    /// the mod is silent until the new one is up. Host and player alike (the host's own game loads only with
+    /// `HostOptions::host_reloads`). The live controller does not take that silence for a closed world.
+    pub reloading: bool,
 }
 
 impl Status {
-    fn new(role: Role, name: &str) -> Status {
+    pub(crate) fn new(role: Role, name: &str) -> Status {
         Status {
             role,
             name: name.to_owned(),
@@ -236,6 +240,7 @@ impl Status {
             links: Vec::new(),
             roster: Vec::new(),
             permissions: Permissions::default(),
+            reloading: false,
         }
     }
 }
@@ -263,6 +268,8 @@ struct Shared {
     /// How many lines were ever logged: the ring below holds only the last ones.
     log_total: AtomicU64,
     stop: AtomicBool,
+    /// A host that is stopped tells its players (`HostSession::end_session`). [`SessionHandle::crash`] turns that off.
+    goodbye: AtomicBool,
     echo: bool,
 }
 
@@ -273,6 +280,7 @@ impl Shared {
             logs: Mutex::new(Vec::new()),
             log_total: AtomicU64::new(0),
             stop: AtomicBool::new(false),
+            goodbye: AtomicBool::new(true),
             echo,
         })
     }
@@ -354,6 +362,14 @@ impl SessionHandle {
         }
     }
 
+    /// Stops the session the way a dying process would: the connections are closed and nobody is told why, so the
+    /// players see an outage and reconnect. [`SessionHandle::stop`] is the orderly end, where a host tells its players
+    /// first. For tests of outages.
+    pub fn crash(&self) {
+        self.shared.goodbye.store(false, Ordering::Release);
+        self.stop();
+    }
+
     /// Polls `condition` on the status every 10 ms until it holds (`true`) or `timeout` passes (`false`).
     pub fn wait_for(&self, timeout: Duration, condition: impl Fn(&Status) -> bool) -> bool {
         let deadline = Instant::now() + timeout;
@@ -383,6 +399,10 @@ fn clock_fn() -> Box<dyn Fn() -> f64 + Send> {
 /// `me` is this game's player id: the permissions line is the host's set-based message seen from that player.
 fn write_to_game(link: &mut gamelink::Session, shared: &Shared, kind: MessageKind, payload: &[u8], me: u16) {
     let Some(line_kind) = line_kind_for(kind) else { return };
+    if kind == MessageKind::ResyncLoad {
+        // the game is about to replace its world: silent until its new script says hello
+        shared.update(|s| s.reloading = true);
+    }
     let view;
     let payload = if kind == MessageKind::Permissions {
         match resync::permissions_for_game(payload, me) {
@@ -422,7 +442,13 @@ fn read_from_game(link: &mut gamelink::Session, shared: &Shared) -> Vec<(Message
     let mut out = Vec::new();
     for line in lines {
         match from_game_line(&line) {
-            Ok(m) => out.push(m),
+            Ok(m) => {
+                if m.0 == MessageKind::Hello {
+                    // a script that starts says hello once: the world is up (again)
+                    shared.update(|s| s.reloading = false);
+                }
+                out.push(m);
+            }
             Err(why) => shared.log(why),
         }
     }
@@ -533,6 +559,12 @@ fn host_loop(
         }
         host_dispatch(outputs, host, net, link, save_dirs, shared);
         refresh_host_status(host, net, shared);
+    }
+    // Stopped by its owner (or the transport is gone): say so to every player first. A player that only sees the
+    // connection drop reconnects to nobody for five minutes; one that is told ends its session at once.
+    if shared.goodbye.load(Ordering::Acquire) {
+        let outputs = host.end_session();
+        host_dispatch(outputs, host, net, link, save_dirs, shared);
     }
 }
 
