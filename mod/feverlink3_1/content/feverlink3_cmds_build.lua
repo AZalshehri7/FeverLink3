@@ -175,12 +175,15 @@ function A.list(o, k)
 		local ok, n = pcall(function() return nat:size() end)
 		if ok and type(n) == "number" then
 			local out = {}
+			local fine = true
 			for i = 1, n do
 				local okI, v = pcall(function() return nat:at(i) end)
-				if not okI then error("cannot read " .. k .. "[" .. i .. "]", 0) end
+				if not okI or v == nil then fine = false; break end
 				out[i] = v
 			end
-			return out
+			-- the view's indexing was not what this assumed (seen in the real game: crosswalks[1] of a node
+			-- configuration): the plain copy of the list is slower but is what the game's own scripts read
+			if fine then return out end
 		end
 	end
 	return A.items(get(o, k))

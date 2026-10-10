@@ -46,6 +46,44 @@ for _, M in ipairs(CMDS) do
 	if type(M.capture) == "function" then Build = M end
 end
 
+-- Developer probe (only when the game was started with FEVERLINK3_DEV=1, which a player never does): Lua text the developer
+-- drops into the session folder as dev_gui.lua / dev_sim.lua is run once in that half's Lua state (the interface state
+-- or the simulation state) and its result is appended to dev_gui_out.txt / dev_sim_out.txt. It is how the real shapes of
+-- the engine's objects are looked at without restarting the game for every question. Inert without the variable.
+local DEV = false
+pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
+
+local function devPoll(half)
+	if not DEV then return end
+	local path = C.path("dev_" .. half .. ".lua")
+	local text = C.readFile(path)
+	if type(text) ~= "string" or text == "" then return end
+	C.writeFile(path, "")
+	local lines = {}
+	local env = setmetatable({
+		api = api, C = C, L = L, Build = Build, CMDS = CMDS,
+		print = function(...)
+			local t = {}
+			for i = 1, select("#", ...) do t[#t + 1] = tostring((select(i, ...))) end
+			lines[#lines + 1] = table.concat(t, "\t")
+		end,
+	}, { __index = _G })
+	local f, err = load(text, "dev_" .. half, "t", env)
+	local out
+	if not f then
+		out = "COMPILE ERROR: " .. tostring(err)
+	else
+		local ok, res = pcall(f)
+		if ok then
+			local okS, ser = pcall(C.serialize, res)
+			out = (#lines > 0 and (table.concat(lines, "\n") .. "\n") or "") .. "RESULT: " .. (okS and ser or tostring(res))
+		else
+			out = (#lines > 0 and (table.concat(lines, "\n") .. "\n") or "") .. "ERROR: " .. tostring(res)
+		end
+	end
+	C.appendFile(C.path("dev_" .. half .. "_out.txt"), "---- t=" .. tostring(os.clock()) .. "\n" .. out .. "\n")
+end
+
 local STEP = L.STEP
 local REPLAY_STEPS = 12 -- a replayed build's engine event is expected within this many steps of the command
 local OUT_KEEP = 40
@@ -322,6 +360,15 @@ local function simCaptureBuild(state, param)
 	if not ok then body, why = nil, tostring(body) end
 	if not body then
 		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(why))
+		-- the first few failures leave the raw proposal in a file, to see the real shapes (members of engine objects)
+		st.rawDumped = (st.rawDumped or 0) + 1
+		if st.rawDumped <= 4 and Build.adapter and Build.adapter.dump then
+			pcall(function()
+				local text = C.serialize(Build.adapter.dump(proposal))
+				C.appendFile(C.path("raw_builds.txt"), "==== t=" .. now .. " why: " .. tostring(why) .. "\n" .. text:sub(1, 60000) .. "\n")
+			end)
+		end
+		state:set(st)
 		return
 	end
 	body.native = true
@@ -336,6 +383,15 @@ local function simCaptureBuild(state, param)
 	trim(st.out, OUT_KEEP)
 	state:set(st)
 	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, " .. string.format("%.3f", os.clock() - t0) .. " s)")
+	-- self-check: could this record be rebuilt here, the way another game will rebuild it? Only the engine's command
+	-- factory is called, nothing is sent.
+	local okC, args, whyC = pcall(L.decodeCommand, body, simCtx(st, { from = C.PLAYER_ID, at = now, key = "self-check" }))
+	if not okC then args, whyC = nil, tostring(args) end
+	if args then
+		logSim("native build self-check: can be rebuilt (" .. tostring(args.chain and (#args.chain + 1) or 1) .. " command(s))")
+	else
+		logSim("native build self-check FAILED: " .. tostring(whyC))
+	end
 end
 
 local function simApplyAction(st, it, now)
@@ -494,6 +550,8 @@ local function update(userParams, state, dt)
 		SIM.subscribed = true
 		pcall(function() state:subscribeToAllEvents() end)
 	end
+	SIM.devTick = (SIM.devTick or 0) + 1
+	if SIM.devTick % 4 == 0 then devPoll("sim") end
 	local ok, err = pcall(function()
 		local st = simState(state)
 		local now = engine.gameTime()
@@ -572,6 +630,9 @@ local G = {
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
 	outSeen = {},             -- native builds the simulation half captured that this half already shipped
+	uiSeq = {},               -- id of a command record from the UI-state hook -> the sequence number it was shipped as
+	authPending = {},         -- round -> a host authority that arrived before this game reached that round
+	bindsWritten = nil,       -- text of the last binds.txt (the UI-state hook reads it to name entities)
 }
 
 -- The originals are kept in package.loaded so a savegame reload (which re-runs this file in the same Lua state)
@@ -634,11 +695,30 @@ end
 -- the engine's own result binds the created entity and answers the originator.
 -- A finished checksum round: remembered (the host's authority is measured against it) and sent. The host's report
 -- carries its account as `authority`; the players apply it when it comes back as an `authority` line.
+-- The host's money values of a checksum round, applied as the difference to this game's own at the same round. The host
+-- reaches a round and sends its values at once; a game that is a little behind has no account of its own for that round
+-- yet, so the values wait here (seen in a real game: every round was skipped, so money and loans never followed).
+local function applyAuthority(p)
+	local own = G.accountAt[p.n]
+	if not own then return false end
+	local applied, failed = L.applyAuthority(engine, own, p.values)
+	if applied.balance then logGui("host authority: balance corrected by " .. applied.balance .. " (round " .. tostring(p.n) .. ")") end
+	if applied.loan then logGui("host authority: loan corrected by " .. applied.loan .. " (round " .. tostring(p.n) .. ")") end
+	for _, name in ipairs(failed) do logGui("host authority: " .. name .. " differs but this build cannot correct it") end
+	return true
+end
+
 local function reportRound(n, t, parts, account)
 	G.reportsSent[n] = true
 	G.accountAt[n] = account
 	G.accountAt[n - 40] = nil
 	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil })
+	local waiting = G.authPending[n]
+	if waiting then
+		G.authPending[n] = nil
+		local ok, err = pcall(applyAuthority, waiting)
+		if not ok then logGui("host authority failed: " .. tostring(err)) end
+	end
 end
 
 -- companies: hands an action this half applied to the simulation half, which keeps the registry in the savegame
@@ -742,6 +822,16 @@ end
 
 -- A build the player made with a native tool, captured by the simulation half (simCaptureBuild): stamped and shipped
 -- like any other action. The engine applied it already, so it is not queued here; the other games rebuild it at the stamp.
+-- (TpF2 Multiplayer stamps past the fastest other clock for the same reason: a game that has passed the stamp
+-- applies the action late, and the worlds fork.)
+local function stampAfterFastest(now)
+	local base = now
+	for _, pc in pairs(G.peers) do
+		if type(pc) == "table" and type(pc.t) == "number" and pc.t > base then base = pc.t end
+	end
+	return L.stampFor(G.session, base)
+end
+
 local function shipNative(o)
 	local body = C.parse(o.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
@@ -753,9 +843,23 @@ local function shipNative(o)
 	local category = adds == 0 and "bulldoze" or "build"
 	local now = engine.gameTime()
 	G.seq = G.seq + 1
-	local at = L.stampFor(G.session, now)
+	local at = stampAfterFastest(now)
 	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
+	return true
+end
+
+-- A command a window issued, recorded by the UI-state hook (feverlink3_uihook.lua), which applied it natively already:
+-- stamped and shipped; the other games apply it at the stamp.
+local function shipUiCommand(p)
+	local body = C.parse(p.body)
+	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
+	local now = engine.gameTime()
+	G.seq = G.seq + 1
+	G.uiSeq[p.id] = G.seq
+	local at = stampAfterFastest(now)
+	send("action", { stamp = at, seq = G.seq, body = p.body, category = type(p.category) == "string" and p.category or "other" })
+	logGui("window command " .. tostring(body.fn) .. " " .. L.itemKey(C.PLAYER_ID, G.seq) .. " stamped " .. at .. " (now " .. now .. ")")
 	return true
 end
 
@@ -765,7 +869,7 @@ local function shipLocal(tag, cb)
 	if not body then return false, err end
 	local now = engine.gameTime()
 	G.seq = G.seq + 1
-	local at = L.stampFor(G.session, now)
+	local at = stampAfterFastest(now)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
 	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
 	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args) })
@@ -908,13 +1012,12 @@ end
 
 -- Host authority at a checkpoint: this game's money is corrected to the host's values, measured at the same round.
 H.authority = function(rec, p)
-	if C.PLAYER_ID == 0 or type(p) ~= "table" or type(p.values) ~= "table" then return end
-	local own = G.accountAt[p.n]
-	if not own then logGui("authority for round " .. tostring(p.n) .. " skipped: no account recorded for it"); return end
-	local applied, failed = L.applyAuthority(engine, own, p.values)
-	if applied.balance then logGui("host authority: balance corrected by " .. applied.balance .. " (round " .. tostring(p.n) .. ")") end
-	if applied.loan then logGui("host authority: loan corrected by " .. applied.loan .. " (round " .. tostring(p.n) .. ")") end
-	for _, name in ipairs(failed) do logGui("host authority: " .. name .. " differs but this build cannot correct it") end
+	if C.PLAYER_ID == 0 or type(p) ~= "table" or type(p.values) ~= "table" or type(p.n) ~= "number" then return end
+	if not applyAuthority(p) then
+		-- this game has not reached the round yet: keep the values until it reports it
+		G.authPending[p.n] = p
+		G.authPending[p.n - 40] = nil
+	end
 end
 
 H.resync_save = function(rec, p)
@@ -1080,6 +1183,23 @@ local function serviceWindow()
 				send("chat", { text = text })
 				Hud.addChat(G.hud, C.PLAYER_NAME, text, C.PLAYER_ID)   -- the host does not echo a message to its sender
 			end
+		elseif rec.kind == "cmd" then
+			local p = C.parse(rec.payload)
+			if type(p) == "table" and type(p.body) == "string" and type(p.id) == "number" then
+				local okN, okShip, whyShip = pcall(shipUiCommand, p)
+				if not okN then logGui("shipping a window command failed: " .. tostring(okShip))
+				elseif not okShip then logGui("a window command was not shipped: " .. tostring(whyShip)) end
+			end
+		elseif rec.kind == "bind" then
+			-- the entity a window command created here, named by the key the other games give theirs
+			local p = C.parse(rec.payload)
+			local seq = type(p) == "table" and G.uiSeq[p.id] or nil
+			if seq and type(p.e) == "number" then
+				local key = L.itemKey(C.PLAYER_ID, seq)
+				G.bind[key] = p.e
+				G.rev[p.e] = key
+				toSim("bind", { key = key, e = p.e })
+			end
 		elseif rec.kind == "speed" then
 			-- a speed button of the window: the session speed is the host's to decide, so it is a request, like the
 			-- one the game's own speed buttons make (0 pauses)
@@ -1101,6 +1221,10 @@ local function serviceWindow()
 	end
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
 	coGuard("page", writeCompanies)
+	if G.frames % 30 == 0 then
+		local okB, text = pcall(C.serialize, G.bind)
+		if okB and text ~= G.bindsWritten and C.writeFile(C.path("binds.txt"), text) then G.bindsWritten = text end
+	end
 end
 
 -- companies: in separate mode (experimental, docs/COMPANIES.md section 8) this game's windows act as the player's own
@@ -1149,6 +1273,7 @@ local function guiUpdate(userParams, state, guiState)
 		send("hello", { time = engine.gameTime(), name = C.PLAYER_NAME })
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
+	if G.frames % 20 == 0 then devPoll("gui") end
 	local ok, err = pcall(function()
 		readLink()
 		serviceWindow()

@@ -15,6 +15,11 @@ if not okC then C = ug_require("feverlink3_1::/feverlink3_common.lua") end
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
 if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 
+-- The hook that wraps the game's command functions in this Lua state (the windows' own), feverlink3_uihook.lua
+local okK, Hook = pcall(ug_require, "feverlink3_uihook.lua")
+if not okK then okK, Hook = pcall(ug_require, "feverlink3_1::/feverlink3_uihook.lua") end
+if not okK or type(Hook) ~= "table" then Hook = nil end
+
 local log = C.logger("ui")
 local M = {}
 local U = { model = nil, outbox = nil, ctl = nil, ctlVersion = nil, cmd = nil }
@@ -45,15 +50,15 @@ local function command(kind, params)
 	return C.writerSend(U.cmd, kind, params)
 end
 
-local function send(text)
+-- ui_out.log has one writer (its sequence numbers only increase), which the hook owns when it is there
+local function outbox()
+	if Hook then return Hook.outbox() end
 	if not U.outbox then U.outbox = Hud.newOutbox(C) end
-	return Hud.sendChat(C, U.outbox, text)
+	return U.outbox
 end
 
--- a speed button of the window (0 pauses): a record for the bridge, which asks the host
-local function sendSpeed(n)
-	if not U.outbox then U.outbox = Hud.newOutbox(C) end
-	return C.writerSend(U.outbox, "speed", { n = n })
+local function send(text)
+	return Hud.sendChat(C, outbox(), text)
 end
 
 -- ---- drawing
@@ -107,6 +112,7 @@ local function setup(react, builtin)
 		local steamIn = react.useState("")
 		local showTest = react.useState(false)
 		react.onStepTimer(function()
+			if Hook then Hook.devPoll() end
 			local a = poll()
 			local b = pollCtl()
 			if a or b then tick:set(tick:old() + 1) end
@@ -231,8 +237,6 @@ local function setup(react, builtin)
 			add(gap())
 			add(section("Session"))
 			add(note(Hud.statusText(m)))
-			local function speedButton(label, n) return button(label, function() sendSpeed(n) end, "secondary", math.floor(WIDTH / 4) - 10) end
-			add(box(H, { speedButton("Pause", 0), speedButton("1x", 1), speedButton("2x", 2), speedButton("3x", 3) }))
 			for _, line in ipairs(Hud.chatLines(m, 12)) do add(note(line)) end
 			add(field("Type a message and press Send", typed:old(), function(v) typed:set(v) end))
 			add(button("Send", function()
@@ -282,6 +286,10 @@ do
 	local okB, builtin = pcall(ug_require, "::/gui/main/builtin.lua")
 	local okE, entry = pcall(ug_require, "::/gui/game_bar/game_bar_widgets.tl")
 	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
+	if Hook and C.DIR and C.IO then
+		local okI, errI = pcall(Hook.install)
+		if not okI then print("[feverlink3] UI hook failed: " .. tostring(errI)) end
+	end
 	if okR and okB and okE and entry and entry.GameBarInfoDisplayExtension then
 		local okS, recipeFn = pcall(function()
 			if C.DIR and C.IO then return setup(react, builtin) end
