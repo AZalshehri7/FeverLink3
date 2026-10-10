@@ -27,6 +27,8 @@ use feverlink3_core::session::ConnectionId;
 
 /// How long [`ClientNet::connect`] waits for each endpoint.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one socket write may wait for the peer to read before the connection is given up.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the sockets tell the session thread.
 #[derive(Debug)]
@@ -109,6 +111,10 @@ struct Link {
 impl Link {
     fn new(stream: TcpStream) -> io::Result<Arc<Link>> {
         stream.set_nodelay(true)?;
+        // One peer that stops reading must not freeze the host thread for ever: a write that makes no progress for
+        // this long fails and the connection closes. Generous, so a big savegame streamed to a slow link (each
+        // write is at most a chunk of about 350 KB) is not cut off.
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let writer = Mutex::new(BufWriter::new(stream.try_clone()?));
         Ok(Arc::new(Link { writer, stream, closed: AtomicBool::new(false) }))
     }
@@ -522,15 +528,17 @@ mod tests {
     #[test]
     fn connect_tries_endpoints_in_order_and_reports_failure() {
         let (tx, _rx) = mpsc::channel();
-        let dead = {
-            let l = TcpListener::bind(loopback()).unwrap();
-            l.local_addr().unwrap()
-        };
+        // A dead address that stays dead: the port is held by a listener for the whole test (a port that was only
+        // freed could be taken by a test running in parallel), and the address is another loopback address than the
+        // one the listener is bound to, where nothing listens.
+        let holder = TcpListener::bind(loopback()).unwrap();
+        let dead = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), holder.local_addr().unwrap().port()));
         assert!(ClientNet::connect(&[dead], 1, tx.clone()).is_err());
         assert!(ClientNet::connect(&[], 1, tx.clone()).is_err());
         let (htx, _hrx) = mpsc::channel();
         let host = HostNet::bind(loopback(), htx).unwrap();
         let ok = ClientNet::connect(&[dead, host.local_addr()], 2, tx).unwrap();
         assert_eq!(ok.peer(), host.local_addr());
+        drop(holder);
     }
 }

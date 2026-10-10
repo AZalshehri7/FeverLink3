@@ -39,6 +39,14 @@ impl SessionKey {
         secret
     }
 
+    /// As [`SessionKey::new_secret`], but `None` when the random source fails instead of a panic: for code that runs
+    /// inside the game, where a panic ends the process.
+    pub fn try_new_secret() -> Option<[u8; Self::SECRET_SIZE]> {
+        let mut secret = [0u8; Self::SECRET_SIZE];
+        getrandom::getrandom(&mut secret).ok()?;
+        Some(secret)
+    }
+
     /// `None` and `Some("")` both mean no password.
     pub fn derive(secret: &[u8; Self::SECRET_SIZE], password: Option<&str>) -> Self {
         let mut ikm = Vec::with_capacity(Self::SECRET_SIZE + Self::KEY_SIZE);
@@ -118,9 +126,24 @@ pub struct Sealer {
 impl Sealer {
     pub const NONCE_SIZE: usize = 12;
     pub const TAG_SIZE: usize = 16;
+    /// A sender's counter lives in `epoch << EPOCH_SHIFT ..`: the low 40 bits count frames, the high 24 are the epoch.
+    pub const EPOCH_SHIFT: u32 = 40;
+    /// The largest epoch; a sender id that has been used this many times is not reused.
+    pub const MAX_EPOCH: u32 = (1 << 24) - 1;
 
     pub fn new(key: &SessionKey, sender: u16) -> Self {
         Self { aes: cipher(key), sender, counter: 0 }
+    }
+
+    /// A sealer for a sender id that may have been used before under this key (a player coming back). Its counter
+    /// starts at `epoch << 40`, above every counter an earlier epoch can reach, so no nonce repeats and the receiver's
+    /// replay window sees the new frames as newer. `None` when `epoch` is over [`Sealer::MAX_EPOCH`].
+    pub fn with_epoch(key: &SessionKey, sender: u16, epoch: u32) -> Option<Self> {
+        (epoch <= Self::MAX_EPOCH).then(|| Self {
+            aes: cipher(key),
+            sender,
+            counter: u64::from(epoch) << Self::EPOCH_SHIFT,
+        })
     }
 
     pub fn sender(&self) -> u16 {

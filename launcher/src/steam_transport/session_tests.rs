@@ -382,6 +382,41 @@ fn a_player_reconnects_over_steam_after_the_host_stops_and_returns() {
 }
 
 #[test]
+fn a_player_whose_steam_connection_dies_comes_back_as_itself() {
+    let table = Table::new(HostOptions::default(), Vec::new());
+    let player = table.player("Pat");
+    assert!(player.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+    let id = player.handle.status().my_id.unwrap();
+    let other = table.player("Bob");
+    assert!(other.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+
+    // the network under the host's connections dies (Steam reports a timeout on both ends)
+    table.machine.break_connections();
+    assert!(player.handle.wait_for(WAIT, |s| s.reconnecting || s.my_id.is_none()), "{:?}", player.handle.logs());
+    // her launcher connects again by itself and the host gives her the slot she held: same id, no new player
+    assert!(
+        player.handle.wait_for(WAIT, |s| s.connected && !s.reconnecting && s.my_id == Some(id)),
+        "{:?}\n{:?}",
+        player.handle.status().my_id,
+        player.handle.logs()
+    );
+    assert!(player.handle.status().reconnect_attempts >= 1);
+    assert!(other.handle.wait_for(WAIT, |s| s.connected && !s.reconnecting));
+    let roster = table.handle.status().roster;
+    let ids: Vec<u16> = roster.iter().map(|e| e.id).collect();
+    assert_eq!(ids.len(), 3, "the host and two players, not three players: {roster:?}");
+    assert!(
+        table.handle.wait_for(WAIT, |s| s
+            .roster
+            .iter()
+            .all(|e| e.state == feverlink3_core::session::ConnectionState::Connected)),
+        "{:?}",
+        table.handle.status().roster
+    );
+    assert!(table.handle.logs().iter().any(|l| l.contains("Pat is back")), "{:?}", table.handle.logs());
+}
+
+#[test]
 fn stopping_a_player_does_not_wait_for_a_route_that_never_comes() {
     let table = Table::new(HostOptions::default(), Vec::new());
     let player = table.player_with("Pat", &table.key, |c| c.connect_timeout = Duration::from_secs(60));
@@ -398,18 +433,19 @@ fn stopping_a_player_does_not_wait_for_a_route_that_never_comes() {
 }
 
 #[test]
-fn a_full_table_of_eight_players_works_and_a_ninth_is_told_the_table_is_full() {
+fn a_full_table_of_eight_games_works_and_one_more_is_told_the_table_is_full() {
     let mut table = Table::new(HostOptions::default(), Vec::new());
-    let mut players: Vec<Player> = (0..8).map(|i| table.player(&format!("P{i}"))).collect();
+    // the table holds eight games: the host and seven players
+    let mut players: Vec<Player> = (0..7).map(|i| table.player(&format!("P{i}"))).collect();
     for p in &players {
         assert!(p.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()), "{:?}", p.handle.logs());
     }
-    assert!(table.handle.wait_for(WAIT, |s| s.players.len() == 9), "the host and eight players");
-    assert!(table.handle.wait_for(WAIT, |s| s.links.len() == 8));
+    assert!(table.handle.wait_for(WAIT, |s| s.players.len() == 8), "the host and seven players");
+    assert!(table.handle.wait_for(WAIT, |s| s.links.len() == 7));
     let mut ids: Vec<u16> = players.iter().map(|p| p.handle.status().my_id.unwrap()).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 8, "eight distinct ids");
+    assert_eq!(ids.len(), 7, "seven distinct ids");
 
     // one action from one player reaches the other seven and the host
     players[0].game.write("action", "{[\"body\"]=\"hi\",[\"seq\"]=1,[\"stamp\"]=2400}");
@@ -419,11 +455,11 @@ fn a_full_table_of_eight_players_works_and_a_ninth_is_told_the_table_is_full() {
         table.game.saw("action", "\"hi\"") && players.iter().skip(1).all(|p| p.game.saw("action", "\"hi\""))
     }));
 
-    // the ninth is welcomed by Steam and turned away by the session
+    // the next one is welcomed by Steam and turned away by the session
     let ninth = table.player("P8");
     assert!(ninth.handle.wait_for(WAIT, |s| s.finished), "{:?}", ninth.handle.logs());
     assert_eq!(ninth.handle.status().rejected.as_deref(), Some("full (8 players)"));
-    assert_eq!(table.handle.status().players.len(), 9);
+    assert_eq!(table.handle.status().players.len(), 8);
     for p in &players {
         assert!(p.handle.status().connected, "the others are untouched");
     }

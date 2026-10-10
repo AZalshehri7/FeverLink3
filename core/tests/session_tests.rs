@@ -221,12 +221,17 @@ fn other_version_is_rejected_with_both_versions_named() {
 }
 
 #[test]
-fn session_is_full_at_max_players() {
-    let mut h = Harness::with("Hote", HostOptions { max_players: 2, ..HostOptions::default() });
-    h.connect("A");
-    h.connect("B");
+fn session_is_full_at_max_players_and_the_host_counts() {
+    let mut h = Harness::with("Hote", HostOptions { max_players: 3, ..HostOptions::default() });
+    let a = h.connect("A");
+    let b = h.connect("B");
     let c = h.connect("C");
-    assert_eq!("full", h.p(c).reject.as_ref().unwrap().reason);
+    assert_eq!(PlayerState::Joined, h.p(a).session.state());
+    assert_eq!(PlayerState::Joined, h.p(b).session.state());
+    let reject = h.p(c).reject.as_ref().unwrap();
+    assert_eq!("full", reject.reason);
+    assert_eq!(Some("3 players"), reject.detail.as_deref());
+    assert_eq!(3, h.host.players().len());
 }
 
 #[test]

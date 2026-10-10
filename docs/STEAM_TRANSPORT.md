@@ -107,8 +107,8 @@ The rules at the top of `net.rs` hold: `Closed` exactly once and last; no frames
   by Steam after its connected timeout (`timed out (5003)`; believed to be about 10 s by default, not stated in the
   header).
 - **Turned away.** A host keeps at most 64 connections, handshakes pending included; the 65th is closed at once and
-  the session never hears of it. The session itself allows the host and 8 players; a ninth is rejected `full (8
-  players)` and told so.
+  the session never hears of it. The session itself holds eight games (`max_players` counts the host: the host and
+  seven players); the next one is rejected `full (8 players)` and told so.
 
 ## 6. What the window can show
 
@@ -210,7 +210,8 @@ in the code), give the code to B, press *Join* on B.
 5. During play `links` should show the host a ping per player and a player the ping to the host.
 
 **Cannot be tested:** two game processes of the *same* account on one PC (Steam runs one instance per account), and
-a full table of 8 players (needs 9 accounts; the transport and the session are tested with 8 on the fake).
+a full table of eight games (needs 8 accounts; the transport is tested with 8 clients and the session with a full table
+on the fake).
 
 ## 10. Failure modes
 

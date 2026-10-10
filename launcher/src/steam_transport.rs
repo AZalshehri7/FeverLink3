@@ -50,7 +50,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long [`SteamHostNet::listen`] waits for Steam to be initialised.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(15);
-/// Connections a host keeps at once (waiting for their handshake included). A session has at most 8 players; this
+/// Connections a host keeps at once (waiting for their handshake included). A session has at most 8 games (the host and seven players); this
 /// only stops a stranger who knows the Steam ID from using up memory.
 pub const MAX_CONNECTIONS: usize = 64;
 /// The status texts a connection attempt reports.
