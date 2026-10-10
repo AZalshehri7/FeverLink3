@@ -40,10 +40,13 @@ function Demo-PatchSettings {
 function Start-GameInstance([string]$LiveName) {
     $env:FEVERLINK3_LIVE_DIR = Join-Path $env:LOCALAPPDATA ('FeverLink3\' + $LiveName)
     $env:FEVERLINK3_TRANSPORT = 'tcp-loopback'
+    # the single-worker script pool (docs/ARCHITECTURE.md section 7): without it two games on a many-core PC update their scripts in
+    # different orders and town growth drifts. FL3_DEMO_POOLPATCH=0 turns it off to see the drift.
+    $env:FEVERLINK3_POOLPATCH = if ($env:FL3_DEMO_POOLPATCH) { $env:FL3_DEMO_POOLPATCH } else { '1' }
     if ($env:FL3_DEMO_DEV) { $env:FEVERLINK3_DEV = $env:FL3_DEMO_DEV }   # '1': the developer probe (dev_gui.lua / dev_sim.lua in the live folder)
     if ($env:FL3_DEMO_HOST_RELOAD) { $env:FEVERLINK3_HOST_RELOAD = $env:FL3_DEMO_HOST_RELOAD }   # '1': the host's game reloads too
     try { Start-Process (Join-Path $Demo.Game 'TransportFever3.exe') -WorkingDirectory $Demo.Game -PassThru }
-    finally { $env:FEVERLINK3_LIVE_DIR = $null; $env:FEVERLINK3_TRANSPORT = $null; $env:FEVERLINK3_HOST_RELOAD = $null; $env:FEVERLINK3_DEV = $null }
+    finally { $env:FEVERLINK3_LIVE_DIR = $null; $env:FEVERLINK3_TRANSPORT = $null; $env:FEVERLINK3_HOST_RELOAD = $null; $env:FEVERLINK3_DEV = $null; $env:FEVERLINK3_POOLPATCH = $null }
 }
 
 # --- screen positions inside one game window (client pixels; both windows have the same layout)

@@ -66,6 +66,31 @@ class Game:
             return self.probe(half, f.read())
 
 
+    def click_run(self, lua, click_fn, timeout=25):
+        """Runs `lua` in the game's UI state from inside a click on the window's DEV button (commands may only be sent from
+        there). `click_fn()` clicks the button. Returns what the script returned."""
+        out = os.path.join(self.dir, "dev_click_out.txt")
+        before = os.path.getsize(out) if os.path.exists(out) else 0
+        with open(os.path.join(self.dir, "dev_click.lua"), "w", encoding="utf-8") as f:
+            f.write(lua)
+        click_fn()
+        end = time.time() + timeout
+        while time.time() < end:
+            if os.path.exists(out) and os.path.getsize(out) > before:
+                with open(out, encoding="utf-8", errors="replace") as f:
+                    f.seek(before)
+                    text = f.read()
+                for marker in ("RESULT: ", "ERROR: ", "COMPILE ERROR: "):
+                    at = text.find(marker)
+                    if at >= 0:
+                        body = text[at + len(marker):].strip()
+                        if marker == "RESULT: ":
+                            return to_py(_L.eval(body))
+                        raise RuntimeError("click script on %s: %s" % (self.role, body[:600]))
+            time.sleep(0.4)
+        raise TimeoutError("the DEV run button of the %s did not answer (is its window open?)" % self.role)
+
+
 HOST = Game("host", "live1")
 GUEST = Game("guest", "live2")
 

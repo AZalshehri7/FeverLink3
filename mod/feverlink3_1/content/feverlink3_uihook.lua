@@ -280,5 +280,44 @@ function M.devPoll()
 	C.appendFile(C.path("dev_ui_out.txt"), "---- t=" .. tostring(os.clock()) .. "\n" .. out .. "\n")
 end
 
+-- DEV only: the same as devPoll, but for the file dev_click.lua and called from a button's click handler. The engine lets
+-- a command be sent only from where a player's click leads (not from a timer), so a command made with the game's own api
+-- through here goes the way a window's command goes: the hook sees it, the engine applies it, the other game replays it.
+function M.devClick()
+	if not DEV then return end
+	local path = C.path("dev_click.lua")
+	local text = C.readFile(path)
+	if type(text) ~= "string" or text == "" then
+		C.appendFile(C.path("dev_click_out.txt"), "---- t=" .. tostring(os.clock()) .. "\nNOTHING TO RUN\n")
+		return
+	end
+	C.writeFile(path, "")
+	local lines = {}
+	local env = setmetatable({
+		api = api, C = C, L = L, Hook = M, U = U,
+		print = function(...)
+			local t = {}
+			for i = 1, select("#", ...) do t[#t + 1] = tostring((select(i, ...))) end
+			lines[#lines + 1] = table.concat(t, "\t")
+		end,
+	}, { __index = _G })
+	local f, err = load(text, "dev_click", "t", env)
+	local out
+	if not f then
+		out = "COMPILE ERROR: " .. tostring(err)
+	else
+		local ok, res = pcall(f)
+		local head = #lines > 0 and (table.concat(lines, "\n") .. "\n") or ""
+		if ok then
+			local okS, ser = pcall(C.serialize, res)
+			out = head .. "RESULT: " .. (okS and ser or tostring(res))
+		else
+			out = head .. "ERROR: " .. tostring(res)
+		end
+	end
+	C.appendFile(C.path("dev_click_out.txt"), "---- t=" .. tostring(os.clock()) .. "\n" .. out .. "\n")
+end
+
+M.dev = DEV
 M.stats = U.stats
 return M

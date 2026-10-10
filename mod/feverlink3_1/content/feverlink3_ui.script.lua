@@ -265,6 +265,11 @@ local function setup(react, builtin)
 				if send(typed:old()) then typed:set("") end
 			end))
 		end
+		-- developer test button (FEVERLINK3_DEV=1 only): runs dev_click.lua from inside a click, where commands may be sent.
+		-- The first row, so that its place in the window does not depend on what the window shows.
+		if Hook and Hook.dev then
+			table.insert(rows, 1, button("DEV run", function() Hook.devClick() end, "secondary"))
+		end
 		return builtin.Window{
 			title = "FeverLink3 Multiplayer",
 			id = "window.feverlink3",

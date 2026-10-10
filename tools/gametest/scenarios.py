@@ -64,16 +64,83 @@ def ui(game, lua):
         return g.probe("ui", lua, timeout=20)
 
 
+# The freeze and the resume use the game's own pause and play buttons in the bottom bar (the same path a player takes).
+BAR_PAUSE, BAR_PLAY, BAR_2X, BAR_3X, BAR_Y = 1087, 1104, 1119, 1135, 1336
+
+
+def native_freeze(timeout=40):
+    click("host", BAR_PAUSE, BAR_Y, 1.0)
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(1.5)
+        a, b = S.HOST.fingerprint(), S.GUEST.fingerprint()
+        if a.get("time") == b.get("time"):
+            time.sleep(1.0)
+            a2 = S.HOST.fingerprint()
+            if a2.get("time") == a.get("time"):
+                return a2, S.GUEST.fingerprint()
+    raise TimeoutError("the two games did not stop at one game time")
+
+
+def native_resume(speed=1):
+    click("host", {1: BAR_PLAY, 2: BAR_2X, 3: BAR_3X}[speed], BAR_Y, 1.0)
+
+
+S.freeze, S.resume = native_freeze, native_resume
+
+
+DEV_BUTTON = (400, 340)   # the DEV run button: the first row of the mod window (calibrated on a screenshot)
+
+
+def dev(game, lua):
+    """Runs Lua in a game's UI state from inside a click on the window's DEV button (the one place the engine lets a
+    command be sent from). Opens the window first when the button does not answer."""
+    g = S.HOST if game == "host" else S.GUEST
+    try:
+        return g.click_run(lua, lambda: click(game, DEV_BUTTON[0], DEV_BUTTON[1], 0.5), timeout=6)
+    except TimeoutError:
+        click(game, 747, 1338, 3.0)
+        return g.click_run(lua, lambda: click(game, DEV_BUTTON[0], DEV_BUTTON[1], 0.5), timeout=20)
+
+
 def record(label, ok):
     RESULTS.append((label, ok))
 
 
-def run(label, fn):
-    """Runs a scenario step and records PASS/FAIL (a crash is a FAIL with the reason printed)."""
+def changed_sections(before, after):
+    """Which parts of the world differ between two fingerprints of the same game (time does not count)."""
+    out = []
+    for k in sorted(set(before) | set(after)):
+        if k == "time":
+            continue
+        va, vb = before.get(k), after.get(k)
+        if isinstance(va, dict) and isinstance(vb, dict) and "hash" in va:
+            if va.get("hash") != vb.get("hash"):
+                out.append("%s %s->%s" % (k, va.get("n"), vb.get("n")))
+        elif va != vb:
+            out.append("%s %s->%s" % (k, va, vb))
+    return out
+
+
+def run(label, fn, expect=None, effect=True):
+    """Runs a scenario step. PASS needs (1) both worlds identical at one game time, (2) no resync and no differing checksum
+    round meanwhile, and (3) when `effect` is true, that the action changed the world (otherwise it did nothing and the
+    comparison proves nothing). `expect` is a section name that must be among the changes."""
     S.mark()
     try:
+        before = S.HOST.fingerprint()
         fn()
         ok, problems = S.check(label)
+        after = S.HOST.fingerprint()
+        changes = changed_sections(before, after)
+        if effect and not changes:
+            print("FAIL  %s: the action changed nothing (the click or command did not take effect)" % label)
+            ok = False
+        elif expect and not any(c.startswith(expect) for c in changes):
+            print("FAIL  %s: expected a change in %s, saw %s" % (label, expect, changes))
+            ok = False
+        else:
+            print("      changed: %s" % (", ".join(changes) or "nothing (expected)"))
         record(label, ok)
     except Exception as e:  # noqa: BLE001
         print("FAIL  %s: %s" % (label, e))
@@ -102,25 +169,62 @@ def economy():
     run("loan obtained on the guest (real window)", lambda: obtain("guest", 533))
 
 
-def names():
-    ids = S.HOST.probe("sim", """
+def entities():
+    return S.HOST.probe("sim", """
 local CT = api.type.ComponentType
-local t, g = {}, {}
-api.engine.forEachEntityWithComponent(function(e) t[#t+1] = e end, CT.TOWN)
-api.engine.forEachEntityWithComponent(function(e) g[#g+1] = e end, CT.STATION_GROUP)
-table.sort(t); table.sort(g)
-return { town = t[1], town2 = t[2], group = g[1], player = api.engine.util.getPlayer() }
+local function all(c) local t = {} api.engine.forEachEntityWithComponent(function(e) t[#t+1] = e end, CT[c]) table.sort(t) return t end
+local t, g = all("TOWN"), all("STATION_GROUP")
+return { town = t[1], town2 = t[2], town3 = t[3], group = g[1], group2 = g[2], player = api.engine.util.getPlayer() }
 """)
 
+
+def names():
+    ids = entities()
+
     def rename(game, entity, name):
-        ui(game, "api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(%d, %s)); return 'sent'" % (entity, '"' + name + '"'))
-    run("town renamed on the host", lambda: rename("host", ids["town"], "Testville"))
-    run("town renamed on the guest", lambda: rename("guest", ids["town2"], "Guestburg"))
-    run("company renamed", lambda: rename("host", ids["player"], "Anna Rail Co"))
-    run("station group renamed", lambda: rename("guest", ids["group"], "Central Yard"))
+        dev(game, 'api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(%d, "%s")); return "sent"' % (entity, name))
+    run("town renamed on the host", lambda: rename("host", ids["town"], "Testville"), expect="towns")
+    run("town renamed on the guest", lambda: rename("guest", ids["town2"], "Guestburg"), expect="towns")
+    run("company renamed on the host", lambda: rename("host", ids["player"], "Anna Rail Co"), expect="companyName")
+    run("station group renamed on the guest", lambda: rename("guest", ids["group"], "Central Yard"), expect="stationGroups")
 
 
-ALL = {"economy": economy, "names": names}
+def lines():
+    ids = entities()
+    make = """
+local g1, g2 = %d, %d
+local function stop(group)
+  local st = api.type.Line.Stop.new()
+  st.stationGroup = group
+  st.station = 0
+  st.terminal = 0
+  return st
+end
+local line = api.type.Line.new()
+line.stops = { stop(g1), stop(g2) }
+local cmd = api.cmd.makeLineCreateCmd("%s", api.type.Vec3f.new(0.8, 0.2, 0.2), api.engine.util.getPlayer(), line)
+api.cmd.sendCommand(cmd, function(res, ok) end)
+return "sent"
+"""
+    run("line created on the host", lambda: dev("host", make % (ids["group"], ids["group2"], "Line One")), expect="lines")
+    run("line created on the guest", lambda: dev("guest", make % (ids["group2"], ids["group"], "Line Two")), expect="lines")
+
+
+def tool_road(game, a, b):
+    """The game's road tool: open it, click two points on the map, leave the tool (Escape twice)."""
+    click(game, 632, 1311, 2.0)               # the roads tool in the toolbar
+    click(game, a[0], a[1], 1.0)
+    click(game, b[0], b[1], 2.0)
+    key(game, 0x1B)
+    key(game, 0x1B)
+
+
+def roads():
+    run("road built on the host with the game's road tool", lambda: tool_road("host", (341, 1018), (574, 1053)), expect="streetEdges")
+    run("road built on the guest with the game's road tool", lambda: tool_road("guest", (434, 1040), (597, 1110)), expect="streetEdges")
+
+
+ALL = {"economy": economy, "names": names, "lines": lines, "roads": roads}
 
 if __name__ == "__main__":
     which = sys.argv[1:] or ["all"]

@@ -14,9 +14,10 @@ impl Lockstep {
     }
 
     /// Steps a stamp must lie ahead of the fastest clock so that every game receives the message before reaching
-    /// it: a fixed reserve plus two steps per speed unit for the engine's batch.
+    /// it: a fixed reserve of two steps plus two steps per speed unit for the engine's batch (0.8 s at normal speed; it was
+    /// four steps, 1.2 s, until the first real test showed that a road should show on the other game in under a second).
     pub fn lead_units(speed: i32) -> i64 {
-        Self::STEP * (4 + 2 * i64::from(speed.max(1)))
+        Self::STEP * (2 + 2 * i64::from(speed.max(1)))
     }
 }
 

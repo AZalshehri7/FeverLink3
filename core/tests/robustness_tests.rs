@@ -1083,7 +1083,7 @@ fn small_pure_functions_take_any_input() {
         let clock = PlayerClock { t: r.gen(), speed: r.gen(), at: f64::from_bits(r.gen()) };
         let _ = clock.estimate(f64::from_bits(r.gen()));
         let _ = PlayerClock::plausible(r.gen(), r.gen());
-        assert!(Lockstep::lead_units(r.gen()) >= Lockstep::STEP * 6);
+        assert!(Lockstep::lead_units(r.gen()) >= Lockstep::STEP * 4);
     }
     for kind in 0..=u8::MAX {
         if let Some(k) = MessageKind::from_u8(kind) {

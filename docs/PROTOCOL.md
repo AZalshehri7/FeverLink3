@@ -102,7 +102,7 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 
 ## Session rules
 
-- **Session state** is broadcast on every change and at least every 3 s. `lead` is `200 × (4 + 2 × speed)` game-time units: what a game adds to its clock when stamping a local action.
+- **Session state** is broadcast on every change and at least every 3 s. `lead` is `200 × (2 + 2 × speed)` game-time units: what a game adds to its clock when stamping a local action.
 - **Clock**: a game reports `{t, speed, ahead}` regularly. The host extrapolates `t + elapsed × speed × 1000` and relays it as PeerClock. Every game holds (speed 0) when it is more than `ahead` steps past the slowest peer.
 - **Stamps** are multiples of 200. A future stamp chosen by the host is `roundUp(maxClock + lead)`.
 - **Start**: `started = true`, `speed = 0`, `pauseAt` = the games' common time when they agree, and a checksum round is requested at once.

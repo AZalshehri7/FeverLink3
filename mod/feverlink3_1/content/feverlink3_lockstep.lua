@@ -67,7 +67,7 @@ function L.slowestPeer(peers)
 end
 
 -- How many steps this game may run ahead of the slowest peer (the `ahead` it reports in its clock). More speed
--- means more steps per engine batch, so a little more room; always below lead (4 + 2 * speed steps).
+-- means more steps per engine batch, so a little more room; always below lead (2 + 2 * speed steps).
 function L.aheadFor(speed)
 	return 2 + math.max(1, math.min(4, speed or 1))
 end

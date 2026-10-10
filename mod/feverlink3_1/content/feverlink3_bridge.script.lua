@@ -601,7 +601,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		pcall(function()
 			local pi = nil
 			pcall(function() pi = param[4] end)
-			logSim("event apply_command/" .. tostring(name) .. " at t=" .. tostring(engine.gameTime()) .. " playerInitiated=" .. tostring(pi))
+			if pi ~= false then logSim("event apply_command/" .. tostring(name) .. " at t=" .. tostring(engine.gameTime()) .. " playerInitiated=" .. tostring(pi)) end
 		end)
 	end
 	if id == "apply_command" and name == "onPreBuildProposal" then
