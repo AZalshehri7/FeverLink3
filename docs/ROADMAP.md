@@ -26,7 +26,9 @@ Versions are not dated. Each phase ends when its tests pass and two people have 
 ## 0.3 — Game side
 - [x] Native module skeleton in Rust: winhttp proxy, PE parsing, signature scanner, detour maths, build table, `cargo test`
 - [x] Address tool (`tools/addr`): finds hook sites in a game executable and prints a build-table row; first run against build 40420 in `tools/addr/out/6ac50427.txt`
-- [ ] Native module: command-list hook, hold/release, single-worker script pool
+- [x] Native module logic, off unless switched on: counters on the simulation's command application, hold/release hook on the command list with the control file (`native_ctl.log` / `native_events.log`), single-worker script pool patch; installed all-or-none from `DllMain` behind `FEVERLINK3_HOOKS` / `FEVERLINK3_HOLD` / `FEVERLINK3_POOLPATCH`; tested on fake game functions (`docs/NATIVE_LINK.md`)
+- [ ] Native module verified in the game: counters, hold/release with each construction tool, pool patch (`docs/NATIVE_LINK.md` section 8)
+- [ ] Lua mod strict mode: `hold_on`, ping, match `held`, stop at the stamp, `release` + trigger command, `cancel`, `hold_off` before a resync (`docs/NATIVE_LINK.md` section 7)
 - [ ] Native module size: `no_std` + `alloc` with a HeapAlloc allocator once the hook set is fixed
 - [ ] Lua mod: stamping, barrier, replay, checksums, deterministic random (core, file link and window commands done; native-build replay and in-game UI open)
 - [x] Lua lockstep test with lupa
