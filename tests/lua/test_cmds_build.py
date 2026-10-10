@@ -1708,7 +1708,7 @@ class PureBuildTest(unittest.TestCase):
 
     def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
         def cat(code):
-            return self.ev("(function() local M = PURE(); return M.commands.makeWorldBuildProposalCmd.category('makeWorldBuildProposalCmd', { n = 4, %s }) end)()" % code)
+            return self.ev("(function() local M = PURE(); return M.commands.makeWorldBuildProposalCmd.categoryFor({ n = 4, %s }) end)()" % code)
 
         for code in ("SIMPLE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }", "NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }",
                      "NATIVE_SIGNAL{ edge = 130, param = 0.5 }", "CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2 }",
