@@ -50,6 +50,12 @@ local function send(text)
 	return Hud.sendChat(C, U.outbox, text)
 end
 
+-- a speed button of the window (0 pauses): a record for the bridge, which asks the host
+local function sendSpeed(n)
+	if not U.outbox then U.outbox = Hud.newOutbox(C) end
+	return C.writerSend(U.outbox, "speed", { n = n })
+end
+
 -- ---- drawing
 
 local WIDTH = 560 -- width of the window's content
@@ -60,17 +66,37 @@ local function setup(react, builtin)
 	local function text(s, class, width)
 		return builtin.TextView{ meta = { class = class or "font-scale-title-4" }, text = s, width = width or WIDTH }
 	end
-	local function gap() return text(" ", "font-scale-body") end
+	local function gap() return text(" ", "font-scale-annotation") end
+	local function heading(s) return text(s, "font-scale-title-2") end
+	local function section(s) return text(s, "font-scale-title-3") end
+	local function note(s) return text(s, "font-scale-body") end
 	local function box(orientation, children) return builtin.BoxLayout{ orientation = orientation, children = children } end
 	local function column(children) return builtin.Component{ layout = box(V, children) } end
-	local function button(label, onClick, width)
-		return builtin.Button{ meta = { class = "secondary" }, content = text(label, "font-scale-title-4", width or WIDTH), onClick = onClick }
+	-- kind: "primary" (the main action), "secondary" (default) or "negative" (stops something)
+	local function button(label, onClick, kind, width)
+		return builtin.Button{
+			meta = { class = kind or "secondary" },
+			content = text(label, "font-scale-title-4", width or WIDTH),
+			onClick = onClick,
+		}
 	end
 	local function field(placeholder, value, onTyping, displayOnly)
 		return builtin.TextInputField{
 			meta = { class = "font-scale-title-4" }, placeholderText = placeholder, value = value, onTyping = onTyping,
 			displayOnly = displayOnly, maxLength = 200,
 		}
+	end
+	-- "Anna  (host)" / "Ben  42 ms" / "Cleo  reconnecting"
+	local function playerLine(p, me)
+		local line = "   " .. tostring(p.name)
+		if p.id == 0 then line = line .. "  (host)" end
+		if p.id == me then line = line .. "  (you)" end
+		if p.state == "away" then
+			line = line .. "  - reconnecting"
+		elseif p.rtt and p.rtt > 0 and p.id ~= me then
+			line = line .. "  - " .. tostring(p.rtt) .. " ms"
+		end
+		return text(line)
 	end
 
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
@@ -79,6 +105,7 @@ local function setup(react, builtin)
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
+		local showTest = react.useState(false)
 		react.onStepTimer(function()
 			local a = poll()
 			local b = pollCtl()
@@ -88,6 +115,10 @@ local function setup(react, builtin)
 		local rows = {}
 		local function add(node) rows[#rows + 1] = node end
 		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
+		local function players(me)
+			add(section("Players"))
+			for _, p in ipairs(ctl.players or {}) do add(playerLine(p, me)) end
+		end
 
 		local state = ctl and ctl.state
 		if not state then
@@ -102,86 +133,98 @@ local function setup(react, builtin)
 		if state == "launcher" then
 			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
 		elseif state == "missing" then
-			add(text("The FeverLink3 module is not running.", "font-scale-title-3"))
-			add(text("Close the game, run `feverlink3 install` from the FeverLink3 folder, then start the game again from Steam. If it keeps happening, send the files named in HOW-TO-PLAY.txt."))
+			add(heading("FeverLink3 is not running"))
+			add(text("The helper file winhttp.dll is not next to TransportFever3.exe. Close the game, copy winhttp.dll into the game's folder (see HOW-TO-PLAY.txt) and start the game again from Steam."))
 		elseif state == "starting" then
 			add(text("Starting the multiplayer module..."))
 		elseif state == "idle" or state == "failed" then
+			add(heading("Play together"))
 			if state == "failed" then
 				add(text("Could not connect: " .. tostring(ctl.message or "unknown problem"), "font-scale-title-3"))
-				add(gap())
+			else
+				add(note("One player hosts and sends a code; the others join with it."))
 			end
-			add(text("Play together: one player hosts, the others join with the host's code."))
 			add(gap())
-			add(text("Your name"))
+			add(section("Your name"))
 			add(field("name", myName(), function(v) nameIn:set(v) end))
 			add(gap())
-			add(button("Host a game", function() command("host", { name = myName() }) end))
+			add(button("Host a game", function() command("host", { name = myName() }) end, "primary"))
 			add(gap())
-			add(text("Or join a friend"))
+			add(section("Join a friend's game"))
 			add(field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end))
-			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end))
+			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end, "primary"))
 
 			-- Steam connection test: can two players reach each other through Steam, without any router setup?
+			-- Folded away by default (it shows the player's Steam ID).
 			local st = ctl.steam
 			add(gap())
-			add(text("Steam connection test", "font-scale-title-3"))
+			add(button(showTest:old() and "Hide the connection test" or "Connection test...", function() showTest:set(not showTest:old()) end, "secondary"))
+			if showTest:old() then
+			add(section("Steam connection test"))
 			if st and st.id then
-				add(text("Your Steam ID (send it to a friend, who pastes it below):", "font-scale-body"))
+				add(note("Your Steam ID (send it to a friend, who pastes it below):"))
 				add(field("your Steam ID", tostring(st.id), function() end, true))
 			else
-				add(text("Steam: " .. tostring(st and st.state or "unknown"), "font-scale-body"))
+				add(note("Steam: " .. tostring(st and st.state or "unknown")))
 			end
 			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
 			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
-			if st and st.note then add(text(tostring(st.note), "font-scale-body")) end
+			if st and st.note then add(note(tostring(st.note))) end
 			if st and st.test then
 				local t = st.test
 				local line = "Test: " .. tostring(t.state) .. ", answers " .. tostring(t.pongs)
 				if t.rtt then line = line .. ", last round trip " .. tostring(t.rtt) .. " ms" end
 				if t.route and t.route ~= "" then line = line .. ", " .. tostring(t.route) end
-				add(text(line, "font-scale-body"))
+				add(note(line))
 			end
-			if st and st.pings and st.pings > 0 then add(text("Pings received from other players: " .. tostring(st.pings), "font-scale-body")) end
+			if st and st.pings and st.pings > 0 then add(note("Pings received from other players: " .. tostring(st.pings))) end
+			end
 		elseif state == "hosting" then
-			add(text("You are hosting", "font-scale-title-2"))
-			add(text("Send this join code to the other players (click it, Ctrl+A, Ctrl+C):"))
+			add(heading("You are hosting"))
+			add(note("Send this join code to the other players:"))
+			-- the game's text fields cannot copy, so the button puts the code on the clipboard (done by the module)
 			add(field("join code", tostring(ctl.code or ""), function() end, true))
-			if ctl.password then add(text("They also need the password.")) end
-			add(gap())
-			add(text("Players", "font-scale-title-3"))
-			for _, p in ipairs(ctl.players or {}) do
-				add(text("  " .. tostring(p.name) .. (p.id == 0 and "  (host)" or ""), "font-scale-title-4"))
+			add(button("Copy code", function() command("copy", {}) end, "secondary"))
+			if ctl.result and ctl.result.kind == "copy" then
+				add(note(tostring(ctl.result.ok and "Copied. Paste it into a message to your friend (Ctrl+V)." or ctl.result.message)))
 			end
+			if ctl.password then add(note("They also need the password.")) end
 			add(gap())
+			players(ctl.me)
+			add(gap())
+			if ctl.started and ctl.resync and ctl.resync ~= "Idle" then
+				add(note("Sending your world to the players: " .. tostring(ctl.resync)))
+			end
 			if ctl.started then
 				add(button("Sync everyone to my world", function() command("resync", {}) end))
 			end
 			add(box(H, {
-				button(ctl.started and "Pause" or "Start the session", function() command(ctl.started and "pause" or "start", {}) end, math.floor(WIDTH / 2) - 10),
-				button("Stop hosting", function() command("leave", {}) end, math.floor(WIDTH / 2) - 10),
+				button(ctl.started and "Pause" or "Start the session", function() command(ctl.started and "pause" or "start", {}) end, "primary", math.floor(WIDTH / 2) - 10),
+				button("Stop hosting", function() command("leave", {}) end, "negative", math.floor(WIDTH / 2) - 10),
 			}))
 		elseif state == "joining" then
-			add(text("Connecting to the host...", "font-scale-title-3"))
-			add(button("Cancel", function() command("leave", {}) end))
+			add(heading("Joining..."))
+			add(text(tostring(ctl.progress or "contacting the host"), "font-scale-title-3"))
+			add(gap())
+			add(button("Cancel", function() command("leave", {}) end, "negative"))
 		elseif state == "joined" then
-			add(text("Connected", "font-scale-title-2"))
-			add(text("Wait for the host to start the session."))
+			add(heading("Connected"))
+			add(note("Wait for the host to start the session. The host's world is sent to you and your game reloads into it."))
 			add(gap())
-			add(text("Players", "font-scale-title-3"))
-			for _, p in ipairs(ctl.players or {}) do
-				add(text("  " .. tostring(p.name) .. (p.id == 0 and "  (host)" or ""), "font-scale-title-4"))
-			end
+			players(ctl.me)
 			add(gap())
-			add(button("Leave", function() command("leave", {}) end))
+			add(button("Leave", function() command("leave", {}) end, "negative"))
 		end
 
 		-- the game side: status and chat, once the mod is part of a session
 		local m = U.model
 		if m and C.ACTIVE then
 			add(gap())
-			add(text(Hud.statusText(m), "font-scale-body"))
-			for _, line in ipairs(Hud.chatLines(m, 12)) do add(text(line, "font-scale-body")) end
+			add(section("Session"))
+			add(note(Hud.statusText(m)))
+			local function speedButton(label, n) return button(label, function() sendSpeed(n) end, "secondary", math.floor(WIDTH / 4) - 10) end
+			add(box(H, { speedButton("Pause", 0), speedButton("1x", 1), speedButton("2x", 2), speedButton("3x", 3) }))
+			for _, line in ipairs(Hud.chatLines(m, 12)) do add(note(line)) end
 			add(field("Type a message and press Send", typed:old(), function(v) typed:set(v) end))
 			add(button("Send", function()
 				if send(typed:old()) then typed:set("") end

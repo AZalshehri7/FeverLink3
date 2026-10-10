@@ -34,7 +34,7 @@ use crate::guard;
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle, Status};
 use crate::steam_transport::SteamEndpoint;
 use crate::steamnet::CoreRef;
-use crate::{luatext, net, resync, steam, steam_transport, steamnet};
+use crate::{clipboard, luatext, net, resync, steam, steam_persona, steam_transport, steamnet};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
@@ -48,7 +48,13 @@ const STEAM_LOAD_ATTEMPTS: u32 = 150;
 pub const DEFAULT_PORT: u16 = 28090;
 
 /// The folder the mod looks in when the launcher did not hand it a session folder.
+///
+/// `FEVERLINK3_LIVE_DIR` names another folder: a second game on the same PC (for tests and recordings) must not
+/// share the first one's files.
 pub fn live_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("FEVERLINK3_LIVE_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("FeverLink3").join("live"))
 }
 
@@ -119,8 +125,14 @@ pub struct Controller {
     /// How often and when the Steam API was looked for: it may not be loaded yet when the controller starts.
     steam_attempts: u32,
     steam_last_try: Instant,
+    /// The Steam display name replaces the neutral default as soon as Steam can say it (checked about once a second).
+    name_from_steam: bool,
+    persona_attempts: u32,
+    persona_last: Instant,
     steam_note: Option<String>,
     steam_loop: Arc<Mutex<LoopCheck>>,
+    /// Puts text on the clipboard (the window's "Copy code"); the tests replace it.
+    clipboard: Box<dyn Fn(&str) -> bool + Send>,
     result: Option<CommandResult>,
     published: String,
     version: u64,
@@ -169,14 +181,24 @@ impl Controller {
             core,
             steam_attempts: 1,
             steam_last_try: Instant::now(),
+            name_from_steam: false,
+            persona_attempts: 0,
+            persona_last: Instant::now(),
             steam_note: None,
             steam_loop: Arc::default(),
+            clipboard: Box::new(clipboard::set_text),
             result: None,
             published: String::new(),
             version: 0,
         };
         c.publish();
         Ok(c)
+    }
+
+    /// Where "Copy code" puts the join code instead of the system clipboard (tests).
+    pub fn with_clipboard(mut self, put: impl Fn(&str) -> bool + Send + 'static) -> Controller {
+        self.clipboard = Box::new(put);
+        self
     }
 
     /// The options every game this controller hosts will use (player limit, flood limit, ping and reconnect timing).
@@ -198,6 +220,15 @@ impl Controller {
             self.command(line.seq, &line.kind, &params);
         }
         self.advance();
+        if !self.name_from_steam && self.persona_attempts < 600 && self.persona_last.elapsed() >= Duration::from_secs(1)
+        {
+            self.persona_attempts += 1;
+            self.persona_last = Instant::now();
+            if let Some(name) = steam_persona::persona_name() {
+                self.default_name = name;
+                self.name_from_steam = true;
+            }
+        }
         if self.steam.is_none()
             && self.steam_attempts < STEAM_LOAD_ATTEMPTS
             && self.steam_last_try.elapsed() >= STEAM_LOAD_EVERY
@@ -230,6 +261,20 @@ impl Controller {
             }
             "permissions" => {
                 let outcome = self.set_permissions(params);
+                self.note(seq, kind, outcome);
+            }
+            "copy" => {
+                // the game's text fields cannot copy, so the host's join code goes to the clipboard from here
+                let outcome = match &self.state {
+                    State::Hosting(h) if !h.code.is_empty() => {
+                        if (self.clipboard)(&h.code) {
+                            Ok("join code copied to the clipboard".to_owned())
+                        } else {
+                            Err("the clipboard is not available right now".to_owned())
+                        }
+                    }
+                    _ => Err("there is no join code to copy".to_owned()),
+                };
                 self.note(seq, kind, outcome);
             }
             "steamtest" => {
@@ -345,8 +390,17 @@ impl Controller {
         // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
         // a relay as the fallback). The direct TCP transport is for development and tests and must be asked for by
         // name.
-        match params.get("transport").and_then(Value::as_str).unwrap_or("auto") {
-            "tcp" => self.host_tcp(params),
+        // `FEVERLINK3_TRANSPORT=tcp-loopback` makes the window's own Host button use the developer transport on this
+        // PC only (two games on one PC cannot use Steam to reach each other: same account). Players never set it.
+        let wanted = params
+            .get("transport")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| std::env::var("FEVERLINK3_TRANSPORT").ok())
+            .unwrap_or_else(|| "auto".into());
+        match wanted.as_str() {
+            "tcp" => self.host_tcp(params, false),
+            "tcp-loopback" => self.host_tcp(params, true),
             "steam" | "auto" => self.host_steam(params),
             other => self.state = State::Failed(format!("unknown transport {other:?}; use \"steam\" or \"tcp\"")),
         }
@@ -409,7 +463,7 @@ impl Controller {
     }
 
     /// Hosts over direct TCP (developer transport): the join code lists the machine's local addresses.
-    fn host_tcp(&mut self, params: &Value) {
+    fn host_tcp(&mut self, params: &Value, force_loopback: bool) {
         let name = self.name_from(params);
         let port =
             params.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_PORT);
@@ -425,7 +479,7 @@ impl Controller {
             Err(e) => return self.state = State::Failed(format!("cannot open the session folder: {e}")),
         };
         // `bind` = "loopback" keeps the developer transport on this PC only: no firewall prompt, no exposed port
-        let loopback = params.get("bind").and_then(Value::as_str) == Some("loopback");
+        let loopback = force_loopback || params.get("bind").and_then(Value::as_str) == Some("loopback");
         let ip = if loopback { [127, 0, 0, 1] } else { [0, 0, 0, 0] };
         let started = session::run_host(HostConfig {
             bind: SocketAddr::from((ip, port)),
@@ -820,8 +874,11 @@ fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// The name the window offers before the player types one.
+///
+/// Not the Windows user name: that would be shown to every other player and written to logs. It is the neutral
+/// [`steam_persona::FALLBACK_NAME`] until the controller reads the player's Steam name, which then replaces it.
 pub fn default_name() -> String {
-    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "player".into())
+    steam_persona::FALLBACK_NAME.to_owned()
 }
 
 /// Starts the controller on a thread of its own. `None` when there is no folder to use. Never returns an error to
@@ -1056,6 +1113,52 @@ mod tests {
         }));
         assert_eq!(w.status()["state"], "failed");
         assert!(w.status()["message"].as_str().unwrap().contains("Steam networking is not available"));
+    }
+
+    #[test]
+    fn copy_puts_the_hosts_join_code_on_the_clipboard_and_says_so() {
+        let t = tempfile::tempdir().unwrap();
+        let copied: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&copied);
+        let mut c =
+            Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap().with_clipboard(move |text| {
+                sink.lock().unwrap().push(text.to_owned());
+                true
+            });
+        let mut w = Window::new(t.path());
+
+        // nothing to copy before hosting
+        w.send("copy", "{}");
+        let seq = w.seq - 1;
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+        assert_eq!(w.status()["result"]["ok"], false);
+        assert!(copied.lock().unwrap().is_empty());
+
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
+        assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
+        let code = w.status()["code"].as_str().unwrap().to_owned();
+        w.send("copy", "{}");
+        let seq = w.seq - 1;
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+        let r = w.status()["result"].clone();
+        assert_eq!((r["ok"].clone(), r["kind"].clone()), (json!(true), json!("copy")));
+        assert_eq!(*copied.lock().unwrap(), vec![code]);
+    }
+
+    #[test]
+    fn copy_reports_a_clipboard_that_cannot_be_opened() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c =
+            Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap().with_clipboard(|_| false);
+        let mut w = Window::new(t.path());
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}");
+        assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
+        w.send("copy", "{}");
+        let seq = w.seq - 1;
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+        let r = w.status()["result"].clone();
+        assert_eq!(r["ok"], false);
+        assert!(r["message"].as_str().unwrap().contains("clipboard"), "{r}");
     }
 
     #[test]

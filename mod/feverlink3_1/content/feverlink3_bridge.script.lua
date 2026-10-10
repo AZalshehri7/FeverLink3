@@ -953,6 +953,12 @@ local function serviceWindow()
 				send("chat", { text = text })
 				Hud.addChat(G.hud, C.PLAYER_NAME, text, C.PLAYER_ID)   -- the host does not echo a message to its sender
 			end
+		elseif rec.kind == "speed" then
+			-- a speed button of the window: the session speed is the host's to decide, so it is a request, like the
+			-- one the game's own speed buttons make (0 pauses)
+			local p = C.parse(rec.payload)
+			local n = type(p) == "table" and tonumber(p.n) or nil
+			if n and n >= 0 and n <= 4 and n == math.floor(n) then send("speed_request", { speed = n }) end
 		elseif rec.kind == "company" and Co then
 			-- an operation typed in the company page (Co.windowCommand), sent like any command the player issues
 			coGuard("window record", function()

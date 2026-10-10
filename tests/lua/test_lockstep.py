@@ -250,6 +250,11 @@ function UI_ENV_NEW()
   env.C, env.Hud = env.ug_require("feverlink3_common"), env.ug_require("feverlink3_hud")
   return env
 end
+function UI_SPEED(n)
+  local e = UI_ENV_NEW()
+  UI_OUTBOX = UI_OUTBOX or e.Hud.newOutbox(e.C)
+  return e.C.writerSend(UI_OUTBOX, "speed", { n = n })
+end
 function UI_SEND(text)
   local e = UI_ENV_NEW()
   UI_OUTBOX = UI_OUTBOX or e.Hud.newOutbox(e.C)
@@ -320,6 +325,10 @@ class Game:
     def ui_send(self, text):
         self.use_env()
         return bool(self.L.eval("UI_SEND(%s)" % lua_str(text)))
+
+    def ui_speed(self, n):
+        self.use_env()
+        return bool(self.L.eval("UI_SPEED(%d)" % n))
 
     def ui_view(self):
         self.use_env()
@@ -841,6 +850,20 @@ class LockstepTest(unittest.TestCase):
         view = str(self.B.ui_view()).split("|")
         self.assertEqual(view[1], "host [host], client (you), dave")
         self.assertEqual(view[2], "client: hello team !")
+
+
+    def test_speed_pressed_in_the_window_is_a_request_to_the_host(self):
+        self.start(speed=1)
+        self.assertTrue(self.B.ui_speed(3))
+        self.assertTrue(self.A.ui_speed(0))
+        self.assertTrue(self.B.ui_speed(9), "the record is written; the bridge refuses a speed it does not know")
+        self.tick(4)
+        b = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "speed_request"]
+        a = [l for l in self.A.lines(self.A.from_game) if l.split(TAB)[1] == "speed_request"]
+        self.assertEqual(len(b), 1, b)
+        self.assertIn('["speed"]=3', b[0])
+        self.assertEqual(len(a), 1, a)
+        self.assertIn('["speed"]=0', a[0])
 
 
 class PureTest(unittest.TestCase):

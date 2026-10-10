@@ -104,7 +104,7 @@ fn game_save_dirs() -> Vec<PathBuf> {
 }
 
 fn default_name() -> String {
-    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "player".into())
+    feverlink3_launcher::steam_persona::FALLBACK_NAME.to_owned()
 }
 
 /// Lines typed on stdin, from a thread of their own so the main thread can watch the session.
