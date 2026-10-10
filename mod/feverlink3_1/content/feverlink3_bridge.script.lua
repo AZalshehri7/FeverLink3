@@ -353,6 +353,29 @@ local function spendReplay(st, now)
 	return true
 end
 
+local function buildCategory(body)
+	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1] or nil
+	if type(rec) ~= "table" then return "build" end
+	-- the rule of the build module's categoryFor, counted on the record: a build that adds no construction, node or edge
+	-- object and takes something away (a construction, edge objects, or more segments than it puts back) is bulldozing
+	local adds = #(rec.cons or {}) + #(rec.nodes or {}) + #(rec.objs or {})
+	local removes = #(rec.rem or {})
+	if adds == 0 and (removes > 0 or #(rec.segs or {}) < #(rec.rmSegs or {}) or #(rec.rmObjs or {}) > 0) then return "bulldoze" end
+	return "build"
+end
+
+-- The category an action is booked under (permissions, the company ledger): for a build record it is fixed once, by the game
+-- that made the build, and travels inside the record, so that every game books it the same way. Counting it again on each
+-- game from the rebuilt proposal made the ledgers differ (a bulldozing that leaves merged road pieces was "build" on one game
+-- and "bulldoze" on the others, and the `companies` part of the checksum differed for good). Only the two build categories
+-- are taken from a record, and only for the build command; anything else is counted the usual way.
+local function actionCategory(body, args)
+	if type(body) == "table" and body.fn == "makeWorldBuildProposalCmd" and (body.category == "build" or body.category == "bulldoze") then
+		return body.category
+	end
+	return L.categoryOf(body.fn, args)
+end
+
 -- A build the player made with a native tool (roads, tracks, stations, depots, bulldozer...): the engine applies it
 -- itself, here and now. It is captured as a build record and handed to the interface half (st.out), which stamps and
 -- ships it like any other action; every OTHER game rebuilds it at the stamp.
@@ -387,6 +410,7 @@ local function simCaptureBuild(state, param)
 		return
 	end
 	body.native = true
+	body.category = buildCategory(body)
 	local okS, text = pcall(C.serialize, body)
 	if not okS then
 		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(text))
@@ -427,7 +451,7 @@ local function simApplyAction(st, it, now)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
-	local category = L.categoryOf(it.body.fn, args)
+	local category = actionCategory(it.body, args)
 	-- companies: the spending limit and the spec's registry change come first; a mod-level action has no engine command
 	local okC, fx = coBefore(ctx, it, spec, args, category, logSim)
 	if not okC then
@@ -489,7 +513,7 @@ local function simReplayCompany(st, param)
 	else
 		args = L.decodeCommand(it.body, ctx)
 		if not args then return end
-		category = L.categoryOf(it.body.fn, args)
+		category = actionCategory(it.body, args)
 	end
 	local okC = coBefore(ctx, it, spec, args, category, logSim)
 	if okC and param.ok and not spec.virtual then
@@ -797,7 +821,7 @@ local function guiApplyNow(it, now)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
-	local category = L.categoryOf(it.body.fn, args)
+	local category = actionCategory(it.body, args)
 	-- companies: the registry and ledger part runs here on the mirror and is replayed on the simulation state (coToSim)
 	local okC, fx = coBefore(ctx, it, spec, args, category, logGui)
 	if not okC then
@@ -886,14 +910,7 @@ local function stampAfterFastest(now)
 end
 
 -- The permission category of a captured build record: a record that adds nothing only removes (bulldoze).
-local function buildCategory(body)
-	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1] or nil
-	local adds = 0
-	if type(rec) == "table" then
-		adds = #(rec.cons or {}) + #(rec.nodes or {}) + #(rec.segs or {}) + #(rec.objs or {})
-	end
-	return adds == 0 and "bulldoze" or "build"
-end
+-- (buildCategory and actionCategory are defined above the simulation half)
 
 local function shipNative(o)
 	local body = C.parse(o.body)
@@ -1190,10 +1207,9 @@ local function natCapture(id, name, param)
 	if not ok then body, why = nil, tostring(body) end
 	local cap = { tool = tostring(id), why = why }
 	if body then
-		if type(text) ~= "string" then
-			local okS, s = pcall(C.serialize, body)
-			if okS then text = s else body, cap.why = nil, tostring(s) end
-		end
+		body.category = buildCategory(body)
+		local okS, s = pcall(C.serialize, body)
+		if okS then text = s else body, cap.why = nil, tostring(s) end
 		if body then cap.body, cap.text = body, text end
 	end
 	cap.t = os.clock()

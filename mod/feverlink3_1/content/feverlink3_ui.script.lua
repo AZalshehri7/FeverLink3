@@ -68,6 +68,31 @@ end
 
 local WIDTH = 560 -- width of the window's content
 
+-- What a sync round is doing, in words (ctl.sync = { phase, done?, total? } from the controller; absent when none runs).
+-- `host` says whose window it is: the players' games stand still while the host's world is prepared, sent and loaded, and
+-- without a word about it that looks like a hang.
+local function syncText(sync, host)
+	if type(sync) ~= "table" then return nil end
+	local pct = nil
+	if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
+		pct = math.floor(100 * sync.done / sync.total)
+	end
+	local phase = sync.phase
+	if phase == "pausing" then
+		return host and "Syncing: stopping every game at the same moment..." or "Syncing: the host is stopping every game at the same moment..."
+	elseif phase == "saving" then
+		return host and "Syncing: saving your world..." or "Syncing: the host is saving its world..."
+	elseif phase == "sending" then
+		local what = host and "Sending your world to the players" or "Receiving the host's world"
+		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...")
+	elseif phase == "loading" then
+		return host and "Syncing: the players are loading your world..." or "Syncing: loading the host's world. The game reloads and the window closes; open it again afterwards."
+	elseif phase == "verifying" then
+		return "Syncing: checking that the worlds match..."
+	end
+	return "Syncing..."
+end
+
 local function setup(react, builtin)
 	local V = builtin.type.Orientation.Vertical
 	local H = builtin.type.Orientation.Horizontal
@@ -265,6 +290,14 @@ local function setup(react, builtin)
 				if send(typed:old()) then typed:set("") end
 			end))
 		end
+		-- while a sync round runs: say so, first thing in the window
+		do
+			local st = ctl and ctl.state
+			local line = syncText(ctl and ctl.sync, st == "hosting")
+			if line then
+				table.insert(rows, 1, heading(line))
+			end
+		end
 		-- developer test button (FEVERLINK3_DEV=1 only): runs dev_click.lua from inside a click, where commands may be sent.
 		-- The first row, so that its place in the window does not depend on what the window shows.
 		if Hook and Hook.dev then
@@ -295,12 +328,40 @@ local function setup(react, builtin)
 		if not okO then log("cannot open the window: " .. tostring(err)) end
 	end
 	return function()
+		-- the button follows the session: it says "syncing" while a round runs, and the window opens by itself when a round
+		-- begins. Guarded: if this recipe cannot hold state in this game build, the button stays as it was.
+		local okT, tick = pcall(react.useState, 0)
+		if not okT then tick = nil end
+		if tick then
+			pcall(function()
+				react.onStepTimer(function()
+					pollCtl()
+					local want = U.ctl and U.ctl.sync ~= nil
+					local text = want and syncText(U.ctl.sync, U.ctl.state == "hosting") or nil
+					if want ~= U.syncShown or text ~= U.syncText then
+						local began = want and not U.syncShown
+						U.syncShown, U.syncText = want, text
+						tick:set(tick:old() + 1)
+						if began then pcall(open) end
+					end
+				end, 0.5)
+			end)
+		end
+		local label = "FeverLink3"
+		if U.syncShown and U.ctl and type(U.ctl.sync) == "table" then
+			local sync = U.ctl.sync
+			if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
+				label = "FeverLink3 - syncing " .. math.floor(100 * sync.done / sync.total) .. "%"
+			else
+				label = "FeverLink3 - syncing"
+			end
+		end
 		-- like the game's own icon buttons (eye, music): a default-styled button holding an auto-fitted image
 		return builtin.BoxLayout{
 			children = {
 				builtin.Button{
 					meta = { tooltip = "FeverLink3 multiplayer" },
-					content = builtin.TextView{ meta = { class = "font-scale-body" }, text = "FeverLink3" },
+					content = builtin.TextView{ meta = { class = "font-scale-body" }, text = label },
 					onClick = open,
 				},
 			},
