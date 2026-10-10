@@ -1729,7 +1729,21 @@ function M.capture(proposal, flags, ctx)
 	local okS, text = pcall(C.serialize, body)
 	if not okS then return nil, "the build record is not plain data: " .. tostring(text) end
 	if #text > LIMIT.bytes then return nil, "the build is too large to send (" .. #text .. " bytes)" end
-	return body
+	return body, nil, text
+end
+
+-- The capture of one applied tool event (builder.proposalApply) for the bridge's strict mode: the native module has held
+-- the tool's command, so the world is still as the tool saw it and the references resolve. `ctx` names entities the way the
+-- bridge keys them (see M.capture). Returns the body, nil and its serialised text (the wire form), or nil and why not. Never
+-- raises. The logging of the same events stays in M.onToolEvent.
+function M.captureToolBuild(id, name, param, ctx)
+	if name ~= "builder.proposalApply" then return nil, "not a build event: " .. tostring(name) end
+	if type(param) ~= "table" then return nil, "the event carries no data" end
+	local okP, proposal = pcall(function() return param[1] or param.proposal end)
+	if not okP or proposal == nil then return nil, "the event carries no proposal" end
+	local ok, body, why, text = pcall(M.capture, proposal, { playerInitiated = true }, ctx)
+	if not ok then return nil, "the build could not be read: " .. tostring(body) end
+	return body, why, text
 end
 
 local function decodeBuildUnsafe(body, ctx)

@@ -3,7 +3,8 @@
 Status: **implemented and tested without the game, not yet run in the game.** Everything below that says "verified"
 means verified by tests or by the address tool on the executable on disk; what only a running game can confirm is
 listed in section 8, with the log lines to look for. The module is off unless an environment variable switches
-a piece on (section 2).
+a piece on (section 2). The mod's half (strict mode, section 7) is written and tested against a fake module, and is
+also not yet run in the game (stage 4 of section 8).
 
 ## 1. What the native module is for
 
@@ -132,6 +133,8 @@ form for people (section 8).
 3. The mod, in its next frame, stamps the action and ships it to the others. At the stamp it writes `release`
    for the originator and then **sends any harmless command through the normal path** (a script event such as
    `O.event("feverlink3", "feverlink3", "nop", {})`). That command is the trigger: see below.
+   (This is the design of the first draft. The mod as built does not release the originator's command at the stamp: it
+   writes `cancel`, and the originator applies the build at the stamp like every other game, section 7.)
 4. The next call to `Add`, any caller, finds the `release` line (the hook looks at the control file itself: a
    metadata call, and a read only if the file grew), takes the entries that are due out of the ring and **hands them
    back to the engine through the unhooked `Add`**, with the destructors a tool would run after its own call. Only
@@ -209,11 +212,106 @@ said "no locks in either hook"; the `Add` hook uses a lock it never waits for.
 
 ## 7. The mod's side of the contract
 
-The Lua mod is unchanged by this work. To use strict mode it has to: read `ready` and fall back to degraded mode if
-`command_list_add` is not in `hooks`; write `hold_on` after `ready`; ping at least every 5 s while holding; match
-each `held` to its own capture (by order and time); announce, stamp and ship the action; stop every game at the stamp;
-write `release` and then send a harmless command, repeating that until `released` arrives; write `cancel` for an
-action the host refused; write `hold_off` before a resync reload (a reload while commands are held is not tested).
+**Built and tested without the game; not yet run in it.** The code is the "strict mode" block of the bridge's interface half
+(`mod/feverlink3_1/content/feverlink3_bridge.script.lua`: `natTick`, `natCapture`, `natDecide`, `natStop`) and
+`M.captureToolBuild` of the build module (`feverlink3_cmds_build.lua`). `tests/lua/test_strict_build.py` runs two mocked games
+against a fake module that honours the files and rules of sections 3 and 4 (`hold_on` / `hold_off` / `release` / `cancel` /
+`ping`, `ready` / `holding` / `held` / `released` / `dropped` / `pong` / `error`, release and cancel only at the next `Add`, the
+10 s silence rule).
+
+**The design.** Strict mode follows TpF2 Multiplayer (MIT): the construction tool's command is held, **cancelled**, and every
+game, the originator's included, applies the build at the stamp through the replay path (`simApplyAction`), so both games apply
+it in the same game step. Section 4 (steps 3 and 5) describes the other thing the module can do, release the held command
+at the stamp so that the originator's own game applies the tool's command. The mod does not use it: the originator's game
+would then apply a different command (the tool's own, with its entity ids and its timing) from the one the others rebuild from
+the description.
+
+### Switching it on
+
+Nothing happens until `native_events.log` has a record (the module off, or not in this build: no file, no line written, no log
+line; the mod looks for the file four times a second). Then:
+
+1. The records are read from the top of the file. **The first batch after a script start is history**: only `ready` (and so the
+   hooks) is taken from it; old `held`, `released`, `dropped`, `pong` and `holding` lines are never acted on. This is how a
+   reloaded mod learns that the module is ready without a `ready` of its own: the events file is append-only and keeps the
+   module's `ready`. No separate memo file is needed; a file that holds no `ready` at all (trimmed by hand) still works, the mod
+   only requires `holding on` to answer its `hold_on` (below).
+2. `ready.hooks` must contain `command_list_add`; if not, strict mode stays off and `mod.log` says so once.
+3. The mod writes `ping {n}` and waits for a `pong` that arrived after the start of this script (an answer in the history proves
+   nothing). Six pings 2.5 s apart without an answer: it stops asking until the module writes another `ready` (a file left by a
+   crashed run).
+4. `hold_on {kinds = {"build_proposal"}}`. The `holding {on = true}` event must follow within 3 s, else strict mode is given up
+   (`hold_off`, one log line) until the next `ready`.
+5. While holding, a line is written at least every 2 s (a `ping`; the module's limit is 10 s), and the `pong`s are watched: 8 s
+   without one means the module is gone, and strict mode switches itself off.
+
+### One build with a native tool
+
+1. The tool event `builder.proposalApply` reaches `guiHandleEvent`. If `hold_on` has been written, `M.captureToolBuild`
+   encodes the proposal (before the engine applied anything, because the command is held) and the result waits in a list of at
+   most 6 captures, each with `os.clock()`. An entry whose capture failed is kept too, without a body, so the order stays
+   aligned. An entry older than 2 s is dropped (one log line): the build went through unheld, and the simulation half's
+   `onPreBuildProposal` capture shipped it the old way.
+2. `held {id, kind, site, ms}` arrives. The oldest capture is paired with it. If `held` is read first (the tool event is
+   dispatched later in the frame), it waits for a capture for 0.4 s and 3 frames; a capture that then turns up for a `held`
+   that was already released is dropped, so that it cannot be paired with the next build.
+3. With a capture: the player's permission is checked (a build the host forbids is cancelled with `action_refused`, like the
+   wrapped `sendCommand`), then **this game checks that it could rebuild the record itself** (never cancel what cannot be
+   rebuilt, `docs/ARCHITECTURE.md` section 6), then the action is shipped exactly as a Lua command is
+   (`send("action", {stamp, seq, body, category})`, stamp past the fastest clock), `cancel {id}` is written, and the item is
+   queued locally with `route(it)`, so the originator applies it at the stamp. `body.native` is not set, and
+   `recordOriginator` is not called: the normal apply path books the company ledger.
+4. Without a usable capture, or when the record cannot be rebuilt here, or the action cannot be sent: `release {id}`. The tool's
+   command goes through natively and the simulation half ships it the old way (replay on peers). A held command is either
+   cancelled and shipped or released, never both; a capture is never shipped without its `held`.
+5. A `release` or `cancel` is only carried out at the next `Add` (section 4): the mod sends a harmless script event
+   (`feverlink3`, `nop`, ignored by the simulation half) at once, and again after 0.6 s, 1.2 s and so on, at most 5 times, until
+   `released` or `dropped` comes back.
+
+### Switching it off (`hold_off`, and a command to make the module run its queue)
+
+- before a resync load (`H.resync_load`): a reload while commands are held is not safe;
+- when the session ends: `identity.txt` says `role=idle` (read once a second);
+- when the mod is not active, on a resync load in progress, on three faults, when `hold_on` was not confirmed, when the module
+  stops answering;
+- when the module switches holding off itself (`holding {on = false}` with a reason other than `hold_off`: silence, control
+  file gone): strict mode notes it and asks again after 3 s, then 6 s, then 9 s; the fourth time it gives up until the next
+  `ready`.
+
+After a resync reload the new script starts at the top of the events file, finds `ready` and does steps 3 and 4 again by
+itself. The same happens when a session starts again after `idle`. Every call is guarded; a fault is logged (at most 12 lines per
+10 s) and the third one switches strict mode off for good. Failing open always means: the held command is released (or
+nothing was held) and the old path ships the build.
+
+### What `mod.log` says (all lines start with `strict:`)
+
+```
+native module found (build 40420, hooks apply_command,command_list_add)
+mode ON (the native module holds build commands; hold_on confirmed)
+held 3 (site 0x5891b4) matched the capture of streetBuilder (15241 bytes, 12 ms to capture, 31 ms old): 1:7 stamped 21600 (now 20400), cancel written
+held 4 (site 0x...): no capture of a tool build; release written, the native build goes through
+held 4 (site 0x...): the capture of streetBuilder failed (<why>); release written, the native build goes through
+held 4 (site 0x...): it cannot be rebuilt here (<why>); release written, the native build goes through
+held 4: not allowed to build, cancelled
+capture of streetBuilder dropped: no held command within 2 s (the native build went through, the simulation half ships it)
+capture of streetBuilder dropped: it came after its held command had been released
+mode off (<why>), hold_off written
+mode is off: <the module has no command_list_add hook | switched holding off (silence) ... | hold_on was not confirmed ...>
+held 3 was released by the module (<reason>) after its build was shipped: the build may exist twice on this game
+```
+
+### Known limits
+
+- **A tool that issues two held commands for one click** (a depot against a road is two commands in the build record, but the
+  tool may add them one after the other) and fires one event: the second `held` has no capture and is released, so it is built
+  natively at once, before the first one is replayed at its stamp. Stage 4, check 5, looks for it.
+- **A `cancel` that is overtaken** by the module's own release (silence after 10 s, the 30 s age limit) builds the road natively
+  as well as at the stamp; the second build is refused by the engine as a collision, or doubles a node. The log line above says
+  so. The mod writes `cancel` in the same frame as `held`, so the window is a few milliseconds.
+- **A command in the ring at the moment of a reload** is released by `hold_off` at the next `Add` and then the world is replaced;
+  never tested in the game.
+- The tool's callback never fires for a cancelled command. If the street tool waits for it, its state is stuck until the
+  player picks the tool again (stage 4, check 3).
 
 ## 8. NEEDS GAME VERIFICATION
 
@@ -300,6 +398,57 @@ event ready: build 40420, hooks [], poolpatch applied, game clock no
 Questions: does the game start and the scripts run (towns, industries); is the pool really one worker (two games on
 a CPU with 8 or more threads stay in step over a long run, which MPFever reported for this patch); the CPU load of
 the game-script update.
+
+### Stage 4: strict mode end to end (`FEVERLINK3_HOOKS=1 FEVERLINK3_HOLD=1` on both games, a session of two games)
+
+Needs the mod's strict mode (section 7) and a host and a player in one session, each game with both switches. Read `mod.log`
+(`%LOCALAPPDATA%\FeverLink3\live\mod.log`, lines marked `strict:`), `native.log`, `native_events.log` and `native_ctl.log` on
+**the building game**, and `mod.log` on the other. Stages 2 A to H must have passed first: this stage builds on them.
+
+1. **Switching on.** After the session starts, expect in `mod.log` `strict: native module found (build 40420, hooks
+   apply_command,command_list_add)` and `strict: mode ON ...`; in `native_ctl.log` a `ping`, a `hold_on`, then a `ping` about
+   every 2 s; in `native_events.log` `pong` and `holding` (`on = true`). Without the module (a game without the switches):
+   no `native_ctl.log`, no `strict:` line, and builds behave as before (replay on peers).
+2. **One road.** On the player's game build one road segment with the street tool. Expect, in this order, on the building
+   game: `tool event streetBuilder/builder.proposalApply`, `strict: held 1 (site 0x...) matched the capture of streetBuilder (N
+   bytes, ...): 1:K stamped T (now t), cancel written`; in `native.log` `event held: command 1 ...` then `event dropped: command
+   1 (cancel)`; no `released`. The road must appear on **both** games, at the same game time T (`action 1:K
+   makeWorldBuildProposalCmd applied at t=T` in the simulation lines of both `mod.log`s), and **not before** on the building
+   game (about the session lead, one to two seconds, after the click). The money leaves the account at T on both. Questions this
+   answers:
+   - the order of the tool event and `held`: if `mod.log` says `no capture of a tool build` followed by `it came after its held
+     command had been released`, the event arrives later than the 0.4 s grace and the grace (`NAT_GRACE`) is too short;
+   - whether `builder.proposalApply` is fired before the command is queued at all (if no event ever appears while `held` does,
+     every build is released and goes the old way: `strict: held N ...: no capture of a tool build`);
+   - whether the cancel needs the mod's `nop` trigger or the replay itself is enough (`native.log` shows `dropped` within a
+     frame or two of `held`; if it takes seconds the trigger is not reaching `Add`).
+3. **The tool after a cancel.** Right after step 2, build a second road with the same tool, then a third. The tool must be
+   usable (no stuck ghost, no frozen cursor, no error in the game log). A tool that waits for its command's callback would
+   hang here; that is the likeliest failure of this stage. Try the bulldozer and the track tool the same way.
+4. **Each tool.** One build per tool of the list in section 8, stage 2 F (street, track, station, depot, bulldozer, upgrade,
+   lane, traffic light). Each should end as in step 2 or, if the capture or the rebuild check refuses, as `strict: held N (site
+   ...): the capture of ... failed (...)` or `it cannot be rebuilt here (...)` followed by `release written`, the road built by
+   the tool at once and shipped the old way (`native build captured` in the simulation lines). Stops and signals are expected to
+   take the second form (`an edge object has no model`, `docs/COVERAGE_BUILD.md` section 8). Write down which tool is which
+   `site`.
+5. **Two commands for one click.** A road depot against a street (two commands in one record) and a station on a road. Look for
+   two `held` lines for one capture: the second shows `no capture of a tool build`, is released and builds natively before the
+   first is replayed; the two games then differ. If this happens the pairing needs a rule for tools that add several commands.
+6. **Both players at once.** Both build different roads in the same second. Both roads appear on both games, no
+   `LATE action`, and the next checksum rounds in the launcher agree (including `companies`).
+7. **Resync.** Trigger a resync from the window. Expect in `native_ctl.log` a `hold_off` before the load, and after the reload
+   the new script's `ping`, `hold_on`, and `strict: mode ON` again. Build a road after it: as in step 2. A crash or hang at the
+   reload with commands held would show here (the likeliest sequence is a build in the second before the resync).
+8. **End of the session.** Leave the session in the window. Expect `strict: mode off (the session ended), hold_off written`, no
+   more lines in `native_ctl.log`, and plain native builds afterwards. Host again: the mode comes back by itself.
+9. **Refusals.** Take the build permission from the player (`docs/PROTOCOL.md`) and build: `strict: held N: not allowed to
+   build, cancelled`, nothing built anywhere, and the tool is usable afterwards. A build the player cannot pay for: the tool
+   itself refuses it before the click, or the replay is refused at the stamp on every game alike (`action ... refused`).
+10. **The module's own switch-off.** Pause the building game's process for 12 s (a debugger, or a long save). Expect
+    `strict: mode is off: the native module switched holding off (silence); trying again in 3 s` and then `mode ON` again, and
+    any command held at that moment built natively (the log line about a release after shipping, if one was).
+11. **Pings.** Over a 5-minute play with no builds, `native_ctl.log` grows by one `ping` line every 2 s and the module never
+    logs `silence`. The file grows without bound (about 45 KB an hour); note whether that matters.
 
 ### Not testable offline, for completeness
 
