@@ -202,7 +202,7 @@ The engine calls the company code makes, all in `Co.extendEngine`, all added to 
 | `mod/feverlink3_1/content/feverlink3_cmds_company.lua` | The module: `commands` (registered in `L.COMMANDS`), `events` (`Companies` / `applyLevel`) and `company` (`Co`, the functions the bridge calls). Pure Lua except `Co.extendEngine`. |
 | `mod/feverlink3_1/content/feverlink3_lockstep.lua` | `spec.virtual` and `spec.apply` documented; `decodeCommand` honours `ctx.refuse`. |
 | `mod/feverlink3_1/content/feverlink3_bridge.script.lua` | Hunks marked `companies`: the context of an action, the guarded calls around the engine command, the registry in the state and its mirror, the replay of pause-time actions, the pre-check, the factory of mod-level actions, `companies.txt`, the window records, the local-company switch. |
-| `tests/lua/test_cmds_company.py` | 24 unit tests of the module and 25 tests of two mocked games (more than one player entity, per-player accounts, ownership, pauses, reloads, forged actions, faults in the company layer). They also pass on Lua 5.3, 5.4 and LuaJIT 2.1 (run by hand with lupa's other runtimes; CI runs the harness' 5.2). |
+| `tests/lua/test_cmds_company.py` | 25 unit tests of the module and 29 tests of two mocked games (more than one player entity, per-player accounts, ownership, pauses, reloads, forged actions, events, the operations module's commands, faults in the company layer). They also pass on Lua 5.3, 5.4 and LuaJIT 2.1 (run by hand with lupa's other runtimes; CI runs the harness' 5.2). |
 
 ## 6. The window
 

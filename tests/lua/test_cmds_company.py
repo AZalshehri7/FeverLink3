@@ -702,6 +702,13 @@ function EXECUTE(cmd, cb)
     if cb then cb({}, true, {}) end
     return
   end
+  if name == "makeEntitySetNameCmd" then
+    assert(WORLD[a[1]], "no entity " .. tostring(a[1]))
+    WORLD[a[1]].NAME = a[2]
+    applied(name, a, nil)
+    if cb then cb({}, true, {}) end
+    return
+  end
   if name == "makeJournalBookAssetCmd" then
     local acc = ACCOUNTS[a[1]]
     assert(acc, "no account for " .. tostring(a[1]))
@@ -742,6 +749,7 @@ function MAKE_API()
   local function mk(name) return function(...) return { __cmd = name, args = { n = select("#", ...), ... } } end end
   api.cmd.makeGameAddPlayerCmd = mk("makeGameAddPlayerCmd")
   api.cmd.makeEntitySetPlayerCmd = mk("makeEntitySetPlayerCmd")
+  api.cmd.makeEntitySetNameCmd = mk("makeEntitySetNameCmd")
   api.type.Vec3f = { new = function(x, y, z) return { x = x, y = y, z = z } end }
   api.type.ComponentType.PLAYER_OWNED = 9
   local baseGet = api.engine.getComponent
@@ -1158,6 +1166,28 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.A.ev("GAME.applied[3].args[3]"), 7)
         self.assertEqual(self.B.ev("GAME.applied[3].args[3]"), 7)
         self.assertEqual(self.A.applied(), self.B.applied())
+        self.assertSameRegistry()
+
+    def test_the_operations_modules_commands_follow_the_senders_company(self):
+        self.start()
+        self.tick(10)
+        self.separate()
+        pa, pb = self.both("GAME.applied[1].entity")
+        # the client renames its company in the finance window: the player entity travels as "own company"
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(api.engine.util.getPlayer(), "Ironworks Ltd"))')
+        self.tick(15)
+        self.assertEqual(self.A.ev("WORLD[%d].NAME" % pa), "Ironworks Ltd")
+        self.assertEqual(self.B.ev("WORLD[%d].NAME" % pb), "Ironworks Ltd")
+        self.assertIsNone(self.A.ev("WORLD[7].NAME"), "the host's company was not renamed")
+        # a journal booking from a window (the cost of a marketing campaign) lands on the sender's company, and is in the ledger
+        self.B.send_gui("local e = api.type.JournalEntry.new(); e.amount = -4000; e.time = -1; e.category.type = api.type.JournalEntry.Type.OTHER; "
+                        "api.cmd.sendCommand(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), e))")
+        self.tick(15)
+        self.assertEqual(self.A.ev("ACCOUNTS[%d].balance" % pa), 2000000 - 4000)
+        self.assertEqual(self.B.ev("ACCOUNTS[%d].balance" % pb), 2000000 - 4000)
+        self.assertEqual(self.both("ACCOUNT.balance"), (1000000, 1000000))
+        led = self.A.registry()["ledger"][1]
+        self.assertEqual((led["gross"], led["made"]), ({"spend": 4000}, {"makeEntitySetNameCmd": 1, "makeJournalBookAssetCmd": 1}))
         self.assertSameRegistry()
 
     def test_a_player_outside_every_company_acts_as_the_games_own_player(self):
