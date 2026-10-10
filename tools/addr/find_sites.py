@@ -3,9 +3,15 @@
 
 The executable is read as data, never executed. For every hook site the native module needs
 (`native/src/build_table.rs`) the tool locates the RVA by up to three independent methods (a known
-table keyed by PE timestamp, a byte signature with wildcards, a string reference), reports how it
-was found and with what confidence, extracts the prologue the detour will steal, checks it is safe
-to relocate, and prints a ready-to-paste Rust literal.
+table keyed by PE timestamp, a byte signature with wildcards, a string reference or the code around
+the site), reports how it was found and with what confidence, extracts the prologue the detour will
+steal, checks it is safe to relocate, and prints a ready-to-paste Rust literal.
+
+Besides the three hook sites it finds the engine helpers the hold path calls (`command_move`,
+`command_destroy`, `handle_destroy`), checks the engine layout facts the module relies on (the
+command-kind byte offset, sizeof(Command)), walks the command dispatcher to name each command kind,
+and verifies that the list of interface tools whose commands may be held (`ui_add_sites`) names only
+direct calls to `CommandList::Add`.
 
 Hook sites located with findings from MPFever (MIT, dkdknight): the per-build RVAs for game builds
 40408 and 40420, the prologue bytes and the identity of each function come from its
@@ -210,6 +216,44 @@ class Image:
                     hits.add(self.text_rva + m.start())
         return sorted(hits)
 
+    def direct_callers(self, target_rva: int) -> list[int]:
+        """RVAs of the byte after every `call rel32` in .text that reaches `target_rva` (the return addresses)."""
+        out = []
+        text = self.text
+        i = text.find(b"\xE8")
+        while i != -1:
+            if i + 5 <= len(text) and self.text_rva + i + 5 + struct.unpack_from("<i", text, i + 1)[0] == target_rva:
+                out.append(self.text_rva + i + 5)
+            i = text.find(b"\xE8", i + 1)
+        return out
+
+    def cstring_at(self, rva: int, limit: int = 200) -> str | None:
+        """A printable ASCII string of at least 3 characters at `rva`, or None."""
+        off = self.rva_to_off(rva)
+        if off is None:
+            return None
+        raw = self.data[off: off + limit]
+        end = raw.find(b"\0")
+        if end < 3 or not all(32 <= c < 127 for c in raw[:end]):
+            return None
+        return raw[:end].decode("ascii")
+
+    def strings_in(self, func: Func) -> list[str]:
+        """The strings a function loads with `lea reg,[rip+d]`, in code order."""
+        out, cur = [], func.begin
+        while cur < func.end:
+            ins = self.disasm(cur, 16)
+            if not ins:
+                cur += 1
+                continue
+            i = ins[0]
+            if i.mnemonic == "lea" and "rip" in i.op_str:
+                s = self.cstring_at(cur + i.size + i.disp)
+                if s:
+                    out.append(s)
+            cur += i.size
+        return out
+
     # -- metadata
     def winhttp_imports(self) -> list[str] | None:
         for imp in getattr(self.pe, "DIRECTORY_ENTRY_IMPORT", []):
@@ -263,16 +307,45 @@ class CallerIdiom:
 
 
 @dataclass
+class InsideParent:
+    """A direct call found inside another, already located function: `regex` runs over the parent's bytes and its
+    group 1 is the 4-byte displacement of an `E8` call. Every match must reach the same target."""
+    parent: str
+    regex: bytes
+    note: str
+
+
+@dataclass
+class AfterCallers:
+    """The function that the code right after every direct call to another located function calls in turn
+    (`call parent; lea rcx,[..]; call X`). Tallied over all direct callers; the top target must hold a clear majority."""
+    parent: str
+    min_votes: int
+    note: str
+
+
+@dataclass
 class Site:
     field: str
-    kind: str  # "detour": the function start is stolen; "patch": bytes are rewritten in place
+    kind: str  # "detour": the function start is stolen; "patch": bytes are rewritten in place; "call": only called
     what: str
     known: dict[int, int]            # PE timestamp -> RVA, from MPFever's BUILDS[] (credited)
     seed: str                        # bytes MPFever expects at the site: verifies a known RVA, not unique on its own
     signature: str | None            # derived by this tool from `signature_from`, meant to be unique in .text
     signature_from: int = 0          # PE timestamp of the build the signature was derived from (self-matches are not evidence)
-    anchor: StringAnchor | CallerIdiom | None = None
+    anchor: StringAnchor | CallerIdiom | InsideParent | AfterCallers | None = None
     patch_len: int = 0               # "patch" sites: the exact region the patch rewrites
+    replacement: object = None       # "patch" sites: bytes -> bytes, the rewritten region built from the expected one
+
+
+def script_pool_replacement(expected: bytes) -> bytes:
+    """The script-pool region with the shared-pool branch removed and the worker count forced to 0, which makes the
+    engine fall back to one worker: `cmp eax,8; nop6; mov [rsp+20h],1; xor eax,eax; nop3`. Same length as `expected`.
+    Finding from MPFever (MIT, dkdknight): PatchScriptPool."""
+    if (len(expected) != 22 or expected[:3] != bytes.fromhex("83F808") or expected[3:5] != bytes.fromhex("0F8D")
+            or expected[9:17] != bytes.fromhex("C744242001000000") or expected[17] != 0xE8):
+        raise ValueError("the script-pool region has an unexpected shape")
+    return expected[:3] + bytes.fromhex("660F1F440000") + expected[9:17] + bytes.fromhex("31C00F1F00")
 
 
 # From MPFever (MIT, dkdknight) native/mpfever_native.cpp: BUILDS[] rows 40408 (0x6ab69fe5) and 40420
@@ -319,6 +392,47 @@ SITES: list[Site] = [
         signature_from=0x6AC50427,
         anchor=StringAnchor(b"GameScriptSystem Pool\0", "pool name copied inline (vmovups xmm0,[rip+d]) a few instructions later"),
         patch_len=22,
+        replacement=script_pool_replacement,
+    ),
+    # The engine helpers the hold path calls (native/src/engine.rs): never hooked, only called, so they carry a
+    # whole-instruction prologue that is checked before the first call. Addresses from MPFever's BUILDS[] (move,
+    # dtor, handleDtor), each confirmed here by how `CommandList::Add` itself uses it.
+    Site(
+        field="command_move",
+        kind="call",
+        what="Command::Command(Command&&): moves the 0x38-byte command (payload pointer, vector, weak progress, "
+             "result byte) and empties the source",
+        known={0x6AB69FE5: 0x9CEDB0, 0x6AC50427: 0x9D0430},
+        seed="48 8B 02 45 33 D2 4C 89 12 48 89 01 48 8B 42 08",
+        signature="48 8B 02 45 33 D2 4C 89 12 48 89 01 48 8B 42 08",
+        signature_from=0x6AC50427,
+        anchor=InsideParent("command_list_add", rb"\xE8(....)\x48\x83\x43\x08\x38",
+                            "the call right before `add qword [list+8], 0x38` that appends the command to the queue vector"),
+    ),
+    Site(
+        field="command_destroy",
+        kind="call",
+        what="Command::~Command(): releases the weak progress pointer, the vector and the payload (0x9c0 bytes, "
+             "variant index at +0x9b8)",
+        known={0x6AB69FE5: 0x9CEFF0, 0x6AC50427: 0x9D0670},
+        seed="40 53 48 83 EC 20 48 8B D9 48 8B 49 28 48 85 C9",
+        signature="40 53 48 83 EC 20 48 8B D9 48 8B 49 28 48 85 C9 74 ?? B8 ?? ?? ?? ?? F0 0F C1 41 0C 83 F8 01 75 ?? "
+                  "48 8B 01 FF 50 08 48 8B 4B 08 48 85 C9",
+        signature_from=0x6AC50427,
+        anchor=InsideParent("command_list_add", rb"\x49\x8B\xCF\xE8(....)\x90",
+                            "`mov rcx,r15; call X; nop`, which Add runs on its moved-from `cmd` argument"),
+    ),
+    Site(
+        field="handle_destroy",
+        kind="call",
+        what="destructor of the 16-byte handle Add writes through `out`; a zeroed handle is a no-op",
+        known={0x6AB69FE5: 0x30393D0, 0x6AC50427: 0x3040C90},
+        seed="40 53 48 83 EC 20 48 8B 19 48 85 DB 74 30 48 8B 4B 08",
+        signature="40 53 48 83 EC 20 48 8B 19 48 85 DB 74 ?? 48 8B 4B 08 48 85 C9 74 ?? B8 ?? ?? ?? ?? F0 0F C1 41 0C "
+                  "83 F8 01 75 ?? 48 8B 01 FF 50 10 BA 10 00 00 00",
+        signature_from=0x6AC50427,
+        anchor=AfterCallers("command_list_add", 20,
+                            "every caller of Add destroys the handle with `lea rcx,[..]; call X` straight after the call"),
     ),
 ]
 
@@ -334,7 +448,10 @@ class Located:
     candidates: dict[str, list[int]] = field(default_factory=dict)
 
 
-def locate(img: Image, site: Site) -> Located:
+def locate(img: Image, site: Site, located: dict[str, int] | None = None) -> Located:
+    """`located` maps the field names of the sites already found to their RVAs: the anchors of the helper sites
+    work from the function of another site."""
+    located = located or {}
     notes: list[str] = []
     cands: dict[str, list[int]] = {}
     seed = Pattern(site.seed)
@@ -413,6 +530,45 @@ def locate(img: Image, site: Site) -> Located:
                 cands["anchor"] = [top]
             else:
                 notes.append(f"caller idiom inconclusive (top target {top:#x} has {n} votes, needs >= {site.anchor.min_votes} and a clear majority)")
+                cands["anchor"] = []
+    elif isinstance(site.anchor, InsideParent):
+        anchor_kind = f"anchored inside {site.anchor.parent}"
+        parent = located.get(site.anchor.parent)
+        pf = img.func_containing(parent) if parent is not None else None
+        if pf is None:
+            notes.append(f"parent site {site.anchor.parent} is not located: cannot anchor")
+            cands["anchor"] = []
+        else:
+            body = img.text_at(pf.begin, pf.end - pf.begin)
+            targets = [pf.begin + m.start(1) + 4 + struct.unpack("<i", m.group(1))[0]
+                       for m in re.finditer(site.anchor.regex, body, re.S)]
+            reached = sorted(set(targets))
+            notes.append(f"{len(targets)} call(s) inside {site.anchor.parent} match ({site.anchor.note}): "
+                         + (", ".join(f"{t:#x}" for t in reached) or "none"))
+            cands["anchor"] = reached if len(reached) == 1 else []
+    elif isinstance(site.anchor, AfterCallers):
+        anchor_kind = f"anchored from what the callers of {site.anchor.parent} call next"
+        parent = located.get(site.anchor.parent)
+        votes = {}
+        for ret in (img.direct_callers(parent) if parent is not None else []):
+            nxt = img.disasm(ret, 32)[:2]
+            if (len(nxt) == 2 and nxt[0].mnemonic == "lea" and nxt[0].op_str.startswith("rcx,")
+                    and nxt[1].mnemonic == "call" and nxt[1].op_str.startswith("0x")):
+                tgt = int(nxt[1].op_str, 16) - img.image_base
+                votes[tgt] = votes.get(tgt, 0) + 1
+        ranked = sorted(votes.items(), key=lambda kv: -kv[1])
+        if not ranked:
+            notes.append(f"no caller of {site.anchor.parent} is followed by `lea rcx; call` ({site.anchor.note})")
+            cands["anchor"] = []
+        else:
+            top, n = ranked[0]
+            runner = ranked[1][1] if len(ranked) > 1 else 0
+            notes.append(f"{sum(votes.values())} caller(s) of {site.anchor.parent} are followed by `lea rcx; call` ({site.anchor.note}): "
+                         + ", ".join(f"{t:#x} x{c}" for t, c in ranked[:4]))
+            if n >= site.anchor.min_votes and n > 2 * runner:
+                cands["anchor"] = [top]
+            else:
+                notes.append(f"inconclusive (top target {top:#x} has {n} votes, needs >= {site.anchor.min_votes} and a clear majority)")
                 cands["anchor"] = []
 
     # verdict
@@ -544,6 +700,160 @@ def rust_bytes(b: bytes) -> str:
     return "&[" + ", ".join(f"0x{x:02X}" for x in b) + "]"
 
 
+# The interface's construction tools whose `CommandList::Add` calls the hold path may hold, as the RVA of the byte
+# after the `call` (the return address the hook sees). From MPFever's native/mpfever_native.cpp UI_SITES_40420
+# (MIT, dkdknight), who played with them in the game; the terrain tool's call is left out on purpose (holding its
+# edit crashed the tool). The tool verifies that every entry is a direct call to `command_list_add`.
+UI_ADD_SITES_KNOWN: dict[int, list[int]] = {
+    0x6AC50427: [
+        0x4D396F,   # UI::Bulldozer::Apply
+        0x51B56C,   # UI::ConstructionBuilder::MousePressed
+        0x528504,   # a tool without a source-file string
+        0x537EE5, 0x538649, 0x5387CD,   # UI::LaneModifier::Apply
+        0x542EBA,   # UI::ModuleBuilder::MousePressed
+        0x5891B4,   # UI::StreetBuilder::UpdateEngine
+        0x5948DD,   # a street-terminal tool (stops, signals, waypoints) without a source-file string
+        0x5BF08D,   # UI::TrackModifier::Build
+        0x28A3024, 0x28A3871,   # the entity window's builtins
+    ],
+}
+
+# The command kind the hold path is about, found by the string its handler references.
+KIND_ANCHORS: dict[str, str] = {"build_proposal": "WorldBuildProposal"}
+
+CALL_PROLOGUE_LEN = 16  # "call" sites: whole instructions, at least this many bytes, compared before the first call
+
+
+def source_tags(img: Image, func: Func) -> str:
+    """What a function says about itself: the `UI::..` profiler tags and source file names it references."""
+    strs = img.strings_in(func)
+    files = sorted({s.replace("\\", "/").rsplit("/", 1)[-1] for s in strs if "train_fever" in s})
+    tags = []
+    for s in strs:
+        if (s.startswith("UI::") or "::" in s) and s not in tags and len(s) < 60:
+            tags.append(s)
+    return ", ".join((tags[:2] + files)[:3]) or "-"
+
+
+def analyse_layout(img: Image, located: dict[str, int]) -> tuple[list[str], int | None]:
+    """Engine layout facts the hold path relies on, each read from two places that must agree.
+
+    - the command-kind byte inside a payload: `movsx rcx, byte [reg+disp32]` in the apply function and again in
+      the command destructor, both followed by `inc rcx` (the dispatcher index is kind + 1);
+    - sizeof(Command): the `add qword [list+8], imm8` after the move constructor call in `CommandList::Add`."""
+    lines: list[str] = []
+    kind_offset = None
+    apply_f = img.func_containing(located["apply_command"]) if "apply_command" in located else None
+    dtor_f = img.func_containing(located["command_destroy"]) if "command_destroy" in located else None
+    add_f = img.func_containing(located["command_list_add"]) if "command_list_add" in located else None
+    if apply_f and dtor_f:
+        a = {struct.unpack("<I", m.group(1))[0] for m in re.finditer(
+            rb"\x49\x0F\xBE\x88(....)\x48\xFF\xC1", img.text_at(apply_f.begin, apply_f.end - apply_f.begin), re.S)}
+        d = {struct.unpack("<I", m.group(1))[0] for m in re.finditer(
+            rb"\x48\x0F\xBE\x8B(....)\x48\x8D\x54\x24.\x48\xFF\xC1", img.text_at(dtor_f.begin, dtor_f.end - dtor_f.begin), re.S)}
+        lines.append(f"kind byte offset in a payload: apply_command reads {', '.join(f'{x:#x}' for x in sorted(a)) or 'nothing'}, "
+                     f"command_destroy reads {', '.join(f'{x:#x}' for x in sorted(d)) or 'nothing'}")
+        if len(a) == 1 and a == d:
+            kind_offset = a.pop()
+            lines.append(f"  AGREE: kind_offset = {kind_offset:#x}")
+        else:
+            lines.append("  !!! the two functions do not agree: kind_offset stays None, the counters and the hold stay off")
+    else:
+        lines.append("kind byte offset: apply_command or command_destroy not located; kind_offset stays None")
+    if add_f:
+        sizes = {m.group(1)[0] for m in re.finditer(rb"\xE8....\x48\x83\x43\x08(.)", img.text_at(add_f.begin, add_f.end - add_f.begin), re.S)}
+        lines.append("sizeof(Command): CommandList::Add advances the queue vector by "
+                     + (", ".join(f"{x:#x}" for x in sorted(sizes)) or "nothing found") + " bytes per command (the module's buffers hold 0x40)")
+        if sizes != {0x38}:
+            lines.append("  !!! expected exactly 0x38")
+    return lines, kind_offset
+
+
+def analyse_kinds(img: Image, located: dict[str, int]) -> tuple[list[str], list[tuple[str, int]], bool]:
+    """Walks the command dispatcher's jump table (the callee `apply_command` passes `kind + 1` to) and names each
+    case by the profiler tag it starts with or by the first string its handler references. Returns report lines,
+    the verified (name, kind) pairs for the build table and whether everything needed was found."""
+    lines: list[str] = []
+    af = img.func_containing(located["apply_command"]) if "apply_command" in located else None
+    if af is None:
+        return ["command kinds: apply_command not located"], [], False
+    body = img.text_at(af.begin, af.end - af.begin)
+    m = re.search(rb"\x49\x0F\xBE\x88....\x48\xFF\xC1\x48\x8D\x55.\xE8(....)", body, re.S)
+    if not m:
+        return ["command kinds: the dispatcher call in apply_command was not found"], [], False
+    disp = af.begin + m.start(1) + 4 + struct.unpack("<i", m.group(1))[0]
+    df = img.func_containing(disp)
+    if df is None or df.begin != disp:
+        return [f"command kinds: {disp:#x} is not a function start"], [], False
+    mt = re.search(rb"\x8B\x84\x8A(....)", img.text_at(df.begin, df.end - df.begin), re.S)
+    if not mt:
+        return [f"command kinds: no jump table in {disp:#x}"], [], False
+    table = struct.unpack("<I", mt.group(1))[0]
+    off = img.rva_to_off(table)
+    if off is None:
+        return [f"command kinds: jump table at {table:#x} is not in the file"], [], False
+    cases: list[tuple[int, int]] = []
+    for i in range(256):
+        entry = struct.unpack_from("<I", img.data, off + 4 * i)[0]
+        if not df.begin <= entry < df.end:
+            break
+        cases.append((i - 1, entry))
+    names: dict[int, tuple[str, int | None]] = {}
+    for kind, entry in cases:
+        label, handler = None, None
+        for k, ins in enumerate(img.disasm(entry, 40)[:4]):
+            if label is None and ins.mnemonic == "lea" and ins.op_str.startswith("rcx, [rip"):
+                label = img.cstring_at(entry + sum(x.size for x in img.disasm(entry, 40)[:k + 1]) + ins.disp)
+            if handler is None and ins.mnemonic == "call" and ins.op_str.startswith("0x"):
+                handler = int(ins.op_str, 16) - img.image_base
+        if label is None and handler is not None:
+            hf = img.func_containing(handler)
+            hs = [s for s in (img.strings_in(hf) if hf else []) if "train_fever" not in s and "{}" not in s]
+            label = hs[0] if hs else None
+        names[kind] = (label or "-", handler)
+    lines.append(f"command kinds: dispatcher {df.begin:#x} (called by apply_command), jump table {table:#x}, {len(cases)} cases "
+                 f"(kind -1 is 'none'); the name is the profiler tag the case starts with or the first string its handler references")
+    for kind, entry in cases:
+        label, handler = names[kind]
+        lines.append(f"  kind {kind:3d}  {label:<44} case {entry:#x}" + (f"  handler {handler:#x}" if handler else ""))
+    verified: list[tuple[str, int]] = []
+    ok = True
+    for name, needle in KIND_ANCHORS.items():
+        hits = [k for k, (lab, _) in names.items() if lab == needle]
+        if len(hits) == 1:
+            verified.append((name, hits[0]))
+            lines.append(f"  verified: {name} = kind {hits[0]} (its case is named by the string '{needle}')")
+        else:
+            ok = False
+            lines.append(f"  !!! {name}: expected exactly one case named '{needle}', found {len(hits)}: the kind table stays empty")
+    return lines, verified, ok
+
+
+def report_callers(img: Image, located: dict[str, int], ts: int) -> tuple[list[str], list[int], bool]:
+    """Every direct caller of `command_list_add` with what its function says about itself, and the check that the
+    hold list (MPFever's, credited) only names direct calls to it. Returns report lines, the verified list, ok."""
+    add = located.get("command_list_add")
+    if add is None:
+        return ["callers of command_list_add: not located"], [], False
+    known = UI_ADD_SITES_KNOWN.get(ts)
+    rets = img.direct_callers(add)
+    lines = [f"direct callers of command_list_add: {len(rets)} (the hold list marks the interface's construction tools)"]
+    for r in rets:
+        f = img.func_containing(r - 5)
+        mark = "HOLD" if known and r in known else "    "
+        lines.append(f"  {mark} return {r:#09x}  in {f.begin:#x}..{f.end:#x}  {source_tags(img, f) if f else '-'}")
+    if known is None:
+        lines.append("this build has no hold list yet: ui_add_sites stays empty and the hold hook stays off. Candidates are the "
+                     "callers above whose function names a source file under Game\\UI\\Actions; test each one in the game")
+        return lines, [], True
+    bad = [r for r in known if r not in rets]
+    if bad:
+        lines.append("  !!! hold list entries that are not direct calls to command_list_add: " + ", ".join(f"{r:#x}" for r in bad))
+        return lines, [], False
+    lines.append(f"hold list: all {len(known)} entries are direct calls to command_list_add (MPFever's list, MIT, dkdknight)")
+    return lines, sorted(known), True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("exe", help="path to TransportFever3.exe (read only)")
@@ -604,11 +914,12 @@ def main() -> int:
     # sites
     rows: dict[str, tuple[Located, bytes | None, str]] = {}
     sigs: dict[str, str] = {}
+    located: dict[str, int] = {}
     for site in SITES:
         p("=" * 100)
         p(f"site {site.field}  [{site.kind}]")
         p(f"  what: {site.what}")
-        loc = locate(img, site)
+        loc = locate(img, site, located)
         for n in loc.notes:
             p(f"  - {n}")
         if loc.rva is None:
@@ -618,6 +929,7 @@ def main() -> int:
             rows[site.field] = (loc, None, "")
             status = 1
             continue
+        located[site.field] = loc.rva
         p(f"  RVA {loc.rva:#x}  (VA {img.image_base + loc.rva:#x})")
         p(f"  located by: {loc.method}")
         p(f"  confidence: {loc.confidence}")
@@ -629,10 +941,12 @@ def main() -> int:
         f = img.func_containing(loc.rva)
         if f:
             p(f"  enclosing function (unwind table): {f.begin:#x}..{f.end:#x}" + ("" if f.begin == loc.rva or site.kind == "patch" else "  !!! site is not a function start"))
+        elif site.kind == "call":
+            p("  no unwind-table entry: a leaf function (no stack frame), which is normal for a small helper")
 
         # prologue
         exact = site.kind == "patch"
-        need = site.patch_len if exact else JMP_ABS_LEN
+        need = site.patch_len if exact else (CALL_PROLOGUE_LEN if site.kind == "call" else JMP_ABS_LEN)
         insns, total, err = take_prologue(img, loc.rva, need, exact)
         p(f"  {'patch region' if exact else 'prologue'} ({'exactly' if exact else 'minimal >='} {need} bytes on an instruction boundary): {total} bytes"
           + (f"  !!! {err}" if err else ""))
@@ -643,6 +957,9 @@ def main() -> int:
             p("  detour safety: " + ("OK (no rip-relative operand, no relative jump/call)" if not bad else "UNSAFE: " + "; ".join(bad)))
             if bad:
                 status = 1
+        elif site.kind == "call":
+            p("  call site: never hooked or patched, so relative operands do not matter; the native module compares these bytes"
+              " with the ones in memory before it calls the function")
         else:
             p("  detour safety: " + ("OK" if not bad else "UNSAFE as a detour: " + "; ".join(bad)))
             p("    (patch site: these bytes are rewritten in place, never relocated to a trampoline, so relative"
@@ -662,6 +979,26 @@ def main() -> int:
         if err:
             status = 1
 
+    # engine layout, command kinds, callers of the command list
+    p("=" * 100)
+    layout_lines, kind_offset = analyse_layout(img, located)
+    for ln in layout_lines:
+        p(ln)
+        if "!!!" in ln:
+            status = 1
+    p("")
+    kind_lines, kinds, kinds_ok = analyse_kinds(img, located)
+    for ln in kind_lines:
+        p(ln)
+    if not kinds_ok:
+        status = 1
+    p("")
+    caller_lines, ui_sites, callers_ok = report_callers(img, located, ts)
+    for ln in caller_lines:
+        p(ln)
+    if not callers_ok:
+        status = 1
+
     # Rust literal
     p("=" * 100)
     p("BuildAddrs row for native/src/build_table.rs")
@@ -673,14 +1010,25 @@ def main() -> int:
     lit.append("    BuildAddrs {")
     lit.append(f"        timestamp: {ts:#010x},")
     lit.append(f"        name: \"{build_name}\",")
+    rust_type = {"detour": "HookSite", "call": "CallSite"}
     for site in SITES:
         loc, prologue, _ = rows[site.field]
         if loc.rva is None or prologue is None:
-            lit.append(f"        // {site.field}: NOT LOCATED ({loc.method}); hook stays off")
+            lit.append(f"        // {site.field}: NOT LOCATED ({loc.method}); the feature that needs it stays off")
             lit.append(f"        {site.field}: None,")
+            continue
+        lit.append(f"        // {site.field}: {loc.method}; confidence {loc.confidence}" + (" (patch site)" if site.kind == "patch" else ""))
+        if site.kind == "patch":
+            repl = site.replacement(prologue) if callable(site.replacement) else prologue
+            lit.append(f"        {site.field}: Some(PatchSite {{ rva: {loc.rva:#x}, expected: {rust_bytes(prologue)}, replacement: {rust_bytes(repl)} }}),")
         else:
-            lit.append(f"        // {site.field}: {loc.method}; confidence {loc.confidence}" + (" (patch site)" if site.kind == "patch" else ""))
-            lit.append(f"        {site.field}: Some(HookSite {{ rva: {loc.rva:#x}, prologue: {rust_bytes(prologue)} }}),")
+            lit.append(f"        {site.field}: Some({rust_type[site.kind]} {{ rva: {loc.rva:#x}, prologue: {rust_bytes(prologue)} }}),")
+    lit.append("        // ui_add_sites: return addresses of the construction tools' calls to command_list_add that may be held")
+    lit.append("        ui_add_sites: &[" + ", ".join(f"{r:#x}" for r in ui_sites) + "],")
+    lit.append("        // kind_offset: the command kind byte inside a payload, read by apply_command and command_destroy")
+    lit.append(f"        kind_offset: {'Some(' + format(kind_offset, '#x') + ')' if kind_offset is not None else 'None'},")
+    lit.append("        // kinds: command kinds the control link may name; the dispatcher case is named by its handler's string")
+    lit.append("        kinds: &[" + ", ".join(f'("{n}", {k})' for n, k in kinds) + "],")
     lit.append("    },")
     out.extend(lit)
     p("")

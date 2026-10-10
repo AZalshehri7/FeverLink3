@@ -5,7 +5,7 @@ members = ["core", "native", "launcher", "tools/release"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 authors = ["FeverLink3 contributors"]
 repository = "https://github.com/AZalshehri7/FeverLink3"

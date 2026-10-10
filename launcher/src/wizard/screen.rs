@@ -1,0 +1,398 @@
+//! The checks screen: six lines about this PC, the next step, and the whole screen the menu loop draws.
+
+use feverlink3_launcher::install::{self, Item};
+
+use super::facts::{folder_dir, installed_state, package_state, Facts, InstallState, Package};
+use super::menu::menu_lines;
+use super::plans::{compare, Comparison};
+use super::problems::{classify_reason, Problem, STEAM_URL};
+use super::versions::{own_version, BuildCheck};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Status {
+    Good,
+    Warn,
+    Bad,
+    Note,
+}
+
+impl Status {
+    /// Plain ASCII, so that it reads the same in every console font.
+    pub(super) fn tag(self) -> &'static str {
+        match self {
+            Status::Good => "[ok]",
+            Status::Warn => "[??]",
+            Status::Bad => "[!!]",
+            Status::Note => "[--]",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Check {
+    status: Status,
+    label: &'static str,
+    text: String,
+}
+
+fn check(status: Status, label: &'static str, text: impl Into<String>) -> Check {
+    Check { status, label, text: text.into() }
+}
+
+/// The six lines of the checks screen: Steam, the game, its build, whether it runs, whether FeverLink3 is
+/// installed, and whether this folder can be installed from.
+pub(super) fn checks(f: &Facts) -> Vec<Check> {
+    vec![steam_check(f), game_check(f), build_check(f), running_check(f), installed_check(f), folder_check(f)]
+}
+
+fn steam_check(f: &Facts) -> Check {
+    match &f.steam_path {
+        Some(path) => check(Status::Good, "Steam", path.display().to_string()),
+        None => check(Status::Bad, "Steam", format!("not found - install Steam first ({STEAM_URL})")),
+    }
+}
+
+fn game_check(f: &Facts) -> Check {
+    match (&f.game_dir, &f.steam_path) {
+        (Some(dir), _) => check(Status::Good, "Transport Fever 3", dir.display().to_string()),
+        (None, Some(_)) => check(
+            Status::Bad,
+            "Transport Fever 3",
+            "not found in your Steam libraries - install it from Steam and start it once",
+        ),
+        (None, None) => check(Status::Bad, "Transport Fever 3", "not found (Steam is missing)"),
+    }
+}
+
+fn build_check(f: &Facts) -> Check {
+    match &f.build {
+        BuildCheck::NoGame => check(Status::Note, "Game build", "not checked (the game was not found)"),
+        BuildCheck::Unreadable(why) => check(Status::Warn, "Game build", format!("could not be read ({why})")),
+        BuildCheck::Known { name } => {
+            check(Status::Good, "Game build", format!("{name} - FeverLink3 knows this build"))
+        }
+        BuildCheck::Unknown { timestamp } => check(
+            Status::Warn,
+            "Game build",
+            format!(
+                "unknown (id {timestamp:#010x}) - FeverLink3 has no hook addresses for it, so the mod would run in a \
+                 reduced mode. Tell the author the build number shown at the bottom right of the game's main menu"
+            ),
+        ),
+    }
+}
+
+fn running_check(f: &Facts) -> Check {
+    if f.game_running {
+        check(Status::Warn, "Game running", "yes - close it before installing or uninstalling")
+    } else {
+        check(Status::Good, "Game running", "no")
+    }
+}
+
+/// What is missing of a partial install, and what to do about it. `users` counts the Steam accounts of this PC
+/// that have a user folder for the game, `mods` those that hold the mod.
+fn partial_text(native_module: bool, mods: usize, users: usize) -> &'static str {
+    match (native_module, mods, users) {
+        (true, _, 0) => {
+            "the native module is there, but the game has not created its user folder yet: start it once from \
+             Steam, close it, then choose 1"
+        }
+        (true, 0, _) => "the native module is there, the mod is missing - choose 1 to finish",
+        (true, _, _) => "the mod is missing for some Steam accounts - choose 1 to finish",
+        (false, 0, _) => "only a helper file is left - choose 1 to finish, or 2 to remove it",
+        (false, mods, users) if mods == users => {
+            "the mod is there, the native module (winhttp.dll) is missing - choose 1 to finish"
+        }
+        (false, _, _) => "the native module and the mod for some Steam accounts are missing - choose 1 to finish",
+    }
+}
+
+fn installed_check(f: &Facts) -> Check {
+    const LABEL: &str = "FeverLink3";
+    match installed_state(f) {
+        InstallState::NoGameFolder => check(Status::Note, LABEL, "unknown (there is no game folder to look in)"),
+        InstallState::Unreadable(why) => check(
+            Status::Warn,
+            LABEL,
+            format!("unknown: winhttp.dll in the game folder cannot be read ({why}) - is the game running?"),
+        ),
+        InstallState::NotInstalled => check(Status::Note, LABEL, "not installed yet"),
+        InstallState::Complete { version: Some(v) } => check(Status::Good, LABEL, format!("installed (version {v})")),
+        InstallState::Complete { version: None } => check(Status::Good, LABEL, "installed (version not known)"),
+        InstallState::Partial { native_module, mods, users } => {
+            check(Status::Warn, LABEL, format!("only partly installed: {}", partial_text(native_module, mods, users)))
+        }
+        InstallState::ForeignDll => check(
+            Status::Bad,
+            LABEL,
+            "another program's winhttp.dll is in the game folder; FeverLink3 will not touch it",
+        ),
+    }
+}
+
+fn folder_check(f: &Facts) -> Check {
+    match package_state(f) {
+        Package::Complete => check(
+            Status::Good,
+            "This folder",
+            format!("{} (version {}, all files present)", folder_dir(f), own_version()),
+        ),
+        Package::TemporaryFolder => {
+            check(Status::Bad, "This folder", "inside a zip file or a temporary folder - unzip it first")
+        }
+        Package::Incomplete { .. } => check(Status::Bad, "This folder", "incomplete - unzip the whole zip file first"),
+    }
+}
+
+pub(super) fn render_checks(checks: &[Check]) -> Vec<String> {
+    checks.iter().map(|c| format!("  {}  {:<18} {}", c.status.tag(), c.label, c.text)).collect()
+}
+
+/// What to do next, in one sentence, from the state of this PC: the first thing that is wrong, else the next
+/// useful step.
+fn next_step(f: &Facts) -> String {
+    if f.steam_path.is_none() {
+        return Problem::SteamMissing.message();
+    }
+    let Some(game_dir) = &f.game_dir else { return Problem::GameMissing.message() };
+    match installed_state(f) {
+        InstallState::ForeignDll => Problem::ForeignDll(game_dir.join(install::DLL_NAME)).message(),
+        InstallState::Unreadable(why) => {
+            classify_reason(Item::NativeDll, &why, &game_dir.join(install::DLL_NAME)).message()
+        }
+        InstallState::Complete { .. } if f.game_running => {
+            "Transport Fever 3 is running: in the game, click FeverLink3 in the bar at the bottom of the screen.".into()
+        }
+        InstallState::Complete { .. } if matches!(compare(f), Ok(Comparison::Differs(_))) => {
+            "This folder holds different files than the installed ones. Choose 3 to compare them or 1 to update; \
+             otherwise choose 4 to start Transport Fever 3."
+                .into()
+        }
+        InstallState::Complete { .. } => {
+            "Choose 4 to start Transport Fever 3, then click FeverLink3 in the bar at the bottom of the game.".into()
+        }
+        state => match package_state(f) {
+            Package::TemporaryFolder => Problem::TemporaryFolder.message(),
+            Package::Incomplete { mod_missing, dll_missing } => {
+                Problem::PackageIncomplete { mod_missing, dll_missing }.message()
+            }
+            Package::Complete if f.game_running => {
+                "Close Transport Fever 3, then choose 1 to install FeverLink3.".into()
+            }
+            Package::Complete if matches!(state, InstallState::Partial { .. }) => {
+                "Choose 1 to finish installing FeverLink3.".into()
+            }
+            Package::Complete => "Choose 1 to install FeverLink3.".into(),
+        },
+    }
+}
+
+/// The license of this program, from `Cargo.toml`, so that the screen cannot say something the project does not.
+pub(super) fn license_line() -> String {
+    format!("License: {} (the text is in the file LICENSE next to this program)", env!("CARGO_PKG_LICENSE"))
+}
+
+/// The whole screen the menu loop draws: banner, checks, next step, menu.
+pub(super) fn render_screen(f: &Facts) -> String {
+    let mut lines = vec![
+        format!("FeverLink3 {} - cooperative multiplayer for Transport Fever 3", own_version()),
+        license_line(),
+        String::new(),
+        "Checking this PC...".to_owned(),
+    ];
+    lines.extend(render_checks(&checks(f)));
+    lines.push(String::new());
+    lines.push(format!("Next step: {}", next_step(f)));
+    lines.push(String::new());
+    lines.extend(menu_lines());
+    lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use feverlink3_launcher::install::{DllState, Item, Outcome};
+
+    use super::*;
+    use crate::wizard::testkit::*;
+
+    #[test]
+    fn the_checks_of_a_healthy_pc_before_install() {
+        let lines = render_checks(&checks(&base_facts()));
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0], r"  [ok]  Steam              C:\Steam");
+        assert_eq!(lines[1], r"  [ok]  Transport Fever 3  C:\Steam\steamapps\common\Transport Fever 3");
+        assert_eq!(lines[2], "  [ok]  Game build         40420 - FeverLink3 knows this build");
+        assert_eq!(lines[3], "  [ok]  Game running       no");
+        assert_eq!(lines[4], "  [--]  FeverLink3         not installed yet");
+        assert_eq!(
+            lines[5],
+            format!(r"  [ok]  This folder        C:\FeverLink3-0.1.0 (version {}, all files present)", own_version())
+        );
+    }
+
+    #[test]
+    fn the_checks_say_what_is_wrong_in_plain_words() {
+        let mut f = base_facts();
+        f.steam_path = None;
+        f.game_dir = None;
+        f.game_files = None;
+        f.build = BuildCheck::NoGame;
+        let text = render_checks(&checks(&f)).join("\n");
+        assert!(text.contains("[!!]  Steam"), "{text}");
+        assert!(text.contains(STEAM_URL));
+        assert!(text.contains("[!!]  Transport Fever 3  not found (Steam is missing)"), "{text}");
+        assert!(text.contains("[--]  Game build         not checked"), "{text}");
+        assert!(text.contains("[--]  FeverLink3         unknown"), "{text}");
+
+        let mut game_missing = base_facts();
+        game_missing.game_dir = None;
+        assert!(render_checks(&checks(&game_missing)).join("\n").contains("not found in your Steam libraries"));
+
+        let mut running = base_facts();
+        running.game_running = true;
+        assert!(render_checks(&checks(&running))[3].contains("[??]  Game running       yes - close it"));
+
+        let mut unknown_build = base_facts();
+        unknown_build.build = BuildCheck::Unknown { timestamp: 0x1234_abcd };
+        let line = &render_checks(&checks(&unknown_build))[2];
+        assert!(line.contains("[??]") && line.contains("0x1234abcd") && line.contains("reduced mode"), "{line}");
+
+        let mut unreadable_build = base_facts();
+        unreadable_build.build = BuildCheck::Unreadable("denied".into());
+        assert!(render_checks(&checks(&unreadable_build))[2].contains("could not be read (denied)"));
+    }
+
+    #[test]
+    fn the_install_line_shows_the_version_or_what_is_missing() {
+        let line = |f: &Facts| installed_check(f).text;
+        assert_eq!(line(&installed_facts()), format!("installed (version {})", own_version()));
+        let mut unknown_version = installed_facts();
+        unknown_version.installed_version = None;
+        assert_eq!(line(&unknown_version), "installed (version not known)");
+        let mut partial = installed_facts();
+        partial.users[0].mod_installed = false;
+        assert_eq!(
+            line(&partial),
+            "only partly installed: the native module is there, the mod is missing - choose 1 to finish"
+        );
+        assert_eq!(installed_check(&partial).status, Status::Warn);
+        let mut foreign = base_facts();
+        foreign.game_files.as_mut().unwrap().dll = Ok(DllState::Foreign);
+        assert_eq!(installed_check(&foreign).status, Status::Bad);
+        let mut no_game = base_facts();
+        no_game.game_files = None;
+        assert_eq!(line(&no_game), "unknown (there is no game folder to look in)");
+    }
+
+    #[test]
+    fn a_winhttp_dll_that_cannot_be_read_is_said_so_and_explained() {
+        let mut locked = base_facts();
+        locked.game_files.as_mut().unwrap().dll =
+            Err("The process cannot access the file because it is being used by another process. (os error 32)".into());
+        let check = installed_check(&locked);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.text.contains("winhttp.dll in the game folder cannot be read"), "{}", check.text);
+        assert!(check.text.contains("(os error 32)") && check.text.contains("is the game running?"), "{}", check.text);
+        assert!(!check.text.contains("no game folder"), "the folder is there: {}", check.text);
+        // what to do next is the plain explanation of the cause, not "choose 1"
+        let next = next_step(&locked);
+        assert!(next.starts_with("A file is in use by another program"), "{next}");
+        assert!(next.contains("winhttp.dll"), "{next}");
+    }
+
+    #[test]
+    fn a_partial_install_says_what_is_missing() {
+        // (native module, users with the mod, users with a user folder)
+        let cases = [
+            ((true, 0, 0), "has not created its user folder yet: start it once from Steam"),
+            ((true, 0, 2), "the native module is there, the mod is missing"),
+            ((true, 1, 2), "the mod is missing for some Steam accounts"),
+            ((false, 0, 1), "only a helper file is left - choose 1 to finish, or 2 to remove it"),
+            ((false, 1, 1), "the mod is there, the native module (winhttp.dll) is missing"),
+            ((false, 2, 2), "the mod is there, the native module (winhttp.dll) is missing"),
+            ((false, 1, 2), "the native module and the mod for some Steam accounts are missing"),
+        ];
+        for ((native_module, mods, users), expected) in cases {
+            let text = partial_text(native_module, mods, users);
+            assert!(text.contains(expected), "{native_module} {mods} {users}: {text}");
+            assert!(text.contains("choose 1") || text.contains("then choose 1"), "every case names the way on: {text}");
+        }
+    }
+
+    #[test]
+    fn the_folder_line_warns_about_zip_and_incomplete_folders() {
+        let mut f = base_facts();
+        f.payload_mod = None;
+        let check = folder_check(&f);
+        assert_eq!((check.status, check.text.as_str()), (Status::Bad, "incomplete - unzip the whole zip file first"));
+        f.exe_path = PathBuf::from("C:/Users/Ann/AppData/Local/Temp/Temp1_FeverLink3-0.1.0.zip/feverlink3.exe");
+        assert!(folder_check(&f).text.contains("zip file or a temporary folder"));
+    }
+
+    #[test]
+    fn next_step_names_the_first_thing_to_do() {
+        let next = |f: &Facts| next_step(f);
+        assert_eq!(next(&base_facts()), "Choose 1 to install FeverLink3.");
+        assert!(next(&installed_facts()).starts_with("Choose 4 to start Transport Fever 3"));
+
+        let mut no_steam = base_facts();
+        no_steam.steam_path = None;
+        assert_eq!(next(&no_steam), Problem::SteamMissing.message());
+        let mut no_game = base_facts();
+        no_game.game_dir = None;
+        assert_eq!(next(&no_game), Problem::GameMissing.message());
+
+        let mut running = base_facts();
+        running.game_running = true;
+        assert_eq!(next(&running), "Close Transport Fever 3, then choose 1 to install FeverLink3.");
+        let mut playing = installed_facts();
+        playing.game_running = true;
+        assert!(next(&playing).contains("click FeverLink3 in the bar at the bottom"));
+
+        let mut partial = base_facts();
+        partial.game_files.as_mut().unwrap().dll = Ok(DllState::Ours);
+        assert_eq!(next(&partial), "Choose 1 to finish installing FeverLink3.");
+
+        let mut incomplete = base_facts();
+        incomplete.payload_mod = None;
+        assert_eq!(next(&incomplete), Problem::PackageIncomplete { mod_missing: true, dll_missing: false }.message());
+        let mut zipped = base_facts();
+        zipped.exe_path = PathBuf::from("C:/Users/Ann/AppData/Local/Temp/Temp1_FeverLink3-0.1.0.zip/feverlink3.exe");
+        assert_eq!(next(&zipped), Problem::TemporaryFolder.message());
+
+        let mut foreign = base_facts();
+        foreign.game_files.as_mut().unwrap().dll = Ok(DllState::Foreign);
+        assert!(next(&foreign).contains("does not belong to FeverLink3"));
+
+        // installed, but this folder holds other files: the comparison is offered
+        let mut changed = installed_facts();
+        changed.plan = Some(report(vec![step(Item::Mod, Outcome::Done, "updated (mirror copy)")]));
+        assert!(next(&changed).contains("Choose 3 to compare"), "{}", next(&changed));
+    }
+
+    #[test]
+    fn the_screen_holds_the_banner_the_checks_the_next_step_and_the_menu() {
+        let screen = render_screen(&base_facts());
+        assert!(screen.starts_with(&format!("FeverLink3 {} - cooperative multiplayer", own_version())));
+        let order: Vec<usize> =
+            ["Checking this PC...", "[ok]  Steam", "Next step: Choose 1", "What would you like to do?"]
+                .iter()
+                .map(|part| screen.find(part).unwrap_or_else(|| panic!("{part} is on the screen")))
+                .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "in this order: {order:?}");
+        assert!(screen.ends_with("Type a number and press Enter.\n"));
+    }
+
+    #[test]
+    fn the_license_is_named_from_cargo_toml_on_the_screen() {
+        let screen = render_screen(&base_facts());
+        let license = env!("CARGO_PKG_LICENSE");
+        assert!(!license.is_empty());
+        assert!(license_line().contains(license) && license_line().contains("the file LICENSE"));
+        let banner: Vec<&str> = screen.lines().take(2).collect();
+        assert!(banner[1].starts_with("License: ") && banner[1].contains(license), "{banner:?}");
+    }
+}

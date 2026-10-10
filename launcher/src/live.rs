@@ -16,12 +16,12 @@
 
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::lobby::JoinCode;
@@ -30,12 +30,16 @@ use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle};
-use crate::{luatext, net, resync, steam, steam_transport, steamnet, upnp};
+use crate::{luatext, net, resync, steam, steam_transport, steamnet};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
 /// The controller's state, rewritten by the controller.
 pub const STATUS_FILE: &str = "ctl_status.txt";
+/// The Steam API is looked up again every couple of seconds (for about five minutes) when it was not there yet.
+const STEAM_LOAD_EVERY: Duration = Duration::from_secs(2);
+const STEAM_LOAD_ATTEMPTS: u32 = 150;
+
 /// The port a host listens on unless the window asks for another.
 pub const DEFAULT_PORT: u16 = 28090;
 
@@ -52,41 +56,22 @@ enum State {
     Failed(String),
 }
 
-/// What the background address lookup found for a host.
-#[derive(Default)]
-struct Public {
-    done: bool,
-    ip: Option<Ipv4Addr>,
-    note: String,
-    mapping: Option<upnp::Mapping>,
-}
-
 struct Hosting {
     handle: SessionHandle,
     secret: [u8; SessionKey::SECRET_SIZE],
-    port: u16,
     lan: Vec<SocketAddr>,
     code: String,
     endpoints: Vec<String>,
     password: bool,
-    public: Arc<Mutex<Public>>,
-    public_shown: Option<Ipv4Addr>,
 }
 
 impl Hosting {
-    /// The code with the public address first (when known), then the local ones.
-    fn rebuild_code(&mut self, public: Option<Ipv4Addr>) {
-        let mut endpoints: Vec<SocketAddr> = Vec::new();
-        if let Some(ip) = public {
-            endpoints.push(SocketAddr::from((ip, self.port)));
-        }
-        let room = JoinCode::MAX_ENDPOINTS.saturating_sub(endpoints.len());
-        endpoints.extend(self.lan.iter().take(room));
-        if let Ok(code) = JoinCode::create(&endpoints, self.secret, None) {
+    /// The join code for the direct (developer) transport: the machine's local addresses and the secret.
+    fn make_code(&mut self) {
+        if let Ok(code) = JoinCode::create(&self.lan, self.secret, None) {
             self.code = code.encode();
-            self.endpoints = endpoints.iter().map(ToString::to_string).collect();
+            self.endpoints = self.lan.iter().map(ToString::to_string).collect();
         }
-        self.public_shown = public;
     }
 }
 
@@ -105,6 +90,9 @@ pub struct Controller {
     commands: Tail,
     state: State,
     steam: Option<steamnet::Probe>,
+    /// How often and when the Steam API was looked for: it may not be loaded yet when the controller starts.
+    steam_attempts: u32,
+    steam_last_try: Instant,
     steam_note: Option<String>,
     steam_loop: Arc<Mutex<LoopCheck>>,
     published: String,
@@ -131,6 +119,8 @@ impl Controller {
             commands,
             state: State::Idle,
             steam: steamnet::Probe::load(),
+            steam_attempts: 1,
+            steam_last_try: Instant::now(),
             steam_note: None,
             steam_loop: Arc::default(),
             published: String::new(),
@@ -150,6 +140,14 @@ impl Controller {
             self.command(&line.kind, &params);
         }
         self.advance();
+        if self.steam.is_none()
+            && self.steam_attempts < STEAM_LOAD_ATTEMPTS
+            && self.steam_last_try.elapsed() >= STEAM_LOAD_EVERY
+        {
+            self.steam = steamnet::Probe::load();
+            self.steam_attempts += 1;
+            self.steam_last_try = Instant::now();
+        }
         if let Some(probe) = &mut self.steam {
             probe.poll();
         }
@@ -231,6 +229,16 @@ impl Controller {
         if !self.idle_or_failed() {
             return;
         }
+        // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
+        // a relay as the fallback). Until that transport is wired in, the only one is the direct TCP transport, which
+        // is for development and tests and must be asked for by name.
+        let transport = params.get("transport").and_then(Value::as_str).unwrap_or("auto");
+        if transport != "tcp" {
+            self.state = State::Failed(
+                "Hosting over Steam is not finished in this build yet; the Steam connection test below works".into(),
+            );
+            return;
+        }
         let name = self.name_from(params);
         let port =
             params.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_PORT);
@@ -255,21 +263,15 @@ impl Controller {
             Err(e) => return self.state = State::Failed(format!("cannot listen on port {port}: {e}")),
         };
         let bound = handle.local_addr().map_or(port, |a| a.port());
-        let lan = net::lan_endpoints(bound);
-        let public = Arc::new(Mutex::new(Public::default()));
-        spawn_address_lookup(bound, Arc::clone(&public));
         let mut hosting = Hosting {
             handle,
             secret,
-            port: bound,
-            lan,
+            lan: net::lan_endpoints(bound),
             code: String::new(),
             endpoints: Vec::new(),
             password: password.is_some(),
-            public,
-            public_shown: None,
         };
-        hosting.rebuild_code(None);
+        hosting.make_code();
         if hosting.code.is_empty() {
             hosting.handle.stop();
             self.state = State::Failed("cannot make a join code".into());
@@ -308,14 +310,7 @@ impl Controller {
 
     fn leave(&mut self) {
         match std::mem::replace(&mut self.state, State::Idle) {
-            State::Hosting(h) => {
-                h.handle.stop();
-                let mapping = h.public.lock().ok().and_then(|p| p.mapping.clone());
-                if let Some(m) = mapping {
-                    let port = h.port;
-                    thread::spawn(move || upnp::unmap_port(&m, port));
-                }
-            }
+            State::Hosting(h) => h.handle.stop(),
             State::Joined { handle } => handle.stop(),
             _ => {}
         }
@@ -325,13 +320,6 @@ impl Controller {
     }
 
     fn advance(&mut self) {
-        if let State::Hosting(h) = &mut self.state {
-            let ip = h.public.lock().ok().and_then(|p| p.ip);
-            if ip != h.public_shown {
-                h.rebuild_code(ip);
-            }
-            return;
-        }
         let State::Joining { rx } = &self.state else { return };
         match rx.try_recv() {
             Ok(Ok(handle)) => self.state = State::Joined { handle },
@@ -357,10 +345,6 @@ impl Controller {
                 v["code"] = json!(h.code);
                 v["endpoints"] = json!(h.endpoints);
                 v["password"] = json!(h.password);
-                if let Ok(p) = h.public.lock() {
-                    v["public"] = json!(p.ip.map(|ip| format!("{ip}:{}", h.port)));
-                    v["lookup"] = json!(if p.done { p.note.as_str() } else { "looking up your public address..." });
-                }
                 add_session(&mut v, &h.handle);
             }
             State::Joined { handle } => {
@@ -399,7 +383,9 @@ impl Controller {
 
     fn steam_json(&self) -> Value {
         let Some(probe) = &self.steam else {
-            return json!({ "state": "not available", "note": self.steam_note });
+            let state =
+                if self.steam_attempts < STEAM_LOAD_ATTEMPTS { "looking for Steam..." } else { "not available" };
+            return json!({ "state": state, "note": self.steam_note });
         };
         let r = probe.report();
         let mut v = json!({
@@ -447,53 +433,6 @@ impl Controller {
             Some("failed") => "failed",
             _ => "idle",
         }
-    }
-}
-
-/// Maps the port on the router and finds the public address, off the controller's thread: both can take seconds.
-fn spawn_address_lookup(port: u16, public: Arc<Mutex<Public>>) {
-    thread::spawn(move || {
-        let outcome = lookup_address(port);
-        if let Ok(mut p) = public.lock() {
-            *p = Public { done: true, ip: outcome.0, note: outcome.1, mapping: outcome.2 };
-        }
-    });
-}
-
-fn lookup_address(port: u16) -> (Option<Ipv4Addr>, String, Option<upnp::Mapping>) {
-    let Some(local) = upnp::local_ipv4() else {
-        return (None, "no network connection found".into(), None);
-    };
-    match upnp::map_port(local, port, "FeverLink3") {
-        Ok(mapping) => match mapping.external_ip {
-            Some(ip) if !upnp::is_private(ip) => {
-                (Some(ip), "the router forwarded the port automatically".into(), Some(mapping))
-            }
-            Some(_) => {
-                let found = upnp::public_ip_lookup().ok();
-                let note =
-                    "the router is behind another router: forward the port on that one, or use a VPN such as Tailscale";
-                (found, note.into(), Some(mapping))
-            }
-            None => match upnp::public_ip_lookup() {
-                Ok(ip) => (Some(ip), "the router forwarded the port automatically".into(), Some(mapping)),
-                Err(e) => {
-                    (None, format!("the port is forwarded, but the public address is unknown ({e})"), Some(mapping))
-                }
-            },
-        },
-        Err(why) => match upnp::public_ip_lookup() {
-            Ok(ip) => (
-                Some(ip),
-                format!("automatic forwarding failed ({why}): forward TCP port {port} to this PC on your router"),
-                None,
-            ),
-            Err(e) => (
-                None,
-                format!("no public address found ({e}); players outside your network need a VPN such as Tailscale"),
-                None,
-            ),
-        },
     }
 }
 
@@ -616,7 +555,7 @@ mod tests {
         let mut player = Controller::new(pd.clone(), "Pat".into(), Vec::new()).unwrap();
         let (mut hw, mut pw) = (Window::new(&hd), Window::new(&pd));
 
-        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0}");
+        hw.send("host", "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\"}");
         assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
         let status = hw.status();
         let code = status["code"].as_str().expect("a join code").to_owned();
@@ -654,11 +593,11 @@ mod tests {
         w.send("join", "{[\"code\"]=\"NOT-A-CODE\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["state"] == "failed"));
         assert!(w.status()["message"].as_str().unwrap().contains("not a valid join code"));
-        w.send("host", "{[\"port\"]=0}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
         // a second host request while hosting changes nothing
         let code = w.status()["code"].clone();
-        w.send("host", "{[\"port\"]=0}");
+        w.send("host", "{[\"port\"]=0,[\"transport\"]=\"tcp\"}");
         c.step();
         assert_eq!(w.status()["code"], code);
     }
@@ -672,12 +611,12 @@ mod tests {
         assert!(until(&mut [&mut c], Duration::from_secs(5), || {
             w.status()["steam"]["note"].as_str().is_some_and(|n| n.contains("not available"))
         }));
-        assert_eq!(w.status()["steam"]["state"], "not available");
+        assert_eq!(w.status()["steam"]["state"], "looking for Steam...");
         // `loop` in the Steam ID field of the test starts the same check; a real ID is a normal test
         w.send("steamtest", "{[\"id\"]=\"76561198869158889\"}");
         w.send("steamtest", "{[\"id\"]=\" Loop \"}");
         c.step();
-        assert_eq!(w.status()["steam"]["state"], "not available");
+        assert_eq!(w.status()["steam"]["state"], "looking for Steam...");
     }
 
     #[test]
