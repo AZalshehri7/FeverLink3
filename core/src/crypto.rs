@@ -39,6 +39,14 @@ impl SessionKey {
         secret
     }
 
+    /// As [`SessionKey::new_secret`], but `None` when the random source fails instead of a panic: for code that runs
+    /// inside the game, where a panic ends the process.
+    pub fn try_new_secret() -> Option<[u8; Self::SECRET_SIZE]> {
+        let mut secret = [0u8; Self::SECRET_SIZE];
+        getrandom::getrandom(&mut secret).ok()?;
+        Some(secret)
+    }
+
     /// `None` and `Some("")` both mean no password.
     pub fn derive(secret: &[u8; Self::SECRET_SIZE], password: Option<&str>) -> Self {
         let mut ikm = Vec::with_capacity(Self::SECRET_SIZE + Self::KEY_SIZE);

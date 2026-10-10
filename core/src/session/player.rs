@@ -83,6 +83,12 @@ pub struct PlayerSession {
     resume: Option<ResumeTicket>,
     /// What the welcome granted for the next return.
     ticket: Option<ResumeTicket>,
+    /// The nonce of the challenge this connection answered: the welcome must carry it.
+    challenge: Option<Vec<u8>>,
+    /// The counter of the welcome. Everything the host sealed before it was sealed before this connection began, so
+    /// a frame with a counter at or below it is a replay from an earlier connection, which a fresh replay window
+    /// cannot know.
+    host_floor: u64,
     roster: BTreeMap<u16, RosterEntry>,
     now: Box<dyn Fn() -> f64 + Send>,
     dropped: u64,
@@ -154,6 +160,8 @@ impl PlayerSession {
             incoming: IncomingSave::new(),
             resume,
             ticket: None,
+            challenge: None,
+            host_floor: 0,
             roster: BTreeMap::new(),
             now,
             dropped: 0,
@@ -264,6 +272,12 @@ impl PlayerSession {
                 self.drop(kind_byte, format!("protocol {}", ch.protocol));
                 return;
             }
+            if self.challenge.is_some() {
+                // a host sends one challenge per connection; a second one is somebody else's
+                self.drop(kind_byte, "second challenge".to_owned());
+                return;
+            }
+            self.challenge = Some(ch.nonce.clone());
             let proof = HostSession::proof(&self.key, &ch.nonce, &self.name).to_vec();
             let mut join = JoinMessage::new(&self.name, &self.version, proof);
             join.resume = self.resume.as_ref().map(|t| ResumeClaim {
@@ -291,8 +305,12 @@ impl PlayerSession {
             return;
         };
 
+        if self.state == PlayerState::Joined && frame.header.counter <= self.host_floor {
+            self.drop(kind_byte, "sealed before this connection began".to_owned());
+            return;
+        }
         if kind == MessageKind::Welcome {
-            self.welcomed(&plain);
+            self.welcomed(&plain, frame.header.counter);
             return;
         }
         if self.state != PlayerState::Joined {
@@ -374,18 +392,25 @@ impl PlayerSession {
         self.out.push(PlayerOutput::DeliverToLocalGame { kind, payload: plain });
     }
 
-    fn welcomed(&mut self, plain: &[u8]) {
+    fn welcomed(&mut self, plain: &[u8], counter: u64) {
         let kind_byte = MessageKind::Welcome.into();
         let Some(w) = codec::try_decode::<WelcomeMessage>(plain) else {
             self.drop(kind_byte, "malformed welcome".to_owned());
             return;
         };
+        // a welcome from the session's key but for another connection is a replay: taking its id and epoch would
+        // repeat counters this id has sealed with before
+        if !w.nonce.is_empty() && self.challenge.as_deref() != Some(w.nonce.as_slice()) {
+            self.drop(kind_byte, "welcome for another connection".to_owned());
+            return;
+        }
         let epoch = w.resume.as_ref().map_or(0, |g| g.epoch);
         let Some(sealer) = Sealer::with_epoch(&self.key, w.you, epoch) else {
             self.drop(kind_byte, format!("welcome with epoch {epoch}"));
             return;
         };
         self.id = Some(w.you);
+        self.host_floor = counter;
         self.assigned_name =
             Some(w.players.iter().find(|p| p.id == w.you).map_or_else(|| self.name.clone(), |p| p.name.clone()));
         self.host_name = Some(w.host_name.clone());

@@ -68,6 +68,16 @@ impl HostSession {
         self.drain()
     }
 
+    /// A player left the game. The round stops counting on it: a player that drops and returns under the same id is
+    /// still the same id to the round, would be sent the rest of a transfer it cannot assemble and a load it never
+    /// received, and would hold the round in Loading until its timeout because it never says hello to that load.
+    /// It takes part in the next round instead (`pending_new_player`).
+    pub(super) fn forget_participant(&mut self, id: u16) {
+        if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
+            participants.remove(&id);
+        }
+    }
+
     // ---------------------------------------------------------------- starting
 
     pub(super) fn begin_resync(&mut self, reason: &str) {

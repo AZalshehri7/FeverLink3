@@ -18,6 +18,12 @@ impl RateLimiter {
         Self { per_second: f64::from(per_second), burst, tokens: burst, last: now }
     }
 
+    /// Fills the bucket again: the host was away, and the frames it is reading now were sent while it was.
+    pub fn refill(&mut self, now: f64) {
+        self.tokens = self.burst;
+        self.last = self.last.max(now);
+    }
+
     /// Takes one frame's worth of the budget. False when the connection is over its limit.
     pub fn allow(&mut self, now: f64) -> bool {
         if self.per_second <= 0.0 {

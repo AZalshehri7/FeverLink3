@@ -129,6 +129,10 @@ pub struct WelcomeMessage {
     pub version: String,
     pub players: Vec<PlayerInfo>,
     pub session: SessionState,
+    /// The nonce of the challenge this welcome answers. It ties the welcome to one connection, so a welcome captured
+    /// on an earlier connection and played again is recognised. Left out by a host that predates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "base64_bytes")]
+    pub nonce: Vec<u8>,
     /// What this player needs to get its id and slot back after a lost connection. Read by the player's session
     /// layer only; it is not passed on to the game.
     #[serde(default, skip_serializing_if = "Option::is_none")]

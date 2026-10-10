@@ -274,7 +274,11 @@ impl Controller {
         let port =
             params.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_PORT);
         let password = params.get("password").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_owned);
-        let secret = SessionKey::new_secret();
+        // inside the game a panic ends the process: no random numbers is a failed host, not a crash
+        let Some(secret) = SessionKey::try_new_secret() else {
+            self.state = State::Failed("this PC has no source of random numbers to make a session key".into());
+            return;
+        };
         let key = SessionKey::derive(&secret, password.as_deref());
         let link = match gamelink::Session::open(&self.dir) {
             Ok(l) => l,

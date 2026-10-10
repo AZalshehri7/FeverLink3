@@ -68,6 +68,7 @@ fn welcome_carries_the_grant_and_says_when_it_gave_a_slot_back() {
         version: "0.1".into(),
         players: vec![host],
         session,
+        nonce: vec![9, 8, 7],
         resume: Some(ResumeGrant { token: vec![1, 2, 3], epoch: 2 }),
         resumed: true,
     };
@@ -75,17 +76,20 @@ fn welcome_carries_the_grant_and_says_when_it_gave_a_slot_back() {
     assert_eq!(json!({"token": "AQID", "epoch": 2}), v["resume"]);
     assert_eq!(json!(true), v["resumed"]);
     assert_eq!(json!(2), v["you"]);
+    assert_eq!(json!("CQgH"), v["nonce"], "the challenge this welcome answers");
 
     w.resumed = false;
     assert!(value(&w).get("resumed").is_none(), "false is left out");
     w.resume = None;
     assert!(value(&w).get("resume").is_none());
+    w.nonce.clear();
+    assert!(value(&w).get("nonce").is_none(), "a host that predates the nonce sends none");
 
     // a welcome from a host that grants nothing still decodes
     let old =
         br#"{"you":2,"hostName":"H","version":"0.1","players":[],"session":{"started":false,"speed":0,"lead":1200}}"#;
     let decoded = codec::try_decode::<WelcomeMessage>(old).expect("decodes");
-    assert_eq!((None, false), (decoded.resume, decoded.resumed));
+    assert_eq!((None, false, true), (decoded.resume, decoded.resumed, decoded.nonce.is_empty()));
 }
 
 #[test]

@@ -142,6 +142,9 @@ struct Identity {
     epoch: u32,
     /// Host time the connection was lost; `None` while the player is connected.
     away_since: Option<f64>,
+    /// The game had said hello when the connection dropped. A player coming back to a session that has not started
+    /// keeps it: its game was not reloaded.
+    ready: bool,
 }
 
 impl fmt::Debug for Identity {
@@ -176,7 +179,11 @@ pub struct HostSession {
     pings: BTreeMap<u16, VecDeque<(u32, f64)>>,
     ping_n: u32,
     last_ping: f64,
-    last_tick: f64,
+    /// Host time of the last call that paces the host (a frame, a tick).
+    last_call: f64,
+    /// Until this host time the host is catching up after being away: what its connections sent meanwhile is not
+    /// counted against them.
+    stall_until: f64,
     checksums: ChecksumRounds,
     permissions: Permissions,
     policy: ChecksumPolicy,
@@ -233,7 +240,8 @@ impl HostSession {
             pings: BTreeMap::new(),
             ping_n: 0,
             last_ping: f64::NEG_INFINITY,
-            last_tick: f64::NEG_INFINITY,
+            last_call: f64::NEG_INFINITY,
+            stall_until: f64::NEG_INFINITY,
             checksums: ChecksumRounds::new(),
             permissions: Permissions::default(),
             policy: ChecksumPolicy::new(ChecksumPolicyConfig::default()),
@@ -301,7 +309,14 @@ impl HostSession {
     pub fn connection_opened(&mut self, connection: ConnectionId) -> Vec<HostOutput> {
         let now = self.now();
         let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce).expect("operating system random source");
+        if getrandom::getrandom(&mut nonce).is_err() {
+            // game-side code does not panic: with no random numbers there is no challenge to give
+            self.log(format!("connection {connection} refused: the host has no source of random numbers"));
+            let why = RejectMessage::new("malformed", Some("the host has no source of random numbers"));
+            self.send_unsealed(connection, MessageKind::Reject, codec::encode(&why));
+            self.out.push(HostOutput::CloseConnection(connection));
+            return self.drain();
+        }
         let limiter = RateLimiter::new(self.options.max_frames_per_second, self.options.frame_burst, now);
         self.connections.insert(
             connection,
@@ -327,12 +342,14 @@ impl HostSession {
 
     pub fn frame_received(&mut self, connection: ConnectionId, frame: &Frame) -> Vec<HostOutput> {
         let now = self.now();
+        self.note_time(now);
+        let forgiven = now < self.stall_until;
         let Some(c) = self.connections.get_mut(&connection) else {
             return self.drain();
         };
         c.last_heard = now;
         let player = c.player;
-        if !c.limiter.allow(now) {
+        if !forgiven && !c.limiter.allow(now) {
             self.dropped += 1;
             let who = player.map_or_else(|| format!("connection {connection}"), |id| self.name(id));
             let detail = format!("more than {} frames per second", self.options.max_frames_per_second);
@@ -428,7 +445,7 @@ impl HostSession {
             .chain(self.identities.values().map(|i| i.name.as_str()))
             .collect();
         let name = Names::unique(&Names::sanitize(&join.name), id, taken);
-        self.identities.insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None });
+        self.identities.insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false });
         let info = PlayerInfo { id, name: name.clone(), ready: false };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
@@ -460,7 +477,10 @@ impl HostSession {
         identity.epoch += 1;
         identity.away_since = None;
         let (name, token, epoch) = (identity.name.clone(), identity.token, identity.epoch);
-        let info = PlayerInfo { id, name: name.clone(), ready: false };
+        // before the start nothing is reloaded for the returner, so it is as ready as it was; in a started session the
+        // hot-join round reloads it and it says hello again
+        let ready = identity.ready && !self.state.started;
+        let info = PlayerInfo { id, name: name.clone(), ready };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
             c.player = Some(id);
@@ -473,12 +493,14 @@ impl HostSession {
     /// The welcome, the others told, the permissions, and for a started session the hot-join round.
     fn greet(&mut self, connection: ConnectionId, info: PlayerInfo, grant: ResumeGrant, resumed: bool) {
         let id = info.id;
+        let nonce = self.connections.get(&connection).map(|c| c.nonce.to_vec()).unwrap_or_default();
         let welcome = WelcomeMessage {
             you: id,
             host_name: self.host_name.clone(),
             version: self.options.version.clone(),
             players: self.players.values().cloned().collect(),
             session: self.state.clone(),
+            nonce,
             resume: Some(grant),
             resumed,
         };
@@ -634,9 +656,16 @@ impl HostSession {
                             self.broadcast(MessageKind::Authority, &codec::encode(&msg), Some(Self::HOST_ID));
                         }
                     }
-                    let expected: Vec<u16> = self.players.values().filter(|p| p.ready).map(|p| p.id).collect();
-                    if let Some(outcome) = self.checksums.report(from, m, &expected) {
-                        self.on_checksum_outcome(outcome);
+                    if self.players.get(&from).is_some_and(|p| p.ready) {
+                        let expected = self.expected_reporters();
+                        if let Some(outcome) = self.checksums.report(from, m, &expected) {
+                            self.on_checksum_outcome(outcome);
+                        }
+                    } else if self.dropped_once.insert(format!("unready-report/{from}")) {
+                        // a game that has not said hello since its last load has no world to compare yet; counted, it could
+                        // fail the verification of a round it was never part of
+                        let who = self.name(from);
+                        self.log(format!("checksum report from {who} ignored: no hello since its last load"));
                     }
                 }
             }
@@ -725,8 +754,9 @@ impl HostSession {
     /// Call regularly (every 250 ms or so): periodic session broadcast, checksum rounds and the resync round's
     /// waits and timeouts.
     pub fn tick(&mut self) -> Vec<HostOutput> {
-        self.resync_step();
         let t = self.now();
+        self.note_time(t);
+        self.resync_step();
         self.watch_connections(t);
         self.ping_players(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
@@ -840,8 +870,8 @@ impl HostSession {
             let who = self.name(player);
             self.log(format!("{who} was removed by the host"));
             self.expel(connection, "kicked", "removed by the host");
-        } else if let Some(identity) = self.identities.remove(&player) {
-            self.log(format!("the slot of {} was released by the host", identity.name));
+        } else if self.identities.contains_key(&player) {
+            self.release_slot(player, |name| format!("the slot of {name} was released by the host"));
         } else {
             self.log(format!("there is no player #{player} to remove"));
         }
@@ -858,7 +888,10 @@ impl HostSession {
         self.pings.remove(&id);
         let hold = hold && self.options.reconnect_window_seconds > 0.0;
         match self.identities.get_mut(&id) {
-            Some(identity) if hold => identity.away_since = Some(now),
+            Some(identity) if hold => {
+                identity.away_since = Some(now);
+                identity.ready = info.ready;
+            }
             _ => {
                 self.identities.remove(&id);
             }
@@ -868,7 +901,28 @@ impl HostSession {
         let left = PlayerLeftMessage { id, name: info.name.clone(), away: hold };
         self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
         self.out.push(HostOutput::PlayerLeft(info));
+        // a resync round counts on the games it sent the save to; this one is gone, and if it returns it is a joiner
+        self.forget_participant(id);
+        // a checksum round that waited for this game's report alone is complete now
+        let expected = self.expected_reporters();
+        for outcome in self.checksums.finished(&expected) {
+            self.on_checksum_outcome(outcome);
+        }
         self.resync_step();
+    }
+
+    /// Frees the slot held for a player who is away, and tells the others it is gone for good (they had it as away).
+    /// `why` makes the log line from the player's name.
+    fn release_slot(&mut self, id: u16, why: impl FnOnce(&str) -> String) {
+        let Some(identity) = self.identities.remove(&id) else { return };
+        self.log(why(&identity.name));
+        let left = PlayerLeftMessage { id, name: identity.name, away: false };
+        self.broadcast(MessageKind::PlayerLeft, &codec::encode(&left), Some(id));
+    }
+
+    /// The games a checksum round waits for: those that said hello since their last load.
+    fn expected_reporters(&self) -> Vec<u16> {
+        self.players.values().filter(|p| p.ready).map(|p| p.id).collect()
     }
 
     /// Ends a connection by the host's decision and says why. A joined player gets a sealed `Kicked` and loses its
@@ -889,43 +943,63 @@ impl HostSession {
         }
     }
 
-    /// Longest gap between two ticks that still counts as the host paying attention. Anything longer means the
-    /// host itself was stalled (its process suspended, say), and nobody could have spoken meanwhile.
+    /// Longest gap between two calls into the host that still counts as the host paying attention. Anything longer
+    /// means the host itself was away (its process suspended, its thread stuck in a write to a peer that stopped
+    /// reading): nobody could be heard meanwhile, and what the connections sent is only now being read.
     const STALL_SECONDS: f64 = 5.0;
+    /// How long at most the frames of a stalled host's backlog are forgiven for.
+    const STALL_GRACE_MAX: f64 = 60.0;
+
+    /// Notes that the host runs now. After a gap of more than [`Self::STALL_SECONDS`] it forgives what the stall did:
+    /// every connection counts as just heard from, the frame budgets are full again and not enforced while the backlog
+    /// is read, the slots held for players who dropped keep their whole window, and the pings sent before the stall
+    /// are forgotten (their answers would measure the stall, not the player).
+    fn note_time(&mut self, now: f64) {
+        let gap = now - self.last_call;
+        self.last_call = now;
+        if !gap.is_finite() || gap <= Self::STALL_SECONDS {
+            return;
+        }
+        self.stall_until = now + gap.min(Self::STALL_GRACE_MAX);
+        for c in self.connections.values_mut() {
+            c.last_heard = now;
+            if c.player.is_none() {
+                c.opened = now;
+            }
+            c.limiter.refill(now);
+        }
+        for identity in self.identities.values_mut() {
+            if let Some(since) = identity.away_since.as_mut() {
+                *since += gap;
+            }
+        }
+        self.pings.clear();
+    }
 
     /// Closes connections that went quiet or never finished the handshake, and frees the slots whose players did
     /// not come back in time.
     fn watch_connections(&mut self, t: f64) {
-        let gap = t - self.last_tick;
-        self.last_tick = t;
-        if gap > Self::STALL_SECONDS {
-            for c in self.connections.values_mut() {
-                c.last_heard = t;
-                c.opened = if c.player.is_none() { t } else { c.opened };
-            }
-        } else {
-            let handshake = self.options.handshake_timeout_seconds;
-            let idle = if self.options.ping_seconds > 0.0 { self.options.idle_timeout_seconds } else { 0.0 };
-            let overdue: Vec<(ConnectionId, Option<u16>)> = self
-                .connections
-                .values()
-                .filter(|c| match c.player {
-                    Some(_) => idle > 0.0 && t - c.last_heard >= idle,
-                    None => handshake > 0.0 && t - c.opened >= handshake,
-                })
-                .map(|c| (c.id, c.player))
-                .collect();
-            for (connection, player) in overdue {
-                match player {
-                    Some(id) => {
-                        let who = self.name(id);
-                        self.log(format!("{who} timed out: nothing heard for {idle:.0} s"));
-                        self.connections.remove(&connection);
-                        self.out.push(HostOutput::CloseConnection(connection));
-                        self.remove_player(id, true);
-                    }
-                    None => self.reject(connection, "timeout", Some("the handshake did not finish in time")),
+        let handshake = self.options.handshake_timeout_seconds;
+        let idle = if self.options.ping_seconds > 0.0 { self.options.idle_timeout_seconds } else { 0.0 };
+        let overdue: Vec<(ConnectionId, Option<u16>)> = self
+            .connections
+            .values()
+            .filter(|c| match c.player {
+                Some(_) => idle > 0.0 && t - c.last_heard >= idle,
+                None => handshake > 0.0 && t - c.opened >= handshake,
+            })
+            .map(|c| (c.id, c.player))
+            .collect();
+        for (connection, player) in overdue {
+            match player {
+                Some(id) => {
+                    let who = self.name(id);
+                    self.log(format!("{who} timed out: nothing heard for {idle:.0} s"));
+                    self.connections.remove(&connection);
+                    self.out.push(HostOutput::CloseConnection(connection));
+                    self.remove_player(id, true);
                 }
+                None => self.reject(connection, "timeout", Some("the handshake did not finish in time")),
             }
         }
         let window = self.options.reconnect_window_seconds;
@@ -936,9 +1010,7 @@ impl HostSession {
             .map(|(&id, _)| id)
             .collect();
         for id in gone {
-            if let Some(identity) = self.identities.remove(&id) {
-                self.log(format!("{} did not come back within {window:.0} s; the slot is free", identity.name));
-            }
+            self.release_slot(id, |name| format!("{name} did not come back within {window:.0} s; the slot is free"));
         }
     }
 
