@@ -51,6 +51,8 @@ const FULL_RETRY: Duration = Duration::from_millis(2);
 const SEND_RELIABLE: i32 = 8;
 /// After this long without Steam interfaces the status says Steam networking is not available.
 const GIVE_UP_NOTE: Duration = Duration::from_secs(120);
+/// What the owners of connections are told when Steam is shut down under the core.
+const STEAM_WENT_AWAY: &str = "Steam went away";
 
 /// `EResult` values `SendMessageToConnection` and `AcceptConnection` return (`steamclientpublic.h`).
 pub mod result {
@@ -82,6 +84,7 @@ pub(super) struct Located {
 }
 
 type LocateFn = Box<dyn Fn() -> Located + Send + Sync>;
+type AliveFn = Box<dyn Fn() -> bool + Send + Sync>;
 type CallbackFn = unsafe extern "C" fn(*mut c_void);
 type SetConfigFn = unsafe extern "C" fn(*mut c_void, i32, i32, isize, i32, *const c_void) -> bool;
 type RealTimeStatusFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, *mut c_void) -> i32;
@@ -90,6 +93,9 @@ type RealTimeStatusFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32,
 pub(super) struct Api {
     /// Finds the interfaces; called again and again until Steam is initialised.
     pub locate: LocateFn,
+    /// Whether Steam is still initialised. A cheap call, made every poll cycle: when the game shuts Steam down (it
+    /// quits, or the client restarts) the interfaces are gone and the core must never call them again.
+    pub alive: AliveFn,
     pub init_relay: unsafe extern "C" fn(*mut c_void),
     pub set_status_callback: unsafe extern "C" fn(*mut c_void, CallbackFn) -> bool,
     /// `ISteamNetworkingUtils::SetConfigValue`; the tuning is skipped when the export is missing.
@@ -187,7 +193,8 @@ impl End {
     pub fn describe(&self) -> String {
         let what = match self.cause {
             Cause::Local => return "closed locally".to_string(),
-            Cause::Shutdown => return "Steam networking stopped".to_string(),
+            Cause::Shutdown if self.detail.is_empty() => return "Steam networking stopped".to_string(),
+            Cause::Shutdown => return self.detail.clone(),
             Cause::Violation => return self.detail.clone(),
             Cause::Peer => "closed by the other side",
             Cause::Problem => "connection problem",
@@ -541,6 +548,25 @@ impl Shared {
             if iface.sockets.is_null() {
                 return out;
             }
+        } else if !(self.api.alive)() {
+            // Steam was shut down under us: forget everything that depended on it, call nothing, and look for Steam
+            // again on the next cycles (a restarted client brings new interfaces)
+            iface.sockets = std::ptr::null_mut();
+            self.set_status(|s| {
+                s.ready = false;
+                s.note = STEAM_WENT_AWAY.into();
+            });
+            let (listeners, conns) = {
+                let mut reg = lock(&self.registry);
+                (std::mem::take(&mut reg.listeners), std::mem::take(&mut reg.conns))
+            };
+            drop(listeners);
+            for (conn, t) in conns {
+                let end = End { opened: t.open, cause: Cause::Shutdown, code: 0, detail: STEAM_WENT_AWAY.into() };
+                out.push(Notice::Closed { owner: t.owner, conn, end });
+            }
+            out.append(&mut lock(&self.local));
+            return out;
         } else if lock(&self.status).steam_id.is_none() && Instant::now() >= iface.next_locate {
             // the account may only become known after the interfaces
             iface.next_locate = Instant::now() + self.config.locate;
@@ -1162,8 +1188,12 @@ mod win {
                 hsteamuser: sym!("SteamAPI_GetHSteamUser"),
                 find_interface: sym!("SteamInternal_FindOrCreateUserInterface"),
             };
+            let hsteamuser = finders.hsteamuser;
             Some(Api {
                 locate: Box::new(move || finders.locate()),
+                // SteamAPI_GetHSteamUser takes no arguments and only reads Steam's current user handle; it is 0 once
+                // the API is shut down (this closure is covered by the SAFETY note above).
+                alive: Box::new(move || hsteamuser() != 0),
                 init_relay: sym!("SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess"),
                 set_status_callback: sym!(
                     "SteamAPI_ISteamNetworkingUtils_SetGlobalCallback_SteamNetConnectionStatusChanged"
@@ -1586,6 +1616,37 @@ mod tests {
         assert_eq!(host.listeners(), 0, "the listen socket is closed too");
         drop(guest_core);
         assert!(guest.connections().is_empty() && host.connections().is_empty());
+    }
+
+    #[test]
+    fn steam_shutting_down_under_the_core_ends_the_connections_and_ends_the_calls() {
+        let p = Pair::new();
+        let host = p.host_core.handle();
+        // the game quits (or the Steam client restarts): the interfaces are gone
+        p.host.set_ready(false);
+        let events = p.host_owner.wait("the end", |e| e.iter().any(|e| matches!(e, Ev::Closed(..))));
+        let Some(Ev::Closed(conn, end)) = events.last() else { panic!("{events:#?}") };
+        assert_eq!((*conn, end.cause, end.opened), (p.host_conn, Cause::Shutdown, true));
+        assert_eq!(end.describe(), "Steam went away");
+        assert_eq!(host.tracked(), (0, 0));
+        assert!(!host.status().ready);
+        // nothing calls into the vanished interfaces any more
+        let runs = p.host.callback_runs();
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(p.host.callback_runs(), runs, "no RunCallbacks after Steam went away");
+        assert!(matches!(host.listen(0, Recorder::new()), Err(CoreError::NotReady(_))));
+        assert_eq!(host.send(p.host_conn, b"x"), SendOutcome::Closed);
+        assert!(!host.close(p.host_conn));
+
+        // Steam comes back: the core finds it again and serves again
+        p.host.set_ready(true);
+        host.wait_ready(Instant::now() + WAIT, &|| false).expect("ready again");
+        assert_eq!(p.host.relay_inits(), 2, "relay access is requested again for the new interfaces");
+        let again = Recorder::new();
+        host.listen(0, again.clone()).expect("listens again");
+        let client = Recorder::new();
+        p.guest_core.handle().connect(p.host.steam_id(), 0, client.clone()).expect("connect");
+        again.wait_opened("a connection to the revived core");
     }
 
     #[test]

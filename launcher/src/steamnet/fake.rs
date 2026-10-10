@@ -682,6 +682,7 @@ impl FakeMachine {
         let id = self.id;
         Api {
             locate: Box::new(move || locate(id)),
+            alive: Box::new(move || model().machines.get(&id).is_some_and(|m| m.ready)),
             init_relay,
             set_status_callback,
             set_config: Some(set_config),
@@ -713,9 +714,23 @@ impl FakeMachine {
 
     // ---- knobs
 
-    /// Steam initialised or not (the interfaces exist or are null).
+    /// Steam initialised or not (the interfaces exist or are null). Shutting Steam down destroys what it held: this
+    /// machine's listen sockets and connections go, and the other ends find out by timing out.
     pub fn set_ready(&self, ready: bool) {
-        self.with(|m| m.ready = ready);
+        let mut m = model();
+        let Some(machine) = m.machines.get_mut(&self.id) else { return };
+        machine.ready = ready;
+        if ready {
+            return;
+        }
+        m.listens.retain(|_, l| l.machine != self.id);
+        let mine: Vec<u32> = m.conns.iter().filter(|(_, c)| c.machine == self.id).map(|(&h, _)| h).collect();
+        for handle in mine {
+            let Some(conn) = m.conns.remove(&handle) else { continue };
+            if let Some(peer) = conn.peer {
+                m.set_state(peer, PROBLEM, 5003, "Timed out");
+            }
+        }
     }
 
     /// An unreachable account never answers a connection attempt.

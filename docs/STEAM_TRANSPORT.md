@@ -6,7 +6,7 @@ frames as the TCP transport; nothing in the protocol, the state machines or the 
 
 **Status.** Built and tested against an in-memory Steam: 75 tests, the transport and session ones on the real code
 paths (the real poller thread, the real `run_host_over` / `run_player_over`). The pieces the earlier probe used were
-proven in the game on 2026-10-09; everything else is listed in [section 8](#8-needs-game-verification) with the steps
+proven in the game on 2026-10-09; everything else is listed in [section 9](#9-needs-game-verification) with the steps
 to check it. Nothing here has run between two real accounts yet.
 
 ## 1. Parts
@@ -16,7 +16,7 @@ to check it. Nothing here has run between two real accounts yet.
 | `launcher/src/steamnet.rs` | The Steam structure layouts as offsets with pure parsers, the ping protocol, and the **probe** (a service on the core, virtual port 1, the `Probe` / `Report` surface `live.rs` uses). |
 | `launcher/src/steamnet/steam_core.rs` | **`SteamCore`**: the interfaces, the one global callback, the one poller thread. `CoreRef` is the handle services hold. |
 | `launcher/src/steam_transport.rs` | **`SteamHostNet`** (virtual port 0), **`SteamClientNet`**, **`SteamEndpoint`**, and the helpers that start sessions over Steam. |
-| `launcher/src/steam_transport/selfcheck.rs` | `loopback_check`: the transports against each other on one account, for the game (section 8, step A). |
+| `launcher/src/steam_transport/selfcheck.rs` | `loopback_check`: the transports against each other on one account, for the game (section 9, step A). |
 | `launcher/src/steamnet/fake.rs`, `steam_transport/session_tests.rs` | The in-memory Steam and the end-to-end session tests (test code only). |
 | `launcher/src/net.rs` | Additive: the `HostTransport` / `ClientTransport` traits (TCP and Steam implement them), `ConnectContext`, `LinkInfo`. |
 | `launcher/src/session.rs` | `run_host` / `run_player` became wrappers over `run_host_over` / `run_player_over`; `Status` gained `links`. |
@@ -45,7 +45,9 @@ callback on a game thread; it only queues the event.
 **Pace.** The latency the core adds is its sleep. With a connection it sleeps **2 ms**; with only listen sockets
 (the probe listens all game long) **20 ms**; with nothing **100 ms**. A new listen socket, connection or close wakes
 it at once. The probe's old controller polled every 100 ms at both ends, which is why its round trip never read
-below 100 ms (a real relay test read 199 ms; a loopback test also read 100 ms).
+below 100 ms (a real relay test read 199 ms; a loopback test also read 100 ms). Measured on Windows 11 in a test of
+the core (polls in 400 ms): 163 with a connection (2.5 ms per cycle, the sleep is a high-resolution one), 13 with
+only a listen socket (about 30 ms: a condition-variable wait is rounded to the 15.6 ms system tick), 3 idle.
 
 **Several cores.** The process has one (`steamnet::global()`, started on first use, retried if the game loads
 `steam_api64.dll` late). The tests make one per fake machine; the callback finds its core by thread.
@@ -82,9 +84,11 @@ below 100 ms (a real relay test read 199 ms; a loopback test also read 100 ms).
 
 The timeout is **30 s** (`CONNECT_TIMEOUT`) because a route through the relays can take 10 to 20 s. Steam's own limit
 for a new connection (`TimeoutInitial`; the public header does not state the default, it is believed to be 10 s) would
-end such a search early, so the core also sets it to **45 s** when Steam becomes ready. In a running session the first attempt's progress goes to the caller (`run_player_over(config, connect,
-&mut |text| ...)`); reconnect attempts write theirs to the session log, and a stop request cancels an attempt that is
-waiting, so leaving never waits 30 s.
+end such a search early, so the core also sets it to **45 s** when Steam becomes ready.
+
+In a session the first attempt's progress goes to the caller (`run_player_over(config, connect, &mut |text| ...)`);
+reconnect attempts write theirs to the session log, and a stop request cancels an attempt that is waiting, so leaving
+never waits 30 s.
 
 ## 5. Closing, and the host leaving
 
@@ -127,7 +131,31 @@ Set globally when Steam becomes ready, best effort (a refusal is reported in the
 Not changed: send buffer (512 KiB), Nagle (5 ms), receive limits (512 KiB per message). The tuned send rate is visible
 as `rate` in the report; 262 144 means the tuning did not take effect.
 
-## 8. Needs game verification
+## 8. What is proven
+
+**In the real game** (build 40420, 2026-10-09, by the probe; the code of these steps was kept):
+
+- The functions come from the flat API exports of the `steam_api64.dll` the game already loaded (`GetModuleHandleA` +
+  `GetProcAddress`, no SDK linked).
+- The accessors `SteamAPI_SteamNetworkingSockets_SteamAPI_v012` and `SteamAPI_SteamUser_v023` return null in the game.
+  What works is `SteamInternal_FindOrCreateUserInterface(SteamAPI_GetHSteamUser(), "SteamNetworkingSockets012" /
+  "SteamNetworkingUtils004" / "SteamUser023")`, valid once the game has initialised Steam (late: the core polls).
+- The global status callback (`SetGlobalCallback_SteamNetConnectionStatusChanged`) fires when
+  `ISteamNetworkingSockets_RunCallbacks` is called, and accepting incoming connections needs it.
+- A P2P listen socket accepts connections by Steam ID; reliable messages (flag 8) go both ways through
+  `SendMessageToConnection` / `ReceiveMessagesOnConnection`, each message released with
+  `SteamNetworkingMessage_t_Release`; ping and pong with the owner's own Steam ID worked in about 100 ms steps (the
+  probe's polling).
+- A friend's account connected to the owner's Steam ID through Steam, route "through a Steam relay", probe-measured
+  round trip 199 ms (inflated by the 100 ms controller polling at both ends).
+
+**In the public headers** (2026-10-10, see section 11): every structure layout and constant the code uses.
+
+**Assumed, not proven**: everything in section 9 below, notably the tuning calls, `GetConnectionRealTimeStatus`,
+`CloseListenSocket`, the 512 KiB behaviour of the send buffer against the real library, linger on close, and the
+`SteamAPI_GetHSteamUser`-is-0-after-shutdown guard.
+
+## 9. Needs game verification
 
 Everything above is tested against the fake. The fake models Steam as the headers and the SDK documentation
 describe it; it cannot prove how the real library behaves. Do these in order; each step says what proves it.
@@ -156,6 +184,8 @@ describe it; it cannot prove how the real library behaves. Do these in order; ea
 
 **B. Two accounts, two PCs, game running on both** (the real network).
 
+0. **Both PCs must run this build**: the probe listens on virtual port 1 now (it was 0), so a friend on the old build
+   answers "no listen socket on that virtual port".
 1. A notes the Steam ID shown in its window; B types it and presses *Test the connection*.
 2. B expects `connected` within a few seconds (note the time and the `finding a route` phase), `route`, `ping`, `rtt`
    (should now agree with `ping` within about 10 ms; a gap of 100 ms means polling is still slow somewhere), `rate`.
@@ -163,6 +193,9 @@ describe it; it cannot prove how the real library behaves. Do these in order; ea
 4. Leave both running a minute: if `route` was a relay, an event `route changed: through a Steam relay -> direct`
    shows whether Steam upgrades the path (not guaranteed; both outcomes are information).
 5. Close B's game without leaving: A's `peers` empties when Steam's connected timeout runs out (about 10 s).
+6. **Quit the game on A while B is connected and while the probe listens**: no crash dialog, no hang on exit (the
+   poller must not call Steam after `SteamAPI_Shutdown`; the `Steam went away` guard relies on
+   `SteamAPI_GetHSteamUser` returning 0 then, which is assumed, not proven). If the game crashes on exit, report it.
 
 **C. The session over Steam** (after the orchestrator wires `run_steam_host` / `run_steam_player` into the live
 controller; use `steam_player_config` so the connect timeout is 30 s).
@@ -178,12 +211,13 @@ controller; use `steam_player_config` so the connect timeout is 30 s).
 **Cannot be tested:** two game processes of the *same* account on one PC (Steam runs one instance per account), and
 a full table of 8 players (needs 9 accounts; the transport and the session are tested with 8 on the fake).
 
-## 9. Failure modes
+## 10. Failure modes
 
 | Situation | What happens |
 |---|---|
 | Steam not initialised yet | The core keeps looking every 250 ms. `listen` and `connect` wait (15 s / inside the connect timeout) and then fail with `Steam networking is not ready (Steam interfaces: hsteamuser 0, user null sockets null utils null)`. After 2 minutes the note says Steam networking is not available. |
 | No `steam_api64.dll` in the process (game started without Steam, a test run) | `steamnet::global()` is `None`: `SteamHostNet::listen` fails with `Steam networking is not available (is the game running through Steam?)`; the controller reports state `not available`. Asking again later retries. |
+| Steam shut down under the core (the game is quitting, the Steam client restarts) | Every poll cycle asks `SteamAPI_GetHSteamUser` whether Steam is still initialised (0 once it is shut down). When it is not: all connections end with `Steam went away`, listen sockets are forgotten, **no further call goes into the vanished interfaces**, and the core looks for Steam again (a restarted client brings new interfaces; the host transport must listen again). |
 | A missing optional export (`CloseListenSocket`, `SetConfigValue`, `GetConnectionRealTimeStatus`) | A listen socket leaks until the process ends / no tuning / no Steam ping. A missing required export: no Steam at all. |
 | No route to the host (firewall blocks Steam's UDP, relay network unreachable, host not running the game) | The attempt stays at `contacting the host` or `finding a route` until Steam gives up (45 s) or ours (30 s): `no route to Steam ID X after 30.0 s (last status: ...)`. Steam's reason codes are kept in the text (5003 timed out, 5009 NAT/firewall, 5006 no relay, 3001 offline mode, ...). |
 | Nobody listens on the virtual port (host not hosting) | Fails fast: `could not connect to Steam ID X: closed by the other side ...`. |
@@ -194,7 +228,7 @@ a full table of 8 players (needs 9 accounts; the transport and the session are t
 | Message above 512 KiB | Refused before Steam, the connection stays open (cannot happen with today's frames). |
 | The player's IP | Steam's direct (ICE) route can show the players' addresses to each other. Relay only needs `P2P_Transport_ICE_Enable` (104) set to 0 or 1; not set. |
 
-## 10. Testing without Steam
+## 11. Testing without Steam
 
 `steamnet/fake.rs` is `ISteamNetworkingSockets` as extern "C" functions over a global model, plugged into the same
 `Api` table the game's exports fill. A test makes machines (own account, interfaces, callback, event queue), starts a
@@ -218,7 +252,7 @@ the state at 176, end reason at 180, end debug at 184, flags at 440; the status 
 after it); the message (data at 0, size at 8); the real-time status (state 0, ping 4, quality 8 and 12, send rate 32,
 pending reliable 40); connection states, `EResult` values, config values, send flags, limits.
 
-## 11. Using it
+## 12. Using it
 
 ```rust
 // host: the Steam ID joiners need is steamnet::global()?.status().steam_id (also steam.id in the controller's status)
@@ -235,7 +269,7 @@ account of the public universe, so a typo is almost never accepted. A join code 
 characters (35 bytes: version, time, secret, count, a family byte, 8 bytes of ID, checksum), three more than one IPv4
 endpoint; a code with both is possible if `JoinCode` gets an endpoint family for Steam IDs. Not done here, on purpose.
 
-## 12. Decisions for the owner
+## 13. Decisions for the owner
 
 1. **Join code**: a Steam endpoint family inside `JoinCode`, or a separate field; and which transport a code with both
    a Steam ID and addresses tries first (Steam first fits the policy).
