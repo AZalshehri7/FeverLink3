@@ -238,6 +238,26 @@ fn a_removed_player_is_told_why_and_does_not_knock_again() {
     host.stop();
 }
 
+#[test]
+fn a_host_that_stops_tells_its_players_who_end_their_session_instead_of_reconnecting() {
+    let root = tempfile::TempDir::new().unwrap();
+    let key = key();
+    let (host, _host_game) = start_host(root.path(), &key, HostOptions::default(), Vec::new());
+    let addr = host.local_addr().unwrap();
+    let (alice, _a) = start_player(root.path(), &key, "Alice", addr);
+    let (bob, _b) = start_player(root.path(), &key, "Bob", addr);
+    assert!(alice.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+    assert!(bob.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+
+    host.stop();
+    for p in [&alice, &bob] {
+        assert!(p.wait_for(WAIT, |s| s.finished), "{:?}", p.status());
+        let s = p.status();
+        assert_eq!(Some("ended (the host ended the session)".to_owned()), s.rejected);
+        assert_eq!((0, false), (s.reconnect_attempts, s.reconnecting), "no reconnecting to a host that said goodbye");
+    }
+}
+
 // ------------------------------------------------------------------ flooding
 
 fn flood_options() -> HostOptions {

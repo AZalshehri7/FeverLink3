@@ -48,7 +48,7 @@ fn a_player_reconnects_after_the_host_drops() {
     let player = run_player(config).unwrap();
     assert!(player.wait_for(Duration::from_secs(5), |s| s.connected));
 
-    host.stop();
+    host.crash();
     assert!(player.wait_for(Duration::from_secs(5), |s| s.reconnecting && !s.connected));
     let mut tail = Tail::new(game_files.join(gamelink::TO_GAME));
     let lines = tail.poll().unwrap();
@@ -88,7 +88,7 @@ fn a_player_gives_up_after_the_window() {
     config.connect_timeout = Duration::from_millis(500);
     let player = run_player(config).unwrap();
     assert!(player.wait_for(Duration::from_secs(5), |s| s.connected));
-    host.stop();
+    host.crash();
     assert!(player.wait_for(Duration::from_secs(10), |s| s.finished));
     assert!(player.status().error.is_some_and(|e| e.contains("could not reconnect")));
 }

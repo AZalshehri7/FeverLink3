@@ -86,8 +86,8 @@ local function setup(react, builtin)
 			displayOnly = displayOnly, maxLength = 200,
 		}
 	end
-	-- "Anna  (host)" / "Ben  42 ms" / "Cleo  reconnecting"
-	local function playerLine(p, me)
+	-- "Anna  (host)" / "Ben  42 ms" / "Cleo  reconnecting"; width: narrower when a button sits next to the line
+	local function playerLine(p, me, width)
 		local line = "   " .. tostring(p.name)
 		if p.id == 0 then line = line .. "  (host)" end
 		if p.id == me then line = line .. "  (you)" end
@@ -96,7 +96,7 @@ local function setup(react, builtin)
 		elseif p.rtt and p.rtt > 0 and p.id ~= me then
 			line = line .. "  - " .. tostring(p.rtt) .. " ms"
 		end
-		return text(line)
+		return text(line, nil, width)
 	end
 
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
@@ -115,9 +115,24 @@ local function setup(react, builtin)
 		local rows = {}
 		local function add(node) rows[#rows + 1] = node end
 		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
-		local function players(me)
+		-- canRemove (the host's list): a "Remove" button next to every player but the host, and under the list what the
+		-- last one did ("Pat was removed", or why it was refused)
+		local function players(me, canRemove)
 			add(section("Players"))
-			for _, p in ipairs(ctl.players or {}) do add(playerLine(p, me)) end
+			for _, p in ipairs(ctl.players or {}) do
+				if canRemove and p.id ~= 0 and p.id ~= me then
+					local id = p.id
+					add(box(H, {
+						playerLine(p, me, WIDTH - 140),
+						button("Remove", function() command("kick", { id = id }) end, "negative", 120),
+					}))
+				else
+					add(playerLine(p, me))
+				end
+			end
+			if canRemove and ctl.result and ctl.result.kind == "kick" and ctl.result.message then
+				add(note(tostring(ctl.result.message)))
+			end
 		end
 
 		local state = ctl and ctl.state
@@ -139,9 +154,13 @@ local function setup(react, builtin)
 			add(text("Starting the multiplayer module..."))
 		elseif state == "idle" or state == "failed" then
 			add(heading("Play together"))
-			if state == "failed" then
+			if ctl.notice then
+				-- how the last session ended by itself: the world was closed, the host ended it or removed this player
+				add(text(tostring(ctl.notice), "font-scale-title-3"))
+			elseif state == "failed" then
 				add(text("Could not connect: " .. tostring(ctl.message or "unknown problem"), "font-scale-title-3"))
-			else
+			end
+			if state ~= "failed" then
 				add(note("One player hosts and sends a code; the others join with it."))
 			end
 			add(gap())
@@ -190,7 +209,7 @@ local function setup(react, builtin)
 			end
 			if ctl.password then add(note("They also need the password.")) end
 			add(gap())
-			players(ctl.me)
+			players(ctl.me, true)
 			add(gap())
 			if ctl.started and ctl.resync and ctl.resync ~= "Idle" then
 				add(note("Sending your world to the players: " .. tostring(ctl.resync)))
@@ -222,7 +241,7 @@ local function setup(react, builtin)
 			add(gap())
 			players(ctl.me)
 			add(gap())
-			add(button("Leave", function() command("leave", {}) end, "negative"))
+			add(button("Leave the session", function() command("leave", {}) end, "primary"))
 		end
 
 		-- the game side: status and chat, once the mod is part of a session

@@ -144,6 +144,10 @@ in-game window.
   (`host`, `join`, `leave`, `start`, `pause`, `speed`, `check`, `resync`) and reads the controller's answer from
   `ctl_status.txt`. The controller writes `identity.txt` (`role=idle|host|player`); the mod becomes active when the
   role is `host` or `player`, without reloading the game.
+- A session ends with the world it lives in: the controller watches `from_game.log` (the mod writes to it every half
+  second while its script runs) and ends the host or player session when the game that had spoken goes silent for 8
+  seconds, except during a resync reload. A host that stops tells its players (`Kicked`, reason `ended`) so they end
+  theirs at once. `docs/LIVE_CONTROL.md`, "When the world is closed".
 - The Lua UI state has no `io` global; the mod takes `package.loaded.io` (finding from MPFever, MIT).
 - Verified in game build 40420 on 2026-10-09: the button and window appear, "Host a game" opens the listener inside
   the game process and the window shows the join code. Joining from a second game, saves and the native hooks are not

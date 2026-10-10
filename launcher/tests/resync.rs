@@ -24,6 +24,8 @@ struct FakeGame {
     seen: Vec<Line>,
     handled: usize,
     save_bytes: Vec<u8>,
+    /// A game told to load stays silent (its world is being replaced) until `finish_load`.
+    hold_hello: bool,
 }
 
 impl FakeGame {
@@ -37,6 +39,7 @@ impl FakeGame {
             seen: Vec::new(),
             handled: 0,
             save_bytes,
+            hold_hello: false,
         }
     }
 
@@ -68,6 +71,7 @@ impl FakeGame {
                     fs::write(self.save_dir.join(format!("{name}.sav")), &self.save_bytes).unwrap();
                     self.write("save_done", &format!("{{[\"id\"]={id},[\"name\"]=\"{name}\",[\"ok\"]=true}}"));
                 }
+                "resync_load" if self.hold_hello => {}
                 "resync_load" => self.announce(),
                 "checksum_request" => {
                     let n = number_after(&line.payload, "[\"n\"]=").unwrap();
@@ -169,6 +173,68 @@ fn a_resync_round_moves_the_hosts_save_to_the_player_and_ends() {
     // and the verification round compared identical worlds
     let sync = host.status().last_sync.expect("a checksum outcome");
     assert!(sync.identical(), "{sync:?}");
+
+    player.stop();
+    host.stop();
+}
+
+/// The status says a game is reloading from the moment it is told to load until its new script says hello: the live
+/// controller must not take the mod's silence in between for a closed world.
+#[test]
+fn a_player_is_marked_reloading_from_the_load_until_its_hello() {
+    let root = tempfile::TempDir::new().unwrap();
+    let key = SessionKey::derive(&SessionKey::new_secret(), None);
+    let host_saves = root.path().join("host-user").join("save");
+    let player_saves = root.path().join("player-user").join("save");
+    let host_link = gamelink::Session::create_under(root.path(), "host").unwrap();
+    let host_dir = host_link.dir().to_path_buf();
+    let host = run_host(HostConfig {
+        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        name: "Host".into(),
+        key: key.clone(),
+        link: host_link,
+        options: HostOptions::default(),
+        save_dirs: vec![host_saves.clone()],
+        echo_log: false,
+    })
+    .unwrap();
+    let player_link = gamelink::Session::create_under(root.path(), "pat").unwrap();
+    let player_dir = player_link.dir().to_path_buf();
+    let mut config = PlayerConfig::new(vec![host.local_addr().unwrap()], "Pat", key, player_link);
+    config.save_dirs = vec![player_saves.clone()];
+    let player = run_player(config).unwrap();
+    assert!(player.wait_for(Duration::from_secs(10), |s| s.connected && s.my_id.is_some()));
+
+    let mut host_game = FakeGame::new(&host_dir, &host_saves, true, b"a world".to_vec());
+    let mut player_game = FakeGame::new(&player_dir, &player_saves, false, Vec::new());
+    player_game.hold_hello = true;
+    host_game.announce();
+    player_game.announce();
+    assert!(host.wait_for(Duration::from_secs(10), |s| s.clocks.len() == 2), "both clocks known");
+    assert!(!player.status().reloading && !host.status().reloading);
+
+    host.command(Command::Start);
+    assert!(host.wait_for(Duration::from_secs(10), |s| s.session.as_ref().is_some_and(|x| x.started)));
+    host.command(Command::Resync);
+    // told to load, the player's game says nothing: reloading, and the host's round waits at Loading
+    let loading = wait(Duration::from_secs(30), || {
+        host_game.step();
+        player_game.step();
+        player.status().reloading
+    });
+    assert!(loading, "player status {:?}", player.status());
+    for _ in 0..20 {
+        host_game.step();
+        player_game.step();
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(player.status().reloading, "still reloading while the game is silent");
+    assert_ne!(host.status().resync.as_deref(), Some("Idle"), "the round waits for the player's hello");
+    assert!(!host.status().reloading, "the host's own game does not reload");
+
+    // the new script's hello ends it
+    player_game.announce();
+    assert!(player.wait_for(Duration::from_secs(5), |s| !s.reloading), "{:?}", player.status());
 
     player.stop();
     host.stop();

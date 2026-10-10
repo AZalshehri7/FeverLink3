@@ -210,7 +210,8 @@ host            token valid, slot held (or still bound to a connection the host 
 ## Leave and removal
 
 - **Leave** (38, player → host, sealed): the player goes on purpose. The host closes the connection, frees the slot at once and broadcasts PlayerLeft without `away`.
-- **Kicked** (22, host → player, sealed): the host ended the session of this player. Reasons: `kicked` (the host's `kick`), `flood` (Limits). The player's session layer reports it like a Reject (`PlayerOutput::Rejected`), so the launcher does not reconnect. Sealed, because an unsealed Reject is only honoured before the Welcome. The player's slot is **not** held: it may join again with the code like anyone else.
+- **Kicked** (22, host → player, sealed): the host ended the session of this player. Reasons: `kicked` (the host's `kick`), `flood` (Limits), `ended` (the host stopped hosting or its world was closed: `HostSession::end_session` sends it to every joined player, and an unsealed Reject with the same reason to a connection that never joined, before it closes them all). The player's session layer reports it like a Reject (`PlayerOutput::Rejected`), so the launcher does not reconnect. Sealed, because an unsealed Reject is only honoured before the Welcome. The player's slot is **not** held: it may join again with the code like anyone else.
+- **End of session** is the host's call too (`HostSession::end_session()`, made when the host session stops): without it a player only sees the connection drop and tries to reconnect to a host that is gone for the whole five minutes.
 - **Kick** is the host's call (`HostSession::kick(id)`): a connected player is sent Kicked, disconnected and removed; for a player who is away it releases the held slot; the host's own id is refused.
 
 ## Ping and round-trip time
