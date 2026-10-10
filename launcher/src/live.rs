@@ -919,6 +919,18 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
     if let Some(r) = &s.resync {
         v["resync"] = json!(r);
     }
+    // what a sync round is doing right now, for the window (host and players): the host's phase, the chunks of the world
+    // sent or received, and this game's own loading (it is silent while its world is replaced)
+    let phase =
+        s.session.as_ref().and_then(|sess| sess.resync.clone()).or_else(|| s.reloading.then(|| "loading".to_owned()));
+    if let Some(phase) = phase {
+        let mut sync = json!({ "phase": phase });
+        if let Some((done, total)) = s.transfer {
+            sync["done"] = json!(done);
+            sync["total"] = json!(total);
+        }
+        v["sync"] = sync;
+    }
     // ping and route per connection, for transports that measure them (Steam)
     v["links"] = json!(s
         .links

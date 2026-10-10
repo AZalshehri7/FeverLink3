@@ -123,6 +123,7 @@ impl HostSession {
             participants: None,
             verify_n: None,
         });
+        self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
         self.resync_step();
     }
@@ -226,6 +227,14 @@ impl HostSession {
             r.state = state;
             r.entered = now;
         }
+        self.set_resync_phase(match state {
+            ResyncState::Pausing => Some("pausing"),
+            ResyncState::Saving => Some("saving"),
+            ResyncState::Transferring => Some("sending"),
+            ResyncState::Loading => Some("loading"),
+            ResyncState::Verifying => Some("verifying"),
+            ResyncState::Idle => None,
+        });
         self.progress(detail);
     }
 
@@ -407,6 +416,7 @@ impl HostSession {
 
     fn finish(&mut self) {
         let Some(r) = self.resync.take() else { return };
+        self.set_resync_phase(None);
         self.set_speed_inner(r.resume_speed);
         self.policy.resync_finished(self.now());
         self.out.push(HostOutput::ResyncProgress {
@@ -420,6 +430,7 @@ impl HostSession {
     /// Ends the round without resuming: the session stays paused.
     fn fail(&mut self, reason: String) {
         let Some(r) = self.resync.take() else { return };
+        self.set_resync_phase(None);
         self.log(format!("resync {} ({}) failed: {reason}", r.id, r.reason));
         self.policy.resync_finished(self.now());
         self.out.push(HostOutput::ResyncFailed { id: r.id, reason });

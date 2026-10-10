@@ -289,7 +289,13 @@ impl HostSession {
             lead_lower_since: None,
             last_checksum: f64::NEG_INFINITY,
             host_name,
-            state: SessionState { started: false, speed: 0, pause_at: None, lead: Lockstep::lead_units(1) },
+            state: SessionState {
+                started: false,
+                speed: 0,
+                pause_at: None,
+                lead: Lockstep::lead_units(1),
+                resync: None,
+            },
             actions_relayed: 0,
             dropped: 0,
             out: Vec::new(),
@@ -867,6 +873,15 @@ impl HostSession {
             self.request_checksum_inner();
         }
         self.drain()
+    }
+
+    /// What the resync round is doing, for the players' windows (None when no round runs). Tells everyone when it changes.
+    pub(super) fn set_resync_phase(&mut self, phase: Option<&str>) {
+        let phase = phase.map(str::to_owned);
+        if self.state.resync != phase {
+            self.state.resync = phase;
+            self.broadcast_session();
+        }
     }
 
     /// The slowest connected player's round trip, in milliseconds (0 while none was measured).

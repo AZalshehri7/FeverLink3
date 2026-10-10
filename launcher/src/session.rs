@@ -216,6 +216,8 @@ pub struct Status {
     /// the mod is silent until the new one is up. Host and player alike (the host's own game loads only with
     /// `HostOptions::host_reloads`). The live controller does not take that silence for a closed world.
     pub reloading: bool,
+    /// Player: chunks received and in all of the savegame the host is sending. Host: chunks sent and in all.
+    pub transfer: Option<(u32, u32)>,
 }
 
 impl Status {
@@ -233,6 +235,7 @@ impl Status {
             players: Vec::new(),
             clocks: Vec::new(),
             session: None,
+            transfer: None,
             last_sync: None,
             actions_relayed: 0,
             dropped: 0,
@@ -658,6 +661,7 @@ fn stream_save(
     host_dispatch(outputs, host, net, link, save_dirs, shared);
     let Some(count) = ResyncLimits::chunk_count(len) else { return };
     for index in 0..count {
+        shared.update(|s| s.transfer = Some((index, count)));
         // no other player connected, or the round moved on: nothing more to send
         if host.resync_state() != ResyncState::Transferring {
             break;
@@ -669,10 +673,12 @@ fn stream_save(
             }
             Err(e) => {
                 shared.log(format!("resync {id}: reading chunk {index}: {e}"));
+                shared.update(|s| s.transfer = None);
                 return;
             }
         }
     }
+    shared.update(|s| s.transfer = None);
 }
 
 fn refresh_host_status(host: &HostSession, net: &dyn HostTransport, shared: &Shared) {
@@ -830,8 +836,13 @@ impl PlayerLoop {
                             return;
                         }
                         // the game must stop running the session while it has no host
-                        let lost =
-                            SessionState { started: false, speed: 0, pause_at: None, lead: Lockstep::lead_units(1) };
+                        let lost = SessionState {
+                            started: false,
+                            speed: 0,
+                            pause_at: None,
+                            lead: Lockstep::lead_units(1),
+                            resync: None,
+                        };
                         write_to_game(&mut self.config.link, shared, MessageKind::Session, &codec::encode(&lost), 0);
                         match retry.as_mut() {
                             // another connection of the same outage dropped before the host welcomed us: the outage's
@@ -886,6 +897,7 @@ impl PlayerLoop {
                 if let Some(session) = self.player.session() {
                     s.session = Some(session.clone());
                 }
+                s.transfer = self.player.transfer_progress();
                 s.clocks = clocks.iter().map(|(&id, &t)| ClockInfo { id, t, speed: None }).collect();
                 s.links = self.net.as_ref().and_then(|n| n.link()).into_iter().collect();
                 // while a new connection has no welcome yet, the last roster stays: no empty list in between

@@ -737,3 +737,70 @@ fn a_host_that_does_not_reload_still_fails_the_round_when_the_worlds_differ() {
     assert!(failures[0].contains("roads"), "{failures:?}");
     assert!(h.host.state().pause_at.is_some(), "the session stays paused");
 }
+
+// ------------------------------------------------------------------ what a round says about itself
+
+#[test]
+fn the_session_state_names_the_phase_of_the_round_and_every_player_is_told() {
+    let (mut h, ids) = Harness::running(2, 2, quiet());
+    let phase = |h: &Harness| h.host.state().resync.clone();
+    let told = |h: &Harness, c| h.p(c).session.session().unwrap().resync.clone();
+    assert_eq!(None, phase(&h));
+
+    h.host_call(|host| host.start_resync("test"));
+    assert_eq!(Some("pausing".to_owned()), phase(&h));
+    assert!(
+        ids.iter().all(|&c| told(&h, c) == Some("pausing".to_owned())),
+        "players' windows can say the host is preparing"
+    );
+
+    let id = h.reach_transferring();
+    assert_eq!(Some("sending".to_owned()), phase(&h));
+    assert!(ids.iter().all(|&c| told(&h, c) == Some("sending".to_owned())));
+
+    let bytes = blob(10);
+    h.send_file(id, &bytes);
+    assert_eq!(Some("loading".to_owned()), phase(&h));
+    assert!(ids.iter().all(|&c| told(&h, c) == Some("loading".to_owned())));
+
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.hello_all(pause_at, 0);
+    assert_eq!(Some("verifying".to_owned()), phase(&h));
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(None, phase(&h), "no round, no phase");
+    assert!(ids.iter().all(|&c| told(&h, c).is_none()), "and the players are told it is over");
+}
+
+#[test]
+fn a_round_that_fails_clears_the_phase_too() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    h.advance(121.0);
+    h.host_call(HostSession::tick);
+    assert_eq!(None, h.host.state().resync);
+    assert!(h.p(ids[0]).session.session().unwrap().resync.is_none());
+}
+
+#[test]
+fn a_player_counts_the_chunks_of_the_save_it_is_receiving() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let id = h.reach_transferring();
+    let bytes = blob(600 * 1024); // three chunks
+    let sha = sha256_hex(&bytes);
+    h.host_call(|host| host.resync_file_ready(id, &sha, bytes.len() as u64));
+    assert_eq!(None, h.p(ids[0]).session.transfer_progress(), "nothing yet");
+    let chunks: Vec<&[u8]> = bytes.chunks(ResyncLimits::CHUNK_SIZE).collect();
+    assert_eq!(3, chunks.len());
+    h.host_call(|host| host.resync_chunk(id, 0, chunks[0]));
+    assert_eq!(Some((1, 3)), h.p(ids[0]).session.transfer_progress());
+    h.host_call(|host| host.resync_chunk(id, 1, chunks[1]));
+    assert_eq!(Some((2, 3)), h.p(ids[0]).session.transfer_progress());
+    h.host_call(|host| host.resync_chunk(id, 2, chunks[2]));
+    assert_eq!(
+        None,
+        h.p(ids[0]).session.transfer_progress(),
+        "complete: the save is handed over and the count is gone"
+    );
+}

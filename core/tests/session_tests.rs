@@ -264,7 +264,7 @@ fn host_only_kinds_from_a_player_are_dropped_and_never_relayed() {
     let a = h.connect("A");
     let b = h.connect("B");
     let before = h.p(b).game.len();
-    let state = SessionState { started: true, speed: 4, pause_at: None, lead: 0 };
+    let state = SessionState { started: true, speed: 4, pause_at: None, lead: 0, resync: None };
     h.player_game(a, MessageKind::Session, &json(&state));
     let load = ResyncLoadMessage { id: 1, name: "evil".into(), sha256: "00".into() };
     h.player_game(a, MessageKind::ResyncLoad, &json(&load));
@@ -462,7 +462,7 @@ fn player_ignores_frames_not_from_the_host_and_messages_before_welcome() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let mut other = Sealer::new(&h.key, 2);
-    let state = SessionState { started: true, speed: 4, pause_at: None, lead: 0 };
+    let state = SessionState { started: true, speed: 4, pause_at: None, lead: 0, resync: None };
     let frame = other.seal(MessageKind::Session.into(), &json(&state));
     h.players.get_mut(&a).unwrap().session.frame_received(&frame);
     assert_eq!(1, h.p(a).session.dropped());

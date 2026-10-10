@@ -185,6 +185,11 @@ impl IncomingSave {
         normalize_sha256(sha256).is_some_and(|s| self.done.contains(&(id, s)))
     }
 
+    /// Chunks received and chunks in all, of the transfer in progress.
+    pub fn progress(&self) -> Option<(usize, usize)> {
+        self.current.as_ref().map(|t| (t.received, t.count))
+    }
+
     /// The id of the transfer in progress.
     pub fn in_progress(&self) -> Option<i32> {
         self.current.as_ref().map(|t| t.id)
