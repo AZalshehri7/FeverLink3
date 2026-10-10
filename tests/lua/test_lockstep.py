@@ -47,6 +47,7 @@ COMMON_SRC = read_src("feverlink3_common.lua")
 LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
+HOOK_SRC = read_src("feverlink3_uihook.lua")
 # the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
 CMDS_SRC = {
     os.path.splitext(f)[0]: read_src(f)
@@ -102,6 +103,8 @@ local function mk(name)
   return function(...) return { __cmd = name, args = { n = select("#", ...), ... } } end
 end
 
+EVENTS_SEEN = {}
+
 -- the engine applying a command (on its own thread: between frames, before the steps of a tick)
 function EXECUTE(cmd, cb)
   local name, a = cmd.__cmd, cmd.args
@@ -111,6 +114,7 @@ function EXECUTE(cmd, cb)
     return
   end
   if name == "makeScriptingSendEventCmd" then
+    EVENTS_SEEN[#EVENTS_SEEN + 1] = { a[2], a[3] }
     SIM_EVENT(a[1], a[2], a[3], a[4])
     if cb then cb({}, true, {}) end
     return
@@ -238,6 +242,25 @@ function RELOAD()
   GUI_API = GUI_ENV.api
 end
 
+function UI_HOOK_NEW()
+  local env = setmetatable({}, { __index = _G })
+  env.api = MAKE_API()
+  env.package = { loaded = {} }
+  env.ug_require = function(p)
+    if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
+    if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_uihook") then return assert(load(HOOK_SRC, "=uihook", "t", env))() end
+    local cmds = p:match("(feverlink3_cmds_[%w_]+)")
+    if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
+    error("no module " .. tostring(p))
+  end
+  env.HookModule = env.ug_require("feverlink3_uihook.lua")
+  env.HookModule.install()
+  UI_HOOK = env
+  return env
+end
+
 -- the window's side (feverlink3_ui.script.lua minus the drawing): read the snapshot, queue a chat line
 function UI_ENV_NEW()
   local env = setmetatable({}, { __index = _G })
@@ -304,6 +327,7 @@ class Game:
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
+        g.HOOK_SRC = HOOK_SRC
         cmds = self.L.table()
         for stem, src in CMDS_SRC.items():
             cmds[stem] = src
@@ -329,6 +353,16 @@ class Game:
     def ui_speed(self, n):
         self.use_env()
         return bool(self.L.eval("UI_SPEED(%d)" % n))
+
+    def window(self, code):
+        """Runs `code` as a game window would: in the window state, whose api the UI hook wrapped (not the bridge's)."""
+        self.use_env()
+        self.L.execute("if not UI_HOOK then UI_HOOK_NEW() end")
+        self.L.execute("local api = UI_HOOK.api; " + code)
+
+    def events_seen(self, event_id="Loan"):
+        """How many events of that id the engine applied here (the bridge's own plumbing events do not count)."""
+        return int(self.L.eval("(function() local n = 0; for _, e in ipairs(EVENTS_SEEN) do if e[1] == %s then n = n + 1 end end; return n end)()" % lua_str(event_id)))
 
     def ui_view(self):
         self.use_env()
@@ -661,6 +695,34 @@ class LockstepTest(unittest.TestCase):
         self.tick(5)
         self.assertEqual(len(self.A.applied()), 1)
         self.assertIn("LATE", self.A.log())
+
+    def test_a_command_from_a_window_state_reaches_the_other_game_once(self):
+        # The windows live in a Lua state of their own (seen in a real game: a loan taken in the window never reached the
+        # bridge's wrap). The UI hook records the command for the bridge; the game applies it natively as ever, and the
+        # other game applies it at the stamp. The originator must not apply it a second time.
+        self.start()
+        self.tick(10)
+        self.A.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, { amount = 5 } }))')
+        self.tick(60)
+        self.assertEqual(self.A.events_seen(), 1, "applied natively on the originator, once")
+        self.assertEqual(self.B.events_seen(), 1, "applied on the other game at the stamp")
+        self.assertIn("window command", self.A.log())
+
+    def test_a_command_from_a_window_state_of_the_guest_reaches_the_host(self):
+        self.start()
+        self.tick(10)
+        self.B.window('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, { amount = 5 } }))')
+        self.tick(60)
+        self.assertEqual(self.B.events_seen(), 1)
+        self.assertEqual(self.A.events_seen(), 1)
+
+    def test_a_speed_button_in_a_window_state_is_a_request_and_not_applied_there(self):
+        self.start()
+        self.tick(5)
+        self.A.window("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(3))")
+        self.tick(5)
+        self.assertEqual(self.relay.speed_requests, [3])
+        self.assertEqual(self.A.speed(), 1, "the session's speed, not the button's")
 
     def test_speed_button_becomes_a_request(self):
         self.start()

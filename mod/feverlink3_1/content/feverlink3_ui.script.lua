@@ -18,7 +18,10 @@ if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 -- The hook that wraps the game's command functions in this Lua state (the windows' own), feverlink3_uihook.lua
 local okK, Hook = pcall(ug_require, "feverlink3_uihook.lua")
 if not okK then okK, Hook = pcall(ug_require, "feverlink3_1::/feverlink3_uihook.lua") end
-if not okK or type(Hook) ~= "table" then Hook = nil end
+if not okK or type(Hook) ~= "table" then
+	print("[feverlink3] UI hook not loaded: " .. tostring(Hook))
+	Hook = nil
+end
 
 local log = C.logger("ui")
 local M = {}
@@ -307,7 +310,7 @@ do
 	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
 	if Hook and C.DIR and C.IO then
 		local okI, errI = pcall(Hook.install)
-		if not okI then print("[feverlink3] UI hook failed: " .. tostring(errI)) end
+		print("[feverlink3] UI hook: " .. (okI and (errI and "installed" or "not installed") or ("failed: " .. tostring(errI))))
 	end
 	if okR and okB and okE and entry and entry.GameBarInfoDisplayExtension then
 		local okS, recipeFn = pcall(function()
