@@ -4,7 +4,7 @@ Game-script mod `feverlink3_1` for Transport Fever 3. Design: `docs/ARCHITECTURE
 
 ## What it does
 
-Nothing, unless the game was started by `FeverLink3.exe`: without the session folder in the environment every entry point returns at once and the game plays stock. With it, the mod:
+Nothing, until a session exists: the mod finds the session folder (the native module's live folder, or the one a launcher-started game gets in its environment) and becomes active only when `identity.txt` says this game is a host or a player; until then every entry point returns at once and the game plays stock. In a session, the mod:
 
 - holds the game at the save time until the host starts the session, then runs it at the session speed, never more than `ahead` steps past the slowest other player (barrier), and stops at exactly the step the host names for a pause;
 - captures the commands a player issues from game windows (vehicle purchase, line creation, vehicle-to-line assignment, and what `docs/COVERAGE_OPS.md` lists besides) through a wrapped `api.cmd.sendCommand`, stamps them `now + lead` rounded up to a step, ships them to the launcher as `action` lines, and applies them on every game, the originator included, at that stamp, in (stamp, sender, sequence) order. The originator's window gets its callback with the real local result once the engine has produced it. A stamp that has already passed is applied at once and logged `LATE`;

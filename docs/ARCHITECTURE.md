@@ -22,7 +22,7 @@ Lockstep is the only model that fits, and it is the one both prior projects (TpF
  |  Transport Fever 3             |                   |  Transport Fever 3  |
  |   +-- native module (Rust)     |                   |   ...               |
  |   |    capture, hold, release  |                   +---------------------+
- |   +-- Lua mod                  |     sealed TCP              |
+ |   +-- Lua mod                  |   sealed frames over Steam  |
  |        stamp, replay, checksum |<---------+                  |
  |              ^  files          |          |                  |
  |              v                 |          v                  v
@@ -53,7 +53,7 @@ Threat: an outsider who learns the host's address, or a player who is not the ho
 
 ## 4. Wire protocol
 
-Transport: TCP, host-relayed star (every player connects to the host). UDP hole punching and a relay server are later work; the frame format must not change for them.
+Topology: a host-relayed star (every player connects to the host). Transport: the players' transport is Steam's peer-to-peer networking, which carries these frames between the games (the listener and a one-process connection test exist; carrying a whole session over it is not finished, `docs/ROADMAP.md`). Plain TCP is the development and test transport that the tests and the `host` / `join` commands use. The frame format does not depend on the transport.
 
 Frame on the wire:
 
@@ -126,8 +126,8 @@ No installer. A release is one zip: `FeverLink3.exe`, the proxy DLL, the mod fol
 - **First run installs the game-side pieces**, nothing else: the proxy DLL into the game folder, the mod into the user mods folder, and the file that lets a Steam-started game find the launcher. An *Uninstall* button removes exactly those. No registry, no admin rights.
 - **Reproducible releases.** Every release is a tag built by GitHub Actions; the zip's SHA-256 is in the release notes. Nothing is built on a developer's PC.
 - **In-app updates.** The launcher checks GitHub Releases, downloads the zip, verifies an Ed25519 signature (public key embedded, private key kept offline by the maintainer) and replaces itself. Files the launcher downloads carry no mark-of-the-web, so Windows SmartScreen appears once per PC, at the very first run, and never for updates. The join code carries the host's version; a player on another version is offered the update before joining.
-- **Code signing** is the only thing that removes the first-run warning. Apply to the SignPath Foundation (free for open-source projects) once 0.3 is playable; the CI builds and release history are their prerequisites. Paid certificates only if that fails.
-- **No injection.** The proxy DLL is loaded by the game itself. It is small, unobfuscated, and documented in plain words in the README, because antivirus heuristics and players' trust both depend on that.
+- **Code signing** is the only thing that removes the first-run warning. The SignPath Foundation's free programme needs an OSI-approved licence and the project is under the PolyForm Noncommercial License, so it probably does not qualify; the paid routes (a Certum certificate, SignPath's paid service) and the trade-off are in `docs/SIGNING.md`.
+- **No injection.** The proxy DLL is loaded by the game itself. It is small, unobfuscated, and documented in plain words (`docs/SECURITY_FOR_USERS.md`), because antivirus heuristics and players' trust both depend on that.
 
 ## 12. Live mode: the session runs inside the game
 
