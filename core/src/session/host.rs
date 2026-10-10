@@ -90,6 +90,9 @@ impl Default for HostOptions {
     }
 }
 
+/// How long the lead wanted by the measured delays must stay below the one in force before the lead is shortened.
+const LEAD_SHRINK_AFTER_SECONDS: f64 = 8.0;
+
 /// What the host asks its caller to do, in this order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostOutput {
@@ -214,6 +217,9 @@ pub struct HostSession {
     next_player_id: u16,
     checksum_n: i32,
     last_session_broadcast: f64,
+    /// Since when the lead wanted by the measured delays has been below the one in force (a lead only shrinks after it has
+    /// stayed lower for a while, so a single quick ping cannot make it too short).
+    lead_lower_since: Option<f64>,
     last_checksum: f64,
     host_name: String,
     state: SessionState,
@@ -280,6 +286,7 @@ impl HostSession {
             next_player_id: 1,
             checksum_n: 0,
             last_session_broadcast: f64::NEG_INFINITY,
+            lead_lower_since: None,
             last_checksum: f64::NEG_INFINITY,
             host_name,
             state: SessionState { started: false, speed: 0, pause_at: None, lead: Lockstep::lead_units(1) },
@@ -849,6 +856,7 @@ impl HostSession {
         self.resync_step();
         self.watch_connections(t);
         self.ping_players(t);
+        self.adapt_lead(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
@@ -861,13 +869,47 @@ impl HostSession {
         self.drain()
     }
 
+    /// The slowest connected player's round trip, in milliseconds (0 while none was measured).
+    fn slowest_rtt_ms(&self) -> f64 {
+        self.rtt_ms.iter().filter(|(id, _)| self.players.contains_key(id)).map(|(_, &ms)| ms).fold(0.0, f64::max)
+    }
+
+    /// The lead the measured delays ask for at this speed.
+    pub(super) fn wanted_lead(&self, speed: i32) -> i64 {
+        Lockstep::lead_for(speed, self.slowest_rtt_ms())
+    }
+
+    /// Keeps `state.lead` in step with the measured delays: longer at once, shorter only after eight seconds of being lower.
+    fn adapt_lead(&mut self, t: f64) {
+        if !self.state.started {
+            return;
+        }
+        let want = self.wanted_lead(self.state.speed.max(1));
+        if want > self.state.lead {
+            self.state.lead = want;
+            self.lead_lower_since = None;
+            self.broadcast_session();
+        } else if want < self.state.lead {
+            let since = *self.lead_lower_since.get_or_insert(t);
+            if t - since >= LEAD_SHRINK_AFTER_SECONDS {
+                self.state.lead = want;
+                self.lead_lower_since = None;
+                self.broadcast_session();
+            }
+        } else {
+            self.lead_lower_since = None;
+        }
+    }
+
     fn set_speed_inner(&mut self, speed: i32) {
         if !self.state.started {
             return;
         }
         let speed = speed.clamp(1, 4);
         self.last_running_speed = speed;
-        self.state = SessionState { speed, pause_at: None, lead: Lockstep::lead_units(speed), ..self.state.clone() };
+        let lead = self.wanted_lead(speed);
+        self.lead_lower_since = None;
+        self.state = SessionState { speed, pause_at: None, lead, ..self.state.clone() };
         self.broadcast_session();
     }
 
@@ -904,7 +946,7 @@ impl HostSession {
 
     /// A stamp every game reaches after receiving a message sent now.
     pub fn future_stamp(&self) -> i64 {
-        Lockstep::round_up_to_step(self.max_clock().saturating_add(Lockstep::lead_units(self.state.speed.max(1))) as f64)
+        Lockstep::round_up_to_step(self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64)
     }
 
     fn broadcast_session(&mut self) {

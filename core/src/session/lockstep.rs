@@ -13,11 +13,31 @@ impl Lockstep {
         ((t / Self::STEP as f64).ceil() as i64).saturating_mul(Self::STEP)
     }
 
-    /// Steps a stamp must lie ahead of the fastest clock so that every game receives the message before reaching
-    /// it: a fixed reserve of two steps plus two steps per speed unit for the engine's batch (0.8 s at normal speed; it was
-    /// four steps, 1.2 s, until the first real test showed that a road should show on the other game in under a second).
+    /// Steps of game time that pass in one real second per speed unit. Measured in the real game (about 1200 units a second at
+    /// normal speed), a little above the 1000 the engine is documented to run at, so a lead counted with it errs to the long side.
+    pub const STEPS_PER_SECOND: f64 = 6.0;
+    /// What an action costs on its way besides the network, in real seconds: the file hand-offs between the game and the
+    /// session thread on both ends (polled every 20 ms) and a game frame.
+    pub const HANDLING_SECONDS: f64 = 0.06;
+    /// The shortest lead, in steps: one for the script event that carries the action into the simulation state (handled at
+    /// its next step) and one of margin for the error in a peer's reported clock.
+    pub const MIN_LEAD_STEPS: i64 = 3;
+    pub const MAX_LEAD_STEPS: i64 = 24;
+
+    /// How far past the fastest clock a stamp must lie so that every game has the action before it reaches the stamp, in
+    /// game-time units: the one-way network time (half the slowest round trip) and the handling, counted in steps at this
+    /// speed, plus the hand-off step and one step of margin. On a good connection that is 3 steps (about half a second at
+    /// normal speed); a slow link or a higher speed lengthens it. It was a fixed 6 steps (1.2 s) at the first real test.
+    pub fn lead_for(speed: i32, rtt_ms: f64) -> i64 {
+        let rtt = if rtt_ms.is_finite() { rtt_ms.max(0.0) } else { 0.0 };
+        let seconds = rtt / 2000.0 + Self::HANDLING_SECONDS;
+        let steps = (seconds * Self::STEPS_PER_SECOND * f64::from(speed.max(1))).ceil() as i64 + 2;
+        Self::STEP * steps.clamp(Self::MIN_LEAD_STEPS, Self::MAX_LEAD_STEPS)
+    }
+
+    /// The lead on a connection with no measured delay (the floor for a speed).
     pub fn lead_units(speed: i32) -> i64 {
-        Self::STEP * (2 + 2 * i64::from(speed.max(1)))
+        Self::lead_for(speed, 0.0)
     }
 }
 

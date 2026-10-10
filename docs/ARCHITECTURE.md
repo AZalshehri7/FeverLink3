@@ -74,7 +74,7 @@ The *only* unsealed frames are `join` (carries a proof the sender knows the key:
 ## 5. Lockstep
 
 - **Clock.** Game time from the engine, in game-time units; one simulation step is 200 units. Every game sends its clock to the host regularly; the host relays it as a peer clock.
-- **Stamp.** A local action is stamped `now + lead`, where lead covers the round trip to the slowest peer plus a reserve for the engine's batch. The host supplies the current lead with the session state; a game may raise it, never lower it.
+- **Stamp.** A local action is stamped `now + lead`, where lead covers the one-way network time to the slowest peer, the file hand-offs and a game frame, one step for the script event that carries the action into the simulation state, and one step of margin, counted in steps at the current speed (`Lockstep::lead_for`: 3 steps on a good connection, about half a second at normal speed, longer for a slow link or a higher speed). The host measures the round trips with its pings, supplies the current lead with the session state and shortens it only after it stayed lower for eight seconds; a game may raise it, never lower it.
 - **Barrier.** No game runs more than *window* steps ahead of the slowest peer. A game that reaches the barrier sets speed 0 until the peer catches up. Pause is a stamp too: every game stops at exactly that step.
 - **Ordering.** Actions at the same stamp apply in (stamp, sender id, sequence) order on every game.
 - **Late actions** (stamp already passed when received) are applied at once and logged `LATE`; a late action at the host triggers a checksum at the next common stamp.

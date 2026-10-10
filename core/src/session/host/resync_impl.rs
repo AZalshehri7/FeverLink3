@@ -103,13 +103,9 @@ impl HostSession {
                 Some(c) => c.estimate(self.now()) as i64,
                 None => self.max_clock(),
             };
-            let at = Lockstep::round_up_to_step(base.saturating_add(Lockstep::lead_units(resume_speed)) as f64);
-            self.state = SessionState {
-                speed: resume_speed,
-                pause_at: Some(at),
-                lead: Lockstep::lead_units(resume_speed),
-                ..self.state.clone()
-            };
+            let lead = self.wanted_lead(resume_speed);
+            let at = Lockstep::round_up_to_step(base.saturating_add(lead) as f64);
+            self.state = SessionState { speed: resume_speed, pause_at: Some(at), lead, ..self.state.clone() };
             self.broadcast_session();
         } else if self.state.pause_at.is_none() {
             self.pause_inner();
