@@ -62,7 +62,7 @@ function Checksums([string]$Path) {
 try {
     Get-Process TransportFever3, feverlink3 -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep 3
-    if (-not $NoInstall) { Step 'install'; & $exe install | Out-Null }
+    if (-not $NoInstall) { Step 'install (copy into the game folder)'; Install-Overlay }
 
     Step 'start game 1 (host)'
     & "${env:ProgramFiles(x86)}\Steam\steam.exe" -applaunch 3493540

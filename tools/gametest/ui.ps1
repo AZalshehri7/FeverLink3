@@ -42,3 +42,18 @@ $Fl3 = @{
     StartGame    = @(1192, 654)  # the button on the loading screen
     BarButton    = @(755, 712)   # FeverLink3 button in the bottom bar
 }
+
+# Installs the build the way a player does it: winhttp.dll next to the game program and the mod in the game's own
+# mods\release folder (checked: the game loads it from there). The copy the old installer put in the user-data
+# folder is removed, because a second mod with the same id would be ambiguous.
+function Install-Overlay {
+    $steam = Join-Path ${env:ProgramFiles(x86)} 'Steam'
+    $game = Join-Path $steam 'steamapps\common\Transport Fever 3'
+    $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    Copy-Item (Join-Path $repo 'target\release\feverlink3_native.dll') (Join-Path $game 'winhttp.dll') -Force
+    robocopy (Join-Path $repo 'mod\feverlink3_1') (Join-Path $game 'mods\release\feverlink3_1') /MIR /NFL /NDL /NJH /NJS | Out-Null
+    foreach ($dir in Get-ChildItem (Join-Path $steam 'userdata') -Directory -ErrorAction SilentlyContinue) {
+        $old = Join-Path $dir.FullName '3493540\local\mods\feverlink3_1'
+        if (Test-Path $old) { [IO.Directory]::Delete($old, $true) }
+    }
+}

@@ -39,7 +39,7 @@ function Wait-Until([scriptblock]$Test, [int]$Seconds, [string]$What) {
 try {
     Get-Process TransportFever3, feverlink3 -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep 3
-    if (-not $NoInstall) { Step 'install'; & $exe install | Out-Null }
+    if (-not $NoInstall) { Step 'install (copy into the game folder)'; Install-Overlay }
 
     Step 'start the game'
     & "${env:ProgramFiles(x86)}\Steam\steam.exe" -applaunch 3493540

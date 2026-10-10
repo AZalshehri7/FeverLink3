@@ -25,12 +25,12 @@ The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). FeverL
 
 Short version (the full guide is [docs/PLAYING.md](docs/PLAYING.md)):
 
-1. Unzip the release, close the game, double-click `feverlink3.exe` and choose `1` (install). A terminal does the same: `feverlink3 install`.
-2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer*.
-3. Click **FeverLink3** in the bar at the bottom of the screen. Under **Steam connection test**, two testers exchange their Steam IDs, paste the other's ID and press **Test the connection**.
-4. Next test build: the host clicks **Host a game** and sends the join code; a friend pastes it and presses **Join**.
+1. Unzip the release, close the game, and copy `winhttp.dll` and the `mods` folder from the zip into the game's folder (in Steam: right-click Transport Fever 3, Manage, Browse local files). There is no installer.
+2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer* when starting a game.
+3. Click **FeverLink3** in the bar at the bottom of the screen. The host clicks **Host a game** and sends the join code; a friend pastes it and presses **Join**.
+4. For connection problems, the window also has a **Steam connection test** (two players exchange Steam IDs).
 
-To remove everything: close the game and run `feverlink3 uninstall`. The installer is a testing tool: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
+To remove everything: delete `winhttp.dll` and `modseleaseeverlink3_1` from the game's folder. The `feverlink3.exe` helper in this repository is a developer tool and is not in the zip: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
 
 ## Credits
 
