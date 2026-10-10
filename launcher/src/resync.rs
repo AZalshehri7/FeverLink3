@@ -95,7 +95,7 @@ pub fn permissions_for_game(payload: &[u8], player: u16) -> Option<Vec<u8>> {
         "build": p.allows_action("build", player),
         "bulldoze": p.allows_action("bulldoze", player),
         "spend": p.allows_action("spend", player),
-        "other": true,
+        "other": p.allows_action("other", player),
     });
     serde_json::to_vec(&view).ok()
 }
@@ -196,5 +196,13 @@ mod tests {
         assert_eq!(host["build"], true);
         assert_eq!(host["bulldoze"], true);
         assert!(permissions_for_game(b"not json", 1).is_none());
+
+        // `other` is a set like the rest
+        let payload = br#"{"other":{"only":[2]}}"#;
+        let other = |id: u16| {
+            let v: serde_json::Value = serde_json::from_slice(&permissions_for_game(payload, id).unwrap()).unwrap();
+            v["other"].clone()
+        };
+        assert_eq!((other(0), other(2), other(3)), (true.into(), true.into(), false.into()));
     }
 }

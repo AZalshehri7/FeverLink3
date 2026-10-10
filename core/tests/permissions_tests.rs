@@ -78,15 +78,18 @@ fn the_host_game_is_always_allowed() {
         bulldoze: PlayerSet::HostOnly,
         spend: PlayerSet::HostOnly,
         speed: PlayerSet::HostOnly,
+        other: PlayerSet::HostOnly,
     };
     h.host_call(|host| host.set_permissions(perms));
-    let m = ActionMessage::new(200, 1, "{}").with_category("bulldoze");
-    h.host_game(MessageKind::Action, &json(&m));
-    assert!(last_action(h.p(a)).allowed);
+    for category in ["bulldoze", "other"] {
+        let m = ActionMessage::new(200, 1, "{}").with_category(category);
+        h.host_game(MessageKind::Action, &json(&m));
+        assert!(last_action(h.p(a)).allowed, "{category}");
+    }
 }
 
 #[test]
-fn categories_are_independent_and_other_is_never_restricted() {
+fn categories_are_independent_and_other_is_restricted_only_when_the_host_says_so() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
@@ -95,6 +98,7 @@ fn categories_are_independent_and_other_is_never_restricted() {
         bulldoze: PlayerSet::HostOnly,
         spend: PlayerSet::HostOnly,
         speed: PlayerSet::HostOnly,
+        other: PlayerSet::Everyone,
     };
     h.host_call(|host| host.set_permissions(perms));
     for (category, allowed) in [("build", false), ("bulldoze", false), ("spend", false), ("other", true)] {
@@ -105,6 +109,16 @@ fn categories_are_independent_and_other_is_never_restricted() {
     h.host_call(|host| host.set_permissions(only_spend));
     action(&mut h, a, "spend");
     assert!(last_action(h.p(b)).allowed);
+
+    // `other` is a set like the rest: listed players pass, the others are relayed as refused
+    let only_b = Permissions { other: PlayerSet::Only(vec![a_id(&h, b)]), ..Permissions::default() };
+    h.host_call(|host| host.set_permissions(only_b));
+    action(&mut h, a, "other");
+    assert!(!last_action(h.p(b)).allowed);
+    action(&mut h, b, "other");
+    assert!(last_action(h.p(a)).allowed);
+    action(&mut h, a, "build");
+    assert!(last_action(h.p(b)).allowed, "the other categories are untouched");
 }
 
 #[test]
@@ -118,6 +132,10 @@ fn an_unknown_category_counts_as_other() {
     let m = last_action(h.p(b));
     assert_eq!("other", m.category);
     assert!(m.allowed);
+    let perms = Permissions { other: PlayerSet::HostOnly, ..Permissions::default() };
+    h.host_call(|host| host.set_permissions(perms));
+    action(&mut h, a, "teleport");
+    assert!(!last_action(h.p(b)).allowed, "an unknown category is judged as other");
 }
 
 #[test]
@@ -193,10 +211,19 @@ fn player_sets_have_the_documented_json_shapes() {
         bulldoze: PlayerSet::HostOnly,
         spend: PlayerSet::Only(vec![1, 3]),
         speed: PlayerSet::Everyone,
+        other: PlayerSet::Everyone,
     };
     let text = String::from_utf8(codec::encode(&p)).unwrap();
     assert_eq!(r#"{"build":"everyone","bulldoze":"hostOnly","spend":{"only":[1,3]},"speed":"everyone"}"#, text);
     assert_eq!(Some(p), codec::try_decode::<Permissions>(text.as_bytes()));
+    // `other` appears once it restricts something
+    let q = Permissions { other: PlayerSet::Only(vec![2]), ..Permissions::default() };
+    let text = String::from_utf8(codec::encode(&q)).unwrap();
+    assert_eq!(
+        r#"{"build":"everyone","bulldoze":"everyone","spend":"everyone","speed":"everyone","other":{"only":[2]}}"#,
+        text
+    );
+    assert_eq!(Some(q), codec::try_decode::<Permissions>(text.as_bytes()));
     assert_eq!(Some(Permissions::default()), codec::try_decode::<Permissions>(b"{}"));
     assert_eq!(None, codec::try_decode::<Permissions>(br#"{"build":"nobody"}"#));
 }

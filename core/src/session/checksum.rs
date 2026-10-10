@@ -37,9 +37,22 @@ pub struct ChecksumRounds {
 
 impl ChecksumRounds {
     const KEEP_ROUNDS: i32 = 20;
+    /// Most parts a report may name. A world has about a dozen (money, towns, vehicles, ...) plus one per script.
+    pub const MAX_PARTS: usize = 128;
+    /// Longest part name or hash in a report (characters). Hashes are 8 hex digits.
+    pub const MAX_TEXT: usize = 128;
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether a report is the size of a real one. The host keeps the reports of 20 rounds for every player until
+    /// the round completes, so their size is what bounds that memory.
+    pub fn acceptable(report: &ChecksumReportMessage) -> bool {
+        let text_ok = |s: &String| s.len() <= Self::MAX_TEXT;
+        report.parts.len() <= Self::MAX_PARTS
+            && report.parts.iter().all(|(k, v)| text_ok(k) && text_ok(v))
+            && report.authority.as_ref().is_none_or(|a| a.len() <= Self::MAX_PARTS && a.keys().all(text_ok))
     }
 
     pub fn open(&mut self, n: i32) {
@@ -52,13 +65,26 @@ impl ChecksumRounds {
         let n = report.n;
         let round = self.rounds.get_mut(&n)?;
         round.insert(from, report);
-        self.rounds.retain(|&k, _| k >= n - Self::KEEP_ROUNDS);
+        self.rounds.retain(|&k, _| k >= n.saturating_sub(Self::KEEP_ROUNDS));
         let round = self.rounds.get(&n)?;
         if !expected.iter().all(|id| round.contains_key(id)) {
             return None;
         }
         let round = self.rounds.remove(&n)?;
         Some(Self::compare(n, &round))
+    }
+
+    /// Rounds that have a report from every one of `expected` although the last report did not just arrive: the game
+    /// they were still waiting for left. Each is removed and compared, oldest first. A round no one reported to waits.
+    pub fn finished(&mut self, expected: &[u16]) -> Vec<ChecksumOutcome> {
+        let mut done: Vec<i32> = self
+            .rounds
+            .iter()
+            .filter(|(_, round)| !round.is_empty() && expected.iter().all(|id| round.contains_key(id)))
+            .map(|(&n, _)| n)
+            .collect();
+        done.sort_unstable();
+        done.into_iter().filter_map(|n| self.rounds.remove(&n).map(|round| Self::compare(n, &round))).collect()
     }
 
     pub fn compare(n: i32, reports: &BTreeMap<u16, ChecksumReportMessage>) -> ChecksumOutcome {

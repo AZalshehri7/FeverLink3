@@ -250,7 +250,7 @@ pub fn run() -> Result<Report, String> {
     {
         let (mut raw, challenge) = raw_challenge(addr)?;
         let proof = HostSession::proof(&wrong_key, &challenge.nonce, "Raw").to_vec();
-        let join = JoinMessage { name: "Raw".into(), version: HostOptions::default().version, proof };
+        let join = JoinMessage::new("Raw", &HostOptions::default().version, proof);
         let header =
             FrameHeader::new(FrameHeader::CURRENT_VERSION, MessageKind::Join.into(), HostSession::UNASSIGNED, 0);
         FrameCodec::write(&mut raw, &Frame::new(header, codec::encode(&join))).map_err(|e| e.to_string())?;
@@ -276,8 +276,11 @@ pub fn run() -> Result<Report, String> {
     }
     ensure(&mut report, host.status().players.len() == 3, "the other players are still listed")?;
     ensure(&mut report, players.iter().all(|(h, _)| h.status().connected), "the other players are still connected")?;
-    players[1].1.write("action", "{[\"body\"]=\"after\",[\"seq\"]=2,[\"stamp\"]=2800}").map_err(io)?;
-    let from_bob = "\"after\"";
+    players[1]
+        .1
+        .write("action", "{[\"body\"]=\"{[\\\"fn\\\"]=\\\"after\\\"}\",[\"seq\"]=2,[\"stamp\"]=2800}")
+        .map_err(io)?;
+    let from_bob = "after";
     ensure(
         &mut report,
         players[0].1.wait_for("action", from_bob, WAIT).is_some(),

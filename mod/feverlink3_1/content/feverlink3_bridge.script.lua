@@ -25,6 +25,21 @@ if not okL then L = ug_require("feverlink3_1::/feverlink3_lockstep.lua") end
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
 if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
 
+-- Command schemas of the other areas (construction, operations, companies): one module each, all optional. A module
+-- that is missing or fails to load is skipped; the commands it would have carried stay native.
+local CMDS = {}
+local Co = nil -- companies: registry, attribution, ledger (feverlink3_cmds_company.lua, docs/COMPANIES.md); nil without that module
+for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverlink3_cmds_company" }) do
+	local okM, M = pcall(ug_require, name .. ".lua")
+	if not okM then okM, M = pcall(ug_require, "feverlink3_1::/" .. name .. ".lua") end
+	if okM and type(M) == "table" then
+		L.registerCommands(M.commands)
+		CMDS[#CMDS + 1] = M
+		if M.events then L.registerEvents(M.events) end
+		if type(M.company) == "table" then Co = M.company end
+	end
+end
+
 local STEP = L.STEP
 local RESULT_KEEP = 60
 local WATCH_STEPS = 10
@@ -89,20 +104,18 @@ local engine = {
 	end,
 	entitiesWith = entitiesWith,
 
-	-- Books `amount` as a journal entry on the player's account: how a game's balance is brought to the host's
-	-- value (finding from MPFever (MIT): JournalEntry with time -1 and category OTHER through
-	-- makeJournalBookAssetCmd).
-	bookJournal = function(amount)
+	-- Books `amount` as a journal entry of the given type (OTHER, LOAN...) on the player's account: how a game's
+	-- balance is brought to the host's value (finding from MPFever (MIT): JournalEntry with time -1 and category OTHER
+	-- through makeJournalBookAssetCmd). Sent with the game's own sendCommand, so it is never replicated.
+	bookJournal = function(amount, kind)
 		local entry = api.type.JournalEntry.new()
 		entry.amount = amount
 		entry.time = -1
-		entry.category.type = api.type.JournalEntry.Type.OTHER
+		entry.category.type = api.type.JournalEntry.Type[kind or "OTHER"]
 		local send = O.sendCommand or api.cmd.sendCommand
 		send(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry))
 	end,
-	-- No loan command is known for TF3 yet (nothing in MPFever): absent, so a loan difference is logged, not
-	-- corrected. A build that has one can supply it through FEVERLINK3_ENGINE.adjustLoan(delta).
-	adjustLoan = nil,
+	-- adjustLoan is defined below the table (it uses the account reader above).
 
 	-- Save and load go through the application object, which exists in the interface state (finding from
 	-- MPFever (MIT): app.saveGame(name, callback, false, true); a savegame is found with
@@ -127,6 +140,36 @@ local engine = {
 	end,
 }
 
+-- Moves the loan by `delta` without moving the balance. TF3 keeps no loan command: the loan is a game script
+-- (game_mechanics/finance/loan.script.tl) and the only thing that changes an account's loan is a journal entry of
+-- category LOAN. The script pays a loan out with one (+amount) and takes its repayment with one (-amount), so such an
+-- entry moves the balance by the same amount; the sum is booked back as OTHER to leave the balance alone. That a LOAN
+-- entry of +x raises the reported loan by x is read from the script, not measured: should a correction move the loan
+-- the wrong way, the next one notices and this switches itself off instead of doubling the error every round.
+do
+	local last, off = nil, false
+	local logEngine = C.logger("engine")
+	engine.adjustLoan = function(delta)
+		if off then error("loan correction is off: the loan moved the wrong way after the last one") end
+		local _, loan = engine.account()
+		if last and type(loan) == "number" and type(last.loan) == "number" then
+			local moved = loan - last.loan
+			if moved * last.delta < 0 and math.abs(moved) >= math.abs(last.delta) / 2 then
+				off = true
+				local why = "loan correction is off: the loan moved by " .. moved .. " after a correction of " .. last.delta
+				logEngine(why .. " (a LOAN journal entry is assumed to raise the loan by its amount; see docs/COVERAGE_OPS.md)")
+				error(why)
+			end
+		end
+		engine.bookJournal(delta, "LOAN")
+		engine.bookJournal(-delta, "OTHER")
+		last = { delta = delta, loan = loan }
+	end
+end
+
+-- companies: reads and bookings on a company's account (balance, journal entries, line results, the local-company switch)
+if Co then Co.extendEngine(engine, { sender = function() return O.sendCommand or api.cmd.sendCommand end }) end
+
 -- The test harness (or a game build with other accessors) replaces any of the above through a global table.
 do
 	local okE, override = pcall(function() return FEVERLINK3_ENGINE end)
@@ -135,8 +178,13 @@ do
 	end
 end
 
-local function checksumParts()
-	return L.checksumParts(engine, C.hashValue)
+-- `co` is the company registry of the half that asks; its digest is a part of its own once anything was configured or recorded
+local function checksumParts(co)
+	local parts, t = L.checksumParts(engine, C.hashValue)
+	local okD, digest = false, nil
+	if Co then okD, digest = pcall(Co.digest, co) end
+	if okD and digest ~= nil then parts.companies = C.hashValue(digest) end
+	return parts, t
 end
 
 -- ================================================================== simulation half
@@ -153,6 +201,8 @@ local function simState(state)
 	st.refused = st.refused or {}
 	st.bind = st.bind or {}
 	st.watches = st.watches or {}
+	st.binders = st.binders or {}
+	if Co and st.co == nil then st.co = Co.new() end
 	return st
 end
 
@@ -160,8 +210,61 @@ local function trim(list, keep)
 	while #list > keep do table.remove(list, 1) end
 end
 
-local function simCtx(st)
-	return { player = engine.player(), resolve = function(key) return L.resolveKey(st.bind, key) end }
+-- The context an action is decoded and applied in: the player entity its `player` arguments become (this game's own; in a
+-- company session the acting player's company, see Co.actor), the sender, the stamp, the action key and the registry.
+local function actionCtx(it, co, resolve)
+	local ctx = { player = engine.canonicalPlayer and engine.canonicalPlayer() or engine.player(), resolve = resolve, co = co }
+	if it then ctx.from, ctx.at, ctx.key = it.from, it.at, it.key end
+	if Co then pcall(Co.actor, ctx) end
+	return ctx
+end
+
+local function simCtx(st, it)
+	return actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
+end
+
+-- companies. Guarded calls into the company module: a fault in that layer is logged and the action goes ahead, since
+-- losing a player's action is worse than a missing ledger line.
+local function coBefore(ctx, it, spec, args, category, log)
+	if not Co then return true end
+	local ok, a, b = pcall(Co.beforeApply, ctx, it, spec, args, category)
+	if not ok then
+		log("company layer failed: " .. tostring(a))
+		return true
+	end
+	return a, b
+end
+
+local function coEffects(ctx, fx, log)
+	if not (Co and fx) then return end
+	if fx.note then log("company: " .. fx.note) end
+	if fx.postings then
+		local ok, done, failed = pcall(Co.runEffects, ctx, fx, engine)
+		if not ok then
+			log("company layer failed: " .. tostring(done))
+			return
+		end
+		for _, what in ipairs(failed) do log("company: could not book a " .. what) end
+	end
+end
+
+-- The balance an action's cost lands on (the acting company's account); nil when it cannot be read.
+local function coBalance(ctx)
+	if not Co or not engine.balanceOf then return nil end
+	local ok, v = pcall(engine.balanceOf, ctx.player)
+	if ok and type(v) == "number" and v == v then return v end
+	return nil
+end
+
+-- After the engine command went out: the ledger, with the cost measured as the account's difference. Returns the cost.
+local function coAfter(ctx, it, spec, category, balance0, log)
+	if not Co then return nil end
+	local cost = nil
+	local balance1 = balance0 ~= nil and coBalance(ctx) or nil
+	if balance0 ~= nil and balance1 ~= nil then cost = balance0 - balance1 end
+	local ok, err = pcall(function() Co.afterApply(ctx, it, spec, Co.info(it, spec, category, cost)) end)
+	if not ok then log("company layer failed: " .. tostring(err)) end
+	return cost
 end
 
 -- Applies one due action in the simulation state. No callback here (finding from MPFever (MIT): the engine
@@ -172,23 +275,49 @@ local function simApplyAction(st, it, now)
 		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
 		st.late = (st.late or 0) + 1
 	end
-	local args, err = L.decodeCommand(it.body, simCtx(st))
+	local ctx = simCtx(st, it)
+	local args, err = L.decodeCommand(it.body, ctx)
 	if not args then
 		logSim("action " .. it.key .. " refused: " .. tostring(err))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err }
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
+	local category = L.categoryOf(it.body.fn, args)
+	-- companies: the spending limit and the spec's registry change come first; a mod-level action has no engine command
+	local okC, fx = coBefore(ctx, it, spec, args, category, logSim)
+	if not okC then
+		logSim("action " .. it.key .. " refused: " .. tostring(fx))
+		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = fx }
+		return
+	end
+	coEffects(ctx, fx, logSim)
+	if spec.virtual then
+		logSim("action " .. it.key .. " " .. it.body.fn .. " applied at t=" .. now)
+		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
+		return
+	end
 	local before = spec.creates and engine.entitiesWith(spec.creates) or nil
+	local bindComps = L.bindsComp(spec, it.body)
+	local bindBefore = nil
+	if bindComps then
+		bindBefore = {}
+		for _, comp in ipairs(bindComps) do bindBefore[comp] = engine.entitiesWith(comp) end
+	end
+	local balance0 = coBalance(ctx)
 	local ok, e = pcall(function()
-		api.cmd.sendCommand(api.cmd[it.body.fn](unpack(args, 1, args.n)))
+		L.sendNow(args, function(a) api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n))) end)
 	end)
 	if not ok then
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e) }
 		return
 	end
+	coAfter(ctx, it, spec, category, balance0, logSim)
 	logSim("action " .. it.key .. " " .. it.body.fn .. " applied at t=" .. now)
+	if bindComps then
+		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0 }
+	end
 	if spec.creates then
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
 	else
@@ -196,13 +325,35 @@ local function simApplyAction(st, it, now)
 	end
 end
 
+-- companies: an action the interface half applied during a pause ran its registry and ledger part on the interface
+-- mirror (guiApplyNow); this is the same part on the simulation state, which the savegame keeps. The journal entries of
+-- a payment were booked by the interface half already, so there are no effects here. `param.cost` is what it measured.
+local function simReplayCompany(st, param)
+	local it = param.it
+	local spec = it.body and L.COMMANDS[it.body.fn]
+	if not spec then return end
+	local ctx = simCtx(st, it)
+	local args = L.decodeCommand(it.body, ctx)
+	if not args then return end
+	local category = L.categoryOf(it.body.fn, args)
+	local okC = coBefore(ctx, it, spec, args, category, logSim)
+	if okC and param.ok and not spec.virtual then
+		local ok, err = pcall(function() Co.afterApply(ctx, it, spec, Co.info(it, spec, category, param.cost)) end)
+		if not ok then logSim("company layer failed: " .. tostring(err)) end
+	end
+end
+
 local function simAdvanceWatches(st, now)
 	if #st.watches == 0 then return end
+	-- an entity bound to one key is not there for the next watch: five vehicles bought in one step appear together
+	local claimed = {}
+	for _, e in pairs(st.bind) do claimed[e] = true end
 	local keep = {}
 	for _, w in ipairs(st.watches) do
 		w.steps = w.steps + 1
-		local created = L.newestEntity(w.before, engine.entitiesWith(w.comp))
+		local created = L.claimEntity(w.before, engine.entitiesWith(w.comp), claimed)
 		if created then
+			claimed[created] = true
 			st.bind[w.key] = created
 			st.results[#st.results + 1] = { key = w.key, at = w.at, success = true, data = { [w.result] = created }, entities = { { created, 0 } } }
 			logSim("action " .. w.key .. " created entity " .. created .. " (" .. w.comp .. ")")
@@ -214,6 +365,45 @@ local function simAdvanceWatches(st, now)
 		end
 	end
 	st.watches = keep
+end
+
+-- Keys for several entities an action created (the constructions of a build, their depots and stations, the stops it
+-- put on a road and their station groups): looked for on each step until the schema says it has found them all, or
+-- WATCH_STEPS have passed. What another action's keys already name is not offered again, so two builds in one step do
+-- not take each other's entities (the engine runs the commands in the order they were applied, on every game).
+local function simAdvanceBinders(st)
+	if #st.binders == 0 then return end
+	local owner = {}
+	for k, e in pairs(st.bind) do owner[e] = k end
+	local keep = {}
+	for _, b in ipairs(st.binders) do
+		b.steps = b.steps + 1
+		local mine = b.key .. "#"
+		local made, seen = {}, {}
+		for _, comp in ipairs(b.comps) do
+			for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
+				local other = owner[e]
+				if not seen[e] and (other == nil or other:sub(1, #mine) == mine) then
+					seen[e] = true
+					made[#made + 1] = e
+				end
+			end
+		end
+		table.sort(made)
+		local map, complete = L.bindMap(L.COMMANDS[b.fn], b.body, b.key, made)
+		for key, e in pairs(map) do
+			st.bind[key] = e
+			owner[e] = key
+		end
+		if complete then
+			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
+		elseif b.steps >= WATCH_STEPS then
+			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps")
+		else
+			keep[#keep + 1] = b
+		end
+	end
+	st.binders = keep
 end
 
 local function update(userParams, state, dt)
@@ -234,13 +424,14 @@ local function update(userParams, state, dt)
 		local due = L.takeDue(st.queue, now)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" then
-				local parts, t = checksumParts()
+				local parts, t = checksumParts(st.co)
 				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountSnapshot(engine) }
 			elseif it.kind == "action" then
 				simApplyAction(st, it, now)
 			end
 		end
 		simAdvanceWatches(st, now)
+		simAdvanceBinders(st)
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)
@@ -259,6 +450,8 @@ local function handleEvent(userParams, state, src, id, name, param)
 			L.enqueue(st.queue, param)
 		elseif name == "bind" and type(param) == "table" and param.key then
 			st.bind[param.key] = param.e
+		elseif name == "co" and Co and type(param) == "table" and type(param.it) == "table" then
+			simReplayCompany(st, param)
 		end
 		state:set(st)
 	end)
@@ -279,6 +472,11 @@ local G = {
 	seq = 0,                  -- local action sequence (the `seq` of this player's actions)
 	pending = {},             -- key -> callback of a command this player issued
 	bind = {}, rev = {},      -- key -> local entity, local entity -> key (mirror of the simulation's bind)
+	co = nil,                 -- companies: mirror of the simulation's registry; ahead of it while a pause applies actions
+	localCompany = nil,       -- the player entity this game's windows act as (separate mode only)
+	coWritten = nil,          -- stamp of the last companies.txt
+	coFault = nil,            -- the last fault of the company layer in a frame (logged once, not every frame)
+	wrapped = false,          -- api.cmd.sendCommand was wrapped: commands are held, stamped and shipped
 	tags = setmetatable({}, { __mode = "k" }),  -- command object -> { name, args }
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
@@ -302,6 +500,20 @@ local function send(kind, payload)
 	if not ok then logGui("cannot send " .. kind .. ": " .. tostring(err)) end
 end
 
+-- companies: the frames that carry the company layer also pace the game and answer the host, so a fault in it is logged
+-- once and skipped, never allowed to end the frame.
+local function coGuard(what, fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then
+		local text = what .. ": " .. tostring(err)
+		if G.coFault ~= text then
+			G.coFault = text
+			logGui("company layer failed in " .. text)
+		end
+	end
+	return ok
+end
+
 local function toSim(name, param)
 	O.sendCommand(O.event("feverlink3", "feverlink3", name, param))
 end
@@ -313,8 +525,8 @@ local function setSpeed(sp)
 	end
 end
 
-local function guiCtx()
-	return { player = engine.player(), resolve = function(key) return L.resolveKey(G.bind, key) end }
+local function guiCtx(it)
+	return actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
 end
 
 local function deliverResult(key, data, success, entities)
@@ -337,14 +549,21 @@ local function reportRound(n, t, parts, account)
 	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil })
 end
 
+-- companies: hands an action this half applied to the simulation half, which keeps the registry in the savegame
+local function coToSim(it, ok, cost)
+	if not Co then return end
+	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost })
+end
+
 local function guiApplyNow(it, now)
 	if it.kind == "checksum" then
-		local parts, t = checksumParts()
+		local parts, t = checksumParts(G.co)
 		reportRound(it.n, t, parts, L.accountSnapshot(engine))
 		return
 	end
 	if it.lateSteps and it.lateSteps > 0 then logGui("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now) end
-	local args, err = L.decodeCommand(it.body, guiCtx())
+	local ctx = guiCtx(it)
+	local args, err = L.decodeCommand(it.body, ctx)
 	if not args then
 		logGui("action " .. it.key .. " refused: " .. tostring(err))
 		send("action_refused", { seq = it.seq, from = it.from, detail = err })
@@ -352,10 +571,33 @@ local function guiApplyNow(it, now)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
-	local cmd = (O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(args, 1, args.n))
-	O.sendCommand(cmd, function(data, success, entities)
+	local category = L.categoryOf(it.body.fn, args)
+	-- companies: the registry and ledger part runs here on the mirror and is replayed on the simulation state (coToSim)
+	local okC, fx = coBefore(ctx, it, spec, args, category, logGui)
+	if not okC then
+		logGui("action " .. it.key .. " refused: " .. tostring(fx))
+		send("action_refused", { seq = it.seq, from = it.from, detail = fx })
+		deliverResult(it.key, nil, false, {})
+		coToSim(it)
+		return
+	end
+	coEffects(ctx, fx, logGui)
+	if spec.virtual then
+		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now)
+		deliverResult(it.key, {}, true, {})
+		coToSim(it)
+		return
+	end
+	local balance0 = coBalance(ctx)
+	-- what the build made is what the engine reports plus what appeared among the components the schema looks at
+	local bindComps = spec.bind and L.bindsComp(spec, it.body) or nil
+	local bindBefore = {}
+	for _, comp in ipairs(bindComps or {}) do bindBefore[comp] = engine.entitiesWith(comp) end
+	local function finish(data, success, entities)
 		if spec.creates and success then
-			local e = type(data) == "table" and data[spec.result] or nil
+			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
+			local okd, e = pcall(function() return data[spec.result] end)
+			if not okd then e = nil end
 			if e == nil and type(entities) == "table" and entities[1] then e = entities[1][1] end
 			if e ~= nil then
 				G.bind[it.key] = e
@@ -363,9 +605,40 @@ local function guiApplyNow(it, now)
 				toSim("bind", { key = it.key, e = e })
 			end
 		end
+		if spec.bind and success then
+			local made, seen = {}, {}
+			local function add(e)
+				if type(e) == "number" and not seen[e] then
+					seen[e] = true
+					made[#made + 1] = e
+				end
+			end
+			for _, r in ipairs(type(entities) == "table" and entities or {}) do add(type(r) == "table" and r[1] or r) end
+			for _, comp in ipairs(bindComps or {}) do
+				for _, e in ipairs(L.newEntities(bindBefore[comp] or {}, engine.entitiesWith(comp))) do add(e) end
+			end
+			table.sort(made)
+			for sub, e in pairs((L.bindMap(spec, it.body, it.key, made))) do
+				G.bind[sub] = e
+				G.rev[e] = sub
+				toSim("bind", { key = sub, e = e })
+			end
+		end
+		-- the game is paused, so nothing else moved the account since the command went out
+		coToSim(it, success, success and coAfter(ctx, it, spec, category, balance0, logGui) or nil)
 		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now .. (success and "" or " REFUSED"))
 		deliverResult(it.key, data, success, entities)
-	end)
+	end
+	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
+	local okS, errS = pcall(L.runChained, args, function(a, cb)
+		O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
+	end, finish)
+	if not okS then
+		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
+		send("action_refused", { seq = it.seq, from = it.from, detail = tostring(errS) })
+		deliverResult(it.key, nil, false, {})
+		coToSim(it)
+	end
 end
 
 local function route(it)
@@ -381,7 +654,8 @@ local function shipLocal(tag, cb)
 	G.seq = G.seq + 1
 	local at = L.stampFor(G.session, now)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
-	send("action", { stamp = at, seq = G.seq, body = C.serialize(body) })
+	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
+	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args) })
 	if cb then G.pending[it.key] = cb end
 	logGui("action " .. it.key .. " " .. tag.name .. " stamped " .. at .. " (now " .. now .. ")")
 	route(it)
@@ -397,7 +671,11 @@ local function installWrap()
 		orig.setSpeed = api.cmd.makeGameSetSpeedCmd
 		orig.event = api.cmd.makeScriptingSendEventCmd
 		orig.factory = {}
-		for name in pairs(L.COMMANDS) do orig.factory[name] = api.cmd[name] end
+		for name in pairs(L.COMMANDS) do
+			-- a build without this factory may refuse the lookup instead of answering nil (MPFever (MIT) looked each one up guarded)
+			local okf, f = pcall(function() return api.cmd[name] end)
+			if okf then orig.factory[name] = f end
+		end
 	end
 	O.sendCommand, O.setSpeed, O.event, O.factory = orig.sendCommand, orig.setSpeed, orig.event, orig.factory
 	local wrapped = 0
@@ -420,6 +698,19 @@ local function installWrap()
 			return cmd
 		end
 	end)
+	-- companies: a mod-level action (spec.virtual) has no engine function, so its factory only makes the tag. Always made
+	-- anew: after a savegame reload the old closure would hold the previous run's tags.
+	for name, spec in pairs(L.COMMANDS) do
+		if spec.virtual then
+			pcall(function()
+				api.cmd[name] = function(...)
+					local cmd = {}
+					G.tags[cmd] = { name = name, args = { n = select("#", ...), ... } }
+					return cmd
+				end
+			end)
+		end
+	end
 	local oks = pcall(function()
 		api.cmd.sendCommand = function(cmd, cb, progress)
 			local tag = cmd ~= nil and G.tags[cmd] or nil
@@ -429,7 +720,7 @@ local function installWrap()
 				send("speed_request", { speed = tag.args[1] })
 				return
 			end
-			local category = L.categoryOf(tag.name)
+			local category = L.categoryOf(tag.name, tag.args)
 			if not L.permitted(G.perms, category) then
 				-- cancelled before stamping: nothing is sent to the other games, the window learns it failed
 				logGui("command " .. tag.name .. " refused: not allowed to " .. category)
@@ -437,12 +728,35 @@ local function installWrap()
 				if cb then pcall(cb, {}, false, {}) end
 				return
 			end
+			-- companies: the player's spending limit, checked at once so the window hears about it; every game checks again at the stamp
+			local okP, okG, why = true, true, nil
+			if Co and G.co then
+				okP, okG, why = pcall(function()
+					return Co.gate(G.co, C.PLAYER_ID, category, engine.gameTime(), Co.freeOfLimit(tag.name, tag.args))
+				end)
+			end
+			if okP then
+				if not okG then
+					logGui("command " .. tag.name .. " refused: " .. tostring(why))
+					send("action_refused", { seq = 0, detail = why })
+					if cb then pcall(cb, {}, false, {}) end
+					return
+				end
+			end
 			local ok, err = shipLocal(tag, cb)
 			if ok then return end
-			logGui("command " .. tag.name .. " sent natively: " .. tostring(err))
+			if L.COMMANDS[tag.name] and L.COMMANDS[tag.name].virtual then
+				-- a mod-level action has no engine command to fall back on
+				logGui("action " .. tag.name .. " not sent: " .. tostring(err))
+				if cb then pcall(cb, {}, false, {}) end
+				return
+			end
+			-- an event nobody replicates (notifications, tutorial steps...) is the normal case, not worth a line each
+			if category ~= "local" then logGui("command " .. tag.name .. " sent natively: " .. tostring(err)) end
 			return O.sendCommand(cmd, cb, progress)
 		end
 	end)
+	G.wrapped = oks
 	logGui("wrapped " .. wrapped .. " command factories" .. (oks and "" or "; sendCommand is read-only, commands stay native"))
 end
 
@@ -566,6 +880,10 @@ end
 local function collectFromSim(state)
 	local ok, st = pcall(function() return state:get() end)
 	if not ok or type(st) ~= "table" then return end
+	-- companies: the mirror takes the state's registry when that is newer; during a pause it is ahead of the state
+	if Co and type(st.co) == "table" and (G.co == nil or (st.co.rev or 0) > (G.co.rev or 0)) then
+		coGuard("mirror", function() G.co = C.plain(st.co) end)
+	end
 	for key, e in pairs(st.bind or {}) do
 		if G.bind[key] ~= e then G.bind[key] = e; G.rev[e] = key end
 	end
@@ -593,6 +911,36 @@ local function collectFromSim(state)
 	end
 end
 
+-- companies: the window's company page is a snapshot file of its own (companies.txt = Co.status, docs/COMPANIES.md
+-- section 6), rewritten when the registry or the roster changed, and every few seconds while there are lines whose
+-- result moves with the game.
+local function writeCompanies()
+	if not (Co and G.co) then return end
+	local hasLines = false
+	for _, m in pairs(G.co.made) do
+		if m.kind == "LINE" then hasLines = true; break end
+	end
+	local stamp = tostring(G.co.rev) .. ":" .. tostring(G.hud.version) .. (hasLines and (":" .. tostring(math.floor(os.clock() / 5))) or "")
+	if G.coWritten == stamp then return end
+	local names = {}
+	for id, p in pairs(G.hud.roster) do names[id] = p.name end
+	local now = engine.gameTime()
+	local earned = Co.earned(G.co, function(key)
+		local e = G.bind[key]
+		if e == nil then return nil end
+		local ok, v = pcall(engine.lineResult, e, 0, now)
+		return ok and v or nil
+	end)
+	local okY, year = pcall(engine.yearLength)
+	local okM, month = pcall(engine.monthLength)
+	local view = {
+		self = C.PLAYER_ID, names = names, now = now, earned = earned, yearLength = okY and year or nil, monthLength = okM and month or nil, perms = G.perms,
+		hostEntityKey = L.keyFor(G.rev, engine.canonicalPlayer and engine.canonicalPlayer() or engine.player()),
+	}
+	local okS, text = pcall(function() return C.serialize(Co.status(G.co, view)) end)
+	if okS and C.writeFile(C.path("companies.txt"), text) then G.coWritten = stamp end
+end
+
 -- The window's side of the hand-off: chat typed there arrives as records in ui_out.log, the model goes back as a
 -- snapshot file. Throttled: a few frames apart is plenty for a chat box.
 local function serviceWindow()
@@ -605,9 +953,37 @@ local function serviceWindow()
 				send("chat", { text = text })
 				Hud.addChat(G.hud, C.PLAYER_NAME, text, C.PLAYER_ID)   -- the host does not echo a message to its sender
 			end
+		elseif rec.kind == "company" and Co then
+			-- an operation typed in the company page (Co.windowCommand), sent like any command the player issues
+			coGuard("window record", function()
+				local p = C.parse(rec.payload)
+				local cmd = type(p) == "table" and Co.windowCommand(p, api) or nil
+				if cmd and G.wrapped then
+					api.cmd.sendCommand(cmd)
+				elseif cmd then
+					logGui("company action not sent: sendCommand is not wrapped, it would apply on this game alone")
+				end
+			end)
 		end
 	end
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
+	coGuard("page", writeCompanies)
+end
+
+-- companies: in separate mode (experimental, docs/COMPANIES.md section 8) this game's windows act as the player's own
+-- company, by making api.engine.util.getPlayer say so; in shared mode, or outside any company, as the game's own player.
+local function syncLocalCompany()
+	if not (Co and G.co and engine.setLocalCompany) then return end
+	local want = nil
+	if G.co.mode == "separate" then
+		local c = G.co.companies[G.co.members[C.PLAYER_ID]]
+		if c and c.entity then want = L.resolveKey(G.bind, c.entity) end
+	end
+	if want ~= G.localCompany then
+		G.localCompany = want
+		local ok = engine.setLocalCompany(want)
+		logGui("local company: " .. (want and ("entity " .. tostring(want)) or "the game's own player") .. (ok and "" or " (could not be set)"))
+	end
 end
 
 local function guiUpdate(userParams, state, guiState)
@@ -619,6 +995,9 @@ local function guiUpdate(userParams, state, guiState)
 		G.reader = C.newReader(C.path(C.TO_GAME))
 		G.writer = C.newWriter(C.path(C.FROM_GAME), C.PLAYER_ID)
 		G.hud = Hud.new(C.PLAYER_ID, C.PLAYER_NAME)
+		G.co = Co and Co.new() or nil
+		-- companies: a reload runs this file again in the same Lua state, so an override of the previous run may still be in place
+		if Co and engine.setLocalCompany then engine.setLocalCompany(nil) end
 		G.uiReader = C.newReader(C.path(Hud.OUTBOX))
 		-- after a resync load: resume the link after the line that asked for it, and keep the window's roster and chat
 		local cursor, uiCursor = (C.readFile(C.path(C.CURSOR)) or ""):match("^(%d+) (%d+)")
@@ -641,6 +1020,7 @@ local function guiUpdate(userParams, state, guiState)
 		readLink()
 		serviceWindow()
 		collectFromSim(state)
+		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
 		setSpeed(L.pace(G.session, G.peers, now, ahead))
@@ -652,8 +1032,17 @@ local function guiUpdate(userParams, state, guiState)
 	if not ok then logGui("frame failed: " .. tostring(err)) end
 end
 
+-- The engine's tool events (builder.proposalCreate / builder.proposalApply, id = the tool): the construction schema logs
+-- what it sees and what it would capture, so that the first game run shows the real shapes (finding from MPFever (MIT):
+-- these events reach guiHandleEvent). Nothing is replicated from them yet.
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
-	-- nothing yet: tool events are not needed for the replication modes implemented here
+	if not C.ACTIVE or type(name) ~= "string" or not name:find("^builder%.") then return end
+	for _, M in ipairs(CMDS) do
+		if type(M.onToolEvent) == "function" then
+			local ok, err = pcall(M.onToolEvent, id, name, param, logGui)
+			if not ok then logGui("tool event handler failed: " .. tostring(err)) end
+		end
+	end
 end
 
 function data()

@@ -66,7 +66,7 @@ impl Vdf {
 pub fn parse_vdf(text: &str) -> Vdf {
     let tokens = tokenize(text);
     let mut pos = 0;
-    Vdf::Table(parse_table(&tokens, &mut pos))
+    Vdf::Table(parse_table(&tokens, &mut pos, 0))
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,8 +123,17 @@ fn tokenize(text: &str) -> Vec<Token> {
     out
 }
 
-fn parse_table(tokens: &[Token], pos: &mut usize) -> Vec<(String, Vdf)> {
+/// Deepest nesting of tables that is read. A real `libraryfolders.vdf` has three levels; a file of ten thousand `{`
+/// would otherwise recurse until the stack is gone, and a stack overflow ends the process whatever the panic setting.
+const MAX_VDF_DEPTH: usize = 32;
+
+fn parse_table(tokens: &[Token], pos: &mut usize, depth: usize) -> Vec<(String, Vdf)> {
     let mut items = Vec::new();
+    if depth > MAX_VDF_DEPTH {
+        // what is nested this deep is not read; neither is the rest of the file
+        *pos = tokens.len();
+        return items;
+    }
     while *pos < tokens.len() {
         match &tokens[*pos] {
             Token::Close => {
@@ -134,14 +143,14 @@ fn parse_table(tokens: &[Token], pos: &mut usize) -> Vec<(String, Vdf)> {
             Token::Open => {
                 // a table without a key: keep it under an empty key rather than lose it
                 *pos += 1;
-                items.push((String::new(), Vdf::Table(parse_table(tokens, pos))));
+                items.push((String::new(), Vdf::Table(parse_table(tokens, pos, depth + 1))));
             }
             Token::Text(key) => {
                 *pos += 1;
                 match tokens.get(*pos) {
                     Some(Token::Open) => {
                         *pos += 1;
-                        items.push((key.clone(), Vdf::Table(parse_table(tokens, pos))));
+                        items.push((key.clone(), Vdf::Table(parse_table(tokens, pos, depth + 1))));
                     }
                     Some(Token::Text(value)) => {
                         *pos += 1;
@@ -355,6 +364,21 @@ mod tests {
         // a table with no key at all is kept under the empty key
         let root = parse_vdf("{ \"x\" \"1\" }");
         assert_eq!(root.get("").unwrap().get("x").and_then(Vdf::as_str), Some("1"));
+    }
+
+    #[test]
+    fn nesting_without_end_does_not_overflow_the_stack() {
+        for text in ["{".repeat(200_000), "\"a\" {".repeat(200_000), "{ \"k\" ".repeat(100_000)] {
+            let root = parse_vdf(&text);
+            assert!(matches!(root, Vdf::Table(_)));
+        }
+        // what is within the limit is read as before
+        let nested = format!("{}\"k\" \"v\"{}", "\"t\" {".repeat(30), "}".repeat(30));
+        let mut node = &parse_vdf(&nested);
+        for _ in 0..30 {
+            node = node.get("t").expect("nested table");
+        }
+        assert_eq!(node.get("k").and_then(Vdf::as_str), Some("v"));
     }
 
     #[test]

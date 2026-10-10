@@ -22,7 +22,7 @@ Lockstep is the only model that fits, and it is the one both prior projects (TpF
  |  Transport Fever 3             |                   |  Transport Fever 3  |
  |   +-- native module (Rust)     |                   |   ...               |
  |   |    capture, hold, release  |                   +---------------------+
- |   +-- Lua mod                  |     sealed TCP              |
+ |   +-- Lua mod                  |   sealed frames over Steam  |
  |        stamp, replay, checksum |<---------+                  |
  |              ^  files          |          |                  |
  |              v                 |          v                  v
@@ -50,10 +50,11 @@ Threat: an outsider who learns the host's address, or a player who is not the ho
 - **Players listen to the host only** for control (session state, checksum requests, authority values, resync). Other players reach them only through kinds the host relays.
 - **Savegames are verified.** A transfer announces the SHA-256 of the file; the receiver checks every chunk's bounds and the final hash before writing. A savegame is code (`.sav.lua` runs on load), so joining a session means trusting the host as you trust a mod author. Say so in the UI.
 - **Limits.** No forward secrecy: the key lives for the session. A hostile *player* holds the session key and can forge frames as another player at the transport level; the host's sender-id rewrite and allow-list are what contain them. This is the TpF2 Multiplayer model and it is the right trade-off for groups of friends.
+- **Strangers and floods.** The host's port is open to the internet, so what an unauthenticated peer can cost is bounded (connections, a join deadline, a 4 KiB first frame, write timeouts) and so is what a joined player can make the host hold or relay (rates, sizes, clock values). The numbers and the review are in `docs/SECURITY.md`.
 
 ## 4. Wire protocol
 
-Transport: TCP, host-relayed star (every player connects to the host). UDP hole punching and a relay server are later work; the frame format must not change for them.
+Topology: a host-relayed star (every player connects to the host). Transport: the players' transport is Steam's peer-to-peer networking, which carries these frames between the games (the listener and a one-process connection test exist; carrying a whole session over it is not finished, `docs/ROADMAP.md`). Plain TCP is the development and test transport that the tests and the `host` / `join` commands use. The frame format does not depend on the transport.
 
 Frame on the wire:
 
@@ -90,7 +91,7 @@ Three modes, from TpF2 Multiplayer, chosen per action kind:
 
 Rules: never cancel a command that nothing will replay (solo play stays stock); never cancel a command that cannot be fully decoded (losing the player's action is worse than a visible divergence); the wire never carries engine entity ids.
 
-Entity references: roads as node positions (match within 1.5 m, else split edge or create node); constructions as file + transform + parameters; vehicles and lines as `<sender>:<seq>` keys bound on every game when the entity appears, or `s:<id>` for entities from the savegame.
+Entity references: roads as node positions (match within 1.5 m, else split edge or create node); constructions as file + transform + parameters; vehicles and lines as `<sender>:<seq>` keys bound on every game when the entity appears, or `s:<id>` for entities from the savegame. Whatever a game resolves from a key is checked (it exists, it is of the expected kind): an action that fails the check is refused, never applied to whatever shares the id. Depots and station groups also carry the building that owns them and their place in it, because their own id is not bound to a key (`docs/COVERAGE_OPS.md`).
 
 ## 7. Determinism
 
@@ -109,7 +110,7 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 
 ## 9. Game builds
 
-The native module is written in Rust (`native/`): the hooking core is `unsafe` in any language, so the gain is in everything around it, which is pure, tested with `cargo test` on any machine, and compiled to a small stripped DLL. It recognises the game build by its PE timestamp and looks addresses up in one table per build (`build_table.rs`). Every address lives in that table, nowhere else, and every detour verifies the exact prologue bytes it expects before writing; the padding is written before the jump so a thread never sees half a jump. An unknown build means: hooks off, mod runs in degraded mode, clear message to the player. The tooling that produces a table row from a game executable is published in `tools/` so anyone can add a build.
+The native module is written in Rust (`native/`): the hooking core is `unsafe` in any language, so the gain is in everything around it, which is pure, tested with `cargo test` on any machine, and compiled to a small stripped DLL. It recognises the game build by its PE timestamp and looks addresses up in one table per build (`build_table.rs`). Every address lives in that table, nowhere else, and every detour verifies the exact prologue bytes it expects before writing; the padding is written before the jump, and everything is written from `DllMain`, while the process is still starting and no game thread is inside the functions, so nothing can see half a jump. An unknown build means: hooks off, mod runs in degraded mode, clear message to the player. The tooling that produces a table row from a game executable is published in `tools/` so anyone can add a build. Beyond the build check, every piece is off unless an environment variable switches it on, is compared with the bytes actually in memory, is installed all-or-none from `DllMain` before the game runs the patched code, and falls back to pass-through (never to a rewrite of running code) when the mod misbehaves; see `docs/NATIVE_LINK.md`.
 
 ## 10. Testing
 
@@ -126,8 +127,8 @@ No installer. A release is one zip: `FeverLink3.exe`, the proxy DLL, the mod fol
 - **First run installs the game-side pieces**, nothing else: the proxy DLL into the game folder, the mod into the user mods folder, and the file that lets a Steam-started game find the launcher. An *Uninstall* button removes exactly those. No registry, no admin rights.
 - **Reproducible releases.** Every release is a tag built by GitHub Actions; the zip's SHA-256 is in the release notes. Nothing is built on a developer's PC.
 - **In-app updates.** The launcher checks GitHub Releases, downloads the zip, verifies an Ed25519 signature (public key embedded, private key kept offline by the maintainer) and replaces itself. Files the launcher downloads carry no mark-of-the-web, so Windows SmartScreen appears once per PC, at the very first run, and never for updates. The join code carries the host's version; a player on another version is offered the update before joining.
-- **Code signing** is the only thing that removes the first-run warning. Apply to the SignPath Foundation (free for open-source projects) once 0.3 is playable; the CI builds and release history are their prerequisites. Paid certificates only if that fails.
-- **No injection.** The proxy DLL is loaded by the game itself. It is small, unobfuscated, and documented in plain words in the README, because antivirus heuristics and players' trust both depend on that.
+- **Code signing** is the only thing that removes the first-run warning. The SignPath Foundation's free programme needs an OSI-approved licence and the project is under the PolyForm Noncommercial License, so it probably does not qualify; the paid routes (a Certum certificate, SignPath's paid service) and the trade-off are in `docs/SIGNING.md`.
+- **No injection.** The proxy DLL is loaded by the game itself. It is small, unobfuscated, and documented in plain words (`docs/SECURITY_FOR_USERS.md`), because antivirus heuristics and players' trust both depend on that.
 
 ## 12. Live mode: the session runs inside the game
 
@@ -147,5 +148,8 @@ in-game window.
 - Verified in game build 40420 on 2026-10-09: the button and window appear, "Host a game" opens the listener inside
   the game process and the window shows the join code. Joining from a second game, saves and the native hooks are not
   yet verified.
-- Open point: a panic in the controller aborts the game (the workspace builds with `panic = "abort"`). The controller
-  code returns errors instead of panicking; a `catch_unwind` guard needs the profile to unwind for the native crate.
+- Panics: the workspace builds with `panic = "abort"`, so a panic in the controller or a session thread ends the game
+  (after writing its message to `native.log`). Measured, `panic = "unwind"` makes the DLL 480 KB (45 %) bigger, more
+  than the 150 KB allowed, so the profile stays and the panics that input can reach were removed instead; the thread
+  roots already run through `launcher::guard::guarded`, which contains a panic the day the profile unwinds. See
+  `docs/SECURITY.md`, section 5, for the table and the audit.

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{HostOutput, HostSession};
+use super::{clip, HostOutput, HostSession};
 use crate::session::checksum::ChecksumOutcome;
 use crate::session::kind::MessageKind;
 use crate::session::messages::{
@@ -68,6 +68,16 @@ impl HostSession {
         self.drain()
     }
 
+    /// A player left the game. The round stops counting on it: a player that drops and returns under the same id is
+    /// still the same id to the round, would be sent the rest of a transfer it cannot assemble and a load it never
+    /// received, and would hold the round in Loading until its timeout because it never says hello to that load.
+    /// It takes part in the next round instead (`pending_new_player`).
+    pub(super) fn forget_participant(&mut self, id: u16) {
+        if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
+            participants.remove(&id);
+        }
+    }
+
     // ---------------------------------------------------------------- starting
 
     pub(super) fn begin_resync(&mut self, reason: &str) {
@@ -102,15 +112,16 @@ impl HostSession {
         self.resync_step();
     }
 
-    pub(super) fn on_new_player(&mut self) {
+    /// A player joined (`new player`) or came back (`player returned`): a started session gets a round for it.
+    pub(super) fn on_new_player(&mut self, reason: &'static str) {
         if !self.state.started {
             return;
         }
         match &self.resync {
-            None => self.begin_resync("new player"),
+            None => self.begin_resync(reason),
             Some(r) if r.participants.is_some() => {
-                self.pending_new_player = true;
-                self.log("new player waits for the next resync round".to_owned());
+                self.pending_new_player = Some(reason);
+                self.log(format!("{reason} waits for the next resync round"));
             }
             Some(_) => {}
         }
@@ -219,7 +230,7 @@ impl HostSession {
     pub(super) fn on_save_done(&mut self, from: u16, m: SaveDoneMessage) {
         let Some((state, id)) = self.resync.as_ref().map(|r| (r.state, r.id)) else { return };
         if from != Self::HOST_ID {
-            if self.dropped_once.insert(format!("savedone/{from}")) {
+            if self.first_time(format!("savedone/{from}")) {
                 let who = self.name(from);
                 self.log(format!("SaveDone from {who} ignored (only the host's game saves)"));
             }
@@ -351,7 +362,7 @@ impl HostSession {
 
     pub(super) fn on_replay_failed(&mut self, from: u16, detail: &str) {
         let who = self.name(from);
-        self.log(format!("replay failed on {who}: {detail}"));
+        self.log(format!("replay failed on {who}: {}", clip(detail, 200)));
         if self.resync.is_some() || !self.state.started {
             return;
         }
@@ -390,8 +401,8 @@ impl HostSession {
     }
 
     fn start_pending(&mut self) {
-        if std::mem::take(&mut self.pending_new_player) {
-            self.begin_resync("new player");
+        if let Some(reason) = self.pending_new_player.take() {
+            self.begin_resync(reason);
         }
     }
 

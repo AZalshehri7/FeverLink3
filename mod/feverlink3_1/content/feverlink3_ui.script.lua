@@ -32,6 +32,7 @@ end
 -- the native module's state (nil until it has written the first one): true when it changed
 local function pollCtl()
 	C.poll()
+	if not U.firstSeen then U.firstSeen = os.clock() end
 	local s = C.parse(C.readFile(C.path(CTL_STATUS)) or "")
 	if type(s) ~= "table" then return false end
 	if U.ctl and U.ctl.version == s.version then return false end
@@ -51,15 +52,25 @@ end
 
 -- ---- drawing
 
+local WIDTH = 560 -- width of the window's content
+
 local function setup(react, builtin)
 	local V = builtin.type.Orientation.Vertical
-	local function text(s) return builtin.TextView{ meta = { class = "font-scale-title-4" }, text = s } end
-	local function column(children) return builtin.Component{ layout = builtin.BoxLayout{ orientation = V, children = children } } end
-	local function button(label, onClick)
-		return builtin.Button{ meta = { class = "secondary" }, content = text(label), onClick = onClick }
+	local H = builtin.type.Orientation.Horizontal
+	local function text(s, class, width)
+		return builtin.TextView{ meta = { class = class or "font-scale-title-4" }, text = s, width = width or WIDTH }
 	end
-	local function field(placeholder, value, onTyping)
-		return builtin.TextInputField{ meta = { class = "font-scale-title-4" }, placeholderText = placeholder, value = value, onTyping = onTyping }
+	local function gap() return text(" ", "font-scale-body") end
+	local function box(orientation, children) return builtin.BoxLayout{ orientation = orientation, children = children } end
+	local function column(children) return builtin.Component{ layout = box(V, children) } end
+	local function button(label, onClick, width)
+		return builtin.Button{ meta = { class = "secondary" }, content = text(label, "font-scale-title-4", width or WIDTH), onClick = onClick }
+	end
+	local function field(placeholder, value, onTyping, displayOnly)
+		return builtin.TextInputField{
+			meta = { class = "font-scale-title-4" }, placeholderText = placeholder, value = value, onTyping = onTyping,
+			displayOnly = displayOnly, maxLength = 200,
+		}
 	end
 
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
@@ -67,6 +78,7 @@ local function setup(react, builtin)
 		local typed = react.useState("")
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
+		local steamIn = react.useState("")
 		react.onStepTimer(function()
 			local a = poll()
 			local b = pollCtl()
@@ -74,60 +86,112 @@ local function setup(react, builtin)
 		end, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
 		local ctl = U.ctl
 		local rows = {}
+		local function add(node) rows[#rows + 1] = node end
+		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
 
-		-- lobby
-		local state = ctl and ctl.state or "starting"
-		if state == "starting" then
-			rows[#rows + 1] = text("Waiting for the FeverLink3 module...")
-		elseif state == "idle" or state == "failed" then
-			if state == "failed" then rows[#rows + 1] = text("Problem: " .. tostring(ctl.message or "unknown")) end
-			rows[#rows + 1] = text("Your name")
-			rows[#rows + 1] = field("name", nameIn:old() ~= "" and nameIn:old() or tostring(ctl.name or ""), function(v) nameIn:set(v) end)
-			rows[#rows + 1] = button("Host a game", function()
-				command("host", { name = nameIn:old() ~= "" and nameIn:old() or ctl.name })
-			end)
-			rows[#rows + 1] = text("or join with a code")
-			rows[#rows + 1] = field("join code", codeIn:old(), function(v) codeIn:set(v) end)
-			rows[#rows + 1] = button("Join", function()
-				command("join", { name = nameIn:old() ~= "" and nameIn:old() or ctl.name, code = codeIn:old() })
-			end)
-		elseif state == "hosting" then
-			rows[#rows + 1] = text("Hosting. Give this code to the other players:")
-			rows[#rows + 1] = field("join code", tostring(ctl.code or ""), function() end)
-			if ctl.password then rows[#rows + 1] = text("(they also need the password)") end
-			for _, ep in ipairs(ctl.endpoints or {}) do rows[#rows + 1] = text("address " .. tostring(ep)) end
-			rows[#rows + 1] = button(ctl.started and "Pause" or "Start the session", function()
-				command(ctl.started and "pause" or "start", {})
-			end)
-			rows[#rows + 1] = button("Stop hosting", function() command("leave", {}) end)
-		elseif state == "joining" then
-			rows[#rows + 1] = text("Joining...")
-			rows[#rows + 1] = button("Cancel", function() command("leave", {}) end)
-		elseif state == "joined" then
-			rows[#rows + 1] = text("Joined the session.")
-			rows[#rows + 1] = button("Leave", function() command("leave", {}) end)
+		local state = ctl and ctl.state
+		if not state then
+			if not C.LIVE then
+				state = "launcher"   -- started by the feverlink3 launcher (developer mode): no in-game controller
+			elseif U.firstSeen and os.clock() - U.firstSeen > 15 then
+				state = "missing"
+			else
+				state = "starting"
+			end
 		end
-		if ctl and ctl.players and #ctl.players > 0 then
-			local names = {}
-			for _, p in ipairs(ctl.players) do names[#names + 1] = tostring(p.name) end
-			rows[#rows + 1] = text("Players: " .. table.concat(names, ", "))
+		if state == "launcher" then
+			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
+		elseif state == "missing" then
+			add(text("The FeverLink3 module is not running.", "font-scale-title-3"))
+			add(text("Close the game, run `feverlink3 install` from the FeverLink3 folder, then start the game again from Steam. If it keeps happening, send the files named in HOW-TO-PLAY.txt."))
+		elseif state == "starting" then
+			add(text("Starting the multiplayer module..."))
+		elseif state == "idle" or state == "failed" then
+			if state == "failed" then
+				add(text("Could not connect: " .. tostring(ctl.message or "unknown problem"), "font-scale-title-3"))
+				add(gap())
+			end
+			add(text("Play together: one player hosts, the others join with the host's code."))
+			add(gap())
+			add(text("Your name"))
+			add(field("name", myName(), function(v) nameIn:set(v) end))
+			add(gap())
+			add(button("Host a game", function() command("host", { name = myName() }) end))
+			add(gap())
+			add(text("Or join a friend"))
+			add(field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end))
+			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end))
+
+			-- Steam connection test: can two players reach each other through Steam, without any router setup?
+			local st = ctl.steam
+			add(gap())
+			add(text("Steam connection test", "font-scale-title-3"))
+			if st and st.id then
+				add(text("Your Steam ID (send it to a friend, who pastes it below):", "font-scale-body"))
+				add(field("your Steam ID", tostring(st.id), function() end, true))
+			else
+				add(text("Steam: " .. tostring(st and st.state or "unknown"), "font-scale-body"))
+			end
+			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
+			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
+			if st and st.note then add(text(tostring(st.note), "font-scale-body")) end
+			if st and st.test then
+				local t = st.test
+				local line = "Test: " .. tostring(t.state) .. ", answers " .. tostring(t.pongs)
+				if t.rtt then line = line .. ", last round trip " .. tostring(t.rtt) .. " ms" end
+				if t.route and t.route ~= "" then line = line .. ", " .. tostring(t.route) end
+				add(text(line, "font-scale-body"))
+			end
+			if st and st.pings and st.pings > 0 then add(text("Pings received from other players: " .. tostring(st.pings), "font-scale-body")) end
+		elseif state == "hosting" then
+			add(text("You are hosting", "font-scale-title-2"))
+			add(text("Send this join code to the other players (click it, Ctrl+A, Ctrl+C):"))
+			add(field("join code", tostring(ctl.code or ""), function() end, true))
+			if ctl.password then add(text("They also need the password.")) end
+			add(gap())
+			add(text("Players", "font-scale-title-3"))
+			for _, p in ipairs(ctl.players or {}) do
+				add(text("  " .. tostring(p.name) .. (p.id == 0 and "  (host)" or ""), "font-scale-title-4"))
+			end
+			add(gap())
+			if ctl.started then
+				add(button("Sync everyone to my world", function() command("resync", {}) end))
+			end
+			add(box(H, {
+				button(ctl.started and "Pause" or "Start the session", function() command(ctl.started and "pause" or "start", {}) end, math.floor(WIDTH / 2) - 10),
+				button("Stop hosting", function() command("leave", {}) end, math.floor(WIDTH / 2) - 10),
+			}))
+		elseif state == "joining" then
+			add(text("Connecting to the host...", "font-scale-title-3"))
+			add(button("Cancel", function() command("leave", {}) end))
+		elseif state == "joined" then
+			add(text("Connected", "font-scale-title-2"))
+			add(text("Wait for the host to start the session."))
+			add(gap())
+			add(text("Players", "font-scale-title-3"))
+			for _, p in ipairs(ctl.players or {}) do
+				add(text("  " .. tostring(p.name) .. (p.id == 0 and "  (host)" or ""), "font-scale-title-4"))
+			end
+			add(gap())
+			add(button("Leave", function() command("leave", {}) end))
 		end
 
 		-- the game side: status and chat, once the mod is part of a session
 		local m = U.model
 		if m and C.ACTIVE then
-			rows[#rows + 1] = text(Hud.statusText(m))
-			for _, line in ipairs(Hud.chatLines(m, 15)) do rows[#rows + 1] = text(line) end
-			rows[#rows + 1] = field("Type a message", typed:old(), function(v) typed:set(v) end)
-			rows[#rows + 1] = button("Send", function()
+			add(gap())
+			add(text(Hud.statusText(m), "font-scale-body"))
+			for _, line in ipairs(Hud.chatLines(m, 12)) do add(text(line, "font-scale-body")) end
+			add(field("Type a message and press Send", typed:old(), function(v) typed:set(v) end))
+			add(button("Send", function()
 				if send(typed:old()) then typed:set("") end
-			end)
+			end))
 		end
 		return builtin.Window{
-			title = "FeverLink3",
+			title = "FeverLink3 Multiplayer",
 			id = "window.feverlink3",
-			initialX = 0.02,
-			initialY = 0.3,
+			initialX = 0.3,
+			initialY = 0.22,
 			movable = true,
 			closable = true,
 			onClose = wp.onClose,
@@ -135,7 +199,7 @@ local function setup(react, builtin)
 		}
 	end)
 
-	-- the bar plugin: a button in the game bar that opens the window (getDefaultWindowApi is the game's own global)
+	-- the bar plugin: a button in the game bar that opens the window
 	local function open()
 		local okG, globals = pcall(ug_require, "::/gui/main/game_react_globals.tl")
 		local okA, api = false, nil
@@ -148,7 +212,16 @@ local function setup(react, builtin)
 		if not okO then log("cannot open the window: " .. tostring(err)) end
 	end
 	return function()
-		return builtin.BoxLayout{ orientation = builtin.type.Orientation.Horizontal, children = { button("FeverLink3", open) } }
+		-- like the game's own icon buttons (eye, music): a default-styled button holding an auto-fitted image
+		return builtin.BoxLayout{
+			children = {
+				builtin.Button{
+					meta = { tooltip = "FeverLink3 multiplayer" },
+					content = builtin.TextView{ meta = { class = "font-scale-body" }, text = "FeverLink3" },
+					onClick = open,
+				},
+			},
+		}
 	end
 end
 

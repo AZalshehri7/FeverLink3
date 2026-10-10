@@ -237,6 +237,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "pbkdf2",
+ "rand",
  "serde",
  "serde_json",
  "sha2",
@@ -263,6 +264,9 @@ version = "0.1.0"
 dependencies = [
  "feverlink3_core",
  "feverlink3_launcher",
+ "rand",
+ "serde_json",
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 

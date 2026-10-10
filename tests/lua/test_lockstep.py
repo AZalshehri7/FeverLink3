@@ -47,6 +47,12 @@ COMMON_SRC = read_src("feverlink3_common.lua")
 LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
+# the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
+CMDS_SRC = {
+    os.path.splitext(f)[0]: read_src(f)
+    for f in sorted(os.listdir(CONTENT))
+    if f.startswith("feverlink3_cmds_") and f.endswith(".lua")
+}
 
 # ---------------------------------------------------------------- mocked engine (one per game)
 
@@ -211,6 +217,8 @@ function LOAD_HALF(label)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    local cmds = p:match("(feverlink3_cmds_[%w_]+)")
+    if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
     error("no module " .. tostring(p))
   end
   assert(load(BRIDGE_SRC, "=bridge-" .. label, "t", env))()
@@ -291,6 +299,10 @@ class Game:
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
+        cmds = self.L.table()
+        for stem, src in CMDS_SRC.items():
+            cmds[stem] = src
+        g.CMDS_SRC = cmds
         self.L.execute(MOCK % dict(t0=T0, first=first_entity))
         self.L.execute(HARNESS)
 
@@ -856,6 +868,29 @@ class PureTest(unittest.TestCase):
         self.assertIsNone(r[0] if isinstance(r, tuple) else r)
         with self.assertRaises(lupa.LuaError):
             self.C.serialize(self.L.eval("print"))
+
+    def test_registered_commands_may_bring_their_own_codec(self):
+        lua = self.L.eval("""function(K)
+          K.registerCommands({
+            makeCustomCmd = {
+              category = "build",
+              encode = function(name, args, ctx) return { fn = name, args = { n = 1, args[1].tag } } end,
+              decode = function(body, ctx) return { n = 1, { tag = body.args[1] } } end,
+            },
+          })
+          local body = K.encodeCommand("makeCustomCmd", { n = 1, { tag = "road" } }, {})
+          local args = K.decodeCommand(body, {})
+          return body.fn, body.args[1], args[1].tag, K.categoryOf("makeCustomCmd")
+        end""")
+        fn, tag, back, category = lua(self.K)
+        self.assertEqual((fn, tag, back, category), ("makeCustomCmd", "road", "road", "build"))
+        # a registered command without hooks still goes through the generic path
+        generic = self.L.eval("""function(K)
+          K.registerCommands({ makeGenericCmd = { category = "other" } })
+          local body, why = K.encodeCommand("makeGenericCmd", { n = 1, 42 }, { plain = function(v) return v end })
+          return body and body.args[1] or why
+        end""")
+        self.assertEqual(generic(self.K), 42)
 
     def test_fnv1a_known_vectors(self):
         self.assertEqual(int(self.C.fnv1a("")), 0x811C9DC5)

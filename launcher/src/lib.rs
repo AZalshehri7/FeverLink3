@@ -19,6 +19,7 @@
 //! transformation is a pure function over its inputs so the tests run on a machine without Steam or the game.
 
 pub mod gamelink;
+pub mod guard;
 pub mod install;
 pub mod live;
 pub mod luatext;
@@ -28,6 +29,8 @@ pub mod resync;
 pub mod selftest;
 pub mod session;
 pub mod steam;
+pub mod steam_transport;
+pub mod steamnet;
 pub mod update;
 
 /// Steam app id of Transport Fever 3.

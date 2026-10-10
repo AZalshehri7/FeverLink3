@@ -17,7 +17,7 @@
 //! [`Session::open`] reads it back.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +30,18 @@ pub const TO_GAME: &str = "to_game.log";
 pub const FROM_GAME: &str = "from_game.log";
 /// Name of the identity file.
 pub const IDENTITY: &str = "identity.txt";
+
+/// Longest line a reader accepts, in bytes, newline included. A payload is at most 1 MiB of JSON, which is at most
+/// four times that as Lua text; a longer line is somebody's mistake, and one without a newline must not make the
+/// reader keep everything it has read.
+pub const MAX_LINE_BYTES: usize = 4 << 20;
+
+/// Most bytes one [`Tail::poll`] reads. A file that grew by more is read over several polls.
+const MAX_READ_PER_POLL: u64 = 8 << 20;
+
+/// Largest `seq` a line may carry. The mod writes the number as a Lua double, which holds integers exactly up to
+/// 2^53; a line beyond that is garbage, and accepting it would end the numbering for every line after it.
+pub const MAX_SEQ: u64 = 1 << 53;
 
 /// One line of either log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,12 +67,12 @@ fn clean_field(s: &str) -> String {
 }
 
 /// Parses one line (without or with its trailing newline). `None` for anything malformed: a line with fewer
-/// than four fields, or a `seq` that is not a number.
+/// than four fields, or a `seq` that is not a number up to [`MAX_SEQ`].
 pub fn parse_line(text: &str) -> Option<Line> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     let text = text.strip_suffix('\r').unwrap_or(text);
     let mut parts = text.splitn(4, '\t');
-    let seq = parts.next()?.trim().parse().ok()?;
+    let seq = parts.next()?.trim().parse().ok().filter(|seq| *seq <= MAX_SEQ)?;
     let kind = parts.next()?.to_string();
     let from = parts.next()?.to_string();
     let payload = parts.next()?.to_string();
@@ -120,7 +132,7 @@ impl Session {
         fs::create_dir_all(dir)?;
         let to_game = dir.join(TO_GAME);
         let last = highest_seq(&to_game)?;
-        Ok(Session { dir: dir.to_path_buf(), next_seq: last + 1, tail: Tail::new(dir.join(FROM_GAME)) })
+        Ok(Session { dir: dir.to_path_buf(), next_seq: last.saturating_add(1), tail: Tail::new(dir.join(FROM_GAME)) })
     }
 
     /// The session folder.
@@ -146,7 +158,7 @@ impl Session {
         let mut file = OpenOptions::new().create(true).append(true).open(self.dir.join(TO_GAME))?;
         file.write_all(format_line(&line).as_bytes())?;
         file.flush()?;
-        self.next_seq += 1;
+        self.next_seq = seq.saturating_add(1);
         Ok(seq)
     }
 
@@ -161,20 +173,17 @@ impl Session {
     }
 }
 
-/// The highest `seq` in a log file, 0 when the file is missing or holds no valid line.
+/// The highest `seq` in a log file, 0 when the file is missing or holds no valid line. The file is read the way a
+/// [`Tail`] reads it, so invalid text or an enormous line is no problem.
 pub fn highest_seq(path: &Path) -> io::Result<u64> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
-    let mut max = 0;
-    for line in BufReader::new(file).lines() {
-        if let Some(l) = parse_line(&line?) {
-            max = max.max(l.seq);
+    let mut tail = Tail::new(path.to_path_buf());
+    loop {
+        let before = tail.offset;
+        tail.poll()?;
+        if tail.offset == before {
+            return Ok(tail.last_seq);
         }
     }
-    Ok(max)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -183,6 +192,10 @@ pub fn highest_seq(path: &Path) -> io::Result<u64> {
 
 /// Reads new lines from an append-only log, tolerating a missing file, a partial last line, truncation and a
 /// rewrite. Lines whose `seq` is not above the last dispatched one are dropped, never dispatched twice.
+///
+/// The file is written by the game and may hold anything: a poll reads at most 8 MiB, a line longer than
+/// [`MAX_LINE_BYTES`] is dropped as a whole (up to its newline, however many polls that takes), and invalid UTF-8
+/// is read as the replacement character. Memory stays at most the size of one line plus one poll.
 #[derive(Debug)]
 pub struct Tail {
     path: PathBuf,
@@ -192,12 +205,21 @@ pub struct Tail {
     last_seq: u64,
     /// Bytes read past `offset` that do not yet end with a newline.
     pending: Vec<u8>,
+    /// The line being read is over [`MAX_LINE_BYTES`]: what is left of it is dropped, up to its newline.
+    skipping: bool,
 }
 
 impl Tail {
     /// A tail of `path` from its start, with nothing dispatched yet.
     pub fn new(path: PathBuf) -> Tail {
-        Tail { path, offset: 0, last_seq: 0, pending: Vec::new() }
+        Tail { path, offset: 0, last_seq: 0, pending: Vec::new(), skipping: false }
+    }
+
+    /// Back to the start of the file, forgetting what was read of an unfinished line.
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.pending = Vec::new();
+        self.skipping = false;
     }
 
     /// The file being tailed.
@@ -218,70 +240,74 @@ impl Tail {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // the file may be recreated later with fresh content: start over then
-                self.offset = 0;
-                self.pending.clear();
+                self.rewind();
                 return Ok(Vec::new());
             }
             Err(e) => return Err(e),
         };
         let len = file.metadata()?.len();
         if len < self.offset {
-            self.offset = 0;
-            self.pending.clear();
+            self.rewind();
         }
         file.seek(SeekFrom::Start(self.offset))?;
         let mut fresh = Vec::new();
-        file.read_to_end(&mut fresh)?;
+        file.take(MAX_READ_PER_POLL).read_to_end(&mut fresh)?;
         if fresh.is_empty() {
             return Ok(Vec::new());
         }
+        // `offset` counts every byte read from the file; an incomplete last line waits in `pending`
+        self.offset = self.offset.saturating_add(fresh.len() as u64);
 
         let mut buf = std::mem::take(&mut self.pending);
         buf.extend_from_slice(&fresh);
+        drop(fresh);
         let mut out = Vec::new();
-        let mut consumed = 0;
-        while let Some(nl) = buf[consumed..].iter().position(|&b| b == b'\n') {
-            let end = consumed + nl + 1;
-            let text = String::from_utf8_lossy(&buf[consumed..end]);
-            if let Some(line) = parse_line(&text) {
-                if line.seq > self.last_seq {
-                    self.last_seq = line.seq;
-                    out.push(line);
+        let mut rest: &[u8] = &buf;
+        while let Some((line, after)) =
+            rest.iter().position(|&b| b == b'\n').and_then(|newline| rest.split_at_checked(newline + 1))
+        {
+            rest = after;
+            // the end of a line that was too long, or one that is: neither is looked at
+            if std::mem::take(&mut self.skipping) || line.len() > MAX_LINE_BYTES {
+                continue;
+            }
+            if let Some(parsed) = parse_line(&String::from_utf8_lossy(line)) {
+                if parsed.seq > self.last_seq {
+                    self.last_seq = parsed.seq;
+                    out.push(parsed);
                 }
             }
-            consumed = end;
         }
-        // `offset` counts every byte read from the file; an incomplete last line waits in `pending`
-        self.offset += fresh.len() as u64;
-        self.pending = buf[consumed..].to_vec();
+        if self.skipping || rest.len() > MAX_LINE_BYTES {
+            self.skipping = true;
+        } else {
+            self.pending = rest.to_vec();
+        }
         Ok(out)
     }
 
     /// Runs the tail on its own thread, calling `on_line` for every new line, polling every `interval`, until
     /// [`TailHandle::stop`] is called or the handle is dropped. Read errors are passed to `on_error` and the
-    /// loop continues (the file may be mid-rewrite).
+    /// loop continues (the file may be mid-rewrite). An error only if the thread cannot be started.
     pub fn spawn(
         mut self,
         interval: Duration,
         mut on_line: impl FnMut(Line) + Send + 'static,
         mut on_error: impl FnMut(io::Error) + Send + 'static,
-    ) -> TailHandle {
+    ) -> io::Result<TailHandle> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        let thread = thread::Builder::new()
-            .name("feverlink3-tail".into())
-            .spawn(move || {
-                while !flag.load(Ordering::Relaxed) {
-                    match self.poll() {
-                        Ok(lines) => lines.into_iter().for_each(&mut on_line),
-                        Err(e) => on_error(e),
-                    }
-                    thread::sleep(interval);
+        let thread = thread::Builder::new().name("feverlink3-tail".into()).spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match self.poll() {
+                    Ok(lines) => lines.into_iter().for_each(&mut on_line),
+                    Err(e) => on_error(e),
                 }
-                self
-            })
-            .expect("spawn tail thread");
-        TailHandle { stop, thread: Some(thread) }
+                thread::sleep(interval);
+            }
+            self
+        })?;
+        Ok(TailHandle { stop, thread: Some(thread) })
     }
 }
 
@@ -293,11 +319,11 @@ pub struct TailHandle {
 }
 
 impl TailHandle {
-    /// Stops the thread and returns the tail, whose `last_seq` tells what was dispatched.
-    pub fn stop(mut self) -> Tail {
+    /// Stops the thread and returns the tail, whose `last_seq` tells what was dispatched. `None` if the thread
+    /// ended in a panic of its own (a callback's, say).
+    pub fn stop(mut self) -> Option<Tail> {
         self.stop.store(true, Ordering::Relaxed);
-        let thread = self.thread.take().expect("tail thread joined once");
-        thread.join().expect("tail thread panicked")
+        self.thread.take().and_then(|t| t.join().ok())
     }
 }
 
@@ -467,11 +493,9 @@ mod tests {
         fs::write(&path, format_line(&line(1, "first"))).unwrap();
         let got = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&got);
-        let handle = Tail::new(path.clone()).spawn(
-            Duration::from_millis(10),
-            move |l| sink.lock().unwrap().push(l),
-            |e| panic!("tail error: {e}"),
-        );
+        let handle = Tail::new(path.clone())
+            .spawn(Duration::from_millis(10), move |l| sink.lock().unwrap().push(l), |e| panic!("tail error: {e}"))
+            .unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(format_line(&line(2, "second")).as_bytes()).unwrap();
         drop(f);
@@ -479,9 +503,87 @@ mod tests {
         while got.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        let tail = handle.stop();
+        let tail = handle.stop().expect("the thread ended cleanly");
         assert_eq!(*got.lock().unwrap(), vec![line(1, "first"), line(2, "second")]);
         assert_eq!(tail.last_seq(), 2);
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_dropped_whole_however_it_arrives() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(FROM_GAME);
+        let mut tail = Tail::new(path.clone());
+        let mut f = File::create(&path).unwrap();
+        f.write_all(format_line(&line(1, "before")).as_bytes()).unwrap();
+        // the start of a line that never ends, in pieces bigger than the limit
+        f.write_all(b"2\taction\t1\t").unwrap();
+        f.write_all(&vec![b'x'; MAX_LINE_BYTES + 10]).unwrap();
+        f.flush().unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line(1, "before")]);
+        assert!(tail.pending.is_empty(), "the reader does not keep what it is skipping");
+        f.write_all(&vec![b'y'; MAX_LINE_BYTES]).unwrap();
+        f.flush().unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![]);
+        assert!(tail.pending.is_empty());
+        // its newline ends the skipping; the next line is read normally
+        f.write_all(b"tail of the long line\n").unwrap();
+        f.write_all(format_line(&line(3, "after")).as_bytes()).unwrap();
+        f.flush().unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line(3, "after")]);
+
+        // a whole line over the limit that arrives in one poll is dropped too
+        let mut huge = b"4\taction\t1\t".to_vec();
+        huge.extend(vec![b'z'; MAX_LINE_BYTES]);
+        huge.push(b'\n');
+        f.write_all(&huge).unwrap();
+        f.write_all(format_line(&line(5, "five")).as_bytes()).unwrap();
+        f.flush().unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line(5, "five")]);
+    }
+
+    #[test]
+    fn a_poll_reads_a_bounded_amount_and_catches_up_on_the_next() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(FROM_GAME);
+        let mut text = String::new();
+        let mut seq = 0;
+        while text.len() < (MAX_READ_PER_POLL as usize) * 2 + 1000 {
+            seq += 1;
+            text.push_str(&format_line(&line(seq, &"p".repeat(1000))));
+        }
+        fs::write(&path, &text).unwrap();
+        let mut tail = Tail::new(path);
+        let first = tail.poll().unwrap();
+        assert!(!first.is_empty() && (first.len() as u64) < seq, "the first poll stopped at its budget");
+        let mut total = first.len() as u64;
+        loop {
+            let more = tail.poll().unwrap();
+            if more.is_empty() {
+                break;
+            }
+            total += more.len() as u64;
+        }
+        assert_eq!((total, tail.last_seq()), (seq, seq), "and every line arrived exactly once");
+    }
+
+    #[test]
+    fn garbage_and_huge_numbers_do_not_end_the_numbering() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(FROM_GAME);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\xff\xfe not text \x00\x01\n");
+        bytes.extend_from_slice(format!("{}\tx\t0\tbeyond what a Lua number holds\n", u64::MAX).as_bytes());
+        bytes.extend_from_slice(format!("{}\tx\t0\tjust over\n", MAX_SEQ + 1).as_bytes());
+        bytes.extend_from_slice(format_line(&line(7, "seven")).as_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(Tail::new(path.clone()).poll().unwrap(), vec![line(7, "seven")]);
+        assert_eq!(highest_seq(&path).unwrap(), 7, "also for a file whose text is not UTF-8");
+        assert_eq!(parse_line(&format!("{MAX_SEQ}\tk\t0\tp")).map(|l| l.seq), Some(MAX_SEQ));
+        // a log that already holds the largest number goes on after it
+        fs::write(root.path().join(TO_GAME), format_line(&line(MAX_SEQ, "last"))).unwrap();
+        let mut s = Session::open(root.path()).unwrap();
+        assert_eq!(s.next_seq(), MAX_SEQ + 1);
+        assert_eq!(s.send("x", "0", "p").unwrap(), MAX_SEQ + 1);
     }
 
     #[test]

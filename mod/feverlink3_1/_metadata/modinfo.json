@@ -1,8 +1,8 @@
 {
     "authors": [ { "name": "FeverLink3", "role": "CREATOR" } ],
-    "description": "Cooperative multiplayer for Transport Fever 3. The mod adds no content and does nothing unless the game was started by FeverLink3.exe: it then stamps player actions, applies every player's actions at the same simulation step, and reports world checksums to the launcher.",
+    "description": "Cooperative multiplayer for Transport Fever 3. The mod adds no content. It needs the FeverLink3 native module (winhttp.dll next to the game, installed by FeverLink3.exe); without it the mod does nothing. With it, a FeverLink3 button appears in the bottom bar: host or join a game there. The mod stamps player actions, applies every player's actions at the same simulation step and reports world checksums.",
     "name": "FeverLink3 Multiplayer",
-    "summary": "Co-op multiplayer (start the game through FeverLink3.exe)",
+    "summary": "Co-op multiplayer (needs the FeverLink3 native module)",
     "tags": [ "Script Mod" ],
     "url": ""
 }

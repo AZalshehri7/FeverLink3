@@ -16,12 +16,22 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 feverlink3_core = { path = "../core" }
 feverlink3_launcher = { path = "../launcher" }
+# Already built into the module through the launcher (same version); declared here because the control link
+# reads payloads with it.
+serde_json = "1.0.151"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
 ] }
 
 # The release profile is the workspace's, in the root Cargo.toml.
+
+[dev-dependencies]
+# The seeded generators of tests/robustness.rs and the log tests (versions as in the launcher; see launcher/Cargo.toml).
+rand = "0.8"
+tempfile = "~3.10"
