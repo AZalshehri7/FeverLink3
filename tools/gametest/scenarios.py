@@ -211,17 +211,19 @@ return "sent"
 
 
 def tool_road(game, a, b):
-    """The game's road tool: open it, click two points on the map, leave the tool (Escape twice)."""
-    click(game, 632, 1311, 2.0)               # the roads tool in the toolbar
-    click(game, a[0], a[1], 1.0)
-    click(game, b[0], b[1], 2.0)
-    key(game, 0x1B)
-    key(game, 0x1B)
+    """The game's road tool (tool_road.ps1): open it, click the start and the end point, leave the tool."""
+    left, right = pids()
+    pid = left if game == "host" else right
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(HERE, "tool_road.ps1"),
+                        "-ProcId", str(pid), "-X0", str(a[0]), "-Y0", str(a[1]), "-X1", str(b[0]), "-Y1", str(b[1])],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[:300])
 
 
 def roads():
-    run("road built on the host with the game's road tool", lambda: tool_road("host", (341, 1018), (574, 1053)), expect="streetEdges")
-    run("road built on the guest with the game's road tool", lambda: tool_road("guest", (434, 1040), (597, 1110)), expect="streetEdges")
+    run("road built on the host with the game's road tool", lambda: tool_road("host", (690, 1000), (860, 1010)), expect="streetEdges")
+    run("road built on the guest with the game's road tool", lambda: tool_road("guest", (690, 1074), (807, 1098)), expect="streetEdges")
 
 
 ALL = {"economy": economy, "names": names, "lines": lines, "roads": roads}
