@@ -2,7 +2,7 @@
 .SYNOPSIS
   The split-screen demo for the project documentation: two real Transport Fever 3 games side by side (LEFT = host
   "Anna", RIGHT = guest "Ben"), each starting in its own world. The host hosts and copies the join code, the guest
-  pastes it and joins, the host starts the session (the host's world is sent and both games reload into it), then
+  pastes it and joins, the host starts the session (the host's world is sent; the guest's game reloads into it while the host keeps playing), then
   each side gives commands (speed, pause, chat) and the other game shows them. A picture of the whole screen is
   taken all the way through and assembled into an animated GIF.
 
@@ -120,7 +120,7 @@ Hold 3.0 'Two copies of Transport Fever 3, each with its own world'
 
 # the host
 Press $Left $Pos.BarButton 'HOST: open the FeverLink3 window in the game bar'
-Hold 1.5 'HOST: the FeverLink3 window'
+Start-Sleep 3     # no picture while the name field still holds the Steam name: the name is typed before the next one
 Write-Into 'Anna' 'HOST: type your name'
 Press $Left $Ui.HostButton 'HOST: press Host a game'
 $ok = Wait-Live 'live1' { param($t) $t.Contains('["state"]="hosting"') } 30 'HOST: starting to host...'
@@ -131,7 +131,7 @@ Hold 2.0 'HOST: copied, ready to send to a friend'
 
 # the guest
 Press $Right $Pos.BarButton 'GUEST: open the FeverLink3 window'
-Hold 1.2 'GUEST: the FeverLink3 window'
+Start-Sleep 3
 Write-Into 'Ben' 'GUEST: type your name'
 Press $Right $Ui.CodeField 'GUEST: click the join code field'
 Send-Chord 0x56
@@ -149,16 +149,16 @@ while ((Get-Date) -lt $end) {
     $t = Live-Text 'live1'
     if ($t -match '\["resync"\]="(Pausing|Saving|Transferring|Loading|Verifying)"') { $seen = $true }
     if ($seen -and $t.Contains('["resync"]="Idle"')) { break }
-    Snap "The host's world is sent to the guest, both games reload into it (sped up)" 0.5
+    Snap "The host's world is sent to the guest, whose game loads it; the host keeps playing (sped up)" 0.5
     Start-Sleep -Milliseconds 1200
 }
 Check $seen 'a resync round ran at Start'
 Start-Sleep 4
-foreach ($id in @($Left, $Right)) { Click-Win $id $Pos.TutorialClose[0] $Pos.TutorialClose[1]; Start-Sleep -Milliseconds 800 }
+Click-Win $Right $Pos.TutorialClose[0] $Pos.TutorialClose[1]    # the reload brought the tutorial panel back
+Start-Sleep -Milliseconds 800
 Hold 3.0 "Both games now play the host's world"
 
-# the windows are closed by the reload: open them again
-Press $Left $Pos.BarButton 'HOST: open the window again'
+# the guest's reload closed its window: open it again (the host's game never reloaded, its window stays)
 Press $Right $Pos.BarButton 'GUEST: open the window again'
 Hold 1.5 'Both windows show the running session'
 
@@ -184,7 +184,7 @@ Check ((Live-Text 'live1').Contains('["speed"]=1')) 'the session runs at x1 afte
 Demo-Step ("{0} pictures in {1}" -f $script:n, $Frames)
 $gif = Join-Path $Out 'split-screen-demo.gif'
 if (Test-Path $Python) {
-    & $Python (Join-Path $PSScriptRoot 'make_demo_gif.py') $Frames $gif --width 1280
+    & $Python (Join-Path $PSScriptRoot 'make_demo_gif.py') $Frames $gif --width 1280 --colors 128 --webp (Join-Path $Out 'split-screen-demo.webp')
 } else {
     Write-Warning "no Python at ${Python}: assemble the GIF later with make_demo_gif.py"
 }

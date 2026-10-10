@@ -6,7 +6,7 @@ title: FeverLink3 status
 
 Last updated 2026-10-10. The project started on 2026-10-09. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html)
 
-FeverLink3 is an early test build and not yet a playable multiplayer game. The first test build has one job: to find out whether two players can reach each other through Steam. This page keeps three things apart: what has been seen working in the real game, what has only been tested without the game, and what has not been done.
+FeverLink3 is an early test build and not yet a full multiplayer game: two real copies of the game can host and join and follow each other's speed, pause and chat commands, but building together has not been seen yet. This page keeps three things apart: what has been seen working in the real game, what has only been tested without the game, and what has not been done.
 
 ## Seen working in the real game
 
@@ -19,6 +19,9 @@ Game build 40420, the maintainer's PC.
 | 2026-10-09 | The mod drives the game's own save and load, and after a reload it finds its session files again. |
 | 2026-10-09 | The Steam peer-to-peer listener starts inside the game. |
 | 2026-10-10 | Inside one running game, a Steam peer-to-peer connection to the game's own Steam ID opens and 6 pings are answered. |
+| 2026-10-10 | The Steam peer-to-peer connection between two different Steam accounts: the maintainer's friend reported `connected` with a round trip of 199 ms through a Steam relay (reported by the friend, not seen by the maintainer). |
+| 2026-10-10 | Two real copies of the game on one PC, over the developer connection on the loopback address (two games of one Steam account cannot reach each other through Steam): the host hosts and presses **Copy code**, the guest pastes the code with Ctrl+V and joins, the host presses **Start the session**, the host's world is sent in chunks and the guest's game loads it while the host's game keeps playing, and the paused checksum after the transfer matches. [Recording](../media/split-screen-demo.gif). |
+| 2026-10-10 | In the same two games: **2x**, **Pause** and **1x** pressed in the window of either game change the speed of both, with the same date on both, and a chat message typed in one game appears in the other. |
 
 ## Tested without the game
 
@@ -33,9 +36,8 @@ Written and covered by automated tests (unit tests, loopback sessions, two simul
 
 ## Not done or not verified
 
-- The Steam peer-to-peer connection between two different Steam accounts: this is what the current test build is for, so the connection is described as being tested.
-- Hosting and joining a game over Steam (the window's Host button says so), and sending the host's world to a second real game and loading it there.
-- Joining from a second real copy of the game.
+- Hosting and joining a whole session over Steam between two accounts (the connection test worked; carrying a session over it is the next test with a friend).
+- A busy world: the sync in which the host's game keeps playing was checked on a small world with no lines or vehicles, and the checksum covers money, loan, constructions, lines and time only. Whether a world with many vehicles stays identical is not known yet; `FEVERLINK3_HOST_RELOAD=1` makes the host reload too, as a fallback.
 - Building together: replicating construction and vehicle commands between two real games.
 - The native hooks that hold construction commands back so every game builds at the same moment: the code exists but is switched off by default and has never run in the real game.
 - Separate companies and a dedicated server. The installer's double-click menu has been tested on a fake PC only, not yet on a clean PC.

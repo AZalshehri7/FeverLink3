@@ -1,6 +1,6 @@
 """Assembles the split-screen demo frames into an animated GIF.
 
-Usage: python make_demo_gif.py FRAMES_DIR OUT.gif [--width 1280] [--colors 255] [--skip f0089,f0091] [--webp OUT.webp]
+Usage: python make_demo_gif.py FRAMES_DIR OUT.gif [--width 1280] [--colors 255] [--skip f0089,f0091] [--skip-caption "text" ...] [--webp OUT.webp] [--still "caption start=file.png" ...]
 
 FRAMES_DIR holds PNG frames and frames.tsv, one line per frame: file name <TAB> caption <TAB> seconds shown
 <TAB> optional mouse position x <TAB> y (screen pixels of the 2560 wide desktop; a ring is drawn there).
@@ -33,12 +33,13 @@ def label(draw, box, text, f, fill, text_fill=(255, 255, 255, 255)):
 
 
 def decorate(img, caption, width, mouse=None):
+    """The picture with the HOST/GUEST labels over the two title bars and the pointer ring, and the caption in a strip
+    of its own under it (so the game's bottom bar with the date and the speed buttons stays visible)."""
     scale = width / 2560.0
     img = img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(overlay)
     big = font(FONT, max(16, int(34 * scale)))
-    cap = font(FONT_LIGHT, max(14, int(30 * scale)))
     half = img.width // 2
     pad = int(14 * scale)
     h = int(46 * scale)
@@ -50,18 +51,24 @@ def decorate(img, caption, width, mouse=None):
         r = max(9, int(22 * scale))
         d.ellipse((mx - r, my - r, mx + r, my + r), outline=(255, 214, 10, 255), width=max(2, int(5 * scale)))
         d.ellipse((mx - 3, my - 3, mx + 3, my + 3), fill=(255, 214, 10, 255))
+    picture = Image.alpha_composite(img, overlay).convert("RGB")
+    strip_h = int(78 * scale)
+    out = Image.new("RGB", (picture.width, picture.height + strip_h), (10, 14, 20))
+    out.paste(picture, (0, 0))
     if caption:
-        bar_h = int(54 * scale)
-        d.rectangle((0, img.height - bar_h, img.width, img.height), fill=(10, 14, 20, 205))
-        w = d.textlength(caption, font=cap)
-        d.text(((img.width - w) / 2, img.height - bar_h + (bar_h - int(30 * scale)) / 2 - 2), caption, font=cap, fill=(240, 244, 250, 255))
-    return Image.alpha_composite(img, overlay).convert("RGB")
+        dr = ImageDraw.Draw(out)
+        cap = font(FONT, max(15, int(34 * scale)))
+        w = dr.textlength(caption, font=cap)
+        dr.text(((out.width - w) / 2, picture.height + (strip_h - int(34 * scale)) / 2 - 3), caption, font=cap, fill=(240, 244, 250))
+    return out
 
 
 def signature(img):
     """A small grey picture of the whole frame and of the two bottom bars (date and speed of both games): two pictures
     count as the same when neither changed visibly. The game's own FPS counter and moving trees do not matter."""
     w, h = img.size
+    h = h - int(78 * (w / 2560.0))   # the picture without the caption strip under it
+    img = img.crop((0, 0, w, h))
     whole = img.convert("L").resize((64, 36), Image.BILINEAR)
     # the bottom bar of each game (speed buttons and date), at full size: a changing digit is a handful of pixels
     left = img.crop((int(w * 0.40), int(h * 0.966), int(w * 0.505), int(h * 0.992))).convert("L")
@@ -96,6 +103,8 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--colors", type=int, default=255)
+    ap.add_argument("--still", action="append", default=[], help="\"caption start=file.png\": write the last picture whose caption starts so, at full size, as a still")
+    ap.add_argument("--skip-caption", action="append", default=[], help="leave out every picture whose caption starts with this text")
     ap.add_argument("--webp", default="", help="also write an animated WebP (much smaller than the GIF, same pictures)")
     ap.add_argument("--skip", default="", help="frame names (without .png) to leave out, comma separated")
     args = ap.parse_args()
@@ -116,7 +125,7 @@ def main():
         sys.exit("no frames")
 
     skip = {x.strip() for x in args.skip.split(",") if x.strip()}
-    rows = [r for r in rows if os.path.splitext(r[0])[0] not in skip]
+    rows = [r for r in rows if os.path.splitext(r[0])[0] not in skip and not any(r[1].startswith(c) for c in args.skip_caption)]
 
     # decorate every picture once (labels, caption, pointer ring), then give all of them one shared palette: static
     # parts of the screen then stay identical from picture to picture and the GIF only stores what changed
@@ -129,6 +138,18 @@ def main():
             continue
         img = img.resize((args.width, int(img.height * args.width / img.width)), Image.LANCZOS)
         pictures.append((decorate(img, caption, args.width, mouse), caption, seconds, mouse))
+
+    for spec in args.still:
+        start, _, target = spec.rpartition("=")
+        hits = [i for i, (_, cap, _, _) in enumerate(pictures) if cap.startswith(start)]
+        if not hits:
+            print("no picture with a caption starting %r" % start)
+            continue
+        name, cap, _, mouse = rows[hits[-1]] if len(rows) == len(pictures) else (None, start, 0, None)
+        full = Image.open(os.path.join(args.frames, rows[hits[-1]][0]))
+        full = full.resize((1600, int(full.height * 1600 / full.width)), Image.LANCZOS)
+        decorate(full, cap, 1600, None).save(target, quality=88, optimize=True)
+        print("still:", target)
 
     samples = pictures[:: max(1, len(pictures) // 24)]
     w, h = samples[0][0].size
