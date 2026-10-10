@@ -107,7 +107,7 @@ Known issues of 0.2.0-test1
 - Game build 40420 only. After a game update, if the game does not start, run feverlink3 uninstall and tell us your build.
 - Unsigned: SmartScreen/antivirus may warn. Windows 11 Smart App Control may block the DLL (untested).
 - Not compatible with MPFever or any other winhttp.dll mod.
-- Install is command-line only for now.
+- The installer is a testing tool (double-click menu or command line), not yet tried on a clean PC by someone else.
 
 How to report: Discord azalshehri or https://github.com/AZalshehri7/FeverLink3/issues. Attach %LOCALAPPDATA%\FeverLink3\native.log and live\mod.log, your game build and Windows version.
 ```

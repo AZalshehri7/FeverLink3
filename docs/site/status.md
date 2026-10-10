@@ -38,7 +38,7 @@ Written and covered by automated tests (unit tests, loopback sessions, two simul
 - Joining from a second real copy of the game.
 - Building together: replicating construction and vehicle commands between two real games.
 - The native hooks that hold construction commands back so every game builds at the same moment: the code exists but is switched off by default and has never run in the real game.
-- Separate companies, a guided installer, a dedicated server.
+- Separate companies and a dedicated server. The installer's double-click menu has been tested on a fake PC only, not yet on a clean PC.
 
 ## What would change this page
 

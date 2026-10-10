@@ -97,14 +97,14 @@ For the person who drives the game. Each entry says what to capture, the exact s
 ## S09 - `feverlink3 doctor`
 
 - **Purpose:** transparency about what the installer sees. Name: `nexus-09-doctor.png`.
-- **Steps:** open a terminal in the unzipped release folder and run `feverlink3 doctor`. Capture the output.
+- **Steps:** double-click `feverlink3.exe` in the unzipped release folder: the checks screen (lines marked `[ok]`, `[??]`, `[!!]`, `[--]` and the line **Next step**) is the picture. For the command-line version, open a terminal in that folder and run `feverlink3 doctor`. Capture the output.
 - **Hide:** Windows user name in any path.
-- **Caption:** "feverlink3 doctor shows what was found and changes nothing."
+- **Caption:** "The installer checks your PC and says what to do next. It changes nothing until you choose."
 
 ## S10 - `feverlink3 install`
 
 - **Purpose:** what the install prints and changes. Name: `nexus-10-install.png`.
-- **Steps:** close the game. In the terminal run `feverlink3 install --dry-run` first (lines start with WOULD), then, on a clean install, `feverlink3 install` (lines start with DONE). Capture the real run, or both stacked in one image.
+- **Steps:** close the game. Double-click `feverlink3.exe`, type `1` and press Enter, and capture the screen with "[ok] FeverLink3 is installed." Or, in a terminal, run `feverlink3 install --dry-run` first (lines start with WOULD), then, on a clean install, `feverlink3 install` (lines start with DONE) and capture the real run.
 - **Hide:** Windows user name in paths.
 - **Caption:** "The installer lists every item it installs: the mod, steam_appid.txt, winhttp.dll and feverlink3_path.txt. --dry-run shows the plan first."
 
@@ -131,7 +131,7 @@ For the person who drives the game. Each entry says what to capture, the exact s
 ## S14 - `feverlink3 uninstall`
 
 - **Purpose:** show that removal is one command. Name: `nexus-14-uninstall.png`.
-- **Steps:** close the game, run `feverlink3 uninstall`, capture the lines marked DONE.
+- **Steps:** close the game, double-click `feverlink3.exe`, type `2`, answer yes, and capture the result; or run `feverlink3 uninstall` in a terminal and capture the lines marked DONE.
 - **Hide:** user name in paths.
 - **Caption:** "One command removes the mod and our winhttp.dll. It never touches another mod's file."
 

@@ -65,10 +65,14 @@ The switched-off code is meant to be turned on for players in a later version: t
 
 ### Known gaps
 
-- The DLL has no version-information resource, so the Details tab in its Properties is empty. That makes it look less trustworthy than it is.
+- `feverlink3.exe` carries an icon, version information and a manifest (no administrator rights asked); the DLL does not yet have a version-information resource, so the Details tab in its Properties is empty. That makes it look less trustworthy than it is.
 - A bug in FeverLink3's code running inside the game can crash the game, because the build aborts instead of unwinding on an internal error (open point in `docs/ARCHITECTURE.md` section 12).
 - If a game update makes the game import one more WinHTTP function than the 14 listed above, the game may fail to start while this DLL is in place. Removing the DLL fixes that. The address tool checks the import list of every game build we add to the module.
 - Not tested yet: Windows 11 with Smart App Control switched on (see below), and other mods that also place a `winhttp.dll` in the game folder (the installer refuses to overwrite another mod's file).
+
+## The installer program, `feverlink3.exe`
+
+It is a separate program that you start yourself (a double-click shows a numbered menu; `install`, `uninstall` and `doctor` also work on the command line). It checks your PC (the same Steam registry values and folders as above), writes or removes the files in the table below, and on request starts `steam.exe` from your Steam folder to launch the game, opens `%LOCALAPPDATA%\FeverLink3` in Explorer, and copies a diagnostics text to the clipboard through `clip.exe` (the text replaces your Windows user name with `<user>` and leaves join codes out; it can still contain folder names). It starts those programs by their full paths, makes no network connection, and asks for no administrator rights. The development commands `host` and `join` are described in `launcher/README.md`.
 
 ## Files FeverLink3 creates or changes
 
@@ -76,7 +80,7 @@ The switched-off code is meant to be turned on for players in a later version: t
 |---|---|---|---|
 | `<game folder>\winhttp.dll` | the DLL | install | yes, only when it is ours (it carries the marker `feverlink3_native`) |
 | `<game folder>\steam_appid.txt` | one line, `3493540` (the game's Steam app id), so that the game program can also be started outside Steam | install, only if the file is absent | yes, only when it holds exactly `3493540` |
-| `<game folder>\feverlink3_path.txt` | the path of `feverlink3.exe`; read only by `feverlink3 doctor` | install | yes |
+| `<game folder>\feverlink3_path.txt` | the path of `feverlink3.exe`; read only by `feverlink3 doctor` and the installer's menu (to find out which version installed), never by the DLL | install | yes |
 | `<Steam>\userdata\<id>\3493540\local\mods\feverlink3_1\` | the mod (Lua game scripts and the window) | install, one copy for each Steam account on the PC | yes |
 | `%LOCALAPPDATA%\FeverLink3\native.log` | the DLL's text log | the DLL | no, delete the folder by hand |
 | `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`; emptied at every game start | the DLL and the mod | no, delete the folder by hand |

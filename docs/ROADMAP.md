@@ -57,7 +57,7 @@ Work after 2026-10-10 runs in parallel workstreams. Each one owns a part of the 
 | Construction and operations replication | Roads, tracks, stations, signals, terrain, bulldozing; vehicles, lines, orders, renames; coverage tables of which engine commands are replicated and how. | 0.3, 0.4 |
 | Companies | Separate companies on one map, own money and vehicles, station access, shared infrastructure rules. | 0.6, 0.7 |
 | Native hooks | The detours in the game executable that hold construction commands and release them at a stamp; the one-worker script pool; the control link to the mod. | 0.3 |
-| Launcher wizard | A guided install, uninstall and update instead of terminal commands. | 0.2 |
+| Launcher wizard | A guided install, uninstall, update check and diagnostics in a console menu (double-click) instead of terminal commands. | 0.2 |
 | Hardening | Review of everything that parses input or runs in the game process; a guard against panics aborting the game; limits; the release signing key; code signing. | all |
 | Listing and documentation | The Nexus Mods page text and screenshots, the user security explainer, the project site, the Mod Hub / Steam Workshop plan, the code signing plan. | 0.2, 0.3 |
 
@@ -82,7 +82,7 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 - [~] Session clock, speed, pause, checksum rounds, resync round (core state machines and loopback tests)
 - [x] `--selftest` over loopback
 - [x] Command-line install, uninstall and doctor: `feverlink3 install`, `uninstall`, `doctor`, each with `--dry-run` where it changes things
-- [ ] Guided installer (wizard) that replaces the terminal commands *(launcher wizard)*
+- [~] Console wizard: a double-click on `feverlink3.exe` shows the checks and a numbered menu (install or repair, uninstall, compare with the installed files, start the game through Steam, open the logs, copy diagnostics) *(launcher wizard)*; tested over a fake PC and a fake Steam tree, not yet used on a clean PC by someone else
 - [x] Live mode: the session controller runs inside the game, driven by the in-game window (verified in the real game 2026-10-09, see P1 to P4)
 - [~] Players connect through Steam peer-to-peer *(connection)*: the listener starts and the game connected to its own Steam ID (P5); the connection between two different accounts (P6) is the test of `0.2.0-test1`; session traffic does not run over it yet (P7)
 - [~] The join code carries the host's Steam ID *(connection)*: the code format and its tests are in the core; the in-game controller does not write it yet

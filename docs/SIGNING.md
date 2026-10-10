@@ -70,7 +70,7 @@ The Foundation can pause or end a subscription and revoke the certificate, even 
 | "Code signing policy" on the home page | not published (it would be false before acceptance) | text below, to be added after acceptance |
 | Privacy policy | `docs/site/privacy.md` | link it |
 | Trusted build system, build fully determined by the repository | the release workflow builds on GitHub Actions from a tag; the Rust toolchain is not pinned (`dtolnay/rust-toolchain@stable`) | pin the toolchain version in the repository and build with `--locked` |
-| Metadata set and enforced (product name, version) | **the exe and the DLL carry no version information resource** | add a version resource with product name `FeverLink3` and the release version to both (a build step, for the hardening work) |
+| Metadata set and enforced (product name, version) | `feverlink3.exe` now carries version information, an icon and a manifest built from `Cargo.toml`; **the DLL still has no version information resource** | add one to the DLL with product name `FeverLink3` and the release version (a build step, for the hardening work) |
 
 ### What to enter in the application
 
@@ -134,7 +134,7 @@ Microsoft renamed Trusted Signing to Artifact Signing. The quickstart (updated 2
 1. **Signing or licence.** Free signing through the SignPath Foundation needs an OSI-approved licence without a commercial dual licence, which the PolyForm Noncommercial decision rules out. Keep the licence and pay for a certificate (cheapest: ask Certum about the open-source product at about EUR 49, otherwise Certum Standard from about EUR 209, otherwise SignPath's paid service), or change the licence. This document does not recommend changing the licence; it only states the trade-off.
 2. Write to Certum (and, if wanted, to SignPath for a quote) with the project's address, the licence and the question whether it qualifies. Nothing has been sent.
 3. Decide how signing fits the rule that nothing is built or signed on a developer's PC.
-4. Approve the version-resource work (for the exe and the DLL) and the toolchain pinning; every route needs a signed file with sensible metadata.
+4. Approve the version-resource work for the DLL (the exe has one now) and the toolchain pinning; every route needs a signed file with sensible metadata.
 5. Until a certificate exists: no signing, and the plain explanation in `docs/SECURITY_FOR_USERS.md`.
 
 ## Sources (all read on 2026-10-10)

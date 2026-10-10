@@ -46,7 +46,7 @@ It is a fresh implementation in Rust and Lua, with the source on GitHub under th
 The zip holds a testing installer, the native module (`winhttp.dll`) and the mod. The installer is a testing tool: the plan is that the mod reaches players from the game's own Mod Hub and from Nexus Mods like any other mod, with the native module as a separate download for now.
 
 1. Close Transport Fever 3.
-2. Download the zip and unzip it anywhere. Open a terminal in that folder (type `cmd` into the folder's address bar and press Enter) and run `feverlink3 install`. Windows SmartScreen may say "Windows protected your PC" the first time, because the program is not code-signed yet: click More info, then Run anyway. Add `--dry-run` to see what it would do first.
+2. Download the zip, unzip it anywhere (Extract All) and double-click `feverlink3.exe`; a menu opens, type `1` and press Enter to install. (From a terminal opened in that folder the same is `feverlink3 install`.) Windows SmartScreen may say "Windows protected your PC" the first time, because the program is not code-signed yet: click More info, then Run anyway. Add `--dry-run` to see what it would do first.
 3. It prints one line per item (the mod, `steam_appid.txt`, `winhttp.dll`, `feverlink3_path.txt`), each marked DONE, SKIP or FAILED with the reason. If a line says the Steam user folder does not exist, start the game once, close it and run the command again.
 4. Start Transport Fever 3 from Steam. When you start a game, open the mod list on the settings page, find *FeverLink3 Multiplayer* and activate it. The **FeverLink3** button appears in the bar at the bottom of the screen.
 
@@ -88,7 +88,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 - Not code-signed: SmartScreen and some antivirus programs warn. Windows 11 Smart App Control in its "On" setting may block the unsigned DLL; this has not been tested.
 - Another mod's `winhttp.dll` conflicts with ours; the installer refuses to overwrite it.
 - The window is English only. A bug in the native module can crash the game (it aborts on an internal error).
-- The install is command-line only; a guided installer is being built.
+- The installer's double-click menu has been tested on a fake PC and a fake Steam tree, not yet on a clean PC by someone else.
 
 ## FAQ
 
@@ -127,7 +127,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 - Under the window, for later builds: the lockstep core (actions stamped and applied at the same step on every game, world checksums, repair by loading the host's savegame, a permissions model, command schemas for everyday operations), tested with simulated games only.
 - Encrypted sessions (AES-256-GCM, key from the join code); the host decides who may send what.
 - Native module `winhttp.dll`: passes the game's 14 WinHTTP functions through and runs the in-game controller. Its hook code is switched off by default and has never run in the real game.
-- Command-line installer (a testing tool): `feverlink3 install`, `uninstall`, `doctor`, with `--dry-run`.
+- Testing installer: a double-click menu (install or repair, uninstall, compare, start the game, open the logs, copy diagnostics) and the commands `feverlink3 install`, `uninstall`, `doctor`, with `--dry-run`.
 - Unsigned. Seen working in the real game: see the status above.
 
 ## Credits and permissions

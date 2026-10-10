@@ -25,7 +25,7 @@ The full design is in the [architecture document](ARCHITECTURE.html) and the [pr
 
 For the test build, once it is published (full guide: [Playing FeverLink3](PLAYING.html)):
 
-1. Download and unzip the release, close Transport Fever 3, and run `feverlink3 install` in a terminal opened in that folder. Windows may warn about an unsigned program the first time: More info, then Run anyway.
+1. Download and unzip the release, close Transport Fever 3, double-click `feverlink3.exe` and choose `1` (install); a terminal does the same with `feverlink3 install`. Windows may warn about an unsigned program the first time: More info, then Run anyway.
 2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer*.
 3. Click **FeverLink3** in the bar at the bottom of the screen. Under **Steam connection test**, two testers send each other their Steam IDs, paste the other's ID and press **Test the connection**.
 4. Next test build: the host clicks **Host a game**, copies the join code and sends it to a friend, who pastes it and presses **Join**.

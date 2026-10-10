@@ -3,15 +3,16 @@
 The FeverLink3 launcher as a Rust crate (`feverlink3_launcher`) and the `feverlink3` command. It is the part of
 `docs/ARCHITECTURE.md` section 2 that touches the machine: Steam, the game folder, the user folder, the session
 files, the game process, and the network. The protocol itself (framing, sealing, state machines) lives in the
-core crate; this crate moves bytes between sockets, the state machines and the game's files.
+core crate; this crate moves bytes between sockets, the state machines and the game's files. Started without
+arguments (which is what a double-click does), `feverlink3.exe` shows a console menu, see *Wizard* below.
 
-The crate has two faces. The `feverlink3` executable is the installer (`install`, `uninstall`, `doctor`) and a
-development tool (`host`, `join`, `selftest`); it stays a testing tool, because the end state is the mod coming
-from the in-game Mod Hub or Nexus Mods with the native module delivered separately (`docs/WORKSHOP.md`). The same library also runs **inside the game process**: the native
-module (`winhttp.dll`, crate `feverlink3_native`) links it and calls [`live::spawn`](src/live.rs), which is how a
-player hosts or joins from the in-game window without any terminal (see "Live mode" below). The in-game window
-itself is the Lua mod's (`mod/feverlink3_1`); this crate has no window of its own, and a guided installer is a
-separate workstream (see `docs/ROADMAP.md`).
+The crate has two faces. The `feverlink3` executable is the installer (the wizard menu, and `install`, `uninstall`,
+`doctor` on the command line) and a development tool (`host`, `join`, `selftest`); it stays a testing tool, because
+the end state is the mod coming from the in-game Mod Hub or Nexus Mods with the native module delivered separately
+(`docs/WORKSHOP.md`). The same library also runs **inside the game process**: the native module (`winhttp.dll`,
+crate `feverlink3_native`) links it and calls [`live::spawn`](src/live.rs), which starts the session controller that
+the in-game window drives, without any terminal (see "Live mode" below). The in-game window itself is the Lua mod's
+(`mod/feverlink3_1`); this crate has no window of its own.
 
 | Module | What it does | Pure part (tested without Steam or the game) |
 |---|---|---|
@@ -27,11 +28,14 @@ separate workstream (see `docs/ROADMAP.md`).
 | `steamnet.rs` | Steam peer-to-peer probe: looks up the flat Steam API in the game's already loaded `steam_api64.dll`, listens on a P2P virtual port, answers pings and can ping a Steam ID. It carries no session traffic yet | structure layouts, ping protocol, Steam ID parsing |
 | `update.rs` | Update logic over bytes: GitHub release JSON, version comparison, Ed25519 signature and SHA-256 checks, the file-swap plan. No network fetch yet | everything |
 | `selftest.rs` | Host, two players, fake games, wrong password and garbage over loopback | it is the test |
-| `main.rs` | `feverlink3 host`, `join`, `selftest`, `doctor`, `install [--dry-run]`, `uninstall [--dry-run]` | option parsing |
+| `main.rs` | `feverlink3` (the wizard), `host`, `join`, `selftest`, `doctor`, `install [--dry-run]`, `uninstall [--dry-run]` | option parsing |
+| `wizard.rs`, `wizard/` | What a double-click does: the checks screen and the numbered menu (install or repair, uninstall, compare with the installed files, start the game through Steam, open the logs, copy diagnostics). Part of the binary, not of the library. | the checks, what each choice may do, the plain-language messages, the version comparison, the diagnostics text and its redaction; the whole menu loop over a fake PC |
+| `build.rs`, `resources/` | The icon, version information and manifest of `feverlink3.exe`, written as a `.res` file in pure Rust and linked by `link.exe` (no Windows SDK tool) | the resource writer, read back in its tests |
 
 ## Command line
 
 ```
+feverlink3                       no arguments (a double-click): checks and menu, see Wizard
 feverlink3 host [--port 28090] [--password P] [--name N] [--launch]
 feverlink3 join CODE [--password P] [--name N] [--launch]
 feverlink3 selftest
@@ -64,6 +68,69 @@ feverlink3 doctor | install [--dry-run] | uninstall [--dry-run]
   the payload to install sits, whether a game is running) and changes nothing.
 - `install` and `uninstall` take `--dry-run` and print one `DONE` / `WOULD` / `SKIP` / `FAILED` line per item with
   the reason (see "Install footprint"). Both refuse to run while the game is running, unless `--dry-run`.
+
+## Wizard (double-click)
+
+`feverlink3.exe` without arguments is what a double-click does, so it must never print a line and vanish. It draws a
+checks screen and a numbered menu, waits for Enter after every action and returns to the menu until `0`; when its
+input ends (a closed pipe) it ends too. The code is the `wizard` module of the binary, [`wizard.rs`](src/wizard.rs)
+(the menu loop and the actions) and [`wizard/`](src/wizard) (one module per concern); the library does not contain it,
+so it is not in `winhttp.dll`.
+
+**Checks**, from one snapshot of the PC (`Facts`) taken before every screen and every action:
+
+| Line | Where it comes from |
+|---|---|
+| Steam, Transport Fever 3 | `steam::discover` (registry, library folders), as `doctor` |
+| Game build | the PE link timestamp of `TransportFever3.exe`, looked up in a copy of the builds of `native/src/build_table.rs` (`KNOWN_BUILDS`; the native crate links the launcher, so the launcher cannot link it. A test reads `build_table.rs` and fails when the two lists differ). An unknown build means the mod runs in reduced mode, and the line says so |
+| Game running | `process::any_game_running` |
+| FeverLink3 | `winhttp.dll` ours (marker), the mod in every Steam user folder, and which version put them there (below) |
+| This folder | `mod/feverlink3_1` and `winhttp.dll` beside the exe, and not running from inside a zip file (`Temp1_*.zip`, WinRAR, 7-Zip) or `%TEMP%`, where `feverlink3_path.txt` would record a path Windows deletes |
+
+Under the checks, **Next step** says the first thing to do in a sentence. The banner, the diagnostics text and the
+file properties of the exe name the license (`CARGO_PKG_LICENSE`, read from `Cargo.toml`, never typed again).
+
+**Menu**
+
+| Key | What it does |
+|---|---|
+| `1` | Install or repair: `install::install`, after the checks of `plan_install` (Steam, game, a complete folder, game closed, a `winhttp.dll` that can be read and is not another mod's: a locked one stops the install before anything changes). It asks first when this folder is older than what is installed |
+| `2` | Uninstall: `install::uninstall`, after a yes/no question (default no) |
+| `3` | This folder against the installed files, no network: the **dry run** of `install::install` is the comparison (what it would change is what differs), so the answer and a real install cannot disagree. Says newer, older, same or not installed |
+| `4` | `steam.exe -applaunch 3493540` from the Steam folder; refuses when the game already runs |
+| `5` | Opens `%LOCALAPPDATA%\FeverLink3` in Explorer, when it exists |
+| `6` | Copies a diagnostics text to the clipboard through `clip.exe` (UTF-16 with a byte order mark, so every alphabet survives; `clip.exe` keeps the mark as an invisible first character, so the text starts with a blank line to keep it off the first real line): the checks, the `doctor` text, and the last 40 lines of `native.log` and `live\mod.log`. The Windows user name (and its 8.3 short form, in any case) becomes `<user>`; a join code, which is the credential of a session, is taken out (only a run that decodes as a join code, checksum included). If the clipboard cannot be written the text is shown on the screen |
+| `0` | Exit (`q` and `exit` too). Digits typed on an Arabic or full-width keyboard layout count |
+
+**The installed version.** The install writes nothing that says which version it is (the footprint is fixed, see
+*Install footprint*). The launcher carries `feverlink3-launcher-version=<version>` in its data, and
+`feverlink3_path.txt` names the launcher that installed; if that file still exists, the wizard reads the marker from
+it. Otherwise the line says "version not known" and the comparison says only that the files differ. (A launcher on a
+network share is not read: with the share gone, Windows can take half a minute to say so.)
+
+**Failures** are explained in plain words (`wizard/problems.rs`): the game is running, Steam or the game is missing,
+the folder is incomplete or zipped, another mod's `winhttp.dll` is in the way, files are in use, Windows refused
+access. The install report only keeps errors as text, so they are sorted by the `(os error N)` code (32, 33 and 1224
+are "in use", 5 is "refused", 112 is "disk full"), which does not change with the language of Windows, then by the
+words `install.rs` itself uses.
+
+**How it is tested.** Every decision is a function of `Facts`; the menu loop runs over the `System` trait and
+`BufRead`/`Write`, and the tests drive it with scripted lines on a PC made of temporary folders (`wizard/testkit.rs`)
+that records what it was asked to start and never starts anything. Install and uninstall run for real, on those
+folders. Not tested without a person: that Steam starts the game, that Explorer opens the folder, that `clip.exe`
+takes the text, what a console looks like.
+
+**Programs it starts**, all by absolute path: `steam.exe` of the Steam folder, `%SystemRoot%\explorer.exe`,
+`%SystemRoot%\System32\clip.exe`, and `cmd.exe /C pause` to wait for a key after a failure (a bare name would be looked
+up in the folder the player unzipped into first). A panic (the release profile aborts) prints what happened and waits
+for a key before the window closes.
+
+**Icon, version information, manifest.** `build.rs` links `resources/feverlink3.ico`, the version information from
+`Cargo.toml` and `resources/feverlink3.manifest` into the exe (Explorer, Task Manager and the file properties then say
+what it is; the manifest asks for no administrator rights and declares Windows 10 and 11). The `.res` file is written by
+`resources/winres.rs` in pure Rust, because `link.exe` takes a `.res` and converts it with `cvtres.exe`, both part of the
+MSVC tools; `rc.exe` of the Windows SDK is not needed. Other targets get nothing, and a problem only warns.
+`resources/make_icon.py` redraws the icon (pure Python, run it only to change the picture).
 
 ## Threading model
 
@@ -183,7 +250,8 @@ uninstall only when it holds exactly our app id.
 
 No registry writes, no admin rights, nothing outside these four paths. `install` and `uninstall` are idempotent:
 a second run reports every step as skipped. Both take `dry_run` and return a `Report` listing each item with
-*done*, *skipped* or *failed* and the reason, which `main.rs` prints.
+*done*, *skipped* or *failed* and the reason, which `main.rs` prints. The wizard (below) calls the same two functions,
+and uses the dry run to compare a folder with what is installed.
 
 Not done yet: adding the mod to the game's default mod list in `settings.lua` (`activeModsState`). The pure
 transformation exists (`install::settings_with_mod_active`) but is not applied until the file's shape is confirmed

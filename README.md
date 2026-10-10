@@ -25,7 +25,7 @@ The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). FeverL
 
 Short version (the full guide is [docs/PLAYING.md](docs/PLAYING.md)):
 
-1. Unzip the release, close the game, run `feverlink3 install` in a terminal opened in that folder.
+1. Unzip the release, close the game, double-click `feverlink3.exe` and choose `1` (install). A terminal does the same: `feverlink3 install`.
 2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer*.
 3. Click **FeverLink3** in the bar at the bottom of the screen. Under **Steam connection test**, two testers exchange their Steam IDs, paste the other's ID and press **Test the connection**.
 4. Next test build: the host clicks **Host a game** and sends the join code; a friend pastes it and presses **Join**.

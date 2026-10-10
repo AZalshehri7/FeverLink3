@@ -17,37 +17,44 @@ Last updated: 2026-10-10. FeverLink3 is an unofficial community project. It is n
 
 `feverlink3.exe` is a testing tool for this phase. The plan is that the mod reaches players from the in-game Mod Hub or from Nexus Mods like any other mod, with the native module (`winhttp.dll`) delivered separately for now. Neither is available yet, and whether the Mod Hub accepts the mod is still being checked (`docs/WORKSHOP.md`).
 
-1. Close Transport Fever 3.
-2. Unzip `FeverLink3-<version>.zip`.
-3. Open a terminal in the unzipped folder: click the folder's address bar, type `cmd`, press Enter. Then type
+1. Unzip `FeverLink3-<version>.zip`: right-click it, **Extract All**. Keep the unzipped folder, for example on the Desktop. Do not run the program from inside the zip file.
+2. Close Transport Fever 3 if it is running, then double-click `feverlink3.exe`. Windows may say "Windows protected your PC" the first time, because the program is not code-signed yet: click **More info**, then **Run anyway**.
+3. A black window opens and checks your PC. Every line starts with `[ok]` (fine), `[??]` (have a look), `[!!]` (must be fixed) or `[--]` (nothing yet). The line **Next step** says what to do.
+4. Type `1` and press Enter (*Install or repair*). When the window says `[ok] FeverLink3 is installed.`, you are done. If something is wrong it says in plain words what to do; fix it and choose `1` again, installing twice does no harm. If it says Transport Fever 3 has not created its user folder yet, start the game once from Steam, close it, and choose `1` again.
+5. After every choice the window waits for Enter, so you can read the answer. `0` closes it.
 
-   ```
-   feverlink3 install
-   ```
+The other choices: `2` removes everything FeverLink3 put on your PC; `3` compares this folder with what is installed (to update, unzip the new zip into a new folder, double-click its `feverlink3.exe`, choose `3` to see what differs and `1` to update); `4` starts Transport Fever 3 through Steam; `5` opens the folder with the logs; `6` copies a text for the host to the clipboard (see "If something goes wrong").
 
-   Windows may say "Windows protected your PC" the first time, because the program is not code-signed yet: click **More info**, then **Run anyway**. (Add `--dry-run` to see what it would do without changing anything.)
-4. It prints one line per item, each marked `DONE`, `SKIP` or `FAILED`:
-   - the mod, copied into your Transport Fever 3 user folder (one line for each Steam account on the PC),
-   - `steam_appid.txt`, `winhttp.dll` and `feverlink3_path.txt` next to the game program.
+**With a terminal instead** (the same result): open a terminal in the unzipped folder (click the folder's address bar, type `cmd`, press Enter) and type
 
-   If a line says `FAILED` or `SKIP`, the reason is printed on the same line. The common ones:
-   - "no Steam user folder ... exists; start the game once": start Transport Fever 3 once from Steam, close it, run the command again.
-   - "Transport Fever 3 was not found": run `feverlink3 doctor`. It prints where it looked and changes nothing.
-   - "a winhttp.dll that is not ours is already in the game folder": another mod uses the same slot. FeverLink3 never overwrites it. The two cannot be used together; remove the other one first.
-   - "is the game running?": close the game and run the command again.
+```
+feverlink3 install
+```
 
-What the files are, and how to check them, is explained in `docs/SECURITY_FOR_USERS.md` (on the project page: https://github.com/AZalshehri7/FeverLink3). A guided installer is being built; this guide describes the command-line install that exists today.
+(Add `--dry-run` to see what it would do without changing anything.) It prints one line per item, each marked `DONE`, `SKIP` or `FAILED`:
 
-To remove everything later, close the game and run `feverlink3 uninstall`.
+- the mod, copied into your Transport Fever 3 user folder (one line for each Steam account on the PC),
+- `steam_appid.txt`, `winhttp.dll` and `feverlink3_path.txt` next to the game program.
+
+If a line says `FAILED` or `SKIP`, the reason is printed on the same line. The common ones:
+
+- "no Steam user folder ... exists; start the game once": start Transport Fever 3 once from Steam, close it, run the command again.
+- "Transport Fever 3 was not found": run `feverlink3 doctor`. It prints where it looked and changes nothing.
+- "a winhttp.dll that is not ours is already in the game folder": another mod uses the same slot. FeverLink3 never overwrites it. The two cannot be used together; remove the other one first.
+- "is the game running?": close the game and run the command again.
+
+What the files are, and how to check them, is explained in `docs/SECURITY_FOR_USERS.md` (on the project page: https://github.com/AZalshehri7/FeverLink3).
+
+To remove everything later, close the game and run `feverlink3 uninstall` (or choose `2` in the window).
 
 ## 2. Start the game
 
-Start Transport Fever 3 from **Steam as usual**. No extra program needs to run.
+Start Transport Fever 3 from **Steam as usual** (no extra program needs to run), or choose `4` in the FeverLink3 window.
 
 - Starting a new game: on the settings page open the **Add Mods** tab, click **Activate** under *FeverLink3 Multiplayer*, then Start Game. (Menu names as of build 40420. If you cannot find the mod, run `feverlink3 doctor` and check that it says "mod installed".)
 - In the game, click **FeverLink3** in the bar at the bottom of the screen (next to the item counters). A window called *FeverLink3 Multiplayer* opens.
 - The mod does nothing until you host or join: without a session, the game plays as it always does.
-- If the window says "The FeverLink3 module is not running", close the game, run `feverlink3 install` again, and start the game from Steam. If it says "looking for Steam..." for more than a minute, make sure the game was started from Steam.
+- If the window says "The FeverLink3 module is not running", close the game, install again (choice `1`), and start the game from Steam. If it says "looking for Steam..." for more than a minute, make sure the game was started from Steam.
 
 ## 3. The Steam connection test (this test build)
 
@@ -88,7 +95,9 @@ Only join people you know. When you join, your game loads the host's world, and 
 
 ## If something goes wrong
 
-Please send the maintainer these files. They hold no personal data besides your Windows user name:
+The easiest way: double-click `feverlink3.exe`, type `6` and press Enter, then paste (`Ctrl+V`) into your message to the maintainer. The text holds what FeverLink3 found on your PC and the end of the two logs; your Windows user name is replaced by `<user>` and join codes are left out. It can still hold folder names.
+
+Or send the maintainer these files (they hold no personal data besides your Windows user name):
 
 - `%LOCALAPPDATA%\FeverLink3\native.log`
 - `%LOCALAPPDATA%\FeverLink3\live\mod.log` and `ctl_status.txt`

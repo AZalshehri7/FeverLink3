@@ -22,7 +22,7 @@ Lockstep is the only model that fits, and it is the one both prior projects (TpF
  |  Transport Fever 3             |                   |  Transport Fever 3  |
  |   +-- native module (Rust)     |                   |   ...               |
  |   |    capture, hold, release  |                   +---------------------+
- |   +-- Lua mod                  |     sealed TCP              |
+ |   +-- Lua mod                  |   sealed frames over Steam  |
  |        stamp, replay, checksum |<---------+                  |
  |              ^  files          |          |                  |
  |              v                 |          v                  v
@@ -53,7 +53,7 @@ Threat: an outsider who learns the host's address, or a player who is not the ho
 
 ## 4. Wire protocol
 
-Transport: TCP, host-relayed star (every player connects to the host). UDP hole punching and a relay server are later work; the frame format must not change for them.
+Topology: a host-relayed star (every player connects to the host). Transport: the players' transport is Steam's peer-to-peer networking, which carries these frames between the games (the listener and a one-process connection test exist; carrying a whole session over it is not finished, `docs/ROADMAP.md`). Plain TCP is the development and test transport that the tests and the `host` / `join` commands use. The frame format does not depend on the transport.
 
 Frame on the wire:
 
