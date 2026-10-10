@@ -9,7 +9,7 @@ use feverlink3_core::lobby::JoinCode;
 use feverlink3_launcher::install::AppIdState;
 
 use super::facts::Facts;
-use super::screen::{checks, render_checks};
+use super::screen::{checks, license_line, render_checks};
 use super::versions::own_version;
 
 /// The log of the native module, in `%LOCALAPPDATA%\FeverLink3`.
@@ -179,6 +179,7 @@ pub(super) fn build_diagnostics(
 ) -> String {
     let mut lines = vec![
         format!("FeverLink3 diagnostics - launcher {}, {}", own_version(), format_utc(now_unix)),
+        license_line(),
         String::new(),
         "== Checks ==".to_owned(),
     ];
@@ -463,6 +464,7 @@ mod tests {
             .starts_with(&format!("FeverLink3 diagnostics - launcher {}, 2026-10-10 11:54:56 UTC\n", own_version())));
         assert!(at("== Checks ==") < at("== feverlink3 doctor ==") && at("== feverlink3 doctor ==") < at("native.log"));
         assert!(at("native.log") < at("live\\mod.log"));
+        assert!(text.lines().nth(1).is_some_and(|l| l.starts_with("License: ")), "the second line names the license");
         assert!(text.contains("[ok]  Steam"));
         assert!(text.contains("winhttp.dll:     ours"));
         assert!(text

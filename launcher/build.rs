@@ -49,7 +49,10 @@ fn write_resources() -> Result<(), String> {
             text("FileDescription", "FeverLink3 launcher"),
             text("FileVersion", &version),
             text("InternalName", "feverlink3"),
-            text("LegalCopyright", "Copyright (c) FeverLink3 contributors. MIT licence."),
+            text(
+                "LegalCopyright",
+                &format!("Copyright (c) FeverLink3 contributors. Licensed under {}.", env("CARGO_PKG_LICENSE")),
+            ),
             text("OriginalFilename", "feverlink3.exe"),
             text("ProductName", "FeverLink3"),
             text("ProductVersion", &version),

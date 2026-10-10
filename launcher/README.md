@@ -64,7 +64,8 @@ so it is not in `winhttp.dll`.
 | FeverLink3 | `winhttp.dll` ours (marker), the mod in every Steam user folder, and which version put them there (below) |
 | This folder | `mod/feverlink3_1` and `winhttp.dll` beside the exe, and not running from inside a zip file (`Temp1_*.zip`, WinRAR, 7-Zip) or `%TEMP%`, where `feverlink3_path.txt` would record a path Windows deletes |
 
-Under the checks, **Next step** says the first thing to do in a sentence.
+Under the checks, **Next step** says the first thing to do in a sentence. The banner, the diagnostics text and the
+file properties of the exe name the license (`CARGO_PKG_LICENSE`, read from `Cargo.toml`, never typed again).
 
 **Menu**
 

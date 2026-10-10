@@ -188,10 +188,16 @@ fn next_step(f: &Facts) -> String {
     }
 }
 
+/// The license of this program, from `Cargo.toml`, so that the screen cannot say something the project does not.
+pub(super) fn license_line() -> String {
+    format!("License: {} (the text is in the file LICENSE next to this program)", env!("CARGO_PKG_LICENSE"))
+}
+
 /// The whole screen the menu loop draws: banner, checks, next step, menu.
 pub(super) fn render_screen(f: &Facts) -> String {
     let mut lines = vec![
         format!("FeverLink3 {} - cooperative multiplayer for Transport Fever 3", own_version()),
+        license_line(),
         String::new(),
         "Checking this PC...".to_owned(),
     ];
@@ -378,5 +384,15 @@ mod tests {
                 .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "in this order: {order:?}");
         assert!(screen.ends_with("Type a number and press Enter.\n"));
+    }
+
+    #[test]
+    fn the_license_is_named_from_cargo_toml_on_the_screen() {
+        let screen = render_screen(&base_facts());
+        let license = env!("CARGO_PKG_LICENSE");
+        assert!(!license.is_empty());
+        assert!(license_line().contains(license) && license_line().contains("the file LICENSE"));
+        let banner: Vec<&str> = screen.lines().take(2).collect();
+        assert!(banner[1].starts_with("License: ") && banner[1].contains(license), "{banner:?}");
     }
 }
