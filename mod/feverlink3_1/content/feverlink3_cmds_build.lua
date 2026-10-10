@@ -291,6 +291,11 @@ function A.stationGroup(station)
 	return nil
 end
 
+-- an edge object that is also a station: a road-side stop (a signal is an edge object and nothing else)
+function A.isStop(e)
+	return A.comp(e, "EDGE_OBJECT") ~= nil and A.comp(e, "STATION") ~= nil
+end
+
 function A.edgeOfObject(o)
 	local ok, e = pcall(function() return api.engine.system.streetSystem.getEdgeForEdgeObject(o) end)
 	if ok and type(e) == "number" and e >= 0 then return e end
@@ -993,6 +998,19 @@ local function captureRecord(proposal, cap)
 		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(idOf(n)) end
 		for i, s in ipairs(A.list(st, names.segs)) do rec.segs[i] = readSegment(s, cap) end
 		for i, o in ipairs(A.list(st, names.objs)) do rec.objs[i] = readEdgeObject(o, i, cap) end
+		-- A script's edge object does not say what it is; the placeholder that stands for it in its segment's object list
+		-- does (0 and 1 a stop on the left or right, 2 a signal), the n-th placeholder for the n-th object.
+		local kinds = {}
+		for _, s in ipairs(rec.segs) do
+			for _, o in ipairs(s.objects or {}) do
+				if type(o[1]) == "number" and o[1] < 0 then kinds[#kinds + 1] = o[2] end
+			end
+		end
+		if #kinds == #rec.objs then
+			for i, o in ipairs(rec.objs) do
+				if o.kind == nil then o.kind = kinds[i] end
+			end
+		end
 		for i, id in ipairs(A.list(st, names.rmObjs)) do rec.rmObjs[i] = cap.obj(id) end
 		for i, n in ipairs(A.list(st, names.ncfg)) do rec.ncfg[i] = readNodeConfig(n, cap) end
 		for i, id in ipairs(A.list(st, names.rmNcfg)) do rec.rmNcfg[i] = cap.node(id) end
@@ -1635,6 +1653,7 @@ local function normalise(rec)
 	for i, o in ipairs(rec.objs) do
 		if type(o) ~= "table" or not okId(o.edge, "edge") or not okText(o.model) or not isNum(o.param) then return nil, "edge object " .. i .. ": bad entry" end
 		if o.params ~= nil and not plainDepth(o.params, 0, budget) then return nil, "edge object " .. i .. ": bad parameters" end
+		if o.kind ~= nil and not isNum(o.kind) then return nil, "edge object " .. i .. ": bad kind" end
 	end
 	for i, r in ipairs(rec.rmObjs) do if not okRef(r, "obj") then return nil, "removed edge object " .. i .. ": bad reference" end end
 	for i, n in ipairs(rec.ncfg) do
@@ -1766,11 +1785,28 @@ end
 -- Keys for what the build created, so that later actions (a vehicle bought at a depot, a line through a station) can
 -- name it: <key>#c<i> for the i-th construction of the record, #c<i>/d<j> for its depots, /s<j> its stations,
 -- /g<j> their station groups. Matched by file and place, not by id, so a town building that grew in the same step
--- is not taken for one of ours. Returns the map and whether everything expected was found.
+-- is not taken for one of ours. Road-side stops have no building to be named by: <key>#o<n> is the n-th stop the engine
+-- made and <key>#o<n>/g its station group (see below). Returns the map and whether everything expected was found.
+
+-- the stops a record puts on a street: every edge object but a signal (kind 2), as in PLAN.stop
+local function stopCount(rec)
+	local n = 0
+	for _, o in ipairs(type(rec.objs) == "table" and rec.objs or {}) do
+		if type(o) == "table" and o.kind ~= 2 then n = n + 1 end
+	end
+	return n
+end
+
 local function bindsComp(body)
 	local rec = body.args and body.args[1]
-	if type(rec) == "table" and type(rec.cons) == "table" and #rec.cons > 0 then return "CONSTRUCTION" end
-	return nil
+	if type(rec) ~= "table" then return nil end
+	local comps = {}
+	if type(rec.cons) == "table" and #rec.cons > 0 then comps[#comps + 1] = "CONSTRUCTION" end
+	if stopCount(rec) > 0 then
+		comps[#comps + 1] = "EDGE_OBJECT"
+		comps[#comps + 1] = "STATION_GROUP"
+	end
+	return comps
 end
 
 local function bindCreated(body, key, made)
@@ -1801,6 +1837,33 @@ local function bindCreated(body, key, made)
 				map[base .. "/s" .. j] = s
 				local g = A.stationGroup(s)
 				if g then map[base .. "/g" .. j] = g end
+			end
+		else
+			complete = false
+		end
+	end
+	-- A stop on a road is an edge object that is a station. Nothing in the record or the world says which of two games'
+	-- entities is the same stop except the order the engine made them in: the same proposal on the same world makes the
+	-- same stops in the same order on every game (ids rise with creation), whatever number each game gives them. So the
+	-- n-th new stop is #o<n>, and its station group #o<n>/g when the stop made one (a stop beside a station joins that
+	-- station's group, which keeps its own key). All or none: a count that is short may mean the engine is not done.
+	local want = stopCount(rec)
+	if want > 0 then
+		local stops, fresh = {}, {}
+		for _, e in ipairs(made) do
+			if A.isStop(e) then
+				stops[#stops + 1] = e
+			elseif A.comp(e, "STATION_GROUP") ~= nil then
+				fresh[e] = true
+			end
+		end
+		table.sort(stops)
+		if #stops >= want then
+			for n = 1, want do
+				local s = stops[n]
+				map[key .. "#o" .. n] = s
+				local g = A.stationGroup(s)
+				if g and fresh[g] then map[key .. "#o" .. n .. "/g"] = g end
 			end
 		else
 			complete = false

@@ -348,16 +348,23 @@ function L.runChained(args, send, done)
 	step(args, 0)
 end
 
--- Keys for entities an action created. A schema names the component whose new entities to look for (spec.bindsComp, a
--- name or a function of the body) and maps them to keys (spec.bind(body, key, made) -> { [key] = entity }, complete).
+-- Keys for entities an action created. A schema names the components whose new entities to look for (spec.bindsComp: a
+-- name, a list of names, or a function of the body that returns either) and maps the new entities of all of them,
+-- ascending, to keys (spec.bind(body, key, made) -> { [key] = entity }, complete). L.bindsComp returns the list or nil.
 function L.bindsComp(spec, body)
 	local c = spec.bindsComp
 	if type(c) == "function" then
 		local ok, v = pcall(c, body)
 		c = ok and v or nil
 	end
-	if type(c) == "string" then return c end
-	return nil
+	if type(c) == "string" then return { c } end
+	if type(c) ~= "table" then return nil end
+	local list = {}
+	for _, name in ipairs(c) do
+		if type(name) == "string" then list[#list + 1] = name end
+	end
+	if #list == 0 then return nil end
+	return list
 end
 
 function L.bindMap(spec, body, key, made)

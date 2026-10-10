@@ -174,6 +174,20 @@ function NEW_ENTITY(comps)
   return GAME.nextEntity
 end
 
+-- An edge object that is a stop is also a station, and has a station group of its own - unless a test names a group
+-- (JOIN_GROUP) for it to join, as a stop beside an existing station does.
+JOIN_GROUP = nil
+function MAKE_STOP(oid)
+  WORLD[oid].STATION = {}
+  if JOIN_GROUP then
+    WORLD[oid].GROUP = JOIN_GROUP
+    local g = WORLD[JOIN_GROUP].STATION_GROUP
+    g.stations[#g.stations + 1] = oid
+  else
+    WORLD[oid].GROUP = NEW_ENTITY({ STATION_GROUP = { stations = { oid } } })
+  end
+end
+
 TEMPLATES = {}
 function DEF_TEMPLATE(name, style, lanes)
   local ls = {}
@@ -420,6 +434,11 @@ BUILD_MOCK3 = r'''
 -- after the harness: constructions that appear one step late, and a town building that grows in the same step
 local BASE_SIMSTEP = SIMSTEP
 function SIMSTEP()
+  if GAME.deferredBuilds then
+    local list = GAME.deferredBuilds
+    GAME.deferredBuilds = nil
+    for _, f in ipairs(list) do f() end
+  end
   if GAME.deferredCons then
     local list = GAME.deferredCons
     GAME.deferredCons = nil
@@ -561,7 +580,10 @@ function APPLY_BUILD(p)
     for _, o in ipairs(cs.objects) do
       if o[1] <= -400000000 then
         local k = -400000000 - o[1] + 1
-        if objIds[k] then list[#list + 1] = { objIds[k], o[2] } end
+        if objIds[k] then
+          list[#list + 1] = { objIds[k], o[2] }
+          if o[2] ~= 2 then MAKE_STOP(objIds[k]) end
+        end
       else
         list[#list + 1] = o
         gone[o[1]] = nil
@@ -604,6 +626,7 @@ function APPLY_BUILD(p)
 end
 
 local BASE_EXECUTE = EXECUTE
+local executeBuild
 function EXECUTE(cmd, cb)
   local name = cmd.__cmd
   if name == "makeWorldReplaceTerrainCmd" then
@@ -612,6 +635,18 @@ function EXECUTE(cmd, cb)
     return
   end
   if name ~= "makeWorldBuildProposalCmd" then return BASE_EXECUTE(cmd, cb) end
+  -- a test can have the engine run the builds of one update together after it, in the order they were sent (it does
+  -- not run a command inside the update that sent it)
+  if DEFER_BUILDS and GAME.inUpdate then
+    GAME.deferredBuilds = GAME.deferredBuilds or {}
+    GAME.deferredBuilds[#GAME.deferredBuilds + 1] = function() executeBuild(cmd, cb) end
+    return
+  end
+  return executeBuild(cmd, cb)
+end
+
+function executeBuild(cmd, cb)
+  local name = cmd.__cmd
   local a = cmd.args
   local ok, res = APPLY_BUILD(a[1])
   if ok then
@@ -766,6 +801,24 @@ function NATIVE_SIGNAL(spec)
   sp.edgeObjectsToAdd = { eo }
   P.proposal = sp
   return P
+end
+
+-- a stop the way a script places one: the segment replaced by itself with one more object, whose model it names
+function SIMPLE_STOP(spec)
+  local w = WORLD[spec.edge]
+  local c = COPY(w.BASE_EDGE)
+  local cs = STORE(c)
+  local objs = {}
+  for i, o in ipairs(cs.objects) do objs[i] = { o[1], o[2] } end
+  objs[#objs + 1] = { -400000000, spec.kind or (spec.left and 0 or 1) }
+  cs.objects = objs
+  local sp = D("SimpleProposal")
+  local ssp = sp.streetProposal
+  ssp.edgesToRemove = { spec.edge }
+  ssp.edgesToAdd = { D("SegmentAndEntity", { entity = -1, comp = c, type = w.KIND }) }
+  ssp.edgeObjectsToAdd = { D("EdgeObjectSimple", { edgeEntity = -1, param = spec.param, left = spec.left == true, model = spec.model or "station/street/bus_stop.mdl" }) }
+  sp.streetProposal = ssp
+  return sp
 end
 
 -- a signal (or stop) bulldozed: the segment replaced by itself without the object, the object listed for removal
@@ -974,6 +1027,18 @@ function BOUND_KEYS()
   return table.concat(ks, " ")
 end
 
+-- the stop a key names: the ends of its segment, its model, the group it belongs to and whether that group is the key's
+function STOP_AT(key)
+  local bind = (STATE:get() or {}).bind or {}
+  local e = bind[key]
+  if not e or not WORLD[e] or not WORLD[e].EDGE_OBJECT then return "none" end
+  local c = STORE(WORLD[WORLD[e].ON].BASE_EDGE)
+  local a, b = P3(STORE(STORE(WORLD[c.node0].BASE_NODE).position)), P3(STORE(STORE(WORLD[c.node1].BASE_NODE).position))
+  if a > b then a, b = b, a end
+  local g = bind[key .. "/g"]
+  return a .. " " .. b .. " " .. STORE(WORLD[e].EDGE_OBJECT).edgeObjectConstruction .. " group" .. tostring(g == WORLD[e].GROUP) .. " " .. tostring(g ~= nil)
+end
+
 function COUNT(comp)
   local n = 0
   for _, w in pairs(WORLD) do if w[comp] then n = n + 1 end end
@@ -1081,11 +1146,11 @@ class BuildTest(unittest.TestCase):
                 self.B.step()
 
     def start(self, speed=1):
-        self.tick(5)
+        self.tick(3)
         self.relay.started, self.relay.speed = True, speed
         self.relay.session()
-        self.tick(5)
-        self.tick(10)
+        self.tick(3)
+        self.tick(6)
 
     def both(self, expr):
         return self.A.lua(expr), self.B.lua(expr)
@@ -1099,7 +1164,7 @@ class BuildTest(unittest.TestCase):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", cb="function(d, s, e) ROAD_OK = s end")
         self.assertTrue(self.B.lua("ROAD_OK == nil"), "the window waits for the real result")
-        self.tick(30)
+        self.tick(14)
         self.assertTrue(self.B.lua("ROAD_OK == true"))
         self.assertSameWorld()
         self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00 street/new_medium_road.street_template", self.A.sig())
@@ -1115,12 +1180,12 @@ class BuildTest(unittest.TestCase):
     def test_a_second_build_attaches_to_a_node_the_first_one_created(self):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
         na = int(self.A.lua("FIND_NODE(400, 0, 0)"))
         self.assertNotEqual(na, nb)
         self.B.issue("SIMPLE_ROAD{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIsNotNone(self.A.lua("FIND_EDGE(400, 0, 500, 100)"), "the second road starts at the first one's end node on the host too")
         self.assertEqual(self.A.lua("#EDGES_AT(FIND_NODE(400, 0, 0))"), 2, "one node, two roads")
@@ -1134,12 +1199,12 @@ class BuildTest(unittest.TestCase):
     def test_a_key_that_names_another_entity_is_not_trusted(self):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
         # on the host the same id means a node elsewhere: the key resolves, but not where the reference says
         self.A.run("ADD_NODE(%d, 999, 999, 0)" % nb)
         self.B.issue("SIMPLE_ROAD{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
-        self.tick(30)
+        self.tick(14)
         self.assertIsNotNone(self.A.lua("FIND_EDGE(400, 0, 500, 100)"), "found by place, not by the id")
         self.assertEqual(self.A.lua("#EDGES_AT(%d)" % nb), 0, "the node that happened to carry the id was left alone")
 
@@ -1148,7 +1213,7 @@ class BuildTest(unittest.TestCase):
         self.tick(5)
         self.A.run("WORLD[111] = nil; WORLD[102] = nil")   # the host's copy of the road lost its end
         self.B.issue("SIMPLE_ROAD{ nodeA = 102, b = { x = 300, y = 100, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         self.assertEqual(self.A.lua("#BUILD_LOG"), 0, "the host built nothing on a node it does not have")
         self.assertEqual(self.B.lua("#BUILD_LOG"), 1)
         self.assertTrue(any("unresolved node at 200.000,0.000,0.000" in d for _, _, d in self.relay.refused), self.relay.refused)
@@ -1158,7 +1223,7 @@ class BuildTest(unittest.TestCase):
         self.tick(5)
         self.A.run("WORLD[102] = nil; WORLD[111] = nil; ADD_NODE(2001, 200.3, 0, 0); ADD_NODE(2002, 199.7, 0, 0)")
         self.B.issue("SIMPLE_ROAD{ nodeA = 102, b = { x = 300, y = 100, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         self.assertEqual(self.A.lua("#BUILD_LOG"), 0)
         self.assertTrue(any("ambiguous node" in d for _, _, d in self.relay.refused), self.relay.refused)
 
@@ -1167,7 +1232,7 @@ class BuildTest(unittest.TestCase):
     def test_a_tool_junction_splits_a_segment_and_adds_a_branch(self):
         self.start()
         self.B.issue("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }", ie="false", pi="true")
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIsNone(self.A.lua("FIND_EDGE(0, 0, 100, 0)"), "the old segment is gone")
         for ends in ("0, 0, 50, 0", "50, 0, 100, 0", "50, 0, 50, 80"):
@@ -1180,7 +1245,7 @@ class BuildTest(unittest.TestCase):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", ctx="CONTEXT(true, true, false, true)", ie="true", pi="false")
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
-        self.tick(40)
+        self.tick(18)
         self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=true buildings=false fields=true player=7 ie=true pi=false")
         self.assertEqual(self.A.lua("BUILD_CTX[2]"), "nil ie=false pi=true", "no context stays no context")
         self.assertEqual(self.B.lua("BUILD_CTX[1]"), self.A.lua("BUILD_CTX[1]"))
@@ -1188,12 +1253,12 @@ class BuildTest(unittest.TestCase):
     def test_upgrade_of_segments_the_session_built(self):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
         ea = int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.assertNotEqual(ea, eb)
         self.B.issue("NATIVE_UPGRADE{ edges = { %d }, template = 'street/new_small_road.street_template', deco = { { 12, true } } }" % eb)
-        self.tick(40)
+        self.tick(18)
         self.assertSameWorld()
         sig = self.A.sig()
         self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00 street/new_small_road.street_template", sig)
@@ -1204,7 +1269,7 @@ class BuildTest(unittest.TestCase):
     def test_upgrading_several_segments_chains_one_command_each(self):
         self.start()
         self.B.issue("NATIVE_UPGRADE{ edges = { 110, 111 }, template = 'street/new_small_road.street_template' }")
-        self.tick(40)
+        self.tick(18)
         self.assertSameWorld()
         self.assertEqual(self.A.lua("#HELPER_CALLS"), 2)
         self.assertEqual(self.A.lua("BUILD_LOG[1]"), "cons=0 rm=0 nodes=0 segs=1 rmsegs=1 objs=0")
@@ -1222,7 +1287,7 @@ class BuildTest(unittest.TestCase):
                      "  local l = lanes[3]; l.transportModes = tm; lanes[3] = l\n"
                      "  c.laneConfigs = lanes; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp\n"
                      "  return P end)()")
-        self.tick(40)
+        self.tick(18)
         self.assertSameWorld("the lanes carry the same modes on both games")
         # the originator's engine stored the shifted write (4 -> 3, 15 -> 14); the replay compensates with the measured shift
         self.assertIn("f3,14", self.A.sig())
@@ -1231,11 +1296,11 @@ class BuildTest(unittest.TestCase):
     def test_bulldozing_a_session_built_segment_uses_the_engines_removal(self):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
         ea = int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb)
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % ea)
@@ -1246,7 +1311,7 @@ class BuildTest(unittest.TestCase):
         self.B.issue("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_medium_road.street_template' }; local sp = P.proposal; "
                      "local added = sp.addedSegments; local s = added[1]; local c = s.comp; c.type = 1; c.typeIndex = 3; s.comp = c; added[1] = s; "
                      "sp.addedSegments = added; P.proposal = sp; return P end)()")
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIn("E 0.00,0.00,0.00 100.00,0.00,0.00 street/new_medium_road.street_template kind0 t1/3", self.A.sig())
         self.assertEqual(self.A.lua("#HELPER_CALLS"), 0, "not replaceSegment: that would have kept the street")
@@ -1256,7 +1321,7 @@ class BuildTest(unittest.TestCase):
     def test_a_station_is_placed_with_a_seed_every_game_agrees_on(self):
         self.start()
         self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 3 } }")
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         sig = self.A.sig()
         self.assertIn("C station/rail/modular_station.con@300.00,200.00,0.00", sig)
@@ -1268,25 +1333,25 @@ class BuildTest(unittest.TestCase):
     def test_a_construction_is_replaced_then_bulldozed_by_the_place_it_stands(self):
         self.start()
         self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 3 } }")
-        self.tick(30)
+        self.tick(14)
         cb = int(self.B.lua("FIND_CON('station/rail/modular_station.con')"))
         ca = int(self.A.lua("FIND_CON('station/rail/modular_station.con')"))
         self.assertNotEqual(ca, cb)
         self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 5 }, remove = %d }" % cb)
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIn("length=5", self.A.sig())
         self.assertNotIn("length=3", self.A.sig())
         cb = int(self.B.lua("FIND_CON('station/rail/modular_station.con')"))
         self.B.issue("CON_REMOVE{ cons = { %d } }" % cb)
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertNotIn("modular_station", self.A.sig())
 
     def test_a_vehicle_is_bought_at_a_depot_the_session_built(self):
         self.start()
         self.B.issue("CON_PROPOSAL{ file = 'depot/road_depot.con', x = 500, y = 100 }")
-        self.tick(30)
+        self.tick(14)
         for g in (self.A, self.B):
             keys = str(g.lua("BOUND_KEYS()")).split()
             self.assertIn("1:1#c1", keys)
@@ -1294,7 +1359,7 @@ class BuildTest(unittest.TestCase):
         depot_b, depot_a = int(self.B.lua("FIND_DEPOT()")), int(self.A.lua("FIND_DEPOT()"))
         self.assertNotEqual(depot_a, depot_b)
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, %d, { vehicles = {} }), function(d, s) BUY_OK = s end)" % depot_b)
-        self.tick(40)
+        self.tick(18)
         self.assertTrue(self.B.lua("BUY_OK == true"))
         self.assertEqual(self.A.lua("GAME.applied[#GAME.applied].name"), "makeVehicleBuyCmd")
         self.assertEqual(self.A.lua("GAME.applied[#GAME.applied].args[2]"), depot_a, "each game bought at its own depot")
@@ -1324,13 +1389,13 @@ class BuildTest(unittest.TestCase):
         self.start()
         split = "WITH_CFG(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }, -1, { { -3, 0, -5, 0 } })"
         self.B.issue(split)
-        self.tick(30)
+        self.tick(14)
         self.assertEqual(self.A.lua("#CFG_LOG"), 1, "with the configuration when the factory takes it")
         self.assertSameWorld()
         for g in (self.A, self.B):
             g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' and #parts.cfgAdd > 0 then return 'Unknown exception' end end; CFG_LOG = {}")
         self.B.issue(split.replace("x = 50", "x = 150").replace("edge = 110", "edge = 111") + "")
-        self.tick(30)
+        self.tick(14)
         self.assertEqual(self.A.lua("#CFG_LOG"), 0, "second form: the engine makes the lane connections itself")
         self.assertEqual(self.B.lua("#CFG_LOG"), 0)
         self.assertSameWorld()
@@ -1342,7 +1407,7 @@ class BuildTest(unittest.TestCase):
         for g in (self.A, self.B):
             g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _, s in ipairs(parts.edgesAdd) do if s.entity == -3 then return 'numbering' end end end end")
         self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.assertIn("(form 4)", self.A.log())
@@ -1352,7 +1417,7 @@ class BuildTest(unittest.TestCase):
         for g in (self.A, self.B):
             g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _, s in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
         self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", cb="function(d, s) NO_OK = s end")
-        self.tick(30)
+        self.tick(14)
         self.assertEqual(self.A.lua("#BUILD_LOG") + self.B.lua("#BUILD_LOG"), 0)
         self.assertTrue(any("refused the street build" in d and "no segment please" in d for _, _, d in self.relay.refused), self.relay.refused)
 
@@ -1361,7 +1426,7 @@ class BuildTest(unittest.TestCase):
         for g in (self.A, self.B):
             g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
         self.B.issue("NATIVE_ROAD_MOVING{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 57 }")
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         for g in (self.A, self.B):
             self.assertEqual(g.lua("#BUILD_LOG"), 1, "one command")
@@ -1375,7 +1440,7 @@ class BuildTest(unittest.TestCase):
         for g in (self.A, self.B):
             g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
         self.B.issue("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; P.toRemove = { 57 }; return P end)()")
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"), "the road is there")
         self.assertNotIn("town/house_a.con", self.A.sig(), "and the house is gone")
@@ -1384,7 +1449,7 @@ class BuildTest(unittest.TestCase):
     def test_a_station_gets_keys_for_its_station_and_its_group(self):
         self.start()
         self.B.issue("CON_PROPOSAL{ file = 'station/bus/bus_station.con', x = 100, y = 300 }")
-        self.tick(30)
+        self.tick(14)
         keys = str(self.A.lua("BOUND_KEYS()")).split()
         self.assertEqual([k for k in keys if k.startswith("1:1#")], ["1:1#c1", "1:1#c1/g1", "1:1#c1/s1"])
 
@@ -1392,7 +1457,7 @@ class BuildTest(unittest.TestCase):
         self.start()
         self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
                      cb="function(d, s, e) DEPOT_OK = s end")
-        self.tick(40)
+        self.tick(18)
         self.assertTrue(self.B.lua("DEPOT_OK == true"))
         self.assertSameWorld()
         for g in (self.A, self.B):
@@ -1411,7 +1476,7 @@ class BuildTest(unittest.TestCase):
         self.relay.pump()
         self.relay.pauseAt = self.relay.future_stamp()
         self.relay.session()
-        self.tick(40)
+        self.tick(18)
         self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
         self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
                      cb="function(d, s, e) PAUSED_OK = s end")
@@ -1428,7 +1493,7 @@ class BuildTest(unittest.TestCase):
         self.relay.pump()
         self.relay.pauseAt = self.relay.future_stamp()
         self.relay.session()
-        self.tick(40)
+        self.tick(18)
         for g in (self.A, self.B):
             g.run("BUILD_REFUSE = function(parts) if #parts.consAdd > 0 then return 'Collision' end end")
         self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
@@ -1444,7 +1509,7 @@ class BuildTest(unittest.TestCase):
     def test_a_signal_captured_before_the_build_ran_has_no_model_and_stays_native(self):
         self.start()
         self.B.issue("NATIVE_SIGNAL{ edge = 130, param = 0.75 }")
-        self.tick(30)
+        self.tick(14)
         self.assertIn("an edge object has no model", self.B.log())
         self.assertEqual(self.A.lua("#BUILD_LOG"), 0, "not shipped: the model is only known after the build")
         self.assertEqual(self.B.lua("#BUILD_LOG"), 1, "the player's own build went through natively")
@@ -1457,7 +1522,7 @@ class BuildTest(unittest.TestCase):
         self.assertIn("rmSegs", body)
         self.assertIn("signal/signal_a.mdl", body, "the model was read from the object the engine created")
         self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
-        self.tick(20)
+        self.tick(12)
         self.assertSameWorld()
         self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig(), "the signal that was there stays, the new one is added")
 
@@ -1466,14 +1531,14 @@ class BuildTest(unittest.TestCase):
         self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created")
         body = self.B.lua("CAPTURE_BODY(SIGNAL_P, SIGNAL_CREATED)")
         self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
-        self.tick(20)
+        self.tick(12)
         self.assertSameWorld()
         self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig())
         # the savegame's signal (rank 1 on the segment) goes, the one just added (rank 2, another id in each game) stays
         for g in (self.A, self.B):
             self.assertNotEqual(g.lua("FIND_EDGE(0, 50, 100, 50)"), 130, "the segment was replaced")
         self.B.issue("NATIVE_UNSIGNAL{ edge = %d, object = 140 }" % int(self.B.lua("FIND_EDGE(0, 50, 100, 50)")))
-        self.tick(30)
+        self.tick(14)
         self.assertSameWorld()
         self.assertIn("[signal/signal_a.mdl@0.750k2]", self.A.sig())
         self.assertNotIn("0.250", self.A.sig())
@@ -1483,11 +1548,11 @@ class BuildTest(unittest.TestCase):
         for g in (self.A, self.B):
             g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
         self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 3 } }")
-        self.tick(30)
+        self.tick(14)
         cb, ca = int(self.B.lua("FIND_CON('station/rail/modular_station.con')")), int(self.A.lua("FIND_CON('station/rail/modular_station.con')"))
         self.B.issue("CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, params = { length = 5 }, remove = %d }" % cb)
         self.B.issue("NATIVE_ROAD_MOVING{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 57 }")
-        self.tick(40)
+        self.tick(18)
         self.assertSameWorld()
         self.assertEqual(self.A.lua("OLD2NEW_LOG[1]"), "%d=0" % ca, "the host's own station id as the key")
         self.assertEqual(self.B.lua("OLD2NEW_LOG[1]"), "%d=0" % cb)
@@ -1501,16 +1566,92 @@ class BuildTest(unittest.TestCase):
                    "local ok, created = APPLY_BUILD(STOP_P); STOP_CREATED = created")
         body = self.B.lua("CAPTURE_BODY(STOP_P, STOP_CREATED)")
         self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
-        self.tick(20)
+        self.tick(12)
         self.assertSameWorld()
         self.assertIn("station/street/bus_stop.mdl@0.500k0", self.A.sig())
+
+    def test_a_road_side_stop_and_its_station_group_get_keys_both_games_agree_on(self):
+        self.start()
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }", cb="function(d, s, e) STOP_OK = s end")
+        self.tick(14)
+        self.assertTrue(self.B.lua("STOP_OK == true"))
+        self.assertSameWorld()
+        self.assertIn("station/street/bus_stop.mdl@0.500k0", self.A.sig())
+        sa, sb = self.both("COUNT('STATION')")
+        self.assertEqual((sa, sb), (1, 1))
+        for g in (self.A, self.B):
+            self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1", "1:1#o1/g"])
+            # the keys name the stop on the segment it was put on, and the group that stop belongs to, in each game's own ids
+            self.assertEqual(g.lua("STOP_AT('1:1#o1')"), "0.00,0.00,0.00 100.00,0.00,0.00 station/street/bus_stop.mdl grouptrue true")
+        ga, gb = self.both("STATE:get().bind['1:1#o1/g']")
+        self.assertNotEqual(ga, gb, "another id in each game, one key")
+
+    def test_two_stops_in_one_step_are_not_taken_for_each_others(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("DEFER_BUILDS = true")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.25, left = true }")
+        self.B.issue("SIMPLE_STOP{ edge = 130, param = 0.75, left = false }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("STOP_AT('1:1#o1')"), "0.00,0.00,0.00 100.00,0.00,0.00 station/street/bus_stop.mdl grouptrue true", "the first build's stop")
+            self.assertEqual(g.lua("STOP_AT('1:2#o1')"), "0.00,50.00,0.00 100.00,50.00,0.00 station/street/bus_stop.mdl grouptrue true", "the second build's stop")
+            self.assertEqual(g.lua("STOP_AT('1:1#o2')"), "none")
+            self.assertEqual(g.lua("STOP_AT('1:2#o2')"), "none")
+        self.assertEqual(self.A.lua("STATE:get().bind['1:1#o1/g'] ~= STATE:get().bind['1:2#o1/g']"), True)
+
+    def test_a_stop_that_joins_a_group_that_exists_is_keyed_but_the_group_keeps_its_own_key(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("WORLD[900] = { STATION_GROUP = { stations = {} } }; JOIN_GROUP = 900")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1"], "no key for a group that was there before")
+            self.assertEqual(g.lua("STOP_AT('1:1#o1')"), "0.00,0.00,0.00 100.00,0.00,0.00 station/street/bus_stop.mdl groupfalse false")
+
+    def test_a_scripts_signal_is_no_stop_and_asks_for_no_keys(self):
+        self.start()
+        # the kind comes from the signal's place in the segment's object list: no station, no group, no keys
+        self.B.issue("SIMPLE_STOP{ edge = 130, param = 0.5, kind = 2, model = 'signal/signal_a.mdl' }")
+        self.tick(14)
+        self.assertSameWorld()
+        self.assertIn("signal/signal_a.mdl@0.500k2", self.A.sig())
+        self.assertEqual(self.both("COUNT('STATION')"), (0, 0))
+        self.assertEqual([k for k in str(self.A.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], [])
+
+    def test_a_signal_alone_asks_for_no_keys(self):
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created")
+        body = self.B.lua("CAPTURE_BODY(SIGNAL_P, SIGNAL_CREATED)")
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
+        self.tick(14)
+        self.assertEqual([k for k in str(self.A.lua("BOUND_KEYS()")).split() if k.startswith("1:1")], [])
+        self.assertEqual(self.A.lua("#STATE:get().binders"), 0, "nothing left to look for")
+
+    def test_a_stop_built_while_paused_is_keyed_on_both_games(self):
+        self.start(speed=2)
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(14)
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }", cb="function(d, s, e) PAUSED_STOP = s end")
+        self.tick(10)
+        self.assertTrue(self.B.lua("PAUSED_STOP == true"))
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("STOP_AT('1:1#o1')"), "0.00,0.00,0.00 100.00,0.00,0.00 station/street/bus_stop.mdl grouptrue true")
 
     # ---- node configurations
 
     def test_lane_connections_and_crosswalks_follow_the_segments_the_session_built(self):
         self.start()
         self.B.issue("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
 
         def edge(game, *p):
             return int(game.lua("FIND_EDGE(%s)" % ", ".join(str(x) for x in p)))
@@ -1518,7 +1659,7 @@ class BuildTest(unittest.TestCase):
         eb1, eb2, eb3 = edge(self.B, 0, 0, 50, 0), edge(self.B, 50, 0, 100, 0), edge(self.B, 50, 0, 50, 80)
         jb = int(self.B.lua("FIND_NODE(50, 0, 0)"))
         self.B.issue("NATIVE_NODECFG{ nodes = { { node = %d, lanes = { { %d, 0, %d, 1 } }, crosswalks = { %d }, dss = true } } }" % (jb, eb1, eb3, eb2))
-        self.tick(30)
+        self.tick(14)
         ea1, ea3 = edge(self.A, 0, 0, 50, 0), edge(self.A, 50, 0, 50, 80)
         self.assertNotEqual(ea1, eb1)
         self.assertEqual(self.A.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (ea1, ea3), "the host's configuration names the host's segments")
@@ -1533,7 +1674,7 @@ class BuildTest(unittest.TestCase):
         self.start()
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeWorldReplaceTerrainCmd(1, 2, 'seed', 3, false))")
         self.B.issue("NATIVE_TERRAIN(10, 20, 12, 12)")
-        self.tick(30)
+        self.tick(14)
         self.assertEqual(self.A.applied(), [])
         self.assertEqual(len(self.B.applied()), 2)
         self.assertEqual(self.B.shipped(), [])
@@ -1544,7 +1685,7 @@ class BuildTest(unittest.TestCase):
         self.start()
         self.B.issue("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; "
                      "local t = P.terrain; t.baseHeightMod = D('GridVec2f', { x0 = 1, y0 = 2, width = 8, height = 8 }); P.terrain = t; return P end)()")
-        self.tick(30)
+        self.tick(14)
         self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.assertIn("a terrain edit of 8x8 cells comes with this build: the cells are not copied", self.B.log())
 
@@ -1553,28 +1694,28 @@ class BuildTest(unittest.TestCase):
     def test_bulldozing_and_building_are_separate_permissions(self):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.relay.send(self.B, "permissions", 0, self.relay.ser({"bulldoze": False}))
         self.tick(2)
         self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb, cb="function(d, s) DOZE_OK = s end")
-        self.tick(20)
+        self.tick(12)
         self.assertTrue(self.B.lua("DOZE_OK == false"))
         self.assertIn((1, 0, "permission denied: bulldoze"), self.relay.refused)
         self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"), "nothing was bulldozed")
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
-        self.tick(30)
+        self.tick(14)
         self.assertIsNotNone(self.A.lua("FIND_EDGE(300, 100, 400, 100)"), "building is still allowed")
         # the other way round: bulldozing allowed, building denied; replacing a segment is building, removing a construction is bulldozing
         self.relay.send(self.B, "permissions", 0, self.relay.ser({"bulldoze": True, "build": False}))
         self.tick(2)
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 200, z = 0 }, b = { x = 400, y = 200, z = 0 } }", cb="function(d, s) BUILD_OK = s end")
         self.B.issue("NATIVE_UPGRADE{ edges = { %d }, template = 'street/new_small_road.street_template' }" % eb, cb="function(d, s) UP_OK = s end")
-        self.tick(20)
+        self.tick(12)
         self.assertTrue(self.B.lua("BUILD_OK == false"))
         self.assertTrue(self.B.lua("UP_OK == false"), "an upgrade replaces segments: it is building")
         self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb)
-        self.tick(30)
+        self.tick(14)
         self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
 
     # ---- wire safety
@@ -1593,7 +1734,7 @@ class BuildTest(unittest.TestCase):
         ]
         for i, (_, body) in enumerate(cases, 1):
             self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + (6 + i) * STEP, "seq": 10 + i, "body": body, "from": 1}))
-        self.tick(30)
+        self.tick(14)
         details = [d for _, _, d in self.relay.refused]
         for want in ("build record version 7", "bad file name", "build record too large", "bad entry", "is not a list", "nothing to build"):
             self.assertTrue(any(want in d for d in details), "%s not in %s" % (want, details))
@@ -1731,6 +1872,15 @@ class PureBuildTest(unittest.TestCase):
     def test_a_proposal_that_is_not_plain_data_cannot_go_on_the_wire(self):
         self.assertEqual(self.ev("(function() local P = CON_PROPOSAL{ file = 'depot/road_depot.con', x = 1, y = 2, params = { f = print } }; "
                                  "local body, why = CAPTURE(P); return tostring(body) .. ':' .. tostring(why):sub(1, 60) end)()").split(":")[0], "nil")
+
+    def test_the_kind_of_a_scripts_edge_object_comes_from_its_placeholder(self):
+        got = self.ev("(function() local out = {}; for _, k in ipairs({ 0, 1, 2 }) do "
+                      "local rec = WIRE_RECORD(SIMPLE_STOP{ edge = 130, param = 0.5, kind = k }); out[#out + 1] = rec.args[1].objs[1].kind end; "
+                      "return table.concat(out, ',') end)()")
+        self.assertEqual(got, "0,1,2")
+        bad = self.ev("(function() local rec, M = WIRE_RECORD(SIMPLE_STOP{ edge = 130, param = 0.5, kind = 2 }); rec = rec.args[1]; rec.objs[1].kind = 'x'; "
+                      "local ok, why = M.normalise(rec); return tostring(ok) .. '|' .. tostring(why) end)()")
+        self.assertEqual(bad, "nil|edge object 1: bad kind")
 
     def test_normalise_refuses_what_it_cannot_trust(self):
         def refuse(mutation):
@@ -1968,14 +2118,18 @@ class LockstepAdditionsTest(unittest.TestCase):
         got = self.L.eval("""function(K)
           local spec = { bindsComp = function(body) return body.cons and "CONSTRUCTION" or nil end,
                          bind = function(body, key, made) return { [key .. "#c1"] = made[1] }, #made > 0 end }
-          local a = K.bindsComp(spec, { cons = {} }) .. "," .. tostring(K.bindsComp(spec, {})) .. "," .. tostring(K.bindsComp({}, {})) .. "," .. K.bindsComp({ bindsComp = "LINE" }, {})
+          local function names(c) return c and table.concat(c, "+") or "nil" end
+          local a = names(K.bindsComp(spec, { cons = {} })) .. "," .. names(K.bindsComp(spec, {})) .. "," .. names(K.bindsComp({}, {})) .. "," ..
+                    names(K.bindsComp({ bindsComp = "LINE" }, {})) .. "," .. names(K.bindsComp({ bindsComp = { "EDGE_OBJECT", 7, "STATION_GROUP" } }, {})) .. "," ..
+                    names(K.bindsComp({ bindsComp = {} }, {})) .. "," .. names(K.bindsComp({ bindsComp = function() error("boom") end }, {}))
           local map, complete = K.bindMap(spec, {}, "1:2", { 77 })
           local none, incomplete = K.bindMap(spec, {}, "1:2", {})
           local bad, badComplete = K.bindMap({ bind = function() error("boom") end }, {}, "1:2", {})
           local plain, plainComplete = K.bindMap({}, {}, "1:2", {})
           return a .. "|" .. map["1:2#c1"] .. tostring(complete) .. "|" .. tostring(next(none)) .. tostring(incomplete) .. "|" .. tostring(next(bad)) .. tostring(badComplete) .. "|" .. tostring(next(plain)) .. tostring(plainComplete)
         end""")(self.K)
-        self.assertEqual(got, "CONSTRUCTION,nil,nil,LINE|77true|nilfalse|nilfalse|niltrue")
+        self.assertEqual(got, "CONSTRUCTION,nil,nil,LINE,EDGE_OBJECT+STATION_GROUP,nil,nil|77true|nilfalse|nilfalse|niltrue")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

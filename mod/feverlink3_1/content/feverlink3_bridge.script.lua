@@ -219,8 +219,12 @@ local function simApplyAction(st, it, now)
 	end
 	local spec = L.COMMANDS[it.body.fn]
 	local before = spec.creates and engine.entitiesWith(spec.creates) or nil
-	local bindComp = L.bindsComp(spec, it.body)
-	local bindBefore = bindComp and engine.entitiesWith(bindComp) or nil
+	local bindComps = L.bindsComp(spec, it.body)
+	local bindBefore = nil
+	if bindComps then
+		bindBefore = {}
+		for _, comp in ipairs(bindComps) do bindBefore[comp] = engine.entitiesWith(comp) end
+	end
 	local ok, e = pcall(function()
 		L.sendNow(args, function(a) api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n))) end)
 	end)
@@ -230,8 +234,8 @@ local function simApplyAction(st, it, now)
 		return
 	end
 	logSim("action " .. it.key .. " " .. it.body.fn .. " applied at t=" .. now)
-	if bindComp then
-		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comp = bindComp, before = bindBefore, steps = 0 }
+	if bindComps then
+		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0 }
 	end
 	if spec.creates then
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
@@ -264,18 +268,36 @@ local function simAdvanceWatches(st, now)
 	st.watches = keep
 end
 
--- Keys for several entities an action created (the constructions of a build, their depots and stations): looked for
--- on each step until the schema says it has found them all, or WATCH_STEPS have passed.
+-- Keys for several entities an action created (the constructions of a build, their depots and stations, the stops it
+-- put on a road and their station groups): looked for on each step until the schema says it has found them all, or
+-- WATCH_STEPS have passed. What another action's keys already name is not offered again, so two builds in one step do
+-- not take each other's entities (the engine runs the commands in the order they were applied, on every game).
 local function simAdvanceBinders(st)
 	if #st.binders == 0 then return end
+	local owner = {}
+	for k, e in pairs(st.bind) do owner[e] = k end
 	local keep = {}
 	for _, b in ipairs(st.binders) do
 		b.steps = b.steps + 1
-		local made = L.newEntities(b.before, engine.entitiesWith(b.comp))
+		local mine = b.key .. "#"
+		local made, seen = {}, {}
+		for _, comp in ipairs(b.comps) do
+			for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
+				local other = owner[e]
+				if not seen[e] and (other == nil or other:sub(1, #mine) == mine) then
+					seen[e] = true
+					made[#made + 1] = e
+				end
+			end
+		end
+		table.sort(made)
 		local map, complete = L.bindMap(L.COMMANDS[b.fn], b.body, b.key, made)
-		for key, e in pairs(map) do st.bind[key] = e end
+		for key, e in pairs(map) do
+			st.bind[key] = e
+			owner[e] = key
+		end
 		if complete then
-			logSim("action " .. b.key .. " created " .. #made .. " " .. b.comp .. " entities, keyed")
+			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
 		elseif b.steps >= WATCH_STEPS then
 			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps")
 		else
@@ -422,6 +444,10 @@ local function guiApplyNow(it, now)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
+	-- what the build made is what the engine reports plus what appeared among the components the schema looks at
+	local bindComps = spec.bind and L.bindsComp(spec, it.body) or nil
+	local bindBefore = {}
+	for _, comp in ipairs(bindComps or {}) do bindBefore[comp] = engine.entitiesWith(comp) end
 	local function finish(data, success, entities)
 		if spec.creates and success then
 			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
@@ -435,8 +461,18 @@ local function guiApplyNow(it, now)
 			end
 		end
 		if spec.bind and success then
-			local made = {}
-			for _, r in ipairs(type(entities) == "table" and entities or {}) do made[#made + 1] = type(r) == "table" and r[1] or r end
+			local made, seen = {}, {}
+			local function add(e)
+				if type(e) == "number" and not seen[e] then
+					seen[e] = true
+					made[#made + 1] = e
+				end
+			end
+			for _, r in ipairs(type(entities) == "table" and entities or {}) do add(type(r) == "table" and r[1] or r) end
+			for _, comp in ipairs(bindComps or {}) do
+				for _, e in ipairs(L.newEntities(bindBefore[comp] or {}, engine.entitiesWith(comp))) do add(e) end
+			end
+			table.sort(made)
 			for sub, e in pairs((L.bindMap(spec, it.body, it.key, made))) do
 				G.bind[sub] = e
 				G.rev[e] = sub
