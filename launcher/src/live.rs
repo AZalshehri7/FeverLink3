@@ -282,6 +282,9 @@ impl Controller {
             // FEVERLINK3_HOST_RELOAD=1 brings the old behaviour back (every game, the host's included, loads the save).
             host_options: HostOptions {
                 host_reloads: std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "1"),
+                // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
+                // resync is requested", but none is started by itself; only the window's Sync button starts one.
+                auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),
                 ..HostOptions::default()
             },
             commands,
