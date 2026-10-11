@@ -89,7 +89,10 @@ pub fn parse_rate(text: &str) -> Result<u32, String> {
             None => (t.as_str(), 1),
         },
     };
-    let n: u64 = digits.trim().parse().map_err(|_| format!("\"{text}\" is not a speed: use bytes per second, or a number with k or m, like 4m"))?;
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("\"{text}\" is not a speed: use bytes per second, or a number with k or m, like 4m"))?;
     let bytes = n.saturating_mul(unit);
     if !(32 * 1024..=64 << 20).contains(&bytes) {
         return Err(format!("\"{text}\" is outside 32k to 64m"));

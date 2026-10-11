@@ -38,9 +38,15 @@ use feverlink3_core::session::ConnectionId;
 use feverlink3_core::crypto::SessionKey;
 
 use crate::gamelink;
-use crate::net::{ClientTransport, ConnectContext, HostTransport, LinkInfo, NetEvent};
+use crate::net::{
+    BulkSendJob, BulkSendResult, BulkSender, ClientTransport, ConnectContext, HostTransport, LinkInfo, NetEvent,
+};
 use crate::session::{self, HostConfig, PlayerConfig, SessionHandle};
+use crate::steamnet::bulk::{Limits, Receiver as BulkReceiver};
+use crate::steamnet::bulk_io::{self, FileSource, Hub, SendJob};
+use crate::steamnet::speed::bulk_config;
 use crate::steamnet::{self, CoreRef, End, Handle, Owner, Route, MAX_MESSAGE};
+use feverlink3_core::session::ResyncLimits;
 
 /// The virtual port sessions use; the probe has 1.
 pub const VIRTUAL_PORT: i32 = 0;
@@ -194,6 +200,8 @@ struct HostShared {
     links: Mutex<HostLinks>,
     next_id: AtomicU64,
     max_connections: usize,
+    /// Routes the bulk datagrams (the acks of a save being sent) to their transfers.
+    hub: Arc<Hub>,
 }
 
 impl Owner for HostShared {
@@ -240,7 +248,12 @@ impl Owner for HostShared {
         }
     }
 
+    fn datagram(&self, handle: Handle, data: &[u8]) {
+        self.hub.on_datagram(handle, data);
+    }
+
     fn closed(&self, handle: Handle, end: End) {
+        self.hub.drop_connection(handle);
         let link = {
             let mut links = lock(&self.links);
             let link = links.by_handle.remove(&handle);
@@ -294,6 +307,7 @@ impl SteamHostNet {
             links: Mutex::new(HostLinks::default()),
             next_id: AtomicU64::new(1),
             max_connections,
+            hub: Hub::new(),
         });
         let owner: Arc<dyn Owner> = shared.clone();
         let listener = core.listen(VIRTUAL_PORT, owner)?;
@@ -392,6 +406,64 @@ struct ClientShared {
     tx: Sender<NetEvent>,
     state: Mutex<ClientState>,
     changed: Condvar,
+    me: std::sync::Weak<ClientShared>,
+    /// Routes the bulk datagrams of the savegame the host sends.
+    hub: Arc<Hub>,
+    /// A bulk receive is running (one at a time).
+    bulk_busy: AtomicBool,
+}
+
+impl ClientShared {
+    /// The host offers a savegame as bulk datagrams. Only the host can (the connection is the one to the host), one at
+    /// a time, at most as big as a resync allows. The finished save goes to the session thread as a `BulkSave` event.
+    fn accept_bulk(&self, handle: Handle, xfer: u32, offer: Vec<u8>, rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+        let link = lock(&self.state).link.clone();
+        let (Some(link), Some(me)) = (link, self.me.upgrade()) else {
+            self.hub.unregister(handle, xfer);
+            return;
+        };
+        if self.bulk_busy.swap(true, Ordering::AcqRel) {
+            self.hub.unregister(handle, xfer);
+            let busy = steamnet::bulk::wire::encode_abort(xfer, steamnet::bulk::wire::reason::BUSY);
+            let _ = self.core.send_datagram(handle, &busy);
+            return;
+        }
+        let spawned = std::thread::Builder::new().name("feverlink3-steam-bulk-recv".into()).spawn(move || {
+            let limits = Limits { max_total: ResyncLimits::MAX_CHUNKS as u64 * ResyncLimits::CHUNK_SIZE as u64 };
+            let started = Instant::now();
+            let mut on_complete = |r: &mut BulkReceiver| {
+                let Some(bytes) = r.take_data() else { return };
+                let sha: String = r.sha256().iter().map(|b| format!("{b:02x}")).collect();
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                let note = format!(
+                    "resync {}: save received as bulk datagrams: {} bytes in {secs:.1} s ({:.2} MB/s), {} duplicate datagram(s), {} acks sent",
+                    r.ctx(),
+                    bytes.len(),
+                    bytes.len() as f64 / secs / 1e6,
+                    r.stats.duplicates,
+                    r.stats.acks_sent
+                );
+                let event = NetEvent::BulkSave { conn: me.conn, id: r.ctx() as i32, sha256: sha, bytes, note };
+                let _ = me.tx.send(event);
+            };
+            let _ = bulk_io::run_receiver(
+                &me.core,
+                &me.hub,
+                handle,
+                &offer,
+                rx,
+                &limits,
+                &|| link.is_closed(),
+                &|_| {},
+                &mut on_complete,
+            );
+            me.bulk_busy.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            self.bulk_busy.store(false, Ordering::Release);
+            self.hub.unregister(handle, xfer);
+        }
+    }
 }
 
 fn status_text(step: i32) -> &'static str {
@@ -445,7 +517,12 @@ impl Owner for ClientShared {
         }
     }
 
-    fn closed(&self, _handle: Handle, end: End) {
+    fn datagram(&self, handle: Handle, data: &[u8]) {
+        self.hub.on_datagram(handle, data);
+    }
+
+    fn closed(&self, handle: Handle, end: End) {
+        self.hub.drop_connection(handle);
         let link = {
             let mut state = lock(&self.state);
             match &state.phase {
@@ -508,12 +585,21 @@ impl SteamClientNet {
         }
         core.wait_ready(deadline, cancelled)?;
 
-        let shared = Arc::new(ClientShared {
+        let shared = Arc::new_cyclic(|me| ClientShared {
             core: core.clone(),
             conn,
             tx,
             state: Mutex::new(ClientState { phase: Phase::Connecting(STATUS_CONTACTING.into()), link: None }),
             changed: Condvar::new(),
+            me: me.clone(),
+            hub: Hub::new(),
+            bulk_busy: AtomicBool::new(false),
+        });
+        let weak = Arc::downgrade(&shared);
+        shared.hub.set_acceptor(move |handle, xfer, offer, rx| {
+            if let Some(shared) = weak.upgrade() {
+                shared.accept_bulk(handle, xfer, offer, rx);
+            }
         });
         let owner: Arc<dyn Owner> = shared.clone();
         let handle = core.connect(endpoint.0, VIRTUAL_PORT, owner)?;
@@ -628,6 +714,33 @@ impl HostTransport for SteamHostNet {
     fn links(&self) -> Vec<LinkInfo> {
         SteamHostNet::links(self)
     }
+
+    fn bulk_sender(&self, conn: ConnectionId) -> Option<BulkSender> {
+        let link = self.link(conn).filter(|l| !l.is_closed())?;
+        let core = self.core.clone();
+        let shared = Arc::clone(&self.shared);
+        Some(Box::new(move |job: BulkSendJob, cancelled: &dyn Fn() -> bool, progress: &dyn Fn(u64)| {
+            let source = match FileSource::open(&job.path) {
+                Ok(s) => s,
+                Err(e) => return BulkSendResult::Failed(format!("cannot read {}: {e}", job.path.display())),
+            };
+            let send = SendJob {
+                xfer: job.ctx,
+                ctx: job.ctx,
+                sha256: job.sha256,
+                source: Box::new(source),
+                cfg: bulk_config(),
+            };
+            let report = bulk_io::run_sender(&core, &shared.hub, link.handle, send, cancelled, progress);
+            match report.state {
+                steamnet::bulk::SenderState::Done => BulkSendResult::Done {
+                    summary: steamnet::throughput::SenderSummary::from_stats(&report.stats).text(),
+                },
+                steamnet::bulk::SenderState::Failed(why) => BulkSendResult::Failed(why),
+                other => BulkSendResult::Failed(format!("ended in state {other:?}")),
+            }
+        }))
+    }
 }
 
 impl ClientTransport for SteamClientNet {
@@ -641,6 +754,10 @@ impl ClientTransport for SteamClientNet {
 
     fn link(&self) -> Option<LinkInfo> {
         Some(self.link_info())
+    }
+
+    fn bulk_capable(&self) -> bool {
+        true
     }
 }
 

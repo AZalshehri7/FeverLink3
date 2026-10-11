@@ -489,7 +489,6 @@ fn creation_options(config: &Config) -> Vec<u8> {
     out
 }
 
-
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -574,7 +573,11 @@ impl SteamCore {
         let shared = Arc::new(Shared {
             api,
             config,
-            iface: Mutex::new(Iface { sockets: std::ptr::null_mut(), utils: std::ptr::null_mut(), next_locate: Instant::now() }),
+            iface: Mutex::new(Iface {
+                sockets: std::ptr::null_mut(),
+                utils: std::ptr::null_mut(),
+                next_locate: Instant::now(),
+            }),
             registry: Mutex::new(Registry::default()),
             sink: Arc::new(EventSink::default()),
             local: Mutex::new(Vec::new()),
@@ -1145,7 +1148,12 @@ impl CoreRef {
         // SAFETY: sockets is Steam's singleton (checked by lock_ready); options is 3 entries of the 16-byte
         // SteamNetworkingConfigValue_t, which Steam copies before the call returns.
         let listener = unsafe {
-            (self.0.api.create_listen)(iface.sockets, virtual_port, (options.len() / OPTION_SIZE) as i32, options.as_ptr().cast())
+            (self.0.api.create_listen)(
+                iface.sockets,
+                virtual_port,
+                (options.len() / OPTION_SIZE) as i32,
+                options.as_ptr().cast(),
+            )
         };
         if listener == 0 {
             return Err(CoreError::Refused(format!(
@@ -1223,14 +1231,7 @@ impl CoreRef {
         // SAFETY: data is valid for data.len() bytes (at most MAX_MESSAGE, so the u32 cast is lossless); conn is a
         // handle of ours; the iface lock is held.
         let code = unsafe {
-            (self.0.api.send)(
-                iface.sockets,
-                conn,
-                data.as_ptr().cast(),
-                data.len() as u32,
-                flags,
-                std::ptr::null_mut(),
-            )
+            (self.0.api.send)(iface.sockets, conn, data.as_ptr().cast(), data.len() as u32, flags, std::ptr::null_mut())
         };
         match code {
             result::OK => SendOutcome::Sent,
@@ -1300,10 +1301,8 @@ impl CoreRef {
     /// transfer raises it while it runs and restores [`CoreRef::send_rate_setting`] after. The text says what happened.
     pub fn set_connection_send_rate(&self, conn: Handle, rate: i32) -> String {
         let Ok(iface) = self.lock_ready() else { return "Steam is not ready".into() };
-        let values = [
-            ("SendRateMin", config_value::SEND_RATE_MIN, rate),
-            ("SendRateMax", config_value::SEND_RATE_MAX, rate),
-        ];
+        let values =
+            [("SendRateMin", config_value::SEND_RATE_MIN, rate), ("SendRateMax", config_value::SEND_RATE_MAX, rate)];
         self.0.set_and_read_back(iface.utils, conn, &values)
     }
 

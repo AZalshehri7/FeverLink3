@@ -605,6 +605,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             version: random_text(rr, 10),
             proof: random_bytes(rr, 40),
             resume: rr.gen_bool(0.5).then(|| ResumeClaim { id: rr.gen(), mac: random_bytes(rr, 40) }),
+            caps: (0..rr.gen_range(0..3)).map(|_| random_text(rr, 12)).collect(),
         });
         round_trip(ResumeGrant { token: random_bytes(rr, 40), epoch: rr.gen() });
         round_trip(RejectMessage {

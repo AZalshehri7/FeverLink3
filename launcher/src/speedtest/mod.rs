@@ -11,6 +11,7 @@
 //!
 //! Everything except `startup::start` and the console calls takes a core, so the tests run it on the fake Steam.
 
+pub mod bulk_modes;
 pub mod cli;
 pub mod console;
 pub mod ladder;

@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::steamnet::{CoreRef, Probe};
 
+use super::bulk_modes;
+
 /// Waiting times and the polling step; [`Timing::real`] for the program, [`Timing::quick`] in the tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
@@ -167,17 +169,21 @@ fn reliable_80(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
 
 /// The test modes, in the order they run. Another mode is one more line: `Mode { name, run }`, where `run` takes the
 /// [`Ctx`] (the probe, the peer, the console) and returns an [`Outcome`].
-pub const MODES: &[Mode] = &[Mode { name: "rate ladder (comprehensive)", run: super::ladder::ladder_mode }];
+pub const MODES: &[Mode] = &[
+    Mode { name: "rate ladder (comprehensive)", run: super::ladder::ladder_mode },
+    Mode { name: "datagrams 32 MB", run: bulk_modes::datagrams_32 },
+];
 
 /// The earlier tests, behind `--classic`: the reliable stream at the configured rate, 8, 32 and 80 MB each way.
 pub const CLASSIC_MODES: &[Mode] = &[
     Mode { name: "reliable 8 MB", run: reliable_8 },
     Mode { name: "reliable 32 MB", run: reliable_32 },
     Mode { name: "reliable 80 MB", run: reliable_80 },
-    // TODO (after the datagram bulk-transfer mode, bulk.rs, is merged): one line per variant, for example
-    // Mode { name: "datagrams 32 MB", run: datagram_32 },
-    // TODO (after the parallel-connection variants are merged):
-    // Mode { name: "parallel x4, 32 MB", run: parallel_4_32 },
+    Mode { name: "datagrams 8 MB", run: bulk_modes::datagrams_8 },
+    Mode { name: "datagrams 32 MB", run: bulk_modes::datagrams_32 },
+    Mode { name: "datagrams 80 MB", run: bulk_modes::datagrams_80 },
+    Mode { name: "parallel x2, 32 MB", run: bulk_modes::parallel_2_32 },
+    Mode { name: "parallel x4, 32 MB", run: bulk_modes::parallel_4_32 },
 ];
 
 /// How the tester got on.
@@ -367,6 +373,20 @@ fn drive(
         } else {
             ctx.say(&format!("  This test failed: {}", outcome.lines.join(" ")));
         }
+        // what the test logged (Steam's samples every second, its detailed status at the start, now and then and at the
+        // end, the settings read back from the connection) goes to the results file
+        let log = ctx.probe.take_log();
+        if !log.is_empty() {
+            report.dumps.push(format!(
+                "--- {} ---
+{}",
+                mode.name,
+                log.join(
+                    "
+"
+                )
+            ));
+        }
         report.outcomes.push(outcome);
         save(report);
     }
@@ -417,10 +437,23 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_the_ladder_and_classic_has_the_three_reliable_modes() {
-        assert_eq!(MODES.len(), 1);
-        let names: Vec<_> = CLASSIC_MODES.iter().map(|m| m.name).collect();
-        assert_eq!(names, ["reliable 8 MB", "reliable 32 MB", "reliable 80 MB"]);
+    fn the_default_is_the_ladder_then_datagrams_and_classic_lists_every_mode() {
+        let names: Vec<_> = MODES.iter().map(|m| m.name).collect();
+        assert_eq!(names, ["rate ladder (comprehensive)", "datagrams 32 MB"]);
+        let classic: Vec<_> = CLASSIC_MODES.iter().map(|m| m.name).collect();
+        assert_eq!(
+            classic,
+            [
+                "reliable 8 MB",
+                "reliable 32 MB",
+                "reliable 80 MB",
+                "datagrams 8 MB",
+                "datagrams 32 MB",
+                "datagrams 80 MB",
+                "parallel x2, 32 MB",
+                "parallel x4, 32 MB"
+            ]
+        );
     }
 
     #[test]
@@ -438,6 +471,21 @@ mod tests {
         assert!(report.outcomes.iter().all(|o| o.ok && o.lines.len() == 4), "{report:?}");
         assert!(report.outcomes[0].lines[0].starts_with("Speed test, 1 MB each way"), "{report:?}");
         assert_eq!(report.own_id, Some(a.steam_id()));
+        assert_eq!(report.dumps.len(), 2, "one log block per mode: {:?}", report.dumps);
+        assert!(
+            report.dumps[0].starts_with(
+                "--- one ---
+"
+            ),
+            "{:?}",
+            report.dumps
+        );
+        assert!(
+            report.dumps[0].contains("steam speed test status (start): fake detailed status"),
+            "{:?}",
+            report.dumps
+        );
+        assert!(report.dumps[0].contains("settings: SendRateMin asked"), "{:?}", report.dumps);
         assert_eq!(report.route, "direct");
         assert_eq!(saves, 3, "saved after each mode and at the end");
         assert!(said.iter().any(|l| l.starts_with("Your Steam ID: ")), "{said:?}");

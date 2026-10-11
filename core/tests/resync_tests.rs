@@ -856,3 +856,114 @@ fn a_player_counts_the_chunks_of_the_save_it_is_receiving() {
         "complete: the save is handed over and the count is gone"
     );
 }
+
+// ------------------------------------------------------------------ the save over bulk datagrams
+
+fn bulk_round(h: &mut Harness) -> i32 {
+    h.host_call(|host| host.start_resync("test"));
+    h.reach_transferring()
+}
+
+#[test]
+fn a_players_capabilities_reach_the_host_and_unknown_ones_do_no_harm() {
+    let mut h = Harness::with(quiet());
+    let a = h.connect_with_caps("A", &[CAP_BULK_DGRAM, "something-from-the-future"]);
+    let b = h.connect("B");
+    let (ia, ib) = (h.p(a).session.id().unwrap(), h.p(b).session.id().unwrap());
+    assert!(h.host.player_supports(ia, CAP_BULK_DGRAM));
+    assert!(h.host.player_supports(ia, "something-from-the-future"));
+    assert!(!h.host.player_supports(ib, CAP_BULK_DGRAM));
+    assert!(!h.host.player_supports(99, CAP_BULK_DGRAM));
+}
+
+#[test]
+fn a_join_message_without_capabilities_is_what_older_players_send() {
+    let join = JoinMessage::new("Old", "0.1", vec![1, 2, 3]);
+    let text = String::from_utf8(json(&join)).unwrap();
+    assert!(!text.contains("caps"), "{text}");
+    let back: JoinMessage = codec::try_decode(text.as_bytes()).unwrap();
+    assert!(back.caps.is_empty());
+    let with: JoinMessage =
+        codec::try_decode(br#"{"name":"N","version":"0.1","proof":"AQID","caps":["bulk-dgram-1"]}"#).unwrap();
+    assert_eq!(with.caps, vec![CAP_BULK_DGRAM.to_owned()]);
+}
+
+#[test]
+fn chunks_skip_the_players_whose_save_goes_by_bulk_and_the_load_still_reaches_everyone() {
+    let (mut h, ids) = Harness::running_with_caps(&[vec![CAP_BULK_DGRAM], vec![]], 1, quiet());
+    let (a, b) = (ids[0], ids[1]);
+    let id = bulk_round(&mut h);
+    let bytes = blob(600 * 1024);
+    let sha = sha256_hex(&bytes);
+    h.host_call(|host| host.resync_file_ready(id, &sha, bytes.len() as u64));
+    let ia = h.p(a).session.id().unwrap();
+    assert!(h.host.resync_receivers().contains(&ia));
+    h.host.resync_set_bulk(id, &[ia, 0, 77]);
+    let chunks: Vec<&[u8]> = bytes.chunks(ResyncLimits::CHUNK_SIZE).collect();
+    for (i, chunk) in chunks.iter().enumerate().take(chunks.len() - 1) {
+        h.host_call(|host| host.resync_chunk(id, i as u32, chunk));
+    }
+    assert!(h.p(a).saves.is_empty(), "A got no chunk");
+    // A's launcher received the save as bulk datagrams; only then does the host send the last chunk and so the load
+    let outs = h.players.get_mut(&a).unwrap().session.bulk_save_received(id, &sha, bytes.clone());
+    h.pump_player(a, outs);
+    assert_eq!(vec![(id, sha.clone(), bytes.clone())], h.p(a).saves);
+    let last = chunks.len() as u32 - 1;
+    h.host_call(|host| host.resync_chunk(id, last, chunks[last as usize]));
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(vec![(id, sha, bytes)], h.p(b).saves, "B got its chunks");
+    assert_eq!(1, h.p(a).count(MessageKind::ResyncLoad));
+    assert_eq!(1, h.p(b).count(MessageKind::ResyncLoad));
+}
+
+#[test]
+fn a_failed_bulk_transfer_falls_back_to_chunks_for_that_player_alone() {
+    let (mut h, ids) = Harness::running_with_caps(&[vec![CAP_BULK_DGRAM], vec![]], 1, quiet());
+    let (a, b) = (ids[0], ids[1]);
+    let id = bulk_round(&mut h);
+    let bytes = blob(600 * 1024);
+    let sha = sha256_hex(&bytes);
+    h.host_call(|host| host.resync_file_ready(id, &sha, bytes.len() as u64));
+    let ia = h.p(a).session.id().unwrap();
+    h.host.resync_set_bulk(id, &[ia]);
+    let chunks: Vec<&[u8]> = bytes.chunks(ResyncLimits::CHUNK_SIZE).collect();
+    // all but the last chunk go the usual way; then the bulk transfer to A is declared failed and A gets every chunk
+    for (i, chunk) in chunks.iter().enumerate().take(chunks.len() - 1) {
+        h.host_call(|host| host.resync_chunk(id, i as u32, chunk));
+    }
+    assert_eq!(ResyncState::Transferring, h.host.resync_state());
+    for (i, chunk) in chunks.iter().enumerate() {
+        h.host_call(|host| host.resync_chunk_to(id, ia, i as u32, chunk));
+    }
+    assert_eq!(ResyncState::Transferring, h.host.resync_state(), "the fallback does not move the round on");
+    assert_eq!(vec![(id, sha.clone(), bytes.clone())], h.p(a).saves);
+    assert!(h.p(b).saves.is_empty(), "B is not sent anything twice");
+    let last = chunks.len() as u32 - 1;
+    h.host_call(|host| host.resync_chunk(id, last, chunks[last as usize]));
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(vec![(id, sha, bytes)], h.p(b).saves);
+    // a chunk for someone who is not a receiver, or of the wrong size, is refused
+    h.host_call(|host| host.resync_chunk_to(id, 99, 0, &[0; 4]));
+}
+
+#[test]
+fn a_bulk_save_with_the_wrong_hash_is_refused_and_a_load_without_the_save_drops_the_player() {
+    let (mut h, ids) = Harness::running_with_caps(&[vec![CAP_BULK_DGRAM]], 1, quiet());
+    let a = ids[0];
+    let bytes = blob(5000);
+    let sha = sha256_hex(&bytes);
+    let outs = h.players.get_mut(&a).unwrap().session.bulk_save_received(4, &sha256_hex(b"other"), bytes.clone());
+    h.pump_player(a, outs);
+    assert!(h.p(a).saves.is_empty());
+    assert!(h.p(a).log.iter().any(|l| l.contains("bulk save 4 refused")), "{:?}", h.p(a).log);
+    let outs = h.players.get_mut(&a).unwrap().session.bulk_save_received(4, "nothex", bytes.clone());
+    h.pump_player(a, outs);
+    assert!(h.p(a).saves.is_empty());
+    let outs = h.players.get_mut(&a).unwrap().session.bulk_save_received(4, &sha, Vec::new());
+    h.pump_player(a, outs);
+    assert!(h.p(a).saves.is_empty());
+    // the right one is taken, once for the load that names it
+    let outs = h.players.get_mut(&a).unwrap().session.bulk_save_received(4, &sha, bytes.clone());
+    h.pump_player(a, outs);
+    assert_eq!(1, h.p(a).saves.len());
+}

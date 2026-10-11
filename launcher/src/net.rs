@@ -151,7 +151,33 @@ pub enum NetEvent {
     Frame { conn: ConnectionId, frame: Frame },
     /// The connection is over; `reason` says why. The last event of a connection.
     Closed { conn: ConnectionId, reason: String },
+    /// A whole savegame arrived as bulk datagrams (Steam transports only), already checked against `sha256`.
+    /// `note` is a line for the log (size, time, rate).
+    BulkSave { conn: ConnectionId, id: i32, sha256: String, bytes: Vec<u8>, note: String },
 }
+
+/// A savegame file to send to one player as bulk datagrams.
+#[derive(Debug, Clone)]
+pub struct BulkSendJob {
+    /// The resync round's id.
+    pub ctx: u32,
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the whole file.
+    pub sha256: [u8; 32],
+}
+
+/// How a bulk send ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkSendResult {
+    /// The receiver has the whole file and its hash matched; `summary` is a line for the log.
+    Done { summary: String },
+    /// It did not work (stalled for 10 s, hash mismatch, connection closed, cancelled).
+    Failed(String),
+}
+
+/// A prepared bulk send to one connection: run it on any thread. Takes the job, a cancel check and a progress callback
+/// (bytes acknowledged so far).
+pub type BulkSender = Box<dyn FnOnce(BulkSendJob, &dyn Fn() -> bool, &dyn Fn(u64)) -> BulkSendResult + Send>;
 
 /// What a connection attempt is given besides its target, for transports where finding the other side can take
 /// long (a Steam route through the relays takes 10 to 20 s): where its events go, how long it may take, a way to
@@ -198,6 +224,11 @@ pub trait HostTransport: Send + 'static {
     fn links(&self) -> Vec<LinkInfo> {
         Vec::new()
     }
+    /// A way to send a file to one connection as bulk datagrams, for transports that have it (Steam). `None`: use
+    /// `ResyncChunk` frames.
+    fn bulk_sender(&self, _conn: ConnectionId) -> Option<BulkSender> {
+        None
+    }
 }
 
 /// What a player session needs from its connection to the host ([`ClientNet`] or
@@ -209,6 +240,10 @@ pub trait ClientTransport: Send + 'static {
     /// What it measured about the connection to the host (ping, route), `None` for a transport that measures nothing.
     fn link(&self) -> Option<LinkInfo> {
         None
+    }
+    /// Whether a savegame can be received as bulk datagrams on this connection (announced in the join message).
+    fn bulk_capable(&self) -> bool {
+        false
     }
 }
 

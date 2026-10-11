@@ -165,6 +165,8 @@ struct Identity {
     /// The game had said hello when the connection dropped. A player coming back to a session that has not started
     /// keeps it: its game was not reloaded.
     ready: bool,
+    /// The capabilities its last join announced.
+    caps: Vec<String>,
 }
 
 impl fmt::Debug for Identity {
@@ -515,7 +517,9 @@ impl HostSession {
             .chain(self.identities.values().map(|i| i.name.as_str()))
             .collect();
         let name = Names::unique(&Names::sanitize(&join.name), id, taken);
-        self.identities.insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false });
+        let caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
+        self.identities
+            .insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false, caps });
         let info = PlayerInfo { id, name: name.clone(), ready: false };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
@@ -546,6 +550,7 @@ impl HostSession {
         let Some(identity) = self.identities.get_mut(&id) else { return false };
         identity.epoch += 1;
         identity.away_since = None;
+        identity.caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
         let (name, token, epoch) = (identity.name.clone(), identity.token, identity.epoch);
         // before the start nothing is reloaded for the returner, so it is as ready as it was; in a started session the
         // hot-join round reloads it and it says hello again
@@ -1272,6 +1277,11 @@ impl HostSession {
     fn send_unsealed(&mut self, connection: ConnectionId, kind: MessageKind, payload: Vec<u8>) {
         let header = FrameHeader::new(FrameHeader::CURRENT_VERSION, kind.into(), Self::UNASSIGNED, 0);
         self.out.push(HostOutput::SendToConnection { connection, frame: Frame::new(header, payload) });
+    }
+
+    /// The connection of a connected player (not the host's own game).
+    pub fn player_connection(&self, player: u16) -> Option<ConnectionId> {
+        self.connection_of(player)
     }
 
     fn connection_of(&self, player: u16) -> Option<ConnectionId> {

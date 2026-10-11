@@ -231,21 +231,14 @@ pub fn run_sender(
     let port = Port { core: core.clone(), conn };
     let rx = hub.register(conn, job.xfer);
     let mut notes = Vec::new();
-    notes.push(format!(
-        "steam rate for the transfer: {}",
-        core.set_connection_send_rate(conn, STEAM_RATE_DURING)
-    ));
+    notes.push(format!("steam rate for the transfer: {}", core.set_connection_send_rate(conn, STEAM_RATE_DURING)));
     let start = Instant::now();
     let xfer = job.xfer;
     let mut sender = match Sender::new(start, job.xfer, job.ctx, job.sha256, job.source, job.cfg) {
         Ok(s) => s,
         Err(why) => {
             hub.unregister(conn, xfer);
-            return SendReport {
-                state: SenderState::Failed(why),
-                stats: SenderStats::default(),
-                rate_notes: notes,
-            };
+            return SendReport { state: SenderState::Failed(why), stats: SenderStats::default(), rate_notes: notes };
         }
     };
     let mut last_progress = Instant::now();
@@ -326,6 +319,7 @@ pub fn recv_report(r: &Receiver) -> RecvReport {
 /// called once, as soon as every datagram is in and the hash has been checked, with the receiver (take the data from
 /// it). The runner then goes on answering the sender for a few seconds. `progress` hears the bytes received so far.
 /// `None` when the offer was refused.
+#[allow(clippy::too_many_arguments)]
 pub fn run_receiver(
     core: &CoreRef,
     hub: &Hub,

@@ -8,7 +8,6 @@
 //! Steam's own view of the connection every second, the highest round trip of each direction and any route change,
 //! and puts a line per sample and Steam's detailed status into the log (`Probe::take_log`).
 
-
 use super::bulk::{Limits, ReceiverState, SenderConfig, SenderState};
 use super::bulk_io::{recv_report, run_receiver, run_sender, RecvReport, SendJob, SendReport, SyntheticSource};
 use super::throughput::{
@@ -67,13 +66,11 @@ impl RunSpec {
 
 /// The runs a mode word of the window stands for, of `mb` MB each way (see [`throughput::plan_for`]).
 pub fn specs_for(mode: &str, mb: u32) -> Vec<RunSpec> {
-    throughput::plan_for(mode)
-        .into_iter()
-        .map(|variant| RunSpec { variant, ..RunSpec::reliable(mb) })
-        .collect()
+    throughput::plan_for(mode).into_iter().map(|variant| RunSpec { variant, ..RunSpec::reliable(mb) }).collect()
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RunKind {
     Reliable(SpeedResult),
     Datagram(DgramResult),
@@ -286,14 +283,7 @@ impl ProbeService {
                                 throughput::encode(&Msg::RateAck { id, asked: r as u32, got: got.0 }),
                             ));
                         }
-                        actions.push(Action::Sender {
-                            conns: group,
-                            id,
-                            total,
-                            chunk,
-                            ours: false,
-                            rate: asked,
-                        });
+                        actions.push(Action::Sender { conns: group, id, total, chunk, ours: false, rate: asked });
                         state.events.push(format!("sending {} MB for a friend's speed test", total / throughput::MB));
                     }
                 }
@@ -324,10 +314,8 @@ impl ProbeService {
                             if inc.rx.got > inc.rx.total.saturating_add(throughput::CHUNK_PAYLOAD as u64) {
                                 state.incoming = None;
                             } else if inc.rx.progress_due(now) {
-                                actions.push(Action::Send(
-                                    conn,
-                                    throughput::encode(&Msg::Prog { id, bytes: inc.rx.got }),
-                                ));
+                                actions
+                                    .push(Action::Send(conn, throughput::encode(&Msg::Prog { id, bytes: inc.rx.got })));
                             }
                         }
                         if let Some(a) = Self::try_upres(state, now, false) {
@@ -357,10 +345,8 @@ impl ProbeService {
                     }
                 }
                 Msg::Prog { id, bytes } => {
-                    if let Some(run) = state
-                        .speed
-                        .as_mut()
-                        .filter(|r| r.owns(conn) && r.id == id && r.phase == Phase::Upload)
+                    if let Some(run) =
+                        state.speed.as_mut().filter(|r| r.owns(conn) && r.id == id && r.phase == Phase::Upload)
                     {
                         run.up_progress = bytes;
                         run.last_progress = now;
@@ -378,10 +364,8 @@ impl ProbeService {
                     }
                 }
                 Msg::UpRes { id, bytes, ms, gap_ms, steady } => {
-                    if let Some(run) = state
-                        .speed
-                        .as_mut()
-                        .filter(|r| r.owns(conn) && r.id == id && r.phase == Phase::Upload)
+                    if let Some(run) =
+                        state.speed.as_mut().filter(|r| r.owns(conn) && r.id == id && r.phase == Phase::Upload)
                     {
                         run.up_remote = Some((bytes, ms, gap_ms, steady));
                         run.last_progress = now;
@@ -470,10 +454,8 @@ impl ProbeService {
                 actions.push(Action::Send(conn, throughput::encode(&msg)));
             }
             Variant::Datagram => {
-                actions.push(Action::Send(
-                    conn,
-                    throughput::encode(&Msg::DgDown { id: run.id, total: run.spec.total }),
-                ));
+                actions
+                    .push(Action::Send(conn, throughput::encode(&Msg::DgDown { id: run.id, total: run.spec.total })));
             }
         }
     }
@@ -492,10 +474,8 @@ impl ProbeService {
 
     fn finish_reliable(&self, state: &mut ProbeState, now: Instant) {
         let rate_set = self.core.send_rate_setting();
-        let (route, ping, effective) = state
-            .test
-            .as_ref()
-            .map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
+        let (route, ping, effective) =
+            state.test.as_ref().map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
         let Some(run) = state.speed.as_mut() else { return };
         if run.spec.rate.is_some() && run.spec.down && !run.rate_unanswered_noted {
             // the responder answers a rate request before it streams, so no answer by now means an older program
@@ -656,7 +636,10 @@ impl ProbeService {
             let state = &mut *guard;
             let summary = SenderSummary::from_stats(&report.stats);
             for note in &report.rate_notes {
-                me.log(state, format!("steam speed test (datagrams, {}): {note}", if ours { "tester" } else { "responder" }));
+                me.log(
+                    state,
+                    format!("steam speed test (datagrams, {}): {note}", if ours { "tester" } else { "responder" }),
+                );
             }
             if ours {
                 if let Some(run) = state.speed.as_mut().filter(|r| r.id == id) {
@@ -722,7 +705,8 @@ impl ProbeService {
         };
         let Some(role) = role else {
             self.hub.unregister(conn, xfer);
-            let _ = self.core.send_datagram(conn, &super::bulk::wire::encode_abort(xfer, super::bulk::wire::reason::BUSY));
+            let _ =
+                self.core.send_datagram(conn, &super::bulk::wire::encode_abort(xfer, super::bulk::wire::reason::BUSY));
             return;
         };
         let Some(me) = self.me.upgrade() else { return };
@@ -732,7 +716,9 @@ impl ProbeService {
             let cancelled = || {
                 let state = lock(&me.state);
                 match role {
-                    Role::Tester(id) => state.speed.as_ref().is_none_or(|r| r.id != id || r.dg.down_cancel || !r.active()),
+                    Role::Tester(id) => {
+                        state.speed.as_ref().is_none_or(|r| r.id != id || r.dg.down_cancel || !r.active())
+                    }
                     Role::Responder => false,
                 }
             };
@@ -764,7 +750,8 @@ impl ProbeService {
                 }
                 completed = Some(report);
             };
-            let ended = run_receiver(&me.core, &me.hub, conn, &offer, rx, &limits, &cancelled, &progress, &mut on_complete);
+            let ended =
+                run_receiver(&me.core, &me.hub, conn, &offer, rx, &limits, &cancelled, &progress, &mut on_complete);
             // not completed: say what arrived anyway
             if completed.is_none() {
                 if let Some(report) = ended {
@@ -1049,11 +1036,8 @@ impl ProbeService {
         let Some(run) = state.speed.as_mut() else { return };
         let up = if run.spec.up {
             let dres = run.dg.up_dres.clone().unwrap_or_default();
-            let (sender_state, stats) = run
-                .dg
-                .up_report
-                .as_ref()
-                .map_or((SenderState::Failed("no report".into()), None), |(r, _)| {
+            let (sender_state, stats) =
+                run.dg.up_report.as_ref().map_or((SenderState::Failed("no report".into()), None), |(r, _)| {
                     (r.state.clone(), Some(r.stats.clone()))
                 });
             let remote_ok = kv_get(&dres, "ok") == 1;
@@ -1306,7 +1290,11 @@ impl Probe {
             state.plan_collected = outcome.id;
             let mut block = String::new();
             if state.plan_total > 1 {
-                block.push_str(&format!("== {} ({} MB) ==\n", run.spec.variant.label(), run.spec.total / throughput::MB));
+                block.push_str(&format!(
+                    "== {} ({} MB) ==\n",
+                    run.spec.variant.label(),
+                    run.spec.total / throughput::MB
+                ));
             }
             match &outcome.failure {
                 None => block.push_str(&outcome.lines.join("\n")),
@@ -1398,7 +1386,8 @@ impl PlanView {
 pub(super) fn speed_report(run: &SpeedRun, outcome: Option<&RunOutcome>, plan: PlanView) -> SpeedReport {
     let mut report = single_report(run, outcome);
     if plan.total > 1 {
-        let blocks: Vec<String> = plan.blocks.iter().flat_map(|b| b.lines().map(str::to_string).collect::<Vec<_>>()).collect();
+        let blocks: Vec<String> =
+            plan.blocks.iter().flat_map(|b| b.lines().map(str::to_string).collect::<Vec<_>>()).collect();
         let finished = plan.left == 0 && run.finalized && plan.collected;
         if finished {
             report.running = false;

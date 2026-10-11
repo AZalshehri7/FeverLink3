@@ -36,8 +36,8 @@ pub(crate) mod fake;
 
 use std::collections::VecDeque;
 
-use speed::{Incoming, Phase, SpeedRun};
 pub use speed::{specs_for, RunKind, RunOutcome, RunSpec};
+use speed::{Incoming, Phase, SpeedRun};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -462,7 +462,13 @@ impl Owner for ProbeService {
         let mut guard = lock(&self.state);
         let state = &mut *guard;
         if let Some(report) = self.core.config_report(conn) {
-            self.log(state, format!("steam connection {conn} ({}): settings at its start: {report}", if _incoming { "incoming" } else { "outgoing" }));
+            self.log(
+                state,
+                format!(
+                    "steam connection {conn} ({}): settings at its start: {report}",
+                    if _incoming { "incoming" } else { "outgoing" }
+                ),
+            );
         }
         if let Some(extra) = state.speed.as_mut().and_then(|r| r.extras.iter_mut().find(|(h, _)| *h == conn)) {
             extra.1 = true;
@@ -734,7 +740,10 @@ impl Probe {
                 send_rate: t.send_rate,
             }),
             pings_received: state.pings_received,
-            speed: state.speed.as_ref().map(|r| speed::speed_report(r, state.outcome.as_ref(), speed::PlanView::of(&state))),
+            speed: state
+                .speed
+                .as_ref()
+                .map(|r| speed::speed_report(r, state.outcome.as_ref(), speed::PlanView::of(&state))),
             peers: state
                 .peers
                 .iter()
@@ -884,7 +893,10 @@ mod tests {
         b[44..48].copy_from_slice(&65_536i32.to_le_bytes());
         b[48..56].copy_from_slice(&250_000i64.to_le_bytes());
         let r = parse_real_time_status(&b).unwrap();
-        assert_eq!((r.out_packets_per_sec, r.out_bytes_per_sec, r.in_packets_per_sec, r.in_bytes_per_sec), (1200.5, 900_000.0, 80.0, 7000.0));
+        assert_eq!(
+            (r.out_packets_per_sec, r.out_bytes_per_sec, r.in_packets_per_sec, r.in_bytes_per_sec),
+            (1200.5, 900_000.0, 80.0, 7000.0)
+        );
         assert_eq!((r.pending_unreliable, r.sent_unacked_reliable, r.queue_time_us), (123, 65_536, 250_000));
         assert_eq!(parse_real_time_status(&b[..40]), None);
         assert_eq!(parse_real_time_status(&[]), None);
@@ -1355,7 +1367,12 @@ mod tests {
         let outcome = finish(&mut probe_a, &mut probe_b, "the run");
         assert_eq!(outcome.failure, None, "{outcome:?}");
         let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
-        assert!(r.rate_note.contains("own send rate set to 4194304") && r.rate_note.contains("peer set its send rate to 4194304"), "{}", r.rate_note);
+        assert!(
+            r.rate_note.contains("own send rate set to 4194304")
+                && r.rate_note.contains("peer set its send rate to 4194304"),
+            "{}",
+            r.rate_note
+        );
         let default = Config::default().send_rate;
         for machine in [&a, &b] {
             let rates: Vec<i32> = machine.connection_config().iter().filter(|c| c.1 == 10).map(|c| c.2).collect();
@@ -1364,9 +1381,9 @@ mod tests {
         until("the peer to put its rate back", || {
             probe_a.poll();
             probe_b.poll();
-            b.connection_config().iter().filter(|c| c.1 == 10).last().is_some_and(|c| c.2 == default)
+            b.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == default)
         });
-        assert!(a.connection_config().iter().filter(|c| c.1 == 10).last().is_some_and(|c| c.2 == default));
+        assert!(a.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == default));
     }
 
     #[test]
@@ -1420,7 +1437,10 @@ mod tests {
         // the settings the connections were created with: the same send rate, send rate and send buffer as the tuning
         let rate = Config::default().send_rate;
         let options = a.creation_options();
-        assert!(options.contains(&(10, rate)) && options.contains(&(11, rate)) && options.contains(&(9, 2 << 20)), "{options:?}");
+        assert!(
+            options.contains(&(10, rate)) && options.contains(&(11, rate)) && options.contains(&(9, 2 << 20)),
+            "{options:?}"
+        );
 
         // a series with a peer that is gone stops after the first block
         b.set_reachable(false);
@@ -1505,7 +1525,13 @@ mod tests {
         });
         // b's probe is asked for far too much: nothing is started
         let conn = lock(&probe_a.service.state).test.as_ref().map(|t| t.conn).unwrap();
-        let ask = throughput::encode(&throughput::Msg::Down { id: 1, total: 10_000 * throughput::MB, chunk: 1000, conns: 1, rate: 0 });
+        let ask = throughput::encode(&throughput::Msg::Down {
+            id: 1,
+            total: 10_000 * throughput::MB,
+            chunk: 1000,
+            conns: 1,
+            rate: 0,
+        });
         assert_eq!(probe_a.core.send(conn, &ask), SendOutcome::Sent);
         thread::sleep(Duration::from_millis(100));
         probe_b.poll();
