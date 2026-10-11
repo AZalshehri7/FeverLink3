@@ -30,10 +30,59 @@ anything else (unset, empty, `0`, `true`) is off. Try them in this order:
 | 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
 | 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
 | 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
+| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the town developer's task-seeding function (`sub_8d4270`, RVA `0x8d4270` in build 40420). It logs one line per call, `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function, **not yet run in the game**. Writes to `native.log` on the thread that calls the function (see below). |
 
 `FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
 The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
 in-game session controller's folder), as before.
+
+### The town-seed log (`FEVERLINK3_LOG_TOWN_SEED=1`)
+
+Purpose: compare two real games. The hook records the random seed with which Transport Fever 3 seeds the task of
+its town developer, so two logs can be diffed to see whether the seeds, the order of the calls and the call site
+agree.
+
+What static analysis of build 40420 (PE timestamp `0x6ac50427`) found, offsets are RVAs:
+
+- `0x8d4270` allocates a 0x1408-byte task object (`mov ecx,0x1408 ; call 0x318c530`), stores its arguments in it,
+  and seeds a `std::mt19937` in the object: `mov edx,[rsp+0x90]`, `mov [rbx+0x84],edx`, then the 624-word fill loop
+  at `0x8d4360` (multiplier `0x6c078965`) and `mov dword [rbx+0x80],0x270`. After the prologue (`push rdi,r14,r15 ;
+  sub rsp,0x30`) `[rsp+0x90]` is `[rsp+0x48]` at entry, so **the seed is the ninth argument**, a 32-bit integer on
+  the stack. Arguments 1 to 4 are `rcx` (an output slot the function fills and returns in `rax`), `rdx`, `r8d`, `r9d`.
+  The function returns its first argument.
+- It has one caller, `0x3b9d4e` inside `0x3b9ae0` (return address RVA `0x3b9d53`). There the ninth argument is
+  `[rsp+0x40]`, loaded from `r11d`, which `0x3b9ae0` read from its own fourth parameter (`mov [rsp+0x20],r9d` at
+  entry, `mov r11d,[rsp+0xd8]` at `0x3b9bdd`). `0x3b9ae0` is called from `0x3b93e7` and `0x3b9fbc`, both passing that
+  parameter along. Where the value is first produced (a `rand()` result, a counter, a saved value) was **not**
+  followed further up: the hook logs what the task is actually seeded with, which is what matters for comparing.
+- Confidence: high that argument 9 (low 32 bits) is the `mt19937` seed, from the disassembly of the callee and of
+  its only caller. Not established: what `a3`/`a4` (the `r8d`/`r9d` arguments, `lea r8d,[r12+1]`, `lea r9d,[r13+1]`
+  at the call) mean; they are logged raw as candidates for a town or cell index. The second argument is a pointer
+  (`[rsi+0x30]` of the caller); the hook does not read behind it, so no town entity id or game time is logged.
+- The start-up `srand(_time64(0))` (`~0x81a61` to `0x81b3c`, which the game logs itself as `Srand seeded with {}`)
+  is not hooked: it runs before this module can be sure of its place and nothing in this hook can read it without a
+  second detour. Use the game's own log line for it.
+
+The log lines: `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, in `native.log` (location in
+`native/README.md`). `n` counts the calls of this run from 1; `seed` is 10 characters (`0x` and 8 hex digits);
+`caller` is the RVA of the return address (so it does not move with the load address), or `abs:0x..` if the return
+address lies outside the image. To compare two games, keep only the first four fields:
+
+```
+grep '^town-seed' native.log | cut -d' ' -f1-4 > game1.txt     (and the same for the second game)
+diff game1.txt game2.txt
+```
+
+Safety: the hook is installed like the others (build known, prologue bytes at `0x8d4270` equal to the table,
+start-up self-test passed, all-or-none, in `DllMain`) and with no other switch it installs nothing else, starts no
+service thread and opens no control link. It reads only its own arguments, and calls the original with the twelve
+argument slots as received (four in registers, eight on the stack; floats travel as raw 64-bit slots). Unlike the
+other hooks it **does write a file line on the calling thread** (one `native.log` append per call), which breaks the
+"no file I/O on the simulation thread" rule below on purpose: it is a diagnostic to be switched on for a comparison,
+not left on. `native.log` stops growing at 2 MiB (about 25 000 of these lines), so the log can be cut short in a long
+session. The site is not found by the address tool yet; the row of the build table was written by hand from this
+analysis and from the bytes of the executable. **Not run in the game**: tested only on fake game functions (a fake
+nine-argument function whose result the hook leaves unchanged, and the bytes restored after uninstalling).
 
 Rules the code keeps:
 

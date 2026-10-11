@@ -14,6 +14,9 @@
 //!    nothing until the mod (or a person) writes `hold_on` to the control file.
 //! 3. `FEVERLINK3_POOLPATCH=1`: the single-worker script pool. A patch, not a hook: independent of the others.
 //!
+//! 4. `FEVERLINK3_LOG_TOWN_SEED=1`: a read-only hook that logs the town developer's random seed on every call
+//!    of the function that seeds its task. Independent of the others; it never changes a result.
+//!
 //! Anything but the exact value `1` (after trimming blanks) is off.
 
 use crate::build_table::{BuildAddrs, Rva};
@@ -21,6 +24,7 @@ use crate::build_table::{BuildAddrs, Rva};
 pub const HOOKS_VAR: &str = "FEVERLINK3_HOOKS";
 pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
 pub const POOLPATCH_VAR: &str = "FEVERLINK3_POOLPATCH";
+pub const TOWN_SEED_VAR: &str = "FEVERLINK3_LOG_TOWN_SEED";
 
 /// The switches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,23 +32,36 @@ pub struct HookConfig {
     pub hooks: bool,
     pub hold: bool,
     pub poolpatch: bool,
+    /// Log the town developer's random seed (read-only; independent of the other switches).
+    pub town_seed: bool,
 }
 
 impl HookConfig {
     /// Reads the switches through `get` (the environment in the module, a map in the tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> HookConfig {
         let on = |name: &str| get(name).is_some_and(|v| v.trim() == "1");
-        HookConfig { hooks: on(HOOKS_VAR), hold: on(HOLD_VAR), poolpatch: on(POOLPATCH_VAR) }
+        HookConfig {
+            hooks: on(HOOKS_VAR),
+            hold: on(HOLD_VAR),
+            poolpatch: on(POOLPATCH_VAR),
+            town_seed: on(TOWN_SEED_VAR),
+        }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch
+        self.hooks || self.poolpatch || self.town_seed
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
-        format!("hooks={} hold={} poolpatch={}", f(self.hooks), f(self.hold), f(self.poolpatch))
+        format!(
+            "hooks={} hold={} poolpatch={} town_seed={}",
+            f(self.hooks),
+            f(self.hold),
+            f(self.poolpatch),
+            f(self.town_seed)
+        )
     }
 }
 
@@ -88,6 +105,8 @@ pub enum Feature {
     Hold,
     /// The single-worker script pool.
     PoolPatch,
+    /// The read-only log of the town developer's seed.
+    TownSeed,
 }
 
 impl Feature {
@@ -96,6 +115,7 @@ impl Feature {
             Feature::Counters => "counters",
             Feature::Hold => "hold",
             Feature::PoolPatch => "poolpatch",
+            Feature::TownSeed => "town_seed",
         }
     }
 }
@@ -210,6 +230,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
             plan_hold(build, image, &mut p);
         }
     }
+    if cfg.town_seed {
+        plan_town_seed(build, image, &mut p);
+    }
     if cfg.poolpatch {
         match &build.script_pool {
             None => p.skipped.push(Skip {
@@ -252,6 +275,24 @@ fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
             });
             p.kind_offset = Some(kind_offset);
         }
+        Err(reason) => skip(p, reason),
+    }
+}
+
+fn plan_town_seed(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let skip = |p: &mut Plan, reason: String| {
+        p.skipped.push(Skip { feature: Feature::TownSeed, name: "town_seed", reason });
+    };
+    let Some(site) = &build.town_seed else {
+        return skip(p, "the build table has no town_seed site for this build".into());
+    };
+    match verify(image, site.rva, site.prologue) {
+        Ok(()) => p.steps.push(Step::Detour {
+            feature: Feature::TownSeed,
+            name: "town_seed",
+            rva: site.rva,
+            expected: site.prologue,
+        }),
         Err(reason) => skip(p, reason),
     }
 }
@@ -301,14 +342,14 @@ mod tests {
     use crate::build_table::{select, CallSite, HookSite, PatchSite};
 
     fn cfg(hooks: bool, hold: bool, poolpatch: bool) -> HookConfig {
-        HookConfig { hooks, hold, poolpatch }
+        HookConfig { hooks, hold, poolpatch, town_seed: false }
     }
 
     /// An image holding exactly the bytes the 40420 row expects, at the row's addresses.
     fn image_of_40420() -> BytesImage {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
-        for s in [&b.command_list_add, &b.apply_command].into_iter().flatten() {
+        for s in [&b.command_list_add, &b.apply_command, &b.town_seed].into_iter().flatten() {
             img.write(s.rva, s.prologue);
         }
         for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
@@ -341,8 +382,41 @@ mod tests {
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on");
-        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on town_seed=off");
+        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off town_seed=off");
+        let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
+        assert!(seed.any() && seed.town_seed && !seed.hooks && !seed.hold && !seed.poolpatch, "its own switch");
+        assert_eq!(seed.describe(), "hooks=off hold=off poolpatch=off town_seed=on");
+        assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).any(), "only the exact value 1");
+    }
+
+    #[test]
+    fn the_town_seed_is_planned_only_on_request_and_only_when_the_bytes_match() {
+        let (b, mut img) = (select(0x6ac5_0427).unwrap(), image_of_40420());
+        let on = HookConfig { town_seed: true, ..Default::default() };
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["town_seed"], "{:?}", p.report());
+        assert!(matches!(&p.steps[0], Step::Detour { rva: 0x8d4270, feature: Feature::TownSeed, .. }));
+        assert!(plan(b, HookConfig { hooks: true, hold: true, poolpatch: true, town_seed: false }, &img)
+            .steps
+            .iter()
+            .all(|s| s.feature() != Feature::TownSeed));
+        img.write(0x8d4270, &[0x90]);
+        let p = plan(b, on, &img);
+        assert!(p.steps.is_empty());
+        assert_eq!(p.skipped.len(), 1);
+        assert_eq!(p.skipped[0].name, "town_seed");
+        assert!(p.skipped[0].reason.contains("0x8d4270"), "{}", p.skipped[0].reason);
+    }
+
+    #[test]
+    fn a_build_without_a_town_seed_site_skips_it_with_a_reason() {
+        let p = plan(&BARE, HookConfig { town_seed: true, ..Default::default() }, &BytesImage::zeroed(0, 16));
+        assert!(p.steps.is_empty());
+        assert_eq!(
+            p.report(),
+            ["hooks: SKIPPED town_seed (town_seed): the build table has no town_seed site for this build"]
+        );
     }
 
     // ---- planning on the real 40420 row
@@ -490,6 +564,7 @@ mod tests {
         name: "bare",
         command_list_add: None,
         apply_command: None,
+        town_seed: None,
         script_pool: None,
         command_move: None,
         command_destroy: None,

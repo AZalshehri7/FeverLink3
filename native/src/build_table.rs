@@ -51,6 +51,10 @@ pub struct BuildAddrs {
     /// then falls back to one worker, as it does itself on small CPUs), which removes the timing-dependent
     /// script update order. Finding from MPFever (MIT): see docs/ARCHITECTURE.md section 7.
     pub script_pool: Option<PatchSite>,
+    /// The seeding function of the town developer's task (`FEVERLINK3_LOG_TOWN_SEED`, read-only logging): it builds
+    /// a 0x1408-byte task object and seeds its `std::mt19937` from its ninth argument. Found by hand from a static
+    /// analysis of build 40420, not by the address tool (docs/NATIVE_LINK.md section 2).
+    pub town_seed: Option<HookSite>,
     /// `Command::Command(Command&&)`: the hold path moves a command out of the caller's hands with it.
     pub command_move: Option<CallSite>,
     /// `Command::~Command()`: runs on a released command (moved-from) and on a cancelled one.
@@ -102,6 +106,16 @@ pub const BUILDS: &[BuildAddrs] = &[
         apply_command: Some(HookSite {
             rva: 0x009e_33b0,
             prologue: &[0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x54],
+        }),
+        // sub_8d4270; its only caller is 0x3b9d4e inside 0x3b9ae0. The prologue is the four stores to the argument
+        // home slots (`mov [rsp+10h],rbx ; mov [rsp+18h],rbp ; mov [rsp+20h],rsi ; mov [rsp+8],rcx`). The seed is
+        // the ninth argument: `mov edx,[rsp+90h]` after `push rdi,r14,r15 ; sub rsp,30h`, stored at [rbx+84h].
+        town_seed: Some(HookSite {
+            rva: 0x008d_4270,
+            prologue: &[
+                0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89,
+                0x4C, 0x24, 0x08,
+            ],
         }),
         script_pool: Some(PatchSite {
             rva: 0x00ab_00fc,
@@ -175,6 +189,7 @@ mod tests {
         name: "test",
         command_list_add: Some(HookSite { rva: 0x1000, prologue: &[0x48; 14] }),
         apply_command: None,
+        town_seed: None,
         script_pool: None,
         command_move: None,
         command_destroy: None,
@@ -200,7 +215,7 @@ mod tests {
     #[test]
     fn every_recorded_prologue_is_long_enough_for_a_detour() {
         for b in BUILDS.iter().chain(FAKE) {
-            for site in [&b.command_list_add, &b.apply_command].into_iter().flatten() {
+            for site in [&b.command_list_add, &b.apply_command, &b.town_seed].into_iter().flatten() {
                 assert!(site.prologue.len() >= crate::detour::JMP_ABS_LEN, "{} has a short prologue", b.name);
             }
         }
@@ -266,6 +281,7 @@ mod tests {
         assert_eq!(b.command_list_add.as_ref().unwrap().rva, 0x9d4040);
         assert_eq!(b.apply_command.as_ref().unwrap().rva, 0x9e33b0);
         assert_eq!(b.script_pool.as_ref().unwrap().rva, 0xab00fc);
+        assert_eq!(b.town_seed.as_ref().unwrap().rva, 0x8d4270);
     }
 
     /// The committed report of the address tool for build 40420: the audit trail of the row above.

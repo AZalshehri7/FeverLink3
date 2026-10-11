@@ -36,6 +36,9 @@ On a known build it still touches nothing in the game's code unless the environm
 | `FEVERLINK3_HOOKS=1` | The read-only counters: a hook on the simulation's command application. |
 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also the hold/release hook on the command list (holds nothing until the mod writes `hold_on`). |
 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool patch; independent of the other two. |
+| `FEVERLINK3_LOG_TOWN_SEED=1` | A read-only diagnostic hook that logs the seed of the town developer's task (`town-seed n=.. seed=.. caller=..` lines in `native.log`) and calls the original unchanged; independent of the others. **Not run in the game.** `src/townseed.rs`, `docs/NATIVE_LINK.md` section 2. |
+
+`native.log` is `<session folder>\native.log` when the launcher started the game, and `%LOCALAPPDATA%\FeverLink3\native.log` when the game itself hosts the session (live mode; `FEVERLINK3_LIVE_DIR` moves its folder). A log over 1 MiB at start is moved to `native.log.1`.
 
 Each piece is checked against the bytes in memory first, installed all-or-none from `DllMain`, preceded by a self-test of the detour machinery in the shipped binary, and logged line by line to `native.log`; anything in doubt leaves the game as shipped. `docs/NATIVE_LINK.md` is the design, the control-file protocol and the list of what still needs a running game.
 
