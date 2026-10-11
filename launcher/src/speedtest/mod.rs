@@ -13,6 +13,7 @@
 
 pub mod cli;
 pub mod console;
+pub mod ladder;
 pub mod responder;
 pub mod results;
 pub mod startup;

@@ -46,6 +46,9 @@ pub fn run_responder(env: &mut Env<'_>, core: &CoreRef, log: &mut dyn FnMut(&str
             log(event);
         }
         seen_events = report.events.clone();
+        for line in probe.take_log() {
+            log(&line);
+        }
         let peers: Vec<(Option<u64>, String, Option<u32>)> =
             report.peers.iter().map(|p| (p.steam_id, p.route.clone(), p.ping_ms)).collect();
         let ids: Vec<Option<u64>> = peers.iter().map(|p| p.0).collect();

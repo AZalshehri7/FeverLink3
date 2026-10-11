@@ -93,6 +93,10 @@ pub struct Ctx<'a, 'b> {
     pub probe: &'a mut Probe,
     pub peer: u64,
     pub env: &'a mut Env<'b>,
+    /// The send rate the connections have by default (what a mode restores after it changed them).
+    pub default_rate: i32,
+    /// What a long mode has measured so far; kept in the report when the player stops the run.
+    pub partial: Option<Outcome>,
 }
 
 impl Ctx<'_, '_> {
@@ -163,7 +167,10 @@ fn reliable_80(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
 
 /// The test modes, in the order they run. Another mode is one more line: `Mode { name, run }`, where `run` takes the
 /// [`Ctx`] (the probe, the peer, the console) and returns an [`Outcome`].
-pub const MODES: &[Mode] = &[
+pub const MODES: &[Mode] = &[Mode { name: "rate ladder (comprehensive)", run: super::ladder::ladder_mode }];
+
+/// The earlier tests, behind `--classic`: the reliable stream at the configured rate, 8, 32 and 80 MB each way.
+pub const CLASSIC_MODES: &[Mode] = &[
     Mode { name: "reliable 8 MB", run: reliable_8 },
     Mode { name: "reliable 32 MB", run: reliable_32 },
     Mode { name: "reliable 80 MB", run: reliable_80 },
@@ -319,7 +326,7 @@ fn drive(
         }
     }
     env.say(&format!("Connecting to Steam ID {peer}..."));
-    let mut ctx = Ctx { probe, peer, env };
+    let mut ctx = Ctx { probe, peer, env, default_rate: core.send_rate_setting(), partial: None };
     if let Err(why) = connect(&mut ctx)? {
         report.error = Some(why);
         return Ok(());
@@ -344,7 +351,15 @@ fn drive(
     ));
     for (n, mode) in modes.iter().enumerate() {
         ctx.say(&format!("Test {} of {}: {}", n + 1, modes.len(), mode.name));
-        let outcome = (mode.run)(&mut ctx)?;
+        let outcome = match (mode.run)(&mut ctx) {
+            Ok(outcome) => outcome,
+            Err(Stop) => {
+                if let Some(partial) = ctx.partial.take() {
+                    report.outcomes.push(partial);
+                }
+                return Err(Stop);
+            }
+        };
         if outcome.ok {
             for line in &outcome.lines {
                 ctx.say(&format!("  {line}"));
@@ -402,8 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn the_table_starts_with_the_three_reliable_modes() {
-        let names: Vec<_> = MODES.iter().map(|m| m.name).collect();
+    fn the_default_is_the_ladder_and_classic_has_the_three_reliable_modes() {
+        assert_eq!(MODES.len(), 1);
+        let names: Vec<_> = CLASSIC_MODES.iter().map(|m| m.name).collect();
         assert_eq!(names, ["reliable 8 MB", "reliable 32 MB", "reliable 80 MB"]);
     }
 

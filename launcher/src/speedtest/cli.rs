@@ -15,6 +15,8 @@ pub struct Cli {
     pub rate: Option<u32>,
     /// `--quick`: only the first (8 MB) run, to try several send rates one after another.
     pub quick: bool,
+    /// `--classic`: the earlier tests (reliable 8, 32 and 80 MB at the configured rate) instead of the rate ladder.
+    pub classic: bool,
 }
 
 /// What this run does.
@@ -38,6 +40,7 @@ pub const USAGE: &str = "Usage: feverlink3-speedtest.exe [--peer <SteamID64> | -
   (no option)        with a peer.txt next to the program: test against that Steam ID; without it: wait for testers\n\
   --peer <SteamID64> test against that Steam ID (ignores peer.txt)\n\
   --listen           wait for testers (ignores peer.txt)\n\
+  --classic          the earlier tests (8, 32, 80 MB at the configured rate) instead of the rate ladder
   --help             show this text";
 
 /// Parses the arguments after the program name.
@@ -53,6 +56,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
             "--help" | "-h" | "/?" => cli.help = true,
             "--listen" => cli.listen = true,
             "--quick" => cli.quick = true,
+            "--classic" => cli.classic = true,
             "--rate" => {
                 let value = inline.or_else(|| it.next().cloned()).ok_or("--rate needs a speed after it, like 4m")?;
                 cli.rate = Some(parse_rate(&value)?);

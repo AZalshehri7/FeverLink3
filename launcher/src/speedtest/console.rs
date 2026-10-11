@@ -9,7 +9,7 @@ use super::cli::{choose_role, parse_args, Role, Source, USAGE};
 use super::responder::run_responder;
 use super::results::{log_line, results_text};
 use super::startup::InitError;
-use super::suite::{run_tester, Env, Timing, MODES};
+use super::suite::{run_tester, Env, Timing, CLASSIC_MODES, MODES};
 use super::{now_text, RESPONDER_FILE, RESULTS_FILE, VERSION};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -141,7 +141,7 @@ pub fn main_entry() -> i32 {
     let mut pump = pump;
     let mut env = Env { say: &mut say, pump: &mut pump, cancelled: &cancelled, timing: Timing::real() };
     let code = match role {
-        Role::Tester(peer) => tester(&mut env, &core, peer, &dir, app_id, cli.quick),
+        Role::Tester(peer) => tester(&mut env, &core, peer, &dir, app_id, cli.quick, cli.classic),
         Role::Responder => responder(&mut env, &core, &dir),
     };
     finish(code)
@@ -162,7 +162,7 @@ fn start_steam(_dir: &Path) -> Result<(crate::steamnet::CoreRef, u32, Pump), Ini
     Err(InitError::Failed { code: 1, message: "this program runs on Windows only".into() })
 }
 
-fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &Path, app_id: u32, quick: bool) -> i32 {
+fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &Path, app_id: u32, quick: bool, classic: bool) -> i32 {
     let path = dir.join(RESULTS_FILE);
     let mut write_failed = false;
     let mut save = |report: &super::suite::TesterReport| {
@@ -175,7 +175,7 @@ fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &P
             ));
         }
     };
-    let modes = if quick { &MODES[..1] } else { MODES };
+    let modes = if quick { &CLASSIC_MODES[..1] } else if classic { CLASSIC_MODES } else { MODES };
     let report = run_tester(env, core, peer, modes, &mut save);
     println_out("");
     if report.aborted {

@@ -1239,6 +1239,28 @@ impl Probe {
         self.core.detailed_status(conn)
     }
 
+    /// Stops the run in progress (Ctrl+C, a safety stop): it ends as failed ("stopped"), its own send rate is put
+    /// back, the extra connections are closed and the peer is told to stop sending.
+    pub fn stop_run(&mut self) {
+        let now = Instant::now();
+        let mut guard = lock(&self.service.state);
+        let state = &mut *guard;
+        let Some(run) = state.speed.as_mut().filter(|r| r.active()) else { return };
+        let (conn, id) = (run.conn, run.id);
+        run.phase = Phase::Failed("stopped".into());
+        self.service.finalize(state, now);
+        drop(guard);
+        if conn != 0 {
+            let _ = self.core.send(conn, &throughput::encode(&Msg::Stop { id }));
+        }
+    }
+
+    /// The core's latest measurement of the test connection (route, ping, quality, queue), when it is up.
+    pub fn link_now(&self) -> Option<LinkSnapshot> {
+        let conn = lock(&self.service.state).test.as_ref().filter(|t| t.connected).map(|t| t.conn)?;
+        self.core.link(conn)
+    }
+
     /// Makes this probe behave like an older program that ignores the rate request and the stop message (tests).
     #[cfg(test)]
     pub(crate) fn act_like_an_old_program(&self) {
