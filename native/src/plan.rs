@@ -21,9 +21,15 @@
 //!    argument with that value before calling the original. An experiment switch, not run in the game. A value
 //!    that does not parse is ignored (and logged); it then changes nothing.
 //!
+//! 5. `FEVERLINK3_LOG_GROWTH=1`: a read-only hook on `TownDeveloper::Develop` (and one on the `TownUpdateSize`
+//!    handler to read the game time) that logs each growth call. `FEVERLINK3_GROWTH_SEED_MODE=derive` (with
+//!    `..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) additionally replaces the random seed `Develop` reads.
+//!    See `growth.rs`. An experiment switch, not run in the game.
+//!
 //! Anything but the exact value `1` (after trimming blanks) is off.
 
 use crate::build_table::{BuildAddrs, Rva};
+use crate::growth::Settings;
 
 pub const HOOKS_VAR: &str = "FEVERLINK3_HOOKS";
 pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
@@ -62,6 +68,8 @@ pub struct HookConfig {
     pub town_seed: bool,
     /// Replace the seed argument with this value (implies the hook; an invalid value is ignored).
     pub force_seed: Option<u32>,
+    /// The town-growth log and seed experiment (`growth.rs`).
+    pub growth: Settings,
 }
 
 impl HookConfig {
@@ -75,23 +83,25 @@ impl HookConfig {
             poolpatch: on(POOLPATCH_VAR),
             town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
             force_seed,
+            growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
         }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch || self.town_seed
+        self.hooks || self.poolpatch || self.town_seed || self.growth.active()
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
         format!(
-            "hooks={} hold={} poolpatch={} town_seed={}{}",
+            "hooks={} hold={} poolpatch={} town_seed={}{}{}",
             f(self.hooks),
             f(self.hold),
             f(self.poolpatch),
             f(self.town_seed),
-            self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default()
+            self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default(),
+            self.growth.describe()
         )
     }
 }
@@ -138,6 +148,10 @@ pub enum Feature {
     PoolPatch,
     /// The read-only log of the town developer's seed.
     TownSeed,
+    /// The log (and seed experiment) on `TownDeveloper::Develop`.
+    Growth,
+    /// The read-only hook on the `TownUpdateSize` handler that reads the game time for the growth hook.
+    GrowthCmd,
 }
 
 impl Feature {
@@ -147,6 +161,8 @@ impl Feature {
             Feature::Hold => "hold",
             Feature::PoolPatch => "poolpatch",
             Feature::TownSeed => "town_seed",
+            Feature::Growth => "town_develop",
+            Feature::GrowthCmd => "town_update_size",
         }
     }
 }
@@ -199,6 +215,8 @@ pub struct Plan {
     pub kind_offset: Option<u32>,
     /// The engine helpers, when the hold hook is planned.
     pub engine: Option<EngineAddrs>,
+    /// The `GameTime` getter, when the growth hook can read the game time (its prologue matched).
+    pub game_time_getter: Option<Rva>,
 }
 
 impl Plan {
@@ -264,6 +282,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
     if cfg.town_seed {
         plan_town_seed(build, image, &mut p);
     }
+    if cfg.growth.active() {
+        plan_growth(build, image, &mut p);
+    }
     if cfg.poolpatch {
         match &build.script_pool {
             None => p.skipped.push(Skip {
@@ -328,6 +349,52 @@ fn plan_town_seed(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
+/// `Develop` is the piece; the `TownUpdateSize` handler hook and the `GameTime` getter are added only when both match,
+/// because they exist to give the log (and the seed experiment) the game time. Without them the log still works.
+fn plan_growth(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let skip = |p: &mut Plan, feature: Feature, name: &'static str, reason: String| {
+        p.skipped.push(Skip { feature, name, reason });
+    };
+    let Some(site) = &build.town_develop else {
+        return skip(
+            p,
+            Feature::Growth,
+            "town_develop",
+            "the build table has no town_develop site for this build".into(),
+        );
+    };
+    if let Err(reason) = verify(image, site.rva, site.prologue) {
+        return skip(p, Feature::Growth, "town_develop", reason);
+    }
+    p.steps.push(Step::Detour {
+        feature: Feature::Growth,
+        name: "town_develop",
+        rva: site.rva,
+        expected: site.prologue,
+    });
+    let (Some(cmd), Some(getter)) = (&build.town_update_size, &build.game_time_getter) else {
+        return skip(
+            p,
+            Feature::GrowthCmd,
+            "town_update_size",
+            "the build table lacks the TownUpdateSize handler or the GameTime getter: no game time".into(),
+        );
+    };
+    let checked = verify(image, cmd.rva, cmd.prologue).and_then(|()| verify(image, getter.rva, getter.prologue));
+    match checked {
+        Ok(()) => {
+            p.steps.push(Step::Detour {
+                feature: Feature::GrowthCmd,
+                name: "town_update_size",
+                rva: cmd.rva,
+                expected: cmd.prologue,
+            });
+            p.game_time_getter = Some(getter.rva);
+        }
+        Err(reason) => skip(p, Feature::GrowthCmd, "town_update_size", format!("{reason}: no game time")),
+    }
+}
+
 fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     let skip = |p: &mut Plan, reason: String| {
         p.skipped.push(Skip { feature: Feature::Hold, name: "command_list_add", reason });
@@ -380,9 +447,14 @@ mod tests {
     fn image_of_40420() -> BytesImage {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
-        for s in [&b.command_list_add, &b.apply_command, &b.town_seed].into_iter().flatten() {
+        for s in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
+            .into_iter()
+            .flatten()
+        {
             img.write(s.rva, s.prologue);
         }
+        let g = b.game_time_getter.as_ref().unwrap();
+        img.write(g.rva, g.prologue);
         for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
             img.write(s.rva, s.prologue);
         }
@@ -580,6 +652,40 @@ mod tests {
     }
 
     #[test]
+    fn growth_is_planned_with_its_game_time_pieces_and_degrades_without_them() {
+        let b = select(0x6ac5_0427).unwrap();
+        let on = HookConfig { growth: Settings { log: true, ..Default::default() }, ..Default::default() };
+        assert!(on.any());
+        let p = plan(b, on, &image_of_40420());
+        assert_eq!(names(&p), ["town_develop", "town_update_size"], "{:?}", p.report());
+        assert_eq!(p.game_time_getter, Some(0x2a96c0));
+        // the handler changed: Develop is still logged, without game time
+        let mut img = image_of_40420();
+        img.write(0x9e12b0 + 3, &[0x90]);
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["town_develop"]);
+        assert_eq!(p.game_time_getter, None);
+        assert_eq!(p.skipped.len(), 1);
+        assert!(p.skipped[0].reason.contains("no game time"), "{}", p.skipped[0].reason);
+        // Develop changed: nothing of growth
+        let mut img = image_of_40420();
+        img.write(0x8de0b0 + 1, &[0x90]);
+        let p = plan(b, on, &img);
+        assert!(p.steps.is_empty());
+        assert_eq!(p.skipped[0].name, "town_develop");
+        // the derive mode alone is enough to ask for the hook
+        let derive = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_GROWTH_SEED_MODE", "derive")]));
+        assert!(derive.any() && derive.growth.mode == crate::growth::Mode::Derive);
+        assert!(derive.describe().contains("growth=on seed_mode=derive"), "{}", derive.describe());
+        // not asked: not planned
+        assert!(plan(b, HookConfig::default(), &image_of_40420()).steps.is_empty());
+    }
+
+    fn env_pairs(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
     fn a_changed_pool_region_is_not_patched() {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = image_of_40420();
@@ -620,6 +726,9 @@ mod tests {
         command_list_add: None,
         apply_command: None,
         town_seed: None,
+        town_develop: None,
+        town_update_size: None,
+        game_time_getter: None,
         script_pool: None,
         command_move: None,
         command_destroy: None,
