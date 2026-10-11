@@ -902,6 +902,173 @@ class NoHoldHookTest(StrictTest):
         self.assertEqual(self.B.shipped_count(), 1, "the old path")
 
 
+SPLIT = "{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }"
+
+
+class NativeVersusReplayTest(StrictTest):
+    """The originator's world gets the tool's NATIVE result (its own command, released at the stamp); every other game gets the
+    record REBUILT. Both must end with the same world: the hard cases of a real session (2026-10-11, the worlds diverged from the
+    first road that touched an existing one)."""
+
+    def test_a_road_that_splits_an_existing_segment_ends_the_same_on_both_games(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertIn("E 0.00,0.00,0.00 50.00,0.00,0.00", self.A.sig(), "the old segment was split at the junction on the replay too")
+        self.assertNotIn("E 0.00,0.00,0.00 100.00,0.00,0.00", self.A.sig(), "and the segment that was split is gone")
+        self.assertEqual(self.relay.vetoes, [])
+
+    def test_a_road_that_connects_to_a_node_the_previous_build_made_two_seconds_earlier(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(10)   # two seconds of game time: the first build has landed on both games
+        self.assertSameWorld()
+        nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
+        self.assertNotEqual(nb, int(self.A.lua("FIND_NODE(400, 0, 0)")), "the games number their new nodes differently")
+        self.B.tool("{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
+        self.tick(16)
+        self.assertSameWorld()
+        self.assertEqual(self.A.lua("#EDGES_AT(FIND_NODE(400, 0, 0))"), 2, "one node, two roads, on the replay too")
+        self.assertEqual(self.B.lua("#EDGES_AT(FIND_NODE(400, 0, 0))"), 2)
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertNotIn("refused", self.log())
+
+    def test_two_builds_in_quick_succession_where_the_second_needs_what_the_first_makes(self):
+        # the second record refers to a node the first creates: the peer's dry run waits for the first to land instead of vetoing
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(6)   # the first is still held (its stamp lies ahead)
+        self.assertEqual(self.B.native.released, [])
+        self.tick(8)
+        nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
+        self.B.tool("{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
+        self.tick(16)
+        self.assertSameWorld()
+        self.assertEqual(self.relay.vetoes, [])
+
+    def test_a_depot_with_its_street_is_keyed_and_placed_the_same_on_both_games(self):
+        self.start()
+        self.B.tool("{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        lines = lambda g, p: sorted(x for x in g.sig().splitlines() if x.startswith(p))
+        self.assertEqual(lines(self.A, "C "), lines(self.B, "C "), "the same construction in the same place")
+        # (the mock engine adds the depot's entrance node to the tool's own build only; the replay leaves it to the depot's script)
+        self.assertTrue(set(lines(self.A, "N ")) <= set(lines(self.B, "N ")), "every street node of the replay is on the originator too")
+        self.assertIn("N 50.00,0.00,0.00", lines(self.A, "N "), "the junction on the road exists on the replay")
+        self.assertEqual(self.relay.vetoes, [])
+
+    def test_a_missing_node_is_made_where_the_result_says_instead_of_refusing_the_build(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(10)
+        nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
+        # this game lost the first road (and with it the node the next road starts at)
+        na_edge = int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.A.run("WORLD[%d] = nil; WORLD[FIND_NODE(400, 0, 0)] = nil; WORLD[FIND_NODE(300, 0, 0)] = nil" % na_edge)
+        self.B.tool("{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb, make="NATIVE_ROAD")
+        self.tick(16)
+        self.assertEqual(self.relay.vetoes, [], "a node that can simply be created is no reason to refuse")
+        self.assertIn("lenient: no node at 400.000,0.000,0.000", self.A.log())
+        self.assertEqual(self.A.builds_applied(), 2)
+        self.assertIsNotNone(self.A.lua("FIND_EDGE(400, 0, 500, 100)"))
+
+
+class VetoTest(StrictTest):
+    """Veto-only validation: a game that cannot build the record says so; silence means yes. A refused build exists on NO game."""
+
+    def test_the_happy_path_has_no_veto_and_no_extra_message(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(16)
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+        self.assertIn("held", str(self.B.action_records()[0]["body"]), "the record says its originator holds the command (peers dry-run it)")
+
+    def test_a_game_that_cannot_resolve_a_segment_vetoes_and_neither_game_builds(self):
+        self.start()
+        before_a, before_b = self.A.sig(), self.B.sig()
+        self.A.run("WORLD[110] = nil")   # this game has no such segment: the split cannot be rebuilt here
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.assertEqual(len(self.relay.vetoes), 1)
+        who, owner, seq, why = self.relay.vetoes[0]
+        self.assertEqual((who, owner, seq), (0, 1, 1))
+        self.assertIn("unresolved segment", why, "the first cause is named")
+        # nobody built it
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+        self.assertEqual(self.B.native.released, [], "the originator's held command was not released")
+        self.assertEqual(self.B.native.dropped, [1], "it was cancelled: the build exists on no game")
+        self.assertEqual(self.B.sig(), before_b, "the originator's world did not run ahead")
+        self.assertNotEqual(self.A.sig(), "")
+        self.assertIn("VETO of 1:1: this game cannot build it (unresolved segment", self.A.log())
+        self.assertIn("cancelled: host could not build it (unresolved segment", self.B.log(), "the originator's log says who and why")
+        self.assertIn("VETO of 1:1 by host: unresolved segment", self.B.log())
+
+    def test_the_veto_is_cast_before_the_stamp_and_the_replay_is_dropped_on_the_vetoing_game(self):
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(2)
+        self.assertEqual(len(self.relay.vetoes), 1, "the veto is out within a tick or two of the record, long before the stamp")
+        stamp = self.B.action_records()[0]["stamp"]
+        self.assertLess(self.B.time(), stamp)
+        self.tick(14)
+        self.assertEqual(self.A.builds_applied(), 0)
+        self.assertNotIn("makeWorldBuildProposalCmd applied", self.A.log())
+
+    def test_the_games_still_work_after_a_vetoed_build(self):
+        # the tool of a vetoed build is dead (a cancelled command gives it no callback), but the session goes on
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.B.sig())
+        self.assertEqual(self.B.native.released, [2])
+
+
+class StrictCancelFallbackTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=1: the first strict flow, for testing sync independent of the tool."""
+
+    def setUp(self):
+        self._old = os.environ.get("FEVERLINK3_STRICT_CANCEL")
+        os.environ["FEVERLINK3_STRICT_CANCEL"] = "1"
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        if self._old is None:
+            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
+        else:
+            os.environ["FEVERLINK3_STRICT_CANCEL"] = self._old
+
+    def test_the_command_is_cancelled_and_every_game_replays_the_record_so_the_worlds_are_identical(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(16)
+        self.assertEqual(self.B.native.dropped, [1], "cancelled, as in the first design")
+        self.assertEqual(self.B.native.released, [])
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1), "both games applied the same rebuilt record")
+        self.assertSameWorld()
+        self.assertIn("FEVERLINK3_STRICT_CANCEL", self.B.log())
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertNotIn("held=true", str(self.B.action_records()[0]["body"]).replace(" ", ""), "no held marker in this mode")
+
+    def test_no_dry_run_veto_in_this_mode(self):
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.assertEqual(self.relay.vetoes, [], "the originator replays it itself: nothing to cancel, the refusal at the stamp is the old one")
+
+
 class ModuleSilentTest(StrictTest):
     """native_events.log exists but the module never answers (an old file of a crashed run)."""
 

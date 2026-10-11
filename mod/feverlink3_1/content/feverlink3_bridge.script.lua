@@ -1237,7 +1237,11 @@ local function stampAfterFastest(now, extraSteps)
 		end
 	end
 	local at = L.stampFor(G.session, base)
-	if extraSteps and peers and not (G.session.pauseAt and base >= G.session.pauseAt) then at = at + extraSteps * STEP end
+	if extraSteps and peers and not (G.session.pauseAt and base >= G.session.pauseAt) then
+		-- the veto travels from a peer to the host to the originator: about a whole round trip, while the lead covers half of one plus
+		-- fixed handling. The host's lead grows with the slowest round trip, so the extra grows with it (half the lead, one step at least).
+		at = at + math.max(extraSteps, math.floor(L.leadOf(G.session) / STEP / 2)) * STEP
+	end
 	return at
 end
 

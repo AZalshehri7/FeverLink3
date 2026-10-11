@@ -209,6 +209,7 @@ and reads; the mapping of the format is described under *File link* below. Direc
 | `action_refused` | ActionRefused (36) | from game | ignored |
 | `action` | Action (50) | both | to game: the origin player's id, as the host filled it into the payload; from game: ignored |
 | `chat` | Chat (51) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
+| `build_veto` | BuildVeto (52) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
 
 Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
 
