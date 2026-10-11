@@ -22,6 +22,9 @@ pub(super) struct FileInfo {
     next: u32,
 }
 
+/// How often a paused verify round that cannot be compared (different sim times) is asked again.
+const MAX_VERIFY_SKEWS: u8 = 3;
+
 #[derive(Debug)]
 pub(super) struct ResyncRound {
     id: i32,
@@ -35,6 +38,8 @@ pub(super) struct ResyncRound {
     /// Players present when the transfer started: they get the chunks and the load, and must say Hello again.
     participants: Option<BTreeSet<u16>>,
     verify_n: Option<i32>,
+    /// Paused verify rounds that came back not comparable (the games reported different sim times): asked again.
+    verify_skews: u8,
 }
 
 impl HostSession {
@@ -122,6 +127,7 @@ impl HostSession {
             file: None,
             participants: None,
             verify_n: None,
+            verify_skews: 0,
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -380,9 +386,19 @@ impl HostSession {
                 if outcome.identical() {
                     self.finish();
                 } else if !outcome.comparable() {
-                    self.fail(
-                        "games reported different times while paused, so the checksums cannot be compared".to_owned(),
-                    );
+                    // the games sampled at different sim times: ask again (a few times) before giving up, so a skewed round
+                    // does not leave the host paused with a failed resync
+                    let again = self.resync.as_mut().is_some_and(|r| {
+                        r.verify_skews += 1;
+                        r.verify_skews <= MAX_VERIFY_SKEWS
+                    });
+                    if again {
+                        self.enter_verifying();
+                    } else {
+                        self.fail(
+                            "games reported different times while paused, so the checksums cannot be compared".to_owned(),
+                        );
+                    }
                 } else {
                     let parts: Vec<&str> = outcome.differing_parts().collect();
                     self.fail(format!("games still differ after the reload: {}", parts.join(", ")));

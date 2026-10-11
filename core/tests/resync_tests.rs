@@ -287,6 +287,44 @@ fn verification_that_differs_fails_and_stays_paused() {
 }
 
 #[test]
+fn a_verification_round_at_different_sim_times_is_asked_again_and_a_later_match_finishes() {
+    let (mut h, ids) = Harness::running(1, 2, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(5000));
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.hello_all(pause_at, 0);
+    for round in 0..3 {
+        let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a")]))));
+        h.player_game(ids[0], MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at + 800, parts(&[("roads", "a")]))));
+        assert_eq!(ResyncState::Verifying, h.host.resync_state(), "skewed round {round}: asked again, not failed");
+    }
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "a")], &[("roads", "a")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(h.failures().is_empty());
+}
+
+#[test]
+fn a_verification_that_stays_at_different_sim_times_fails_after_four_skewed_rounds() {
+    let (mut h, ids) = Harness::running(1, 2, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(5000));
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.hello_all(pause_at, 0);
+    for _ in 0..4 {
+        let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a")]))));
+        h.player_game(ids[0], MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at + 800, parts(&[("roads", "a")]))));
+    }
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(h.failures()[0].contains("different times"));
+    assert_eq!(Some(pause_at), h.host.state().pause_at);
+}
+
+#[test]
 fn verification_that_never_completes_fails_after_120_seconds() {
     let (mut h, _) = Harness::running(1, 2, quiet());
     h.host_call(|host| host.start_resync("t"));
