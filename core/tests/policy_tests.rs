@@ -45,7 +45,7 @@ fn drift_parts_are_the_named_ones_and_script_prefixed_ones() {
     for part in ["vehicles", "onboard", "persons", "stocks", "nodeConfigs", "script:trains", "script:"] {
         assert!(ChecksumPolicy::is_drift_part(part), "{part}");
     }
-    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions"] {
+    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions", "townBuildings", "townBuildings:12"] {
         assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
     }
 }
@@ -58,6 +58,14 @@ fn drift_reloads_only_after_300_seconds_of_continuous_drift() {
     assert_eq!(None, p.on_outcome(1299.9, &outcome(&["persons"])));
     let reason = p.on_outcome(1300.0, &outcome(&["persons"])).expect("300 s reached");
     assert!(reason.contains("persons"), "{reason}");
+}
+
+#[test]
+fn town_buildings_reload_after_two_consecutive_differing_checks() {
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["townBuildings", "townBuildings:12"])));
+    let reason = p.on_outcome(10.0, &outcome(&["townBuildings", "townBuildings:12"])).expect("second check in a row");
+    assert!(reason.contains("townBuildings:12"), "{reason}");
 }
 
 #[test]

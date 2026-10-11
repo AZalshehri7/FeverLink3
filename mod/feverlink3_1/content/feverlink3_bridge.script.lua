@@ -226,12 +226,58 @@ do
 	end
 end
 
+-- The town-buildings lane: what the towns have grown, hashed per town so a log can name the town that differs. Idea from
+-- MPFever (MIT, see THIRD_PARTY_NOTICES.md): a `townBuildings` part. Read-only: only components are read, nothing is
+-- changed. A TOWN_BUILDING component gives its town, level (1-4), depth, timeBuilt and its CONSTRUCTION entity; that
+-- construction gives the model file and the transform. Entity ids of the buildings never enter a hash (the same rule as
+-- the constructions part), the town entity id only names the part (towns come from the savegame, so it agrees).
+-- Parts: `townBuildings` = "<total>/<hash of all towns>", and `townBuildings:<town id>` = "<count>/<hash>" for the first
+-- TOWN_PART_LIMIT towns (the host accepts at most 128 parts; the aggregate covers the rest).
+local TOWN_PART_LIMIT = 48
+local logTowns = C.logger("towns")
+local function townBuildingsPart(parts)
+	local ok, err = pcall(function()
+		local CTYPE = api.type.ComponentType
+		local byTown, townIds = {}, {}
+		for _, e in ipairs(engine.entitiesWith("TOWN_BUILDING")) do
+			local tb = api.engine.getComponent(e, CTYPE.TOWN_BUILDING)
+			if tb then
+				local con = tb.construction and api.engine.getComponent(tb.construction, CTYPE.CONSTRUCTION)
+				local m = con and con.transf
+				local parcels = 0
+				pcall(function() parcels = #tb.parcels end)
+				local key = string.format("%s@%.1f,%.1f,%.1f/L%s/D%s/P%d/T%s", tostring(con and con.fileName), m and m[13] or 0,
+					m and m[14] or 0, m and m[15] or 0, tostring(tb.level), tostring(tb.depth), parcels, tostring(tb.timeBuilt))
+				local town = tb.town
+				if byTown[town] == nil then byTown[town] = {}; townIds[#townIds + 1] = town end
+				local list = byTown[town]
+				list[#list + 1] = key
+			end
+		end
+		table.sort(townIds)
+		local all, total = {}, 0
+		for i, town in ipairs(townIds) do
+			local list = byTown[town]
+			table.sort(list)
+			total = total + #list
+			all[#all + 1] = { town = town, n = #list, items = list }
+			if i <= TOWN_PART_LIMIT then parts["townBuildings:" .. tostring(town)] = #list .. "/" .. C.hashValue(list) end
+		end
+		parts.townBuildings = total .. "/" .. C.hashValue(all)
+	end)
+	if not ok then
+		parts.townBuildings = "error"
+		logTowns("townBuildings lane failed: " .. tostring(err))
+	end
+end
+
 -- `co` is the company registry of the half that asks; its digest is a part of its own once anything was configured or recorded
 local function checksumParts(co)
 	local parts, t = L.checksumParts(engine, C.hashValue)
 	local okD, digest = false, nil
 	if Co then okD, digest = pcall(Co.digest, co) end
 	if okD and digest ~= nil then parts.companies = C.hashValue(digest) end
+	townBuildingsPart(parts)
 	return parts, t
 end
 
