@@ -172,7 +172,7 @@ function MAKE_API()
       GAME.guiQueue[#GAME.guiQueue + 1] = { c, cb }
     end,
   }
-  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd" }) do
+  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd", "makeTownUpdateSizeCmd", "makeTownUpdateCargoNeedsCmd" }) do
     cmd[n] = mk(n)
   end
   return {

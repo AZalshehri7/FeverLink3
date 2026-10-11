@@ -502,6 +502,51 @@ class InBridgeTest(unittest.TestCase):
         self.assertIn("cmd townUpdateSize town=90 pi=0", text)
 
 
+class InBridgeCmdsTest(InBridgeTest):
+    """FEVERLINK3_TOWN_TRACE_CMDS in the real bridge: the game script's factory calls reach the file, unchanged."""
+
+    def setUp(self):
+        super().setUp()
+        self.old_cmds = os.environ.get("FEVERLINK3_TOWN_TRACE_CMDS")
+
+    def tearDown(self):
+        if self.old_cmds is None:
+            os.environ.pop("FEVERLINK3_TOWN_TRACE_CMDS", None)
+        else:
+            os.environ["FEVERLINK3_TOWN_TRACE_CMDS"] = self.old_cmds
+        super().tearDown()
+
+    def test_factories_are_wrapped_only_when_the_switch_is_on(self):
+        import time
+
+        os.environ["FEVERLINK3_TOWN_TRACE"] = "90"
+        os.environ.pop("FEVERLINK3_TOWN_TRACE_CMDS", None)
+        g = self.game("off")
+        g.step()
+        g.L.execute("R = SIM_ENV.api.cmd.makeTownUpdateSizeCmd(90, {0.5, 1, 0.25}, false)")
+        self.assertEqual("makeTownUpdateSizeCmd", g.L.eval("R.__cmd"))
+        time.sleep(1.1)
+        g.step()
+        self.assertNotIn(" mk ", T.read_text(os.path.join(g.dir, "town_trace.txt")))
+
+    def test_the_game_scripts_call_is_logged_and_returned_unchanged(self):
+        import time
+
+        os.environ["FEVERLINK3_TOWN_TRACE"] = "90"
+        os.environ["FEVERLINK3_TOWN_TRACE_CMDS"] = "1"
+        g = self.game("on")
+        g.step()
+        g.L.execute("SIZE = {0.5, 1, 0.25}; R = SIM_ENV.api.cmd.makeTownUpdateSizeCmd(90, SIZE, false)")
+        self.assertEqual("makeTownUpdateSizeCmd", g.L.eval("R.__cmd"))
+        self.assertTrue(g.L.eval("R.args[2] == SIZE"))
+        time.sleep(1.1)
+        g.step()
+        text = T.read_text(os.path.join(g.dir, "town_trace.txt"))
+        self.assertIn(" mk makeTownUpdateSizeCmd town=90 k=1 flag=0 f32=3f000000,3f800000,3e800000 ", text)
+        self.assertIn(" town=90 in k=1 ", text)
+        self.assertIn(" town=90 order pos=", text)
+
+
 def WRITES_LEN(test):
     return [l for l in test.lines() if " info " not in l]
 
