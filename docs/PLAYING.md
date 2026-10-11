@@ -68,6 +68,16 @@ This tells us whether a save of about 80 MB can be sent over Steam, and how long
 
 If it says `Speed test failed: ...` the reason follows (no route to the other PC, the connection ended, no data for 60 s). A line saying `STALLED` means the data stopped for more than 5 seconds at some point; say when it happened.
 
+### Without Transport Fever 3
+
+A friend who does not own the game can take part with the small program `feverlink3-speedtest.exe`, which needs only Steam (running and logged in). **It has not run on real Steam yet; it is tested only against the fake Steam of the test suite.** It runs the same speed test as the window (the reliable stream, 8, 32 and 80 MB each way) between two PCs, using Valve's test app id 480 (Spacewar) on both.
+
+- The maintainer builds two packages with `tools/speedtest/make_package.ps1`: the **tester** package (made with `-PeerSteamId <the other player's SteamID64>`, which writes `peer.txt`) and the **responder** package (made without it). Each is a folder and a zip next to the repository, holding the exe, Valve's `steam_api64.dll`, `steam_appid.txt` (480), `peer.txt` (tester only), a `README.txt` and a SHA-256 file. The Steam ID is written nowhere except `peer.txt`.
+- Unzip, double-click `feverlink3-speedtest.exe`. With a `peer.txt` next to it the program is the **tester**: it connects to that Steam ID ("waiting for the other PC to start its program..." for up to 120 seconds, then once more), runs the tests one after another and writes `speedtest-results.txt` (date, program version, both Steam IDs, route and ping, the four-line result of each run); at the end it says which file to send. Without a `peer.txt` it is the **responder**: it prints its own Steam ID, waits, answers every tester that connects (several, one after another) and logs each test to `speedtest-responder.txt`. Start the responder first, then the tester.
+- `feverlink3-speedtest.exe --peer <SteamID64>` and `feverlink3-speedtest.exe --listen` override the files.
+- If it cannot start it says why in plain words: Steam is not running, not logged in or in Offline Mode, `steam_api64.dll` missing from the folder, or Steam's own message.
+- The program needs no administrator rights and only talks to the Steam network and the one other PC. To remove it, delete the folder.
+
 ## What works and what does not (yet)
 
 **Verified in the real game by the maintainer (game build 40420):**

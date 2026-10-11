@@ -350,6 +350,23 @@ and returns a handle with the pid, `is_running()` and `wait()`. `process::any_ga
 whether any game instance runs, which the install checks before touching `winhttp.dll` (Windows locks it while the
 game runs).
 
+## Standalone speed test (`feverlink3-speedtest.exe`)
+
+`src/bin/feverlink3-speedtest.rs` is a console program that runs the Steam P2P speed test without Transport Fever 3
+(`src/speedtest/`). It loads `steam_api64.dll` from its own folder with `LoadLibraryW` and a full path, writes
+`steam_appid.txt` (480, Valve's Spacewar) when missing, and initialises Steam with `SteamAPI_InitFlat` (or
+`SteamAPI_Init` when the DLL has no `InitFlat`); Steam not running, not logged in, a missing DLL and Steam's own
+message are explained in plain English (`startup.rs`). `steamnet::global()` then finds the loaded DLL by name, exactly
+as inside the game, and starts the same core; the program calls `SteamAPI_RunCallbacks` on every step. Role: a
+`peer.txt` (a SteamID64) next to the exe makes it the tester, none makes it the responder; `--peer <id>` and `--listen`
+override (`cli.rs`). The tester waits up to 120 s (twice) for the other PC, runs the table `suite::MODES` (name and
+function per entry; more modes are one line each) over a `Probe`, and rewrites `speedtest-results.txt` after each
+mode (`results.rs`); the responder logs to `speedtest-responder.txt` (`responder.rs`). Package it with
+`tools/speedtest/make_package.ps1 [-PeerSteamId <id>] [-SteamApiDll <path>] [-Out <folder>]`.
+
+Tested with the fake Steam (cargo test): roles, arguments, results text, error texts, timeouts, several testers one after
+another. **Not yet run on real Steam.**
+
 ## Build
 
 ```
