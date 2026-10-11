@@ -152,6 +152,10 @@ pub enum Feature {
     Growth,
     /// The read-only hook on the `TownUpdateSize` handler that reads the game time for the growth hook.
     GrowthCmd,
+    /// The read-only wrap of the octree candidate gather (deep growth log).
+    GrowthCands,
+    /// The read-only wrap of the country-edge selection (deep growth log).
+    GrowthEdges,
 }
 
 impl Feature {
@@ -163,6 +167,8 @@ impl Feature {
             Feature::TownSeed => "town_seed",
             Feature::Growth => "town_develop",
             Feature::GrowthCmd => "town_update_size",
+            Feature::GrowthCands => "town_candidates",
+            Feature::GrowthEdges => "town_edges",
         }
     }
 }
@@ -284,6 +290,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
     }
     if cfg.growth.active() {
         plan_growth(build, image, &mut p);
+        if cfg.growth.deep {
+            plan_growth_deep(build, image, &mut p);
+        }
     }
     if cfg.poolpatch {
         match &build.script_pool {
@@ -395,6 +404,26 @@ fn plan_growth(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
+/// The two read-only wraps of the deep log. Each is checked on its own; a missing one costs only its own lines.
+fn plan_growth_deep(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    for (feature, name, site) in [
+        (Feature::GrowthCands, "town_candidates", &build.town_candidates),
+        (Feature::GrowthEdges, "town_edges", &build.town_edges),
+    ] {
+        match site {
+            None => p.skipped.push(Skip {
+                feature,
+                name,
+                reason: "the build table has no such site for this build".into(),
+            }),
+            Some(site) => match verify(image, site.rva, site.prologue) {
+                Ok(()) => p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue }),
+                Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+            },
+        }
+    }
+}
+
 fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     let skip = |p: &mut Plan, reason: String| {
         p.skipped.push(Skip { feature: Feature::Hold, name: "command_list_add", reason });
@@ -447,7 +476,7 @@ mod tests {
     fn image_of_40420() -> BytesImage {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
-        for s in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
+        for s in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size, &b.town_candidates, &b.town_edges]
             .into_iter()
             .flatten()
         {
@@ -679,6 +708,23 @@ mod tests {
         assert!(derive.describe().contains("growth=on seed_mode=derive"), "{}", derive.describe());
         // not asked: not planned
         assert!(plan(b, HookConfig::default(), &image_of_40420()).steps.is_empty());
+    }
+
+    #[test]
+    fn the_deep_log_adds_two_wraps_each_checked_on_its_own() {
+        let b = select(0x6ac5_0427).unwrap();
+        let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
+        assert!(deep.any() && deep.growth.deep);
+        let p = plan(b, deep, &image_of_40420());
+        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_candidates", "town_edges"], "{:?}", p.report());
+        let mut img = image_of_40420();
+        img.write(0x9677c0 + 6, &[0x90]);
+        let p = plan(b, deep, &img);
+        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_edges"]);
+        assert!(p.skipped.iter().any(|s| s.name == "town_candidates"));
+        // without the deep switch neither is planned
+        let log = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH", "1")]));
+        assert_eq!(names(&plan(b, log, &image_of_40420())), ["town_develop", "town_update_size"]);
     }
 
     fn env_pairs(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {

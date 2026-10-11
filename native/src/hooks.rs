@@ -16,6 +16,7 @@
 //! being patched. After that the module never rewrites game code again: a misbehaving mod is handled by the
 //! hooks passing everything through (holding off, silence), not by uninstalling.
 
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -185,6 +186,10 @@ fn arm_growth(base: usize, log: fn(&str), settings: &Settings, getter: usize, di
     *GROWTH_TRACE.lock().unwrap_or_else(|p| p.into_inner()) = settings.trace;
     *GROWTH_DIR.lock().unwrap_or_else(|p| p.into_inner()) = dir;
     GROWTH_TIME.store(0, Ordering::Release);
+    GROWTH_DEEP.store(settings.deep, Ordering::Release);
+    DEEP_CMD_N.store(0, Ordering::Release);
+    DEEP_ORPHANS.store(0, Ordering::Release);
+    *DEEP_TICK.lock().unwrap_or_else(|p| p.into_inner()) = DeepTick { valid: false, t: None, c: 0, per_town: Vec::new() };
     GROWTH_SWITCHED.store(false, Ordering::Release);
     GROWTH_DERIVE.store(settings.mode == Mode::Derive, Ordering::Release);
     GROWTH_AFTER_WALL_S.store(settings.after_wall_s, Ordering::Release);
@@ -205,6 +210,7 @@ fn growth_settings() -> Settings {
         after_game_s: (game != u64::MAX).then_some(game),
         quantum_ms: GROWTH_QUANTUM_MS.load(Ordering::Acquire),
         trace: *GROWTH_TRACE.lock().unwrap_or_else(|p| p.into_inner()),
+        deep: GROWTH_DEEP.load(Ordering::Acquire),
     }
 }
 
@@ -230,6 +236,291 @@ impl Drop for ClearGrowthTime {
     }
 }
 
+// ---- the deep growth log (`FEVERLINK3_LOG_GROWTH_DEEP=1`, `docs/NATIVE_LINK.md` section 11.5). Read-only: it reads the
+// arguments of calls and the memory they point to, and writes lines; it never writes into the game.
+
+static GROWTH_DEEP: AtomicBool = AtomicBool::new(false);
+/// The unhooked candidate gather (`0x9677c0`) and edge selection (`0x95d100`); 0 until published.
+static CANDS_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static EDGES_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// `TownUpdateSize` commands seen (for the sampling).
+static DEEP_CMD_N: AtomicU64 = AtomicU64::new(0);
+/// Gathers and selections made outside any `Develop` that were logged.
+static DEEP_ORPHANS: AtomicU64 = AtomicU64::new(0);
+
+/// The per-tick counters that give a command its place: `c` over all towns, `k` per town.
+struct DeepTick {
+    valid: bool,
+    t: Option<u32>,
+    c: u32,
+    per_town: Vec<(u32, u32)>,
+}
+
+static DEEP_TICK: Mutex<DeepTick> = Mutex::new(DeepTick { valid: false, t: None, c: 0, per_town: Vec::new() });
+
+/// `(c, k)` of the next `TownUpdateSize` command of `town` at tick `t`; both count from 0 within a tick.
+fn deep_next_index(t: Option<u32>, town: u32) -> (u32, u32) {
+    let mut s = DEEP_TICK.lock().unwrap_or_else(|p| p.into_inner());
+    if !s.valid || s.t != t {
+        s.valid = true;
+        s.t = t;
+        s.c = 0;
+        s.per_town.clear();
+    }
+    let c = s.c;
+    s.c += 1;
+    let k = match s.per_town.iter_mut().find(|(id, _)| *id == town) {
+        Some((_, n)) => {
+            let k = *n;
+            *n += 1;
+            k
+        }
+        None => {
+            s.per_town.push((town, 1));
+            0
+        }
+    };
+    (c, k)
+}
+
+/// The `TownUpdateSize` command being executed on this thread.
+#[derive(Clone, Copy)]
+struct DeepCmd {
+    t: Option<u32>,
+    k: u32,
+    want: bool,
+}
+
+/// The `Develop` call being executed on this thread, with the counters of the gathers and selections inside it.
+#[derive(Clone, Copy)]
+struct DeepDev {
+    town: u32,
+    t: Option<u32>,
+    k: u32,
+    want: bool,
+    d: u64,
+    cand_j: u32,
+    edge_j: u32,
+}
+
+#[derive(Clone, Copy)]
+struct DeepCtx {
+    cmd: Option<DeepCmd>,
+    dev: Option<DeepDev>,
+}
+
+const DEEP_NONE: DeepCtx = DeepCtx { cmd: None, dev: None };
+
+thread_local! {
+    static DEEP_CTX: Cell<DeepCtx> = const { Cell::new(DEEP_NONE) };
+}
+
+fn deep_ctx() -> DeepCtx {
+    DEEP_CTX.try_with(Cell::get).unwrap_or(DEEP_NONE)
+}
+
+fn deep_ctx_update(f: impl FnOnce(&mut DeepCtx)) {
+    let _ = DEEP_CTX.try_with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+/// Clears the command of this thread when the handler returns or unwinds.
+struct DeepCmdGuard;
+
+impl Drop for DeepCmdGuard {
+    fn drop(&mut self) {
+        deep_ctx_update(|c| c.cmd = None);
+    }
+}
+
+/// Puts back the `Develop` that was running before (none, normally) when this one returns or unwinds.
+struct DeepDevGuard(Option<DeepDev>);
+
+impl Drop for DeepDevGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        deep_ctx_update(|c| c.dev = prev);
+    }
+}
+
+/// The u32 at `addr` when the address is aligned and the bytes are committed and readable.
+fn deep_read_u32(addr: u64) -> Option<u32> {
+    if addr == 0 || !addr.is_multiple_of(4) {
+        return None;
+    }
+    // SAFETY: the range is checked to be readable first.
+    unsafe { mem::readable(addr as *const u8, 4).then(|| core::ptr::read_volatile(addr as *const u32)) }
+}
+
+/// Where the lines of the current thread belong: the `Develop` it is in, else a numbered orphan (the first
+/// [`growth::ORPHAN_MAX`] only). The second value is the call's index `j`, the third whether to log it.
+fn deep_place(is_cand: bool) -> Option<(growth::DeepKey, u32, bool)> {
+    let pid = std::process::id();
+    match deep_ctx().dev {
+        Some(d) => {
+            deep_ctx_update(|c| {
+                if let Some(d) = c.dev.as_mut() {
+                    if is_cand {
+                        d.cand_j += 1;
+                    } else {
+                        d.edge_j += 1;
+                    }
+                }
+            });
+            let j = if is_cand { d.cand_j } else { d.edge_j };
+            Some((growth::DeepKey { pid, t: d.t, town: d.town, k: d.k }, j, d.want))
+        }
+        None => {
+            let n = DEEP_ORPHANS.fetch_add(1, Ordering::Relaxed);
+            (n < growth::ORPHAN_MAX).then(|| (growth::DeepKey { pid, t: None, town: 0, k: 0 }, n as u32, true))
+        }
+    }
+}
+
+/// `TownUpdateSize` entry: logs the payload `{town, 3 floats, flag}` and makes the command known to the calls inside it.
+/// The payload layout is that of the handler at `0x9e12b0` (`mov r8d,[r15]`, `vmovsd [r15+4]`, `mov ecx,[r15+0xc]`,
+/// `movzx r9d,byte [r15+0x10]`).
+fn deep_payload(payload: u64, time: Option<u32>) -> Option<DeepCmdGuard> {
+    // SAFETY: only asks the OS whether the 0x11 bytes are readable.
+    if payload == 0 || !unsafe { mem::readable(payload as *const u8, 0x11) } {
+        return None;
+    }
+    let p = payload as *const u8;
+    // SAFETY: just checked readable.
+    let (town, b1, b2, b3, flag) = unsafe {
+        (
+            core::ptr::read_unaligned(p as *const u32),
+            core::ptr::read_unaligned(p.add(4) as *const u32),
+            core::ptr::read_unaligned(p.add(8) as *const u32),
+            core::ptr::read_unaligned(p.add(0xc) as *const u32),
+            *p.add(0x10),
+        )
+    };
+    let n = DEEP_CMD_N.fetch_add(1, Ordering::Relaxed) + 1;
+    let traced = GROWTH_TRACE.lock().unwrap_or_else(|p| p.into_inner()).contains(town);
+    let want = traced || growth::sampled(n, town, time.unwrap_or(0));
+    let (c, k) = deep_next_index(time, town);
+    deep_ctx_update(|ctx| ctx.cmd = Some(DeepCmd { t: time, k, want }));
+    if want {
+        let key = growth::DeepKey { pid: std::process::id(), t: time, town, k };
+        growth_file_line(&growth::payload_line(&key, c, [b1, b2, b3], flag));
+    }
+    Some(DeepCmdGuard)
+}
+
+/// `Develop` entry: remembers which call this is, for the gathers and selections inside it.
+fn deep_dev_enter(town: u32, seed: u32, n: u64, time: Option<u32>) -> DeepDevGuard {
+    let ctx = deep_ctx();
+    let (t, k, want) = match ctx.cmd {
+        Some(c) => (c.t, c.k, c.want),
+        None => {
+            let traced = GROWTH_TRACE.lock().unwrap_or_else(|p| p.into_inner()).contains(town);
+            (time, 0, traced || growth::sampled(n, town, seed))
+        }
+    };
+    deep_ctx_update(|c| c.dev = Some(DeepDev { town, t, k, want, d: n, cand_j: 0, edge_j: 0 }));
+    DeepDevGuard(ctx.dev)
+}
+
+/// `Develop` exit: the generator state it started from and the one it ended with.
+fn deep_dev_exit(state: u64, start: u32) {
+    let Some(d) = deep_ctx().dev else { return };
+    if !d.want {
+        return;
+    }
+    if let Some(end) = deep_read_u32(state) {
+        let key = growth::DeepKey { pid: std::process::id(), t: d.t, town: d.town, k: d.k };
+        growth_file_line(&growth::dev_line(&key, d.d, start, end));
+    }
+}
+
+/// After a gather: the count and the hashes of its records.
+fn deep_candidates(out: u64) {
+    let Some((key, j, want)) = deep_place(true) else { return };
+    if !want || out == 0 {
+        return;
+    }
+    // SAFETY: only asks the OS first; `out` is the vector the gather just filled.
+    let Ok(hdr) = (unsafe { mem::read(out as *const u8, 16) }) else { return };
+    let begin = u64::from_le_bytes(hdr[..8].try_into().unwrap_or([0; 8]));
+    let end = u64::from_le_bytes(hdr[8..].try_into().unwrap_or([0; 8]));
+    let empty = growth::digest_records(&[]);
+    if begin == end {
+        growth_file_line(&growth::cand_line(&key, j, &empty, false));
+        return;
+    }
+    let len = end.wrapping_sub(begin);
+    if end < begin || len % growth::RECORD_LEN as u64 != 0 {
+        growth_file_line(&growth::cand_line(&key, j, &empty, true));
+        return;
+    }
+    let n = len / growth::RECORD_LEN as u64;
+    if n as usize > growth::MAX_RECORDS {
+        growth_file_line(&growth::cand_line(&key, j, &growth::Digest { n, ..empty }, true));
+        return;
+    }
+    // SAFETY: checked readable by `read`.
+    match unsafe { mem::read(begin as *const u8, len as usize) } {
+        Ok(bytes) => growth_file_line(&growth::cand_line(&key, j, &growth::digest_records(&bytes), false)),
+        Err(_) => growth_file_line(&growth::cand_line(&key, j, &growth::Digest { n, ..empty }, true)),
+    }
+}
+
+/// The candidate gather `(out, centre*, radius [xmm2], ctx [r9], 5 stack arguments) -> out`. Calls the original with
+/// every slot as given (the float stays in `xmm2`), then logs the vector it filled. Changes nothing.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system-unwind" fn candidates_hook(
+    rcx: u64,
+    rdx: u64,
+    radius: f32,
+    r9: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+) -> u64 {
+    let original = CANDS_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return rcx;
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, f32, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline for the gather this hook replaces, which takes these slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    let ret = unsafe { original(rcx, rdx, radius, r9, a5, a6, a7, a8, a9) };
+    if GROWTH_DEEP.load(Ordering::Acquire) {
+        crate::log::guarded("growth deep candidates", || deep_candidates(rcx));
+    }
+    ret
+}
+
+/// The edge selection `(centre*, radius [xmm1], world, ctx [r9], arg5, u32* rng) -> void`: logs the rng state before and
+/// after. Calls the original with every slot as given. Changes nothing.
+unsafe extern "system-unwind" fn edges_hook(rcx: u64, radius: f32, r8: u64, r9: u64, a5: u64, rng: u64) -> u64 {
+    let original = EDGES_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    let deep = GROWTH_DEEP.load(Ordering::Acquire);
+    let before = if deep { crate::log::guarded("growth deep edge", || deep_read_u32(rng)).flatten() } else { None };
+    type Original = unsafe extern "system-unwind" fn(u64, f32, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline for the selection this hook replaces, which takes these slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    let ret = unsafe { original(rcx, radius, r8, r9, a5, rng) };
+    if deep {
+        crate::log::guarded("growth deep edge", || {
+            let Some((key, j, want)) = deep_place(false) else { return };
+            if want {
+                growth_file_line(&growth::edge_line(&key, j, before, deep_read_u32(rng)));
+            }
+        });
+    }
+    ret
+}
+
 /// The `TownUpdateSize` command handler `(this, payload) -> bool`: reads the game time the way the handler itself
 /// does a few instructions later (`[[this+8]+0x28]` is the `GameTime` system, `0x2a96c0` the getter), keeps it for
 /// `Develop` to see, and calls the original with the arguments as given. Changes nothing.
@@ -240,6 +531,7 @@ unsafe extern "system-unwind" fn growth_cmd_hook(this: u64, payload: u64) -> u64
     }
     let _clear = ClearGrowthTime;
     let getter = GROWTH_GETTER.load(Ordering::Acquire);
+    let mut time = None;
     if getter != 0 && this != 0 {
         // SAFETY: the handler's own first loads (`mov rax,[rbp+8]`, `mov rcx,[rax+0x28]`), with its `this`.
         let ctx = unsafe { core::ptr::read_unaligned((this + 8) as *const u64) };
@@ -250,9 +542,16 @@ unsafe extern "system-unwind" fn growth_cmd_hook(this: u64, payload: u64) -> u64
                 let get: unsafe extern "system-unwind" fn(u64) -> u32 = unsafe { core::mem::transmute(getter) };
                 let t = unsafe { get(system) };
                 GROWTH_TIME.store(TIME_VALID | u64::from(t), Ordering::Release);
+                time = Some(t);
             }
         }
     }
+    // the payload and the place of this command, for the lines of the calls inside it (own bookkeeping, contained)
+    let _deep_cmd = if GROWTH_DEEP.load(Ordering::Acquire) {
+        crate::log::guarded("growth deep payload", || deep_payload(payload, time)).flatten()
+    } else {
+        None
+    };
     type Original = unsafe extern "system-unwind" fn(u64, u64) -> u64;
     // SAFETY: the trampoline for the handler this hook replaces.
     let original: Original = unsafe { core::mem::transmute(original) };
@@ -314,10 +613,20 @@ unsafe extern "system-unwind" fn growth_hook(rcx: u64, rdx: u64, r8: u64, r9: u6
                 growth_file_line(a);
             });
         }
+        let deep = settings.deep;
+        let _dev = if deep {
+            crate::log::guarded("growth deep develop", || deep_dev_enter(town, seed, n, time))
+        } else {
+            None
+        };
         type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64) -> u64;
         // SAFETY: the trampoline for `Develop`, which takes these seven slots.
         let original: Original = unsafe { core::mem::transmute(original) };
         let ret = unsafe { original(rcx, rdx, r8, r9, a5, a6, a7) };
+        if deep {
+            // the state the original ended with: how many numbers it drew shows in it
+            crate::log::guarded("growth deep develop", || deep_dev_exit(a5, used.unwrap_or(seed)));
+        }
         if want_line || traced {
             // Our own bookkeeping, contained; the call into the game above is outside the guard. The line is written
             // after the call because it carries the return value.
@@ -354,7 +663,7 @@ unsafe extern "system-unwind" fn growth_hook(rcx: u64, rdx: u64, r8: u64, r9: u6
 
 /// The diagnostic hooks: logs and experiments that are not among the pieces the mod's `ready` event lists.
 fn is_diagnostic(name: &str) -> bool {
-    matches!(name, "town_seed" | "town_develop" | "town_update_size")
+    matches!(name, "town_seed" | "town_develop" | "town_update_size" | "town_candidates" | "town_edges")
 }
 
 /// Where the jumps lead.
@@ -365,6 +674,8 @@ pub struct Targets {
     pub seed: usize,
     pub growth: usize,
     pub growth_cmd: usize,
+    pub cands: usize,
+    pub edges: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -475,6 +786,8 @@ pub unsafe fn execute(
                 Feature::TownSeed => targets.seed,
                 Feature::Growth => targets.growth,
                 Feature::GrowthCmd => targets.growth_cmd,
+                Feature::GrowthCands => targets.cands,
+                Feature::GrowthEdges => targets.edges,
                 _ => targets.add,
             };
             match unsafe { Detour::prepare(at, expected) } {
@@ -492,6 +805,8 @@ pub unsafe fn execute(
     TOWN_SEED_ORIGINAL.store(original_of("town_seed"), Ordering::Release);
     GROWTH_ORIGINAL.store(original_of("town_develop"), Ordering::Release);
     GROWTH_CMD_ORIGINAL.store(original_of("town_update_size"), Ordering::Release);
+    CANDS_ORIGINAL.store(original_of("town_candidates"), Ordering::Release);
+    EDGES_ORIGINAL.store(original_of("town_edges"), Ordering::Release);
     observer(Stage::Prepared);
 
     // 4. write the jumps; if one fails, take the others out again
@@ -652,6 +967,8 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         seed: town_seed_hook as *const () as usize,
         growth: growth_hook as *const () as usize,
         growth_cmd: growth_cmd_hook as *const () as usize,
+        cands: candidates_hook as *const () as usize,
+        edges: edges_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -672,6 +989,8 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     let seed_logged = installed.hook_names().contains(&"town_seed");
     let growth_logged = installed.hook_names().contains(&"town_develop");
     let time_read = installed.hook_names().contains(&"town_update_size");
+    let cands_on = installed.hook_names().contains(&"town_candidates");
+    let edges_on = installed.hook_names().contains(&"town_edges");
     rt.set_installed(mod_hooks.clone(), installed.poolpatch());
     let anything = !installed.is_empty();
     let hooked = !mod_hooks.is_empty();
@@ -695,6 +1014,14 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     if growth_logged {
         let g = &cfg.growth;
         log("hooks: town_develop: TOWN GROWTH log: 'growth n=.. pid=.. town=.. seed=.. [t=<tick of 200 ms>] [used=..] r9b=.. a6=.. a7=.. ret=.. caller=..' (first 2000 calls, then about 1 in 50; every call of the towns in FEVERLINK3_TOWN_TRACE); also appended to growth.log in this game's live folder");
+        if g.deep {
+            log(&format!(
+                "hooks: town_develop: DEEP growth log (FEVERLINK3_LOG_GROWTH_DEEP): 'gdeep-payload|dev|cand|edge ...' lines in growth.log only (payload: {}, rng end state: yes, candidates: {}, edge rng: {}); read-only",
+                if time_read { "yes" } else { "NO, the TownUpdateSize hook is missing" },
+                if cands_on { "yes" } else { "NO, not installed" },
+                if edges_on { "yes" } else { "NO, not installed" },
+            ));
+        }
         if !time_read {
             log(
                 "hooks: town_develop: the game time cannot be read on this build: no t= field, and no seed replacement",
@@ -907,6 +1234,8 @@ mod tests {
             seed: town_seed_hook as *const () as usize,
             growth: growth_hook as *const () as usize,
             growth_cmd: growth_cmd_hook as *const () as usize,
+            cands: candidates_hook as *const () as usize,
+            edges: edges_hook as *const () as usize,
         }
     }
 

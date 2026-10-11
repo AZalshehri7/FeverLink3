@@ -63,6 +63,13 @@ pub struct BuildAddrs {
     /// The `TownUpdateSize` command handler (kind 40): the only caller of `Develop` that seeds from the game time.
     /// Hooked read-only to read the game time the seed is made from.
     pub town_update_size: Option<HookSite>,
+    /// Candidate gather of the octree walk (`FEVERLINK3_LOG_GROWTH_DEEP`, read-only): `(out vector*, float2* centre,
+    /// float radius [xmm2], ctx* [r9], 5 stack args) -> out`; the vector `[rcx]..[rcx+8]` holds 0x40-byte records,
+    /// sorted by `std::sort` (`0x966150`) before the function returns.
+    pub town_candidates: Option<HookSite>,
+    /// Country-edge selection (`FEVERLINK3_LOG_GROWTH_DEEP`, read-only): `(float2* centre, float radius [xmm1], world
+    /// [r8], ctx* [r9], arg5, u32* rng [stack arg 6])`, returns nothing; draws `vec[RandomInt(0,n)]`.
+    pub town_edges: Option<HookSite>,
     /// `GameTime` getter: `fn(system*) -> u32` (the dword at `+0x40` of the `GameTime` component). Called, never
     /// hooked; the prologue is compared first.
     pub game_time_getter: Option<CallSite>,
@@ -138,6 +145,16 @@ pub const BUILDS: &[BuildAddrs] = &[
         town_update_size: Some(HookSite {
             rva: 0x009e_12b0,
             prologue: &[0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x50],
+        }),
+        // `mov [rsp+10h],rbx ; vmovss [rsp+18h],xmm2 ; push rbp,rsi,rdi` (14 bytes, no rip-relative operand)
+        town_candidates: Some(HookSite {
+            rva: 0x0096_77c0,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x10, 0xC5, 0xFA, 0x11, 0x54, 0x24, 0x18, 0x55, 0x56, 0x57],
+        }),
+        // `mov rax,rsp ; mov [rax+8],rbx ; push rbp,rsi,rdi,r12,r13` (14 bytes, no rip-relative operand)
+        town_edges: Some(HookSite {
+            rva: 0x0095_d100,
+            prologue: &[0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55],
         }),
         // `sub rsp,28h ; mov rax,[rcx+10h] ; mov rcx,[rcx+8] ; mov edx,[rax]` (then a call to the component lookup)
         game_time_getter: Some(CallSite {
@@ -219,6 +236,8 @@ mod tests {
         town_seed: None,
         town_develop: None,
         town_update_size: None,
+        town_candidates: None,
+        town_edges: None,
         game_time_getter: None,
         script_pool: None,
         command_move: None,
@@ -245,7 +264,7 @@ mod tests {
     #[test]
     fn every_recorded_prologue_is_long_enough_for_a_detour() {
         for b in BUILDS.iter().chain(FAKE) {
-            for site in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
+            for site in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size, &b.town_candidates, &b.town_edges]
                 .into_iter()
                 .flatten()
             {
@@ -319,6 +338,8 @@ mod tests {
         assert_eq!(b.town_seed.as_ref().unwrap().rva, 0x8d4270);
         assert_eq!(b.town_develop.as_ref().unwrap().rva, 0x8de0b0);
         assert_eq!(b.town_update_size.as_ref().unwrap().rva, 0x9e12b0);
+        assert_eq!(b.town_candidates.as_ref().unwrap().rva, 0x9677c0);
+        assert_eq!(b.town_edges.as_ref().unwrap().rva, 0x95d100);
         assert_eq!(b.game_time_getter.as_ref().unwrap().rva, 0x2a96c0);
     }
 

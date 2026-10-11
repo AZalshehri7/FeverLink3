@@ -545,6 +545,8 @@ mod tests {
             town_seed: None,
             town_develop: None,
             town_update_size: None,
+            town_candidates: None,
+            town_edges: None,
             game_time_getter: None,
             script_pool: None,
             command_move: None,
