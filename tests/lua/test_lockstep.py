@@ -1004,6 +1004,55 @@ class PureTest(unittest.TestCase):
         with self.assertRaises(lupa.LuaError):
             self.C.serialize(self.L.eval("print"))
 
+    def test_window_placeholders_become_the_keys_of_the_records_that_made_them(self):
+        body = self.C.parse('{["args"]={[1]={["__ref"]="entity",["key"]="ui:3"},[2]={["list"]={{["__ref"]="entity",["key"]="s:9"},'
+                            '{["__ref"]="entity",["key"]="ui:4"}}}},["fn"]="x"}')
+        body = body[0] if isinstance(body, tuple) else body
+        seq = self.L.eval("function(id) return ({ [3] = 12, [4] = 13 })[id] end")
+        ok = self.K.rewriteUiKeys(body, seq, 1)
+        self.assertTrue(ok)
+        text = self.C.serialize(body)
+        self.assertIn('"1:12"', text)
+        self.assertIn('"1:13"', text)
+        self.assertIn('"s:9"', text, "a saved entity is left alone")
+        self.assertNotIn("ui:", text)
+        body2 = self.C.parse('{["args"]={[1]={["__ref"]="entity",["key"]="ui:7"}}}')
+        body2 = body2[0] if isinstance(body2, tuple) else body2
+        ok2, missing = self.K.rewriteUiKeys(body2, seq, 1)
+        self.assertFalse(ok2)
+        self.assertEqual(7, missing, "a command that was never shipped cannot be named")
+
+    def test_an_action_that_waits_for_a_pending_entity_is_not_a_refusal(self):
+        body = self.C.parse('{["args"]={[1]={["__ref"]="entity",["key"]="1:5"},[2]={["__ref"]="entity",["key"]="s:8"}}}')
+        body = body[0] if isinstance(body, tuple) else body
+        pend = lambda k: self.K.keyIsPending(k, self.L.eval("{ { key = '1:5' } }"), self.L.eval("{ { key = '0:2' } }"))  # noqa: E731
+        self.assertTrue(pend("1:5"))
+        self.assertTrue(pend("0:2"))
+        self.assertTrue(pend("0:2#stop1"), "a sub-key of an action still looking for its entities")
+        self.assertFalse(pend("0:20"))
+        self.assertFalse(pend("s:8"))
+        isp = self.L.eval("function(k) return k == '1:5' end")
+        self.assertEqual("1:5", self.K.pendingRef(body, isp))
+        self.assertIsNone(self.K.pendingRef(body, self.L.eval("function(k) return false end")))
+
+    def test_notes_of_what_a_game_did_not_replicate_ride_with_its_actions_and_explain_a_refusal(self):
+        notes = self.L.eval("{}")
+        self.K.addNote(notes, 1000, "a native build at t=1000 was not replicated")
+        self.K.addNote(notes, 5000, "action 1:5 did not find every entity it created")
+        for i in range(10):
+            self.K.addNote(notes, 6000 + i, "n" + str(i), 4)
+        self.assertEqual(4, len(notes), "the list is bounded")
+        fresh = self.L.eval("{ { at = 5000, text = 'a' }, { at = 5100, text = 'b' }, { at = 5200, text = 'c' }, { at = 5300, text = 'd' }, { at = 5400, text = 'e' } }")
+        got = self.K.recentNotes(fresh, 5500)
+        self.assertEqual(3, len(got), "the newest three")
+        self.assertEqual("t=5400 e", got[3])
+        self.assertEqual(0, len(self.K.recentNotes(fresh, 5000 + 700000)), "old notes are not relevant to later actions")
+        body = self.L.eval("{ diverged = { 't=997800 a native build was not replicated' } }")
+        why = self.K.refusalDetail("argument 2: stop 2: stationGroup s:1 does not exist here", body)
+        self.assertIn("[the sender had not replicated: t=997800 a native build was not replicated]", why)
+        plain = self.K.refusalDetail("not enough money", body)
+        self.assertEqual("not enough money", plain, "only a reference problem is explained by it")
+
     def test_registered_commands_may_bring_their_own_codec(self):
         lua = self.L.eval("""function(K)
           K.registerCommands({

@@ -250,6 +250,94 @@ function L.resolveKey(bind, key)
 	return bind[key]
 end
 
+-- Window commands name an entity their own window command created a moment ago by a placeholder key "ui:<id>" (<id> is
+-- the record number the UI hook gave that command): the bridge's table of keys reaches the hook a second or so after the
+-- creation (a vehicle bought and put on a line within that second was sent as "s:<id>", an id no other game shares; seen in
+-- a real game). The bridge, which knows the sequence number each record was shipped as, replaces the placeholders before the
+-- body leaves. seqOf(id) -> sequence number | nil. Returns true, or false and the id that was never shipped.
+function L.rewriteUiKeys(node, seqOf, from)
+	if type(node) ~= "table" then return true end
+	if node.__ref == "entity" and type(node.key) == "string" then
+		local id = node.key:match("^ui:(%d+)$")
+		if id then
+			local seq = seqOf(tonumber(id))
+			if not seq then return false, tonumber(id) end
+			node.key = L.itemKey(from, seq)
+		end
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" then
+			local ok, bad = L.rewriteUiKeys(v, seqOf, from)
+			if not ok then return false, bad end
+		end
+	end
+	return true
+end
+
+-- An entity a command created is found a step or more after the command ran (a watch, see the bridge), so an action stamped
+-- for the same step or the next that names it cannot resolve it yet: that is waiting, not an error. Returns the first key in
+-- the body that isPending(key) names, or nil.
+function L.pendingRef(node, isPending)
+	if type(node) ~= "table" then return nil end
+	if node.__ref == "entity" and type(node.key) == "string" and isPending(node.key) then return node.key end
+	for _, v in pairs(node) do
+		if type(v) == "table" then
+			local k = L.pendingRef(v, isPending)
+			if k then return k end
+		end
+	end
+	return nil
+end
+
+-- Whether `key` is (or is under) the key of an action whose entities are still being looked for: watches
+-- { key = ... }, binders { key = ... } (their sub-keys are "<key>#...").
+function L.keyIsPending(key, watches, binders)
+	for _, w in ipairs(watches or {}) do
+		if w.key == key then return true end
+	end
+	for _, b in ipairs(binders or {}) do
+		if b.key == key or key:sub(1, #b.key + 1) == b.key .. "#" then return true end
+	end
+	return false
+end
+
+-- What a game that could not replicate something (a native build, an action whose entities were not all found) tells the
+-- others about its own divergence: notes = { { at = game time, text = ... }, ... } newest last. An action it ships carries
+-- the recent ones (body.diverged = { "text", ... }), so a refusal on another game names the first divergence, not only the
+-- reference that came out wrong.
+L.NOTE_WINDOW = 600000   -- game time (ms) a note stays relevant to the actions that follow
+L.NOTE_MAX = 3
+
+function L.recentNotes(notes, now)
+	local out = {}
+	for _, n in ipairs(notes or {}) do
+		if type(n) == "table" and type(n.text) == "string" and type(n.at) == "number" and now - n.at <= L.NOTE_WINDOW and n.at <= now then
+			out[#out + 1] = "t=" .. n.at .. " " .. n.text
+		end
+	end
+	while #out > L.NOTE_MAX do table.remove(out, 1) end
+	return out
+end
+
+function L.addNote(notes, at, text, keep)
+	notes[#notes + 1] = { at = at, text = text }
+	while #notes > (keep or 8) do table.remove(notes, 1) end
+end
+
+-- A refusal reason with what the sender said about itself, when the reason is an unresolved or missing reference.
+function L.refusalDetail(err, body)
+	err = tostring(err)
+	local d = type(body) == "table" and body.diverged or nil
+	if type(d) == "table" and #d > 0 and (err:find("unresolved", 1, true) or err:find("does not exist", 1, true)) then
+		local texts = {}
+		for i, t in ipairs(d) do
+			if type(t) == "string" and i <= L.NOTE_MAX then texts[#texts + 1] = t end
+		end
+		if #texts > 0 then err = err .. " [the sender had not replicated: " .. table.concat(texts, "; ") .. "]" end
+	end
+	return err
+end
+
 -- Encodes a captured command for the wire. ctx.keyOf(entity) -> key or nil; ctx.plain(value) -> deep copy that
 -- raises on values that cannot travel. Returns the body or nil and a reason (the command then stays native).
 function L.encodeCommand(name, args, ctx)

@@ -351,6 +351,13 @@ local function spendReplay(st, now)
 	return true
 end
 
+-- What this game could not replicate or key, kept in the state (L.addNote) and shipped with the actions that follow, so a
+-- refusal on another game can name its first cause (docs/ARCHITECTURE.md, references).
+local function simNote(st, now, text)
+	st.notes = st.notes or {}
+	L.addNote(st.notes, now, text)
+end
+
 -- A build the player made with a native tool (roads, tracks, stations, depots, bulldozer...): the engine applies it
 -- itself, here and now. It is captured as a build record and handed to the interface half (st.out), which stamps and
 -- ships it like any other action; every OTHER game rebuilds it at the stamp.
@@ -373,6 +380,7 @@ local function simCaptureBuild(state, param)
 	if not ok then body, why = nil, tostring(body) end
 	if not body then
 		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(why))
+		simNote(st, now, "a native build at t=" .. now .. " was not replicated (" .. tostring(why) .. ")")
 		-- the first few failures leave the raw proposal in a file, to see the real shapes (members of engine objects)
 		st.rawDumped = (st.rawDumped or 0) + 1
 		if st.rawDumped <= 4 and Build.adapter and Build.adapter.dump then
@@ -413,13 +421,23 @@ local function simApplyAction(st, it, now)
 		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
 		return
 	end
-	if it.lateSteps and it.lateSteps > 0 then
+	if it.lateSteps and it.lateSteps > 0 and not it.waited then
 		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
 		st.late = (st.late or 0) + 1
 	end
 	local ctx = simCtx(st, it)
 	local args, err = L.decodeCommand(it.body, ctx)
 	if not args then
+		-- It names an entity another action created, which the watch has not found yet (the engine shows a new entity a step
+		-- after the command): wait for it, a few steps at most, instead of refusing. Every game waits alike.
+		local waitsFor = (it.waited or 0) < WATCH_STEPS + 2 and L.pendingRef(it.body, function(k) return L.keyIsPending(k, st.watches, st.binders) end) or nil
+		if waitsFor then
+			if not it.waited then logSim("action " .. it.key .. " waits for the entity " .. waitsFor .. " names") end
+			it.waited = (it.waited or 0) + 1
+			L.enqueue(st.queue, it)
+			return
+		end
+		err = L.refusalDetail(err, it.body)
 		logSim("action " .. it.key .. " refused: " .. tostring(err))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err }
 		return
@@ -513,6 +531,7 @@ local function simAdvanceWatches(st, now)
 		elseif w.steps >= WATCH_STEPS then
 			st.results[#st.results + 1] = { key = w.key, at = w.at, success = false, detail = "no " .. w.comp .. " appeared" }
 			logSim("action " .. w.key .. ": nothing created after " .. w.steps .. " steps")
+			simNote(st, now, "action " .. w.key .. " created nothing that was found")
 		else
 			keep[#keep + 1] = w
 		end
@@ -524,7 +543,7 @@ end
 -- put on a road and their station groups): looked for on each step until the schema says it has found them all, or
 -- WATCH_STEPS have passed. What another action's keys already name is not offered again, so two builds in one step do
 -- not take each other's entities (the engine runs the commands in the order they were applied, on every game).
-local function simAdvanceBinders(st)
+local function simAdvanceBinders(st, now)
 	if #st.binders == 0 then return end
 	local owner = {}
 	for k, e in pairs(st.bind) do owner[e] = k end
@@ -552,6 +571,7 @@ local function simAdvanceBinders(st)
 			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
 		elseif b.steps >= WATCH_STEPS then
 			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps")
+			simNote(st, now, "action " .. b.key .. " did not find every entity it created")
 		else
 			keep[#keep + 1] = b
 		end
@@ -587,7 +607,7 @@ local function update(userParams, state, dt)
 			end
 		end
 		simAdvanceWatches(st, now)
-		simAdvanceBinders(st)
+		simAdvanceBinders(st, now)
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)
@@ -788,6 +808,7 @@ local function guiApplyNow(it, now)
 	local ctx = guiCtx(it)
 	local args, err = L.decodeCommand(it.body, ctx)
 	if not args then
+		err = L.refusalDetail(err, it.body)
 		logGui("action " .. it.key .. " refused: " .. tostring(err))
 		send("action_refused", { seq = it.seq, from = it.from, detail = err })
 		deliverResult(it.key, nil, false, {})
@@ -906,11 +927,20 @@ local function shipUiCommand(p)
 	local body = C.parse(p.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
 	local now = engine.gameTime()
+	-- entities a window command made a moment ago travel under the key of the record that made them (L.rewriteUiKeys)
+	local text = p.body
+	local note = L.recentNotes(G.notes, now)
+	if text:find("ui:", 1, true) or #note > 0 then
+		local okR, missing = L.rewriteUiKeys(body, function(id) return G.uiSeq[id] end, C.PLAYER_ID)
+		if not okR then return false, "it names the entity window command #" .. tostring(missing) .. " made, which was never shipped" end
+		if #note > 0 then body.diverged = note end
+		text = C.serialize(body)
+	end
 	G.seq = G.seq + 1
 	G.uiSeq[p.id] = G.seq
 	local at = stampAfterFastest(now)
 	local category = type(p.category) == "string" and p.category or "other"
-	send("action", { stamp = at, seq = G.seq, body = p.body, category = category })
+	send("action", { stamp = at, seq = G.seq, body = text, category = category })
 	logGui("window command " .. tostring(body.fn) .. " " .. L.itemKey(C.PLAYER_ID, G.seq) .. " stamped " .. at .. " (now " .. now .. ")")
 	recordOriginator(body, G.seq, at, category)
 	return true
@@ -921,6 +951,8 @@ local function shipLocal(tag, cb)
 	local body, err = L.encodeCommand(tag.name, tag.args, { plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end })
 	if not body then return false, err end
 	local now = engine.gameTime()
+	local note = L.recentNotes(G.notes, now)
+	if #note > 0 then body.diverged = note end
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
@@ -1156,6 +1188,7 @@ local function collectFromSim(state)
 	for key, e in pairs(st.bind or {}) do
 		if G.bind[key] ~= e then G.bind[key] = e; G.rev[e] = key end
 	end
+	G.notes = st.notes
 	local highest = nil
 	for _, o in ipairs(st.out or {}) do
 		if not G.outSeen[o.n] then

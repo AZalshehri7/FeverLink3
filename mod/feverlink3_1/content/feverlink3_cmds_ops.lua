@@ -289,6 +289,22 @@ local SCHEMA = {
 
 local rebuild
 
+-- Writes a table into member k of an engine object. Some members only take an engine object of their own type (the real
+-- engine: Line.vehicleInfo is a LineVehicleInfo, and a plain table is refused with "bad argument #2 ... (const LineVehicleInfo
+-- expected, got no value)" - seen in every real game that created a line). When the table is refused and the member holds an
+-- engine object, it is filled in place, member by member; if that fails too, the first refusal stands.
+local function setMember(obj, k, val)
+	local ok, err = pcall(function() obj[k] = val end)
+	if ok then return end
+	if type(val) ~= "table" then error(err, 0) end
+	local cur = try(function() return obj[k] end)
+	if cur == nil or type(cur) == "number" or type(cur) == "string" or type(cur) == "boolean" or A.members(cur) == nil then error(err, 0) end
+	local okAll = pcall(function()
+		for kk, vv in pairs(val) do setMember(cur, kk, vv) end
+	end)
+	if not okAll then error(err, 0) end
+end
+
 -- Sets the members of `obj` from `tree`. A member the engine calls read-only is left to it (`skipped`, and not
 -- compared afterwards). Any other refusal does not stop the rebuild: it is kept in `failed` (member name -> reason),
 -- and the comparison with what was read decides whether it mattered, so a member the engine will not take but which
@@ -318,7 +334,7 @@ local function fill(obj, tree, typeName, where, skipped, failed)
 					val = {}
 					for i = 1, #mv do val[i] = rebuild(ft.list, mv[i], at .. "[" .. i .. "]", skipped, failed) end
 				end
-				obj[k] = val
+				setMember(obj, k, val)
 			end)
 			if not ok then
 				local msg = tostring(err)
@@ -442,7 +458,13 @@ local function decodeRef(ctx, r, kind)
 		if e == nil and r.key ~= nil then e = ctx.resolve(r.key) end
 	end
 	if e == nil then return nil, "unresolved " .. kind .. " reference " .. tostring(r.key) end
-	if not A.isKind(e, kind) then return nil, kind .. " " .. tostring(r.key) .. " does not exist here" end
+	if not A.isKind(e, kind) then
+		local why = kind .. " " .. tostring(r.key) .. " does not exist here"
+		-- an "s:" key is the id the sending game gave the entity: right for what the savegame holds, wrong for anything its
+		-- player made since without a replicated command (a native build that was not replicated, a purchase not yet keyed)
+		if tostring(r.key):match("^s:") then why = why .. " (an s: key names an entity of the savegame or one the sender made without a replicated command)" end
+		return nil, why
+	end
 	return e
 end
 
