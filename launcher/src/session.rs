@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::session::{
-    codec, ChecksumOutcome, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep, MessageKind,
+    codec, ChecksumOutcome, ChecksumPolicy, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep, MessageKind,
     PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession, PlayerState,
     ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState,
 };
@@ -621,7 +621,11 @@ fn host_dispatch(
                 shared.log(if result.identical() {
                     format!("checksum {} identical across {} game(s)", result.n, result.reporters.len())
                 } else {
-                    format!("checksum {} differs in {}", result.n, result.differing.join(", "))
+                    format!(
+                        "checksum {} differs in {}",
+                        result.n,
+                        ChecksumPolicy::describe_parts(result.differing.iter().map(String::as_str))
+                    )
                 });
                 shared.update(|s| s.last_sync = Some(result));
             }

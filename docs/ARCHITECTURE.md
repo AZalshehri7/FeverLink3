@@ -105,6 +105,17 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 ## 8. Checksums and resync
 
 - Every 10 s of real time the host names a future stamp; every game hashes its world at that stamp and reports per-part hashes (money, loans, company, towns, industries, cargo, vehicles, roads, constructions, lines, names, node configs, terrain edits).
+- **Lanes the script computes today** (`L.checksumParts`, one small function each, registered by one `lane(...)` line; a lane whose engine accessor is missing is simply absent): `time`, `balance`, `loan`, `constructions`, `lines`, `companies`, plus the wider ones from MPFever (MIT, `mpfever_refs.lua` `contentHash`):
+
+  | Lane | What is hashed (sorted, no entity ids, positions rounded to 0.1) | Policy |
+  |---|---|---|
+  | `stations` | per station group: stations, terminals, positions of the terminals' stop nodes | reload after 2 rounds |
+  | `edges` | per road/rail edge: endpoints in canonical order, street type, type index, road type, template, style, decoration count, models of the edge objects (signals, stops) | reload after 2 rounds |
+  | `nodeConfigs` | per node: position, lane connections, crosswalks, traffic-light preference and type, double slip | drift |
+  | `vehicles` | per line (name and stop count): vehicle count and sorted coarse states (state, stopped by the player, sell on arrival); no positions, no ids | drift |
+  | `names` | sorted names of station groups, lines, towns, players | reload after 2 rounds |
+
+  Cost per round is one component read per entity (station groups and their terminal nodes, road edges and nodes and edge objects, vehicles, named entities) plus a sort and one hash; roads dominate, so a large map is tens of milliseconds, in the simulation script. Vehicle ids are left out on purpose: ids are not guaranteed equal between games and a permanent false difference would reload every 5 minutes. The launcher log names the lanes ("checksum 12 differs in stations, vehicles (drift)").
 - **Money** is corrected in place from the host's values. **Drift parts** reload only after 5 minutes. **Everything else** reloads after two consecutive differing checks, or at once when a replay fails.
 - **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → every other game loads it (the host's own game keeps playing its live world; `host_reloads` turns the host's reload back on) → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
 

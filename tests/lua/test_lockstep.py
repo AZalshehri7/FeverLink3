@@ -649,7 +649,7 @@ class LockstepTest(unittest.TestCase):
         (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
         self.assertEqual(pa, pb, "identical worlds give identical parts")
-        self.assertEqual(set(pa), {"time", "balance", "loan", "constructions", "lines"})
+        self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names"}, {"time", "balance", "loan", "constructions", "lines"})
         # paused round: the games are stopped, the interface half answers
         self.relay.pauseAt = self.relay.future_stamp()
         self.relay.session()
@@ -1003,6 +1003,82 @@ class PureTest(unittest.TestCase):
         self.assertIsNone(r[0] if isinstance(r, tuple) else r)
         with self.assertRaises(lupa.LuaError):
             self.C.serialize(self.L.eval("print"))
+
+    WIDE_ENGINE = """(function(v)
+      local e = {
+        gameTime = function() return 5 end,
+        account = function() return 100, 10 end,
+        constructions = function() return {} end,
+        lines = function() return {} end,
+      }
+      if v.stations then e.stations = function() return v.stations end end
+      if v.edges then e.edges = function() return v.edges end end
+      if v.nodeConfigs then e.nodeConfigs = function() return v.nodeConfigs end end
+      if v.vehicles then e.vehicles = function() return v.vehicles end end
+      if v.names then e.names = function() return v.names end end
+      return e
+    end)"""
+
+    def _wide(self, **kw):
+        L = self.L
+        mk = L.eval(self.WIDE_ENGINE)
+        tbl = L.table_from(kw, recursive=True)
+        parts, _t = self.K.checksumParts(mk(tbl), self.C.hashValue)
+        return {k: parts[k] for k in parts}
+
+    def test_wide_lanes_are_absent_without_their_accessor(self):
+        parts = self._wide()
+        for name in ("stations", "edges", "nodeConfigs", "vehicles", "names"):
+            self.assertNotIn(name, parts)
+        self.assertIn("balance", parts)
+
+    def test_stations_lane_ignores_order_and_sees_a_moved_stop(self):
+        a = [{"stations": 1, "terminals": 2, "at": [{"x": 1.04, "y": 2}, {"x": 5, "y": 6}]}, {"stations": 1, "terminals": 1, "at": [{"x": 9, "y": 9}]}]
+        b = [a[1], {"stations": 1, "terminals": 2, "at": [{"x": 5, "y": 6.01}, {"x": 1.0, "y": 2}]}]
+        c = [a[0], {"stations": 1, "terminals": 1, "at": [{"x": 9, "y": 12}]}]
+        pa, pb, pc = (self._wide(stations=x)["stations"] for x in (a, b, c))
+        self.assertEqual(pa, pb)
+        self.assertNotEqual(pa, pc)
+
+    def test_edges_lane_canonical_endpoints_and_edge_objects_count(self):
+        base = {"x0": 0, "y0": 0, "x1": 50, "y1": 0, "type": "NORMAL", "typeIndex": -1, "roadType": "STREET", "template": "t", "style": "s", "decorations": 0, "objects": ["signal.mdl", "stop.mdl"]}
+        flipped = dict(base, x0=50, x1=0, objects=["stop.mdl", "signal.mdl"])
+        fewer = dict(base, objects=["stop.mdl"])
+        other = dict(base, template="u")
+        h = lambda e: self._wide(edges=[e])["edges"]
+        self.assertEqual(h(base), h(flipped))
+        self.assertNotEqual(h(base), h(fewer))
+        self.assertNotEqual(h(base), h(other))
+
+    def test_node_configs_lane_sees_a_traffic_light(self):
+        n = {"x": 1, "y": 2, "lanes": 4, "crosswalks": 1, "preference": "AUTO", "light": 0, "slip": False}
+        h = lambda x: self._wide(nodeConfigs=[x])["nodeConfigs"]
+        self.assertEqual(h(n), h(dict(n)))
+        self.assertNotEqual(h(n), h(dict(n, light=1)))
+
+    def test_vehicles_lane_counts_per_line_and_ignores_order(self):
+        v = lambda line, state="EN_ROUTE", stopped=False: {"line": line, "state": state, "stopped": stopped, "sell": False}
+        a = [v("A#2"), v("A#2", "AT_TERMINAL"), v("B#3")]
+        b = [v("B#3"), v("A#2", "AT_TERMINAL"), v("A#2")]
+        h = lambda x: self._wide(vehicles=x)["vehicles"]
+        self.assertEqual(h(a), h(b))
+        self.assertNotEqual(h(a), h(a[:2]))                       # a vehicle fewer
+        self.assertNotEqual(h(a), h([v("A#2"), v("A#2"), v("B#3", stopped=True)]))
+
+    def test_names_lane_sees_a_renamed_station_and_a_town_but_not_order(self):
+        n = {"stations": ["Alpha", "Beta"], "lines": ["L1"], "towns": ["T1", "T2"], "players": ["P"]}
+        h = lambda x: self._wide(names=x)["names"]
+        self.assertEqual(h(n), h(dict(n, stations=["Beta", "Alpha"])))
+        self.assertNotEqual(h(n), h(dict(n, stations=["Alpha", "Gamma"])))
+        self.assertNotEqual(h(n), h(dict(n, towns=["T1", "T3"])))
+        self.assertNotEqual(h(n), h(dict(n, players=["Q"])))
+
+    def test_a_failing_accessor_yields_an_error_part_not_a_crash(self):
+        L = self.L
+        e = L.eval(self.WIDE_ENGINE)(L.table_from({"stations": [{"stations": 1}]}, recursive=True))
+        e.stations = L.eval("function() error('boom') end")
+        parts, _t = self.K.checksumParts(e, self.C.hashValue)
+        self.assertEqual(parts["stations"], "error")
 
     def test_registered_commands_may_bring_their_own_codec(self):
         lua = self.L.eval("""function(K)

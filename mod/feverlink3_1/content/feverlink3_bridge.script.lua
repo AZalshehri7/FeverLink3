@@ -213,6 +213,121 @@ do
 	end
 end
 
+-- Read-only accessors behind the wider checksum lanes (stations, edges, nodeConfigs, vehicles, names; see
+-- L.checksumParts). Plain data out, no ids. Field choices after MPFever (MIT) mpfever_refs.lua contentHash. Each reads
+-- one component per entity, so a round costs about one component read per station group + terminal node, road edge
+-- (+ node, cached, + edge object), vehicle, named entity.
+do
+	local function comp(e, name)
+		local ok, c = pcall(api.engine.getComponent, e, api.type.ComponentType[name])
+		return ok and c or nil
+	end
+	local function nameOf(e)
+		local n = comp(e, "NAME")
+		return n and n.name and tostring(n.name) or ""
+	end
+	local function guard(fn) local ok, v = pcall(fn); return ok and v or nil end
+	local function lineKey(e)
+		local l = comp(e, "LINE")
+		return nameOf(e) .. "#" .. tostring(l and l.stops and #l.stops or 0)
+	end
+	local function nodeAt(cache, n)
+		local p = cache[n]
+		if p == nil then
+			local c = comp(n, "BASE_NODE")
+			p = c and c.position and { x = c.position.x, y = c.position.y } or false
+			cache[n] = p
+		end
+		return p
+	end
+
+	engine.stations = function()
+		local out, nodes = {}, {}
+		for _, g in ipairs(entitiesWith("STATION_GROUP")) do
+			local sg = comp(g, "STATION_GROUP")
+			local item = { stations = 0, terminals = 0, at = {} }
+			for i = 1, sg and sg.stations and #sg.stations or 0 do
+				item.stations = item.stations + 1
+				local st = comp(sg.stations[i], "STATION")
+				for k = 1, st and st.terminals and #st.terminals or 0 do
+					item.terminals = item.terminals + 1
+					local p = nodeAt(nodes, st.terminals[k].vehicleNodeId)
+					if p then item.at[#item.at + 1] = p end
+				end
+			end
+			out[#out + 1] = item
+		end
+		return out
+	end
+
+	engine.edges = function()
+		local out, seen, nodes = {}, {}, {}
+		local map = guard(function() return api.engine.system.streetSystem.getNode2SegmentMap() end) or {}
+		for _, segs in pairs(map) do
+			for i = 1, #segs do
+				local e = segs[i]
+				if not seen[e] then
+					seen[e] = true
+					local c = comp(e, "BASE_EDGE")
+					local a, b = c and nodeAt(nodes, c.node0), c and nodeAt(nodes, c.node1)
+					if a and b then
+						local objs = {}
+						for k = 1, #(c.objects or {}) do
+							local eo = comp(c.objects[k][1], "EDGE_OBJECT")
+							objs[#objs + 1] = eo and tostring(eo.edgeObjectConstruction) or "?"
+						end
+						out[#out + 1] = {
+							x0 = a.x, y0 = a.y, x1 = b.x, y1 = b.y, type = tostring(c.type), typeIndex = c.typeIndex,
+							roadType = tostring(c.roadType), template = tostring(c.roadTemplate), style = tostring(c.roadStyle),
+							decorations = guard(function() return #c.edgeDecorations end), objects = objs,
+						}
+					end
+				end
+			end
+		end
+		return out
+	end
+
+	engine.nodeConfigs = function()
+		local out = {}
+		local map = guard(function() return api.engine.system.streetSystem.getNode2SegmentMap() end) or {}
+		for n in pairs(map) do
+			local nc, c = comp(n, "BASE_NODE_CONFIG"), comp(n, "BASE_NODE")
+			if nc and c and c.position then
+				out[#out + 1] = {
+					x = c.position.x, y = c.position.y, lanes = #(nc.laneConnections or {}), crosswalks = #(nc.crosswalks or {}),
+					preference = tostring(nc.trafficLightPreference),
+					light = guard(function() return nc.trafficLightConfig.trafficLightType end), slip = nc.doubleSlipSwitch,
+				}
+			end
+		end
+		return out
+	end
+
+	engine.vehicles = function()
+		local out, keys = {}, {}
+		for _, e in ipairs(entitiesWith("TRANSPORT_VEHICLE")) do
+			local v = comp(e, "TRANSPORT_VEHICLE")
+			if v then
+				local line = v.line and v.line >= 0 and v.line or nil
+				if line and not keys[line] then keys[line] = lineKey(line) end
+				out[#out + 1] = { line = line and keys[line] or "-", state = tostring(v.state), stopped = v.userStopped, sell = v.sellOnArrival }
+			end
+		end
+		return out
+	end
+
+	engine.names = function()
+		local out = {}
+		for kind, cname in pairs({ stations = "STATION_GROUP", lines = "LINE", towns = "TOWN", players = "PLAYER" }) do
+			local list = {}
+			for _, e in ipairs(entitiesWith(cname)) do list[#list + 1] = nameOf(e) end
+			out[kind] = list
+		end
+		return out
+	end
+end
+
 -- companies: reads and bookings on a company's account (balance, journal entries, line results, the local-company switch)
 if Co then Co.extendEngine(engine, { sender = function() return O.sendCommand or api.cmd.sendCommand end }) end
 
