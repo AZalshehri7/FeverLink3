@@ -30,16 +30,22 @@ anything else (unset, empty, `0`, `true`) is off. Try them in this order:
 | 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
 | 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
 | 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
-| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the town developer's task-seeding function (`sub_8d4270`, RVA `0x8d4270` in build 40420). It logs one line per call, `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, `research/TOWN_GROWTH_FINDINGS.md`). Writes to `native.log` on the thread that calls the function (see below). |
+| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the **map-generation** seed (`RandomLocationFactory`'s constructor, `sub_8d4270`, RVA `0x8d4270` in build 40420; NOT town growth, see section 11). It logs one line per call, `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, `research/TOWN_GROWTH_FINDINGS.md`). Writes to `native.log` on the thread that calls the function (see below). |
+| 5 | `FEVERLINK3_LOG_GROWTH=1`, `FEVERLINK3_GROWTH_SEED_MODE=derive` (`..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) | The town-growth log (a hook on `TownDeveloper::Develop`, RVA `0x8de0b0`, plus a read-only hook on the `TownUpdateSize` handler for the game time) and the seed experiment: after a threshold the random seed `Develop` reads is replaced by a hash of (town, quantized game time). Only which random numbers are drawn changes. Section 11. | Two detours on engine functions; **not run in the game**. |
 
 `FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
 The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
 in-game session controller's folder), as before.
 
-### The town-seed log (`FEVERLINK3_LOG_TOWN_SEED=1`)
+### The map-generation seed log (`FEVERLINK3_LOG_TOWN_SEED=1`)
 
-Purpose: compare two real games. The hook records the random seed with which Transport Fever 3 seeds the task of
-its town developer, so two logs can be diffed to see whether the seeds, the order of the calls and the call site
+**This is map generation, not town growth.** Static analysis (`research/TOWN_RNG_STATE.md`) showed that `0x8d4270` is
+`RandomLocationFactory::RandomLocationFactory`, reached from map generation and the in-game industry placement; it never
+sees a growth step. The town developer's growth generator is logged by section 11. The env-var names keep `TOWN_SEED`
+for compatibility; the log prefix is `mapgen-seed`.
+
+Purpose: compare two real games. The hook records the random seed with which Transport Fever 3 seeds the location
+factory's task (the task the first reading of this analysis took for the town developer's), so two logs can be diffed to see whether the seeds, the order of the calls and the call site
 agree.
 
 What static analysis of build 40420 (PE timestamp `0x6ac50427`) found, offsets are RVAs:
@@ -63,7 +69,7 @@ What static analysis of build 40420 (PE timestamp `0x6ac50427`) found, offsets a
   is not hooked: it runs before this module can be sure of its place and nothing in this hook can read it without a
   second detour. Use the game's own log line for it.
 
-### Forcing the seed (`FEVERLINK3_FORCE_TOWN_SEED=<number>`), an experiment
+### Forcing the map-generation seed (`FEVERLINK3_FORCE_TOWN_SEED=<number>`), an experiment
 
 **This is an experiment switch.** It has been run in two real games with the same value (`0x2cd15ea0`) in both: constructions stayed identical for about 13 checksum rounds, then differed (`research/TOWN_GROWTH_FINDINGS.md`); it has not been shown to hold over time, and it changes only the seed, no game mechanic. The value is decimal or `0x` hex and must fit 32
 bits; anything else is ignored with a log line (`hooks: FEVERLINK3_FORCE_TOWN_SEED: ignored, ...`) and changes nothing.
@@ -74,7 +80,7 @@ How: the ninth argument is a stack slot (`[rsp+0x48]` at the original's entry). 
 receives all twelve slots as parameters and calls the trampoline with twelve arguments, so the compiler writes a fresh
 outgoing slot nine; the hook passes the forced value (zero-extended to 64 bits, the original reads only the low 32)
 there and the other eleven slots as received. A test on the fake twelve-argument function proves that the original
-reads the forced value from `[rsp+0x48]`. The log line gains a field: `town-seed n=.. seed=<original> forced=<value>
+reads the forced value from `[rsp+0x48]`. The log line gains a field: `mapgen-seed n=.. seed=<original> forced=<value>
 caller=.. a3=.. a4=..`.
 
 Why this may not be enough: the seed only initialises the `mt19937` once, at the first load (the function is called
@@ -83,13 +89,13 @@ advances with every draw, and games whose draws differ in number or timing (a re
 only) leave equal seeds with unequal generators. So even if forcing works, step 2 will be a reset of the `mt19937`
 state (the 624-word array and the index at `+0x80`/`+0x84` of the task object) to a common value at every sync point. That analysis is in progress (`research/TOWN_RNG_STATE.md`, in another branch).
 
-The log lines: `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, in `native.log` (location in
+The log lines: `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, in `native.log` (location in
 `native/README.md`). `n` counts the calls of this run from 1; `seed` is 10 characters (`0x` and 8 hex digits);
 `caller` is the RVA of the return address (so it does not move with the load address), or `abs:0x..` if the return
 address lies outside the image. To compare two games, keep only the first four fields:
 
 ```
-grep '^town-seed' native.log | cut -d' ' -f1-4 > game1.txt     (and the same for the second game)
+grep '^mapgen-seed' native.log | cut -d' ' -f1-4 > game1.txt     (and the same for the second game)
 diff game1.txt game2.txt
 ```
 
@@ -631,7 +637,7 @@ there.
   `on_add`, `on_apply`, `release` or the hooks (only in `DllMain` and the WinHTTP relays, where no exception can come).
 - The hook bodies call the originals directly from `system-unwind` functions (`Runtime::on_add`, `on_apply`,
   `engine::release`, no closures), so the exception passes through.
-- The bookkeeping in the hooks (counting, the hold machine, the watch, the town-seed log, the service thread's pump)
+- The bookkeeping in the hooks (counting, the hold machine, the watch, the map-generation seed log, the growth log, the service thread's pump)
   runs inside `log::guarded`: a panic there becomes one log line and the original is called, so our code can no longer
   end the game. The calls into the game are never inside `guarded`, because `catch_unwind` aborts on a foreign exception.
   A command already taken out of the engine's hands when the bookkeeping fails is given back to the engine.
@@ -643,3 +649,100 @@ there.
 `<site>: a panic was contained` means a bug in our bookkeeping that the game survived (report the line above it). A
 game exception through a hook now shows up as nothing at all from us. If the process still dies with
 `0xc0000409`, map the offset with the tool first.
+
+## 11. Town growth: the growth log and the seed experiment (`FEVERLINK3_LOG_GROWTH`, `FEVERLINK3_GROWTH_SEED_MODE`)
+
+**Not run in the game.** Tested only on fake game functions (section 6 style) and checked against the disassembly of
+a copy of `TransportFever3.exe` build 40420 (PE timestamp `0x6ac50427`). This section is the design and the
+checklist for the first real run. The analysis it rests on is `research/TOWN_RNG_STATE.md`; the older
+`FEVERLINK3_LOG_TOWN_SEED` / `FEVERLINK3_FORCE_TOWN_SEED` hook (section 2) is **map generation**, not growth, and is
+left as it was (its log lines now start with `mapgen-seed`).
+
+**Rule kept.** The experiment changes only *which random numbers* the town developer draws, by replacing one 32-bit
+generator seed before the game's own function reads it. Growth, ratings and every rule stay the game's own; no game
+mechanic is disabled or altered.
+
+### What was verified in the executable (copy of build 40420, capstone)
+
+- `TownDeveloper::Develop` is at RVA `0x8de0b0`; its first 15 bytes are whole instructions, none rip-relative:
+  `44 89 44 24 18 | 55 | 53 | 56 | 57 | 41 54 | 41 55 | 41 56` (`mov [rsp+18h],r8d ; push rbp,rbx,rsi,rdi,r12,r13,r14`).
+  It then pushes `r15` and sets `lea rbp,[rsp-0F68h]`, so with `E` the stack pointer at entry `rbp = E - 0xFA8` and
+  `[rbp+0xFD0]` is `[E+0x28]`: **stack argument 5**. Arguments 6 and 7 are `[rbp+0xFD8]` (a float at +0, a byte at
+  +4) and `[rbp+0xFE0]`; no eighth argument is read. `r8d` is the town entity (`mov edi,r8d`), `r9b` a flag (stored at
+  `[rsp+0x70]`), `rdx` the ECS world.
+- `0x8de135 mov rax,[rbp+0xFD0]` and `0x8de13c mov [rbp-0x50],rax`: the function copies the **pointer** (fifth
+  argument) once at entry. The value behind it, the `minstd_rand` state, is **not** read at entry: every draw reloads
+  `[rbp-0x50]` and reads the u32 through it (`0x3055870` / `0x489a40` for integers, `0x30558c0` for floats:
+  `mov eax,[rcx]`, `imul r8,rax,0xbc8f`, mod `0x7fffffff`, store back). So writing the u32 *before the original runs*
+  changes every draw; writing it later would change only the draws after that. (The analysis note's
+  `*(u32*)[rsp+0x28]` means the u32 behind that pointer.)
+- The only growth caller is the `TownUpdateSize` handler `0x9e12b0` (call at `0x9e146b`, return address `0x9e1470`).
+  It makes the u32 in its own frame (`mov [rsp+0x90],ecx` at `0x9e1423`) from a hash of the dword returned by
+  `0x2a96c0([[this+8]+0x28])` (the `GameTime` component field at `+0x40`: FNV-1a 64 over its 4 bytes,
+  `+ 0x45f16db3af769df3`, `^ 0x2ceadadbf054a7e9`, mod `0x7fffffff`, 0 -> 1), puts `&[rsp+0x90]` in `[rsp+0x20]` (that
+  is argument 5), `[rsp+0x98]` in argument 6, 0 in argument 7, `[r15]` (the town entity) in `r8d`, `byte [r15+0x10]` in
+  `r9b`, and calls `Develop`. The result is not used (`mov al,1` follows). The `TownCreate` handler (`0x90d100`) also
+  calls `Develop`, with its own seed; the experiment never touches those calls (no game time is known for them).
+- Unit of the game time: the field is a 32-bit value read through `ecs::component::GameTime`; that it counts
+  **milliseconds** is an assumption (medium certainty). The log prints it raw (`t=`); the quantum and the game-time
+  threshold are applied to it as if milliseconds. If the first run shows another unit, only the meaning of
+  `FEVERLINK3_GROWTH_SEED_QUANTUM_MS` and `..._AFTER_GAMETIME` changes, nothing breaks.
+
+### Switches
+
+Read once at start. The usual rules: unknown build, prologue mismatch or failed self-test install nothing and the
+reason is logged (fail-open).
+
+| Environment | What it does |
+|---|---|
+| `FEVERLINK3_LOG_GROWTH=1` | Hooks `Develop` (`0x8de0b0`) and, to read the game time, the `TownUpdateSize` handler (`0x9e12b0`, 15 bytes `40 53 55 56 57 41 54 41 56 41 57 48 83 EC 50`). The handler hook reads `[[this+8]+0x28]`, calls the game's own getter `0x2a96c0` (prologue compared first, never patched) and keeps the value while the handler runs, then calls the original unchanged. The `Develop` hook logs `growth n=<counter> town=<entity> seed=0x<u32 the game made> t=<game time, only for TownUpdateSize calls> caller=<rva>` and calls the original unchanged. If the handler or getter bytes differ, only `Develop` is hooked and there is no `t=`. |
+| `FEVERLINK3_GROWTH_SEED_MODE=off` | The default: log only. |
+| `FEVERLINK3_GROWTH_SEED_MODE=derive` | Implies the hook (and the log). Before the switch the hook only logs. After the switch, for every `TownUpdateSize` call (game time known), the u32 behind argument 5 is overwritten with `derive(town, t)` before the original runs, and the line reads `growth n=.. town=.. seed=<orig> t=.. used=<derived> caller=..`. Calls without a known game time (`TownCreate`) are never rewritten. Without a readable game time on this build, nothing is ever rewritten. |
+| `FEVERLINK3_GROWTH_SEED_AFTER=<seconds>` | Wall-clock seconds since the hook was installed before the switch may happen. Default 0. |
+| `FEVERLINK3_GROWTH_SEED_AFTER_GAMETIME=<game seconds>` | The switch also waits until the game time (field / 1000) has reached this. Unset: no game-time condition. Both conditions must hold. |
+| `FEVERLINK3_GROWTH_SEED_QUANTUM_MS=<ms>` | The time input of the derived seed is the game time rounded **down** to a multiple of this. Default 1000. 0 or garbage is ignored (default) and logged. |
+
+A value that does not parse is ignored with a `hooks: ...` line in `native.log` and leaves the default.
+
+**Which threshold is testable.** The game-time threshold. Both games load the same save and run the same
+`TownUpdateSize` commands at the same game times, so with `..._AFTER_GAMETIME` both games switch at the same
+simulation step. Wall-clock `..._AFTER` counts from the moment each process installed the hook (the games are started
+seconds apart and load for different durations), so the two games would switch at slightly different simulation steps
+and the comparison is blurred by that. Use the wall-clock value only to get a first run going without knowing the
+game's time values.
+
+**The derived seed.** `derive(town, t, Q) = FNV-1a-64(le32(town) ++ le32(t - t % Q))`, folded (`h ^ h>>32`) to 32 bits
+and mapped to `1 .. 0x7ffffffe` (`x % 0x7ffffffe + 1`), the range of valid `minstd_rand` states. A pure function of
+the town and the quantum-aligned time: two games that run a town's growth command a few milliseconds apart draw
+identically, as long as both fall inside the same quantum (a pair straddling a quantum boundary still differs; with
+Q = 1000 ms and a few ms of skew that is rare, but it can happen, and the logs will show it).
+
+**What it tests.** If the towns drift because the game time at which the command runs differs slightly between the
+two games (so the hash seeds differ), the derived seeds are equal and the drift should stop after the switch. If the
+games already had equal seeds and still drift, the cause is elsewhere (different input state, a different command
+payload, a persistent generator not found by static analysis, `math.random`).
+
+**Volume.** The first 2000 calls are logged, then about one in 50, picked by the content of the call (a hash of town
+and original seed), not by the counter, so two games that make the same calls log the same lines. Lines are
+formatted only when written. The switch writes one extra line, `growth-switch n=..: from now on ... wall=..s
+game_time=..`. `native.log` stops growing at 2 MiB (shared with everything else the module logs), and it is written on
+the simulation thread like the map-generation log, which is why this is a diagnostic to be switched on for a
+comparison, not left on.
+
+**Comparing two runs.** Counters differ between processes, so cut the first two fields:
+
+```
+grep '^growth ' native.log | cut -d' ' -f3- | sort > game1.txt        (and the same for the second game)
+diff game1.txt game2.txt
+```
+
+Look for: (1) before the `growth-switch` line, whether `town=` and `seed=` agree at equal `t=` in both games (if the
+seeds differ at the same `t=`, the games run the command at different game times); (2) after it, `used=` identical per
+town and quantum in both games, whatever `seed=` was; (3) whether the `townBuildings` lanes of the checksum rounds stay
+identical after the switch when they drifted before.
+
+**Safety.** The hooks are `extern "system-unwind"` functions (`native/src/hooks.rs`); the bookkeeping that can fail
+(formatting, the log call) is inside `log::guarded`; the calls to the original, and to the game's getter, are outside
+it; a null or misaligned state pointer is passed through untouched. The seed write is one volatile store to the u32
+the caller handed us, the game's own object. The call-site identification (`hook_caller`, a stack walk) runs only for
+lines that are written.
