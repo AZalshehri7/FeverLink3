@@ -138,6 +138,7 @@ local function setup(react, builtin)
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
+		local mbIn = react.useState(32)
 		local showTest = react.useState(false)
 		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
 		-- paused (a guest's window must notice the host ending the session then too).
@@ -230,6 +231,21 @@ local function setup(react, builtin)
 			end
 			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
 			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
+			-- Speed test: how long would the save of a synced game take over Steam? Both players keep this window open.
+			add(gap())
+			add(section("Speed test"))
+			add(note("Sends this much data each way. 80 MB is about the size of a save that has to cross."))
+			local sizes = {}
+			for _, mb in ipairs(C.SPEED_CHOICES) do
+				local chosen = (C.speedChoice(mbIn:old()) == mb)
+				sizes[#sizes + 1] = button((chosen and "[ " or "") .. mb .. " MB" .. (chosen and " ]" or ""),
+					function() mbIn:set(mb) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_CHOICES) - 10)
+			end
+			add(box(H, sizes))
+			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old())) end))
+			if st and st.speed then
+				for _, line in ipairs(C.speedLines(st.speed)) do add(note(line)) end
+			end
 			if st and st.note then add(note(tostring(st.note))) end
 			if st and st.test then
 				local t = st.test

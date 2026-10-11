@@ -337,4 +337,34 @@ function C.plain(v, depth)
 	return out
 end
 
+-- ------------------------------------------------------------------ Steam speed test (the window's text)
+
+-- The sizes the window offers, in MB. 80 is about the size of the save that has to cross when a game is synced.
+C.SPEED_CHOICES = { 8, 32, 80 }
+
+-- The size to test: a number the window offers, else 32.
+function C.speedChoice(mb)
+	for _, choice in ipairs(C.SPEED_CHOICES) do
+		if tonumber(mb) == choice then return choice end
+	end
+	return 32
+end
+
+-- The command parameters of the speed test button.
+function C.speedParams(steamId, mb)
+	return { id = steamId, mb = C.speedChoice(mb) }
+end
+
+-- The lines to show under the buttons for the controller's steam.speed value: the result lines of a finished test, the
+-- progress or failure line otherwise, nothing when no test was started.
+function C.speedLines(speed)
+	if type(speed) ~= "table" then return {} end
+	local out = {}
+	if type(speed.lines) == "table" then
+		for i = 1, #speed.lines do out[#out + 1] = tostring(speed.lines[i]) end
+	end
+	if #out == 0 and speed.status ~= nil then out[1] = tostring(speed.status) end
+	return out
+end
+
 return C

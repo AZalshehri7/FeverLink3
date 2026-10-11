@@ -131,6 +131,59 @@ Set globally when Steam becomes ready, best effort (a refusal is reported in the
 Not changed: send buffer (512 KiB), Nagle (5 ms), receive limits (512 KiB per message). The tuned send rate is visible
 as `rate` in the report; 262 144 means the tuning did not take effect.
 
+**Changing the send rate for a test: `FEVERLINK3_STEAM_SENDRATE=<bytes per second>`.** Set it in the environment of the
+game (before it starts) on both PCs. The numbers 10 (`SendRateMin`) and 11 (`SendRateMax`) were checked against
+`steamnetworkingtypes.h` of GameNetworkingSockets (`k_ESteamNetworkingConfig_SendRateMin = 10`, `...SendRateMax = 11`),
+and the header says to set both to the same value to fix the rate (the library does not estimate the bandwidth yet), which
+is what the core does. The value is clamped to 32 KiB/s .. 64 MiB/s; unset, empty or not a number means 1 048 576. The
+speed test's second line shows both the value asked for and the one Steam reports (`GetConnectionRealTimeStatus`,
+`m_nSendRateBytesPerSecond`). **What is a good value?** Steam sends at exactly that rate whatever the line can carry, so
+too high on a slow line means queuing and loss, too low wastes the line. Try 1 MiB/s (the default), then 2 097 152 and
+4 194 304 and keep the highest one without a stall or a growing queue. An 80 MB save is 107 MB on the wire (base64), so at
+1 MiB/s it takes about 102 s, at 4 MiB/s about 26 s.
+
+## 7.1 The speed test
+
+The window's **Run the speed test** (command `steamtest` with `{id, mb}`) answers: can a resync save (about 80 MB) cross
+Steam, and how fast. It uses the probe's connection (virtual port 1), so both players need the window of a game with the
+mod; the friend does nothing but wait. Code: `launcher/src/steamnet/throughput.rs` (messages, timing, result text) and
+the probe in `launcher/src/steamnet.rs` (state machine).
+
+Data: random bytes (incompressible), in messages of 349 524 bytes of payload, the size of one resync chunk on the wire
+(256 KiB of save, base64). They go through `send_reliable` like resync chunks do, so Steam's 512 KiB buffer paces the
+sender exactly as it does for a save.
+
+Message flow (each line one Steam message; `d` is the data message):
+
+```
+tester                               friend
+  tput up <id> <bytes> <chunk>  -->     starts timing
+  tput d <id> <seq> + payload   -->  (N chunks, sender thread, blocks while the buffer is full)
+                                <--  tput prog <id> <bytes>        every 500 ms
+  tput end <id> <sent> <peak queued> <longest wait>  -->
+                                <--  tput upres <id> <bytes> <ms> <longest gap> <bytes after first chunk>
+  tput down <id> <bytes> <chunk> -->    starts a sender thread
+                                <--  tput d ... (N chunks)
+                                <--  tput end <id> <sent> <peak queued> <longest wait>
+```
+
+The receiver times from the first chunk to the last (so the route set-up does not count) and the rate is the bytes after
+the first chunk over that time. Result, shown under the button and as one `steam speed test:` line in `session.log`:
+
+- MB/s each direction (1 MB = 1 000 000 bytes) and total seconds;
+- route (`direct` or `through a Steam relay`, from the connection info flags) and Steam's round trip (`m_nPing`);
+- the send rate asked for and the one Steam reports;
+- peak queued bytes (`m_cbPendingReliable`, measured by the core once a second, so a coarse peak, at most 512 KiB);
+- a stall: the longest time without data (the receiver's longest gap, the sender's longest wait for buffer room); over
+  5 s it says STALLED. The test is abandoned after 60 s without progress;
+- the estimate for an 80 MB save (107 MB on the wire) at the measured rates: "if you host" uses your upload, "if your
+  friend hosts" your download.
+
+A friend can ask a probe to send at most 128 MB and two such streams at once; more is ignored.
+
+The fake-Steam tests (two in-memory accounts) cover the messages, the math, a full run, a refusal, a friend who leaves
+and the limits. They cannot say anything about a real line; see the steps in `docs/PLAYING.md`, section 5.
+
 ## 8. What is proven
 
 **In the real game** (build 40420, 2026-10-09, by the probe; the code of these steps was kept):
