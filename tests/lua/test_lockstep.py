@@ -48,6 +48,7 @@ LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
 HOOK_SRC = read_src("feverlink3_uihook.lua")
+TRACE_SRC = read_src("feverlink3_towntrace.lua")
 # the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
 CMDS_SRC = {
     os.path.splitext(f)[0]: read_src(f)
@@ -228,6 +229,7 @@ function LOAD_HALF(label)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_towntrace") then return assert(load(TRACE_SRC, "=towntrace", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
     if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
     error("no module " .. tostring(p))
@@ -335,6 +337,7 @@ class Game:
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
         g.HOOK_SRC = HOOK_SRC
+        g.TRACE_SRC = TRACE_SRC
         cmds = self.L.table()
         for stem, src in CMDS_SRC.items():
             cmds[stem] = src

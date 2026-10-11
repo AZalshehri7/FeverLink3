@@ -679,10 +679,12 @@ mechanic is disabled or altered.
   is argument 5), `[rsp+0x98]` in argument 6, 0 in argument 7, `[r15]` (the town entity) in `r8d`, `byte [r15+0x10]` in
   `r9b`, and calls `Develop`. The result is not used (`mov al,1` follows). The `TownCreate` handler (`0x90d100`) also
   calls `Develop`, with its own seed; the experiment never touches those calls (no game time is known for them).
-- Unit of the game time: the field is a 32-bit value read through `ecs::component::GameTime`; that it counts
-  **milliseconds** is an assumption (medium certainty). The log prints it raw (`t=`); the quantum and the game-time
-  threshold are applied to it as if milliseconds. If the first run shows another unit, only the meaning of
-  `FEVERLINK3_GROWTH_SEED_QUANTUM_MS` and `..._AFTER_GAMETIME` changes, nothing breaks.
+- Unit of the game time: the field is a 32-bit value read through `ecs::component::GameTime`. **It counts ticks of
+  200 ms, not milliseconds** (measured 2026-10-11: 13,617,200 ms = tick 68,086; `research/run-2026-10-11-growth-seed-identical/`).
+  The log prints it raw (`t=`, ticks). The game-time threshold `FEVERLINK3_GROWTH_SEED_AFTER_GAMETIME` (game seconds) is
+  converted to ticks (x 5) and the quantum `FEVERLINK3_GROWTH_SEED_QUANTUM_MS` (milliseconds) to ticks (rounded up, at
+  least 1) before they meet the dword; the derived seed hashes the quantized TICK. (Before this fix the switch compared
+  ticks as milliseconds and never fired; the derive mode has therefore not been tested in a game.)
 
 ### Switches
 
@@ -691,7 +693,7 @@ reason is logged (fail-open).
 
 | Environment | What it does |
 |---|---|
-| `FEVERLINK3_LOG_GROWTH=1` | Hooks `Develop` (`0x8de0b0`) and, to read the game time, the `TownUpdateSize` handler (`0x9e12b0`, 15 bytes `40 53 55 56 57 41 54 41 56 41 57 48 83 EC 50`). The handler hook reads `[[this+8]+0x28]`, calls the game's own getter `0x2a96c0` (prologue compared first, never patched) and keeps the value while the handler runs, then calls the original unchanged. The `Develop` hook logs `growth n=<counter> town=<entity> seed=0x<u32 the game made> t=<game time, only for TownUpdateSize calls> caller=<rva>` and calls the original unchanged. If the handler or getter bytes differ, only `Develop` is hooked and there is no `t=`. |
+| `FEVERLINK3_LOG_GROWTH=1` | Hooks `Develop` (`0x8de0b0`) and, to read the game time, the `TownUpdateSize` handler (`0x9e12b0`, 15 bytes `40 53 55 56 57 41 54 41 56 41 57 48 83 EC 50`). The handler hook reads `[[this+8]+0x28]`, calls the game's own getter `0x2a96c0` (prologue compared first, never patched) and keeps the value while the handler runs, then calls the original unchanged. The `Develop` hook logs `growth n=<counter> pid=<process id> town=<entity> seed=0x<u32 the game made> [t=<tick of 200 ms, only for TownUpdateSize calls>] [used=..] r9b=<flag byte> a6=0x<slot 6> a6f=<its low dword as float> a6b=<its byte at +4> a7=0x<slot 7> ret=0x<rax of the original> caller=<rva>` (after the original returns, because of `ret`) and calls the original unchanged. Every line is also appended to `growth.log` in the game's own live folder (`FEVERLINK3_LIVE_DIR`; `native.log` is shared by two games on one PC). If the handler or getter bytes differ, only `Develop` is hooked and there is no `t=`. |
 | `FEVERLINK3_GROWTH_SEED_MODE=off` | The default: log only. |
 | `FEVERLINK3_GROWTH_SEED_MODE=derive` | Implies the hook (and the log). Before the switch the hook only logs. After the switch, for every `TownUpdateSize` call (game time known), the u32 behind argument 5 is overwritten with `derive(town, t)` before the original runs, and the line reads `growth n=.. town=.. seed=<orig> t=.. used=<derived> caller=..`. Calls without a known game time (`TownCreate`) are never rewritten. Without a readable game time on this build, nothing is ever rewritten. |
 | `FEVERLINK3_GROWTH_SEED_AFTER=<seconds>` | Wall-clock seconds since the hook was installed before the switch may happen. Default 0. |
@@ -718,14 +720,14 @@ two games (so the hash seeds differ), the derived seeds are equal and the drift 
 games already had equal seeds and still drift, the cause is elsewhere (different input state, a different command
 payload, a persistent generator not found by static analysis, `math.random`).
 
-**Volume.** The first 2000 calls are logged, then about one in 50, picked by the content of the call (a hash of town
+**Volume.** (Towns named in `FEVERLINK3_TOWN_TRACE` are exempt: every call is logged, to `growth.log` only.) The first 2000 calls are logged, then about one in 50, picked by the content of the call (a hash of town
 and original seed), not by the counter, so two games that make the same calls log the same lines. Lines are
 formatted only when written. The switch writes one extra line, `growth-switch n=..: from now on ... wall=..s
 game_time=..`. `native.log` stops growing at 2 MiB (shared with everything else the module logs), and it is written on
 the simulation thread like the map-generation log, which is why this is a diagnostic to be switched on for a
 comparison, not left on.
 
-**Comparing two runs.** Counters differ between processes, so cut the first two fields:
+**Comparing two runs.** For the first-divergence experiment see "The town trace" below. Counters and process ids differ between processes, so cut the first two fields:
 
 ```
 grep '^growth ' native.log | cut -d' ' -f3- | sort > game1.txt        (and the same for the second game)
@@ -744,3 +746,25 @@ identical after the switch when they drifted before.
 it; a null or misaligned state pointer is passed through untouched. The seed write is one volatile store to the u32
 the caller handed us, the game's own object. The call-site identification (`hook_caller`, a stack walk) runs only for
 lines that are written.
+
+### The town trace (`FEVERLINK3_TOWN_TRACE`): finding the first divergence
+
+Read-only; changes no mechanic. `FEVERLINK3_TOWN_TRACE=<comma list of town entity ids | all>` (default off; tools:
+`FL3_DEMO_TOWN_TRACE`) makes each game write, in its own live folder:
+
+- `town_trace.txt` (Lua, `feverlink3_towntrace.lua`, called from the sim script's `update`): per 200 ms tick and traced
+  town, only when it changed: `t=<tick> town=<id> n=<buildings> h=<hash>` (plus ` base` the first time) followed by the diff
+  lines `+ / - / ~ <file>@x,y,z L=<level> D=<depth> P=<parcels> T=<timeBuilt>` (`~` shows `old>new` for the changed
+  fields; entity ids never appear); `t=<tick> town=<id> info dev=.. size=.. cap=.. scale=.. needs=.. weights=.. noise=..
+  poll=.. emis=..`, the town component values readable from the sim script, at every change and at least every 5 s of
+  game time; `t=<tick> cmd <name> [town=<id>] [pi=0|1]` for every `apply_command` event the sim script receives.
+  The ratings, the population and XP live in the game script's state and cannot be read from the sim script. With `all`
+  the world is sampled every 5 ticks and the baseline lists no buildings. Lines are buffered and appended once per second
+  or 200 lines; a failing write never raises, and five trace errors switch the trace off.
+- `growth.log` (native, needs `FEVERLINK3_LOG_GROWTH=1`): every `Develop` call of the traced towns (see above).
+
+`python tools/gametest/compare_town_trace.py <live1> <live2>` aligns the two games and prints, per traced town, the first
+tick at which the state differs, the building diff of each game, the buildings only one game has, the `Develop` calls
+around that tick, the commands seen, and a verdict: `inputs differed before the call` / `same inputs, different result
+(nondeterminism inside Develop)` / `a non-growth writer`. The session controller clears the live folder when it starts,
+so start the trace games before the session.
