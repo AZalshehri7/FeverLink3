@@ -161,8 +161,24 @@ impl Default for Config {
             locate: Duration::from_millis(250),
             link_every: Duration::from_secs(1),
             initial_timeout_ms: 45_000,
-            send_rate: 1 << 20,
+            send_rate: send_rate_setting(std::env::var(SEND_RATE_ENV).ok().as_deref()),
         }
+    }
+}
+
+/// The environment variable that replaces the send rate (bytes per second) for the speed test.
+pub const SEND_RATE_ENV: &str = "FEVERLINK3_STEAM_SENDRATE";
+/// The send rate used when the variable is not set: 1 MiB/s (Steam's own default is 256 KiB/s).
+pub const DEFAULT_SEND_RATE: i32 = 1 << 20;
+/// Bounds for the variable: below 32 KiB/s nothing works, above 64 MiB/s no home line can follow.
+pub const SEND_RATE_RANGE: (i32, i32) = (32 * 1024, 64 << 20);
+
+/// The send rate for an environment value: unset, empty or not a number is [`DEFAULT_SEND_RATE`], anything else is
+/// kept inside [`SEND_RATE_RANGE`].
+pub fn send_rate_setting(value: Option<&str>) -> i32 {
+    match value.and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(n) => n.clamp(i64::from(SEND_RATE_RANGE.0), i64::from(SEND_RATE_RANGE.1)) as i32,
+        None => DEFAULT_SEND_RATE,
     }
 }
 
@@ -995,6 +1011,11 @@ impl CoreRef {
         Ok(conn)
     }
 
+    /// The send rate (bytes per second) this core asked Steam for as `SendRateMin` and `SendRateMax`.
+    pub fn send_rate_setting(&self) -> i32 {
+        self.0.config.send_rate
+    }
+
     /// Hands one reliable message to Steam. Only an open connection of ours accepts one.
     pub fn send(&self, conn: Handle, data: &[u8]) -> SendOutcome {
         if data.len() > MAX_MESSAGE {
@@ -1820,6 +1841,17 @@ mod tests {
         // a closed connection has no measurement any more
         assert!(guest.close(p.guest_conn));
         assert_eq!(guest.link(p.guest_conn), None);
+    }
+
+    #[test]
+    fn the_send_rate_variable_is_parsed_and_bounded() {
+        assert_eq!(send_rate_setting(None), 1 << 20);
+        assert_eq!(send_rate_setting(Some("")), 1 << 20);
+        assert_eq!(send_rate_setting(Some("fast")), 1 << 20);
+        assert_eq!(send_rate_setting(Some(" 4194304 ")), 4_194_304);
+        assert_eq!(send_rate_setting(Some("1")), 32 * 1024);
+        assert_eq!(send_rate_setting(Some("-5")), 32 * 1024);
+        assert_eq!(send_rate_setting(Some("99999999999")), 64 << 20);
     }
 
     #[test]

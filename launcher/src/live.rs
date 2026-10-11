@@ -223,6 +223,8 @@ pub struct Controller {
     persona_last: Instant,
     steam_note: Option<String>,
     steam_loop: Arc<Mutex<LoopCheck>>,
+    /// The speed test whose summary line already went to `session.log`.
+    speed_logged: u64,
     /// Puts text on the clipboard (the window's "Copy code"); the tests replace it.
     clipboard: Box<dyn Fn(&str) -> bool + Send>,
     result: Option<CommandResult>,
@@ -293,6 +295,7 @@ impl Controller {
             persona_last: Instant::now(),
             steam_note: None,
             steam_loop: Arc::default(),
+            speed_logged: 0,
             clipboard: Box::new(clipboard::set_text),
             result: None,
             log_cursor: 0,
@@ -359,8 +362,24 @@ impl Controller {
         if let Some(probe) = &mut self.steam {
             probe.poll();
         }
+        self.log_speed_test();
         self.write_session_log();
         self.publish();
+    }
+
+    /// Writes the summary line of a finished (or failed) Steam speed test to `session.log`, once per test.
+    fn log_speed_test(&mut self) {
+        let Some(speed) = self.steam.as_ref().and_then(|p| p.report().speed) else { return };
+        let Some(line) = speed.log.filter(|_| speed.id != self.speed_logged) else { return };
+        self.speed_logged = speed.id;
+        let path = self.dir.join(SESSION_LOG_FILE);
+        if fs::metadata(&path).map(|m| m.len() > SESSION_LOG_MAX).unwrap_or(false) {
+            let _ = fs::remove_file(&path);
+        }
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
     }
 
     /// Appends the session's new log lines (who joined, resync rounds, checksum differences, replay failures) to
@@ -431,8 +450,13 @@ impl Controller {
                     return self.steam_loop();
                 }
                 let id = steamnet::parse_steam_id(text);
+                // `mb` asks for the speed test (8, 32 or 80 MB in the window; any number up to 128 is accepted)
+                let speed_mb = params.get("mb").and_then(Value::as_f64).filter(|mb| *mb >= 1.0).map(|mb| mb as u32);
                 match (&mut self.steam, id) {
-                    (Some(probe), Some(id)) => probe.test(id),
+                    (Some(probe), Some(id)) => match speed_mb {
+                        Some(mb) => probe.speed_test(id, mb),
+                        None => probe.test(id),
+                    },
                     (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),
                     (None, _) => self.steam_note = Some("Steam networking is not available in this game".into()),
                 }
@@ -877,6 +901,9 @@ impl Controller {
                 "rate": t.send_rate,
             });
         }
+        if let Some(sp) = r.speed {
+            v["speed"] = json!({ "running": sp.running, "status": sp.status, "lines": sp.lines });
+        }
         v["peers"] = json!(r
             .peers
             .iter()
@@ -1219,6 +1246,41 @@ mod tests {
         let dir = root.join(name);
         let controller = Controller::with_core(dir.clone(), name.into(), Vec::new(), core.handle()).unwrap();
         SteamPc { machine, _core: core, controller, window: Window::new(&dir), dir }
+    }
+
+    #[test]
+    fn the_speed_test_runs_from_the_window_and_leaves_one_line_in_the_session_log() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut friend, mut me) = (steam_pc(root.path(), "friend"), steam_pc(root.path(), "me"));
+        let id = friend.machine.steam_id();
+        me.window.send("steamtest", &format!("{{[\"id\"]=\"{id}\",[\"mb\"]=2}}"));
+        assert!(until(&mut [&mut friend.controller, &mut me.controller], Duration::from_secs(20), || {
+            me.window.status()["steam"]["speed"]["running"] == false
+        }));
+        let speed = me.window.status()["steam"]["speed"].clone();
+        let lines: Vec<&str> = speed["lines"].as_array().expect("lines").iter().filter_map(|l| l.as_str()).collect();
+        assert_eq!(lines.len(), 4, "{speed:?}");
+        assert!(lines[0].starts_with("Speed test, 2 MB each way: you to friend "), "{lines:?}");
+        assert!(speed["status"].as_str().is_some_and(|s| s == lines[0]));
+        // one summary line, written once however long the controller keeps running
+        until(&mut [&mut friend.controller, &mut me.controller], Duration::from_millis(500), || false);
+        let log = fs::read_to_string(me.dir.join(SESSION_LOG_FILE)).expect("a session log");
+        let summary: Vec<&str> = log.lines().filter(|l| l.starts_with("steam speed test: ")).collect();
+        assert_eq!(summary.len(), 1, "{log}");
+        assert!(summary[0].contains("2 MB each way") && summary[0].contains("80 MB save about"), "{log}");
+        // only the tester logs
+        assert!(!friend.dir.join(SESSION_LOG_FILE).exists());
+    }
+
+    #[test]
+    fn a_speed_test_without_a_valid_id_is_refused_in_words() {
+        let root = tempfile::tempdir().unwrap();
+        let mut me = steam_pc(root.path(), "me");
+        me.window.send("steamtest", "{[\"id\"]=\"abc\",[\"mb\"]=8}");
+        assert!(until(&mut [&mut me.controller], Duration::from_secs(5), || {
+            me.window.status()["steam"]["note"].as_str().is_some_and(|n| n.contains("not a Steam ID"))
+        }));
+        assert!(me.window.status()["steam"]["speed"].is_null());
     }
 
     #[test]
