@@ -17,11 +17,20 @@ pub struct ChecksumOutcome {
     pub time: i64,
     pub reporters: Vec<u16>,
     pub differences: Vec<ChecksumDifference>,
+    /// Each reporter's own sim time, set only when the samples were taken at different times. Games at x3/x4 step
+    /// coarsely, so a round stamped for one time is hashed at the first step at or after it, which differs between
+    /// games. Such samples are of different worlds: they are not compared (`differences` stays empty).
+    pub time_skew: Option<BTreeMap<u16, i64>>,
 }
 
 impl ChecksumOutcome {
+    /// False when the samples were taken at different sim times: nothing can be said about them.
+    pub fn comparable(&self) -> bool {
+        self.time_skew.is_none()
+    }
+
     pub fn identical(&self) -> bool {
-        self.differences.is_empty()
+        self.comparable() && self.differences.is_empty()
     }
 
     pub fn differing_parts(&self) -> impl Iterator<Item = &str> {
@@ -89,6 +98,11 @@ impl ChecksumRounds {
 
     pub fn compare(n: i32, reports: &BTreeMap<u16, ChecksumReportMessage>) -> ChecksumOutcome {
         let reporters: Vec<u16> = reports.keys().copied().collect();
+        let time = reporters.first().map_or(0, |id| reports[id].time);
+        if reports.values().any(|r| r.time != time) {
+            let skew = reports.iter().map(|(&id, r)| (id, r.time)).collect();
+            return ChecksumOutcome { n, time, reporters, differences: Vec::new(), time_skew: Some(skew) };
+        }
         let parts: BTreeSet<&str> = reports.values().flat_map(|r| r.parts.keys().map(String::as_str)).collect();
         let mut differences = Vec::new();
         for part in parts {
@@ -99,7 +113,6 @@ impl ChecksumRounds {
                 differences.push(ChecksumDifference { part: part.to_owned(), values });
             }
         }
-        let time = reporters.first().map_or(0, |id| reports[id].time);
-        ChecksumOutcome { n, time, reporters, differences }
+        ChecksumOutcome { n, time, reporters, differences, time_skew: None }
     }
 }
