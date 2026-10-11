@@ -188,3 +188,17 @@ fn the_wider_lanes_are_classified_and_named_in_the_difference_message() {
     let reason = p.on_outcome(10.0, &outcome(&["names", "stations"])).expect("two rounds");
     assert!(reason.starts_with("names, stations differ"), "{reason}");
 }
+
+#[test]
+fn a_difference_in_balance_or_loan_is_corrected_in_place_and_never_reloads() {
+    let mut p = policy();
+    for t in 0..6 {
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &outcome(&["balance"])), "balance round {t}");
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0 + 5.0, &outcome(&["loan", "balance"])), "loan round {t}");
+    }
+    // another part next to the money still counts, and the money is left out of the reason
+    p.on_outcome(100.0, &outcome(&["balance", "roads"]));
+    let reason = p.on_outcome(110.0, &outcome(&["balance", "roads"])).expect("roads differ twice");
+    assert!(reason.starts_with("roads differ"), "{reason}");
+    assert!(ChecksumPolicy::describe_parts(["balance"]).contains("(corrected)"));
+}

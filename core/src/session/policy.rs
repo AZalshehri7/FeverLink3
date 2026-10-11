@@ -34,8 +34,9 @@ pub struct ChecksumPolicy {
 impl ChecksumPolicy {
     /// Parts that drift without anyone doing anything (the engine is not bit-exact for them); `script:*` too.
     pub const DRIFT_PARTS: [&'static str; 5] = ["vehicles", "onboard", "persons", "stocks", "nodeConfigs"];
-    /// Corrected through Authority, never a reason to reload.
-    pub const MONEY_PART: &'static str = "money";
+    /// Corrected through Authority, never a reason to reload. The lanes the script reports are `balance` and `loan`
+    /// (`money` is the older name); a rule written for "money" alone let a difference of 180 in `balance` reload the world.
+    pub const MONEY_PARTS: [&'static str; 3] = ["money", "balance", "loan"];
 
     pub fn new(config: ChecksumPolicyConfig) -> Self {
         Self { config, ..Self::default() }
@@ -43,6 +44,10 @@ impl ChecksumPolicy {
 
     pub fn config(&self) -> &ChecksumPolicyConfig {
         &self.config
+    }
+
+    pub fn is_money_part(part: &str) -> bool {
+        Self::MONEY_PARTS.contains(&part)
     }
 
     pub fn is_drift_part(part: &str) -> bool {
@@ -55,7 +60,7 @@ impl ChecksumPolicy {
         let named: Vec<String> = parts
             .into_iter()
             .map(|p| {
-                if p == Self::MONEY_PART {
+                if Self::is_money_part(p) {
                     format!("{p} (corrected)")
                 } else if Self::is_drift_part(p) {
                     format!("{p} (drift)")
@@ -78,7 +83,7 @@ impl ChecksumPolicy {
             return None;
         }
         let parts: BTreeSet<String> =
-            outcome.differing_parts().filter(|p| *p != Self::MONEY_PART).map(str::to_owned).collect();
+            outcome.differing_parts().filter(|p| !Self::is_money_part(p)).map(str::to_owned).collect();
         let drift: BTreeSet<String> = parts.iter().filter(|p| Self::is_drift_part(p)).cloned().collect();
         let other: BTreeSet<String> = parts.iter().filter(|p| !Self::is_drift_part(p)).cloned().collect();
 
