@@ -176,6 +176,7 @@ class FakeNative:
                 self.game.L.globals().NATIVE_RELEASE(e["id"])
                 self.released.append(e["id"])
                 self.emit("released", {"id": e["id"], "reason": e.get("reason", "release"), "ms": int(self.clock.t * 1000)})
+                self.emit("applied", {"id": e["id"], "ok": True})
             elif e["phase"] == "cancel":
                 self.game.L.globals().NATIVE_DROP(e["id"])
                 self.dropped.append(e["id"])
@@ -253,6 +254,7 @@ function NATIVE_RELEASE(id)
   if h then GAME.guiQueue[#GAME.guiQueue + 1] = h end
 end
 function NATIVE_DROP(id) NATIVE_HELD[id] = nil end
+function NATIVE_HELD_COUNT() local n = 0; for _ in pairs(NATIVE_HELD) do n = n + 1 end; return n end
 
 local BASE_MAKE_API_STRICT = MAKE_API
 function MAKE_API()
@@ -274,8 +276,8 @@ end
 -- a native tool: builds the proposal, tells the interface half what it previews (builder.proposalCreate: the real tool is
 -- blocked while its command is held, and its apply event only comes after the engine applied the build) and adds its command
 TOOLS = {}
-function TOOL_MAKE(spec)
-  local p = SIMPLE_ROAD(spec)
+function TOOL_MAKE(spec, make)
+  local p = (make or SIMPLE_ROAD)(spec)
   TOOLS[#TOOLS + 1] = { p = p, cmd = SIM_ENV.api.cmd.makeWorldBuildProposalCmd(p, nil, false, true) }
   return #TOOLS
 end
@@ -300,9 +302,9 @@ class StrictGame(N.NativeGame):
         self.L.execute(STRICT_LUA)
         self.reload()   # fresh halves, so that the interface half's sendCommand sits on the module's hook
 
-    def tool(self, road, event=True, add=True, event_first=True, site=True):
+    def tool(self, road, event=True, add=True, event_first=True, site=True, make=None):
         """A native tool's confirm click: the tool event and the command's Add, in either order."""
-        i = int(self.L.eval("TOOL_MAKE(%s)" % road))
+        i = int(self.L.eval("TOOL_MAKE(%s%s)" % (road, (", " + make) if make else "")))
         steps = [("TOOL_EVENT(%d)" % i) if event else None, ("TOOL_ADD(%d, %s)" % (i, "true" if site else "false")) if add else None]
         if not event_first:
             steps.reverse()
@@ -388,35 +390,54 @@ class StrictTest(unittest.TestCase):
 class StrictOnTest(StrictTest):
     # ---- (a) the build is applied by every game at the stamp, the originator included
 
-    def test_a_tool_build_is_applied_by_every_game_at_the_stamp_the_originator_included(self):
+    def test_a_tool_build_is_held_until_the_stamp_then_released_on_the_originator_and_replayed_by_the_others(self):
         self.start()
         self.strict_on(self.A, self.B)
         self.B.tool(self.road(300, 0, 400, 0))
-        self.tick(2)
+        self.tick(1)
         stamp = self.B.action_records()[0]["stamp"]
         self.assertGreater(stamp, self.B.time(), "the stamp lies ahead of the originator's game")
-        self.assertEqual(self.B.native.dropped, [1], "the held command was cancelled")
-        self.assertIn("cancel", self.B.native.ctl_kinds())
-        self.assertEqual(self.B.builds_applied(), 0, "the originator's copy did not apply early")
-        self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.B.sig())
+        self.assertEqual(self.B.native.held, [1])
+        self.assertEqual(self.B.native.released, [], "the command is still held: the originator's world does not run ahead")
+        self.assertEqual(self.B.native.dropped, [], "the command is never cancelled: a cancelled command kills the tool")
+        self.assertNotIn("cancel", self.B.native.ctl_kinds())
+        self.assertEqual(self.B.builds_applied(), 0)
         while self.B.time() < stamp - STEP:
             self.tick(1)
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "nobody applies before the stamp")
-        self.tick(6)
-        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stamp])
-        self.assertEqual(self.B.builds(), self.A.builds(), "both games applied it once, at the same game time")
+            self.assertEqual(self.B.native.released, [], "still held")
+        self.tick(8)
+        self.assertEqual(self.B.native.released, [1], "released at the stamp")
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stamp], "the other game replayed it at the stamp")
+        self.assertEqual(self.B.builds_applied(), 1, "the originator's engine applied its own command once")
+        self.assertEqual(self.A.builds_applied(), 1)
         self.assertSameWorld()
         self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.B.sig())
-        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1), "shipped once, and the replays were not shipped back")
-        self.assertEqual(self.B.native.released, [], "nothing was handed back to the engine")
-        self.assertNotIn("native build captured", self.log(), "the simulation half did not see a native build: the engine never got it")
+        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1), "shipped once; neither the replay nor the release was shipped back")
+        self.assertNotIn("native build captured", self.log(), "the released build was not captured as a new build")
         self.assertNotIn("refused", self.log())
         self.assertIn("matched the capture of streetBuilder", self.B.log())
-        self.assertIn("cancel written", self.B.log())
+        self.assertIn("held until the stamp", self.B.log())
+        self.assertIn("released at game time", self.B.log())
         self.assertIn("mode ON", self.B.log())
+        self.assertIn("applied by the engine (accepted true)", self.B.log())
+        self.assertIn("due at t=%d: the native module holds this game's own copy" % stamp, self.B.log())
         body = self.B.action_records()[0]
         self.assertEqual(body["category"], "build")
         self.assertNotIn("native=true", str(body["body"]).replace(" ", "").lower(), "the shipped record is not marked as already applied")
+        self.assertNotIn("heldid", str(body).lower(), "the local release mark never goes on the wire")
+
+    def test_the_originators_tool_is_alive_after_each_build(self):
+        # the tool's own callback runs when its command is released: the fake tool is "alive" when its held command went back
+        self.start()
+        for i in range(3):
+            self.B.tool(self.road(300 + 150 * i, 0, 400 + 150 * i, 0))
+            self.tick(12)
+            self.assertEqual(self.B.native.released, list(range(1, i + 2)), "the tool's command %d was handed back to the engine" % (i + 1))
+            self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "no command stays held")
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertSameWorld()
 
     def test_the_company_ledger_and_every_checksum_part_agree_after_a_strict_build(self):
         self.start()
@@ -439,7 +460,7 @@ class StrictOnTest(StrictTest):
         self.assertEqual(self.A.builds(), self.B.builds())
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 3))
         self.assertEqual([r["seq"] for r in self.B.action_records()], [1, 2, 3])
-        self.assertEqual(self.B.native.dropped, [1, 2, 3])
+        self.assertEqual(self.B.native.released, [1, 2, 3])
 
     def test_two_commands_held_at_once_are_all_given_back_rather_than_paired_with_one_preview(self):
         # a real tool is blocked after its click, so this cannot happen; if it ever does, no record may be shipped for the
@@ -462,11 +483,99 @@ class StrictOnTest(StrictTest):
         self.assertEqual(self.B.native.dropped, [], "the held command waits for its capture")
         self.B.tool_event(i)                                       # the event follows within the grace
         self.tick(20)
-        self.assertEqual(self.B.native.dropped, [1])
-        self.assertEqual(self.B.native.released, [])
+        self.assertEqual(self.B.native.released, [1])
+        self.assertEqual(self.B.native.dropped, [])
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertEqual(self.B.shipped_count(), 1)
+
+    def test_a_depot_the_originator_built_with_the_tool_is_keyed_on_the_originator_too(self):
+        # the released command is applied by the engine; the binders registered at the stamp key what it made, so that a later
+        # action (a vehicle bought at the depot, a line through the station) can name it on every game
+        self.start()
+        self.B.tool("{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        # (the worlds are not compared: the mock engine adds the depot's entrance segment to the tool's own build, while the
+        # replay leaves it to the depot's script, which the mock does not run)
+        self.assertIn("C depot/road_depot.con@50.00,-30.00,0.00", self.B.sig())
+        self.assertIn("C depot/road_depot.con@50.00,-30.00,0.00", self.A.sig())
+        for g in (self.A, self.B):
+            self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split(), "%s keyed the depot" % g.label)
+        self.assertIn("action 1:1 created 1 CONSTRUCTION entities, keyed", self.B.log())
+        self.assertNotIn("native build captured", self.log())
+        self.assertEqual(self.B.shipped_count(), 1)
+
+    def test_a_vehicle_bought_at_the_originators_depot_is_found_on_both_games(self):
+        self.start()
+        self.B.tool("{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(16)
+        for g in (self.A, self.B):
+            self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split())
+        self.assertEqual(self.B.native.released, [1])
+        self.assertNotIn("does not exist here", self.log())
+
+    def test_the_late_stamp_still_releases_and_the_command_is_not_held_forever(self):
+        # the game of the originator stands still for a while before the stamp (a stall): the command stays held (the module's
+        # own 30 s age and the 10 s silence rule are the bounds, and pings keep the silence rule quiet), and goes back when
+        # the stamp is reached
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.frames(60)   # 3 s of interface frames, the simulation does not advance
+        self.assertEqual(self.B.native.released, [], "still held at the stamp's door")
+        self.assertTrue(self.B.native.holding)
+        self.assertEqual(self.B.native.heard[-1][2] in ("ping", "hold_on", "release"), True)
+        self.tick(10)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+
+    def test_the_module_giving_the_command_back_early_does_not_ship_the_build_twice(self):
+        # silence or age: the module hands the command back before the stamp. The build is in the originator's world early, the
+        # replay mark keeps the simulation half from capturing it as a second build
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.frames(2)
+        self.assertEqual(self.B.native.held, [1])
+        self.B.native.handle(999, "hold_off", {})   # what the module does on its own (silence): holding off, the command goes back
+        self.B.native.on_add(0, 0)
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertIn("released by the module (hold_off) before its stamp", self.B.log())
+        self.assertEqual(self.B.shipped_count(), 1, "shipped once")
+        self.assertNotIn("native build captured", self.B.log())
+        self.assertIn("is the early release of the held command of 1:1", self.B.log())
+        self.assertSameWorld()
+        self.assertEqual(self.A.builds_applied(), 1)
+        self.assertEqual(self.B.builds_applied(), 1)
+
+    def test_strict_mode_stopping_while_a_command_is_held_gives_it_back_without_a_second_ship(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.frames(2)
+        self.assertEqual(self.B.native.held, [1])
+        with open(os.path.join(self.B.dir, "identity.txt"), "w", encoding="utf-8") as f:
+            f.write("id=1\nname=client\nrole=idle\n")   # the session ended while the command is held: strict mode stops
+        self.frames(30)
+        self.assertIn("goes back to the engine before its stamp (the session ended)", self.B.log())
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertEqual(self.B.shipped_count(), 1)
+        self.assertNotIn("native build captured", self.B.log())
+        self.assertSameWorld()
+
+    def test_a_build_the_originator_refuses_at_the_stamp_is_cancelled_not_left_held(self):
+        # the same rule that refuses it on every other game refuses it here: the held command is destroyed, nothing is built
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.frames(2)
+        self.assertEqual(self.B.native.held, [1])
+        self.B.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _ in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
+        self.tick(14)
+        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [])
+        self.assertIn("was refused at its stamp: cancelled", self.B.log())
+        self.assertEqual(self.B.builds_applied(), 0)
+        self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
 
     # ---- (g) both players building at once
 
@@ -481,7 +590,7 @@ class StrictOnTest(StrictTest):
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
         self.assertEqual(self.A.builds(), self.B.builds(), "the same builds at the same game times on both games")
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (1, 1))
-        self.assertEqual((self.A.native.dropped, self.B.native.dropped), ([1], [1]))
+        self.assertEqual((self.A.native.released, self.B.native.released), ([1], [1]))
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(40)
         self.assertEqual(self.relay.reports[1][0][1], self.relay.reports[1][1][1])
@@ -544,7 +653,7 @@ class StrictOnTest(StrictTest):
         # and the next build is strict again
         self.B.tool(self.road(500, 0, 600, 0))
         self.tick(16)
-        self.assertEqual(self.B.native.dropped, [2])
+        self.assertEqual(self.B.native.released, [1, 2])
         self.assertSameWorld()
 
     # ---- (d) a capture without a held command
@@ -635,7 +744,7 @@ class StrictOnTest(StrictTest):
         # and a build after the reload is strict again
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(20)
-        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [1])
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertEqual(self.B.shipped_count(), 1)
@@ -645,7 +754,7 @@ class StrictOnTest(StrictTest):
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(16)
         self.assertIn("held", self.B.native.event_kinds())
-        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [1])
         before = self.B.native.ctl_kinds()
         self.B.reload()   # no hold_off first (a crash of the scripts, say): the module still holds, and the file holds the history
         self.relay.session()
@@ -659,7 +768,7 @@ class StrictOnTest(StrictTest):
         # and it works: a build after the restart is strict
         self.B.tool(self.road(500, 0, 600, 0))
         self.tick(20)
-        self.assertEqual(self.B.native.dropped, [1, 2])
+        self.assertEqual(self.B.native.released, [1, 2])
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
 
@@ -695,7 +804,7 @@ class StrictOnTest(StrictTest):
         self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(6)
-        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [1])
         expected = ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt]
         self.assertEqual(self.A.builds(), expected)
         self.assertEqual(self.B.builds(), expected, "the originator applied it during the pause too, and only once")
@@ -721,10 +830,10 @@ class StrictOnTest(StrictTest):
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))                     # preview and click
         self.tick(12)
-        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [1])
         self.B.tool(self.road(500, 0, 600, 0), event=False)        # a click with no preview of its own: the old one is spent
         self.tick(14)
-        self.assertEqual(self.B.native.released, [2])
+        self.assertEqual(self.B.native.released, [1, 2])
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
 
@@ -737,7 +846,7 @@ class StrictOnTest(StrictTest):
         self.tick(24)
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
-        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [1])
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (1, 1))
 
     # ---- refusals
