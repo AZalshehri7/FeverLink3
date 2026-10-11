@@ -29,6 +29,7 @@ pub mod process;
 pub mod resync;
 pub mod selftest;
 pub mod session;
+pub mod speedtest;
 pub mod steam;
 pub mod steam_persona;
 pub mod steam_transport;
