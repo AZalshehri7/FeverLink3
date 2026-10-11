@@ -77,6 +77,16 @@ struct Machine {
     ping_ms: i32,
     /// The send rate in force: Steam's default until `SetConfigValue` changes it.
     send_rate: i32,
+    /// Connection-scope values set with `SetConfigValue`: (connection, value id) to number.
+    conn_config: HashMap<(u32, i32), i32>,
+    /// The (value id, number) pairs given as options when a listen socket or connection was created.
+    options: Vec<(i32, i32)>,
+    /// Every Nth unreliable message this machine sends is lost (0: none).
+    unreliable_loss_every: u64,
+    unreliable_count: u64,
+    unreliable_lost: u64,
+    /// Unreliable messages dropped because the peer's receive buffer was full.
+    unreliable_overflow: u64,
 }
 
 struct Listen {
@@ -87,6 +97,7 @@ struct Listen {
 struct Wire {
     visible_at: Instant,
     data: Vec<u8>,
+    reliable: bool,
 }
 
 struct Conn {
@@ -257,7 +268,7 @@ unsafe extern "C" fn set_config(
     utils: *mut c_void,
     value: i32,
     scope: i32,
-    _scope_object: isize,
+    scope_object: isize,
     data_type: i32,
     arg: *const c_void,
 ) -> bool {
@@ -268,6 +279,10 @@ unsafe extern "C" fn set_config(
     }
     // SAFETY: the caller passes a pointer to one int32 for data type 1 (Int32), as SetConfigValue requires.
     let number = unsafe { *(arg as *const i32) };
+    if scope == 4 {
+        machine.conn_config.insert((scope_object as u32, value), number);
+        return true;
+    }
     machine.config.push((value, scope, data_type, number));
     // k_ESteamNetworkingConfig_SendRateMin / SendRateMax set the rate connections send at
     if scope == 1 && (value == 10 || value == 11) {
@@ -295,9 +310,23 @@ unsafe extern "C" fn run_callbacks(sockets: *mut c_void) {
     }
 }
 
-unsafe extern "C" fn create_listen(sockets: *mut c_void, virtual_port: i32, _n: i32, _options: *const c_void) -> u32 {
+/// Records the (id, int32) pairs of a creation-time option array (16 bytes each).
+fn record_options(machine: &mut Machine, n: i32, options: *const c_void) {
+    for i in 0..n.max(0) as usize {
+        // SAFETY: the core passes n entries of the 16-byte SteamNetworkingConfigValue_t.
+        let entry = unsafe { std::slice::from_raw_parts((options as *const u8).add(i * 16), 16) };
+        let id = i32::from_le_bytes(entry[0..4].try_into().expect("4 bytes"));
+        let number = i32::from_le_bytes(entry[8..12].try_into().expect("4 bytes"));
+        machine.options.push((id, number));
+    }
+}
+
+unsafe extern "C" fn create_listen(sockets: *mut c_void, virtual_port: i32, n: i32, options: *const c_void) -> u32 {
     let mut m = model();
     let machine = machine_of(sockets);
+    if let Some(mm) = m.machines.get_mut(&machine) {
+        record_options(mm, n, options);
+    }
     if m.listens.values().any(|l| l.machine == machine && l.virtual_port == virtual_port) {
         return 0;
     }
@@ -320,8 +349,8 @@ unsafe extern "C" fn connect_p2p(
     sockets: *mut c_void,
     identity: *const c_void,
     virtual_port: i32,
-    _n: i32,
-    _options: *const c_void,
+    n: i32,
+    options: *const c_void,
 ) -> u32 {
     // SAFETY: ConnectP2P is given a 136-byte SteamNetworkingIdentity.
     let identity = unsafe { std::slice::from_raw_parts(identity as *const u8, 136) };
@@ -336,6 +365,9 @@ unsafe extern "C" fn connect_p2p(
     m.tick();
     let local = machine_of(sockets);
     let Some(local_id) = m.machines.get(&local).map(|mm| mm.steam_id) else { return 0 };
+    if let Some(mm) = m.machines.get_mut(&local) {
+        record_options(mm, n, options);
+    }
     let outgoing = m.new_handle();
     m.conns.insert(
         outgoing,
@@ -424,7 +456,7 @@ unsafe extern "C" fn send(
     conn: u32,
     data: *const c_void,
     len: u32,
-    _flags: i32,
+    flags: i32,
     out_number: *mut i64,
 ) -> i32 {
     let len = len as usize;
@@ -441,6 +473,32 @@ unsafe extern "C" fn send(
         return 8;
     }
     let Some(peer) = c.peer.filter(|p| m.conns.contains_key(p)) else { return 3 };
+    let reliable = flags & 8 != 0;
+    if !reliable {
+        // unreliable: lost on the wire now and then, dropped when the receiver's buffer is full, never refused
+        let (lose, overflow) = {
+            let overflow = m.inbox_bytes(peer) + len > SEND_BUFFER;
+            let Some(mm) = m.machines.get_mut(&machine) else { return 3 };
+            mm.unreliable_count += 1;
+            let lose = mm.unreliable_loss_every > 0 && mm.unreliable_count % mm.unreliable_loss_every == 0;
+            if lose {
+                mm.unreliable_lost += 1;
+            } else if overflow {
+                mm.unreliable_overflow += 1;
+            }
+            mm.largest_sent = mm.largest_sent.max(len);
+            (lose, overflow)
+        };
+        if !lose && !overflow {
+            // SAFETY: the caller passes len readable bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
+            let visible_at = Instant::now() + m.wire_delay(machine);
+            if let Some(p) = m.conns.get_mut(&peer) {
+                p.inbox.push_back(Wire { visible_at, data: bytes, reliable: false });
+            }
+        }
+        return 1;
+    }
     if m.inbox_bytes(peer) + len > SEND_BUFFER {
         if let Some(mm) = m.machines.get_mut(&machine) {
             mm.full_sends += 1;
@@ -451,7 +509,7 @@ unsafe extern "C" fn send(
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
     let visible_at = Instant::now() + m.wire_delay(machine);
     if let Some(p) = m.conns.get_mut(&peer) {
-        p.inbox.push_back(Wire { visible_at, data: bytes });
+        p.inbox.push_back(Wire { visible_at, data: bytes, reliable: true });
     }
     if let Some(mm) = m.machines.get_mut(&machine) {
         mm.largest_sent = mm.largest_sent.max(len);
@@ -476,12 +534,12 @@ unsafe extern "C" fn receive(sockets: *mut c_void, conn: u32, out: *mut *mut c_v
         let Some(c) = m.conns.get_mut(&conn).filter(|c| c.machine == machine) else { return -1 };
         while taken.len() < max.max(0) as usize && c.inbox.front().is_some_and(|w| w.visible_at <= now) {
             if let Some(w) = c.inbox.pop_front() {
-                taken.push(w.data);
+                taken.push((w.data, w.reliable));
             }
         }
     }
     let count = taken.len();
-    for (i, data) in taken.into_iter().enumerate() {
+    for (i, (data, reliable)) in taken.into_iter().enumerate() {
         let data = data.into_boxed_slice();
         let mut header = Box::new([0u64; MESSAGE_BYTES / 8]);
         let base = header.as_mut_ptr() as *mut u8;
@@ -491,7 +549,7 @@ unsafe extern "C" fn receive(sockets: *mut c_void, conn: u32, out: *mut *mut c_v
             std::ptr::write_unaligned(base as *mut *const u8, data.as_ptr());
             std::ptr::write_unaligned(base.add(8) as *mut i32, data.len() as i32);
             std::ptr::write_unaligned(base.add(12) as *mut u32, conn);
-            std::ptr::write_unaligned(base.add(196) as *mut i32, 8);
+            std::ptr::write_unaligned(base.add(196) as *mut i32, if reliable { 8 } else { 0 });
         }
         let pointer = header.as_mut_ptr() as *mut c_void;
         m.messages.insert(pointer as usize, Message { machine, _header: header, _data: data });
@@ -579,11 +637,78 @@ unsafe extern "C" fn real_time_status(
     b[4..8].copy_from_slice(&machine.ping_ms.to_le_bytes());
     b[8..12].copy_from_slice(&0.99f32.to_le_bytes());
     b[12..16].copy_from_slice(&0.98f32.to_le_bytes());
-    b[32..36].copy_from_slice(&machine.send_rate.to_le_bytes());
+    let rate = machine.conn_config.get(&(conn, 10)).copied().unwrap_or(machine.send_rate);
+    b[32..36].copy_from_slice(&rate.to_le_bytes());
     b[40..44].copy_from_slice(&pending.to_le_bytes());
     // SAFETY: the caller passes a buffer of at least sizeof(SteamNetConnectionRealTimeStatus_t) bytes.
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out as *mut u8, b.len()) };
     1
+}
+
+unsafe extern "C" fn flush(sockets: *mut c_void, conn: u32) -> i32 {
+    let m = model();
+    if m.conns.get(&conn).is_some_and(|c| c.machine == machine_of(sockets)) {
+        1
+    } else {
+        3
+    }
+}
+
+unsafe extern "C" fn detailed_status(sockets: *mut c_void, conn: u32, out: *mut c_char, len: i32) -> i32 {
+    let m = model();
+    if !m.conns.get(&conn).is_some_and(|c| c.machine == machine_of(sockets)) {
+        return -1;
+    }
+    let text = format!("fake detailed status of connection {conn}\nSending: 0 B/s\nPending: 0 bytes\n");
+    let bytes = text.as_bytes();
+    if bytes.len() + 1 > len.max(0) as usize {
+        return bytes.len() as i32 + 1;
+    }
+    // SAFETY: the caller's buffer holds len bytes and the text plus its NUL fits.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        *out.add(bytes.len()) = 0;
+    }
+    0
+}
+
+unsafe extern "C" fn get_config(
+    utils: *mut c_void,
+    value: i32,
+    scope: i32,
+    scope_object: isize,
+    data_type: *mut i32,
+    result: *mut c_void,
+    size: *mut usize,
+) -> i32 {
+    let m = model();
+    let Some(machine) = m.machines.get(&machine_of(utils)) else { return -1 };
+    // SAFETY: the core passes a type slot, an int32 result and its size.
+    unsafe {
+        if *size < 4 {
+            return -3;
+        }
+        *data_type = 1;
+        *size = 4;
+        if scope == 4 {
+            if let Some(n) = machine.conn_config.get(&(scope_object as u32, value)) {
+                *(result as *mut i32) = *n;
+                return 1;
+            }
+            // not set on the connection: inherited from the global value, if any
+            return match machine.config.iter().rev().find(|c| c.0 == value && c.1 == 1) {
+                Some(c) => {
+                    *(result as *mut i32) = c.3;
+                    2
+                }
+                None => {
+                    *(result as *mut i32) = 0;
+                    2
+                }
+            };
+        }
+    }
+    -2
 }
 
 fn locate(machine: usize) -> Located {
@@ -662,6 +787,12 @@ impl FakeMachine {
                 callback_runs: 0,
                 ping_ms: 30,
                 send_rate: 262_144,
+                conn_config: HashMap::new(),
+                options: Vec::new(),
+                unreliable_loss_every: 0,
+                unreliable_count: 0,
+                unreliable_lost: 0,
+                unreliable_overflow: 0,
             },
         );
         FakeMachine { id }
@@ -697,6 +828,9 @@ impl FakeMachine {
             close,
             connection_info,
             real_time_status: Some(real_time_status),
+            flush: Some(flush),
+            detailed_status: Some(detailed_status),
+            get_config: Some(get_config),
         }
     }
 
@@ -785,7 +919,7 @@ impl FakeMachine {
     pub fn inject(&self, conn: u32, bytes: &[u8]) {
         let mut m = model();
         if let Some(c) = m.conns.get_mut(&conn).filter(|c| c.machine == self.id) {
-            c.inbox.push_back(Wire { visible_at: Instant::now(), data: bytes.to_vec() });
+            c.inbox.push_back(Wire { visible_at: Instant::now(), data: bytes.to_vec(), reliable: true });
         }
     }
 
@@ -828,6 +962,30 @@ impl FakeMachine {
     }
 
     /// Size in bytes of the biggest message this machine sent.
+    /// Every `n`th unreliable message this machine sends is lost on the wire (0: none are).
+    pub fn lose_every_nth_unreliable(&self, n: u64) {
+        self.with(|m| m.unreliable_loss_every = n);
+    }
+
+    /// (unreliable messages sent, lost on the wire, dropped on a full receive buffer).
+    pub fn unreliable_counts(&self) -> (u64, u64, u64) {
+        self.with(|m| (m.unreliable_count, m.unreliable_lost, m.unreliable_overflow))
+    }
+
+    /// The (value id, number) pairs given as options when listen sockets and connections were created.
+    pub fn creation_options(&self) -> Vec<(i32, i32)> {
+        self.with(|m| m.options.clone())
+    }
+
+    /// The connection-scope values set with `SetConfigValue`: (connection, value id, number).
+    pub fn connection_config(&self) -> Vec<(u32, i32, i32)> {
+        self.with(|m| {
+            let mut v: Vec<_> = m.conn_config.iter().map(|((c, id), n)| (*c, *id, *n)).collect();
+            v.sort_unstable();
+            v
+        })
+    }
+
     pub fn largest_sent(&self) -> usize {
         self.with(|m| m.largest_sent)
     }

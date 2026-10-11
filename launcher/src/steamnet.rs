@@ -183,8 +183,15 @@ const RT_STATE: usize = 0;
 const RT_PING: usize = 4;
 const RT_QUALITY_LOCAL: usize = 8;
 const RT_QUALITY_REMOTE: usize = 12;
+const RT_OUT_PPS: usize = 16;
+const RT_OUT_BPS: usize = 20;
+const RT_IN_PPS: usize = 24;
+const RT_IN_BPS: usize = 28;
 const RT_SEND_RATE: usize = 32;
+const RT_PENDING_UNRELIABLE: usize = 36;
 const RT_PENDING_RELIABLE: usize = 40;
+const RT_SENT_UNACKED: usize = 44;
+const RT_QUEUE_TIME: usize = 48;
 
 /// What `GetConnectionRealTimeStatus` says about a connection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -200,6 +207,15 @@ pub struct RealTime {
     pub send_rate: u32,
     /// Reliable bytes queued and not yet on the wire.
     pub pending_reliable: u32,
+    pub pending_unreliable: u32,
+    /// Reliable bytes on the wire and not yet acknowledged.
+    pub sent_unacked_reliable: u32,
+    pub out_packets_per_sec: f32,
+    pub out_bytes_per_sec: f32,
+    pub in_packets_per_sec: f32,
+    pub in_bytes_per_sec: f32,
+    /// How long a message queued now would wait before it goes on the wire, microseconds.
+    pub queue_time_us: i64,
 }
 
 /// Reads a `SteamNetConnectionRealTimeStatus_t`. `None` when the buffer is too short.
@@ -212,6 +228,16 @@ pub fn parse_real_time_status(buf: &[u8]) -> Option<RealTime> {
         quality_remote: float_at(RT_QUALITY_REMOTE)?,
         send_rate: u32::try_from(le_i32(buf, RT_SEND_RATE)?).unwrap_or(0),
         pending_reliable: u32::try_from(le_i32(buf, RT_PENDING_RELIABLE)?).unwrap_or(0),
+        pending_unreliable: le_i32(buf, RT_PENDING_UNRELIABLE).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        sent_unacked_reliable: le_i32(buf, RT_SENT_UNACKED).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        out_packets_per_sec: float_at(RT_OUT_PPS).unwrap_or(0.0),
+        out_bytes_per_sec: float_at(RT_OUT_BPS).unwrap_or(0.0),
+        in_packets_per_sec: float_at(RT_IN_PPS).unwrap_or(0.0),
+        in_bytes_per_sec: float_at(RT_IN_BPS).unwrap_or(0.0),
+        queue_time_us: buf
+            .get(RT_QUEUE_TIME..RT_QUEUE_TIME + 8)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, i64::from_le_bytes),
     })
 }
 
@@ -1110,12 +1136,30 @@ mod tests {
                 quality_local: 0.75,
                 quality_remote: 0.5,
                 send_rate: 1_048_576,
-                pending_reliable: 350_000
+                pending_reliable: 350_000,
+                pending_unreliable: 0,
+                sent_unacked_reliable: 0,
+                out_packets_per_sec: 0.0,
+                out_bytes_per_sec: 0.0,
+                in_packets_per_sec: 0.0,
+                in_bytes_per_sec: 0.0,
+                queue_time_us: 0,
             })
         );
         // Steam reports a negative ping while it has no estimate
         b[4..8].copy_from_slice(&(-1i32).to_le_bytes());
         assert_eq!(parse_real_time_status(&b).map(|r| r.ping_ms), Some(None));
+        // the rates, the unacked reliable bytes and the queue time sit at 16..32, 44 and 48
+        b[16..20].copy_from_slice(&1200.5f32.to_le_bytes());
+        b[20..24].copy_from_slice(&900_000.0f32.to_le_bytes());
+        b[24..28].copy_from_slice(&80.0f32.to_le_bytes());
+        b[28..32].copy_from_slice(&7000.0f32.to_le_bytes());
+        b[36..40].copy_from_slice(&123i32.to_le_bytes());
+        b[44..48].copy_from_slice(&65_536i32.to_le_bytes());
+        b[48..56].copy_from_slice(&250_000i64.to_le_bytes());
+        let r = parse_real_time_status(&b).unwrap();
+        assert_eq!((r.out_packets_per_sec, r.out_bytes_per_sec, r.in_packets_per_sec, r.in_bytes_per_sec), (1200.5, 900_000.0, 80.0, 7000.0));
+        assert_eq!((r.pending_unreliable, r.sent_unacked_reliable, r.queue_time_us), (123, 65_536, 250_000));
         assert_eq!(parse_real_time_status(&b[..40]), None);
         assert_eq!(parse_real_time_status(&[]), None);
     }
