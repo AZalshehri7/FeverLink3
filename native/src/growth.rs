@@ -395,7 +395,7 @@ pub struct Digest {
 /// Digest of `bytes` as 0x40-byte records (a trailing partial record is ignored).
 pub fn digest_records(bytes: &[u8]) -> Digest {
     let mut d = Digest { n: 0, ordered: FNV_OFFSET, sum: 0, id_ordered: FNV_OFFSET, id_sum: 0 };
-    for rec in bytes.chunks_exact(RECORD_LEN) {
+    for rec in bytes.as_chunks::<RECORD_LEN>().0 {
         let g = record_geometry(rec);
         let id = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
         d.n += 1;
