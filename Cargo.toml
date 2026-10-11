@@ -12,16 +12,17 @@ repository = "https://github.com/AZalshehri7/FeverLink3"
 
 # Shared by every crate. Tuned for the native DLL: smallest code, one codegen unit, stripped.
 #
-# panic = "abort": a panic in the game process ends the game, after the panic hook has written the message to
-# native.log. "unwind" would let launcher::guard contain a panic in the controller or a session thread, but it makes
-# feverlink3_native.dll 480 KB (45 %) larger (MSVC, rustc 1.99: 1 088 512 -> 1 580 032 bytes), and Cargo takes the
-# setting per profile, not per crate, so it cannot be had for the DLL alone without a second profile and a change to
-# the packaging. The decision and the numbers are in docs/SECURITY.md, section 5; CI prints both sizes in the job
-# summary. To try it: change the line below.
+# panic = "unwind" is REQUIRED, not a size trade-off, since the crash of 2026-10-11 (docs/NATIVE_LINK.md, section 10):
+# the hooks sit between the game and its own C++ functions, and those throw. With "abort" every Rust frame is a
+# terminate pad for a foreign exception (even one declared extern "system-unwind"), so the first exception of the
+# game that passed through a hook ended the process with "panic in a function that cannot unwind". With "unwind" the
+# exception passes through our frames; the price is about 550 KB of DLL (MSVC, rustc 1.99: 1 132 544 -> 1 662 464
+# bytes), docs/SECURITY.md section 5. It also lets launcher::guard and native::log::guarded contain a panic in our own
+# bookkeeping. CI fails if the shipped DLL has a terminate pad on the hook path (tools/dll_unwind_check.py).
 [profile.release]
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 debug = false

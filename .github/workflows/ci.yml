@@ -18,26 +18,32 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release -p feverlink3_native
       - run: Get-Item target/release/feverlink3_native.dll | Select-Object Name, Length
+      - name: The shipped DLL unwinds (the game's exceptions pass through the hooks)
+        shell: pwsh
+        run: |
+          python -m pip install pefile capstone
+          python tools/dll_unwind_check.py target/release/feverlink3_native.dll target/release/feverlink3_native.pdb --check
+          python tools/dll_unwind_check.py target/release/feverlink3_native.dll target/release/feverlink3_native.pdb
       - name: DLL size in the job summary
         shell: pwsh
         run: |
-          # The shipped DLL (panic = "abort") and the same code with unwinding, in another target folder so the
-          # artifact below is untouched: what panic = "unwind" would cost is on every run (docs/SECURITY.md, section 5).
-          $abort = (Get-Item target/release/feverlink3_native.dll).Length
-          $env:CARGO_PROFILE_RELEASE_PANIC = 'unwind'
-          cargo build --release -p feverlink3_native --target-dir target/unwind
+          # The shipped DLL (panic = "unwind") and the same code with abort, in another target folder so the artifact
+          # below is untouched. Abort is smaller and cannot be shipped: docs/NATIVE_LINK.md section 10.
+          $unwind = (Get-Item target/release/feverlink3_native.dll).Length
+          $env:CARGO_PROFILE_RELEASE_PANIC = 'abort'
+          cargo build --release -p feverlink3_native --target-dir target/abort
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Remove-Item Env:CARGO_PROFILE_RELEASE_PANIC
-          $unwind = (Get-Item target/unwind/release/feverlink3_native.dll).Length
+          $abort = (Get-Item target/abort/release/feverlink3_native.dll).Length
           $extra = $unwind - $abort
           @(
             '### feverlink3_native.dll (release, windows-latest)',
             '',
             '| panic | bytes | KiB |',
             '|---|---:|---:|',
-            ('| abort (shipped) | {0:N0} | {1:N1} |' -f $abort, ($abort / 1KB)),
-            ('| unwind | {0:N0} | {1:N1} |' -f $unwind, ($unwind / 1KB)),
-            ('| difference | {0:N0} (+{1:N1} %) | {2:N1} |' -f $extra, (100 * $extra / $abort), ($extra / 1KB))
+            ('| unwind (shipped) | {0:N0} | {1:N1} |' -f $unwind, ($unwind / 1KB)),
+            ('| abort (not shippable) | {0:N0} | {1:N1} |' -f $abort, ($abort / 1KB)),
+            ('| cost of unwinding | {0:N0} (+{1:N1} %) | {2:N1} |' -f $extra, (100 * $extra / $abort), ($extra / 1KB))
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
