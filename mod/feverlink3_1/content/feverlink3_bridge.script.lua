@@ -11,8 +11,9 @@
 --     wraps api.cmd.sendCommand so a player's command is held, encoded and shipped as an `action`,
 --     forwards stamped items to the simulation half, applies due items itself while the game is paused,
 --     hands the originator's callback the real result, writes checksum reports and refusals,
---     strict mode (when the native module is there): has a construction tool's build held, shipped and applied at the stamp
---     by every game, the originator's included (native_ctl.log / native_events.log, docs/NATIVE_LINK.md section 7).
+--     strict mode (when the native module is there): has a construction tool's build held and shipped; the other games replay it
+--     at the stamp and this game releases its own held command at the stamp, so the tool stays alive
+--     (native_ctl.log / native_events.log, docs/NATIVE_LINK.md section 7).
 --   simulation half (update, once per step; handleEvent)
 --     keeps the queue in the game-script state, applies due items at their exact step, computes checksum
 --     parts, installs the deterministic math.random.
@@ -1277,9 +1278,12 @@ end
 --   2. the module holds the tool's command at CommandList::Add and writes `held {id}` to native_events.log. natPair matches it
 --      with the oldest capture. If `held` is read first, it waits (N.parked) for the capture for a short grace;
 --   3. natDecide: the player's permission, a check that this game could rebuild the record, then the action is shipped with a
---      stamp exactly as shipLocal does, `cancel {id}` destroys the held command (the engine never applies it) and the item is
---      routed to this game's own queue, so the originator applies the build at the stamp through the normal replay path
---      (simApplyAction), like every other game. No recordOriginator: the normal apply path books the company ledger;
+--      stamp exactly as shipLocal does and the command STAYS HELD (cancelling it left the originator's tool dead: a cancelled
+--      command never gives the tool its "applied" callback). The item is routed to this game's own queue with a local heldId.
+--      At the stamp the simulation half (simApplyAction) does what every game does (ledger, snapshot, binders that key the
+--      entities) except sending, and reports a "#release" result; natRelease then writes the replay mark, `release` and the
+--      trigger, so the engine applies the tool's own command and the tool lives on. Every OTHER game replays the build at the
+--      stamp. No recordOriginator: the normal apply path books the company ledger;
 --   4. whatever does not fit (no usable capture, a record that cannot be rebuilt here) is released: `release {id}` lets the
 --      native build go through and the simulation half's onPreBuildProposal capture ships it the old way.
 -- A capture is never shipped without its `held`, and a held command is either cancelled-and-shipped or released, never both.

@@ -280,19 +280,40 @@ said "no locks in either hook"; the `Add` hook uses a lock it never waits for.
 
 ## 7. The mod's side of the contract
 
-**Built and tested without the game; run in two real games for the road tools and the bulldozer only.** The code is the "strict mode" block of the bridge's interface half
+**Built and tested without the game. The first design (cancel, replay on the originator too) ran in two real games and left the
+originator's tool dead after one build; the redesign below (hold until the stamp, then release on the originator) has NOT
+run in the game.** The code is the "strict mode" block of the bridge's interface half
 (`mod/feverlink3_1/content/feverlink3_bridge.script.lua`: `natTick`, `natCapture`, `natDecide`, `natStop`) and
 `M.captureToolBuild` of the build module (`feverlink3_cmds_build.lua`). `tests/lua/test_strict_build.py` runs two mocked games
 against a fake module that honours the files and rules of sections 3 and 4 (`hold_on` / `hold_off` / `release` / `cancel` /
 `ping`, `ready` / `holding` / `held` / `released` / `dropped` / `pong` / `error`, release and cancel only at the next `Add`, the
 10 s silence rule).
 
-**The design.** Strict mode follows TpF2 Multiplayer (MIT): the construction tool's command is held, **cancelled**, and every
-game, the originator's included, applies the build at the stamp through the replay path (`simApplyAction`), so both games apply
-it in the same game step. Section 4 (steps 3 and 5) describes the other thing the module can do, release the held command
-at the stamp so that the originator's own game applies the tool's command. The mod does not use it: the originator's game
-would then apply a different command (the tool's own, with its entity ids and its timing) from the one the others rebuild from
-the description.
+**The design (changed 2026-10-11).** The construction tool's command is held until the stamp. At the stamp every OTHER game
+replays the build from the shipped record through `simApplyAction`, and the ORIGINATING game RELEASES its own held command,
+so the engine applies the tool's own command and the tool gets the "applied" callback it waits for. The first design
+(TpF2 Multiplayer, MIT) cancelled the command and had the originator replay the build too, which keeps the two games in the
+same game step, but the first real two-game run (`docs/research/run-2026-10-11-strict-tool-dead`, logs in
+`%LOCALAPPDATA%\FeverLink3\live1` and `live2`) showed the price: after the cancel the originating game's tool was dead (no
+preview, clicks did nothing, the tool stayed highlighted, and no `tool event` line was ever logged again on that game, the host
+included, after it built once). The build itself landed on both games every time (`action 1:2 makeWorldBuildProposalCmd applied
+at t=1304000 ... created 1 CONSTRUCTION entities, keyed`). `proposalApply` never fired for a cancelled build, only
+`proposalPrepareForApply`; a cancelled command is destroyed together with its callback, so the tool's state machine never
+finishes. The cost of the redesign: the originator's engine applies the tool's own command a little after the stamp (one
+interface frame to see the result, one trigger, one tick) instead of inside the same simulation step as the others, and it
+applies the tool's command rather than the one rebuilt from the description. Stage 4 measures that skew.
+
+Sequence on the originating game (all of it in the bridge):
+
+1. `natDecide` ships the action with a stamp and leaves the command held. The item is marked with a local `heldId` (never on
+   the wire) and queued for the originator's own simulation half; the simulation half is told (`heldout`).
+2. At the stamp, `simApplyAction` treats the item like a peer does (decode, company check, ledger, the snapshot of the entity
+   lists, binders and watches that key what the build creates) but sends nothing, and appends a result `<key>#release<id>`.
+3. The interface half sees the result (`collectFromSim`) and calls `natRelease`: replay-mark event, `release {id}`, trigger. The
+   mark is first so that the build's `onPreBuildProposal` finds it and the simulation half does not capture the originator's own
+   released build as a new one.
+4. A game paused at the stamp (`L.applyNow`) goes through `guiApplyNow`, which calls `natPauseRelease` instead of sending the
+   command, and finishes the ledger and the keys when the module reports `applied`.
 
 ### Switching it on
 
@@ -329,12 +350,15 @@ line; the mod looks for the file four times a second). Then:
 3. With a capture: the player's permission is checked (a build the host forbids is cancelled with `action_refused`, like the
    wrapped `sendCommand`), then **this game checks that it could rebuild the record itself** (never cancel what cannot be
    rebuilt, `docs/ARCHITECTURE.md` section 6), then the action is shipped exactly as a Lua command is
-   (`send("action", {stamp, seq, body, category})`, stamp past the fastest clock), `cancel {id}` is written, and the item is
-   queued locally with `route(it)`, so the originator applies it at the stamp. `body.native` is not set, and
-   `recordOriginator` is not called: the normal apply path books the company ledger.
-4. Without a usable capture, or when the record cannot be rebuilt here, or the action cannot be sent: `release {id}`. The tool's
-   command goes through natively and the simulation half ships it the old way (replay on peers). A held command is either
-   cancelled and shipped or released, never both; a capture is never shipped without its `held`.
+   (`send("action", {stamp, seq, body, category})`, stamp past the fastest clock), nothing is written for the command (it stays
+   held), and the item is queued locally with `route(it)` and `heldId` set, so that at the stamp the simulation half books and
+   keys it and the interface half releases the command (the design above). `body.native` is not set, and `recordOriginator` is
+   not called: the normal apply path books the company ledger, with the same inputs as on the other games.
+4. Without a usable capture, or when the record cannot be rebuilt here, or the action cannot be sent: `release {id}` at once.
+   The tool's command goes through natively and the simulation half ships it the old way (replay on peers); this is the
+   unchanged "not replicated" fallback. A held command is shipped and released at its stamp, or released at once and shipped by
+   the old path, or cancelled (no permission, or refused at its stamp), never two of these; a capture is never shipped without
+   its `held`.
 5. A `release` or `cancel` is only carried out at the next `Add` (section 4): the mod sends a harmless script event
    (`feverlink3`, `nop`, ignored by the simulation half) at once, and again after 0.6 s, 1.2 s and so on, at most 5 times, until
    `released` or `dropped` comes back.
@@ -359,7 +383,12 @@ nothing was held) and the old path ships the build.
 ```
 native module found (build 40420, hooks apply_command,command_list_add)
 mode ON (the native module holds build commands; hold_on confirmed)
-held 3 (site 0x5891b4) matched the capture of streetBuilder (15241 bytes, 12 ms to capture, 31 ms old): 1:7 stamped 21600 (now 20400), cancel written
+held 3 (site 0x5891b4) matched the capture of streetBuilder (15241 bytes, 12 ms to capture, 31 ms old): 1:7 stamped 21600 (now 20400), held until the stamp
+held 3 (1:7) released at game time 21600 (stamp 21600); the engine applies it here, the other games replay it at the stamp
+held 3 (1:7) applied by the engine (accepted true) at game time 21800, stamp 21600
+held 3 (1:7) was refused at its stamp: cancelled
+held 3 (1:7) was released by the module (<reason>) before its stamp: the build is in this world early and is not shipped twice
+held 3 (1:7) goes back to the engine before its stamp (<why strict mode stopped>)
 held 4 (site 0x...): no capture of a tool build; release written, the native build goes through
 held 4 (site 0x...): the capture of streetBuilder failed (<why>); release written, the native build goes through
 held 4 (site 0x...): it cannot be rebuilt here (<why>); release written, the native build goes through
@@ -368,7 +397,6 @@ capture of streetBuilder dropped: no held command within 2 s (the native build w
 capture of streetBuilder dropped: it came after its held command had been released
 mode off (<why>), hold_off written
 mode is off: <the module has no command_list_add hook | switched holding off (silence) ... | hold_on was not confirmed ...>
-held 3 was released by the module (<reason>) after its build was shipped: the build may exist twice on this game
 ```
 
 ### Known limits
@@ -376,13 +404,29 @@ held 3 was released by the module (<reason>) after its build was shipped: the bu
 - **A tool that issues two held commands for one click** (a depot against a road is two commands in the build record, but the
   tool may add them one after the other) and fires one event: the second `held` has no capture and is released, so it is built
   natively at once, before the first one is replayed at its stamp. Stage 4, check 5, looks for it.
-- **A `cancel` that is overtaken** by the module's own release (silence after 10 s, the 30 s age limit) builds the road natively
-  as well as at the stamp; the second build is refused by the engine as a collision, or doubles a node. The log line above says
-  so. The mod writes `cancel` in the same frame as `held`, so the window is a few milliseconds.
+- **The module gives a held command back before its stamp** (10 s silence, the 30 s age limit, `hold_off`, the control file
+  gone), or strict mode stops while one is held (resync load, session end, a fault): the build enters the originator's world
+  early. Worlds stay equal except for that, nothing is shipped twice (see below), and the log says so. The game would have to
+  stall for seconds with the pings quiet for this to happen; the pings (every 2 s) keep the silence rule quiet.
+- **How an early give-back is kept from being shipped twice.** A stop the mod causes writes the replay mark before `hold_off`
+  (commands reach the engine in that order). For a give-back it did not cause the mark would come too late (the build was
+  applied before the `released` line was read), so the simulation half keeps a list of shipped-but-held builds (`heldout`,
+  removed by `heldgone` when the mod released or cancelled itself, 35 s of wall time, never across a reload) and the capture of
+  the next native build with no replay mark is swallowed against it.
+- **The skew** between the originator's apply and the others' (above). If it turns out to matter, the release could be written
+  a little before the stamp; the module cannot read the game clock, so that is a guess to tune in the game.
+- **A refusal at the stamp** cancels the held command; that tool may then stay dead as in the first design. It needs a build
+  that was accepted when it was captured and refused a second later, which the other games would refuse too.
 - **A command in the ring at the moment of a reload** is released by `hold_off` at the next `Add` and then the world is replaced;
   never tested in the game.
-- The tool's callback never fires for a cancelled command. If the street tool waits for it, its state is stuck until the
-  player picks the tool again (stage 4, check 3).
+- **A held command and a paused session.** Items stamped past a pause wait for it; the tool stays blocked, up to the module's
+  30 s age limit (then the early give-back above).
+- **Echoed captures.** An earlier analysis found the replay guard (`markReplay`/`spendReplay`) leaking in some cases ('native
+  build 1:14 captured' right after 'action 0:6 applied'). The cause was not found in the code or in the logs that were kept
+  (they hold no `mod.log` lines of such a case); what is certain is that a mark is a count with a 12-step expiry and that
+  every replay of a chain of commands adds one mark per command, so a command whose engine event does not come leaves a
+  mark that swallows a later real build, and an event that comes late (after 12 steps) is captured. The originator's own
+  released build no longer relies on that guard alone: its mark is written immediately before the release, in command order.
 
 ## 8. NEEDS GAME VERIFICATION
 
@@ -481,9 +525,12 @@ Needs the mod's strict mode (section 7) and a host and a player in one session, 
    every 2 s; in `native_events.log` `pong` and `holding` (`on = true`). Without the module (a game without the switches):
    no `native_ctl.log`, no `strict:` line, and builds behave as before (replay on peers).
 2. **One road.** On the player's game build one road segment with the street tool. Expect, in this order, on the building
-   game: `tool event streetBuilder/builder.proposalApply`, `strict: held 1 (site 0x...) matched the capture of streetBuilder (N
-   bytes, ...): 1:K stamped T (now t), cancel written`; in `native.log` `event held: command 1 ...` then `event dropped: command
-   1 (cancel)`; no `released`. The road must appear on **both** games, at the same game time T (`action 1:K
+   game: `tool event streetBuilder/builder.proposalCreate`, `strict: held 1 (site 0x...) matched the capture of streetBuilder (N
+   bytes, ...): 1:K stamped T (now t), held until the stamp`; in `native.log` `event held: command 1 ...`; then, at T,
+   `strict: held 1 (1:K) released at game time ... (stamp T)` and in `native.log` `event released: command 1 (release)` and
+   `event applied: command 1, accepted by the engine: true`; no `dropped`. The road must appear on **both** games, on the
+   building game a moment after T (note the two game times: `released at game time` and `applied by the engine ... at game
+   time`; the skew to the other game's `action 1:K ... applied at t=T`), and on the other game at T (`action 1:K
    makeWorldBuildProposalCmd applied at t=T` in the simulation lines of both `mod.log`s), and **not before** on the building
    game (about the session lead, one to two seconds, after the click). The money leaves the account at T on both. Questions this
    answers:
@@ -491,11 +538,16 @@ Needs the mod's strict mode (section 7) and a host and a player in one session, 
      command had been released`, the event arrives later than the 0.4 s grace and the grace (`NAT_GRACE`) is too short;
    - whether `builder.proposalApply` is fired before the command is queued at all (if no event ever appears while `held` does,
      every build is released and goes the old way: `strict: held N ...: no capture of a tool build`);
-   - whether the cancel needs the mod's `nop` trigger or the replay itself is enough (`native.log` shows `dropped` within a
-     frame or two of `held`; if it takes seconds the trigger is not reaching `Add`).
-3. **The tool after a cancel.** Right after step 2, build a second road with the same tool, then a third. The tool must be
-   usable (no stuck ghost, no frozen cursor, no error in the game log). A tool that waits for its command's callback would
-   hang here; that is the likeliest failure of this stage. Try the bulldozer and the track tool the same way.
+   - whether the release needs the mod's `nop` trigger (`native.log` shows `released` within a frame or two of the
+     `released at game time` line; if it takes seconds the trigger is not reaching `Add`);
+   - no `native build ... captured` line may follow on the building game (the replay mark worked), and no second road.
+3. **The tool stays alive.** Right after step 2, build a second road with the same tool, then a third; then **three roads
+   and two depots in a row** on each game (the check that failed in the first real run). After each one a `tool event
+   ...builder.proposalCreate` line must appear again on that game, the preview and ghost must follow the cursor, clicks must
+   build, and the tool must not stay highlighted without effect. Both worlds identical at the end (roads, depots, and the
+   checksum rounds including `companies`); `binds.txt` on the building game must list the keys of its own depots
+   (`1:K#c1/d1`) like the other game's. Try the bulldozer and the track tool the same way. A tool still dead here means the
+   released command does not give the tool its callback either, and the redesign is wrong.
 4. **Each tool.** One build per tool of the list in section 8, stage 2 F (street, track, station, depot, bulldozer, upgrade,
    lane, traffic light). Each should end as in step 2 or, if the capture or the rebuild check refuses, as `strict: held N (site
    ...): the capture of ... failed (...)` or `it cannot be rebuilt here (...)` followed by `release written`, the road built by
