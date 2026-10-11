@@ -455,7 +455,11 @@ impl Controller {
                 let speed_mb = params.get("mb").and_then(Value::as_f64).filter(|mb| *mb >= 1.0).map(|mb| mb as u32);
                 match (&mut self.steam, id) {
                     (Some(probe), Some(id)) => match speed_mb {
-                        Some(mb) => probe.speed_test(id, mb),
+                        Some(mb) => {
+                            // `mode`: reliable (default), dgram, both, parallel (reliable on 1, 2 and 4 connections), all
+                            let mode = params.get("mode").and_then(Value::as_str).unwrap_or("reliable");
+                            probe.start_plan(id, steamnet::specs_for(mode, mb));
+                        }
                         None => probe.test(id),
                     },
                     (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),

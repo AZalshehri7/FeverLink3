@@ -65,6 +65,14 @@ impl RunSpec {
     }
 }
 
+/// The runs a mode word of the window stands for, of `mb` MB each way (see [`throughput::plan_for`]).
+pub fn specs_for(mode: &str, mb: u32) -> Vec<RunSpec> {
+    throughput::plan_for(mode)
+        .into_iter()
+        .map(|variant| RunSpec { variant, ..RunSpec::reliable(mb) })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub enum RunKind {
     Reliable(SpeedResult),
@@ -1182,6 +1190,33 @@ impl Probe {
     /// Starts a speed test run with the friend `steam_id`, connecting first when the connection test is not already
     /// on that friend. A run in progress is replaced.
     pub fn start_run(&mut self, steam_id: u64, spec: RunSpec) {
+        {
+            let mut state = lock(&self.service.state);
+            state.plan.clear();
+            state.plan_total = 0;
+            state.plan_blocks.clear();
+        }
+        self.begin_run(steam_id, spec);
+    }
+
+    /// Starts a series of runs, one after another (stopping at the first that fails); the report shows the result
+    /// block of each, in order.
+    pub fn start_plan(&mut self, steam_id: u64, mut specs: Vec<RunSpec>) {
+        if specs.is_empty() {
+            return;
+        }
+        let first = specs.remove(0);
+        {
+            let mut state = lock(&self.service.state);
+            state.plan = specs.into();
+            state.plan_peer = steam_id;
+            state.plan_total = state.plan.len() + 1;
+            state.plan_blocks.clear();
+        }
+        self.begin_run(steam_id, first);
+    }
+
+    fn begin_run(&mut self, steam_id: u64, spec: RunSpec) {
         if !self.core.status().ready {
             return;
         }
@@ -1259,9 +1294,39 @@ impl Probe {
         self.service.perform(actions);
     }
 
+    /// The next run of a series, once the one before it has ended: collects its block.
+    pub(super) fn advance_plan(&mut self) {
+        let next = {
+            let mut guard = lock(&self.service.state);
+            let state = &mut *guard;
+            let (Some(run), Some(outcome)) = (state.speed.as_ref(), state.outcome.clone()) else { return };
+            if state.plan_total == 0 || !run.finalized || state.plan_collected == outcome.id {
+                return;
+            }
+            state.plan_collected = outcome.id;
+            let mut block = String::new();
+            if state.plan_total > 1 {
+                block.push_str(&format!("== {} ({} MB) ==\n", run.spec.variant.label(), run.spec.total / throughput::MB));
+            }
+            match &outcome.failure {
+                None => block.push_str(&outcome.lines.join("\n")),
+                Some(why) => {
+                    block.push_str(&format!("Speed test failed: {why}"));
+                    state.plan.clear();
+                }
+            }
+            state.plan_blocks.push(block);
+            state.plan.pop_front().map(|spec| (state.plan_peer, spec))
+        };
+        if let Some((peer, spec)) = next {
+            self.begin_run(peer, spec);
+        }
+    }
+
     /// Whether a run is in progress.
     pub fn run_active(&self) -> bool {
-        lock(&self.service.state).speed.as_ref().is_some_and(|r| !r.finalized)
+        let state = lock(&self.service.state);
+        state.speed.as_ref().is_some_and(|r| !r.finalized) || (state.plan_total > 0 && !state.plan.is_empty())
     }
 
     /// The outcome of the last run, once it has ended.
@@ -1287,8 +1352,49 @@ impl Probe {
     }
 }
 
+/// What a series of runs adds to the window's view: the blocks so far and how many runs are left.
+pub(super) struct PlanView {
+    pub blocks: Vec<String>,
+    pub total: usize,
+    pub left: usize,
+    /// The last run's block is among `blocks`.
+    pub collected: bool,
+}
+
+impl PlanView {
+    pub fn of(state: &ProbeState) -> PlanView {
+        PlanView {
+            blocks: state.plan_blocks.clone(),
+            total: state.plan_total,
+            left: state.plan.len(),
+            collected: state.outcome.as_ref().is_some_and(|o| o.id == state.plan_collected),
+        }
+    }
+}
+
 /// The window's view of a run.
-pub(super) fn speed_report(run: &SpeedRun, outcome: Option<&RunOutcome>) -> SpeedReport {
+pub(super) fn speed_report(run: &SpeedRun, outcome: Option<&RunOutcome>, plan: PlanView) -> SpeedReport {
+    let mut report = single_report(run, outcome);
+    if plan.total > 1 {
+        let blocks: Vec<String> = plan.blocks.iter().flat_map(|b| b.lines().map(str::to_string).collect::<Vec<_>>()).collect();
+        let finished = plan.left == 0 && run.finalized && plan.collected;
+        if finished {
+            report.running = false;
+            report.status = blocks.first().cloned().unwrap_or_default();
+            report.lines = blocks;
+        } else {
+            let done = plan.total - plan.left - usize::from(!run.finalized);
+            report.running = true;
+            report.status = format!("[run {} of {}] {}", done + 1, plan.total, report.status);
+            let mut lines = blocks;
+            lines.push(report.status.clone());
+            report.lines = lines;
+        }
+    }
+    report
+}
+
+fn single_report(run: &SpeedRun, outcome: Option<&RunOutcome>) -> SpeedReport {
     let now = Instant::now();
     let mb = |bytes: u64| bytes as f64 / throughput::MB as f64;
     let total = mb(run.spec.total);

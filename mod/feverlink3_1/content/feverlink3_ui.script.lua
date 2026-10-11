@@ -139,6 +139,7 @@ local function setup(react, builtin)
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
 		local mbIn = react.useState(32)
+		local modeIn = react.useState("reliable")
 		local showTest = react.useState(false)
 		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
 		-- paused (a guest's window must notice the host ending the session then too).
@@ -242,7 +243,16 @@ local function setup(react, builtin)
 					function() mbIn:set(mb) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_CHOICES) - 10)
 			end
 			add(box(H, sizes))
-			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old())) end))
+			add(note("How the data travels: Steam's reliable stream, our own datagram protocol, both one after the other, or the reliable stream on 1, 2 and 4 connections at once."))
+			local modes = {}
+			for _, m in ipairs(C.SPEED_MODES) do
+				local chosen = (C.speedMode(modeIn:old()) == m)
+				local label = C.SPEED_MODE_LABELS[m]
+				modes[#modes + 1] = button((chosen and "[ " or "") .. label .. (chosen and " ]" or ""),
+					function() modeIn:set(m) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_MODES) - 10)
+			end
+			add(box(H, modes))
+			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old(), modeIn:old())) end))
 			if st and st.speed then
 				for _, line in ipairs(C.speedLines(st.speed)) do add(note(line)) end
 			end

@@ -36,8 +36,8 @@ pub(crate) mod fake;
 
 use std::collections::VecDeque;
 
-use speed::{Incoming, Phase, RunOutcome, SpeedRun};
-pub use speed::{RunKind, RunSpec};
+use speed::{Incoming, Phase, SpeedRun};
+pub use speed::{specs_for, RunKind, RunOutcome, RunSpec};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -429,6 +429,12 @@ struct ProbeState {
     /// Tests the tester asked us to stop sending.
     stopped_ids: std::collections::HashSet<u64>,
     last_run_id: u64,
+    /// A series of runs (the window's "both" or "parallel"): the ones still to run, the result blocks so far.
+    plan: VecDeque<RunSpec>,
+    plan_peer: u64,
+    plan_total: usize,
+    plan_blocks: Vec<String>,
+    plan_collected: u64,
     /// Lines for the session log, taken by [`Probe::take_log`].
     log: Vec<String>,
 }
@@ -628,6 +634,7 @@ impl Probe {
         self.refresh_links();
         self.drive_test();
         self.drive_speed();
+        self.advance_plan();
     }
 
     /// Takes the core's latest route and ping of the test connection and of the players connected to us. The core
@@ -727,7 +734,7 @@ impl Probe {
                 send_rate: t.send_rate,
             }),
             pings_received: state.pings_received,
-            speed: state.speed.as_ref().map(|r| speed::speed_report(r, state.outcome.as_ref())),
+            speed: state.speed.as_ref().map(|r| speed::speed_report(r, state.outcome.as_ref(), speed::PlanView::of(&state))),
             peers: state
                 .peers
                 .iter()
@@ -1388,6 +1395,44 @@ mod tests {
         assert_eq!(outcome.failure, None, "{outcome:?}");
         let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
         assert!(r.up.capped && r.down.capped, "{r:?}");
+    }
+
+    #[test]
+    fn a_series_of_runs_shows_one_block_per_run_and_stops_at_the_first_failure() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        a.lose_every_nth_unreliable(40);
+        probe_a.start_plan(b.steam_id(), specs_for("both", 2));
+        let first = probe_a.report().speed.expect("a report");
+        assert!(first.running && first.status.starts_with("[run 1 of 2] "), "{first:?}");
+        until("both runs", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let lines = probe_a.report().speed.unwrap().lines;
+        let headers: Vec<&String> = lines.iter().filter(|l| l.starts_with("== ")).collect();
+        assert_eq!(headers, ["== reliable (2 MB) ==", "== datagrams (2 MB) =="], "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Speed test, 2 MB each way")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Datagram speed test, 2 MB each way")), "{lines:?}");
+        // the datagrams went out unreliably, some were lost, and every one was sent with the settings of the connection
+        let (sent, lost, _) = a.unreliable_counts();
+        assert!(sent > 1000 && lost > 0, "{sent} {lost}");
+        // the settings the connections were created with: the same send rate, send rate and send buffer as the tuning
+        let rate = Config::default().send_rate;
+        let options = a.creation_options();
+        assert!(options.contains(&(10, rate)) && options.contains(&(11, rate)) && options.contains(&(9, 2 << 20)), "{options:?}");
+
+        // a series with a peer that is gone stops after the first block
+        b.set_reachable(false);
+        a.break_connections();
+        probe_a.start_plan(b.steam_id(), specs_for("all", 1));
+        until("the failure", || {
+            probe_a.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let lines = probe_a.report().speed.unwrap().lines;
+        assert!(lines.iter().any(|l| l.starts_with("Speed test failed:")), "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("== ")).count(), 1, "{lines:?}");
     }
 
     #[test]

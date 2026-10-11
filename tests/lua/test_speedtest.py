@@ -67,6 +67,17 @@ class SpeedTextTest(unittest.TestCase):
         self.assertEqual(80, params["mb"])
         self.assertEqual(32, self.C.speedParams("1", 7)["mb"])
 
+    def test_the_mode_is_one_of_the_offered_words(self):
+        mode = self.C.speedMode
+        self.assertEqual(["reliable", "dgram", "both", "parallel"], [self.C.SPEED_MODES[i] for i in (1, 2, 3, 4)])
+        for word in ("reliable", "dgram", "both", "parallel"):
+            self.assertEqual(word, mode(word))
+        for odd in (None, "", "all", "DGRAM", 5):
+            self.assertEqual("reliable", mode(odd), odd)
+        params = self.C.speedParams("76561198869158889", 8, "dgram")
+        self.assertEqual(("76561198869158889", 8, "dgram"), (params["id"], params["mb"], params["mode"]))
+        self.assertEqual("reliable", self.C.speedParams("1", 8)["mode"])
+
     def test_the_window_script_still_compiles(self):
         check = self.lua.eval("function(src) local f, err = load(src, 'ui', 't'); return f ~= nil, err end")
         ok, err = check(read("feverlink3_ui.script.lua"))
