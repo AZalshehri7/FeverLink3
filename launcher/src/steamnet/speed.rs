@@ -70,6 +70,7 @@ pub fn specs_for(mode: &str, mb: u32) -> Vec<RunSpec> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RunKind {
     Reliable(SpeedResult),
     Datagram(DgramResult),

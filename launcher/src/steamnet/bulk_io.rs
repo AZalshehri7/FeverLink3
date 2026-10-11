@@ -319,6 +319,7 @@ pub fn recv_report(r: &Receiver) -> RecvReport {
 /// called once, as soon as every datagram is in and the hash has been checked, with the receiver (take the data from
 /// it). The runner then goes on answering the sender for a few seconds. `progress` hears the bytes received so far.
 /// `None` when the offer was refused.
+#[allow(clippy::too_many_arguments)]
 pub fn run_receiver(
     core: &CoreRef,
     hub: &Hub,

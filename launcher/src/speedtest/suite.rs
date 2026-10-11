@@ -359,9 +359,15 @@ fn drive(
         // end, the settings read back from the connection) goes to the results file
         let log = ctx.probe.take_log();
         if !log.is_empty() {
-            report.dumps.push(format!("--- {} ---
-{}", mode.name, log.join("
-")));
+            report.dumps.push(format!(
+                "--- {} ---
+{}",
+                mode.name,
+                log.join(
+                    "
+"
+                )
+            ));
         }
         report.outcomes.push(outcome);
         save(report);
@@ -446,9 +452,19 @@ mod tests {
         assert!(report.outcomes[0].lines[0].starts_with("Speed test, 1 MB each way"), "{report:?}");
         assert_eq!(report.own_id, Some(a.steam_id()));
         assert_eq!(report.dumps.len(), 2, "one log block per mode: {:?}", report.dumps);
-        assert!(report.dumps[0].starts_with("--- one ---
-"), "{:?}", report.dumps);
-        assert!(report.dumps[0].contains("steam speed test status (start): fake detailed status"), "{:?}", report.dumps);
+        assert!(
+            report.dumps[0].starts_with(
+                "--- one ---
+"
+            ),
+            "{:?}",
+            report.dumps
+        );
+        assert!(
+            report.dumps[0].contains("steam speed test status (start): fake detailed status"),
+            "{:?}",
+            report.dumps
+        );
         assert!(report.dumps[0].contains("settings: SendRateMin asked"), "{:?}", report.dumps);
         assert_eq!(report.route, "direct");
         assert_eq!(saves, 3, "saved after each mode and at the end");

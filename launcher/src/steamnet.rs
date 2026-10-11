@@ -1381,9 +1381,9 @@ mod tests {
         until("the peer to put its rate back", || {
             probe_a.poll();
             probe_b.poll();
-            b.connection_config().iter().filter(|c| c.1 == 10).last().is_some_and(|c| c.2 == default)
+            b.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == default)
         });
-        assert!(a.connection_config().iter().filter(|c| c.1 == 10).last().is_some_and(|c| c.2 == default));
+        assert!(a.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == default));
     }
 
     #[test]
