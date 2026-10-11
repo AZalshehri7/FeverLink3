@@ -74,11 +74,17 @@ impl Harness {
     }
 
     pub fn connect(&mut self, name: &str) -> ConnectionId {
+        self.connect_with_caps(name, &[])
+    }
+
+    /// A player whose join message announces these capabilities.
+    pub fn connect_with_caps(&mut self, name: &str, caps: &[&str]) -> ConnectionId {
         self.next_connection += 1;
         let c = self.next_connection;
         let clock = Arc::clone(&self.now);
-        let session =
+        let mut session =
             PlayerSession::with_clock(self.key.clone(), name, "0.1", Box::new(move || *clock.lock().unwrap()));
+        session.set_capabilities(caps.iter().map(|c| (*c).to_owned()).collect());
         self.players.insert(c, Player { session, game: Vec::new(), log: Vec::new(), saves: Vec::new() });
         self.routable.insert(c);
         let outs = self.host.connection_opened(c);
@@ -187,8 +193,15 @@ impl Harness {
 
     /// A started session at `speed`, with the given number of ready players, all at game time 10 000.
     pub fn running(players: usize, speed: i32, options: HostOptions) -> (Self, Vec<ConnectionId>) {
+        let caps = vec![Vec::new(); players];
+        Self::running_with_caps(&caps, speed, options)
+    }
+
+    /// As `running`, one player for each entry of `caps`, announcing those capabilities.
+    pub fn running_with_caps(caps: &[Vec<&str>], speed: i32, options: HostOptions) -> (Self, Vec<ConnectionId>) {
         let mut h = Self::with(options);
-        let ids: Vec<ConnectionId> = (0..players).map(|i| h.connect(&format!("P{i}"))).collect();
+        let ids: Vec<ConnectionId> =
+            caps.iter().enumerate().map(|(i, c)| h.connect_with_caps(&format!("P{i}"), c)).collect();
         h.hello_all(10_000, 0);
         h.host_call(HostSession::start);
         h.host_call(|host| host.set_speed(speed));

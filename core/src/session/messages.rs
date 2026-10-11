@@ -60,11 +60,19 @@ pub struct JoinMessage {
     pub proof: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<ResumeClaim>,
+    /// What this player's end can do besides the basics (see [`CAP_BULK_DGRAM`]). A host ignores words it does not
+    /// know; a host that predates the field ignores the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
 }
+
+/// Capability: the player can receive a savegame as bulk datagrams (own reliability and congestion control over Steam's
+/// unreliable messages) instead of as `ResyncChunk` frames. Only a Steam transport has it.
+pub const CAP_BULK_DGRAM: &str = "bulk-dgram-1";
 
 impl JoinMessage {
     pub fn new(name: &str, version: &str, proof: Vec<u8>) -> Self {
-        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None }
+        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None, caps: Vec::new() }
     }
 }
 
