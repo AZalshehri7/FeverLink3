@@ -394,9 +394,37 @@ pub struct Digest {
 
 /// Digest of `bytes` as 0x40-byte records (a trailing partial record is ignored).
 pub fn digest_records(bytes: &[u8]) -> Digest {
+    digest_by(bytes, record_geometry)
+}
+
+/// Hash of the 20 position bytes `+4..+0x18` of a record alone (the sort input of `0x966150`: the other fields are
+/// built after the gather and say nothing about the order it was gathered in).
+pub fn record_position(rec: &[u8]) -> u64 {
+    fnv1a(FNV_OFFSET, &rec[4..0x18])
+}
+
+/// [`digest_records`] with the position bytes only.
+pub fn digest_positions(bytes: &[u8]) -> Digest {
+    digest_by(bytes, record_position)
+}
+
+/// Digest of a vector of `u32` ids (the edge candidates of `0x95d100`): `ordered` and `sum` over the ids themselves;
+/// the id fields are left at their start values.
+pub fn digest_ids(bytes: &[u8]) -> Digest {
+    let mut d = Digest { n: 0, ordered: FNV_OFFSET, sum: 0, id_ordered: FNV_OFFSET, id_sum: 0 };
+    for c in bytes.as_chunks::<4>().0 {
+        d.n += 1;
+        d.ordered = fnv1a(d.ordered, c);
+        d.sum = d.sum.wrapping_add(mix64(u64::from(u32::from_le_bytes(*c))));
+    }
+    d
+}
+
+/// Digest of `bytes` as 0x40-byte records, hashing each record's geometry with `geom`.
+pub fn digest_by(bytes: &[u8], geom: fn(&[u8]) -> u64) -> Digest {
     let mut d = Digest { n: 0, ordered: FNV_OFFSET, sum: 0, id_ordered: FNV_OFFSET, id_sum: 0 };
     for rec in bytes.as_chunks::<RECORD_LEN>().0 {
-        let g = record_geometry(rec);
+        let g = geom(rec);
         let id = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
         d.n += 1;
         d.ordered = fnv1a(d.ordered, &g.to_le_bytes());
@@ -455,6 +483,39 @@ pub fn cand_line(key: &DeepKey, j: u32, d: &Digest, capped: bool) -> String {
         d.sum,
         d.id_ordered,
         d.id_sum,
+        if capped { " capped=1" } else { "" }
+    )
+}
+
+/// The records the candidate sort (`0x966150`) was given, in the order they were gathered (`ho`/`hs`: positions only,
+/// order-sensitive hash and sum; `hio`/`his`: the entity ids), and how many neighbours of the sorted result have exactly
+/// the same squared distance to the centre (`ties`, `-` if the centre could not be read): only ties keep the input order.
+pub fn sort_line(key: &DeepKey, j: u32, d: &Digest, ties: Option<u64>, capped: bool) -> String {
+    format!(
+        "{} j={j} n={} ho={:#018x} hs={:#018x} hio={:#018x} his={:#018x} ties={}{}",
+        key.head("sort"),
+        d.n,
+        d.ordered,
+        d.sum,
+        d.id_ordered,
+        d.id_sum,
+        ties.map_or("-".to_string(), |t| t.to_string()),
+        if capped { " capped=1" } else { "" }
+    )
+}
+
+/// The country-edge pick (`0x95d627`): the candidate ids in the order the function holds them (`ho` ordered hash, `hs`
+/// sum), the rng state before and after the draw and the index drawn (`idx`).
+pub fn pick_line(key: &DeepKey, j: u32, d: &Digest, before: Option<u32>, after: Option<u32>, idx: u32, capped: bool) -> String {
+    let f = |v: Option<u32>| v.map_or("-".to_string(), |v| format!("{v:#010x}"));
+    format!(
+        "{} j={j} n={} ho={:#018x} hs={:#018x} before={} after={} idx={idx}{}",
+        key.head("pick"),
+        d.n,
+        d.ordered,
+        d.sum,
+        f(before),
+        f(after),
         if capped { " capped=1" } else { "" }
     )
 }
@@ -694,6 +755,38 @@ mod tests {
         let (d1, d2) = (digest_records(&rec(1, [1; 20], 1, [2; 24], 0)), digest_records(&rec(2, [1; 20], 1, [2; 24], 0)));
         assert_ne!(d1.id_sum, d2.id_sum);
         assert_eq!(d1.sum, d2.sum);
+    }
+
+    #[test]
+    fn id_and_position_digests_separate_order_from_content() {
+        let ids = |v: &[u32]| v.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>();
+        let (a, b) = (digest_ids(&ids(&[1, 2, 3])), digest_ids(&ids(&[3, 1, 2])));
+        assert_eq!((a.n, b.n), (3, 3));
+        assert_eq!(a.sum, b.sum);
+        assert_ne!(a.ordered, b.ordered);
+        assert_ne!(a.sum, digest_ids(&ids(&[1, 2, 4])).sum);
+        // positions only: flag, floats and ids do not matter
+        let x = rec(1, [1; 20], 1, [2; 24], 0);
+        let y = rec(9, [1; 20], 0, [7; 24], 3);
+        let (px, py) = (digest_positions(&x), digest_positions(&y));
+        assert_eq!((px.n, px.ordered, px.sum), (py.n, py.ordered, py.sum));
+        assert_ne!(px.id_sum, py.id_sum);
+        assert_ne!(digest_positions(&x).sum, digest_positions(&rec(1, [2; 20], 1, [2; 24], 0)).sum);
+    }
+
+    #[test]
+    fn sort_and_pick_lines_have_fixed_fields() {
+        let key = DeepKey { pid: 7, t: Some(100), town: 5, k: 0 };
+        let d = Digest { n: 4, ordered: 1, sum: 2, id_ordered: 3, id_sum: 4 };
+        assert_eq!(
+            sort_line(&key, 0, &d, Some(2), false),
+            "gdeep-sort pid=7 t=100 town=5 k=0 j=0 n=4 ho=0x0000000000000001 hs=0x0000000000000002 hio=0x0000000000000003 his=0x0000000000000004 ties=2"
+        );
+        assert!(sort_line(&key, 0, &d, None, true).ends_with("ties=- capped=1"));
+        assert_eq!(
+            pick_line(&key, 1, &d, Some(5), None, 3, false),
+            "gdeep-pick pid=7 t=100 town=5 k=0 j=1 n=4 ho=0x0000000000000001 hs=0x0000000000000002 before=0x00000005 after=- idx=3"
+        );
     }
 
     #[test]

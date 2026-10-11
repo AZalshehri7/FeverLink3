@@ -521,6 +521,177 @@ unsafe extern "system-unwind" fn edges_hook(rcx: u64, radius: f32, r8: u64, r9: 
     ret
 }
 
+/// Where the redirected `call`s lead after the hooks: the real `std::sort` (`0x966150`) and `RandomInt` (`0x3055870`);
+/// 0 until published (before the call is patched).
+static SORT_CALLEE: AtomicUsize = AtomicUsize::new(0);
+static PICK_CALLEE: AtomicUsize = AtomicUsize::new(0);
+
+/// [`deep_place`] without counting: the place the next gather or selection of this thread will be logged at.
+fn deep_peek(is_cand: bool) -> Option<(growth::DeepKey, u32, bool)> {
+    let pid = std::process::id();
+    match deep_ctx().dev {
+        Some(d) => {
+            let j = if is_cand { d.cand_j } else { d.edge_j };
+            Some((growth::DeepKey { pid, t: d.t, town: d.town, k: d.k }, j, d.want))
+        }
+        None => {
+            let n = DEEP_ORPHANS.load(Ordering::Relaxed);
+            (n < growth::ORPHAN_MAX).then_some((growth::DeepKey { pid, t: None, town: 0, k: 0 }, n as u32, true))
+        }
+    }
+}
+
+/// The bytes of a vector `[begin, end)` of elements of `size` bytes: `Ok(bytes)`, or `Err(count)` when it is too large to
+/// hash or not readable (the count is 0 if the bounds make no sense).
+fn deep_vector(begin: u64, end: u64, size: u64, max: usize) -> Result<Vec<u8>, u64> {
+    if begin == end {
+        return Ok(Vec::new());
+    }
+    let len = end.wrapping_sub(begin);
+    if end < begin || !len.is_multiple_of(size) {
+        return Err(0);
+    }
+    let n = len / size;
+    if n as usize > max {
+        return Err(n);
+    }
+    // SAFETY: checked readable by `read`.
+    unsafe { mem::read(begin as *const u8, len as usize) }.map_err(|_| n)
+}
+
+/// What is known before the sort.
+struct SortPre {
+    key: growth::DeepKey,
+    j: u32,
+    digest: growth::Digest,
+    capped: bool,
+}
+
+/// Before `std::sort`: the records in the order they were gathered (positions only).
+fn deep_sort_before(begin: u64, end: u64) -> Option<SortPre> {
+    let (key, j, want) = deep_peek(true)?;
+    if !want {
+        return None;
+    }
+    let empty = growth::digest_records(&[]);
+    Some(match deep_vector(begin, end, growth::RECORD_LEN as u64, growth::MAX_RECORDS) {
+        Ok(bytes) => SortPre { key, j, digest: growth::digest_positions(&bytes), capped: false },
+        Err(n) => SortPre { key, j, digest: growth::Digest { n, ..empty }, capped: true },
+    })
+}
+
+/// After `std::sort`: the number of neighbours with exactly equal squared distance to the centre (`*(ctx+0x20)`, the
+/// comparator's centre), then the line.
+fn deep_sort_after(pre: SortPre, begin: u64, end: u64, ctx: u64) {
+    let mut ties = None;
+    if !pre.capped {
+        // the centre is a pointer to two floats at `ctx+0x20`: read the pointer, then the floats
+        // SAFETY: only after the OS says the 8 bytes are readable.
+        let ptr = (ctx != 0 && unsafe { mem::readable(ctx.wrapping_add(0x20) as *const u8, 8) })
+            .then(|| unsafe { core::ptr::read_unaligned(ctx.wrapping_add(0x20) as *const u64) });
+        if let (Some(p), Ok(bytes)) = (ptr, deep_vector(begin, end, growth::RECORD_LEN as u64, growth::MAX_RECORDS)) {
+            if let (Some(cx), Some(cy)) = (deep_read_u32(p), deep_read_u32(p.wrapping_add(4))) {
+                let (cx, cy) = (f32::from_bits(cx), f32::from_bits(cy));
+                let mut last: Option<f32> = None;
+                let mut n = 0u64;
+                for rec in bytes.as_chunks::<{ growth::RECORD_LEN }>().0 {
+                    let x = f32::from_bits(u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]));
+                    let y = f32::from_bits(u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]));
+                    let (dx, dy) = (x - cx, y - cy);
+                    let d = dy * dy + dx * dx;
+                    if last == Some(d) {
+                        n += 1;
+                    }
+                    last = Some(d);
+                }
+                ties = Some(n);
+            }
+        }
+    }
+    growth_file_line(&growth::sort_line(&pre.key, pre.j, &pre.digest, ties, pre.capped));
+}
+
+/// What is known before the draw of the country edge.
+struct PickPre {
+    key: growth::DeepKey,
+    j: u32,
+    digest: growth::Digest,
+    capped: bool,
+    before: Option<u32>,
+}
+
+/// Before `RandomInt` at `0x95d627`: the id vector `[frame-0x40, frame-0x38)` of `0x95d100` and the rng state.
+fn deep_pick_before(rng: u64, frame: u64) -> Option<PickPre> {
+    let (key, j, want) = deep_peek(false)?;
+    if !want {
+        return None;
+    }
+    let before = deep_read_u32(rng);
+    let empty = growth::digest_ids(&[]);
+    // SAFETY: only asks the OS first.
+    let hdr = frame.checked_sub(0x40).and_then(|a| unsafe { mem::read(a as *const u8, 16) }.ok());
+    let Some(hdr) = hdr else {
+        return Some(PickPre { key, j, digest: empty, capped: true, before });
+    };
+    let begin = u64::from_le_bytes(hdr[..8].try_into().unwrap_or([0; 8]));
+    let end = u64::from_le_bytes(hdr[8..].try_into().unwrap_or([0; 8]));
+    Some(match deep_vector(begin, end, 4, growth::MAX_RECORDS) {
+        Ok(bytes) => PickPre { key, j, digest: growth::digest_ids(&bytes), capped: false, before },
+        Err(n) => PickPre { key, j, digest: growth::Digest { n, ..empty }, capped: true, before },
+    })
+}
+
+/// After the draw: the rng state and the index drawn.
+fn deep_pick_after(pre: PickPre, rng: u64, idx: u32) {
+    let after = deep_read_u32(rng);
+    growth_file_line(&growth::pick_line(&pre.key, pre.j, &pre.digest, pre.before, after, idx, pre.capped));
+}
+
+/// The call `std::sort(begin, end, count, ctx)` at `0x967c16`, reached through a thunk the module placed at the call.
+/// Logs the records as gathered, calls the real sort with every argument as given, then logs the ties. Changes nothing.
+unsafe extern "system-unwind" fn sort_hook(begin: u64, end: u64, count: u64, ctx: u64) -> u64 {
+    let callee = SORT_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return 0;
+    }
+    let pre = if GROWTH_DEEP.load(Ordering::Acquire) {
+        crate::log::guarded("growth deep sort", || deep_sort_before(begin, end)).flatten()
+    } else {
+        None
+    };
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the real function at the call's original target, which takes these four slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    let ret = unsafe { original(begin, end, count, ctx) };
+    if let Some(pre) = pre {
+        crate::log::guarded("growth deep sort", || deep_sort_after(pre, begin, end, ctx));
+    }
+    ret
+}
+
+/// The call `RandomInt(rng, 0, n)` at `0x95d627`, reached through a thunk that also passes the caller's frame pointer
+/// (`rbp`, where the id vector lives) in `r9`, which the callee does not use. Logs the candidates, calls the real
+/// function with `(rng, lo, n)` as given and logs the draw. Changes nothing.
+unsafe extern "system-unwind" fn pick_hook(rng: u64, lo: u64, n: u64, frame: u64) -> u64 {
+    let callee = PICK_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return 0;
+    }
+    let pre = if GROWTH_DEEP.load(Ordering::Acquire) {
+        crate::log::guarded("growth deep pick", || deep_pick_before(rng, frame)).flatten()
+    } else {
+        None
+    };
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64) -> u64;
+    // SAFETY: the real function at the call's original target, which takes these three slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    let ret = unsafe { original(rng, lo, n) };
+    if let Some(pre) = pre {
+        crate::log::guarded("growth deep pick", || deep_pick_after(pre, rng, ret as u32));
+    }
+    ret
+}
+
 /// The `TownUpdateSize` command handler `(this, payload) -> bool`: reads the game time the way the handler itself
 /// does a few instructions later (`[[this+8]+0x28]` is the `GameTime` system, `0x2a96c0` the getter), keeps it for
 /// `Develop` to see, and calls the original with the arguments as given. Changes nothing.
@@ -663,7 +834,10 @@ unsafe extern "system-unwind" fn growth_hook(rcx: u64, rdx: u64, r8: u64, r9: u6
 
 /// The diagnostic hooks: logs and experiments that are not among the pieces the mod's `ready` event lists.
 fn is_diagnostic(name: &str) -> bool {
-    matches!(name, "town_seed" | "town_develop" | "town_update_size" | "town_candidates" | "town_edges")
+    matches!(
+        name,
+        "town_seed" | "town_develop" | "town_update_size" | "town_candidates" | "town_edges" | "town_sort" | "town_pick"
+    )
 }
 
 /// Where the jumps lead.
@@ -676,6 +850,8 @@ pub struct Targets {
     pub growth_cmd: usize,
     pub cands: usize,
     pub edges: usize,
+    pub sort: usize,
+    pub pick: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -696,11 +872,13 @@ impl Image for ProcessImage {
 pub struct Installed {
     detours: Vec<(&'static str, Detour)>,
     patch: Option<AppliedPatch>,
+    /// Redirected `call` instructions (the deep growth log): the displacement was rewritten to lead to a thunk.
+    call_patches: Vec<(&'static str, AppliedPatch)>,
 }
 
 impl Installed {
     pub fn hook_names(&self) -> Vec<&'static str> {
-        self.detours.iter().map(|(n, _)| *n).collect()
+        self.detours.iter().map(|(n, _)| *n).chain(self.call_patches.iter().map(|(n, _)| *n)).collect()
     }
 
     pub fn poolpatch(&self) -> bool {
@@ -708,7 +886,7 @@ impl Installed {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.detours.is_empty() && self.patch.is_none()
+        self.detours.is_empty() && self.patch.is_none() && self.call_patches.is_empty()
     }
 
     /// Takes everything out again, newest first: the jumps, then the patch.
@@ -720,6 +898,12 @@ impl Installed {
     /// No thread may be inside the first bytes of a hooked function or inside the patched region.
     pub unsafe fn uninstall_all(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
+        while let Some((name, mut p)) = self.call_patches.pop() {
+            match unsafe { p.restore() } {
+                Ok(()) => lines.push(format!("hooks: {name}: call restored, original bytes back")),
+                Err(e) => lines.push(format!("hooks: {name}: call NOT restored: {e}")),
+            }
+        }
         while let Some((name, mut d)) = self.detours.pop() {
             match unsafe { d.uninstall() } {
                 Ok(()) => lines.push(format!("hooks: {name}: jump removed, original bytes restored")),
@@ -826,11 +1010,50 @@ pub unsafe fn execute(
     }
     if let Some(why) = failure {
         lines.push(why);
-        let mut undo = Installed { detours: written, patch: None };
+        let mut undo = Installed { detours: written, ..Default::default() };
         lines.push("hooks: rolling back the jumps already written".to_string());
         lines.extend(unsafe { undo.uninstall_all() });
     } else {
         inst.detours = written;
+        // 5. the call-site redirects of the deep log: read-only, each independent (a failure costs only that one)
+        for step in &plan.steps {
+            let Step::CallPatch { feature, name, rva, expected, callee } = step else { continue };
+            let (hook, prefix): (usize, &[u8]) = match feature {
+                Feature::GrowthSort => (targets.sort, &[]),
+                // `mov r9, rbp`: the caller's frame pointer as a fourth argument the callee ignores
+                _ => (targets.pick, &[0x4C, 0x8B, 0xCD]),
+            };
+            let callee_addr = base + *callee as usize;
+            if *feature == Feature::GrowthSort {
+                SORT_CALLEE.store(callee_addr, Ordering::Release);
+            } else {
+                PICK_CALLEE.store(callee_addr, Ordering::Release);
+            }
+            let mut thunk = prefix.to_vec();
+            thunk.extend_from_slice(&crate::detour::jmp_abs(hook as u64));
+            let at = base + *rva as usize;
+            // SAFETY: executable memory with absolute jumps only; the thunk is never freed.
+            let thunk_at = match unsafe { mem::alloc_exec_near(at, &thunk) } {
+                Ok(p) => p as usize,
+                Err(e) => {
+                    lines.push(format!("hooks: {name}: NOT installed, no executable memory near the call: {e:?}"));
+                    continue;
+                }
+            };
+            let Ok(rel) = i32::try_from(thunk_at as i64 - (at as i64 + 5)) else {
+                lines.push(format!("hooks: {name}: NOT installed, the thunk is out of reach of a rel32 call"));
+                continue;
+            };
+            let mut replacement = vec![0xE8];
+            replacement.extend_from_slice(&rel.to_le_bytes());
+            match unsafe { AppliedPatch::apply(at as *mut u8, expected, &replacement) } {
+                Ok(p) => {
+                    lines.push(format!("hooks: {name}: call at rva {rva:#x} redirected to a thunk at {thunk_at:#x}"));
+                    inst.call_patches.push((name, p));
+                }
+                Err(e) => lines.push(format!("hooks: {name}: NOT installed, the call was not patched: {e}")),
+            }
+        }
     }
     (inst, lines)
 }
@@ -879,7 +1102,8 @@ fn apply_selftest(p: &mut Plan, report: &selftest::Report, log: fn(&str)) {
     };
     let mut skipped = Vec::new();
     p.steps.retain(|s| {
-        let remove = matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && *feature == Feature::Hold));
+        let remove = matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && *feature == Feature::Hold))
+            || matches!(s, Step::CallPatch { .. } if drop_all);
         if remove {
             skipped.push(Skip { feature: s.feature(), name: s.name(), reason: why(s.feature()).to_string() });
         }
@@ -969,6 +1193,8 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         growth_cmd: growth_cmd_hook as *const () as usize,
         cands: candidates_hook as *const () as usize,
         edges: edges_hook as *const () as usize,
+        sort: sort_hook as *const () as usize,
+        pick: pick_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -991,6 +1217,8 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     let time_read = installed.hook_names().contains(&"town_update_size");
     let cands_on = installed.hook_names().contains(&"town_candidates");
     let edges_on = installed.hook_names().contains(&"town_edges");
+    let sort_on = installed.hook_names().contains(&"town_sort");
+    let pick_on = installed.hook_names().contains(&"town_pick");
     rt.set_installed(mod_hooks.clone(), installed.poolpatch());
     let anything = !installed.is_empty();
     let hooked = !mod_hooks.is_empty();
@@ -1016,10 +1244,12 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         log("hooks: town_develop: TOWN GROWTH log: 'growth n=.. pid=.. town=.. seed=.. [t=<tick of 200 ms>] [used=..] r9b=.. a6=.. a7=.. ret=.. caller=..' (first 2000 calls, then about 1 in 50; every call of the towns in FEVERLINK3_TOWN_TRACE); also appended to growth.log in this game's live folder");
         if g.deep {
             log(&format!(
-                "hooks: town_develop: DEEP growth log (FEVERLINK3_LOG_GROWTH_DEEP): 'gdeep-payload|dev|cand|edge ...' lines in growth.log only (payload: {}, rng end state: yes, candidates: {}, edge rng: {}); read-only",
+                "hooks: town_develop: DEEP growth log (FEVERLINK3_LOG_GROWTH_DEEP): 'gdeep-payload|dev|cand|edge ...' lines in growth.log only (payload: {}, rng end state: yes, candidates: {}, edge rng: {}, sort input: {}, edge pick: {}); read-only",
                 if time_read { "yes" } else { "NO, the TownUpdateSize hook is missing" },
                 if cands_on { "yes" } else { "NO, not installed" },
                 if edges_on { "yes" } else { "NO, not installed" },
+                if sort_on { "yes" } else { "NO, not installed" },
+                if pick_on { "yes" } else { "NO, not installed" },
             ));
         }
         if !time_read {
@@ -1165,6 +1395,8 @@ mod tests {
             }),
             town_candidates: Some(HookSite { rva: CANDS_RVA, prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()) }),
             town_edges: Some(HookSite { rva: EDGES_RVA, prologue: Box::leak(stub(edges_probe as *const () as usize)[..14].to_vec().into_boxed_slice()) }),
+            town_sort_call: Some(call_site(SORT_CALL_RVA, SORT_CALLEE_RVA, sort_callee_probe as *const () as usize)),
+            town_pick_call: Some(call_site(PICK_CALL_RVA, PICK_CALLEE_RVA, pick_callee_probe as *const () as usize)),
             game_time_getter: Some(CallSite { rva: GETTER_RVA, prologue: &GETTER_FN }),
             script_pool: Some(pool.clone()),
             command_move: Some(helper.clone()),
@@ -1186,6 +1418,18 @@ mod tests {
         g.fill(DEVELOP_RVA as usize, &DEVELOP_FN);
         g.fill(CMD_RVA as usize, &handler_fn());
         g.fill(CANDS_RVA as usize, &stub(cands_probe as *const () as usize));
+        let rel = |from: u32, to: u32| (i64::from(to) - i64::from(from) - 5) as i32;
+        let mut sort_caller = vec![0x48, 0x83, 0xEC, 0x28, 0xE8];
+        sort_caller.extend_from_slice(&rel(SORT_CALL_RVA, SORT_CALLEE_RVA).to_le_bytes());
+        sort_caller.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        g.fill(SORT_CALLER_RVA as usize, &sort_caller);
+        g.fill(SORT_CALLEE_RVA as usize, &stub(sort_callee_probe as *const () as usize));
+        // push rbp ; mov rbp,rcx ; mov rcx,rdx ; xor edx,edx ; sub rsp,20h ; call ; add rsp,20h ; pop rbp ; ret
+        let mut pick_caller = vec![0x55, 0x48, 0x89, 0xCD, 0x48, 0x89, 0xD1, 0x31, 0xD2, 0x48, 0x83, 0xEC, 0x20, 0xE8];
+        pick_caller.extend_from_slice(&rel(PICK_CALL_RVA, PICK_CALLEE_RVA).to_le_bytes());
+        pick_caller.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20, 0x5D, 0xC3]);
+        g.fill(PICK_CALLER_RVA as usize, &pick_caller);
+        g.fill(PICK_CALLEE_RVA as usize, &stub(pick_callee_probe as *const () as usize));
         g.fill(EDGES_RVA as usize, &stub(edges_probe as *const () as usize));
         g.fill(GETTER_RVA as usize, &GETTER_FN);
         g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
@@ -1240,6 +1484,8 @@ mod tests {
             growth_cmd: growth_cmd_hook as *const () as usize,
             cands: candidates_hook as *const () as usize,
             edges: edges_hook as *const () as usize,
+            sort: sort_hook as *const () as usize,
+            pick: pick_hook as *const () as usize,
         }
     }
 
@@ -1686,6 +1932,13 @@ mod tests {
     const CMD_RVA: u32 = 0x800;
     const GETTER_RVA: u32 = 0x900;
     const CANDS_RVA: u32 = 0xa00;
+    // fake callers of the two redirected calls: the `call rel32` is at +4 (sort) and +13 (pick)
+    const SORT_CALLER_RVA: u32 = 0xc00;
+    const SORT_CALL_RVA: u32 = 0xc04;
+    const SORT_CALLEE_RVA: u32 = 0xc40;
+    const PICK_CALLER_RVA: u32 = 0xd00;
+    const PICK_CALL_RVA: u32 = 0xd0d;
+    const PICK_CALLEE_RVA: u32 = 0xd40;
     const EDGES_RVA: u32 = 0xb00;
     /// A fake `Develop(rcx, rdx, r8d, r9b, u32* state, a6, a7)`: reads the state through its fifth argument, which is
     /// `[rsp+28h]` at entry as in the game, and returns `*state + r8d`:
@@ -1705,6 +1958,18 @@ mod tests {
         b[10] = 0xFF;
         b[11] = 0xE0;
         b
+    }
+
+    /// A call-site row of the fake build: the `call rel32` at `rva` leads to `callee`, whose body is the Rust function `to`.
+    fn call_site(rva: u32, callee: u32, to: usize) -> crate::build_table::CallPatchSite {
+        let rel = (i64::from(callee) - i64::from(rva) - 5) as i32;
+        let mut call = vec![0xE8];
+        call.extend_from_slice(&rel.to_le_bytes());
+        crate::build_table::CallPatchSite {
+            rva,
+            expected: Box::leak(call.into_boxed_slice()),
+            callee: CallSite { rva: callee, prologue: Box::leak(stub(to).to_vec().into_boxed_slice()) },
+        }
     }
 
     /// A fake `TownUpdateSize` handler: a stub to `growth_probe`.
@@ -1809,6 +2074,34 @@ mod tests {
 
     // ---- the deep growth log
 
+    static SORT_SEEN: Mutex<Vec<[u64; 4]>> = Mutex::new(Vec::new());
+    static PICK_SEEN: Mutex<Vec<[u64; 3]>> = Mutex::new(Vec::new());
+
+    /// Fake `std::sort(begin, end, count, ctx)`: orders the 0x40-byte records by squared distance (x at +4, y at +8) from
+    /// the origin, stably.
+    extern "system" fn sort_callee_probe(begin: u64, end: u64, count: u64, ctx: u64) -> u64 {
+        SORT_SEEN.lock().unwrap_or_else(|p| p.into_inner()).push([begin, end, count, ctx]);
+        let n = ((end - begin) / 64) as usize;
+        let bytes = unsafe { core::slice::from_raw_parts_mut(begin as *mut u8, n * 64) };
+        let mut recs: Vec<Vec<u8>> = bytes.chunks(64).map(<[u8]>::to_vec).collect();
+        let key = |r: &Vec<u8>| {
+            let x = f32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+            let y = f32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+            y * y + x * x
+        };
+        recs.sort_by(|a, b| key(a).total_cmp(&key(b)));
+        bytes.copy_from_slice(&recs.concat());
+        0x1234
+    }
+
+    /// Fake `RandomInt(rng, lo, hi)`: `state = state * 3 + 1`, returns `state % hi`.
+    extern "system" fn pick_callee_probe(rng: u64, lo: u64, hi: u64) -> u64 {
+        PICK_SEEN.lock().unwrap_or_else(|p| p.into_inner()).push([rng, lo, hi]);
+        let s = unsafe { &mut *(rng as *mut u32) };
+        *s = s.wrapping_mul(3).wrapping_add(1);
+        u64::from(*s) % (hi as u32 as u64)
+    }
+
     /// What the fake candidate gather wrote into its out vector: (pointer, byte length) of the records, 0 = none.
     static CAND_DATA: AtomicUsize = AtomicUsize::new(0);
     static CAND_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -1818,6 +2111,15 @@ mod tests {
     static CAND_SEEN: Mutex<Vec<CandArgs>> = Mutex::new(Vec::new());
     static EDGE_SEEN: Mutex<Vec<EdgeArgs>> = Mutex::new(Vec::new());
     static CAND_GAME: AtomicUsize = AtomicUsize::new(0);
+    static CALLERS_ON: AtomicBool = AtomicBool::new(false);
+    static SORT_CALLER: AtomicUsize = AtomicUsize::new(0);
+    static PICK_CALLER: AtomicUsize = AtomicUsize::new(0);
+    static SORT_BEGIN: AtomicUsize = AtomicUsize::new(0);
+    static SORT_END: AtomicUsize = AtomicUsize::new(0);
+    static SORT_CTX: AtomicUsize = AtomicUsize::new(0);
+    static PICK_FRAME: AtomicUsize = AtomicUsize::new(0);
+    static PICK_RNG: AtomicUsize = AtomicUsize::new(0);
+    static PICK_RESULT: AtomicU64 = AtomicU64::new(0);
     static EDGE_GAME: AtomicUsize = AtomicUsize::new(0);
     static CAND_OUT: Mutex<[u64; 3]> = Mutex::new([0; 3]);
 
@@ -1851,6 +2153,16 @@ mod tests {
     extern "system" fn develop_probe(_a: u64, _b: u64, town: u64, _flag: u64, state: u64, _a6: u64, _a7: u64) -> u64 {
         let cands: CandFn = unsafe { core::mem::transmute(CAND_GAME.load(SeqCst)) };
         let edges: EdgeFn = unsafe { core::mem::transmute(EDGE_GAME.load(SeqCst)) };
+        if CALLERS_ON.load(SeqCst) {
+            // as inside the gather: the sort of the records, then (further on) the draw of an edge
+            let sort: extern "system" fn(u64, u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(SORT_CALLER.load(SeqCst)) };
+            let (b, e, c) = (SORT_BEGIN.load(SeqCst) as u64, SORT_END.load(SeqCst) as u64, SORT_CTX.load(SeqCst) as u64);
+            sort(b, e, 3, c);
+            let pick: extern "system" fn(u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(PICK_CALLER.load(SeqCst)) };
+            PICK_RESULT.store(pick(PICK_FRAME.load(SeqCst) as u64, PICK_RNG.load(SeqCst) as u64, 3), SeqCst);
+        }
         let mut out = CAND_OUT.lock().unwrap_or_else(|p| p.into_inner());
         cands(out.as_mut_ptr() as u64, 0xc0ffee, 2.5, 9, 10, 11, 12, 13, 14);
         drop(out);
@@ -1942,7 +2254,7 @@ mod tests {
         let (mut inst, lines, plan) = install_growth_in(&game, build, cfg, Some(dir.clone()));
         assert_eq!(
             inst.hook_names(),
-            ["town_develop", "town_update_size", "town_candidates", "town_edges"],
+            ["town_develop", "town_update_size", "town_candidates", "town_edges", "town_sort", "town_pick"],
             "{lines:?} {:?}",
             plan.report()
         );
@@ -1984,12 +2296,159 @@ mod tests {
         assert_eq!(l.len(), 16);
 
         let undone = unsafe { inst.uninstall_all() };
-        assert_eq!(undone.len(), 4, "{undone:?}");
+        assert_eq!(undone.len(), 6, "{undone:?}");
         assert_eq!(game.bytes(CANDS_RVA as usize, 15), stub(cands_probe as *const () as usize), "byte for byte as shipped");
         assert_eq!(game.bytes(EDGES_RVA as usize, 15), stub(edges_probe as *const () as usize));
         assert_eq!(call_handler(&game, &sim, 500, p7, 100), plain);
         assert_eq!(deep_lines(&dir).len(), 16, "nothing is logged after the hooks are out");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record with the position floats (x at +4, y at +8) and an id.
+    fn record_at(id: u32, x: f32, y: f32) -> Vec<u8> {
+        let mut r = record(id, 0, 1, 2);
+        r[4..8].copy_from_slice(&x.to_le_bytes());
+        r[8..12].copy_from_slice(&y.to_le_bytes());
+        r
+    }
+
+    fn leak_u32s(v: &[u32]) -> &'static mut [u32] {
+        Box::leak(v.to_vec().into_boxed_slice())
+    }
+
+    #[test]
+    fn the_sort_and_pick_redirects_log_the_input_order_and_the_candidates_and_change_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("deep-calls");
+        let (game, build) = deep_game();
+        let sim = fake_sim();
+        set_candidates(&[record(1, 1, 1, 1)]);
+        CAND_GAME.store(game.at(CANDS_RVA as usize) as usize, SeqCst);
+        EDGE_GAME.store(game.at(EDGES_RVA as usize) as usize, SeqCst);
+        SORT_CALLER.store(game.at(SORT_CALLER_RVA as usize) as usize, SeqCst);
+        PICK_CALLER.store(game.at(PICK_CALLER_RVA as usize) as usize, SeqCst);
+        // three records: distances 25, 25 and 2 from the origin; gathered in this order
+        let (r1, r2, r3) = (record_at(1, 3.0, 4.0), record_at(2, 5.0, 0.0), record_at(3, 1.0, 1.0));
+        let gathered: &'static mut [u8] = Box::leak([r1.clone(), r2.clone(), r3.clone()].concat().into_boxed_slice());
+        SORT_BEGIN.store(gathered.as_ptr() as usize, SeqCst);
+        SORT_END.store(gathered.as_ptr() as usize + gathered.len(), SeqCst);
+        let centre: &'static mut [f32; 2] = Box::leak(Box::new([0.0, 0.0]));
+        let ctx: &'static mut [u64; 8] = Box::leak(Box::new([0u64; 8]));
+        ctx[4] = centre.as_ptr() as u64;
+        SORT_CTX.store(ctx.as_ptr() as usize, SeqCst);
+        // the pick's frame: the id vector's begin and end at frame-0x40 and frame-0x38
+        let ids = leak_u32s(&[10, 20, 30]);
+        let frame: &'static mut [u64; 16] = Box::leak(Box::new([0u64; 16]));
+        frame[0] = ids.as_ptr() as u64;
+        frame[1] = ids.as_ptr() as u64 + 12;
+        let frame_ptr = frame.as_ptr() as u64 + 0x40;
+        PICK_FRAME.store(frame_ptr as usize, SeqCst);
+        let rng: &'static mut u32 = Box::leak(Box::new(0));
+        PICK_RNG.store(rng as *mut u32 as usize, SeqCst);
+        CALLERS_ON.store(true, SeqCst);
+        let p7 = payload(7, [1.0, 2.0, 3.0], 0);
+        PROBE_DEVELOP.store(game.at(DEVELOP_RVA as usize) as usize, SeqCst);
+
+        // the game as shipped
+        *rng = 100;
+        SORT_SEEN.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        PICK_SEEN.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let plain = command(&game, &sim, 500, p7, 100);
+        let plain_pick = PICK_RESULT.load(SeqCst);
+        let sorted_plain = gathered.to_vec();
+        assert_eq!(plain_pick, 301 % 3);
+        assert_ne!(sorted_plain, [r1.clone(), r2.clone(), r3.clone()].concat(), "the fake sort moved the records");
+        let seen_sort = SORT_SEEN.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let seen_pick = PICK_SEEN.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        gathered.copy_from_slice(&[r1.clone(), r2.clone(), r3.clone()].concat());
+        *rng = 100;
+        SORT_SEEN.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        PICK_SEEN.lock().unwrap_or_else(|p| p.into_inner()).clear();
+
+        let cfg = HookConfig { growth: deep_settings(), ..Default::default() };
+        let (mut inst, lines, plan) = install_growth_in(&game, build, cfg, Some(dir.clone()));
+        assert_eq!(
+            inst.hook_names(),
+            ["town_develop", "town_update_size", "town_candidates", "town_edges", "town_sort", "town_pick"],
+            "{lines:?} {:?}",
+            plan.report()
+        );
+        assert!(lines.iter().any(|l| l.contains("town_sort: call at rva 0xc04 redirected")), "{lines:?}");
+        assert_ne!(game.bytes(SORT_CALL_RVA as usize, 5), plan_expected(build, true), "the call now leads to the thunk");
+
+        assert_eq!(command(&game, &sim, 500, p7, 100), plain, "the result is the same");
+        assert_eq!(PICK_RESULT.load(SeqCst), plain_pick, "the draw is the same");
+        assert_eq!(gathered.to_vec(), sorted_plain, "the callee sorted the same input");
+        assert_eq!(*SORT_SEEN.lock().unwrap_or_else(|p| p.into_inner()), seen_sort, "every argument as given");
+        assert_eq!(*PICK_SEEN.lock().unwrap_or_else(|p| p.into_inner()), seen_pick);
+
+        let pid = std::process::id();
+        let l = deep_lines(&dir);
+        let pre = growth::digest_positions(&[r1.clone(), r2.clone(), r3.clone()].concat());
+        let sort_line = l.iter().find(|x| x.starts_with("gdeep-sort")).expect("sort line");
+        assert_eq!(
+            *sort_line,
+            format!(
+                "gdeep-sort pid={pid} t=500 town=7 k=0 j=0 n=3 ho={:#018x} hs={:#018x} hio={:#018x} his={:#018x} ties=1",
+                pre.ordered, pre.sum, pre.id_ordered, pre.id_sum
+            )
+        );
+        let ids_digest = growth::digest_ids(&[10u32, 20, 30].iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>());
+        let pick_line = l.iter().find(|x| x.starts_with("gdeep-pick")).expect("pick line");
+        assert_eq!(
+            *pick_line,
+            format!(
+                "gdeep-pick pid={pid} t=500 town=7 k=0 j=0 n=3 ho={:#018x} hs={:#018x} before=0x00000064 after=0x0000012d idx=1",
+                ids_digest.ordered, ids_digest.sum
+            )
+        );
+        // the sort line comes before the gather's own line (the sort is inside the gather)
+        let at = |kind: &str| l.iter().position(|x| x.starts_with(kind)).unwrap();
+        assert!(at("gdeep-sort") < at("gdeep-cand") && at("gdeep-pick") < at("gdeep-dev"));
+
+        // the records gathered in another order: the sum stays, the ordered hash changes
+        gathered.copy_from_slice(&[r3.clone(), r1.clone(), r2.clone()].concat());
+        *rng = 100;
+        command(&game, &sim, 501, p7, 100);
+        let l = deep_lines(&dir);
+        let second = l.iter().rev().find(|x| x.starts_with("gdeep-sort")).unwrap();
+        let other = growth::digest_positions(&[r3.clone(), r1.clone(), r2.clone()].concat());
+        assert_eq!((other.sum, other.ordered != pre.ordered), (pre.sum, true));
+        assert!(second.contains(&format!("ho={:#018x} hs={:#018x}", other.ordered, other.sum)), "{second}");
+
+        let undone = unsafe { inst.uninstall_all() };
+        assert!(undone.iter().any(|u| u.contains("town_sort: call restored")), "{undone:?}");
+        assert_eq!(game.bytes(SORT_CALL_RVA as usize, 5), plan_expected(build, true), "byte for byte as shipped");
+        assert_eq!(game.bytes(PICK_CALL_RVA as usize, 5), plan_expected(build, false));
+        let n_before = deep_lines(&dir).len();
+        command(&game, &sim, 502, p7, 100);
+        assert_eq!(deep_lines(&dir).len(), n_before);
+        CALLERS_ON.store(false, SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn plan_expected(build: &BuildAddrs, sort: bool) -> Vec<u8> {
+        let site = if sort { &build.town_sort_call } else { &build.town_pick_call };
+        site.as_ref().unwrap().expected.to_vec()
+    }
+
+    #[test]
+    fn a_changed_call_or_callee_leaves_the_call_alone() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (game, build) = deep_game();
+        CALLERS_ON.store(false, SeqCst);
+        game.fill(PICK_CALLEE_RVA as usize + 12, &[0xcc]);
+        game.fill(SORT_CALL_RVA as usize + 1, &[0x77]);
+        let sort_call_before = game.bytes(SORT_CALL_RVA as usize, 5);
+        let cfg = HookConfig { growth: deep_settings(), ..Default::default() };
+        let (mut inst, _, plan) = install_growth_in(&game, build, cfg, None);
+        assert_eq!(inst.hook_names(), ["town_develop", "town_update_size", "town_candidates", "town_edges"]);
+        let report = plan.report();
+        assert!(report.iter().any(|l| l.contains("SKIPPED town_pick") && l.contains("callee")), "{report:?}");
+        assert!(report.iter().any(|l| l.contains("SKIPPED town_sort")), "{report:?}");
+        assert_eq!(game.bytes(SORT_CALL_RVA as usize, 5), sort_call_before);
+        assert_eq!(game.bytes(PICK_CALL_RVA as usize, 5), plan_expected(build, false));
+        unsafe { inst.uninstall_all() };
     }
 
     #[test]
@@ -2024,12 +2483,23 @@ mod tests {
         game.fill(CANDS_RVA as usize + 12, &[0xcc]);
         let cfg = HookConfig { growth: deep_settings(), ..Default::default() };
         let (mut inst, _, plan) = install_growth_in(&game, build, cfg, Some(dir.clone()));
-        assert_eq!(inst.hook_names(), ["town_develop", "town_update_size", "town_edges"], "{:?}", plan.report());
+        assert_eq!(
+            inst.hook_names(),
+            ["town_develop", "town_update_size", "town_edges", "town_sort", "town_pick"],
+            "{:?}",
+            plan.report()
+        );
         assert!(plan.report().iter().any(|l| l.contains("SKIPPED town_candidates")));
         assert_eq!(game.bytes(CANDS_RVA as usize + 12, 1), [0xcc], "the changed function is left as it is");
         call_handler(&game, &sim, 10, payload(7, [1.0; 3], 0), 3);
         let kinds: Vec<_> = deep_lines(&dir).iter().map(|l| l.split(' ').next().unwrap().to_string()).collect();
-        assert_eq!(kinds, ["gdeep-payload", "gdeep-edge", "gdeep-dev"]);
+        assert_eq!(
+            kinds,
+            ["gdeep-payload", "gdeep-edge", "gdeep-dev"],
+            "{:?} {:?}",
+            std::fs::read_to_string(dir.join(growth::LOG_FILE)),
+            GROWTH_DIR.lock().map(|d| d.clone())
+        );
         unsafe { inst.uninstall_all() };
         let _ = std::fs::remove_dir_all(&dir);
     }

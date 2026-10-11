@@ -156,6 +156,10 @@ pub enum Feature {
     GrowthCands,
     /// The read-only wrap of the country-edge selection (deep growth log).
     GrowthEdges,
+    /// The call-site redirect before the candidate sort (deep growth log).
+    GrowthSort,
+    /// The call-site redirect before the country-edge pick (deep growth log).
+    GrowthPick,
 }
 
 impl Feature {
@@ -169,6 +173,8 @@ impl Feature {
             Feature::GrowthCmd => "town_update_size",
             Feature::GrowthCands => "town_candidates",
             Feature::GrowthEdges => "town_edges",
+            Feature::GrowthSort => "town_sort",
+            Feature::GrowthPick => "town_pick",
         }
     }
 }
@@ -178,18 +184,21 @@ impl Feature {
 pub enum Step {
     Detour { feature: Feature, name: &'static str, rva: Rva, expected: &'static [u8] },
     Patch { feature: Feature, name: &'static str, rva: Rva, expected: &'static [u8], replacement: &'static [u8] },
+    /// The displacement of a `call rel32` at `rva` is redirected to a thunk of the module (`expected` is the whole
+    /// 5-byte instruction); the hook calls `callee` itself.
+    CallPatch { feature: Feature, name: &'static str, rva: Rva, expected: &'static [u8], callee: Rva },
 }
 
 impl Step {
     pub fn name(&self) -> &'static str {
         match self {
-            Step::Detour { name, .. } | Step::Patch { name, .. } => name,
+            Step::Detour { name, .. } | Step::Patch { name, .. } | Step::CallPatch { name, .. } => name,
         }
     }
 
     pub fn feature(&self) -> Feature {
         match self {
-            Step::Detour { feature, .. } | Step::Patch { feature, .. } => *feature,
+            Step::Detour { feature, .. } | Step::Patch { feature, .. } | Step::CallPatch { feature, .. } => *feature,
         }
     }
 }
@@ -238,7 +247,7 @@ impl Plan {
                 Step::Detour { name, rva, expected, .. } => {
                     format!("hooks: {name}: {} bytes at rva {rva:#x} match the build table", expected.len())
                 }
-                Step::Patch { name, rva, expected, .. } => {
+                Step::Patch { name, rva, expected, .. } | Step::CallPatch { name, rva, expected, .. } => {
                     format!("hooks: {name}: {} bytes at rva {rva:#x} match the build table", expected.len())
                 }
             });
@@ -292,6 +301,7 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
         plan_growth(build, image, &mut p);
         if cfg.growth.deep {
             plan_growth_deep(build, image, &mut p);
+            plan_growth_calls(build, image, &mut p);
         }
     }
     if cfg.poolpatch {
@@ -424,6 +434,31 @@ fn plan_growth_deep(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
+/// The two call-site redirects of the deep log: the call bytes and the callee's prologue must both match.
+fn plan_growth_calls(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    for (feature, name, site) in [
+        (Feature::GrowthSort, "town_sort", &build.town_sort_call),
+        (Feature::GrowthPick, "town_pick", &build.town_pick_call),
+    ] {
+        let Some(site) = site else {
+            p.skipped.push(Skip { feature, name, reason: "the build table has no such site for this build".into() });
+            continue;
+        };
+        let checked = verify(image, site.rva, site.expected)
+            .and_then(|()| verify(image, site.callee.rva, site.callee.prologue).map_err(|e| format!("callee: {e}")));
+        match checked {
+            Ok(()) => p.steps.push(Step::CallPatch {
+                feature,
+                name,
+                rva: site.rva,
+                expected: site.expected,
+                callee: site.callee.rva,
+            }),
+            Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+        }
+    }
+}
+
 fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     let skip = |p: &mut Plan, reason: String| {
         p.skipped.push(Skip { feature: Feature::Hold, name: "command_list_add", reason });
@@ -484,6 +519,10 @@ mod tests {
         }
         let g = b.game_time_getter.as_ref().unwrap();
         img.write(g.rva, g.prologue);
+        for c in [&b.town_sort_call, &b.town_pick_call].into_iter().flatten() {
+            img.write(c.rva, c.expected);
+            img.write(c.callee.rva, c.callee.prologue);
+        }
         for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
             img.write(s.rva, s.prologue);
         }
@@ -716,12 +755,25 @@ mod tests {
         let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
         assert!(deep.any() && deep.growth.deep);
         let p = plan(b, deep, &image_of_40420());
-        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_candidates", "town_edges"], "{:?}", p.report());
+        assert_eq!(names(&p),
+            ["town_develop", "town_update_size", "town_candidates", "town_edges", "town_sort", "town_pick"],
+            "{:?}",
+            p.report()
+        );
         let mut img = image_of_40420();
         img.write(0x9677c0 + 6, &[0x90]);
         let p = plan(b, deep, &img);
-        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_edges"]);
+        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_edges", "town_sort", "town_pick"]);
         assert!(p.skipped.iter().any(|s| s.name == "town_candidates"));
+        // a changed call or callee skips only that redirect
+        let mut img = image_of_40420();
+        img.write(0x967c16 + 1, &[0x00]);
+        assert!(!names(&plan(b, deep, &img)).contains(&"town_sort"));
+        let mut img = image_of_40420();
+        img.write(0x3055870 + 2, &[0x00]);
+        let p = plan(b, deep, &img);
+        assert!(!names(&p).contains(&"town_pick") && names(&p).contains(&"town_sort"));
+        assert!(p.skipped.iter().any(|s| s.name == "town_pick" && s.reason.starts_with("callee: ")), "{:?}", p.skipped);
         // without the deep switch neither is planned
         let log = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH", "1")]));
         assert_eq!(names(&plan(b, log, &image_of_40420())), ["town_develop", "town_update_size"]);
@@ -776,6 +828,8 @@ mod tests {
         town_update_size: None,
         town_candidates: None,
         town_edges: None,
+        town_sort_call: None,
+        town_pick_call: None,
         game_time_getter: None,
         script_pool: None,
         command_move: None,

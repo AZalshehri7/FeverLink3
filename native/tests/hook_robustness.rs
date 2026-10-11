@@ -735,6 +735,9 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                     Step::Detour { rva, expected, .. } => {
                         assert_eq!(image.read(*rva, expected.len()).as_deref(), Some(*expected));
                     }
+                    Step::CallPatch { rva, expected, .. } => {
+                        assert_eq!(image.read(*rva, expected.len()).as_deref(), Some(*expected));
+                    }
                     Step::Patch { rva, expected, replacement, .. } => {
                         assert_eq!(image.read(*rva, expected.len()).as_deref(), Some(*expected));
                         assert_eq!(expected.len(), replacement.len());
