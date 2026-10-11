@@ -25,6 +25,7 @@ pub mod patch;
 pub mod pe;
 pub mod plan;
 pub mod scan;
+pub mod townseed;
 
 #[cfg(windows)]
 pub mod engine;

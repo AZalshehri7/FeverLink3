@@ -484,6 +484,7 @@ mod tests {
             name: "fake",
             command_list_add: None,
             apply_command: None,
+            town_seed: None,
             script_pool: None,
             command_move: None,
             command_destroy: None,

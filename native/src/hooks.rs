@@ -16,6 +16,7 @@
 //! being patched. After that the module never rewrites game code again: a misbehaving mod is handled by the
 //! hooks passing everything through (holding off, silence), not by uninstalling.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -34,6 +35,7 @@ use crate::plan::{self, Feature, HookConfig, Image, Plan, Skip, Step};
 use crate::runtime::{Init, Runtime};
 #[cfg(target_arch = "x86_64")]
 use crate::selftest;
+use crate::townseed::{self, Counter};
 
 /// The live runtime the two hook functions work on. Set before any jump is written.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -67,11 +69,70 @@ unsafe extern "system-unwind" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
     }
 }
 
+/// The unhooked town-seed function (the trampoline), published before the jump is written; 0 until then.
+static TOWN_SEED_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Base address of the image, for turning the caller into an RVA in the log; 0 until armed.
+static TOWN_SEED_BASE: AtomicUsize = AtomicUsize::new(0);
+/// The log function (`fn(&str)` as an address); 0 until armed.
+static TOWN_SEED_LOG: AtomicUsize = AtomicUsize::new(0);
+static TOWN_SEED_COUNTER: Counter = Counter::new();
+
+/// The largest image the caller's RVA is believed for (the game's executable is 70 MB).
+const TOWN_SEED_IMAGE_BOUND: usize = 0x1000_0000;
+
+/// Tells the town-seed hook where to log and what the image base is. Called once, before the jump is written.
+fn arm_town_seed(base: usize, log: fn(&str)) {
+    TOWN_SEED_COUNTER.reset();
+    TOWN_SEED_BASE.store(base, Ordering::Release);
+    TOWN_SEED_LOG.store(log as usize, Ordering::Release);
+}
+
+/// The function the game's town-task seeding function is made to jump to: logs, then calls the original with the
+/// same twelve argument slots (four in registers, eight on the stack) and returns what it returns, unchanged.
+///
+/// The game's function is `sub_8d4270(out, a2, a3, a4, a5..a8, seed, a10, a11, a12)`; the seed is the ninth
+/// argument, `[rsp+0x48]` at its entry. Slots are passed through as raw 64-bit values (three of them carry floats,
+/// two pointers), so the original sees exactly the bits the caller wrote. Reads nothing behind any pointer.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system-unwind" fn town_seed_hook(
+    out: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    seed: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+) -> u64 {
+    // first, before anything can change the frames above us: the return address of the call that got here
+    let caller = hook_caller();
+    let original = TOWN_SEED_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return out;
+    }
+    let log = TOWN_SEED_LOG.load(Ordering::Acquire);
+    if log != 0 {
+        // SAFETY: stored by `arm_town_seed` from a `fn(&str)`.
+        let log: fn(&str) = unsafe { core::mem::transmute(log) };
+        let caller = townseed::caller_field(caller, TOWN_SEED_BASE.load(Ordering::Acquire), TOWN_SEED_IMAGE_BOUND);
+        log(&townseed::line(TOWN_SEED_COUNTER.next(), seed as u32, &caller, a3 as u32, a4 as u32));
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline `Detour::prepare` built for the function this hook replaces, which takes these slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(out, a2, a3, a4, a5, a6, a7, a8, seed, a10, a11, a12) }
+}
+
 /// Where the jumps lead.
 #[derive(Debug, Clone, Copy)]
 pub struct Targets {
     pub apply: usize,
     pub add: usize,
+    pub seed: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -177,7 +238,11 @@ pub unsafe fn execute(
     for step in &plan.steps {
         if let Step::Detour { feature, name, rva, expected } = step {
             let at = (base + *rva as usize) as *mut u8;
-            let hook = if *feature == Feature::Counters { targets.apply } else { targets.add };
+            let hook = match feature {
+                Feature::Counters => targets.apply,
+                Feature::TownSeed => targets.seed,
+                _ => targets.add,
+            };
             match unsafe { Detour::prepare(at, expected) } {
                 Ok(d) => prepared.push((name, hook, d)),
                 Err(e) => lines.push(format!("hooks: {name}: NOT installed, prologue check failed: {e}")),
@@ -190,6 +255,7 @@ pub unsafe fn execute(
         prepared.iter().find(|(n, _, _)| *n == wanted).map(|(_, _, d)| d.original() as usize).unwrap_or(0)
     };
     rt.set_original_addresses(original_of("command_list_add"), original_of("apply_command"));
+    TOWN_SEED_ORIGINAL.store(original_of("town_seed"), Ordering::Release);
     observer(Stage::Prepared);
 
     // 4. write the jumps; if one fails, take the others out again
@@ -315,8 +381,13 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         }
         _ => None,
     };
-    let planned: Vec<&'static str> =
-        plan.steps.iter().filter(|s| matches!(s, Step::Detour { .. })).map(Step::name).collect();
+    // the town-seed log is not one of the pieces the mod's `ready` event lists
+    let planned: Vec<&'static str> = plan
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::Detour { .. }) && s.feature() != Feature::TownSeed)
+        .map(Step::name)
+        .collect();
     let rt = Runtime::new(Init {
         build,
         base,
@@ -332,15 +403,25 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         return;
     }
     let Some(rt) = RUNTIME.get() else { return };
-    let targets = Targets { apply: apply_hook as *const () as usize, add: add_hook as *const () as usize };
+    let targets = Targets {
+        apply: apply_hook as *const () as usize,
+        add: add_hook as *const () as usize,
+        seed: town_seed_hook as *const () as usize,
+    };
+    if plan.has(Feature::TownSeed) {
+        arm_town_seed(base, log);
+    }
     // SAFETY: called from DllMain, before the game runs the functions being patched.
     let (installed, lines) = unsafe { execute(&plan, base, rt, &targets, &mut |_| {}) };
     for l in lines {
         log(&l);
     }
-    rt.set_installed(installed.hook_names(), installed.poolpatch());
+    let mod_hooks: Vec<&'static str> = installed.hook_names().into_iter().filter(|n| *n != "town_seed").collect();
+    let seed_logged = installed.hook_names().contains(&"town_seed");
+    rt.set_installed(mod_hooks.clone(), installed.poolpatch());
     let anything = !installed.is_empty();
-    let hooked = !installed.hook_names().is_empty();
+    let hooked = !mod_hooks.is_empty();
+    let mod_pieces = hooked || installed.poolpatch();
     if let Ok(mut slot) = INSTALLED.lock() {
         *slot = Some(installed);
     }
@@ -349,6 +430,14 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         return;
     }
     pin_module();
+    if seed_logged {
+        log("hooks: town_seed: logging each call of the town task's seeding function as 'town-seed n=.. seed=.. caller=..' (read-only)");
+    }
+    if !mod_pieces {
+        // only the seed log: nothing for the control link to do
+        log("hooks: installed (town-seed log only; nothing else in the game is changed, no control link)");
+        return;
+    }
     log(&installed_line(hooked));
     if let Some(link) = link {
         spawn_service(rt, link, since, log);
@@ -440,6 +529,11 @@ mod tests {
     const ADD_RVA: u32 = 0x200;
     const POOL_RVA: u32 = 0x300;
     const MOVE_RVA: u32 = 0x400;
+    const SEED_RVA: u32 = 0x600;
+    /// A fake of the town task's seeding function: `fn(a1..a12) -> a1 + a5 + a9` in 32 bits, reading its ninth
+    /// argument from the stack as the real one does: `mov eax,[rsp+48h] ; add eax,[rsp+28h] ; add eax,ecx ; nop4 ; ret`.
+    const SEED_FN: [u8; 15] =
+        [0x8B, 0x44, 0x24, 0x48, 0x03, 0x44, 0x24, 0x28, 0x01, 0xC8, 0x90, 0x90, 0x90, 0x90, 0xC3];
     const POOL_BEFORE: &[u8] = &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00];
     const POOL_AFTER: &[u8] = &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00];
 
@@ -457,6 +551,7 @@ mod tests {
             name: "fake",
             command_list_add: Some(add.clone()),
             apply_command: Some(APPLY.clone()),
+            town_seed: Some(HookSite { rva: SEED_RVA, prologue: &SEED_FN[..14] }),
             script_pool: Some(pool.clone()),
             command_move: Some(helper.clone()),
             command_destroy: Some(helper.clone()),
@@ -473,6 +568,7 @@ mod tests {
         g.fill(APPLY_RVA as usize, &SUM);
         g.fill(ADD_RVA as usize, SUM5);
         g.fill(POOL_RVA as usize, POOL_BEFORE);
+        g.fill(SEED_RVA as usize, &SEED_FN);
         g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
         g
     }
@@ -493,7 +589,7 @@ mod tests {
     }
 
     fn everything() -> HookConfig {
-        HookConfig { hooks: true, hold: true, poolpatch: true }
+        HookConfig { hooks: true, hold: true, poolpatch: true, town_seed: false }
     }
 
     // the hooks of these tests: they only prove that the game's functions lead to them and that the published
@@ -517,7 +613,11 @@ mod tests {
     }
 
     fn targets() -> Targets {
-        Targets { apply: test_apply as *const () as usize, add: test_add as *const () as usize }
+        Targets {
+            apply: test_apply as *const () as usize,
+            add: test_add as *const () as usize,
+            seed: town_seed_hook as *const () as usize,
+        }
     }
 
     fn apply_fn(g: &Pages) -> extern "system" fn(u64, u64) -> u64 {
@@ -570,6 +670,79 @@ mod tests {
         assert_eq!(apply_fn(&game)(1, 2), 8);
         assert_eq!(add_fn(&game)(1, 2, 3, 4, 5), 15);
         assert_eq!(game.protection(0), PAGE_EXECUTE_READ);
+    }
+
+    static SEED_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn seed_log(line: &str) {
+        SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).push(line.to_string());
+    }
+
+    type SeedFn = extern "system" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+
+    fn seed_fn(g: &Pages) -> SeedFn {
+        unsafe { core::mem::transmute(g.at(SEED_RVA as usize)) }
+    }
+
+    #[test]
+    fn the_town_seed_hook_logs_the_ninth_argument_and_changes_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { town_seed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.report());
+        let before = seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+        assert_eq!(before, 15, "the fake: a1 + a5 + a9");
+
+        SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        arm_town_seed(base, seed_log);
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(inst.hook_names(), ["town_seed"], "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("town_seed: jump written")), "{lines:?}");
+        assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM, "the other functions are untouched");
+        assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5);
+
+        // same result as unhooked; the high half of the seed slot is garbage the log must ignore
+        let hooked = seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 0xAAAA_BBBB_0000_0009, 10, 11, 12);
+        assert_eq!(hooked, before);
+        assert_eq!(seed_fn(&game)(100, 2, 0x1_0000_0007, 4, 5, 6, 7, 8, 1, 10, 11, 12), 106);
+        let logged = SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged[0].starts_with("town-seed n=1 seed=0x00000009 caller="), "{}", logged[0]);
+        assert!(logged[0].ends_with(" a3=0x3 a4=0x4"), "{}", logged[0]);
+        assert!(logged[1].starts_with("town-seed n=2 seed=0x00000001 caller="), "{}", logged[1]);
+        assert!(logged[1].contains(" a3=0x7 "), "{}", logged[1]);
+
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(SEED_RVA as usize, SEED_FN.len()), SEED_FN, "byte for byte as the game shipped it");
+        assert_eq!(seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 15);
+    }
+
+    #[test]
+    fn without_the_switch_the_seed_function_is_not_touched() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let plan = plan::plan(build, everything(), &ProcessImage { base });
+        assert!(!plan.has(Feature::TownSeed));
+        let rt = runtime(build, base);
+        let (mut inst, _) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(game.bytes(SEED_RVA as usize, SEED_FN.len()), SEED_FN);
+        unsafe { inst.uninstall_all() };
+    }
+
+    #[test]
+    fn a_changed_seed_function_is_not_hooked() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        game.fill(SEED_RVA as usize + 3, &[0x49]);
+        let cfg = HookConfig { town_seed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert!(plan.steps.is_empty());
+        assert!(plan.report().iter().any(|l| l.contains("SKIPPED town_seed")), "{:?}", plan.report());
     }
 
     #[test]
@@ -783,7 +956,7 @@ mod tests {
         let dir = crate::testutil::TempDir::new("attach");
         let (build, game) = (fake_build(), fake_game());
         let base = game.base as usize;
-        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true };
+        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true, town_seed: false };
         let link = Some(Link { dir: dir.path().to_path_buf(), live: false });
         attach_at(base, build, cfg, link, capture);
         let rt = RUNTIME.get().expect("attach set the runtime");
