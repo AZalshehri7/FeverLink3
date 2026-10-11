@@ -1430,7 +1430,18 @@ local function with(form, extra)
 end
 
 PLAN.construction = function(rec, R, f, notes)
-	return commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	-- A construction that brings its own street piece (a station or depot entrance, even one that ends at a node already
+	-- there) collides with that piece in the engine's check, a non-critical error that stops the build unless errors are
+	-- ignored. The plan `withStreet` already builds such a construction that way (its second command); a tool's build
+	-- that has no street of its own to put first was refused on both games in a real session (2026-10-11, a cargo station)
+	-- when it was rebuilt with the flags of the tool's capture.
+	local ie, pi = f.ie, f.pi
+	if rec.src == "native" then
+		for _, s in ipairs(rec.segs) do
+			if isConstructionSegment(s) then ie, pi = true, false break end
+		end
+	end
+	return commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), ie, pi, f.dust)
 end
 
 -- Street part first, then the construction on the street that is now cut (finding from MPFever (MIT): the engine

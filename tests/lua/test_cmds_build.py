@@ -1453,6 +1453,20 @@ class BuildTest(unittest.TestCase):
         keys = str(self.A.lua("BOUND_KEYS()")).split()
         self.assertEqual([k for k in keys if k.startswith("1:1#")], ["1:1#c1", "1:1#c1/g1", "1:1#c1/s1"])
 
+    def test_a_station_whose_only_street_is_its_own_entrance_is_built_ignoring_the_collision_with_it(self):
+        # a cargo station placed beside the end of a road (real game, 2026-10-11): the tool's proposal holds the station and its
+        # entrance piece, nothing foreign, so the plan is `construction`; it was refused on both games with the tool's flags
+        self.start()
+        self.B.run("ENTRANCE_P = NATIVE_ROAD{ nodeA = 101, b = { x = 100, y = 40, z = 0 }, template = 'street/simple.street_template' }; "
+                   "ENTRANCE_P.toAdd = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 100, y = 40, z = 0 }, file = 'station/street/cargo_station.con' }.toAdd")
+        self.B.issue("ENTRANCE_P", cb="function(d, s, e) ENTRANCE_OK = s end")
+        self.tick(18)
+        self.assertTrue(self.B.lua("ENTRANCE_OK == true"))
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("BUILD_LOG[1]"), "cons=1 rm=0 nodes=0 segs=0 rmsegs=0 objs=0", "the entrance is left to the station's script")
+            self.assertTrue(str(g.lua("BUILD_CTX[1]")).endswith("ie=true pi=false"), g.lua("BUILD_CTX[1]"))
+
     def test_a_depot_against_a_road_is_built_in_two_commands_street_first(self):
         self.start()
         self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
