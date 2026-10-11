@@ -1,10 +1,14 @@
-//! The text of the read-only town-seed log (`FEVERLINK3_LOG_TOWN_SEED=1`, `docs/NATIVE_LINK.md` section 2).
+//! The text of the read-only map-generation seed log (`FEVERLINK3_LOG_TOWN_SEED=1`, `docs/NATIVE_LINK.md` section 2).
+//!
+//! This is MAP GENERATION (and in-game industry placement), not town growth: the function it hooks is
+//! `RandomLocationFactory::RandomLocationFactory` (`docs/research/TOWN_RNG_STATE.md`). The growth generator is
+//! logged by `growth.rs`.
 //!
 //! The hook itself is in `hooks.rs`; this is the part that needs no Windows: how a call is turned into a log line.
 //! One line per call of the function that seeds the town developer's task:
 //!
 //! ```text
-//! town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>
+//! mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>
 //! ```
 //!
 //! Two games are compared by cutting every line after the third field (`cut -d' ' -f1-4`), so nothing that can
@@ -14,8 +18,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Prefix of every line, so the log can be filtered with `grep '^town-seed'`.
-pub const PREFIX: &str = "town-seed";
+/// Prefix of every line, so the log can be filtered with `grep '^mapgen-seed'`.
+pub const PREFIX: &str = "mapgen-seed";
 
 /// Calls counted so far; the first call is number 1.
 #[derive(Debug, Default)]
@@ -68,16 +72,16 @@ mod tests {
     fn a_line_has_the_fields_in_a_fixed_order() {
         assert_eq!(
             line(7, 0xdead_beef, None, "0x3b9d53", 3, 0x10),
-            "town-seed n=7 seed=0xdeadbeef caller=0x3b9d53 a3=0x3 a4=0x10"
+            "mapgen-seed n=7 seed=0xdeadbeef caller=0x3b9d53 a3=0x3 a4=0x10"
         );
-        assert_eq!(line(1, 5, None, "?", 0, 0), "town-seed n=1 seed=0x00000005 caller=? a3=0x0 a4=0x0");
+        assert_eq!(line(1, 5, None, "?", 0, 0), "mapgen-seed n=1 seed=0x00000005 caller=? a3=0x0 a4=0x0");
     }
 
     #[test]
     fn a_forced_seed_is_logged_after_the_original() {
         assert_eq!(
             line(1, 0x2cd1_5ea0, Some(0x1234), "0x3b9d53", 3, 4),
-            "town-seed n=1 seed=0x2cd15ea0 forced=0x00001234 caller=0x3b9d53 a3=0x3 a4=0x4"
+            "mapgen-seed n=1 seed=0x2cd15ea0 forced=0x00001234 caller=0x3b9d53 a3=0x3 a4=0x4"
         );
     }
 

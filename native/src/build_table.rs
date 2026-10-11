@@ -55,6 +55,17 @@ pub struct BuildAddrs {
     /// a 0x1408-byte task object and seeds its `std::mt19937` from its ninth argument. Found by hand from a static
     /// analysis of build 40420, not by the address tool (docs/NATIVE_LINK.md section 2).
     pub town_seed: Option<HookSite>,
+    /// `TownDeveloper::Develop(this, world, town entity r8d, flag r9b, minstd state pointer [stack arg 5], arg 6,
+    /// arg 7)`: draws a town's growth from a `std::minstd_rand` whose single 32-bit state the caller owns
+    /// (`FEVERLINK3_LOG_GROWTH`, `FEVERLINK3_GROWTH_SEED_MODE`). Static analysis of build 40420, verified again in
+    /// `docs/NATIVE_LINK.md` section 11.
+    pub town_develop: Option<HookSite>,
+    /// The `TownUpdateSize` command handler (kind 40): the only caller of `Develop` that seeds from the game time.
+    /// Hooked read-only to read the game time the seed is made from.
+    pub town_update_size: Option<HookSite>,
+    /// `GameTime` getter: `fn(system*) -> u32` (the dword at `+0x40` of the `GameTime` component). Called, never
+    /// hooked; the prologue is compared first.
+    pub game_time_getter: Option<CallSite>,
     /// `Command::Command(Command&&)`: the hold path moves a command out of the caller's hands with it.
     pub command_move: Option<CallSite>,
     /// `Command::~Command()`: runs on a released command (moved-from) and on a cancelled one.
@@ -116,6 +127,22 @@ pub const BUILDS: &[BuildAddrs] = &[
                 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89,
                 0x4C, 0x24, 0x08,
             ],
+        }),
+        // TownDeveloper::Develop: `mov [rsp+18h],r8d ; push rbp,rbx,rsi,rdi,r12,r13,r14` (15 bytes, no rip-relative
+        // operand). Stack argument 5 at entry is `[rsp+28h]`: a pointer to the u32 minstd state.
+        town_develop: Some(HookSite {
+            rva: 0x008d_e0b0,
+            prologue: &[0x44, 0x89, 0x44, 0x24, 0x18, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56],
+        }),
+        // `push rbx,rbp,rsi,rdi,r12,r14,r15 ; sub rsp,50h`
+        town_update_size: Some(HookSite {
+            rva: 0x009e_12b0,
+            prologue: &[0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x50],
+        }),
+        // `sub rsp,28h ; mov rax,[rcx+10h] ; mov rcx,[rcx+8] ; mov edx,[rax]` (then a call to the component lookup)
+        game_time_getter: Some(CallSite {
+            rva: 0x002a_96c0,
+            prologue: &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x8B, 0x49, 0x08, 0x8B, 0x10],
         }),
         script_pool: Some(PatchSite {
             rva: 0x00ab_00fc,
@@ -190,6 +217,9 @@ mod tests {
         command_list_add: Some(HookSite { rva: 0x1000, prologue: &[0x48; 14] }),
         apply_command: None,
         town_seed: None,
+        town_develop: None,
+        town_update_size: None,
+        game_time_getter: None,
         script_pool: None,
         command_move: None,
         command_destroy: None,
@@ -215,7 +245,10 @@ mod tests {
     #[test]
     fn every_recorded_prologue_is_long_enough_for_a_detour() {
         for b in BUILDS.iter().chain(FAKE) {
-            for site in [&b.command_list_add, &b.apply_command, &b.town_seed].into_iter().flatten() {
+            for site in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
+                .into_iter()
+                .flatten()
+            {
                 assert!(site.prologue.len() >= crate::detour::JMP_ABS_LEN, "{} has a short prologue", b.name);
             }
         }
@@ -234,7 +267,9 @@ mod tests {
     #[test]
     fn call_sites_record_a_prologue_to_compare() {
         for b in BUILDS.iter().chain(FAKE) {
-            for site in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
+            for site in
+                [&b.command_move, &b.command_destroy, &b.handle_destroy, &b.game_time_getter].into_iter().flatten()
+            {
                 assert!(site.prologue.len() >= CALL_PROLOGUE_MIN, "{}: call site prologue too short", b.name);
             }
         }
@@ -282,6 +317,9 @@ mod tests {
         assert_eq!(b.apply_command.as_ref().unwrap().rva, 0x9e33b0);
         assert_eq!(b.script_pool.as_ref().unwrap().rva, 0xab00fc);
         assert_eq!(b.town_seed.as_ref().unwrap().rva, 0x8d4270);
+        assert_eq!(b.town_develop.as_ref().unwrap().rva, 0x8de0b0);
+        assert_eq!(b.town_update_size.as_ref().unwrap().rva, 0x9e12b0);
+        assert_eq!(b.game_time_getter.as_ref().unwrap().rva, 0x2a96c0);
     }
 
     /// The committed report of the address tool for build 40420: the audit trail of the row above.
