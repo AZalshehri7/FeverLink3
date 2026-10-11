@@ -55,6 +55,10 @@ impl ChecksumPolicy {
 
     /// Judges one finished checksum round. `Some(reason)` when the games should be resynchronised now.
     pub fn on_outcome(&mut self, now: f64, outcome: &ChecksumOutcome) -> Option<String> {
+        if !outcome.comparable() {
+            // sampled at different sim times (coarse steps at x3/x4): neither a match nor a desync; streaks stay as they are
+            return None;
+        }
         let parts: BTreeSet<String> =
             outcome.differing_parts().filter(|p| *p != Self::MONEY_PART).map(str::to_owned).collect();
         let drift: BTreeSet<String> = parts.iter().filter(|p| Self::is_drift_part(p)).cloned().collect();

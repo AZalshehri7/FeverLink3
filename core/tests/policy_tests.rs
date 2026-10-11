@@ -10,7 +10,7 @@ fn outcome(parts: &[&str]) -> ChecksumOutcome {
             values: BTreeMap::from([(0, Some("a".to_owned())), (1, Some("b".to_owned()))]),
         })
         .collect();
-    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences }
+    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences, time_skew: None }
 }
 
 fn policy() -> ChecksumPolicy {
@@ -142,4 +142,17 @@ fn thresholds_are_configurable() {
     assert!(p.on_outcome(2.0, &outcome(&["roads"])).is_some());
     p.on_outcome(100.0, &outcome(&["stocks"]));
     assert!(p.on_outcome(110.0, &outcome(&["stocks"])).is_some());
+}
+
+#[test]
+fn rounds_sampled_at_different_times_never_request_and_keep_the_streak() {
+    let mut p = policy();
+    let mut skewed = outcome(&[]);
+    skewed.time_skew = Some(BTreeMap::from([(0, 5000), (1, 5100)]));
+    for t in 0..10 {
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &skewed));
+    }
+    assert_eq!(None, p.on_outcome(100.0, &outcome(&["roads"])));
+    assert_eq!(None, p.on_outcome(110.0, &skewed));
+    assert!(p.on_outcome(120.0, &outcome(&["roads"])).is_some());
 }

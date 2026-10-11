@@ -418,6 +418,20 @@ fn identical_reports_give_an_identical_outcome() {
 }
 
 #[test]
+fn reports_taken_at_different_sim_times_are_not_compared() {
+    let reports: BTreeMap<u16, ChecksumReportMessage> = [
+        (0, ChecksumReportMessage::new(1, 5000, parts(&[("time", "a"), ("money", "1")]))),
+        (1, ChecksumReportMessage::new(1, 5100, parts(&[("time", "b"), ("money", "2")]))),
+    ]
+    .into_iter()
+    .collect();
+    let o = ChecksumRounds::compare(1, &reports);
+    assert!(!o.comparable() && !o.identical());
+    assert!(o.differences.is_empty());
+    assert_eq!(Some(5100), o.time_skew.as_ref().map(|m| m[&1]));
+}
+
+#[test]
 fn tick_rebroadcasts_the_session_and_requests_checksums_while_running() {
     let options = HostOptions { session_broadcast_seconds: 3.0, checksum_seconds: 10.0, ..HostOptions::default() };
     let mut h = Harness::with("Hote", options);
