@@ -455,7 +455,11 @@ impl Controller {
                 let speed_mb = params.get("mb").and_then(Value::as_f64).filter(|mb| *mb >= 1.0).map(|mb| mb as u32);
                 match (&mut self.steam, id) {
                     (Some(probe), Some(id)) => match speed_mb {
-                        Some(mb) => probe.speed_test(id, mb),
+                        Some(mb) => {
+                            // `mode`: reliable (default), dgram, both, parallel (reliable on 1, 2 and 4 connections), all
+                            let mode = params.get("mode").and_then(Value::as_str).unwrap_or("reliable");
+                            probe.start_plan(id, steamnet::specs_for(mode, mb));
+                        }
                         None => probe.test(id),
                     },
                     (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),
@@ -1281,8 +1285,9 @@ mod tests {
         let summary: Vec<&str> = log.lines().filter(|l| l.starts_with("steam speed test: ")).collect();
         assert_eq!(summary.len(), 1, "{log}");
         assert!(summary[0].contains("2 MB each way") && summary[0].contains("80 MB save about"), "{log}");
-        // only the tester logs
-        assert!(!friend.dir.join(SESSION_LOG_FILE).exists());
+        // only the tester logs a summary; the responder logs its own side (settings, what it sent, Steam's status)
+        let theirs = fs::read_to_string(friend.dir.join(SESSION_LOG_FILE)).unwrap_or_default();
+        assert!(!theirs.lines().any(|l| l.starts_with("steam speed test: ")), "{theirs}");
     }
 
     #[test]

@@ -65,6 +65,14 @@ impl RunSpec {
     }
 }
 
+/// The runs a mode word of the window stands for, of `mb` MB each way (see [`throughput::plan_for`]).
+pub fn specs_for(mode: &str, mb: u32) -> Vec<RunSpec> {
+    throughput::plan_for(mode)
+        .into_iter()
+        .map(|variant| RunSpec { variant, ..RunSpec::reliable(mb) })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub enum RunKind {
     Reliable(SpeedResult),
@@ -144,6 +152,9 @@ pub(super) struct SpeedRun {
     pub down_requested_at: Option<Instant>,
     pub rate_unanswered_noted: bool,
     pub finalized: bool,
+    /// Several connections: the data waits until the responder has said it is ready for it (the data of the extra
+    /// connections could otherwise reach it before the announcement on the first one).
+    pub sender_pending: bool,
 }
 
 impl SpeedRun {
@@ -248,7 +259,7 @@ impl ProbeService {
             let state = &mut *guard;
             let legacy = self.legacy.load(std::sync::atomic::Ordering::Relaxed);
             match msg {
-                Msg::Up { id, total, chunk, conns: _ } => {
+                Msg::Up { id, total, chunk, conns } => {
                     if total > 0 && total <= throughput::MAX_TOTAL && chunk > 0 {
                         let remote = Self::peer_remote(state, conn);
                         state.incoming =
@@ -256,6 +267,9 @@ impl ProbeService {
                         state
                             .events
                             .push(format!("a friend is testing the speed: {} MB coming", total / throughput::MB));
+                        if conns > 1 {
+                            actions.push(Action::Send(conn, throughput::encode(&Msg::Prog { id, bytes: 0 })));
+                        }
                     }
                 }
                 Msg::Down { id, total, chunk, conns, rate } => {
@@ -350,6 +364,17 @@ impl ProbeService {
                     {
                         run.up_progress = bytes;
                         run.last_progress = now;
+                        if run.sender_pending {
+                            run.sender_pending = false;
+                            actions.push(Action::Sender {
+                                conns: run.conns(),
+                                id,
+                                total: run.spec.total,
+                                chunk: throughput::CHUNK_PAYLOAD as u64,
+                                ours: true,
+                                rate: None,
+                            });
+                        }
                     }
                 }
                 Msg::UpRes { id, bytes, ms, gap_ms, steady } => {
@@ -472,6 +497,14 @@ impl ProbeService {
             .as_ref()
             .map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
         let Some(run) = state.speed.as_mut() else { return };
+        if run.spec.rate.is_some() && run.spec.down && !run.rate_unanswered_noted {
+            // the responder answers a rate request before it streams, so no answer by now means an older program
+            run.rate_unanswered_noted = true;
+            run.rate_notes.push(match run.rate_ack {
+                Some((asked, got)) => format!("peer set its send rate to {asked} B/s (Steam reports {got})"),
+                None => "peer did not change its rate (an older program, or it ignored the request)".to_string(),
+            });
+        }
         let sent = run.up_stats.clone().unwrap_or_default();
         let up = match run.up_remote.filter(|_| run.spec.up) {
             Some((bytes, ms, gap, steady)) => Direction {
@@ -858,10 +891,21 @@ impl ProbeService {
                 },
                 Phase::Upload => {
                     let elapsed = now.saturating_duration_since(run.phase_started);
+                    if run.sender_pending && elapsed > Duration::from_secs(3) {
+                        run.sender_pending = false;
+                        actions.push(Action::Sender {
+                            conns: run.conns(),
+                            id,
+                            total: run.spec.total,
+                            chunk: throughput::CHUNK_PAYLOAD as u64,
+                            ours: true,
+                            rate: None,
+                        });
+                    }
                     if elapsed > run.spec.cap && !run.up_capped {
                         run.up_capped = true;
                         logs.push(format!(
-                            "steam speed test: upload stopped after {} s (the time limit)",
+                            "steam speed test note: upload stopped after {} s (the time limit)",
                             elapsed.as_secs()
                         ));
                         match run.spec.variant {
@@ -892,7 +936,7 @@ impl ProbeService {
                     if elapsed > run.spec.cap && !run.down_capped {
                         run.down_capped = true;
                         logs.push(format!(
-                            "steam speed test: download stopped after {} s (the time limit)",
+                            "steam speed test note: download stopped after {} s (the time limit)",
                             elapsed.as_secs()
                         ));
                         actions.push(Action::Send(run.conn, throughput::encode(&Msg::Stop { id })));
@@ -914,7 +958,7 @@ impl ProbeService {
                             run.rate_unanswered_noted = true;
                             let note = "peer did not change its rate (an older program, or it ignored the request)";
                             run.rate_notes.push(note.into());
-                            logs.push(format!("steam speed test: {note}"));
+                            logs.push(format!("steam speed test note: {note}"));
                         }
                     }
                     if run.spec.variant == Variant::Datagram {
@@ -955,12 +999,12 @@ impl ProbeService {
         if let (Some(rate), Variant::Reliable(_)) = (run.spec.rate, run.spec.variant) {
             let (got, notes) = self.set_rates(&run.conns(), rate);
             let note = format!("own send rate set to {rate} B/s, Steam reports {got} B/s ({notes})");
-            logs.push(format!("steam speed test: {note}"));
+            logs.push(format!("steam speed test note: {note}"));
             run.rate_notes.push(note);
         }
         for h in run.conns() {
             if let Some(report) = self.core.config_report(h) {
-                logs.push(format!("steam speed test: connection {h} settings: {report}"));
+                logs.push(format!("steam speed test note: connection {h} settings: {report}"));
             }
         }
         if let Some(dump) = self.core.detailed_status(run.conn) {
@@ -975,14 +1019,18 @@ impl ProbeService {
                     let chunk = throughput::CHUNK_PAYLOAD as u64;
                     let msg = Msg::Up { id: run.id, total: run.spec.total, chunk, conns: run.spec.conns() };
                     actions.push(Action::Send(run.conn, throughput::encode(&msg)));
-                    actions.push(Action::Sender {
-                        conns: run.conns(),
-                        id: run.id,
-                        total: run.spec.total,
-                        chunk,
-                        ours: true,
-                        rate: None,
-                    });
+                    if run.spec.conns() > 1 {
+                        run.sender_pending = true;
+                    } else {
+                        actions.push(Action::Sender {
+                            conns: run.conns(),
+                            id: run.id,
+                            total: run.spec.total,
+                            chunk,
+                            ours: true,
+                            rate: None,
+                        });
+                    }
                 }
                 Variant::Datagram => {
                     run.dg.up_spawned = true;
@@ -1076,7 +1124,7 @@ impl ProbeService {
         run.finalized = true;
         let mut logs = Vec::new();
         if run.spec.rate.is_some() && matches!(run.spec.variant, Variant::Reliable(_)) {
-            logs.push(format!("steam speed test: rate restored: {}", self.restore_rates(&run.conns())));
+            logs.push(format!("steam speed test note: rate restored: {}", self.restore_rates(&run.conns())));
         }
         for (h, _) in &run.extras {
             self.core.close(*h);
@@ -1129,7 +1177,7 @@ impl ProbeService {
         };
         logs.extend(run.samples.log_lines(&label));
         for n in &run.rate_notes {
-            logs.push(format!("steam speed test: {n}"));
+            logs.push(format!("steam speed test note: {n}"));
         }
         state.outcome = Some(outcome);
         for l in logs {
@@ -1142,6 +1190,33 @@ impl Probe {
     /// Starts a speed test run with the friend `steam_id`, connecting first when the connection test is not already
     /// on that friend. A run in progress is replaced.
     pub fn start_run(&mut self, steam_id: u64, spec: RunSpec) {
+        {
+            let mut state = lock(&self.service.state);
+            state.plan.clear();
+            state.plan_total = 0;
+            state.plan_blocks.clear();
+        }
+        self.begin_run(steam_id, spec);
+    }
+
+    /// Starts a series of runs, one after another (stopping at the first that fails); the report shows the result
+    /// block of each, in order.
+    pub fn start_plan(&mut self, steam_id: u64, mut specs: Vec<RunSpec>) {
+        if specs.is_empty() {
+            return;
+        }
+        let first = specs.remove(0);
+        {
+            let mut state = lock(&self.service.state);
+            state.plan = specs.into();
+            state.plan_peer = steam_id;
+            state.plan_total = state.plan.len() + 1;
+            state.plan_blocks.clear();
+        }
+        self.begin_run(steam_id, first);
+    }
+
+    fn begin_run(&mut self, steam_id: u64, spec: RunSpec) {
         if !self.core.status().ready {
             return;
         }
@@ -1195,6 +1270,7 @@ impl Probe {
             down_requested_at: None,
             rate_unanswered_noted: false,
             finalized: false,
+            sender_pending: false,
         });
     }
 
@@ -1218,9 +1294,39 @@ impl Probe {
         self.service.perform(actions);
     }
 
+    /// The next run of a series, once the one before it has ended: collects its block.
+    pub(super) fn advance_plan(&mut self) {
+        let next = {
+            let mut guard = lock(&self.service.state);
+            let state = &mut *guard;
+            let (Some(run), Some(outcome)) = (state.speed.as_ref(), state.outcome.clone()) else { return };
+            if state.plan_total == 0 || !run.finalized || state.plan_collected == outcome.id {
+                return;
+            }
+            state.plan_collected = outcome.id;
+            let mut block = String::new();
+            if state.plan_total > 1 {
+                block.push_str(&format!("== {} ({} MB) ==\n", run.spec.variant.label(), run.spec.total / throughput::MB));
+            }
+            match &outcome.failure {
+                None => block.push_str(&outcome.lines.join("\n")),
+                Some(why) => {
+                    block.push_str(&format!("Speed test failed: {why}"));
+                    state.plan.clear();
+                }
+            }
+            state.plan_blocks.push(block);
+            state.plan.pop_front().map(|spec| (state.plan_peer, spec))
+        };
+        if let Some((peer, spec)) = next {
+            self.begin_run(peer, spec);
+        }
+    }
+
     /// Whether a run is in progress.
     pub fn run_active(&self) -> bool {
-        lock(&self.service.state).speed.as_ref().is_some_and(|r| !r.finalized)
+        let state = lock(&self.service.state);
+        state.speed.as_ref().is_some_and(|r| !r.finalized) || (state.plan_total > 0 && !state.plan.is_empty())
     }
 
     /// The outcome of the last run, once it has ended.
@@ -1268,8 +1374,49 @@ impl Probe {
     }
 }
 
+/// What a series of runs adds to the window's view: the blocks so far and how many runs are left.
+pub(super) struct PlanView {
+    pub blocks: Vec<String>,
+    pub total: usize,
+    pub left: usize,
+    /// The last run's block is among `blocks`.
+    pub collected: bool,
+}
+
+impl PlanView {
+    pub fn of(state: &ProbeState) -> PlanView {
+        PlanView {
+            blocks: state.plan_blocks.clone(),
+            total: state.plan_total,
+            left: state.plan.len(),
+            collected: state.outcome.as_ref().is_some_and(|o| o.id == state.plan_collected),
+        }
+    }
+}
+
 /// The window's view of a run.
-pub(super) fn speed_report(run: &SpeedRun, outcome: Option<&RunOutcome>) -> SpeedReport {
+pub(super) fn speed_report(run: &SpeedRun, outcome: Option<&RunOutcome>, plan: PlanView) -> SpeedReport {
+    let mut report = single_report(run, outcome);
+    if plan.total > 1 {
+        let blocks: Vec<String> = plan.blocks.iter().flat_map(|b| b.lines().map(str::to_string).collect::<Vec<_>>()).collect();
+        let finished = plan.left == 0 && run.finalized && plan.collected;
+        if finished {
+            report.running = false;
+            report.status = blocks.first().cloned().unwrap_or_default();
+            report.lines = blocks;
+        } else {
+            let done = plan.total - plan.left - usize::from(!run.finalized);
+            report.running = true;
+            report.status = format!("[run {} of {}] {}", done + 1, plan.total, report.status);
+            let mut lines = blocks;
+            lines.push(report.status.clone());
+            report.lines = lines;
+        }
+    }
+    report
+}
+
+fn single_report(run: &SpeedRun, outcome: Option<&RunOutcome>) -> SpeedReport {
     let now = Instant::now();
     let mb = |bytes: u64| bytes as f64 / throughput::MB as f64;
     let total = mb(run.spec.total);

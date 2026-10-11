@@ -350,9 +350,22 @@ function C.speedChoice(mb)
 	return 32
 end
 
+-- How the data travels: Steam's reliable stream (the default), our own datagram protocol, both one after the other, or the
+-- reliable stream on 1, 2 and 4 connections at once. The names are the launcher's `mode` words.
+C.SPEED_MODES = { "reliable", "dgram", "both", "parallel" }
+C.SPEED_MODE_LABELS = { reliable = "Reliable", dgram = "Datagrams", both = "Both", parallel = "Parallel" }
+
+-- The mode to run: one of the offered words, else reliable.
+function C.speedMode(mode)
+	for _, m in ipairs(C.SPEED_MODES) do
+		if mode == m then return m end
+	end
+	return "reliable"
+end
+
 -- The command parameters of the speed test button.
-function C.speedParams(steamId, mb)
-	return { id = steamId, mb = C.speedChoice(mb) }
+function C.speedParams(steamId, mb, mode)
+	return { id = steamId, mb = C.speedChoice(mb), mode = C.speedMode(mode) }
 end
 
 -- The lines to show under the buttons for the controller's steam.speed value: the result lines of a finished test, the

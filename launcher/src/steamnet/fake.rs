@@ -79,6 +79,8 @@ struct Machine {
     send_rate: i32,
     /// Connection-scope values set with `SetConfigValue`: (connection, value id) to number.
     conn_config: HashMap<(u32, i32), i32>,
+    /// Every connection-scope setting in the order it was made: (connection, value id, number).
+    conn_config_log: Vec<(u32, i32, i32)>,
     /// The (value id, number) pairs given as options when a listen socket or connection was created.
     options: Vec<(i32, i32)>,
     /// Every Nth unreliable message this machine sends is lost (0: none).
@@ -281,6 +283,7 @@ unsafe extern "C" fn set_config(
     let number = unsafe { *(arg as *const i32) };
     if scope == 4 {
         machine.conn_config.insert((scope_object as u32, value), number);
+        machine.conn_config_log.push((scope_object as u32, value, number));
         return true;
     }
     machine.config.push((value, scope, data_type, number));
@@ -788,6 +791,7 @@ impl FakeMachine {
                 ping_ms: 30,
                 send_rate: 262_144,
                 conn_config: HashMap::new(),
+                conn_config_log: Vec::new(),
                 options: Vec::new(),
                 unreliable_loss_every: 0,
                 unreliable_count: 0,
@@ -977,13 +981,9 @@ impl FakeMachine {
         self.with(|m| m.options.clone())
     }
 
-    /// The connection-scope values set with `SetConfigValue`: (connection, value id, number).
+    /// The connection-scope values set with `SetConfigValue`, in the order they were set: (connection, value id, number).
     pub fn connection_config(&self) -> Vec<(u32, i32, i32)> {
-        self.with(|m| {
-            let mut v: Vec<_> = m.conn_config.iter().map(|((c, id), n)| (*c, *id, *n)).collect();
-            v.sort_unstable();
-            v
-        })
+        self.with(|m| m.conn_config_log.clone())
     }
 
     pub fn largest_sent(&self) -> usize {
