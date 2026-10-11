@@ -17,6 +17,10 @@
 //! 4. `FEVERLINK3_LOG_TOWN_SEED=1`: a read-only hook that logs the town developer's random seed on every call
 //!    of the function that seeds its task. Independent of the others; it never changes a result.
 //!
+//!    `FEVERLINK3_FORCE_TOWN_SEED=<number>` (decimal or `0x` hex, 32 bit): the same hook also replaces the seed
+//!    argument with that value before calling the original. An experiment switch, not run in the game. A value
+//!    that does not parse is ignored (and logged); it then changes nothing.
+//!
 //! Anything but the exact value `1` (after trimming blanks) is off.
 
 use crate::build_table::{BuildAddrs, Rva};
@@ -25,6 +29,28 @@ pub const HOOKS_VAR: &str = "FEVERLINK3_HOOKS";
 pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
 pub const POOLPATCH_VAR: &str = "FEVERLINK3_POOLPATCH";
 pub const TOWN_SEED_VAR: &str = "FEVERLINK3_LOG_TOWN_SEED";
+pub const FORCE_TOWN_SEED_VAR: &str = "FEVERLINK3_FORCE_TOWN_SEED";
+
+/// Parses the forced seed: decimal or `0x` hex, must fit 32 bits; blanks around it are ignored.
+pub fn parse_seed(text: &str) -> Result<u32, String> {
+    let t = text.trim();
+    let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => t.parse::<u64>(),
+    };
+    match parsed {
+        Ok(v) => u32::try_from(v).map_err(|_| format!("{t:?} does not fit 32 bits")),
+        Err(_) => Err(format!("{t:?} is not a decimal or 0x-hex number")),
+    }
+}
+
+/// What `FEVERLINK3_FORCE_TOWN_SEED` says: `Ok(None)` when unset or blank, `Err(reason)` when it does not parse.
+pub fn forced_seed(get: impl Fn(&str) -> Option<String>) -> Result<Option<u32>, String> {
+    match get(FORCE_TOWN_SEED_VAR) {
+        Some(v) if !v.trim().is_empty() => parse_seed(&v).map(Some),
+        _ => Ok(None),
+    }
+}
 
 /// The switches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,17 +60,21 @@ pub struct HookConfig {
     pub poolpatch: bool,
     /// Log the town developer's random seed (read-only; independent of the other switches).
     pub town_seed: bool,
+    /// Replace the seed argument with this value (implies the hook; an invalid value is ignored).
+    pub force_seed: Option<u32>,
 }
 
 impl HookConfig {
     /// Reads the switches through `get` (the environment in the module, a map in the tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> HookConfig {
         let on = |name: &str| get(name).is_some_and(|v| v.trim() == "1");
+        let force_seed = forced_seed(&get).ok().flatten();
         HookConfig {
             hooks: on(HOOKS_VAR),
             hold: on(HOLD_VAR),
             poolpatch: on(POOLPATCH_VAR),
-            town_seed: on(TOWN_SEED_VAR),
+            town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
+            force_seed,
         }
     }
 
@@ -56,11 +86,12 @@ impl HookConfig {
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
         format!(
-            "hooks={} hold={} poolpatch={} town_seed={}",
+            "hooks={} hold={} poolpatch={} town_seed={}{}",
             f(self.hooks),
             f(self.hold),
             f(self.poolpatch),
-            f(self.town_seed)
+            f(self.town_seed),
+            self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default()
         )
     }
 }
@@ -342,7 +373,7 @@ mod tests {
     use crate::build_table::{select, CallSite, HookSite, PatchSite};
 
     fn cfg(hooks: bool, hold: bool, poolpatch: bool) -> HookConfig {
-        HookConfig { hooks, hold, poolpatch, town_seed: false }
+        HookConfig { hooks, hold, poolpatch, ..Default::default() }
     }
 
     /// An image holding exactly the bytes the 40420 row expects, at the row's addresses.
@@ -376,7 +407,7 @@ mod tests {
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
         assert_eq!(all, cfg(true, true, true));
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
-            let c = HookConfig::from_lookup(|_| Some(off.to_string()));
+            let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
             assert_eq!(c, HookConfig::default(), "{off:?} must not switch anything on");
         }
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
@@ -391,13 +422,37 @@ mod tests {
     }
 
     #[test]
+    fn the_forced_seed_parses_decimal_and_hex_in_32_bits_and_ignores_the_rest() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(parse_seed("12345"), Ok(12345));
+        assert_eq!(parse_seed(" 0x2cd15ea0 "), Ok(0x2cd1_5ea0));
+        assert_eq!(parse_seed("0XFFFFFFFF"), Ok(u32::MAX));
+        assert_eq!(parse_seed("4294967295"), Ok(u32::MAX));
+        for bad in ["4294967296", "0x100000000", "-1", "abc", "0x", "0xzz", "1.5"] {
+            assert!(parse_seed(bad).is_err(), "{bad}");
+        }
+        let c = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "0x10")]));
+        assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
+        assert_eq!(c.describe(), "hooks=off hold=off poolpatch=off town_seed=on force_seed=0x00000010");
+        let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
+        assert_eq!(bad, HookConfig::default(), "an invalid value switches nothing on");
+        assert!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "nope")])).is_err());
+        assert_eq!(forced_seed(env(&[])), Ok(None));
+        assert_eq!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "  ")])), Ok(None));
+        let both = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1"), (FORCE_TOWN_SEED_VAR, "7")]));
+        assert_eq!((both.town_seed, both.force_seed), (true, Some(7)));
+    }
+
+    #[test]
     fn the_town_seed_is_planned_only_on_request_and_only_when_the_bytes_match() {
         let (b, mut img) = (select(0x6ac5_0427).unwrap(), image_of_40420());
         let on = HookConfig { town_seed: true, ..Default::default() };
         let p = plan(b, on, &img);
         assert_eq!(names(&p), ["town_seed"], "{:?}", p.report());
         assert!(matches!(&p.steps[0], Step::Detour { rva: 0x8d4270, feature: Feature::TownSeed, .. }));
-        assert!(plan(b, HookConfig { hooks: true, hold: true, poolpatch: true, town_seed: false }, &img)
+        assert!(plan(b, HookConfig { hooks: true, hold: true, poolpatch: true, ..Default::default() }, &img)
             .steps
             .iter()
             .all(|s| s.feature() != Feature::TownSeed));

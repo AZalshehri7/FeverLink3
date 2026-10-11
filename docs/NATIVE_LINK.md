@@ -63,6 +63,26 @@ What static analysis of build 40420 (PE timestamp `0x6ac50427`) found, offsets a
   is not hooked: it runs before this module can be sure of its place and nothing in this hook can read it without a
   second detour. Use the game's own log line for it.
 
+### Forcing the seed (`FEVERLINK3_FORCE_TOWN_SEED=<number>`), an experiment
+
+**This is an experiment switch and it has not run in the game.** The value is decimal or `0x` hex and must fit 32
+bits; anything else is ignored with a log line (`hooks: FEVERLINK3_FORCE_TOWN_SEED: ignored, ...`) and changes nothing.
+Either this switch or `FEVERLINK3_LOG_TOWN_SEED=1` installs the hook, with the same fail-open rules (unknown build,
+prologue mismatch, failed self-test: nothing installed, the reason logged). No other hook is affected.
+
+How: the ninth argument is a stack slot (`[rsp+0x48]` at the original's entry). The hook is an ordinary function that
+receives all twelve slots as parameters and calls the trampoline with twelve arguments, so the compiler writes a fresh
+outgoing slot nine; the hook passes the forced value (zero-extended to 64 bits, the original reads only the low 32)
+there and the other eleven slots as received. A test on the fake twelve-argument function proves that the original
+reads the forced value from `[rsp+0x48]`. The log line gains a field: `town-seed n=.. seed=<original> forced=<value>
+caller=.. a3=.. a4=..`.
+
+Why this may not be enough: the seed only initialises the `mt19937` once, at the first load (the function is called
+twice per process with the same seed, and a resync load never calls it again). After that the generator state
+advances with every draw, and games whose draws differ in number or timing (a resync that loads a save in one game
+only) leave equal seeds with unequal generators. So even if forcing works, step 2 will be a reset of the `mt19937`
+state (the 624-word array and the index at `+0x80`/`+0x84` of the task object) to a common value at every sync point.
+
 The log lines: `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, in `native.log` (location in
 `native/README.md`). `n` counts the calls of this run from 1; `seed` is 10 characters (`0x` and 8 hex digits);
 `caller` is the RVA of the return address (so it does not move with the load address), or `abs:0x..` if the return

@@ -37,6 +37,7 @@ On a known build it still touches nothing in the game's code unless the environm
 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also the hold/release hook on the command list (holds nothing until the mod writes `hold_on`). |
 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool patch; independent of the other two. |
 | `FEVERLINK3_LOG_TOWN_SEED=1` | A read-only diagnostic hook that logs the seed of the town developer's task (`town-seed n=.. seed=.. caller=..` lines in `native.log`) and calls the original unchanged; independent of the others. **Not run in the game.** `src/townseed.rs`, `docs/NATIVE_LINK.md` section 2. |
+| `FEVERLINK3_FORCE_TOWN_SEED=<number>` | **Experiment, has not run in the game.** Decimal or `0x` hex, 32 bit. Installs the same town-seed hook and additionally replaces the seed argument with this value before calling the original, so games started with the same value seed the town developer identically (log lines then read `seed=<original> forced=<value>`). An invalid value is ignored and logged. Equal seeds alone may not keep the generators equal after a resync (the generator state advances); a reset of the state at every sync point would be the next step. `docs/NATIVE_LINK.md` section 2. |
 
 `native.log` is `<session folder>\native.log` when the launcher started the game, and `%LOCALAPPDATA%\FeverLink3\native.log` when the game itself hosts the session (live mode; `FEVERLINK3_LIVE_DIR` moves its folder). A log over 1 MiB at start is moved to `native.log.1`.
 

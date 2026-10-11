@@ -47,9 +47,11 @@ pub fn caller_field(caller: Option<usize>, base: usize, image_size: usize) -> St
     }
 }
 
-/// The log line of one call. `seed`, `a3` and `a4` are the low 32 bits of their argument slots.
-pub fn line(n: u64, seed: u32, caller: &str, a3: u32, a4: u32) -> String {
-    format!("{PREFIX} n={n} seed={seed:#010x} caller={caller} a3={a3:#x} a4={a4:#x}")
+/// The log line of one call. `seed`, `a3` and `a4` are the low 32 bits of their argument slots. With
+/// `FEVERLINK3_FORCE_TOWN_SEED` the value the original is called with follows the original seed as `forced=`.
+pub fn line(n: u64, seed: u32, forced: Option<u32>, caller: &str, a3: u32, a4: u32) -> String {
+    let forced = forced.map(|f| format!(" forced={f:#010x}")).unwrap_or_default();
+    format!("{PREFIX} n={n} seed={seed:#010x}{forced} caller={caller} a3={a3:#x} a4={a4:#x}")
 }
 
 #[cfg(test)]
@@ -65,16 +67,24 @@ mod tests {
     #[test]
     fn a_line_has_the_fields_in_a_fixed_order() {
         assert_eq!(
-            line(7, 0xdead_beef, "0x3b9d53", 3, 0x10),
+            line(7, 0xdead_beef, None, "0x3b9d53", 3, 0x10),
             "town-seed n=7 seed=0xdeadbeef caller=0x3b9d53 a3=0x3 a4=0x10"
         );
-        assert_eq!(line(1, 5, "?", 0, 0), "town-seed n=1 seed=0x00000005 caller=? a3=0x0 a4=0x0");
+        assert_eq!(line(1, 5, None, "?", 0, 0), "town-seed n=1 seed=0x00000005 caller=? a3=0x0 a4=0x0");
+    }
+
+    #[test]
+    fn a_forced_seed_is_logged_after_the_original() {
+        assert_eq!(
+            line(1, 0x2cd1_5ea0, Some(0x1234), "0x3b9d53", 3, 4),
+            "town-seed n=1 seed=0x2cd15ea0 forced=0x00001234 caller=0x3b9d53 a3=0x3 a4=0x4"
+        );
     }
 
     #[test]
     fn the_diffable_part_ignores_the_trailing_fields() {
-        let a = line(2, 9, "0x3b9d53", 1, 2);
-        let b = line(2, 9, "0x3b9d53", 8, 9);
+        let a = line(2, 9, None, "0x3b9d53", 1, 2);
+        let b = line(2, 9, None, "0x3b9d53", 8, 9);
         let cut = |s: &str| s.split(' ').take(4).collect::<Vec<_>>().join(" ");
         assert_eq!(cut(&a), cut(&b));
         assert_ne!(a, b);

@@ -380,7 +380,9 @@ impl HostSession {
                 if outcome.identical() {
                     self.finish();
                 } else if !outcome.comparable() {
-                    self.fail("games reported different times while paused, so the checksums cannot be compared".to_owned());
+                    self.fail(
+                        "games reported different times while paused, so the checksums cannot be compared".to_owned(),
+                    );
                 } else {
                     let parts: Vec<&str> = outcome.differing_parts().collect();
                     self.fail(format!("games still differ after the reload: {}", parts.join(", ")));
