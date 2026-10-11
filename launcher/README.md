@@ -294,7 +294,7 @@ over Steam is still being wired in (see "Commands").
   the id the host assigned. The mod becomes active when the role is `host` or `player`, without reloading the game.
 - **Commands.** The window (the Lua mod) appends file-link lines to `ctl_cmd.log`: `host`, `join`, `leave`,
   `start`, `pause`, `speed`, `check`, `resync` and `steamtest`. The payload is a Lua literal table (`host`:
-  `{name, transport}`; `join`: `{name, code}`; `speed`: `{n}` clamped to 1 to 4; `steamtest`: `{id}`). `host` and
+  `{name, transport}`; `join`: `{name, code}`; `speed`: `{n}` clamped to 1 to 4; `steamtest`: `{id}` or `{id, mb}` for the speed test). `host` and
   `join` are accepted only while idle or after a failure; the other session commands only while hosting. **`host`
   starts a session only with `transport = "tcp"`, the developer transport that the tests use; without it the
   controller answers `failed` with "Hosting over Steam is not finished in this build yet; the Steam connection

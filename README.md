@@ -35,6 +35,7 @@ Short version (the full guide is [docs/PLAYING.md](docs/PLAYING.md)):
 2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer* when starting a game.
 3. Click **FeverLink3** in the bar at the bottom of the screen. The host clicks **Host a game**, presses **Copy code** and sends the code; a friend pastes it (Ctrl+V) and presses **Join**, and the host presses **Start the session**.
 4. For connection problems, the window has a **Connection test...** section (two players exchange Steam IDs).
+5. To measure how fast a save can cross Steam (an 80 MB save is the size that matters), the same section has a **speed test**: pick 8, 32 or 80 MB and press **Run the speed test**; the steps for two players are in [docs/PLAYING.md](docs/PLAYING.md) section 5, the design in [docs/STEAM_TRANSPORT.md](docs/STEAM_TRANSPORT.md) section 7.1. `FEVERLINK3_STEAM_SENDRATE=<bytes per second>` changes Steam's send rate for such a test.
 
 To remove everything: delete `winhttp.dll` and `mods
 eleaseeverlink3_1` from the game's folder. The `feverlink3.exe` helper in this repository is a developer tool and is not in the zip: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
