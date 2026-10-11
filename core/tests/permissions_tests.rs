@@ -53,6 +53,23 @@ fn a_build_veto_is_relayed_to_every_other_game_with_the_sender_filled_in() {
 }
 
 #[test]
+fn a_build_commit_is_relayed_to_every_other_game_with_the_sender_filled_in() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    let c = h.connect("C");
+    h.player_game(b, MessageKind::BuildCommit, br#"{"seq":3,"owner":1,"stamp":13617200,"from":77}"#);
+    let at_a: BuildCommitMessage = h.p(a).last(MessageKind::BuildCommit);
+    let at_c: BuildCommitMessage = h.p(c).last(MessageKind::BuildCommit);
+    assert_eq!(a_id(&h, b), at_a.from, "the host names the sender");
+    assert_eq!(at_a, at_c);
+    assert_eq!((3, 1, 13617200), (at_a.seq, at_a.owner, at_a.stamp));
+    assert_eq!(0, h.p(b).count(MessageKind::BuildCommit), "not echoed to its sender");
+    h.player_game(b, MessageKind::BuildCommit, b"not json");
+    assert_eq!(1, h.p(a).count(MessageKind::BuildCommit));
+}
+
+#[test]
 fn set_permissions_reaches_every_game_and_players_remember_it() {
     let mut h = Harness::new();
     let a = h.connect("A");

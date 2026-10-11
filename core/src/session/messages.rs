@@ -441,6 +441,18 @@ pub struct BuildVetoMessage {
     pub name: Option<String>,
 }
 
+/// "Apply it": the commit of a held strict build made in a paused game (`owner`:`seq` names the action; `stamp` is the game time to
+/// apply it at). `from` is set by the host on relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildCommitMessage {
+    pub seq: i64,
+    pub owner: u16,
+    pub stamp: i64,
+    #[serde(default)]
+    pub from: u16,
+}
+
 /// `from` and `name` are set by the host on relay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
