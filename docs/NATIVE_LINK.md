@@ -30,7 +30,7 @@ anything else (unset, empty, `0`, `true`) is off. Try them in this order:
 | 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
 | 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
 | 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
-| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the **map-generation** seed (`RandomLocationFactory`'s constructor, `sub_8d4270`, RVA `0x8d4270` in build 40420; NOT town growth, see section 11). It logs one line per call, `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, `research/TOWN_GROWTH_FINDINGS.md`). Writes to `native.log` on the thread that calls the function (see below). |
+| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the **map-generation** seed (`RandomLocationFactory`'s constructor, `sub_8d4270`, RVA `0x8d4270` in build 40420; NOT town growth, see section 11). It logs one line per call, `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, the maintainer's private research notes). Writes to `native.log` on the thread that calls the function (see below). |
 | 5 | `FEVERLINK3_LOG_GROWTH=1`, `FEVERLINK3_GROWTH_SEED_MODE=derive` (`..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) | The town-growth log (a hook on `TownDeveloper::Develop`, RVA `0x8de0b0`, plus a read-only hook on the `TownUpdateSize` handler for the game time) and the seed experiment: after a threshold the random seed `Develop` reads is replaced by a hash of (town, quantized game time). Only which random numbers are drawn changes. Section 11. | Two detours on engine functions; **not run in the game**. |
 
 `FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
@@ -39,7 +39,7 @@ in-game session controller's folder), as before.
 
 ### The map-generation seed log (`FEVERLINK3_LOG_TOWN_SEED=1`)
 
-**This is map generation, not town growth.** Static analysis (`research/TOWN_RNG_STATE.md`) showed that `0x8d4270` is
+**This is map generation, not town growth.** Static analysis (the maintainer's private research notes) showed that `0x8d4270` is
 `RandomLocationFactory::RandomLocationFactory`, reached from map generation and the in-game industry placement; it never
 sees a growth step. The town developer's growth generator is logged by section 11. The env-var names keep `TOWN_SEED`
 for compatibility; the log prefix is `mapgen-seed`.
@@ -71,7 +71,7 @@ What static analysis of build 40420 (PE timestamp `0x6ac50427`) found, offsets a
 
 ### Forcing the map-generation seed (`FEVERLINK3_FORCE_TOWN_SEED=<number>`), an experiment
 
-**This is an experiment switch.** It has been run in two real games with the same value (`0x2cd15ea0`) in both: constructions stayed identical for about 13 checksum rounds, then differed (`research/TOWN_GROWTH_FINDINGS.md`); it has not been shown to hold over time, and it changes only the seed, no game mechanic. The value is decimal or `0x` hex and must fit 32
+**This is an experiment switch.** It has been run in two real games with the same value (`0x2cd15ea0`) in both. It changes only the seed of map generation, no game mechanic, and it has no effect on town growth: a later measurement showed that the seed of the growth step is identical on both games anyway. The value is decimal or `0x` hex and must fit 32
 bits; anything else is ignored with a log line (`hooks: FEVERLINK3_FORCE_TOWN_SEED: ignored, ...`) and changes nothing.
 Either this switch or `FEVERLINK3_LOG_TOWN_SEED=1` installs the hook, with the same fail-open rules (unknown build,
 prologue mismatch, failed self-test: nothing installed, the reason logged). No other hook is affected.
@@ -83,11 +83,7 @@ there and the other eleven slots as received. A test on the fake twelve-argument
 reads the forced value from `[rsp+0x48]`. The log line gains a field: `mapgen-seed n=.. seed=<original> forced=<value>
 caller=.. a3=.. a4=..`.
 
-Why this may not be enough: the seed only initialises the `mt19937` once, at the first load (the function is called
-twice per process with the same seed, and a resync load never calls it again). After that the generator state
-advances with every draw, and games whose draws differ in number or timing (a resync that loads a save in one game
-only) leave equal seeds with unequal generators. So even if forcing works, step 2 will be a reset of the `mt19937`
-state (the 624-word array and the index at `+0x80`/`+0x84` of the task object) to a common value at every sync point. That analysis is in progress (`research/TOWN_RNG_STATE.md`, in another branch).
+Why this does not help town growth: this function seeds the generator of map generation and industry spawning, not the generator of town growth (see section 11). The growth step receives the same seed on both games, so no reset of this generator is planned.
 
 The log lines: `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, in `native.log` (location in
 `native/README.md`). `n` counts the calls of this run from 1; `seed` is 10 characters (`0x` and 8 hex digits);
@@ -301,7 +297,7 @@ against a fake module that honours the files and rules of sections 3 and 4 (`hol
 replays the build from the shipped record through `simApplyAction`, and the ORIGINATING game RELEASES its own held command,
 so the engine applies the tool's own command and the tool gets the "applied" callback it waits for. The first design
 (TpF2 Multiplayer, MIT) cancelled the command and had the originator replay the build too, which keeps the two games in the
-same game step, but the first real two-game run (`docs/research/run-2026-10-11-strict-tool-dead`, logs in
+same game step, but the first real two-game run (a private run log, logs in
 `%LOCALAPPDATA%\FeverLink3\live1` and `live2`) showed the price: after the cancel the originating game's tool was dead (no
 preview, clicks did nothing, the tool stayed highlighted, and no `tool event` line was ever logged again on that game, the host
 included, after it built once). The build itself landed on both games every time (`action 1:2 makeWorldBuildProposalCmd applied
@@ -654,7 +650,7 @@ game exception through a hook now shows up as nothing at all from us. If the pro
 
 **Not run in the game.** Tested only on fake game functions (section 6 style) and checked against the disassembly of
 a copy of `TransportFever3.exe` build 40420 (PE timestamp `0x6ac50427`). This section is the design and the
-checklist for the first real run. The analysis it rests on is `research/TOWN_RNG_STATE.md`; the older
+checklist for the first real run. The analysis it rests on is the maintainer's private research notes; the older
 `FEVERLINK3_LOG_TOWN_SEED` / `FEVERLINK3_FORCE_TOWN_SEED` hook (section 2) is **map generation**, not growth, and is
 left as it was (its log lines now start with `mapgen-seed`).
 
@@ -740,6 +736,8 @@ Look for: (1) before the `growth-switch` line, whether `town=` and `seed=` agree
 seeds differ at the same `t=`, the games run the command at different game times); (2) after it, `used=` identical per
 town and quantum in both games, whatever `seed=` was; (3) whether the `townBuildings` lanes of the checksum rounds stay
 identical after the switch when they drifted before.
+
+**Measured result (2026-10-11, first real run, log only).** For 1,717 growth calls logged by both games, at the same town and the same `t=`, the seeds were identical in every case, including the towns whose `townBuildings` lane still differed between the two games with nobody acting. So the seed is not the cause of the drift, and the seed experiment below could not help. `t=` is a tick count of 200 ms (game time 13,617,200 ms is `t=68086`), not milliseconds. The derive switch was written on milliseconds and never fired in that run; it is kept as an experiment and is being corrected to ticks. The search for the cause continues with a per-step trace of the drifting towns and a static analysis of the executable.
 
 **Safety.** The hooks are `extern "system-unwind"` functions (`native/src/hooks.rs`); the bookkeeping that can fail
 (formatting, the log call) is inside `log::guarded`; the calls to the original, and to the game's getter, are outside

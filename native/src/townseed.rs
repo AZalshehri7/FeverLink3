@@ -1,7 +1,7 @@
 //! The text of the read-only map-generation seed log (`FEVERLINK3_LOG_TOWN_SEED=1`, `docs/NATIVE_LINK.md` section 2).
 //!
 //! This is MAP GENERATION (and in-game industry placement), not town growth: the function it hooks is
-//! `RandomLocationFactory::RandomLocationFactory` (`docs/research/TOWN_RNG_STATE.md`). The growth generator is
+//! `RandomLocationFactory::RandomLocationFactory` (the maintainer's private research notes). The growth generator is
 //! logged by `growth.rs`.
 //!
 //! The hook itself is in `hooks.rs`; this is the part that needs no Windows: how a call is turned into a log line.

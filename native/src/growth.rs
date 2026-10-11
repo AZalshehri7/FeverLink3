@@ -4,7 +4,7 @@
 //! The hook itself is in `hooks.rs`; this is the part that needs no Windows: what the switches say, which calls are
 //! logged, how the replacement seed is made and how a call is turned into a log line.
 //!
-//! What the game does (build 40420, `docs/research/TOWN_RNG_STATE.md`): the `TownUpdateSize` command handler makes
+//! What the game does (build 40420, the maintainer's private research notes): the `TownUpdateSize` command handler makes
 //! one 32-bit `std::minstd_rand` state per command, seeded from a hash of the game time, and passes a pointer to it
 //! to `TownDeveloper::Develop`, which draws growth decisions from it. The experiment changes only that one number,
 //! before `Develop` reads it: which random numbers are drawn. Growth, ratings and every rule stay the game's own.
