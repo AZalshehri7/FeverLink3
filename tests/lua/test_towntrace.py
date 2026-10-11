@@ -233,6 +233,211 @@ class TraceTest(unittest.TestCase):
         self.assertNotIn("10", "".join(l for l in out if l.startswith("+ ")), "no entity id in a building line")
 
 
+CMD_SETUP = r"""
+TICK = 100
+ACC.updateCount = function() return TICK * 2 end
+ACC.lineUsage = function(t) return 0.1 + t / 1000 end
+ACC.supplyDemand = function(t) return { {1.5, 3}, {2, 4}, {0, 1} } end
+ORDER_T, ORDER_C = { 7, 8, 9 }, { 1, 2, 3 }
+ACC.townOrder = function() return ORDER_T end
+ACC.cargoOrder = function() return ORDER_C end
+function newc(spec)
+  return TT.new({ spec = spec, cmds = true, acc = ACC, hash = hash, tick = function() return TICK end,
+                  clock = function() return NOW end, write = function(text) WRITES[#WRITES + 1] = text return true end })
+end
+CALLS = {}
+APICMD = {
+  makeTownUpdateSizeCmd = function(...) CALLS[#CALLS + 1] = table.pack(...) return "cmdA", nil, 42 end,
+  makeTownUpdateCargoNeedsCmd = function(...) CALLS[#CALLS + 1] = table.pack(...) return "cmdB" end,
+  makeOther = function() return "o" end,
+}
+"""
+
+
+class CmdTraceTest(unittest.TestCase):
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        self.lua.execute("function ug_require(n) error('no ' .. n) end")
+        self.lua.globals().SRC = read("feverlink3_towntrace.lua")
+        self.lua.execute("TT = assert(load(SRC, 'towntrace', 't'))()")
+        self.lua.execute(SETUP)
+        self.lua.execute(CMD_SETUP)
+        self.lua.execute("TOWNS[7] = {developmentActive = true, sizeFactors = {0.5, 1, 0.25}, initialLandUseCapacities = {10, 20, 30}, capacityScalingFactor = {1, 1, 1}, cargoNeeds = {{1}, {}, {}}}")
+        self.lua.execute("add(1, 7, 'h.mdl', 10)")
+
+    def lines(self):
+        return [l for l in self.lua.eval("written()").splitlines() if l]
+
+    def mk(self):
+        return [l for l in self.lines() if " mk " in l]
+
+    def wrap(self, spec="7"):
+        self.lua.execute("t = newc('%s'); H = { tracer = t }; N = TT.installCmdWrappers(APICMD, H)" % spec)
+
+    def test_bits_are_exact(self):
+        r = self.lua.eval("function(x) return TT.bits32(x), TT.bits64(x) end")
+        self.assertEqual(("3f800000", "3ff0000000000000"), tuple(r(1.0)))
+        self.assertEqual(("3e800000", "3fd0000000000000"), tuple(r(0.25)))
+        self.assertEqual(("bf000000", "bfe0000000000000"), tuple(r(-0.5)))
+        # 0.1 is not a float32 number: the two widths differ
+        self.assertEqual(("3dcccccd", "3fb999999999999a"), tuple(r(0.1)))
+        self.assertEqual(("-", "-"), tuple(r(None)))
+
+    def test_soft_bits_match_ieee_for_many_values(self):
+        import random
+        import struct
+
+        rnd = random.Random(7)
+        values = [0.0, 1.0, -1.0, 0.1, 1e-45, 1e-40, 3.4e38, 3.5e38, 1e300, 5e-324, 2.2250738585072014e-308, 16777217.0, 0.30000000000000004]
+        values += [rnd.uniform(-2, 2) for _ in range(300)] + [rnd.random() * 10 ** rnd.randint(-30, 30) for _ in range(300)]
+        soft = self.lua.eval("function(x, e, m) return TT.softBits(x, e, m) end")
+        for x in values:
+            self.assertEqual(struct.pack(">d", x).hex(), soft(x, 11, 52), x)
+            try:
+                want32 = struct.pack(">f", x).hex()
+            except OverflowError:
+                want32 = "7f800000" if x > 0 else "ff800000"
+            self.assertEqual(want32, soft(x, 8, 23), x)
+        self.assertEqual("80000000", soft(-0.0, 8, 23))
+
+    def test_pass_through_is_exact_arguments_and_all_results(self):
+        self.wrap()
+        self.lua.execute("SIZE = {0.5, 1, 0.25}; R = table.pack(APICMD.makeTownUpdateSizeCmd(7, SIZE, false))")
+        self.assertEqual("cmdA", self.lua.eval("R[1]"))
+        self.assertIsNone(self.lua.eval("R[2]"))
+        self.assertEqual(42, self.lua.eval("R[3]"))
+        self.assertEqual(3, self.lua.eval("R.n"))
+        self.assertEqual(1, self.lua.eval("#CALLS"))
+        self.assertTrue(self.lua.eval("CALLS[1][2] == SIZE"), "the very same table object")
+        self.assertEqual((3, 7, False), (self.lua.eval("CALLS[1].n"), self.lua.eval("CALLS[1][1]"), self.lua.eval("CALLS[1][3]")))
+        # the other factory of the table is untouched, the two traced ones are wrapped
+        self.assertEqual(2, self.lua.eval("N"))
+        self.assertEqual("o", self.lua.eval("APICMD.makeOther()"))
+
+    def test_the_call_is_logged_before_the_original_runs(self):
+        self.lua.execute("t = newc('7'); H = { tracer = t }")
+        self.lua.execute("APICMD.makeTownUpdateSizeCmd = function(...) t.flush(true); SEEN = #written() return 1 end")
+        self.lua.execute("TT.installCmdWrappers(APICMD, H); APICMD.makeTownUpdateSizeCmd(7, {0.5, 1, 0.25}, false)")
+        self.assertGreater(self.lua.eval("SEEN"), 0, "the line was already buffered when the original ran")
+        self.assertEqual(1, len(self.mk()))
+
+    def test_size_line_content_and_inputs(self):
+        self.wrap()
+        self.lua.execute("APICMD.makeTownUpdateSizeCmd(7, {0.5, 1, 0.1}, false); t.flush(true)")
+        mk = self.mk()[0]
+        self.assertEqual("t=100 uc=200 mk makeTownUpdateSizeCmd town=7 k=1 flag=0 "
+                         "f32=3f000000,3f800000,3dcccccd f64=3fe0000000000000,3ff0000000000000,3fb999999999999a "
+                         "v=0.5,1,0.10000000000000001", mk)
+        inp = [l for l in self.lines() if " in k=1 " in l][0]
+        self.assertTrue(inp.startswith("t=100 town=7 in k=1 lu=0.10700000000000001 sd=1.5/3,2/4,0/1 dev=1 size=[0.5,1,0.25] cap=[10,20,30] scale=[1,1,1] needs=[[1],[],[]] bld="), inp)
+
+    def test_cargo_needs_line(self):
+        self.wrap()
+        self.lua.execute("APICMD.makeTownUpdateCargoNeedsCmd(7, {{1, 2}, {}, {3}}, true); t.flush(true)")
+        mk = self.mk()[0]
+        self.assertRegex(mk, r"^t=100 uc=200 mk makeTownUpdateCargoNeedsCmd town=7 k=1 flag=1 needs=\[\[1,2\],\[\],\[3\]\] nh=\S+$")
+
+    def test_k_counts_calls_of_one_town_in_one_tick_and_restarts(self):
+        self.wrap()
+        self.lua.execute("for i = 1, 2 do APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false) end; TICK = 101; APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false); t.flush(true)")
+        ks = [l.split(" k=")[1].split()[0] for l in self.mk()]
+        self.assertEqual(["1", "2", "1"], ks)
+
+    def test_untraced_town_not_logged_but_passed_through(self):
+        self.wrap()
+        self.lua.execute("R = APICMD.makeTownUpdateSizeCmd(8, {1, 1, 1}, false); t.flush(true)")
+        self.assertEqual("cmdA", self.lua.eval("R"))
+        self.assertEqual([], self.mk())
+
+    def test_all_mode_logs_every_town(self):
+        self.wrap("all")
+        self.lua.execute("APICMD.makeTownUpdateSizeCmd(8, {1, 1, 1}, false); t.flush(true)")
+        self.assertEqual(1, len(self.mk()))
+
+    def test_userdata_like_sequences_are_read_by_index(self):
+        self.wrap()
+        self.lua.execute("""
+          VEC = setmetatable({}, { __index = function(_, i) return ({0.5, 1, 0.25})[i] end, __len = function() return 3 end })
+          APICMD.makeTownUpdateSizeCmd(7, VEC, false); t.flush(true)""")
+        self.assertIn("v=0.5,1,0.25", self.mk()[0])
+
+    def test_order_line_hash_changes_with_the_order_and_is_throttled(self):
+        self.lua.execute("t = newc('7'); t.step(100); t.step(101); t.flush(true)")
+        order = [l for l in self.lines() if " order " in l]
+        self.assertEqual(1, len(order), order)
+        self.assertRegex(order[0], r"^t=100 town=7 order pos=1 towns=3:\S+ cargos=3:\S+$")
+        first = order[0].split("towns=")[1]
+        self.lua.execute("ORDER_T = { 8, 7, 9 }; t.step(102); t.flush(true)")
+        order = [l for l in self.lines() if " order " in l]
+        self.assertEqual(2, len(order))
+        self.assertIn("pos=2", order[1])
+        self.assertNotEqual(first, order[1].split("towns=")[1])
+        self.lua.execute("t.step(130); t.flush(true)")
+        self.assertEqual(3, len([l for l in self.lines() if " order " in l]), "repeated after 25 ticks")
+
+    def test_buffered_not_written_before_a_second(self):
+        self.wrap()
+        self.lua.execute("APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false)")
+        self.assertEqual(0, int(self.lua.eval("#WRITES")))
+        self.lua.execute("NOW = 1.5; APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false)")
+        self.assertEqual(1, int(self.lua.eval("#WRITES")))
+
+    def test_errors_switch_the_command_trace_off_but_never_break_the_call(self):
+        self.wrap()
+        # make the formatting itself fail: a hash that raises
+        self.lua.execute("t = TT.new({ spec = '7', cmds = true, acc = ACC, hash = function() error('boom') end, tick = function() return TICK end, "
+                         "clock = function() return NOW end, write = function(x) WRITES[#WRITES + 1] = x return true end }); H.tracer = t")
+        self.lua.execute("for i = 1, 8 do R = APICMD.makeTownUpdateCargoNeedsCmd(7, {{1}}, false) end; t.flush(true)")
+        self.assertEqual("cmdB", self.lua.eval("R"))
+        self.assertEqual(8, self.lua.eval("#CALLS"), "the original ran every time")
+        self.assertFalse(self.lua.eval("t.cmds"))
+        self.assertTrue(any("switched off after 5 errors" in l for l in self.lines()), self.lines())
+        before = len(self.lines())
+        self.lua.execute("APICMD.makeTownUpdateCargoNeedsCmd(7, {{1}}, false); t.flush(true)")
+        self.assertEqual(before, len(self.lines()))
+
+    def test_a_raising_input_accessor_is_tolerated(self):
+        self.wrap()
+        self.lua.execute("ACC.lineUsage = function() error('no usage') end; APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false); t.flush(true)")
+        inp = [l for l in self.lines() if " in k=1 " in l][0]
+        self.assertIn("lu=err", inp)
+        self.assertTrue(self.lua.eval("t.cmds"))
+
+    def test_noop_when_the_env_is_off(self):
+        # cmds not requested: wrappers pass through and write nothing
+        self.lua.execute("t = new('7'); H = { tracer = t }; TT.installCmdWrappers(APICMD, H); R = APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false); t.step(1); t.flush(true)")
+        self.assertEqual("cmdA", self.lua.eval("R"))
+        self.assertEqual([], self.mk())
+        self.assertEqual([], [l for l in self.lines() if " order " in l])
+        # and without a tracer at all
+        self.lua.execute("H.tracer = nil; R = APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false)")
+        self.assertEqual("cmdA", self.lua.eval("R"))
+
+    def test_installing_twice_does_not_wrap_the_wrapper(self):
+        self.wrap()
+        self.assertEqual(0, self.lua.eval("TT.installCmdWrappers(APICMD, H)"))
+        self.lua.execute("APICMD.makeTownUpdateSizeCmd(7, {1, 1, 1}, false); t.flush(true)")
+        self.assertEqual(1, len(self.mk()))
+        self.assertEqual(1, self.lua.eval("#CALLS"))
+
+    def test_the_api_accessors_for_the_inputs(self):
+        self.lua.execute(r"""
+          CT = { TOWN_BUILDING = 1, CONSTRUCTION = 2, TOWN = 3, GAME_TIME = 4 }
+          API = { type = { ComponentType = CT },
+                  engine = { getComponent = function(e, t) if t == CT.GAME_TIME then return { updateCount = 77 } end end,
+                             util = { getWorld = function() return 1 end, town = { getTownLineUsage = function(e) return 0.5 end } },
+                             forEachEntityWithComponent = function(fn, t) for _, e in ipairs({ 9, 3, 5 }) do fn(e) end end,
+                             system = { townBuildingSystem = { getCargoSupplyAndLimit = function(e, lu) return { [12] = { 1, 2 }, [3] = { 0.5, 1 } } end } } },
+                  res = { cargoTypeRep = { getAll = function() return { [4] = 'x' } end } } }
+          A = TT.apiAccessors(API, function() return {} end)
+        """)
+        self.assertEqual(77, self.lua.eval("A.updateCount()"))
+        self.assertEqual(0.5, self.lua.eval("A.lineUsage(1)"))
+        self.assertEqual("1.5/3", self.lua.eval("(function() local s = A.supplyDemand(1)[2] return s[1] .. '/' .. s[2] end)()"))
+        self.assertEqual("9,3,5", self.lua.eval("table.concat(A.townOrder(), ',')"))
+        self.assertEqual("4", self.lua.eval("table.concat(A.cargoOrder(), ',')"))
+
+
 class InBridgeTest(unittest.TestCase):
     """The real bridge in the lockstep harness (two mocked games): the switch, the file in the game's own folder."""
 
