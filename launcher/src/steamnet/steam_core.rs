@@ -1106,6 +1106,11 @@ enum Receive {
 }
 
 impl CoreRef {
+    /// An identity of this core (the address of its shared state), for keeping one service per core.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     /// What the core knows about Steam.
     pub fn status(&self) -> CoreStatus {
         lock(&self.0.status).clone()

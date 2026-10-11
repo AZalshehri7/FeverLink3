@@ -27,6 +27,9 @@ pub mod bulk;
 /// Threads that connect the bulk transfer to a Steam connection.
 pub mod bulk_io;
 
+/// Parallel Steam connections for big files: the way a resync save crosses Steam.
+pub mod par;
+
 /// The speed test engine of the probe: one run in two directions, reliable or as datagrams.
 pub mod speed;
 

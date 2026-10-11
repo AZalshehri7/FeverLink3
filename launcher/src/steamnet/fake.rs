@@ -89,6 +89,10 @@ struct Machine {
     unreliable_lost: u64,
     /// Unreliable messages dropped because the peer's receive buffer was full.
     unreliable_overflow: u64,
+    /// What one connection of this machine can send per second, and the whole machine's line (0: unlimited).
+    conn_cap: f64,
+    line_cap: f64,
+    line_busy: Instant,
 }
 
 struct Listen {
@@ -115,6 +119,8 @@ struct Conn {
     inbox: VecDeque<Wire>,
     /// State changes that happen later: (when, state, reason, debug).
     scheduled: Vec<(Instant, i32, i32, String)>,
+    /// When this end's sends have left the wire (the per-connection cap).
+    busy_until: Instant,
 }
 
 /// A message handed out and not yet released; the boxes keep the memory the core reads alive.
@@ -239,6 +245,28 @@ impl Model {
 
     fn inbox_bytes(&self, conn: u32) -> usize {
         self.conns.get(&conn).map_or(0, |c| c.inbox.iter().map(|w| w.data.len()).sum())
+    }
+
+    /// When a reliable message of `len` bytes sent now on `conn` has left the sender: each connection moves at most
+    /// `conn_cap` bytes per second and the machine's connections together at most `line_cap`.
+    fn departure(&mut self, conn: u32, machine: usize, len: usize) -> Instant {
+        let now = Instant::now();
+        let (cap, line) = self.machines.get(&machine).map_or((0.0, 0.0), |m| (m.conn_cap, m.line_cap));
+        let mut at = now;
+        if cap > 0.0 {
+            if let Some(c) = self.conns.get_mut(&conn) {
+                at = c.busy_until.max(now) + Duration::from_secs_f64(len as f64 / cap);
+                c.busy_until = at;
+            }
+        }
+        if line > 0.0 {
+            if let Some(m) = self.machines.get_mut(&machine) {
+                let end = m.line_busy.max(now) + Duration::from_secs_f64(len as f64 / line);
+                m.line_busy = end;
+                at = at.max(end);
+            }
+        }
+        at
     }
 
     fn wire_delay(&self, machine: usize) -> Duration {
@@ -384,6 +412,7 @@ unsafe extern "C" fn connect_p2p(
             end_debug: String::new(),
             inbox: VecDeque::new(),
             scheduled: Vec::new(),
+            busy_until: Instant::now(),
         },
     );
     m.queue(outgoing, 0);
@@ -415,6 +444,7 @@ unsafe extern "C" fn connect_p2p(
                             end_debug: String::new(),
                             inbox: VecDeque::new(),
                             scheduled: Vec::new(),
+                            busy_until: Instant::now(),
                         },
                     );
                     if let Some(c) = m.conns.get_mut(&outgoing) {
@@ -510,7 +540,7 @@ unsafe extern "C" fn send(
     }
     // SAFETY: the caller passes len readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
-    let visible_at = Instant::now() + m.wire_delay(machine);
+    let visible_at = m.departure(conn, machine, len) + m.wire_delay(machine);
     if let Some(p) = m.conns.get_mut(&peer) {
         p.inbox.push_back(Wire { visible_at, data: bytes, reliable: true });
     }
@@ -797,6 +827,9 @@ impl FakeMachine {
                 unreliable_count: 0,
                 unreliable_lost: 0,
                 unreliable_overflow: 0,
+                conn_cap: 0.0,
+                line_cap: 0.0,
+                line_busy: Instant::now(),
             },
         );
         FakeMachine { id }
@@ -889,6 +922,25 @@ impl FakeMachine {
     /// A relay point other than 0 makes this machine's connections report a relayed route.
     pub fn set_relay(&self, pop: u32) {
         self.with(|m| m.relay_pop = pop);
+    }
+
+    /// Every connection this machine sends on carries at most `bytes_per_second` (0: no limit), and all of them
+    /// together at most `line` (0: no limit): what Steam showed between two real PCs (1 MB/s a connection).
+    pub fn set_caps(&self, per_connection: f64, line: f64) {
+        self.with(|m| {
+            m.conn_cap = per_connection;
+            m.line_cap = line;
+        });
+    }
+
+    /// Ends one connection with a problem at both ends (a connection that dies mid-transfer).
+    pub fn kill_connection(&self, handle: u32) {
+        let mut m = model();
+        let peer = m.conns.get(&handle).and_then(|c| c.peer);
+        m.set_state(handle, PROBLEM, 5003, "Timed out");
+        if let Some(p) = peer {
+            m.set_state(p, PROBLEM, 5003, "Timed out");
+        }
     }
 
     /// The ping Steam reports for this machine's connections; a negative number is "no estimate yet".

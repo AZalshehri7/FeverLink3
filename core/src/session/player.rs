@@ -498,6 +498,21 @@ impl PlayerSession {
         self.drain()
     }
 
+    /// A savegame that arrived as a file over parallel connections, already checked against its SHA-256 and written to
+    /// disk by the launcher: recorded like a received save, so the `ResyncLoad` that names it is accepted. The file is
+    /// not held here, so there is no output to act on. Ignored (with a log line) before the welcome.
+    pub fn bulk_file_received(&mut self, id: i32, sha256: &str, len: u64) -> Vec<PlayerOutput> {
+        if self.state != PlayerState::Joined {
+            self.log(format!("bulk file {id} ignored: not joined"));
+            return self.drain();
+        }
+        match self.incoming.accept_external(id, sha256, len) {
+            Ok(()) => self.log(format!("save {id} received over parallel connections ({len} bytes)")),
+            Err(err) => self.log(format!("bulk file {id} refused: {err}")),
+        }
+        self.drain()
+    }
+
     fn receive_chunk(&mut self, plain: &[u8]) {
         let kind = MessageKind::ResyncChunk.into();
         let Some(m) = codec::try_decode::<ResyncChunkMessage>(plain) else {

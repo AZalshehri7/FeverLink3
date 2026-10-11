@@ -62,6 +62,9 @@ fn brief(event: &NetEvent) -> String {
         NetEvent::Frame { conn, frame } => format!("a frame of {} bytes on {conn}", frame.body.len()),
         NetEvent::Closed { conn, reason } => format!("Closed on {conn} ({reason})"),
         NetEvent::BulkSave { conn, bytes, .. } => format!("a bulk save of {} bytes on {conn}", bytes.len()),
+        NetEvent::BulkFile { conn, len, .. } => format!("a bulk file of {len} bytes on {conn}"),
+        NetEvent::BulkProgress { conn, done, .. } => format!("bulk progress {done} on {conn}"),
+        NetEvent::Note { conn, text } => format!("a note on {conn}: {text}"),
     }
 }
 

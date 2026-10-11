@@ -154,6 +154,12 @@ pub enum NetEvent {
     /// A whole savegame arrived as bulk datagrams (Steam transports only), already checked against `sha256`.
     /// `note` is a line for the log (size, time, rate).
     BulkSave { conn: ConnectionId, id: i32, sha256: String, bytes: Vec<u8>, note: String },
+    /// A whole savegame arrived over parallel connections and was written to `path` (checked against `sha256`).
+    BulkFile { conn: ConnectionId, id: i32, sha256: String, len: u64, path: std::path::PathBuf, note: String },
+    /// How far a parallel receive is, for the window: bytes in all, and a text ("7 connections, 6.9 MB/s").
+    BulkProgress { conn: ConnectionId, id: i32, done: u64, total: u64, note: String },
+    /// A line for the session log (a parallel receive that failed).
+    Note { conn: ConnectionId, text: String },
 }
 
 /// A savegame file to send to one player as bulk datagrams.
@@ -178,6 +184,34 @@ pub enum BulkSendResult {
 /// A prepared bulk send to one connection: run it on any thread. Takes the job, a cancel check and a progress callback
 /// (bytes acknowledged so far).
 pub type BulkSender = Box<dyn FnOnce(BulkSendJob, &dyn Fn() -> bool, &dyn Fn(u64)) -> BulkSendResult + Send>;
+
+/// A savegame file to send to one player over parallel Steam connections.
+#[derive(Debug, Clone)]
+pub struct ParJob {
+    /// The resync round's id.
+    pub ctx: u32,
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the whole file.
+    pub sha256: [u8; 32],
+    /// The per-transfer secret derived from the session key.
+    pub secret: [u8; 32],
+    /// The connections and their numbers.
+    pub cfg: crate::steamnet::par::ParConfig,
+}
+
+/// What a parallel send reports while it runs.
+pub type ParProgress = crate::steamnet::par::Progress;
+
+/// A prepared parallel send to one player: run it on any thread. Takes the job, a cancel check and a progress callback.
+pub type ParSender = Box<dyn FnOnce(ParJob, &dyn Fn() -> bool, &dyn Fn(&ParProgress)) -> BulkSendResult + Send>;
+
+/// What a player's transport needs to receive a savegame over parallel connections.
+#[derive(Debug, Clone)]
+pub struct ParContext {
+    pub secret: [u8; 32],
+    /// Where the finished `<name>.sav` is written (the first savegame folder).
+    pub dir: std::path::PathBuf,
+}
 
 /// What a connection attempt is given besides its target, for transports where finding the other side can take
 /// long (a Steam route through the relays takes 10 to 20 s): where its events go, how long it may take, a way to
@@ -229,6 +263,10 @@ pub trait HostTransport: Send + 'static {
     fn bulk_sender(&self, _conn: ConnectionId) -> Option<BulkSender> {
         None
     }
+    /// A way to send a file to one connection's player over parallel Steam connections (Steam). `None`: not possible.
+    fn par_sender(&self, _conn: ConnectionId) -> Option<ParSender> {
+        None
+    }
 }
 
 /// What a player session needs from its connection to the host ([`ClientNet`] or
@@ -245,6 +283,12 @@ pub trait ClientTransport: Send + 'static {
     fn bulk_capable(&self) -> bool {
         false
     }
+    /// Whether a savegame can be received over parallel connections (a listen socket for them exists).
+    fn par_capable(&self) -> bool {
+        false
+    }
+    /// Lets the host (and only it) send a savegame over parallel connections to this player.
+    fn enable_par(&self, _ctx: ParContext) {}
 }
 
 /// One TCP connection: its writer, a handle to shut it down, and the flag that makes closing idempotent.

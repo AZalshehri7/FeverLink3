@@ -16,6 +16,7 @@ use super::*;
 use crate::gamelink::{self, Line, Tail};
 use crate::session::{run_host_over, run_player_over, Command};
 use crate::steamnet::fake::FakeMachine;
+use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
 use crate::steamnet::SteamCore;
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -125,11 +126,11 @@ struct Table {
 
 impl Table {
     fn new(options: HostOptions, save: Vec<u8>) -> Table {
-        Table::new_with(options, save, false)
+        Table::new_with(options, save, BulkSettings { mode: BulkMode::Off, ..BulkSettings::default() })
     }
 
     /// As `new`; `bulk` makes the host send saves to players that can take them as bulk datagrams.
-    fn new_with(options: HostOptions, save: Vec<u8>, bulk: bool) -> Table {
+    fn new_with(options: HostOptions, save: Vec<u8>, bulk: BulkSettings) -> Table {
         let machine = FakeMachine::new();
         let core = machine.core();
         let root = tempfile::TempDir::new().unwrap();
@@ -146,7 +147,7 @@ impl Table {
         options: HostOptions,
         save: Vec<u8>,
         folder: &str,
-        bulk: bool,
+        bulk: BulkSettings,
     ) -> (SessionHandle, FakeGame) {
         let saves = root.join(format!("{folder}-user")).join("save");
         let link = gamelink::Session::create_under(root, folder).unwrap();
@@ -382,7 +383,7 @@ fn a_player_reconnects_over_steam_after_the_host_stops_and_returns() {
     assert!(player.handle.logs().join("\n").contains("connection closed: closed by the other side"));
 
     // the host comes back on the same Steam ID
-    let (host, ..) = Table::start_host(root.path(), &core, &key, HostOptions::default(), Vec::new(), "host2", false);
+    let (host, ..) = Table::start_host(root.path(), &core, &key, HostOptions::default(), Vec::new(), "host2", BulkSettings::default());
     assert!(player.handle.wait_for(WAIT, |s| s.connected && !s.reconnecting && s.my_id.is_some()));
     assert!(host.wait_for(WAIT, |s| s.players.len() == 2));
     assert!(player.handle.status().reconnect_attempts >= 1);
@@ -504,13 +505,21 @@ fn what_the_session_log_says_about_a_failed_first_connection() {
 /// frame is sent, and it arrives byte for byte. With `lose_all`, every datagram of the host is lost: the transfer
 /// stalls, the host falls back to chunks after the stall time, and the save arrives all the same.
 fn resync_round_moves_a_save_by_bulk(chunks: usize, lose_all: bool) -> (Table, Player) {
+    let settings = BulkSettings { mode: BulkMode::Dgram, ..BulkSettings::default() };
+    resync_round(chunks, settings, |table, _| {
+        if lose_all {
+            table.machine.lose_every_nth_unreliable(1);
+        }
+    })
+}
+
+/// A resync round with the host set to `bulk`; `setup` runs once the player has joined, before the round starts.
+fn resync_round(chunks: usize, bulk: BulkSettings, setup: impl FnOnce(&Table, &Player)) -> (Table, Player) {
     let save: Vec<u8> = (0..(chunks * ResyncLimits::CHUNK_SIZE + 4321)).map(|i| (i % 249) as u8).collect();
-    let mut table = Table::new_with(HostOptions::default(), save.clone(), true);
-    if lose_all {
-        table.machine.lose_every_nth_unreliable(1);
-    }
+    let mut table = Table::new_with(HostOptions::default(), save.clone(), bulk);
     let mut player = table.player("Pat");
     assert!(player.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()), "{:?}", player.handle.logs());
+    setup(&table, &player);
     table.game.announce();
     player.game.announce();
     assert!(table.handle.wait_for(WAIT, |s| s.clocks.len() == 2), "both clocks known");
@@ -529,6 +538,51 @@ fn resync_round_moves_a_save_by_bulk(chunks: usize, lose_all: bool) -> (Table, P
     assert!(player.game.saw("resync_load", "feverlink3-resync-1"));
     assert!(table.handle.status().last_sync.expect("a checksum outcome").identical());
     (table, player)
+}
+
+fn par_settings(connect_timeout: Duration) -> BulkSettings {
+    let par = crate::steamnet::par::ParConfig {
+        min_size: 1_000_000,
+        forced: Some(3),
+        connect_timeout,
+        ..crate::steamnet::par::ParConfig::default()
+    };
+    BulkSettings { mode: BulkMode::Par, par }
+}
+
+#[test]
+fn a_resync_save_goes_over_parallel_connections_and_no_chunk_is_sent_on_the_main_connection() {
+    let (table, player) = resync_round(7, par_settings(Duration::from_secs(20)), |_, _| {});
+    let host_log = table.handle.logs().join("\n");
+    assert!(host_log.contains("over parallel Steam connections"), "{host_log}");
+    assert!(host_log.contains("has the save (parallel connections)"), "{host_log}");
+    assert!(host_log.contains("3 connection"), "{host_log}");
+    // nothing as big as a ResyncChunk frame (350 KB) went over the session's stream: the largest message is a
+    // 128 KiB binary chunk of the parallel transfer
+    let largest = table.machine.largest_sent();
+    assert!(largest > 130_000 && largest < 140_000, "largest message {largest}");
+    let player_log = player.handle.logs().join("\n");
+    assert!(player_log.contains("received over parallel connections"), "{player_log}");
+    assert!(!player.saves.join("feverlink3-resync-1.sav.part").exists());
+    // the window's numbers were published while it ran or are cleared at the end
+    assert!(table.handle.status().transfer.is_none() && table.handle.status().transfer_note.is_none());
+    player.handle.stop();
+    table.handle.stop();
+}
+
+#[test]
+fn when_the_extra_connections_cannot_be_opened_the_player_gets_the_chunks_instead() {
+    let (table, player) = resync_round(7, par_settings(Duration::from_secs(2)), |_, player| {
+        // from now on nobody reaches the player: new Steam connections to it hang, the session's stays up
+        player._machine.set_reachable(false);
+    });
+    let host_log = table.handle.logs().join("\n");
+    assert!(host_log.contains("bulk transfer to Pat failed ("), "{host_log}");
+    assert!(host_log.contains("within 2 s"), "the cause is logged: {host_log}");
+    assert!(host_log.contains("sending the chunks instead"), "{host_log}");
+    assert!(table.machine.largest_sent() > 349_000, "the chunks went over the session's stream");
+    player.handle.stop();
+    table.handle.stop();
 }
 
 #[test]

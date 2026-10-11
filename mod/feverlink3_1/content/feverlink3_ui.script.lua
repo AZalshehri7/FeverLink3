@@ -68,7 +68,7 @@ end
 
 local WIDTH = 560 -- width of the window's content
 
--- What a sync round is doing, in words (ctl.sync = { phase, done?, total? } from the controller; absent when none runs).
+-- What a sync round is doing, in words (ctl.sync = { phase, done?, total?, note? } from the controller; absent when none runs).
 -- `host` says whose window it is: the players' games stand still while the host's world is prepared, sent and loaded, and
 -- without a word about it that looks like a hang.
 local function syncText(sync, host)
@@ -84,7 +84,9 @@ local function syncText(sync, host)
 		return host and "Syncing: saving your world..." or "Syncing: the host is saving its world..."
 	elseif phase == "sending" then
 		local what = host and "Sending your world to the players" or "Receiving the host's world"
-		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...")
+		-- sync.note: what a transfer over several Steam connections says about itself ("7 connections, 6.9 MB/s")
+		local note = (type(sync.note) == "string" and sync.note ~= "") and (" (" .. sync.note .. ")") or ""
+		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...") .. note
 	elseif phase == "loading" then
 		return host and "Syncing: the players are loading your world..." or "Syncing: loading the host's world. The game reloads and the window closes; open it again afterwards."
 	elseif phase == "verifying" then

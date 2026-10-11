@@ -41,6 +41,47 @@ pub fn enabled_for(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim().eq_ignore_ascii_case("dgram"))
 }
 
+/// How the host sends a resync save to players that can take it another way than `ResyncChunk` frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BulkMode {
+    /// Chunks only.
+    Off,
+    /// Parallel Steam connections, scaled to the size of the file (the default).
+    #[default]
+    Par,
+    /// Bulk datagrams (experimental).
+    Dgram,
+}
+
+impl BulkMode {
+    /// `off`, `par`, `dgram` (case does not matter); anything else, or nothing, is the default (`par`).
+    pub fn parse(value: Option<&str>) -> BulkMode {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("off") | Some("0") | Some("no") | Some("chunks") => BulkMode::Off,
+            Some("dgram") => BulkMode::Dgram,
+            _ => BulkMode::Par,
+        }
+    }
+
+    pub fn from_env() -> BulkMode {
+        BulkMode::parse(std::env::var(BULK_ENV).ok().as_deref())
+    }
+}
+
+/// The mode and the numbers of the parallel path, as the host session is given them.
+#[derive(Debug, Clone, Default)]
+pub struct BulkSettings {
+    pub mode: BulkMode,
+    pub par: super::par::ParConfig,
+}
+
+impl BulkSettings {
+    /// From `FEVERLINK3_BULK`, `FEVERLINK3_BULK_CONNS` and `FEVERLINK3_BULK_MAX`.
+    pub fn from_env() -> BulkSettings {
+        BulkSettings { mode: BulkMode::from_env(), par: super::par::ParConfig::from_env() }
+    }
+}
+
 // ---- routing
 
 type Acceptor = Arc<dyn Fn(Handle, u32, Vec<u8>, Channel<Vec<u8>>) + Send + Sync>;

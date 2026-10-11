@@ -187,6 +187,19 @@ impl IncomingSave {
         Ok(ReceivedSave { id, sha256: sha, bytes })
     }
 
+    /// A save that arrived as a file by another route (parallel connections) and was already checked against its
+    /// SHA-256 by whoever wrote it: only recorded, so that the `ResyncLoad` naming it is accepted. A transfer of chunks
+    /// in progress is dropped.
+    pub fn accept_external(&mut self, id: i32, sha256: &str, len: u64) -> Result<(), ChunkError> {
+        let sha = normalize_sha256(sha256).ok_or(ChunkError::BadSha)?;
+        if len == 0 || len > ResyncLimits::MAX_CHUNKS as u64 * ResyncLimits::CHUNK_SIZE as u64 {
+            return Err(ChunkError::BadSize(len as usize));
+        }
+        self.current = None;
+        self.done.insert((id, sha));
+        Ok(())
+    }
+
     /// Drops an unfinished transfer older than [`ResyncLimits::RECEIVE_TIMEOUT`]; returns its id.
     pub fn expire(&mut self, now: f64) -> Option<i32> {
         if self.current.as_ref().is_some_and(|t| now - t.started >= ResyncLimits::RECEIVE_TIMEOUT) {

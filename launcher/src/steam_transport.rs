@@ -40,8 +40,10 @@ use feverlink3_core::crypto::SessionKey;
 use crate::gamelink;
 use crate::net::{
     BulkSendJob, BulkSendResult, BulkSender, ClientTransport, ConnectContext, HostTransport, LinkInfo, NetEvent,
+    ParContext, ParJob, ParProgress, ParSender,
 };
-use crate::session::{self, HostConfig, PlayerConfig, SessionHandle};
+use crate::steamnet::par::{self, Allow, ParEvent, ParService};
+use crate::session::{self, par_note, HostConfig, PlayerConfig, SessionHandle};
 use crate::steamnet::bulk::{Limits, Receiver as BulkReceiver};
 use crate::steamnet::bulk_io::{self, FileSource, Hub, SendJob};
 use crate::steamnet::speed::bulk_config;
@@ -151,11 +153,19 @@ struct Link {
     closed: AtomicBool,
     /// Why we closed it (the first reason wins); `None` when the other side ended it.
     reason: Mutex<Option<String>>,
+    /// The other side's Steam ID when Steam said (0: unknown); parallel bulk connections go to it.
+    remote: AtomicU64,
 }
 
 impl Link {
     fn new(conn: ConnectionId, handle: Handle) -> Arc<Link> {
-        Arc::new(Link { conn, handle, closed: AtomicBool::new(false), reason: Mutex::new(None) })
+        Arc::new(Link {
+            conn,
+            handle,
+            closed: AtomicBool::new(false),
+            reason: Mutex::new(None),
+            remote: AtomicU64::new(0),
+        })
     }
 
     fn is_closed(&self) -> bool {
@@ -205,7 +215,7 @@ struct HostShared {
 }
 
 impl Owner for HostShared {
-    fn opened(&self, handle: Handle, incoming: bool, _remote: Option<u64>) {
+    fn opened(&self, handle: Handle, incoming: bool, remote: Option<u64>) {
         if !incoming {
             return;
         }
@@ -215,6 +225,7 @@ impl Owner for HostShared {
                 None
             } else {
                 let link = Link::new(self.next_id.fetch_add(1, Ordering::Relaxed), handle);
+                link.remote.store(remote.unwrap_or(0), Ordering::Release);
                 links.by_handle.insert(handle, Arc::clone(&link));
                 links.by_conn.insert(link.conn, Arc::clone(&link));
                 Some(link)
@@ -550,6 +561,9 @@ pub struct SteamClientNet {
     endpoint: SteamEndpoint,
     link: Arc<Link>,
     send_timeout: Duration,
+    /// The listener for parallel bulk connections (shared by the process), when Steam opened it.
+    par: Option<Arc<ParService>>,
+    tx: Sender<NetEvent>,
 }
 
 impl SteamClientNet {
@@ -653,7 +667,9 @@ impl SteamClientNet {
         let link = link.ok_or_else(|| io::Error::other("connection opened without a link"))?;
         let route = core.route(handle).map_or("route unknown", Route::text);
         progress(&format!("connected, {route}"));
-        Ok(SteamClientNet { core: core.clone(), endpoint, link, send_timeout: SEND_TIMEOUT })
+        let par = ParService::for_core(core).ok();
+        let tx = shared.tx.clone();
+        Ok(SteamClientNet { core: core.clone(), endpoint, link, send_timeout: SEND_TIMEOUT, par, tx })
     }
 
     pub fn conn(&self) -> ConnectionId {
@@ -691,7 +707,26 @@ impl SteamClientNet {
 
 impl Drop for SteamClientNet {
     fn drop(&mut self) {
+        if let Some(par) = &self.par {
+            par.disallow(self.endpoint.0, self.link.conn);
+        }
         self.close();
+    }
+}
+
+/// The ping and queue of one connection, as the parallel sender reads them.
+struct LinkControl {
+    core: CoreRef,
+    handle: Handle,
+}
+
+impl par::Control for LinkControl {
+    fn ping_ms(&self) -> Option<u32> {
+        self.core.link(self.handle).and_then(|l| l.ping_ms)
+    }
+
+    fn pending(&self) -> u32 {
+        self.core.link(self.handle).map_or(0, |l| l.pending)
     }
 }
 
@@ -713,6 +748,10 @@ impl HostTransport for SteamHostNet {
 
     fn links(&self) -> Vec<LinkInfo> {
         SteamHostNet::links(self)
+    }
+
+    fn par_sender(&self, conn: ConnectionId) -> Option<ParSender> {
+        self.par_sender_for(conn)
     }
 
     fn bulk_sender(&self, conn: ConnectionId) -> Option<BulkSender> {
@@ -743,6 +782,46 @@ impl HostTransport for SteamHostNet {
     }
 }
 
+impl SteamHostNet {
+    /// Sending one file to the player on `conn` over parallel connections to the player's Steam ID.
+    fn par_sender_for(&self, conn: ConnectionId) -> Option<ParSender> {
+        let link = self.link(conn).filter(|l| !l.is_closed())?;
+        let remote = link.remote.load(Ordering::Acquire);
+        if remote == 0 {
+            return None;
+        }
+        let core = self.core.clone();
+        Some(Box::new(move |job: ParJob, cancelled: &dyn Fn() -> bool, progress: &dyn Fn(&ParProgress)| {
+            let source = match par::FileSource::open(&job.path) {
+                Ok(s) => s,
+                Err(e) => return BulkSendResult::Failed(format!("cannot read {}: {e}", job.path.display())),
+            };
+            let size = par::PayloadSource::len(&source);
+            let spec = par::SendSpec {
+                remote,
+                xfer: job.ctx,
+                ctx: job.ctx,
+                secret: job.secret,
+                sha256: job.sha256,
+                source: Arc::new(source),
+                conns: job.cfg.conns_for(size),
+                cfg: job.cfg,
+                control: Some(Arc::new(LinkControl { core: core.clone(), handle: link.handle })),
+            };
+            let report = par::run_send(&core, spec, cancelled, progress);
+            if report.ok {
+                BulkSendResult::Done { summary: report.summary() }
+            } else {
+                BulkSendResult::Failed(format!(
+                    "{}; {}",
+                    report.error.clone().unwrap_or_else(|| "failed".into()),
+                    report.summary()
+                ))
+            }
+        }))
+    }
+}
+
 impl ClientTransport for SteamClientNet {
     fn send(&self, frame: &Frame) -> io::Result<()> {
         SteamClientNet::send(self, frame)
@@ -758,6 +837,45 @@ impl ClientTransport for SteamClientNet {
 
     fn bulk_capable(&self) -> bool {
         true
+    }
+
+    fn par_capable(&self) -> bool {
+        self.par.is_some()
+    }
+
+    fn enable_par(&self, ctx: ParContext) {
+        let Some(par) = &self.par else { return };
+        let (conn, tx) = (self.link.conn, Mutex::new(self.tx.clone()));
+        let emit = move |event: NetEvent| {
+            let _ = lock(&tx).send(event);
+        };
+        let on_event = move |event: ParEvent| match event {
+            ParEvent::Progress { ctx, bytes, total, lanes, rate } => {
+                emit(NetEvent::BulkProgress { conn, id: ctx as i32, done: bytes, total, note: par_note(lanes, rate) })
+            }
+            ParEvent::Done { ctx, sha256, len, path, secs, lanes_max } => {
+                let note = format!(
+                    "resync {ctx}: save received over parallel connections: {len} bytes in {secs:.1} s ({:.2} MB/s), {lanes_max} connection(s) at most",
+                    len as f64 / secs.max(0.001) / 1e6
+                );
+                emit(NetEvent::BulkFile { conn, id: ctx as i32, sha256: par::service::hex(&sha256), len, path, note })
+            }
+            ParEvent::Failed { ctx, why } => {
+                emit(NetEvent::Note { conn, text: format!("resync {ctx}: the parallel receive failed: {why}") })
+            }
+        };
+        par.allow(
+            self.endpoint.0,
+            Allow {
+                secret: Some(ctx.secret),
+                dir: ctx.dir,
+                stem: Box::new(crate::resync::save_name_for),
+                ext: "sav",
+                max_total: ResyncLimits::MAX_CHUNKS as u64 * ResyncLimits::CHUNK_SIZE as u64,
+                on_event: Box::new(on_event),
+                owner: self.link.conn,
+            },
+        );
     }
 }
 

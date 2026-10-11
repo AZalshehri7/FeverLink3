@@ -70,6 +70,10 @@ pub struct JoinMessage {
 /// unreliable messages) instead of as `ResyncChunk` frames. Only a Steam transport has it.
 pub const CAP_BULK_DGRAM: &str = "bulk-dgram-1";
 
+/// Capability: the player can receive a savegame over several parallel Steam connections (the host opens them to the
+/// player's second virtual port), written straight to the save file. Only a Steam transport has it.
+pub const CAP_BULK_PAR: &str = "bulk-par-1";
+
 impl JoinMessage {
     pub fn new(name: &str, version: &str, proof: Vec<u8>) -> Self {
         Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None, caps: Vec::new() }
