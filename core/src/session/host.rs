@@ -10,10 +10,10 @@ use super::kind::MessageKind;
 use super::limits::RateLimiter;
 use super::lockstep::{Lockstep, PlayerClock};
 use super::messages::{
-    codec, ActionMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
-    ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo,
-    PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant,
-    SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
+    codec, ActionMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage, ChallengeMessage, ChatMessage,
+    ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions,
+    PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage,
+    ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
 };
 use super::names::Names;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};

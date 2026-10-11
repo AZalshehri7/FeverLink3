@@ -23,7 +23,8 @@ fn every_kind_number_maps_back_to_itself_and_nothing_else_does() {
     let known: Vec<u8> = (0..=255u8).filter(|&v| MessageKind::from_u8(v).is_some()).collect();
     assert_eq!(
         vec![
-            1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38, 50, 51, 52, 53
+            1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38, 50, 51,
+            52, 53
         ],
         known
     );

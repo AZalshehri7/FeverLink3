@@ -21,6 +21,9 @@ mod steam_core;
 /// The speed test: message format, timing math, the sender loop, the text of the result.
 pub mod throughput;
 
+/// Bulk transfer over unreliable datagrams with our own reliability and congestion control.
+pub mod bulk;
+
 /// An in-memory Steam for the tests of this module and of the transport.
 #[cfg(test)]
 pub(crate) mod fake;

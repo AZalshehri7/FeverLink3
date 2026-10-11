@@ -1541,7 +1541,11 @@ mod tests {
         let logged = growth_lines();
         let switches: Vec<_> = logged.iter().filter(|l| l.starts_with("growth-switch")).collect();
         assert_eq!(switches.len(), 1, "{logged:?}");
-        assert!(switches[0].contains("game_time=302 ticks") && switches[0].contains("5 ticks = 1000 ms"), "{}", switches[0]);
+        assert!(
+            switches[0].contains("game_time=302 ticks") && switches[0].contains("5 ticks = 1000 ms"),
+            "{}",
+            switches[0]
+        );
         let calls: Vec<_> = logged.iter().filter(|l| l.starts_with("growth n=")).collect();
         assert_eq!(calls.len(), 6, "{logged:?}");
         assert!(!calls[0].contains("used="), "{}", calls[0]);
@@ -1580,7 +1584,8 @@ mod tests {
         assert!(plan.report().iter().any(|l| l.contains("SKIPPED town_update_size")), "{:?}", plan.report());
         assert_eq!(develop_direct(&game, 7, 100), 107);
         assert_eq!(PROBE_STATE.load(SeqCst), 100);
-        assert!(growth_lines()[0].starts_with(&format!("growth n=1 pid={} town=7 seed=0x00000064 r9b=1", std::process::id())));
+        assert!(growth_lines()[0]
+            .starts_with(&format!("growth n=1 pid={} town=7 seed=0x00000064 r9b=1", std::process::id())));
         unsafe { inst.uninstall_all() };
     }
 

@@ -135,7 +135,14 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { log: false, mode: Mode::Off, after_wall_s: 0, after_game_s: None, quantum_ms: DEFAULT_QUANTUM_MS, trace: Trace::default() }
+        Settings {
+            log: false,
+            mode: Mode::Off,
+            after_wall_s: 0,
+            after_game_s: None,
+            quantum_ms: DEFAULT_QUANTUM_MS,
+            trace: Trace::default(),
+        }
     }
 }
 
@@ -389,7 +396,9 @@ mod tests {
         assert!(s.switch_due(10, Some(300)));
         // the run of 2026-10-11: threshold 14216 s is tick 71080; the dword 68086 (13,617 s) must not fire it
         let late = Settings { mode: Mode::Derive, after_game_s: Some(14_216), ..Default::default() };
-        assert!(!late.switch_due(0, Some(68_086)) && !late.switch_due(0, Some(71_079)) && late.switch_due(0, Some(71_080)));
+        assert!(
+            !late.switch_due(0, Some(68_086)) && !late.switch_due(0, Some(71_079)) && late.switch_due(0, Some(71_080))
+        );
         assert!(!s.switch_due(100, None), "a game-time threshold without a readable game time never fires");
         let s = Settings { mode: Mode::Derive, ..Default::default() };
         assert!(s.switch_due(0, Some(0)), "default: from the first call that has a game time");
