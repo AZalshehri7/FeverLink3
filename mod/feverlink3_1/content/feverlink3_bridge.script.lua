@@ -397,6 +397,7 @@ end
 -- Town trace (feverlink3_towntrace.lua): off unless FEVERLINK3_TOWN_TRACE is set. Read-only; one file per game.
 local TRACE = nil
 local TRACE_FAILS = 0
+local townTraceGuard
 local function townTrace()
 	if TRACE ~= nil then return TRACE or nil end
 	TRACE = false
@@ -411,22 +412,40 @@ local function townTrace()
 			acc = M.apiAccessors(api, engine.entitiesWith),
 			hash = C.hashValue,
 			write = function(text) return C.appendFile(C.path(M.FILE), text) end,
+			-- FEVERLINK3_TOWN_TRACE_CMDS=1: log the payload of the game script's makeTownUpdateSizeCmd / makeTownUpdateCargoNeedsCmd
+			cmds = os.getenv("FEVERLINK3_TOWN_TRACE_CMDS") == "1",
+			tick = function() return math.floor(engine.gameTime() / STEP) end,
 		})
-		if t.enabled then TRACE = t; logTowns("town trace on: " .. spec .. " -> " .. M.FILE) end
+		if t.enabled then
+			TRACE = t
+			logTowns("town trace on: " .. spec .. " -> " .. M.FILE)
+			if t.cmds then
+				-- the holder lives in package.loaded so a savegame reload finds the wrappers instead of wrapping them again
+				local holder = package.loaded["feverlink3_towntrace_holder"]
+				if type(holder) ~= "table" then holder = {}; package.loaded["feverlink3_towntrace_holder"] = holder end
+				holder.tracer = t
+				local n = M.installCmdWrappers(api.cmd, holder, function(fn) townTraceGuard(fn) end)
+				logTowns("town trace: " .. n .. " command factories wrapped (makeTownUpdateSizeCmd, makeTownUpdateCargoNeedsCmd)")
+			end
+		end
 	end)
 	if not ok then logTowns("town trace failed to start: " .. tostring(err)) end
 	return TRACE or nil
 end
 
 -- a trace step must never break the simulation: after a few failures it switches itself off
-local function townTraceGuard(fn)
+function townTraceGuard(fn)
 	local t = townTrace()
 	if not t then return end
 	local ok, err = pcall(fn, t)
 	if not ok then
 		TRACE_FAILS = TRACE_FAILS + 1
 		logTowns("town trace error: " .. tostring(err))
-		if TRACE_FAILS >= 5 then TRACE = false; logTowns("town trace switched off after 5 errors") end
+		if TRACE_FAILS >= 5 then
+			TRACE = false
+			pcall(function() local h = package.loaded["feverlink3_towntrace_holder"]; if type(h) == "table" then h.tracer = nil end end)
+			logTowns("town trace switched off after 5 errors")
+		end
 	end
 end
 
