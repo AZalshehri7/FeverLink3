@@ -104,7 +104,8 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 
 ## 8. Checksums and resync
 
-- Every 10 s of real time the host names a future stamp; every game hashes its world at that stamp and reports per-part hashes (money, loans, company, towns, industries, cargo, vehicles, roads, constructions, lines, names, node configs, terrain edits).
+- Every 10 s of real time the host names a future stamp; every game hashes its world at that stamp and reports per-part hashes (money, loans, company, towns, industries, cargo, vehicles, roads, constructions, town buildings, lines, names, node configs, terrain edits).
+- **Town buildings** (read-only; the idea is MPFever's `townBuildings` lane): `townBuildings` is `<count>/<hash>` over every `TOWN_BUILDING`; `townBuildings:<town id>` is the same per town (the first 48 towns), so the log names the town whose growth differs and shows the building counts on each side. A building enters the hash by model file, position (0.1 m), level, depth, parcel count and build time, never by entity id. Not a drift part: it reloads after two consecutive differing checks, like constructions.
 - **Money** is corrected in place from the host's values. **Drift parts** reload only after 5 minutes. **Everything else** reloads after two consecutive differing checks, or at once when a replay fails.
 - **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → every other game loads it (the host's own game keeps playing its live world; `host_reloads` turns the host's reload back on) → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
 

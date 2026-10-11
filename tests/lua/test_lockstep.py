@@ -64,6 +64,13 @@ WORLD = {
   [54] = { CONSTRUCTION = { fileName = "depot.con", transf = { [13] = 100, [14] = 200, [15] = 5 } } },
   [55] = { VEHICLE_DEPOT = {} },
   [56] = { CONSTRUCTION = { fileName = "station.con", transf = { [13] = -40.5, [14] = 12, [15] = 0 } } },
+  -- two towns' buildings: each TOWN_BUILDING names its town and its CONSTRUCTION entity
+  [60] = { CONSTRUCTION = { fileName = "house_a.con", transf = { [13] = 10.04, [14] = 20, [15] = 1 } } },
+  [61] = { CONSTRUCTION = { fileName = "house_b.con", transf = { [13] = 30, [14] = 40, [15] = 2 } } },
+  [62] = { CONSTRUCTION = { fileName = "shop.con", transf = { [13] = 500, [14] = 600, [15] = 3 } } },
+  [63] = { TOWN_BUILDING = { town = 90, construction = 60, level = 1, depth = 1, timeBuilt = 100, parcels = { 1 } } },
+  [64] = { TOWN_BUILDING = { town = 90, construction = 61, level = 2, depth = 1, timeBuilt = 200, parcels = { 2, 3 } } },
+  [65] = { TOWN_BUILDING = { town = 91, construction = 62, level = 1, depth = 2, timeBuilt = 300, parcels = { 4 } } },
 }
 ACCOUNT = { balance = 1000000, loan = 250000 }
 JOURNAL = {}
@@ -82,7 +89,7 @@ app = {
   findAllSavegames = function(ns) assert(ns == 1); return SAVES end,
   loadGame = function(id, flag) assert(id.saveGameNamespace == 1 and id.path); LOADED = id.saveGameName; RELOAD_PENDING = true end,
 }
-local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8 }
+local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8, TOWN_BUILDING = 9 }
 local NAMEOF = {}
 for k, v in pairs(CT) do NAMEOF[v] = k end
 
@@ -649,7 +656,8 @@ class LockstepTest(unittest.TestCase):
         (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
         self.assertEqual(pa, pb, "identical worlds give identical parts")
-        self.assertEqual(set(pa), {"time", "balance", "loan", "constructions", "lines"})
+        self.assertEqual(set(pa), {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
+        self.assertTrue(pa["townBuildings"].startswith("3/") and pa["townBuildings:90"].startswith("2/") and pa["townBuildings:91"].startswith("1/"), pa)
         # paused round: the games are stopped, the interface half answers
         self.relay.pauseAt = self.relay.future_stamp()
         self.relay.session()
@@ -666,6 +674,20 @@ class LockstepTest(unittest.TestCase):
         pa, pb = self.relay.reports[3][0][1], self.relay.reports[3][1][1]
         self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance"})
         self.assertEqual(pa["loan"], pb["loan"])
+        # one building of town 91 grown on one game only: the aggregate and that town's part differ, nothing else
+        self.B.L.execute("WORLD[65].TOWN_BUILDING.level = 2")
+        self.relay.checksum_request(4, self.relay.pauseAt, True)
+        self.tick(5)
+        pa, pb = self.relay.reports[4][0][1], self.relay.reports[4][1][1]
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "townBuildings", "townBuildings:91"})
+        self.assertEqual(pa["townBuildings:90"], pb["townBuildings:90"])
+        # a building in town 90 on one game only: the counts in the part values name the town
+        self.B.L.execute("WORLD[66] = { TOWN_BUILDING = { town = 90, construction = 62, level = 1, depth = 1, timeBuilt = 400, parcels = {} } }")
+        self.relay.checksum_request(5, self.relay.pauseAt, True)
+        self.tick(5)
+        pa, pb = self.relay.reports[5][0][1], self.relay.reports[5][1][1]
+        self.assertTrue(pa["townBuildings:90"].startswith("2/") and pb["townBuildings:90"].startswith("3/"), (pa, pb))
+        self.assertTrue(pa["townBuildings"].startswith("3/") and pb["townBuildings"].startswith("4/"))
 
     def test_truncated_to_game_log_does_not_reapply(self):
         self.start()
