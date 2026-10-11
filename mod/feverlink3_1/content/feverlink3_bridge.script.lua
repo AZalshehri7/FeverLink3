@@ -672,6 +672,7 @@ local G = {
 	started = false, frames = 0,
 	perms = L.newPermissions(),
 	hud = nil, hudWritten = { version = nil }, uiReader = nil,
+	marks = {},               -- checksum stamps ahead: the batch is shortened to land on each (L.pace)
 	accountAt = {},           -- checksum round n -> this game's account at that round
 	loading = false,          -- a resync load was started: the rest of this batch of lines belongs to the reloaded game
 	session = L.newSession(), peers = {},
@@ -1598,6 +1599,7 @@ end
 H.checksum_request = function(rec, p)
 	local it = L.checksumItem(p)
 	if not it then logGui("malformed checksum_request"); return end
+	L.addMark(G.marks, it.at, engine.gameTime())
 	route(it)
 end
 
@@ -1822,7 +1824,7 @@ local function guiUpdate(userParams, state, guiState)
 		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
-		setSpeed(L.pace(G.session, G.peers, now, ahead))
+		setSpeed(L.pace(G.session, G.peers, now, ahead, G.marks))
 		if now ~= G.lastClock or G.frames % 30 == 0 then
 			G.lastClock = now
 			send("clock", { t = now, speed = engine.speed(), ahead = ahead })

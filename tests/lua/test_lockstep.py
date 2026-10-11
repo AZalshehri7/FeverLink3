@@ -1083,6 +1083,34 @@ class PureTest(unittest.TestCase):
         self.assertEqual(K.stampFor(s, 1000, 2000), 3000, "a game may raise the lead")
         self.assertEqual(K.stampFor(s, 1000, 400), 2200, "never lower it")
 
+    def test_pace_lands_batches_on_checksum_stamps(self):
+        K, L = self.K, self.L
+        s = K.newSession()
+        peers = L.table()
+        K.applySession(s, L.table_from({"started": True, "speed": 4, "lead": 1200}))
+        marks = L.table()
+        self.assertEqual(K.pace(s, peers, 1000, 6, marks), 4, "no mark: full batch")
+        K.addMark(marks, 2000, 1000)
+        self.assertEqual(K.pace(s, peers, 1000, 6, marks), 4, "5 steps of room: full batch")
+        self.assertEqual(K.pace(s, peers, 1400, 6, marks), 3, "batch shortened to land exactly on the stamp")
+        self.assertEqual(K.pace(s, peers, 1800, 6, marks), 1)
+        self.assertEqual(K.pace(s, peers, 2000, 6, marks), 4, "at the stamp: the mark no longer limits")
+        K.addMark(marks, 3000, 2000)
+        self.assertEqual(len(marks), 1, "passed marks are dropped")
+        # a mark never holds the game, and a pause still wins
+        K.applySession(s, L.table_from({"started": True, "speed": 4, "pauseAt": 2200, "lead": 1200}))
+        self.assertEqual(K.pace(s, peers, 2000, 6, marks), 1)
+        self.assertEqual(K.pace(s, peers, 2200, 6, marks), 0)
+        # two games at different phases reach the same time at the stamp
+        for start in (1000, 1200, 1600):
+            now, sp = start, 4
+            m = L.table()
+            K.addMark(m, 2400, now)
+            K.applySession(s, L.table_from({"started": True, "speed": sp, "lead": 1200}))
+            while now < 2400:
+                now += int(K.pace(s, peers, now, 6, m)) * 200
+            self.assertEqual(now, 2400)
+
     def test_queue_order_and_late(self):
         K, L = self.K, self.L
         q = L.table()

@@ -205,6 +205,9 @@ pub struct HostSession {
     /// counted against them.
     stall_until: f64,
     checksums: ChecksumRounds,
+    /// Checksum rounds completed, and how many of them were skipped because the games hashed at different sim times.
+    rounds_done: u32,
+    rounds_skewed: u32,
     permissions: Permissions,
     policy: ChecksumPolicy,
     resync: Option<ResyncRound>,
@@ -276,6 +279,8 @@ impl HostSession {
             last_call: f64::NEG_INFINITY,
             stall_until: f64::NEG_INFINITY,
             checksums: ChecksumRounds::new(),
+            rounds_done: 0,
+            rounds_skewed: 0,
             permissions: Permissions::default(),
             policy: ChecksumPolicy::new(ChecksumPolicyConfig::default()),
             resync: None,
