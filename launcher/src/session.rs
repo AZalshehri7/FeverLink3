@@ -78,7 +78,7 @@ const fn row(name: &'static str, kind: MessageKind, to_game: bool, from_game: bo
 /// The complete mapping, `docs/PROTOCOL.md` kinds to file-link kinds (documented in `launcher/README.md`).
 /// Names are the snake_case of the message kind, except `peerclock`, which is what the mod already reads.
 /// `resync_chunk` never goes to the game: the launcher streams savegame chunks to disk itself.
-pub const LINE_KINDS: [LineKind; 20] = [
+pub const LINE_KINDS: [LineKind; 21] = [
     row("welcome", MessageKind::Welcome, true, false),
     row("session", MessageKind::Session, true, false),
     row("peerclock", MessageKind::PeerClock, true, false),
@@ -99,6 +99,7 @@ pub const LINE_KINDS: [LineKind; 20] = [
     row("action", MessageKind::Action, true, true),
     row("chat", MessageKind::Chat, true, true),
     row("build_veto", MessageKind::BuildVeto, true, true),
+    row("build_commit", MessageKind::BuildCommit, true, true),
 ];
 
 /// The line kind a message is written as, `None` for kinds that do not go to the game.

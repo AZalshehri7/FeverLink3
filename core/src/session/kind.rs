@@ -44,12 +44,15 @@ pub enum MessageKind {
     /// only when it cannot (silence means yes); the host relays it to every other game, which drops the queued replay, and the
     /// originator cancels its held command.
     BuildVeto = 52,
+    /// The originator of a held strict build in a PAUSED game tells the others to apply it now: it waited a real-time grace for
+    /// vetoes first, and nobody applies the build before this arrives. Carries the stamp to apply it at.
+    BuildCommit = 53,
 }
 
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
     /// (session state, checksum requests, authority values, resynchronisation).
-    pub const FROM_PLAYER: [MessageKind; 12] = [
+    pub const FROM_PLAYER: [MessageKind; 13] = [
         MessageKind::Hello,
         MessageKind::Clock,
         MessageKind::SpeedRequest,
@@ -62,6 +65,7 @@ impl MessageKind {
         MessageKind::Action,
         MessageKind::Chat,
         MessageKind::BuildVeto,
+        MessageKind::BuildCommit,
     ];
 
     /// The kind for a header byte; `None` for a value this build does not know.
@@ -96,6 +100,7 @@ impl MessageKind {
             50 => Action,
             51 => Chat,
             52 => BuildVeto,
+            53 => BuildCommit,
             _ => return None,
         })
     }

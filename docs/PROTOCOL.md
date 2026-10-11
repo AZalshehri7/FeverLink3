@@ -91,6 +91,7 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Action | 50 | game → host → all but origin | `{stamp, seq, body, category?, from, allowed}` (`from` and `allowed` set by the host; `category` is `build`, `bulldoze`, `spend` or `other`, default `other`) |
 | Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name}` (set by the host) |
 | BuildVeto | 52 | game → host → all but origin | `{seq, owner, why ≤ 300, from, name}` (`from`, `name` set by the host). "I cannot build action `owner`:`seq`", sent only by a game that dry-ran a held strict build and found it cannot be rebuilt; silence means yes. The originator cancels its held command, every game drops the queued replay. |
+| BuildCommit | 53 | game → host → all but origin | `{seq, owner, stamp, from}` (`from` set by the host). The originator of a held strict build made while the game is PAUSED waits a real-time grace for vetoes (the peers dry-run the record and park it, applying nothing), then sends this; every game applies the parked build at `stamp` (the pause time, or a normal stamp when the game was unpaused meanwhile) and the originator releases its own command. A veto during the grace drops the build everywhere. |
 
 A player may send kinds 30 to 38 and 50 to 52. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
 

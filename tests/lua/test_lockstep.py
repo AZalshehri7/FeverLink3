@@ -417,6 +417,7 @@ class Relay:
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
         self.vetoes = []
+        self.commits = []
         self.started, self.speed, self.pauseAt = False, 0, None
 
     # launcher -> mod
@@ -511,6 +512,12 @@ class Relay:
                     for o in self.games:
                         if o is not g:
                             self.send(o, "build_veto", 0, out)
+                elif rec.kind == "build_commit":
+                    self.commits.append((g.id, int(p.owner), int(p.seq), int(p.stamp)))
+                    out = self.ser({"seq": int(p.seq), "owner": int(p.owner), "stamp": int(p.stamp), "from": g.id})
+                    for o in self.games:
+                        if o is not g:
+                            self.send(o, "build_commit", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
                     if g.id == 0 and p.authority is not None:

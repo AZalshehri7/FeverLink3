@@ -446,8 +446,11 @@ function L.sendNow(args, send)
 	for _, entry in ipairs(args.chain or {}) do
 		local nextArgs = entry
 		if type(entry) == "function" then nextArgs = entry() end
-		if type(nextArgs) ~= "table" then error("a further command of the action could not be made") end
-		send(nextArgs)
+		-- `false` from a function: nothing to do after all (the step checked the world and found it already as wanted)
+		if nextArgs ~= false then
+			if type(nextArgs) ~= "table" then error("a further command of the action could not be made") end
+			send(nextArgs)
+		end
 	end
 end
 
@@ -461,6 +464,7 @@ function L.runChained(args, send, done)
 				if type(entry) == "function" then return entry() end
 				return entry
 			end)
+			if ok and nextArgs == false then return done(data, success, entities) end   -- nothing further to do
 			if ok and type(nextArgs) == "table" then
 				local okS = pcall(step, nextArgs, i + 1)
 				if okS then return end
