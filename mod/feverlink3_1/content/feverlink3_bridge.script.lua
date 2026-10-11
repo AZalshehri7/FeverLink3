@@ -11,8 +11,9 @@
 --     wraps api.cmd.sendCommand so a player's command is held, encoded and shipped as an `action`,
 --     forwards stamped items to the simulation half, applies due items itself while the game is paused,
 --     hands the originator's callback the real result, writes checksum reports and refusals,
---     strict mode (when the native module is there): has a construction tool's build held, shipped and applied at the stamp
---     by every game, the originator's included (native_ctl.log / native_events.log, docs/NATIVE_LINK.md section 7).
+--     strict mode (when the native module is there): has a construction tool's build held and shipped; the other games replay it
+--     at the stamp and this game releases its own held command at the stamp, so the tool stays alive
+--     (native_ctl.log / native_events.log, docs/NATIVE_LINK.md section 7).
 --   simulation half (update, once per step; handleEvent)
 --     keeps the queue in the game-script state, applies due items at their exact step, computes checksum
 --     parts, installs the deterministic math.random.
@@ -514,6 +515,34 @@ local function spendReplay(st, now)
 	return true
 end
 
+-- Strict mode, the originating game: a shipped build whose own copy the native module still holds. If the module gives that
+-- command back BEFORE the stamp (its silence rule, its age limit, hold_off), the build lands in this world early and its engine
+-- event comes with no replay mark; this list tells the capture that it is that build, not a new one, so it is not shipped a second
+-- time. The interface half adds an entry when it ships (event "heldout") and removes it when it released the command itself or
+-- cancelled it ("heldgone"); an entry lives 35 s of wall time at most (the module's own limit is 30 s) and never across a reload.
+local HELD_WALL = 35
+local function heldOutLive(e)
+	local age = os.clock() - (tonumber(e.wall) or 0)
+	return age >= 0 and age <= HELD_WALL
+end
+
+local function takeHeldOut(st)
+	local list = st.heldOut
+	if type(list) ~= "table" then return nil end
+	local keep, taken = {}, nil
+	for _, e in ipairs(list) do
+		if not heldOutLive(e) then
+			-- expired: dropped
+		elseif not taken then
+			taken = e
+		else
+			keep[#keep + 1] = e
+		end
+	end
+	st.heldOut = keep
+	return taken
+end
+
 local function buildCategory(body)
 	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1] or nil
 	if type(rec) ~= "table" then return "build" end
@@ -557,6 +586,14 @@ local function simCaptureBuild(state, param, post)
 	if not post and spendReplay(st, now) then
 		state:set(st)
 		return
+	end
+	if not post then
+		local e = takeHeldOut(st)
+		if e then
+			state:set(st)
+			logSim("a native build at t=" .. now .. " is the early release of the held command of " .. tostring(e.key) .. " (already shipped): not shipped again")
+			return
+		end
 	end
 	local proposal, playerInitiated, result = nil, nil, nil
 	pcall(function() proposal, playerInitiated, result = param[1], param[4], param[3] end)
@@ -663,21 +700,29 @@ local function simApplyAction(st, it, now)
 		for _, comp in ipairs(bindComps) do bindBefore[comp] = engine.entitiesWith(comp) end
 	end
 	local balance0 = coBalance(ctx)
-	local ok, e = pcall(function()
-		L.sendNow(args, function(a)
-			local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
-			if isBuild then markReplay(st, now, SIM.state) end
-			api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
-			if isBuild then takeBackEvents(st, SIM.state) end
+	-- Strict mode, the originating game: the native module still holds the tool's own command (it.heldId, set by natDecide, never
+	-- on the wire). Nothing is sent here; everything else is as on every other game (the ledger, the snapshot of the entity
+	-- lists, the binders that key what the build creates). The interface half releases the held command when it sees the
+	-- "#release" result below, after this snapshot (so the new entities are not in it).
+	local held = it.heldId ~= nil and it.from == C.PLAYER_ID
+	local ok, e = true, nil
+	if not held then
+		ok, e = pcall(function()
+			L.sendNow(args, function(a)
+				local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
+				if isBuild then markReplay(st, now, SIM.state) end
+				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
+				if isBuild then takeBackEvents(st, SIM.state) end
+			end)
 		end)
-	end)
+	end
 	if not ok then
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e) }
 		return
 	end
 	coAfter(ctx, it, spec, category, balance0, logSim)
-	logSim("action " .. it.key .. " " .. it.body.fn .. " applied at t=" .. now)
+	logSim("action " .. it.key .. " " .. it.body.fn .. (held and (" due at t=" .. now .. ": the native module holds this game's own copy (held " .. tostring(it.heldId) .. "), the interface half releases it") or (" applied at t=" .. now)))
 	if bindComps then
 		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0 }
 	end
@@ -685,6 +730,9 @@ local function simApplyAction(st, it, now)
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
 	else
 		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
+	end
+	if held then
+		st.results[#st.results + 1] = { key = it.key .. "#release" .. tostring(it.heldId), of = it.key, at = now, success = true, release = it.heldId }
 	end
 end
 
@@ -852,6 +900,16 @@ local function handleEvent(userParams, state, src, id, name, param)
 			L.enqueue(st.queue, param)
 		elseif name == "replay" then
 			markReplay(st, engine.gameTime())
+		elseif name == "heldout" and type(param) == "table" then
+			st.heldOut = st.heldOut or {}
+			st.heldOut[#st.heldOut + 1] = { key = param.key, wall = os.clock() }
+			trim(st.heldOut, 8)
+		elseif name == "heldgone" and type(param) == "table" then
+			local keep = {}
+			for _, e in ipairs(st.heldOut or {}) do
+				if e.key ~= param.key then keep[#keep + 1] = e end
+			end
+			st.heldOut = keep
 		elseif name == "outack" and type(param) == "table" then
 			local keep = {}
 			for _, o in ipairs(st.out or {}) do
@@ -1028,6 +1086,9 @@ local function recordOriginator(body, seq, at, category)
 	end)
 end
 
+-- strict mode (defined in its section below): a game paused at the stamp releases its own held command; a refusal cancels it
+local natPauseRelease, natHeldRefused
+
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
@@ -1043,6 +1104,7 @@ local function guiApplyNow(it, now)
 		logGui("action " .. it.key .. " refused: " .. tostring(err))
 		send("action_refused", { seq = it.seq, from = it.from, detail = err })
 		deliverResult(it.key, nil, false, {})
+		if it.heldId and natHeldRefused then pcall(natHeldRefused, it) end
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
@@ -1054,6 +1116,7 @@ local function guiApplyNow(it, now)
 		send("action_refused", { seq = it.seq, from = it.from, detail = fx })
 		deliverResult(it.key, nil, false, {})
 		coToSim(it)
+		if it.heldId and natHeldRefused then pcall(natHeldRefused, it) end
 		return
 	end
 	coEffects(ctx, fx, logGui)
@@ -1105,15 +1168,22 @@ local function guiApplyNow(it, now)
 		deliverResult(it.key, data, success, entities)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
-	local okS, errS = pcall(L.runChained, args, function(a, cb)
-		if it.body.fn == "makeWorldBuildProposalCmd" then toSim("replay", {}) end
-		O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
-	end, finish)
+	local okS, errS
+	if it.heldId and natPauseRelease then
+		-- the tool's own command is held by the native module: it is released instead of sent (the whole build is that one command)
+		okS, errS = pcall(natPauseRelease, it, finish)
+	else
+		okS, errS = pcall(L.runChained, args, function(a, cb)
+			if it.body.fn == "makeWorldBuildProposalCmd" then toSim("replay", {}) end
+			O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
+		end, finish)
+	end
 	if not okS then
 		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
 		send("action_refused", { seq = it.seq, from = it.from, detail = tostring(errS) })
 		deliverResult(it.key, nil, false, {})
 		coToSim(it)
+		if it.heldId and natHeldRefused then pcall(natHeldRefused, it) end
 	end
 end
 
@@ -1208,9 +1278,12 @@ end
 --   2. the module holds the tool's command at CommandList::Add and writes `held {id}` to native_events.log. natPair matches it
 --      with the oldest capture. If `held` is read first, it waits (N.parked) for the capture for a short grace;
 --   3. natDecide: the player's permission, a check that this game could rebuild the record, then the action is shipped with a
---      stamp exactly as shipLocal does, `cancel {id}` destroys the held command (the engine never applies it) and the item is
---      routed to this game's own queue, so the originator applies the build at the stamp through the normal replay path
---      (simApplyAction), like every other game. No recordOriginator: the normal apply path books the company ledger;
+--      stamp exactly as shipLocal does and the command STAYS HELD (cancelling it left the originator's tool dead: a cancelled
+--      command never gives the tool its "applied" callback). The item is routed to this game's own queue with a local heldId.
+--      At the stamp the simulation half (simApplyAction) does what every game does (ledger, snapshot, binders that key the
+--      entities) except sending, and reports a "#release" result; natRelease then writes the replay mark, `release` and the
+--      trigger, so the engine applies the tool's own command and the tool lives on. Every OTHER game replays the build at the
+--      stamp. No recordOriginator: the normal apply path books the company ledger;
 --   4. whatever does not fit (no usable capture, a record that cannot be rebuilt here) is released: `release {id}` lets the
 --      native build go through and the simulation half's onPreBuildProposal capture ships it the old way.
 -- A capture is never shipped without its `held`, and a held command is either cancelled-and-shipped or released, never both.
@@ -1241,7 +1314,8 @@ local function natNew()
 		pingN = 0, pingAt = -100, pingsTried = 0, pongAt = nil, watchFrom = nil, lastTick = nil, lastWrite = -100,
 		holdSent = false, holdAt = 0, active = false, activeSince = 0,
 		retryAt = nil, retries = 0, gaveUp = false,
-		caps = {}, parked = {}, awaiting = {}, shipped = {}, owed = {},
+		caps = {}, parked = {}, awaiting = {}, owed = {},
+		heldByKey = {}, byId = {}, finishes = {},   -- shipped builds whose own copy is held: by action key / by held id; pause-path completions
 		sessionOn = true, sessionAt = -100,
 		logWin = -100, logN = 0, logLost = 0, faults = 0, dead = false,
 	}
@@ -1290,6 +1364,16 @@ local function natStop(why)
 	if not N then return end
 	if N.holdSent then
 		N.holdSent, N.active = false, false
+		-- hold_off gives every held command back at the next Add, before its stamp: the builds enter this world early. Each gets
+		-- its replay mark first (the commands queue in this order), or the simulation half would ship it a second time.
+		for _, h in pairs(N.heldByKey) do
+			if not (h.released or h.done or h.cancelled) then
+				h.released, h.early = os.clock(), true
+				pcall(toSim, "replay", {})
+				pcall(toSim, "heldgone", { key = h.key })
+				natSay("held " .. h.id .. " (" .. h.key .. ") goes back to the engine before its stamp (" .. tostring(why) .. ")")
+			end
+		end
 		pcall(natSend, "hold_off", {})
 		natTrigger()
 		natSay("mode off (" .. tostring(why) .. "), hold_off written")
@@ -1325,6 +1409,54 @@ local function natOrder(kind, id)
 		natTrigger()
 	end
 	return ok
+end
+
+-- The stamp of a shipped build has come on this game (the simulation half took the snapshot of its entity lists and booked the
+-- ledger, as every other game does): the held command goes back to the engine, which applies it. The replay mark comes first
+-- in the engine's command list, so the build's event finds it and the simulation half does not capture this build as a new one.
+local function natRelease(key)
+	local N = G.nat
+	local h = N and N.heldByKey[key]
+	if not h or h.released or h.done or h.cancelled then return false end
+	h.released = os.clock()
+	pcall(toSim, "replay", {})
+	local ok = natOrder("release", h.id)
+	pcall(toSim, "heldgone", { key = key })
+	natSay(string.format("held %d (%s) released at game time %d (stamp %d); the engine applies it here, the other games replay it at the stamp",
+		h.id, key, engine.gameTime(), h.at or 0))
+	return ok
+end
+
+-- The action was refused at its stamp (the same rule that refuses it on every other game): the held command is destroyed.
+function natHeldRefused(it)
+	local N = G.nat
+	local h = N and N.heldByKey[it.key]
+	if not h or h.released or h.done or h.cancelled then return end
+	h.cancelled = true
+	pcall(toSim, "heldgone", { key = it.key })
+	natSay("held " .. h.id .. " (" .. it.key .. ") was refused at its stamp: cancelled")
+	natOrder("cancel", h.id)
+end
+
+-- A game that is paused at the stamp applies the action itself (guiApplyNow): the held command is released and `finish` (the
+-- ledger and the keys of what the build made) runs when the module reports that the engine applied it.
+function natPauseRelease(it, finish)
+	local N = G.nat
+	local h = N and N.heldByKey[it.key]
+	if not h or h.done then
+		finish({}, true, {})   -- the command went back to the engine earlier: the build is in this world already
+		return
+	end
+	if h.cancelled then
+		finish({}, false, {})
+		return
+	end
+	h.finish = finish
+	if h.released then return end   -- released already (hold_off): finish when the engine reports it
+	if not natRelease(it.key) then
+		h.finish = nil
+		error("the release of held " .. h.id .. " could not be written")
+	end
 end
 
 local function natSessionOn(N, now)
@@ -1374,11 +1506,16 @@ local function natDecideUnsafe(h, cap)
 	if not okS then return release("the action cannot be sent (" .. tostring(errS) .. ")") end
 	G.seq = seq
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq) }
-	local okC = natOrder("cancel", id)
-	N.shipped[id] = true
-	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), %s",
-		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now,
-		okC and "cancel written" or "CANCEL NOT WRITTEN (the build may be applied twice here)"))
+	-- The command stays HELD until the stamp (nobody's world runs ahead of the others). It is not cancelled: a cancelled command
+	-- never gives the tool its "applied" callback and the tool stays dead (real run 2026-10-11). At the stamp this game's
+	-- simulation half does everything the other games do except sending (simApplyAction, it.heldId) and this half then releases
+	-- the held command (natRelease); every OTHER game replays the build at the stamp.
+	it.heldId = id
+	local rec = { id = id, key = it.key, at = at, t = os.clock() }
+	N.heldByKey[it.key], N.byId[id] = rec, rec
+	pcall(toSim, "heldout", { key = it.key })
+	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp",
+		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now))
 	route(it)
 end
 
@@ -1489,6 +1626,8 @@ local function natEvent(N, rec, p, history)
 		for _, h in ipairs(hooks) do
 			if h == "command_list_add" then N.hookOk = true end
 		end
+		-- a (new) module link: whatever it held is gone
+		for _, h in pairs(N.heldByKey) do h.done = true end
 		-- a (new) module link: the handshake starts again
 		N.holdSent, N.active, N.pongAt, N.pingsTried, N.gaveUp, N.retryAt, N.retries = false, false, nil, 0, false, nil, 0
 		if N.hookOk then
@@ -1532,12 +1671,27 @@ local function natEvent(N, rec, p, history)
 					break
 				end
 			end
-			if N.shipped[id] then
-				N.shipped[id] = nil
-				if kind == "released" then
-					natSay("held " .. id .. " was released by the module (" .. tostring(p.reason) .. ") after its build was shipped: the build may exist twice on this game")
+			local rec = N.byId[id]
+			if rec and not rec.done then
+				rec.done = true
+				if kind == "dropped" then
+					natSay("held " .. id .. " destroyed by the module (" .. tostring(p.reason) .. ")")
+				elseif not rec.released then
+					-- given back by the module itself (silence, age, hold_off, the control file gone) before this game asked: the build
+					-- enters this world before its stamp. The mark keeps the simulation half from shipping it again.
+					-- no replay mark here: the build was applied before this line was read, so its event is already past; the entry the
+					-- simulation half keeps for it ("heldout") is what stops the capture. It is dropped by the next build event.
+					rec.released, rec.early = os.clock(), true
+					natSay("held " .. id .. " (" .. rec.key .. ") was released by the module (" .. tostring(p.reason) .. ") before its stamp: the build is in this world early and is not shipped twice")
 				end
 			end
+		end
+	elseif kind == "applied" then
+		local id = tonumber(p.id)
+		local rec = id and N.byId[id]
+		if rec then
+			natSay(string.format("held %d (%s) applied by the engine (accepted %s) at game time %d, stamp %d", id, rec.key, tostring(p.ok), engine.gameTime(), rec.at or 0))
+			if rec.finish then N.finishes[#N.finishes + 1] = { rec = rec, ok = p.ok ~= false, frame = G.frames + 2 } end
 		end
 	elseif kind == "error" then
 		natSay("native module error [" .. tostring(p.where) .. "]: " .. tostring(p.detail))
@@ -1630,6 +1784,36 @@ local function natTick()
 	while N.parked[1] and now - N.parked[1].t >= NAT_GRACE and G.frames - N.parked[1].frame >= 3 do
 		N.owed[#N.owed + 1] = now
 		natDecide(table.remove(N.parked, 1), nil)
+	end
+	-- a game paused at the stamp finishes its bookkeeping a couple of frames after the engine applied the build (the entities show a
+	-- moment later), or gives up after 4 s
+	if #N.finishes > 0 then
+		local keep = {}
+		for _, f in ipairs(N.finishes) do
+			if G.frames >= f.frame then
+				local fin = f.rec.finish
+				f.rec.finish = nil
+				if fin then
+					local okF, errF = pcall(fin, {}, f.ok, {})
+					if not okF then natFault("finishing " .. f.rec.key, errF) end
+				end
+			else
+				keep[#keep + 1] = f
+			end
+		end
+		N.finishes = keep
+	end
+	for key, h in pairs(N.heldByKey) do
+		if h.finish and h.released and now - h.released > 4 then
+			local fin = h.finish
+			h.finish = nil
+			natSay("held " .. h.id .. " (" .. key .. "): the engine did not report the build within 4 s")
+			pcall(fin, {}, false, {})
+		end
+		if now - h.t > 120 then
+			N.heldByKey[key] = nil
+			N.byId[h.id] = nil
+		end
 	end
 	for id, a in pairs(N.awaiting) do
 		if now - a.t > 0.6 * (a.tries + 1) then
@@ -1891,11 +2075,14 @@ local function collectFromSim(state)
 		if not G.resultsSeen[r.key] then
 			G.resultsSeen[r.key] = true
 			deliverResult(r.key, r.data, r.success, r.entities or {})
+			-- strict mode: the simulation half reached the stamp of a build whose own copy this game's native module holds
+			if r.release and r.of and G.nat then pcall(natRelease, r.of) end
 		end
 	end
 	for _, r in ipairs(st.refused or {}) do
 		if not G.refusedSent[r.key] then
 			G.refusedSent[r.key] = true
+			if G.nat then pcall(natHeldRefused, { key = r.key }) end
 			send("action_refused", { seq = r.seq, from = r.from, detail = r.detail })
 			deliverResult(r.key, nil, false, {})
 		end
