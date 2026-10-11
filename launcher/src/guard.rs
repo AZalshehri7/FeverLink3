@@ -1,10 +1,10 @@
 //! Thread roots that survive a panic, when the build unwinds.
 //!
-//! The release profile builds with `panic = "abort"` (the native DLL grows by about 280 KB when it unwinds, see
-//! `docs/SECURITY.md`), and then a panic anywhere in the game process ends the game after the panic hook has
-//! written the message to the log. Every thread root that matters (the controller, the session threads) still
-//! runs its work through [`guarded`], so that switching the profile to `unwind` is the only change needed to turn
-//! such a panic into a log line and a stopped session. Tests always unwind, which is how this is tested.
+//! The release profile builds with `panic = "unwind"` (it has to: the game's C++ exceptions pass through the native
+//! hooks, see `docs/NATIVE_LINK.md` section 10), so a panic on a thread root that matters (the controller, the session
+//! threads), which all run their work through [`guarded`], becomes a log line and a stopped session instead of the end
+//! of the game. Under `abort` this would do nothing and the panic hook's message would be all that is left. Tests
+//! always unwind, which is how this is tested.
 
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};

@@ -122,10 +122,15 @@ unsafe extern "system-unwind" fn town_seed_hook(
     let forced = (forced & FORCE_FLAG != 0).then_some(forced as u32);
     let log = TOWN_SEED_LOG.load(Ordering::Acquire);
     if log != 0 {
-        // SAFETY: stored by `arm_town_seed` from a `fn(&str)`.
-        let log: fn(&str) = unsafe { core::mem::transmute(log) };
-        let caller = townseed::caller_field(caller, TOWN_SEED_BASE.load(Ordering::Acquire), TOWN_SEED_IMAGE_BOUND);
-        log(&townseed::line(TOWN_SEED_COUNTER.next(), seed as u32, forced, &caller, a3 as u32, a4 as u32));
+        // The log line is our own bookkeeping, on the game's thread: a failure in it (a panic, under `unwind`) is
+        // contained and the original is called all the same. The call below is not inside the guard, so a C++
+        // exception of the game passes through it.
+        crate::log::guarded("town_seed hook", || {
+            // SAFETY: stored by `arm_town_seed` from a `fn(&str)`.
+            let log: fn(&str) = unsafe { core::mem::transmute(log) };
+            let caller = townseed::caller_field(caller, TOWN_SEED_BASE.load(Ordering::Acquire), TOWN_SEED_IMAGE_BOUND);
+            log(&townseed::line(TOWN_SEED_COUNTER.next(), seed as u32, forced, &caller, a3 as u32, a4 as u32));
+        });
     }
     // The ninth slot is an ordinary parameter of this function: the call below writes the outgoing copy of it to the
     // original's `[rsp+0x48]`, so replacing the value here is what the original reads. The other slots pass as given.
@@ -521,7 +526,8 @@ fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&s
             return;
         }
         loop {
-            rt.pump();
+            // a failure in one round (a panic, under `unwind`) costs that round, not the link
+            crate::log::guarded("service thread", || rt.pump());
             std::thread::park_timeout(Duration::from_millis(20));
         }
     });

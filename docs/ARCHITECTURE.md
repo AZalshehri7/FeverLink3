@@ -168,8 +168,8 @@ in-game window.
 - Verified in game build 40420 on 2026-10-09: the button and window appear, "Host a game" opens the listener inside
   the game process and the window shows the join code. Joining from a second game, saves and the native hooks are not
   yet verified.
-- Panics: the workspace builds with `panic = "abort"`, so a panic in the controller or a session thread ends the game
-  (after writing its message to `native.log`). Measured, `panic = "unwind"` makes the DLL 480 KB (45 %) bigger, more
-  than the 150 KB allowed, so the profile stays and the panics that input can reach were removed instead; the thread
-  roots already run through `launcher::guard::guarded`, which contains a panic the day the profile unwinds. See
-  `docs/SECURITY.md`, section 5, for the table and the audit.
+- Panics: the workspace builds with `panic = "unwind"` (the native hooks must let the game's C++ exceptions through,
+  `docs/NATIVE_LINK.md` section 10), so a panic in the controller or a session thread is contained by
+  `launcher::guard::guarded` (a log line, a stopped session) and one in a hook by `native::log::guarded` (the game's
+  call goes on). The panic hook writes message, place and a backtrace to `native.log` first. See `docs/SECURITY.md`,
+  section 5, for the audit.

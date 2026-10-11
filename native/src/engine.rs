@@ -233,10 +233,13 @@ pub unsafe fn capture(fns: &EngineFns, args: &AddArgs) -> Option<Box<Held>> {
 /// Hands a held command to the engine: `Add` with the held arguments, then the destructors of the handle it
 /// returned and of the moved-from command, exactly what a tool does after its own call.
 ///
+/// `system-unwind`: `Add` is a C++ function and can throw. Under `panic = "abort"` a plain Rust function that calls it
+/// ends the process when the exception comes through (`panic in a function that cannot unwind`); this one lets it pass.
+///
 /// # Safety
 /// `add` is the unhooked `CommandList::Add`; the list the command was taken for must still exist.
 #[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be handed back only once
-pub unsafe fn release(fns: &EngineFns, mut held: Box<Held>, add: AddFn) {
+pub unsafe extern "system-unwind" fn release(fns: &EngineFns, mut held: Box<Held>, add: AddFn) {
     let mut out = Room::<HANDLE_SIZE>([0; HANDLE_SIZE]);
     unsafe {
         add(

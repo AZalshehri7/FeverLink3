@@ -10,7 +10,7 @@ Transport Fever 3 imports `WINHTTP.dll`, and Windows looks for it in the game fo
 
 - The pure parts, which are most of the module, are unit-tested on any machine: PE parsing (`pe.rs`), signature scanning (`scan.rs`), detour byte maths (`detour.rs`), the build table (`build_table.rs`), the control-file codec (`link.rs`), the hold/release state machine (`hold.rs`), the counters (`counters.rs`) and the install plan (`plan.rs`).
 - Memory safety where it matters most: the control-file parsing (and, later, the terrain-cell codec) handle data from outside the process. The reader is bounded and never panics.
-- Small output. Release profile: `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`, stripped. A panic inside the game would kill it, so game-side code returns errors.
+- Small output. Release profile: `opt-level = "z"`, fat LTO, one codegen unit, `panic = "unwind"` (required: the game's C++ exceptions pass through the hooks, `docs/NATIVE_LINK.md` section 10), stripped. Game-side code returns errors, and its bookkeeping in the hooks runs inside `log::guarded`.
 - A panic still leaves a trace: `log::install_panic_hook` writes its message, thread and place to `native.log` before the process ends, and `native.log` stops growing at 2 MiB.
 - The unsafe surface is confined to the relays (`proxy.rs`), memory access (`mem.rs`), detours and patches (`detour.rs`, `patch.rs`), the engine objects (`engine.rs`), the hooks and their installation (`hooks.rs`, `runtime.rs`) and the entry point. Each `unsafe` block has a `SAFETY` comment, and everything that touches game code is tested on fake game functions in executable memory.
 
@@ -51,7 +51,7 @@ Each piece is checked against the bytes in memory first, installed all-or-none f
 
 ## Size
 
-The module links Rust's `std` for `Vec`, `String`, threads and file logging, and the launcher crate (for the in-game session controller) with `serde_json`. Measured release build with the MSVC toolchain (the reference figure, printed by CI in the job summary): 1 088 512 bytes with `panic = "abort"`. With `panic = "unwind"` the same code is 1 580 032 bytes (+491 520, 45 %), which is why the profile stays on abort; `docs/SECURITY.md` section 5 has the numbers and the audit. The planned optimisation, once the hook set is known, is `#![no_std]` + `alloc` with a `HeapAlloc`-backed allocator and a panic handler that logs and aborts; the session controller's dependencies would have to move out of the DLL first.
+The module links Rust's `std` for `Vec`, `String`, threads and file logging, and the launcher crate (for the in-game session controller) with `serde_json`. Measured release build with the MSVC toolchain (the reference figure, printed by CI in the job summary): 1 662 464 bytes with `panic = "unwind"`, the shipped setting; with `panic = "abort"` the same code is 1 132 544 bytes, but that build cannot let the game's C++ exceptions through the hooks (`docs/NATIVE_LINK.md` section 10; `docs/SECURITY.md` section 5 has the numbers and the audit). The planned optimisation, once the hook set is known, is `#![no_std]` + `alloc` with a `HeapAlloc`-backed allocator and a panic handler that logs and aborts; the session controller's dependencies would have to move out of the DLL first.
 
 ## Status
 

@@ -123,9 +123,11 @@ Rules the code keeps:
 - **Nothing the module does can hang the game.** The hooks never wait for a lock (a busy state means "call the
   original"), never do file I/O on the simulation thread, and the module is pinned in memory so a hook never points
   into an unloaded DLL. Held commands cannot be held forever (section 4).
-- **Panics.** The workspace builds with `panic = "abort"`, so a panic inside the game would kill it. The game-side
-  code returns errors; it indexes only fixed arrays by bounded values and reads foreign memory only after asking the
-  OS whether it is readable.
+- **Panics and the game's exceptions.** The workspace builds with `panic = "unwind"` (section 10: with `abort` a C++
+  exception of the game passing through a hook ends the process). The hooks' own bookkeeping runs inside
+  `log::guarded`, which turns a panic in it into a log line and a call of the original; the calls into the game are
+  never inside it. The game-side code returns errors; it indexes only fixed arrays by bounded values and reads foreign
+  memory only after asking the OS whether it is readable.
 - **Unknown kinds are never held.** A command is held only if its kind is in the set the mod named, the build table
   knows the kind, *and* it was added from one of the construction tools' call sites (section 4).
 - **Solo play is stock behaviour.** With holding off, the hooks count and call the original.
@@ -598,3 +600,46 @@ Needs the mod's strict mode (section 7) and a host and a player in one session, 
    and a `holding` event. A hold that depends on a mod that has stopped talking is the one way this module could
    freeze a player's tools, so silence switches it off, and the 30 s age limit and the vanished-file rule back that
    up.
+
+## 10. The crash of 2026-10-11: a game exception through a hook, and why the build unwinds
+
+**What happened.** In a real two-game test the host process died right after it replayed the guest's second depot
+build (`makeWorldBuildProposalCmd` applied, `event apply_command/onPreBuildProposal`, a `withStreet` build of 1 + 0
+constructions, 2 + 1 nodes, 3 + 2 segments). `native.log` ended with `PANIC in thread 'unnamed' at
+library\core\src\panicking.rs:225: panic in a function that cannot unwind`, the Application log with module
+`WINHTTP.dll` (our DLL), exception `0xc0000409`, fault offset `0xb7bf5`.
+
+**Where.** The saved crashing DLL and PDB (built from `fc78393`) put offset `0xb7bf5` in `std::panicking::panic_with_hook`
+at its final `int 0x29` (fast fail), which is what every panic ends in under `panic = "abort"` after the panic hook
+has run. So `0xb7bf5` is the abort, not the cause. The message is the cause: `core::panicking::panic_cannot_unwind` has
+no caller in a `panic = "abort"` DLL except the terminate pads that rustc puts around calls into other languages.
+There were exactly two in our code, in the hook path: the closure `pass`/`call` that called the original `Add` and the
+original apply in `Runtime::on_add` / `on_apply`, and `engine::release` (which calls the original `Add` to hand back a
+held command). There was no earlier panic: the panic hook ran once, for the terminate. (The log is shared by two games,
+but a single `PANIC` line followed by nothing is the whole story of that process.)
+
+**Why.** The game's `Add` and apply functions are C++ and can throw (a Lua error in a command handler, for one; the
+last event was the Lua `onPreBuildProposal` hook of the replayed build). A C++ exception unwinding through Rust frames
+compiled with `panic = "abort"` is not allowed to pass: such a frame has a terminate pad for it. This holds for
+`extern "system-unwind"` functions too, which the hooks already were (the earlier comment "declared as one that may
+unwind" was true of the ABI but not of the build). Earlier runs did not crash only because the game did not throw
+there.
+
+**The fix.**
+- `[profile.release] panic = "unwind"` (root `Cargo.toml`). The DLL grows from 1 132 544 to 1 662 464 bytes (+530 kB,
+  47 %). `python tools/dll_unwind_check.py DLL PDB` lists the terminate pads of a build: with unwinding none is left in
+  `on_add`, `on_apply`, `release` or the hooks (only in `DllMain` and the WinHTTP relays, where no exception can come).
+- The hook bodies call the originals directly from `system-unwind` functions (`Runtime::on_add`, `on_apply`,
+  `engine::release`, no closures), so the exception passes through.
+- The bookkeeping in the hooks (counting, the hold machine, the watch, the town-seed log, the service thread's pump)
+  runs inside `log::guarded`: a panic there becomes one log line and the original is called, so our code can no longer
+  end the game. The calls into the game are never inside `guarded`, because `catch_unwind` aborts on a foreign exception.
+  A command already taken out of the engine's hands when the bookkeeping fails is given back to the engine.
+- The panic hook (`log::install_panic_hook`) no longer takes the log's lock (it reads the path from an atomic), is safe
+  against re-entry, numbers the panics (`PANIC #1` is the original cause) and writes a backtrace as `dll+0xRVA`
+  addresses of the DLL, resolvable with `tools/dll_unwind_check.py DLL PDB --rva 0x...`.
+
+**What to check in the next real run.** `native.log` has `PANIC #n` lines only if something is wrong; a line
+`<site>: a panic was contained` means a bug in our bookkeeping that the game survived (report the line above it). A
+game exception through a hook now shows up as nothing at all from us. If the process still dies with
+`0xc0000409`, map the offset with the tool first.
