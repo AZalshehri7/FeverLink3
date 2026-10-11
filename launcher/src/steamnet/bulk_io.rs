@@ -308,7 +308,7 @@ pub struct RecvReport {
     pub acks_sent: u64,
 }
 
-fn recv_report(r: &Receiver) -> RecvReport {
+pub fn recv_report(r: &Receiver) -> RecvReport {
     RecvReport {
         xfer: r.xfer(),
         ctx: r.ctx(),

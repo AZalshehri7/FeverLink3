@@ -53,7 +53,13 @@ pub const MAX_CONNS: u32 = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
     Up { id: u64, total: u64, chunk: u64, conns: u32 },
-    Down { id: u64, total: u64, chunk: u64, conns: u32 },
+    /// `rate` (bytes per second, 0 for none): the Steam send rate the responder sets on its own connections before it
+    /// streams. Old programs ignore the extra fields.
+    Down { id: u64, total: u64, chunk: u64, conns: u32, rate: u32 },
+    /// Stop sending test `id` (the tester gave up on it).
+    Stop { id: u64 },
+    /// The responder's answer to a `rate` request: what was asked and the rate Steam then reports (0: not readable).
+    RateAck { id: u64, asked: u32, got: u32 },
     /// Send me `total` bytes as bulk datagrams.
     DgDown { id: u64, total: u64 },
     /// The datagram transfer `id` arrived (or failed): the receiver's numbers.
@@ -82,9 +88,12 @@ pub fn parse(data: &[u8]) -> Option<Msg> {
             if kind == "up" {
                 Msg::Up { id, total, chunk, conns }
             } else {
-                Msg::Down { id, total, chunk, conns }
+                let rate = u32::try_from(num().unwrap_or(0)).ok()?;
+                Msg::Down { id, total, chunk, conns, rate }
             }
         }
+        "stop" => Msg::Stop { id: num()? },
+        "rate" => Msg::RateAck { id: num()?, asked: u32::try_from(num()?).ok()?, got: u32::try_from(num()?).ok()? },
         "dgdown" => Msg::DgDown { id: num()?, total: num()? },
         "dres" | "dsend" => {
             let id = num()?;
@@ -113,8 +122,11 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
     let text = match msg {
         Msg::Up { id, total, chunk, conns: 1 } => format!("tput up {id} {total} {chunk}\n"),
         Msg::Up { id, total, chunk, conns } => format!("tput up {id} {total} {chunk} {conns}\n"),
-        Msg::Down { id, total, chunk, conns: 1 } => format!("tput down {id} {total} {chunk}\n"),
-        Msg::Down { id, total, chunk, conns } => format!("tput down {id} {total} {chunk} {conns}\n"),
+        Msg::Down { id, total, chunk, conns: 1, rate: 0 } => format!("tput down {id} {total} {chunk}\n"),
+        Msg::Down { id, total, chunk, conns, rate: 0 } => format!("tput down {id} {total} {chunk} {conns}\n"),
+        Msg::Down { id, total, chunk, conns, rate } => format!("tput down {id} {total} {chunk} {conns} {rate}\n"),
+        Msg::Stop { id } => format!("tput stop {id}\n"),
+        Msg::RateAck { id, asked, got } => format!("tput rate {id} {asked} {got}\n"),
         Msg::DgDown { id, total } => format!("tput dgdown {id} {total}\n"),
         Msg::Dres { id, kv } => format!("tput dres {id}{}\n", kv_text(kv)),
         Msg::Dsend { id, kv } => format!("tput dsend {id}{}\n", kv_text(kv)),
@@ -373,6 +385,10 @@ pub struct Direction {
     pub peak_pending: u32,
     /// The longest time no data moved: the receiver's longest gap or the sender's longest wait.
     pub longest_pause_ms: u64,
+    /// The highest round trip Steam reported while this direction ran, ms (`None`: no sample).
+    pub ping_peak_ms: Option<u32>,
+    /// The direction was stopped after the time limit; `bytes` and `rate` are what had moved by then.
+    pub capped: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -391,6 +407,10 @@ pub struct SpeedResult {
     pub rate_effective: Option<u32>,
     /// Connections the data went over (1 for the plain test).
     pub conns: u32,
+    /// Changes of the route during the run ("direct -> through a Steam relay at 12 s").
+    pub route_notes: Vec<String>,
+    /// What the run did to the Steam send rate: asked, applied here, the responder's answer (empty: left alone).
+    pub rate_note: String,
     /// One line about what Steam itself reported during the run (empty when there were no samples).
     pub steam_line: String,
 }
@@ -711,6 +731,9 @@ pub struct DgramSide {
     pub pause_ms: u64,
     /// The sending side's numbers, when they arrived.
     pub sender: Option<SenderSummary>,
+    pub ping_peak_ms: Option<u32>,
+    /// Stopped after the time limit: the numbers are those of the part that moved.
+    pub capped: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -828,7 +851,10 @@ mod tests {
             Msg::DgDown { id: 9, total: 80_000_000 },
             Msg::Dres { id: 9, kv: vec![("bytes".into(), 80_000_000), ("ms".into(), 17_000), ("ok".into(), 1)] },
             Msg::Dsend { id: 9, kv: vec![] },
-            Msg::Down { id: 7, total: 32_000_000, chunk: 349_525, conns: 2 },
+            Msg::Down { id: 7, total: 32_000_000, chunk: 349_525, conns: 2, rate: 0 },
+            Msg::Down { id: 7, total: 32_000_000, chunk: 349_525, conns: 1, rate: 4_194_304 },
+            Msg::Stop { id: 7 },
+            Msg::RateAck { id: 7, asked: 4_194_304, got: 4_194_304 },
             Msg::End { id: 7, sent: 32_000_000, peak_pending: 524_288, max_block_ms: 812 },
             Msg::Prog { id: 7, bytes: 1_048_576 },
             Msg::UpRes { id: 7, bytes: 32_000_000, ms: 17_500, gap_ms: 900, steady: 31_650_475 },
@@ -946,6 +972,7 @@ mod tests {
                 secs: 17.8,
                 peak_pending: 524_288,
                 longest_pause_ms: 400,
+                ..Direction::default()
             },
             down: Direction {
                 bytes: 32 * MB,
@@ -953,6 +980,7 @@ mod tests {
                 secs: 15.2,
                 peak_pending: 400_000,
                 longest_pause_ms: 900,
+                ..Direction::default()
             },
             total_secs: 34.2,
             ping_ms: Some(199),
@@ -960,6 +988,8 @@ mod tests {
             rate_set: 1_048_576,
             rate_effective: Some(1_048_576),
             conns: 1,
+            route_notes: Vec::new(),
+            rate_note: String::new(),
             steam_line: String::new(),
         }
     }

@@ -223,8 +223,6 @@ pub struct Controller {
     persona_last: Instant,
     steam_note: Option<String>,
     steam_loop: Arc<Mutex<LoopCheck>>,
-    /// The speed test whose summary line already went to `session.log`.
-    speed_logged: u64,
     /// Puts text on the clipboard (the window's "Copy code"); the tests replace it.
     clipboard: Box<dyn Fn(&str) -> bool + Send>,
     result: Option<CommandResult>,
@@ -298,7 +296,6 @@ impl Controller {
             persona_last: Instant::now(),
             steam_note: None,
             steam_loop: Arc::default(),
-            speed_logged: 0,
             clipboard: Box::new(clipboard::set_text),
             result: None,
             log_cursor: 0,
@@ -370,18 +367,19 @@ impl Controller {
         self.publish();
     }
 
-    /// Writes the summary line of a finished (or failed) Steam speed test to `session.log`, once per test.
+    /// Writes what the Steam speed test logged (the summary line of a finished or failed run, Steam's samples and status
+    /// dumps) to `session.log`.
     fn log_speed_test(&mut self) {
-        let Some(speed) = self.steam.as_ref().and_then(|p| p.report().speed) else { return };
-        let Some(line) = speed.log.filter(|_| speed.id != self.speed_logged) else { return };
-        self.speed_logged = speed.id;
+        let Some(lines) = self.steam.as_ref().map(|p| p.take_log()).filter(|l| !l.is_empty()) else { return };
         let path = self.dir.join(SESSION_LOG_FILE);
         if fs::metadata(&path).map(|m| m.len() > SESSION_LOG_MAX).unwrap_or(false) {
             let _ = fs::remove_file(&path);
         }
         use std::io::Write;
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{line}");
+            for line in lines {
+                let _ = writeln!(f, "{line}");
+            }
         }
     }
 
