@@ -139,12 +139,20 @@ local function setup(react, builtin)
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
 		local showTest = react.useState(false)
-		react.onStepTimer(function()
-			if Hook then Hook.devPoll() end
-			local a = poll()
-			local b = pollCtl()
-			if a or b then tick:set(tick:old() + 1) end
-		end, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
+		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
+		-- paused (a guest's window must notice the host ending the session then too).
+		if not U.refresh then
+			U.refresh = Hud.newTicker(0.5, os.clock, function()
+				if Hook then Hook.devPoll() end
+				local a = poll()
+				local b = pollCtl()
+				return a or b
+			end)
+		end
+		local refresh = U.refresh
+		local function onRefresh() if refresh() then tick:set(tick:old() + 1) end end
+		react.onStepTimer(onRefresh, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
+		if react.onStep then react.onStep(onRefresh) end
 		local ctl = U.ctl
 		local rows = {}
 		local function add(node) rows[#rows + 1] = node end

@@ -173,5 +173,40 @@ class UiHookTest(unittest.TestCase):
         self.assertEqual(1, len(self.records()), "one record, not two")
 
 
+class WindowTickerTest(unittest.TestCase):
+    """The window refresh (Hud.newTicker): two drivers (step timer, per-frame onStep) share one 0.5 s throttle, so the
+    window refreshes while the game is paused and the guest sees the host's end of the session."""
+
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        src = open(os.path.join(CONTENT, "feverlink3_hud.lua"), encoding="utf-8").read()
+        self.lua.execute("local src = ...; Hud = assert(load(src, '=hud', 't'))()", src)
+
+    def test_frame_driver_alone_refreshes_at_the_interval_and_reports_the_ended_state(self):
+        r = self.lua.execute(r"""
+            local now, state, seen = 0, "joined", {}
+            local t = Hud.newTicker(0.5, function() return now end, function() seen[#seen + 1] = state; return state end)
+            local out = {}
+            out[#out + 1] = tostring(t())            -- first frame: runs
+            now = 0.1; state = "failed"
+            out[#out + 1] = tostring(t())            -- too soon: skipped
+            now = 0.6
+            out[#out + 1] = tostring(t())            -- due: sees the ended state
+            now = 0.7
+            out[#out + 1] = tostring(t())            -- throttled again
+            return table.concat(out, ",") .. "|" .. #seen
+        """)
+        self.assertEqual("joined,nil,failed,nil|2", r)
+
+    def test_a_clock_that_goes_back_does_not_stall_the_ticker(self):
+        r = self.lua.execute(r"""
+            local now, n = 100, 0
+            local t = Hud.newTicker(0.5, function() return now end, function() n = n + 1; return true end)
+            t(); now = 1; t()
+            return n
+        """)
+        self.assertEqual(2, r)
+
+
 if __name__ == "__main__":
     unittest.main()
