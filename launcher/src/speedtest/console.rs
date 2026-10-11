@@ -101,6 +101,11 @@ pub fn main_entry() -> i32 {
         println_out(USAGE);
         return 0;
     }
+    if let Some(rate) = cli.rate {
+        // read once by the Steam core when it starts (FEVERLINK3_STEAM_SENDRATE), so it is set before Steam is started
+        std::env::set_var("FEVERLINK3_STEAM_SENDRATE", rate.to_string());
+        println_out(&format!("Steam send rate for this run: {rate} bytes per second (--rate)."));
+    }
     let dir = match exe_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -136,7 +141,7 @@ pub fn main_entry() -> i32 {
     let mut pump = pump;
     let mut env = Env { say: &mut say, pump: &mut pump, cancelled: &cancelled, timing: Timing::real() };
     let code = match role {
-        Role::Tester(peer) => tester(&mut env, &core, peer, &dir, app_id),
+        Role::Tester(peer) => tester(&mut env, &core, peer, &dir, app_id, cli.quick),
         Role::Responder => responder(&mut env, &core, &dir),
     };
     finish(code)
@@ -157,7 +162,7 @@ fn start_steam(_dir: &Path) -> Result<(crate::steamnet::CoreRef, u32, Pump), Ini
     Err(InitError::Failed { code: 1, message: "this program runs on Windows only".into() })
 }
 
-fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &Path, app_id: u32) -> i32 {
+fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &Path, app_id: u32, quick: bool) -> i32 {
     let path = dir.join(RESULTS_FILE);
     let mut write_failed = false;
     let mut save = |report: &super::suite::TesterReport| {
@@ -170,7 +175,8 @@ fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &P
             ));
         }
     };
-    let report = run_tester(env, core, peer, MODES, &mut save);
+    let modes = if quick { &MODES[..1] } else { MODES };
+    let report = run_tester(env, core, peer, modes, &mut save);
     println_out("");
     if report.aborted {
         println_out(&format!("Stopped. What was measured so far is in {}", path.display()));

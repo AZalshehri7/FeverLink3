@@ -11,6 +11,10 @@ pub struct Cli {
     pub peer: Option<u64>,
     pub listen: bool,
     pub help: bool,
+    /// `--rate`: the Steam send rate in bytes per second for this run (sets FEVERLINK3_STEAM_SENDRATE).
+    pub rate: Option<u32>,
+    /// `--quick`: only the first (8 MB) run, to try several send rates one after another.
+    pub quick: bool,
 }
 
 /// What this run does.
@@ -48,6 +52,11 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
         match name {
             "--help" | "-h" | "/?" => cli.help = true,
             "--listen" => cli.listen = true,
+            "--quick" => cli.quick = true,
+            "--rate" => {
+                let value = inline.or_else(|| it.next().cloned()).ok_or("--rate needs a speed after it, like 4m")?;
+                cli.rate = Some(parse_rate(&value)?);
+            }
             "--peer" => {
                 let value = inline.or_else(|| it.next().cloned()).ok_or("--peer needs a Steam ID after it")?;
                 let id = parse_steam_id(&value).ok_or_else(|| {
@@ -64,6 +73,24 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
         return Err("--peer and --listen cannot be used together".into());
     }
     Ok(cli)
+}
+
+/// A send rate: bytes per second, or a number with `k` (KiB) or `m` (MiB) after it. 32 KiB to 64 MiB, as the Steam core accepts.
+pub fn parse_rate(text: &str) -> Result<u32, String> {
+    let t = text.trim().to_ascii_lowercase();
+    let (digits, unit) = match t.strip_suffix('m') {
+        Some(d) => (d, 1u64 << 20),
+        None => match t.strip_suffix('k') {
+            Some(d) => (d, 1u64 << 10),
+            None => (t.as_str(), 1),
+        },
+    };
+    let n: u64 = digits.trim().parse().map_err(|_| format!("\"{text}\" is not a speed: use bytes per second, or a number with k or m, like 4m"))?;
+    let bytes = n.saturating_mul(unit);
+    if !(32 * 1024..=64 << 20).contains(&bytes) {
+        return Err(format!("\"{text}\" is outside 32k to 64m"));
+    }
+    Ok(bytes as u32)
 }
 
 /// The Steam ID in the text of a peer.txt: the first non-empty line (a byte order mark is ignored).
@@ -122,6 +149,12 @@ mod tests {
         assert_eq!(parse_args(&args(&["--peer=76561190000000001"])).unwrap().peer, Some(FAKE));
         assert!(parse_args(&args(&["--listen"])).unwrap().listen);
         assert!(parse_args(&args(&["--help"])).unwrap().help);
+        let c = parse_args(&args(&["--rate", "4m", "--quick"])).unwrap();
+        assert_eq!((c.rate, c.quick), (Some(4 << 20), true));
+        assert_eq!(parse_args(&args(&["--rate=512k"])).unwrap().rate, Some(512 << 10));
+        assert_eq!(parse_rate("2097152").unwrap(), 2 << 20);
+        assert!(parse_rate("fast").is_err() && parse_rate("1k").is_err() && parse_rate("100m").is_err());
+        assert!(parse_args(&args(&["--rate"])).unwrap_err().contains("needs a speed"));
     }
 
     #[test]
