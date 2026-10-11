@@ -49,6 +49,24 @@ impl ChecksumPolicy {
         Self::DRIFT_PARTS.contains(&part) || part.starts_with("script:")
     }
 
+    /// The lanes of one checksum round for a log line: each name, with what happens to it when it is not an ordinary
+    /// part ("stations, vehicles (drift), money (corrected)").
+    pub fn describe_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+        let named: Vec<String> = parts
+            .into_iter()
+            .map(|p| {
+                if p == Self::MONEY_PART {
+                    format!("{p} (corrected)")
+                } else if Self::is_drift_part(p) {
+                    format!("{p} (drift)")
+                } else {
+                    p.to_owned()
+                }
+            })
+            .collect();
+        named.join(", ")
+    }
+
     pub fn in_cooldown(&self, now: f64) -> bool {
         self.last_resync_end.is_some_and(|end| now - end < self.config.cooldown_seconds)
     }

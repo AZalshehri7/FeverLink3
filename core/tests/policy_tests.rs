@@ -164,3 +164,27 @@ fn rounds_sampled_at_different_times_never_request_and_keep_the_streak() {
     assert_eq!(None, p.on_outcome(110.0, &skewed));
     assert!(p.on_outcome(120.0, &outcome(&["roads"])).is_some());
 }
+
+#[test]
+fn the_wider_lanes_are_classified_and_named_in_the_difference_message() {
+    // vehicles and nodeConfigs drift; stations, edges, names and the rest reload after two rounds
+    for part in ["vehicles", "nodeConfigs"] {
+        assert!(ChecksumPolicy::is_drift_part(part), "{part}");
+    }
+    for part in ["stations", "edges", "names"] {
+        assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
+    }
+    assert_eq!(
+        "stations, vehicles (drift), money (corrected), edges",
+        ChecksumPolicy::describe_parts(["stations", "vehicles", "money", "edges"])
+    );
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["vehicles"])));
+    assert_eq!(None, p.on_outcome(240.0, &outcome(&["vehicles"])));
+    let reason = p.on_outcome(300.0, &outcome(&["vehicles"])).expect("drifted five minutes");
+    assert!(reason.contains("vehicles drifted"), "{reason}");
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["stations", "names"])));
+    let reason = p.on_outcome(10.0, &outcome(&["names", "stations"])).expect("two rounds");
+    assert!(reason.starts_with("names, stations differ"), "{reason}");
+}

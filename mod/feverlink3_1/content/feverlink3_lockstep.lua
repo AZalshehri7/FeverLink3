@@ -539,6 +539,86 @@ end
 
 -- ------------------------------------------------------------------ checksums (section 8)
 
+-- Wider lanes (idea and field choices from MPFever (MIT), mpfever_refs.lua contentHash: stations, edges, edgeObjects,
+-- nodeConfigs, vehicleState, names). Each lane is a small function over an optional engine accessor of the same name that
+-- returns plain data; a build or test without the accessor simply has no such part. No entity id enters a hash (ids are
+-- not guaranteed equal between games): positions rounded to 0.1, models and names stand in for ids, lists are sorted.
+local function r1(v) return string.format("%.1f", v or 0) end
+
+local function sortedItems(keys)
+	table.sort(keys)
+	return { n = #keys, items = keys }
+end
+
+-- stations: every station group with its station count, terminal count and the position of each terminal's stop node
+local function stationsLane(engine)
+	local keys = {}
+	for _, g in ipairs(engine.stations()) do
+		local at = {}
+		for _, p in ipairs(g.at or {}) do at[#at + 1] = r1(p.x) .. "," .. r1(p.y) end
+		table.sort(at)
+		keys[#keys + 1] = tostring(g.stations or 0) .. "/" .. tostring(g.terminals or 0) .. "@" .. table.concat(at, ";")
+	end
+	return sortedItems(keys)
+end
+
+-- road and rail edges: endpoints (canonical order), street type, template/style, decorations and the models of the edge
+-- objects (signals, stops, ...) in a canonical order
+local function edgesLane(engine)
+	local keys = {}
+	for _, e in ipairs(engine.edges()) do
+		local a, b = r1(e.x0) .. "," .. r1(e.y0), r1(e.x1) .. "," .. r1(e.y1)
+		if a > b then a, b = b, a end
+		local objs = {}
+		for _, m in ipairs(e.objects or {}) do objs[#objs + 1] = tostring(m) end
+		table.sort(objs)
+		keys[#keys + 1] = a .. "-" .. b .. "/" .. tostring(e.type) .. "/" .. tostring(e.typeIndex) .. "/" .. tostring(e.roadType)
+			.. "/" .. tostring(e.template) .. "/" .. tostring(e.style) .. "/d" .. tostring(e.decorations or 0)
+			.. "/o" .. table.concat(objs, ",")
+	end
+	return sortedItems(keys)
+end
+
+-- lane connections, crosswalks and traffic lights of the nodes (a drift part: see ChecksumPolicy::DRIFT_PARTS)
+local function nodeConfigsLane(engine)
+	local keys = {}
+	for _, n in ipairs(engine.nodeConfigs()) do
+		keys[#keys + 1] = r1(n.x) .. "," .. r1(n.y) .. "/" .. tostring(n.lanes) .. "/" .. tostring(n.crosswalks)
+			.. "/" .. tostring(n.preference) .. "/" .. tostring(n.light) .. "/" .. tostring(n.slip)
+	end
+	return sortedItems(keys)
+end
+
+-- vehicles (a drift part): per line key (name and stop count) the number of vehicles and their sorted coarse states
+-- (state, stopped by the player, to be sold); positions are left out on purpose
+local function vehiclesLane(engine)
+	local byLine = {}
+	for _, v in ipairs(engine.vehicles()) do
+		local k = tostring(v.line or "-")
+		local t = byLine[k] or {}
+		byLine[k] = t
+		t[#t + 1] = tostring(v.state) .. "/" .. tostring(v.stopped) .. "/" .. tostring(v.sell)
+	end
+	local keys = {}
+	for k, t in pairs(byLine) do
+		table.sort(t)
+		keys[#keys + 1] = k .. "=" .. #t .. ":" .. table.concat(t, ",")
+	end
+	return sortedItems(keys)
+end
+
+-- names of station groups, lines, towns and players (engine.names() -> { stations = {...}, lines = {...}, ... })
+local function namesLane(engine)
+	local all, out = engine.names(), {}
+	for _, kind in ipairs({ "stations", "lines", "towns", "players" }) do
+		local list = {}
+		for _, nm in ipairs(all[kind] or {}) do list[#list + 1] = tostring(nm) end
+		table.sort(list)
+		out[kind] = list
+	end
+	return out
+end
+
 -- Parts over an engine accessor:
 --   engine.gameTime()       -> number
 --   engine.account()        -> balance, loan
@@ -573,6 +653,13 @@ function L.checksumParts(engine, hashFn)
 		table.sort(keys)
 		return { n = #list, items = keys }
 	end)
+	-- wider lanes: each is skipped when the engine has no accessor of that name
+	local function lane(name, fn) if engine[name] then part(name, function() return fn(engine) end) end end
+	lane("stations", stationsLane)
+	lane("edges", edgesLane)
+	lane("nodeConfigs", nodeConfigsLane)
+	lane("vehicles", vehiclesLane)
+	lane("names", namesLane)
 	return parts, t
 end
 
