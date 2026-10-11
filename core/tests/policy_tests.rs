@@ -45,7 +45,8 @@ fn drift_parts_are_the_named_ones_and_script_prefixed_ones() {
     for part in ["vehicles", "onboard", "persons", "stocks", "nodeConfigs", "script:trains", "script:"] {
         assert!(ChecksumPolicy::is_drift_part(part), "{part}");
     }
-    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions", "townBuildings", "townBuildings:12"] {
+    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions", "townBuildings", "townBuildings:12"]
+    {
         assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
     }
 }

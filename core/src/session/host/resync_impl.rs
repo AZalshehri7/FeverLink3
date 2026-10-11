@@ -389,7 +389,9 @@ impl HostSession {
         }
         if self.rounds_done % SKEW_LOG_EVERY == 0 {
             let (done, skewed) = (self.rounds_done, self.rounds_skewed);
-            self.log(format!("checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"));
+            self.log(format!(
+                "checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"
+            ));
         }
     }
 
@@ -412,7 +414,8 @@ impl HostSession {
                         self.enter_verifying();
                     } else {
                         self.fail(
-                            "games reported different times while paused, so the checksums cannot be compared".to_owned(),
+                            "games reported different times while paused, so the checksums cannot be compared"
+                                .to_owned(),
                         );
                     }
                 } else {

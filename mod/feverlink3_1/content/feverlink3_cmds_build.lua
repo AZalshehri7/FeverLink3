@@ -381,6 +381,24 @@ function A.nodesNear(p, tol)
 	return list
 end
 
+-- true when a segment of the world passes within `tol` metres of p (its ends are looked up, then the line between its ends)
+function A.edgeNear(p, tol)
+	local list = octree(p, EDGE_REACH, "BASE_EDGE")
+	for _, e in ipairs(list or {}) do
+		local info = A.edgeInfo(e)
+		if info then
+			local ax, ay, bx, by = info.p0.x, info.p0.y, info.p1.x, info.p1.y
+			local dx, dy = bx - ax, by - ay
+			local l2 = dx * dx + dy * dy
+			local t = l2 > 0 and ((p.x - ax) * dx + (p.y - ay) * dy) / l2 or 0
+			t = math.max(0, math.min(1, t))
+			local qx, qy = ax + t * dx, ay + t * dy
+			if sqrt((p.x - qx) ^ 2 + (p.y - qy) ^ 2) <= tol then return true end
+		end
+	end
+	return false
+end
+
 -- the segments attached to a node, streets then tracks (accessors used by the game's own entity windows)
 function A.edgesAt(n)
 	local out, seen = {}, {}
@@ -1348,8 +1366,33 @@ local function streetProposal(rec, R, notes, opts)
 	for _, n in ipairs(rec.nodes) do
 		if not opts.drop or type(n.id) ~= "number" or usedNode[n.id] then nodes[#nodes + 1] = newNodeAndEntity(n, R) end
 	end
+	-- Lenient ends: a segment to add that ends at a node of the world which this game does not have (the shipped result says where
+	-- it must be) gets a new node there instead of refusing the whole build. Only for the ends of segments the record adds, and only
+	-- when no segment of this world passes through the place (that would be a crossing, not a missing node); the record is
+	-- a tool's result (src native), so the position is the originator's real one. Before this, such a build was refused outright.
+	local RS = R
+	if rec.src == "native" and not opts.strict then
+		local lowest = 0
+		for _, x in ipairs(rec.nodes) do if type(x.id) == "number" and x.id < lowest then lowest = x.id end end
+		for _, x in ipairs(rec.segs) do if type(x.id) == "number" and x.id < lowest then lowest = x.id end end
+		local made = {}
+		local function lenient(ref)
+			local okR, e = pcall(R.node, ref)
+			if okR then return e end
+			if not tostring(e):find("^unresolved node") or type(ref) ~= "table" or not ref.p then error(e, 0) end
+			local k = pkey(ref.p)
+			if made[k] then return made[k] end
+			if A.edgeNear and A.edgeNear(ref.p, 0.5) then error(e, 0) end
+			lowest = lowest - 1
+			made[k] = lowest
+			nodes[#nodes + 1] = newNodeAndEntity({ id = lowest, pos = ref.p }, R)
+			log("lenient: no node at " .. k .. " on this game, a new node is made there (the shipped result says it exists)")
+			return lowest
+		end
+		RS = setmetatable({ node = lenient, nodeOr = function(v) if type(v) == "table" then return lenient(v) end return v end }, { __index = R })
+	end
 	for i, s in ipairs(keepSeg) do
-		edges[i] = newSegmentAndEntity(s, R, notes, type(s.id) == "number" and s.id or nil, opts)
+		edges[i] = newSegmentAndEntity(s, RS, notes, type(s.id) == "number" and s.id or nil, opts)
 	end
 	local rmNodes, rmEdges, rmObjs = {}, {}, {}
 	for i, ref in ipairs(rec.rmNodes) do rmNodes[i] = R.node(ref) end

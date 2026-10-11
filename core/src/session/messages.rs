@@ -427,6 +427,20 @@ impl Permissions {
     }
 }
 
+/// "I cannot build this": the veto of a held strict build (`owner`:`seq` names the action). `why` is the first cause the game found
+/// (an unresolved node or segment, a critical error of the engine). `from` and `name` are set by the host on relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildVetoMessage {
+    pub seq: i64,
+    pub owner: u16,
+    pub why: String,
+    #[serde(default)]
+    pub from: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// `from` and `name` are set by the host on relay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

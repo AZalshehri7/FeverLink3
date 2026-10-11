@@ -416,6 +416,7 @@ class Relay:
         self.history = {g.id: [] for g in games}
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
+        self.vetoes = []
         self.started, self.speed, self.pauseAt = False, 0, None
 
     # launcher -> mod
@@ -503,6 +504,13 @@ class Relay:
                     for o in self.games:
                         if o is not g:
                             self.send(o, "chat", 0, out)
+                elif rec.kind == "build_veto":
+                    # the host fills in the sender and relays to everyone but the origin (the payload carries the sender)
+                    self.vetoes.append((g.id, int(p.owner), int(p.seq), str(p.why)))
+                    out = self.ser({"seq": int(p.seq), "owner": int(p.owner), "why": str(p.why), "from": g.id, "name": g.label})
+                    for o in self.games:
+                        if o is not g:
+                            self.send(o, "build_veto", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
                     if g.id == 0 and p.authority is not None:

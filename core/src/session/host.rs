@@ -10,7 +10,7 @@ use super::kind::MessageKind;
 use super::limits::RateLimiter;
 use super::lockstep::{Lockstep, PlayerClock};
 use super::messages::{
-    codec, ActionMessage, AuthorityMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
+    codec, ActionMessage, AuthorityMessage, BuildVetoMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
     ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo,
     PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant,
     SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
@@ -708,6 +708,15 @@ impl HostSession {
                     }
                     self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
                     self.actions_relayed += 1;
+                }
+            }
+
+            MessageKind::BuildVeto => {
+                if let Some(mut m) = codec::try_decode::<BuildVetoMessage>(payload) {
+                    m.from = from;
+                    m.name = Some(self.name(from));
+                    m.why = m.why.chars().take(300).collect();
+                    self.broadcast(MessageKind::BuildVeto, &codec::encode(&m), Some(from));
                 }
             }
 

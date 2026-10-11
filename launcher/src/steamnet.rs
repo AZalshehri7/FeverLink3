@@ -31,8 +31,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use steam_core::{
-    global, send_rate_setting, SEND_RATE_ENV, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, LinkSnapshot, Owner, Route, SendOutcome,
-    SteamCore, MAX_MESSAGE,
+    global, send_rate_setting, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, LinkSnapshot, Owner, Route,
+    SendOutcome, SteamCore, MAX_MESSAGE, SEND_RATE_ENV,
 };
 
 // ---- layouts of the Steam structures (Steamworks SDK, `#pragma pack(8)`); pure, tested
@@ -452,7 +452,9 @@ impl ProbeService {
                 Msg::Up { id, total, chunk } => {
                     if total > 0 && total <= throughput::MAX_TOTAL && chunk > 0 {
                         state.incoming = Some(Incoming { conn, rx: throughput::Receiver::new(id, total, now) });
-                        state.events.push(format!("a friend is testing the speed: {} MB coming", total / throughput::MB));
+                        state
+                            .events
+                            .push(format!("a friend is testing the speed: {} MB coming", total / throughput::MB));
                     }
                 }
                 Msg::Down { id, total, chunk } => {
@@ -496,13 +498,17 @@ impl ProbeService {
                     }
                 }
                 Msg::Prog { id, bytes } => {
-                    if let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload) {
+                    if let Some(run) =
+                        state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload)
+                    {
                         run.up_progress = bytes;
                         run.last_progress = now;
                     }
                 }
                 Msg::UpRes { id, bytes, ms, gap_ms, steady } => {
-                    if let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload) {
+                    if let Some(run) =
+                        state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload)
+                    {
                         run.up_remote = Some((bytes, ms, gap_ms, steady));
                         run.phase = Phase::Download;
                         run.phase_started = now;
@@ -533,7 +539,8 @@ impl ProbeService {
             .as_ref()
             .filter(|t| t.conn == conn)
             .map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
-        let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Download) else {
+        let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Download)
+        else {
             return;
         };
         let (Some(rx), Some(remote)) = (run.down.as_ref(), run.up_remote) else { return };
@@ -571,9 +578,8 @@ impl ProbeService {
     fn spawn_sender(&self, conn: Handle, id: u64, total: u64, chunk: u64, ours: bool) {
         let Some(me) = self.me.upgrade() else { return };
         let spawned = thread::Builder::new().name("feverlink3-steam-speed".into()).spawn(move || {
-            let cancelled = || {
-                ours && !lock(&me.state).speed.as_ref().is_some_and(|r| r.id == id && r.phase == Phase::Upload)
-            };
+            let cancelled =
+                || ours && !lock(&me.state).speed.as_ref().is_some_and(|r| r.id == id && r.phase == Phase::Upload);
             let stats = throughput::stream(&me.core, conn, id, total, chunk, &cancelled);
             let mut state = lock(&me.state);
             if ours {
@@ -948,17 +954,23 @@ fn speed_report(run: &SpeedRun) -> SpeedReport {
     let now = Instant::now();
     let mb = |bytes: u64| bytes as f64 / throughput::MB as f64;
     let total = mb(run.total);
-    let mut report = SpeedReport { id: run.id, running: run.active(), status: String::new(), lines: Vec::new(), log: None };
+    let mut report =
+        SpeedReport { id: run.id, running: run.active(), status: String::new(), lines: Vec::new(), log: None };
     let quiet = now.saturating_duration_since(run.last_progress);
-    let stalled =
-        if run.active() && quiet >= throughput::STALL { format!(" (no data for {} s)", quiet.as_secs()) } else { String::new() };
+    let stalled = if run.active() && quiet >= throughput::STALL {
+        format!(" (no data for {} s)", quiet.as_secs())
+    } else {
+        String::new()
+    };
     match &run.phase {
         Phase::Connecting => report.status = format!("Speed test of {total:.0} MB: connecting...{stalled}"),
         Phase::Upload => {
             let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
             let rate = throughput::rate_text(Some(run.up_progress as f64 / secs));
-            report.status =
-                format!("Speed test, sending to your friend: {:.1} of {total:.0} MB, {rate}{stalled}", mb(run.up_progress));
+            report.status = format!(
+                "Speed test, sending to your friend: {:.1} of {total:.0} MB, {rate}{stalled}",
+                mb(run.up_progress)
+            );
         }
         Phase::Download => {
             let got = run.down.as_ref().map_or(0, |d| d.got);
@@ -997,7 +1009,6 @@ impl Drop for Probe {
 mod tests {
     use super::fake::FakeMachine;
     use super::*;
-
 
     #[test]
     fn identity_has_the_steam_layout() {
@@ -1421,7 +1432,8 @@ mod tests {
 
     // ---- the speed test, between two fake accounts
 
-    fn two_probes() -> (FakeMachine, FakeMachine, super::steam_core::SteamCore, super::steam_core::SteamCore, Probe, Probe) {
+    fn two_probes(
+    ) -> (FakeMachine, FakeMachine, super::steam_core::SteamCore, super::steam_core::SteamCore, Probe, Probe) {
         let (a, b) = (FakeMachine::new(), FakeMachine::new());
         let (core_a, core_b) = (a.core(), b.core());
         let (mut probe_a, mut probe_b) = (Probe::on(core_a.handle()), Probe::on(core_b.handle()));
@@ -1449,7 +1461,10 @@ mod tests {
         let done = probe_a.report().speed.expect("report");
         assert!(done.lines.len() == 4, "{done:?}");
         assert!(done.lines[0].starts_with("Speed test, 3 MB each way: you to friend "), "{done:?}");
-        assert!(done.lines[1].contains("through a Steam relay") && done.lines[1].contains("round trip 120 ms"), "{done:?}");
+        assert!(
+            done.lines[1].contains("through a Steam relay") && done.lines[1].contains("round trip 120 ms"),
+            "{done:?}"
+        );
         assert!(done.lines[1].contains(&format!("send rate {} B/s", Config::default().send_rate)), "{done:?}");
         assert!(done.lines[2].contains("no stall"), "{done:?}");
         assert!(done.lines[3].starts_with("An 80 MB save"), "{done:?}");

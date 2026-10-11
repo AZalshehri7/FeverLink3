@@ -93,7 +93,8 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
 /// A data message of `len` payload bytes: header, then random bytes that no compression can shrink.
 pub fn data_message(id: u64, seq: u64, len: usize) -> Vec<u8> {
     let mut out = encode(&Msg::Data { id, seq, len });
-    let mut x = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seq.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x1234_5678_9ABC_DEF1;
+    let mut x =
+        id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seq.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x1234_5678_9ABC_DEF1;
     out.reserve(len);
     let mut left = len;
     while left > 0 {
@@ -137,7 +138,18 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(id: u64, total: u64, now: Instant) -> Receiver {
-        Receiver { id, total, got: 0, chunks: 0, started: now, first: None, first_len: 0, last: now, max_gap: Duration::ZERO, last_prog: now }
+        Receiver {
+            id,
+            total,
+            got: 0,
+            chunks: 0,
+            started: now,
+            first: None,
+            first_len: 0,
+            last: now,
+            max_gap: Duration::ZERO,
+            last_prog: now,
+        }
     }
 
     pub fn on_chunk(&mut self, now: Instant, len: usize) {
@@ -212,7 +224,14 @@ pub struct SendStats {
 
 /// Sends `total` bytes in chunks of `chunk` bytes, then the end message. Blocks while Steam's buffer is full, which
 /// is how the link's speed paces it. Runs on a thread of its own; `cancelled` is asked before every chunk.
-pub fn stream(core: &CoreRef, conn: Handle, id: u64, total: u64, chunk: u64, cancelled: &dyn Fn() -> bool) -> SendStats {
+pub fn stream(
+    core: &CoreRef,
+    conn: Handle,
+    id: u64,
+    total: u64,
+    chunk: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> SendStats {
     let start = Instant::now();
     let mut stats = SendStats::default();
     let chunk = chunk.clamp(1, CHUNK_PAYLOAD as u64);
@@ -238,7 +257,12 @@ pub fn stream(core: &CoreRef, conn: Handle, id: u64, total: u64, chunk: u64, can
     }
     stats.elapsed_ms = start.elapsed().as_millis() as u64;
     if stats.error.is_none() {
-        let end = encode(&Msg::End { id, sent: stats.sent, peak_pending: stats.peak_pending, max_block_ms: stats.max_block_ms });
+        let end = encode(&Msg::End {
+            id,
+            sent: stats.sent,
+            peak_pending: stats.peak_pending,
+            max_block_ms: stats.max_block_ms,
+        });
         if let Err(e) = core.send_reliable(conn, &end, SEND_TIMEOUT) {
             stats.error = Some(e.to_string());
         }
@@ -403,7 +427,16 @@ mod tests {
 
     #[test]
     fn garbage_and_pings_are_not_speed_messages() {
-        for bad in [&b"ping 123"[..], b"tput", b"tput up 1 2\n", b"tput up x 2 3\n", b"tput nope 1\n", b"tput up 1 2 3", b"", b"\xff\xfe"] {
+        for bad in [
+            &b"ping 123"[..],
+            b"tput",
+            b"tput up 1 2\n",
+            b"tput up x 2 3\n",
+            b"tput nope 1\n",
+            b"tput up 1 2 3",
+            b"",
+            b"\xff\xfe",
+        ] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
         // a header that never ends within the limit
@@ -492,8 +525,20 @@ mod tests {
     fn result() -> SpeedResult {
         SpeedResult {
             total_bytes: 32 * MB,
-            up: Direction { bytes: 32 * MB, rate: Some(1_800_000.0), secs: 17.8, peak_pending: 524_288, longest_pause_ms: 400 },
-            down: Direction { bytes: 32 * MB, rate: Some(2_100_000.0), secs: 15.2, peak_pending: 400_000, longest_pause_ms: 900 },
+            up: Direction {
+                bytes: 32 * MB,
+                rate: Some(1_800_000.0),
+                secs: 17.8,
+                peak_pending: 524_288,
+                longest_pause_ms: 400,
+            },
+            down: Direction {
+                bytes: 32 * MB,
+                rate: Some(2_100_000.0),
+                secs: 15.2,
+                peak_pending: 400_000,
+                longest_pause_ms: 900,
+            },
             total_secs: 34.2,
             ping_ms: Some(199),
             route: "through a Steam relay".into(),
@@ -507,10 +552,16 @@ mod tests {
         let r = result();
         let lines = r.lines();
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[0], "Speed test, 32 MB each way: you to friend 1.80 MB/s, friend to you 2.10 MB/s, 34.2 s in all");
+        assert_eq!(
+            lines[0],
+            "Speed test, 32 MB each way: you to friend 1.80 MB/s, friend to you 2.10 MB/s, 34.2 s in all"
+        );
         assert_eq!(lines[1], "Route: through a Steam relay, round trip 199 ms, send rate 1048576 B/s");
         assert_eq!(lines[2], "Queue peak: 512 KiB sending, 391 KiB receiving; longest pause 0.9 s, no stall");
-        assert_eq!(lines[3], "An 80 MB save (about 107 MB over Steam): about 59 s if you host, 51 s if your friend hosts");
+        assert_eq!(
+            lines[3],
+            "An 80 MB save (about 107 MB over Steam): about 59 s if you host, 51 s if your friend hosts"
+        );
         assert!(!r.stalled());
     }
 
@@ -531,7 +582,18 @@ mod tests {
     fn the_log_line_is_one_line_with_the_numbers() {
         let line = result().log_line();
         assert!(!line.contains('\n'));
-        for part in ["32 MB each way", "up 1.80 MB/s", "down 2.10 MB/s", "total 34.2 s", "through a Steam relay", "ping 199 ms", "send rate 1048576 (asked 1048576)", "queue peak 512/390 KiB", "longest pause 900 ms", "about 59 s hosting / 51 s joining"] {
+        for part in [
+            "32 MB each way",
+            "up 1.80 MB/s",
+            "down 2.10 MB/s",
+            "total 34.2 s",
+            "through a Steam relay",
+            "ping 199 ms",
+            "send rate 1048576 (asked 1048576)",
+            "queue peak 512/390 KiB",
+            "longest pause 900 ms",
+            "about 59 s hosting / 51 s joining",
+        ] {
             assert!(line.contains(part), "{part} missing in {line}");
         }
         let mut r = result();

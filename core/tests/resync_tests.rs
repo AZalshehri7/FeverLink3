@@ -296,8 +296,15 @@ fn a_verification_round_at_different_sim_times_is_asked_again_and_a_later_match_
     h.hello_all(pause_at, 0);
     for round in 0..3 {
         let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
-        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a")]))));
-        h.player_game(ids[0], MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at + 800, parts(&[("roads", "a")]))));
+        h.host_game(
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a")]))),
+        );
+        h.player_game(
+            ids[0],
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at + 800, parts(&[("roads", "a")]))),
+        );
         assert_eq!(ResyncState::Verifying, h.host.resync_state(), "skewed round {round}: asked again, not failed");
     }
     let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
@@ -316,8 +323,15 @@ fn a_verification_that_stays_at_different_sim_times_fails_after_four_skewed_roun
     h.hello_all(pause_at, 0);
     for _ in 0..4 {
         let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
-        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a")]))));
-        h.player_game(ids[0], MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at + 800, parts(&[("roads", "a")]))));
+        h.host_game(
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a")]))),
+        );
+        h.player_game(
+            ids[0],
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at + 800, parts(&[("roads", "a")]))),
+        );
     }
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     assert!(h.failures()[0].contains("different times"));

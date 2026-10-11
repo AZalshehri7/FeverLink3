@@ -538,7 +538,11 @@ fn skewed_rounds_are_counted_and_logged_every_twenty_rounds() {
         let req: ChecksumRequestMessage = h.p(a).last(MessageKind::ChecksumRequest);
         let skew = if i % 4 == 0 { 200 } else { 0 };
         h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, p.clone())));
-        h.player_game(a, MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at + skew, p.clone())));
+        h.player_game(
+            a,
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at + skew, p.clone())),
+        );
     }
     let lines: Vec<&String> = h.host_log.iter().filter(|l| l.contains("skipped as skewed")).collect();
     assert_eq!(1, lines.len(), "{:?}", h.host_log);
