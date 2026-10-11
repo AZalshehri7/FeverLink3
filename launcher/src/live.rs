@@ -1281,8 +1281,9 @@ mod tests {
         let summary: Vec<&str> = log.lines().filter(|l| l.starts_with("steam speed test: ")).collect();
         assert_eq!(summary.len(), 1, "{log}");
         assert!(summary[0].contains("2 MB each way") && summary[0].contains("80 MB save about"), "{log}");
-        // only the tester logs
-        assert!(!friend.dir.join(SESSION_LOG_FILE).exists());
+        // only the tester logs a summary; the responder logs its own side (settings, what it sent, Steam's status)
+        let theirs = fs::read_to_string(friend.dir.join(SESSION_LOG_FILE)).unwrap_or_default();
+        assert!(!theirs.lines().any(|l| l.starts_with("steam speed test: ")), "{theirs}");
     }
 
     #[test]

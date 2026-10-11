@@ -144,6 +144,9 @@ pub(super) struct SpeedRun {
     pub down_requested_at: Option<Instant>,
     pub rate_unanswered_noted: bool,
     pub finalized: bool,
+    /// Several connections: the data waits until the responder has said it is ready for it (the data of the extra
+    /// connections could otherwise reach it before the announcement on the first one).
+    pub sender_pending: bool,
 }
 
 impl SpeedRun {
@@ -248,7 +251,7 @@ impl ProbeService {
             let state = &mut *guard;
             let legacy = self.legacy.load(std::sync::atomic::Ordering::Relaxed);
             match msg {
-                Msg::Up { id, total, chunk, conns: _ } => {
+                Msg::Up { id, total, chunk, conns } => {
                     if total > 0 && total <= throughput::MAX_TOTAL && chunk > 0 {
                         let remote = Self::peer_remote(state, conn);
                         state.incoming =
@@ -256,6 +259,9 @@ impl ProbeService {
                         state
                             .events
                             .push(format!("a friend is testing the speed: {} MB coming", total / throughput::MB));
+                        if conns > 1 {
+                            actions.push(Action::Send(conn, throughput::encode(&Msg::Prog { id, bytes: 0 })));
+                        }
                     }
                 }
                 Msg::Down { id, total, chunk, conns, rate } => {
@@ -350,6 +356,17 @@ impl ProbeService {
                     {
                         run.up_progress = bytes;
                         run.last_progress = now;
+                        if run.sender_pending {
+                            run.sender_pending = false;
+                            actions.push(Action::Sender {
+                                conns: run.conns(),
+                                id,
+                                total: run.spec.total,
+                                chunk: throughput::CHUNK_PAYLOAD as u64,
+                                ours: true,
+                                rate: None,
+                            });
+                        }
                     }
                 }
                 Msg::UpRes { id, bytes, ms, gap_ms, steady } => {
@@ -472,6 +489,14 @@ impl ProbeService {
             .as_ref()
             .map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
         let Some(run) = state.speed.as_mut() else { return };
+        if run.spec.rate.is_some() && run.spec.down && !run.rate_unanswered_noted {
+            // the responder answers a rate request before it streams, so no answer by now means an older program
+            run.rate_unanswered_noted = true;
+            run.rate_notes.push(match run.rate_ack {
+                Some((asked, got)) => format!("peer set its send rate to {asked} B/s (Steam reports {got})"),
+                None => "peer did not change its rate (an older program, or it ignored the request)".to_string(),
+            });
+        }
         let sent = run.up_stats.clone().unwrap_or_default();
         let up = match run.up_remote.filter(|_| run.spec.up) {
             Some((bytes, ms, gap, steady)) => Direction {
@@ -858,10 +883,21 @@ impl ProbeService {
                 },
                 Phase::Upload => {
                     let elapsed = now.saturating_duration_since(run.phase_started);
+                    if run.sender_pending && elapsed > Duration::from_secs(3) {
+                        run.sender_pending = false;
+                        actions.push(Action::Sender {
+                            conns: run.conns(),
+                            id,
+                            total: run.spec.total,
+                            chunk: throughput::CHUNK_PAYLOAD as u64,
+                            ours: true,
+                            rate: None,
+                        });
+                    }
                     if elapsed > run.spec.cap && !run.up_capped {
                         run.up_capped = true;
                         logs.push(format!(
-                            "steam speed test: upload stopped after {} s (the time limit)",
+                            "steam speed test note: upload stopped after {} s (the time limit)",
                             elapsed.as_secs()
                         ));
                         match run.spec.variant {
@@ -892,7 +928,7 @@ impl ProbeService {
                     if elapsed > run.spec.cap && !run.down_capped {
                         run.down_capped = true;
                         logs.push(format!(
-                            "steam speed test: download stopped after {} s (the time limit)",
+                            "steam speed test note: download stopped after {} s (the time limit)",
                             elapsed.as_secs()
                         ));
                         actions.push(Action::Send(run.conn, throughput::encode(&Msg::Stop { id })));
@@ -914,7 +950,7 @@ impl ProbeService {
                             run.rate_unanswered_noted = true;
                             let note = "peer did not change its rate (an older program, or it ignored the request)";
                             run.rate_notes.push(note.into());
-                            logs.push(format!("steam speed test: {note}"));
+                            logs.push(format!("steam speed test note: {note}"));
                         }
                     }
                     if run.spec.variant == Variant::Datagram {
@@ -955,12 +991,12 @@ impl ProbeService {
         if let (Some(rate), Variant::Reliable(_)) = (run.spec.rate, run.spec.variant) {
             let (got, notes) = self.set_rates(&run.conns(), rate);
             let note = format!("own send rate set to {rate} B/s, Steam reports {got} B/s ({notes})");
-            logs.push(format!("steam speed test: {note}"));
+            logs.push(format!("steam speed test note: {note}"));
             run.rate_notes.push(note);
         }
         for h in run.conns() {
             if let Some(report) = self.core.config_report(h) {
-                logs.push(format!("steam speed test: connection {h} settings: {report}"));
+                logs.push(format!("steam speed test note: connection {h} settings: {report}"));
             }
         }
         if let Some(dump) = self.core.detailed_status(run.conn) {
@@ -975,14 +1011,18 @@ impl ProbeService {
                     let chunk = throughput::CHUNK_PAYLOAD as u64;
                     let msg = Msg::Up { id: run.id, total: run.spec.total, chunk, conns: run.spec.conns() };
                     actions.push(Action::Send(run.conn, throughput::encode(&msg)));
-                    actions.push(Action::Sender {
-                        conns: run.conns(),
-                        id: run.id,
-                        total: run.spec.total,
-                        chunk,
-                        ours: true,
-                        rate: None,
-                    });
+                    if run.spec.conns() > 1 {
+                        run.sender_pending = true;
+                    } else {
+                        actions.push(Action::Sender {
+                            conns: run.conns(),
+                            id: run.id,
+                            total: run.spec.total,
+                            chunk,
+                            ours: true,
+                            rate: None,
+                        });
+                    }
                 }
                 Variant::Datagram => {
                     run.dg.up_spawned = true;
@@ -1076,7 +1116,7 @@ impl ProbeService {
         run.finalized = true;
         let mut logs = Vec::new();
         if run.spec.rate.is_some() && matches!(run.spec.variant, Variant::Reliable(_)) {
-            logs.push(format!("steam speed test: rate restored: {}", self.restore_rates(&run.conns())));
+            logs.push(format!("steam speed test note: rate restored: {}", self.restore_rates(&run.conns())));
         }
         for (h, _) in &run.extras {
             self.core.close(*h);
@@ -1129,7 +1169,7 @@ impl ProbeService {
         };
         logs.extend(run.samples.log_lines(&label));
         for n in &run.rate_notes {
-            logs.push(format!("steam speed test: {n}"));
+            logs.push(format!("steam speed test note: {n}"));
         }
         state.outcome = Some(outcome);
         for l in logs {
@@ -1195,6 +1235,7 @@ impl Probe {
             down_requested_at: None,
             rate_unanswered_noted: false,
             finalized: false,
+            sender_pending: false,
         });
     }
 

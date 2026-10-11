@@ -1248,6 +1248,148 @@ mod tests {
         });
     }
 
+    fn finish(probe_a: &mut Probe, probe_b: &mut Probe, what: &str) -> RunOutcome {
+        until(what, || {
+            probe_a.poll();
+            probe_b.poll();
+            !probe_a.run_active()
+        });
+        probe_a.run_outcome().expect("an outcome")
+    }
+
+    #[test]
+    fn a_datagram_run_moves_data_both_ways_through_lost_datagrams() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // every 25th datagram each machine sends is lost on the wire
+        a.lose_every_nth_unreliable(25);
+        b.lose_every_nth_unreliable(25);
+        probe_a.start_run(b.steam_id(), RunSpec::datagrams(4));
+        let outcome = finish(&mut probe_a, &mut probe_b, "the datagram run to finish");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Datagram(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.up.ok && r.down.ok, "{r:?}");
+        assert_eq!((r.up.bytes, r.down.bytes), (4 * throughput::MB, 4 * throughput::MB), "{r:?}");
+        assert!(r.up.rate.is_some_and(|x| x > 0.0) && r.down.rate.is_some_and(|x| x > 0.0), "{r:?}");
+        // the sender's numbers came back for both directions, and the datagrams that were lost were sent again
+        let (up, down) = (r.up.sender.as_ref().expect("up sender"), r.down.sender.as_ref().expect("down sender"));
+        assert!(up.loss_bp > 0 && down.loss_bp > 0, "{r:?}");
+        let lines = outcome.lines;
+        assert!(lines[0].starts_with("Datagram speed test, 4 MB each way: you to friend "), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("You to friend: you sent: lost ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Friend to you: your friend sent: lost ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("An 80 MB save (datagrams")), "{lines:?}");
+        assert!(outcome.log_line.starts_with("steam speed test (datagrams): 4 MB each way"), "{}", outcome.log_line);
+        // the connection's Steam send rate was raised for the transfer and put back after
+        let log = probe_a.take_log().join("\n");
+        assert!(log.contains("steam rate restored"), "{log}");
+        let during = bulk_io::STEAM_RATE_DURING;
+        assert!(a.connection_config().iter().any(|c| c.1 == 10 && c.2 == during), "{:?}", a.connection_config());
+        assert!(a.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == Config::default().send_rate));
+        // a ping still works afterwards
+        until("a pong", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1)
+        });
+    }
+
+    #[test]
+    fn a_datagram_offer_while_the_friend_is_busy_is_refused() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // two uploads at once: the second offer meets a busy receiver and is aborted with a reason, not hung
+        probe_a.start_run(b.steam_id(), RunSpec::datagrams(1));
+        let _ = finish(&mut probe_a, &mut probe_b, "the first run");
+        let _ = a;
+        // a hostile peer sends an offer for a huge transfer: refused as too big
+        let conn = lock(&probe_a.service.state).test.as_ref().map(|t| t.conn).unwrap();
+        let offer = bulk::wire::Offer {
+            xfer: 999,
+            ts: 0,
+            ctx: 0,
+            total: 10_000 * throughput::MB,
+            payload: bulk::PAYLOAD as u16,
+            sha256: [1; 32],
+        };
+        probe_a.service.core.send_datagram(conn, &bulk::wire::encode_offer(&offer));
+        until("the refusal", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_b.take_log().is_empty() && lock(&probe_b.service.state).dg_in.is_none()
+        });
+        assert!(lock(&probe_b.service.state).dg_in.is_none());
+    }
+
+    #[test]
+    fn reliable_runs_over_several_connections_count_every_chunk_once() {
+        for n in [2u32, 4] {
+            let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+            let spec = RunSpec { variant: throughput::Variant::Reliable(n), ..RunSpec::reliable(3) };
+            probe_a.start_run(b.steam_id(), spec);
+            let outcome = finish(&mut probe_a, &mut probe_b, &format!("the parallel run of {n}"));
+            assert_eq!(outcome.failure, None, "{outcome:?}");
+            let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+            assert_eq!((r.up.bytes, r.down.bytes), (3 * throughput::MB, 3 * throughput::MB), "{r:?}");
+            assert_eq!(r.conns, n);
+            assert!(outcome.lines[0].contains(&format!("over {n} connections")), "{:?}", outcome.lines);
+            // the extra connections were closed again
+            until("the extras to close", || {
+                probe_a.poll();
+                probe_b.poll();
+                probe_b.report().peers.len() <= 1
+            });
+        }
+    }
+
+    #[test]
+    fn a_run_at_a_chosen_send_rate_asks_the_peer_to_set_its_own_and_both_restore_it() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        let spec = RunSpec { rate: Some(4 << 20), ..RunSpec::reliable(2) };
+        probe_a.start_run(b.steam_id(), spec);
+        let outcome = finish(&mut probe_a, &mut probe_b, "the run");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.rate_note.contains("own send rate set to 4194304") && r.rate_note.contains("peer set its send rate to 4194304"), "{}", r.rate_note);
+        let default = Config::default().send_rate;
+        for machine in [&a, &b] {
+            let rates: Vec<i32> = machine.connection_config().iter().filter(|c| c.1 == 10).map(|c| c.2).collect();
+            assert!(rates.contains(&(4 << 20)), "{rates:?}");
+        }
+        until("the peer to put its rate back", || {
+            probe_a.poll();
+            probe_b.poll();
+            b.connection_config().iter().filter(|c| c.1 == 10).last().is_some_and(|c| c.2 == default)
+        });
+        assert!(a.connection_config().iter().filter(|c| c.1 == 10).last().is_some_and(|c| c.2 == default));
+    }
+
+    #[test]
+    fn a_peer_that_ignores_the_rate_request_is_reported_as_such() {
+        let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        probe_b.act_like_an_old_program();
+        let spec = RunSpec { rate: Some(2 << 20), ..RunSpec::reliable(1) };
+        probe_a.start_run(b.steam_id(), spec);
+        let outcome = finish(&mut probe_a, &mut probe_b, "the run");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.rate_note.contains("peer did not change its rate"), "{}", r.rate_note);
+        assert_eq!(r.down.bytes, throughput::MB);
+    }
+
+    #[test]
+    fn a_direction_still_running_at_the_time_limit_is_stopped_and_reported_as_it_stands() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // a receiver that stops reading: the sender's buffer fills and nothing moves
+        b.stall_receive(true);
+        let spec = RunSpec { cap: Duration::from_millis(400), ..RunSpec::reliable(64) };
+        probe_a.start_run(b.steam_id(), spec);
+        let _ = a;
+        let outcome = finish(&mut probe_a, &mut probe_b, "the capped run");
+        b.stall_receive(false);
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.up.capped && r.down.capped, "{r:?}");
+    }
+
     #[test]
     fn the_numbers_of_a_finished_speed_test_are_complete() {
         let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
