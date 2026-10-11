@@ -64,6 +64,13 @@ WORLD = {
   [54] = { CONSTRUCTION = { fileName = "depot.con", transf = { [13] = 100, [14] = 200, [15] = 5 } } },
   [55] = { VEHICLE_DEPOT = {} },
   [56] = { CONSTRUCTION = { fileName = "station.con", transf = { [13] = -40.5, [14] = 12, [15] = 0 } } },
+  -- two towns' buildings: each TOWN_BUILDING names its town and its CONSTRUCTION entity
+  [60] = { CONSTRUCTION = { fileName = "house_a.con", transf = { [13] = 10.04, [14] = 20, [15] = 1 } } },
+  [61] = { CONSTRUCTION = { fileName = "house_b.con", transf = { [13] = 30, [14] = 40, [15] = 2 } } },
+  [62] = { CONSTRUCTION = { fileName = "shop.con", transf = { [13] = 500, [14] = 600, [15] = 3 } } },
+  [63] = { TOWN_BUILDING = { town = 90, construction = 60, level = 1, depth = 1, timeBuilt = 100, parcels = { 1 } } },
+  [64] = { TOWN_BUILDING = { town = 90, construction = 61, level = 2, depth = 1, timeBuilt = 200, parcels = { 2, 3 } } },
+  [65] = { TOWN_BUILDING = { town = 91, construction = 62, level = 1, depth = 2, timeBuilt = 300, parcels = { 4 } } },
 }
 ACCOUNT = { balance = 1000000, loan = 250000 }
 JOURNAL = {}
@@ -82,7 +89,7 @@ app = {
   findAllSavegames = function(ns) assert(ns == 1); return SAVES end,
   loadGame = function(id, flag) assert(id.saveGameNamespace == 1 and id.path); LOADED = id.saveGameName; RELOAD_PENDING = true end,
 }
-local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8 }
+local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8, TOWN_BUILDING = 9 }
 local NAMEOF = {}
 for k, v in pairs(CT) do NAMEOF[v] = k end
 
@@ -409,6 +416,7 @@ class Relay:
         self.history = {g.id: [] for g in games}
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
+        self.vetoes = []
         self.started, self.speed, self.pauseAt = False, 0, None
 
     # launcher -> mod
@@ -496,6 +504,13 @@ class Relay:
                     for o in self.games:
                         if o is not g:
                             self.send(o, "chat", 0, out)
+                elif rec.kind == "build_veto":
+                    # the host fills in the sender and relays to everyone but the origin (the payload carries the sender)
+                    self.vetoes.append((g.id, int(p.owner), int(p.seq), str(p.why)))
+                    out = self.ser({"seq": int(p.seq), "owner": int(p.owner), "why": str(p.why), "from": g.id, "name": g.label})
+                    for o in self.games:
+                        if o is not g:
+                            self.send(o, "build_veto", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
                     if g.id == 0 and p.authority is not None:
@@ -649,7 +664,8 @@ class LockstepTest(unittest.TestCase):
         (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
         self.assertEqual(pa, pb, "identical worlds give identical parts")
-        self.assertEqual(set(pa), {"time", "balance", "loan", "constructions", "lines"})
+        self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
+        self.assertTrue(pa["townBuildings"].startswith("3/") and pa["townBuildings:90"].startswith("2/") and pa["townBuildings:91"].startswith("1/"), pa)
         # paused round: the games are stopped, the interface half answers
         self.relay.pauseAt = self.relay.future_stamp()
         self.relay.session()
@@ -666,6 +682,20 @@ class LockstepTest(unittest.TestCase):
         pa, pb = self.relay.reports[3][0][1], self.relay.reports[3][1][1]
         self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance"})
         self.assertEqual(pa["loan"], pb["loan"])
+        # one building of town 91 grown on one game only: the aggregate and that town's part differ, nothing else
+        self.B.L.execute("WORLD[65].TOWN_BUILDING.level = 2")
+        self.relay.checksum_request(4, self.relay.pauseAt, True)
+        self.tick(5)
+        pa, pb = self.relay.reports[4][0][1], self.relay.reports[4][1][1]
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"balance", "townBuildings", "townBuildings:91"})
+        self.assertEqual(pa["townBuildings:90"], pb["townBuildings:90"])
+        # a building in town 90 on one game only: the counts in the part values name the town
+        self.B.L.execute("WORLD[66] = { TOWN_BUILDING = { town = 90, construction = 62, level = 1, depth = 1, timeBuilt = 400, parcels = {} } }")
+        self.relay.checksum_request(5, self.relay.pauseAt, True)
+        self.tick(5)
+        pa, pb = self.relay.reports[5][0][1], self.relay.reports[5][1][1]
+        self.assertTrue(pa["townBuildings:90"].startswith("2/") and pb["townBuildings:90"].startswith("3/"), (pa, pb))
+        self.assertTrue(pa["townBuildings"].startswith("3/") and pb["townBuildings"].startswith("4/"))
 
     def test_truncated_to_game_log_does_not_reapply(self):
         self.start()
@@ -1004,6 +1034,131 @@ class PureTest(unittest.TestCase):
         with self.assertRaises(lupa.LuaError):
             self.C.serialize(self.L.eval("print"))
 
+    WIDE_ENGINE = """(function(v)
+      local e = {
+        gameTime = function() return 5 end,
+        account = function() return 100, 10 end,
+        constructions = function() return {} end,
+        lines = function() return {} end,
+      }
+      if v.stations then e.stations = function() return v.stations end end
+      if v.edges then e.edges = function() return v.edges end end
+      if v.nodeConfigs then e.nodeConfigs = function() return v.nodeConfigs end end
+      if v.vehicles then e.vehicles = function() return v.vehicles end end
+      if v.names then e.names = function() return v.names end end
+      return e
+    end)"""
+
+    def _wide(self, **kw):
+        L = self.L
+        mk = L.eval(self.WIDE_ENGINE)
+        tbl = L.table_from(kw, recursive=True)
+        parts, _t = self.K.checksumParts(mk(tbl), self.C.hashValue)
+        return {k: parts[k] for k in parts}
+
+    def test_wide_lanes_are_absent_without_their_accessor(self):
+        parts = self._wide()
+        for name in ("stations", "edges", "nodeConfigs", "vehicles", "names"):
+            self.assertNotIn(name, parts)
+        self.assertIn("balance", parts)
+
+    def test_stations_lane_ignores_order_and_sees_a_moved_stop(self):
+        a = [{"stations": 1, "terminals": 2, "at": [{"x": 1.04, "y": 2}, {"x": 5, "y": 6}]}, {"stations": 1, "terminals": 1, "at": [{"x": 9, "y": 9}]}]
+        b = [a[1], {"stations": 1, "terminals": 2, "at": [{"x": 5, "y": 6.01}, {"x": 1.0, "y": 2}]}]
+        c = [a[0], {"stations": 1, "terminals": 1, "at": [{"x": 9, "y": 12}]}]
+        pa, pb, pc = (self._wide(stations=x)["stations"] for x in (a, b, c))
+        self.assertEqual(pa, pb)
+        self.assertNotEqual(pa, pc)
+
+    def test_edges_lane_canonical_endpoints_and_edge_objects_count(self):
+        base = {"x0": 0, "y0": 0, "x1": 50, "y1": 0, "type": "NORMAL", "typeIndex": -1, "roadType": "STREET", "template": "t", "style": "s", "decorations": 0, "objects": ["signal.mdl", "stop.mdl"]}
+        flipped = dict(base, x0=50, x1=0, objects=["stop.mdl", "signal.mdl"])
+        fewer = dict(base, objects=["stop.mdl"])
+        other = dict(base, template="u")
+        h = lambda e: self._wide(edges=[e])["edges"]
+        self.assertEqual(h(base), h(flipped))
+        self.assertNotEqual(h(base), h(fewer))
+        self.assertNotEqual(h(base), h(other))
+
+    def test_node_configs_lane_sees_a_traffic_light(self):
+        n = {"x": 1, "y": 2, "lanes": 4, "crosswalks": 1, "preference": "AUTO", "light": 0, "slip": False}
+        h = lambda x: self._wide(nodeConfigs=[x])["nodeConfigs"]
+        self.assertEqual(h(n), h(dict(n)))
+        self.assertNotEqual(h(n), h(dict(n, light=1)))
+
+    def test_vehicles_lane_counts_per_line_and_ignores_order(self):
+        v = lambda line, state="EN_ROUTE", stopped=False: {"line": line, "state": state, "stopped": stopped, "sell": False}
+        a = [v("A#2"), v("A#2", "AT_TERMINAL"), v("B#3")]
+        b = [v("B#3"), v("A#2", "AT_TERMINAL"), v("A#2")]
+        h = lambda x: self._wide(vehicles=x)["vehicles"]
+        self.assertEqual(h(a), h(b))
+        self.assertNotEqual(h(a), h(a[:2]))                       # a vehicle fewer
+        self.assertNotEqual(h(a), h([v("A#2"), v("A#2"), v("B#3", stopped=True)]))
+
+    def test_names_lane_sees_a_renamed_station_and_a_town_but_not_order(self):
+        n = {"stations": ["Alpha", "Beta"], "lines": ["L1"], "towns": ["T1", "T2"], "players": ["P"]}
+        h = lambda x: self._wide(names=x)["names"]
+        self.assertEqual(h(n), h(dict(n, stations=["Beta", "Alpha"])))
+        self.assertNotEqual(h(n), h(dict(n, stations=["Alpha", "Gamma"])))
+        self.assertNotEqual(h(n), h(dict(n, towns=["T1", "T3"])))
+        self.assertNotEqual(h(n), h(dict(n, players=["Q"])))
+
+    def test_a_failing_accessor_yields_an_error_part_not_a_crash(self):
+        L = self.L
+        e = L.eval(self.WIDE_ENGINE)(L.table_from({"stations": [{"stations": 1}]}, recursive=True))
+        e.stations = L.eval("function() error('boom') end")
+        parts, _t = self.K.checksumParts(e, self.C.hashValue)
+        self.assertEqual(parts["stations"], "error")
+
+    def test_window_placeholders_become_the_keys_of_the_records_that_made_them(self):
+        body = self.C.parse('{["args"]={[1]={["__ref"]="entity",["key"]="ui:3"},[2]={["list"]={{["__ref"]="entity",["key"]="s:9"},'
+                            '{["__ref"]="entity",["key"]="ui:4"}}}},["fn"]="x"}')
+        body = body[0] if isinstance(body, tuple) else body
+        seq = self.L.eval("function(id) return ({ [3] = 12, [4] = 13 })[id] end")
+        ok = self.K.rewriteUiKeys(body, seq, 1)
+        self.assertTrue(ok)
+        text = self.C.serialize(body)
+        self.assertIn('"1:12"', text)
+        self.assertIn('"1:13"', text)
+        self.assertIn('"s:9"', text, "a saved entity is left alone")
+        self.assertNotIn("ui:", text)
+        body2 = self.C.parse('{["args"]={[1]={["__ref"]="entity",["key"]="ui:7"}}}')
+        body2 = body2[0] if isinstance(body2, tuple) else body2
+        ok2, missing = self.K.rewriteUiKeys(body2, seq, 1)
+        self.assertFalse(ok2)
+        self.assertEqual(7, missing, "a command that was never shipped cannot be named")
+
+    def test_an_action_that_waits_for_a_pending_entity_is_not_a_refusal(self):
+        body = self.C.parse('{["args"]={[1]={["__ref"]="entity",["key"]="1:5"},[2]={["__ref"]="entity",["key"]="s:8"}}}')
+        body = body[0] if isinstance(body, tuple) else body
+        pend = lambda k: self.K.keyIsPending(k, self.L.eval("{ { key = '1:5' } }"), self.L.eval("{ { key = '0:2' } }"))  # noqa: E731
+        self.assertTrue(pend("1:5"))
+        self.assertTrue(pend("0:2"))
+        self.assertTrue(pend("0:2#stop1"), "a sub-key of an action still looking for its entities")
+        self.assertFalse(pend("0:20"))
+        self.assertFalse(pend("s:8"))
+        isp = self.L.eval("function(k) return k == '1:5' end")
+        self.assertEqual("1:5", self.K.pendingRef(body, isp))
+        self.assertIsNone(self.K.pendingRef(body, self.L.eval("function(k) return false end")))
+
+    def test_notes_of_what_a_game_did_not_replicate_ride_with_its_actions_and_explain_a_refusal(self):
+        notes = self.L.eval("{}")
+        self.K.addNote(notes, 1000, "a native build at t=1000 was not replicated")
+        self.K.addNote(notes, 5000, "action 1:5 did not find every entity it created")
+        for i in range(10):
+            self.K.addNote(notes, 6000 + i, "n" + str(i), 4)
+        self.assertEqual(4, len(notes), "the list is bounded")
+        fresh = self.L.eval("{ { at = 5000, text = 'a' }, { at = 5100, text = 'b' }, { at = 5200, text = 'c' }, { at = 5300, text = 'd' }, { at = 5400, text = 'e' } }")
+        got = self.K.recentNotes(fresh, 5500)
+        self.assertEqual(3, len(got), "the newest three")
+        self.assertEqual("t=5400 e", got[3])
+        self.assertEqual(0, len(self.K.recentNotes(fresh, 5000 + 700000)), "old notes are not relevant to later actions")
+        body = self.L.eval("{ diverged = { 't=997800 a native build was not replicated' } }")
+        why = self.K.refusalDetail("argument 2: stop 2: stationGroup s:1 does not exist here", body)
+        self.assertIn("[the sender had not replicated: t=997800 a native build was not replicated]", why)
+        plain = self.K.refusalDetail("not enough money", body)
+        self.assertEqual("not enough money", plain, "only a reference problem is explained by it")
+
     def test_registered_commands_may_bring_their_own_codec(self):
         lua = self.L.eval("""function(K)
           K.registerCommands({
@@ -1082,6 +1237,34 @@ class PureTest(unittest.TestCase):
         self.assertEqual(K.stampFor(s, 1050), 2400, "rounded up to a step")
         self.assertEqual(K.stampFor(s, 1000, 2000), 3000, "a game may raise the lead")
         self.assertEqual(K.stampFor(s, 1000, 400), 2200, "never lower it")
+
+    def test_pace_lands_batches_on_checksum_stamps(self):
+        K, L = self.K, self.L
+        s = K.newSession()
+        peers = L.table()
+        K.applySession(s, L.table_from({"started": True, "speed": 4, "lead": 1200}))
+        marks = L.table()
+        self.assertEqual(K.pace(s, peers, 1000, 6, marks), 4, "no mark: full batch")
+        K.addMark(marks, 2000, 1000)
+        self.assertEqual(K.pace(s, peers, 1000, 6, marks), 4, "5 steps of room: full batch")
+        self.assertEqual(K.pace(s, peers, 1400, 6, marks), 3, "batch shortened to land exactly on the stamp")
+        self.assertEqual(K.pace(s, peers, 1800, 6, marks), 1)
+        self.assertEqual(K.pace(s, peers, 2000, 6, marks), 4, "at the stamp: the mark no longer limits")
+        K.addMark(marks, 3000, 2000)
+        self.assertEqual(len(marks), 1, "passed marks are dropped")
+        # a mark never holds the game, and a pause still wins
+        K.applySession(s, L.table_from({"started": True, "speed": 4, "pauseAt": 2200, "lead": 1200}))
+        self.assertEqual(K.pace(s, peers, 2000, 6, marks), 1)
+        self.assertEqual(K.pace(s, peers, 2200, 6, marks), 0)
+        # two games at different phases reach the same time at the stamp
+        for start in (1000, 1200, 1600):
+            now, sp = start, 4
+            m = L.table()
+            K.addMark(m, 2400, now)
+            K.applySession(s, L.table_from({"started": True, "speed": sp, "lead": 1200}))
+            while now < 2400:
+                now += int(K.pace(s, peers, now, 6, m)) * 200
+            self.assertEqual(now, 2400)
 
     def test_queue_order_and_late(self):
         K, L = self.K, self.L

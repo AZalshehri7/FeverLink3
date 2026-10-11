@@ -51,6 +51,7 @@ local U = {
 	seq = 0,                                      -- id of the next command record
 	orig = nil, outbox = nil,
 	lastPoll = -10, bindsText = nil, rev = {},
+	pending = {},   -- entity -> { key = "ui:<record id>", at = clock }: created by a command of this window, not yet in binds.txt
 	stats = { shipped = 0, speed = 0, untouched = 0, failed = 0 },
 }
 
@@ -106,6 +107,27 @@ local function reverse()
 	return U.rev
 end
 
+-- How long a window-made entity keeps its placeholder key after the bridge's table should have it (the file is rewritten
+-- about every half second, and read here at the next command).
+local PENDING_SECONDS = 120
+
+-- The key of an entity: the bridge's binding, else the placeholder of the window command that created it a moment ago
+-- (the bridge turns it into the real key before the command leaves; L.rewriteUiKeys), else "s:<id>" (the savegame).
+local function keyOf(rev, e)
+	local k = rev[e]
+	if k then
+		U.pending[e] = nil
+		return k
+	end
+	local p = U.pending[e]
+	if p then
+		if os.clock() - p.at <= PENDING_SECONDS then return p.key end
+		U.pending[e] = nil
+	end
+	return "s:" .. tostring(e)
+end
+M.keyOf = function(e) return keyOf(reverse(), e) end
+
 local function originals()
 	local t = package.loaded["feverlink3_ui_orig_cmds"]
 	if type(t) ~= "table" then
@@ -140,7 +162,7 @@ local function handle(tag, cmd, cb, progress, O)
 	local category = L.categoryOf(tag.name, tag.args)
 	if category == "local" then return false end
 	local rev = reverse()
-	local ctx = { plain = C.plain, keyOf = function(e) return rev[e] or ("s:" .. tostring(e)) end }
+	local ctx = { plain = C.plain, keyOf = function(e) return keyOf(rev, e) end }
 	local ok, body, why = pcall(L.encodeCommand, tag.name, tag.args, ctx)
 	if not ok then body, why = nil, tostring(body) end
 	if not body then
@@ -164,6 +186,7 @@ local function handle(tag, cmd, cb, progress, O)
 			pcall(function() e = res[spec.result] end)
 			if e == nil and type(entities) == "table" and type(entities[1]) == "table" then e = entities[1][1] end
 			if type(e) == "number" then
+				U.pending[e] = { key = "ui:" .. tostring(id), at = os.clock() }   -- usable at once, before the bridge's table has it
 				-- the bridge names the entity by the sequence number of the record it already holds: after it
 				if recorded then send("bind", { id = id, e = e }) else waitingBind = e end
 			end

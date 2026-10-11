@@ -32,9 +32,9 @@ use std::time::{Duration, Instant};
 
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::session::{
-    codec, ChecksumOutcome, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep, MessageKind,
-    PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession, PlayerState,
-    ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState,
+    codec, ChecksumOutcome, ChecksumPolicy, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep,
+    MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession,
+    PlayerState, ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState,
 };
 
 use crate::gamelink::{self, Line};
@@ -78,7 +78,7 @@ const fn row(name: &'static str, kind: MessageKind, to_game: bool, from_game: bo
 /// The complete mapping, `docs/PROTOCOL.md` kinds to file-link kinds (documented in `launcher/README.md`).
 /// Names are the snake_case of the message kind, except `peerclock`, which is what the mod already reads.
 /// `resync_chunk` never goes to the game: the launcher streams savegame chunks to disk itself.
-pub const LINE_KINDS: [LineKind; 19] = [
+pub const LINE_KINDS: [LineKind; 20] = [
     row("welcome", MessageKind::Welcome, true, false),
     row("session", MessageKind::Session, true, false),
     row("peerclock", MessageKind::PeerClock, true, false),
@@ -98,6 +98,7 @@ pub const LINE_KINDS: [LineKind; 19] = [
     row("action_refused", MessageKind::ActionRefused, false, true),
     row("action", MessageKind::Action, true, true),
     row("chat", MessageKind::Chat, true, true),
+    row("build_veto", MessageKind::BuildVeto, true, true),
 ];
 
 /// The line kind a message is written as, `None` for kinds that do not go to the game.
@@ -624,7 +625,11 @@ fn host_dispatch(
                 shared.log(if result.identical() {
                     format!("checksum {} identical across {} game(s)", result.n, result.reporters.len())
                 } else {
-                    format!("checksum {} differs in {}", result.n, result.differing.join(", "))
+                    format!(
+                        "checksum {} differs in {}",
+                        result.n,
+                        ChecksumPolicy::describe_parts(result.differing.iter().map(String::as_str))
+                    )
                 });
                 shared.update(|s| s.last_sync = Some(result));
             }

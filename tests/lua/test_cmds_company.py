@@ -889,7 +889,7 @@ class CompanyGameTest(unittest.TestCase):
         self.relay.pump()
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(20)
-        self.assertEqual(set(self.relay.reports[1][0][1]), {"time", "balance", "loan", "constructions", "lines"}, "pristine: no part")
+        self.assertEqual(set(self.relay.reports[1][0][1]) - {"stations", "edges", "nodeConfigs", "vehicles", "names"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings"}, "pristine: no part")
         self.buy(self.B)
         self.relay.checksum_request(2, self.relay.future_stamp(), False)
         self.tick(20)

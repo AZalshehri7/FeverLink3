@@ -172,6 +172,70 @@ class UiHookTest(unittest.TestCase):
         self.assertEqual(1, self.sent())
         self.assertEqual(1, len(self.records()), "one record, not two")
 
+    def test_an_entity_a_window_command_just_made_is_named_by_its_record_not_by_its_id(self):
+        # the bridge's table of keys (binds.txt) reaches the hook about a second after a creation; a command that names the
+        # new entity before that used to carry "s:<id>", an id the other games do not share
+        self.runtime()
+        self.lua.execute("""
+          local L = ug_require("feverlink3_lockstep.lua")
+          L.COMMANDS.makeFakeCreateCmd = { player = { 1 }, creates = "LINE", result = "resultEntity", category = "build" }
+          L.COMMANDS.makeFakeUseCmd = { entity = { 1 }, category = "other" }
+          api.cmd.makeFakeCreateCmd = function(...) return { kind = "fake", ... } end
+          api.cmd.makeFakeUseCmd = function(...) return { kind = "use", ... } end
+        """)
+        self.lua.execute("Hook.install()")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeFakeCreateCmd(5, 'x'), function() end)")   # the mock answers entity 77
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeFakeUseCmd(77))")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeFakeUseCmd(5000))")   # an entity of the savegame
+        recs = self.records()
+        self.assertEqual(["cmd", "bind", "cmd", "cmd"], [r[0] for r in recs])
+        parse = self.lua.eval("function(s) return C.parse(s) end")
+        used = parse(recs[2][1]["body"])
+        self.assertEqual("ui:1", used["args"][1]["key"], "named by the record that made it")
+        saved = parse(recs[3][1]["body"])
+        self.assertEqual("s:5000", saved["args"][1]["key"])
+        # once the bridge's table has it, that key wins
+        with open(os.path.join(self.tmp, "binds.txt"), "w", encoding="utf-8") as f:
+            f.write('{["1:1"]=77}')
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeFakeUseCmd(77))")
+        again = parse(self.records()[-1][1]["body"])
+        self.assertEqual("1:1", again["args"][1]["key"])
+
+
+class WindowTickerTest(unittest.TestCase):
+    """The window refresh (Hud.newTicker): two drivers (step timer, per-frame onStep) share one 0.5 s throttle, so the
+    window refreshes while the game is paused and the guest sees the host's end of the session."""
+
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        src = open(os.path.join(CONTENT, "feverlink3_hud.lua"), encoding="utf-8").read()
+        self.lua.execute("local src = ...; Hud = assert(load(src, '=hud', 't'))()", src)
+
+    def test_frame_driver_alone_refreshes_at_the_interval_and_reports_the_ended_state(self):
+        r = self.lua.execute(r"""
+            local now, state, seen = 0, "joined", {}
+            local t = Hud.newTicker(0.5, function() return now end, function() seen[#seen + 1] = state; return state end)
+            local out = {}
+            out[#out + 1] = tostring(t())            -- first frame: runs
+            now = 0.1; state = "failed"
+            out[#out + 1] = tostring(t())            -- too soon: skipped
+            now = 0.6
+            out[#out + 1] = tostring(t())            -- due: sees the ended state
+            now = 0.7
+            out[#out + 1] = tostring(t())            -- throttled again
+            return table.concat(out, ",") .. "|" .. #seen
+        """)
+        self.assertEqual("joined,nil,failed,nil|2", r)
+
+    def test_a_clock_that_goes_back_does_not_stall_the_ticker(self):
+        r = self.lua.execute(r"""
+            local now, n = 100, 0
+            local t = Hud.newTicker(0.5, function() return now end, function() n = n + 1; return true end)
+            t(); now = 1; t()
+            return n
+        """)
+        self.assertEqual(2, r)
+
 
 if __name__ == "__main__":
     unittest.main()

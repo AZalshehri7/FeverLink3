@@ -19,12 +19,14 @@
 pub mod build_table;
 pub mod counters;
 pub mod detour;
+pub mod growth;
 pub mod hold;
 pub mod link;
 pub mod patch;
 pub mod pe;
 pub mod plan;
 pub mod scan;
+pub mod townseed;
 
 #[cfg(windows)]
 pub mod engine;

@@ -418,6 +418,20 @@ fn identical_reports_give_an_identical_outcome() {
 }
 
 #[test]
+fn reports_taken_at_different_sim_times_are_not_compared() {
+    let reports: BTreeMap<u16, ChecksumReportMessage> = [
+        (0, ChecksumReportMessage::new(1, 5000, parts(&[("time", "a"), ("money", "1")]))),
+        (1, ChecksumReportMessage::new(1, 5100, parts(&[("time", "b"), ("money", "2")]))),
+    ]
+    .into_iter()
+    .collect();
+    let o = ChecksumRounds::compare(1, &reports);
+    assert!(!o.comparable() && !o.identical());
+    assert!(o.differences.is_empty());
+    assert_eq!(Some(5100), o.time_skew.as_ref().map(|m| m[&1]));
+}
+
+#[test]
 fn tick_rebroadcasts_the_session_and_requests_checksums_while_running() {
     let options = HostOptions { session_broadcast_seconds: 3.0, checksum_seconds: 10.0, ..HostOptions::default() };
     let mut h = Harness::with("Hote", options);
@@ -509,4 +523,28 @@ fn proof_depends_on_key_nonce_and_name() {
     assert_ne!(p, HostSession::proof(&key, &nonce, "B"));
     assert_ne!(p, HostSession::proof(&key, &[1], "A"));
     assert_ne!(p, HostSession::proof(&SessionKey::derive(&SECRET, Some("pw")), &nonce, "A"));
+}
+
+#[test]
+fn skewed_rounds_are_counted_and_logged_every_twenty_rounds() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.host_call(HostSession::start);
+    let p = parts(&[("money", "1")]);
+    for i in 0..20 {
+        h.host_call(HostSession::request_checksum);
+        let req: ChecksumRequestMessage = h.p(a).last(MessageKind::ChecksumRequest);
+        let skew = if i % 4 == 0 { 200 } else { 0 };
+        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, p.clone())));
+        h.player_game(
+            a,
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at + skew, p.clone())),
+        );
+    }
+    let lines: Vec<&String> = h.host_log.iter().filter(|l| l.contains("skipped as skewed")).collect();
+    assert_eq!(1, lines.len(), "{:?}", h.host_log);
+    assert!(lines[0].contains("5 of 20"), "{}", lines[0]);
 }

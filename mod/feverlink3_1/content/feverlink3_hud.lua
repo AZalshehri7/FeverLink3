@@ -204,4 +204,19 @@ function H.sendChat(C, outbox, text)
 	return (C.writerSend(outbox, "chat", { text = text }))
 end
 
+-- A throttled ticker for the window's refresh. The step timer (react.onStepTimer) is not guaranteed to fire while the
+-- game is paused, which left a guest's window saying "Connected" after the host had ended the session; the window now
+-- also calls the ticker from react.onStep (every interface frame, which runs while paused). The ticker runs fn at most
+-- once per `interval` seconds of the real clock (os.clock), however many drivers call it, and returns fn's result
+-- (nil when it skipped this call).
+function H.newTicker(interval, clock, fn)
+	local last
+	return function()
+		local now = clock()
+		if last and now >= last and now - last < interval then return nil end
+		last = now
+		return fn()
+	end
+end
+
 return H

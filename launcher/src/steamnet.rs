@@ -18,17 +18,21 @@
 
 mod steam_core;
 
+/// The speed test: message format, timing math, the sender loop, the text of the result.
+pub mod throughput;
+
 /// An in-memory Steam for the tests of this module and of the transport.
 #[cfg(test)]
 pub(crate) mod fake;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use steam_core::{
-    global, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, LinkSnapshot, Owner, Route, SendOutcome,
-    SteamCore, MAX_MESSAGE,
+    global, send_rate_setting, Cause, Config, CoreError, CoreRef, CoreStatus, End, Handle, LinkSnapshot, Owner, Route,
+    SendOutcome, SteamCore, MAX_MESSAGE, SEND_RATE_ENV,
 };
 
 // ---- layouts of the Steam structures (Steamworks SDK, `#pragma pack(8)`); pure, tested
@@ -266,6 +270,22 @@ pub struct Report {
     pub pings_received: u32,
     /// Players connected to our probe now, with the route and ping Steam measured.
     pub peers: Vec<PeerReport>,
+    /// The speed test, once one was started.
+    pub speed: Option<SpeedReport>,
+}
+
+/// What the window shows about the speed test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeedReport {
+    /// Identifies the run (its start time); the controller logs each finished run once.
+    pub id: u64,
+    pub running: bool,
+    /// One line: the progress while it runs, the reason when it failed, the headline when it is done.
+    pub status: String,
+    /// The result lines of a finished run.
+    pub lines: Vec<String>,
+    /// The one line for the session log, once the run has ended.
+    pub log: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +354,52 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Where a speed test is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Phase {
+    /// Waiting for the test connection.
+    Connecting,
+    /// We send, the friend times.
+    Upload,
+    /// The friend sends, we time.
+    Download,
+    Done,
+    Failed(String),
+}
+
+/// A speed test we started.
+struct SpeedRun {
+    id: u64,
+    conn: Handle,
+    total: u64,
+    phase: Phase,
+    started: Instant,
+    phase_started: Instant,
+    last_progress: Instant,
+    /// Bytes the friend says arrived so far.
+    up_progress: u64,
+    up_stats: Option<throughput::SendStats>,
+    /// The friend's timing of our upload: bytes, ms, longest gap, bytes after the first chunk.
+    up_remote: Option<(u64, u64, u64, u64)>,
+    down: Option<throughput::Receiver>,
+    result: Option<throughput::SpeedResult>,
+}
+
+impl SpeedRun {
+    fn active(&self) -> bool {
+        matches!(self.phase, Phase::Connecting | Phase::Upload | Phase::Download)
+    }
+}
+
+/// An upload from a friend that we are timing.
+struct Incoming {
+    conn: Handle,
+    rx: throughput::Receiver,
+}
+
+/// Speed tests a friend may have us send at once.
+const MAX_SENDERS: usize = 2;
+
 struct TestConn {
     conn: Handle,
     target: u64,
@@ -361,15 +427,178 @@ struct ProbeState {
     test: Option<TestConn>,
     peers: Vec<Peer>,
     pings_received: u32,
+    speed: Option<SpeedRun>,
+    incoming: Option<Incoming>,
+    senders: usize,
 }
 
 /// The probe's side of the core: what happens to its connections, on the poller thread.
 struct ProbeService {
     core: CoreRef,
+    me: std::sync::Weak<ProbeService>,
     state: Mutex<ProbeState>,
 }
 
 impl ProbeService {
+    /// A speed-test message from `conn`. Replies are sent after the state is unlocked.
+    fn tput(&self, conn: Handle, msg: throughput::Msg) {
+        use throughput::Msg;
+        let now = Instant::now();
+        let mut reply: Option<Vec<u8>> = None;
+        let mut start_sender: Option<(u64, u64, u64)> = None;
+        {
+            let mut state = lock(&self.state);
+            match msg {
+                Msg::Up { id, total, chunk } => {
+                    if total > 0 && total <= throughput::MAX_TOTAL && chunk > 0 {
+                        state.incoming = Some(Incoming { conn, rx: throughput::Receiver::new(id, total, now) });
+                        state
+                            .events
+                            .push(format!("a friend is testing the speed: {} MB coming", total / throughput::MB));
+                    }
+                }
+                Msg::Down { id, total, chunk } => {
+                    if total > 0 && total <= throughput::MAX_TOTAL && state.senders < MAX_SENDERS {
+                        state.senders += 1;
+                        start_sender = Some((id, total, chunk));
+                        state.events.push(format!("sending {} MB for a friend's speed test", total / throughput::MB));
+                    }
+                }
+                Msg::Data { id, len, .. } => {
+                    if let Some(inc) = state.incoming.as_mut().filter(|i| i.conn == conn && i.rx.id == id) {
+                        inc.rx.on_chunk(now, len);
+                        if inc.rx.got > inc.rx.total.saturating_add(throughput::CHUNK_PAYLOAD as u64) {
+                            state.incoming = None;
+                        } else if inc.rx.progress_due(now) {
+                            reply = Some(throughput::encode(&Msg::Prog { id, bytes: inc.rx.got }));
+                        }
+                    } else if let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id) {
+                        if run.phase == Phase::Download {
+                            if let Some(rx) = run.down.as_mut() {
+                                rx.on_chunk(now, len);
+                                run.last_progress = now;
+                            }
+                        }
+                    }
+                }
+                Msg::End { id, peak_pending, max_block_ms, .. } => {
+                    if state.incoming.as_ref().is_some_and(|i| i.conn == conn && i.rx.id == id) {
+                        if let Some(inc) = state.incoming.take() {
+                            let rx = inc.rx;
+                            reply = Some(throughput::encode(&Msg::UpRes {
+                                id,
+                                bytes: rx.got,
+                                ms: rx.span_ms(),
+                                gap_ms: rx.max_gap_ms(),
+                                steady: rx.steady(),
+                            }));
+                        }
+                    } else {
+                        self.finish_download(&mut state, conn, id, peak_pending, max_block_ms, now);
+                    }
+                }
+                Msg::Prog { id, bytes } => {
+                    if let Some(run) =
+                        state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload)
+                    {
+                        run.up_progress = bytes;
+                        run.last_progress = now;
+                    }
+                }
+                Msg::UpRes { id, bytes, ms, gap_ms, steady } => {
+                    if let Some(run) =
+                        state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload)
+                    {
+                        run.up_remote = Some((bytes, ms, gap_ms, steady));
+                        run.phase = Phase::Download;
+                        run.phase_started = now;
+                        run.last_progress = now;
+                        run.down = Some(throughput::Receiver::new(id, run.total, now));
+                        reply = Some(throughput::encode(&Msg::Down {
+                            id,
+                            total: run.total,
+                            chunk: throughput::CHUNK_PAYLOAD as u64,
+                        }));
+                    }
+                }
+            }
+        }
+        if let Some(bytes) = reply {
+            let _ = self.core.send(conn, &bytes);
+        }
+        if let Some((id, total, chunk)) = start_sender {
+            self.spawn_sender(conn, id, total, chunk, false);
+        }
+    }
+
+    /// The friend's data is all here: the test is over, the numbers go together.
+    fn finish_download(&self, state: &mut ProbeState, conn: Handle, id: u64, peak: u32, block_ms: u64, now: Instant) {
+        let rate_set = self.core.send_rate_setting();
+        let (route, ping, effective) = state
+            .test
+            .as_ref()
+            .filter(|t| t.conn == conn)
+            .map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
+        let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Download)
+        else {
+            return;
+        };
+        let (Some(rx), Some(remote)) = (run.down.as_ref(), run.up_remote) else { return };
+        let (up_bytes, up_ms, up_gap, up_steady) = remote;
+        let sent = run.up_stats.clone().unwrap_or_default();
+        let result = throughput::SpeedResult {
+            total_bytes: run.total,
+            up: throughput::Direction {
+                bytes: up_bytes,
+                rate: throughput::rate_of(up_steady, up_ms),
+                secs: up_ms as f64 / 1000.0,
+                peak_pending: sent.peak_pending,
+                longest_pause_ms: up_gap.max(sent.max_block_ms),
+            },
+            down: throughput::Direction {
+                bytes: rx.got,
+                rate: rx.rate(),
+                secs: rx.span_ms() as f64 / 1000.0,
+                peak_pending: peak,
+                longest_pause_ms: rx.max_gap_ms().max(block_ms),
+            },
+            total_secs: now.saturating_duration_since(run.started).as_secs_f64(),
+            ping_ms: ping,
+            route,
+            rate_set,
+            rate_effective: effective,
+        };
+        run.result = Some(result);
+        run.phase = Phase::Done;
+        state.events.push("speed test finished".into());
+    }
+
+    /// Streams `total` bytes to `conn` on a thread of its own. `ours` is a test we started (it can be stopped by
+    /// replacing or failing it); the other kind answers a friend and runs to the end.
+    fn spawn_sender(&self, conn: Handle, id: u64, total: u64, chunk: u64, ours: bool) {
+        let Some(me) = self.me.upgrade() else { return };
+        let spawned = thread::Builder::new().name("feverlink3-steam-speed".into()).spawn(move || {
+            let cancelled =
+                || ours && !lock(&me.state).speed.as_ref().is_some_and(|r| r.id == id && r.phase == Phase::Upload);
+            let stats = throughput::stream(&me.core, conn, id, total, chunk, &cancelled);
+            let mut state = lock(&me.state);
+            if ours {
+                if let Some(run) = state.speed.as_mut().filter(|r| r.id == id) {
+                    if let (Some(e), Phase::Upload) = (&stats.error, &run.phase) {
+                        run.phase = Phase::Failed(format!("sending stopped: {e}"));
+                    }
+                    run.up_stats = Some(stats);
+                }
+            } else {
+                state.senders = state.senders.saturating_sub(1);
+            }
+        });
+        if spawned.is_err() && !ours {
+            let mut state = lock(&self.state);
+            state.senders = state.senders.saturating_sub(1);
+        }
+    }
+
     fn is_test(state: &ProbeState, conn: Handle) -> bool {
         state.test.as_ref().is_some_and(|t| t.conn == conn)
     }
@@ -406,6 +635,9 @@ impl Owner for ProbeService {
     }
 
     fn message(&self, conn: Handle, data: &[u8]) {
+        if let Some(msg) = throughput::parse(data) {
+            return self.tput(conn, msg);
+        }
         if data.len() > PING_LIMIT {
             return;
         }
@@ -429,6 +661,14 @@ impl Owner for ProbeService {
         let mut state = lock(&self.state);
         state.peers.retain(|p| p.conn != conn);
         let ours = Self::is_test(&state, conn);
+        if state.incoming.as_ref().is_some_and(|i| i.conn == conn) {
+            state.incoming = None;
+        }
+        if end.cause != Cause::Local {
+            if let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.active()) {
+                run.phase = Phase::Failed(format!("the connection ended: {}", end.describe()));
+            }
+        }
         if end.cause == Cause::Local {
             // we closed it: a replaced test, or the probe going away
             return;
@@ -464,7 +704,11 @@ impl Probe {
 
     /// A probe on a given core (the tests use a fake one).
     pub fn on(core: CoreRef) -> Probe {
-        let service = Arc::new(ProbeService { core: core.clone(), state: Mutex::new(ProbeState::default()) });
+        let service = Arc::new_cyclic(|me| ProbeService {
+            core: core.clone(),
+            me: me.clone(),
+            state: Mutex::new(ProbeState::default()),
+        });
         Probe {
             core,
             service,
@@ -516,6 +760,81 @@ impl Probe {
         }
         self.refresh_links();
         self.drive_test();
+        self.drive_speed();
+    }
+
+    /// Starts a speed test that waited for the connection, and ends one that makes no progress.
+    fn drive_speed(&self) {
+        let now = Instant::now();
+        let mut start: Option<(Handle, u64, u64)> = None;
+        {
+            let mut guard = lock(&self.service.state);
+            let state = &mut *guard;
+            let Some(run) = state.speed.as_mut().filter(|r| r.active()) else { return };
+            if run.phase == Phase::Connecting {
+                match state.test.as_ref() {
+                    Some(t) if t.connected => {
+                        run.conn = t.conn;
+                        run.phase = Phase::Upload;
+                        run.phase_started = now;
+                        run.last_progress = now;
+                        start = Some((t.conn, run.id, run.total));
+                    }
+                    Some(t) if t.state.starts_with("failed") => {
+                        run.phase = Phase::Failed(format!("no connection: {}", t.state));
+                    }
+                    Some(_) => {
+                        if now.saturating_duration_since(run.started) > Duration::from_secs(60) {
+                            run.phase = Phase::Failed("no connection after 60 s".into());
+                        }
+                    }
+                    None => run.phase = Phase::Failed("no connection".into()),
+                }
+            } else if now.saturating_duration_since(run.last_progress) > throughput::ABORT_AFTER {
+                run.phase = Phase::Failed(format!("no data for {} s", throughput::ABORT_AFTER.as_secs()));
+            }
+        }
+        if let Some((conn, id, total)) = start {
+            let chunk = throughput::CHUNK_PAYLOAD as u64;
+            let _ = self.core.send(conn, &throughput::encode(&throughput::Msg::Up { id, total, chunk }));
+            self.service.spawn_sender(conn, id, total, chunk, true);
+        }
+    }
+
+    /// Starts a speed test of `mb` MB each way with the friend `steam_id`, connecting first when the connection
+    /// test is not already on that friend.
+    pub fn speed_test(&mut self, steam_id: u64, mb: u32) {
+        if !self.core.status().ready {
+            return;
+        }
+        let total = (u64::from(mb.max(1)) * throughput::MB).min(throughput::MAX_TOTAL);
+        let reuse = lock(&self.service.state).test.as_ref().is_some_and(|t| t.target == steam_id && t.connected);
+        if !reuse {
+            self.test(steam_id);
+        }
+        let now = Instant::now();
+        let mut state = lock(&self.service.state);
+        if state.test.is_none() {
+            return;
+        }
+        if let Some(old) = state.speed.as_mut().filter(|r| r.active()) {
+            old.phase = Phase::Failed("replaced by a new test".into());
+        }
+        state.events.push(format!("speed test of {} MB started", total / throughput::MB));
+        state.speed = Some(SpeedRun {
+            id: now_ms(),
+            conn: 0,
+            total,
+            phase: Phase::Connecting,
+            started: now,
+            phase_started: now,
+            last_progress: now,
+            up_progress: 0,
+            up_stats: None,
+            up_remote: None,
+            down: None,
+            result: None,
+        });
     }
 
     /// Takes the core's latest route and ping of the test connection and of the players connected to us. The core
@@ -573,6 +892,9 @@ impl Probe {
         let mut state = lock(&self.service.state);
         if let Some(old) = state.test.take() {
             self.core.close(old.conn);
+            if let Some(run) = state.speed.as_mut().filter(|r| r.active() && r.phase != Phase::Connecting) {
+                run.phase = Phase::Failed("the connection was replaced".into());
+            }
         }
         let owner: Arc<dyn Owner> = self.service.clone();
         match self.core.connect(steam_id, PROBE_PORT, owner) {
@@ -612,6 +934,7 @@ impl Probe {
                 send_rate: t.send_rate,
             }),
             pings_received: state.pings_received,
+            speed: state.speed.as_ref().map(speed_report),
             peers: state
                 .peers
                 .iter()
@@ -624,6 +947,51 @@ impl Probe {
                 .collect(),
         }
     }
+}
+
+/// The window's view of a speed test.
+fn speed_report(run: &SpeedRun) -> SpeedReport {
+    let now = Instant::now();
+    let mb = |bytes: u64| bytes as f64 / throughput::MB as f64;
+    let total = mb(run.total);
+    let mut report =
+        SpeedReport { id: run.id, running: run.active(), status: String::new(), lines: Vec::new(), log: None };
+    let quiet = now.saturating_duration_since(run.last_progress);
+    let stalled = if run.active() && quiet >= throughput::STALL {
+        format!(" (no data for {} s)", quiet.as_secs())
+    } else {
+        String::new()
+    };
+    match &run.phase {
+        Phase::Connecting => report.status = format!("Speed test of {total:.0} MB: connecting...{stalled}"),
+        Phase::Upload => {
+            let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
+            let rate = throughput::rate_text(Some(run.up_progress as f64 / secs));
+            report.status = format!(
+                "Speed test, sending to your friend: {:.1} of {total:.0} MB, {rate}{stalled}",
+                mb(run.up_progress)
+            );
+        }
+        Phase::Download => {
+            let got = run.down.as_ref().map_or(0, |d| d.got);
+            let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
+            let rate = throughput::rate_text(Some(got as f64 / secs));
+            report.status =
+                format!("Speed test, receiving from your friend: {:.1} of {total:.0} MB, {rate}{stalled}", mb(got));
+        }
+        Phase::Done => {
+            if let Some(result) = &run.result {
+                report.lines = result.lines();
+                report.status = report.lines.first().cloned().unwrap_or_default();
+                report.log = Some(result.log_line());
+            }
+        }
+        Phase::Failed(why) => {
+            report.status = format!("Speed test failed: {why}");
+            report.log = Some(format!("steam speed test failed: {why}"));
+        }
+    }
+    report
 }
 
 impl Drop for Probe {
@@ -641,7 +1009,6 @@ impl Drop for Probe {
 mod tests {
     use super::fake::FakeMachine;
     use super::*;
-    use std::thread;
 
     #[test]
     fn identity_has_the_steam_layout() {
@@ -1061,5 +1428,135 @@ mod tests {
             probe_b.report().peers.is_empty()
         });
         assert!(a.connections().is_empty());
+    }
+
+    // ---- the speed test, between two fake accounts
+
+    fn two_probes(
+    ) -> (FakeMachine, FakeMachine, super::steam_core::SteamCore, super::steam_core::SteamCore, Probe, Probe) {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        let (core_a, core_b) = (a.core(), b.core());
+        let (mut probe_a, mut probe_b) = (Probe::on(core_a.handle()), Probe::on(core_b.handle()));
+        until("both probes", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().state == "ready" && probe_b.report().state == "ready"
+        });
+        (a, b, core_a, core_b, probe_a, probe_b)
+    }
+
+    #[test]
+    fn a_speed_test_moves_data_both_ways_and_reports_the_numbers() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        a.set_ping(120);
+        a.set_relay(0x646162);
+        probe_a.speed_test(b.steam_id(), 3);
+        let first = probe_a.report().speed.expect("a speed test");
+        assert!(first.running && first.status.contains("connecting"), "{first:?}");
+        until("the speed test to finish", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let done = probe_a.report().speed.expect("report");
+        assert!(done.lines.len() == 4, "{done:?}");
+        assert!(done.lines[0].starts_with("Speed test, 3 MB each way: you to friend "), "{done:?}");
+        assert!(
+            done.lines[1].contains("through a Steam relay") && done.lines[1].contains("round trip 120 ms"),
+            "{done:?}"
+        );
+        assert!(done.lines[1].contains(&format!("send rate {} B/s", Config::default().send_rate)), "{done:?}");
+        assert!(done.lines[2].contains("no stall"), "{done:?}");
+        assert!(done.lines[3].starts_with("An 80 MB save"), "{done:?}");
+        let log = done.log.expect("a log line");
+        assert!(log.starts_with("steam speed test: 3 MB each way, up ") && !log.contains(char::from(10)), "{log}");
+        // the friend counted what it received and what it sent
+        let events = probe_b.report().events;
+        assert!(events.iter().any(|e| e == "a friend is testing the speed: 3 MB coming"), "{events:?}");
+        assert!(events.iter().any(|e| e == "sending 3 MB for a friend's speed test"), "{events:?}");
+        // a ping still works on the same connection afterwards
+        until("a pong", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1)
+        });
+    }
+
+    #[test]
+    fn the_numbers_of_a_finished_speed_test_are_complete() {
+        let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        probe_a.speed_test(b.steam_id(), 4);
+        until("the speed test to finish", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let state = lock(&probe_a.service.state);
+        let result = state.speed.as_ref().and_then(|r| r.result.clone()).expect("a result");
+        assert_eq!(result.total_bytes, 4 * throughput::MB);
+        assert_eq!((result.up.bytes, result.down.bytes), (4 * throughput::MB, 4 * throughput::MB));
+        assert!(result.up.rate.is_some_and(|r| r > 0.0) && result.down.rate.is_some_and(|r| r > 0.0), "{result:?}");
+        assert!(result.total_secs > 0.0 && !result.stalled(), "{result:?}");
+        assert_eq!(result.rate_set, Config::default().send_rate);
+        assert_eq!(result.route, "direct");
+        // the queue never exceeds Steam's 512 KiB buffer
+        assert!(result.up.peak_pending <= 512 * 1024 && result.down.peak_pending <= 512 * 1024, "{result:?}");
+    }
+
+    #[test]
+    fn a_speed_test_to_a_friend_without_a_probe_fails_with_the_reason() {
+        let (a, b) = (FakeMachine::new(), FakeMachine::new());
+        let (core_a, _core_b) = (a.core(), b.core());
+        let mut probe = Probe::on(core_a.handle());
+        until("the listen socket", || {
+            probe.poll();
+            probe.report().state == "ready"
+        });
+        probe.speed_test(b.steam_id(), 1);
+        until("the failure", || {
+            probe.poll();
+            probe.report().speed.is_some_and(|s| !s.running)
+        });
+        let s = probe.report().speed.unwrap();
+        assert!(s.status.starts_with("Speed test failed: no connection: failed: closed by the other side"), "{s:?}");
+        assert!(s.log.is_some_and(|l| l.starts_with("steam speed test failed:")));
+    }
+
+    #[test]
+    fn a_speed_test_ends_when_the_friend_goes_away() {
+        let (_a, b, _ca, core_b, mut probe_a, probe_b) = two_probes();
+        // the friend's side stops reading, so the upload cannot finish before the friend goes away
+        b.stall_receive(true);
+        probe_a.speed_test(b.steam_id(), 128);
+        until("the upload to begin", || {
+            probe_a.poll();
+            probe_a.report().speed.is_some_and(|s| s.status.contains("sending to your friend"))
+        });
+        drop(probe_b);
+        drop(core_b);
+        until("the end", || {
+            probe_a.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let s = probe_a.report().speed.unwrap();
+        assert!(s.status.starts_with("Speed test failed:"), "{s:?}");
+    }
+
+    #[test]
+    fn a_friend_cannot_make_the_probe_receive_or_send_more_than_the_limit() {
+        let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        probe_a.test(b.steam_id());
+        until("connected", || {
+            probe_a.poll();
+            probe_a.report().test.is_some_and(|t| t.state == "connected")
+        });
+        // b's probe is asked for far too much: nothing is started
+        let conn = lock(&probe_a.service.state).test.as_ref().map(|t| t.conn).unwrap();
+        let ask = throughput::encode(&throughput::Msg::Down { id: 1, total: 10_000 * throughput::MB, chunk: 1000 });
+        assert_eq!(probe_a.core.send(conn, &ask), SendOutcome::Sent);
+        thread::sleep(Duration::from_millis(100));
+        probe_b.poll();
+        let events = probe_b.report().events;
+        assert!(!events.iter().any(|e| e.starts_with("sending ")), "{events:?}");
     }
 }

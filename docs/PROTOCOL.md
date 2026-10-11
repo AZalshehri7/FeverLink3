@@ -90,8 +90,9 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Leave | 38 | player → host | `{}`: the player goes on purpose |
 | Action | 50 | game → host → all but origin | `{stamp, seq, body, category?, from, allowed}` (`from` and `allowed` set by the host; `category` is `build`, `bulldoze`, `spend` or `other`, default `other`) |
 | Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name}` (set by the host) |
+| BuildVeto | 52 | game → host → all but origin | `{seq, owner, why ≤ 300, from, name}` (`from`, `name` set by the host). "I cannot build action `owner`:`seq`", sent only by a game that dry-ran a held strict build and found it cannot be rebuilt; silence means yes. The originator cancels its held command, every game drops the queued replay. |
 
-A player may send kinds 30 to 38, 50 and 51. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
+A player may send kinds 30 to 38 and 50 to 52. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
 
 What the host does with the content of those kinds, beyond decoding them (a message that does not decode is ignored, as always):
 

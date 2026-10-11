@@ -22,6 +22,11 @@ pub(super) struct FileInfo {
     next: u32,
 }
 
+/// How often a paused verify round that cannot be compared (different sim times) is asked again.
+const MAX_VERIFY_SKEWS: u8 = 3;
+/// A line in the session log with the count of skewed rounds after this many finished rounds.
+const SKEW_LOG_EVERY: u32 = 20;
+
 #[derive(Debug)]
 pub(super) struct ResyncRound {
     id: i32,
@@ -35,6 +40,8 @@ pub(super) struct ResyncRound {
     /// Players present when the transfer started: they get the chunks and the load, and must say Hello again.
     participants: Option<BTreeSet<u16>>,
     verify_n: Option<i32>,
+    /// Paused verify rounds that came back not comparable (the games reported different sim times): asked again.
+    verify_skews: u8,
 }
 
 impl HostSession {
@@ -122,6 +129,7 @@ impl HostSession {
             file: None,
             participants: None,
             verify_n: None,
+            verify_skews: 0,
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -372,13 +380,44 @@ impl HostSession {
 
     // ---------------------------------------------------------------- results
 
+    /// Counts a finished round and, every `SKEW_LOG_EVERY` rounds, logs how many were skipped as skewed (the games hashed
+    /// at different sim times), so a real game can measure how well the games hash at the same time.
+    fn count_round(&mut self, skewed: bool) {
+        self.rounds_done += 1;
+        if skewed {
+            self.rounds_skewed += 1;
+        }
+        if self.rounds_done % SKEW_LOG_EVERY == 0 {
+            let (done, skewed) = (self.rounds_done, self.rounds_skewed);
+            self.log(format!(
+                "checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"
+            ));
+        }
+    }
+
     pub(super) fn on_checksum_outcome(&mut self, outcome: ChecksumOutcome) {
         let verify = self.resync.as_ref().and_then(|r| r.verify_n);
+        self.count_round(!outcome.comparable());
         self.out.push(HostOutput::ChecksumCompleted(outcome.clone()));
         if self.resync.is_some() {
             if verify == Some(outcome.n) {
                 if outcome.identical() {
                     self.finish();
+                } else if !outcome.comparable() {
+                    // the games sampled at different sim times: ask again (a few times) before giving up, so a skewed round
+                    // does not leave the host paused with a failed resync
+                    let again = self.resync.as_mut().is_some_and(|r| {
+                        r.verify_skews += 1;
+                        r.verify_skews <= MAX_VERIFY_SKEWS
+                    });
+                    if again {
+                        self.enter_verifying();
+                    } else {
+                        self.fail(
+                            "games reported different times while paused, so the checksums cannot be compared"
+                                .to_owned(),
+                        );
+                    }
                 } else {
                     let parts: Vec<&str> = outcome.differing_parts().collect();
                     self.fail(format!("games still differ after the reload: {}", parts.join(", ")));

@@ -317,7 +317,54 @@ impl Runtime {
     ///
     /// # Safety
     /// `args` are the arguments of a live call to `CommandList::Add` on the calling thread.
-    pub unsafe fn on_add(&self, args: AddArgs, caller: Option<usize>) -> *mut u8 {
+    ///
+    /// Two rules shape this function, both learned from a crash of the real game (`docs/NATIVE_LINK.md`, section 10):
+    ///
+    /// - The build must unwind (`panic = "unwind"`, root `Cargo.toml`) and every function between this one and the
+    ///   engine's `Add` ([`engine::release`]) is `system-unwind`, with `Add` called from its body, not from a closure.
+    ///   A C++ exception of the game then passes through our frames as through any others. Under `panic = "abort"`
+    ///   every Rust frame, `system-unwind` or not, is a terminate pad: the exception ends the process with
+    ///   `panic in a function that cannot unwind`.
+    /// - Our own bookkeeping runs inside [`crate::log::guarded`] and never around a call into the game. A bug in it
+    ///   (under `unwind`) costs the step, not the game: the call goes on to the original.
+    #[allow(improper_ctypes_definitions)] // only ever called from Rust, with Rust types; "system-unwind" is for the exception
+    pub unsafe extern "system-unwind" fn on_add(&self, args: AddArgs, caller: Option<usize>) -> *mut u8 {
+        let add = self.add_fn();
+        // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
+        // was taken out of the engine's hands must be given back, whatever happens)
+        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0 };
+        crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
+        let Some(add) = add else { return args.out };
+        let Some(engine) = self.engine else {
+            // SAFETY: the arguments of the live call that is being hooked.
+            return unsafe { add(args.list, args.out, args.cmd, args.done, args.progress) };
+        };
+        // the engine is touched only now, outside the lock, in the order the machine decided
+        for action in plan.due {
+            match action {
+                Action::Release { id, handle, .. } => {
+                    crate::log::guarded("add hook (watch)", || self.watch.arm(handle.payload(), id, plan.now));
+                    // SAFETY: the original Add of this process, called on the thread that queues commands.
+                    unsafe { engine::release(&engine, handle, add) };
+                }
+                Action::Drop { handle, .. } => unsafe { engine::discard(&engine, handle) },
+            }
+        }
+        if let Some(back) = plan.spill {
+            unsafe { engine::release(&engine, back, add) };
+            return args.out;
+        }
+        if plan.held_here {
+            return args.out;
+        }
+        // SAFETY: the arguments of the live call that is being hooked.
+        unsafe { add(args.list, args.out, args.cmd, args.done, args.progress) }
+    }
+
+    /// The part of [`Runtime::on_add`] that decides: counts the call and, when holding is on, asks the machine what
+    /// is due and whether this command is held (taking it out of the engine's hands if so). Touches the engine only
+    /// through its move constructor. The result is written into `plan` step by step.
+    fn plan_add(&self, args: &AddArgs, caller: Option<usize>, have_add: bool, plan: &mut AddPlan) {
         let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
         let tool = site.and_then(|rva| self.build.ui_site_index(rva));
         self.counters.added(match (caller, tool) {
@@ -325,30 +372,26 @@ impl Runtime {
             (Some(_), Some(i)) => AddSource::Tool(i),
             (Some(_), None) => AddSource::Other,
         });
-        let Some(add) = self.add_fn() else { return args.out };
-        // SAFETY: the arguments of the live call that is being hooked.
-        let pass = || unsafe { add(args.list, args.out, args.cmd, args.done, args.progress) };
-        let Some(engine) = self.engine else { return pass() };
-        if !self.live.load(Relaxed) {
-            return pass();
+        let Some(engine) = self.engine else { return };
+        if !have_add || !self.live.load(Relaxed) {
+            return;
         }
         let now = self.now_ms();
-        let Some(mut machine) = try_lock_briefly(&self.machine) else { return pass() };
+        plan.now = now;
+        let Some(mut machine) = try_lock_briefly(&self.machine) else { return };
         // the mod writes `release` and then sends a command to get here: look at the file now, do not wait for the pump
         self.ingest(&mut machine, now);
-        let due = machine.take_due(self.game_time(), now);
+        plan.due = machine.take_due(self.game_time(), now);
 
-        let mut held_here = false;
-        let mut spill: Option<Box<Held>> = None;
         if let (Some(rva), Some(_)) = (site, tool) {
             // SAFETY: the kind is read only from readable memory.
             if let Some(kind) = unsafe { engine::command_kind(args.cmd, engine.kind_offset) } {
                 if machine.admit(kind, now) == Admit::Hold {
                     // SAFETY: the arguments of the live call, as the caller guarantees.
-                    if let Some(held) = unsafe { engine::capture(&engine, &args) } {
+                    if let Some(held) = unsafe { engine::capture(&engine, args) } {
                         match machine.hold(kind, rva, held, now) {
-                            Ok(_) => held_here = true,
-                            Err(back) => spill = Some(back), // refused after capture: it goes straight on
+                            Ok(_) => plan.held_here = true,
+                            Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
                         }
                     }
                 }
@@ -356,29 +399,9 @@ impl Runtime {
         }
         self.sync_flags(&machine);
         drop(machine);
-        if held_here || !due.is_empty() {
+        if plan.held_here || !plan.due.is_empty() {
             self.wake();
         }
-
-        // the engine is touched only now, outside the lock, in the order the machine decided
-        for action in due {
-            match action {
-                Action::Release { id, handle, .. } => {
-                    self.watch.arm(handle.payload(), id, now);
-                    // SAFETY: the original Add of this process, called on the thread that queues commands.
-                    unsafe { engine::release(&engine, handle, add) };
-                }
-                Action::Drop { handle, .. } => unsafe { engine::discard(&engine, handle) },
-            }
-        }
-        if let Some(back) = spill {
-            unsafe { engine::release(&engine, back, add) };
-            return args.out;
-        }
-        if held_here {
-            return args.out;
-        }
-        pass()
     }
 
     // ---- the apply hook
@@ -388,30 +411,51 @@ impl Runtime {
     ///
     /// # Safety
     /// `sim` and `cmd` are the arguments of a live call on the calling thread.
-    pub unsafe fn on_apply(&self, sim: *mut u8, cmd: *mut u8) -> u64 {
+    ///
+    /// `system-unwind` and calling the original from its own body, for the reason given at [`Runtime::on_add`]: the
+    /// simulation's apply function can throw (a script error in a command's handler), and the exception must pass.
+    #[allow(improper_ctypes_definitions)] // only ever called from Rust, with Rust types; "system-unwind" is for the exception
+    pub unsafe extern "system-unwind" fn on_apply(&self, sim: *mut u8, cmd: *mut u8) -> u64 {
         let orig = self.orig_apply.load(Acquire);
         if orig == 0 {
             return 0; // unreachable once installed
         }
         // SAFETY: the trampoline of the apply function, published before the jump was written.
-        let call = |sim, cmd| unsafe { core::mem::transmute::<usize, ApplyFn>(orig)(sim, cmd) };
-        let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
-        // SAFETY: only readable memory is read.
-        match unsafe { engine::command_kind(cmd, kind_offset) } {
-            Some(k) => self.counters.applied(k),
-            None => self.counters.applied_unreadable(),
-        }
-        if self.watch.is_idle() {
-            return call(sim, cmd);
-        }
-        let id = unsafe { engine::payload_of(cmd) }.and_then(|p| self.watch.claim(p));
-        let result = call(sim, cmd);
-        if let Some(id) = id {
-            let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
-            self.watch.finish(id, ok);
+        let original = unsafe { core::mem::transmute::<usize, ApplyFn>(orig) };
+        // the bookkeeping before the call: count the command, and recognise one the module released
+        let claimed = crate::log::guarded("apply hook", || {
+            let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+            // SAFETY: only readable memory is read.
+            match unsafe { engine::command_kind(cmd, kind_offset) } {
+                Some(k) => self.counters.applied(k),
+                None => self.counters.applied_unreadable(),
+            }
+            if self.watch.is_idle() {
+                return None;
+            }
+            unsafe { engine::payload_of(cmd) }.and_then(|p| self.watch.claim(p))
+        })
+        .flatten();
+        let result = unsafe { original(sim, cmd) };
+        if let Some(id) = claimed {
+            crate::log::guarded("apply hook (result)", || {
+                let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
+                self.watch.finish(id, ok);
+            });
         }
         result
     }
+}
+
+/// What [`Runtime::plan_add`] decided: the engine is touched according to it, after the lock is gone.
+struct AddPlan {
+    /// Held commands to hand back or destroy, in order.
+    due: Vec<Action<Box<Held>>>,
+    /// A command taken and then refused by the machine: it goes straight on.
+    spill: Option<Box<Held>>,
+    /// The current command was held: the caller gets an empty handle and the original is not called.
+    held_here: bool,
+    now: u64,
 }
 
 #[cfg(test)]
@@ -425,6 +469,18 @@ mod tests {
 
     thread_local! {
         static CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// The fake engine throws from `Add` / `apply` while set: the stand-in for a C++ exception of the game.
+        static THROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The payload of the fake engine's "exception".
+    const THROWN: &str = "engine exception";
+
+    fn throw_if_set() {
+        if THROW.with(|t| t.get()) {
+            // unwinds through the hook's frames like the game's own exception; no panic hook, no message
+            std::panic::resume_unwind(Box::new(THROWN));
+        }
     }
 
     fn note(s: impl Into<String>) {
@@ -454,6 +510,7 @@ mod tests {
         _done: *mut u8,
         _progress: *mut u8,
     ) -> *mut u8 {
+        throw_if_set();
         let payload = unsafe { *(cmd as *const usize) };
         if payload == 0 {
             note("add empty command");
@@ -464,6 +521,7 @@ mod tests {
         out
     }
     unsafe extern "system-unwind" fn e_apply(_sim: *mut u8, cmd: *mut u8) -> u64 {
+        throw_if_set();
         let payload = unsafe { *(cmd as *const usize) };
         if payload == 0 {
             return 1;
@@ -484,6 +542,10 @@ mod tests {
             name: "fake",
             command_list_add: None,
             apply_command: None,
+            town_seed: None,
+            town_develop: None,
+            town_update_size: None,
+            game_time_getter: None,
             script_pool: None,
             command_move: None,
             command_destroy: None,
@@ -894,6 +956,81 @@ mod tests {
         let k = kinds(dir.path());
         assert_eq!(k.iter().filter(|x| *x == "error").count(), 3, "{k:?}"); // two bad lines, one discarded line
         assert!(k.contains(&"pong".to_string()), "and the good line after them still works");
+    }
+
+    // ---- the engine throws, our bookkeeping fails: the game goes on
+
+    fn thrown(r: std::thread::Result<impl std::fmt::Debug>) -> bool {
+        matches!(r, Err(p) if p.downcast_ref::<&str>() == Some(&THROWN))
+    }
+
+    #[test]
+    fn an_exception_from_add_passes_through_the_hook_on_every_path() {
+        let dir = TempDir::new("rt-throw-add");
+        let rt = runtime(Some(dir.path()));
+        // holding off: the plain pass-through
+        THROW.with(|t| t.set(true));
+        let mut c = Call::new(52, 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { rt.on_add(c.args(), at(SITE_A)) }));
+        assert!(thrown(r));
+        THROW.with(|t| t.set(false));
+        // holding on: the release of a held command is what calls Add, from inside the hook
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let mut a = Call::new(52, 10);
+        unsafe { rt.on_add(a.args(), at(SITE_A)) };
+        ctl(dir.path(), "2\trelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n");
+        THROW.with(|t| t.set(true));
+        let mut nop = Call::new(27, 50);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { rt.on_add(nop.args(), at(0x999)) }));
+        assert!(thrown(r));
+        THROW.with(|t| t.set(false));
+        // and the module is still usable afterwards: nothing is stuck locked or half-counted
+        calls();
+        let mut again = Call::new(27, 51);
+        unsafe { rt.on_add(again.args(), at(0x999)) };
+        assert_eq!(calls(), ["add kind 27 tag 51"]);
+        rt.pump();
+    }
+
+    #[test]
+    fn an_exception_from_apply_passes_through_the_hook() {
+        let dir = TempDir::new("rt-throw-apply");
+        let rt = runtime(Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let mut sim = [0u8; 8];
+        let mut command = cmd(52, 4);
+        THROW.with(|t| t.set(true));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            rt.on_apply(sim.as_mut_ptr(), command.command.as_mut_ptr())
+        }));
+        assert!(thrown(r));
+        THROW.with(|t| t.set(false));
+        assert_eq!(unsafe { rt.on_apply(sim.as_mut_ptr(), command.command.as_mut_ptr()) }, 7, "the next one is fine");
+        calls();
+    }
+
+    fn broken_clock() -> Option<u64> {
+        panic!("a bug in the bookkeeping")
+    }
+
+    #[test]
+    fn a_bug_in_the_add_bookkeeping_still_calls_the_original() {
+        let dir = TempDir::new("rt-bug-add");
+        let mut rt = runtime(Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        rt.clock = Some(broken_clock); // read inside the planning, under the machine's lock
+        let mut c = Call::new(52, 1);
+        let out = unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        assert_eq!(out, c.args().out);
+        assert_eq!(calls(), ["add kind 52 tag 1"], "the game's call was made as if the module were not there");
+        // the lock the planning died holding is poisoned, not stuck: later calls still work
+        rt.clock = None;
+        let mut next = Call::new(27, 2);
+        unsafe { rt.on_add(next.args(), at(SITE_A)) };
+        assert_eq!(calls(), ["add kind 27 tag 2"]);
     }
 
     #[test]

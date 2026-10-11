@@ -31,7 +31,14 @@ function EXECUTE(cmd, cb)
     local a = cmd.args
     SIM_EVENT(0, "apply_command", "onPreBuildProposal", { a[1], a[2], a[3], a[4] })
   end
-  return BASE_EXECUTE_BUILD(cmd, cb)
+  -- and again once it has run (onPostBuildProposal, with the entities the build made)
+  local a = cmd.args
+  return BASE_EXECUTE_BUILD(cmd, function(res, ok, ents)
+    if cb then cb(res, ok, ents) end
+    if ANNOUNCE_BUILDS and cmd.__cmd == "makeWorldBuildProposalCmd" and ok then
+      SIM_EVENT(0, "apply_command", "onPostBuildProposal", { a[1], a[2], ents, a[4] })
+    end
+  end)
 end
 
 -- what a native tool does: its command goes straight to the engine, past the mod's wrapped sendCommand
@@ -103,6 +110,21 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.shipped_count(), 0, "a replay is not shipped again (it would come back as the host's own build)")
         self.assertIn("native build captured", self.B.log())
         self.assertNotIn("refused", self.A.log() + self.B.log())
+
+    def test_a_stop_or_signal_without_a_model_before_the_build_is_read_after_it_and_reaches_the_other_game(self):
+        # the engine names the model of an edge object only when the build has run (a real game, 2026-10-11: "an edge object has no
+        # model" for every stop built with the stop tool, and the other game never got it)
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; "
+                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIGNAL_P, nil, false, true), nil }")
+        self.tick(16)
+        self.assertIn("has an edge object that the engine has not made yet", self.B.log())
+        self.assertIn("native build captured", self.B.log())
+        self.assertNotIn("is not replicated", self.B.log())
+        self.assertNotIn("refused", self.A.log() + self.B.log())
+        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
+        self.assertIn("signal/signal_a.mdl@0.750k2", self.A.sig())
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.A.shipped_count(), self.B.shipped_count()), (1, 1, 0, 1))
 
     def test_the_same_in_the_other_direction(self):
         self.start()

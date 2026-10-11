@@ -138,18 +138,27 @@ local function setup(react, builtin)
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
+		local mbIn = react.useState(32)
 		local showTest = react.useState(false)
-		react.onStepTimer(function()
-			if Hook then Hook.devPoll() end
-			local a = poll()
-			local b = pollCtl()
-			if a or b then tick:set(tick:old() + 1) end
-		end, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
+		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
+		-- paused (a guest's window must notice the host ending the session then too).
+		if not U.refresh then
+			U.refresh = Hud.newTicker(0.5, os.clock, function()
+				if Hook then Hook.devPoll() end
+				local a = poll()
+				local b = pollCtl()
+				return a or b
+			end)
+		end
+		local refresh = U.refresh
+		local function onRefresh() if refresh() then tick:set(tick:old() + 1) end end
+		react.onStepTimer(onRefresh, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
+		if react.onStep then react.onStep(onRefresh) end
 		local ctl = U.ctl
 		local rows = {}
 		local function add(node) rows[#rows + 1] = node end
 		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
-		-- canRemove (the host's list): a "Remove" button next to every player but the host, and under the list what the
+		-- canRemove (the host's list): a red "X  Kick" button next to every player but the host, and under the list what the
 		-- last one did ("Pat was removed", or why it was refused)
 		local function players(me, canRemove)
 			add(section("Players"))
@@ -158,7 +167,7 @@ local function setup(react, builtin)
 					local id = p.id
 					add(box(H, {
 						playerLine(p, me, WIDTH - 140),
-						button("Remove", function() command("kick", { id = id }) end, "negative", 120),
+						button("X  Kick", function() command("kick", { id = id }) end, "negative", 120),
 					}))
 				else
 					add(playerLine(p, me))
@@ -222,6 +231,21 @@ local function setup(react, builtin)
 			end
 			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
 			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
+			-- Speed test: how long would the save of a synced game take over Steam? Both players keep this window open.
+			add(gap())
+			add(section("Speed test"))
+			add(note("Sends this much data each way. 80 MB is about the size of a save that has to cross."))
+			local sizes = {}
+			for _, mb in ipairs(C.SPEED_CHOICES) do
+				local chosen = (C.speedChoice(mbIn:old()) == mb)
+				sizes[#sizes + 1] = button((chosen and "[ " or "") .. mb .. " MB" .. (chosen and " ]" or ""),
+					function() mbIn:set(mb) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_CHOICES) - 10)
+			end
+			add(box(H, sizes))
+			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old())) end))
+			if st and st.speed then
+				for _, line in ipairs(C.speedLines(st.speed)) do add(note(line)) end
+			end
 			if st and st.note then add(note(tostring(st.note))) end
 			if st and st.test then
 				local t = st.test
@@ -347,21 +371,34 @@ local function setup(react, builtin)
 				end, 0.5)
 			end)
 		end
-		local label = "FeverLink3"
+		-- the label of a button in the bar is cut off at the bottom by the bar's height, so the button is an icon like the
+		-- game's own (eye, music): "multiple persons" from the entity window's icons. While a round runs the percentage
+		-- sits next to it ("45%"); the words of the round are in the window.
+		local pct = nil
 		if U.syncShown and U.ctl and type(U.ctl.sync) == "table" then
 			local sync = U.ctl.sync
 			if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
-				label = "FeverLink3 - syncing " .. math.floor(100 * sync.done / sync.total) .. "%"
+				pct = math.floor(100 * sync.done / sync.total) .. "%"
 			else
-				label = "FeverLink3 - syncing"
+				pct = "..."
 			end
 		end
-		-- like the game's own icon buttons (eye, music): a default-styled button holding an auto-fitted image
+		local icon = builtin.ImageView{
+			path = "::/gui/entity_window/icons/symbol_person_multiple.tga",
+			scaling = builtin.type.ImageViewScaling.AutoFit,
+		}
+		local content = icon
+		if pct then
+			content = builtin.BoxLayout{
+				orientation = builtin.type.Orientation.Horizontal,
+				children = { icon, builtin.TextView{ meta = { class = "font-scale-body" }, text = pct } },
+			}
+		end
 		return builtin.BoxLayout{
 			children = {
 				builtin.Button{
-					meta = { tooltip = "FeverLink3 multiplayer" },
-					content = builtin.TextView{ meta = { class = "font-scale-body" }, text = label },
+					meta = { tooltip = pct and ("FeverLink3 multiplayer: syncing " .. pct) or "FeverLink3 multiplayer" },
+					content = content,
 					onClick = open,
 				},
 			},

@@ -29,6 +29,30 @@ fn a_id(h: &Harness, c: ConnectionId) -> u16 {
 }
 
 #[test]
+fn a_build_veto_is_relayed_to_every_other_game_with_the_sender_filled_in() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    let c = h.connect("C");
+    // B says it cannot build action 3 of player A; it claims to be someone else, which the host overwrites
+    h.player_game(
+        b,
+        MessageKind::BuildVeto,
+        br#"{"seq":3,"owner":1,"why":"unresolved segment 1,2,3 - 4,5,6","from":77}"#,
+    );
+    let at_a: BuildVetoMessage = h.p(a).last(MessageKind::BuildVeto);
+    let at_c: BuildVetoMessage = h.p(c).last(MessageKind::BuildVeto);
+    assert_eq!(a_id(&h, b), at_a.from, "the host names the sender");
+    assert_eq!(at_a, at_c, "everyone else gets the same veto");
+    assert_eq!((3, 1), (at_a.seq, at_a.owner));
+    assert_eq!(Some("B".to_owned()), at_a.name);
+    assert_eq!(0, h.p(b).count(MessageKind::BuildVeto), "not echoed to its sender");
+    // garbage is dropped, not relayed
+    h.player_game(b, MessageKind::BuildVeto, b"not json");
+    assert_eq!(1, h.p(a).count(MessageKind::BuildVeto));
+}
+
+#[test]
 fn set_permissions_reaches_every_game_and_players_remember_it() {
     let mut h = Harness::new();
     let a = h.connect("A");

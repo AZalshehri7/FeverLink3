@@ -34,8 +34,9 @@ pub struct ChecksumPolicy {
 impl ChecksumPolicy {
     /// Parts that drift without anyone doing anything (the engine is not bit-exact for them); `script:*` too.
     pub const DRIFT_PARTS: [&'static str; 5] = ["vehicles", "onboard", "persons", "stocks", "nodeConfigs"];
-    /// Corrected through Authority, never a reason to reload.
-    pub const MONEY_PART: &'static str = "money";
+    /// Corrected through Authority, never a reason to reload. The lanes the script reports are `balance` and `loan`
+    /// (`money` is the older name); a rule written for "money" alone let a difference of 180 in `balance` reload the world.
+    pub const MONEY_PARTS: [&'static str; 3] = ["money", "balance", "loan"];
 
     pub fn new(config: ChecksumPolicyConfig) -> Self {
         Self { config, ..Self::default() }
@@ -45,8 +46,30 @@ impl ChecksumPolicy {
         &self.config
     }
 
+    pub fn is_money_part(part: &str) -> bool {
+        Self::MONEY_PARTS.contains(&part)
+    }
+
     pub fn is_drift_part(part: &str) -> bool {
         Self::DRIFT_PARTS.contains(&part) || part.starts_with("script:")
+    }
+
+    /// The lanes of one checksum round for a log line: each name, with what happens to it when it is not an ordinary
+    /// part ("stations, vehicles (drift), money (corrected)").
+    pub fn describe_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+        let named: Vec<String> = parts
+            .into_iter()
+            .map(|p| {
+                if Self::is_money_part(p) {
+                    format!("{p} (corrected)")
+                } else if Self::is_drift_part(p) {
+                    format!("{p} (drift)")
+                } else {
+                    p.to_owned()
+                }
+            })
+            .collect();
+        named.join(", ")
     }
 
     pub fn in_cooldown(&self, now: f64) -> bool {
@@ -55,8 +78,12 @@ impl ChecksumPolicy {
 
     /// Judges one finished checksum round. `Some(reason)` when the games should be resynchronised now.
     pub fn on_outcome(&mut self, now: f64, outcome: &ChecksumOutcome) -> Option<String> {
+        if !outcome.comparable() {
+            // sampled at different sim times (coarse steps at x3/x4): neither a match nor a desync; streaks stay as they are
+            return None;
+        }
         let parts: BTreeSet<String> =
-            outcome.differing_parts().filter(|p| *p != Self::MONEY_PART).map(str::to_owned).collect();
+            outcome.differing_parts().filter(|p| !Self::is_money_part(p)).map(str::to_owned).collect();
         let drift: BTreeSet<String> = parts.iter().filter(|p| Self::is_drift_part(p)).cloned().collect();
         let other: BTreeSet<String> = parts.iter().filter(|p| !Self::is_drift_part(p)).cloned().collect();
 

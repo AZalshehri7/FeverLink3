@@ -149,32 +149,21 @@ native control link), Steam's structures.
 | `steamnet::symbol` | The size check is made when the code is compiled |
 | `update.rs`, `selftest.rs`, `main.rs` | The launcher executable, not the game process; an embedded constant and the self-test's thread joins |
 
-**The unwind measurement.** Cargo's `panic` setting belongs to a profile, not to a crate, and it is not allowed in a
-per-package override, so trying it for the DLL alone needs either a dedicated profile (and the packaging in
-`tools/release` and `launcher/src/install.rs` pointed at its output folder) or a change of the workspace's release
-profile. The workspace one is simpler, and affects only the launcher executable's size besides. Measured on
-`x86_64-pc-windows-msvc`, rustc 1.99.0, `cargo build --release -p feverlink3_native`:
+**The unwind decision (reversed on 2026-10-11).** The profile was `panic = "abort"` for size. A real crash showed that it
+cannot stay: the hooks sit between the game and its own C++ functions, and a C++ exception passing through a Rust
+frame built with `abort` hits a terminate pad, even in a `system-unwind` function (`docs/NATIVE_LINK.md`, section 10).
+The workspace profile is now `panic = "unwind"`. Measured on `x86_64-pc-windows-msvc`, rustc 1.99.0, `cargo build
+--release -p feverlink3_native`, the same code: 1 132 544 bytes with `abort`, 1 662 464 with `unwind` (+529 920, +46.8 %;
+the earlier measurement was 1 088 512 against 1 580 032). That is far over the 150 KB once allowed, and it is the price
+of a DLL that lives inside another program's exception handling. CI prints both sizes in the job summary and runs
+`tools/dll_unwind_check.py` on the shipped DLL.
 
-| | `panic = "abort"` | `panic = "unwind"` | difference |
-|---|---:|---:|---:|
-| `main` without the hardening (c6b5788) | 1 059 328 bytes | not built | |
-| This branch (hardened, `main` merged in) | 1 088 512 bytes | 1 580 032 bytes | +491 520 (+45.2 %) |
-
-The first measurement, on the tree as it was when the review began, gave 791 040 against 1 078 272 bytes (+287 232,
-+36.3 %); the hooks, the relay codec, the Steam transport and the roster work that came in with `main` add code for
-the unwind tables to describe, so the cost of unwinding grows with the program. In the merged build the `.text`
-section grows by 227 KB (landing pads for every destructor, and the C++ exception runtime that `panic_unwind`
-links), `.rdata` by 216 KB (exception tables), `.pdata` by 37 KB. That is more than three times the 150 KB the owner
-allowed, so **the profile stays `panic = "abort"`**. The hardening itself cost 29 184 bytes (+2.8 %: the exact float
-parser, the checks, the byte budget, the panic hook, the guards). CI prints the release size in the job summary.
-
-What was done instead: the panics that input can reach were removed (above); every thread root that matters runs
-through `launcher::guard::guarded` (the controller's step, the host and player session threads, the connection
-readers, each cycle of the shared Steam poller, the loopback check; `DllMain` has its own `catch_unwind`), which does nothing under `abort` and, with `unwind`, turns a panic into a log line, a stopped
-session (`Controller::recover`, `Status::error`) and a controller that carries on; it is tested, because tests
-always unwind. Switching to unwind is one line (`panic = "unwind"` in the root `Cargo.toml`); the cost is the table
-above. One loose end for that day: the window shows a player session's `Status::error`, but not yet that a host
-session's thread ended.
+What unwinding buys besides: every thread root that matters runs through `launcher::guard::guarded` (the controller's
+step, the host and player session threads, the connection readers, each cycle of the shared Steam poller, the loopback
+check; `DllMain` has its own `catch_unwind`), which now turns a panic into a log line, a stopped session
+(`Controller::recover`, `Status::error`) and a controller that carries on; the hooks' bookkeeping and the service
+thread's pump run through `native::log::guarded` and fail open (the game's call is made all the same). One loose end:
+the window shows a player session's `Status::error`, but not yet that a host session's thread ended.
 
 The roadmap's plan to shrink the DLL to tens of kilobytes with `no_std` has no unwinding at all, which makes the
 removal of panics the only containment that carries over.

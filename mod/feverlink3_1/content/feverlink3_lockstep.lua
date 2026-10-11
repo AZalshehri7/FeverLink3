@@ -76,7 +76,11 @@ end
 --   not started          -> 0 (every game holds at the save time)
 --   barrier              -> 0 once past slowest peer + ahead steps; never a batch that would cross it
 --   pause                -> 0 at pauseAt exactly; the last batch is shortened to land on it
-function L.pace(s, peers, now, ahead)
+--   landing marks        -> `marks` (checksum stamps) never hold the game; the batch is shortened so that one lands
+--                           exactly on the mark. At x3/x4 a batch is several steps, and games whose batches fall at
+--                           different phases would otherwise hash their checksum at different sim times (the host then
+--                           skips the round: ChecksumOutcome.time_skew).
+function L.pace(s, peers, now, ahead, marks)
 	if not s.started then return 0 end
 	local want = s.speed or 0
 	if want <= 0 then return 0 end
@@ -91,7 +95,29 @@ function L.pace(s, peers, now, ahead)
 		local room = math.floor((stopAt - now) / L.STEP)
 		if room < want then want = math.max(room, 1) end
 	end
+	local land = L.nextMark(marks, now)
+	if land then
+		local room = math.floor((land - now) / L.STEP)
+		if room < want then want = math.max(room, 1) end
+	end
 	return want
+end
+
+-- The earliest mark after `now` (nil: none). Marks is a list of times.
+function L.nextMark(marks, now)
+	local best = nil
+	for _, m in ipairs(marks or {}) do
+		if type(m) == "number" and m > now and (best == nil or m < best) then best = m end
+	end
+	return best
+end
+
+-- Remembers a checksum stamp as a landing mark (a short list; marks already passed are dropped).
+function L.addMark(marks, at, now)
+	for i = #marks, 1, -1 do
+		if marks[i] <= now then table.remove(marks, i) end
+	end
+	if type(at) == "number" and at > now and #marks < 16 then marks[#marks + 1] = at end
 end
 
 -- ------------------------------------------------------------------ stamps
@@ -248,6 +274,94 @@ function L.resolveKey(bind, key)
 	local saved = key:match("^s:(%d+)$")
 	if saved then return tonumber(saved) end
 	return bind[key]
+end
+
+-- Window commands name an entity their own window command created a moment ago by a placeholder key "ui:<id>" (<id> is
+-- the record number the UI hook gave that command): the bridge's table of keys reaches the hook a second or so after the
+-- creation (a vehicle bought and put on a line within that second was sent as "s:<id>", an id no other game shares; seen in
+-- a real game). The bridge, which knows the sequence number each record was shipped as, replaces the placeholders before the
+-- body leaves. seqOf(id) -> sequence number | nil. Returns true, or false and the id that was never shipped.
+function L.rewriteUiKeys(node, seqOf, from)
+	if type(node) ~= "table" then return true end
+	if node.__ref == "entity" and type(node.key) == "string" then
+		local id = node.key:match("^ui:(%d+)$")
+		if id then
+			local seq = seqOf(tonumber(id))
+			if not seq then return false, tonumber(id) end
+			node.key = L.itemKey(from, seq)
+		end
+	end
+	for _, v in pairs(node) do
+		if type(v) == "table" then
+			local ok, bad = L.rewriteUiKeys(v, seqOf, from)
+			if not ok then return false, bad end
+		end
+	end
+	return true
+end
+
+-- An entity a command created is found a step or more after the command ran (a watch, see the bridge), so an action stamped
+-- for the same step or the next that names it cannot resolve it yet: that is waiting, not an error. Returns the first key in
+-- the body that isPending(key) names, or nil.
+function L.pendingRef(node, isPending)
+	if type(node) ~= "table" then return nil end
+	if node.__ref == "entity" and type(node.key) == "string" and isPending(node.key) then return node.key end
+	for _, v in pairs(node) do
+		if type(v) == "table" then
+			local k = L.pendingRef(v, isPending)
+			if k then return k end
+		end
+	end
+	return nil
+end
+
+-- Whether `key` is (or is under) the key of an action whose entities are still being looked for: watches
+-- { key = ... }, binders { key = ... } (their sub-keys are "<key>#...").
+function L.keyIsPending(key, watches, binders)
+	for _, w in ipairs(watches or {}) do
+		if w.key == key then return true end
+	end
+	for _, b in ipairs(binders or {}) do
+		if b.key == key or key:sub(1, #b.key + 1) == b.key .. "#" then return true end
+	end
+	return false
+end
+
+-- What a game that could not replicate something (a native build, an action whose entities were not all found) tells the
+-- others about its own divergence: notes = { { at = game time, text = ... }, ... } newest last. An action it ships carries
+-- the recent ones (body.diverged = { "text", ... }), so a refusal on another game names the first divergence, not only the
+-- reference that came out wrong.
+L.NOTE_WINDOW = 600000   -- game time (ms) a note stays relevant to the actions that follow
+L.NOTE_MAX = 3
+
+function L.recentNotes(notes, now)
+	local out = {}
+	for _, n in ipairs(notes or {}) do
+		if type(n) == "table" and type(n.text) == "string" and type(n.at) == "number" and now - n.at <= L.NOTE_WINDOW and n.at <= now then
+			out[#out + 1] = "t=" .. n.at .. " " .. n.text
+		end
+	end
+	while #out > L.NOTE_MAX do table.remove(out, 1) end
+	return out
+end
+
+function L.addNote(notes, at, text, keep)
+	notes[#notes + 1] = { at = at, text = text }
+	while #notes > (keep or 8) do table.remove(notes, 1) end
+end
+
+-- A refusal reason with what the sender said about itself, when the reason is an unresolved or missing reference.
+function L.refusalDetail(err, body)
+	err = tostring(err)
+	local d = type(body) == "table" and body.diverged or nil
+	if type(d) == "table" and #d > 0 and (err:find("unresolved", 1, true) or err:find("does not exist", 1, true)) then
+		local texts = {}
+		for i, t in ipairs(d) do
+			if type(t) == "string" and i <= L.NOTE_MAX then texts[#texts + 1] = t end
+		end
+		if #texts > 0 then err = err .. " [the sender had not replicated: " .. table.concat(texts, "; ") .. "]" end
+	end
+	return err
 end
 
 -- Encodes a captured command for the wire. ctx.keyOf(entity) -> key or nil; ctx.plain(value) -> deep copy that
@@ -539,6 +653,86 @@ end
 
 -- ------------------------------------------------------------------ checksums (section 8)
 
+-- Wider lanes (idea and field choices from MPFever (MIT), mpfever_refs.lua contentHash: stations, edges, edgeObjects,
+-- nodeConfigs, vehicleState, names). Each lane is a small function over an optional engine accessor of the same name that
+-- returns plain data; a build or test without the accessor simply has no such part. No entity id enters a hash (ids are
+-- not guaranteed equal between games): positions rounded to 0.1, models and names stand in for ids, lists are sorted.
+local function r1(v) return string.format("%.1f", v or 0) end
+
+local function sortedItems(keys)
+	table.sort(keys)
+	return { n = #keys, items = keys }
+end
+
+-- stations: every station group with its station count, terminal count and the position of each terminal's stop node
+local function stationsLane(engine)
+	local keys = {}
+	for _, g in ipairs(engine.stations()) do
+		local at = {}
+		for _, p in ipairs(g.at or {}) do at[#at + 1] = r1(p.x) .. "," .. r1(p.y) end
+		table.sort(at)
+		keys[#keys + 1] = tostring(g.stations or 0) .. "/" .. tostring(g.terminals or 0) .. "@" .. table.concat(at, ";")
+	end
+	return sortedItems(keys)
+end
+
+-- road and rail edges: endpoints (canonical order), street type, template/style, decorations and the models of the edge
+-- objects (signals, stops, ...) in a canonical order
+local function edgesLane(engine)
+	local keys = {}
+	for _, e in ipairs(engine.edges()) do
+		local a, b = r1(e.x0) .. "," .. r1(e.y0), r1(e.x1) .. "," .. r1(e.y1)
+		if a > b then a, b = b, a end
+		local objs = {}
+		for _, m in ipairs(e.objects or {}) do objs[#objs + 1] = tostring(m) end
+		table.sort(objs)
+		keys[#keys + 1] = a .. "-" .. b .. "/" .. tostring(e.type) .. "/" .. tostring(e.typeIndex) .. "/" .. tostring(e.roadType)
+			.. "/" .. tostring(e.template) .. "/" .. tostring(e.style) .. "/d" .. tostring(e.decorations or 0)
+			.. "/o" .. table.concat(objs, ",")
+	end
+	return sortedItems(keys)
+end
+
+-- lane connections, crosswalks and traffic lights of the nodes (a drift part: see ChecksumPolicy::DRIFT_PARTS)
+local function nodeConfigsLane(engine)
+	local keys = {}
+	for _, n in ipairs(engine.nodeConfigs()) do
+		keys[#keys + 1] = r1(n.x) .. "," .. r1(n.y) .. "/" .. tostring(n.lanes) .. "/" .. tostring(n.crosswalks)
+			.. "/" .. tostring(n.preference) .. "/" .. tostring(n.light) .. "/" .. tostring(n.slip)
+	end
+	return sortedItems(keys)
+end
+
+-- vehicles (a drift part): per line key (name and stop count) the number of vehicles and their sorted coarse states
+-- (state, stopped by the player, to be sold); positions are left out on purpose
+local function vehiclesLane(engine)
+	local byLine = {}
+	for _, v in ipairs(engine.vehicles()) do
+		local k = tostring(v.line or "-")
+		local t = byLine[k] or {}
+		byLine[k] = t
+		t[#t + 1] = tostring(v.state) .. "/" .. tostring(v.stopped) .. "/" .. tostring(v.sell)
+	end
+	local keys = {}
+	for k, t in pairs(byLine) do
+		table.sort(t)
+		keys[#keys + 1] = k .. "=" .. #t .. ":" .. table.concat(t, ",")
+	end
+	return sortedItems(keys)
+end
+
+-- names of station groups, lines, towns and players (engine.names() -> { stations = {...}, lines = {...}, ... })
+local function namesLane(engine)
+	local all, out = engine.names(), {}
+	for _, kind in ipairs({ "stations", "lines", "towns", "players" }) do
+		local list = {}
+		for _, nm in ipairs(all[kind] or {}) do list[#list + 1] = tostring(nm) end
+		table.sort(list)
+		out[kind] = list
+	end
+	return out
+end
+
 -- Parts over an engine accessor:
 --   engine.gameTime()       -> number
 --   engine.account()        -> balance, loan
@@ -573,6 +767,13 @@ function L.checksumParts(engine, hashFn)
 		table.sort(keys)
 		return { n = #list, items = keys }
 	end)
+	-- wider lanes: each is skipped when the engine has no accessor of that name
+	local function lane(name, fn) if engine[name] then part(name, function() return fn(engine) end) end end
+	lane("stations", stationsLane)
+	lane("edges", edgesLane)
+	lane("nodeConfigs", nodeConfigsLane)
+	lane("vehicles", vehiclesLane)
+	lane("names", namesLane)
 	return parts, t
 end
 

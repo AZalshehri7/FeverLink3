@@ -10,7 +10,7 @@ fn outcome(parts: &[&str]) -> ChecksumOutcome {
             values: BTreeMap::from([(0, Some("a".to_owned())), (1, Some("b".to_owned()))]),
         })
         .collect();
-    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences }
+    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences, time_skew: None }
 }
 
 fn policy() -> ChecksumPolicy {
@@ -45,7 +45,8 @@ fn drift_parts_are_the_named_ones_and_script_prefixed_ones() {
     for part in ["vehicles", "onboard", "persons", "stocks", "nodeConfigs", "script:trains", "script:"] {
         assert!(ChecksumPolicy::is_drift_part(part), "{part}");
     }
-    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions"] {
+    for part in ["roads", "lines", "money", "scripts", "Vehicles", "constructions", "townBuildings", "townBuildings:12"]
+    {
         assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
     }
 }
@@ -58,6 +59,14 @@ fn drift_reloads_only_after_300_seconds_of_continuous_drift() {
     assert_eq!(None, p.on_outcome(1299.9, &outcome(&["persons"])));
     let reason = p.on_outcome(1300.0, &outcome(&["persons"])).expect("300 s reached");
     assert!(reason.contains("persons"), "{reason}");
+}
+
+#[test]
+fn town_buildings_reload_after_two_consecutive_differing_checks() {
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["townBuildings", "townBuildings:12"])));
+    let reason = p.on_outcome(10.0, &outcome(&["townBuildings", "townBuildings:12"])).expect("second check in a row");
+    assert!(reason.contains("townBuildings:12"), "{reason}");
 }
 
 #[test]
@@ -142,4 +151,55 @@ fn thresholds_are_configurable() {
     assert!(p.on_outcome(2.0, &outcome(&["roads"])).is_some());
     p.on_outcome(100.0, &outcome(&["stocks"]));
     assert!(p.on_outcome(110.0, &outcome(&["stocks"])).is_some());
+}
+
+#[test]
+fn rounds_sampled_at_different_times_never_request_and_keep_the_streak() {
+    let mut p = policy();
+    let mut skewed = outcome(&[]);
+    skewed.time_skew = Some(BTreeMap::from([(0, 5000), (1, 5100)]));
+    for t in 0..10 {
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &skewed));
+    }
+    assert_eq!(None, p.on_outcome(100.0, &outcome(&["roads"])));
+    assert_eq!(None, p.on_outcome(110.0, &skewed));
+    assert!(p.on_outcome(120.0, &outcome(&["roads"])).is_some());
+}
+
+#[test]
+fn the_wider_lanes_are_classified_and_named_in_the_difference_message() {
+    // vehicles and nodeConfigs drift; stations, edges, names and the rest reload after two rounds
+    for part in ["vehicles", "nodeConfigs"] {
+        assert!(ChecksumPolicy::is_drift_part(part), "{part}");
+    }
+    for part in ["stations", "edges", "names"] {
+        assert!(!ChecksumPolicy::is_drift_part(part), "{part}");
+    }
+    assert_eq!(
+        "stations, vehicles (drift), money (corrected), edges",
+        ChecksumPolicy::describe_parts(["stations", "vehicles", "money", "edges"])
+    );
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["vehicles"])));
+    assert_eq!(None, p.on_outcome(240.0, &outcome(&["vehicles"])));
+    let reason = p.on_outcome(300.0, &outcome(&["vehicles"])).expect("drifted five minutes");
+    assert!(reason.contains("vehicles drifted"), "{reason}");
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["stations", "names"])));
+    let reason = p.on_outcome(10.0, &outcome(&["names", "stations"])).expect("two rounds");
+    assert!(reason.starts_with("names, stations differ"), "{reason}");
+}
+
+#[test]
+fn a_difference_in_balance_or_loan_is_corrected_in_place_and_never_reloads() {
+    let mut p = policy();
+    for t in 0..6 {
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &outcome(&["balance"])), "balance round {t}");
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0 + 5.0, &outcome(&["loan", "balance"])), "loan round {t}");
+    }
+    // another part next to the money still counts, and the money is left out of the reason
+    p.on_outcome(100.0, &outcome(&["balance", "roads"]));
+    let reason = p.on_outcome(110.0, &outcome(&["balance", "roads"])).expect("roads differ twice");
+    assert!(reason.starts_with("roads differ"), "{reason}");
+    assert!(ChecksumPolicy::describe_parts(["balance"]).contains("(corrected)"));
 }

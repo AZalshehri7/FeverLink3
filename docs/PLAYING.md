@@ -56,6 +56,18 @@ If joining fails, the window says why (wrong code, the host is not hosting, no r
 
 Press **Connection test...** in the window (under the join code field) to open the **Steam connection test**. It checks that two players can reach each other through Steam, without hosting: your **Steam ID** (17 digits) is shown; paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**. Within about 20 seconds the window shows `connected` with the round-trip time and whether the route is `direct` or `through a Steam relay`. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
 
+## 5. How to run the Steam speed test with a friend
+
+This tells us whether a save of about 80 MB can be sent over Steam, and how long it takes. It needs two Steam accounts on two PCs (one account can only talk to itself). Both of you do steps 1 to 3; only one of you does step 4.
+
+1. Both start Transport Fever 3 from Steam, start a game with the mod active, and open the window (**FeverLink3** in the bottom bar). Stay in the game for the whole test; do not pause it with the main menu.
+2. Both press **Connection test...**. Each sees their own **Steam ID**. Send yours to the other (any chat), and paste the other's into **paste the other player's Steam ID**.
+3. Optional: to try a faster send rate, both start the game with the environment variable `FEVERLINK3_STEAM_SENDRATE` set (for example 4194304 for 4 MiB/s; the default is 1048576). Without it you measure the default.
+4. One of you picks the size (**8 MB**, **32 MB** or **80 MB**; start with 32 MB) and presses **Run the speed test**. The other does nothing. The note under the button shows the progress ("sending to your friend: 12.4 of 32 MB"), then the result, four lines: MB/s each direction and total seconds; the route and round trip; the queue and any stall; and how long an 80 MB save would take if you host and if your friend hosts. The test sends the data both ways, so it takes about twice the size divided by the speed (a minute or two for 32 MB at 1 MB/s).
+5. Send us the result: the four lines, or the line starting `steam speed test:` in `session.log` (the file `%LOCALAPPDATA%\FeverLink3\live\session.log` on the PC that pressed the button). Then swap roles and run it once the other way, and once with 80 MB.
+
+If it says `Speed test failed: ...` the reason follows (no route to the other PC, the connection ended, no data for 60 s). A line saying `STALLED` means the data stopped for more than 5 seconds at some point; say when it happened.
+
 ## What works and what does not (yet)
 
 **Verified in the real game by the maintainer (game build 40420):**
@@ -68,12 +80,14 @@ Press **Connection test...** in the window (under the join code field) to open t
 **Not verified yet:**
 
 - Joining a host over Steam from a second Steam account, the world transfer over that connection, and playing together afterwards (this build is for that test).
-- Building together: the mod captures player actions (buying vehicles, creating lines, roads and rails built with the tools in some cases, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
-- The native hooks that would hold construction commands back so every game builds at the same moment: switched off in this version, and never run in the real game.
+- Building together beyond the slice that was seen: the mod captures player actions (buying vehicles, stations, depots, rail, and more) and replays them on every game, but only roads, bulldozing, loans and lines have been checked with two real games.
+- The native hooks that hold construction commands back so every game builds at the same moment: switched off unless a developer turns them on; run in two real games for the road tools and the bulldozer, not for anything else.
 
 **Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
 
-**Not built yet:** separate companies (one shared company for now), a dedicated server.
+**Towns and sync.** The game grows towns with choices that can differ from one computer to the next, so after a while two players' towns can differ, and a road or station built through such a town may fail on the other computer; FeverLink3 then repairs the world with a resync. Town growth is never switched off and no rating is changed; FeverLink3 does not alter how the game works. In our tests the two games' growth started from different random seeds and drifted apart about 10 seconds after each resync; making the seeds equal helped for a while (about 13 checks) but not for good, so the work continues on keeping growth identical on every computer. Until then, expect an occasional resync after building in or near a town.
+
+**Not built yet:** separate companies (one shared company for now), a dedicated server, towns that grow during a session.
 
 ## If something goes wrong
 

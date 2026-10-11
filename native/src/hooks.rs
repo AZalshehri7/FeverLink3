@@ -16,6 +16,7 @@
 //! being patched. After that the module never rewrites game code again: a misbehaving mod is handled by the
 //! hooks passing everything through (holding off, silence), not by uninstalling.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -27,6 +28,7 @@ use windows_sys::Win32::System::LibraryLoader::{
 use crate::build_table::{BuildAddrs, Rva};
 use crate::detour::{hook_caller, Detour};
 use crate::engine::{AddArgs, EngineFns};
+use crate::growth::{self, Mode, Settings};
 use crate::hold::HoldConfig;
 use crate::mem;
 use crate::patch::AppliedPatch;
@@ -34,6 +36,7 @@ use crate::plan::{self, Feature, HookConfig, Image, Plan, Skip, Step};
 use crate::runtime::{Init, Runtime};
 #[cfg(target_arch = "x86_64")]
 use crate::selftest;
+use crate::townseed::{self, Counter};
 
 /// The live runtime the two hook functions work on. Set before any jump is written.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -67,11 +70,252 @@ unsafe extern "system-unwind" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
     }
 }
 
+/// The unhooked town-seed function (the trampoline), published before the jump is written; 0 until then.
+static TOWN_SEED_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Base address of the image, for turning the caller into an RVA in the log; 0 until armed.
+static TOWN_SEED_BASE: AtomicUsize = AtomicUsize::new(0);
+/// The log function (`fn(&str)` as an address); 0 until armed.
+static TOWN_SEED_LOG: AtomicUsize = AtomicUsize::new(0);
+static TOWN_SEED_COUNTER: Counter = Counter::new();
+/// The forced seed (`FEVERLINK3_FORCE_TOWN_SEED`): bit 32 set means "force", the low 32 bits are the value.
+static TOWN_SEED_FORCE: AtomicU64 = AtomicU64::new(0);
+const FORCE_FLAG: u64 = 1 << 32;
+
+/// The largest image the caller's RVA is believed for (the game's executable is 70 MB).
+const TOWN_SEED_IMAGE_BOUND: usize = 0x1000_0000;
+
+/// Tells the town-seed hook where to log and what the image base is. Called once, before the jump is written.
+fn arm_town_seed(base: usize, log: fn(&str), force: Option<u32>) {
+    TOWN_SEED_FORCE.store(force.map_or(0, |v| FORCE_FLAG | u64::from(v)), Ordering::Release);
+    TOWN_SEED_COUNTER.reset();
+    TOWN_SEED_BASE.store(base, Ordering::Release);
+    TOWN_SEED_LOG.store(log as usize, Ordering::Release);
+}
+
+/// The function the game's town-task seeding function is made to jump to: logs, then calls the original with the
+/// same twelve argument slots (four in registers, eight on the stack) and returns what it returns, unchanged.
+///
+/// The game's function is `sub_8d4270(out, a2, a3, a4, a5..a8, seed, a10, a11, a12)`; the seed is the ninth
+/// argument, `[rsp+0x48]` at its entry. Slots are passed through as raw 64-bit values (three of them carry floats,
+/// two pointers), so the original sees exactly the bits the caller wrote. Reads nothing behind any pointer.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system-unwind" fn town_seed_hook(
+    out: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    seed: u64,
+    a10: u64,
+    a11: u64,
+    a12: u64,
+) -> u64 {
+    // first, before anything can change the frames above us: the return address of the call that got here
+    let caller = hook_caller();
+    let original = TOWN_SEED_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return out;
+    }
+    let forced = TOWN_SEED_FORCE.load(Ordering::Acquire);
+    let forced = (forced & FORCE_FLAG != 0).then_some(forced as u32);
+    let log = TOWN_SEED_LOG.load(Ordering::Acquire);
+    if log != 0 {
+        // The log line is our own bookkeeping, on the game's thread: a failure in it (a panic, under `unwind`) is
+        // contained and the original is called all the same. The call below is not inside the guard, so a C++
+        // exception of the game passes through it.
+        crate::log::guarded("town_seed hook", || {
+            // SAFETY: stored by `arm_town_seed` from a `fn(&str)`.
+            let log: fn(&str) = unsafe { core::mem::transmute(log) };
+            let caller = townseed::caller_field(caller, TOWN_SEED_BASE.load(Ordering::Acquire), TOWN_SEED_IMAGE_BOUND);
+            log(&townseed::line(TOWN_SEED_COUNTER.next(), seed as u32, forced, &caller, a3 as u32, a4 as u32));
+        });
+    }
+    // The ninth slot is an ordinary parameter of this function: the call below writes the outgoing copy of it to the
+    // original's `[rsp+0x48]`, so replacing the value here is what the original reads. The other slots pass as given.
+    let seed = forced.map_or(seed, u64::from);
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline `Detour::prepare` built for the function this hook replaces, which takes these slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(out, a2, a3, a4, a5, a6, a7, a8, seed, a10, a11, a12) }
+}
+
+// ---- town growth (`growth.rs`, `docs/NATIVE_LINK.md` section 11)
+
+/// The unhooked `TownDeveloper::Develop` and `TownUpdateSize` handler (trampolines); 0 until published.
+static GROWTH_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static GROWTH_CMD_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Address of the game's `GameTime` getter; 0 when the game time cannot be read.
+static GROWTH_GETTER: AtomicUsize = AtomicUsize::new(0);
+static GROWTH_BASE: AtomicUsize = AtomicUsize::new(0);
+static GROWTH_LOG: AtomicUsize = AtomicUsize::new(0);
+static GROWTH_COUNTER: growth::Counter = growth::Counter::new();
+/// The game time of the `TownUpdateSize` command being executed: `TIME_VALID | time`, 0 outside such a command.
+static GROWTH_TIME: AtomicU64 = AtomicU64::new(0);
+const TIME_VALID: u64 = 1 << 32;
+/// Set once (until re-armed): the seed is replaced from now on.
+static GROWTH_SWITCHED: AtomicBool = AtomicBool::new(false);
+static GROWTH_DERIVE: AtomicBool = AtomicBool::new(false);
+static GROWTH_AFTER_WALL_S: AtomicU64 = AtomicU64::new(0);
+/// Game seconds before the switch; `u64::MAX` = no threshold.
+static GROWTH_AFTER_GAME_S: AtomicU64 = AtomicU64::new(u64::MAX);
+static GROWTH_QUANTUM_MS: AtomicU32 = AtomicU32::new(growth::DEFAULT_QUANTUM_MS);
+/// When the hook was armed, in nanoseconds after `GROWTH_ORIGIN`.
+static GROWTH_START_NS: AtomicU64 = AtomicU64::new(0);
+static GROWTH_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+fn growth_now_ns() -> u64 {
+    GROWTH_ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+fn growth_wall_s() -> u64 {
+    growth_now_ns().saturating_sub(GROWTH_START_NS.load(Ordering::Acquire)) / 1_000_000_000
+}
+
+/// Tells the growth hooks where to log, what they may do and where the game-time getter is (0 = none). Called once,
+/// before the jumps are written.
+fn arm_growth(base: usize, log: fn(&str), settings: &Settings, getter: usize) {
+    GROWTH_COUNTER.reset();
+    GROWTH_TIME.store(0, Ordering::Release);
+    GROWTH_SWITCHED.store(false, Ordering::Release);
+    GROWTH_DERIVE.store(settings.mode == Mode::Derive, Ordering::Release);
+    GROWTH_AFTER_WALL_S.store(settings.after_wall_s, Ordering::Release);
+    GROWTH_AFTER_GAME_S.store(settings.after_game_s.unwrap_or(u64::MAX), Ordering::Release);
+    GROWTH_QUANTUM_MS.store(settings.quantum_ms, Ordering::Release);
+    GROWTH_START_NS.store(growth_now_ns(), Ordering::Release);
+    GROWTH_GETTER.store(getter, Ordering::Release);
+    GROWTH_BASE.store(base, Ordering::Release);
+    GROWTH_LOG.store(log as usize, Ordering::Release);
+}
+
+fn growth_settings() -> Settings {
+    let game = GROWTH_AFTER_GAME_S.load(Ordering::Acquire);
+    Settings {
+        log: true,
+        mode: if GROWTH_DERIVE.load(Ordering::Acquire) { Mode::Derive } else { Mode::Off },
+        after_wall_s: GROWTH_AFTER_WALL_S.load(Ordering::Acquire),
+        after_game_s: (game != u64::MAX).then_some(game),
+        quantum_ms: GROWTH_QUANTUM_MS.load(Ordering::Acquire),
+    }
+}
+
+/// Clears the game time of the running command when the handler returns or unwinds.
+struct ClearGrowthTime;
+
+impl Drop for ClearGrowthTime {
+    fn drop(&mut self) {
+        GROWTH_TIME.store(0, Ordering::Release);
+    }
+}
+
+/// The `TownUpdateSize` command handler `(this, payload) -> bool`: reads the game time the way the handler itself
+/// does a few instructions later (`[[this+8]+0x28]` is the `GameTime` system, `0x2a96c0` the getter), keeps it for
+/// `Develop` to see, and calls the original with the arguments as given. Changes nothing.
+unsafe extern "system-unwind" fn growth_cmd_hook(this: u64, payload: u64) -> u64 {
+    let original = GROWTH_CMD_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    let _clear = ClearGrowthTime;
+    let getter = GROWTH_GETTER.load(Ordering::Acquire);
+    if getter != 0 && this != 0 {
+        // SAFETY: the handler's own first loads (`mov rax,[rbp+8]`, `mov rcx,[rax+0x28]`), with its `this`.
+        let ctx = unsafe { core::ptr::read_unaligned((this + 8) as *const u64) };
+        if ctx != 0 {
+            let system = unsafe { core::ptr::read_unaligned((ctx + 0x28) as *const u64) };
+            if system != 0 {
+                // SAFETY: the address of the getter the planner checked; it takes the system and returns the dword.
+                let get: unsafe extern "system-unwind" fn(u64) -> u32 = unsafe { core::mem::transmute(getter) };
+                let t = unsafe { get(system) };
+                GROWTH_TIME.store(TIME_VALID | u64::from(t), Ordering::Release);
+            }
+        }
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64) -> u64;
+    // SAFETY: the trampoline for the handler this hook replaces.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(this, payload) }
+}
+
+/// The function `TownDeveloper::Develop` is made to jump to. The game's function is
+/// `Develop(this, world, town entity (r8d), flag (r9b), u32* minstd state, arg 6, arg 7)`: the fifth argument is
+/// `[rsp+0x28]` at entry, a pointer to the one 32-bit state of the generator, which the function copies to a local
+/// and draws from through the pointer. Logs the call, in `derive` mode (after the switch, for a call whose game time
+/// is known) overwrites the u32 behind the pointer, and calls the original with every slot as given.
+///
+/// The original's result is ignored by its only growth caller; it is forwarded as received.
+unsafe extern "system-unwind" fn growth_hook(rcx: u64, rdx: u64, r8: u64, r9: u64, a5: u64, a6: u64, a7: u64) -> u64 {
+    let original = GROWTH_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    let log = GROWTH_LOG.load(Ordering::Acquire);
+    // a null or misaligned pointer is not the state we know: pass the call through untouched
+    if log != 0 && a5 != 0 && a5.is_multiple_of(4) {
+        let state = a5 as *mut u32;
+        let town = r8 as u32;
+        // SAFETY: the pointer the caller passes is its live generator state (a local of the command handler).
+        let seed = unsafe { core::ptr::read_volatile(state) };
+        let n = GROWTH_COUNTER.next();
+        let packed = GROWTH_TIME.load(Ordering::Acquire);
+        let time = (packed & TIME_VALID != 0).then_some(packed as u32);
+        let settings = growth_settings();
+
+        let mut announce = None;
+        if settings.mode == Mode::Derive
+            && !GROWTH_SWITCHED.load(Ordering::Acquire)
+            && settings.switch_due(growth_wall_s(), time)
+            && GROWTH_SWITCHED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
+            announce = Some(growth::switch_line(n, growth_wall_s(), time, &settings));
+        }
+        let used = match time {
+            Some(t) if settings.mode == Mode::Derive && GROWTH_SWITCHED.load(Ordering::Acquire) => {
+                Some(growth::derive(town, t, settings.quantum_ms))
+            }
+            _ => None,
+        };
+        if let Some(u) = used {
+            // SAFETY: as above; the original reads its draws through this pointer, so this is what it uses.
+            unsafe { core::ptr::write_volatile(state, u) };
+        }
+        let want_line = announce.is_some() || growth::sampled(n, town, seed);
+        // from the hook's own frame, as the other hooks do (and only when a line is written: it walks the stack)
+        let caller = if want_line { hook_caller() } else { None };
+        if want_line {
+            // Our own bookkeeping, contained; the call into the game below is outside the guard.
+            crate::log::guarded("growth hook", || {
+                // SAFETY: stored by `arm_growth` from a `fn(&str)`.
+                let log: fn(&str) = unsafe { core::mem::transmute(log) };
+                if let Some(a) = &announce {
+                    log(a);
+                }
+                let caller = townseed::caller_field(caller, GROWTH_BASE.load(Ordering::Acquire), TOWN_SEED_IMAGE_BOUND);
+                log(&growth::line(n, town, seed, time, used, &caller));
+            });
+        }
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline for `Develop`, which takes these seven slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(rcx, rdx, r8, r9, a5, a6, a7) }
+}
+
+/// The diagnostic hooks: logs and experiments that are not among the pieces the mod's `ready` event lists.
+fn is_diagnostic(name: &str) -> bool {
+    matches!(name, "town_seed" | "town_develop" | "town_update_size")
+}
+
 /// Where the jumps lead.
 #[derive(Debug, Clone, Copy)]
 pub struct Targets {
     pub apply: usize,
     pub add: usize,
+    pub seed: usize,
+    pub growth: usize,
+    pub growth_cmd: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -177,7 +421,13 @@ pub unsafe fn execute(
     for step in &plan.steps {
         if let Step::Detour { feature, name, rva, expected } = step {
             let at = (base + *rva as usize) as *mut u8;
-            let hook = if *feature == Feature::Counters { targets.apply } else { targets.add };
+            let hook = match feature {
+                Feature::Counters => targets.apply,
+                Feature::TownSeed => targets.seed,
+                Feature::Growth => targets.growth,
+                Feature::GrowthCmd => targets.growth_cmd,
+                _ => targets.add,
+            };
             match unsafe { Detour::prepare(at, expected) } {
                 Ok(d) => prepared.push((name, hook, d)),
                 Err(e) => lines.push(format!("hooks: {name}: NOT installed, prologue check failed: {e}")),
@@ -190,6 +440,9 @@ pub unsafe fn execute(
         prepared.iter().find(|(n, _, _)| *n == wanted).map(|(_, _, d)| d.original() as usize).unwrap_or(0)
     };
     rt.set_original_addresses(original_of("command_list_add"), original_of("apply_command"));
+    TOWN_SEED_ORIGINAL.store(original_of("town_seed"), Ordering::Release);
+    GROWTH_ORIGINAL.store(original_of("town_develop"), Ordering::Release);
+    GROWTH_CMD_ORIGINAL.store(original_of("town_update_size"), Ordering::Release);
     observer(Stage::Prepared);
 
     // 4. write the jumps; if one fails, take the others out again
@@ -276,7 +529,14 @@ fn apply_selftest(p: &mut Plan, report: &selftest::Report, log: fn(&str)) {
 
 /// Reads the switches from the environment and installs what they ask for.
 pub fn attach_from_env(build: &'static BuildAddrs, link: Option<Link>, log: fn(&str)) {
-    let cfg = HookConfig::from_lookup(|name| std::env::var(name).ok());
+    let get = |name: &str| std::env::var(name).ok();
+    if let Err(reason) = plan::forced_seed(get) {
+        log(&format!("hooks: {}: ignored, {reason}", plan::FORCE_TOWN_SEED_VAR));
+    }
+    for complaint in growth::Settings::from_lookup(get).1 {
+        log(&format!("hooks: {complaint}"));
+    }
+    let cfg = HookConfig::from_lookup(get);
     attach(build, cfg, link, log);
 }
 
@@ -315,8 +575,13 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         }
         _ => None,
     };
-    let planned: Vec<&'static str> =
-        plan.steps.iter().filter(|s| matches!(s, Step::Detour { .. })).map(Step::name).collect();
+    // the town-seed log is not one of the pieces the mod's `ready` event lists
+    let planned: Vec<&'static str> = plan
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::Detour { .. }) && !is_diagnostic(s.name()))
+        .map(Step::name)
+        .collect();
     let rt = Runtime::new(Init {
         build,
         base,
@@ -332,15 +597,34 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         return;
     }
     let Some(rt) = RUNTIME.get() else { return };
-    let targets = Targets { apply: apply_hook as *const () as usize, add: add_hook as *const () as usize };
+    let targets = Targets {
+        apply: apply_hook as *const () as usize,
+        add: add_hook as *const () as usize,
+        seed: town_seed_hook as *const () as usize,
+        growth: growth_hook as *const () as usize,
+        growth_cmd: growth_cmd_hook as *const () as usize,
+    };
+    if plan.has(Feature::TownSeed) {
+        arm_town_seed(base, log, cfg.force_seed);
+    }
+    if plan.has(Feature::Growth) {
+        let getter =
+            if plan.has(Feature::GrowthCmd) { plan.game_time_getter.map_or(0, |r| base + r as usize) } else { 0 };
+        arm_growth(base, log, &cfg.growth, getter);
+    }
     // SAFETY: called from DllMain, before the game runs the functions being patched.
     let (installed, lines) = unsafe { execute(&plan, base, rt, &targets, &mut |_| {}) };
     for l in lines {
         log(&l);
     }
-    rt.set_installed(installed.hook_names(), installed.poolpatch());
+    let mod_hooks: Vec<&'static str> = installed.hook_names().into_iter().filter(|n| !is_diagnostic(n)).collect();
+    let seed_logged = installed.hook_names().contains(&"town_seed");
+    let growth_logged = installed.hook_names().contains(&"town_develop");
+    let time_read = installed.hook_names().contains(&"town_update_size");
+    rt.set_installed(mod_hooks.clone(), installed.poolpatch());
     let anything = !installed.is_empty();
-    let hooked = !installed.hook_names().is_empty();
+    let hooked = !mod_hooks.is_empty();
+    let mod_pieces = hooked || installed.poolpatch();
     if let Ok(mut slot) = INSTALLED.lock() {
         *slot = Some(installed);
     }
@@ -349,6 +633,37 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         return;
     }
     pin_module();
+    if seed_logged {
+        log("hooks: town_seed: MAP GENERATION seed log (not town growth): one line per call of the location factory's constructor as 'mapgen-seed n=.. seed=.. caller=..'");
+        if let Some(v) = cfg.force_seed {
+            log(&format!("hooks: town_seed: EXPERIMENT: replacing the seed argument with {v:#010x} on every call"));
+        } else {
+            log("hooks: town_seed: read-only");
+        }
+    }
+    if growth_logged {
+        let g = &cfg.growth;
+        log("hooks: town_develop: TOWN GROWTH log: 'growth n=.. town=.. seed=.. [t=..] [used=..] caller=..' (first 2000 calls, then about 1 in 50)");
+        if !time_read {
+            log(
+                "hooks: town_develop: the game time cannot be read on this build: no t= field, and no seed replacement",
+            );
+        }
+        match g.mode {
+            Mode::Derive => log(&format!(
+                "hooks: town_develop: EXPERIMENT growth seed mode derive: after wall>={}s and game>={} the seed Develop reads is replaced by derive(town, game time rounded down to {} ms); only which random numbers are drawn changes",
+                g.after_wall_s,
+                g.after_game_s.map_or("none".to_string(), |v| format!("{v}s")),
+                g.quantum_ms
+            )),
+            Mode::Off => log("hooks: town_develop: read-only"),
+        }
+    }
+    if !mod_pieces {
+        // only the diagnostic hooks: nothing for the control link to do
+        log("hooks: installed (diagnostic logs only; nothing else in the game is changed, no control link)");
+        return;
+    }
     log(&installed_line(hooked));
     if let Some(link) = link {
         spawn_service(rt, link, since, log);
@@ -414,7 +729,8 @@ fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&s
             return;
         }
         loop {
-            rt.pump();
+            // a failure in one round (a panic, under `unwind`) costs that round, not the link
+            crate::log::guarded("service thread", || rt.pump());
             std::thread::park_timeout(Duration::from_millis(20));
         }
     });
@@ -428,6 +744,7 @@ fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&s
 mod tests {
     use super::*;
     use crate::build_table::{CallSite, HookSite, PatchSite};
+    use crate::growth::{Mode, Settings};
     use crate::mem::pages::Pages;
     use crate::selftest::{SUM5, SUM5_PROLOGUE};
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
@@ -440,6 +757,11 @@ mod tests {
     const ADD_RVA: u32 = 0x200;
     const POOL_RVA: u32 = 0x300;
     const MOVE_RVA: u32 = 0x400;
+    const SEED_RVA: u32 = 0x600;
+    /// A fake of the town task's seeding function: `fn(a1..a12) -> a1 + a5 + a9` in 32 bits, reading its ninth
+    /// argument from the stack as the real one does: `mov eax,[rsp+48h] ; add eax,[rsp+28h] ; add eax,ecx ; nop4 ; ret`.
+    const SEED_FN: [u8; 15] =
+        [0x8B, 0x44, 0x24, 0x48, 0x03, 0x44, 0x24, 0x28, 0x01, 0xC8, 0x90, 0x90, 0x90, 0x90, 0xC3];
     const POOL_BEFORE: &[u8] = &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00];
     const POOL_AFTER: &[u8] = &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00];
 
@@ -457,6 +779,13 @@ mod tests {
             name: "fake",
             command_list_add: Some(add.clone()),
             apply_command: Some(APPLY.clone()),
+            town_seed: Some(HookSite { rva: SEED_RVA, prologue: &SEED_FN[..14] }),
+            town_develop: Some(HookSite { rva: DEVELOP_RVA, prologue: &DEVELOP_FN[..15] }),
+            town_update_size: Some(HookSite {
+                rva: CMD_RVA,
+                prologue: Box::leak(handler_fn().to_vec().into_boxed_slice()),
+            }),
+            game_time_getter: Some(CallSite { rva: GETTER_RVA, prologue: &GETTER_FN }),
             script_pool: Some(pool.clone()),
             command_move: Some(helper.clone()),
             command_destroy: Some(helper.clone()),
@@ -473,6 +802,10 @@ mod tests {
         g.fill(APPLY_RVA as usize, &SUM);
         g.fill(ADD_RVA as usize, SUM5);
         g.fill(POOL_RVA as usize, POOL_BEFORE);
+        g.fill(SEED_RVA as usize, &SEED_FN);
+        g.fill(DEVELOP_RVA as usize, &DEVELOP_FN);
+        g.fill(CMD_RVA as usize, &handler_fn());
+        g.fill(GETTER_RVA as usize, &GETTER_FN);
         g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
         g
     }
@@ -493,7 +826,7 @@ mod tests {
     }
 
     fn everything() -> HookConfig {
-        HookConfig { hooks: true, hold: true, poolpatch: true }
+        HookConfig { hooks: true, hold: true, poolpatch: true, ..Default::default() }
     }
 
     // the hooks of these tests: they only prove that the game's functions lead to them and that the published
@@ -517,7 +850,13 @@ mod tests {
     }
 
     fn targets() -> Targets {
-        Targets { apply: test_apply as *const () as usize, add: test_add as *const () as usize }
+        Targets {
+            apply: test_apply as *const () as usize,
+            add: test_add as *const () as usize,
+            seed: town_seed_hook as *const () as usize,
+            growth: growth_hook as *const () as usize,
+            growth_cmd: growth_cmd_hook as *const () as usize,
+        }
     }
 
     fn apply_fn(g: &Pages) -> extern "system" fn(u64, u64) -> u64 {
@@ -570,6 +909,110 @@ mod tests {
         assert_eq!(apply_fn(&game)(1, 2), 8);
         assert_eq!(add_fn(&game)(1, 2, 3, 4, 5), 15);
         assert_eq!(game.protection(0), PAGE_EXECUTE_READ);
+    }
+
+    static SEED_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn seed_log(line: &str) {
+        SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).push(line.to_string());
+    }
+
+    type SeedFn = extern "system" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+
+    fn seed_fn(g: &Pages) -> SeedFn {
+        unsafe { core::mem::transmute(g.at(SEED_RVA as usize)) }
+    }
+
+    #[test]
+    fn the_town_seed_hook_logs_the_ninth_argument_and_changes_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { town_seed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.report());
+        let before = seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+        assert_eq!(before, 15, "the fake: a1 + a5 + a9");
+
+        SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        arm_town_seed(base, seed_log, None);
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(inst.hook_names(), ["town_seed"], "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("town_seed: jump written")), "{lines:?}");
+        assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM, "the other functions are untouched");
+        assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5);
+
+        // same result as unhooked; the high half of the seed slot is garbage the log must ignore
+        let hooked = seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 0xAAAA_BBBB_0000_0009, 10, 11, 12);
+        assert_eq!(hooked, before);
+        assert_eq!(seed_fn(&game)(100, 2, 0x1_0000_0007, 4, 5, 6, 7, 8, 1, 10, 11, 12), 106);
+        let logged = SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged[0].starts_with("mapgen-seed n=1 seed=0x00000009 caller="), "{}", logged[0]);
+        assert!(logged[0].ends_with(" a3=0x3 a4=0x4"), "{}", logged[0]);
+        assert!(logged[1].starts_with("mapgen-seed n=2 seed=0x00000001 caller="), "{}", logged[1]);
+        assert!(logged[1].contains(" a3=0x7 "), "{}", logged[1]);
+
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(SEED_RVA as usize, SEED_FN.len()), SEED_FN, "byte for byte as the game shipped it");
+        assert_eq!(seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 15);
+    }
+
+    #[test]
+    fn a_forced_town_seed_is_what_the_original_reads_from_its_ninth_slot() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { town_seed: true, force_seed: Some(0x100), ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.report());
+
+        SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        arm_town_seed(base, seed_log, cfg.force_seed);
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(inst.hook_names(), ["town_seed"], "{lines:?}");
+
+        // the fake returns a1 + a5 + the ninth argument read from [rsp+0x48] on entry: the original sees 0x100,
+        // not the caller's value, the garbage in the high half of the slot is gone, a1 and a5 pass as given
+        assert_eq!(seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 0xAAAA_BBBB_0000_0009, 10, 11, 12), 1 + 5 + 0x100);
+        assert_eq!(seed_fn(&game)(100, 2, 3, 4, 50, 6, 7, 8, 1, 10, 11, 12), 100 + 50 + 0x100);
+        let logged = SEED_LINES.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged[0].starts_with("mapgen-seed n=1 seed=0x00000009 forced=0x00000100 caller="), "{}", logged[0]);
+        assert!(logged[1].starts_with("mapgen-seed n=2 seed=0x00000001 forced=0x00000100 caller="), "{}", logged[1]);
+
+        // re-armed without forcing: the caller's value passes again
+        arm_town_seed(base, seed_log, None);
+        assert_eq!(seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 15);
+        unsafe { inst.uninstall_all() };
+        assert_eq!(seed_fn(&game)(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), 15);
+    }
+
+    #[test]
+    fn without_the_switch_the_seed_function_is_not_touched() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let plan = plan::plan(build, everything(), &ProcessImage { base });
+        assert!(!plan.has(Feature::TownSeed));
+        let rt = runtime(build, base);
+        let (mut inst, _) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert_eq!(game.bytes(SEED_RVA as usize, SEED_FN.len()), SEED_FN);
+        unsafe { inst.uninstall_all() };
+    }
+
+    #[test]
+    fn a_changed_seed_function_is_not_hooked() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        game.fill(SEED_RVA as usize + 3, &[0x49]);
+        let cfg = HookConfig { town_seed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert!(plan.steps.is_empty());
+        assert!(plan.report().iter().any(|l| l.contains("SKIPPED town_seed")), "{:?}", plan.report());
     }
 
     #[test]
@@ -783,7 +1226,7 @@ mod tests {
         let dir = crate::testutil::TempDir::new("attach");
         let (build, game) = (fake_build(), fake_game());
         let base = game.base as usize;
-        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true };
+        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true, ..Default::default() };
         let link = Some(Link { dir: dir.path().to_path_buf(), live: false });
         attach_at(base, build, cfg, link, capture);
         let rt = RUNTIME.get().expect("attach set the runtime");
@@ -851,5 +1294,263 @@ mod tests {
         assert_eq!(game.bytes(APPLY_RVA as usize, 16), SUM);
         assert_eq!(game.bytes(POOL_RVA as usize, POOL_BEFORE.len()), POOL_BEFORE);
         assert_eq!(apply_fn(&game)(1, 2), 8);
+    }
+
+    // ---- town growth
+
+    const DEVELOP_RVA: u32 = 0x700;
+    const CMD_RVA: u32 = 0x800;
+    const GETTER_RVA: u32 = 0x900;
+    /// A fake `Develop(rcx, rdx, r8d, r9b, u32* state, a6, a7)`: reads the state through its fifth argument, which is
+    /// `[rsp+28h]` at entry as in the game, and returns `*state + r8d`:
+    /// `mov rax,[rsp+28h] ; mov eax,[rax] ; add eax,r8d ; nop5 ; ret`.
+    const DEVELOP_FN: [u8; 16] =
+        [0x48, 0x8B, 0x44, 0x24, 0x28, 0x8B, 0x00, 0x44, 0x01, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3];
+    /// A fake of the game-time getter: `mov eax,[rcx] ; ret ; nop..` (14 bytes).
+    const GETTER_FN: [u8; 14] = [0x8B, 0x01, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
+
+    /// A fake `TownUpdateSize` handler: `mov rax, <growth_probe> ; jmp rax ; nop3` (15 bytes).
+    fn handler_fn() -> [u8; 15] {
+        let mut b = [0x90u8; 15];
+        b[0] = 0x48;
+        b[1] = 0xB8;
+        b[2..10].copy_from_slice(&(growth_probe as *const () as usize as u64).to_le_bytes());
+        b[10] = 0xFF;
+        b[11] = 0xE0;
+        b
+    }
+
+    /// What the fake handler does: remember the game time the hook published, then run the (hooked) fake `Develop`
+    /// of the fake game on a state it sets up, as the real handler does.
+    static PROBE_DEVELOP: AtomicUsize = AtomicUsize::new(0);
+    static PROBE_STATE: AtomicU32 = AtomicU32::new(0);
+    static PROBE_INIT: AtomicU32 = AtomicU32::new(0);
+    static PROBE_TIME: AtomicU64 = AtomicU64::new(0);
+
+    extern "system" fn growth_probe(_this: u64, town: u64) -> u64 {
+        PROBE_TIME.store(GROWTH_TIME.load(SeqCst), SeqCst);
+        PROBE_STATE.store(PROBE_INIT.load(SeqCst), SeqCst);
+        develop(PROBE_DEVELOP.load(SeqCst), town, PROBE_STATE.as_ptr() as u64)
+    }
+
+    fn develop(at: usize, town: u64, state: u64) -> u64 {
+        type DevelopFn = extern "system" fn(u64, u64, u64, u64, u64, u64, u64) -> u64;
+        let f: DevelopFn = unsafe { core::mem::transmute(at) };
+        f(1, 2, town, 1, state, 6, 7)
+    }
+
+    /// `Develop` of the fake game, called directly (not from the handler) on `PROBE_STATE` set to `init`.
+    fn develop_direct(game: &Pages, town: u64, init: u32) -> u64 {
+        PROBE_STATE.store(init, SeqCst);
+        develop(game.at(DEVELOP_RVA as usize) as usize, town, PROBE_STATE.as_ptr() as u64)
+    }
+
+    static GROWTH_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn growth_log(line: &str) {
+        GROWTH_LINES.lock().unwrap_or_else(|p| p.into_inner()).push(line.to_string());
+    }
+
+    fn growth_lines() -> Vec<String> {
+        GROWTH_LINES.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The memory the fake handler's `this` points through: `this -> ctx (at +8) -> system (at +0x28) -> game time`.
+    struct FakeSim {
+        this: u64,
+        time: &'static AtomicU32,
+    }
+
+    fn fake_sim() -> FakeSim {
+        let time: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let ctx: &'static mut [u64; 8] = Box::leak(Box::new([0u64; 8]));
+        ctx[5] = time as *const AtomicU32 as u64;
+        let this: &'static mut [u64; 2] = Box::leak(Box::new([0u64; 2]));
+        this[1] = ctx.as_ptr() as u64;
+        FakeSim { this: this.as_ptr() as u64, time }
+    }
+
+    /// Runs the fake handler (through its hook, if installed) at game time `t` for `town` with the state `init`.
+    fn command(game: &Pages, sim: &FakeSim, t: u32, town: u64, init: u32) -> u64 {
+        sim.time.store(t, SeqCst);
+        PROBE_INIT.store(init, SeqCst);
+        type HandlerFn = extern "system" fn(u64, u64) -> u64;
+        let f: HandlerFn = unsafe { core::mem::transmute(game.at(CMD_RVA as usize)) };
+        f(sim.this, town)
+    }
+
+    fn growth_setup(settings: Settings) -> (Pages, &'static BuildAddrs, HookConfig) {
+        (fake_game(), fake_build(), HookConfig { growth: settings, ..Default::default() })
+    }
+
+    fn install_growth(game: &Pages, build: &'static BuildAddrs, cfg: HookConfig) -> (Installed, Vec<String>, Plan) {
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        let getter =
+            if plan.has(Feature::GrowthCmd) { plan.game_time_getter.map_or(0, |r| base + r as usize) } else { 0 };
+        GROWTH_LINES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        arm_growth(base, growth_log, &cfg.growth, getter);
+        PROBE_DEVELOP.store(game.at(DEVELOP_RVA as usize) as usize, SeqCst);
+        let (inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        (inst, lines, plan)
+    }
+
+    fn log_only() -> Settings {
+        Settings { log: true, ..Default::default() }
+    }
+
+    fn derive_after_game(seconds: u64) -> Settings {
+        Settings { log: true, mode: Mode::Derive, after_game_s: Some(seconds), ..Default::default() }
+    }
+
+    #[test]
+    fn the_growth_log_reports_the_call_and_changes_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (game, build, cfg) = growth_setup(log_only());
+        let sim = fake_sim();
+        assert_eq!(develop_direct(&game, 7, 100), 107, "the fake: state + town");
+
+        let (mut inst, lines, plan) = install_growth(&game, build, cfg);
+        assert_eq!(plan.steps.len(), 2, "{:?}", plan.report());
+        assert_eq!(inst.hook_names(), ["town_develop", "town_update_size"], "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("town_develop: jump written")), "{lines:?}");
+
+        // through the fake handler: the game time is read through the pointer chain and logged
+        assert_eq!(command(&game, &sim, 12_345, 7, 100), 107, "the original's result is unchanged");
+        assert_eq!(PROBE_STATE.load(SeqCst), 100, "log only: the state is not touched");
+        assert_eq!(PROBE_TIME.load(SeqCst), TIME_VALID | 12_345, "visible to Develop while the handler runs");
+        assert_eq!(GROWTH_TIME.load(SeqCst), 0, "and gone when it returns");
+        // Develop called by someone else (no game time known)
+        assert_eq!(develop_direct(&game, 8, 100), 108);
+        assert_eq!(PROBE_STATE.load(SeqCst), 100);
+
+        let logged = growth_lines();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        assert!(logged[0].starts_with("growth n=1 town=7 seed=0x00000064 t=12345 caller="), "{}", logged[0]);
+        assert!(!logged[0].contains("used="), "{}", logged[0]);
+        assert!(logged[1].starts_with("growth n=2 town=8 seed=0x00000064 caller="), "{}", logged[1]);
+        assert!(!logged[1].contains(" t="), "{}", logged[1]);
+
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(DEVELOP_RVA as usize, DEVELOP_FN.len()), DEVELOP_FN, "byte for byte as shipped");
+        assert_eq!(game.bytes(CMD_RVA as usize, 15), handler_fn());
+        assert_eq!(game.bytes(GETTER_RVA as usize, GETTER_FN.len()), GETTER_FN, "the getter is never touched");
+        assert_eq!(develop_direct(&game, 1, 9), 10);
+    }
+
+    #[test]
+    fn before_the_switch_derive_mode_only_logs_and_after_it_the_original_reads_the_derived_seed() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (game, build, cfg) = growth_setup(derive_after_game(60));
+        let sim = fake_sim();
+        let (mut inst, lines, _) = install_growth(&game, build, cfg);
+        assert_eq!(inst.hook_names(), ["town_develop", "town_update_size"], "{lines:?}");
+
+        // game time 59 s: below the threshold, the original reads the game's own seed
+        assert_eq!(command(&game, &sim, 59_000, 7, 100), 107);
+        assert_eq!(PROBE_STATE.load(SeqCst), 100);
+        assert!(!GROWTH_SWITCHED.load(SeqCst));
+
+        // 60.5 s: the switch; the original reads derive(town, 60.5 s rounded down to 1000 ms)
+        let d7 = growth::derive(7, 60_500, 1000);
+        assert_eq!(d7, growth::derive(7, 60_000, 1000));
+        assert_eq!(command(&game, &sim, 60_500, 7, 100), u64::from(d7) + 7, "the draw is from the derived seed");
+        assert_eq!(PROBE_STATE.load(SeqCst), d7);
+        assert!(GROWTH_SWITCHED.load(SeqCst));
+
+        // 300 ms later, same quantum: the same seed whatever the game's own seed (it differs: 5 vs 100)
+        assert_eq!(command(&game, &sim, 60_800, 7, 5), u64::from(d7) + 7);
+        // another town differs, the next quantum differs
+        let d8 = growth::derive(8, 60_800, 1000);
+        assert_ne!(d8, d7);
+        assert_eq!(command(&game, &sim, 60_800, 8, 5), u64::from(d8) + 8);
+        let d7_next = growth::derive(7, 61_000, 1000);
+        assert_ne!(d7_next, d7);
+        assert_eq!(command(&game, &sim, 61_000, 7, 5), u64::from(d7_next) + 7);
+
+        // a call whose game time is unknown (not from TownUpdateSize) is never rewritten
+        assert_eq!(develop_direct(&game, 7, 42), 49);
+
+        let logged = growth_lines();
+        let switches: Vec<_> = logged.iter().filter(|l| l.starts_with("growth-switch")).collect();
+        assert_eq!(switches.len(), 1, "{logged:?}");
+        assert!(switches[0].contains("game_time=60500") && switches[0].contains("1000 ms"), "{}", switches[0]);
+        let calls: Vec<_> = logged.iter().filter(|l| l.starts_with("growth n=")).collect();
+        assert_eq!(calls.len(), 6, "{logged:?}");
+        assert!(!calls[0].contains("used="), "{}", calls[0]);
+        assert!(calls[1].contains(&format!(" seed=0x00000064 t=60500 used={d7:#010x} ")), "{}", calls[1]);
+        assert!(calls[2].contains(&format!(" seed=0x00000005 t=60800 used={d7:#010x} ")), "{}", calls[2]);
+        assert!(!calls[5].contains("used="), "{}", calls[5]);
+        // the switch line comes right before the first replaced call's line
+        let at = logged.iter().position(|l| l.starts_with("growth-switch")).unwrap();
+        assert!(logged[at + 1].starts_with("growth n=2 "), "{logged:?}");
+
+        unsafe { inst.uninstall_all() };
+        assert_eq!(game.bytes(DEVELOP_RVA as usize, DEVELOP_FN.len()), DEVELOP_FN);
+    }
+
+    #[test]
+    fn a_wall_clock_threshold_not_yet_reached_keeps_derive_mode_logging_only() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let settings = Settings { log: true, mode: Mode::Derive, after_wall_s: 3600, ..Default::default() };
+        let (game, build, cfg) = growth_setup(settings);
+        let sim = fake_sim();
+        let (mut inst, _, _) = install_growth(&game, build, cfg);
+        assert_eq!(command(&game, &sim, 99_999_000, 7, 100), 107);
+        assert_eq!(PROBE_STATE.load(SeqCst), 100);
+        assert!(growth_lines().iter().all(|l| !l.contains("used=") && !l.starts_with("growth-switch")));
+        unsafe { inst.uninstall_all() };
+    }
+
+    #[test]
+    fn without_a_readable_game_time_derive_mode_never_rewrites() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (game, build, cfg) = growth_setup(Settings { log: true, mode: Mode::Derive, ..Default::default() });
+        // the handler no longer matches the table: only Develop is hooked, there is no game time
+        game.fill(CMD_RVA as usize + 13, &[0xCC]);
+        let (mut inst, _, plan) = install_growth(&game, build, cfg);
+        assert_eq!(inst.hook_names(), ["town_develop"]);
+        assert!(plan.report().iter().any(|l| l.contains("SKIPPED town_update_size")), "{:?}", plan.report());
+        assert_eq!(develop_direct(&game, 7, 100), 107);
+        assert_eq!(PROBE_STATE.load(SeqCst), 100);
+        assert!(growth_lines()[0].starts_with("growth n=1 town=7 seed=0x00000064 caller="));
+        unsafe { inst.uninstall_all() };
+    }
+
+    #[test]
+    fn a_changed_develop_prologue_installs_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (game, build, cfg) = growth_setup(log_only());
+        game.fill(DEVELOP_RVA as usize + 6, &[0x40]);
+        let (inst, _, plan) = install_growth(&game, build, cfg);
+        assert!(plan.steps.iter().all(|s| s.feature() != Feature::Growth), "{:?}", plan.report());
+        assert!(plan.report().iter().any(|l| l.contains("SKIPPED town_develop")), "{:?}", plan.report());
+        assert!(!inst.hook_names().contains(&"town_develop"));
+        assert_eq!(game.bytes(DEVELOP_RVA as usize + 6, 1), [0x40], "the changed function is left as it is");
+    }
+
+    #[test]
+    fn without_the_growth_switches_nothing_of_growth_is_touched() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let plan = plan::plan(build, everything(), &ProcessImage { base });
+        assert!(!plan.has(Feature::Growth) && !plan.has(Feature::GrowthCmd));
+        assert_eq!(game.bytes(DEVELOP_RVA as usize, DEVELOP_FN.len()), DEVELOP_FN);
+        assert_eq!(game.bytes(CMD_RVA as usize, 15), handler_fn());
+    }
+
+    #[test]
+    fn only_the_first_calls_and_a_fraction_of_the_rest_are_logged() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (game, build, cfg) = growth_setup(log_only());
+        let (mut inst, _, _) = install_growth(&game, build, cfg);
+        for i in 0..2600u32 {
+            develop_direct(&game, u64::from(i % 17), i.wrapping_mul(2_654_435_761));
+        }
+        let n = growth_lines().len();
+        assert!((2000..2080).contains(&n), "2000 first calls, then about one in 50 of 600: {n}");
+        unsafe { inst.uninstall_all() };
     }
 }

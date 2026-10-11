@@ -14,13 +14,49 @@
 //!    nothing until the mod (or a person) writes `hold_on` to the control file.
 //! 3. `FEVERLINK3_POOLPATCH=1`: the single-worker script pool. A patch, not a hook: independent of the others.
 //!
+//! 4. `FEVERLINK3_LOG_TOWN_SEED=1`: a read-only hook that logs the town developer's random seed on every call
+//!    of the function that seeds its task. Independent of the others; it never changes a result.
+//!
+//!    `FEVERLINK3_FORCE_TOWN_SEED=<number>` (decimal or `0x` hex, 32 bit): the same hook also replaces the seed
+//!    argument with that value before calling the original. An experiment switch, not run in the game. A value
+//!    that does not parse is ignored (and logged); it then changes nothing.
+//!
+//! 5. `FEVERLINK3_LOG_GROWTH=1`: a read-only hook on `TownDeveloper::Develop` (and one on the `TownUpdateSize`
+//!    handler to read the game time) that logs each growth call. `FEVERLINK3_GROWTH_SEED_MODE=derive` (with
+//!    `..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) additionally replaces the random seed `Develop` reads.
+//!    See `growth.rs`. An experiment switch, not run in the game.
+//!
 //! Anything but the exact value `1` (after trimming blanks) is off.
 
 use crate::build_table::{BuildAddrs, Rva};
+use crate::growth::Settings;
 
 pub const HOOKS_VAR: &str = "FEVERLINK3_HOOKS";
 pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
 pub const POOLPATCH_VAR: &str = "FEVERLINK3_POOLPATCH";
+pub const TOWN_SEED_VAR: &str = "FEVERLINK3_LOG_TOWN_SEED";
+pub const FORCE_TOWN_SEED_VAR: &str = "FEVERLINK3_FORCE_TOWN_SEED";
+
+/// Parses the forced seed: decimal or `0x` hex, must fit 32 bits; blanks around it are ignored.
+pub fn parse_seed(text: &str) -> Result<u32, String> {
+    let t = text.trim();
+    let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => t.parse::<u64>(),
+    };
+    match parsed {
+        Ok(v) => u32::try_from(v).map_err(|_| format!("{t:?} does not fit 32 bits")),
+        Err(_) => Err(format!("{t:?} is not a decimal or 0x-hex number")),
+    }
+}
+
+/// What `FEVERLINK3_FORCE_TOWN_SEED` says: `Ok(None)` when unset or blank, `Err(reason)` when it does not parse.
+pub fn forced_seed(get: impl Fn(&str) -> Option<String>) -> Result<Option<u32>, String> {
+    match get(FORCE_TOWN_SEED_VAR) {
+        Some(v) if !v.trim().is_empty() => parse_seed(&v).map(Some),
+        _ => Ok(None),
+    }
+}
 
 /// The switches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,23 +64,45 @@ pub struct HookConfig {
     pub hooks: bool,
     pub hold: bool,
     pub poolpatch: bool,
+    /// Log the town developer's random seed (read-only; independent of the other switches).
+    pub town_seed: bool,
+    /// Replace the seed argument with this value (implies the hook; an invalid value is ignored).
+    pub force_seed: Option<u32>,
+    /// The town-growth log and seed experiment (`growth.rs`).
+    pub growth: Settings,
 }
 
 impl HookConfig {
     /// Reads the switches through `get` (the environment in the module, a map in the tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> HookConfig {
         let on = |name: &str| get(name).is_some_and(|v| v.trim() == "1");
-        HookConfig { hooks: on(HOOKS_VAR), hold: on(HOLD_VAR), poolpatch: on(POOLPATCH_VAR) }
+        let force_seed = forced_seed(&get).ok().flatten();
+        HookConfig {
+            hooks: on(HOOKS_VAR),
+            hold: on(HOLD_VAR),
+            poolpatch: on(POOLPATCH_VAR),
+            town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
+            force_seed,
+            growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
+        }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch
+        self.hooks || self.poolpatch || self.town_seed || self.growth.active()
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
-        format!("hooks={} hold={} poolpatch={}", f(self.hooks), f(self.hold), f(self.poolpatch))
+        format!(
+            "hooks={} hold={} poolpatch={} town_seed={}{}{}",
+            f(self.hooks),
+            f(self.hold),
+            f(self.poolpatch),
+            f(self.town_seed),
+            self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default(),
+            self.growth.describe()
+        )
     }
 }
 
@@ -88,6 +146,12 @@ pub enum Feature {
     Hold,
     /// The single-worker script pool.
     PoolPatch,
+    /// The read-only log of the town developer's seed.
+    TownSeed,
+    /// The log (and seed experiment) on `TownDeveloper::Develop`.
+    Growth,
+    /// The read-only hook on the `TownUpdateSize` handler that reads the game time for the growth hook.
+    GrowthCmd,
 }
 
 impl Feature {
@@ -96,6 +160,9 @@ impl Feature {
             Feature::Counters => "counters",
             Feature::Hold => "hold",
             Feature::PoolPatch => "poolpatch",
+            Feature::TownSeed => "town_seed",
+            Feature::Growth => "town_develop",
+            Feature::GrowthCmd => "town_update_size",
         }
     }
 }
@@ -148,6 +215,8 @@ pub struct Plan {
     pub kind_offset: Option<u32>,
     /// The engine helpers, when the hold hook is planned.
     pub engine: Option<EngineAddrs>,
+    /// The `GameTime` getter, when the growth hook can read the game time (its prologue matched).
+    pub game_time_getter: Option<Rva>,
 }
 
 impl Plan {
@@ -210,6 +279,12 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
             plan_hold(build, image, &mut p);
         }
     }
+    if cfg.town_seed {
+        plan_town_seed(build, image, &mut p);
+    }
+    if cfg.growth.active() {
+        plan_growth(build, image, &mut p);
+    }
     if cfg.poolpatch {
         match &build.script_pool {
             None => p.skipped.push(Skip {
@@ -253,6 +328,70 @@ fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
             p.kind_offset = Some(kind_offset);
         }
         Err(reason) => skip(p, reason),
+    }
+}
+
+fn plan_town_seed(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let skip = |p: &mut Plan, reason: String| {
+        p.skipped.push(Skip { feature: Feature::TownSeed, name: "town_seed", reason });
+    };
+    let Some(site) = &build.town_seed else {
+        return skip(p, "the build table has no town_seed site for this build".into());
+    };
+    match verify(image, site.rva, site.prologue) {
+        Ok(()) => p.steps.push(Step::Detour {
+            feature: Feature::TownSeed,
+            name: "town_seed",
+            rva: site.rva,
+            expected: site.prologue,
+        }),
+        Err(reason) => skip(p, reason),
+    }
+}
+
+/// `Develop` is the piece; the `TownUpdateSize` handler hook and the `GameTime` getter are added only when both match,
+/// because they exist to give the log (and the seed experiment) the game time. Without them the log still works.
+fn plan_growth(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let skip = |p: &mut Plan, feature: Feature, name: &'static str, reason: String| {
+        p.skipped.push(Skip { feature, name, reason });
+    };
+    let Some(site) = &build.town_develop else {
+        return skip(
+            p,
+            Feature::Growth,
+            "town_develop",
+            "the build table has no town_develop site for this build".into(),
+        );
+    };
+    if let Err(reason) = verify(image, site.rva, site.prologue) {
+        return skip(p, Feature::Growth, "town_develop", reason);
+    }
+    p.steps.push(Step::Detour {
+        feature: Feature::Growth,
+        name: "town_develop",
+        rva: site.rva,
+        expected: site.prologue,
+    });
+    let (Some(cmd), Some(getter)) = (&build.town_update_size, &build.game_time_getter) else {
+        return skip(
+            p,
+            Feature::GrowthCmd,
+            "town_update_size",
+            "the build table lacks the TownUpdateSize handler or the GameTime getter: no game time".into(),
+        );
+    };
+    let checked = verify(image, cmd.rva, cmd.prologue).and_then(|()| verify(image, getter.rva, getter.prologue));
+    match checked {
+        Ok(()) => {
+            p.steps.push(Step::Detour {
+                feature: Feature::GrowthCmd,
+                name: "town_update_size",
+                rva: cmd.rva,
+                expected: cmd.prologue,
+            });
+            p.game_time_getter = Some(getter.rva);
+        }
+        Err(reason) => skip(p, Feature::GrowthCmd, "town_update_size", format!("{reason}: no game time")),
     }
 }
 
@@ -301,16 +440,21 @@ mod tests {
     use crate::build_table::{select, CallSite, HookSite, PatchSite};
 
     fn cfg(hooks: bool, hold: bool, poolpatch: bool) -> HookConfig {
-        HookConfig { hooks, hold, poolpatch }
+        HookConfig { hooks, hold, poolpatch, ..Default::default() }
     }
 
     /// An image holding exactly the bytes the 40420 row expects, at the row's addresses.
     fn image_of_40420() -> BytesImage {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
-        for s in [&b.command_list_add, &b.apply_command].into_iter().flatten() {
+        for s in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
+            .into_iter()
+            .flatten()
+        {
             img.write(s.rva, s.prologue);
         }
+        let g = b.game_time_getter.as_ref().unwrap();
+        img.write(g.rva, g.prologue);
         for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
             img.write(s.rva, s.prologue);
         }
@@ -335,14 +479,71 @@ mod tests {
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
         assert_eq!(all, cfg(true, true, true));
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
-            let c = HookConfig::from_lookup(|_| Some(off.to_string()));
+            let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
             assert_eq!(c, HookConfig::default(), "{off:?} must not switch anything on");
         }
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on");
-        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on town_seed=off");
+        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off town_seed=off");
+        let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
+        assert!(seed.any() && seed.town_seed && !seed.hooks && !seed.hold && !seed.poolpatch, "its own switch");
+        assert_eq!(seed.describe(), "hooks=off hold=off poolpatch=off town_seed=on");
+        assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).any(), "only the exact value 1");
+    }
+
+    #[test]
+    fn the_forced_seed_parses_decimal_and_hex_in_32_bits_and_ignores_the_rest() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(parse_seed("12345"), Ok(12345));
+        assert_eq!(parse_seed(" 0x2cd15ea0 "), Ok(0x2cd1_5ea0));
+        assert_eq!(parse_seed("0XFFFFFFFF"), Ok(u32::MAX));
+        assert_eq!(parse_seed("4294967295"), Ok(u32::MAX));
+        for bad in ["4294967296", "0x100000000", "-1", "abc", "0x", "0xzz", "1.5"] {
+            assert!(parse_seed(bad).is_err(), "{bad}");
+        }
+        let c = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "0x10")]));
+        assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
+        assert_eq!(c.describe(), "hooks=off hold=off poolpatch=off town_seed=on force_seed=0x00000010");
+        let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
+        assert_eq!(bad, HookConfig::default(), "an invalid value switches nothing on");
+        assert!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "nope")])).is_err());
+        assert_eq!(forced_seed(env(&[])), Ok(None));
+        assert_eq!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "  ")])), Ok(None));
+        let both = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1"), (FORCE_TOWN_SEED_VAR, "7")]));
+        assert_eq!((both.town_seed, both.force_seed), (true, Some(7)));
+    }
+
+    #[test]
+    fn the_town_seed_is_planned_only_on_request_and_only_when_the_bytes_match() {
+        let (b, mut img) = (select(0x6ac5_0427).unwrap(), image_of_40420());
+        let on = HookConfig { town_seed: true, ..Default::default() };
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["town_seed"], "{:?}", p.report());
+        assert!(matches!(&p.steps[0], Step::Detour { rva: 0x8d4270, feature: Feature::TownSeed, .. }));
+        assert!(plan(b, HookConfig { hooks: true, hold: true, poolpatch: true, ..Default::default() }, &img)
+            .steps
+            .iter()
+            .all(|s| s.feature() != Feature::TownSeed));
+        img.write(0x8d4270, &[0x90]);
+        let p = plan(b, on, &img);
+        assert!(p.steps.is_empty());
+        assert_eq!(p.skipped.len(), 1);
+        assert_eq!(p.skipped[0].name, "town_seed");
+        assert!(p.skipped[0].reason.contains("0x8d4270"), "{}", p.skipped[0].reason);
+    }
+
+    #[test]
+    fn a_build_without_a_town_seed_site_skips_it_with_a_reason() {
+        let p = plan(&BARE, HookConfig { town_seed: true, ..Default::default() }, &BytesImage::zeroed(0, 16));
+        assert!(p.steps.is_empty());
+        assert_eq!(
+            p.report(),
+            ["hooks: SKIPPED town_seed (town_seed): the build table has no town_seed site for this build"]
+        );
     }
 
     // ---- planning on the real 40420 row
@@ -451,6 +652,40 @@ mod tests {
     }
 
     #[test]
+    fn growth_is_planned_with_its_game_time_pieces_and_degrades_without_them() {
+        let b = select(0x6ac5_0427).unwrap();
+        let on = HookConfig { growth: Settings { log: true, ..Default::default() }, ..Default::default() };
+        assert!(on.any());
+        let p = plan(b, on, &image_of_40420());
+        assert_eq!(names(&p), ["town_develop", "town_update_size"], "{:?}", p.report());
+        assert_eq!(p.game_time_getter, Some(0x2a96c0));
+        // the handler changed: Develop is still logged, without game time
+        let mut img = image_of_40420();
+        img.write(0x9e12b0 + 3, &[0x90]);
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["town_develop"]);
+        assert_eq!(p.game_time_getter, None);
+        assert_eq!(p.skipped.len(), 1);
+        assert!(p.skipped[0].reason.contains("no game time"), "{}", p.skipped[0].reason);
+        // Develop changed: nothing of growth
+        let mut img = image_of_40420();
+        img.write(0x8de0b0 + 1, &[0x90]);
+        let p = plan(b, on, &img);
+        assert!(p.steps.is_empty());
+        assert_eq!(p.skipped[0].name, "town_develop");
+        // the derive mode alone is enough to ask for the hook
+        let derive = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_GROWTH_SEED_MODE", "derive")]));
+        assert!(derive.any() && derive.growth.mode == crate::growth::Mode::Derive);
+        assert!(derive.describe().contains("growth=on seed_mode=derive"), "{}", derive.describe());
+        // not asked: not planned
+        assert!(plan(b, HookConfig::default(), &image_of_40420()).steps.is_empty());
+    }
+
+    fn env_pairs(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
     fn a_changed_pool_region_is_not_patched() {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = image_of_40420();
@@ -490,6 +725,10 @@ mod tests {
         name: "bare",
         command_list_add: None,
         apply_command: None,
+        town_seed: None,
+        town_develop: None,
+        town_update_size: None,
+        game_time_getter: None,
         script_pool: None,
         command_move: None,
         command_destroy: None,

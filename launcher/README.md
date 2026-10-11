@@ -209,6 +209,7 @@ and reads; the mapping of the format is described under *File link* below. Direc
 | `action_refused` | ActionRefused (36) | from game | ignored |
 | `action` | Action (50) | both | to game: the origin player's id, as the host filled it into the payload; from game: ignored |
 | `chat` | Chat (51) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
+| `build_veto` | BuildVeto (52) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
 
 Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
 
@@ -294,7 +295,7 @@ over Steam is still being wired in (see "Commands").
   the id the host assigned. The mod becomes active when the role is `host` or `player`, without reloading the game.
 - **Commands.** The window (the Lua mod) appends file-link lines to `ctl_cmd.log`: `host`, `join`, `leave`,
   `start`, `pause`, `speed`, `check`, `resync` and `steamtest`. The payload is a Lua literal table (`host`:
-  `{name, transport}`; `join`: `{name, code}`; `speed`: `{n}` clamped to 1 to 4; `steamtest`: `{id}`). `host` and
+  `{name, transport}`; `join`: `{name, code}`; `speed`: `{n}` clamped to 1 to 4; `steamtest`: `{id}` or `{id, mb}` for the speed test). `host` and
   `join` are accepted only while idle or after a failure; the other session commands only while hosting. **`host`
   starts a session only with `transport = "tcp"`, the developer transport that the tests use; without it the
   controller answers `failed` with "Hosting over Steam is not finished in this build yet; the Steam connection

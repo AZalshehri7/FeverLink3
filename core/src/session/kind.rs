@@ -40,12 +40,16 @@ pub enum MessageKind {
     // ---- player -> host, relayed by the host to everyone else with the origin filled in
     Action = 50,
     Chat = 51,
+    /// A game could not rebuild a held strict build: "I cannot build action `seq` of player `owner`" with the first cause. Sent
+    /// only when it cannot (silence means yes); the host relays it to every other game, which drops the queued replay, and the
+    /// originator cancels its held command.
+    BuildVeto = 52,
 }
 
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
     /// (session state, checksum requests, authority values, resynchronisation).
-    pub const FROM_PLAYER: [MessageKind; 11] = [
+    pub const FROM_PLAYER: [MessageKind; 12] = [
         MessageKind::Hello,
         MessageKind::Clock,
         MessageKind::SpeedRequest,
@@ -57,6 +61,7 @@ impl MessageKind {
         MessageKind::Leave,
         MessageKind::Action,
         MessageKind::Chat,
+        MessageKind::BuildVeto,
     ];
 
     /// The kind for a header byte; `None` for a value this build does not know.
@@ -90,6 +95,7 @@ impl MessageKind {
             38 => Leave,
             50 => Action,
             51 => Chat,
+            52 => BuildVeto,
             _ => return None,
         })
     }

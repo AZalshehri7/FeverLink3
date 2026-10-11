@@ -54,7 +54,7 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 | `resync` | `{}` | `hosting` | Starts a resync round: every other game loads the host's save (the host's own game keeps playing; set `FEVERLINK3_HOST_RELOAD=1` in the game's environment to reload it too). Needs a started session; ignored while a round runs. |
 | `kick` | `{id}` | `hosting` | Removes player `id`: it is told "kicked", disconnected, its slot freed, and its launcher does not reconnect. For a player who is `away` it releases the held slot. It may join again with the code like anyone else. Answers in `result`; refuses the host's own id 0, an id that is not in `players`, and a missing `id`. The window's **Remove** button next to each player in the host's Players list sends it and shows `result.message` under the list. |
 | `permissions` | `{build?, bulldoze?, spend?, speed?, other?}` | `hosting` | Sets who may do what and tells every game. Each value is `"everyone"`, `"hostOnly"` or `{only = {ids}}`. **Keys not named keep their value**, so a command may carry one key. At least one key is required; a value that is none of the three refuses the whole command (nothing changes) and says which key. Answers in `result`. See below. |
-| `steamtest` | `{id}` | any | Steam connection test: pings the Steam ID (17 digits, as a string) through Steam's networking. The progress is `steam.test`; a bad ID or no Steam shows in `steam.note`. |
+| `steamtest` | `{id, mb?}` | any | Steam connection test: pings the Steam ID (17 digits, as a string) through Steam's networking. The progress is `steam.test`; a bad ID or no Steam shows in `steam.note`. With `mb` (1 to 128; the window offers 8, 32 and 80) it runs the speed test of that many MB each way instead (docs/STEAM_TRANSPORT.md section 7.1); the progress and result are `steam.speed`. |
 
 #### `permissions` values
 
@@ -145,6 +145,7 @@ The Steam networking probe behind the connection test; `launcher/src/steamnet.rs
 | `pings` | number | Pings other players sent to this account. |
 | `note` | string | A message about the last `steamtest` command (bad ID, no Steam). |
 | `test` | table | The connection test in progress or done: `target` (Steam ID), `state` (`connecting`, `finding a route`, `connected`, `failed: ...`), `pongs` (answers received), `rtt` (last round trip in ms), `route` (`direct`, `through a Steam relay` or `unknown`). Absent until `steamtest`. |
+| `speed` | table | The speed test: `running` (bool), `status` (the progress line, the failure reason, or the headline of the result) and `lines` (the four result lines of a finished test, otherwise empty). A finished or failed test also writes one `steam speed test: ...` line to `session.log`. Absent until a speed test was started. |
 
 ## Which fields each state has
 

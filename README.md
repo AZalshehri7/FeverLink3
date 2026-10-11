@@ -1,11 +1,15 @@
 # FeverLink3
 
+> **Under development - please do not use it yet.** FeverLink3 is an unfinished test project. It can crash the game, drift the two worlds apart, force a reload of your world, or leave a build tool unresponsive, and a crash loses any progress you have not saved. Do not install it on a game you care about, and keep backups of your saves. The code is published so that its progress can be followed, not as a release for players.
+>
+> The research behind the project (test-run logs, analyses of the game) is kept private because of its size and the machine details in it; ask in an issue and it can be shared individually (see `docs/research/README.md`).
+
 Cooperative multiplayer for Transport Fever 3. The goal: several players build in one world at the same time, each in their own copy of the game. Source available under the PolyForm Noncommercial License (free for noncommercial use; see Licence below), Windows and Steam only, unofficial.
 
-**Status: early test build (0.2.0-test5), last updated 2026-10-10. Two players can host, join and see each other's speed, pause and chat commands in two real games; building together is not verified yet.** What is real and what is not:
+**Status: early test build (0.2.0-test5), last updated 2026-10-10. Two players can host, join and see each other's speed, pause and chat commands in two real games; building has been seen working for a thin slice (roads, bulldozing, lines); stations, rail, vehicles and terrain have not been tried.** What is real and what is not:
 
 - **Verified in the real game** (build 40420): the mod loads; its window opens from a button in the bottom bar; the Steam peer-to-peer connection works between two different accounts (a friend's test: connected, 199 ms round trip through a Steam relay); and with two real copies of the game on one PC, using the developer connection on the loopback address, a host can host a game, copy the join code, a guest can paste it and join, the host's world is sent and the guest's game loads it while the host keeps playing, and speed, pause and chat from either side show up in both games. See the demo: [docs/media/split-screen-demo.gif](docs/media/split-screen-demo.gif).
-- **Not verified yet:** hosting and joining over Steam between two accounts (the code is there, the test with a friend is pending), building together (replicating construction and vehicle commands between two real games), long sessions in a busy world with vehicles (the host-keeps-playing sync was checked on a small world with no lines), and the native command hooks (switched off unless a developer turns them on; never run in the game).
+- **Not verified yet:** hosting and joining over Steam between two accounts (the code is there, the test with a friend is pending), stations, depots, rail, buying vehicles and terrain between two real games, long sessions in a busy world with vehicles (the host-keeps-playing sync was checked on a small world with no lines), and the native command hooks (switched off unless a developer turns them on; the capture-and-hold hook has been run in two real games for roads and the bulldozer, the rest has not).
 
 Details and dates: [docs/ROADMAP.md](docs/ROADMAP.md). How to try the test build: [docs/PLAYING.md](docs/PLAYING.md). What the `winhttp.dll` file is and why antivirus programs may look at it: [docs/SECURITY_FOR_USERS.md](docs/SECURITY_FOR_USERS.md).
 
@@ -35,9 +39,9 @@ Short version (the full guide is [docs/PLAYING.md](docs/PLAYING.md)):
 2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer* when starting a game.
 3. Click **FeverLink3** in the bar at the bottom of the screen. The host clicks **Host a game**, presses **Copy code** and sends the code; a friend pastes it (Ctrl+V) and presses **Join**, and the host presses **Start the session**.
 4. For connection problems, the window has a **Connection test...** section (two players exchange Steam IDs).
+5. To measure how fast a save can cross Steam (an 80 MB save is the size that matters), the same section has a **speed test**: pick 8, 32 or 80 MB and press **Run the speed test**; the steps for two players are in [docs/PLAYING.md](docs/PLAYING.md) section 5, the design in [docs/STEAM_TRANSPORT.md](docs/STEAM_TRANSPORT.md) section 7.1. `FEVERLINK3_STEAM_SENDRATE=<bytes per second>` changes Steam's send rate for such a test.
 
-To remove everything: delete `winhttp.dll` and `mods
-eleaseeverlink3_1` from the game's folder. The `feverlink3.exe` helper in this repository is a developer tool and is not in the zip: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
+To remove everything: delete `winhttp.dll` and `mods\release\feverlink3_1` from the game's folder. The `feverlink3.exe` helper in this repository is a developer tool and is not in the zip: the plan is that the mod reaches players from the in-game Mod Hub or Nexus Mods, with the native module (`winhttp.dll`) delivered separately for now ([docs/WORKSHOP.md](docs/WORKSHOP.md)).
 
 ## Credits
 
@@ -56,7 +60,7 @@ FeverLink3 is not affiliated with, endorsed by or supported by Urban Games or Pa
 |---|---|---|
 | `core/` | Crate `feverlink3_core`. Protocol: framing, sealed channel, join codes, the host and player session state machines, resync and permissions. No game or UI code. Tests in `core/tests`. | Rust |
 | `launcher/` | Crate `feverlink3_launcher` and the `feverlink3` command (`install`, `uninstall`, `doctor`, `selftest`, and `host` / `join` for development). Also the session controller that runs inside the game, the file link to the mod, savegame transfer and update verification. See `launcher/README.md`. | Rust |
-| `native/` | `winhttp.dll`: the proxy the game loads itself. It relays the 14 WinHTTP functions the game imports and starts the in-game session controller. It also contains the command counters, the capture-and-hold hook, the determinism patch and the control link to the mod; all of that is off unless switched on by environment variables, is tested on fake game functions, and has not yet run in the game. See `native/README.md` and `docs/NATIVE_LINK.md`. | Rust |
+| `native/` | `winhttp.dll`: the proxy the game loads itself. It relays the 14 WinHTTP functions the game imports and starts the in-game session controller. It also contains the command counters, the capture-and-hold hook, the determinism patch and the control link to the mod; all of that is off unless switched on by environment variables, is tested on fake game functions, and has been run in two real games only for the road and bulldozer hold; the rest has not run in the game. See `native/README.md` and `docs/NATIVE_LINK.md`. | Rust |
 | `mod/feverlink3_1/` | Game-script mod: lockstep core (stamping, barrier, pause, queue, deterministic random, checksums), file link, command capture and the command schemas for everyday operations, and the in-game window. See `mod/README.md`. | Lua |
 | `tools/addr/` | Address tool: finds the hook sites in a game executable and prints a build-table row. See `tools/addr/README.md`. | Python |
 | `tools/release/` | Release tool: reproducible zip, manifest with SHA-256, Ed25519 key generation and signing. See `docs/RELEASING.md`. | Rust |

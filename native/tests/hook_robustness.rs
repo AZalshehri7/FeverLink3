@@ -688,7 +688,7 @@ impl Image for Sparse {
 
 fn expected_bytes(b: &BuildAddrs) -> Vec<(Rva, &'static [u8])> {
     let mut v = Vec::new();
-    for s in [&b.command_list_add, &b.apply_command].into_iter().flatten() {
+    for s in [&b.command_list_add, &b.apply_command, &b.town_seed].into_iter().flatten() {
         v.push((s.rva, s.prologue));
     }
     for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
@@ -719,7 +719,14 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 }
             }
             let image = Sparse { planted, readable: r.gen_bool(0.95) };
-            let cfg = HookConfig { hooks: r.gen(), hold: r.gen(), poolpatch: r.gen() };
+            let cfg = HookConfig {
+                hooks: r.gen(),
+                hold: r.gen(),
+                poolpatch: r.gen(),
+                town_seed: r.gen(),
+                force_seed: None,
+                growth: Default::default(),
+            };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
             with_skips += usize::from(!p.skipped.is_empty());
@@ -739,7 +746,8 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
             assert!(!p.has(Feature::PoolPatch) || cfg.poolpatch);
             assert!(!p.has(Feature::Hold) || (p.engine.is_some() && p.kind_offset.is_some()));
             assert!(cfg.any() || p.steps.is_empty());
-            assert!(p.steps.len() <= 3);
+            assert!(p.steps.len() <= 4);
+            assert!(!p.has(Feature::TownSeed) || cfg.town_seed);
             for line in p.report() {
                 assert!(line.starts_with("hooks: "), "{line}");
             }
@@ -753,9 +761,12 @@ fn the_switches_read_any_text_and_only_a_lone_one_turns_one_on() {
     let mut r = rng(17);
     for _ in 0..iters(5_000) {
         let value = random_text(&mut r, 6);
-        let cfg = HookConfig::from_lookup(|_| Some(value.clone()));
+        let cfg =
+            HookConfig::from_lookup(|k| (k != feverlink3_native::plan::FORCE_TOWN_SEED_VAR).then(|| value.clone()));
+        // any text is a verdict (a number or an error) for the forced seed, never a panic
+        let _ = feverlink3_native::plan::parse_seed(&value);
         let on = value.trim() == "1";
-        assert_eq!((cfg.hooks, cfg.hold, cfg.poolpatch), (on, on, on), "{value:?}");
+        assert_eq!((cfg.hooks, cfg.hold, cfg.poolpatch, cfg.town_seed), (on, on, on, on), "{value:?}");
         assert_eq!(cfg.any(), on);
         assert!(cfg.describe().starts_with("hooks="));
     }

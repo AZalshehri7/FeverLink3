@@ -33,7 +33,8 @@ lupa = T.lupa
 # ---------------------------------------------------------------- the mock
 
 OPS_PRELUDE = r'''
-OPS = { priceBuy = 10000, loanSign = 1, drop = nil, refuse = nil, replaceKeepsEntity = false, player = 7, strictCmd = false,
+OBJECTS = setmetatable({}, { __mode = "k" })   -- every engine object NEW made
+OPS = { realVehicleInfo = false, priceBuy = 10000, loanSign = 1, drop = nil, refuse = nil, replaceKeepsEntity = false, player = 7, strictCmd = false,
   userdataResults = false }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
@@ -52,13 +53,20 @@ function NEW(typeName)
   local data = def.init()
   local member = {}
   for _, k in ipairs(def.members) do member[k] = true end
-  return setmetatable({}, {
+  local obj
+  obj = setmetatable({}, {
     __index = function(_, k)
       if k == "__members" then return def.members end
       return data[k]
     end,
     __newindex = function(_, k, v)
       if not member[k] then error("no member '" .. tostring(k) .. "' in " .. typeName) end
+      -- the real engine (seen in every real game): Line.vehicleInfo is typed; a plain table is refused with this message
+      if OPS.realVehicleInfo and typeName == "Line" and k == "vehicleInfo" then
+        if not OBJECTS[v] then error("bad argument #2 to '?' (const LineVehicleInfo expected, got no value)") end
+        data[k] = v
+        return
+      end
       if def.readonly and def.readonly[k] then error("member '" .. k .. "' is read only") end
       if OPS.drop == k then return end   -- an engine that quietly ignores a member
       if OPS.refuse == k then error("cannot set " .. k) end   -- one that refuses it, not as "read only"
@@ -66,6 +74,8 @@ function NEW(typeName)
     end,
     __tostring = function() return "<" .. typeName .. ">" end,
   })
+  OBJECTS[obj] = true
+  return obj
 end
 TYPES = {
   TransportVehicleConfig = { members = { "vehicles", "vehicleGroups", "muFileNames" },
@@ -76,7 +86,9 @@ TYPES = {
     init = function() return { modelId = 0, reversed = false, compartment2loadConfig = {} } end },
   LoadConfig = { members = { "loadConfigIndex" }, init = function() return { loadConfigIndex = 0 } end },
   Line = { members = { "stops", "customFilters", "reservationPriority", "vehicleInfo" }, readonly = { vehicleInfo = true },
-    init = function() return { stops = {}, customFilters = false, reservationPriority = 1.0, vehicleInfo = { transportModes = { true } } } end },
+    init = function() return { stops = {}, customFilters = false, reservationPriority = 1.0,
+      vehicleInfo = OPS.realVehicleInfo and NEW("LineVehicleInfo") or { transportModes = { true } } } end },
+  LineVehicleInfo = { members = { "transportModes" }, init = function() return { transportModes = {} } end },
   LineStop = { members = { "stationGroup", "station", "terminal", "alternativeTerminals", "stopConfig", "loadMode", "minWaitingTime",
       "maxWaitingTime", "maxAdditionalWaitingTime", "waypoints" },
     init = function() return { stationGroup = -1, station = -1, terminal = -1, alternativeTerminals = {}, stopConfig = NEW("StopConfig"),
@@ -142,6 +154,7 @@ function BUILD_LINE(api, spec)
   line.stops = stops
   line.customFilters = spec.customFilters or false
   line.reservationPriority = spec.priority or 1.0
+  if spec.modes then line.vehicleInfo.transportModes = spec.modes end
   return line
 end
 
@@ -328,7 +341,7 @@ OPS_EXEC.makeLineCreateCmd = function(a)
     if not (WORLD[g] and WORLD[g].STATION_GROUP) then return false, "no station group " .. tostring(g) end
   end
   local created = newId()
-  WORLD[created] = { LINE = { stops = comp.stops, customFilters = comp.customFilters, reservationPriority = comp.reservationPriority },
+  WORLD[created] = { LINE = { stops = comp.stops, customFilters = comp.customFilters, reservationPriority = comp.reservationPriority, vehicleInfo = comp.vehicleInfo },
     NAME = { name = a[1] }, COLOR = { color = a[2] } }
   return true, created, { resultEntity = created }
 end
@@ -491,6 +504,12 @@ function SNAPSHOT()
     if w.LINE then
       rows[#rows + 1] = "line " .. nameOf(e) .. " color=" .. sig(w.COLOR and w.COLOR.color) .. " prio=" .. tostring(w.LINE.reservationPriority) ..
         " filters=" .. tostring(w.LINE.customFilters) .. " stops=" .. sig(w.LINE.stops)
+      local tm = OPS.realVehicleInfo and w.LINE.vehicleInfo and w.LINE.vehicleInfo.transportModes
+      if tm then
+        local bits = {}
+        for i = 1, #tm do bits[i] = tostring(tm[i]) end
+        rows[#rows] = rows[#rows] .. " modes=" .. table.concat(bits, ",")
+      end
     end
     if w.STATION_GROUP or w.TOWN then rows[#rows + 1] = "named " .. nameOf(e) end
     if w.blocked ~= nil then rows[#rows + 1] = "blocked " .. tostring(w.blocked) end
@@ -661,6 +680,46 @@ class VehicleTest(OpsBase):
         self.assertNotIn(str(vb), body, "no entity id of the client's game travels")
         self.assertIn("vehicle/bus_red.mdl is 101 here and 201 on the sending game", self.A.log(),
                       "a model id that differs between the games is noted for whoever checks the build")
+
+    def test_a_vehicle_bought_in_a_window_and_used_at_once_is_named_by_its_purchase(self):
+        # A window that buys a vehicle and puts it on a line in the same breath (a real player did it a second after the
+        # purchase) names the vehicle before the bridge's table of keys has it. It used to travel as "s:<id>" - an id the
+        # other game does not share (refused there: "vehicle s:106787 does not exist here"). Now it travels as the key of
+        # the purchase, and the vehicle is on the line in both games.
+        self.start()
+        self.B.window(buy("BUY", BUS_RED).replace(
+            "function(d, s, e) BUY = { s, d and d.resultVehicleEntity } end",
+            "function(d, s, e) BUY = { s, d and d.resultVehicleEntity }; "
+            "api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(d.resultVehicleEntity, 71, 1)) end"))
+        self.settle()
+        bought = int(self.B.L.eval("BUY[2]"))
+        self.assertNotEqual(bought, 0)
+        shipped = self.B.actions_shipped()
+        self.assertEqual(len(shipped), 2, "the purchase and the assignment")
+        body, _ = self.wire(shipped[1])
+        self.assertNotIn("ui:", body, "the placeholder never leaves the game")
+        self.assertNotIn('"s:%d"' % bought, body, "the sender's id never travels as a saved entity")
+        self.assertIn('"1:1"', body, "the vehicle is named by the key of the purchase")
+        self.assertNotIn("refused", self.A.log())
+        self.agree()
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
+        self.assertIn("line=Line 1 stop=1", self.A.snapshot())
+
+    def test_a_refused_reference_names_what_the_sender_had_not_replicated(self):
+        self.start()
+        # the sender's simulation half could not replicate a native build a moment ago ...
+        self.B.L.execute('local st = STATE:get(); st.notes = { { at = GAME.time, text = "a native build at t=" .. GAME.time .. " was not replicated (test)" } }; STATE:set(st)')
+        self.tick(2)
+        # ... and now acts on a station group nobody else has
+        self.B.L.execute("WORLD[99999] = { STATION_GROUP = { stations = {} } }")
+        self.B.send_gui("local line = BUILD_LINE(api, { stops = { { group = 99999 }, { group = 58 } } })\n"
+                        'api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Ghost", api.type.Vec3f.new(0, 0, 0), api.engine.util.getPlayer(), line))')
+        self.settle()
+        text = self.A.log()
+        self.assertIn("refused", text)
+        self.assertIn("does not exist here", text)
+        self.assertIn("the sender had not replicated: ", text)
+        self.assertIn("was not replicated (test)", text)
 
     def test_two_purchases_in_one_step_are_two_vehicles_with_two_keys(self):
         self.start()
@@ -915,6 +974,19 @@ class LineTest(OpsBase):
         self.settle()
         self.assertEqual(len(self.B.actions_shipped()), 1, "only the first line was shipped")
         self.assertIn("does not rebuild equal at Line.stops.1.loadMode (the engine refused: Line.stops[1].loadMode:", self.B.log())
+
+    def test_a_line_member_that_wants_an_engine_object_is_filled_in_place(self):
+        # the real engine takes Line.vehicleInfo only as a LineVehicleInfo; every real game logged the refusal and the
+        # transport modes the window had chosen never reached the other game unless they were the defaults
+        for g in (self.A, self.B):
+            g.L.execute("OPS.realVehicleInfo = true")
+        self.start()
+        self.B.send_gui(LINE_2.replace("customFilters = true,", "customFilters = true, modes = { true, false, true },"))
+        self.settle()
+        self.agree("the line carries the transport modes in both games")
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2), "the line was created on both")
+        self.assertIn("modes=true,false,true", self.A.snapshot())
+        self.assertNotIn("vehicleInfo", self.A.log() + self.B.log(), "no refused member to report")
 
     def test_read_only_members_are_left_to_the_engine_and_noted_once(self):
         self.start()

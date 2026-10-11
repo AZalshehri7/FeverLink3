@@ -10,7 +10,7 @@ use super::kind::MessageKind;
 use super::limits::RateLimiter;
 use super::lockstep::{Lockstep, PlayerClock};
 use super::messages::{
-    codec, ActionMessage, AuthorityMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
+    codec, ActionMessage, AuthorityMessage, BuildVetoMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
     ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo,
     PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant,
     SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
@@ -205,6 +205,9 @@ pub struct HostSession {
     /// counted against them.
     stall_until: f64,
     checksums: ChecksumRounds,
+    /// Checksum rounds completed, and how many of them were skipped because the games hashed at different sim times.
+    rounds_done: u32,
+    rounds_skewed: u32,
     permissions: Permissions,
     policy: ChecksumPolicy,
     resync: Option<ResyncRound>,
@@ -276,6 +279,8 @@ impl HostSession {
             last_call: f64::NEG_INFINITY,
             stall_until: f64::NEG_INFINITY,
             checksums: ChecksumRounds::new(),
+            rounds_done: 0,
+            rounds_skewed: 0,
             permissions: Permissions::default(),
             policy: ChecksumPolicy::new(ChecksumPolicyConfig::default()),
             resync: None,
@@ -703,6 +708,15 @@ impl HostSession {
                     }
                     self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
                     self.actions_relayed += 1;
+                }
+            }
+
+            MessageKind::BuildVeto => {
+                if let Some(mut m) = codec::try_decode::<BuildVetoMessage>(payload) {
+                    m.from = from;
+                    m.name = Some(self.name(from));
+                    m.why = m.why.chars().take(300).collect();
+                    self.broadcast(MessageKind::BuildVeto, &codec::encode(&m), Some(from));
                 }
             }
 
