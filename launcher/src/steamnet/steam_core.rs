@@ -168,10 +168,12 @@ impl Default for Config {
 
 /// The environment variable that replaces the send rate (bytes per second) for the speed test.
 pub const SEND_RATE_ENV: &str = "FEVERLINK3_STEAM_SENDRATE";
-/// The send rate used when the variable is not set: 64 MiB/s, the top of [`SEND_RATE_RANGE`], so that the connection
-/// and Steam's relays are the limit and not this number (Steam's own default is 256 KiB/s and the first test builds used
-/// 1 MiB/s, which a speed test measured as the limit on a direct route). The variable still lowers it.
-pub const DEFAULT_SEND_RATE: i32 = 64 << 20;
+/// The send rate used when the variable is not set: 1 MiB/s (Steam's own default is 256 KiB/s). A speed test between two
+/// real PCs on a direct route (2026-10-11) showed that the line itself carries about 1 MB/s: with the rate at the top of
+/// [`SEND_RATE_RANGE`] the speed stayed the same, the uplink saturated, other traffic (a voice call) broke up, and the
+/// route flipped between direct and relayed with stalls. The library has no bandwidth estimation, so a fixed rate must
+/// stay at or below what a typical home uplink carries until the rate adapts to the measured delay.
+pub const DEFAULT_SEND_RATE: i32 = 1 << 20;
 /// Bounds for the variable: below 32 KiB/s nothing works, above 64 MiB/s no home line can follow.
 pub const SEND_RATE_RANGE: (i32, i32) = (32 * 1024, 64 << 20);
 
