@@ -394,6 +394,42 @@ local function townBuildingsPart(parts)
 	end
 end
 
+-- Town trace (feverlink3_towntrace.lua): off unless FEVERLINK3_TOWN_TRACE is set. Read-only; one file per game.
+local TRACE = nil
+local TRACE_FAILS = 0
+local function townTrace()
+	if TRACE ~= nil then return TRACE or nil end
+	TRACE = false
+	local ok, err = pcall(function()
+		local spec = os.getenv("FEVERLINK3_TOWN_TRACE")
+		if type(spec) ~= "string" or spec == "" then return end
+		local okM, M = pcall(ug_require, "feverlink3_towntrace.lua")
+		if not okM then okM, M = pcall(ug_require, "feverlink3_1::/feverlink3_towntrace.lua") end
+		if not okM or type(M) ~= "table" then error("module not loaded: " .. tostring(M)) end
+		local t = M.new({
+			spec = spec,
+			acc = M.apiAccessors(api, engine.entitiesWith),
+			hash = C.hashValue,
+			write = function(text) return C.appendFile(C.path(M.FILE), text) end,
+		})
+		if t.enabled then TRACE = t; logTowns("town trace on: " .. spec .. " -> " .. M.FILE) end
+	end)
+	if not ok then logTowns("town trace failed to start: " .. tostring(err)) end
+	return TRACE or nil
+end
+
+-- a trace step must never break the simulation: after a few failures it switches itself off
+local function townTraceGuard(fn)
+	local t = townTrace()
+	if not t then return end
+	local ok, err = pcall(fn, t)
+	if not ok then
+		TRACE_FAILS = TRACE_FAILS + 1
+		logTowns("town trace error: " .. tostring(err))
+		if TRACE_FAILS >= 5 then TRACE = false; logTowns("town trace switched off after 5 errors") end
+	end
+end
+
 -- `co` is the company registry of the half that asks; its digest is a part of its own once anything was configured or recorded
 local function checksumParts(co)
 	local parts, t = L.checksumParts(engine, C.hashValue)
@@ -844,6 +880,9 @@ end
 
 local function update(userParams, state, dt)
 	C.poll()
+	townTraceGuard(function(t)
+		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
+	end)
 	if not C.ACTIVE then
 		return
 	end
@@ -888,6 +927,20 @@ local function handleEvent(userParams, state, src, id, name, param)
 			local pi = nil
 			pcall(function() pi = param[4] end)
 			if pi ~= false then logSim("event apply_command/" .. tostring(name) .. " at t=" .. tostring(engine.gameTime()) .. " playerInitiated=" .. tostring(pi)) end
+		end)
+	end
+	if id == "apply_command" then
+		townTraceGuard(function(t)
+			local pi, town = nil, nil
+			pcall(function() pi = param[4] end)
+			pcall(function()
+				for i = 1, 3 do
+					local d = param[i]
+					if type(d) == "table" and d.townEntity ~= nil then town = d.townEntity end
+				end
+			end)
+			if type(pi) ~= "boolean" then pi = nil end
+			t.noteCommand(math.floor(engine.gameTime() / STEP), name, town, pi)
 		end)
 	end
 	if id == "apply_command" and name == "onPreBuildProposal" then
