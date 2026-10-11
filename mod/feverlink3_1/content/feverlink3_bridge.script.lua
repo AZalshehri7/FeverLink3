@@ -379,23 +379,33 @@ end
 -- A build the player made with a native tool (roads, tracks, stations, depots, bulldozer...): the engine applies it
 -- itself, here and now. It is captured as a build record and handed to the interface half (st.out), which stamps and
 -- ships it like any other action; every OTHER game rebuilds it at the stamp.
-local function simCaptureBuild(state, param)
+-- `post` = the second look at a build whose first capture (onPreBuildProposal) found an edge object (a stop, a signal)
+-- without its model: the engine names the model only when the build has run, so the capture is repeated from
+-- onPostBuildProposal, where the object exists (the way MPFever reads the stops it ships, MIT). The replay marks were
+-- spent by the first look, and the result list of the event is given to the capture.
+local function simCaptureBuild(state, param, post)
 	local st = simState(state)
 	local now = engine.gameTime()
-	if spendReplay(st, now) then
+	if not post and spendReplay(st, now) then
 		state:set(st)
 		return
 	end
-	local proposal, playerInitiated = nil, nil
-	pcall(function() proposal, playerInitiated = param[1], param[4] end)
+	local proposal, playerInitiated, result = nil, nil, nil
+	pcall(function() proposal, playerInitiated, result = param[1], param[4], param[3] end)
 	if proposal == nil or playerInitiated == false or not Build then return end
 	local rev = {}
 	for key, e in pairs(st.bind) do rev[e] = key end
 	local t0 = os.clock()
-	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true }, {
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, result = post and result or nil }, {
 		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
 	})
 	if not ok then body, why = nil, tostring(body) end
+	if not body and not post and tostring(why):find("has no model", 1, true) then
+		SIM.deferredBuild = { at = now }
+		logSim("a native build at t=" .. now .. " has an edge object that the engine has not made yet: read again after the build")
+		state:set(st)
+		return
+	end
 	if not body then
 		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(why))
 		-- the first few failures leave the raw proposal in a file, to see the real shapes (members of engine objects)
@@ -424,6 +434,7 @@ local function simCaptureBuild(state, param)
 	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, " .. string.format("%.3f", os.clock() - t0) .. " s)")
 	-- self-check: could this record be rebuilt here, the way another game will rebuild it? Only the engine's command
 	-- factory is called, nothing is sent.
+	if post then return end   -- the world has changed already: the segment it replaces is the new one, a check would mislead
 	local okC, args, whyC = pcall(L.decodeCommand, body, simCtx(st, { from = C.PLAYER_ID, at = now, key = "self-check" }))
 	if not okC then args, whyC = nil, tostring(args) end
 	if args then
@@ -577,7 +588,7 @@ local function simAdvanceBinders(st)
 		if complete then
 			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
 		elseif b.steps >= WATCH_STEPS then
-			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps")
+			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps (a build the engine refuses creates nothing; its reason is only logged for a build applied during a pause)")
 		else
 			keep[#keep + 1] = b
 		end
@@ -638,6 +649,17 @@ local function handleEvent(userParams, state, src, id, name, param)
 		if not C.ACTIVE then return end
 		local ok, err = pcall(simCaptureBuild, state, param)
 		if not ok then logSim("onPreBuildProposal capture failed: " .. tostring(err)) end
+		return
+	end
+	if id == "apply_command" and name == "onPostBuildProposal" then
+		local d = SIM.deferredBuild
+		SIM.deferredBuild = nil
+		if d and d.at == engine.gameTime() then
+			C.poll()
+			if not C.ACTIVE then return end
+			local ok, err = pcall(simCaptureBuild, state, param, true)
+			if not ok then logSim("onPostBuildProposal capture failed: " .. tostring(err)) end
+		end
 		return
 	end
 	C.poll()
@@ -739,6 +761,24 @@ end
 
 local function guiCtx(it)
 	return actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
+end
+
+-- What the engine says when it refuses a command (errorState of the result), for the log: without it a refused build is
+-- only "REFUSED" and the reason has to be guessed from the record.
+local function refusalWhy(data)
+	local parts = {}
+	pcall(function()
+		local es = data.resultProposalData.errorState
+		for _, k in ipairs({ "messages", "warnings" }) do
+			local list = es[k]
+			if list ~= nil then
+				for i = 1, math.min(#list, 6) do parts[#parts + 1] = k:sub(1, 1) .. ":" .. tostring(list[i]) end
+			end
+		end
+		if es.critical ~= nil then parts[#parts + 1] = "critical=" .. tostring(es.critical) end
+	end)
+	if #parts == 0 then return "" end
+	return " (" .. table.concat(parts, "; "):sub(1, 400) .. ")"
 end
 
 local function deliverResult(key, data, success, entities)
@@ -878,7 +918,7 @@ local function guiApplyNow(it, now)
 		end
 		-- the game is paused, so nothing else moved the account since the command went out
 		coToSim(it, success, success and coAfter(ctx, it, spec, category, balance0, logGui) or nil)
-		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now .. (success and "" or " REFUSED"))
+		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now .. (success and "" or (" REFUSED" .. refusalWhy(data))))
 		deliverResult(it.key, data, success, entities)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
