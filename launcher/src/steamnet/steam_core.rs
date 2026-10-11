@@ -168,8 +168,10 @@ impl Default for Config {
 
 /// The environment variable that replaces the send rate (bytes per second) for the speed test.
 pub const SEND_RATE_ENV: &str = "FEVERLINK3_STEAM_SENDRATE";
-/// The send rate used when the variable is not set: 1 MiB/s (Steam's own default is 256 KiB/s).
-pub const DEFAULT_SEND_RATE: i32 = 1 << 20;
+/// The send rate used when the variable is not set: 64 MiB/s, the top of [`SEND_RATE_RANGE`], so that the connection
+/// and Steam's relays are the limit and not this number (Steam's own default is 256 KiB/s and the first test builds used
+/// 1 MiB/s, which a speed test measured as the limit on a direct route). The variable still lowers it.
+pub const DEFAULT_SEND_RATE: i32 = 64 << 20;
 /// Bounds for the variable: below 32 KiB/s nothing works, above 64 MiB/s no home line can follow.
 pub const SEND_RATE_RANGE: (i32, i32) = (32 * 1024, 64 << 20);
 
@@ -1845,9 +1847,9 @@ mod tests {
 
     #[test]
     fn the_send_rate_variable_is_parsed_and_bounded() {
-        assert_eq!(send_rate_setting(None), 1 << 20);
-        assert_eq!(send_rate_setting(Some("")), 1 << 20);
-        assert_eq!(send_rate_setting(Some("fast")), 1 << 20);
+        assert_eq!(send_rate_setting(None), DEFAULT_SEND_RATE);
+        assert_eq!(send_rate_setting(Some("")), DEFAULT_SEND_RATE);
+        assert_eq!(send_rate_setting(Some("fast")), DEFAULT_SEND_RATE);
         assert_eq!(send_rate_setting(Some(" 4194304 ")), 4_194_304);
         assert_eq!(send_rate_setting(Some("1")), 32 * 1024);
         assert_eq!(send_rate_setting(Some("-5")), 32 * 1024);
