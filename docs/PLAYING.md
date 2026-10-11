@@ -68,12 +68,12 @@ Press **Connection test...** in the window (under the join code field) to open t
 **Not verified yet:**
 
 - Joining a host over Steam from a second Steam account, the world transfer over that connection, and playing together afterwards (this build is for that test).
-- Building together: the mod captures player actions (buying vehicles, creating lines, roads and rails built with the tools in some cases, and more) and replays them on every game, but this has only been checked with simulated games, never with two real ones.
-- The native hooks that would hold construction commands back so every game builds at the same moment: switched off in this version, and never run in the real game.
+- Building together beyond the slice that was seen: the mod captures player actions (buying vehicles, stations, depots, rail, and more) and replays them on every game, but only roads, bulldozing, loans and lines have been checked with two real games.
+- The native hooks that hold construction commands back so every game builds at the same moment: switched off unless a developer turns them on; run in two real games for the road tools and the bulldozer, not for anything else.
 
 **Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
 
-**Towns do not grow while a session runs.** The game grows a town with random choices that differ from one computer to the next, so two players' towns would drift apart, and a road or station built through a town would fail on the other computer. The mod therefore switches growth off for every town while you are hosting or joined, and switches it back on for the towns it switched off when the session ends (or when you load a save made during a session in a normal game). A town whose growth you had switched off yourself stays off.
+**Towns and sync.** The game grows towns with choices that can differ from one computer to the next, so after a while two players' towns can differ, and a road or station built through such a town may fail on the other computer; FeverLink3 then repairs the world with a resync. Town growth is never switched off. Making growth identical on every computer is being worked on.
 
 **Not built yet:** separate companies (one shared company for now), a dedicated server, towns that grow during a session.
 

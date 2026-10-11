@@ -1,10 +1,9 @@
 # Native module and mod: the control link
 
-Status: **implemented and tested without the game, not yet run in the game.** Everything below that says "verified"
+Status: **implemented and tested without the game; the capture-and-hold hook has been run in two real games for road tools and the bulldozer, the rest has not run in the game.** Everything below that says "verified"
 means verified by tests or by the address tool on the executable on disk; what only a running game can confirm is
 listed in section 8, with the log lines to look for. The module is off unless an environment variable switches
-a piece on (section 2). The mod's half (strict mode, section 7) is written and tested against a fake module, and is
-also not yet run in the game (stage 4 of section 8).
+a piece on (section 2). The mod's half (strict mode, section 7) is written and tested against a fake module, and has been run in two real games for the road tools and the bulldozer (stage 4 of section 8 for the rest).
 
 ## 1. What the native module is for
 
@@ -212,7 +211,7 @@ said "no locks in either hook"; the `Add` hook uses a lock it never waits for.
 
 ## 7. The mod's side of the contract
 
-**Built and tested without the game; not yet run in it.** The code is the "strict mode" block of the bridge's interface half
+**Built and tested without the game; run in two real games for the road tools and the bulldozer only.** The code is the "strict mode" block of the bridge's interface half
 (`mod/feverlink3_1/content/feverlink3_bridge.script.lua`: `natTick`, `natCapture`, `natDecide`, `natStop`) and
 `M.captureToolBuild` of the build module (`feverlink3_cmds_build.lua`). `tests/lua/test_strict_build.py` runs two mocked games
 against a fake module that honours the files and rules of sections 3 and 4 (`hold_on` / `hold_off` / `release` / `cancel` /

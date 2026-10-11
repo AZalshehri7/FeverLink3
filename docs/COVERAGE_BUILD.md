@@ -2,7 +2,7 @@
 
 What the mod does with every construction-related command and proposal call of Transport Fever 3 (stage 0.4: "constructions against streets, upgrades, signals, decorations, terrain"). Code: `mod/feverlink3_1/content/feverlink3_cmds_build.lua`. Tests: `tests/lua/test_cmds_build.py`. Design background: `docs/ARCHITECTURE.md` sections 5 and 6, `docs/NATIVE_LINK.md`.
 
-**Nothing here has run in the real game.** The argument lists below come from the game's own scripts (`gui.zip`, `mission.zip`, `game_mechanics.zip` in the game's `base\content`, read-only) and from MPFever (MIT), which ran them. Everything the code assumes about the engine without proof is listed in "Needs game verification" at the end, each with the in-game steps and the log line that settles it.
+**Only a thin slice has run in the real game (roads, the bulldozer, loans, lines, renames).** The argument lists below come from the game's own scripts (`gui.zip`, `mission.zip`, `game_mechanics.zip` in the game's `base\content`, read-only) and from MPFever (MIT), which ran them. Everything the code assumes about the engine without proof is listed in "Needs game verification" at the end, each with the in-game steps and the log line that settles it.
 
 ## 1. How a build reaches the mod
 
