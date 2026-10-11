@@ -1,14 +1,19 @@
 //! The comprehensive speed test: one run, no key presses.
 //!
 //! - Stage 0: connect, take the idle round trip (the baseline) and the route.
-//! - Stage 1, the rate ladder: 8 MB over the reliable stream at Steam send rates of 1, 2, 4, 8, 16 and 32 MiB/s, upload
-//!   then download at each rate, climbing while the path keeps up and stopping at the first safety stop (round trip
-//!   above 3x the baseline or baseline + 150 ms, a stall of 5 s, a gain under 10 %, a step that did not finish in 30 s).
+//! - Stage 1, the rate ladder: 8 MB over the reliable stream at Steam send rates of 1, 2 and 4 MiB/s (a real relay path
+//!   already delivered less at 2 MiB/s than at 1), upload then download at each rate, climbing while the path keeps up
+//!   and stopping at the first safety stop (round trip above 3x the baseline or baseline + 150 ms, a stall of 5 s, a
+//!   gain under 10 %, a step that did not finish in 30 s).
 //! - Stage 2: 32 MB each way at the best sustainable rate found, and 80 MB (the size of a big save) when that rate is
 //!   4 MiB/s or more.
-//! - Stage 3: 2 and 4 reliable connections at once, 8 MB split between them.
+//! - Stage 3: 2, 4, 8 and 16 reliable connections at once, each at 1 MiB/s (the rate one connection really delivers),
+//!   8 MB split between them; a direction skips the next step when the last one did not scale (under 1.3 times the
+//!   speed of the step before) or broke a safety rule.
+//! - Stage 4: `Auto (scaled)`, 80 MB each way: exactly the code path of a resync save (`steamnet::par`), with the
+//!   number of connections from the size of the file and adapted to the path; the connections used, MB/s and time.
 //! - The report: a table of every step, the best sustainable rate per direction, the time an 80 MB save takes at the
-//!   default and at the best rate, and a verdict in plain English.
+//!   default and at the best rate, the Auto run, and a verdict in plain English.
 //!
 //! The decisions are made on a [`Path`] (the thing that measures one step), so the tests drive them on a simulated
 //! path; [`ProbePath`] is the real one on the Steam probe. Whatever happens (an error, Ctrl+C) the send rates are put
@@ -24,7 +29,13 @@ use super::suite::{Ctx, Outcome, Stop};
 /// One MiB per second, the default send rate.
 pub const MIB: i32 = 1 << 20;
 /// The rates of the ladder, in order. Never above the last.
-pub const RATES: [i32; 6] = [MIB, 2 * MIB, 4 * MIB, 8 * MIB, 16 * MIB, 32 * MIB];
+pub const RATES: [i32; 3] = [MIB, 2 * MIB, 4 * MIB];
+/// The connection counts of the parallel stage, each at the default rate.
+pub const PARALLEL: [u32; 4] = [2, 4, 8, 16];
+/// A parallel step must reach this many times the speed of the step before it to count as scaling.
+pub const SCALES: f64 = 1.3;
+/// The size of the `Auto (scaled)` run of stage 4, each way.
+pub const AUTO_MB: u32 = 80;
 /// Megabytes of one ladder step.
 pub const STEP_MB: u32 = 8;
 /// A step still running after this long is abandoned (the numbers so far stand).
@@ -34,9 +45,9 @@ pub const STALL_MS: u64 = 5_000;
 /// A step must gain this much speed over the previous one to be worth the higher rate.
 pub const MIN_GAIN: f64 = 1.10;
 /// The ladder takes no new step after this much time.
-pub const LADDER_BUDGET: Duration = Duration::from_secs(300);
-/// Nothing new starts after this much time; the whole run aims at 8 minutes.
-pub const TOTAL_BUDGET: Duration = Duration::from_secs(450);
+pub const LADDER_BUDGET: Duration = Duration::from_secs(240);
+/// Nothing new starts after this much time; the whole run aims at 10 minutes.
+pub const TOTAL_BUDGET: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dir {
@@ -116,6 +127,10 @@ pub trait Path {
     fn parallel_available(&self) -> bool {
         true
     }
+    /// The `Auto (scaled)` run of `mb` MB each way: the lines of its result block, or `None` when this path has none.
+    fn auto(&mut self, _mb: u32) -> Result<Option<Vec<String>>, Stop> {
+        Ok(None)
+    }
     /// Puts the send rates of both sides back to the default (called on every way out).
     fn restore(&mut self);
     /// Called with the summary after every step (the partial result for an abort).
@@ -131,6 +146,8 @@ pub struct Summary {
     pub best: [i32; 2],
     pub notes: Vec<String>,
     pub parallel_note: String,
+    /// The result block of the `Auto (scaled)` run.
+    pub auto: Vec<String>,
     pub finished: bool,
     pub default_rate: i32,
 }
@@ -252,7 +269,7 @@ fn body<P: Path>(path: &mut P, s: &mut Summary) -> Result<(), Stop> {
                 step.stop_note = j.why.clone();
             } else if rate == *RATES.last().unwrap_or(&rate) {
                 active[dir.idx()] = false;
-                step.stop_note = Some("top of the ladder (32 MiB/s) reached".into());
+                step.stop_note = Some("top of the ladder (4 MiB/s) reached".into());
             }
             path.say(&step_line(&step));
             if let Some(w) = &step.stop_note {
@@ -278,8 +295,14 @@ fn body<P: Path>(path: &mut P, s: &mut Summary) -> Result<(), Stop> {
                 s.notes.push(format!("{} {label} run skipped (time).", dir.text()));
                 continue;
             }
-            let req =
-                Req { stage: if mb == 32 { "validate" } else { "save size" }, dir, conns: 1, rate: best, mb, cap: Duration::from_secs(cap) };
+            let req = Req {
+                stage: if mb == 32 { "validate" } else { "save size" },
+                dir,
+                conns: 1,
+                rate: best,
+                mb,
+                cap: Duration::from_secs(cap),
+            };
             let step = path.measure(&req)?;
             path.say(&step_line(&step));
             s.steps.push(step);
@@ -290,27 +313,66 @@ fn body<P: Path>(path: &mut P, s: &mut Summary) -> Result<(), Stop> {
     if !path.parallel_available() {
         s.parallel_note = "parallel connections: not available in this version".into();
     } else {
-        path.say("Stage 3: parallel connections (8 MB split)...");
-        'par: for n in [2u32, 4] {
+        path.say("Stage 3: parallel connections at 1 MiB/s each (8 MB split)...");
+        let mut prev: [Option<f64>; 2] = [speed_at(s, Dir::Up, MIB, 1), speed_at(s, Dir::Down, MIB, 1)];
+        let mut active = [true; 2];
+        'par: for n in PARALLEL {
             for dir in [Dir::Up, Dir::Down] {
+                if !active[dir.idx()] {
+                    continue;
+                }
                 if path.elapsed() + STEP_CAP + Duration::from_secs(30) > TOTAL_BUDGET {
                     s.parallel_note = "parallel connections: skipped (time)".into();
                     break 'par;
                 }
-                // each connection keeps at least the default, together they reach about the best rate
-                let rate = (s.best[dir.idx()] / n as i32).max(MIB);
-                let req = Req { stage: "parallel", dir, conns: n, rate, mb: STEP_MB, cap: STEP_CAP };
+                let req = Req { stage: "parallel", dir, conns: n, rate: MIB, mb: STEP_MB, cap: STEP_CAP };
                 let step = path.measure(&req)?;
                 path.say(&step_line(&step));
-                let failed = step.failed.clone();
+                let verdict = judge(None, &step, base);
+                let speed = step.speed;
+                if let Some(why) = step.failed.clone() {
+                    s.notes.push(format!(
+                        "{} x{n}: failed ({why}); no more parallel steps in this direction.",
+                        dir.text()
+                    ));
+                    active[dir.idx()] = false;
+                } else if !verdict.sustainable {
+                    s.notes.push(format!(
+                        "{} x{n}: {}; no more parallel steps in this direction.",
+                        dir.text(),
+                        verdict.why.unwrap_or_default()
+                    ));
+                    active[dir.idx()] = false;
+                } else if let (Some(before), Some(now)) = (prev[dir.idx()], speed) {
+                    if now < before * SCALES {
+                        s.notes.push(format!(
+                            "{} x{n}: did not scale ({} to {}); the larger counts were skipped in this direction.",
+                            dir.text(),
+                            mbs(before),
+                            mbs(now)
+                        ));
+                        active[dir.idx()] = false;
+                    }
+                }
+                prev[dir.idx()] = speed.or(prev[dir.idx()]);
                 s.steps.push(step);
                 path.publish(s);
-                if let Some(why) = failed {
-                    s.parallel_note = format!("parallel connections: failed ({why})");
-                    break 'par;
-                }
+            }
+            if !active[0] && !active[1] {
+                break;
             }
         }
+    }
+    // stage 4
+    if path.elapsed() + Duration::from_secs(150) > TOTAL_BUDGET {
+        s.notes.push("The Auto (scaled) run was skipped (time).".into());
+    } else {
+        path.say(&format!("Stage 4: Auto (scaled), {AUTO_MB} MB each way (the way a resync save is sent)..."));
+        match path.auto(AUTO_MB)? {
+            Some(lines) => s.auto = lines,
+            None => s.notes.push("Auto (scaled): not available in this version.".into()),
+        }
+        path.publish(s);
     }
     s.finished = true;
     path.publish(s);
@@ -407,17 +469,28 @@ pub fn report_lines(s: &Summary) -> Vec<String> {
         }
     }
     out.push("(* = the step did not finish in its time limit; the speed is what had moved by then)".into());
-    if s.steps.iter().any(|x| x.dir == Dir::Down && x.peer_unchanged) && !s.steps.iter().any(|x| x.dir == Dir::Down && x.steam_rate.is_some()) {
+    if s.steps.iter().any(|x| x.dir == Dir::Down && x.peer_unchanged)
+        && !s.steps.iter().any(|x| x.dir == Dir::Down && x.steam_rate.is_some())
+    {
         out.push("The peer did not change its rate: the download steps are at the peer's default.".into());
     }
     out.push(if s.parallel_note.is_empty() {
         let p: Vec<_> = s.steps.iter().filter(|x| x.stage == "parallel").collect();
-        if p.is_empty() { "Parallel connections: not run.".to_string() } else { "Parallel connections: see the table (stage parallel).".to_string() }
+        if p.is_empty() {
+            "Parallel connections: not run.".to_string()
+        } else {
+            "Parallel connections: see the table (stage parallel).".to_string()
+        }
     } else {
         format!("{}.", s.parallel_note.trim_end_matches('.'))
     });
     for n in &s.notes {
         out.push(n.clone());
+    }
+    if !s.auto.is_empty() {
+        out.push(String::new());
+        out.push(format!("Auto (scaled), {AUTO_MB} MB each way (the way a resync save is sent):"));
+        out.extend(s.auto.iter().map(|l| format!("  {l}")));
     }
     out.push(String::new());
     out.push(format!(
@@ -437,7 +510,9 @@ pub fn report_lines(s: &Summary) -> Vec<String> {
             .filter_map(|x| x.speed)
             .next_back()
             .or_else(|| speed_at(s, dir, best, 1));
-        let t = |rate: Option<f64>, mb: f64| throughput::estimate_secs(mb, rate).map_or_else(|| "unknown".to_string(), throughput::secs_text);
+        let t = |rate: Option<f64>, mb: f64| {
+            throughput::estimate_secs(mb, rate).map_or_else(|| "unknown".to_string(), throughput::secs_text)
+        };
         out.push(format!(
             "An {SAVE_MB:.0} MB save, {}: at the default rate {} about {} ({} on the wire with base64, {} if binary); at the best rate {} about {} ({} if binary).",
             dir.text(),
@@ -487,7 +562,9 @@ pub fn verdict(s: &Summary) -> Vec<String> {
     ));
     let default_speed = |dir: Dir| speed_at(s, dir, s.default_rate, 1);
     let best_speed = |dir: Dir| speed_at(s, dir, s.best[dir.idx()], 1);
-    let est = |v: Option<f64>| throughput::estimate_secs(SAVE_MB, v).map_or_else(|| "unknown".to_string(), throughput::secs_text);
+    let est = |v: Option<f64>| {
+        throughput::estimate_secs(SAVE_MB, v).map_or_else(|| "unknown".to_string(), throughput::secs_text)
+    };
     lines.push(format!(
         "4. An {SAVE_MB:.0} MB save takes about {} / {} (up / down) at the default rate and about {} / {} at the best rates.",
         est(default_speed(Dir::Up)),
@@ -499,7 +576,10 @@ pub fn verdict(s: &Summary) -> Vec<String> {
     lines.push(if rec <= s.default_rate {
         format!("5. Recommended default send rate: {} (nothing higher held up on this path).", mib_text(s.default_rate))
     } else {
-        format!("5. Recommended default send rate: {} (the lower of the two best rates, without a safety stop).", mib_text(rec))
+        format!(
+            "5. Recommended default send rate: {} (the lower of the two best rates, without a safety stop).",
+            mib_text(rec)
+        )
     });
     lines
 }
@@ -608,13 +688,7 @@ impl Path for ProbePath<'_, '_, '_> {
     }
 
     fn measure(&mut self, req: &Req) -> Result<Step, Stop> {
-        let mut step = Step {
-            stage: req.stage,
-            dir: req.dir,
-            conns: req.conns,
-            asked: req.rate,
-            ..Step::default()
-        };
+        let mut step = Step { stage: req.stage, dir: req.dir, conns: req.conns, asked: req.rate, ..Step::default() };
         let spec = RunSpec {
             variant: Variant::Reliable(req.conns),
             total: u64::from(req.mb) * MB,
@@ -642,7 +716,8 @@ impl Path for ProbePath<'_, '_, '_> {
                 break o;
             }
             if !self.ctx.probe.run_active() {
-                step.failed = Some("the step could not be started (Steam is not ready or the connection is gone)".into());
+                step.failed =
+                    Some("the step could not be started (Steam is not ready or the connection is gone)".into());
                 return Ok(step);
             }
             if began.elapsed() > req.cap * 2 + Duration::from_secs(40) {
@@ -691,6 +766,12 @@ impl Path for ProbePath<'_, '_, '_> {
             }
         }
         Ok(step)
+    }
+
+    fn auto(&mut self, mb: u32) -> Result<Option<Vec<String>>, Stop> {
+        let name = format!("Auto (scaled), {mb} MB each way");
+        let outcome = super::bulk_modes::run_spec(self.ctx, &name, RunSpec::auto(mb))?;
+        Ok(Some(if outcome.ok { outcome.lines } else { vec![format!("failed: {}", outcome.lines.join(" "))] }))
     }
 
     fn restore(&mut self) {

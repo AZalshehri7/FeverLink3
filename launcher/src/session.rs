@@ -44,10 +44,10 @@ use crate::net::{
     BulkSendJob, BulkSendResult, ClientNet, ClientTransport, ConnectContext, HostNet, HostTransport, LinkInfo,
     NetEvent, ParContext, ParJob, CONNECT_TIMEOUT,
 };
-use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
-use crate::steamnet::par::wire::secret_from_key;
 use crate::process::Role;
 use crate::resync;
+use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
+use crate::steamnet::par::wire::secret_from_key;
 
 /// Period of the state machines' tick (session broadcast, checksum rounds).
 pub const TICK: Duration = Duration::from_millis(250);
@@ -970,8 +970,7 @@ pub fn run_player_over(
     let thread = {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("feverlink3-player".into()).spawn(move || {
-            let mut state =
-                PlayerLoop {
+            let mut state = PlayerLoop {
                 config,
                 player,
                 net: Some(first),
@@ -1068,7 +1067,10 @@ impl PlayerLoop {
                                 std::fs::rename(&tmp, dir.join(format!("{name}.sav")))
                             });
                             if let Err(e) = copy {
-                                shared.log(format!("resync {id}: cannot copy the received save to {}: {e}", dir.display()));
+                                shared.log(format!(
+                                    "resync {id}: cannot copy the received save to {}: {e}",
+                                    dir.display()
+                                ));
                             }
                         }
                         outputs.extend(self.player.bulk_file_received(id, &sha256, len));

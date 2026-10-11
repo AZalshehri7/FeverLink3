@@ -456,7 +456,8 @@ impl Controller {
                 match (&mut self.steam, id) {
                     (Some(probe), Some(id)) => match speed_mb {
                         Some(mb) => {
-                            // `mode`: reliable (default), dgram, both, parallel (reliable on 1, 2 and 4 connections), all
+                            // `mode`: reliable (default), dgram, both, parallel (reliable on 1, 2 and 4 connections), auto (the resync's
+                            // parallel connections, scaled to the size), all
                             let mode = params.get("mode").and_then(Value::as_str).unwrap_or("reliable");
                             probe.start_plan(id, steamnet::specs_for(mode, mb));
                         }

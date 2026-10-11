@@ -46,7 +46,7 @@ pub const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 /// Longest header line.
 const HEADER_LIMIT: usize = 400;
 /// Most parallel connections a reliable variant (or a friend's request) uses.
-pub const MAX_CONNS: u32 = 4;
+pub const MAX_CONNS: u32 = 16;
 
 // ---- messages
 
@@ -81,6 +81,31 @@ pub enum Msg {
     DgDown {
         id: u64,
         total: u64,
+    },
+    /// I will send `total` bytes over parallel connections to your parallel port (`Auto (scaled)`): get ready.
+    ParUp {
+        id: u64,
+        total: u64,
+    },
+    /// Ready for the parallel upload `id`.
+    ParReady {
+        id: u64,
+    },
+    /// The parallel upload `id` was received (or failed): the receiver's numbers (`ok`, `bytes`, `ms`, `lanes`).
+    ParRes {
+        id: u64,
+        kv: Vec<(String, u64)>,
+    },
+    /// Send me `total` bytes over parallel connections.
+    ParDown {
+        id: u64,
+        total: u64,
+    },
+    /// The parallel transfer `id` was sent: the sender's numbers and a sentence on why it stopped adding connections.
+    ParSend {
+        id: u64,
+        kv: Vec<(String, u64)>,
+        text: String,
     },
     /// The datagram transfer `id` arrived (or failed): the receiver's numbers.
     Dres {
@@ -139,6 +164,25 @@ pub fn parse(data: &[u8]) -> Option<Msg> {
         "stop" => Msg::Stop { id: num()? },
         "rate" => Msg::RateAck { id: num()?, asked: u32::try_from(num()?).ok()?, got: u32::try_from(num()?).ok()? },
         "dgdown" => Msg::DgDown { id: num()?, total: num()? },
+        "parup" => Msg::ParUp { id: num()?, total: num()? },
+        "parready" => Msg::ParReady { id: num()? },
+        "pardown" => Msg::ParDown { id: num()?, total: num()? },
+        "parres" | "parsend" => {
+            let id = num()?;
+            let mut kv = Vec::new();
+            for word in header.split_whitespace().skip(2).take(24) {
+                let (k, v) = word.split_once('=')?;
+                kv.push((k.to_string(), v.parse().ok()?));
+            }
+            if kind == "parres" {
+                Msg::ParRes { id, kv }
+            } else {
+                // the sentence follows the header line
+                let body = &rest[end + 1..];
+                let text = String::from_utf8_lossy(&body[..body.len().min(400)]).into_owned();
+                Msg::ParSend { id, kv, text }
+            }
+        }
         "dres" | "dsend" => {
             let id = num()?;
             let mut kv = Vec::new();
@@ -172,6 +216,11 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
         Msg::Stop { id } => format!("tput stop {id}\n"),
         Msg::RateAck { id, asked, got } => format!("tput rate {id} {asked} {got}\n"),
         Msg::DgDown { id, total } => format!("tput dgdown {id} {total}\n"),
+        Msg::ParUp { id, total } => format!("tput parup {id} {total}\n"),
+        Msg::ParReady { id } => format!("tput parready {id}\n"),
+        Msg::ParDown { id, total } => format!("tput pardown {id} {total}\n"),
+        Msg::ParRes { id, kv } => format!("tput parres {id}{}\n", kv_text(kv)),
+        Msg::ParSend { id, kv, text } => format!("tput parsend {id}{}\n{text}", kv_text(kv)),
         Msg::Dres { id, kv } => format!("tput dres {id}{}\n", kv_text(kv)),
         Msg::Dsend { id, kv } => format!("tput dsend {id}{}\n", kv_text(kv)),
         Msg::Data { id, seq, .. } => format!("tput d {id} {seq}\n"),
@@ -577,6 +626,9 @@ pub enum Variant {
     Reliable(u32),
     /// Bulk datagrams with our own reliability and congestion control.
     Datagram,
+    /// Parallel Steam connections, their number scaled to the size of the file and adapted to the path: the way a
+    /// resync save is sent (`steamnet::par`).
+    Auto,
 }
 
 impl Variant {
@@ -585,6 +637,7 @@ impl Variant {
             Variant::Reliable(1) => "reliable".to_string(),
             Variant::Reliable(n) => format!("reliable, {n} connections"),
             Variant::Datagram => "datagrams".to_string(),
+            Variant::Auto => "Auto (scaled)".to_string(),
         }
     }
 }
@@ -595,6 +648,7 @@ pub fn plan_for(mode: &str) -> Vec<Variant> {
     use Variant::{Datagram, Reliable};
     match mode.trim().to_ascii_lowercase().as_str() {
         "dgram" | "datagram" | "datagrams" => vec![Datagram],
+        "auto" | "par" | "scaled" => vec![Variant::Auto],
         "both" => vec![Reliable(1), Datagram],
         "parallel" => vec![Reliable(1), Reliable(2), Reliable(4)],
         "all" => vec![Reliable(1), Reliable(2), Reliable(4), Datagram],
@@ -888,6 +942,137 @@ impl DgramResult {
     }
 }
 
+// ---- Auto (scaled): parallel connections
+
+/// One direction of an `Auto (scaled)` transfer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParSide {
+    pub ok: bool,
+    /// Why it did not work (empty when it did).
+    pub why: String,
+    pub bytes: u64,
+    /// Bytes per second over the whole transfer as the sender counted them (acknowledged by the receiver).
+    pub rate: Option<f64>,
+    pub secs: f64,
+    /// The connections the size rule asked for, the most that worked at once, how many were opened in all.
+    pub target: u32,
+    pub used: u32,
+    pub opened: u32,
+    /// Why the connections stopped growing (or that they did not).
+    pub stop: String,
+    pub requeued: u64,
+    pub ping_peak_ms: Option<u32>,
+    pub capped: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ParResult {
+    pub total_bytes: u64,
+    pub up: ParSide,
+    pub down: ParSide,
+    pub total_secs: f64,
+    pub ping_ms: Option<u32>,
+    pub route: String,
+    pub route_notes: Vec<String>,
+    pub steam: SteamSamples,
+    pub rate_notes: Vec<String>,
+}
+
+impl ParResult {
+    /// Seconds for the 80 MB save at the two directions' rates (no base64 on this path).
+    pub fn estimates(&self) -> (Option<f64>, Option<f64>) {
+        let secs = |rate: Option<f64>| rate.filter(|r| *r > 0.0).map(|r| SAVE_MB * MB as f64 / r);
+        (secs(self.up.rate), secs(self.down.rate))
+    }
+
+    fn side_line(name: &str, side: &ParSide) -> String {
+        if !side.ok {
+            return format!("{name}: FAILED: {}", if side.why.is_empty() { "unknown" } else { &side.why });
+        }
+        format!(
+            "{name}: {} connection(s) (the rule asked for {}, {} opened), {} in {:.1} s{}; {}",
+            side.used,
+            side.target,
+            side.opened,
+            rate_text(side.rate),
+            side.secs,
+            if side.requeued > 0 {
+                format!(", {} chunk(s) re-sent after a connection died", side.requeued)
+            } else {
+                String::new()
+            },
+            side.stop
+        )
+    }
+
+    /// The lines the window shows for a finished `Auto (scaled)` run.
+    pub fn lines(&self) -> Vec<String> {
+        let mb = self.total_bytes as f64 / MB as f64;
+        let route = if self.route.is_empty() { "unknown route" } else { &self.route };
+        let ping = self.ping_ms.map_or_else(|| "unknown".into(), |p| format!("{p} ms"));
+        let mut out = vec![
+            format!(
+                "Auto (scaled) speed test, {mb:.0} MB each way: you to friend {} on {} connection(s), friend to you {} on {}, {:.1} s in all",
+                rate_text(self.up.rate),
+                self.up.used,
+                rate_text(self.down.rate),
+                self.down.used,
+                self.total_secs
+            ),
+            format!(
+                "Route: {route}, round trip {ping}{}",
+                if self.route_notes.is_empty() {
+                    ", no route change".to_string()
+                } else {
+                    format!(", ROUTE CHANGED: {}", self.route_notes.join("; "))
+                }
+            ),
+            Self::side_line("You to friend", &self.up),
+            Self::side_line("Friend to you", &self.down),
+        ];
+        let (host, guest) = self.estimates();
+        let secs = |e: Option<f64>| e.map_or_else(|| "unknown".to_string(), secs_text);
+        let n80 = crate::steamnet::par::ParConfig::default().conns_for((SAVE_MB * MB as f64) as u64);
+        out.push(format!(
+            "An {SAVE_MB:.0} MB save (carried as it is, no base64, on up to {n80} connections): about {} if you host, {} if your friend hosts",
+            secs(host),
+            secs(guest)
+        ));
+        let steam = self.steam.summary_line();
+        if !steam.is_empty() {
+            out.push(steam);
+        }
+        out
+    }
+
+    /// One line for the session log.
+    pub fn log_line(&self) -> String {
+        let (host, guest) = self.estimates();
+        let secs = |e: Option<f64>| e.map_or_else(|| "?".to_string(), |s| format!("{s:.0}"));
+        let side = |s: &ParSide| {
+            if s.ok {
+                format!("{} conns of {} wanted, {}", s.used, s.target, s.stop)
+            } else {
+                format!("FAILED: {}", s.why)
+            }
+        };
+        format!(
+            "steam speed test (auto scaled): {:.0} MB each way, up {} [{}], down {} [{}], total {:.1} s, {}, ping {} ms, route changes: {}, 80 MB save about {} s hosting / {} s joining",
+            self.total_bytes as f64 / MB as f64,
+            rate_text(self.up.rate),
+            side(&self.up),
+            rate_text(self.down.rate),
+            side(&self.down),
+            self.total_secs,
+            if self.route.is_empty() { "route unknown" } else { &self.route },
+            self.ping_ms.map_or_else(|| "?".into(), |p| p.to_string()),
+            if self.route_notes.is_empty() { "none".to_string() } else { self.route_notes.join("; ") },
+            secs(host),
+            secs(guest),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1092,15 @@ mod tests {
             Msg::End { id: 7, sent: 32_000_000, peak_pending: 524_288, max_block_ms: 812 },
             Msg::Prog { id: 7, bytes: 1_048_576 },
             Msg::UpRes { id: 7, bytes: 32_000_000, ms: 17_500, gap_ms: 900, steady: 31_650_475 },
+            Msg::ParUp { id: 7, total: 80_000_000 },
+            Msg::ParReady { id: 7 },
+            Msg::ParDown { id: 7, total: 80_000_000 },
+            Msg::ParRes { id: 7, kv: vec![("ok".into(), 1), ("bytes".into(), 80_000_000), ("lanes".into(), 7)] },
+            Msg::ParSend {
+                id: 7,
+                kv: vec![("ok".into(), 1), ("used".into(), 8), ("target".into(), 8)],
+                text: "all 8 connections were opened".into(),
+            },
         ];
         for m in all {
             assert_eq!(parse(&encode(&m)), Some(m.clone()), "{m:?}");

@@ -184,6 +184,9 @@ pub const CLASSIC_MODES: &[Mode] = &[
     Mode { name: "datagrams 80 MB", run: bulk_modes::datagrams_80 },
     Mode { name: "parallel x2, 32 MB", run: bulk_modes::parallel_2_32 },
     Mode { name: "parallel x4, 32 MB", run: bulk_modes::parallel_4_32 },
+    Mode { name: "Auto (scaled) 8 MB", run: bulk_modes::auto_8 },
+    Mode { name: "Auto (scaled) 32 MB", run: bulk_modes::auto_32 },
+    Mode { name: "Auto (scaled) 80 MB", run: bulk_modes::auto_80 },
 ];
 
 /// How the tester got on.
@@ -437,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_the_ladder_then_datagrams_and_classic_lists_every_mode() {
+    fn the_default_is_the_ladder_with_its_auto_stage_then_datagrams_and_classic_lists_every_mode() {
         let names: Vec<_> = MODES.iter().map(|m| m.name).collect();
         assert_eq!(names, ["rate ladder (comprehensive)", "datagrams 32 MB"]);
         let classic: Vec<_> = CLASSIC_MODES.iter().map(|m| m.name).collect();
@@ -451,7 +454,10 @@ mod tests {
                 "datagrams 32 MB",
                 "datagrams 80 MB",
                 "parallel x2, 32 MB",
-                "parallel x4, 32 MB"
+                "parallel x4, 32 MB",
+                "Auto (scaled) 8 MB",
+                "Auto (scaled) 32 MB",
+                "Auto (scaled) 80 MB"
             ]
         );
     }

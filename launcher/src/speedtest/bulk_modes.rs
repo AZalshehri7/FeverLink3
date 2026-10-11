@@ -20,7 +20,7 @@ pub fn run_spec(ctx: &mut Ctx<'_, '_>, name: &str, spec: RunSpec) -> Result<Outc
                 Some(o) if o.failure.is_none() && o.kind.is_some() => {
                     let mut lines = o.lines;
                     // a datagram or parallel result block says what it was; the plain one keeps its format
-                    if matches!(o.kind, Some(RunKind::Datagram(_))) || spec.conns() > 1 {
+                    if matches!(o.kind, Some(RunKind::Datagram(_) | RunKind::Par(_))) || spec.conns() > 1 {
                         lines.push(format!("(log line: {})", o.log_line));
                     }
                     Outcome { name: name.to_string(), ok: true, lines }
@@ -55,6 +55,22 @@ pub fn datagrams_32(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
 
 pub fn datagrams_80(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
     datagrams(ctx, 80)
+}
+
+fn auto(ctx: &mut Ctx<'_, '_>, mb: u32) -> Result<Outcome, Stop> {
+    run_spec(ctx, &format!("Auto (scaled), {mb} MB each way"), RunSpec::auto(mb))
+}
+
+pub fn auto_8(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
+    auto(ctx, 8)
+}
+
+pub fn auto_32(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
+    auto(ctx, 32)
+}
+
+pub fn auto_80(ctx: &mut Ctx<'_, '_>) -> Result<Outcome, Stop> {
+    auto(ctx, 80)
 }
 
 fn parallel(ctx: &mut Ctx<'_, '_>, conns: u32, mb: u32) -> Result<Outcome, Stop> {

@@ -10,10 +10,13 @@
 
 use super::bulk::{Limits, ReceiverState, SenderConfig, SenderState};
 use super::bulk_io::{recv_report, run_receiver, run_sender, RecvReport, SendJob, SendReport, SyntheticSource};
+use super::par::{self, Allow, ParConfig, ParEvent, SendReport as ParSendReport, SendSpec, SyntheticPayload};
 use super::throughput::{
-    self, kv_get, DgramResult, DgramSide, Direction, Msg, SenderSummary, SpeedResult, SteamSamples, Variant,
+    self, kv_get, DgramResult, DgramSide, Direction, Msg, ParResult, ParSide, SenderSummary, SpeedResult, SteamSamples,
+    Variant,
 };
 use super::*;
+use std::sync::Arc;
 
 /// The longest a direction of a plain run may take.
 pub const LONG_CAP: Duration = Duration::from_secs(600);
@@ -56,10 +59,15 @@ impl RunSpec {
         RunSpec { variant: Variant::Datagram, ..RunSpec::reliable(mb) }
     }
 
+    /// `Auto (scaled)`: a file of `mb` MB sent each way over parallel connections, their number from the size.
+    pub fn auto(mb: u32) -> RunSpec {
+        RunSpec { variant: Variant::Auto, ..RunSpec::reliable(mb) }
+    }
+
     pub fn conns(&self) -> u32 {
         match self.variant {
             Variant::Reliable(n) => n.clamp(1, throughput::MAX_CONNS),
-            Variant::Datagram => 1,
+            Variant::Datagram | Variant::Auto => 1,
         }
     }
 }
@@ -74,7 +82,20 @@ pub fn specs_for(mode: &str, mb: u32) -> Vec<RunSpec> {
 pub enum RunKind {
     Reliable(SpeedResult),
     Datagram(DgramResult),
+    Par(ParResult),
 }
+
+/// What a parallel receiver reported, queued by its callback and handled by the poll.
+#[derive(Debug)]
+pub enum ParNote {
+    /// We are the responder of a friend's upload (the speed test connection `conn`, run `id`).
+    Responder { conn: Handle, id: u64, event: ParEvent },
+    /// We are the tester receiving the download of run `id`.
+    Tester { id: u64, event: ParEvent },
+}
+
+/// The owner id of the speed test's allowance in the parallel listener.
+const SPEED_OWNER: u64 = u64::MAX;
 
 /// A finished run.
 #[derive(Debug, Clone)]
@@ -113,6 +134,29 @@ pub(super) struct DgRun {
     pub down_progress: u64,
 }
 
+/// How the download of an `Auto (scaled)` run ended at our receiver: (bytes, seconds, most connections) or why not, and when.
+pub(super) type ParDownEnd = (Result<(u64, f64, usize), String>, Instant);
+
+/// The state of an `Auto (scaled)` run.
+#[derive(Default)]
+pub(super) struct ParRun {
+    /// The responder said it is ready for our upload.
+    pub up_ready: bool,
+    pub up_spawned: bool,
+    pub up_report: Option<(ParSendReport, Instant)>,
+    pub up_cancel: bool,
+    pub up_lanes: usize,
+    pub down_cancel: bool,
+    pub down_registered: bool,
+    /// The download as our receiver ended it: Ok((bytes, secs, lanes)) or Err(why).
+    pub down_done: Option<ParDownEnd>,
+    pub down_progress: u64,
+    pub down_lanes: usize,
+    /// The responder's numbers about what it sent, and its sentence.
+    pub down_send: Option<(Vec<(String, u64)>, String)>,
+    pub result: Option<ParResult>,
+}
+
 /// A speed test run we started.
 pub(super) struct SpeedRun {
     pub id: u64,
@@ -135,6 +179,7 @@ pub(super) struct SpeedRun {
     pub result: Option<SpeedResult>,
     pub dgram: Option<DgramResult>,
     pub dg: DgRun,
+    pub par: ParRun,
     pub up_capped: bool,
     pub down_capped: bool,
     pub up_ping_peak: u32,
@@ -211,6 +256,7 @@ enum Action {
     Send(Handle, Vec<u8>),
     Sender { conns: Vec<Handle>, id: u64, total: u64, chunk: u64, ours: bool, rate: Option<i32> },
     DgSender { conn: Handle, id: u64, total: u64, ours: bool },
+    ParSender { conn: Handle, remote: u64, id: u64, total: u64, ours: bool },
 }
 
 impl ProbeService {
@@ -295,6 +341,63 @@ impl ProbeService {
                             "sending {} MB as datagrams for a friend's speed test",
                             total / throughput::MB
                         ));
+                    }
+                }
+                Msg::ParUp { id, total } => {
+                    if total > 0 && total <= throughput::MAX_TOTAL && state.par_in.is_none() && state.incoming.is_none()
+                    {
+                        if let (Some(remote), Some(svc)) = (Self::peer_remote(state, conn), self.par_service_unlocked())
+                        {
+                            let weak = self.me.clone();
+                            svc.allow(
+                                remote,
+                                Allow {
+                                    secret: Some(par::SPEED_SECRET),
+                                    dir: std::env::temp_dir(),
+                                    stem: Box::new(|ctx| format!("feverlink3-speedtest-{}-{ctx}", std::process::id())),
+                                    ext: "tmp",
+                                    max_total: throughput::MAX_TOTAL,
+                                    on_event: Box::new(move |event| {
+                                        if let Some(me) = weak.upgrade() {
+                                            lock(&me.par_events).push(ParNote::Responder { conn, id, event });
+                                        }
+                                    }),
+                                    owner: SPEED_OWNER,
+                                },
+                            );
+                            state.par_in = Some((conn, id));
+                            state.events.push("a friend is testing the speed (parallel connections)".into());
+                            actions.push(Action::Send(conn, throughput::encode(&Msg::ParReady { id })));
+                        }
+                    }
+                }
+                Msg::ParReady { id } => {
+                    if let Some(run) = state.speed.as_mut().filter(|r| r.owns(conn) && r.id == id) {
+                        run.par.up_ready = true;
+                        run.last_progress = now;
+                    }
+                }
+                Msg::ParDown { id, total } => {
+                    if total > 0 && total <= throughput::MAX_TOTAL && state.senders < MAX_SENDERS {
+                        if let Some(remote) = Self::peer_remote(state, conn) {
+                            state.senders += 1;
+                            actions.push(Action::ParSender { conn, remote, id, total, ours: false });
+                            state.events.push(format!(
+                                "sending {} MB over parallel connections for a friend's speed test",
+                                total / throughput::MB
+                            ));
+                        }
+                    }
+                }
+                Msg::ParRes { id, kv } => {
+                    if let Some(run) = state.speed.as_mut().filter(|r| r.owns(conn) && r.id == id) {
+                        run.last_progress = now;
+                        let _ = kv;
+                    }
+                }
+                Msg::ParSend { id, kv, text } => {
+                    if let Some(run) = state.speed.as_mut().filter(|r| r.owns(conn) && r.id == id) {
+                        run.par.down_send = Some((kv, text));
                     }
                 }
                 Msg::Stop { id } => {
@@ -457,6 +560,33 @@ impl ProbeService {
                 actions
                     .push(Action::Send(conn, throughput::encode(&Msg::DgDown { id: run.id, total: run.spec.total })));
             }
+            Variant::Auto => {
+                // our receiver must be ready for the friend's connections before the friend is asked to send
+                if let Some(svc) = self.par_service_unlocked() {
+                    let weak = self.me.clone();
+                    let id = run.id;
+                    svc.allow(
+                        run.target,
+                        Allow {
+                            secret: Some(par::SPEED_SECRET),
+                            dir: std::env::temp_dir(),
+                            stem: Box::new(|ctx| format!("feverlink3-speedtest-{}-{ctx}", std::process::id())),
+                            ext: "tmp",
+                            max_total: throughput::MAX_TOTAL,
+                            on_event: Box::new(move |event| {
+                                if let Some(me) = weak.upgrade() {
+                                    lock(&me.par_events).push(ParNote::Tester { id, event });
+                                }
+                            }),
+                            owner: SPEED_OWNER,
+                        },
+                    );
+                    run.par.down_registered = true;
+                    actions.push(Action::Send(conn, throughput::encode(&Msg::ParDown { id, total: run.spec.total })));
+                } else {
+                    run.phase = Phase::Failed("this PC cannot listen for the parallel connections".into());
+                }
+            }
         }
     }
 
@@ -541,6 +671,9 @@ impl ProbeService {
                     self.spawn_sender(conns, id, total, chunk, ours, rate);
                 }
                 Action::DgSender { conn, id, total, ours } => self.spawn_dgram_sender(conn, id, total, ours),
+                Action::ParSender { conn, remote, id, total, ours } => {
+                    self.spawn_par_sender(conn, remote, id, total, ours)
+                }
             }
         }
     }
@@ -596,6 +729,157 @@ impl ProbeService {
         if spawned.is_err() && !ours {
             let mut state = lock(&self.state);
             state.senders = state.senders.saturating_sub(1);
+        }
+    }
+
+    /// The listener for parallel connections of this core, created on first use.
+    pub(super) fn par_service_unlocked(&self) -> Option<Arc<par::ParService>> {
+        let mut slot = lock(&self.par_svc);
+        if slot.is_none() {
+            *slot = par::ParService::for_core(&self.core).ok();
+        }
+        slot.clone()
+    }
+
+    /// Sends `total` synthetic bytes to `remote` over parallel connections, on a thread of its own. `ours` is the
+    /// tester's upload (it stops when the run does); the other kind answers a friend's request and reports back.
+    fn spawn_par_sender(&self, conn: Handle, remote: u64, id: u64, total: u64, ours: bool) {
+        let Some(me) = self.me.upgrade() else { return };
+        let xfer = if ours { up_xfer(id) } else { down_xfer(id) };
+        let spawned = thread::Builder::new().name("feverlink3-steam-par-send".into()).spawn(move || {
+            let sha = SyntheticSource::sha256(u64::from(xfer), total);
+            let cfg = ParConfig::from_env();
+            let spec = SendSpec {
+                remote,
+                xfer,
+                ctx: xfer,
+                secret: par::SPEED_SECRET,
+                sha256: sha,
+                source: Arc::new(SyntheticPayload { id: u64::from(xfer), len: total }),
+                conns: cfg.conns_for(total),
+                cfg,
+                control: Some(Arc::new(par::CoreControl { core: me.core.clone(), handle: conn })),
+            };
+            let cancelled = || {
+                let state = lock(&me.state);
+                if ours {
+                    !state.speed.as_ref().is_some_and(|r| r.id == id && !r.par.up_cancel && r.active())
+                } else {
+                    state.stopped_ids.contains(&id)
+                }
+            };
+            let progress = |p: &par::Progress| {
+                if ours {
+                    let mut state = lock(&me.state);
+                    if let Some(run) = state.speed.as_mut().filter(|r| r.id == id) {
+                        if p.bytes > run.up_progress {
+                            run.last_progress = Instant::now();
+                        }
+                        run.up_progress = p.bytes;
+                        run.par.up_lanes = p.lanes;
+                    }
+                }
+            };
+            let report = par::run_send(&me.core, spec, &cancelled, &progress);
+            let mut guard = lock(&me.state);
+            let state = &mut *guard;
+            let who = if ours { "tester" } else { "responder" };
+            for note in &report.notes {
+                me.log(state, format!("steam speed test (parallel, {who}): {note}"));
+            }
+            me.log(
+                state,
+                format!(
+                    "steam speed test (parallel, {who}): {} - {}",
+                    if report.ok { "complete".to_string() } else { report.error.clone().unwrap_or_default() },
+                    report.summary()
+                ),
+            );
+            if ours {
+                if let Some(run) = state.speed.as_mut().filter(|r| r.id == id) {
+                    run.last_progress = Instant::now();
+                    run.par.up_report = Some((report, Instant::now()));
+                }
+            } else {
+                state.senders = state.senders.saturating_sub(1);
+                state.stopped_ids.remove(&id);
+                let kv: Vec<(String, u64)> = [
+                    ("ok", u64::from(report.ok)),
+                    ("ms", (report.secs * 1000.0) as u64),
+                    ("bytes", report.bytes),
+                    ("target", u64::from(report.target)),
+                    ("used", report.lanes_max as u64),
+                    ("opened", report.lanes_opened as u64),
+                    ("requeued", report.requeued),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+                let text = match &report.error {
+                    Some(e) => format!("{e}; {}", report.stop),
+                    None => report.stop.clone(),
+                };
+                let _ = me.core.send(conn, &throughput::encode(&Msg::ParSend { id, kv, text }));
+            }
+        });
+        if spawned.is_err() && !ours {
+            let mut state = lock(&self.state);
+            state.senders = state.senders.saturating_sub(1);
+        }
+    }
+
+    /// What a parallel receiver reported: the responder answers the friend, the tester notes its download.
+    fn handle_par_note(&self, state: &mut ProbeState, note: ParNote, now: Instant, actions: &mut Vec<Action>) {
+        match note {
+            ParNote::Responder { conn, id, event } => match event {
+                ParEvent::Progress { .. } => {}
+                ParEvent::Done { len, secs, lanes_max, path, .. } => {
+                    let _ = std::fs::remove_file(&path);
+                    state.par_in = None;
+                    let kv = vec![
+                        ("ok".to_string(), 1),
+                        ("bytes".to_string(), len),
+                        ("ms".to_string(), (secs * 1000.0) as u64),
+                        ("lanes".to_string(), lanes_max as u64),
+                    ];
+                    actions.push(Action::Send(conn, throughput::encode(&Msg::ParRes { id, kv })));
+                    self.log(
+                        state,
+                        format!(
+                            "steam speed test (responder, parallel): received {} MB in {secs:.1} s over {lanes_max} connection(s)",
+                            len / throughput::MB
+                        ),
+                    );
+                }
+                ParEvent::Failed { why, .. } => {
+                    state.par_in = None;
+                    let kv = vec![("ok".to_string(), 0)];
+                    actions.push(Action::Send(conn, throughput::encode(&Msg::ParRes { id, kv })));
+                    self.log(state, format!("steam speed test (responder, parallel): the upload failed: {why}"));
+                }
+            },
+            ParNote::Tester { id, event } => {
+                let Some(run) = state.speed.as_mut().filter(|r| r.id == id) else { return };
+                match event {
+                    ParEvent::Progress { bytes, lanes, .. } => {
+                        if bytes > run.par.down_progress {
+                            run.last_progress = now;
+                        }
+                        run.par.down_progress = bytes;
+                        run.par.down_lanes = lanes;
+                    }
+                    ParEvent::Done { len, secs, lanes_max, path, .. } => {
+                        let _ = std::fs::remove_file(&path);
+                        run.last_progress = now;
+                        run.par.down_progress = len;
+                        run.par.down_done = Some((Ok((len, secs, lanes_max)), now));
+                    }
+                    ParEvent::Failed { why, .. } => {
+                        run.last_progress = now;
+                        run.par.down_done = Some((Err(why), now));
+                    }
+                }
+            }
         }
     }
 
@@ -840,6 +1124,7 @@ impl ProbeService {
         let mut after_upload = false;
         let mut force_download = false;
         let mut finish_dgram = false;
+        let mut finish_par = false;
         {
             let Some(run) = state.speed.as_mut().filter(|r| r.active()) else { return };
             self.sample(run, now, &mut logs);
@@ -902,9 +1187,34 @@ impl ProbeService {
                                 after_upload = true;
                             }
                             Variant::Datagram => run.dg.up_cancel = true,
+                            Variant::Auto => run.par.up_cancel = true,
                         }
                     } else if now.saturating_duration_since(run.last_progress) > throughput::ABORT_AFTER {
                         run.phase = Phase::Failed(format!("no data for {} s", throughput::ABORT_AFTER.as_secs()));
+                    } else if run.spec.variant == Variant::Auto {
+                        if !run.par.up_spawned {
+                            if run.par.up_ready {
+                                run.par.up_spawned = true;
+                                run.last_progress = now;
+                                actions.push(Action::ParSender {
+                                    conn: run.conn,
+                                    remote: run.target,
+                                    id,
+                                    total: run.spec.total,
+                                    ours: true,
+                                });
+                            } else if elapsed > Duration::from_secs(8) {
+                                run.phase = Phase::Failed(
+                                    "your friend's program did not answer the parallel test (an older version?)".into(),
+                                );
+                            }
+                        } else if run.par.up_report.is_some() {
+                            if run.spec.down {
+                                self.start_download(run, now, actions);
+                            } else {
+                                finish_par = true;
+                            }
+                        }
                     } else if run.spec.variant == Variant::Datagram {
                         if let Some((rep, at)) = &run.dg.up_report {
                             let failed = matches!(rep.state, SenderState::Failed(_));
@@ -930,6 +1240,7 @@ impl ProbeService {
                         match run.spec.variant {
                             Variant::Reliable(_) => force_download = true,
                             Variant::Datagram => run.dg.down_cancel = true,
+                            Variant::Auto => run.par.down_cancel = true,
                         }
                     } else if now.saturating_duration_since(run.last_progress) > throughput::ABORT_AFTER {
                         run.phase = Phase::Failed(format!("no data for {} s", throughput::ABORT_AFTER.as_secs()));
@@ -946,6 +1257,16 @@ impl ProbeService {
                             let note = "peer did not change its rate (an older program, or it ignored the request)";
                             run.rate_notes.push(note.into());
                             logs.push(format!("steam speed test note: {note}"));
+                        }
+                    }
+                    if run.spec.variant == Variant::Auto {
+                        if let Some((_, at)) = &run.par.down_done {
+                            if run.par.down_send.is_some()
+                                || run.down_capped
+                                || now.saturating_duration_since(*at) > REPORT_WAIT
+                            {
+                                finish_par = true;
+                            }
                         }
                     }
                     if run.spec.variant == Variant::Datagram {
@@ -970,10 +1291,12 @@ impl ProbeService {
         }
         if finish_dgram {
             self.finish_dgram(state, now);
+        } else if finish_par {
+            self.finish_par(state, now);
         } else if state
             .speed
             .as_ref()
-            .is_some_and(|r| r.phase == Phase::Download && r.spec.variant != Variant::Datagram)
+            .is_some_and(|r| r.phase == Phase::Download && !matches!(r.spec.variant, Variant::Datagram | Variant::Auto))
         {
             self.maybe_finish_download(state, now, force_download);
         }
@@ -1023,12 +1346,83 @@ impl ProbeService {
                     run.dg.up_spawned = true;
                     actions.push(Action::DgSender { conn: run.conn, id: run.id, total: run.spec.total, ours: true });
                 }
+                Variant::Auto => {
+                    actions.push(Action::Send(
+                        run.conn,
+                        throughput::encode(&Msg::ParUp { id: run.id, total: run.spec.total }),
+                    ));
+                }
             }
         } else if run.spec.down {
             self.start_download(run, now, actions);
         } else {
             run.phase = Phase::Failed("the run has no direction".into());
         }
+    }
+
+    fn finish_par(&self, state: &mut ProbeState, now: Instant) {
+        let (route, ping) = state.test.as_ref().map_or((String::new(), None), |t| (t.route.clone(), t.ping_ms));
+        let Some(run) = state.speed.as_mut() else { return };
+        let up = if run.spec.up {
+            match &run.par.up_report {
+                Some((rep, _)) => ParSide {
+                    ok: rep.ok,
+                    why: if run.up_capped { String::new() } else { rep.error.clone().unwrap_or_default() },
+                    bytes: rep.bytes,
+                    rate: Some(rep.rate).filter(|r| *r > 0.0),
+                    secs: rep.secs,
+                    target: rep.target,
+                    used: rep.lanes_max as u32,
+                    opened: rep.lanes_opened as u32,
+                    stop: rep.stop.clone(),
+                    requeued: rep.requeued,
+                    ping_peak_ms: nz(run.up_ping_peak),
+                    capped: run.up_capped,
+                },
+                None => ParSide { ok: false, why: "nothing was sent".into(), ..ParSide::default() },
+            }
+        } else {
+            ParSide { ok: true, ..ParSide::default() }
+        };
+        let down = if run.spec.down {
+            match &run.par.down_done {
+                Some((Ok((bytes, secs, lanes)), _)) => {
+                    let (kv, text) = run.par.down_send.clone().unwrap_or_default();
+                    let used = kv_get(&kv, "used");
+                    ParSide {
+                        ok: true,
+                        why: String::new(),
+                        bytes: *bytes,
+                        rate: Some(*bytes as f64 / secs.max(0.001)),
+                        secs: *secs,
+                        target: kv_get(&kv, "target") as u32,
+                        used: if used > 0 { used as u32 } else { *lanes as u32 },
+                        opened: kv_get(&kv, "opened") as u32,
+                        stop: if text.is_empty() { "the sender's numbers did not come back".to_string() } else { text },
+                        requeued: kv_get(&kv, "requeued"),
+                        ping_peak_ms: nz(run.down_ping_peak),
+                        capped: run.down_capped,
+                    }
+                }
+                Some((Err(why), _)) => ParSide { ok: false, why: why.clone(), ..ParSide::default() },
+                None => ParSide { ok: false, why: "nothing arrived".into(), ..ParSide::default() },
+            }
+        } else {
+            ParSide { ok: true, ..ParSide::default() }
+        };
+        run.par.result = Some(ParResult {
+            total_bytes: run.spec.total,
+            up,
+            down,
+            total_secs: now.saturating_duration_since(run.started).as_secs_f64(),
+            ping_ms: ping,
+            route,
+            route_notes: run.route_notes.clone(),
+            steam: run.samples.clone(),
+            rate_notes: run.rate_notes.clone(),
+        });
+        run.phase = Phase::Done;
+        state.events.push("speed test finished".into());
     }
 
     fn finish_dgram(&self, state: &mut ProbeState, now: Instant) {
@@ -1142,6 +1536,18 @@ impl ProbeService {
                     log_line: d.log_line(),
                 }
             }
+            (Phase::Done, None, None) if run.par.result.is_some() => {
+                let p = run.par.result.clone().unwrap_or_default();
+                logs.insert(0, p.log_line());
+                RunOutcome {
+                    id: run.id,
+                    spec: run.spec,
+                    kind: Some(RunKind::Par(p.clone())),
+                    failure: None,
+                    lines: p.lines(),
+                    log_line: p.log_line(),
+                }
+            }
             (phase, _, _) => {
                 let why = match phase {
                     Phase::Failed(w) => w.clone(),
@@ -1239,6 +1645,7 @@ impl Probe {
             end_info: None,
             result: None,
             dg: DgRun::default(),
+            par: ParRun::default(),
             dgram: None,
             up_capped: false,
             down_capped: false,
@@ -1272,6 +1679,10 @@ impl Probe {
             let state = &mut *guard;
             if let Some(a) = ProbeService::try_upres(state, now, false) {
                 actions.push(a);
+            }
+            let notes: Vec<ParNote> = std::mem::take(&mut *lock(&self.service.par_events));
+            for note in notes {
+                self.service.handle_par_note(state, note, now, &mut actions);
             }
             self.service.step_run(state, now, &mut actions);
         }
@@ -1411,6 +1822,7 @@ fn single_report(run: &SpeedRun, outcome: Option<&RunOutcome>) -> SpeedReport {
     let total = mb(run.spec.total);
     let name = match run.spec.variant {
         Variant::Datagram => "Datagram speed test",
+        Variant::Auto => "Auto (scaled) speed test",
         Variant::Reliable(_) => "Speed test",
     };
     let mut report =
@@ -1426,18 +1838,31 @@ fn single_report(run: &SpeedRun, outcome: Option<&RunOutcome>) -> SpeedReport {
         Phase::Upload => {
             let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
             let rate = throughput::rate_text(Some(run.up_progress as f64 / secs));
-            report.status =
-                format!("{name}, sending to your friend: {:.1} of {total:.0} MB, {rate}{stalled}", mb(run.up_progress));
+            let lanes = if run.spec.variant == Variant::Auto && run.par.up_lanes > 0 {
+                format!(", {} connection(s)", run.par.up_lanes)
+            } else {
+                String::new()
+            };
+            report.status = format!(
+                "{name}, sending to your friend: {:.1} of {total:.0} MB, {rate}{lanes}{stalled}",
+                mb(run.up_progress)
+            );
         }
         Phase::Download => {
             let got = match run.spec.variant {
                 Variant::Datagram => run.dg.down_progress,
+                Variant::Auto => run.par.down_progress,
                 Variant::Reliable(_) => run.down.as_ref().map_or(0, |d| d.got),
             };
             let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
             let rate = throughput::rate_text(Some(got as f64 / secs));
+            let lanes = if run.spec.variant == Variant::Auto && run.par.down_lanes > 0 {
+                format!(", {} connection(s)", run.par.down_lanes)
+            } else {
+                String::new()
+            };
             report.status =
-                format!("{name}, receiving from your friend: {:.1} of {total:.0} MB, {rate}{stalled}", mb(got));
+                format!("{name}, receiving from your friend: {:.1} of {total:.0} MB, {rate}{lanes}{stalled}", mb(got));
         }
         Phase::Done | Phase::Failed(_) => {
             if let Some(o) = outcome.filter(|o| o.id == run.id) {

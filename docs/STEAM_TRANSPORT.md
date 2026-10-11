@@ -7,7 +7,7 @@ frames as the TCP transport; nothing in the protocol, the state machines or the 
 **Status.** Built and tested against an in-memory Steam: 75 tests, the transport and session ones on the real code
 paths (the real poller thread, the real `run_host_over` / `run_player_over`). The pieces the earlier probe used were
 proven in the game on 2026-10-09; everything else is listed in [section 9](#9-needs-game-verification) with the steps
-to check it. Nothing here has run between two real accounts yet.
+to check it. Nothing here has run between two real accounts yet (the parallel bulk connections of 7.3 are built on a measurement between two real accounts, but the code has not run on real Steam).
 
 ## 1. Parts
 
@@ -297,7 +297,7 @@ case and could not use the 37.5 MB/s one. The tests assert completion and byte-f
 the bottleneck dropping mid-transfer, a blackout, the 10 s stall failure, a wrong hash failing both ends, offers above the
 limit, hostile acks, and 60 000 random and mutated datagrams.
 
-### Capability and the resync save (`FEVERLINK3_BULK=dgram`, off by default)
+### Capability and the resync save (`FEVERLINK3_BULK=dgram`, experimental; the default is the parallel connections of 7.3)
 
 A player on a Steam transport announces `caps: ["bulk-dgram-1"]` in its join message (an additive field: an older host
 ignores it, an older player does not send it, a host ignores words it does not know). Receiving is always available on
@@ -337,6 +337,167 @@ Whether Steam delivers 1100-byte unreliable messages without fragmenting (the ma
 fragment can be read with `MTU_DataSize`; 1100 is below the 1200-byte figure), how real loss and jitter look on the
 route, whether 64 MiB/s as Steam's per-connection rate is accepted and honoured for unreliable messages, whether the
 relay behaves, and the delay target against a real voice call.
+
+## 7.3 Parallel connections: the resync save over N Steam connections (the default)
+
+**Status: written and tested against the in-memory fake Steam (every connection capped, the line capped, connections
+refused or dying, a wrong hash, a stall, hostile messages, and a real resync round between two sessions). It has NOT
+run on real Steam, between two real PCs. Every number under "simulator" is the fake Steam's, not a measurement.**
+
+### Why (the measurements this is built on)
+
+Two real friends, real Steam, a relay route with 35 ms round trip:
+
+| what | result |
+|---|---|
+| one connection, send rate 1 MiB/s | exactly 1.01 MB/s delivered |
+| one connection, send rate 2 MiB/s | worse: 0.68 MB/s, delivery quality fell to 56 % |
+| 2 connections at 1 MiB/s each | 2.03 MB/s up, 2.04 down |
+| 4 connections at 1 MiB/s each | 3.77 MB/s up, 3.69 down |
+
+The ping stayed where it was (35 to 40 ms), no stalls. On a direct route with 230 ms one connection also gave 1.01 MB/s
+(several connections were not tried there). So **one Steam connection is capped at about 1 MB/s, and connections to the
+same peer add up almost linearly**. A resync save is about 70 to 80 MB (compressed, so it does not shrink); sent as base64
+chunks (107 MB on the wire) over the one session connection it takes 100 s and more, with both games frozen. Over 7 or
+8 connections, as binary, the same save is a matter of 10 to 15 s.
+
+### The rule
+
+`N = clamp(ceil(size / (PER_CONN_RATE x TARGET_SECONDS)), 1, N_MAX)` with `PER_CONN_RATE` = 1 MiB/s (also the Steam send
+rate set on every bulk connection), `TARGET_SECONDS` = 10.5 and `N_MAX` = 16 (`launcher/src/steamnet/par/mod.rs`).
+`TARGET_SECONDS` is below the 15 to 20 s that is wanted in the end because the start-up (connections open one at a time,
+see below) and the check of the file take the rest. A file under 6 MB (`MIN_SIZE`) is sent the old way, in `ResyncChunk`
+frames on the session connection, because one or two connections would not pay for the set-up.
+
+| file | N | file | N |
+|---|---|---|---|
+| 6 to 11 MB | 1 | 75 MB | 7 |
+| 32 MB | 3 | 80 MB | 8 |
+| 50 MB | 5 | 200 MB and more | 16 |
+
+Environment (set it for the game, on the host): `FEVERLINK3_BULK=off|par|dgram` (default `par`; `off` is chunks only,
+`dgram` is the experimental datagram path of 7.2), `FEVERLINK3_BULK_CONNS=<n>` forces N (the growth is then not checked
+for scaling, only for safety), `FEVERLINK3_BULK_MAX=<n>` changes the cap.
+
+### Capability and connections
+
+A player on a Steam transport announces `caps: ["bulk-par-1"]` in its join message (an additive field, like
+`bulk-dgram-1`; an older host ignores it, an older player does not send it) when it has somewhere to put a save (a
+savegame folder) and Steam opened its second listen socket. The **host** opens the extra connections, one per bulk
+connection, to the player's Steam ID on **virtual port 2** (0 is the session, 1 the probe); the main session connection
+is not touched and keeps carrying the lockstep and the control messages. There is one listen socket per process
+(`ParService`, `steamnet/par/service.rs`); the player allows exactly one account to use it, the host's, with the secret
+of the session.
+
+**Who may send.** (1) Steam authenticates the peer's Steam ID: a connection from any other account is closed at once.
+(2) The first message of every connection is a `Hello` naming the transfer (id, round, size, chunk size, chunk count, the
+SHA-256 of the whole file) with a 16-byte token, HMAC-SHA-256 over those fields keyed with a secret derived from the
+session key; a wrong token, a size over the limit (512 MiB), a chunk size outside 4 KiB to 256 KiB or a count that does
+not fit the size is refused with a reason. (3) The whole-file SHA-256 is checked at the end, and the sealed `ResyncLoad`
+only loads a save whose round and SHA-256 equal the ones in it.
+
+### Wire format (one Steam reliable message each; little-endian; `par/wire.rs`)
+
+| kind | from | fields after magic `0xFD` and kind |
+|---|---|---|
+| 1 hello | sender | xfer u32, ctx u32, total u64, chunk u32, count u32, sha256 [32], lane u16, token [16] |
+| 2 accept | receiver | xfer u32 |
+| 3 refuse | receiver | xfer u32, reason u8 |
+| 4 chunk | sender | xfer u32, index u32, count u32, len u32, payload (128 KiB, the last one shorter) |
+| 5 ack | receiver | xfer u32, n u16, n x index u32 (at most 1024) |
+| 6 done | receiver | xfer u32, ok u8 |
+| 7 abort | both | xfer u32, reason u8 |
+
+No base64, no JSON, no AES on top (Steam encrypts the connection). A chunk message is 131 090 bytes, a quarter of Steam's
+512 KiB limit; the 128 KiB chunk keeps Steam's pacing smooth and the loss from a dead connection small.
+
+### Sending (`par/send.rs`)
+
+Every connection ("lane") has a thread that, while it has less than 1 MiB unacknowledged (`INFLIGHT`), takes the next
+chunk (first the ones requeued from dead lanes, then the next new index), reads it from the file at its offset and sends
+it. Chunks therefore go to whichever lane has room: work stealing, the shortest queue. The receiver acknowledges chunks
+(batched every 20 ms); when a lane dies its unacknowledged chunks go back on the queue. The sender ends when the receiver
+says `done ok`.
+
+### Growing (`par/growth.rs`)
+
+Start with `min(N, 4)` connections. Two seconds after the first one works, and from then on one connection at a time, a
+new connection is opened only if the last one paid for itself: measured over the last 1.5 s of the 2 s since it was
+opened (so its start-up does not count), the aggregate rate must have risen by at least 60 % of the per-connection rate
+over what it was just before. (The task asked for one connection every second; a gain can be told from noise only over
+about 2 s, and the cost of the slower ramp is under half a second on a 75 MB save.) The first group is checked against
+60 % of its size times the rate. With `FEVERLINK3_BULK_CONNS` this check is skipped. Safety, always on:
+
+- the Steam ping of the **session connection** (its average over 3 s) must stay below `max(3 x baseline, baseline +
+  120 ms)`, the baseline being the lowest ping of the first second: above it, growth stops; when even the lowest ping of
+  3 s is above it, the newest connection is closed;
+- no data for 2 s stops the growth;
+- a queue on the session connection that is above 128 KiB and still growing stops it.
+
+The report says how many connections were used and why growth stopped ("all 7 connections were opened", "connection 5
+added only 0.08 MB/s (less than 60 % of 1.05 MB/s): the path is saturated", "the Steam ping rose ...").
+
+### Receiving (`par/service.rs`)
+
+Chunks are checked against the hello (transfer id, count, index inside the file, exact length) and queued (at most 64
+chunks, 8 MiB) for a writer thread that writes each at `index x chunk size` in a preallocated
+`feverlink3-resync-<id>.sav.part` in the first savegame folder; nothing else of the file is in memory. A duplicate chunk
+is ignored (and acknowledged); a connection that breaks a rule (a chunk before the hello, a wrong id, an index outside the
+file, a wrong length, a second hello, garbage) is closed and only that one. When every chunk is in, the file is hashed
+(streamed), compared with the SHA-256 of the hello, moved to `<name>.sav` and reported to the session thread, which
+records it like a received save (`bulk_file_received`) **before** `done ok` goes back to the sender. The host holds the
+last chunk (the one that starts the load) until every bulk transfer has ended, exactly as for the datagram path. Other
+savegame folders get a copy.
+
+### Fallback, for that player alone
+
+If anything goes wrong (the extra connections cannot be opened within 25 s, the receiver refuses, a wrong secret, no
+progress for 10 s, the SHA-256 does not match, every connection lost, the player has no capability) the host logs the
+cause (`bulk transfer to Pat failed (<cause>); sending the chunks instead`) and sends that player every chunk the usual
+way; the other players are not affected. The receiver removes a partial file after 10 s without data.
+
+### What the window shows
+
+`sync.note` next to `{phase, done, total}`: "Receiving the host's world: 63% (7 connections, 6.9 MB/s)" on the player,
+"Sending your world to the players: 63% (7 connections, 6.9 MB/s)" on the host (`Status.transfer_note`, only for this path).
+
+### Speed test: `Auto (scaled)`
+
+The in-game speed test (mode **Auto (scaled)**) and the standalone program (`Auto (scaled) 8/32/80 MB` in `--classic`, 80 MB
+at the end of the comprehensive run) use exactly this code: the sender is the same `run_send`, the receiver the same
+`ParService` (the data is random bytes, written to a temporary file in the temp folder and deleted after, so the disk and
+the hash are part of the measurement). The tester asks (`tput parup`/`pardown`), each side opens its connections to the
+other's virtual port 2 under the speed test's own allowance (a fixed, public secret; Steam's check of the peer is what
+protects it), and the result lists, per direction, the connections the rule asked for, the most that worked at once, how
+many were opened, MB/s, seconds, why growth stopped, and the estimate for an 80 MB save. The comprehensive run of the
+program is now: baseline; the ladder at 1, 2 and 4 MiB/s (2 MiB/s was already worse on the relay); validation; **x2, x4,
+x8 and x16 connections at 1 MiB/s each** (8 MB split; a direction skips the larger counts after a step that did not reach
+1.3 times the speed of the one before, or that broke the ping or stall rule); **Auto (scaled), 80 MB each way**; the
+datagram test. About 10 minutes.
+
+### Simulator results (fake Steam: each connection capped at 1 MB/s; `launcher/src/steamnet/par/tests.rs`)
+
+| case | result |
+|---|---|
+| 75 MB, rule gives 7, line not limited | 13.7 s (ideal 10.7 s = size / (7 x 1 MB/s); the ramp costs about 1.5 s); 5.5 MB/s |
+| 40 MB, line capped at 4 MB/s, up to 16 allowed | growth stopped at 5 connections ("connection 5 added only 0.08 MB/s ... saturated"), 3.7 MB/s, completed |
+| 40 MB, 6 wanted, path scales | all 6 opened |
+| a connection killed 1.5 s into a 20 MB transfer of 4 | completed, the dead connection's chunks re-sent, file identical |
+| receiver not listening / sender not allowed | fails in under a second with "could not open any extra Steam connection" |
+| nothing answers | "no extra Steam connection opened within 2 s" after 2 s (25 s by default) |
+| wrong secret, file over the limit | refused with the reason |
+| wrong SHA-256 | both ends fail, no file is left |
+| receiver stops reading | "no progress for 10 s" after 10 s |
+| memory | the receiver queued less than 12 MiB of a 75 MB file; the sender had at most 8 x 1 MiB in flight |
+| two sessions, resync with a 7 MB save | no frame bigger than 131 090 bytes on the session's connection; the save arrives identical |
+| the same, the player's extra connections cannot be opened | chunks instead, save identical |
+
+### What only a run on real Steam can show
+
+Whether the extra connections to the player's second virtual port open as quickly as the speed test's did, whether 4 to 8
+connections from the same host scale on that player's line as the measurement with a friend did, the real ping with 8
+connections open, and whether Steam handles the close of 8 connections right after a transfer without upsetting the
+session connection. The numbers above are the fake Steam's.
 
 ## 8. What is proven
 

@@ -186,7 +186,11 @@ fn messages_round_trip_and_garbage_is_refused() {
     assert!(wire::parse(&[hello.clone(), vec![0]].concat()).is_none());
     assert!(wire::parse(&chunk[..chunk.len() - 1]).is_none(), "the length field must match");
     assert!(wire::parse(&wire::encode_chunk(1, 0, 1, b"")).is_none(), "an empty chunk");
-    assert!(wire::parse(&[]).is_none() && wire::parse(&[wire::MAGIC]).is_none() && wire::parse(&[0, 1, 2, 3, 4, 5]).is_none());
+    assert!(
+        wire::parse(&[]).is_none()
+            && wire::parse(&[wire::MAGIC]).is_none()
+            && wire::parse(&[0, 1, 2, 3, 4, 5]).is_none()
+    );
     // random bytes never panic
     let mut seed = 0x1234_5678_9abc_def0u64;
     for _ in 0..20_000 {
@@ -561,7 +565,7 @@ fn a_stranger_is_closed_and_hostile_messages_from_an_allowed_peer_close_only_tha
     ] {
         let raw = Raw::connect(&core, rig.receiver.steam_id());
         let mut h = Hello::new(&SECRET, 3, 3, total, chunk, 8, [3; 32], 0);
-        h.count = 8;
+        h.count = wire::chunk_count(total, chunk).unwrap_or(8);
         h.token = h.expected_token(&SECRET);
         raw.send(&wire::encode_hello(&h));
         let answer = wire::parse(&raw.last().unwrap()).map(|m| match m {
@@ -572,7 +576,12 @@ fn a_stranger_is_closed_and_hostile_messages_from_an_allowed_peer_close_only_tha
     }
 
     // a chunk before any hello, garbage, an ack from the wrong side: the connection is closed
-    for garbage in [wire::encode_chunk(5, 0, 8, b"data"), vec![1, 2, 3], wire::encode_ack(5, &[1]), vec![wire::MAGIC, 99, 0, 0, 0, 0]] {
+    for garbage in [
+        wire::encode_chunk(5, 0, 8, b"data"),
+        vec![1, 2, 3],
+        wire::encode_ack(5, &[1]),
+        vec![wire::MAGIC, 99, 0, 0, 0, 0],
+    ] {
         let raw = Raw::connect(&core, rig.receiver.steam_id());
         raw.send(&garbage);
         assert!(raw.wait_closed(), "{garbage:?}");

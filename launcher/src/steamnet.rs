@@ -385,7 +385,7 @@ const LISTEN_RETRY: Duration = Duration::from_secs(5);
 /// Longest ping the probe answers.
 const PING_LIMIT: usize = 4096;
 /// Players that may be connected to the probe's listen socket at once; the next one is closed on arrival.
-const MAX_PEERS: usize = 16;
+const MAX_PEERS: usize = 24;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -429,6 +429,9 @@ struct ProbeState {
     senders: usize,
     /// A datagram upload from a friend that we are receiving (its transfer id).
     dg_in: Option<u32>,
+    /// A parallel (`Auto (scaled)`) upload from a friend that we are receiving: the connection of the speed test and
+    /// the run id it carries.
+    par_in: Option<(Handle, u64)>,
     /// Tests the tester asked us to stop sending.
     stopped_ids: std::collections::HashSet<u64>,
     last_run_id: u64,
@@ -451,6 +454,10 @@ struct ProbeService {
     hub: Arc<bulk_io::Hub>,
     /// Acts like an older program that does not know the rate request (tests).
     legacy: std::sync::atomic::AtomicBool,
+    /// What the parallel receiver reported, taken by the poll (the callbacks only queue, they never lock `state`).
+    par_events: Mutex<Vec<speed::ParNote>>,
+    /// The listener for parallel bulk connections of this core (created on first use).
+    par_svc: Mutex<Option<Arc<par::ParService>>>,
 }
 
 impl ProbeService {
@@ -584,6 +591,8 @@ impl Probe {
             state: Mutex::new(ProbeState::default()),
             hub: bulk_io::Hub::new(),
             legacy: std::sync::atomic::AtomicBool::new(false),
+            par_events: Mutex::new(Vec::new()),
+            par_svc: Mutex::new(None),
         });
         let weak = Arc::downgrade(&service);
         service.hub.set_acceptor(move |conn, xfer, offer, rx| {
@@ -1307,6 +1316,52 @@ mod tests {
         let during = bulk_io::STEAM_RATE_DURING;
         assert!(a.connection_config().iter().any(|c| c.1 == 10 && c.2 == during), "{:?}", a.connection_config());
         assert!(a.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == Config::default().send_rate));
+        // a ping still works afterwards
+        until("a pong", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1)
+        });
+    }
+
+    #[test]
+    fn an_auto_run_sends_and_receives_over_parallel_connections_and_reports_them() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // every connection carries 5 MB/s, the line does not limit; 30 MB each way is three connections by the rule
+        a.set_caps(5_000_000.0, 0.0);
+        b.set_caps(5_000_000.0, 0.0);
+        probe_a.start_run(b.steam_id(), RunSpec::auto(30));
+        let outcome = finish(&mut probe_a, &mut probe_b, "the auto run to finish");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Par(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.up.ok && r.down.ok, "{r:?}");
+        assert_eq!((r.up.bytes, r.down.bytes), (30 * throughput::MB, 30 * throughput::MB), "{r:?}");
+        let rule = par::ParConfig::default().conns_for(30 * throughput::MB);
+        assert_eq!(rule, 3);
+        assert_eq!((r.up.target, r.down.target), (rule, rule), "{r:?}");
+        assert!(r.up.used >= 2 && r.down.used >= 2, "{r:?}");
+        assert!(r.up.rate.is_some_and(|x| x > 1.5e6) && r.down.rate.is_some_and(|x| x > 1.5e6), "{r:?}");
+        let lines = outcome.lines;
+        assert!(lines[0].starts_with("Auto (scaled) speed test, 30 MB each way: you to friend "), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("You to friend: ") && l.contains("connection(s) (the rule asked for 3")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Friend to you: ") && l.contains("connection(s) (the rule asked for 3")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.starts_with("An 80 MB save (carried as it is")), "{lines:?}");
+        assert!(outcome.log_line.starts_with("steam speed test (auto scaled): 30 MB each way"), "{}", outcome.log_line);
+        // the temporary files are gone
+        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with(&format!("feverlink3-speedtest-{}-", std::process::id()))
+            })
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         // a ping still works afterwards
         until("a pong", || {
             probe_a.poll();

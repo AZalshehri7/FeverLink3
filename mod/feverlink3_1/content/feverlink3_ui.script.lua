@@ -245,7 +245,7 @@ local function setup(react, builtin)
 					function() mbIn:set(mb) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_CHOICES) - 10)
 			end
 			add(box(H, sizes))
-			add(note("How the data travels: Steam's reliable stream, our own datagram protocol, both one after the other, or the reliable stream on 1, 2 and 4 connections at once."))
+			add(note("How the data travels: Steam's reliable stream, our own datagram protocol, both one after the other, the reliable stream on 1, 2 and 4 connections at once, or Auto (scaled): the way a synced save is sent, over several Steam connections at once (as many as the size needs)."))
 			local modes = {}
 			for _, m in ipairs(C.SPEED_MODES) do
 				local chosen = (C.speedMode(modeIn:old()) == m)

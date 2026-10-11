@@ -162,7 +162,15 @@ fn start_steam(_dir: &Path) -> Result<(crate::steamnet::CoreRef, u32, Pump), Ini
     Err(InitError::Failed { code: 1, message: "this program runs on Windows only".into() })
 }
 
-fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &Path, app_id: u32, quick: bool, classic: bool) -> i32 {
+fn tester(
+    env: &mut Env<'_>,
+    core: &crate::steamnet::CoreRef,
+    peer: u64,
+    dir: &Path,
+    app_id: u32,
+    quick: bool,
+    classic: bool,
+) -> i32 {
     let path = dir.join(RESULTS_FILE);
     let mut write_failed = false;
     let mut save = |report: &super::suite::TesterReport| {
@@ -175,7 +183,13 @@ fn tester(env: &mut Env<'_>, core: &crate::steamnet::CoreRef, peer: u64, dir: &P
             ));
         }
     };
-    let modes = if quick { &CLASSIC_MODES[..1] } else if classic { CLASSIC_MODES } else { MODES };
+    let modes = if quick {
+        &CLASSIC_MODES[..1]
+    } else if classic {
+        CLASSIC_MODES
+    } else {
+        MODES
+    };
     let report = run_tester(env, core, peer, modes, &mut save);
     println_out("");
     if report.aborted {

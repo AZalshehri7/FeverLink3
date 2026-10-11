@@ -45,7 +45,6 @@ pub struct GrowthCfg {
 
 #[derive(Debug, Clone, Copy)]
 struct Opened {
-    at: f64,
     /// The aggregate rate over the 2 s before it was opened.
     before: f64,
 }
@@ -137,7 +136,7 @@ impl Growth {
     /// A connection was opened at `t` (the scaling check of the next decision looks at its effect).
     pub fn note_opened(&mut self, t: f64) {
         let before = self.agg(t, WINDOW);
-        self.opened.push(Opened { at: t, before });
+        self.opened.push(Opened { before });
         self.last_open = t;
     }
 
@@ -199,8 +198,7 @@ impl Growth {
         if let Some(&(_, now)) = self.pending.back() {
             let earlier = self.pending.iter().find(|p| p.0 >= t - 2.0).map_or(now, |p| p.1);
             if now > 128 * 1024 && now > earlier.saturating_add(32 * 1024) {
-                self.stopped =
-                    Some(format!("the control connection's queue is growing ({} KiB pending)", now / 1024));
+                self.stopped = Some(format!("the control connection's queue is growing ({} KiB pending)", now / 1024));
                 return Step::Hold;
             }
         }
@@ -261,7 +259,15 @@ mod tests {
     use super::*;
 
     fn cfg(target: usize) -> GrowthCfg {
-        GrowthCfg { rate: 1_000_000.0, target, initial: 4, forced: false, gain_fraction: 0.6, open_every: 2.0, settle: 2.0 }
+        GrowthCfg {
+            rate: 1_000_000.0,
+            target,
+            initial: 4,
+            forced: false,
+            gain_fraction: 0.6,
+            open_every: 2.0,
+            settle: 2.0,
+        }
     }
 
     /// Runs the controller against a line that delivers `min(lanes x per_lane, line)`; returns lanes at the end.

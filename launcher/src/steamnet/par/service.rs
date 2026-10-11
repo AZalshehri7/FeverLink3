@@ -39,10 +39,26 @@ const LINGER: Duration = Duration::from_secs(5);
 /// What the owner of an allowance hears.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParEvent {
-    Progress { ctx: u32, bytes: u64, total: u64, lanes: usize, rate: f64 },
+    Progress {
+        ctx: u32,
+        bytes: u64,
+        total: u64,
+        lanes: usize,
+        rate: f64,
+    },
     /// The whole file is in, its SHA-256 matched and it is at `path`.
-    Done { ctx: u32, sha256: [u8; 32], len: u64, path: PathBuf, secs: f64, lanes_max: usize },
-    Failed { ctx: u32, why: String },
+    Done {
+        ctx: u32,
+        sha256: [u8; 32],
+        len: u64,
+        path: PathBuf,
+        secs: f64,
+        lanes_max: usize,
+    },
+    Failed {
+        ctx: u32,
+        why: String,
+    },
 }
 
 /// Who may send what, and where it goes.
@@ -65,9 +81,16 @@ const DONE: u8 = 1;
 const FAILED: u8 = 2;
 
 enum Job {
-    Chunk { lane: Handle, index: u32, data: Vec<u8> },
+    Chunk {
+        lane: Handle,
+        index: u32,
+        data: Vec<u8>,
+    },
     /// A chunk that was already in: only acknowledge it (so the sender's window opens).
-    Dup { lane: Handle, index: u32 },
+    Dup {
+        lane: Handle,
+        index: u32,
+    },
 }
 
 struct Xfer {
@@ -127,7 +150,7 @@ struct RxLane {
 
 struct Inner {
     core: CoreRef,
-    allow: Mutex<HashMap<u64, Arc<Allow>>>,
+    allow: Mutex<HashMap<u64, Vec<Arc<Allow>>>>,
     lanes: Mutex<HashMap<Handle, Arc<RxLane>>>,
     xfers: Mutex<HashMap<u64, Arc<Xfer>>>,
     stop: AtomicBool,
@@ -172,28 +195,44 @@ impl ParService {
         Ok(service)
     }
 
-    /// Lets `remote` send transfers (replaces an earlier allowance of the same account).
+    /// Lets `remote` send transfers. An account can have several allowances (a session's and a speed test's, each
+    /// with its own secret); a later one by the same `owner` replaces the earlier one.
     pub fn allow(&self, remote: u64, allow: Allow) {
-        lock(&self.inner.allow).insert(remote, Arc::new(allow));
+        let mut all = lock(&self.inner.allow);
+        let list = all.entry(remote).or_default();
+        list.retain(|a| a.owner != allow.owner);
+        list.push(Arc::new(allow));
     }
 
     /// Withdraws the allowance of `owner` (0: whoever's it is); its running transfer fails and its connections close.
     pub fn disallow(&self, remote: u64, owner: u64) {
-        {
-            let mut allow = lock(&self.inner.allow);
-            if allow.get(&remote).is_some_and(|a| owner != 0 && a.owner != owner) {
-                return;
+        let left = {
+            let mut all = lock(&self.inner.allow);
+            let Some(list) = all.get_mut(&remote) else { return };
+            list.retain(|a| owner != 0 && a.owner != owner);
+            let left = list.len();
+            if left == 0 {
+                all.remove(&remote);
             }
-            allow.remove(&remote);
-        }
-        let x = lock(&self.inner.xfers).remove(&remote);
-        if let Some(x) = x {
+            left
+        };
+        // a transfer that came in under the withdrawn allowance fails
+        let doomed = {
+            let mut xfers = lock(&self.inner.xfers);
+            match xfers.get(&remote) {
+                Some(x) if owner == 0 || x.allow.owner == owner => xfers.remove(&remote),
+                _ => None,
+            }
+        };
+        if let Some(x) = doomed {
             self.inner.fail(&x, "the session ended");
         }
-        let lanes: Vec<Handle> =
-            lock(&self.inner.lanes).values().filter(|l| l.remote == remote).map(|l| l.conn).collect();
-        for conn in lanes {
-            self.inner.core.close(conn);
+        if left == 0 {
+            let lanes: Vec<Handle> =
+                lock(&self.inner.lanes).values().filter(|l| l.remote == remote).map(|l| l.conn).collect();
+            for conn in lanes {
+                self.inner.core.close(conn);
+            }
         }
     }
 
@@ -302,20 +341,25 @@ impl Inner {
         if lock(&lane.xfer).is_some() {
             return self.violation(conn);
         }
-        let Some(allow) = lock(&self.allow).get(&lane.remote).cloned() else {
+        let allows = lock(&self.allow).get(&lane.remote).cloned().unwrap_or_default();
+        if allows.is_empty() {
             return self.refuse(conn, h.xfer, reason::NOT_EXPECTED);
-        };
-        if h.total == 0 || h.total > allow.max_total {
-            return self.refuse(conn, h.xfer, reason::TOO_BIG);
         }
-        if !(4096..=256 * 1024).contains(&h.chunk) || wire::chunk_count(h.total, h.chunk) != Some(h.count) {
+        if h.total == 0
+            || !(4096..=256 * 1024).contains(&h.chunk)
+            || wire::chunk_count(h.total, h.chunk) != Some(h.count)
+        {
             return self.refuse(conn, h.xfer, reason::BAD_FIELDS);
         }
-        if let Some(secret) = &allow.secret {
-            if !h.token_ok(secret) {
-                return self.refuse(conn, h.xfer, reason::BAD_TOKEN);
-            }
+        // the allowances whose secret the hello proves (one without a secret takes any), then the one that takes the size
+        let proven: Vec<&Arc<Allow>> =
+            allows.iter().filter(|a| a.secret.as_ref().is_none_or(|secret| h.token_ok(secret))).collect();
+        if proven.is_empty() {
+            return self.refuse(conn, h.xfer, reason::BAD_TOKEN);
         }
+        let Some(allow) = proven.into_iter().find(|a| h.total <= a.max_total).cloned() else {
+            return self.refuse(conn, h.xfer, reason::TOO_BIG);
+        };
         let x = {
             let mut xfers = lock(&self.xfers);
             match xfers.get(&lane.remote).cloned() {
@@ -417,12 +461,13 @@ impl Inner {
 
 impl Owner for Inner {
     fn opened(&self, conn: Handle, incoming: bool, remote: Option<u64>) {
-        let allowed = incoming && remote.is_some_and(|r| lock(&self.allow).contains_key(&r));
+        let allowed = incoming && remote.is_some_and(|r| lock(&self.allow).get(&r).is_some_and(|l| !l.is_empty()));
         let Some(remote) = remote.filter(|_| allowed) else {
             self.core.close(conn);
             return;
         };
-        lock(&self.lanes).insert(conn, Arc::new(RxLane { conn, remote, since: Instant::now(), xfer: Mutex::new(None) }));
+        lock(&self.lanes)
+            .insert(conn, Arc::new(RxLane { conn, remote, since: Instant::now(), xfer: Mutex::new(None) }));
     }
 
     fn message(&self, conn: Handle, data: &[u8]) {
@@ -491,7 +536,9 @@ fn writer(inner: Arc<Inner>, x: Arc<Xfer>, file: File, rx: mpsc::Receiver<Job>) 
             None => {}
         }
         let now = Instant::now();
-        if written == x.count || now.duration_since(last_flush) >= Duration::from_millis(20) || acks.values().any(|v| v.len() >= 16)
+        if written == x.count
+            || now.duration_since(last_flush) >= Duration::from_millis(20)
+            || acks.values().any(|v| v.len() >= 16)
         {
             flush_acks(&inner, &x, &mut acks);
             last_flush = now;

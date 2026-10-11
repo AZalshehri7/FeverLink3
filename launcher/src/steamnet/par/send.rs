@@ -29,6 +29,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---- sources
 
 /// Bytes that can be read at any offset from several threads.
+#[allow(clippy::len_without_is_empty)]
 pub trait PayloadSource: Send + Sync {
     fn len(&self) -> u64;
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()>;
@@ -125,6 +126,22 @@ pub trait Control: Send + Sync {
     fn ping_ms(&self) -> Option<u32>;
     /// Reliable bytes queued and not yet on the wire.
     fn pending(&self) -> u32;
+}
+
+/// The ping and queue of one Steam connection of a core, read from the core's periodic measurement.
+pub struct CoreControl {
+    pub core: CoreRef,
+    pub handle: Handle,
+}
+
+impl Control for CoreControl {
+    fn ping_ms(&self) -> Option<u32> {
+        self.core.link(self.handle).and_then(|l| l.ping_ms)
+    }
+
+    fn pending(&self) -> u32 {
+        self.core.link(self.handle).map_or(0, |l| l.pending)
+    }
 }
 
 // ---- the job
@@ -387,7 +404,8 @@ impl Owner for LaneOwner {
         }
         let note = self.shared.core.set_connection_send_rate(conn, self.shared.cfg.per_conn_rate);
         if self.lane.idx == 0 {
-            self.shared.note(format!("send rate of a bulk connection set to {} B/s: {note}", self.shared.cfg.per_conn_rate));
+            self.shared
+                .note(format!("send rate of a bulk connection set to {} B/s: {note}", self.shared.cfg.per_conn_rate));
         }
         let hello = Hello { lane: self.lane.idx, ..self.shared.hello.clone() };
         match self.shared.core.send_reliable(conn, &wire::encode_hello(&hello), Duration::from_secs(5)) {
@@ -427,7 +445,9 @@ impl Owner for LaneOwner {
                         }
                     }
                 }
-                self.lane.inflight_bytes.fetch_sub(freed.min(self.lane.inflight_bytes.load(Ordering::Acquire)), Ordering::AcqRel);
+                self.lane
+                    .inflight_bytes
+                    .fetch_sub(freed.min(self.lane.inflight_bytes.load(Ordering::Acquire)), Ordering::AcqRel);
                 for i in indices {
                     if let Some(len) = wire::chunk_len(s.total, s.chunk as u32, i) {
                         s.mark_acked(i, len);
@@ -686,10 +706,9 @@ pub fn run_send(
     report.stop = match growth.stopped() {
         Some(why) => format!("stopped adding connections: {why}"),
         None if report.lanes_opened as u32 >= target => format!("all {target} connections were opened"),
-        None => format!(
-            "the transfer ended with {} of {target} connections opened (no need for more)",
-            report.lanes_opened
-        ),
+        None => {
+            format!("the transfer ended with {} of {target} connections opened (no need for more)", report.lanes_opened)
+        }
     };
     shared.finished.store(true, Ordering::Release);
     shared.qcv.notify_all();

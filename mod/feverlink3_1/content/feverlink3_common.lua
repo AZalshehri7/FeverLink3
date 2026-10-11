@@ -350,10 +350,11 @@ function C.speedChoice(mb)
 	return 32
 end
 
--- How the data travels: Steam's reliable stream (the default), our own datagram protocol, both one after the other, or the
--- reliable stream on 1, 2 and 4 connections at once. The names are the launcher's `mode` words.
-C.SPEED_MODES = { "reliable", "dgram", "both", "parallel" }
-C.SPEED_MODE_LABELS = { reliable = "Reliable", dgram = "Datagrams", both = "Both", parallel = "Parallel" }
+-- How the data travels: Steam's reliable stream (the default), our own datagram protocol, both one after the other, the
+-- reliable stream on 1, 2 and 4 connections at once, or "auto": the way a resync save is sent (several Steam connections,
+-- their number from the size of the file). The names are the launcher's `mode` words.
+C.SPEED_MODES = { "reliable", "dgram", "both", "parallel", "auto" }
+C.SPEED_MODE_LABELS = { reliable = "Reliable", dgram = "Datagrams", both = "Both", parallel = "Parallel", auto = "Auto (scaled)" }
 
 -- The mode to run: one of the offered words, else reliable.
 function C.speedMode(mode)

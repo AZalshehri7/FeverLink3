@@ -30,7 +30,9 @@ mod tests;
 
 use std::time::Duration;
 
-pub use send::{run_send, Control, FileSource, PayloadSource, Progress, SendReport, SendSpec, SyntheticPayload};
+pub use send::{
+    run_send, Control, CoreControl, FileSource, PayloadSource, Progress, SendReport, SendSpec, SyntheticPayload,
+};
 pub use service::{Allow, ParEvent, ParService};
 
 /// The virtual port the receiving side listens on (0 is the session, 1 the probe).
@@ -52,6 +54,12 @@ pub const INFLIGHT: usize = 1 << 20;
 pub const INITIAL: u32 = 4;
 /// A transfer with no progress for this long is abandoned (the caller falls back to the chunks).
 pub const STALL: Duration = Duration::from_secs(10);
+
+/// The secret of the speed test's transfers. It is a fixed value, not a secret: the speed test sends random bytes
+/// between two accounts that already talk to each other, and what protects it is Steam's authentication of the peer's
+/// Steam ID (the receiver takes connections only from the account it is testing with). The value only keeps a speed
+/// test's allowance apart from a session's, which has a real secret.
+pub const SPEED_SECRET: [u8; 32] = *b"feverlink3 speed test par v1....";
 
 /// Environment: `FEVERLINK3_BULK_CONNS=<n>` forces the number of connections (growth is then not checked for
 /// scaling), `FEVERLINK3_BULK_MAX=<n>` changes the cap.

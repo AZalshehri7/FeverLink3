@@ -42,10 +42,10 @@ use crate::net::{
     BulkSendJob, BulkSendResult, BulkSender, ClientTransport, ConnectContext, HostTransport, LinkInfo, NetEvent,
     ParContext, ParJob, ParProgress, ParSender,
 };
-use crate::steamnet::par::{self, Allow, ParEvent, ParService};
 use crate::session::{self, par_note, HostConfig, PlayerConfig, SessionHandle};
 use crate::steamnet::bulk::{Limits, Receiver as BulkReceiver};
 use crate::steamnet::bulk_io::{self, FileSource, Hub, SendJob};
+use crate::steamnet::par::{self, Allow, ParEvent, ParService};
 use crate::steamnet::speed::bulk_config;
 use crate::steamnet::{self, CoreRef, End, Handle, Owner, Route, MAX_MESSAGE};
 use feverlink3_core::session::ResyncLimits;
@@ -714,22 +714,6 @@ impl Drop for SteamClientNet {
     }
 }
 
-/// The ping and queue of one connection, as the parallel sender reads them.
-struct LinkControl {
-    core: CoreRef,
-    handle: Handle,
-}
-
-impl par::Control for LinkControl {
-    fn ping_ms(&self) -> Option<u32> {
-        self.core.link(self.handle).and_then(|l| l.ping_ms)
-    }
-
-    fn pending(&self) -> u32 {
-        self.core.link(self.handle).map_or(0, |l| l.pending)
-    }
-}
-
 impl HostTransport for SteamHostNet {
     fn send(&self, conn: ConnectionId, frame: &Frame) -> io::Result<()> {
         SteamHostNet::send(self, conn, frame)
@@ -806,7 +790,7 @@ impl SteamHostNet {
                 source: Arc::new(source),
                 conns: job.cfg.conns_for(size),
                 cfg: job.cfg,
-                control: Some(Arc::new(LinkControl { core: core.clone(), handle: link.handle })),
+                control: Some(Arc::new(par::CoreControl { core: core.clone(), handle: link.handle })),
             };
             let report = par::run_send(&core, spec, cancelled, progress);
             if report.ok {

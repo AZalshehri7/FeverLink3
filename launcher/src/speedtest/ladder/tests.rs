@@ -19,6 +19,8 @@ struct Sim {
     parallel: bool,
     calls: Vec<Req>,
     published: usize,
+    auto_lines: Option<Vec<String>>,
+    auto_asked: Vec<u32>,
 }
 
 impl Sim {
@@ -35,6 +37,8 @@ impl Sim {
             parallel: true,
             calls: Vec::new(),
             published: 0,
+            auto_lines: None,
+            auto_asked: Vec::new(),
         }
     }
 }
@@ -88,6 +92,12 @@ impl Path for Sim {
     fn parallel_available(&self) -> bool {
         self.parallel
     }
+    fn auto(&mut self, mb: u32) -> Result<Option<Vec<String>>, Stop> {
+        if self.auto_lines.is_some() {
+            self.auto_asked.push(mb);
+        }
+        Ok(self.auto_lines.clone())
+    }
     fn restore(&mut self) {
         self.restored += 1;
     }
@@ -118,13 +128,20 @@ fn the_ladder_climbs_while_the_path_follows_and_stops_when_it_does_not() {
     let mut sim = Sim::new(3.5);
     let (s, r) = go(&mut sim);
     assert!(r.is_ok() && s.finished);
-    // 1, 2, 4 grow (1.0, 2.0, 3.5 MB/s), 8 does not grow
-    assert_eq!(ladder_rates(&s, Dir::Up), [MIB, 2 * MIB, 4 * MIB, 8 * MIB]);
+    // 1, 2, 4 grow (1.0, 2.0, 3.5 MB/s); 4 MiB/s is the top of the ladder
+    assert_eq!(ladder_rates(&s, Dir::Up), [MIB, 2 * MIB, 4 * MIB]);
     assert_eq!(s.best, [4 * MIB, 4 * MIB]);
     let last = s.steps.iter().rfind(|x| x.stage == "ladder" && x.dir == Dir::Up).unwrap();
-    assert!(last.stop_note.as_deref().unwrap().contains("less than 10 %"), "{last:?}");
+    assert!(last.stop_note.as_deref().unwrap().contains("top of the ladder (4 MiB/s)"), "{last:?}");
     assert!(sim.restored >= 1);
-    assert!(sim.calls.iter().all(|c| c.rate <= 32 * MIB));
+    assert!(sim.calls.iter().all(|c| c.rate <= 4 * MIB));
+
+    // a path that stops growing at 2 MiB/s: the 4 MiB/s step is the one that does not grow
+    let mut sim = Sim::new(2.0);
+    let (s, _) = go(&mut sim);
+    let last = s.steps.iter().rfind(|x| x.stage == "ladder" && x.dir == Dir::Up).unwrap();
+    assert_eq!(last.asked, 4 * MIB);
+    assert!(last.stop_note.as_deref().unwrap().contains("less than 10 %"), "{last:?}");
 }
 
 #[test]
@@ -157,11 +174,11 @@ fn a_path_that_carries_only_the_default_gets_no_validation() {
 #[test]
 fn a_round_trip_above_the_limit_stops_the_climb_and_is_not_sustainable() {
     let mut sim = Sim::new(100.0);
-    sim.inflate_above = 4 * MIB;
+    sim.inflate_above = 2 * MIB;
     let (s, _) = go(&mut sim);
-    assert_eq!(ladder_rates(&s, Dir::Up), [MIB, 2 * MIB, 4 * MIB, 8 * MIB]);
-    assert_eq!(s.best, [4 * MIB, 4 * MIB], "the unsafe step is not the best");
-    let stop = s.steps.iter().find(|x| x.asked == 8 * MIB).unwrap().stop_note.clone().unwrap();
+    assert_eq!(ladder_rates(&s, Dir::Up), [MIB, 2 * MIB, 4 * MIB]);
+    assert_eq!(s.best, [2 * MIB, 2 * MIB], "the unsafe step is not the best");
+    let stop = s.steps.iter().find(|x| x.asked == 4 * MIB).unwrap().stop_note.clone().unwrap();
     assert!(stop.contains("round trip rose to 920 ms") && stop.contains("limit 380 ms"), "{stop}");
 }
 
@@ -176,12 +193,12 @@ fn a_stall_stops_the_climb() {
 }
 
 #[test]
-fn the_ladder_never_goes_above_32_mib_and_ends_there() {
+fn the_ladder_never_goes_above_4_mib_and_ends_there() {
     let mut sim = Sim::new(1000.0);
     let (s, _) = go(&mut sim);
-    assert_eq!(ladder_rates(&s, Dir::Down).last(), Some(&(32 * MIB)));
-    assert_eq!(s.best, [32 * MIB, 32 * MIB]);
-    assert!(sim.calls.iter().all(|c| c.rate <= 32 * MIB));
+    assert_eq!(ladder_rates(&s, Dir::Down).last(), Some(&(4 * MIB)));
+    assert_eq!(s.best, [4 * MIB, 4 * MIB]);
+    assert!(sim.calls.iter().all(|c| c.rate <= 4 * MIB));
     let last = s.steps.iter().rfind(|x| x.stage == "ladder").unwrap();
     assert!(last.stop_note.as_deref().unwrap().contains("top of the ladder"));
 }
@@ -221,10 +238,43 @@ fn parallel_connections_are_run_or_declared_unavailable() {
     let (s, _) = go(&mut sim);
     assert_eq!(s.parallel_note, "parallel connections: not available in this version");
     assert!(report_lines(&s).join("\n").contains("parallel connections: not available in this version"));
+    // a line of 3.5 MB/s: x2 and x4 scale, x8 does not, so x16 is skipped
     let mut sim = Sim::new(3.5);
     let (s, _) = go(&mut sim);
     let par: Vec<_> = s.steps.iter().filter(|x| x.stage == "parallel").map(|x| (x.conns, x.dir)).collect();
-    assert_eq!(par, [(2, Dir::Up), (2, Dir::Down), (4, Dir::Up), (4, Dir::Down)]);
+    assert_eq!(par, [(2, Dir::Up), (2, Dir::Down), (4, Dir::Up), (4, Dir::Down), (8, Dir::Up), (8, Dir::Down)]);
+    assert!(s.steps.iter().filter(|x| x.stage == "parallel").all(|x| x.asked == MIB), "1 MiB/s on every connection");
+    assert!(s.notes.iter().any(|n| n.contains("up x8: did not scale")), "{:?}", s.notes);
+    // a line that scales all the way: 2, 4, 8 and 16, both ways
+    let mut sim = Sim::new(100.0);
+    let (s, _) = go(&mut sim);
+    let par: Vec<u32> = s.steps.iter().filter(|x| x.stage == "parallel" && x.dir == Dir::Up).map(|x| x.conns).collect();
+    assert_eq!(par, [2, 4, 8, 16]);
+}
+
+#[test]
+fn the_auto_run_ends_the_test_and_its_block_is_in_the_report() {
+    let mut sim = Sim::new(100.0);
+    let (s, _) = go(&mut sim);
+    assert!(s.auto.is_empty(), "this path has no Auto run");
+    assert!(s.notes.iter().any(|n| n.contains("Auto (scaled): not available")));
+    sim.auto_lines = Some(vec!["Auto (scaled) speed test, 80 MB each way: ...".into()]);
+    let mut s = Summary { default_rate: MIB, ..Summary::default() };
+    run(&mut sim, &mut s).unwrap();
+    assert_eq!(sim.auto_asked, vec![80]);
+    let text = report_lines(&s).join(
+        "
+",
+    );
+    assert!(text.contains("Auto (scaled), 80 MB each way (the way a resync save is sent):"), "{text}");
+    assert!(text.contains("  Auto (scaled) speed test, 80 MB each way: ..."), "{text}");
+    // out of time: skipped, and said
+    let mut sim = Sim::new(100.0);
+    sim.clock = TOTAL_BUDGET;
+    sim.auto_lines = Some(vec!["x".into()]);
+    let (s, _) = go(&mut sim);
+    assert!(sim.auto_asked.is_empty());
+    assert!(s.notes.iter().any(|n| n.contains("Auto (scaled) run was skipped (time)")), "{:?}", s.notes);
 }
 
 #[test]
@@ -280,7 +330,9 @@ fn the_peer_rate_is_read_from_the_run_note() {
     let note = "own send rate set to 4194304 B/s, Steam reports 4194304 B/s (x); peer set its send rate to 4194304 B/s (Steam reports 4194304)";
     assert_eq!(peer_reported_rate(note), Some(4_194_304));
     assert_eq!(
-        peer_reported_rate("own send rate set to 5 B/s, Steam reports 5 B/s; peer did not change its rate (an older program)"),
+        peer_reported_rate(
+            "own send rate set to 5 B/s, Steam reports 5 B/s; peer did not change its rate (an older program)"
+        ),
         None
     );
     assert_eq!(peer_reported_rate(""), None);

@@ -15,8 +15,8 @@ use feverlink3_core::session::{HostOptions, ResyncLimits};
 use super::*;
 use crate::gamelink::{self, Line, Tail};
 use crate::session::{run_host_over, run_player_over, Command};
-use crate::steamnet::fake::FakeMachine;
 use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
+use crate::steamnet::fake::FakeMachine;
 use crate::steamnet::SteamCore;
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -383,7 +383,15 @@ fn a_player_reconnects_over_steam_after_the_host_stops_and_returns() {
     assert!(player.handle.logs().join("\n").contains("connection closed: closed by the other side"));
 
     // the host comes back on the same Steam ID
-    let (host, ..) = Table::start_host(root.path(), &core, &key, HostOptions::default(), Vec::new(), "host2", BulkSettings::default());
+    let (host, ..) = Table::start_host(
+        root.path(),
+        &core,
+        &key,
+        HostOptions::default(),
+        Vec::new(),
+        "host2",
+        BulkSettings::default(),
+    );
     assert!(player.handle.wait_for(WAIT, |s| s.connected && !s.reconnecting && s.my_id.is_some()));
     assert!(host.wait_for(WAIT, |s| s.players.len() == 2));
     assert!(player.handle.status().reconnect_attempts >= 1);
