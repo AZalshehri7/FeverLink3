@@ -76,7 +76,11 @@ end
 --   not started          -> 0 (every game holds at the save time)
 --   barrier              -> 0 once past slowest peer + ahead steps; never a batch that would cross it
 --   pause                -> 0 at pauseAt exactly; the last batch is shortened to land on it
-function L.pace(s, peers, now, ahead)
+--   landing marks        -> `marks` (checksum stamps) never hold the game; the batch is shortened so that one lands
+--                           exactly on the mark. At x3/x4 a batch is several steps, and games whose batches fall at
+--                           different phases would otherwise hash their checksum at different sim times (the host then
+--                           skips the round: ChecksumOutcome.time_skew).
+function L.pace(s, peers, now, ahead, marks)
 	if not s.started then return 0 end
 	local want = s.speed or 0
 	if want <= 0 then return 0 end
@@ -91,7 +95,29 @@ function L.pace(s, peers, now, ahead)
 		local room = math.floor((stopAt - now) / L.STEP)
 		if room < want then want = math.max(room, 1) end
 	end
+	local land = L.nextMark(marks, now)
+	if land then
+		local room = math.floor((land - now) / L.STEP)
+		if room < want then want = math.max(room, 1) end
+	end
 	return want
+end
+
+-- The earliest mark after `now` (nil: none). Marks is a list of times.
+function L.nextMark(marks, now)
+	local best = nil
+	for _, m in ipairs(marks or {}) do
+		if type(m) == "number" and m > now and (best == nil or m < best) then best = m end
+	end
+	return best
+end
+
+-- Remembers a checksum stamp as a landing mark (a short list; marks already passed are dropped).
+function L.addMark(marks, at, now)
+	for i = #marks, 1, -1 do
+		if marks[i] <= now then table.remove(marks, i) end
+	end
+	if type(at) == "number" and at > now and #marks < 16 then marks[#marks + 1] = at end
 end
 
 -- ------------------------------------------------------------------ stamps

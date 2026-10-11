@@ -24,6 +24,8 @@ pub(super) struct FileInfo {
 
 /// How often a paused verify round that cannot be compared (different sim times) is asked again.
 const MAX_VERIFY_SKEWS: u8 = 3;
+/// A line in the session log with the count of skewed rounds after this many finished rounds.
+const SKEW_LOG_EVERY: u32 = 20;
 
 #[derive(Debug)]
 pub(super) struct ResyncRound {
@@ -378,8 +380,22 @@ impl HostSession {
 
     // ---------------------------------------------------------------- results
 
+    /// Counts a finished round and, every `SKEW_LOG_EVERY` rounds, logs how many were skipped as skewed (the games hashed
+    /// at different sim times), so a real game can measure how well the games hash at the same time.
+    fn count_round(&mut self, skewed: bool) {
+        self.rounds_done += 1;
+        if skewed {
+            self.rounds_skewed += 1;
+        }
+        if self.rounds_done % SKEW_LOG_EVERY == 0 {
+            let (done, skewed) = (self.rounds_done, self.rounds_skewed);
+            self.log(format!("checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"));
+        }
+    }
+
     pub(super) fn on_checksum_outcome(&mut self, outcome: ChecksumOutcome) {
         let verify = self.resync.as_ref().and_then(|r| r.verify_n);
+        self.count_round(!outcome.comparable());
         self.out.push(HostOutput::ChecksumCompleted(outcome.clone()));
         if self.resync.is_some() {
             if verify == Some(outcome.n) {

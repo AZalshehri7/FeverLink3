@@ -524,3 +524,23 @@ fn proof_depends_on_key_nonce_and_name() {
     assert_ne!(p, HostSession::proof(&key, &[1], "A"));
     assert_ne!(p, HostSession::proof(&SessionKey::derive(&SECRET, Some("pw")), &nonce, "A"));
 }
+
+#[test]
+fn skewed_rounds_are_counted_and_logged_every_twenty_rounds() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.host_call(HostSession::start);
+    let p = parts(&[("money", "1")]);
+    for i in 0..20 {
+        h.host_call(HostSession::request_checksum);
+        let req: ChecksumRequestMessage = h.p(a).last(MessageKind::ChecksumRequest);
+        let skew = if i % 4 == 0 { 200 } else { 0 };
+        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, p.clone())));
+        h.player_game(a, MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at + skew, p.clone())));
+    }
+    let lines: Vec<&String> = h.host_log.iter().filter(|l| l.contains("skipped as skewed")).collect();
+    assert_eq!(1, lines.len(), "{:?}", h.host_log);
+    assert!(lines[0].contains("5 of 20"), "{}", lines[0]);
+}
