@@ -1,5 +1,7 @@
 # FeverLink3
 
+> **Under development - please do not use it yet.** FeverLink3 is an unfinished test project. It can crash the game, drift the two worlds apart, force a reload of your world, or leave a build tool unresponsive, and a crash loses any progress you have not saved. Do not install it on a game you care about, and keep backups of your saves. The code is published so that its progress can be followed, not as a release for players.
+
 Cooperative multiplayer for Transport Fever 3. The goal: several players build in one world at the same time, each in their own copy of the game. Source available under the PolyForm Noncommercial License (free for noncommercial use; see Licence below), Windows and Steam only, unofficial.
 
 **Status: early test build (0.2.0-test5), last updated 2026-10-10. Two players can host, join and see each other's speed, pause and chat commands in two real games; building has been seen working for a thin slice (roads, bulldozing, lines); stations, rail, vehicles and terrain have not been tried.** What is real and what is not:
