@@ -350,6 +350,30 @@ and returns a handle with the pid, `is_running()` and `wait()`. `process::any_ga
 whether any game instance runs, which the install checks before touching `winhttp.dll` (Windows locks it while the
 game runs).
 
+## Bulk datagrams (`src/steamnet/bulk/`, `bulk_io.rs`, `speed.rs`)
+
+Own reliability and congestion control over Steam's unreliable messages, for the resync save and the speed test; see
+`docs/STEAM_TRANSPORT.md` section 7.2. **Not run on real Steam yet.**
+
+- `bulk/wire.rs` (datagram format), `bulk/cc.rs` (delay-based rate controller), `bulk/sender.rs` and `bulk/receiver.rs`
+  (state machines driven by a clock; no Steam, no threads) and `bulk/tests.rs` (deterministic network simulator: latency,
+  jitter, random and bursty loss, reordering, duplication, a bottleneck with a finite queue). `cargo test -p
+  feverlink3_launcher --lib bulk::tests -- --nocapture` prints the numbers of each case; the ignored test
+  `trace_the_5_mb_s_run` prints the rate and queue over time (`TRACE_LOSS`, `TRACE_JITTER` change the network).
+- `bulk_io.rs`: the `Hub` that routes a connection's bulk datagrams to their transfer (the core hands them to
+  `Owner::datagram`), `run_sender` and `run_receiver` (threads on the real clock), file and synthetic sources. A sender
+  raises the connection's Steam send rate to 64 MiB/s for the transfer and puts it back.
+- `speed.rs`: the probe's speed test as *runs* (`RunSpec`: reliable on 1 to 4 connections or datagrams, an optional Steam
+  send rate that both sides set on their connections, which directions, a time cap per direction). The responder
+  answers `tput` messages: `up`/`down` (with the number of connections and an optional `rate`; it answers a rate request
+  with `tput rate` so a tester can tell an old program that ignores it), `dgdown`, `stop`. `Probe::start_run`,
+  `start_plan` (a series), `run_outcome`, `take_log`.
+- Settings: `FEVERLINK3_BULK=dgram` (host: send resync saves to capable players as datagrams; default off),
+  `FEVERLINK3_BULK_TARGET_MS` (queue delay target, default 40), `FEVERLINK3_BULK_MAX_RATE` (bytes per second, default
+  40 000 000).
+- Steam plumbing in `steamnet/steam_core.rs`: `send_datagram`, `send_reliable_no_nagle`, `flush`, `detailed_status`,
+  `config_report`, `set_connection_send_rate` (sets both rates on a live connection and reads them back).
+
 ## Standalone speed test (`feverlink3-speedtest.exe`)
 
 `src/bin/feverlink3-speedtest.rs` is a console program that runs the Steam P2P speed test without Transport Fever 3
