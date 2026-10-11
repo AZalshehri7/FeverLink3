@@ -149,6 +149,7 @@ pub fn start_host(root: &Path, key: &SessionKey, options: HostOptions, save: Vec
     let dir = link.dir().to_path_buf();
     let saves = root.join("host-saves");
     let handle = run_host(HostConfig {
+        bulk: false,
         bind: loopback(),
         name: "Host".into(),
         key: key.clone(),

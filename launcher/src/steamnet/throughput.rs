@@ -52,24 +52,68 @@ pub const MAX_CONNS: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Msg {
-    Up { id: u64, total: u64, chunk: u64, conns: u32 },
+    Up {
+        id: u64,
+        total: u64,
+        chunk: u64,
+        conns: u32,
+    },
     /// `rate` (bytes per second, 0 for none): the Steam send rate the responder sets on its own connections before it
     /// streams. Old programs ignore the extra fields.
-    Down { id: u64, total: u64, chunk: u64, conns: u32, rate: u32 },
+    Down {
+        id: u64,
+        total: u64,
+        chunk: u64,
+        conns: u32,
+        rate: u32,
+    },
     /// Stop sending test `id` (the tester gave up on it).
-    Stop { id: u64 },
+    Stop {
+        id: u64,
+    },
     /// The responder's answer to a `rate` request: what was asked and the rate Steam then reports (0: not readable).
-    RateAck { id: u64, asked: u32, got: u32 },
+    RateAck {
+        id: u64,
+        asked: u32,
+        got: u32,
+    },
     /// Send me `total` bytes as bulk datagrams.
-    DgDown { id: u64, total: u64 },
+    DgDown {
+        id: u64,
+        total: u64,
+    },
     /// The datagram transfer `id` arrived (or failed): the receiver's numbers.
-    Dres { id: u64, kv: Vec<(String, u64)> },
+    Dres {
+        id: u64,
+        kv: Vec<(String, u64)>,
+    },
     /// The datagram transfer `id` was sent: the sender's numbers.
-    Dsend { id: u64, kv: Vec<(String, u64)> },
-    Data { id: u64, seq: u64, len: usize },
-    End { id: u64, sent: u64, peak_pending: u32, max_block_ms: u64 },
-    Prog { id: u64, bytes: u64 },
-    UpRes { id: u64, bytes: u64, ms: u64, gap_ms: u64, steady: u64 },
+    Dsend {
+        id: u64,
+        kv: Vec<(String, u64)>,
+    },
+    Data {
+        id: u64,
+        seq: u64,
+        len: usize,
+    },
+    End {
+        id: u64,
+        sent: u64,
+        peak_pending: u32,
+        max_block_ms: u64,
+    },
+    Prog {
+        id: u64,
+        bytes: u64,
+    },
+    UpRes {
+        id: u64,
+        bytes: u64,
+        ms: u64,
+        gap_ms: u64,
+        steady: u64,
+    },
 }
 
 /// Reads a speed-test message; `None` for anything else (a ping, garbage, a header that does not parse).
@@ -791,7 +835,11 @@ impl DgramResult {
             ),
             format!(
                 "Route: {route}, round trip {ping}{}",
-                if self.route_notes.is_empty() { ", no route change".to_string() } else { format!(", ROUTE CHANGED: {}", self.route_notes.join("; ")) }
+                if self.route_notes.is_empty() {
+                    ", no route change".to_string()
+                } else {
+                    format!(", ROUTE CHANGED: {}", self.route_notes.join("; "))
+                }
             ),
         ];
         out.extend(self.side_lines("You to friend", "you sent:", &self.up));
@@ -819,7 +867,8 @@ impl DgramResult {
     pub fn log_line(&self) -> String {
         let (host, guest) = self.estimates();
         let secs = |e: Option<f64>| e.map_or_else(|| "?".to_string(), |s| format!("{s:.0}"));
-        let sender = |s: &DgramSide| s.sender.as_ref().map_or_else(|| "no sender numbers".to_string(), SenderSummary::text);
+        let sender =
+            |s: &DgramSide| s.sender.as_ref().map_or_else(|| "no sender numbers".to_string(), SenderSummary::text);
         format!(
             "steam speed test (datagrams): {:.0} MB each way, up {} [{}], down {} [{}], total {:.1} s, {}, ping {} ms, route changes: {}, longest pause {} ms{}, 80 MB save about {} s hosting / {} s joining",
             self.total_bytes as f64 / MB as f64,

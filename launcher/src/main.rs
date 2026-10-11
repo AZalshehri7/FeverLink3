@@ -203,6 +203,7 @@ fn host(args: &[String]) -> Result<(), String> {
     let link = gamelink::Session::create(&name).map_err(|e| format!("cannot create the session folder: {e}"))?;
     let session_dir = link.dir().to_path_buf();
     let handle = session::run_host(HostConfig {
+        bulk: feverlink3_launcher::steamnet::bulk_io::enabled(),
         bind: SocketAddr::from(([0, 0, 0, 0], port)),
         name: name.clone(),
         key,

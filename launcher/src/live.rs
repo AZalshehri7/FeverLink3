@@ -608,6 +608,7 @@ impl Controller {
             Err(e) => return self.state = State::Failed(format!("cannot open the session folder: {e}")),
         };
         let config = HostConfig {
+            bulk: steamnet::bulk_io::enabled(),
             bind: SocketAddr::from(([0, 0, 0, 0], 0)), // not used by Steam
             name,
             key,
@@ -660,6 +661,7 @@ impl Controller {
         let loopback = force_loopback || params.get("bind").and_then(Value::as_str) == Some("loopback");
         let ip = if loopback { [127, 0, 0, 1] } else { [0, 0, 0, 0] };
         let started = session::run_host(HostConfig {
+            bulk: steamnet::bulk_io::enabled(),
             bind: SocketAddr::from((ip, port)),
             name,
             key,

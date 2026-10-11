@@ -231,21 +231,14 @@ pub fn run_sender(
     let port = Port { core: core.clone(), conn };
     let rx = hub.register(conn, job.xfer);
     let mut notes = Vec::new();
-    notes.push(format!(
-        "steam rate for the transfer: {}",
-        core.set_connection_send_rate(conn, STEAM_RATE_DURING)
-    ));
+    notes.push(format!("steam rate for the transfer: {}", core.set_connection_send_rate(conn, STEAM_RATE_DURING)));
     let start = Instant::now();
     let xfer = job.xfer;
     let mut sender = match Sender::new(start, job.xfer, job.ctx, job.sha256, job.source, job.cfg) {
         Ok(s) => s,
         Err(why) => {
             hub.unregister(conn, xfer);
-            return SendReport {
-                state: SenderState::Failed(why),
-                stats: SenderStats::default(),
-                rate_notes: notes,
-            };
+            return SendReport { state: SenderState::Failed(why), stats: SenderStats::default(), rate_notes: notes };
         }
     };
     let mut last_progress = Instant::now();

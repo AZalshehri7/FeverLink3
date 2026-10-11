@@ -156,6 +156,7 @@ pub fn run() -> Result<Report, String> {
     let host_link = gamelink::Session::create_under(&scratch.0, "host").map_err(io)?;
     let host_dir = host_link.dir().to_path_buf();
     let host = run_host(HostConfig {
+        bulk: false,
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         name: "Host".into(),
         key: key.clone(),

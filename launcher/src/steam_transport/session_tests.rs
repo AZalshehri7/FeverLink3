@@ -125,11 +125,16 @@ struct Table {
 
 impl Table {
     fn new(options: HostOptions, save: Vec<u8>) -> Table {
+        Table::new_with(options, save, false)
+    }
+
+    /// As `new`; `bulk` makes the host send saves to players that can take them as bulk datagrams.
+    fn new_with(options: HostOptions, save: Vec<u8>, bulk: bool) -> Table {
         let machine = FakeMachine::new();
         let core = machine.core();
         let root = tempfile::TempDir::new().unwrap();
         let key = SessionKey::derive(&SessionKey::new_secret(), None);
-        let (handle, game) = Table::start_host(root.path(), &core, &key, options, save, "host");
+        let (handle, game) = Table::start_host(root.path(), &core, &key, options, save, "host", bulk);
         Table { root, key, machine, core, handle, game }
     }
 
@@ -141,6 +146,7 @@ impl Table {
         options: HostOptions,
         save: Vec<u8>,
         folder: &str,
+        bulk: bool,
     ) -> (SessionHandle, FakeGame) {
         let saves = root.join(format!("{folder}-user")).join("save");
         let link = gamelink::Session::create_under(root, folder).unwrap();
@@ -148,6 +154,7 @@ impl Table {
         let core_ref = core.handle();
         let handle = run_host_over(
             HostConfig {
+                bulk,
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
                 name: "Host".into(),
                 key: key.clone(),
@@ -375,7 +382,7 @@ fn a_player_reconnects_over_steam_after_the_host_stops_and_returns() {
     assert!(player.handle.logs().join("\n").contains("connection closed: closed by the other side"));
 
     // the host comes back on the same Steam ID
-    let (host, ..) = Table::start_host(root.path(), &core, &key, HostOptions::default(), Vec::new(), "host2");
+    let (host, ..) = Table::start_host(root.path(), &core, &key, HostOptions::default(), Vec::new(), "host2", false);
     assert!(player.handle.wait_for(WAIT, |s| s.connected && !s.reconnecting && s.my_id.is_some()));
     assert!(host.wait_for(WAIT, |s| s.players.len() == 2));
     assert!(player.handle.status().reconnect_attempts >= 1);
@@ -491,4 +498,64 @@ fn what_the_session_log_says_about_a_failed_first_connection() {
     let err = Player::start(root.path(), SteamEndpoint(target.steam_id()), "Pat", &key, |_| {}).err().expect("refused");
     assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     assert!(err.to_string().contains("could not connect to Steam ID"), "{err}");
+}
+
+/// A resync round with `FEVERLINK3_BULK=dgram` on the host: the save goes to the player as bulk datagrams, no chunk
+/// frame is sent, and it arrives byte for byte. With `lose_all`, every datagram of the host is lost: the transfer
+/// stalls, the host falls back to chunks after the stall time, and the save arrives all the same.
+fn resync_round_moves_a_save_by_bulk(chunks: usize, lose_all: bool) -> (Table, Player) {
+    let save: Vec<u8> = (0..(chunks * ResyncLimits::CHUNK_SIZE + 4321)).map(|i| (i % 249) as u8).collect();
+    let mut table = Table::new_with(HostOptions::default(), save.clone(), true);
+    if lose_all {
+        table.machine.lose_every_nth_unreliable(1);
+    }
+    let mut player = table.player("Pat");
+    assert!(player.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()), "{:?}", player.handle.logs());
+    table.game.announce();
+    player.game.announce();
+    assert!(table.handle.wait_for(WAIT, |s| s.clocks.len() == 2), "both clocks known");
+    table.handle.command(Command::Start);
+    assert!(table.handle.wait_for(WAIT, |s| s.session.as_ref().is_some_and(|x| x.started)));
+    table.handle.command(Command::Resync);
+    let done = wait(Duration::from_secs(120), || {
+        table.game.step();
+        player.game.step();
+        table.handle.status().resync.as_deref() == Some("Idle")
+    });
+    let logs = table.handle.logs().join("\n");
+    assert!(done, "the round reaches Idle; host log:\n{logs}\nstatus: {:?}", table.handle.status().resync);
+    let received = player.saves.join("feverlink3-resync-1.sav");
+    assert!(fs::read(&received).expect("received save on disk") == save, "the save arrived intact");
+    assert!(player.game.saw("resync_load", "feverlink3-resync-1"));
+    assert!(table.handle.status().last_sync.expect("a checksum outcome").identical());
+    (table, player)
+}
+
+#[test]
+fn a_resync_save_goes_to_a_capable_player_as_bulk_datagrams_and_no_chunk_is_sent() {
+    let (table, player) = resync_round_moves_a_save_by_bulk(3, false);
+    let host_log = table.handle.logs().join("\n");
+    assert!(host_log.contains("sending the save to 1 player(s) as bulk datagrams"), "{host_log}");
+    assert!(host_log.contains("has the save (bulk datagrams)"), "{host_log}");
+    // nothing as big as a chunk (350 KB) went over the reliable stream, and the datagrams were really sent
+    assert!(table.machine.largest_sent() < 100_000, "largest message {}", table.machine.largest_sent());
+    let (sent, _, _) = table.machine.unreliable_counts();
+    assert!(sent > 700, "{sent} datagrams");
+    let player_log = player.handle.logs().join("\n");
+    assert!(player_log.contains("save received as bulk datagrams"), "{player_log}");
+    player.handle.stop();
+    table.handle.stop();
+}
+
+#[test]
+fn a_bulk_transfer_that_stalls_falls_back_to_chunks_for_that_player() {
+    let (table, player) = resync_round_moves_a_save_by_bulk(2, true);
+    let host_log = table.handle.logs().join("\n");
+    assert!(
+        host_log.contains("bulk transfer to Pat failed (no progress for 10 s); sending the chunks instead"),
+        "{host_log}"
+    );
+    assert!(table.machine.largest_sent() > 349_000, "the chunks went over the reliable stream");
+    player.handle.stop();
+    table.handle.stop();
 }

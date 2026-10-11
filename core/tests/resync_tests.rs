@@ -883,7 +883,8 @@ fn a_join_message_without_capabilities_is_what_older_players_send() {
     assert!(!text.contains("caps"), "{text}");
     let back: JoinMessage = codec::try_decode(text.as_bytes()).unwrap();
     assert!(back.caps.is_empty());
-    let with: JoinMessage = codec::try_decode(br#"{"name":"N","version":"0.1","proof":"AQID","caps":["bulk-dgram-1"]}"#).unwrap();
+    let with: JoinMessage =
+        codec::try_decode(br#"{"name":"N","version":"0.1","proof":"AQID","caps":["bulk-dgram-1"]}"#).unwrap();
     assert_eq!(with.caps, vec![CAP_BULK_DGRAM.to_owned()]);
 }
 

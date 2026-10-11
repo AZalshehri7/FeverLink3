@@ -1279,6 +1279,11 @@ impl HostSession {
         self.out.push(HostOutput::SendToConnection { connection, frame: Frame::new(header, payload) });
     }
 
+    /// The connection of a connected player (not the host's own game).
+    pub fn player_connection(&self, player: u16) -> Option<ConnectionId> {
+        self.connection_of(player)
+    }
+
     fn connection_of(&self, player: u16) -> Option<ConnectionId> {
         self.connections.values().find(|c| c.player == Some(player)).map(|c| c.id)
     }

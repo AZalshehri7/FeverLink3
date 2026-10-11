@@ -117,8 +117,7 @@ impl HostSession {
             valid.then(|| (file.sha256.clone(), file.count))
         });
         if let Some((sha256, count)) = ok {
-            let msg =
-                ResyncChunkMessage { id, index: index as i32, count: count as i32, sha256, data: data.to_vec() };
+            let msg = ResyncChunkMessage { id, index: index as i32, count: count as i32, sha256, data: data.to_vec() };
             let only: BTreeSet<u16> = [player].into();
             self.send_to_players(MessageKind::ResyncChunk, &codec::encode(&msg), &only);
         } else {
@@ -390,7 +389,10 @@ impl HostSession {
         for bulk in &r.bulk {
             participants.remove(bulk);
         }
-        self.send_to_players(MessageKind::ResyncChunk, &codec::encode(&msg), &participants);
+        // nobody is sent this chunk (every receiver gets the save by bulk datagrams): do not even seal it
+        if participants.iter().any(|&p| p != Self::HOST_ID) {
+            self.send_to_players(MessageKind::ResyncChunk, &codec::encode(&msg), &participants);
+        }
         if done {
             self.enter_loading();
             self.resync_step();
