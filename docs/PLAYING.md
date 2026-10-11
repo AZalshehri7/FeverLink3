@@ -73,7 +73,7 @@ Press **Connection test...** in the window (under the join code field) to open t
 
 **Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
 
-**Towns and sync.** The game grows towns with choices that can differ from one computer to the next, so after a while two players' towns can differ, and a road or station built through such a town may fail on the other computer; FeverLink3 then repairs the world with a resync. Town growth is never switched off. Making growth identical on every computer is being worked on.
+**Towns and sync.** The game grows towns with choices that can differ from one computer to the next, so after a while two players' towns can differ, and a road or station built through such a town may fail on the other computer; FeverLink3 then repairs the world with a resync. Town growth is never switched off and no rating is changed; FeverLink3 does not alter how the game works. In our tests the two games' growth started from different random seeds and drifted apart about 10 seconds after each resync; making the seeds equal helped for a while (about 13 checks) but not for good, so the work continues on keeping growth identical on every computer. Until then, expect an occasional resync after building in or near a town.
 
 **Not built yet:** separate companies (one shared company for now), a dedicated server, towns that grow during a session.
 

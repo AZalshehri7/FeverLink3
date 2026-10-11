@@ -30,7 +30,7 @@ anything else (unset, empty, `0`, `true`) is off. Try them in this order:
 | 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
 | 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
 | 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
-| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the town developer's task-seeding function (`sub_8d4270`, RVA `0x8d4270` in build 40420). It logs one line per call, `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function, **not yet run in the game**. Writes to `native.log` on the thread that calls the function (see below). |
+| 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the town developer's task-seeding function (`sub_8d4270`, RVA `0x8d4270` in build 40420). It logs one line per call, `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, `research/TOWN_GROWTH_FINDINGS.md`). Writes to `native.log` on the thread that calls the function (see below). |
 
 `FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
 The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
@@ -65,7 +65,7 @@ What static analysis of build 40420 (PE timestamp `0x6ac50427`) found, offsets a
 
 ### Forcing the seed (`FEVERLINK3_FORCE_TOWN_SEED=<number>`), an experiment
 
-**This is an experiment switch and it has not run in the game.** The value is decimal or `0x` hex and must fit 32
+**This is an experiment switch.** It has been run in two real games with the same value (`0x2cd15ea0`) in both: constructions stayed identical for about 13 checksum rounds, then differed (`research/TOWN_GROWTH_FINDINGS.md`); it has not been shown to hold over time, and it changes only the seed, no game mechanic. The value is decimal or `0x` hex and must fit 32
 bits; anything else is ignored with a log line (`hooks: FEVERLINK3_FORCE_TOWN_SEED: ignored, ...`) and changes nothing.
 Either this switch or `FEVERLINK3_LOG_TOWN_SEED=1` installs the hook, with the same fail-open rules (unknown build,
 prologue mismatch, failed self-test: nothing installed, the reason logged). No other hook is affected.
@@ -81,7 +81,7 @@ Why this may not be enough: the seed only initialises the `mt19937` once, at the
 twice per process with the same seed, and a resync load never calls it again). After that the generator state
 advances with every draw, and games whose draws differ in number or timing (a resync that loads a save in one game
 only) leave equal seeds with unequal generators. So even if forcing works, step 2 will be a reset of the `mt19937`
-state (the 624-word array and the index at `+0x80`/`+0x84` of the task object) to a common value at every sync point.
+state (the 624-word array and the index at `+0x80`/`+0x84` of the task object) to a common value at every sync point. That analysis is in progress (`research/TOWN_RNG_STATE.md`, in another branch).
 
 The log lines: `town-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, in `native.log` (location in
 `native/README.md`). `n` counts the calls of this run from 1; `seed` is 10 characters (`0x` and 8 hex digits);
