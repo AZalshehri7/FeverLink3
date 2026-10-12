@@ -1222,6 +1222,45 @@ class BuildLogLinesTest(StrictTest):
         self.assertNotIn("removes [", self.A.log())
 
 
+class TraceLogTest(StrictTest):
+    """trace.log (FEVERLINK3_TRACE, on by default): one self-contained block per build and a line per checksum round, in the session folder."""
+
+    DEPOT = ConstructionDefaultTest.DEPOT
+
+    def trace(self, g):
+        import os as _os
+        path = _os.path.join(g.dir, "trace.log")
+        return open(path, encoding="utf-8").read() if _os.path.exists(path) else ""
+
+    def test_a_build_leaves_its_record_decode_send_result_and_the_originators_ship_line_on_both_games(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(40)
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40)
+        a, b = self.trace(self.A), self.trace(self.B)
+        self.assertRegex(b, r"gui build\.ship 1:1 held=1 site=\S+ done=\w+ tool=\S+ plan=\w+ stamp=\d+ now=\d+ lead=\d+ bytes=\d+ capture_ms=[\d.]+ balance=\S+ record=\{")
+        self.assertRegex(a, r"sim build\.record 1:1 role=replay from=1 stamp=\d+ now=\d+ late=0 balance=\S+ record=\{")
+        self.assertRegex(a, r"sim build\.decode 1:1 ok=true ms=[\d.]+")
+        self.assertRegex(a, r"build\.plan 1:1 plan=\w+ form=1 built ms=[\d.]+")
+        self.assertRegex(a, r"build\.factory 1:1 plan=\w+ form=1 ok ms=[\d.]+ ie=\w+ pi=\w+ dust=\w+ counts\[")
+        self.assertRegex(a, r"sim build\.send 1:1 ie=\w+ pi=\w+ dust=\w+ ctx\{")
+        self.assertRegex(a, r"sim build\.result 1:1 ok=true steps=\d+ made=\d+ \[\d+\{[A-Z_,]+\}")
+        self.assertRegex(a, r"sim checksum t=\d+ light=false lanes=true items\{[^}]*\} parts=\{")
+        self.assertIn("native ", b)
+
+class TraceOffTest(StrictTest):
+    extra_env = {"FEVERLINK3_TRACE": "0"}
+
+    def test_no_trace_file(self):
+        import os as _os
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(30)
+        self.assertFalse(_os.path.exists(_os.path.join(self.A.dir, "trace.log")))
+        self.assertFalse(_os.path.exists(_os.path.join(self.B.dir, "trace.log")))
+
+
 class ConstructionBlockTest(StrictTest):
     """FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers): a build that adds a construction is cancelled at the originator (with a chat line)
     and replayed by nobody, but only when the native module can fire the tool's callback; otherwise it stays hold-and-release."""

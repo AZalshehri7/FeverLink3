@@ -2136,15 +2136,25 @@ local function decodeBuildUnsafe(body, ctx)
 	-- The forms of the plan are tried in order and the engine's factory is the judge, here, before anything is applied: a
 	-- proposal it rejects in every form refuses the action on every game alike.
 	local args, used, lastErr
+	local tkey = ctx and ctx.traceKey
+	local trace = C.tracer("build")
 	for i, form in ipairs(FORMS[plan] or { {} }) do
 		local notes = {}
+		local t0 = os.clock()
 		local ok, built = pcall(PLAN[plan], rec, R, f, notes, form)
+		if tkey then trace("build.plan", string.format("%s plan=%s form=%d %s ms=%.1f%s", tkey, plan, i, ok and "built" or "failed", (os.clock() - t0) * 1000, ok and "" or (" error(" .. type(built) .. ")=" .. tostring(built))) ) end
 		if not ok then
 			lastErr = tostring(built)
 			-- what cannot be found is not found in any form
 			if lastErr:find("^unresolved ") or lastErr:find("^ambiguous ") then return nil, lastErr end
 		else
+			local tF = os.clock()
 			local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(built, 1, built.n)) end)
+			if tkey then
+				trace("build.factory", string.format("%s plan=%s form=%d %s ms=%.1f ie=%s pi=%s dust=%s counts[%s]%s", tkey, plan, i, okF and "ok" or "THREW", (os.clock() - tF) * 1000,
+					tostring(built[3]), tostring(built[4]), tostring(built[5]), proposalCounts(built[1]),
+					okF and "" or (" error(" .. type(errF) .. ")=" .. tostring(errF))))
+			end
 			if okF then
 				args, used = built, i
 				logNotes(notes, "build " .. plan)

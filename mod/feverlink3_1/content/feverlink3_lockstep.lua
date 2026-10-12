@@ -748,7 +748,7 @@ end
 -- `light` (optional, true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
 -- see ChecksumRequestMessage.full). Each of those costs one component read per edge, node, construction or town building.
 L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true }
-function L.checksumParts(engine, hashFn, timing, light)
+function L.checksumParts(engine, hashFn, timing, light, detail)
 	local parts = {}
 	local clock = timing and function() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end or nil
 	local function part(name, fn)
@@ -756,6 +756,7 @@ function L.checksumParts(engine, hashFn, timing, light)
 		local t0 = clock and clock() or 0
 		local ok, v = pcall(fn)
 		parts[name] = ok and hashFn(v) or "error"
+		if ok and detail and type(v) == "table" and type(v.items) == "table" then detail[name] = v.items end
 		if clock then timing[name] = clock() - t0 end
 	end
 	local okT, t = pcall(engine.gameTime)

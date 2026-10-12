@@ -377,7 +377,7 @@ end
 -- TOWN_PART_LIMIT towns (the host accepts at most 128 parts; the aggregate covers the rest).
 local TOWN_PART_LIMIT = 48
 local logTowns = C.logger("towns")
-local function townBuildingsPart(parts)
+local function townBuildingsPart(parts, detail)
 	local ok, err = pcall(function()
 		local CTYPE = api.type.ComponentType
 		local byTown, townIds = {}, {}
@@ -406,6 +406,11 @@ local function townBuildingsPart(parts)
 			if i <= TOWN_PART_LIMIT then parts["townBuildings:" .. tostring(town)] = #list .. "/" .. C.hashValue(list) end
 		end
 		parts.townBuildings = total .. "/" .. C.hashValue(all)
+		if detail then
+			local flat = {}
+			for _, t in ipairs(all) do for _, k in ipairs(t.items) do flat[#flat + 1] = tostring(t.town) .. "|" .. k end end
+			detail.townBuildings = flat
+		end
 	end)
 	if not ok then
 		parts.townBuildings = "error"
@@ -472,6 +477,8 @@ end
 -- Checksum cost (observation only, never raises, behaviour unchanged): the seconds of every part are measured with os.clock. A
 -- checksum that takes more than CS_SLOW_MS in total logs one line naming the worst parts; every CS_SUMMARY rounds one summary line
 -- (count, average, maximum and the part that was the slowest in the maximum round). Each half (interface, simulation) counts its own.
+local traceSim, traceGui = C.tracer("sim"), C.tracer("gui")   -- trace.log (docs/TRACE.md)
+local DETAIL = {}   -- the itemised keys of the last full checksum round of this state (dumped when a resync starts)
 local CS_SLOW_MS, CS_SUMMARY = 50, 20
 local CS = { n = 0, sum = 0, max = 0, maxPart = "?", maxWhere = "", nLight = 0, sumLight = 0, maxLight = 0 }
 local function checksumNote(timing, total, where, light)
@@ -507,16 +514,26 @@ local function checksumParts(co, where, light)
 	local function clock() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end
 	local t0 = clock()
 	local timing = {}
-	local parts, t = L.checksumParts(engine, C.hashValue, timing, light)
+	local detail = (not light) and {} or nil
+	local parts, t = L.checksumParts(engine, C.hashValue, timing, light, detail)
 	local okD, digest = false, nil
 	local t1 = clock()
 	if Co then okD, digest = pcall(Co.digest, co) end
 	if okD and digest ~= nil then parts.companies = C.hashValue(digest) end
 	timing.companies = clock() - t1
 	local t2 = clock()
-	if not light then townBuildingsPart(parts) end
+	if not light then townBuildingsPart(parts, detail) end
 	timing.townBuildings = clock() - t2
 	checksumNote(timing, clock() - t0, where or "gui", light == true)
+	-- the part-level breakdown: every lane's hash, the item counts, and the itemised keys of the full round are kept for a dump when a resync starts
+	pcall(function()
+		local counts = {}
+		for k, v in pairs(detail or {}) do counts[#counts + 1] = k .. "=" .. #v end
+		table.sort(counts)
+		local tr = (where == "sim") and traceSim or traceGui
+		tr("checksum", string.format("t=%s light=%s lanes=%s items{%s} parts=%s", tostring(t), tostring(light == true), tostring(next(parts) ~= nil), table.concat(counts, " "), C.serialize(parts)))
+		if detail then DETAIL.last = { time = t, lanes = detail } end
+	end)
 	return parts, t
 end
 
@@ -752,9 +769,22 @@ local function describeBuild(it, args, role)
 	end)
 	if ok and text then
 		logSim(string.format("build %s (%s): %s", it.key, role, text))
+		traceSim("build.line", string.format("%s role=%s %s", it.key, role, text))
 		return info
 	end
 	return nil
+end
+
+-- Which components an entity of this world has (a fixed probe list), for the trace of what a build made: "id{CONSTRUCTION,NAME,...}"
+local PROBE_COMPS = { "CONSTRUCTION", "STATION_GROUP", "STATION", "EDGE_OBJECT", "BASE_EDGE", "BASE_EDGE_TRACK", "BASE_NODE", "TOWN_BUILDING",
+	"VEHICLE_DEPOT", "NAME", "PLAYER_OWNED", "MODEL_INSTANCE_LIST", "SUBCONSTRUCTION", "LINE", "TRANSPORT_VEHICLE" }
+local function entLine(e)
+	local have = {}
+	for _, name in ipairs(PROBE_COMPS) do
+		local okc, c = pcall(function() return api.engine.getComponent(e, api.type.ComponentType[name]) end)
+		if okc and c then have[#have + 1] = name end
+	end
+	return tostring(e) .. "{" .. table.concat(have, ",") .. "}"
 end
 
 -- How a CONSTRUCTION entity of this world looks in the log: file@x,y
@@ -1002,7 +1032,19 @@ local function simApplyAction(st, it, now)
 		st.late = (st.late or 0) + 1
 	end
 	local ctx = simCtx(st, it)
+	local tDecode = os.clock()
+	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
+		ctx.traceKey = it.key
+		pcall(function()
+			traceSim("build.record", string.format("%s role=%s from=%s stamp=%s now=%s late=%s balance=%s record=%s", it.key,
+				(it.heldId and it.from == C.PLAYER_ID) and "originator" or "replay", tostring(it.from), tostring(it.at), tostring(now),
+				tostring(it.lateSteps or 0), tostring(engine.account()), C.serialize(it.body)))
+		end)
+	end
 	local args, err = L.decodeCommand(it.body, ctx)
+	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
+		traceSim("build.decode", string.format("%s ok=%s ms=%.1f%s", it.key, tostring(args ~= nil), (os.clock() - tDecode) * 1000, args and "" or (" error=" .. tostring(err))))
+	end
 	if not args then
 		-- It names an entity another action created, which the watch has not found yet (the engine shows a new entity a step
 		-- after the command): wait for it, a few steps at most, instead of refusing. Every game waits alike.
@@ -1015,6 +1057,7 @@ local function simApplyAction(st, it, now)
 		end
 		err = L.refusalDetail(err, it.body)
 		logSim("action " .. it.key .. " refused: " .. tostring(err))
+		traceSim("build.refused", it.key .. " " .. tostring(err))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err }
 		return
 	end
@@ -1056,6 +1099,15 @@ local function simApplyAction(st, it, now)
 				if isBuild then
 					markReplay(st, now, SIM.state, it.key, a[4] == false)
 					if isBuild and not preInfo then preInfo = describeBuild(it, a, "replay") end
+					if isBuild then
+						pcall(function()
+							local c = a[2]
+							traceSim("build.send", string.format("%s ie=%s pi=%s dust=%s ctx{align=%s cleanup=%s buildings=%s fields=%s player=%s} chain=%s now=%s balance=%s",
+								it.key, tostring(a[3]), tostring(a[4]), tostring(a[5]), tostring(c and c.checkTerrainAlignment), tostring(c and c.cleanupStreetGraph),
+								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.player), tostring(a.chain and (#a.chain + 1) or 1),
+								tostring(engine.gameTime()), tostring(engine.account())))
+						end)
+					end
 				end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
@@ -1064,13 +1116,14 @@ local function simApplyAction(st, it, now)
 	end
 	if not ok then
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
+		traceSim("build.error", string.format("%s type=%s value=%s", it.key, type(e), tostring(e)))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e) }
 		return
 	end
 	coAfter(ctx, it, spec, category, balance0, logSim)
 	logSim("action " .. it.key .. " " .. it.body.fn .. (held and (" due at t=" .. now .. ": the native module holds this game's own copy (held " .. tostring(it.heldId) .. "), the interface half releases it") or (" applied at t=" .. now)))
 	if bindComps then
-		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0, pre = preInfo }
+		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0, pre = preInfo, money0 = balance0 }
 	end
 	if spec.creates then
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
@@ -1161,6 +1214,15 @@ local function simAdvanceBinders(st, now)
 		end
 		if complete then
 			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
+			pcall(function()
+				local ents = {}
+				for i = 1, math.min(#made, 16) do ents[#ents + 1] = entLine(made[i]) end
+				local keys = {}
+				for k, e in pairs(map) do keys[#keys + 1] = k .. "=" .. tostring(e) end
+				table.sort(keys)
+				traceSim("build.result", string.format("%s ok=true steps=%d made=%d [%s] keys[%s] money %s -> %s", b.key, b.steps, #made, table.concat(ents, " "),
+					table.concat(keys, " "), tostring(b.money0), tostring(engine.account())))
+			end)
 		elseif b.steps >= WATCH_STEPS then
 			-- what is missing and why: the counts the record promised against what this world shows now
 			local ok2, why = pcall(function()
@@ -1183,6 +1245,16 @@ local function simAdvanceBinders(st, now)
 				return string.format("expected %d construction(s) %s, found %d new CONSTRUCTION-like entit%s [%s]; removed buildings still present: %d of %d checked; the engine's verdict before applying: %s",
 					sum.cons or 0, "[" .. table.concat(sum.add or {}, " ") .. "]", #found, #found == 1 and "y" or "ies", table.concat(found, " "), still, total,
 					pre and pre.verdict or "n/a (see the build line)")
+			end)
+			pcall(function()
+				local ents = {}
+				for _, comp in ipairs(b.comps) do
+					for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
+						if #ents < 16 then ents[#ents + 1] = comp .. ":" .. entLine(e) end
+					end
+				end
+				traceSim("build.result", string.format("%s ok=false steps=%d new entities [%s] money %s -> %s record=%s", b.key, b.steps, table.concat(ents, " "),
+					tostring(b.money0), tostring(engine.account()), C.serialize(b.body)))
 			end)
 			logSim("action " .. b.key .. ": RESULT DIFFERS from the record after " .. b.steps .. " steps: " .. (ok2 and why or ("(" .. tostring(why) .. ")")) .. " [not every entity it created was found; a build the engine refuses creates nothing]")
 			simNote(st, now, "action " .. b.key .. " did not find every entity it created")
@@ -1378,6 +1450,19 @@ local function handleEvent(userParams, state, src, id, name, param)
 		local st = simState(state)
 		if name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
+		elseif name == "dumpdetail" and type(param) == "table" then
+			local d = DETAIL.last
+			if d then
+				local lines = { "# itemised keys of the last full checksum round of this game: time=" .. tostring(d.time) .. " why=" .. tostring(param.why) }
+				for lane, items in pairs(d.lanes) do
+					for _, k in ipairs(items) do lines[#lines + 1] = lane .. "\t" .. tostring(k) end
+				end
+				local fname = "detail_" .. tostring(d.time) .. "_" .. tostring(C.PLAYER_ID) .. ".txt"
+				C.writeFile(C.path(fname), table.concat(lines, "\n") .. "\n")
+				traceSim("detail", string.format("%s: %d lines written to %s (diff the two games' files to see which entities differ)", tostring(param.why), #lines - 1, fname))
+			else
+				traceSim("detail", "no full checksum round has run in this game yet")
+			end
 		elseif name == "nativebind" and type(param) == "table" then
 			local nb = SIM.nativeBinds and SIM.nativeBinds[param.n]
 			if nb and type(param.key) == "string" then
@@ -1988,6 +2073,7 @@ end
 
 -- One line each, at most 12 per 10 s (the rest are counted): a stuck state must not fill mod.log.
 local function natSay(text)
+	traceGui("native", text)
 	local N = G.nat
 	if N then
 		local now = os.clock()
@@ -2242,6 +2328,9 @@ local function natDecideUnsafe(h, cap)
 	G.seq = seq
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq) }
 	noteBuild(it.key, at)
+	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
+		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), #text,
+		cap.ms or 0, tostring(engine.account()), text))
 	if cancelFlow then
 		-- cancel flow: the first strict flow. The command is cancelled, every game (this one too) replays the record.
 		wire.held = nil
@@ -2484,6 +2573,9 @@ local function natEvent(N, rec, p, history)
 		N.holdSent, N.active, N.pongAt, N.pingsTried, N.gaveUp, N.retryAt, N.retries = false, false, nil, 0, false, nil, 0
 		if N.hookOk then
 			natSay("native module found (build " .. tostring(p.build) .. ", hooks " .. table.concat(hooks, ",") .. ")")
+			traceGui("version", string.format("player=%s name=%s role=%s native_build=%s native_version=%s hooks=%s record_version=%s strict_cancel=%s fire_done=%s", tostring(C.PLAYER_ID),
+				tostring(C.PLAYER_NAME), (C.PLAYER_ID == 0) and "host" or "guest", tostring(p.build), tostring(p.version), table.concat(hooks, ","), tostring(Build and Build.VERSION),
+				tostring(STRICT_CANCEL), tostring(FIRE_DONE)))
 		else
 			natSay("mode is off: the native module has no command_list_add hook (hooks: " .. table.concat(hooks, ",") .. ")")
 		end
@@ -2837,6 +2929,8 @@ H.resync_save = function(rec, p)
 	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_save"); return end
 	local function save()
 		logGui("resync: saving the game as '" .. p.name .. "'")
+		traceGui("resync", string.format("saving as %s id=%s now=%s balance=%s (the itemised keys of the last full checksum round of this game follow in detail_*.txt)", tostring(p.name), tostring(p.id), tostring(engine.gameTime()), tostring(engine.account())))
+		pcall(toSim, "dumpdetail", { why = "resync " .. tostring(p.name) })
 		engine.saveGame(p.name, function(ok, err)
 			logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
 			send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil })

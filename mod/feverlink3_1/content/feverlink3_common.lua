@@ -126,6 +126,35 @@ function C.logger(tag)
 	end
 end
 
+-- Trace log (FEVERLINK3_TRACE, DEFAULT ON in test builds, FEVERLINK3_TRACE=0 switches it off): everything a real run needs to be explained
+-- from the logs alone, in trace.log of the session folder (docs/TRACE.md). One line per event: "<HH:MM:SS> +<cpu s> <state> <tag> <text>".
+-- Built for per-build and per-round events, never per tick. The file rolls over to trace.2.log, trace.3.log ... every 8 MB (nothing is
+-- deleted); after TRACE_MAX_SEGMENTS segments it stops and says so once.
+C.TRACE = true
+pcall(function() C.TRACE = os.getenv("FEVERLINK3_TRACE") ~= "0" end)
+local TRACE_SEGMENT, TRACE_MAX_SEGMENTS = 8 * 1024 * 1024, 12
+local traceState = { seg = 1, bytes = 0, stopped = false }
+function C.tracer(state)
+	return function(tag, text)
+		if not C.TRACE or traceState.stopped or not (C.DIR and C.IO) then return end
+		pcall(function()
+			local line = string.format("%s +%.3f %s %s %s", os.date("%H:%M:%S"), os.clock(), state, tag, tostring(text))
+			if #line > 200000 then line = line:sub(1, 200000) .. " ...(cut)" end
+			if traceState.bytes > TRACE_SEGMENT then
+				traceState.seg, traceState.bytes = traceState.seg + 1, 0
+				if traceState.seg > TRACE_MAX_SEGMENTS then
+					traceState.stopped = true
+					C.appendFile(C.path("trace." .. TRACE_MAX_SEGMENTS .. ".log"), os.date("%H:%M:%S") .. " TRACE FULL: no more lines" .. NL)
+					return
+				end
+			end
+			local name = traceState.seg == 1 and "trace.log" or ("trace." .. traceState.seg .. ".log")
+			C.appendFile(C.path(name), line .. NL)
+			traceState.bytes = traceState.bytes + #line + 1
+		end)
+	end
+end
+
 -- ------------------------------------------------------------------ deterministic serialisation
 
 -- Writes a value as one line of Lua literal syntax with a fixed order: keys sorted (numbers, then strings, then
