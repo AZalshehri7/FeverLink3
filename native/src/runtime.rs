@@ -551,6 +551,7 @@ mod tests {
             town_pick_call: None,
             game_time_getter: None,
             script_pool: None,
+            lua_makeseed: None,
             command_move: None,
             command_destroy: None,
             handle_destroy: None,

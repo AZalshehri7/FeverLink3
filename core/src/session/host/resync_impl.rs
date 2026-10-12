@@ -407,7 +407,7 @@ impl HostSession {
     /// With a reloading host the host's game loads its own save now, while the players download it: the host is paused
     /// and its file is already complete, so the reload costs no extra time after the transfer.
     fn load_host_early(&mut self) {
-        if !self.options.host_reloads {
+        if !self.options.host_reloads || !self.options.host_loads_early {
             return;
         }
         let Some(r) = self.resync.as_ref() else { return };
@@ -481,7 +481,7 @@ impl HostSession {
         if skewed {
             self.rounds_skewed += 1;
         }
-        if self.rounds_done % SKEW_LOG_EVERY == 0 {
+        if self.rounds_done.is_multiple_of(SKEW_LOG_EVERY) {
             let (done, skewed) = (self.rounds_done, self.rounds_skewed);
             self.log(format!(
                 "checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"

@@ -36,6 +36,10 @@ SOFTWARE.
 
 https://github.com/dkdknight/MPFever
 
+Also from MPFever: the idea of pinning Lua's string-hash seed (`makeseed`, called by `lua_newstate`) to a constant so
+that `pairs` order over string keys is the same in every process, and the location of that function in build 40420.
+The code is our own; the site was located with their findings.
+
 ```
 MIT License
 

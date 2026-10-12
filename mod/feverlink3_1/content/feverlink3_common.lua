@@ -381,4 +381,34 @@ function C.speedLines(speed)
 	return out
 end
 
+-- ------------------------------------------------------------------ string-hash seed probe (observation only)
+
+-- Builds a table of 30 fixed string keys and folds the order `pairs` visits them in into one number. Lua hashes
+-- short strings with a per-state seed, so the order, and with it this number, differs between processes unless the
+-- native module pins the seed (FEVERLINK3_LUA_SEED=fixed). Nothing here changes the game; it only reads.
+function C.luaSeedProbe()
+	local keys = {}
+	for i = 1, 30 do keys[i] = "lane_" .. string.format("%02d", i) .. "_probe" end
+	local t = {}
+	for i = 1, #keys do t[keys[i]] = i end
+	local h, n = 0, 0
+	for _, i in pairs(t) do
+		n = n + 1
+		h = (h * 131 + i * 7 + n) % 4294967291
+	end
+	return h
+end
+
+-- Writes `luaseed probe order=<number>` with `log` once per Lua state, only when FEVERLINK3_LUA_SEED_LOG=1. Never
+-- raises. Returns true when it wrote the line.
+function C.luaSeedProbeOnce(log)
+	local on = false
+	pcall(function() on = os.getenv("FEVERLINK3_LUA_SEED_LOG") == "1" end)
+	if not on or C.seedProbed then return false end
+	C.seedProbed = true
+	local ok, h = pcall(C.luaSeedProbe)
+	pcall(log, "luaseed probe order=" .. (ok and string.format("%.0f", h) or "error"))
+	return true
+end
+
 return C

@@ -189,7 +189,8 @@ fn arm_growth(base: usize, log: fn(&str), settings: &Settings, getter: usize, di
     GROWTH_DEEP.store(settings.deep, Ordering::Release);
     DEEP_CMD_N.store(0, Ordering::Release);
     DEEP_ORPHANS.store(0, Ordering::Release);
-    *DEEP_TICK.lock().unwrap_or_else(|p| p.into_inner()) = DeepTick { valid: false, t: None, c: 0, per_town: Vec::new() };
+    *DEEP_TICK.lock().unwrap_or_else(|p| p.into_inner()) =
+        DeepTick { valid: false, t: None, c: 0, per_town: Vec::new() };
     GROWTH_SWITCHED.store(false, Ordering::Release);
     GROWTH_DERIVE.store(settings.mode == Mode::Derive, Ordering::Release);
     GROWTH_AFTER_WALL_S.store(settings.after_wall_s, Ordering::Release);
@@ -836,7 +837,13 @@ unsafe extern "system-unwind" fn growth_hook(rcx: u64, rdx: u64, r8: u64, r9: u6
 fn is_diagnostic(name: &str) -> bool {
     matches!(
         name,
-        "town_seed" | "town_develop" | "town_update_size" | "town_candidates" | "town_edges" | "town_sort" | "town_pick"
+        "town_seed"
+            | "town_develop"
+            | "town_update_size"
+            | "town_candidates"
+            | "town_edges"
+            | "town_sort"
+            | "town_pick"
     )
 }
 
@@ -874,6 +881,8 @@ pub struct Installed {
     patch: Option<AppliedPatch>,
     /// Redirected `call` instructions (the deep growth log): the displacement was rewritten to lead to a thunk.
     call_patches: Vec<(&'static str, AppliedPatch)>,
+    /// The pinned Lua string-hash seed.
+    seed_patch: Option<AppliedPatch>,
 }
 
 impl Installed {
@@ -885,8 +894,12 @@ impl Installed {
         self.patch.as_ref().is_some_and(AppliedPatch::is_applied)
     }
 
+    pub fn lua_seed(&self) -> bool {
+        self.seed_patch.as_ref().is_some_and(AppliedPatch::is_applied)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.detours.is_empty() && self.patch.is_none() && self.call_patches.is_empty()
+        self.detours.is_empty() && self.patch.is_none() && self.call_patches.is_empty() && self.seed_patch.is_none()
     }
 
     /// Takes everything out again, newest first: the jumps, then the patch.
@@ -908,6 +921,12 @@ impl Installed {
             match unsafe { d.uninstall() } {
                 Ok(()) => lines.push(format!("hooks: {name}: jump removed, original bytes restored")),
                 Err(e) => lines.push(format!("hooks: {name}: jump NOT removed: {e}")),
+            }
+        }
+        if let Some(mut p) = self.seed_patch.take() {
+            match unsafe { p.restore() } {
+                Ok(()) => lines.push("hooks: lua_makeseed: original bytes restored".to_string()),
+                Err(e) => lines.push(format!("hooks: lua_makeseed: original bytes NOT restored: {e}")),
             }
         }
         if let Some(mut p) = self.patch.take() {
@@ -944,9 +963,18 @@ pub unsafe fn execute(
 
     // 1. the pool patch, independent of the detours
     for step in &plan.steps {
-        if let Step::Patch { name, rva, expected, replacement, .. } = step {
+        if let Step::Patch { feature, name, rva, expected, replacement } = step {
             let at = (base + *rva as usize) as *mut u8;
             match unsafe { AppliedPatch::apply(at, expected, replacement) } {
+                Ok(p) if *feature == Feature::LuaSeed => {
+                    lines.push(format!(
+                        "lua seed pinned to {:#010x} (lua_makeseed: {} bytes at rva {rva:#x}, page protection {})",
+                        crate::build_table::LUA_SEED,
+                        expected.len(),
+                        if p.protection_restored() { "restored" } else { "NOT restored" }
+                    ));
+                    inst.seed_patch = Some(p);
+                }
                 Ok(p) => {
                     lines.push(format!(
                         "hooks: {name}: applied, {} bytes at rva {rva:#x}, page protection {}",
@@ -954,6 +982,9 @@ pub unsafe fn execute(
                         if p.protection_restored() { "restored" } else { "NOT restored" }
                     ));
                     inst.patch = Some(p);
+                }
+                Err(e) if *feature == Feature::LuaSeed => {
+                    lines.push(format!("lua seed NOT pinned, the game keeps its own seed: {e}"))
                 }
                 Err(e) => lines.push(format!("hooks: {name}: NOT applied: {e}")),
             }
@@ -1125,6 +1156,9 @@ pub fn attach_from_env(build: &'static BuildAddrs, link: Option<Link>, log: fn(&
         log(&format!("hooks: {complaint}"));
     }
     let cfg = HookConfig::from_lookup(get);
+    if !cfg.luaseed && std::env::var(plan::LUA_SEED_LOG_VAR).is_ok_and(|v| v.trim() == "1") {
+        log("lua seed: not pinned, the game keeps its own per-process seed (the mod's probe records its effect)");
+    }
     attach(build, cfg, link, log);
 }
 
@@ -1370,6 +1404,9 @@ mod tests {
     /// argument from the stack as the real one does: `mov eax,[rsp+48h] ; add eax,[rsp+28h] ; add eax,ecx ; nop4 ; ret`.
     const SEED_FN: [u8; 15] =
         [0x8B, 0x44, 0x24, 0x48, 0x03, 0x44, 0x24, 0x28, 0x01, 0xC8, 0x90, 0x90, 0x90, 0x90, 0xC3];
+    const LUASEED_RVA: u32 = 0x380;
+    const SEED_BEFORE: &[u8] = &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 1, 2, 3, 4, 0x48];
+    static SEED_AFTER: [u8; 14] = crate::build_table::lua_seed_patch(crate::build_table::LUA_SEED);
     const POOL_BEFORE: &[u8] = &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00];
     const POOL_AFTER: &[u8] = &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00];
 
@@ -1382,6 +1419,8 @@ mod tests {
         }));
         let pool: &'static PatchSite =
             Box::leak(Box::new(PatchSite { rva: POOL_RVA, expected: POOL_BEFORE, replacement: POOL_AFTER }));
+        let seed: &'static PatchSite =
+            Box::leak(Box::new(PatchSite { rva: LUASEED_RVA, expected: SEED_BEFORE, replacement: &SEED_AFTER }));
         Box::leak(Box::new(BuildAddrs {
             timestamp: 9,
             name: "fake",
@@ -1393,12 +1432,19 @@ mod tests {
                 rva: CMD_RVA,
                 prologue: Box::leak(handler_fn().to_vec().into_boxed_slice()),
             }),
-            town_candidates: Some(HookSite { rva: CANDS_RVA, prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()) }),
-            town_edges: Some(HookSite { rva: EDGES_RVA, prologue: Box::leak(stub(edges_probe as *const () as usize)[..14].to_vec().into_boxed_slice()) }),
+            town_candidates: Some(HookSite {
+                rva: CANDS_RVA,
+                prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()),
+            }),
+            town_edges: Some(HookSite {
+                rva: EDGES_RVA,
+                prologue: Box::leak(stub(edges_probe as *const () as usize)[..14].to_vec().into_boxed_slice()),
+            }),
             town_sort_call: Some(call_site(SORT_CALL_RVA, SORT_CALLEE_RVA, sort_callee_probe as *const () as usize)),
             town_pick_call: Some(call_site(PICK_CALL_RVA, PICK_CALLEE_RVA, pick_callee_probe as *const () as usize)),
             game_time_getter: Some(CallSite { rva: GETTER_RVA, prologue: &GETTER_FN }),
             script_pool: Some(pool.clone()),
+            lua_makeseed: Some(seed.clone()),
             command_move: Some(helper.clone()),
             command_destroy: Some(helper.clone()),
             handle_destroy: Some(helper.clone()),
@@ -1432,6 +1478,7 @@ mod tests {
         g.fill(PICK_CALLEE_RVA as usize, &stub(pick_callee_probe as *const () as usize));
         g.fill(EDGES_RVA as usize, &stub(edges_probe as *const () as usize));
         g.fill(GETTER_RVA as usize, &GETTER_FN);
+        g.fill(LUASEED_RVA as usize, SEED_BEFORE);
         g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
         g
     }
@@ -1702,6 +1749,47 @@ mod tests {
     }
 
     #[test]
+    fn the_seed_pin_writes_mov_eax_ret_and_comes_out_again() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { luaseed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.report());
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(inst.lua_seed() && !inst.poolpatch() && inst.hook_names().is_empty(), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("lua seed pinned to 0x464c3353")), "{lines:?}");
+        assert_eq!(game.bytes(LUASEED_RVA as usize, 14), SEED_AFTER);
+        // the patched function really returns the constant
+        let f: extern "system" fn() -> u32 = unsafe { core::mem::transmute(game.at(LUASEED_RVA as usize)) };
+        assert_eq!(f(), 0x464C_3353);
+        assert!(unsafe { inst.uninstall_all() }.iter().any(|l| l.contains("lua_makeseed: original bytes restored")));
+        assert_eq!(game.bytes(LUASEED_RVA as usize, 14), SEED_BEFORE);
+    }
+
+    #[test]
+    fn a_seed_site_that_does_not_match_is_left_alone_and_logged() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { luaseed: true, ..Default::default() };
+        // the planner already refuses other bytes
+        game.fill(LUASEED_RVA as usize + 3, &[0xFF]);
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert!(plan.steps.is_empty() && plan.skipped[0].name == "lua_makeseed", "{:?}", plan.report());
+        // and the executor refuses them again if the memory changed after planning
+        game.fill(LUASEED_RVA as usize, SEED_BEFORE);
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        game.fill(LUASEED_RVA as usize + 3, &[0xFF]);
+        let (inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(!inst.lua_seed() && inst.is_empty());
+        assert!(lines.iter().any(|l| l.starts_with("lua seed NOT pinned")), "{lines:?}");
+        assert_eq!(game.bytes(LUASEED_RVA as usize + 3, 1), [0xFF], "nothing written");
+    }
+
+    #[test]
     fn a_pool_region_that_is_not_the_expected_one_is_not_patched() {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let (build, game) = (fake_build(), fake_game());
@@ -1901,7 +1989,7 @@ mod tests {
         assert_in_order(
             &logged,
             &[
-                "hooks: switches hooks=on hold=off poolpatch=on",
+                "hooks: switches hooks=on hold=off poolpatch=on luaseed=off",
                 "hooks: self-test: detour, trampoline and stack argument work in this binary",
                 "hooks: self-test: the hook identifies the call site of a detoured function",
                 "hooks: apply_command: 16 bytes at rva 0x100 match the build table",
@@ -2127,7 +2215,17 @@ mod tests {
     type EdgeFn = extern "system" fn(u64, f32, u64, u64, u64, u64) -> u64;
 
     /// Fake `0x9677c0`: fills the out vector `[begin, end, cap]` with `CAND_DATA`, returns `out ^ 0x5a`.
-    extern "system" fn cands_probe(out: u64, c: u64, radius: f32, r9: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) -> u64 {
+    extern "system" fn cands_probe(
+        out: u64,
+        c: u64,
+        radius: f32,
+        r9: u64,
+        a5: u64,
+        a6: u64,
+        a7: u64,
+        a8: u64,
+        a9: u64,
+    ) -> u64 {
         CAND_SEEN.lock().unwrap_or_else(|p| p.into_inner()).push((out, c, radius.to_bits(), r9, [a5, a6, a7, a8, a9]));
         if out >= 0x1_0000 {
             let (b, n) = (CAND_DATA.load(SeqCst) as u64, CAND_LEN.load(SeqCst) as u64);
@@ -2157,7 +2255,8 @@ mod tests {
             // as inside the gather: the sort of the records, then (further on) the draw of an edge
             let sort: extern "system" fn(u64, u64, u64, u64) -> u64 =
                 unsafe { core::mem::transmute(SORT_CALLER.load(SeqCst)) };
-            let (b, e, c) = (SORT_BEGIN.load(SeqCst) as u64, SORT_END.load(SeqCst) as u64, SORT_CTX.load(SeqCst) as u64);
+            let (b, e, c) =
+                (SORT_BEGIN.load(SeqCst) as u64, SORT_END.load(SeqCst) as u64, SORT_CTX.load(SeqCst) as u64);
             sort(b, e, 3, c);
             let pick: extern "system" fn(u64, u64, u64) -> u64 =
                 unsafe { core::mem::transmute(PICK_CALLER.load(SeqCst)) };
@@ -2199,7 +2298,8 @@ mod tests {
         let stub_bytes = stub(develop_probe as *const () as usize);
         game.fill(DEVELOP_RVA as usize, &stub_bytes);
         let mut build = fake_build().clone();
-        build.town_develop = Some(HookSite { rva: DEVELOP_RVA, prologue: Box::leak(stub_bytes.to_vec().into_boxed_slice()) });
+        build.town_develop =
+            Some(HookSite { rva: DEVELOP_RVA, prologue: Box::leak(stub_bytes.to_vec().into_boxed_slice()) });
         (game, Box::leak(Box::new(build)))
     }
 
@@ -2268,7 +2368,11 @@ mod tests {
         assert_eq!(seen_c.len(), 1);
         assert_eq!(seen_c, plain_cands, "every slot as without the hook");
         assert_eq!(seen_e, plain_edges);
-        assert_eq!((seen_c[0].2, seen_c[0].3, seen_c[0].4), (2.5f32.to_bits(), 9, [10, 11, 12, 13, 14]), "the float too");
+        assert_eq!(
+            (seen_c[0].2, seen_c[0].3, seen_c[0].4),
+            (2.5f32.to_bits(), 9, [10, 11, 12, 13, 14]),
+            "the float too"
+        );
         assert_eq!(seen_e, vec![(0xbeef, 1.5f32.to_bits(), 3, 4, 5, PROBE_STATE.as_ptr() as u64)]);
         // a second command of the same town in the same tick, then another town
         set_candidates(&[b.clone(), a.clone()]);
@@ -2280,7 +2384,13 @@ mod tests {
         let l = deep_lines(&dir);
         assert!(l[0].starts_with(&format!("gdeep-payload pid={pid} t=500 town=7 k=0 c=0 b1=0x3f800000 b2=0x40200000 b3=0xc0400000 f1=1 f2=2.5 f3=-3 flag=0")), "{}", l[0]);
         let d1 = growth::digest_records(&[a.clone(), b.clone()].concat());
-        assert_eq!(l[1], format!("gdeep-cand pid={pid} t=500 town=7 k=0 j=0 n=2 ho={:#018x} hs={:#018x} hio={:#018x} his={:#018x}", d1.ordered, d1.sum, d1.id_ordered, d1.id_sum));
+        assert_eq!(
+            l[1],
+            format!(
+                "gdeep-cand pid={pid} t=500 town=7 k=0 j=0 n=2 ho={:#018x} hs={:#018x} hio={:#018x} his={:#018x}",
+                d1.ordered, d1.sum, d1.id_ordered, d1.id_sum
+            )
+        );
         assert_eq!(l[2], format!("gdeep-edge pid={pid} t=500 town=7 k=0 j=0 before=0x00000064 after=0x0000012d"));
         assert_eq!(l[3], format!("gdeep-dev pid={pid} t=500 town=7 k=0 d=1 seed=0x00000064 end=0x0000083c"));
         // the second command: k=1, the same records in the other order: same sum, other ordered hash
@@ -2290,14 +2400,22 @@ mod tests {
         assert_ne!(d1.ordered, d2.ordered);
         assert_eq!(field(&l[5], "hs"), format!("{:#018x}", d2.sum));
         assert_eq!(field(&l[5], "ho"), format!("{:#018x}", d2.ordered));
-        assert!(l[8].starts_with(&format!("gdeep-payload pid={pid} t=500 town=8 k=0 c=2 ")) && l[8].ends_with("flag=1"), "{}", l[8]);
+        assert!(
+            l[8].starts_with(&format!("gdeep-payload pid={pid} t=500 town=8 k=0 c=2 ")) && l[8].ends_with("flag=1"),
+            "{}",
+            l[8]
+        );
         // a new tick starts the counters again
         assert!(l[12].starts_with(&format!("gdeep-payload pid={pid} t=501 town=7 k=0 c=0 ")), "{}", l[12]);
         assert_eq!(l.len(), 16);
 
         let undone = unsafe { inst.uninstall_all() };
         assert_eq!(undone.len(), 6, "{undone:?}");
-        assert_eq!(game.bytes(CANDS_RVA as usize, 15), stub(cands_probe as *const () as usize), "byte for byte as shipped");
+        assert_eq!(
+            game.bytes(CANDS_RVA as usize, 15),
+            stub(cands_probe as *const () as usize),
+            "byte for byte as shipped"
+        );
         assert_eq!(game.bytes(EDGES_RVA as usize, 15), stub(edges_probe as *const () as usize));
         assert_eq!(call_handler(&game, &sim, 500, p7, 100), plain);
         assert_eq!(deep_lines(&dir).len(), 16, "nothing is logged after the hooks are out");
@@ -2374,7 +2492,11 @@ mod tests {
             plan.report()
         );
         assert!(lines.iter().any(|l| l.contains("town_sort: call at rva 0xc04 redirected")), "{lines:?}");
-        assert_ne!(game.bytes(SORT_CALL_RVA as usize, 5), plan_expected(build, true), "the call now leads to the thunk");
+        assert_ne!(
+            game.bytes(SORT_CALL_RVA as usize, 5),
+            plan_expected(build, true),
+            "the call now leads to the thunk"
+        );
 
         assert_eq!(command(&game, &sim, 500, p7, 100), plain, "the result is the same");
         assert_eq!(PICK_RESULT.load(SeqCst), plain_pick, "the draw is the same");
@@ -2531,8 +2653,16 @@ mod tests {
         assert!(deep_payload(0xdead_0000, Some(1)).is_none());
         assert!(deep_payload(0, None).is_none());
         let l = deep_lines(&dir);
-        assert!(l[0].starts_with(&format!("gdeep-cand pid={} t=- town=0 k=0 j=0 n=1 ", std::process::id())), "{}", l[0]);
-        assert!(l[1].starts_with("gdeep-edge ") && l[1].contains(" j=1 before=0x00000009 after=0x0000001c"), "{}", l[1]);
+        assert!(
+            l[0].starts_with(&format!("gdeep-cand pid={} t=- town=0 k=0 j=0 n=1 ", std::process::id())),
+            "{}",
+            l[0]
+        );
+        assert!(
+            l[1].starts_with("gdeep-edge ") && l[1].contains(" j=1 before=0x00000009 after=0x0000001c"),
+            "{}",
+            l[1]
+        );
         assert!(l.iter().any(|x| x.ends_with("capped=1")), "{l:?}");
         unsafe { inst.uninstall_all() };
         let _ = std::fs::remove_dir_all(&dir);
@@ -2560,14 +2690,16 @@ mod tests {
         assert_eq!(count("gdeep-payload", " town=5 "), 2300);
         assert_eq!(count("gdeep-dev", " town=5 "), 2300);
         let sampled = count("gdeep-payload", " town=6 ");
-        assert!((1000..1200).contains(&sampled), "the first 2000 commands (both towns) all, then a fraction: {sampled}");
+        assert!(
+            (1000..1200).contains(&sampled),
+            "the first 2000 commands (both towns) all, then a fraction: {sampled}"
+        );
         // the lines of one command belong together: as many gathers and edges as payloads
         assert_eq!(count("gdeep-cand", " town=6 "), sampled);
         assert_eq!(count("gdeep-edge", " town=6 "), sampled);
         unsafe { inst.uninstall_all() };
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     #[test]
     fn the_growth_log_reports_the_call_and_changes_nothing() {

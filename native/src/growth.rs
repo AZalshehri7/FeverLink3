@@ -506,7 +506,15 @@ pub fn sort_line(key: &DeepKey, j: u32, d: &Digest, ties: Option<u64>, capped: b
 
 /// The country-edge pick (`0x95d627`): the candidate ids in the order the function holds them (`ho` ordered hash, `hs`
 /// sum), the rng state before and after the draw and the index drawn (`idx`).
-pub fn pick_line(key: &DeepKey, j: u32, d: &Digest, before: Option<u32>, after: Option<u32>, idx: u32, capped: bool) -> String {
+pub fn pick_line(
+    key: &DeepKey,
+    j: u32,
+    d: &Digest,
+    before: Option<u32>,
+    after: Option<u32>,
+    idx: u32,
+    capped: bool,
+) -> String {
     let f = |v: Option<u32>| v.map_or("-".to_string(), |v| format!("{v:#010x}"));
     format!(
         "{} j={j} n={} ho={:#018x} hs={:#018x} before={} after={} idx={idx}{}",
@@ -752,7 +760,8 @@ mod tests {
         let off = record_geometry(&rec(1, [1; 20], 0, [2; 24], 0));
         assert_eq!(off, record_geometry(&rec(1, [1; 20], 0, [9; 24], 0)), "floats ignored when the flag is clear");
         assert_ne!(off, base);
-        let (d1, d2) = (digest_records(&rec(1, [1; 20], 1, [2; 24], 0)), digest_records(&rec(2, [1; 20], 1, [2; 24], 0)));
+        let (d1, d2) =
+            (digest_records(&rec(1, [1; 20], 1, [2; 24], 0)), digest_records(&rec(2, [1; 20], 1, [2; 24], 0)));
         assert_ne!(d1.id_sum, d2.id_sum);
         assert_eq!(d1.sum, d2.sum);
     }

@@ -204,9 +204,9 @@ pub unsafe fn alloc_exec_near(near: usize, bytes: &[u8]) -> Result<*mut u8, MemE
                 continue;
             }
             // SAFETY: an explicit-address reservation either fails or yields a fresh private allocation.
-            let mem = unsafe {
-                VirtualAlloc(cand as *const c_void, bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-            } as *mut u8;
+            let mem =
+                unsafe { VirtualAlloc(cand as *const c_void, bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
+                    as *mut u8;
             if !mem.is_null() {
                 return unsafe { seal_exec(mem, bytes) };
             }

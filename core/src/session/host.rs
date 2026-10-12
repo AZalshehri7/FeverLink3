@@ -44,6 +44,9 @@ pub struct HostOptions {
     /// running its live world, only the other games load, and the paused checksum after the round says whether the
     /// two still match (a difference fails the round and leaves the session paused, as it always does).
     pub host_reloads: bool,
+    /// With a reloading host: send the host's game its load while the players still download (default true) instead of
+    /// together with them after the transfer. A lab experiment switch (FEVERLINK3_HOST_LOAD_EARLY=0).
+    pub host_loads_early: bool,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -78,6 +81,7 @@ impl Default for HostOptions {
             checksum_seconds: 10.0,
             auto_resync: true,
             host_reloads: true,
+            host_loads_early: true,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,

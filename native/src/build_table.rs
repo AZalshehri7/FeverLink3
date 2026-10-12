@@ -33,6 +33,25 @@ pub struct CallSite {
     pub prologue: &'static [u8],
 }
 
+/// The seed the pinned `makeseed` returns: the ASCII of "FL3S" as a big-endian number, `0x464C3353`. Arbitrary but
+/// fixed, so it is the same on every machine.
+pub const LUA_SEED: u32 = u32::from_be_bytes(*b"FL3S");
+
+/// `mov eax, seed ; ret`, then `int3` up to `N` bytes: the body that replaces `makeseed`.
+pub const fn lua_seed_patch<const N: usize>(seed: u32) -> [u8; N] {
+    let mut out = [0xCC; N];
+    let s = seed.to_le_bytes();
+    out[0] = 0xB8;
+    out[1] = s[0];
+    out[2] = s[1];
+    out[3] = s[2];
+    out[4] = s[3];
+    out[5] = 0xC3;
+    out
+}
+
+static LUA_SEED_PATCH_40420: [u8; 26] = lua_seed_patch(LUA_SEED);
+
 /// Shortest prologue a [`CallSite`] may record.
 pub const CALL_PROLOGUE_MIN: usize = 8;
 
@@ -92,6 +111,11 @@ pub struct BuildAddrs {
     /// `GameTime` getter: `fn(system*) -> u32` (the dword at `+0x40` of the `GameTime` component). Called, never
     /// hooked; the prologue is compared first.
     pub game_time_getter: Option<CallSite>,
+    /// Lua 5.2's `makeseed`, the seed of the string hash, called once by `lua_newstate`. The replacement is
+    /// `mov eax, LUA_SEED ; ret` padded with `int3` (see [`lua_seed_patch`]), so every process hashes strings the
+    /// same way and `pairs` order over string keys no longer differs between processes. `expected` is the
+    /// function's 26-byte prologue. Site located with findings from MPFever (MIT, dkdknight).
+    pub lua_makeseed: Option<PatchSite>,
     /// `Command::Command(Command&&)`: the hold path moves a command out of the caller's hands with it.
     pub command_move: Option<CallSite>,
     /// `Command::~Command()`: runs on a released command (moved-from) and on a cancelled one.
@@ -218,6 +242,17 @@ pub const BUILDS: &[BuildAddrs] = &[
                 0x31, 0xC0, 0x0F, 0x1F, 0x00,
             ],
         }),
+        // makeseed (lua 5.2.2, RVA 0x2fc8fe0): `push rbx ; sub rsp,50h ; mov rax,[rip+..] ; xor rax,rsp ;
+        // mov [rsp+48h],rax ; mov rbx,rcx ; xor ecx,ecx`
+        // site located with findings from MPFever (MIT, dkdknight)
+        lua_makeseed: Some(PatchSite {
+            rva: 0x02fc_8fe0,
+            expected: &[
+                0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 0x4B, 0x4A, 0xD2, 0x00, 0x48, 0x33, 0xC4, 0x48,
+                0x89, 0x44, 0x24, 0x48, 0x48, 0x8B, 0xD9, 0x33, 0xC9,
+            ],
+            replacement: &LUA_SEED_PATCH_40420,
+        }),
         // Command::Command(Command&&): `mov rax,[rdx] ; xor r10d,r10d ; mov [rdx],r10 ; mov [rcx],rax ; mov rax,[rdx+8]`
         command_move: Some(CallSite {
             rva: 0x009d_0430,
@@ -285,6 +320,7 @@ mod tests {
         town_pick_call: None,
         game_time_getter: None,
         script_pool: None,
+        lua_makeseed: None,
         command_move: None,
         command_destroy: None,
         handle_destroy: None,
@@ -309,9 +345,17 @@ mod tests {
     #[test]
     fn every_recorded_prologue_is_long_enough_for_a_detour() {
         for b in BUILDS.iter().chain(FAKE) {
-            for site in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size, &b.town_candidates, &b.town_edges]
-                .into_iter()
-                .flatten()
+            for site in [
+                &b.command_list_add,
+                &b.apply_command,
+                &b.town_seed,
+                &b.town_develop,
+                &b.town_update_size,
+                &b.town_candidates,
+                &b.town_edges,
+            ]
+            .into_iter()
+            .flatten()
             {
                 assert!(site.prologue.len() >= crate::detour::JMP_ABS_LEN, "{} has a short prologue", b.name);
             }
@@ -321,11 +365,24 @@ mod tests {
     #[test]
     fn patch_sites_replace_exactly_as_many_bytes_as_they_expect() {
         for b in BUILDS.iter().chain(FAKE) {
-            if let Some(p) = &b.script_pool {
+            for p in [&b.script_pool, &b.lua_makeseed].into_iter().flatten() {
                 assert_eq!(p.expected.len(), p.replacement.len(), "{}: patch length mismatch", b.name);
                 assert_ne!(p.expected, p.replacement, "{}: patch changes nothing", b.name);
             }
         }
+    }
+
+    #[test]
+    fn the_seed_patch_is_mov_eax_ret_padded_with_int3() {
+        let p = select(0x6ac5_0427).unwrap().lua_makeseed.as_ref().unwrap();
+        assert_eq!(p.rva, 0x02fc_8fe0);
+        assert_eq!(p.expected.len(), 26);
+        assert_eq!(&p.expected[..6], &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x50], "push rbx ; sub rsp,50h");
+        assert_eq!(LUA_SEED, 0x464C_3353);
+        assert_eq!(&p.replacement[..6], &[0xB8, 0x53, 0x33, 0x4C, 0x46, 0xC3]);
+        assert!(p.replacement[6..].iter().all(|&b| b == 0xCC));
+        assert_eq!(p.replacement.len(), p.expected.len());
+        assert_eq!(lua_seed_patch::<8>(1), [0xB8, 1, 0, 0, 0, 0xC3, 0xCC, 0xCC]);
     }
 
     #[test]

@@ -726,6 +726,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 town_seed: r.gen(),
                 force_seed: None,
                 growth: Default::default(),
+                luaseed: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
