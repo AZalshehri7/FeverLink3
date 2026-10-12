@@ -856,7 +856,18 @@ end
 -- without its model: the engine names the model only when the build has run, so the capture is repeated from
 -- onPostBuildProposal, where the object exists (the way MPFever reads the stops it ships, MIT). The replay marks were
 -- spent by the first look, and the result list of the event is given to the capture.
-local function simCaptureBuild(state, param, post)
+-- Keys for what the originator's OWN native build made (a stop, a station, a depot read after the build ran): the build was applied by the
+-- engine at the click and shipped by the capture, so the stamp-time binder of a replay never exists here. The entity lists are taken
+-- BEFORE the build (the pre-build event), the interface half says under which key the record was shipped ("nativebind"), and a binder
+-- like a replay's then keys the new stops and their station groups on this game too: a line or a vehicle bought here can then name
+-- them for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here", "unresolved line reference 1:3").
+local NATIVE_BIND_COMPS = { "CONSTRUCTION", "EDGE_OBJECT", "STATION_GROUP" }
+local function snapshotComps(comps)
+	local before = {}
+	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end
+	return before
+end
+local function simCaptureBuild(state, param, post, deferredBefore)
 	local st = simState(state)
 	local now = engine.gameTime()
 	-- A build the engine or a game script made on its own (a town growing a road: playerInitiated false) is nobody's tool build:
@@ -892,7 +903,7 @@ local function simCaptureBuild(state, param, post)
 	})
 	if not ok then body, why = nil, tostring(body) end
 	if not body and not post and tostring(why):find("has no model", 1, true) then
-		SIM.deferredBuild = { at = now }
+		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)) }
 		logSim("a native build at t=" .. now .. " has an edge object that the engine has not made yet: read again after the build")
 		state:set(st)
 		return
@@ -929,6 +940,17 @@ local function simCaptureBuild(state, param, post)
 	st.outSeq = (st.outSeq or 0) + 1
 	st.out[#st.out + 1] = { n = st.outSeq, at = now, body = text }
 	trim(st.out, OUT_KEEP)
+	pcall(function()
+		local spec = L.COMMANDS.makeWorldBuildProposalCmd
+		local comps = spec and L.bindsComp(spec, body)
+		if not comps then return end
+		local before = deferredBefore
+		if not before and not post then before = snapshotComps(comps) end
+		if type(before) ~= "table" then return end
+		SIM.nativeBinds = SIM.nativeBinds or {}
+		SIM.nativeBinds[st.outSeq] = { body = body, comps = comps, before = before }
+		SIM.nativeBinds[st.outSeq - 8] = nil
+	end)
 	state:set(st)
 	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, " .. string.format("%.3f", os.clock() - t0) .. " s)")
 	-- self-check: could this record be rebuilt here, the way another game will rebuild it? Only the engine's command
@@ -1318,7 +1340,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		if d and d.at == engine.gameTime() then
 			C.poll()
 			if not C.ACTIVE then return end
-			local ok, err = pcall(simCaptureBuild, state, param, true)
+			local ok, err = pcall(simCaptureBuild, state, param, true, d.before)
 			if not ok then logSim("onPostBuildProposal capture failed: " .. tostring(err)) end
 		end
 		return
@@ -1330,6 +1352,13 @@ local function handleEvent(userParams, state, src, id, name, param)
 		local st = simState(state)
 		if name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
+		elseif name == "nativebind" and type(param) == "table" then
+			local nb = SIM.nativeBinds and SIM.nativeBinds[param.n]
+			if nb and type(param.key) == "string" then
+				SIM.nativeBinds[param.n] = nil
+				st.binders[#st.binders + 1] = { key = param.key, fn = "makeWorldBuildProposalCmd", body = nb.body, comps = nb.comps, before = nb.before, steps = 0 }
+				logSim("action " .. param.key .. ": this game's own native build is keyed here like a replay (" .. table.concat(nb.comps, "/") .. ")")
+			end
 		elseif name == "replay" then
 			markReplay(st, engine.gameTime())
 		elseif name == "heldout" and type(param) == "table" then
@@ -1821,6 +1850,7 @@ local function shipNative(o)
 	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
 	recordOriginator(body, G.seq, at, category)
+	pcall(toSim, "nativebind", { n = o.n, key = L.itemKey(C.PLAYER_ID, G.seq) })
 	return true
 end
 
@@ -2111,6 +2141,11 @@ local function natDecideUnsafe(h, cap)
 		-- A build that cannot be captured cannot be shipped: the others never get it, and the safety net's resync would erase it here
 		-- later (real session 2026-10-12: a guest's bus stops, line and buses). With the tool's callback fireable the build is cancelled and
 		-- the player told; otherwise it still goes through (fail open: the tool would stay dead).
+		if tostring(cap.why):find("has no model", 1, true) then
+			-- an edge object (a stop) gets its model and parameters only when the build runs: the record is read AFTER the build (the
+			-- simulation half's deferred read, SIM.deferredBuild) and shipped then; nothing to cancel
+			return release("the capture of " .. tostring(cap.tool) .. " waits for the build (" .. tostring(cap.why) .. "): the record is read after it ran and shipped then")
+		end
 		if FIRE_DONE and h.done then
 			natSay("held " .. id .. " (site " .. natSite(h) .. "): the capture of " .. tostring(cap.tool) .. " failed (" .. tostring(cap.why) .. "): cancelled, this kind of build is not replicated")
 			natOrder("cancel", id)

@@ -111,6 +111,17 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertIn("native build captured", self.B.log())
         self.assertNotIn("refused", self.A.log() + self.B.log())
 
+    def test_the_originators_own_native_build_gets_its_keys_like_a_replay(self):
+        # a depot the engine built at the click and the capture shipped: the originator keys it too, so that a vehicle bought at it can be
+        # named for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here")
+        self.start()
+        self.B.run("DEPOT_P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }; "
+                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(DEPOT_P, nil, false, true), nil }")
+        self.tick(20)
+        for g in (self.A, self.B):
+            self.assertIn("1:1#c1", str(g.lua("BOUND_KEYS()")).split(), "%s keyed the depot" % g.label)
+        self.assertIn("this game's own native build is keyed here like a replay", self.B.log())
+
     def test_a_stop_or_signal_without_a_model_before_the_build_is_read_after_it_and_reaches_the_other_game(self):
         # the engine names the model of an edge object only when the build has run (a real game, 2026-10-11: "an edge object has no
         # model" for every stop built with the stop tool, and the other game never got it)

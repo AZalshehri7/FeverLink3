@@ -1273,6 +1273,15 @@ class UncapturableBuildTest(StrictTest):
         self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
         self.assertSameWorld()
 
+    def test_a_capture_that_only_lacks_the_model_of_an_edge_object_is_released_and_read_after_the_build(self):
+        # a stop or signal gets its model when the build runs: no cancel, the record is read afterwards by the simulation half
+        self.start()
+        self.B.tool("{ edge = 130, param = 0.75 }", make="NATIVE_SIGNAL")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertIn("waits for the build", self.B.log())
+        self.assertEqual(self.relay.chats, [])
+
     def test_without_a_fireable_callback_it_is_released_as_before(self):
         self.fires_off = True
         self.start()
