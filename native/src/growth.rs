@@ -36,6 +36,8 @@ pub const AFTER_GAMETIME_VAR: &str = "FEVERLINK3_GROWTH_SEED_AFTER_GAMETIME";
 pub const QUANTUM_VAR: &str = "FEVERLINK3_GROWTH_SEED_QUANTUM_MS";
 /// Towns whose every Develop call is logged (and whose buildings the Lua side traces): `all` or a comma list of ids.
 pub const TRACE_VAR: &str = "FEVERLINK3_TOWN_TRACE";
+/// `FEVERLINK3_LOG_GROWTH_DEEP=1`: the read-only deep log (payload, rng end state, candidate order); implies the growth log.
+pub const DEEP_VAR: &str = "FEVERLINK3_LOG_GROWTH_DEEP";
 /// The per-game file the growth lines are appended to, in the live folder.
 pub const LOG_FILE: &str = "growth.log";
 /// One game-time tick in milliseconds.
@@ -131,6 +133,8 @@ pub struct Settings {
     pub quantum_ms: u32,
     /// `FEVERLINK3_TOWN_TRACE`: the towns that are logged on every call (no sampling).
     pub trace: Trace,
+    /// `FEVERLINK3_LOG_GROWTH_DEEP=1` (implies `log`).
+    pub deep: bool,
 }
 
 impl Default for Settings {
@@ -142,6 +146,7 @@ impl Default for Settings {
             after_game_s: None,
             quantum_ms: DEFAULT_QUANTUM_MS,
             trace: Trace::default(),
+            deep: false,
         }
     }
 }
@@ -157,7 +162,8 @@ impl Settings {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> (Settings, Vec<String>) {
         let mut s = Settings::default();
         let mut complaints = Vec::new();
-        s.log = get(LOG_GROWTH_VAR).is_some_and(|v| v.trim() == "1");
+        s.deep = get(DEEP_VAR).is_some_and(|v| v.trim() == "1");
+        s.log = s.deep || get(LOG_GROWTH_VAR).is_some_and(|v| v.trim() == "1");
         if let Some(v) = get(MODE_VAR).filter(|v| !v.trim().is_empty()) {
             match v.trim().to_ascii_lowercase().as_str() {
                 "off" => {}
@@ -206,8 +212,9 @@ impl Settings {
         };
         let game = self.after_game_s.map(|g| format!(" after_gametime={g}s")).unwrap_or_default();
         let trace = if self.trace.is_empty() { String::new() } else { format!(" trace={}", self.trace.describe()) };
+        let deep = if self.deep { " deep=on" } else { "" };
         format!(
-            " growth=on seed_mode={mode} after={}s{game} quantum={}ms({}ticks){trace}",
+            " growth=on seed_mode={mode} after={}s{game} quantum={}ms({}ticks){trace}{deep}",
             self.after_wall_s,
             self.quantum_ms,
             quantum_ticks(self.quantum_ms)
@@ -329,6 +336,194 @@ pub fn switch_line(n: u64, wall_s: u64, time: Option<u32>, s: &Settings) -> Stri
         s.after_wall_s,
         s.after_game_s.map_or("none".to_string(), |g| format!("{g}s"))
     )
+}
+
+// ---- the deep log (`FEVERLINK3_LOG_GROWTH_DEEP=1`, `docs/NATIVE_LINK.md` section 11.5)
+
+/// Prefix of the deep lines (`grep '^gdeep-'`).
+pub const DEEP_PREFIX: &str = "gdeep";
+/// Size of one candidate record of the octree gather (`0x9677c0`, build 40420).
+pub const RECORD_LEN: usize = 0x40;
+/// Most records hashed from one vector (a larger one is counted and flagged, not hashed).
+pub const MAX_RECORDS: usize = 1 << 16;
+/// Most calls outside any `Develop` that are logged.
+pub const ORPHAN_MAX: u64 = 200;
+
+/// FNV-1a over `bytes`, continuing from `h`.
+pub fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// splitmix64 finalizer, so that a sum of per-record hashes does not cancel or cluster.
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Hash of the pure-data part of one 0x40-byte record: the 20-byte component element at +4 (positions), the validity
+/// flag at +0x3c and, only when the flag is set, the six floats at +0x24..+0x3c. Skipped on purpose: the entity id
+/// (+0, hashed apart: ids may differ between processes) and +0x18..+0x24, which is uninitialised stack when the flag
+/// is clear.
+pub fn record_geometry(rec: &[u8]) -> u64 {
+    let mut h = fnv1a(FNV_OFFSET, &rec[4..0x18]);
+    let flag = rec[0x3c];
+    h = fnv1a(h, &[flag]);
+    if flag != 0 {
+        h = fnv1a(h, &rec[0x24..0x3c]);
+    }
+    h
+}
+
+/// What a vector of records is logged as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Digest {
+    pub n: u64,
+    /// Order-sensitive hash over the geometry of every record.
+    pub ordered: u64,
+    /// Order-insensitive sum over the geometry hashes.
+    pub sum: u64,
+    /// The same two over the entity ids only.
+    pub id_ordered: u64,
+    pub id_sum: u64,
+}
+
+/// Digest of `bytes` as 0x40-byte records (a trailing partial record is ignored).
+pub fn digest_records(bytes: &[u8]) -> Digest {
+    digest_by(bytes, record_geometry)
+}
+
+/// Hash of the 20 position bytes `+4..+0x18` of a record alone (the sort input of `0x966150`: the other fields are
+/// built after the gather and say nothing about the order it was gathered in).
+pub fn record_position(rec: &[u8]) -> u64 {
+    fnv1a(FNV_OFFSET, &rec[4..0x18])
+}
+
+/// [`digest_records`] with the position bytes only.
+pub fn digest_positions(bytes: &[u8]) -> Digest {
+    digest_by(bytes, record_position)
+}
+
+/// Digest of a vector of `u32` ids (the edge candidates of `0x95d100`): `ordered` and `sum` over the ids themselves;
+/// the id fields are left at their start values.
+pub fn digest_ids(bytes: &[u8]) -> Digest {
+    let mut d = Digest { n: 0, ordered: FNV_OFFSET, sum: 0, id_ordered: FNV_OFFSET, id_sum: 0 };
+    for c in bytes.as_chunks::<4>().0 {
+        d.n += 1;
+        d.ordered = fnv1a(d.ordered, c);
+        d.sum = d.sum.wrapping_add(mix64(u64::from(u32::from_le_bytes(*c))));
+    }
+    d
+}
+
+/// Digest of `bytes` as 0x40-byte records, hashing each record's geometry with `geom`.
+pub fn digest_by(bytes: &[u8], geom: fn(&[u8]) -> u64) -> Digest {
+    let mut d = Digest { n: 0, ordered: FNV_OFFSET, sum: 0, id_ordered: FNV_OFFSET, id_sum: 0 };
+    for rec in bytes.as_chunks::<RECORD_LEN>().0 {
+        let g = geom(rec);
+        let id = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+        d.n += 1;
+        d.ordered = fnv1a(d.ordered, &g.to_le_bytes());
+        d.sum = d.sum.wrapping_add(mix64(g));
+        d.id_ordered = fnv1a(d.id_ordered, &id.to_le_bytes());
+        d.id_sum = d.id_sum.wrapping_add(mix64(u64::from(id)));
+    }
+    d
+}
+
+/// Where a deep line belongs: `t` is the game tick (`-` when unknown), `k` the index of the `TownUpdateSize` command of
+/// this town within the tick (0 for a `Develop` not run by that command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepKey {
+    pub pid: u32,
+    pub t: Option<u32>,
+    pub town: u32,
+    pub k: u32,
+}
+
+impl DeepKey {
+    fn head(&self, kind: &str) -> String {
+        let t = self.t.map_or("-".to_string(), |t| t.to_string());
+        format!("{DEEP_PREFIX}-{kind} pid={} t={t} town={} k={}", self.pid, self.town, self.k)
+    }
+}
+
+/// The payload of one `TownUpdateSize` command: three size floats (raw bits) and the flag byte. `c` is the index of the
+/// command within the tick over all towns.
+pub fn payload_line(key: &DeepKey, c: u32, bits: [u32; 3], flag: u8) -> String {
+    let f = bits.map(f32::from_bits);
+    format!(
+        "{} c={c} b1={:#010x} b2={:#010x} b3={:#010x} f1={} f2={} f3={} flag={flag}",
+        key.head("payload"),
+        bits[0],
+        bits[1],
+        bits[2],
+        f[0],
+        f[1],
+        f[2]
+    )
+}
+
+/// The rng state `Develop` started from (`seed`, after a derived replacement if any) and ended with.
+pub fn dev_line(key: &DeepKey, d: u64, seed: u32, end: u32) -> String {
+    format!("{} d={d} seed={seed:#010x} end={end:#010x}", key.head("dev"))
+}
+
+/// One gather of candidates (`0x9677c0`), the `j`-th of this `Develop`. `capped`: too many records to hash.
+pub fn cand_line(key: &DeepKey, j: u32, d: &Digest, capped: bool) -> String {
+    format!(
+        "{} j={j} n={} ho={:#018x} hs={:#018x} hio={:#018x} his={:#018x}{}",
+        key.head("cand"),
+        d.n,
+        d.ordered,
+        d.sum,
+        d.id_ordered,
+        d.id_sum,
+        if capped { " capped=1" } else { "" }
+    )
+}
+
+/// The records the candidate sort (`0x966150`) was given, in the order they were gathered (`ho`/`hs`: positions only,
+/// order-sensitive hash and sum; `hio`/`his`: the entity ids), and how many neighbours of the sorted result have exactly
+/// the same squared distance to the centre (`ties`, `-` if the centre could not be read): only ties keep the input order.
+pub fn sort_line(key: &DeepKey, j: u32, d: &Digest, ties: Option<u64>, capped: bool) -> String {
+    format!(
+        "{} j={j} n={} ho={:#018x} hs={:#018x} hio={:#018x} his={:#018x} ties={}{}",
+        key.head("sort"),
+        d.n,
+        d.ordered,
+        d.sum,
+        d.id_ordered,
+        d.id_sum,
+        ties.map_or("-".to_string(), |t| t.to_string()),
+        if capped { " capped=1" } else { "" }
+    )
+}
+
+/// The country-edge pick (`0x95d627`): the candidate ids in the order the function holds them (`ho` ordered hash, `hs`
+/// sum), the rng state before and after the draw and the index drawn (`idx`).
+pub fn pick_line(key: &DeepKey, j: u32, d: &Digest, before: Option<u32>, after: Option<u32>, idx: u32, capped: bool) -> String {
+    let f = |v: Option<u32>| v.map_or("-".to_string(), |v| format!("{v:#010x}"));
+    format!(
+        "{} j={j} n={} ho={:#018x} hs={:#018x} before={} after={} idx={idx}{}",
+        key.head("pick"),
+        d.n,
+        d.ordered,
+        d.sum,
+        f(before),
+        f(after),
+        if capped { " capped=1" } else { "" }
+    )
+}
+
+/// One edge selection (`0x95d100`), the `j`-th of this `Develop`: the rng state before and after (None = unreadable).
+pub fn edge_line(key: &DeepKey, j: u32, before: Option<u32>, after: Option<u32>) -> String {
+    let f = |v: Option<u32>| v.map_or("-".to_string(), |v| format!("{v:#010x}"));
+    format!("{} j={j} before={} after={}", key.head("edge"), f(before), f(after))
 }
 
 #[cfg(test)]
@@ -511,5 +706,108 @@ mod tests {
         let (via_env, _) = Settings::from_lookup(|k| (k == TRACE_VAR).then(|| "5,6".to_string()));
         assert!(via_env.trace.contains(6) && !via_env.active(), "the trace alone does not install the hook");
         assert!(via_env.describe().is_empty());
+    }
+
+    fn rec(id: u32, pos: [u8; 20], flag: u8, floats: [u8; 24], junk: u8) -> Vec<u8> {
+        let mut r = vec![0u8; RECORD_LEN];
+        r[..4].copy_from_slice(&id.to_le_bytes());
+        r[4..0x18].copy_from_slice(&pos);
+        r[0x18..0x24].fill(junk);
+        r[0x24..0x3c].copy_from_slice(&floats);
+        r[0x3c] = flag;
+        r
+    }
+
+    #[test]
+    fn deep_switch_implies_the_growth_log() {
+        let (s, _) = Settings::from_lookup(env(&[(DEEP_VAR, "1")]));
+        assert!(s.deep && s.log && s.active() && s.describe().ends_with(" deep=on"));
+        assert!(!Settings::from_lookup(env(&[(DEEP_VAR, "yes")])).0.active());
+        assert!(!Settings::from_lookup(env(&[])).0.deep);
+    }
+
+    #[test]
+    fn a_digest_separates_order_from_content() {
+        let a = rec(1, [1; 20], 1, [2; 24], 0);
+        let b = rec(2, [3; 20], 1, [4; 24], 0);
+        let ab = [a.clone(), b.clone()].concat();
+        let ba = [b, a].concat();
+        let (x, y) = (digest_records(&ab), digest_records(&ba));
+        assert_eq!(x.n, 2);
+        assert_eq!(x.sum, y.sum, "same set");
+        assert_ne!(x.ordered, y.ordered, "other order");
+        assert_eq!(x.id_sum, y.id_sum);
+        assert_ne!(x.id_ordered, y.id_ordered);
+        assert_eq!(digest_records(&[]).n, 0);
+        assert_eq!(digest_records(&ab[..100]).n, 1, "a partial record is ignored");
+    }
+
+    #[test]
+    fn ids_junk_and_unset_floats_are_not_hashed_as_geometry() {
+        let base = record_geometry(&rec(1, [1; 20], 1, [2; 24], 0));
+        assert_eq!(base, record_geometry(&rec(99, [1; 20], 1, [2; 24], 0)), "id apart");
+        assert_eq!(base, record_geometry(&rec(1, [1; 20], 1, [2; 24], 0xaa)), "stack junk skipped");
+        assert_ne!(base, record_geometry(&rec(1, [1; 20], 1, [3; 24], 0)));
+        assert_ne!(base, record_geometry(&rec(1, [5; 20], 1, [2; 24], 0)));
+        let off = record_geometry(&rec(1, [1; 20], 0, [2; 24], 0));
+        assert_eq!(off, record_geometry(&rec(1, [1; 20], 0, [9; 24], 0)), "floats ignored when the flag is clear");
+        assert_ne!(off, base);
+        let (d1, d2) = (digest_records(&rec(1, [1; 20], 1, [2; 24], 0)), digest_records(&rec(2, [1; 20], 1, [2; 24], 0)));
+        assert_ne!(d1.id_sum, d2.id_sum);
+        assert_eq!(d1.sum, d2.sum);
+    }
+
+    #[test]
+    fn id_and_position_digests_separate_order_from_content() {
+        let ids = |v: &[u32]| v.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>();
+        let (a, b) = (digest_ids(&ids(&[1, 2, 3])), digest_ids(&ids(&[3, 1, 2])));
+        assert_eq!((a.n, b.n), (3, 3));
+        assert_eq!(a.sum, b.sum);
+        assert_ne!(a.ordered, b.ordered);
+        assert_ne!(a.sum, digest_ids(&ids(&[1, 2, 4])).sum);
+        // positions only: flag, floats and ids do not matter
+        let x = rec(1, [1; 20], 1, [2; 24], 0);
+        let y = rec(9, [1; 20], 0, [7; 24], 3);
+        let (px, py) = (digest_positions(&x), digest_positions(&y));
+        assert_eq!((px.n, px.ordered, px.sum), (py.n, py.ordered, py.sum));
+        assert_ne!(px.id_sum, py.id_sum);
+        assert_ne!(digest_positions(&x).sum, digest_positions(&rec(1, [2; 20], 1, [2; 24], 0)).sum);
+    }
+
+    #[test]
+    fn sort_and_pick_lines_have_fixed_fields() {
+        let key = DeepKey { pid: 7, t: Some(100), town: 5, k: 0 };
+        let d = Digest { n: 4, ordered: 1, sum: 2, id_ordered: 3, id_sum: 4 };
+        assert_eq!(
+            sort_line(&key, 0, &d, Some(2), false),
+            "gdeep-sort pid=7 t=100 town=5 k=0 j=0 n=4 ho=0x0000000000000001 hs=0x0000000000000002 hio=0x0000000000000003 his=0x0000000000000004 ties=2"
+        );
+        assert!(sort_line(&key, 0, &d, None, true).ends_with("ties=- capped=1"));
+        assert_eq!(
+            pick_line(&key, 1, &d, Some(5), None, 3, false),
+            "gdeep-pick pid=7 t=100 town=5 k=0 j=1 n=4 ho=0x0000000000000001 hs=0x0000000000000002 before=0x00000005 after=- idx=3"
+        );
+    }
+
+    #[test]
+    fn deep_lines_have_fixed_fields() {
+        let key = DeepKey { pid: 7, t: Some(100), town: 60479, k: 1 };
+        assert_eq!(
+            payload_line(&key, 3, [0x3f80_0000, 0x4000_0000, 0xc040_0000], 0),
+            "gdeep-payload pid=7 t=100 town=60479 k=1 c=3 b1=0x3f800000 b2=0x40000000 b3=0xc0400000 f1=1 f2=2 f3=-3 flag=0"
+        );
+        assert_eq!(
+            dev_line(&DeepKey { t: None, ..key }, 9, 5, 0x10),
+            "gdeep-dev pid=7 t=- town=60479 k=1 d=9 seed=0x00000005 end=0x00000010"
+        );
+        let d = Digest { n: 2, ordered: 1, sum: 2, id_ordered: 3, id_sum: 4 };
+        assert_eq!(
+            cand_line(&key, 0, &d, true),
+            "gdeep-cand pid=7 t=100 town=60479 k=1 j=0 n=2 ho=0x0000000000000001 hs=0x0000000000000002 hio=0x0000000000000003 his=0x0000000000000004 capped=1"
+        );
+        assert_eq!(
+            edge_line(&key, 1, Some(1), None),
+            "gdeep-edge pid=7 t=100 town=60479 k=1 j=1 before=0x00000001 after=-"
+        );
     }
 }

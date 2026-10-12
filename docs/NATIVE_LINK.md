@@ -770,3 +770,59 @@ around that tick, the commands seen, and a verdict: `inputs differed before the 
 so start the trace games before the session.
 
 **Command payload (`FEVERLINK3_TOWN_TRACE_CMDS=1`, tools: `FL3_DEMO_TOWN_TRACE_CMDS`).** Tests whether the three size factors and the cargo needs that the game's own growth script hands to the native step differ between the games before that step. The bridge wraps `api.cmd.makeTownUpdateSizeCmd` and `makeTownUpdateCargoNeedsCmd` in the simulation script context; the wrapper logs first (buffered, flushed once per second, never raising; five errors switch the command trace off) and then calls the original with the same arguments and returns what it returned. For each traced town it writes an `mk` line (arguments, the floats as exact bits as float and as double, and as 17-digit numbers), an `in` line (line usage, supply/demand totals, the town component fields, building count and hash) and `order` lines (the order in which the script's town and cargo loops hand out entities, hashed). `python tools/gametest/compare_town_cmds.py <live1> <live2>` pairs the calls and says `payload floats differ` / `inputs differ, payload equal` / `all equal`. Whether the growth script runs in a Lua state that sees the replaced `api.cmd` can only be confirmed in a running game: with the switch on and no `mk` lines, it does not.
+
+### 11.5 The deep growth log (`FEVERLINK3_LOG_GROWTH_DEEP=1`): payload, rng end state, candidate order
+
+**Not run in the game.** Tested only on the fake-function harness (`cargo test`). Read-only: no hook writes into the game or
+changes an argument or a result. Default off. It implies `FEVERLINK3_LOG_GROWTH` (so `Develop` and the `TownUpdateSize`
+handler are hooked as before) and adds two wraps; all lines go to `growth.log` of the game's own live folder only (not
+`native.log`). It exists to separate three explanations of why a few towns' buildings drift apart after a resync although the
+seed given to `Develop` is identical: **H1** the two worlds differ internally (octree leaf order, hash-map order, entity ids),
+**H2** the Lua-computed `TownUpdateSize` payload differs, or a non-growth writer.
+
+Disassembly of a copy of build 40420 (capstone), what the hooks rely on:
+
+| Site | Evidence |
+|---|---|
+| Payload, handler `0x9e12b0` | `mov r15,rdx` (payload); `mov ebx,[r15]` town (`0x9e12eb`); `mov ecx,[r15+0xc]` / `vmovsd xmm0,[r15+4]` stored to the Town component at `+0x10..+0x18` (`0x9e1356`..`0x9e1365`), i.e. three floats at `+4,+8,+0xc`; `movzx r9d,byte [r15+0x10]` and `mov r8d,[r15]` right before `call 0x8de0b0` (`0x9e1460`): the flag byte at `+0x10`. The earlier report was right. |
+| Rng end state | `Develop` receives the `u32*` as stack argument 5 (`lea rax,[rsp+0x90]; mov [rsp+0x20],rax` at `0x9e1453`, `[rsp+0x28]` at entry). The hook reads it again after the original returns. A minstd state after N draws is distinct, so equal start and different end means a different number of draws. |
+| Candidate gather `0x9677c0` | Callers: only `0x968fe4` (inside `0x968f40`, called from `Develop` `0x8de883` and from `0x95b940`, which is also called by `0x9e0bd0`: a gather can run outside `Develop`). Convention: `rcx` out vector (`[rcx],[rcx+8],[rcx+0x10]` zeroed at entry, `begin/end/cap`), `rdx` `float2*` centre, **third argument is a float in `xmm2`** (the radius; the prologue's `vmovss [rsp+0x18],xmm2`), `r9` context, five stack arguments (`[rbp+0xa8]` = argument 6 is read); returns `rcx`. The hook is declared `(u64,u64,f32,u64,u64,u64,u64,u64,u64)` so that `xmm2` is forwarded. **Correction of the report:** the function does end with a sort: `call 0x966150` at `0x967c16` with `(begin,end,count,lambda)` is MSVC `std::sort` (introsort: partition `0x9655b0`, heap sort `0x965130`, insertion `0x964e70`, comparator `0x96a1e0` then squared distance to the centre at `[r12+4],[r12+8]`). The hook sees the vector **after** the sort, so a different pre-sort order only shows if the comparator leaves ties (equal key and equal distance). |
+| Record (0x40 bytes, built by `0x2644ba0` at `0x966f1a`) | `+0` u32 entity id; `+4..+0x18` the 20-byte component element (positions: x, y at `+4,+8` are what the comparator reads); `+0x18..+0x38` the first 32 bytes and `+0x38..+0x40` the last 8 of a 0x28-byte struct built by `0xba1ac0`: `+0x18..+0x24` zero, or uninitialised stack when the source pointer is null; six floats at `+0x24..+0x3c`; flag byte at `+0x3c` (1 when the source was non-null). No pointers. |
+| Edge selection `0x95d100` | Callers `0x8df78a`, `0x95ba4c`. `rcx` `float2*` centre, radius in `xmm1`, `r8` world, `r9` context, argument 5 `[rsp+0x28]`, **argument 6 `[rsp+0x30]` the `u32*` rng** (the caller stores `r15` there at `0x8df76a`; the function passes it to `RandomInt` at `0x95d627`). Returns nothing (the caller jumps on). The candidate vector and the drawn index are locals of the function, so the entry/exit wrap logs the rng state before and after only (a draw happened iff it changed); the vector itself is read by the call-site redirect S3 below. `RandomInt` `0x3055870` itself cannot be detoured: a `jg rel8` lies inside its first 14 bytes (a relative jump cannot be stolen), hence the call-site redirect. |
+| S2, the sort call `0x967c16` (`e8 35 e5 ff ff`) | `call 0x966150` at the end of `0x9677c0`: `rcx` begin, `rdx` end, `r8` count (depth limit), `r9` the comparator struct (`[r9+0x20]` is a pointer to the centre `float2`, read by the comparator at `0x964f69`). Records 0x40 bytes. The function `0x966150` recurses (introsort), so it is **not** detoured: only this one call is redirected. Logged before the sort: the count and hashes of the records in gathered order over their position bytes `+4..+0x17` (the other fields are built after the gather); after the sort: `ties`, the number of adjacent records with exactly equal squared distance to the centre (computed in `f32` as the comparator does; the comparator's first key, `0x96a1e0`, is not evaluated, so `ties` can over-count). Ties are the only place where the input order survives the sort. |
+| S3, the edge pick `0x95d627` (`e8 44 82 6f 02`) | `call 0x3055870` = `RandomInt(rng=r13, 0, n)` in `0x95d100`, right after `sub rax,rcx ; sar rax,2` (`n` = element count) and `mov rax,[rbp-0x40]` (`0x95d62f`): the candidate vector is a `vector<u32>` of edge ids whose begin and end are `[rbp-0x40]`, `[rbp-0x38]` (`rbp = entry rsp - 0x418`, constant through the function). The ids are copied from octree leaf vectors with no sort, so their order is the Add/Remove history. Logged just before the draw: the count, an ordered hash and an unordered sum of the ids, the rng state before and after, and the index drawn. |
+
+**Call-site redirects (S2, S3).** A `call rel32` is five bytes, too short for the 14-byte absolute jump of the ordinary detour, so the 4-byte displacement is rewritten instead: `E8 <rel32 to a thunk>`. The thunk is 14 bytes (`jmp [rip+0] ; dq hook`; for S3 prefixed by `4C 8B CD` = `mov r9,rbp`, which hands the frame pointer to the hook as a fourth argument that `RandomInt` ignores) placed by `VirtualAlloc` at an explicit address within 1 GiB of the call (`mem::alloc_exec_near`). The hook logs, calls the real function at its original address (`0x966150` / `0x3055870`; both prologues are compared too) with every argument as given, logs, and returns what it returned. The bytes at the call (`expected`) and at the callee are compared before anything is written, the callee address is published before the call is patched, a failure leaves the call as shipped and costs only that redirect, and `uninstall_all` writes the five bytes back. Because the thunk is entered by a normal `call`/`ret` pair the stack, the callee-saved registers and `vzeroupper` (executed before both calls) are as the compiler of the game expects; `r9` and the other volatile registers are free at that point.
+
+Prologues (14 bytes each, no rip-relative operand, so the ordinary detour is safe): `0x9677c0`
+`48 89 5C 24 10 C5 FA 11 54 24 18 55 56 57`; `0x95d100` `48 8B C4 48 89 58 08 55 56 57 41 54 41 55`. Both are in the build
+table (`town_candidates`, `town_edges`) and checked against the image before anything is written; a mismatch skips only that
+wrap. Bookkeeping runs inside `log::guarded`, the game's functions are called outside it, both hooks are
+`extern "system-unwind"`, reads of game memory are checked with `VirtualQuery` first, at most 65,536 records are hashed per
+vector (more are counted and flagged `capped=1`).
+
+Lines (`<key>` = `pid=<process id> t=<tick of 200 ms, - if unknown> town=<id> k=<index of this town's command within the tick>`):
+
+```text
+gdeep-payload <key> c=<command index within the tick, all towns> b1=0x.. b2=0x.. b3=0x.. f1=.. f2=.. f3=.. flag=<byte>
+gdeep-cand    <key> j=<n-th gather of this Develop> n=<records> ho=0x.. hs=0x.. hio=0x.. his=0x..  [capped=1]
+gdeep-edge    <key> j=<n-th selection of this Develop> before=0x<rng> after=0x<rng>
+gdeep-dev     <key> d=<Develop call counter> seed=0x<state Develop started from> end=0x<state it ended with>
+gdeep-sort    <key> j=<as the gather's> n=<records> ho=0x.. hs=0x.. hio=0x.. his=0x.. ties=<n or ->   (S2: BEFORE the sort, positions only)
+gdeep-pick    <key> j=<as the edge's> n=<ids> ho=0x.. hs=0x.. before=0x<rng> after=0x<rng> idx=<index drawn>   (S3)
+```
+
+`b1..b3` are the raw bits of the three size floats and `f1..f3` the same as floats. `ho` is the order-sensitive FNV-1a over
+the pure-data part of every record (position element, flag, floats; not the id, not the stack junk); `hs` the order-insensitive
+sum of mixed per-record hashes of the same; `hio`/`his` the same two over the entity ids only. Pairing key for two games:
+`(kind, town, t, k, j)`. Gathers and selections outside any `Develop` have `t=- town=0 k=0` and `j` = a running number (first
+200 only). Volume: the commands of towns in `FEVERLINK3_TOWN_TRACE` always; the others the first 2000 commands and then about
+one in 50 chosen by `(town, t)`, so both games log the same ones; all lines of one command are logged or skipped together.
+
+Comparing two games: `python tools/gametest/compare_growth_deep.py <live dir or growth.log of game 1> <same of game 2>`
+(standard library only, run without `-I`; `--pid-a/--pid-b` choose a process when the file holds several, default the last).
+It pairs the lines, finds the first difference in the order of game 1's file and prints a verdict (and, for every kind of difference, its first occurrence):
+`payload differs` (H2), `octree history order differs (S3 edge pick ...)` / `(S2 sort input ...)` (ordered hash differs, sum equal: H1), `candidate order differs while the sum is equal` (the sorted gather result), `candidate set differs`,
+`inputs equal but rng end state differs` (different number of draws: the edge selection or something not logged),
+or `all equal`; with counts of every kind of difference and of unpaired lines, and a note when only entity ids differ.
+Demo setup: `FL3_DEMO_LOG_GROWTH_DEEP=1` (with `FL3_DEMO_TOWN_TRACE`).

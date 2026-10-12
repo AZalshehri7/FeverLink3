@@ -36,6 +36,19 @@ pub struct CallSite {
 /// Shortest prologue a [`CallSite`] may record.
 pub const CALL_PROLOGUE_MIN: usize = 8;
 
+/// One `call rel32` inside a function whose target is redirected (`FEVERLINK3_LOG_GROWTH_DEEP`, read-only): the 4-byte
+/// displacement is rewritten to lead to a thunk that reaches a hook, which calls `callee` itself. Used where the function
+/// around the call must not be detoured (it recurses) or the callee cannot be (a relative jump in its first bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallPatchSite {
+    /// The RVA of the `call` instruction (its `E8` byte).
+    pub rva: Rva,
+    /// The five bytes there: `E8` and the displacement, which fixes the callee.
+    pub expected: &'static [u8],
+    /// The callee the displacement leads to; its prologue is compared too, because the hook calls it directly.
+    pub callee: CallSite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildAddrs {
     /// PE link timestamp.
@@ -63,6 +76,19 @@ pub struct BuildAddrs {
     /// The `TownUpdateSize` command handler (kind 40): the only caller of `Develop` that seeds from the game time.
     /// Hooked read-only to read the game time the seed is made from.
     pub town_update_size: Option<HookSite>,
+    /// Candidate gather of the octree walk (`FEVERLINK3_LOG_GROWTH_DEEP`, read-only): `(out vector*, float2* centre,
+    /// float radius [xmm2], ctx* [r9], 5 stack args) -> out`; the vector `[rcx]..[rcx+8]` holds 0x40-byte records,
+    /// sorted by `std::sort` (`0x966150`) before the function returns.
+    pub town_candidates: Option<HookSite>,
+    /// Country-edge selection (`FEVERLINK3_LOG_GROWTH_DEEP`, read-only): `(float2* centre, float radius [xmm1], world
+    /// [r8], ctx* [r9], arg5, u32* rng [stack arg 6])`, returns nothing; draws `vec[RandomInt(0,n)]`.
+    pub town_edges: Option<HookSite>,
+    /// The call `std::sort(begin, end, count, ctx)` at the end of the candidate gather (`0x967c16` in `0x9677c0`):
+    /// logged BEFORE the sort (the input order) and after it (distance ties).
+    pub town_sort_call: Option<CallPatchSite>,
+    /// The call `RandomInt(rng, 0, n)` that picks the country edge in `0x95d100` (`0x95d627`): the id vector at
+    /// `[rbp-0x40, rbp-0x38)` is read just before it.
+    pub town_pick_call: Option<CallPatchSite>,
     /// `GameTime` getter: `fn(system*) -> u32` (the dword at `+0x40` of the `GameTime` component). Called, never
     /// hooked; the prologue is compared first.
     pub game_time_getter: Option<CallSite>,
@@ -138,6 +164,40 @@ pub const BUILDS: &[BuildAddrs] = &[
         town_update_size: Some(HookSite {
             rva: 0x009e_12b0,
             prologue: &[0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x50],
+        }),
+        // `mov [rsp+10h],rbx ; vmovss [rsp+18h],xmm2 ; push rbp,rsi,rdi` (14 bytes, no rip-relative operand)
+        town_candidates: Some(HookSite {
+            rva: 0x0096_77c0,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x10, 0xC5, 0xFA, 0x11, 0x54, 0x24, 0x18, 0x55, 0x56, 0x57],
+        }),
+        // `mov rax,rsp ; mov [rax+8],rbx ; push rbp,rsi,rdi,r12,r13` (14 bytes, no rip-relative operand)
+        town_edges: Some(HookSite {
+            rva: 0x0095_d100,
+            prologue: &[0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55],
+        }),
+        // `call 0x966150` (std::sort of the gathered records) at the end of `0x9677c0`; callee: `mov [rsp+8],rbx ;
+        // mov [rsp+10h],rbp ; mov [rsp+18h],rsi ; push rdi`
+        town_sort_call: Some(CallPatchSite {
+            rva: 0x0096_7c16,
+            expected: &[0xE8, 0x35, 0xE5, 0xFF, 0xFF],
+            callee: CallSite {
+                rva: 0x0096_6150,
+                prologue: &[
+                    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+                ],
+            },
+        }),
+        // `call 0x3055870` (RandomInt(rng, 0, n)) at `0x95d627` in `0x95d100`; callee: `sub rsp,28h ; lea r9d,[r8-1] ;
+        // cmp edx,r9d ; jg ; mov r8d,edx`
+        town_pick_call: Some(CallPatchSite {
+            rva: 0x0095_d627,
+            expected: &[0xE8, 0x44, 0x82, 0x6F, 0x02],
+            callee: CallSite {
+                rva: 0x0305_5870,
+                prologue: &[
+                    0x48, 0x83, 0xEC, 0x28, 0x45, 0x8D, 0x48, 0xFF, 0x41, 0x3B, 0xD1, 0x7F, 0x14, 0x44, 0x8B, 0xC2,
+                ],
+            },
         }),
         // `sub rsp,28h ; mov rax,[rcx+10h] ; mov rcx,[rcx+8] ; mov edx,[rax]` (then a call to the component lookup)
         game_time_getter: Some(CallSite {
@@ -219,6 +279,10 @@ mod tests {
         town_seed: None,
         town_develop: None,
         town_update_size: None,
+        town_candidates: None,
+        town_edges: None,
+        town_sort_call: None,
+        town_pick_call: None,
         game_time_getter: None,
         script_pool: None,
         command_move: None,
@@ -245,7 +309,7 @@ mod tests {
     #[test]
     fn every_recorded_prologue_is_long_enough_for_a_detour() {
         for b in BUILDS.iter().chain(FAKE) {
-            for site in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
+            for site in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size, &b.town_candidates, &b.town_edges]
                 .into_iter()
                 .flatten()
             {
@@ -319,6 +383,17 @@ mod tests {
         assert_eq!(b.town_seed.as_ref().unwrap().rva, 0x8d4270);
         assert_eq!(b.town_develop.as_ref().unwrap().rva, 0x8de0b0);
         assert_eq!(b.town_update_size.as_ref().unwrap().rva, 0x9e12b0);
+        assert_eq!(b.town_candidates.as_ref().unwrap().rva, 0x9677c0);
+        assert_eq!(b.town_edges.as_ref().unwrap().rva, 0x95d100);
+        for (site, call) in [(&b.town_sort_call, 0x967c16u32), (&b.town_pick_call, 0x95d627)] {
+            let s = site.as_ref().unwrap();
+            assert_eq!(s.rva, call);
+            // the displacement leads to the recorded callee
+            let rel = i32::from_le_bytes(s.expected[1..5].try_into().unwrap());
+            assert_eq!(s.expected[0], 0xE8);
+            assert_eq!(s.rva.wrapping_add(5).wrapping_add(rel as u32), s.callee.rva);
+            assert!(s.callee.prologue.len() >= CALL_PROLOGUE_MIN);
+        }
         assert_eq!(b.game_time_getter.as_ref().unwrap().rva, 0x2a96c0);
     }
 
