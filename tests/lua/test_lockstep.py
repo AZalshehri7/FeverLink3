@@ -665,6 +665,27 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.A.applied(), self.B.applied())
         self.assertEqual(self.B.L.eval("GAME.applied[3].args[1]"), self.B.L.eval("GAME.applied[1].entity"))
 
+    def test_the_checksum_cost_is_logged_only_above_the_threshold_and_changes_nothing(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertNotIn("checksum slow", self.A.log() + self.B.log(), "a fast checksum says nothing")
+        # a clock that advances 30 ms per reading makes every checksum cost more than 50 ms on game A
+        self.A.L.execute("local t = 0; os.clock = function() t = t + 0.03; return t end")
+        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertIn("checksum slow: total ", self.A.log())
+        self.assertRegex(self.A.log(), r"checksum slow: total \d+ ms: \w+ \d+")
+        self.assertNotIn("checksum slow", self.B.log())
+        self.assertEqual(self.relay.reports[2][0][1], self.relay.reports[2][1][1], "timing never enters the parts")
+        # a clock that raises is harmless
+        self.A.L.execute("os.clock = function() error('no clock') end")
+        self.relay.checksum_request(3, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertIn(0, self.relay.reports.get(3, {}))
+
     def test_checksum_rounds(self):
         self.start()
         self.tick(10, lag_b=True)

@@ -56,12 +56,21 @@ end
 local DEV = false
 pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 
--- Developer fallback: FEVERLINK3_STRICT_CANCEL=1 restores the first strict flow exactly (the tool's command is cancelled when the
--- build is shipped and EVERY game, the originator's included, replays the same rebuilt record at the stamp): the tool is dead
--- after one build, but all worlds are identical by construction, so sync can be tested independent of the tool. No veto check
--- runs in that mode (nothing is held, so there is nothing to cancel).
-local STRICT_CANCEL = false
-pcall(function() STRICT_CANCEL = os.getenv("FEVERLINK3_STRICT_CANCEL") == "1" end)
+-- Strict mode, how the ORIGINATING game applies its own build. Default: for the build kinds real two-game runs proved (the plans in
+-- STRICT_CANCEL_PLANS: street, combined, bulldoze) the tool's command is cancelled when the build is shipped and EVERY game, the
+-- originator's included, replays the same rebuilt record at the stamp. All worlds then allocate the same entity ids (applying the
+-- tool's own command on one game and a rebuilt record on the others gave different ids, and everything keyed by id drifted a few
+-- game minutes later). The tool is kept usable by the native module, which fires the tool's completion callback before it drops the
+-- command (FEVERLINK3_STRICT_FIRE_DONE, default on in the native module). Every other kind keeps hold-and-release (hold until the
+-- stamp, then the engine applies the tool's own command on the originator). FEVERLINK3_STRICT_CANCEL=0 is the developer switch back
+-- to hold-and-release for everything; =1 cancels every kind.
+local STRICT_CANCEL = "plans"
+pcall(function()
+	local v = os.getenv("FEVERLINK3_STRICT_CANCEL")
+	if v == "0" then STRICT_CANCEL = "off" elseif v == "1" then STRICT_CANCEL = "all" end
+end)
+local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
+local CANCEL_EXTRA_STEPS = 6   -- extra steps of lead for a build every game applies at the stamp (see natDecideUnsafe)
 
 local function devPoll(half)
 	if not DEV then return end
@@ -450,12 +459,48 @@ function townTraceGuard(fn)
 end
 
 -- `co` is the company registry of the half that asks; its digest is a part of its own once anything was configured or recorded
-local function checksumParts(co)
-	local parts, t = L.checksumParts(engine, C.hashValue)
+-- Checksum cost (observation only, never raises, behaviour unchanged): the seconds of every part are measured with os.clock. A
+-- checksum that takes more than CS_SLOW_MS in total logs one line naming the worst parts; every CS_SUMMARY rounds one summary line
+-- (count, average, maximum and the part that was the slowest in the maximum round). Each half (interface, simulation) counts its own.
+local CS_SLOW_MS, CS_SUMMARY = 50, 20
+local CS = { n = 0, sum = 0, max = 0, maxPart = "?", maxWhere = "" }
+local function checksumNote(timing, total, where)
+	local ok = pcall(function()
+		local ms = total * 1000
+		local names = {}
+		for k in pairs(timing) do names[#names + 1] = k end
+		table.sort(names, function(a, b) if timing[a] ~= timing[b] then return timing[a] > timing[b] end return a < b end)
+		local worst = names[1] or "?"
+		CS.n = CS.n + 1
+		CS.sum = CS.sum + ms
+		if ms > CS.max then CS.max, CS.maxPart, CS.maxWhere = ms, worst, where end
+		if ms > CS_SLOW_MS then
+			local top = {}
+			for i = 1, math.min(5, #names) do top[i] = string.format("%s %.0f", names[i], timing[names[i]] * 1000) end
+			C.logger(where)(string.format("checksum slow: total %.0f ms: %s", ms, table.concat(top, ", ")))
+		end
+		if CS.n % CS_SUMMARY == 0 then
+			C.logger(where)(string.format("checksum cost over %d rounds: avg %.1f ms, max %.0f ms (%s, slowest part %s)", CS.n, CS.sum / CS.n, CS.max, CS.maxWhere, CS.maxPart))
+			CS.n, CS.sum, CS.max = 0, 0, 0
+		end
+	end)
+	return ok
+end
+
+local function checksumParts(co, where)
+	local function clock() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end
+	local t0 = clock()
+	local timing = {}
+	local parts, t = L.checksumParts(engine, C.hashValue, timing)
 	local okD, digest = false, nil
+	local t1 = clock()
 	if Co then okD, digest = pcall(Co.digest, co) end
 	if okD and digest ~= nil then parts.companies = C.hashValue(digest) end
+	timing.companies = clock() - t1
+	local t2 = clock()
 	townBuildingsPart(parts)
+	timing.townBuildings = clock() - t2
+	checksumNote(timing, clock() - t0, where or "gui")
 	return parts, t
 end
 
@@ -716,7 +761,10 @@ local function simCaptureBuild(state, param, post)
 	-- timeout unrecognised and was shipped a second time as 0:7.
 	local piEarly = nil
 	pcall(function() piEarly = param[4] end)
-	if not post and spendReplay(st, now) then
+	-- A replayed record carries playerInitiated = true, so only a build with that flag can be one: a town's own road (false) that the
+	-- engine announces between the mark and the replay's event must not spend the mark, or the replay is taken for a new tool build
+	-- and shipped back (the echo seen in lab runs N0-1 and N0-4: the other game refused the duplicate road).
+	if not post and piEarly ~= false and spendReplay(st, now) then
 		state:set(st)
 		return
 	end
@@ -958,8 +1006,95 @@ local function simAdvanceBinders(st, now)
 	st.binders = keep
 end
 
+-- Build trace (FEVERLINK3_BUILD_TRACE=1, observation only): every 30 game seconds one block in build_trace.txt of the road graph:
+-- counts and hashes of the BASE_NODE and BASE_EDGE entities in id order and in position order, the pairs() order of the
+-- node-to-segment map, and the ids and positions of the nodes/edges that appeared since the last block. Two games that ended
+-- up with the same road graph by different paths show it as equal position hashes with different id or order hashes.
+local BT = { on = nil, last = -1, seenN = {}, seenE = {}, fails = 0 }
+local function buildTraceStep(tick)
+	if BT.on == nil then
+		local ok, v = pcall(function() return os.getenv("FEVERLINK3_BUILD_TRACE") == "1" end)
+		BT.on = ok and v or false
+	end
+	if not BT.on or BT.fails >= 5 or not C.DIR then return end
+	if tick % 50 ~= 0 or tick == BT.last then return end
+	BT.last = tick
+	local ok, err = pcall(function()
+		local function comp(e, name)
+			local o, c = pcall(api.engine.getComponent, e, api.type.ComponentType[name])
+			return o and c or nil
+		end
+		local function r1(v) return string.format("%.1f", v or 0) end
+		local lines = {}
+		local nodes, ids, pos = {}, {}, {}
+		local order = {}
+		local okm, map = pcall(function() return api.engine.system.streetSystem.getNode2SegmentMap() end)
+		map = okm and map or {}
+		local segSeen, edgeIds = {}, {}
+		for n, segs in pairs(map) do
+			order[#order + 1] = tostring(n) .. "/" .. tostring(#segs)
+			local c = comp(n, "BASE_NODE")
+			local p = c and c.position and (r1(c.position.x) .. "," .. r1(c.position.y) .. "," .. r1(c.position.z)) or "?"
+			nodes[n] = p
+			ids[#ids + 1] = n
+			pos[#pos + 1] = p
+			for i = 1, #segs do
+				if not segSeen[segs[i]] then segSeen[segs[i]] = true; edgeIds[#edgeIds + 1] = segs[i] end
+			end
+		end
+		table.sort(ids)
+		table.sort(pos)
+		local idKeys = {}
+		for i = 1, #ids do idKeys[i] = ids[i] .. "@" .. nodes[ids[i]] end
+		local edgePos, edgeKeys = {}, {}
+		table.sort(edgeIds)
+		for i = 1, #edgeIds do
+			local e = edgeIds[i]
+			local c = comp(e, "BASE_EDGE")
+			if c then
+				local a, b = nodes[c.node0] or tostring(c.node0), nodes[c.node1] or tostring(c.node1)
+				if a > b then a, b = b, a end
+				edgePos[#edgePos + 1] = a .. "-" .. b .. "/" .. tostring(c.type) .. "/" .. tostring(c.typeIndex)
+				edgeKeys[e] = tostring(c.node0) .. ">" .. tostring(c.node1) .. "@" .. a .. "-" .. b
+			end
+		end
+		table.sort(edgePos)
+		local eIdKeys = {}
+		for i = 1, #edgeIds do eIdKeys[i] = edgeIds[i] .. ":" .. tostring(edgeKeys[edgeIds[i]]) end
+		local cons = entitiesWith("CONSTRUCTION")
+		table.sort(cons)
+		local bal = 0
+		pcall(function() bal = engine.account() end)
+		local maxVeh, nVeh = 0, 0
+		for _, e in ipairs(entitiesWith("TRANSPORT_VEHICLE")) do nVeh = nVeh + 1; if e > maxVeh then maxVeh = e end end
+		lines[#lines + 1] = string.format("t=%d veh=%d maxVeh=%d maxCons=%s maxEdge=%s balance=%s nodes=%d idsHash=%s posHash=%s maxId=%s edges=%d eIdsHash=%s ePosHash=%s mapOrder=%s mapN=%d cons=%d consHash=%s",
+			tick, nVeh, maxVeh, tostring(cons[#cons]), tostring(edgeIds[#edgeIds]), tostring(bal), #ids, C.hashValue(idKeys), C.hashValue(pos), tostring(ids[#ids]), #edgeIds, C.hashValue(eIdKeys), C.hashValue(edgePos),
+			C.hashValue(order), #order, #cons, C.hashValue(cons))
+		local nNew = 0
+		for i = 1, #ids do
+			if not BT.seenN[ids[i]] then
+				BT.seenN[ids[i]] = true
+				if BT.last > 0 and BT.started and nNew < 40 then nNew = nNew + 1; lines[#lines + 1] = "  newnode " .. ids[i] .. "@" .. nodes[ids[i]] end
+			end
+		end
+		for i = 1, #edgeIds do
+			if not BT.seenE[edgeIds[i]] then
+				BT.seenE[edgeIds[i]] = true
+				if BT.started and nNew < 80 then nNew = nNew + 1; lines[#lines + 1] = "  newedge " .. edgeIds[i] .. ":" .. tostring(edgeKeys[edgeIds[i]]) end
+			end
+		end
+		BT.started = true
+		C.appendFile(C.path("build_trace.txt"), table.concat(lines, "\n") .. "\n")
+	end)
+	if not ok then
+		BT.fails = BT.fails + 1
+		if BT.fails == 1 then logSim("build trace error: " .. tostring(err)) end
+	end
+end
+
 local function update(userParams, state, dt)
 	C.poll()
+	pcall(function() buildTraceStep(math.floor(engine.gameTime() / STEP)) end)
 	townTraceGuard(function(t)
 		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
 	end)
@@ -992,7 +1127,7 @@ local function update(userParams, state, dt)
 		local due = L.takeDue(st.queue, now)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" then
-				local parts, t = checksumParts(st.co)
+				local parts, t = checksumParts(st.co, "sim")
 				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountSnapshot(engine) }
 			elseif it.kind == "action" then
 				simApplyAction(st, it, now)
@@ -1278,7 +1413,7 @@ local natPauseRelease, natHeldRefused, natVeto, vetoChat
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
-		local parts, t = checksumParts(G.co)
+		local parts, t = checksumParts(G.co, "gui")
 		reportRound(it.n, t, parts, L.accountSnapshot(engine))
 		return
 	end
@@ -1856,25 +1991,34 @@ local function natDecideUnsafe(h, cap)
 	if not args then return release("it cannot be rebuilt here (" .. tostring(whyD) .. ")") end
 	local seq = G.seq + 1
 	local at
-	if not STRICT_CANCEL then
+	local cancelFlow = STRICT_CANCEL == "all"
+	if STRICT_CANCEL == "plans" then
+		local okP, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
+		cancelFlow = okP and STRICT_CANCEL_PLANS[plan or ""] == true
+	end
+	if not cancelFlow then
 		-- the record says it is held: the other games dry-run it and veto it if they cannot build it (see "veto-only validation")
 		wire.held = true
 		if pausedNow() then wire.commit = true end   -- the peers park it until the originator's commit (see "a held build in a PAUSED game")
 		text = C.serialize(wire)
 		at = stampAfterFastest(now, VETO_STEPS)
 	else
-		at = stampAfterFastest(now)
+		-- every game applies the record at the stamp, the originator too, and a game that has passed the stamp applies it late and
+		-- allocates other entity ids (real run A1-1: the host was 1.8 game s ahead of the guest's clock when the guest's build
+		-- arrived, 3 steps late). A game may run `aheadFor(speed)` steps plus a batch past the slowest clock, so the lead gets that
+		-- on top.
+		at = stampAfterFastest(now, CANCEL_EXTRA_STEPS)
 	end
 	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
 	if not okS then return release("the action cannot be sent (" .. tostring(errS) .. ")") end
 	G.seq = seq
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq) }
 	noteBuild(it.key, at)
-	if STRICT_CANCEL then
-		-- developer fallback: the first strict flow. The command is cancelled, every game (this one too) replays the record.
+	if cancelFlow then
+		-- cancel flow: the first strict flow. The command is cancelled, every game (this one too) replays the record.
 		wire.held = nil
 		local okC = natOrder("cancel", id)
-		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), FEVERLINK3_STRICT_CANCEL: %s",
+		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), cancel flow: %s",
 			id, natSite(h), cap.tool, #text, it.key, at, now, okC and "cancel written, this game replays the record too" or "CANCEL NOT WRITTEN (the build may be applied twice here)"))
 		route(it)
 		return
@@ -2514,7 +2658,7 @@ H.action = function(rec, p)
 	if G.vetoed[it.key] then logGui("action " .. it.key .. " was vetoed already: dropped"); return end
 	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
 		noteBuild(it.key, it.at)
-		if it.body.held == true and not STRICT_CANCEL then
+		if it.body.held == true then
 			-- the originator holds its command until the stamp and cancels it on a veto: dry-run now, veto when this game cannot build it
 			local now = engine.gameTime()
 			if it.body.commit == true then

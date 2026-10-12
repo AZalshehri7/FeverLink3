@@ -337,8 +337,16 @@ class StrictTest(unittest.TestCase):
     """Two games that both have the native module."""
 
     natives = (True, True)
+    # FEVERLINK3_STRICT_CANCEL for the test: "0" = hold-and-release for every build (what most tests here are about), "1" = cancel
+    # every kind, None = unset (the default: cancel and replay on every game for street, combined and bulldoze builds)
+    strict_cancel = "0"
 
     def setUp(self):
+        self._old_cancel = os.environ.get("FEVERLINK3_STRICT_CANCEL")
+        if self.strict_cancel is None:
+            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
+        else:
+            os.environ["FEVERLINK3_STRICT_CANCEL"] = self.strict_cancel
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-strict-")
         self.clock = Clock()
         self.A = StrictGame("host", 0, self.tmp, 50000, self.clock, native=self.natives[0])
@@ -349,6 +357,10 @@ class StrictTest(unittest.TestCase):
         if os.environ.get("FEVERLINK3_TEST_VERBOSE"):
             print("\n--- host mod.log ---\n" + self.A.log() + "\n--- client mod.log ---\n" + self.B.log())
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if getattr(self, "_old_cancel", None) is None:
+            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
+        else:
+            os.environ["FEVERLINK3_STRICT_CANCEL"] = self._old_cancel
 
     def frames(self, n=1):
         """n interface frames of 50 ms each: both games, the relay and the fake modules' service threads."""
@@ -1073,17 +1085,7 @@ class VetoTest(StrictTest):
 class StrictCancelFallbackTest(StrictTest):
     """FEVERLINK3_STRICT_CANCEL=1: the first strict flow, for testing sync independent of the tool."""
 
-    def setUp(self):
-        self._old = os.environ.get("FEVERLINK3_STRICT_CANCEL")
-        os.environ["FEVERLINK3_STRICT_CANCEL"] = "1"
-        super().setUp()
-
-    def tearDown(self):
-        super().tearDown()
-        if self._old is None:
-            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
-        else:
-            os.environ["FEVERLINK3_STRICT_CANCEL"] = self._old
+    strict_cancel = "1"
 
     def test_the_command_is_cancelled_and_every_game_replays_the_record_so_the_worlds_are_identical(self):
         self.start()
@@ -1093,7 +1095,7 @@ class StrictCancelFallbackTest(StrictTest):
         self.assertEqual(self.B.native.released, [])
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1), "both games applied the same rebuilt record")
         self.assertSameWorld()
-        self.assertIn("FEVERLINK3_STRICT_CANCEL", self.B.log())
+        self.assertIn("cancel flow", self.B.log())
         self.assertEqual(self.relay.vetoes, [])
         self.assertNotIn("held=true", str(self.B.action_records()[0]["body"]).replace(" ", ""), "no held marker in this mode")
 
@@ -1103,6 +1105,34 @@ class StrictCancelFallbackTest(StrictTest):
         self.B.tool(SPLIT, make="NATIVE_SPLIT")
         self.tick(20)
         self.assertEqual(self.relay.vetoes, [], "the originator replays it itself: nothing to cancel, the refusal at the stamp is the old one")
+
+
+class DefaultCancelFlowTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL unset: road (street, combined) and bulldoze builds are cancelled and replayed on every game."""
+
+    strict_cancel = None
+
+    def test_a_road_build_is_cancelled_and_replayed_everywhere_by_default(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual(self.B.native.dropped, [1])
+        self.assertEqual(self.B.native.released, [])
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+        self.assertIn("cancel flow", self.B.log())
+
+
+class HoldAndReleaseSwitchTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=0: the developer switch back to hold-and-release for every kind."""
+
+    def test_the_originator_releases_its_own_command(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertSameWorld()
 
 
 class ModuleSilentTest(StrictTest):

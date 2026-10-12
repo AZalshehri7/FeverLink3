@@ -744,11 +744,15 @@ end
 --   engine.lines()          -> list of { stops = number }
 -- Each part is hashed separately so the launcher can name the differing one. Entity ids never enter a hash:
 -- constructions are compared by file and position, lines by their stop counts, both sorted.
-function L.checksumParts(engine, hashFn)
+-- `timing` (optional table): filled with the seconds each part took (observation only, never part of the result).
+function L.checksumParts(engine, hashFn, timing)
 	local parts = {}
+	local clock = timing and function() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end or nil
 	local function part(name, fn)
+		local t0 = clock and clock() or 0
 		local ok, v = pcall(fn)
 		parts[name] = ok and hashFn(v) or "error"
+		if clock then timing[name] = clock() - t0 end
 	end
 	local okT, t = pcall(engine.gameTime)
 	t = okT and t or -1

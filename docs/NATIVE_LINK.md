@@ -22,19 +22,18 @@ networking.
 
 ## 2. Switches and safety rules
 
-Nothing is installed unless the environment says so, and each piece has its own switch. The values are exactly `1`;
-anything else (unset, empty, `0`, `true`) is off. Try them in this order:
+Since 2026-10-12 pieces 1, 2, 3 and 6 are ON by default (a session of several games needs them: the strict build flow of section 7 runs on 1 and 2); a variable set to exactly `0` turns that piece off, and every piece stays fail-open (an unknown build or bytes that do not match install nothing and the reason is logged). The diagnostic pieces 4 and 5 are off unless their variable is exactly `1`. In this order:
 
 | Order | Environment | What it installs | Risk |
 |---|---|---|---|
-| 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
-| 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
+| 1 | on by default; `FEVERLINK3_HOOKS=0` turns it off | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
+| 2 | on by default; `FEVERLINK3_HOLD=0` turns it off | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
 | 3 | on by default; `FEVERLINK3_POOLPATCH=0` turns it off | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
 | 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the **map-generation** seed (`RandomLocationFactory`'s constructor, `sub_8d4270`, RVA `0x8d4270` in build 40420; NOT town growth, see section 11). It logs one line per call, `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, the maintainer's private research notes). Writes to `native.log` on the thread that calls the function (see below). |
 | 5 | `FEVERLINK3_LOG_GROWTH=1`, `FEVERLINK3_GROWTH_SEED_MODE=derive` (`..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) | The town-growth log (a hook on `TownDeveloper::Develop`, RVA `0x8de0b0`, plus a read-only hook on the `TownUpdateSize` handler for the game time) and the seed experiment: after a threshold the random seed `Develop` reads is replaced by a hash of (town, quantized game time). Only which random numbers are drawn changes. Section 11. | Two detours on engine functions; **not run in the game**. |
 | 6 | on by default; `FEVERLINK3_LUA_SEED=0` turns it off | The Lua string-hash seed pinned to a constant (see stage 6 below). Lab runs 2026-10-12: with the pin the `pairs`-order probe number was equal in every Lua state of both games, without it every state differed; fail-open on an unknown build or other bytes. | A patch on the first bytes of Lua's `makeseed`. |
 
-`FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
+`FEVERLINK3_HOLD` without `FEVERLINK3_HOOKS` does nothing and says so. The switches are read once, at start.
 The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
 in-game session controller's folder), as before.
 
@@ -293,6 +292,8 @@ run in the game.** The code is the "strict mode" block of the bridge's interface
 against a fake module that honours the files and rules of sections 3 and 4 (`hold_on` / `hold_off` / `release` / `cancel` /
 `ping`, `ready` / `holding` / `held` / `released` / `dropped` / `pong` / `error`, release and cancel only at the next `Add`, the
 10 s silence rule).
+
+**Update 2026-10-12: what runs by default now.** Real two-game runs (the lab, private notes) showed that releasing the tool's own command on the originator makes the originator and the other games allocate DIFFERENT entity ids for the same build (new nodes and edges), and everything keyed by id then iterates differently: the worlds drifted about three game minutes after the first build. With cancel-and-replay on every game, the originator included, all ids were equal. So the default is: hooks and hold are on (`FEVERLINK3_HOOKS=0` / `FEVERLINK3_HOLD=0` switch them off), and for the build plans `street`, `combined` and `bulldoze` the mod cancels the held command and every game replays the shipped record at the stamp (the stamp lies six steps further ahead than for a held build, so no game passes it). The tool stays usable: four consecutive cancelled road builds in one tool session on a game window were all captured and shipped (lab run A1-1), so firing the tool's completion callback before the cancel (the TpF2 mechanism) was not needed and is not implemented. Every other plan (constructions, stations, depots, upgrades, removals, stops, node settings) is not proven this way and keeps hold-and-release as described below. `FEVERLINK3_STRICT_CANCEL=0` makes every kind hold-and-release again, `=1` cancels every kind.
 
 **The design (changed 2026-10-11).** The construction tool's command is held until the stamp. At the stamp every OTHER game
 replays the build from the shipped record through `simApplyAction`, and the ORIGINATING game RELEASES its own held command,

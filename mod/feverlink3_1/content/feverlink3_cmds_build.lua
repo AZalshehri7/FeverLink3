@@ -1972,6 +1972,16 @@ function M.captureToolBuild(id, name, param, ctx)
 	return body, why, text
 end
 
+-- The plan (street, combined, bulldoze, construction, ...) a captured build body falls under; nil when it cannot be told.
+-- The bridge's strict mode cancels and replays only the plans that real games proved (see STRICT_CANCEL_PLANS there).
+function M.planOf(body)
+	local ok, plan = pcall(function()
+		local rec = normalise(body.args[1])
+		return rec and classify(rec) or nil
+	end)
+	return ok and plan or nil
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
