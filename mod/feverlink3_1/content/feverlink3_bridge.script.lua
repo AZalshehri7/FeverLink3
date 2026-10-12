@@ -1744,6 +1744,11 @@ end
 -- game that is slow, paused or gone casts no veto. The dry run waits for earlier builds that have not landed yet (they create
 -- what this one may refer to); if they do not land before the stamp it is skipped (silence).
 local VETO_STEPS = 1          -- extra steps of lead for a held build (the veto's way back)
+-- A build that adds or removes constructions takes the other games much longer to dry-run (every building has to be found, the engine's
+-- factory runs on a big proposal; real session 2026-10-12: a veto 2 s after the build was released after a 626 ms grace): a longer
+-- window, so that a veto reaches the originator before it releases its command.
+local CONSTRUCTION_VETO_STEPS = 12   -- extra steps of lead
+local CONSTRUCTION_GRACE_MS = 4000   -- a paused game waits at least this long
 local VETO_MARGIN = 1         -- a dry run later than this many steps before the stamp is useless and skipped
 
 local function noteBuild(key, at)
@@ -2197,7 +2202,8 @@ local function natDecideUnsafe(h, cap)
 		wire.held = true
 		if pausedNow() then wire.commit = true end   -- the peers park it until the originator's commit (see "a held build in a PAUSED game")
 		text = C.serialize(wire)
-		at = stampAfterFastest(now, VETO_STEPS)
+		local heavy = Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body)
+		at = stampAfterFastest(now, heavy and CONSTRUCTION_VETO_STEPS or VETO_STEPS)
 	else
 		-- every game applies the record at the stamp, the originator too, and a game that has passed the stamp applies it late and
 		-- allocates other entity ids (real run A1-1: the host was 1.8 game s ahead of the guest's clock when the guest's build
@@ -2231,6 +2237,7 @@ local function natDecideUnsafe(h, cap)
 		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now))
 	if wire.commit then
 		local ms, rtt = graceMs()
+		if Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body) then ms = math.max(ms, CONSTRUCTION_GRACE_MS) end
 		G.graces[it.key] = { it = it, due = os.clock() + ms / 1000, ms = ms }
 		natSay(string.format("%s: the game is paused, so the build waits %d ms (round trip about %.0f ms) for a veto before it is committed", it.key, ms, rtt))
 		return

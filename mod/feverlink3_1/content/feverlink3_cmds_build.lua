@@ -2067,6 +2067,30 @@ function M.addsConstructions(body)
 	return ok and adds == true
 end
 
+-- What was passed to the engine's command factory, for the log when it throws: the lengths of the proposal's lists (constructions and
+-- street parts to add and to remove). Never raises.
+local function proposalCounts(proposal)
+	local parts = {}
+	pcall(function()
+		local function n(obj, key)
+			local ok, l = pcall(function() return obj[key] end)
+			return ok and l ~= nil and #l or nil
+		end
+		for _, k in ipairs({ "constructionsToAdd", "constructionsToRemove" }) do
+			local c = n(proposal, k)
+			if c then parts[#parts + 1] = k .. "=" .. c end
+		end
+		local ok, st = pcall(function() return proposal.streetProposal end)
+		if ok and st ~= nil then
+			for _, k in ipairs({ "nodesToAdd", "edgesToAdd", "nodesToRemove", "edgesToRemove", "edgeObjectsToAdd", "edgeObjectsToRemove", "nodeConfigsToAdd" }) do
+				local c = n(st, k)
+				if c then parts[#parts + 1] = k .. "=" .. c end
+			end
+		end
+	end)
+	return table.concat(parts, " ")
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
@@ -2099,7 +2123,12 @@ local function decodeBuildUnsafe(body, ctx)
 				logNotes(notes, "build " .. plan)
 				break
 			end
-			lastErr = "the engine's command factory refused the " .. plan .. " build: " .. tostring(errF):sub(1, 160)
+			local first = tostring(errF):gsub("\nstack traceback:.*", ""):sub(1, 160)
+			lastErr = "the engine's command factory refused the " .. plan .. " build: " .. first
+			-- say what it was given: the next real run names the part that makes it throw
+			log(string.format("factory threw for %s (form %d of %d): %s; passed [%s]; record cons=%d rem=%d nodes=%d+%d segs=%d+%d objs=%d+%d; first command ie=%s pi=%s",
+				plan, i, #(FORMS[plan] or { {} }), first, proposalCounts(built[1]), #rec.cons, #rec.rem, #rec.nodes, #rec.rmNodes, #rec.segs, #rec.rmSegs,
+				#rec.objs, #rec.rmObjs, tostring(built[3]), tostring(built[4])))
 		end
 	end
 	if not args then return nil, lastErr or "no way to build it" end
