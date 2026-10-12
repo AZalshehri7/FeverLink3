@@ -36,13 +36,13 @@
 -- `bld` the building count and hash of the last trace step. `order` is the order in which forEachEntityWithComponent(TOWN)
 -- (the game script's loop, whose index decides which towns grow in which step) and pairs(cargoTypeRep.getAll()) (the
 -- candidate order for new cargo needs) hand out their entities, hashed to one number; written when it changes and at
--- least every INFO_EVERY ticks. tools/gametest/compare_town_cmds.py pairs the two games' lines.
+-- least every INFO_EVERY ticks. the maintainer's local comparer pairs the two games' lines.
 --
 -- Keys never contain entity ids (those differ between the games); the town id names the lane, as in the checksum's
 -- `townBuildings:<id>` part. With `all` the world is sampled every ALL_EVERY ticks to keep the cost low and the baseline
 -- lists no buildings. Lines are buffered and written in one append per flush (a second of wall time or a few hundred
 -- lines), so the sim never waits on the disk; a failed write drops the buffer, it never raises.
--- tools/gametest/compare_town_trace.py reads this file together with growth.log.
+-- the maintainer's local comparer reads this file together with growth.log.
 
 local M = {}
 

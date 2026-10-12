@@ -415,7 +415,7 @@ mode (`results.rs`); the responder logs to `speedtest-responder.txt` (`responder
 minutes): the idle round trip, the ladder at 1, 2 and 4 MiB/s, a validation at the best rate, 2, 4, 8 and 16 connections at
 1 MiB/s each (skipped for a direction after a step that did not scale), `Auto (scaled)` 80 MB each way (the resync's code
 path), and the datagram test; `--classic` lists the single modes, `Auto (scaled)` 8, 32 and 80 MB among them. Package it with
-`tools/speedtest/make_package.ps1 [-PeerSteamId <id>] [-SteamApiDll <path>] [-Out <folder>]`.
+a local script of the maintainer (not in the repository).
 
 Tested with the fake Steam (cargo test): roles, arguments, results text, error texts, timeouts, several testers one after
 another. **Not yet run on real Steam.**

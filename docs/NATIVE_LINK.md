@@ -763,7 +763,7 @@ Read-only; changes no mechanic. `FEVERLINK3_TOWN_TRACE=<comma list of town entit
   or 200 lines; a failing write never raises, and five trace errors switch the trace off.
 - `growth.log` (native, needs `FEVERLINK3_LOG_GROWTH=1`): every `Develop` call of the traced towns (see above).
 
-`python tools/gametest/compare_town_trace.py <live1> <live2>` aligns the two games and prints, per traced town, the first
+The maintainer's local comparer (not in the repository) aligns the two games and prints, per traced town, the first
 tick at which the state differs, the building diff of each game, the buildings only one game has, the `Develop` calls
 around that tick, the commands seen, and a verdict: `inputs differed before the call` / `same inputs, different result
 (nondeterminism inside Develop)` / `a non-growth writer`. The session controller clears the live folder when it starts,
@@ -819,7 +819,7 @@ sum of mixed per-record hashes of the same; `hio`/`his` the same two over the en
 200 only). Volume: the commands of towns in `FEVERLINK3_TOWN_TRACE` always; the others the first 2000 commands and then about
 one in 50 chosen by `(town, t)`, so both games log the same ones; all lines of one command are logged or skipped together.
 
-Comparing two games: `python tools/gametest/compare_growth_deep.py <live dir or growth.log of game 1> <same of game 2>`
+Comparing two games is done with a local script (not in the repository) that takes the live folder or `growth.log` of each game
 (standard library only, run without `-I`; `--pid-a/--pid-b` choose a process when the file holds several, default the last).
 It pairs the lines, finds the first difference in the order of game 1's file and prints a verdict (and, for every kind of difference, its first occurrence):
 `payload differs` (H2), `octree history order differs (S3 edge pick ...)` / `(S2 sort input ...)` (ordered hash differs, sum equal: H1), `candidate order differs while the sum is equal` (the sorted gather result), `candidate set differs`,

@@ -8,7 +8,7 @@
 -- What it does with a command the player issues (and only while a session is on):
 --   * a speed button (makeGameSetSpeedCmd): not applied. It becomes a `speed` record for the bridge, which asks the
 --     host; the session speed comes back and the bridge sets the engine speed. So the game's own bar is the speed
---     control, as in Transport Fever 2 Multiplayer (docs/research/TPF2_COMPARISON.md).
+--     control, as in Transport Fever 2 Multiplayer.
 --   * a command with a schema (feverlink3_cmds_*.lua, the same registry the bridge uses): encoded, handed to the bridge
 --     as a `cmd` record (ui_out.log), and applied natively here and now, exactly as without the mod ("replay on peers":
 --     the other games apply it at the stamp the bridge gives it). Its callback runs as usual; a created entity (a line)

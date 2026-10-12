@@ -44,7 +44,7 @@ Each one is a thing that has to be seen working before the matching claim may ap
 ### Timeline
 
 - **2026-10-09:** project skeleton and design; protocol core and its tests; session state machines; native module skeleton in Rust; Lua mod with lockstep core and a two-game lupa test; address tool and its first run on build 40420; launcher platform layer; release pipeline and update verification; resync round, checksum policy, hot join and permissions in the core; launcher TCP host/join; first run of the mod in the real game; live mode (the session runs inside the game, driven by the in-game window).
-- **2026-10-10:** Steam peer-to-peer probe, first one-process connection to the game's own Steam ID; the window became Steam-first and the connection research was written down (`docs/research/P2P_CONNECTIVITY.md`); the join code can carry the host's Steam ID; plug-in point in the mod for command schemas and the schemas for everyday operations (vehicles, lines, names, bookings, events) with their tests (`docs/COVERAGE_OPS.md`); CI runs every Lua test; documentation and listing material (this document set).
+- **2026-10-10:** Steam peer-to-peer probe, first one-process connection to the game's own Steam ID; the window became Steam-first and the connection research was written down (maintainer's private notes); the join code can carry the host's Steam ID; plug-in point in the mod for command schemas and the schemas for everyday operations (vehicles, lines, names, bookings, events) with their tests (`docs/COVERAGE_OPS.md`); CI runs every Lua test; documentation and listing material (this document set).
 
 ## Workstreams
 
@@ -52,7 +52,7 @@ Work after 2026-10-10 runs in parallel workstreams. Each one owns a part of the 
 
 | Workstream | Covers | Stages |
 |---|---|---|
-| Connection (Steam peer-to-peer) | Steam peer-to-peer as the way players reach each other: the first cross-account test (P6), then hosting and joining carried over it (P7), and what the window shows when it fails. Other transports only if Steam proves not to be enough (research notes: `docs/research/P2P_CONNECTIVITY.md`). Replaces the hole-punching item that used to sit in 0.8. | 0.2, 0.3 |
+| Connection (Steam peer-to-peer) | Steam peer-to-peer as the way players reach each other: the first cross-account test (P6), then hosting and joining carried over it (P7), and what the window shows when it fails. Other transports only if Steam proves not to be enough (private research notes). Replaces the hole-punching item that used to sit in 0.8. | 0.2, 0.3 |
 | Session robustness and reconnect | A player who drops comes back without losing the world; hot join; host leaving; timeouts; what the window shows when something fails. | 0.2, 0.5 |
 | Construction and operations replication | Roads, tracks, stations, signals, terrain, bulldozing; vehicles, lines, orders, renames; coverage tables of which engine commands are replicated and how. | 0.3, 0.4 |
 | Companies | Separate companies on one map, own money and vehicles, station access, shared infrastructure rules. | 0.6, 0.7 |
