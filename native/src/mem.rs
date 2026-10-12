@@ -184,6 +184,39 @@ pub unsafe fn alloc_exec(bytes: &[u8]) -> Result<*mut u8, MemError> {
     if mem.is_null() {
         return Err(MemError::Alloc(unsafe { GetLastError() }));
     }
+    unsafe { seal_exec(mem, bytes) }
+}
+
+/// Like [`alloc_exec`], but within about 1 GiB of `near`, so that a `call rel32` from `near` can reach it. Tries
+/// 64 KiB steps outwards on both sides; `Err` when every address in range is taken.
+///
+/// # Safety
+/// As for [`alloc_exec`].
+pub unsafe fn alloc_exec_near(near: usize, bytes: &[u8]) -> Result<*mut u8, MemError> {
+    const STEP: usize = 0x10000;
+    if bytes.is_empty() {
+        return Err(MemError::Alloc(0));
+    }
+    let base = near & !(STEP - 1);
+    for i in 0..0x4000usize {
+        for cand in [base.wrapping_add(i * STEP), base.wrapping_sub(i * STEP)] {
+            if cand == 0 || (i == 0 && cand != base) {
+                continue;
+            }
+            // SAFETY: an explicit-address reservation either fails or yields a fresh private allocation.
+            let mem =
+                unsafe { VirtualAlloc(cand as *const c_void, bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
+                    as *mut u8;
+            if !mem.is_null() {
+                return unsafe { seal_exec(mem, bytes) };
+            }
+        }
+    }
+    Err(MemError::Alloc(unsafe { GetLastError() }))
+}
+
+/// Copies `bytes` into the fresh allocation `mem` and makes it executable (not writable).
+unsafe fn seal_exec(mem: *mut u8, bytes: &[u8]) -> Result<*mut u8, MemError> {
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, bytes.len()) };
     let mut previous = 0u32;
     if unsafe { VirtualProtect(mem as *const c_void, bytes.len(), PAGE_EXECUTE_READ, &mut previous) } == 0 {

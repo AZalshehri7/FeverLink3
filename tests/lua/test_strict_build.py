@@ -803,7 +803,7 @@ class StrictOnTest(StrictTest):
         self.tick(18)
         self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
         self.B.tool(self.road(300, 0, 400, 0))
-        self.tick(6)
+        self.tick(14)   # the grace for vetoes (real time), then the commit
         self.assertEqual(self.B.native.released, [1])
         expected = ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt]
         self.assertEqual(self.A.builds(), expected)
@@ -961,6 +961,42 @@ class NativeVersusReplayTest(StrictTest):
         self.assertIn("N 50.00,0.00,0.00", lines(self.A, "N "), "the junction on the road exists on the replay")
         self.assertEqual(self.relay.vetoes, [])
 
+    def test_a_depot_whose_entrance_reaches_an_existing_node_gets_that_connection_on_the_other_game_and_a_road_from_it_resolves(self):
+        # real run 2026-10-11 (Dunwich): the originator's result has the depot's entrance piece to a town node; a road built from that
+        # piece was vetoed by the other game ("unresolved segment ...") because its replay of the depot had not made the piece
+        self.start()
+        n = int(self.B.lua("FIND_NODE(100, 0, 0)"))
+        self.B.tool("{ node = %d, door = { x = 150, y = -40, z = 0 }, params = { seed = 261 } }" % n, make="NATIVE_DEPOT_ENTRANCE")
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+        self.assertIn("E 100.00,0.00,0.00 150.00,-40.00,0.00", self.A.sig(), "the entrance piece exists on the replay too")
+        self.assertIn("did not make the street connection", self.A.log(), "the log names the first cause on the replaying game")
+        nb = int(self.B.lua("FIND_NODE(150, -40, 0)"))
+        self.B.tool("{ nodeA = %d, b = { x = 250, y = -80, z = 0 } }" % nb)
+        self.tick(16)
+        self.assertSameWorld()
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertEqual(self.B.native.released, [1, 2])
+
+    def test_an_airfield_with_signs_on_its_own_taxiways_is_shipped_before_it_is_built_and_replayed_without_a_veto(self):
+        # real run 2026-10-11: the tool's preview could not be read (the signs' models), the build went through un-vetted and was
+        # shipped afterwards as 21 references to nodes nobody else had ("unresolved node")
+        self.start()
+        self.B.tool("{ a = { x = 600, y = 600, z = 0 }, b = { x = 700, y = 650, z = 0 }, params = { seed = 5 } }", make="NATIVE_AIRFIELD")
+        self.tick(1)
+        self.assertEqual(self.B.native.released, [], "still held: the record was shipped first, so a veto can still stop it")
+        self.assertEqual(len(self.B.action_records()), 1)
+        self.assertNotIn("capture of streetBuilder failed", self.B.log())
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertNotIn("refused", self.log())
+        self.assertNotIn("native build captured", self.log())
+        lines = lambda g: sorted(x for x in g.sig().splitlines() if x.startswith("C "))
+        self.assertEqual(lines(self.A), lines(self.B), "the same airfield on both games")
+        self.assertEqual(self.B.shipped_count(), 1)
+
     def test_a_missing_node_is_made_where_the_result_says_instead_of_refusing_the_build(self):
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))
@@ -1091,6 +1127,241 @@ class ModuleSilentTest(StrictTest):
         self.tick(16)
         self.assertSameWorld()
         self.assertEqual(self.B.shipped_count(), 1, "the old path")
+
+
+class PausedGraceTest(StrictTest):
+    """A build made while the session is PAUSED: the originator holds its command for a real-time grace, the peers dry-run the record
+    and park it, and only the originator's commit makes every game apply it (real run 2026-10-11: a veto came too late and the
+    guest's game built a road the host could not)."""
+
+    def pause(self):
+        self.start(speed=2)
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(18)
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
+
+    def test_nobody_applies_the_build_before_the_grace_is_over_and_the_commit_is_sent(self):
+        self.pause()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.assertEqual(self.B.native.released, [], "the originator holds its command through the grace")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "the peer has parked the replay: nothing applied yet")
+        self.assertEqual(self.relay.commits, [])
+        self.assertIn("parked until its originator commits it", self.A.log())
+        self.assertIn("for a veto before it is committed", self.B.log())
+        self.tick(14)
+        self.assertEqual(self.relay.commits, [(1, 1, 1, self.relay.pauseAt)], "one commit, at the pause time")
+        self.assertEqual(self.B.native.released, [1])
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt])
+        self.assertEqual(self.B.builds(), ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt])
+        self.assertSameWorld()
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertEqual(self.B.shipped_count(), 1)
+        self.assertIn("committed by its originator", self.A.log())
+
+    def test_the_grace_is_chosen_from_the_round_trip_and_logged(self):
+        self.pause()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(2)
+        import re
+        m = re.search(r"waits (\d+) ms \(round trip about (\d+) ms\)", self.B.log())
+        self.assertIsNotNone(m, self.B.log())
+        grace, rtt = int(m.group(1)), int(m.group(2))
+        self.assertGreaterEqual(grace, 250)
+        self.assertLessEqual(grace, 1500)
+        self.assertGreaterEqual(grace, min(1500, 2 * rtt))
+
+    def test_a_veto_during_the_grace_drops_the_build_everywhere_and_says_so_once(self):
+        self.pause()
+        before = (self.A.sig(), self.B.sig())
+        self.A.run("WORLD[110] = nil")   # the host cannot build this split
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.assertEqual(len(self.relay.vetoes), 1)
+        self.assertEqual(self.relay.commits, [], "no commit after a veto")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+        self.assertEqual(self.B.native.released, [])
+        self.assertEqual(self.B.native.dropped, [1], "cancelled: the build exists on no game")
+        self.assertEqual(self.B.sig(), before[1])
+        # one chat line for this vetoed build, from the originator: cancelled everywhere, who and why in words
+        self.assertEqual(len(self.relay.chats), 1)
+        who, text = self.relay.chats[0]
+        self.assertEqual(who, 1)
+        self.assertIn("client's build was cancelled on every game", text)
+        self.assertIn("missing on host's game", text)
+        self.assertNotIn("unresolved", text, "the technical text stays in the log")
+        self.assertNotIn("Player 1", text)
+        self.assertIn("[FeverLink3]", text)
+        self.assertIn("unresolved segment", self.B.log())
+        self.assertEqual(self.A.log().count("chat client: [FeverLink3]"), 1, "the other game gets that one line")
+
+    def test_a_game_that_is_unpaused_during_the_grace_gives_the_build_a_normal_stamp(self):
+        self.pause()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.assertEqual(self.relay.commits, [])
+        self.relay.pauseAt = None
+        self.relay.session()
+        self.tick(30)
+        self.assertEqual(len(self.relay.commits), 1)
+        stamp = self.relay.commits[0][3]
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stamp], "the peer applied it at the commit's stamp")
+        self.assertEqual(self.B.builds(), ["makeWorldBuildProposalCmd@%d" % stamp], "so did the originator, once")
+        self.assertSameWorld()
+        self.assertIn("no longer paused", self.B.log())
+
+    def test_a_parked_build_whose_commit_never_comes_is_dropped_by_the_peer(self):
+        self.pause()
+        orig = self.relay.send
+
+        def send(g, kind, frm, payload):
+            if kind == "build_commit":
+                return None
+            return orig(g, kind, frm, payload)
+        self.relay.send = send
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.frames(260)   # 13 s of interface frames
+        self.assertIn("originator never committed it: dropped", self.A.log())
+        self.assertEqual(self.A.builds_applied(), 0)
+
+    def test_a_peer_that_never_answers_is_no_veto(self):
+        self.pause()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(16)
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+
+    def test_a_second_build_in_the_pause_that_needs_the_first_one_works(self):
+        self.pause()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(14)
+        nb = int(self.B.lua("FIND_NODE(400, 0, 0)"))
+        self.B.tool("{ nodeA = %d, b = { x = 500, y = 100, z = 0 } }" % nb)
+        self.tick(14)
+        self.assertSameWorld()
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertEqual(self.B.native.released, [1, 2])
+        self.assertEqual(len(self.relay.commits), 2)
+
+    def test_a_depot_with_its_street_then_a_road_from_its_street_end_in_a_paused_game(self):
+        self.pause()
+        n = int(self.B.lua("FIND_NODE(100, 0, 0)"))
+        self.B.tool("{ node = %d, door = { x = 150, y = -40, z = 0 }, params = { seed = 261 } }" % n, make="NATIVE_DEPOT_ENTRANCE")
+        self.tick(14)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+        nb = int(self.B.lua("FIND_NODE(150, -40, 0)"))
+        self.B.tool("{ nodeA = %d, b = { x = 250, y = -80, z = 0 } }" % nb)
+        self.tick(14)
+        self.assertSameWorld()
+        self.assertEqual(self.relay.vetoes, [])
+        self.assertEqual(self.B.native.released, [1, 2])
+
+
+class VetoWordsTest(StrictTest):
+    def test_a_veto_that_comes_after_the_release_says_plainly_that_the_build_exists_on_one_game_and_asks_for_a_resync(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        # a veto from the host arrives late
+        self.relay.send(self.B, "build_veto", 0, self.relay.ser({"seq": 1, "owner": 1, "why": "unresolved segment 1.000,2.000,0.000 - 3.000,4.000,0.000", "from": 0, "name": "host"}))
+        self.tick(2)
+        self.assertEqual(len(self.relay.chats), 1)
+        text = self.relay.chats[0][1]
+        self.assertIn("client's build exists on their game only", text)
+        self.assertIn("the games will be synchronised", text)
+        self.assertNotIn("cancelled on every game", text)
+        self.assertEqual(len(self.relay.replay_failed), 1, "a resync is asked for")
+        self.assertIn("came too late", self.B.log())
+
+    def test_a_second_veto_of_the_same_build_adds_no_second_line(self):
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(10)
+        self.relay.send(self.B, "build_veto", 0, self.relay.ser({"seq": 1, "owner": 1, "why": "unresolved node 1,2,3", "from": 0, "name": "host"}))
+        self.tick(2)
+        self.assertEqual(len(self.relay.chats), 1)
+
+    def test_the_log_of_the_vetoing_game_does_not_claim_the_build_was_applied_there(self):
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(10)
+        self.assertNotIn("vetoed too late: it was applied already", self.A.log())
+        self.assertIn("never entered this game's queue: this game vetoed it", self.A.log())
+        self.assertNotIn("Player 1", self.A.log() + self.B.log())
+
+
+class HeldAcrossResyncTest(StrictTest):
+    """Real run 2026-10-11: a held host build was never released at its stamp, a resync saved a world without it and the module's
+    30 s limit put it into the world later, shipped a second time."""
+
+    def test_a_town_build_is_not_taken_for_the_early_release_of_a_held_command(self):
+        self.start()
+        self.A.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.assertEqual(self.A.native.held, [1])
+        # the engine itself builds something (playerInitiated false: a town growing a road)
+        self.A.L.execute("SIM_EVENT(0, 'apply_command', 'onPreBuildProposal', { SIMPLE_ROAD{ a = { x = 700, y = 0, z = 0 }, b = { x = 800, y = 0, z = 0 } }, nil, nil, false })")
+        self.assertNotIn("is the early release of the held command", self.A.log())
+        # the module gives the command back by its age limit
+        self.A.native.ring[0]["phase"], self.A.native.ring[0]["reason"] = "release", "timeout"
+        self.A.native.on_add(0, 0)
+        self.tick(16)
+        self.assertIn("is the early release of the held command of 0:1", self.A.log())
+        self.assertEqual(self.A.shipped_count(), 1, "shipped once: the late release is not a new build")
+        self.assertNotIn("native build captured", self.A.log())
+
+    def test_a_resync_request_while_a_build_is_held_releases_it_before_the_save_and_no_game_applies_it_twice(self):
+        self.start()
+        self.A.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.assertEqual(self.A.native.held, [1])
+        self.assertEqual(self.A.native.released, [])
+        self.relay.send(self.A, "resync_save", 0, self.relay.ser({"id": 1, "name": "feverlink3-resync-1"}))
+        self.tick(3)
+        self.assertEqual(self.A.native.released, [1], "released before the save")
+        self.assertIn("released before the resync save", self.A.log())
+        self.assertEqual([x[:3] for x in self.relay.saves_done], [(0, 1, True)], "the save happened after the engine applied it")
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig(), "the saved world contains the build")
+        self.tick(16)
+        self.assertEqual(self.A.builds_applied(), 1, "applied once on the originator")
+        self.assertEqual(self.A.shipped_count(), 1)
+        self.assertNotIn("native build captured", self.A.log())
+
+    def test_a_held_build_whose_stamp_passed_without_a_release_is_released_by_the_watchdog(self):
+        self.start()
+        self.A.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        # the interface half never sees the simulation half's release result
+        self.A.L.execute("local g = STATE.get; STATE.get = function(self) local v = g(self); if v and v.results then local k = {}; for _, r in ipairs(v.results) do if not r.release then k[#k + 1] = r end end; v.results = k end; return v end")
+        self.tick(24)
+        self.assertEqual(self.A.native.released, [1])
+        self.assertIn("WATCHDOG: the stamp", self.A.log())
+        self.assertSameWorld()
+        self.assertEqual(self.A.builds_applied(), 1)
+        self.assertEqual(self.B.builds_applied(), 1)
+        self.assertEqual(self.A.shipped_count(), 1)
+        self.assertNotIn("native build captured", self.A.log())
+
+    def test_a_build_held_in_a_game_that_stays_paused_before_its_stamp_is_cancelled_everywhere_before_the_module_gives_it_back(self):
+        self.start(speed=2)
+        self.tick(6)
+        self.A.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.assertEqual(self.A.native.held, [1])
+        # the game is stopped (frames go on, the clock does not) for longer than the limit
+        self.frames(500)
+        self.assertEqual(self.A.native.released, [], "never given back early")
+        self.assertEqual(self.A.native.dropped, [1])
+        self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats))
+        self.assertEqual(self.B.builds_applied(), 0)
 
 
 if __name__ == "__main__":

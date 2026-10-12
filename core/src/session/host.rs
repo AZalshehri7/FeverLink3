@@ -10,10 +10,10 @@ use super::kind::MessageKind;
 use super::limits::RateLimiter;
 use super::lockstep::{Lockstep, PlayerClock};
 use super::messages::{
-    codec, ActionMessage, AuthorityMessage, BuildVetoMessage, ChallengeMessage, ChatMessage, ChecksumReportMessage,
-    ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo,
-    PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant,
-    SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
+    codec, ActionMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage, ChallengeMessage, ChatMessage,
+    ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions,
+    PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage,
+    ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
 };
 use super::names::Names;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
@@ -44,6 +44,9 @@ pub struct HostOptions {
     /// running its live world, only the other games load, and the paused checksum after the round says whether the
     /// two still match (a difference fails the round and leaves the session paused, as it always does).
     pub host_reloads: bool,
+    /// With a reloading host: send the host's game its load while the players still download (default true) instead of
+    /// together with them after the transfer. A lab experiment switch (FEVERLINK3_HOST_LOAD_EARLY=0).
+    pub host_loads_early: bool,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -78,6 +81,7 @@ impl Default for HostOptions {
             checksum_seconds: 10.0,
             auto_resync: true,
             host_reloads: true,
+            host_loads_early: true,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,
@@ -165,6 +169,8 @@ struct Identity {
     /// The game had said hello when the connection dropped. A player coming back to a session that has not started
     /// keeps it: its game was not reloaded.
     ready: bool,
+    /// The capabilities its last join announced.
+    caps: Vec<String>,
 }
 
 impl fmt::Debug for Identity {
@@ -515,7 +521,9 @@ impl HostSession {
             .chain(self.identities.values().map(|i| i.name.as_str()))
             .collect();
         let name = Names::unique(&Names::sanitize(&join.name), id, taken);
-        self.identities.insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false });
+        let caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
+        self.identities
+            .insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false, caps });
         let info = PlayerInfo { id, name: name.clone(), ready: false };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
@@ -546,6 +554,7 @@ impl HostSession {
         let Some(identity) = self.identities.get_mut(&id) else { return false };
         identity.epoch += 1;
         identity.away_since = None;
+        identity.caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
         let (name, token, epoch) = (identity.name.clone(), identity.token, identity.epoch);
         // before the start nothing is reloaded for the returner, so it is as ready as it was; in a started session the
         // hot-join round reloads it and it says hello again
@@ -717,6 +726,13 @@ impl HostSession {
                     m.name = Some(self.name(from));
                     m.why = m.why.chars().take(300).collect();
                     self.broadcast(MessageKind::BuildVeto, &codec::encode(&m), Some(from));
+                }
+            }
+
+            MessageKind::BuildCommit => {
+                if let Some(mut m) = codec::try_decode::<BuildCommitMessage>(payload) {
+                    m.from = from;
+                    self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), Some(from));
                 }
             }
 
@@ -1265,6 +1281,11 @@ impl HostSession {
     fn send_unsealed(&mut self, connection: ConnectionId, kind: MessageKind, payload: Vec<u8>) {
         let header = FrameHeader::new(FrameHeader::CURRENT_VERSION, kind.into(), Self::UNASSIGNED, 0);
         self.out.push(HostOutput::SendToConnection { connection, frame: Frame::new(header, payload) });
+    }
+
+    /// The connection of a connected player (not the host's own game).
+    pub fn player_connection(&self, player: u16) -> Option<ConnectionId> {
+        self.connection_of(player)
     }
 
     fn connection_of(&self, player: u16) -> Option<ConnectionId> {

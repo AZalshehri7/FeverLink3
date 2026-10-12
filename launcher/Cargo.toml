@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "feverlink3"
 path = "src/main.rs"
 
+[[bin]]
+name = "feverlink3-speedtest"
+path = "src/bin/feverlink3-speedtest.rs"
+
 [dependencies]
 rand = "0.8"
 feverlink3_core = { path = "../core" }

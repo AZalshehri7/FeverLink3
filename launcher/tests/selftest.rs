@@ -27,6 +27,7 @@ fn a_player_reconnects_after_the_host_drops() {
     let start_host = |bind: SocketAddr, name: &str| {
         let link = gamelink::Session::create_under(root.path(), name).unwrap();
         run_host(HostConfig {
+            bulk: Default::default(),
             bind,
             name: name.into(),
             key: key.clone(),
@@ -72,6 +73,7 @@ fn a_player_gives_up_after_the_window() {
     let key = SessionKey::derive(&SessionKey::new_secret(), None);
     let host_link = gamelink::Session::create_under(root.path(), "Host").unwrap();
     let host = run_host(HostConfig {
+        bulk: Default::default(),
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         name: "Host".into(),
         key: key.clone(),

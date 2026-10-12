@@ -726,6 +726,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 town_seed: r.gen(),
                 force_seed: None,
                 growth: Default::default(),
+                luaseed: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
@@ -733,6 +734,9 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
             for step in &p.steps {
                 match step {
                     Step::Detour { rva, expected, .. } => {
+                        assert_eq!(image.read(*rva, expected.len()).as_deref(), Some(*expected));
+                    }
+                    Step::CallPatch { rva, expected, .. } => {
                         assert_eq!(image.read(*rva, expected.len()).as_deref(), Some(*expected));
                     }
                     Step::Patch { rva, expected, replacement, .. } => {
@@ -757,7 +761,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
 }
 
 #[test]
-fn the_switches_read_any_text_and_only_a_lone_one_turns_one_on() {
+fn the_switches_read_any_text_and_only_a_lone_one_turns_an_opt_in_one_on() {
     let mut r = rng(17);
     for _ in 0..iters(5_000) {
         let value = random_text(&mut r, 6);
@@ -766,8 +770,11 @@ fn the_switches_read_any_text_and_only_a_lone_one_turns_one_on() {
         // any text is a verdict (a number or an error) for the forced seed, never a panic
         let _ = feverlink3_native::plan::parse_seed(&value);
         let on = value.trim() == "1";
-        assert_eq!((cfg.hooks, cfg.hold, cfg.poolpatch, cfg.town_seed), (on, on, on, on), "{value:?}");
-        assert_eq!(cfg.any(), on);
+        // the pool patch and the seed pin are on unless the text is a lone zero
+        let default_on = value.trim() != "0";
+        assert_eq!((cfg.hooks, cfg.hold, cfg.town_seed), (on, on, on), "{value:?}");
+        assert_eq!((cfg.poolpatch, cfg.luaseed), (default_on, default_on), "{value:?}");
+        assert_eq!(cfg.any(), on || default_on);
         assert!(cfg.describe().starts_with("hooks="));
     }
 }

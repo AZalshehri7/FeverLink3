@@ -39,9 +39,15 @@ pub(super) struct ResyncRound {
     file: Option<FileInfo>,
     /// Players present when the transfer started: they get the chunks and the load, and must say Hello again.
     participants: Option<BTreeSet<u16>>,
+    /// Participants whose save travels another way (bulk datagrams): they are not sent `ResyncChunk`s, and the
+    /// launcher falls back to [`HostSession::resync_chunk_to`] for one whose transfer fails.
+    bulk: BTreeSet<u16>,
     verify_n: Option<i32>,
     /// Paused verify rounds that came back not comparable (the games reported different sim times): asked again.
     verify_skews: u8,
+    /// The host's game was sent the load while the players are still receiving the save (it is paused, so it can
+    /// reload in that time instead of after it).
+    host_loading: bool,
 }
 
 impl HostSession {
@@ -77,13 +83,62 @@ impl HostSession {
         self.drain()
     }
 
+    /// The players (not the host's game) the transfer in progress goes to. Valid once the file was announced.
+    pub fn resync_receivers(&self) -> Vec<u16> {
+        self.resync
+            .as_ref()
+            .and_then(|r| r.participants.as_ref())
+            .map(|p| p.iter().copied().filter(|&id| id != Self::HOST_ID).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the player announced `cap` in its join message.
+    pub fn player_supports(&self, id: u16, cap: &str) -> bool {
+        self.identities.get(&id).is_some_and(|i| i.caps.iter().any(|c| c == cap))
+    }
+
+    /// The save of round `id` travels to these players another way: `resync_chunk` no longer sends them chunks. Call
+    /// after `resync_file_ready` and before the first chunk. Players that are not receivers are ignored.
+    pub fn resync_set_bulk(&mut self, id: i32, players: &[u16]) {
+        let Some(r) = self.resync.as_mut().filter(|r| r.id == id && r.state == ResyncState::Transferring) else {
+            return;
+        };
+        let receivers = r.participants.clone().unwrap_or_default();
+        r.bulk = players.iter().copied().filter(|p| *p != Self::HOST_ID && receivers.contains(p)).collect();
+    }
+
+    /// Seals chunk `index` of the file to one player only, whatever the round's chunk counter says: the fallback when
+    /// a bulk transfer to that player failed. Does not move the round on. The chunk must have exactly the size
+    /// [`ResyncLimits::chunk_len`] gives.
+    pub fn resync_chunk_to(&mut self, id: i32, player: u16, index: u32, data: &[u8]) -> Vec<HostOutput> {
+        let ok = self.resync.as_ref().and_then(|r| {
+            let file = r.file.as_ref()?;
+            let valid = r.id == id
+                && r.state == ResyncState::Transferring
+                && r.participants.as_ref().is_some_and(|p| p.contains(&player))
+                && ResyncLimits::chunk_len(file.len, index) == Some(data.len());
+            valid.then(|| (file.sha256.clone(), file.count))
+        });
+        if let Some((sha256, count)) = ok {
+            let msg = ResyncChunkMessage { id, index: index as i32, count: count as i32, sha256, data: data.to_vec() };
+            let only: BTreeSet<u16> = [player].into();
+            self.send_to_players(MessageKind::ResyncChunk, &codec::encode(&msg), &only);
+        } else {
+            self.log(format!("chunk {index} of save {id} for player {player} refused"));
+        }
+        self.drain()
+    }
+
     /// A player left the game. The round stops counting on it: a player that drops and returns under the same id is
     /// still the same id to the round, would be sent the rest of a transfer it cannot assemble and a load it never
     /// received, and would hold the round in Loading until its timeout because it never says hello to that load.
     /// It takes part in the next round instead (`pending_new_player`).
     pub(super) fn forget_participant(&mut self, id: u16) {
-        if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
-            participants.remove(&id);
+        if let Some(r) = self.resync.as_mut() {
+            r.bulk.remove(&id);
+            if let Some(participants) = r.participants.as_mut() {
+                participants.remove(&id);
+            }
         }
     }
 
@@ -128,8 +183,10 @@ impl HostSession {
             pause_at,
             file: None,
             participants: None,
+            bulk: BTreeSet::new(),
             verify_n: None,
             verify_skews: 0,
+            host_loading: false,
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -303,6 +360,7 @@ impl HostSession {
         }
         if remote {
             self.progress(format!("sending {len} bytes in {count} chunk(s)"));
+            self.load_host_early();
         } else {
             self.enter_loading();
             self.resync_step();
@@ -332,16 +390,43 @@ impl HostSession {
         };
         file.next += 1;
         let done = file.next == file.count;
-        let participants = r.participants.clone().unwrap_or_default();
-        self.send_to_players(MessageKind::ResyncChunk, &codec::encode(&msg), &participants);
+        let mut participants = r.participants.clone().unwrap_or_default();
+        for bulk in &r.bulk {
+            participants.remove(bulk);
+        }
+        // nobody is sent this chunk (every receiver gets the save by bulk datagrams): do not even seal it
+        if participants.iter().any(|&p| p != Self::HOST_ID) {
+            self.send_to_players(MessageKind::ResyncChunk, &codec::encode(&msg), &participants);
+        }
         if done {
             self.enter_loading();
             self.resync_step();
         }
     }
 
+    /// With a reloading host the host's game loads its own save now, while the players download it: the host is paused
+    /// and its file is already complete, so the reload costs no extra time after the transfer.
+    fn load_host_early(&mut self) {
+        if !self.options.host_reloads || !self.options.host_loads_early {
+            return;
+        }
+        let Some(r) = self.resync.as_ref() else { return };
+        let (id, sha256) = (r.id, r.file.as_ref().map(|f| f.sha256.clone()).unwrap_or_default());
+        if let Some(p) = self.players.get_mut(&Self::HOST_ID) {
+            p.ready = false;
+        }
+        self.clocks.remove(&Self::HOST_ID);
+        if let Some(r) = self.resync.as_mut() {
+            r.host_loading = true;
+        }
+        let load = ResyncLoadMessage { id, name: format!("feverlink3-resync-{id}"), sha256 };
+        let host: BTreeSet<u16> = [Self::HOST_ID].into_iter().collect();
+        self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &host);
+    }
+
     fn enter_loading(&mut self) {
         let host_reloads = self.options.host_reloads;
+        let host_loading = self.resync.as_ref().is_some_and(|r| r.host_loading);
         if !host_reloads {
             // the host's game keeps its live world: it is not sent the load, owes no new hello and keeps its clock
             if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
@@ -352,16 +437,25 @@ impl HostSession {
         let (id, participants) = (r.id, r.participants.clone().unwrap_or_default());
         let sha256 = r.file.as_ref().map(|f| f.sha256.clone()).unwrap_or_default();
         for p in self.players.values_mut() {
+            if p.id == Self::HOST_ID && host_loading {
+                continue; // loaded early: its hello may already be in
+            }
             p.ready = p.id == Self::HOST_ID && !host_reloads;
         }
-        if host_reloads {
+        if host_loading {
+            self.clocks.retain(|&id, _| id == Self::HOST_ID);
+        } else if host_reloads {
             self.clocks.clear();
         } else {
             self.clocks.retain(|&id, _| id == Self::HOST_ID);
         }
         self.enter(ResyncState::Loading, format!("loading; waiting for {} game(s)", participants.len()));
         let load = ResyncLoadMessage { id, name: format!("feverlink3-resync-{id}"), sha256 };
-        self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &participants);
+        let mut to_load = participants;
+        if host_loading {
+            to_load.remove(&Self::HOST_ID);
+        }
+        self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &to_load);
     }
 
     fn enter_verifying(&mut self) {
@@ -387,7 +481,7 @@ impl HostSession {
         if skewed {
             self.rounds_skewed += 1;
         }
-        if self.rounds_done % SKEW_LOG_EVERY == 0 {
+        if self.rounds_done.is_multiple_of(SKEW_LOG_EVERY) {
             let (done, skewed) = (self.rounds_done, self.rounds_skewed);
             self.log(format!(
                 "checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"

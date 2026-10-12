@@ -210,6 +210,7 @@ and reads; the mapping of the format is described under *File link* below. Direc
 | `action` | Action (50) | both | to game: the origin player's id, as the host filled it into the payload; from game: ignored |
 | `chat` | Chat (51) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
 | `build_veto` | BuildVeto (52) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
+| `build_commit` | BuildCommit (53) | both | to game: `0` (the payload carries `from`); from game: ignored |
 
 Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
 
@@ -348,6 +349,76 @@ replays history; a file that shrinks is re-read from its start. A partial last l
 and returns a handle with the pid, `is_running()` and `wait()`. `process::any_game_running()` asks `tasklist`
 whether any game instance runs, which the install checks before touching `winhttp.dll` (Windows locks it while the
 game runs).
+
+## Parallel connections (`src/steamnet/par/`): the resync save, the default bulk path
+
+A resync save crosses Steam over N extra connections to the player's virtual port 2 (one Steam connection delivers
+about 1 MB/s, several add up almost linearly; the measurement and the whole design are in `docs/STEAM_TRANSPORT.md`
+section 7.3). **Not run on real Steam yet; tested on the fake Steam only.**
+
+- `par/mod.rs`: the constants and `ParConfig` (the rule `N = clamp(ceil(size / (1 MiB/s x 10.5 s)), 1, 16)`, files under
+  6 MB keep the chunk frames), `par/wire.rs` (the messages, the HMAC token), `par/growth.rs` (the pure controller that
+  decides when a connection is opened or the newest closed: each must add 60 % of a connection's rate over 2 s, the
+  session connection's ping must stay below `max(3 x baseline, baseline + 120 ms)`, no stall, no growing queue),
+  `par/send.rs` (`run_send`: one thread per connection, work stealing with at most 1 MiB in flight each, requeue of a
+  dead connection's chunks, `Control` = the session connection's ping and queue) and `par/service.rs` (`ParService`: one
+  listen socket per core, the allowances per Steam ID, the writer thread, the SHA-256 check at the end).
+- The host (`session::stream_save`) uses it for players that announced `bulk-par-1` when the file is at least 6 MB
+  (`SteamHostNet::par_sender` opens the connections to the player's Steam ID); the player's `SteamClientNet` allows the
+  host's account with the secret derived from the session key (`ClientTransport::enable_par`) and reports the finished
+  file as `NetEvent::BulkFile` (and progress as `BulkProgress`) before it says `done` to the sender. Any failure sends that
+  player the chunks instead (`bulk transfer to X failed (...); sending the chunks instead`).
+- Settings: `FEVERLINK3_BULK=off|par|dgram` (default `par`), `FEVERLINK3_BULK_CONNS=<n>` (force N), `FEVERLINK3_BULK_MAX=<n>`
+  (the cap, default 16). `HostConfig.bulk` is a `BulkSettings { mode, par }`.
+- The speed test's `Auto (scaled)` variant (`Variant::Auto`, `RunSpec::auto(mb)`, messages `parup`/`parready`/`parres`/
+  `pardown`/`parsend`) runs the same `run_send` and `ParService`; the fake Steam has `set_caps(per_connection, line)` and
+  `kill_connection` for the tests (`cargo test -p feverlink3_launcher --lib par:: -- --nocapture` prints the 75 MB and
+  the saturated-line numbers).
+
+## Bulk datagrams (`src/steamnet/bulk/`, `bulk_io.rs`, `speed.rs`)
+
+Own reliability and congestion control over Steam's unreliable messages, for the resync save and the speed test; see
+`docs/STEAM_TRANSPORT.md` section 7.2. **Not run on real Steam yet.**
+
+- `bulk/wire.rs` (datagram format), `bulk/cc.rs` (delay-based rate controller), `bulk/sender.rs` and `bulk/receiver.rs`
+  (state machines driven by a clock; no Steam, no threads) and `bulk/tests.rs` (deterministic network simulator: latency,
+  jitter, random and bursty loss, reordering, duplication, a bottleneck with a finite queue). `cargo test -p
+  feverlink3_launcher --lib bulk::tests -- --nocapture` prints the numbers of each case; the ignored test
+  `trace_the_5_mb_s_run` prints the rate and queue over time (`TRACE_LOSS`, `TRACE_JITTER` change the network).
+- `bulk_io.rs`: the `Hub` that routes a connection's bulk datagrams to their transfer (the core hands them to
+  `Owner::datagram`), `run_sender` and `run_receiver` (threads on the real clock), file and synthetic sources. A sender
+  raises the connection's Steam send rate to 64 MiB/s for the transfer and puts it back.
+- `speed.rs`: the probe's speed test as *runs* (`RunSpec`: reliable on 1 to 4 connections or datagrams, an optional Steam
+  send rate that both sides set on their connections, which directions, a time cap per direction). The responder
+  answers `tput` messages: `up`/`down` (with the number of connections and an optional `rate`; it answers a rate request
+  with `tput rate` so a tester can tell an old program that ignores it), `dgdown`, `stop`. `Probe::start_run`,
+  `start_plan` (a series), `run_outcome`, `take_log`.
+- Settings: `FEVERLINK3_BULK=dgram` (host: send resync saves to capable players as datagrams instead of the parallel
+  connections; experimental),
+  `FEVERLINK3_BULK_TARGET_MS` (queue delay target, default 40), `FEVERLINK3_BULK_MAX_RATE` (bytes per second, default
+  40 000 000).
+- Steam plumbing in `steamnet/steam_core.rs`: `send_datagram`, `send_reliable_no_nagle`, `flush`, `detailed_status`,
+  `config_report`, `set_connection_send_rate` (sets both rates on a live connection and reads them back).
+
+## Standalone speed test (`feverlink3-speedtest.exe`)
+
+`src/bin/feverlink3-speedtest.rs` is a console program that runs the Steam P2P speed test without Transport Fever 3
+(`src/speedtest/`). It loads `steam_api64.dll` from its own folder with `LoadLibraryW` and a full path, writes
+`steam_appid.txt` (480, Valve's Spacewar) when missing, and initialises Steam with `SteamAPI_InitFlat` (or
+`SteamAPI_Init` when the DLL has no `InitFlat`); Steam not running, not logged in, a missing DLL and Steam's own
+message are explained in plain English (`startup.rs`). `steamnet::global()` then finds the loaded DLL by name, exactly
+as inside the game, and starts the same core; the program calls `SteamAPI_RunCallbacks` on every step. Role: a
+`peer.txt` (a SteamID64) next to the exe makes it the tester, none makes it the responder; `--peer <id>` and `--listen`
+override (`cli.rs`). The tester waits up to 120 s (twice) for the other PC, runs the table `suite::MODES` (name and
+function per entry; more modes are one line each) over a `Probe`, and rewrites `speedtest-results.txt` after each
+mode (`results.rs`); the responder logs to `speedtest-responder.txt` (`responder.rs`). The default run (`ladder.rs`, about 10
+minutes): the idle round trip, the ladder at 1, 2 and 4 MiB/s, a validation at the best rate, 2, 4, 8 and 16 connections at
+1 MiB/s each (skipped for a direction after a step that did not scale), `Auto (scaled)` 80 MB each way (the resync's code
+path), and the datagram test; `--classic` lists the single modes, `Auto (scaled)` 8, 32 and 80 MB among them. Package it with
+a local script of the maintainer (not in the repository).
+
+Tested with the fake Steam (cargo test): roles, arguments, results text, error texts, timeouts, several testers one after
+another. **Not yet run on real Steam.**
 
 ## Build
 

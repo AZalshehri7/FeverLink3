@@ -26,9 +26,16 @@
 //!    `..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) additionally replaces the random seed `Develop` reads.
 //!    See `growth.rs`. An experiment switch, not run in the game.
 //!
-//! Anything but the exact value `1` (after trimming blanks) is off.
 
-use crate::build_table::{BuildAddrs, Rva};
+//! 6. Lua string-hash seed pin: pin the seed of Lua's string hash to a constant (`build_table::LUA_SEED`), so the
+//!    iteration order of `pairs` over string keys is the same in every process. A patch, independent of the others.
+//!
+//! Switches 1, 2, 4 and 5 are off unless the value is exactly `1` (after trimming blanks). Two pieces are ON by default
+//! because a session of several games needs them to stay in step: the single-worker script pool (3) and the Lua seed pin
+//! (6); `FEVERLINK3_POOLPATCH=0` and `FEVERLINK3_LUA_SEED=0` turn them off. Both stay fail-open: an unknown build or other
+//! bytes at the site install nothing and the reason is logged.
+
+use crate::build_table::{BuildAddrs, PatchSite, Rva};
 use crate::growth::Settings;
 
 pub const HOOKS_VAR: &str = "FEVERLINK3_HOOKS";
@@ -57,6 +64,9 @@ pub fn forced_seed(get: impl Fn(&str) -> Option<String>) -> Result<Option<u32>, 
         _ => Ok(None),
     }
 }
+pub const LUA_SEED_VAR: &str = "FEVERLINK3_LUA_SEED";
+/// `1` asks the mod's Lua probe (and the module's log) to record the string-hash seed's effect. Observation only.
+pub const LUA_SEED_LOG_VAR: &str = "FEVERLINK3_LUA_SEED_LOG";
 
 /// The switches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -70,35 +80,39 @@ pub struct HookConfig {
     pub force_seed: Option<u32>,
     /// The town-growth log and seed experiment (`growth.rs`).
     pub growth: Settings,
+    pub luaseed: bool,
 }
 
 impl HookConfig {
     /// Reads the switches through `get` (the environment in the module, a map in the tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> HookConfig {
         let on = |name: &str| get(name).is_some_and(|v| v.trim() == "1");
+        let off = |name: &str| get(name).is_some_and(|v| v.trim() == "0");
         let force_seed = forced_seed(&get).ok().flatten();
         HookConfig {
             hooks: on(HOOKS_VAR),
             hold: on(HOLD_VAR),
-            poolpatch: on(POOLPATCH_VAR),
+            poolpatch: !off(POOLPATCH_VAR),
             town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
             force_seed,
             growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
+            luaseed: !off(LUA_SEED_VAR),
         }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch || self.town_seed || self.growth.active()
+        self.hooks || self.poolpatch || self.town_seed || self.growth.active() || self.luaseed
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
         format!(
-            "hooks={} hold={} poolpatch={} town_seed={}{}{}",
+            "hooks={} hold={} poolpatch={} luaseed={} town_seed={}{}{}",
             f(self.hooks),
             f(self.hold),
             f(self.poolpatch),
+            f(self.luaseed),
             f(self.town_seed),
             self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default(),
             self.growth.describe()
@@ -152,6 +166,16 @@ pub enum Feature {
     Growth,
     /// The read-only hook on the `TownUpdateSize` handler that reads the game time for the growth hook.
     GrowthCmd,
+    /// The read-only wrap of the octree candidate gather (deep growth log).
+    GrowthCands,
+    /// The read-only wrap of the country-edge selection (deep growth log).
+    GrowthEdges,
+    /// The call-site redirect before the candidate sort (deep growth log).
+    GrowthSort,
+    /// The call-site redirect before the country-edge pick (deep growth log).
+    GrowthPick,
+    /// The pinned Lua string-hash seed.
+    LuaSeed,
 }
 
 impl Feature {
@@ -163,6 +187,11 @@ impl Feature {
             Feature::TownSeed => "town_seed",
             Feature::Growth => "town_develop",
             Feature::GrowthCmd => "town_update_size",
+            Feature::GrowthCands => "town_candidates",
+            Feature::GrowthEdges => "town_edges",
+            Feature::GrowthSort => "town_sort",
+            Feature::GrowthPick => "town_pick",
+            Feature::LuaSeed => "luaseed",
         }
     }
 }
@@ -170,20 +199,40 @@ impl Feature {
 /// One thing to do to the game's code, already checked against the image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    Detour { feature: Feature, name: &'static str, rva: Rva, expected: &'static [u8] },
-    Patch { feature: Feature, name: &'static str, rva: Rva, expected: &'static [u8], replacement: &'static [u8] },
+    Detour {
+        feature: Feature,
+        name: &'static str,
+        rva: Rva,
+        expected: &'static [u8],
+    },
+    Patch {
+        feature: Feature,
+        name: &'static str,
+        rva: Rva,
+        expected: &'static [u8],
+        replacement: &'static [u8],
+    },
+    /// The displacement of a `call rel32` at `rva` is redirected to a thunk of the module (`expected` is the whole
+    /// 5-byte instruction); the hook calls `callee` itself.
+    CallPatch {
+        feature: Feature,
+        name: &'static str,
+        rva: Rva,
+        expected: &'static [u8],
+        callee: Rva,
+    },
 }
 
 impl Step {
     pub fn name(&self) -> &'static str {
         match self {
-            Step::Detour { name, .. } | Step::Patch { name, .. } => name,
+            Step::Detour { name, .. } | Step::Patch { name, .. } | Step::CallPatch { name, .. } => name,
         }
     }
 
     pub fn feature(&self) -> Feature {
         match self {
-            Step::Detour { feature, .. } | Step::Patch { feature, .. } => *feature,
+            Step::Detour { feature, .. } | Step::Patch { feature, .. } | Step::CallPatch { feature, .. } => *feature,
         }
     }
 }
@@ -232,7 +281,7 @@ impl Plan {
                 Step::Detour { name, rva, expected, .. } => {
                     format!("hooks: {name}: {} bytes at rva {rva:#x} match the build table", expected.len())
                 }
-                Step::Patch { name, rva, expected, .. } => {
+                Step::Patch { name, rva, expected, .. } | Step::CallPatch { name, rva, expected, .. } => {
                     format!("hooks: {name}: {} bytes at rva {rva:#x} match the build table", expected.len())
                 }
             });
@@ -284,27 +333,37 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
     }
     if cfg.growth.active() {
         plan_growth(build, image, &mut p);
-    }
-    if cfg.poolpatch {
-        match &build.script_pool {
-            None => p.skipped.push(Skip {
-                feature: Feature::PoolPatch,
-                name: "script_pool",
-                reason: "the build table has no script_pool site for this build".into(),
-            }),
-            Some(site) => match verify(image, site.rva, site.expected) {
-                Ok(()) => p.steps.push(Step::Patch {
-                    feature: Feature::PoolPatch,
-                    name: "script_pool",
-                    rva: site.rva,
-                    expected: site.expected,
-                    replacement: site.replacement,
-                }),
-                Err(reason) => p.skipped.push(Skip { feature: Feature::PoolPatch, name: "script_pool", reason }),
-            },
+        if cfg.growth.deep {
+            plan_growth_deep(build, image, &mut p);
+            plan_growth_calls(build, image, &mut p);
         }
     }
+    if cfg.poolpatch {
+        plan_patch(Feature::PoolPatch, "script_pool", &build.script_pool, image, &mut p);
+    }
+    if cfg.luaseed {
+        plan_patch(Feature::LuaSeed, "lua_makeseed", &build.lua_makeseed, image, &mut p);
+    }
     p
+}
+
+/// A patch site: a step when the build has it and the image holds the expected bytes, a skip with the reason otherwise.
+fn plan_patch(feature: Feature, name: &'static str, site: &Option<PatchSite>, image: &dyn Image, p: &mut Plan) {
+    match site {
+        None => {
+            p.skipped.push(Skip { feature, name, reason: format!("the build table has no {name} site for this build") })
+        }
+        Some(site) => match verify(image, site.rva, site.expected) {
+            Ok(()) => p.steps.push(Step::Patch {
+                feature,
+                name,
+                rva: site.rva,
+                expected: site.expected,
+                replacement: site.replacement,
+            }),
+            Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+        },
+    }
 }
 
 fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
@@ -395,6 +454,49 @@ fn plan_growth(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
+/// The two read-only wraps of the deep log. Each is checked on its own; a missing one costs only its own lines.
+fn plan_growth_deep(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    for (feature, name, site) in [
+        (Feature::GrowthCands, "town_candidates", &build.town_candidates),
+        (Feature::GrowthEdges, "town_edges", &build.town_edges),
+    ] {
+        match site {
+            None => {
+                p.skipped.push(Skip { feature, name, reason: "the build table has no such site for this build".into() })
+            }
+            Some(site) => match verify(image, site.rva, site.prologue) {
+                Ok(()) => p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue }),
+                Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+            },
+        }
+    }
+}
+
+/// The two call-site redirects of the deep log: the call bytes and the callee's prologue must both match.
+fn plan_growth_calls(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    for (feature, name, site) in [
+        (Feature::GrowthSort, "town_sort", &build.town_sort_call),
+        (Feature::GrowthPick, "town_pick", &build.town_pick_call),
+    ] {
+        let Some(site) = site else {
+            p.skipped.push(Skip { feature, name, reason: "the build table has no such site for this build".into() });
+            continue;
+        };
+        let checked = verify(image, site.rva, site.expected)
+            .and_then(|()| verify(image, site.callee.rva, site.callee.prologue).map_err(|e| format!("callee: {e}")));
+        match checked {
+            Ok(()) => p.steps.push(Step::CallPatch {
+                feature,
+                name,
+                rva: site.rva,
+                expected: site.expected,
+                callee: site.callee.rva,
+            }),
+            Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+        }
+    }
+}
+
 fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     let skip = |p: &mut Plan, reason: String| {
         p.skipped.push(Skip { feature: Feature::Hold, name: "command_list_add", reason });
@@ -447,19 +549,33 @@ mod tests {
     fn image_of_40420() -> BytesImage {
         let b = select(0x6ac5_0427).unwrap();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
-        for s in [&b.command_list_add, &b.apply_command, &b.town_seed, &b.town_develop, &b.town_update_size]
-            .into_iter()
-            .flatten()
+        for s in [
+            &b.command_list_add,
+            &b.apply_command,
+            &b.town_seed,
+            &b.town_develop,
+            &b.town_update_size,
+            &b.town_candidates,
+            &b.town_edges,
+        ]
+        .into_iter()
+        .flatten()
         {
             img.write(s.rva, s.prologue);
         }
         let g = b.game_time_getter.as_ref().unwrap();
         img.write(g.rva, g.prologue);
+        for c in [&b.town_sort_call, &b.town_pick_call].into_iter().flatten() {
+            img.write(c.rva, c.expected);
+            img.write(c.callee.rva, c.callee.prologue);
+        }
         for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
             img.write(s.rva, s.prologue);
         }
         let p = b.script_pool.as_ref().unwrap();
         img.write(p.rva, p.expected);
+        let q = b.lua_makeseed.as_ref().unwrap();
+        img.write(q.rva, q.expected);
         img
     }
 
@@ -474,23 +590,29 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
         };
-        assert_eq!(HookConfig::from_lookup(env(&[])), HookConfig::default());
+        let defaults = HookConfig { poolpatch: true, luaseed: true, ..Default::default() };
+        assert_eq!(HookConfig::from_lookup(env(&[])), defaults, "the pool patch and the seed pin are on by default");
         assert!(!HookConfig::default().any());
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
-        assert_eq!(all, cfg(true, true, true));
+        assert_eq!(all, HookConfig { luaseed: true, ..cfg(true, true, true) });
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
             let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
-            assert_eq!(c, HookConfig::default(), "{off:?} must not switch anything on");
+            let on_by_default = off.trim() != "0";
+            assert_eq!(
+                c,
+                HookConfig { poolpatch: on_by_default, luaseed: on_by_default, ..Default::default() },
+                "{off:?} must not switch anything else on"
+            );
         }
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on town_seed=off");
-        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off town_seed=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off");
+        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off luaseed=off town_seed=off");
         let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
-        assert!(seed.any() && seed.town_seed && !seed.hooks && !seed.hold && !seed.poolpatch, "its own switch");
-        assert_eq!(seed.describe(), "hooks=off hold=off poolpatch=off town_seed=on");
-        assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).any(), "only the exact value 1");
+        assert!(seed.any() && seed.town_seed && !seed.hooks && !seed.hold, "its own switch");
+        assert_eq!(seed.describe(), "hooks=off hold=off poolpatch=on luaseed=on town_seed=on");
+        assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).town_seed, "only the exact value 1");
     }
 
     #[test]
@@ -507,9 +629,9 @@ mod tests {
         }
         let c = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "0x10")]));
         assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
-        assert_eq!(c.describe(), "hooks=off hold=off poolpatch=off town_seed=on force_seed=0x00000010");
+        assert_eq!(c.describe(), "hooks=off hold=off poolpatch=on luaseed=on town_seed=on force_seed=0x00000010");
         let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
-        assert_eq!(bad, HookConfig::default(), "an invalid value switches nothing on");
+        assert_eq!(bad, HookConfig::from_lookup(env(&[])), "an invalid value switches nothing on");
         assert!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "nope")])).is_err());
         assert_eq!(forced_seed(env(&[])), Ok(None));
         assert_eq!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "  ")])), Ok(None));
@@ -681,6 +803,39 @@ mod tests {
         assert!(plan(b, HookConfig::default(), &image_of_40420()).steps.is_empty());
     }
 
+    #[test]
+    fn the_deep_log_adds_two_wraps_each_checked_on_its_own() {
+        let b = select(0x6ac5_0427).unwrap();
+        let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
+        assert!(deep.any() && deep.growth.deep);
+        let deep = HookConfig { poolpatch: false, luaseed: false, ..deep }; // on by default; not what this test is about
+        let p = plan(b, deep, &image_of_40420());
+        assert_eq!(
+            names(&p),
+            ["town_develop", "town_update_size", "town_candidates", "town_edges", "town_sort", "town_pick"],
+            "{:?}",
+            p.report()
+        );
+        let mut img = image_of_40420();
+        img.write(0x9677c0 + 6, &[0x90]);
+        let p = plan(b, deep, &img);
+        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_edges", "town_sort", "town_pick"]);
+        assert!(p.skipped.iter().any(|s| s.name == "town_candidates"));
+        // a changed call or callee skips only that redirect
+        let mut img = image_of_40420();
+        img.write(0x967c16 + 1, &[0x00]);
+        assert!(!names(&plan(b, deep, &img)).contains(&"town_sort"));
+        let mut img = image_of_40420();
+        img.write(0x3055870 + 2, &[0x00]);
+        let p = plan(b, deep, &img);
+        assert!(!names(&p).contains(&"town_pick") && names(&p).contains(&"town_sort"));
+        assert!(p.skipped.iter().any(|s| s.name == "town_pick" && s.reason.starts_with("callee: ")), "{:?}", p.skipped);
+        // without the deep switch neither is planned
+        let log = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH", "1")]));
+        let log = HookConfig { poolpatch: false, luaseed: false, ..log };
+        assert_eq!(names(&plan(b, log, &image_of_40420())), ["town_develop", "town_update_size"]);
+    }
+
     fn env_pairs(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
     }
@@ -728,8 +883,13 @@ mod tests {
         town_seed: None,
         town_develop: None,
         town_update_size: None,
+        town_candidates: None,
+        town_edges: None,
+        town_sort_call: None,
+        town_pick_call: None,
         game_time_getter: None,
         script_pool: None,
+        lua_makeseed: None,
         command_move: None,
         command_destroy: None,
         handle_destroy: None,
@@ -792,6 +952,50 @@ mod tests {
         assert!(plan(leaked, cfg(false, false, true), &img).steps.is_empty());
         img.write(8, &[1, 2, 3]);
         assert_eq!(names(&plan(leaked, cfg(false, false, true), &img)), ["script_pool"]);
+    }
+
+    #[test]
+    fn the_seed_pin_is_on_unless_zero() {
+        let env = |v: Option<&'static str>| {
+            HookConfig::from_lookup(move |n| if n == LUA_SEED_VAR { v.map(String::from) } else { None })
+        };
+        for on in [None, Some(""), Some("fixed"), Some("1"), Some("on")] {
+            assert!(env(on).luaseed, "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0 ")] {
+            assert!(!env(off).luaseed, "{off:?}");
+        }
+        assert!(env(Some("fixed")).any(), "the seed pin alone makes the module touch the game's code");
+        assert!(!HookConfig::default().any());
+    }
+
+    #[test]
+    fn the_seed_pin_is_planned_only_when_asked_and_verified() {
+        let img = image_of_40420();
+        let b = select(0x6ac5_0427).unwrap();
+        let on = HookConfig { luaseed: true, ..Default::default() };
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["lua_makeseed"]);
+        let Step::Patch { replacement, expected, feature, .. } = &p.steps[0] else { panic!("not a patch") };
+        assert_eq!(*feature, Feature::LuaSeed);
+        assert_eq!(expected.len(), 26);
+        assert_eq!(&replacement[..6], &[0xB8, 0x53, 0x33, 0x4C, 0x46, 0xC3]);
+        assert!(plan(b, HookConfig::default(), &img).steps.is_empty(), "off by default");
+
+        // other bytes at the site: nothing is planned, the reason is given (fail open)
+        let mut other = img.clone();
+        other.write(b.lua_makeseed.as_ref().unwrap().rva + 7, &[0x00]);
+        let p = plan(b, on, &other);
+        assert!(p.steps.is_empty());
+        assert_eq!((p.skipped[0].name, p.skipped[0].feature), ("lua_makeseed", Feature::LuaSeed));
+        assert!(p.skipped[0].reason.contains("the table expects"), "{}", p.skipped[0].reason);
+
+        // a build without the site
+        let mut bare = BARE.clone();
+        bare.lua_makeseed = None;
+        let leaked: &'static BuildAddrs = Box::leak(Box::new(bare));
+        let p = plan(leaked, on, &img);
+        assert!(p.steps.is_empty() && p.skipped[0].reason.contains("no lua_makeseed site"));
     }
 
     #[test]

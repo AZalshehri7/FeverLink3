@@ -172,6 +172,34 @@ impl IncomingSave {
         Ok(Some(ReceivedSave { id: t.id, sha256: t.sha256, bytes }))
     }
 
+    /// A save that arrived whole by another route (bulk datagrams): checked against its SHA-256 and the size limit like
+    /// the assembled chunks. A transfer of chunks in progress is dropped: the host sends the save one way or the other.
+    pub fn accept_whole(&mut self, id: i32, sha256: &str, bytes: Vec<u8>) -> Result<ReceivedSave, ChunkError> {
+        let sha = normalize_sha256(sha256).ok_or(ChunkError::BadSha)?;
+        if bytes.is_empty() || bytes.len() as u64 > ResyncLimits::MAX_CHUNKS as u64 * ResyncLimits::CHUNK_SIZE as u64 {
+            return Err(ChunkError::BadSize(bytes.len()));
+        }
+        if sha256_hex(&bytes) != sha {
+            return Err(ChunkError::HashMismatch);
+        }
+        self.current = None;
+        self.done.insert((id, sha.clone()));
+        Ok(ReceivedSave { id, sha256: sha, bytes })
+    }
+
+    /// A save that arrived as a file by another route (parallel connections) and was already checked against its
+    /// SHA-256 by whoever wrote it: only recorded, so that the `ResyncLoad` naming it is accepted. A transfer of chunks
+    /// in progress is dropped.
+    pub fn accept_external(&mut self, id: i32, sha256: &str, len: u64) -> Result<(), ChunkError> {
+        let sha = normalize_sha256(sha256).ok_or(ChunkError::BadSha)?;
+        if len == 0 || len > ResyncLimits::MAX_CHUNKS as u64 * ResyncLimits::CHUNK_SIZE as u64 {
+            return Err(ChunkError::BadSize(len as usize));
+        }
+        self.current = None;
+        self.done.insert((id, sha));
+        Ok(())
+    }
+
     /// Drops an unfinished transfer older than [`ResyncLimits::RECEIVE_TIMEOUT`]; returns its id.
     pub fn expire(&mut self, now: f64) -> Option<i32> {
         if self.current.as_ref().is_some_and(|t| now - t.started >= ResyncLimits::RECEIVE_TIMEOUT) {

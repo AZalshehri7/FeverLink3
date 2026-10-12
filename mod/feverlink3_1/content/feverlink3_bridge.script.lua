@@ -394,6 +394,61 @@ local function townBuildingsPart(parts)
 	end
 end
 
+-- Town trace (feverlink3_towntrace.lua): off unless FEVERLINK3_TOWN_TRACE is set. Read-only; one file per game.
+local TRACE = nil
+local TRACE_FAILS = 0
+local townTraceGuard
+local function townTrace()
+	if TRACE ~= nil then return TRACE or nil end
+	TRACE = false
+	local ok, err = pcall(function()
+		local spec = os.getenv("FEVERLINK3_TOWN_TRACE")
+		if type(spec) ~= "string" or spec == "" then return end
+		local okM, M = pcall(ug_require, "feverlink3_towntrace.lua")
+		if not okM then okM, M = pcall(ug_require, "feverlink3_1::/feverlink3_towntrace.lua") end
+		if not okM or type(M) ~= "table" then error("module not loaded: " .. tostring(M)) end
+		local t = M.new({
+			spec = spec,
+			acc = M.apiAccessors(api, engine.entitiesWith),
+			hash = C.hashValue,
+			write = function(text) return C.appendFile(C.path(M.FILE), text) end,
+			-- FEVERLINK3_TOWN_TRACE_CMDS=1: log the payload of the game script's makeTownUpdateSizeCmd / makeTownUpdateCargoNeedsCmd
+			cmds = os.getenv("FEVERLINK3_TOWN_TRACE_CMDS") == "1",
+			tick = function() return math.floor(engine.gameTime() / STEP) end,
+		})
+		if t.enabled then
+			TRACE = t
+			logTowns("town trace on: " .. spec .. " -> " .. M.FILE)
+			if t.cmds then
+				-- the holder lives in package.loaded so a savegame reload finds the wrappers instead of wrapping them again
+				local holder = package.loaded["feverlink3_towntrace_holder"]
+				if type(holder) ~= "table" then holder = {}; package.loaded["feverlink3_towntrace_holder"] = holder end
+				holder.tracer = t
+				local n = M.installCmdWrappers(api.cmd, holder, function(fn) townTraceGuard(fn) end)
+				logTowns("town trace: " .. n .. " command factories wrapped (makeTownUpdateSizeCmd, makeTownUpdateCargoNeedsCmd)")
+			end
+		end
+	end)
+	if not ok then logTowns("town trace failed to start: " .. tostring(err)) end
+	return TRACE or nil
+end
+
+-- a trace step must never break the simulation: after a few failures it switches itself off
+function townTraceGuard(fn)
+	local t = townTrace()
+	if not t then return end
+	local ok, err = pcall(fn, t)
+	if not ok then
+		TRACE_FAILS = TRACE_FAILS + 1
+		logTowns("town trace error: " .. tostring(err))
+		if TRACE_FAILS >= 5 then
+			TRACE = false
+			pcall(function() local h = package.loaded["feverlink3_towntrace_holder"]; if type(h) == "table" then h.tracer = nil end end)
+			logTowns("town trace switched off after 5 errors")
+		end
+	end
+end
+
 -- `co` is the company registry of the half that asks; its digest is a part of its own once anything was configured or recorded
 local function checksumParts(co)
 	local parts, t = L.checksumParts(engine, C.hashValue)
@@ -408,6 +463,61 @@ end
 
 local logSim = C.logger("sim")
 local SIM = { rng = nil, subscribed = false }
+
+-- Live vs loaded log (feverlink3_livevsloaded.lua): off unless FEVERLINK3_LIVE_VS_LOADED=1. Observe-only, own guard.
+local LVL = nil
+local LVL_FAILS = 0
+local function livevsloaded()
+	if LVL ~= nil then return LVL or nil end
+	LVL = false
+	local ok, err = pcall(function()
+		if os.getenv("FEVERLINK3_LIVE_VS_LOADED") ~= "1" then return end
+		local okM, M = pcall(ug_require, "feverlink3_livevsloaded.lua")
+		if not okM then okM, M = pcall(ug_require, "feverlink3_1::/feverlink3_livevsloaded.lua") end
+		if not okM or type(M) ~= "table" then error("module not loaded: " .. tostring(M)) end
+		local okT, TT = pcall(ug_require, "feverlink3_towntrace.lua")
+		if not okT then okT, TT = pcall(ug_require, "feverlink3_1::/feverlink3_towntrace.lua") end
+		local bits32 = okT and type(TT) == "table" and TT.bits32 or nil
+		local t = M.new({
+			enabled = true,
+			towns = os.getenv("FEVERLINK3_TOWN_TRACE"),
+			acc = M.apiAccessors(api, engine.entitiesWith),
+			bits32 = bits32,
+			write = function(text) return C.appendFile(C.path(M.FILE), text) end,
+			-- L4: facts about math.random that cost no draw. nil until this script's override is installed.
+			-- The game scripts' own Lua states are not reachable from here, so a draw cannot be compared there.
+			randomProbe = function()
+				if not SIM.rng then return nil end
+				local facts = { installed = 1, rng_t = tostring(SIM.rng.t), rng_n = tostring(SIM.rng.n) }
+				-- the math.random that a chunk compiled with the default environment sees (the VM's global table)
+				local okL, seen = pcall(function() return load("return math.random")() end)
+				facts.global_is_override = (okL and seen == math.random) and 1 or 0
+				facts.package_math_is_ours = (package.loaded.math == nil or package.loaded.math == math) and 1 or 0
+				return facts
+			end,
+		})
+		if t.enabled then
+			LVL = t
+			logSim("live-vs-loaded log on -> " .. M.FILE)
+		end
+	end)
+	if not ok then logSim("live-vs-loaded log failed to start: " .. tostring(err)) end
+	return LVL or nil
+end
+
+local function livevsloadedGuard(fn)
+	local t = livevsloaded()
+	if not t then return end
+	local ok, err = pcall(fn, t)
+	if not ok then
+		LVL_FAILS = LVL_FAILS + 1
+		logSim("live-vs-loaded log error: " .. tostring(err))
+		if LVL_FAILS >= 5 then
+			LVL = false
+			logSim("live-vs-loaded log switched off after 5 errors")
+		end
+	end
+end
 
 local function simState(state)
 	local st = state:get()
@@ -600,11 +710,17 @@ end
 local function simCaptureBuild(state, param, post)
 	local st = simState(state)
 	local now = engine.gameTime()
+	-- A build the engine or a game script made on its own (a town growing a road: playerInitiated false) is nobody's tool build:
+	-- it must not use up a replay mark or the "early release" entry of a held command. It did in real run 2026-10-11: a town's
+	-- build at t=13624000 was taken for the early release of the host's held build 0:6, which then came out of the module's 30 s
+	-- timeout unrecognised and was shipped a second time as 0:7.
+	local piEarly = nil
+	pcall(function() piEarly = param[4] end)
 	if not post and spendReplay(st, now) then
 		state:set(st)
 		return
 	end
-	if not post then
+	if not post and piEarly ~= false then
 		local e = takeHeldOut(st)
 		if e then
 			state:set(st)
@@ -844,6 +960,12 @@ end
 
 local function update(userParams, state, dt)
 	C.poll()
+	townTraceGuard(function(t)
+		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
+	end)
+	livevsloadedGuard(function(t)
+		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
+	end)
 	if not C.ACTIVE then
 		return
 	end
@@ -851,6 +973,11 @@ local function update(userParams, state, dt)
 		SIM.rng = L.newRandom(engine.gameTime)
 		L.installRandom(SIM.rng)
 		logSim("deterministic math.random installed")
+	end
+	-- one line per game start for the string-hash seed experiment; inert unless FEVERLINK3_LUA_SEED_LOG=1
+	if not SIM.seedProbed then
+		SIM.seedProbed = true
+		pcall(C.luaSeedProbeOnce, logSim)
 	end
 	if not SIM.subscribed then
 		SIM.subscribed = true
@@ -888,6 +1015,20 @@ local function handleEvent(userParams, state, src, id, name, param)
 			local pi = nil
 			pcall(function() pi = param[4] end)
 			if pi ~= false then logSim("event apply_command/" .. tostring(name) .. " at t=" .. tostring(engine.gameTime()) .. " playerInitiated=" .. tostring(pi)) end
+		end)
+	end
+	if id == "apply_command" then
+		townTraceGuard(function(t)
+			local pi, town = nil, nil
+			pcall(function() pi = param[4] end)
+			pcall(function()
+				for i = 1, 3 do
+					local d = param[i]
+					if type(d) == "table" and d.townEntity ~= nil then town = d.townEntity end
+				end
+			end)
+			if type(pi) ~= "boolean" then pi = nil end
+			t.noteCommand(math.floor(engine.gameTime() / STEP), name, town, pi)
 		end)
 	end
 	if id == "apply_command" and name == "onPreBuildProposal" then
@@ -928,7 +1069,22 @@ local function handleEvent(userParams, state, src, id, name, param)
 				if q.key == param.key then dropped = true else keep[#keep + 1] = q end
 			end
 			st.queue = keep
-			logSim("action " .. tostring(param.key) .. (dropped and " dropped from the queue: a game vetoed it (" .. tostring(param.why) .. ")" or " vetoed too late: it was applied already (" .. tostring(param.why) .. ")"))
+			local applied = false
+			for _, r in ipairs(st.results or {}) do
+				if r.key == param.key then applied = true end
+			end
+			local what
+			if dropped then
+				what = " dropped from the queue: a game vetoed it ("
+			elseif param.own then
+				-- the game that casts the veto never queued the build: nothing to drop here, nothing was applied
+				what = " never entered this game's queue: this game vetoed it ("
+			elseif applied then
+				what = " vetoed too late: it was applied already ("
+			else
+				what = " not in the queue (not received yet, or applied by the interface half during a pause): vetoed ("
+			end
+			logSim("action " .. tostring(param.key) .. what .. tostring(param.why) .. ")")
 		elseif name == "heldgone" and type(param) == "table" then
 			local keep = {}
 			for _, e in ipairs(st.heldOut or {}) do
@@ -976,6 +1132,8 @@ local G = {
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
 	outSeen = {},             -- native builds the simulation half captured that this half already shipped
 	uiSeq = {},               -- id of a command record from the UI-state hook -> the sequence number it was shipped as
+	graces = {},              -- key -> a held build of a PAUSED game that waits for vetoes before it is committed
+	parked = {},              -- key -> a held build of another player's paused game, received but not applied until its commit
 	buildAts = {},            -- key -> stamp of the build actions this game knows (the veto check waits for the earlier ones)
 	dry = {},                 -- key -> a build whose dry run waits for the earlier builds to land
 	vetoed = {},              -- key -> why, builds a game vetoed
@@ -1115,7 +1273,7 @@ local function recordOriginator(body, seq, at, category)
 end
 
 -- strict mode (defined in its section below): a game paused at the stamp releases its own held command; a refusal cancels it
-local natPauseRelease, natHeldRefused, natVeto
+local natPauseRelease, natHeldRefused, natVeto, vetoChat
 
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
@@ -1245,6 +1403,33 @@ local function stampAfterFastest(now, extraSteps)
 	return at
 end
 
+-- ---- a held build in a PAUSED game
+--
+-- A paused game applies every action at once (the stamp is the pause time), so the veto design (peers dry-run the record while the
+-- originator still holds its command) has no time to work: the originator released at once and a peer's veto came too late (real
+-- run 2026-10-11: a road the host could not build was built on the guest's game). In a paused game the record is therefore shipped
+-- with `commit = true`: the peers dry-run it and PARK it (nothing is applied), the originator keeps its command held for a
+-- real-time grace, and only then sends `build_commit {seq, owner, stamp}`; every game applies the build on the commit. A veto
+-- during the grace drops it everywhere; a peer that never answers casts no veto (silence is yes); a peer that never gets the
+-- commit (its originator vanished) drops the parked record after PARK_MAX seconds.
+local GRACE_MIN, GRACE_MAX, GRACE_DRY_MS, GRACE_MARGIN_MS = 250, 1500, 100, 100
+local PARK_MAX = 10.0       -- seconds a peer keeps a parked record without its commit
+
+local function pausedNow()
+	local s = G.session
+	return s.pauseAt ~= nil and engine.gameTime() >= s.pauseAt
+end
+
+-- The grace in real milliseconds: two round trips' worth (the record out, the veto back) plus a dry run and a margin. The round
+-- trip is read from the host's lead (lead_for: half a round trip plus handling, in steps), which the host derives from its
+-- measurement of the slowest connection.
+local function graceMs()
+	local steps = math.floor(L.leadOf(G.session) / STEP + 0.5)
+	local rtt = math.max(0, 2000 * ((steps - 2) / 6 - 0.06))
+	local ms = math.max(GRACE_MIN, math.min(GRACE_MAX, math.floor(2 * rtt + GRACE_DRY_MS + GRACE_MARGIN_MS)))
+	return ms, rtt
+end
+
 -- ---- veto-only validation of a held strict build, on the games that did not make it
 --
 -- A strict build is stamped and shipped with `held = true` in its record: its originator keeps the tool's command held until the
@@ -1324,10 +1509,10 @@ end
 
 local function sendVeto(it, why)
 	G.vetoed[it.key] = why
-	toSim("drop", { key = it.key, why = why })
+	toSim("drop", { key = it.key, why = why, own = true })
 	send("build_veto", { seq = it.seq, owner = it.from, why = tostring(why):sub(1, 300), name = C.PLAYER_NAME })
-	logGui("VETO of " .. it.key .. ": this game cannot build it (" .. tostring(why) .. "); the build is dropped everywhere")
-	pcall(Hud.addChat, G.hud, "FeverLink3", "Player " .. tostring(it.from) .. "'s build could not be made on this game (" .. tostring(why):sub(1, 120) .. "); it was cancelled on every game", -1)
+	-- (the chat line is the originator's, once per vetoed build: it alone knows whether its build was still held; see H.build_veto)
+	logGui("VETO of " .. it.key .. ": this game cannot build it (" .. tostring(why) .. "); the build is dropped on this game")
 end
 
 local function vetoCheck(it, now)
@@ -1595,7 +1780,7 @@ end
 function natVeto(key, who, why)
 	local N = G.nat
 	local h = N and N.heldByKey[key]
-	if not h then return false end
+	if not h then return nil end   -- not a held build of this game
 	if h.released or h.done or h.cancelled then
 		natSay("veto of " .. key .. " by " .. tostring(who) .. " came too late (the command was released already): " .. tostring(why))
 		return false
@@ -1674,6 +1859,7 @@ local function natDecideUnsafe(h, cap)
 	if not STRICT_CANCEL then
 		-- the record says it is held: the other games dry-run it and veto it if they cannot build it (see "veto-only validation")
 		wire.held = true
+		if pausedNow() then wire.commit = true end   -- the peers park it until the originator's commit (see "a held build in a PAUSED game")
 		text = C.serialize(wire)
 		at = stampAfterFastest(now, VETO_STEPS)
 	else
@@ -1703,6 +1889,12 @@ local function natDecideUnsafe(h, cap)
 	pcall(toSim, "heldout", { key = it.key })
 	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp",
 		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now))
+	if wire.commit then
+		local ms, rtt = graceMs()
+		G.graces[it.key] = { it = it, due = os.clock() + ms / 1000, ms = ms }
+		natSay(string.format("%s: the game is paused, so the build waits %d ms (round trip about %.0f ms) for a veto before it is committed", it.key, ms, rtt))
+		return
+	end
 	route(it)
 end
 
@@ -1714,6 +1906,106 @@ local function natDecide(h, cap)
 	natFault("the verdict on held " .. tostring(h.id), err)
 	local N = G.nat
 	if N and not N.awaiting[h.id] then pcall(natOrder, "release", h.id) end
+end
+
+-- The grace of a paused game's held build is over (or a resync / the end of the session cuts it short): tell the others to apply it
+-- and release this game's own command. If the game was unpaused meanwhile the normal stamp logic takes over: a new stamp ahead.
+local function natCommit(key, why)
+	local g = G.graces[key]
+	if not g then return end
+	G.graces[key] = nil
+	local it = g.it
+	local now = engine.gameTime()
+	if not pausedNow() then
+		it.at = stampAfterFastest(now)
+		noteBuild(key, it.at)
+		local h = G.nat and G.nat.heldByKey[key]
+		if h then h.at = it.at end
+		logGui("commit of " .. key .. ": the game is no longer paused, the build gets the stamp " .. it.at .. " (now " .. now .. ")")
+	end
+	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at })
+	logGui("commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. it.at)
+	route(it)
+end
+
+-- Before the game is saved for a resync: no build may stay held across the save. A grace is cut short (committed); a build whose
+-- stamp has not come is taken out of the queue and released now, so the save contains it and no game applies it a second time
+-- after the reload. Returns the number of releases that must be confirmed by the engine before the save.
+local function natSettle(why)
+	local N = G.nat
+	local waiting = 0
+	if not N then return 0 end
+	for key in pairs(G.graces) do natCommit(key, why) end
+	for key, h in pairs(N.heldByKey) do
+		if not (h.released or h.done or h.cancelled) then
+			pcall(toSim, "drop", { key = key, why = "released before the " .. why, own = true })
+			if natRelease(key) then waiting = waiting + 1 end
+			natSay("held " .. h.id .. " (" .. key .. ") released before the " .. why .. ", " .. tostring((h.at or 0) - engine.gameTime()) .. " ms before its stamp: the saved world contains the build")
+		elseif h.released and not h.applied and not h.done then
+			waiting = waiting + 1
+		end
+	end
+	return waiting
+end
+
+local function settleDone()
+	local N = G.nat
+	if not N then return true end
+	for _, h in pairs(N.heldByKey) do
+		if h.released and not h.applied and not h.done and os.clock() - h.released < 4 then return false end
+	end
+	return true
+end
+
+-- Held builds that cannot go the normal way. (1) Their stamp passed and nobody released them (the interface half did not see the
+-- simulation half's release result: seen once in a real run, the command was then kept for the module's 30 s limit): released now
+-- and the cause logged. (2) The stamp lies ahead but the game stands still (a pause before it): the module gives a command back
+-- after 30 s, which would put the build into this world alone, so the build is cancelled on every game before that.
+local HELD_STUCK_STEPS = 3
+local HELD_PAUSED_MAX = 20.0
+local function heldWatchdog(N, now)
+	local gt = engine.gameTime()
+	for key, h in pairs(N.heldByKey) do
+		if not (h.released or h.done or h.cancelled) and not G.graces[key] and h.at then
+			if gt >= h.at + HELD_STUCK_STEPS * STEP and now - h.t > 2 then
+				natSay(string.format("WATCHDOG: the stamp %d of held %d (%s) passed %d ms ago (game time %d) and the command is still held; the simulation half's release result %s; releasing it now",
+					h.at, h.id, key, gt - h.at, gt, G.resultsSeen[key .. "#release" .. tostring(h.id)] and "WAS seen" or "was not seen"))
+				natRelease(key)
+			elseif gt < h.at and now - h.t > HELD_PAUSED_MAX then
+				local why = "held for " .. HELD_PAUSED_MAX .. " s and its stamp still lies ahead (the game is paused)"
+				G.vetoed[key] = why
+				pcall(toSim, "drop", { key = key, why = why, own = true })
+				send("build_veto", { seq = tonumber(key:match(":(%d+)$")), owner = C.PLAYER_ID, why = why, name = C.PLAYER_NAME })
+				natVeto(key, C.PLAYER_NAME, why)
+				vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
+			end
+		end
+	end
+end
+
+-- every frame: graces that are over, parked records whose commit never came
+local function commitPump()
+	local clock = os.clock()
+	for key, g in pairs(G.graces) do
+		local h = G.nat and G.nat.heldByKey[key]
+		if G.vetoed[key] or (h and h.cancelled) then
+			G.graces[key] = nil
+		elseif clock >= g.due then
+			natCommit(key, "grace over")
+		end
+	end
+	if G.pendingSave and (settleDone() or clock - G.pendingSave.since > 4) then
+		local ps = G.pendingSave
+		G.pendingSave = nil
+		ps.go()
+	end
+	for key, pk in pairs(G.parked) do
+		if clock - pk.wall > PARK_MAX then
+			G.parked[key] = nil
+			G.vetoed[key] = "no commit"
+			logGui("build " .. key .. " was parked for " .. PARK_MAX .. " s and its originator never committed it: dropped")
+		end
+	end
 end
 
 -- Drops the captures that waited longer than NAT_CAP_TTL for their `held` (the native build went through unheld).
@@ -1877,6 +2169,7 @@ local function natEvent(N, rec, p, history)
 		local id = tonumber(p.id)
 		local rec = id and N.byId[id]
 		if rec then
+			rec.applied = true
 			natSay(string.format("held %d (%s) applied by the engine (accepted %s) at game time %d, stamp %d", id, rec.key, tostring(p.ok), engine.gameTime(), rec.at or 0))
 			if rec.finish then N.finishes[#N.finishes + 1] = { rec = rec, ok = p.ok ~= false, frame = G.frames + 2 } end
 		end
@@ -1990,6 +2283,7 @@ local function natTick()
 		end
 		N.finishes = keep
 	end
+	heldWatchdog(N, now)
 	for key, h in pairs(N.heldByKey) do
 		if h.finish and h.released and now - h.released > 4 then
 			local fin = h.finish
@@ -2127,7 +2421,17 @@ H.peerclock = function(rec, p)
 end
 
 H.player_left = function(rec, p)
-	if type(p) == "table" and p.id ~= nil then L.removePeer(G.peers, p.id) end
+	if type(p) == "table" and p.id ~= nil then
+		L.removePeer(G.peers, p.id)
+		-- a parked build whose originator left is never committed
+		for key, pk in pairs(G.parked) do
+			if pk.it.from == p.id then
+				G.parked[key] = nil
+				G.vetoed[key] = "originator left"
+				logGui("build " .. key .. " was parked and its originator left: dropped")
+			end
+		end
+	end
 	Hud.playerLeft(G.hud, p)
 end
 
@@ -2158,11 +2462,21 @@ end
 
 H.resync_save = function(rec, p)
 	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_save"); return end
-	logGui("resync: saving the game as '" .. p.name .. "'")
-	engine.saveGame(p.name, function(ok, err)
-		logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
-		send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil })
-	end)
+	local function save()
+		logGui("resync: saving the game as '" .. p.name .. "'")
+		engine.saveGame(p.name, function(ok, err)
+			logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
+			send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil })
+		end)
+	end
+	-- no held build may stay held across the save (a held command is in no world, a queued replay is in the save): settle them first
+	local okS, waiting = pcall(natSettle, "resync save")
+	if okS and waiting and waiting > 0 then
+		logGui("resync: " .. waiting .. " held build(s) are released first; the game is saved when the engine has applied them")
+		G.pendingSave = { since = os.clock(), go = save }
+		return
+	end
+	save()
 end
 
 -- Loading restarts the scripts, and with them this reader. The sequence of this very line is written to the cursor
@@ -2203,6 +2517,15 @@ H.action = function(rec, p)
 		if it.body.held == true and not STRICT_CANCEL then
 			-- the originator holds its command until the stamp and cancels it on a veto: dry-run now, veto when this game cannot build it
 			local now = engine.gameTime()
+			if it.body.commit == true then
+				-- the originator's game is paused: dry-run now, then park the record until its commit arrives (a veto in between drops it)
+				local okV, errV = pcall(vetoCheck, it, now)
+				if not okV then logGui("veto check of " .. it.key .. " failed: " .. tostring(errV)) end
+				if G.vetoed[it.key] then return end
+				G.parked[it.key] = { it = it, wall = os.clock() }
+				logGui("build " .. it.key .. " parked until its originator commits it (it holds its own command through a grace)")
+				return
+			end
 			if L.applyNow(G.session, now, it) or not pendingBefore(it, now) then
 				local okV, errV = pcall(vetoCheck, it, now)
 				if not okV then logGui("veto check of " .. it.key .. " failed: " .. tostring(errV)) end
@@ -2217,6 +2540,28 @@ end
 
 -- A game could not build a held strict build (rec.from is that game). Every game drops the queued replay; the originator
 -- cancels its held command and tells its player.
+-- The cause of a veto in words for the chat; the technical text stays in the log.
+local function vetoWords(why, who)
+	why = tostring(why or "")
+	if why:find("^unresolved node") or why:find("^unresolved segment") or why:find("^unresolved construction") or why:find("^unresolved object") then
+		return "a road or building it connects to is missing on " .. who .. "'s game"
+	elseif why:find("^ambiguous") then
+		return "it matches more than one road on " .. who .. "'s game"
+	elseif why:find("^engine:") then
+		return "the engine on " .. who .. "'s game refuses it (" .. why:gsub("^engine: ", ""):sub(1, 60) .. ")"
+	end
+	return "it cannot be made on " .. who .. "'s game (" .. why:sub(1, 60) .. ")"
+end
+
+vetoChat = function(key, text)
+	G.vetoChatted = G.vetoChatted or {}
+	if G.vetoChatted[key] then return end
+	G.vetoChatted[key] = true
+	text = "[FeverLink3] " .. text
+	pcall(Hud.addChat, G.hud, "FeverLink3", text, -1)
+	send("chat", { text = text })   -- the host relays it to everybody else: one line per vetoed build
+end
+
 H.build_veto = function(rec, p)
 	if type(p) ~= "table" or type(p.seq) ~= "number" or type(p.owner) ~= "number" then logGui("malformed build_veto"); return end
 	local key = L.itemKey(p.owner, p.seq)
@@ -2228,10 +2573,37 @@ H.build_veto = function(rec, p)
 	G.dry[key] = nil
 	toSim("drop", { key = key, why = who .. ": " .. why })
 	logGui("VETO of " .. key .. " by " .. who .. ": " .. why)
+	G.graces[key], G.parked[key] = nil, nil
 	if p.owner == C.PLAYER_ID then
-		natVeto(key, who, why)
-		pcall(Hud.addChat, G.hud, "FeverLink3", who .. "'s game could not build this: " .. why:sub(1, 160) .. ". Nothing was built on any game.", -1)
+		local cancelled = natVeto(key, who, why)
+		local me, cause = tostring(C.PLAYER_NAME), vetoWords(why, who)
+		if cancelled == nil then
+			-- not held here (the old flow): the veto changes nothing on this game
+		elseif cancelled then
+			vetoChat(key, me .. "'s build was cancelled on every game: " .. cause .. ".")
+		else
+			-- the command was released already: the build exists on this game, the vetoing game dropped it. The games differ now.
+			vetoChat(key, me .. "'s build exists on their game only (" .. cause .. "); the games will be synchronised.")
+			logGui("veto of " .. key .. " came too late: this game has the build, " .. who .. " does not; asking the host for a resync")
+			send("replay_failed", { detail = "build " .. key .. " exists on one game only (a veto came after it was applied): " .. why:sub(1, 100) })
+		end
 	end
+end
+
+-- The originator of a parked build commits it: apply it now (the pause time) or at the stamp it names.
+H.build_commit = function(rec, p)
+	if type(p) ~= "table" or type(p.seq) ~= "number" or type(p.owner) ~= "number" then logGui("malformed build_commit"); return end
+	local key = L.itemKey(p.owner, p.seq)
+	local by = tonumber(p.from) or tonumber(rec.from)
+	if by ~= p.owner then logGui("build_commit of " .. key .. " from " .. tostring(by) .. " ignored: only its originator commits"); return end
+	local pk = G.parked[key]
+	if not pk then logGui("commit of " .. key .. ": nothing parked for it (vetoed, expired or not received)"); return end
+	G.parked[key] = nil
+	if G.vetoed[key] then return end
+	if type(p.stamp) == "number" then pk.it.at = p.stamp end
+	noteBuild(key, pk.it.at)
+	logGui("build " .. key .. " committed by its originator: applied at " .. tostring(pk.it.at) .. " (now " .. engine.gameTime() .. ")")
+	route(pk.it)
 end
 
 H.checksum_request = function(rec, p)
@@ -2463,6 +2835,8 @@ local function guiUpdate(userParams, state, guiState)
 		collectFromSim(state)
 		local okT, errT = pcall(natTick)
 		if not okT then natFault("frame", errT) end
+		local okG, errG = pcall(commitPump)
+		if not okG then logGui("commit pump failed: " .. tostring(errG)) end
 		local okD, errD = pcall(dryPump)
 		if not okD then logGui("veto check failed: " .. tostring(errD)) end
 		coGuard("local company", syncLocalCompany)

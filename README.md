@@ -8,14 +8,14 @@ Cooperative multiplayer for Transport Fever 3. The goal: several players build i
 
 **Status: early test build (0.2.0-test5), last updated 2026-10-10. Two players can host, join and see each other's speed, pause and chat commands in two real games; building has been seen working for a thin slice (roads, bulldozing, lines); stations, rail, vehicles and terrain have not been tried.** What is real and what is not:
 
-- **Verified in the real game** (build 40420): the mod loads; its window opens from a button in the bottom bar; the Steam peer-to-peer connection works between two different accounts (a friend's test: connected, 199 ms round trip through a Steam relay); and with two real copies of the game on one PC, using the developer connection on the loopback address, a host can host a game, copy the join code, a guest can paste it and join, the host's world is sent and the guest's game loads it while the host keeps playing, and speed, pause and chat from either side show up in both games. See the demo: [docs/media/split-screen-demo.gif](docs/media/split-screen-demo.gif).
+- **Verified in the real game** (build 40420): the mod loads; its window opens from a button in the bottom bar; the Steam peer-to-peer connection works between two different accounts (a friend's test: connected, 199 ms round trip through a Steam relay); and with two real copies of the game on one PC, using the developer connection on the loopback address, a host can host a game, copy the join code, a guest can paste it and join, the host's world is sent and the guest's game loads it, and speed, pause and chat from either side show up in both games. See the demo: [docs/media/split-screen-demo.gif](docs/media/split-screen-demo.gif).
 - **Not verified yet:** hosting and joining over Steam between two accounts (the code is there, the test with a friend is pending), stations, depots, rail, buying vehicles and terrain between two real games, long sessions in a busy world with vehicles (the host-keeps-playing sync was checked on a small world with no lines), and the native command hooks (switched off unless a developer turns them on; the capture-and-hold hook has been run in two real games for roads and the bulldozer, the rest has not).
 
 Details and dates: [docs/ROADMAP.md](docs/ROADMAP.md). How to try the test build: [docs/PLAYING.md](docs/PLAYING.md). What the `winhttp.dll` file is and why antivirus programs may look at it: [docs/SECURITY_FOR_USERS.md](docs/SECURITY_FOR_USERS.md).
 
 ## See it working
 
-Two real copies of the game side by side, each starting in its own world. The left one hosts, the right one joins with the copied code, the host's world is sent to the guest, then each side gives commands and the other game follows. (Recorded with `tools/gametest/demo_split.ps1`; the names are made up.)
+Two real copies of the game side by side, each starting in its own world. The left one hosts, the right one joins with the copied code, the host's world is sent to the guest, then each side gives commands and the other game follows. (The names are made up.)
 
 ![The host (left) and the guest (right): host, copy code, paste, join, start, speed, pause and chat](docs/media/split-screen-demo.gif)
 
@@ -24,7 +24,7 @@ Two real copies of the game side by side, each starting in its own world. The le
 Transport Fever 3 has no network code, so FeverLink3 keeps every copy of the world identical instead of sending the world around:
 
 1. **Commands, not state.** Every player action is captured as the engine command it produces, stamped with a future simulation step, and sent to everyone. Every game, including the one where the player clicked, applies it at that step. Identical inputs on a deterministic simulation give identical worlds.
-2. **Host authority.** One game is the authority. The games compare world checksums at common steps; a lasting difference is repaired by loading the host's savegame in the other games (the host keeps playing; a switch makes the host's game reload too).
+2. **Host authority.** One game is the authority. The games compare world checksums at common steps; a lasting difference is repaired by loading the host's savegame in every game, the host's own included (two games that both start from a fresh load of one save stay identical; a game that kept running does not).
 3. **Sealed transport.** A join code carries the session secret. Everything on the wire is encrypted and authenticated with a key derived from it; the host decides who speaks and what kinds of messages a player may send.
 4. **No entity ids on the wire.** Entity ids differ between games, so roads travel as positions, constructions as file plus placement, vehicles and lines as per-session keys.
 5. **Connecting the players.** The players' games reach each other through Steam's peer-to-peer networking, so a player only has to share a join code and has nothing to set up. The Steam connection has been proven between two different accounts in the connection test; carrying whole sessions over it is the next test.

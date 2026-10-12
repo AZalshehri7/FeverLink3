@@ -68,7 +68,7 @@ end
 
 local WIDTH = 560 -- width of the window's content
 
--- What a sync round is doing, in words (ctl.sync = { phase, done?, total? } from the controller; absent when none runs).
+-- What a sync round is doing, in words (ctl.sync = { phase, done?, total?, note? } from the controller; absent when none runs).
 -- `host` says whose window it is: the players' games stand still while the host's world is prepared, sent and loaded, and
 -- without a word about it that looks like a hang.
 local function syncText(sync, host)
@@ -84,7 +84,9 @@ local function syncText(sync, host)
 		return host and "Syncing: saving your world..." or "Syncing: the host is saving its world..."
 	elseif phase == "sending" then
 		local what = host and "Sending your world to the players" or "Receiving the host's world"
-		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...")
+		-- sync.note: what a transfer over several Steam connections says about itself ("7 connections, 6.9 MB/s")
+		local note = (type(sync.note) == "string" and sync.note ~= "") and (" (" .. sync.note .. ")") or ""
+		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...") .. note
 	elseif phase == "loading" then
 		return host and "Syncing: the players are loading your world..." or "Syncing: loading the host's world. The game reloads and the window closes; open it again afterwards."
 	elseif phase == "verifying" then
@@ -139,6 +141,7 @@ local function setup(react, builtin)
 		local codeIn = react.useState("")
 		local steamIn = react.useState("")
 		local mbIn = react.useState(32)
+		local modeIn = react.useState("reliable")
 		local showTest = react.useState(false)
 		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
 		-- paused (a guest's window must notice the host ending the session then too).
@@ -242,7 +245,16 @@ local function setup(react, builtin)
 					function() mbIn:set(mb) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_CHOICES) - 10)
 			end
 			add(box(H, sizes))
-			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old())) end))
+			add(note("How the data travels: Steam's reliable stream, our own datagram protocol, both one after the other, the reliable stream on 1, 2 and 4 connections at once, or Auto (scaled): the way a synced save is sent, over several Steam connections at once (as many as the size needs)."))
+			local modes = {}
+			for _, m in ipairs(C.SPEED_MODES) do
+				local chosen = (C.speedMode(modeIn:old()) == m)
+				local label = C.SPEED_MODE_LABELS[m]
+				modes[#modes + 1] = button((chosen and "[ " or "") .. label .. (chosen and " ]" or ""),
+					function() modeIn:set(m) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_MODES) - 10)
+			end
+			add(box(H, modes))
+			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old(), modeIn:old())) end))
 			if st and st.speed then
 				for _, line in ipairs(C.speedLines(st.speed)) do add(note(line)) end
 			end

@@ -79,6 +79,8 @@ pub struct PlayerSession {
     session: Option<SessionState>,
     permissions: Permissions,
     incoming: IncomingSave,
+    /// What the join message announces (see [`super::CAP_BULK_DGRAM`]).
+    caps: Vec<String>,
     /// The slot this session asks for in its join, if it is a return.
     resume: Option<ResumeTicket>,
     /// What the welcome granted for the next return.
@@ -158,6 +160,7 @@ impl PlayerSession {
             session: None,
             permissions: Permissions::default(),
             incoming: IncomingSave::new(),
+            caps: Vec::new(),
             resume,
             ticket: None,
             challenge: None,
@@ -289,6 +292,7 @@ impl PlayerSession {
             self.challenge = Some(ch.nonce.clone());
             let proof = HostSession::proof(&self.key, &ch.nonce, &self.name).to_vec();
             let mut join = JoinMessage::new(&self.name, &self.version, proof);
+            join.caps = self.caps.clone();
             join.resume = self.resume.as_ref().map(|t| ResumeClaim {
                 id: t.id,
                 mac: HostSession::resume_proof(&t.token, &ch.nonce, t.id, &self.name).to_vec(),
@@ -470,6 +474,43 @@ impl PlayerSession {
             let frame = sealer.seal(MessageKind::Pong.into(), &codec::encode(&PongMessage { n: m.n }));
             self.out.push(PlayerOutput::SendToHost(frame));
         }
+    }
+
+    /// What this player's end can do, announced in the join message: set before the connection's first frame is handled.
+    pub fn set_capabilities(&mut self, caps: Vec<String>) {
+        self.caps = caps;
+    }
+
+    /// A savegame that arrived whole over another route than `ResyncChunk` frames (bulk datagrams): the same checks, the
+    /// same output as when the last chunk arrives. Ignored (with a log line) before the welcome.
+    pub fn bulk_save_received(&mut self, id: i32, sha256: &str, bytes: Vec<u8>) -> Vec<PlayerOutput> {
+        if self.state != PlayerState::Joined {
+            self.log(format!("bulk save {id} ignored: not joined"));
+            return self.drain();
+        }
+        match self.incoming.accept_whole(id, sha256, bytes) {
+            Ok(save) => {
+                self.log(format!("save {} received as bulk datagrams ({} bytes)", save.id, save.bytes.len()));
+                self.out.push(PlayerOutput::SaveReceived { id: save.id, sha256: save.sha256, bytes: save.bytes });
+            }
+            Err(err) => self.log(format!("bulk save {id} refused: {err}")),
+        }
+        self.drain()
+    }
+
+    /// A savegame that arrived as a file over parallel connections, already checked against its SHA-256 and written to
+    /// disk by the launcher: recorded like a received save, so the `ResyncLoad` that names it is accepted. The file is
+    /// not held here, so there is no output to act on. Ignored (with a log line) before the welcome.
+    pub fn bulk_file_received(&mut self, id: i32, sha256: &str, len: u64) -> Vec<PlayerOutput> {
+        if self.state != PlayerState::Joined {
+            self.log(format!("bulk file {id} ignored: not joined"));
+            return self.drain();
+        }
+        match self.incoming.accept_external(id, sha256, len) {
+            Ok(()) => self.log(format!("save {id} received over parallel connections ({len} bytes)")),
+            Err(err) => self.log(format!("bulk file {id} refused: {err}")),
+        }
+        self.drain()
     }
 
     fn receive_chunk(&mut self, plain: &[u8]) {

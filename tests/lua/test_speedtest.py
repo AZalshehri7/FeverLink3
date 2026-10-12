@@ -67,6 +67,53 @@ class SpeedTextTest(unittest.TestCase):
         self.assertEqual(80, params["mb"])
         self.assertEqual(32, self.C.speedParams("1", 7)["mb"])
 
+    def test_the_mode_is_one_of_the_offered_words(self):
+        mode = self.C.speedMode
+        self.assertEqual(
+            ["reliable", "dgram", "both", "parallel", "auto"], [self.C.SPEED_MODES[i] for i in (1, 2, 3, 4, 5)]
+        )
+        self.assertEqual("Auto (scaled)", self.C.SPEED_MODE_LABELS["auto"])
+        for word in ("reliable", "dgram", "both", "parallel", "auto"):
+            self.assertEqual(word, mode(word))
+        for odd in (None, "", "all", "DGRAM", 5):
+            self.assertEqual("reliable", mode(odd), odd)
+        params = self.C.speedParams("76561199000000042", 8, "dgram")
+        self.assertEqual(("76561199000000042", 8, "dgram"), (params["id"], params["mb"], params["mode"]))
+        self.assertEqual("reliable", self.C.speedParams("1", 8)["mode"])
+
+    def test_the_window_says_how_a_transfer_over_several_connections_is_going(self):
+        import re
+
+        src = read("feverlink3_ui.script.lua")
+        found = re.search(r"local function syncText\(sync, host\).*?\nend\n", src, re.S)
+        self.assertIsNotNone(found, "syncText is in the window script")
+        sync_text = self.lua.eval("function(src) return load(src .. ' return syncText', 'sync', 't')() end")(found.group(0))
+        # a chunk transfer: the percentage only
+        self.assertEqual(
+            "Syncing: Receiving the host's world: 63%",
+            sync_text(self.lua.table_from({"phase": "sending", "done": 63, "total": 100}), False),
+        )
+        # over parallel connections: the note follows
+        line = sync_text(
+            self.lua.table_from(
+                {"phase": "sending", "done": 63, "total": 100, "note": "7 connections, 6.9 MB/s"}
+            ),
+            False,
+        )
+        self.assertEqual("Syncing: Receiving the host's world: 63% (7 connections, 6.9 MB/s)", line)
+        line = sync_text(
+            self.lua.table_from({"phase": "sending", "done": 5, "total": 100, "note": "1 connection, 1.0 MB/s"}), True
+        )
+        self.assertEqual("Syncing: Sending your world to the players: 5% (1 connection, 1.0 MB/s)", line)
+        # no note, an empty one, a number: nothing added
+        for odd in (None, "", 5):
+            sync = {"phase": "sending", "done": 1, "total": 2}
+            if odd is not None:
+                sync["note"] = odd
+            self.assertEqual(
+                "Syncing: Receiving the host's world: 50%", sync_text(self.lua.table_from(sync), False), odd
+            )
+
     def test_the_window_script_still_compiles(self):
         check = self.lua.eval("function(src) local f, err = load(src, 'ui', 't'); return f ~= nil, err end")
         ok, err = check(read("feverlink3_ui.script.lua"))

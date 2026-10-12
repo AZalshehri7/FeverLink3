@@ -21,11 +21,26 @@ mod steam_core;
 /// The speed test: message format, timing math, the sender loop, the text of the result.
 pub mod throughput;
 
+/// Bulk transfer over unreliable datagrams with our own reliability and congestion control.
+pub mod bulk;
+
+/// Threads that connect the bulk transfer to a Steam connection.
+pub mod bulk_io;
+
+/// Parallel Steam connections for big files: the way a resync save crosses Steam.
+pub mod par;
+
+/// The speed test engine of the probe: one run in two directions, reliable or as datagrams.
+pub mod speed;
+
 /// An in-memory Steam for the tests of this module and of the transport.
 #[cfg(test)]
 pub(crate) mod fake;
 
 use std::collections::VecDeque;
+
+pub use speed::{specs_for, RunKind, RunOutcome, RunSpec};
+use speed::{Incoming, Phase, SpeedRun};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -180,8 +195,15 @@ const RT_STATE: usize = 0;
 const RT_PING: usize = 4;
 const RT_QUALITY_LOCAL: usize = 8;
 const RT_QUALITY_REMOTE: usize = 12;
+const RT_OUT_PPS: usize = 16;
+const RT_OUT_BPS: usize = 20;
+const RT_IN_PPS: usize = 24;
+const RT_IN_BPS: usize = 28;
 const RT_SEND_RATE: usize = 32;
+const RT_PENDING_UNRELIABLE: usize = 36;
 const RT_PENDING_RELIABLE: usize = 40;
+const RT_SENT_UNACKED: usize = 44;
+const RT_QUEUE_TIME: usize = 48;
 
 /// What `GetConnectionRealTimeStatus` says about a connection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -197,6 +219,15 @@ pub struct RealTime {
     pub send_rate: u32,
     /// Reliable bytes queued and not yet on the wire.
     pub pending_reliable: u32,
+    pub pending_unreliable: u32,
+    /// Reliable bytes on the wire and not yet acknowledged.
+    pub sent_unacked_reliable: u32,
+    pub out_packets_per_sec: f32,
+    pub out_bytes_per_sec: f32,
+    pub in_packets_per_sec: f32,
+    pub in_bytes_per_sec: f32,
+    /// How long a message queued now would wait before it goes on the wire, microseconds.
+    pub queue_time_us: i64,
 }
 
 /// Reads a `SteamNetConnectionRealTimeStatus_t`. `None` when the buffer is too short.
@@ -209,6 +240,16 @@ pub fn parse_real_time_status(buf: &[u8]) -> Option<RealTime> {
         quality_remote: float_at(RT_QUALITY_REMOTE)?,
         send_rate: u32::try_from(le_i32(buf, RT_SEND_RATE)?).unwrap_or(0),
         pending_reliable: u32::try_from(le_i32(buf, RT_PENDING_RELIABLE)?).unwrap_or(0),
+        pending_unreliable: le_i32(buf, RT_PENDING_UNRELIABLE).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        sent_unacked_reliable: le_i32(buf, RT_SENT_UNACKED).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        out_packets_per_sec: float_at(RT_OUT_PPS).unwrap_or(0.0),
+        out_bytes_per_sec: float_at(RT_OUT_BPS).unwrap_or(0.0),
+        in_packets_per_sec: float_at(RT_IN_PPS).unwrap_or(0.0),
+        in_bytes_per_sec: float_at(RT_IN_BPS).unwrap_or(0.0),
+        queue_time_us: buf
+            .get(RT_QUEUE_TIME..RT_QUEUE_TIME + 8)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, i64::from_le_bytes),
     })
 }
 
@@ -344,7 +385,7 @@ const LISTEN_RETRY: Duration = Duration::from_secs(5);
 /// Longest ping the probe answers.
 const PING_LIMIT: usize = 4096;
 /// Players that may be connected to the probe's listen socket at once; the next one is closed on arrival.
-const MAX_PEERS: usize = 16;
+const MAX_PEERS: usize = 24;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -353,52 +394,6 @@ fn now_ms() -> u64 {
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
-
-/// Where a speed test is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Phase {
-    /// Waiting for the test connection.
-    Connecting,
-    /// We send, the friend times.
-    Upload,
-    /// The friend sends, we time.
-    Download,
-    Done,
-    Failed(String),
-}
-
-/// A speed test we started.
-struct SpeedRun {
-    id: u64,
-    conn: Handle,
-    total: u64,
-    phase: Phase,
-    started: Instant,
-    phase_started: Instant,
-    last_progress: Instant,
-    /// Bytes the friend says arrived so far.
-    up_progress: u64,
-    up_stats: Option<throughput::SendStats>,
-    /// The friend's timing of our upload: bytes, ms, longest gap, bytes after the first chunk.
-    up_remote: Option<(u64, u64, u64, u64)>,
-    down: Option<throughput::Receiver>,
-    result: Option<throughput::SpeedResult>,
-}
-
-impl SpeedRun {
-    fn active(&self) -> bool {
-        matches!(self.phase, Phase::Connecting | Phase::Upload | Phase::Download)
-    }
-}
-
-/// An upload from a friend that we are timing.
-struct Incoming {
-    conn: Handle,
-    rx: throughput::Receiver,
-}
-
-/// Speed tests a friend may have us send at once.
-const MAX_SENDERS: usize = 2;
 
 struct TestConn {
     conn: Handle,
@@ -428,8 +423,26 @@ struct ProbeState {
     peers: Vec<Peer>,
     pings_received: u32,
     speed: Option<SpeedRun>,
+    /// The last run's outcome, once it has ended.
+    outcome: Option<RunOutcome>,
     incoming: Option<Incoming>,
     senders: usize,
+    /// A datagram upload from a friend that we are receiving (its transfer id).
+    dg_in: Option<u32>,
+    /// A parallel (`Auto (scaled)`) upload from a friend that we are receiving: the connection of the speed test and
+    /// the run id it carries.
+    par_in: Option<(Handle, u64)>,
+    /// Tests the tester asked us to stop sending.
+    stopped_ids: std::collections::HashSet<u64>,
+    last_run_id: u64,
+    /// A series of runs (the window's "both" or "parallel"): the ones still to run, the result blocks so far.
+    plan: VecDeque<RunSpec>,
+    plan_peer: u64,
+    plan_total: usize,
+    plan_blocks: Vec<String>,
+    plan_collected: u64,
+    /// Lines for the session log, taken by [`Probe::take_log`].
+    log: Vec<String>,
 }
 
 /// The probe's side of the core: what happens to its connections, on the poller thread.
@@ -437,168 +450,17 @@ struct ProbeService {
     core: CoreRef,
     me: std::sync::Weak<ProbeService>,
     state: Mutex<ProbeState>,
+    /// Routes the bulk datagrams of this probe's connections.
+    hub: Arc<bulk_io::Hub>,
+    /// Acts like an older program that does not know the rate request (tests).
+    legacy: std::sync::atomic::AtomicBool,
+    /// What the parallel receiver reported, taken by the poll (the callbacks only queue, they never lock `state`).
+    par_events: Mutex<Vec<speed::ParNote>>,
+    /// The listener for parallel bulk connections of this core (created on first use).
+    par_svc: Mutex<Option<Arc<par::ParService>>>,
 }
 
 impl ProbeService {
-    /// A speed-test message from `conn`. Replies are sent after the state is unlocked.
-    fn tput(&self, conn: Handle, msg: throughput::Msg) {
-        use throughput::Msg;
-        let now = Instant::now();
-        let mut reply: Option<Vec<u8>> = None;
-        let mut start_sender: Option<(u64, u64, u64)> = None;
-        {
-            let mut state = lock(&self.state);
-            match msg {
-                Msg::Up { id, total, chunk } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && chunk > 0 {
-                        state.incoming = Some(Incoming { conn, rx: throughput::Receiver::new(id, total, now) });
-                        state
-                            .events
-                            .push(format!("a friend is testing the speed: {} MB coming", total / throughput::MB));
-                    }
-                }
-                Msg::Down { id, total, chunk } => {
-                    if total > 0 && total <= throughput::MAX_TOTAL && state.senders < MAX_SENDERS {
-                        state.senders += 1;
-                        start_sender = Some((id, total, chunk));
-                        state.events.push(format!("sending {} MB for a friend's speed test", total / throughput::MB));
-                    }
-                }
-                Msg::Data { id, len, .. } => {
-                    if let Some(inc) = state.incoming.as_mut().filter(|i| i.conn == conn && i.rx.id == id) {
-                        inc.rx.on_chunk(now, len);
-                        if inc.rx.got > inc.rx.total.saturating_add(throughput::CHUNK_PAYLOAD as u64) {
-                            state.incoming = None;
-                        } else if inc.rx.progress_due(now) {
-                            reply = Some(throughput::encode(&Msg::Prog { id, bytes: inc.rx.got }));
-                        }
-                    } else if let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id) {
-                        if run.phase == Phase::Download {
-                            if let Some(rx) = run.down.as_mut() {
-                                rx.on_chunk(now, len);
-                                run.last_progress = now;
-                            }
-                        }
-                    }
-                }
-                Msg::End { id, peak_pending, max_block_ms, .. } => {
-                    if state.incoming.as_ref().is_some_and(|i| i.conn == conn && i.rx.id == id) {
-                        if let Some(inc) = state.incoming.take() {
-                            let rx = inc.rx;
-                            reply = Some(throughput::encode(&Msg::UpRes {
-                                id,
-                                bytes: rx.got,
-                                ms: rx.span_ms(),
-                                gap_ms: rx.max_gap_ms(),
-                                steady: rx.steady(),
-                            }));
-                        }
-                    } else {
-                        self.finish_download(&mut state, conn, id, peak_pending, max_block_ms, now);
-                    }
-                }
-                Msg::Prog { id, bytes } => {
-                    if let Some(run) =
-                        state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload)
-                    {
-                        run.up_progress = bytes;
-                        run.last_progress = now;
-                    }
-                }
-                Msg::UpRes { id, bytes, ms, gap_ms, steady } => {
-                    if let Some(run) =
-                        state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Upload)
-                    {
-                        run.up_remote = Some((bytes, ms, gap_ms, steady));
-                        run.phase = Phase::Download;
-                        run.phase_started = now;
-                        run.last_progress = now;
-                        run.down = Some(throughput::Receiver::new(id, run.total, now));
-                        reply = Some(throughput::encode(&Msg::Down {
-                            id,
-                            total: run.total,
-                            chunk: throughput::CHUNK_PAYLOAD as u64,
-                        }));
-                    }
-                }
-            }
-        }
-        if let Some(bytes) = reply {
-            let _ = self.core.send(conn, &bytes);
-        }
-        if let Some((id, total, chunk)) = start_sender {
-            self.spawn_sender(conn, id, total, chunk, false);
-        }
-    }
-
-    /// The friend's data is all here: the test is over, the numbers go together.
-    fn finish_download(&self, state: &mut ProbeState, conn: Handle, id: u64, peak: u32, block_ms: u64, now: Instant) {
-        let rate_set = self.core.send_rate_setting();
-        let (route, ping, effective) = state
-            .test
-            .as_ref()
-            .filter(|t| t.conn == conn)
-            .map_or((String::new(), None, None), |t| (t.route.clone(), t.ping_ms, t.send_rate));
-        let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.id == id && r.phase == Phase::Download)
-        else {
-            return;
-        };
-        let (Some(rx), Some(remote)) = (run.down.as_ref(), run.up_remote) else { return };
-        let (up_bytes, up_ms, up_gap, up_steady) = remote;
-        let sent = run.up_stats.clone().unwrap_or_default();
-        let result = throughput::SpeedResult {
-            total_bytes: run.total,
-            up: throughput::Direction {
-                bytes: up_bytes,
-                rate: throughput::rate_of(up_steady, up_ms),
-                secs: up_ms as f64 / 1000.0,
-                peak_pending: sent.peak_pending,
-                longest_pause_ms: up_gap.max(sent.max_block_ms),
-            },
-            down: throughput::Direction {
-                bytes: rx.got,
-                rate: rx.rate(),
-                secs: rx.span_ms() as f64 / 1000.0,
-                peak_pending: peak,
-                longest_pause_ms: rx.max_gap_ms().max(block_ms),
-            },
-            total_secs: now.saturating_duration_since(run.started).as_secs_f64(),
-            ping_ms: ping,
-            route,
-            rate_set,
-            rate_effective: effective,
-        };
-        run.result = Some(result);
-        run.phase = Phase::Done;
-        state.events.push("speed test finished".into());
-    }
-
-    /// Streams `total` bytes to `conn` on a thread of its own. `ours` is a test we started (it can be stopped by
-    /// replacing or failing it); the other kind answers a friend and runs to the end.
-    fn spawn_sender(&self, conn: Handle, id: u64, total: u64, chunk: u64, ours: bool) {
-        let Some(me) = self.me.upgrade() else { return };
-        let spawned = thread::Builder::new().name("feverlink3-steam-speed".into()).spawn(move || {
-            let cancelled =
-                || ours && !lock(&me.state).speed.as_ref().is_some_and(|r| r.id == id && r.phase == Phase::Upload);
-            let stats = throughput::stream(&me.core, conn, id, total, chunk, &cancelled);
-            let mut state = lock(&me.state);
-            if ours {
-                if let Some(run) = state.speed.as_mut().filter(|r| r.id == id) {
-                    if let (Some(e), Phase::Upload) = (&stats.error, &run.phase) {
-                        run.phase = Phase::Failed(format!("sending stopped: {e}"));
-                    }
-                    run.up_stats = Some(stats);
-                }
-            } else {
-                state.senders = state.senders.saturating_sub(1);
-            }
-        });
-        if spawned.is_err() && !ours {
-            let mut state = lock(&self.state);
-            state.senders = state.senders.saturating_sub(1);
-        }
-    }
-
     fn is_test(state: &ProbeState, conn: Handle) -> bool {
         state.test.as_ref().is_some_and(|t| t.conn == conn)
     }
@@ -607,7 +469,21 @@ impl ProbeService {
 impl Owner for ProbeService {
     fn opened(&self, conn: Handle, _incoming: bool, remote: Option<u64>) {
         let route = self.core.route(conn).map_or("unknown", Route::text);
-        let mut state = lock(&self.state);
+        let mut guard = lock(&self.state);
+        let state = &mut *guard;
+        if let Some(report) = self.core.config_report(conn) {
+            self.log(
+                state,
+                format!(
+                    "steam connection {conn} ({}): settings at its start: {report}",
+                    if _incoming { "incoming" } else { "outgoing" }
+                ),
+            );
+        }
+        if let Some(extra) = state.speed.as_mut().and_then(|r| r.extras.iter_mut().find(|(h, _)| *h == conn)) {
+            extra.1 = true;
+            return;
+        }
         if let Some(t) = state.test.as_mut().filter(|t| t.conn == conn) {
             t.connected = true;
             t.state = "connected".into();
@@ -617,7 +493,7 @@ impl Owner for ProbeService {
         } else if state.peers.len() >= MAX_PEERS {
             // anyone who knows an account's Steam ID can connect to the probe: it holds a few, not as many as asked
             state.events.push("a connection was turned away: the probe is full".into());
-            drop(state);
+            drop(guard);
             self.core.close(conn);
         } else {
             state.peers.push(Peer { conn, steam_id: remote, link: None });
@@ -657,7 +533,12 @@ impl Owner for ProbeService {
         }
     }
 
+    fn datagram(&self, conn: Handle, data: &[u8]) {
+        self.hub.on_datagram(conn, data);
+    }
+
     fn closed(&self, conn: Handle, end: End) {
+        self.hub.drop_connection(conn);
         let mut state = lock(&self.state);
         state.peers.retain(|p| p.conn != conn);
         let ours = Self::is_test(&state, conn);
@@ -665,7 +546,7 @@ impl Owner for ProbeService {
             state.incoming = None;
         }
         if end.cause != Cause::Local {
-            if let Some(run) = state.speed.as_mut().filter(|r| r.conn == conn && r.active()) {
+            if let Some(run) = state.speed.as_mut().filter(|r| r.owns(conn) && r.active()) {
                 run.phase = Phase::Failed(format!("the connection ended: {}", end.describe()));
             }
         }
@@ -708,6 +589,16 @@ impl Probe {
             core: core.clone(),
             me: me.clone(),
             state: Mutex::new(ProbeState::default()),
+            hub: bulk_io::Hub::new(),
+            legacy: std::sync::atomic::AtomicBool::new(false),
+            par_events: Mutex::new(Vec::new()),
+            par_svc: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&service);
+        service.hub.set_acceptor(move |conn, xfer, offer, rx| {
+            if let Some(service) = weak.upgrade() {
+                service.accept_dgram(conn, xfer, offer, rx);
+            }
         });
         Probe {
             core,
@@ -761,80 +652,7 @@ impl Probe {
         self.refresh_links();
         self.drive_test();
         self.drive_speed();
-    }
-
-    /// Starts a speed test that waited for the connection, and ends one that makes no progress.
-    fn drive_speed(&self) {
-        let now = Instant::now();
-        let mut start: Option<(Handle, u64, u64)> = None;
-        {
-            let mut guard = lock(&self.service.state);
-            let state = &mut *guard;
-            let Some(run) = state.speed.as_mut().filter(|r| r.active()) else { return };
-            if run.phase == Phase::Connecting {
-                match state.test.as_ref() {
-                    Some(t) if t.connected => {
-                        run.conn = t.conn;
-                        run.phase = Phase::Upload;
-                        run.phase_started = now;
-                        run.last_progress = now;
-                        start = Some((t.conn, run.id, run.total));
-                    }
-                    Some(t) if t.state.starts_with("failed") => {
-                        run.phase = Phase::Failed(format!("no connection: {}", t.state));
-                    }
-                    Some(_) => {
-                        if now.saturating_duration_since(run.started) > Duration::from_secs(60) {
-                            run.phase = Phase::Failed("no connection after 60 s".into());
-                        }
-                    }
-                    None => run.phase = Phase::Failed("no connection".into()),
-                }
-            } else if now.saturating_duration_since(run.last_progress) > throughput::ABORT_AFTER {
-                run.phase = Phase::Failed(format!("no data for {} s", throughput::ABORT_AFTER.as_secs()));
-            }
-        }
-        if let Some((conn, id, total)) = start {
-            let chunk = throughput::CHUNK_PAYLOAD as u64;
-            let _ = self.core.send(conn, &throughput::encode(&throughput::Msg::Up { id, total, chunk }));
-            self.service.spawn_sender(conn, id, total, chunk, true);
-        }
-    }
-
-    /// Starts a speed test of `mb` MB each way with the friend `steam_id`, connecting first when the connection
-    /// test is not already on that friend.
-    pub fn speed_test(&mut self, steam_id: u64, mb: u32) {
-        if !self.core.status().ready {
-            return;
-        }
-        let total = (u64::from(mb.max(1)) * throughput::MB).min(throughput::MAX_TOTAL);
-        let reuse = lock(&self.service.state).test.as_ref().is_some_and(|t| t.target == steam_id && t.connected);
-        if !reuse {
-            self.test(steam_id);
-        }
-        let now = Instant::now();
-        let mut state = lock(&self.service.state);
-        if state.test.is_none() {
-            return;
-        }
-        if let Some(old) = state.speed.as_mut().filter(|r| r.active()) {
-            old.phase = Phase::Failed("replaced by a new test".into());
-        }
-        state.events.push(format!("speed test of {} MB started", total / throughput::MB));
-        state.speed = Some(SpeedRun {
-            id: now_ms(),
-            conn: 0,
-            total,
-            phase: Phase::Connecting,
-            started: now,
-            phase_started: now,
-            last_progress: now,
-            up_progress: 0,
-            up_stats: None,
-            up_remote: None,
-            down: None,
-            result: None,
-        });
+        self.advance_plan();
     }
 
     /// Takes the core's latest route and ping of the test connection and of the players connected to us. The core
@@ -934,7 +752,10 @@ impl Probe {
                 send_rate: t.send_rate,
             }),
             pings_received: state.pings_received,
-            speed: state.speed.as_ref().map(speed_report),
+            speed: state
+                .speed
+                .as_ref()
+                .map(|r| speed::speed_report(r, state.outcome.as_ref(), speed::PlanView::of(&state))),
             peers: state
                 .peers
                 .iter()
@@ -947,51 +768,6 @@ impl Probe {
                 .collect(),
         }
     }
-}
-
-/// The window's view of a speed test.
-fn speed_report(run: &SpeedRun) -> SpeedReport {
-    let now = Instant::now();
-    let mb = |bytes: u64| bytes as f64 / throughput::MB as f64;
-    let total = mb(run.total);
-    let mut report =
-        SpeedReport { id: run.id, running: run.active(), status: String::new(), lines: Vec::new(), log: None };
-    let quiet = now.saturating_duration_since(run.last_progress);
-    let stalled = if run.active() && quiet >= throughput::STALL {
-        format!(" (no data for {} s)", quiet.as_secs())
-    } else {
-        String::new()
-    };
-    match &run.phase {
-        Phase::Connecting => report.status = format!("Speed test of {total:.0} MB: connecting...{stalled}"),
-        Phase::Upload => {
-            let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
-            let rate = throughput::rate_text(Some(run.up_progress as f64 / secs));
-            report.status = format!(
-                "Speed test, sending to your friend: {:.1} of {total:.0} MB, {rate}{stalled}",
-                mb(run.up_progress)
-            );
-        }
-        Phase::Download => {
-            let got = run.down.as_ref().map_or(0, |d| d.got);
-            let secs = now.saturating_duration_since(run.phase_started).as_secs_f64().max(0.001);
-            let rate = throughput::rate_text(Some(got as f64 / secs));
-            report.status =
-                format!("Speed test, receiving from your friend: {:.1} of {total:.0} MB, {rate}{stalled}", mb(got));
-        }
-        Phase::Done => {
-            if let Some(result) = &run.result {
-                report.lines = result.lines();
-                report.status = report.lines.first().cloned().unwrap_or_default();
-                report.log = Some(result.log_line());
-            }
-        }
-        Phase::Failed(why) => {
-            report.status = format!("Speed test failed: {why}");
-            report.log = Some(format!("steam speed test failed: {why}"));
-        }
-    }
-    report
 }
 
 impl Drop for Probe {
@@ -1107,12 +883,33 @@ mod tests {
                 quality_local: 0.75,
                 quality_remote: 0.5,
                 send_rate: 1_048_576,
-                pending_reliable: 350_000
+                pending_reliable: 350_000,
+                pending_unreliable: 0,
+                sent_unacked_reliable: 0,
+                out_packets_per_sec: 0.0,
+                out_bytes_per_sec: 0.0,
+                in_packets_per_sec: 0.0,
+                in_bytes_per_sec: 0.0,
+                queue_time_us: 0,
             })
         );
         // Steam reports a negative ping while it has no estimate
         b[4..8].copy_from_slice(&(-1i32).to_le_bytes());
         assert_eq!(parse_real_time_status(&b).map(|r| r.ping_ms), Some(None));
+        // the rates, the unacked reliable bytes and the queue time sit at 16..32, 44 and 48
+        b[16..20].copy_from_slice(&1200.5f32.to_le_bytes());
+        b[20..24].copy_from_slice(&900_000.0f32.to_le_bytes());
+        b[24..28].copy_from_slice(&80.0f32.to_le_bytes());
+        b[28..32].copy_from_slice(&7000.0f32.to_le_bytes());
+        b[36..40].copy_from_slice(&123i32.to_le_bytes());
+        b[44..48].copy_from_slice(&65_536i32.to_le_bytes());
+        b[48..56].copy_from_slice(&250_000i64.to_le_bytes());
+        let r = parse_real_time_status(&b).unwrap();
+        assert_eq!(
+            (r.out_packets_per_sec, r.out_bytes_per_sec, r.in_packets_per_sec, r.in_bytes_per_sec),
+            (1200.5, 900_000.0, 80.0, 7000.0)
+        );
+        assert_eq!((r.pending_unreliable, r.sent_unacked_reliable, r.queue_time_us), (123, 65_536, 250_000));
         assert_eq!(parse_real_time_status(&b[..40]), None);
         assert_eq!(parse_real_time_status(&[]), None);
     }
@@ -1482,6 +1279,240 @@ mod tests {
         });
     }
 
+    fn finish(probe_a: &mut Probe, probe_b: &mut Probe, what: &str) -> RunOutcome {
+        until(what, || {
+            probe_a.poll();
+            probe_b.poll();
+            !probe_a.run_active()
+        });
+        probe_a.run_outcome().expect("an outcome")
+    }
+
+    #[test]
+    fn a_datagram_run_moves_data_both_ways_through_lost_datagrams() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // every 25th datagram each machine sends is lost on the wire
+        a.lose_every_nth_unreliable(25);
+        b.lose_every_nth_unreliable(25);
+        probe_a.start_run(b.steam_id(), RunSpec::datagrams(4));
+        let outcome = finish(&mut probe_a, &mut probe_b, "the datagram run to finish");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Datagram(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.up.ok && r.down.ok, "{r:?}");
+        assert_eq!((r.up.bytes, r.down.bytes), (4 * throughput::MB, 4 * throughput::MB), "{r:?}");
+        assert!(r.up.rate.is_some_and(|x| x > 0.0) && r.down.rate.is_some_and(|x| x > 0.0), "{r:?}");
+        // the sender's numbers came back for both directions, and the datagrams that were lost were sent again
+        let (up, down) = (r.up.sender.as_ref().expect("up sender"), r.down.sender.as_ref().expect("down sender"));
+        assert!(up.loss_bp > 0 && down.loss_bp > 0, "{r:?}");
+        let lines = outcome.lines;
+        assert!(lines[0].starts_with("Datagram speed test, 4 MB each way: you to friend "), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("You to friend: you sent: lost ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Friend to you: your friend sent: lost ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("An 80 MB save (datagrams")), "{lines:?}");
+        assert!(outcome.log_line.starts_with("steam speed test (datagrams): 4 MB each way"), "{}", outcome.log_line);
+        // the connection's Steam send rate was raised for the transfer and put back after
+        let log = probe_a.take_log().join("\n");
+        assert!(log.contains("steam rate restored"), "{log}");
+        let during = bulk_io::STEAM_RATE_DURING;
+        assert!(a.connection_config().iter().any(|c| c.1 == 10 && c.2 == during), "{:?}", a.connection_config());
+        assert!(a.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == Config::default().send_rate));
+        // a ping still works afterwards
+        until("a pong", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1)
+        });
+    }
+
+    #[test]
+    fn an_auto_run_sends_and_receives_over_parallel_connections_and_reports_them() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // every connection carries 5 MB/s, the line does not limit; 30 MB each way is three connections by the rule
+        a.set_caps(5_000_000.0, 0.0);
+        b.set_caps(5_000_000.0, 0.0);
+        probe_a.start_run(b.steam_id(), RunSpec::auto(30));
+        let outcome = finish(&mut probe_a, &mut probe_b, "the auto run to finish");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Par(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.up.ok && r.down.ok, "{r:?}");
+        assert_eq!((r.up.bytes, r.down.bytes), (30 * throughput::MB, 30 * throughput::MB), "{r:?}");
+        let rule = par::ParConfig::default().conns_for(30 * throughput::MB);
+        assert_eq!(rule, 3);
+        assert_eq!((r.up.target, r.down.target), (rule, rule), "{r:?}");
+        assert!(r.up.used >= 2 && r.down.used >= 2, "{r:?}");
+        assert!(r.up.rate.is_some_and(|x| x > 1.5e6) && r.down.rate.is_some_and(|x| x > 1.5e6), "{r:?}");
+        let lines = outcome.lines;
+        assert!(lines[0].starts_with("Auto (scaled) speed test, 30 MB each way: you to friend "), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("You to friend: ") && l.contains("connection(s) (the rule asked for 3")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Friend to you: ") && l.contains("connection(s) (the rule asked for 3")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.starts_with("An 80 MB save (carried as it is")), "{lines:?}");
+        assert!(outcome.log_line.starts_with("steam speed test (auto scaled): 30 MB each way"), "{}", outcome.log_line);
+        // the temporary files are gone
+        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with(&format!("feverlink3-speedtest-{}-", std::process::id()))
+            })
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // a ping still works afterwards
+        until("a pong", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().test.is_some_and(|t| t.pongs >= 1)
+        });
+    }
+
+    #[test]
+    fn a_datagram_offer_while_the_friend_is_busy_is_refused() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // two uploads at once: the second offer meets a busy receiver and is aborted with a reason, not hung
+        probe_a.start_run(b.steam_id(), RunSpec::datagrams(1));
+        let _ = finish(&mut probe_a, &mut probe_b, "the first run");
+        let _ = a;
+        // a hostile peer sends an offer for a huge transfer: refused as too big
+        let conn = lock(&probe_a.service.state).test.as_ref().map(|t| t.conn).unwrap();
+        let offer = bulk::wire::Offer {
+            xfer: 999,
+            ts: 0,
+            ctx: 0,
+            total: 10_000 * throughput::MB,
+            payload: bulk::PAYLOAD as u16,
+            sha256: [1; 32],
+        };
+        probe_a.service.core.send_datagram(conn, &bulk::wire::encode_offer(&offer));
+        until("the refusal", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_b.take_log().is_empty() && lock(&probe_b.service.state).dg_in.is_none()
+        });
+        assert!(lock(&probe_b.service.state).dg_in.is_none());
+    }
+
+    #[test]
+    fn reliable_runs_over_several_connections_count_every_chunk_once() {
+        for n in [2u32, 4] {
+            let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+            let spec = RunSpec { variant: throughput::Variant::Reliable(n), ..RunSpec::reliable(3) };
+            probe_a.start_run(b.steam_id(), spec);
+            let outcome = finish(&mut probe_a, &mut probe_b, &format!("the parallel run of {n}"));
+            assert_eq!(outcome.failure, None, "{outcome:?}");
+            let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+            assert_eq!((r.up.bytes, r.down.bytes), (3 * throughput::MB, 3 * throughput::MB), "{r:?}");
+            assert_eq!(r.conns, n);
+            assert!(outcome.lines[0].contains(&format!("over {n} connections")), "{:?}", outcome.lines);
+            // the extra connections were closed again
+            until("the extras to close", || {
+                probe_a.poll();
+                probe_b.poll();
+                probe_b.report().peers.len() <= 1
+            });
+        }
+    }
+
+    #[test]
+    fn a_run_at_a_chosen_send_rate_asks_the_peer_to_set_its_own_and_both_restore_it() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        let spec = RunSpec { rate: Some(4 << 20), ..RunSpec::reliable(2) };
+        probe_a.start_run(b.steam_id(), spec);
+        let outcome = finish(&mut probe_a, &mut probe_b, "the run");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(
+            r.rate_note.contains("own send rate set to 4194304")
+                && r.rate_note.contains("peer set its send rate to 4194304"),
+            "{}",
+            r.rate_note
+        );
+        let default = Config::default().send_rate;
+        for machine in [&a, &b] {
+            let rates: Vec<i32> = machine.connection_config().iter().filter(|c| c.1 == 10).map(|c| c.2).collect();
+            assert!(rates.contains(&(4 << 20)), "{rates:?}");
+        }
+        until("the peer to put its rate back", || {
+            probe_a.poll();
+            probe_b.poll();
+            b.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == default)
+        });
+        assert!(a.connection_config().iter().rfind(|c| c.1 == 10).is_some_and(|c| c.2 == default));
+    }
+
+    #[test]
+    fn a_peer_that_ignores_the_rate_request_is_reported_as_such() {
+        let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        probe_b.act_like_an_old_program();
+        let spec = RunSpec { rate: Some(2 << 20), ..RunSpec::reliable(1) };
+        probe_a.start_run(b.steam_id(), spec);
+        let outcome = finish(&mut probe_a, &mut probe_b, "the run");
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.rate_note.contains("peer did not change its rate"), "{}", r.rate_note);
+        assert_eq!(r.down.bytes, throughput::MB);
+    }
+
+    #[test]
+    fn a_direction_still_running_at_the_time_limit_is_stopped_and_reported_as_it_stands() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        // a receiver that stops reading: the sender's buffer fills and nothing moves
+        b.stall_receive(true);
+        let spec = RunSpec { cap: Duration::from_millis(400), ..RunSpec::reliable(64) };
+        probe_a.start_run(b.steam_id(), spec);
+        let _ = a;
+        let outcome = finish(&mut probe_a, &mut probe_b, "the capped run");
+        b.stall_receive(false);
+        assert_eq!(outcome.failure, None, "{outcome:?}");
+        let Some(RunKind::Reliable(r)) = outcome.kind else { panic!("{outcome:?}") };
+        assert!(r.up.capped && r.down.capped, "{r:?}");
+    }
+
+    #[test]
+    fn a_series_of_runs_shows_one_block_per_run_and_stops_at_the_first_failure() {
+        let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
+        a.lose_every_nth_unreliable(40);
+        probe_a.start_plan(b.steam_id(), specs_for("both", 2));
+        let first = probe_a.report().speed.expect("a report");
+        assert!(first.running && first.status.starts_with("[run 1 of 2] "), "{first:?}");
+        until("both runs", || {
+            probe_a.poll();
+            probe_b.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let lines = probe_a.report().speed.unwrap().lines;
+        let headers: Vec<&String> = lines.iter().filter(|l| l.starts_with("== ")).collect();
+        assert_eq!(headers, ["== reliable (2 MB) ==", "== datagrams (2 MB) =="], "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Speed test, 2 MB each way")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Datagram speed test, 2 MB each way")), "{lines:?}");
+        // the datagrams went out unreliably, some were lost, and every one was sent with the settings of the connection
+        let (sent, lost, _) = a.unreliable_counts();
+        assert!(sent > 1000 && lost > 0, "{sent} {lost}");
+        // the settings the connections were created with: the same send rate, send rate and send buffer as the tuning
+        let rate = Config::default().send_rate;
+        let options = a.creation_options();
+        assert!(
+            options.contains(&(10, rate)) && options.contains(&(11, rate)) && options.contains(&(9, 2 << 20)),
+            "{options:?}"
+        );
+
+        // a series with a peer that is gone stops after the first block
+        b.set_reachable(false);
+        a.break_connections();
+        probe_a.start_plan(b.steam_id(), specs_for("all", 1));
+        until("the failure", || {
+            probe_a.poll();
+            probe_a.report().speed.is_some_and(|s| !s.running)
+        });
+        let lines = probe_a.report().speed.unwrap().lines;
+        assert!(lines.iter().any(|l| l.starts_with("Speed test failed:")), "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("== ")).count(), 1, "{lines:?}");
+    }
+
     #[test]
     fn the_numbers_of_a_finished_speed_test_are_complete() {
         let (_a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
@@ -1552,7 +1583,13 @@ mod tests {
         });
         // b's probe is asked for far too much: nothing is started
         let conn = lock(&probe_a.service.state).test.as_ref().map(|t| t.conn).unwrap();
-        let ask = throughput::encode(&throughput::Msg::Down { id: 1, total: 10_000 * throughput::MB, chunk: 1000 });
+        let ask = throughput::encode(&throughput::Msg::Down {
+            id: 1,
+            total: 10_000 * throughput::MB,
+            chunk: 1000,
+            conns: 1,
+            rate: 0,
+        });
         assert_eq!(probe_a.core.send(conn, &ask), SendOutcome::Sent);
         thread::sleep(Duration::from_millis(100));
         probe_b.poll();

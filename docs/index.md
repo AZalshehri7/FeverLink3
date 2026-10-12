@@ -12,11 +12,11 @@ title: FeverLink3
 
 ## See it working
 
-Two real copies of the game side by side, each starting in its own world: the left one hosts and copies the join code, the right one pastes it and joins, the host's world is sent to the guest while the host keeps playing, then each side gives commands and the other game follows. The names are made up.
+Two real copies of the game side by side, each starting in its own world: the left one hosts and copies the join code, the right one pastes it and joins, the host's world is sent to the guest, then each side gives commands and the other game follows. The names are made up.
 
 ![The host (left) and the guest (right): host, copy code, paste, join, start, speed, pause and chat](media/split-screen-demo.gif)
 
-Stills: [the host copies the code](media/demo-1-host-copies-code.jpg), [the guest has joined](media/demo-2-guest-joined.jpg), [the world is sent while the host keeps playing](media/demo-3-world-sent-host-keeps-playing.jpg), [the guest pauses and both games stop](media/demo-4-guest-pauses-both-stop.jpg), [chat on both sides](media/demo-5-chat-both-sides.jpg). This ran over the developer connection on one PC (two games of one Steam account cannot reach each other through Steam).
+Stills: [the host copies the code](media/demo-1-host-copies-code.jpg), [the guest has joined](media/demo-2-guest-joined.jpg), [the world is sent](media/demo-3-world-sent-host-keeps-playing.jpg), [the guest pauses and both games stop](media/demo-4-guest-pauses-both-stop.jpg), [chat on both sides](media/demo-5-chat-both-sides.jpg). This ran over the developer connection on one PC (two games of one Steam account cannot reach each other through Steam).
 
 ## What it is
 

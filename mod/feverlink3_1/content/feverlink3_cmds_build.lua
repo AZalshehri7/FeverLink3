@@ -349,6 +349,8 @@ local function nodesFromScan(p, tol)
 	return out
 end
 
+function A.nodesScan(p, tol) return nodesFromScan(p, tol) end
+
 -- Which of the three ways above finds a node. Probed once against a node that exists: the octree is used by the
 -- game's own scripts for BASE_EDGE, CONSTRUCTION and STATION, not seen for BASE_NODE.
 function A.probeNodeLookup()
@@ -595,15 +597,25 @@ local function resolveNode(ref, ctx)
 		local p = A.nodePos(e)
 		if p and d3(p, ref.p) <= TOL_SAME then return e end
 	end
-	local cands = {}
-	for _, n in ipairs(A.nodesNear(ref.p, TOL_NODE)) do
-		local p = A.nodePos(n)
-		if p then
-			local d = d3(p, ref.p)
-			if d <= TOL_NODE then cands[#cands + 1] = { e = n, s = d, k = pkey(p) } end
+	local function search(list)
+		local cands = {}
+		for _, n in ipairs(list) do
+			local p = A.nodePos(n)
+			if p then
+				local d = d3(p, ref.p)
+				if d <= TOL_NODE then cands[#cands + 1] = { e = n, s = d, k = pkey(p) } end
+			end
 		end
+		return pick(cands, TOL_NODE)
 	end
-	return pick(cands, TOL_NODE)
+	local found, why = search(A.nodesNear(ref.p, TOL_NODE))
+	if found == nil and why == nil and A.nodeMode ~= "scan" then
+		-- the octree may not know a node built a moment ago (a paused game never ticks its spatial index): the street graph's own
+		-- map does
+		found, why = search(A.nodesScan(ref.p, TOL_NODE))
+		if found ~= nil then log("references: the node at " .. pkey(ref.p) .. " was not in the octree but is in the street graph") end
+	end
+	return found, why
 end
 
 local function resolveEdge(ref, ctx)
@@ -612,23 +624,35 @@ local function resolveEdge(ref, ctx)
 		local info = A.edgeInfo(e)
 		if info and edgeScore(info, ref) <= TOL_SAME then return e end
 	end
-	local cands, seen = {}, {}
-	for _, n in ipairs(A.nodesNear(ref.p0, TOL_NODE)) do
-		local p = A.nodePos(n)
-		if p and d3(p, ref.p0) <= TOL_NODE then
-			for _, ed in ipairs(A.edgesAt(n)) do
-				if not seen[ed] then
-					seen[ed] = true
-					local info = A.edgeInfo(ed)
-					if info then
-						local s = edgeScore(info, ref)
-						if s <= TOL_NODE then cands[#cands + 1] = { e = ed, s = s, k = pkey(info.p0) .. ";" .. pkey(info.p1) } end
+	-- Looked for at the nodes near either end of the reference (the other end helps when the octree lacks the node at the first),
+	-- then, if the octree found nothing, in the street graph's own map.
+	local function search(scan)
+		local cands, seen = {}, {}
+		for _, at in ipairs({ ref.p0, ref.p1 }) do
+			for _, n in ipairs(scan and A.nodesScan(at, TOL_NODE) or A.nodesNear(at, TOL_NODE)) do
+				local p = A.nodePos(n)
+				if p and d3(p, at) <= TOL_NODE then
+					for _, ed in ipairs(A.edgesAt(n)) do
+						if not seen[ed] then
+							seen[ed] = true
+							local info = A.edgeInfo(ed)
+							if info then
+								local s = edgeScore(info, ref)
+								if s <= TOL_NODE then cands[#cands + 1] = { e = ed, s = s, k = pkey(info.p0) .. ";" .. pkey(info.p1) } end
+							end
+						end
 					end
 				end
 			end
 		end
+		return pick(cands, TOL_NODE)
 	end
-	return pick(cands, TOL_NODE)
+	local found, why = search(false)
+	if found == nil and why == nil and A.nodeMode ~= "scan" then
+		found, why = search(true)
+		if found ~= nil then log("references: " .. describe(ref) .. " was not found through the octree but is in the street graph") end
+	end
+	return found, why
 end
 
 local function resolveCon(ref, ctx)
@@ -713,11 +737,12 @@ end
 -- the state of one capture: how entities are keyed, what the proposal itself knows about entities it removes, and
 -- the references already made
 local function newCapture(ctx, opts)
-	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {} }, memo = {}, result = opts.result }
+	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {} }, memo = {}, result = opts.result, alias = {} }
 
 	function cap.node(id)
 		if type(id) ~= "number" then fail("a node reference is not an entity id") end
 		if id < 0 then return id end
+		if cap.alias["n" .. id] then return cap.alias["n" .. id] end
 		local m = cap.memo["n" .. id]
 		if m then return m end
 		local p = A.nodePos(id) or cap.known.nodes[id]
@@ -730,6 +755,7 @@ local function newCapture(ctx, opts)
 	function cap.edge(id)
 		if type(id) ~= "number" then fail("a segment reference is not an entity id") end
 		if id < 0 then return id end
+		if cap.alias["e" .. id] then return cap.alias["e" .. id] end
 		local m = cap.memo["e" .. id]
 		if m then return m end
 		local info = A.edgeInfo(id) or cap.known.edges[id]
@@ -827,6 +853,7 @@ end
 local function ownTemplate(template)
 	local tpl = tostring(template or "")
 	return tpl:find("/constructions/", 1, true) ~= nil or tpl:find("simple.street_template", 1, true) ~= nil
+		or tpl:find("/airport/", 1, true) ~= nil   -- an airfield's runway and taxiways (real run 2026-10-11: 21 segments of an airfield)
 end
 
 -- one segment to add (SegmentAndEntity): everything the rebuild needs, from members read by name
@@ -841,10 +868,22 @@ local function readSegment(s, cap)
 			if ok then return r end
 			return -2147483647
 		end
-		return {
+		local seg = {
 			id = cap.edge(get(s, "entity")), type = get(s, "type"), n0 = nodeRef("node0"), n1 = nodeRef("node1"), objects = {},
 			c = { roadTemplate = template, type = get(c, "type"), typeIndex = get(c, "typeIndex"), roadType = get(c, "roadType"), roadStyle = get(c, "roadStyle") },
 		}
+		-- A piece that ends at a node the world already had is a CONNECTION to the street (a depot's entrance to a town road), made
+		-- by the tool, not by the construction's own script: its geometry travels so that a game whose replay did not make it can.
+		if (type(seg.n0) == "table") ~= (type(seg.n1) == "table") then
+			local okG, g = pcall(function()
+				return { t0 = A.xyz(get(c, "tangent0")), t1 = A.xyz(get(c, "tangent1")), p0 = A.xyz(get(c, "position0")), p1 = A.xyz(get(c, "position1")) }
+			end)
+			if okG and g.t0 and g.t1 and g.p0 and g.p1 then
+				seg.c.t0, seg.c.t1, seg.c.p0, seg.c.p1 = g.t0, g.t1, g.p0, g.p1
+				seg.connector = true
+			end
+		end
+		return seg
 	end
 	local lanes = A.list(c, "laneConfigs")
 	-- lanes travel only when they are not the lanes of the street template (tram tracks on a road, platform lanes of a
@@ -1009,6 +1048,21 @@ local function captureRecord(proposal, cap)
 
 	if st ~= nil then
 		learnRemoved(st, names, cap)
+		-- Read after the build ran (cap.result): the proposal's own nodes and segments carry the entity ids the engine gave them.
+		-- They are NEW entities of this build, not references to ones the world had; placeholders again, so that another game
+		-- creates them (the airfield of real run 2026-10-11 was shipped as 21 references to nodes nobody else had).
+		if cap.result ~= nil then
+			for _, kind in ipairs({ { "n", names.nodes }, { "e", names.segs } }) do
+				local k = 0
+				for _, x in ipairs(A.list(st, kind[2])) do
+					local id = get(x, "entity")
+					if type(id) == "number" and id >= 0 then
+						k = k + 1
+						cap.alias[kind[1] .. id] = -k
+					end
+				end
+			end
+		end
 		local rmSegIds = {}
 		for i, s in ipairs(A.list(st, names.rmSegs)) do rmSegIds[i] = idOf(s) end
 		indexWorldObjects(rmSegIds, cap)
@@ -1027,7 +1081,26 @@ local function captureRecord(proposal, cap)
 		end
 		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(idOf(n)) end
 		for i, s in ipairs(A.list(st, names.segs)) do rec.segs[i] = readSegment(s, cap) end
-		for i, o in ipairs(A.list(st, names.objs)) do rec.objs[i] = readEdgeObject(o, i, cap) end
+		local ownEdge = {}
+		for _, sg in ipairs(rec.segs) do
+			if ownTemplate(sg.c and sg.c.roadTemplate) and type(sg.id) == "number" then ownEdge[sg.id] = true end
+		end
+		for _, o in ipairs(A.list(st, names.objs)) do
+			-- An edge object on a segment of a construction's own (the signs of an airfield's taxiways) is made by the construction's
+			-- script; the engine names its model only after the build, which is why the tool's preview cannot read it. It is not
+			-- described: the record is complete without it and can be shipped before the build.
+			local okO, eo = pcall(readEdgeObject, o, #rec.objs + 1, cap)
+			if okO then
+				rec.objs[#rec.objs + 1] = eo
+			else
+				local edgeId = get(o, "edgeEntity")
+				if edgeId == nil then edgeId = get(o, "segmentEntity") end
+				local mine = #rec.cons > 0 and tostring(eo):find("has no model", 1, true)
+					and type(edgeId) == "number" and ownEdge[cap.edge(edgeId)]
+				if not mine then error(eo, 0) end
+				rec.ownObjs = (rec.ownObjs or 0) + 1
+			end
+		end
 		-- A script's edge object does not say what it is; the placeholder that stands for it in its segment's object list
 		-- does (0 and 1 a stop on the left or right, 2 a signal), the n-th placeholder for the n-th object.
 		local kinds = {}
@@ -1064,6 +1137,19 @@ end
 
 local function isConstructionSegment(s)
 	return ownTemplate(s.c and s.c.roadTemplate)
+end
+
+-- the edge objects of a record that sit on a construction's own segments (made by its script) and the others
+local function foreignObjCount(rec)
+	local own = {}
+	for _, sg in ipairs(rec.segs) do
+		if isConstructionSegment(sg) and type(sg.id) == "number" then own[sg.id] = true end
+	end
+	local n = 0
+	for _, o in ipairs(rec.objs) do
+		if not (type(o.edge) == "number" and own[o.edge]) then n = n + 1 end
+	end
+	return n
 end
 
 local function counts(rec)
@@ -1154,7 +1240,7 @@ local function classify(rec)
 		for _, s in ipairs(rec.segs) do
 			if isConstructionSegment(s) then own = own + 1 else foreign = foreign + 1 end
 		end
-		if foreign == 0 and nRmSegs == 0 and nObjs + nRmObjs == 0 then return "construction" end
+		if foreign == 0 and nRmSegs == 0 and foreignObjCount(rec) + nRmObjs == 0 then return "construction" end
 		-- constructions taken away with segments, and nothing new but what the engine re-adds when it merges: a bulldozing
 		if nCons == 0 and nNodes == 0 and nObjs == 0 and nRmSegs > 0 then return "bulldoze" end
 		-- a depot or station against a street: street first, construction second; any other mixture (a road that takes
@@ -1354,9 +1440,11 @@ local function streetProposal(rec, R, notes, opts)
 	opts = opts or {}
 	if opts.renumber then rec = renumbered(rec) end
 	local sp = A.new("SimpleProposal")
-	local keepSeg, usedNode = {}, {}
+	local keepSeg, usedNode, dropped = {}, {}, {}
 	for _, s in ipairs(rec.segs) do
-		if not (opts.drop and isConstructionSegment(s)) then
+		if opts.drop and isConstructionSegment(s) then
+			if type(s.id) == "number" then dropped[s.id] = true end
+		else
 			keepSeg[#keepSeg + 1] = s
 			if type(s.n0) == "number" then usedNode[s.n0] = true end
 			if type(s.n1) == "number" then usedNode[s.n1] = true end
@@ -1398,7 +1486,10 @@ local function streetProposal(rec, R, notes, opts)
 	for i, ref in ipairs(rec.rmNodes) do rmNodes[i] = R.node(ref) end
 	for i, ref in ipairs(rec.rmSegs) do rmEdges[i] = R.edge(ref) end
 	for i, ref in ipairs(rec.rmObjs) do rmObjs[i] = R.obj(ref) end
-	for i, o in ipairs(rec.objs) do objs[i] = newEdgeObject(o, R, R.edgeOr(o.edge), notes, opts) end
+	for _, o in ipairs(rec.objs) do
+		-- (with `drop`, the objects on the dropped segments of a construction's own go with them)
+		if not (opts.drop and type(o.edge) == "number" and dropped[o.edge]) then objs[#objs + 1] = newEdgeObject(o, R, R.edgeOr(o.edge), notes, opts) end
+	end
 	local cfgs, rmCfgs = {}, {}
 	if not opts.drop and opts.cfg ~= false then
 		for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, R) end
@@ -1472,6 +1563,78 @@ local function with(form, extra)
 	return o
 end
 
+-- The connection of a construction to the street (a depot's entrance piece that ends at a node the world already had) is part of
+-- the originator's native result, but a replay that hands the engine the construction alone may not reproduce it: a road that is
+-- then built from that piece cannot be resolved on the other game (real run 2026-10-11: "unresolved segment 923.952,6856.501 -
+-- 919.444,6840.109" for the entrance of a depot, the same place as the previous run's refused 0:5). After the construction,
+-- this step looks whether each such piece exists and builds the missing ones where the shipped result says they are. It says
+-- which it was (the first-cause note of the log); `false` when nothing is missing, so a replay that already has it does nothing.
+local function connectorStep(rec, R, f, notes)
+	return function()
+		local pos = {}
+		for _, n in ipairs(rec.nodes) do if type(n.id) == "number" then pos[n.id] = n.pos end end
+		local mini = part(rec, {})
+		mini.src = rec.src
+		local lowest = 0
+		for _, s in ipairs(rec.segs) do
+			if s.connector then
+				local first = type(s.n0) == "table"
+				local refEnd, newEnd = first and s.n0 or s.n1, first and s.n1 or s.n0
+				local newPos = pos[newEnd]
+				local label = pkey(s.c.p0) .. " - " .. pkey(s.c.p1)
+				local okE, en = pcall(R.node, refEnd)
+				if not newPos or not okE then
+					log("connector " .. label .. ": cannot be checked here (" .. (okE and "no position for its new end" or tostring(en)) .. ")")
+				else
+					local exists = false
+					for _, ed in ipairs(A.edgesAt(en)) do
+						local info = A.edgeInfo(ed)
+						if info then
+							local other = d3(info.p0, refEnd.p) <= TOL_NODE and info.p1 or info.p0
+							if d3(other, newPos) <= 1.5 then exists = true end
+						end
+					end
+					if exists then
+						log("connector " .. label .. ": this game's construction made it itself")
+					else
+						log("connector " .. label .. ": this game's replay did not make the street connection the originator's result has; it is built here")
+						local newRef = { __ref = "node", p = newPos }
+						local okN = pcall(R.node, newRef)
+						local endRef = newEnd
+						if okN then
+							endRef = newRef
+						else
+							lowest = lowest - 1
+							mini.nodes[#mini.nodes + 1] = { id = lowest, pos = newPos }
+							endRef = lowest
+						end
+						lowest = lowest - 1
+						local seg = {}
+						for k, v in pairs(s) do seg[k] = v end
+						seg.id = lowest
+						if first then seg.n1 = endRef else seg.n0 = endRef end
+						mini.segs[#mini.segs + 1] = seg
+					end
+				end
+			end
+		end
+		if #mini.segs == 0 then return false end
+		local okP, args = pcall(function()
+			local sp = streetProposal(mini, R, notes, { cfg = false })
+			return commandArgs(sp, newContext(f.ctx, CTX_NATIVE, R), true, false, f.dust)
+		end)
+		if okP then
+			local okF, why = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
+			if not okF then okP, args = false, why end
+		end
+		if not okP then
+			log("connector: cannot be built here (" .. tostring(args) .. "); the games will differ at this place until a resync")
+			return false
+		end
+		return args
+	end
+end
+
 PLAN.construction = function(rec, R, f, notes)
 	-- A construction that brings its own street piece (a station or depot entrance, even one that ends at a node already
 	-- there) collides with that piece in the engine's check, a non-critical error that stops the build unless errors are
@@ -1484,7 +1647,16 @@ PLAN.construction = function(rec, R, f, notes)
 			if isConstructionSegment(s) then ie, pi = true, false break end
 		end
 	end
-	return commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), ie, pi, f.dust)
+	local first = commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), ie, pi, f.dust)
+	if rec.src == "native" then
+		for _, s in ipairs(rec.segs) do
+			if s.connector then
+				first.chain = { connectorStep(rec, R, f, notes) }
+				break
+			end
+		end
+	end
+	return first
 end
 
 -- Street part first, then the construction on the street that is now cut (finding from MPFever (MIT): the engine

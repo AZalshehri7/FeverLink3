@@ -18,6 +18,11 @@ pub fn save_name(id: i32) -> String {
     format!("feverlink3-resync-{id}")
 }
 
+/// As [`save_name`] for the transfer context a parallel bulk transfer carries (the round id).
+pub fn save_name_for(ctx: u32) -> String {
+    save_name(ctx as i32)
+}
+
 /// The `save` folders of the given per-user folders (`userdata/<id>/3493540/local`).
 pub fn save_dirs(user_dirs: &[PathBuf]) -> Vec<PathBuf> {
     user_dirs.iter().map(|d| d.join("save")).collect()

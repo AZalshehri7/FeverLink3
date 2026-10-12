@@ -40,15 +40,19 @@ pub const MAX_MESSAGE: usize = 512 * 1024;
 /// Steam itself refuses more than [`MAX_MESSAGE`] by default; this is the bound if that setting ever changes.
 pub const COPY_LIMIT: usize = 2 << 20;
 /// Messages asked for in one `ReceiveMessagesOnConnection` call.
-const RECEIVE_BATCH: usize = 16;
+const RECEIVE_BATCH: usize = 64;
 /// Messages taken from one connection per poll cycle, so one busy connection cannot starve the others.
-const RECEIVE_PER_CYCLE: usize = 64;
+const RECEIVE_PER_CYCLE: usize = 4096;
 /// Status events kept between two poll cycles; more are dropped (and counted).
 const SINK_LIMIT: usize = 1024;
 /// How long a send that finds Steam's send buffer full waits before trying again.
 const FULL_RETRY: Duration = Duration::from_millis(2);
 /// `k_nSteamNetworkingSend_Reliable`.
 const SEND_RELIABLE: i32 = 8;
+/// `k_nSteamNetworkingSend_ReliableNoNagle`: the speed test's chunks are not held for the Nagle timer.
+const SEND_RELIABLE_NO_NAGLE: i32 = 9;
+/// `k_nSteamNetworkingSend_UnreliableNoNagle`: bulk datagrams, each its own packet at once.
+const SEND_UNRELIABLE_NO_NAGLE: i32 = 1;
 /// After this long without Steam interfaces the status says Steam networking is not available.
 const GIVE_UP_NOTE: Duration = Duration::from_secs(120);
 /// What the owners of connections are told when Steam is shut down under the core.
@@ -67,8 +71,11 @@ pub mod result {
 pub mod config_value {
     pub const SEND_RATE_MIN: i32 = 10;
     pub const SEND_RATE_MAX: i32 = 11;
+    pub const SEND_BUFFER_SIZE: i32 = 9;
+    pub const NAGLE_TIME: i32 = 12;
     pub const TIMEOUT_INITIAL: i32 = 24;
     pub const SCOPE_GLOBAL: i32 = 1;
+    pub const SCOPE_CONNECTION: i32 = 4;
     pub const TYPE_INT32: i32 = 1;
 }
 
@@ -88,6 +95,9 @@ type AliveFn = Box<dyn Fn() -> bool + Send + Sync>;
 type CallbackFn = unsafe extern "C" fn(*mut c_void);
 type SetConfigFn = unsafe extern "C" fn(*mut c_void, i32, i32, isize, i32, *const c_void) -> bool;
 type RealTimeStatusFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, *mut c_void) -> i32;
+type FlushFn = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+type DetailedFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_char, i32) -> i32;
+type GetConfigFn = unsafe extern "C" fn(*mut c_void, i32, i32, isize, *mut i32, *mut c_void, *mut usize) -> i32;
 
 /// The Steam functions the core uses (the flat API of `steam_api64.dll`, `steamnetworkingsockets_flat.h`).
 pub(super) struct Api {
@@ -113,6 +123,12 @@ pub(super) struct Api {
     pub connection_info: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> bool,
     /// `GetConnectionRealTimeStatus` (ping, quality, send rate); a missing export only means no ping.
     pub real_time_status: Option<RealTimeStatusFn>,
+    /// `FlushMessagesOnConnection`; a missing export only means nothing is flushed.
+    pub flush: Option<FlushFn>,
+    /// `GetDetailedConnectionStatus`: Steam's own multi-line text about a connection.
+    pub detailed_status: Option<DetailedFn>,
+    /// `ISteamNetworkingUtils::GetConfigValue`, to read back what a `SetConfigValue` did.
+    pub get_config: Option<GetConfigFn>,
 }
 
 /// How the poller paces itself, and what it asks Steam for. The defaults are what the game uses.
@@ -137,6 +153,8 @@ pub struct Config {
     /// `SendRateMin` and `SendRateMax` in bytes per second. Steam's default is 256 KiB/s, which makes a 31 MB
     /// savegame take two minutes.
     pub send_rate: i32,
+    /// `SendBufferSize` in bytes (Steam's default is 512 KiB, which the reliable speed test fills at once).
+    pub send_buffer: i32,
 }
 
 impl Config {
@@ -162,14 +180,21 @@ impl Default for Config {
             link_every: Duration::from_secs(1),
             initial_timeout_ms: 45_000,
             send_rate: send_rate_setting(std::env::var(SEND_RATE_ENV).ok().as_deref()),
+            send_buffer: DEFAULT_SEND_BUFFER,
         }
     }
 }
 
 /// The environment variable that replaces the send rate (bytes per second) for the speed test.
 pub const SEND_RATE_ENV: &str = "FEVERLINK3_STEAM_SENDRATE";
-/// The send rate used when the variable is not set: 1 MiB/s (Steam's own default is 256 KiB/s).
+/// The send rate used when the variable is not set: 1 MiB/s (Steam's own default is 256 KiB/s). A speed test between two
+/// real PCs on a direct route (2026-10-11) showed that the line itself carries about 1 MB/s: with the rate at the top of
+/// [`SEND_RATE_RANGE`] the speed stayed the same, the uplink saturated, other traffic (a voice call) broke up, and the
+/// route flipped between direct and relayed with stalls. The library has no bandwidth estimation, so a fixed rate must
+/// stay at or below what a typical home uplink carries until the rate adapts to the measured delay.
 pub const DEFAULT_SEND_RATE: i32 = 1 << 20;
+/// The send buffer asked for: 2 MiB.
+pub const DEFAULT_SEND_BUFFER: i32 = 2 << 20;
 /// Bounds for the variable: below 32 KiB/s nothing works, above 64 MiB/s no home line can follow.
 pub const SEND_RATE_RANGE: (i32, i32) = (32 * 1024, 64 << 20);
 
@@ -246,8 +271,17 @@ pub trait Owner: Send + Sync {
     fn progress(&self, _conn: Handle, _state: i32) {}
     /// One message arrived (one Steam message is one unit; the owner defines what it holds).
     fn message(&self, conn: Handle, data: &[u8]);
+    /// A bulk datagram ([`super::bulk::wire::MAGIC`] first): not a session frame or a probe message, so it is not
+    /// passed to [`Owner::message`]. Owners that do not take part in bulk transfers ignore it.
+    fn datagram(&self, _conn: Handle, _data: &[u8]) {}
     /// The connection is over. The last call for `conn`, made exactly once.
     fn closed(&self, conn: Handle, end: End);
+}
+
+/// Text up to the first NUL.
+fn c_text_lossy(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim_end().to_string()
 }
 
 /// What the poller found, to be handed to owners once the locks are released.
@@ -255,6 +289,7 @@ enum Notice {
     Opened { owner: Arc<dyn Owner>, conn: Handle, incoming: bool, remote: Option<u64> },
     Progress { owner: Arc<dyn Owner>, conn: Handle, state: i32 },
     Message { owner: Arc<dyn Owner>, conn: Handle, data: Vec<u8> },
+    Datagram { owner: Arc<dyn Owner>, conn: Handle, data: Vec<u8> },
     Closed { owner: Arc<dyn Owner>, conn: Handle, end: End },
 }
 
@@ -264,6 +299,7 @@ impl Notice {
             Notice::Opened { owner, conn, incoming, remote } => owner.opened(conn, incoming, remote),
             Notice::Progress { owner, conn, state } => owner.progress(conn, state),
             Notice::Message { owner, conn, data } => owner.message(conn, &data),
+            Notice::Datagram { owner, conn, data } => owner.datagram(conn, &data),
             Notice::Closed { owner, conn, end } => owner.closed(conn, end),
         }
     }
@@ -350,6 +386,23 @@ pub struct LinkSnapshot {
     pub send_rate: u32,
     /// Reliable bytes queued and not yet on the wire.
     pub pending: u32,
+    /// Steam's view of the whole connection (`SteamNetConnectionRealTimeStatus_t`), for the speed test's log.
+    pub steam: SteamView,
+}
+
+/// The fields of Steam's real-time status the speed test records every second.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SteamView {
+    pub quality_remote: f32,
+    pub out_packets_per_sec: f32,
+    pub out_bytes_per_sec: f32,
+    pub in_packets_per_sec: f32,
+    pub in_bytes_per_sec: f32,
+    pub pending_unreliable: u32,
+    pub pending_reliable: u32,
+    pub sent_unacked_reliable: u32,
+    /// How long a message queued now would wait before it goes on the wire, microseconds.
+    pub queue_time_us: i64,
 }
 
 /// What the core knows about Steam, readable without touching Steam.
@@ -417,6 +470,25 @@ pub(super) unsafe extern "C" fn on_status_changed(callback: *mut c_void) {
 // The core
 // ---------------------------------------------------------------------------------------------------------------
 
+/// `SteamNetworkingConfigValue_t` is 16 bytes: the value id, the data type, and an 8-byte union holding the int32.
+const OPTION_SIZE: usize = 16;
+
+/// The options passed when a listen socket or connection is created, so they hold from its first packet: the same
+/// send rate, send rate and send buffer as the global tuning. The array is `n` entries of [`OPTION_SIZE`] bytes.
+fn creation_options(config: &Config) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (value, number) in [
+        (config_value::SEND_RATE_MIN, config.send_rate),
+        (config_value::SEND_RATE_MAX, config.send_rate),
+        (config_value::SEND_BUFFER_SIZE, config.send_buffer),
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+        out.extend_from_slice(&config_value::TYPE_INT32.to_le_bytes());
+        out.extend_from_slice(&i64::from(number).to_le_bytes());
+    }
+    out
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -424,6 +496,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Steam's interface pointers, behind the lock that serialises every call into Steam.
 struct Iface {
     sockets: *mut c_void,
+    /// `ISteamNetworkingUtils*`, valid whenever `sockets` is.
+    utils: *mut c_void,
     next_locate: Instant,
 }
 
@@ -440,11 +514,21 @@ struct Tracked {
     /// The latest measurement of an open connection, and when the next one is due.
     link: Option<LinkSnapshot>,
     link_due: Instant,
+    /// What setting the connection's own SendRateMin/Max and SendBufferSize did, and what Steam then reads.
+    config_report: String,
 }
 
 impl Tracked {
     fn new(owner: Arc<dyn Owner>, incoming: bool, remote: Option<u64>) -> Tracked {
-        Tracked { owner, incoming, open: false, remote, link: None, link_due: Instant::now() }
+        Tracked {
+            owner,
+            incoming,
+            open: false,
+            remote,
+            link: None,
+            link_due: Instant::now(),
+            config_report: String::new(),
+        }
     }
 }
 
@@ -467,6 +551,8 @@ struct Shared {
     woken: Mutex<bool>,
     wake: Condvar,
     stopped: AtomicBool,
+    /// The last cycle left messages unread (it reached its per-connection limit): the next one starts at once.
+    more_pending: AtomicBool,
     created: Instant,
 }
 
@@ -487,7 +573,11 @@ impl SteamCore {
         let shared = Arc::new(Shared {
             api,
             config,
-            iface: Mutex::new(Iface { sockets: std::ptr::null_mut(), next_locate: Instant::now() }),
+            iface: Mutex::new(Iface {
+                sockets: std::ptr::null_mut(),
+                utils: std::ptr::null_mut(),
+                next_locate: Instant::now(),
+            }),
             registry: Mutex::new(Registry::default()),
             sink: Arc::new(EventSink::default()),
             local: Mutex::new(Vec::new()),
@@ -496,6 +586,7 @@ impl SteamCore {
             woken: Mutex::new(false),
             wake: Condvar::new(),
             stopped: AtomicBool::new(false),
+            more_pending: AtomicBool::new(false),
             created: Instant::now(),
         });
         let poller = {
@@ -539,7 +630,10 @@ impl Shared {
         };
         let rest = self.config.rest(listeners, conns);
         if conns > 0 {
-            thread::sleep(rest);
+            // a cycle that hit its per-connection limit left messages in Steam: read them at once, do not sleep on them
+            if !self.more_pending.swap(false, Ordering::AcqRel) {
+                thread::sleep(rest);
+            }
             return;
         }
         let guard = lock(&self.woken);
@@ -589,6 +683,7 @@ impl Shared {
             // Steam was shut down under us: forget everything that depended on it, call nothing, and look for Steam
             // again on the next cycles (a restarted client brings new interfaces)
             iface.sockets = std::ptr::null_mut();
+            iface.utils = std::ptr::null_mut();
             self.set_status(|s| {
                 s.ready = false;
                 s.note = STEAM_WENT_AWAY.into();
@@ -614,8 +709,9 @@ impl Shared {
         let sockets = iface.sockets;
         // SAFETY: sockets is Steam's ISteamNetworkingSockets singleton, located above; the iface lock is held.
         unsafe { (self.api.run_callbacks)(sockets) };
+        let utils = iface.utils;
         for event in self.sink.take() {
-            self.on_event(sockets, event, &mut out);
+            self.on_event(sockets, utils, event, &mut out);
         }
         let open: Vec<(Handle, Arc<dyn Owner>)> = {
             let reg = lock(&self.registry);
@@ -675,6 +771,17 @@ impl Shared {
             quality: real.map_or(1.0, |r| r.quality_local),
             send_rate: real.map_or(0, |r| r.send_rate),
             pending: real.map_or(0, |r| r.pending_reliable),
+            steam: real.map_or_else(SteamView::default, |r| SteamView {
+                quality_remote: r.quality_remote,
+                out_packets_per_sec: r.out_packets_per_sec,
+                out_bytes_per_sec: r.out_bytes_per_sec,
+                in_packets_per_sec: r.in_packets_per_sec,
+                in_bytes_per_sec: r.in_bytes_per_sec,
+                pending_unreliable: r.pending_unreliable,
+                pending_reliable: r.pending_reliable,
+                sent_unacked_reliable: r.sent_unacked_reliable,
+                queue_time_us: r.queue_time_us,
+            }),
         })
     }
 
@@ -710,6 +817,7 @@ impl Shared {
         }
         let tuning = self.tune(found.utils);
         iface.sockets = found.sockets;
+        iface.utils = found.utils;
         self.set_status(|s| {
             s.ready = true;
             s.steam_id = found.steam_id.or(s.steam_id);
@@ -726,6 +834,7 @@ impl Shared {
             ("initial timeout", config_value::TIMEOUT_INITIAL, self.config.initial_timeout_ms),
             ("send rate min", config_value::SEND_RATE_MIN, self.config.send_rate),
             ("send rate max", config_value::SEND_RATE_MAX, self.config.send_rate),
+            ("send buffer", config_value::SEND_BUFFER_SIZE, self.config.send_buffer),
         ];
         let mut refused = Vec::new();
         for (name, value, number) in &settings {
@@ -746,15 +855,74 @@ impl Shared {
         }
         if refused.is_empty() {
             format!(
-                "tuned: initial timeout {} ms, send rate {} bytes/s",
-                self.config.initial_timeout_ms, self.config.send_rate
+                "tuned: initial timeout {} ms, send rate {} bytes/s, send buffer {} bytes",
+                self.config.initial_timeout_ms, self.config.send_rate, self.config.send_buffer
             )
         } else {
             format!("tuning refused for: {}", refused.join(", "))
         }
     }
 
-    fn on_event(&self, sockets: *mut c_void, e: StatusEvent, out: &mut Vec<Notice>) {
+    /// The values a connection is given: the same as the global tuning.
+    fn connection_values(&self) -> [(&'static str, i32, i32); 3] {
+        [
+            ("SendRateMin", config_value::SEND_RATE_MIN, self.config.send_rate),
+            ("SendRateMax", config_value::SEND_RATE_MAX, self.config.send_rate),
+            ("SendBufferSize", config_value::SEND_BUFFER_SIZE, self.config.send_buffer),
+        ]
+    }
+
+    /// Sets connection-scope values with `SetConfigValue` and reads each back with `GetConfigValue`, plus the
+    /// connection's NagleTime as it stands: one line for the log. The iface lock must be held.
+    fn set_and_read_back(&self, utils: *mut c_void, conn: Handle, values: &[(&str, i32, i32)]) -> String {
+        let Some(set) = self.api.set_config else { return "SetConfigValue is not exported".into() };
+        let mut parts = Vec::new();
+        for (name, value, number) in values {
+            // SAFETY: SetConfigValue reads one int32 through the pointer; utils is Steam's singleton; the iface lock is held.
+            let accepted = unsafe {
+                set(
+                    utils,
+                    *value,
+                    config_value::SCOPE_CONNECTION,
+                    conn as isize,
+                    config_value::TYPE_INT32,
+                    std::ptr::from_ref(number).cast(),
+                )
+            };
+            let read = self.read_config(utils, conn, *value);
+            let verdict = if accepted { "accepted" } else { "REFUSED" };
+            parts.push(format!("{name} asked {number}, {verdict}, Steam reads {read}"));
+        }
+        parts.push(format!("NagleTime Steam reads {}", self.read_config(utils, conn, config_value::NAGLE_TIME)));
+        parts.join("; ")
+    }
+
+    /// A connection-scope int32 as Steam reports it, as text.
+    fn read_config(&self, utils: *mut c_void, conn: Handle, value: i32) -> String {
+        let Some(get) = self.api.get_config else { return "unreadable (GetConfigValue is not exported)".into() };
+        let mut data_type = 0i32;
+        let mut number = 0i32;
+        let mut size = std::mem::size_of::<i32>();
+        // SAFETY: the out pointers are a type slot, an int32 and its size; the iface lock is held.
+        let code = unsafe {
+            get(
+                utils,
+                value,
+                config_value::SCOPE_CONNECTION,
+                conn as isize,
+                &mut data_type,
+                std::ptr::from_mut(&mut number).cast(),
+                &mut size,
+            )
+        };
+        match code {
+            1 => number.to_string(),
+            2 => format!("{number} (inherited)"),
+            other => format!("unreadable (result {other})"),
+        }
+    }
+
+    fn on_event(&self, sockets: *mut c_void, utils: *mut c_void, e: StatusEvent, out: &mut Vec<Notice>) {
         let mut reg = lock(&self.registry);
         match e.state {
             state::CONNECTING | state::FINDING_ROUTE => {
@@ -777,6 +945,7 @@ impl Shared {
                 if let Some(t) = reg.conns.get_mut(&e.conn) {
                     if !t.open {
                         t.open = true;
+                        t.config_report = self.set_and_read_back(utils, e.conn, &self.connection_values());
                         out.push(Notice::Opened {
                             owner: Arc::clone(&t.owner),
                             conn: e.conn,
@@ -845,7 +1014,11 @@ impl Shared {
                 // SAFETY: a message ReceiveMessagesOnConnection returned and nobody released yet.
                 match unsafe { self.take_message(message) } {
                     Ok(data) if violation.is_none() => {
-                        out.push(Notice::Message { owner: Arc::clone(owner), conn, data });
+                        if super::bulk::wire::is_bulk(&data) {
+                            out.push(Notice::Datagram { owner: Arc::clone(owner), conn, data });
+                        } else {
+                            out.push(Notice::Message { owner: Arc::clone(owner), conn, data });
+                        }
                     }
                     Ok(_) => {}
                     Err(size) => {
@@ -860,6 +1033,9 @@ impl Shared {
             if n < RECEIVE_BATCH {
                 break;
             }
+        }
+        if taken >= RECEIVE_PER_CYCLE {
+            self.more_pending.store(true, Ordering::Release);
         }
         Receive::Fine
     }
@@ -930,6 +1106,11 @@ enum Receive {
 }
 
 impl CoreRef {
+    /// An identity of this core (the address of its shared state), for keeping one service per core.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     /// What the core knows about Steam.
     pub fn status(&self) -> CoreStatus {
         lock(&self.0.status).clone()
@@ -968,8 +1149,17 @@ impl CoreRef {
     /// Opens a P2P listen socket on `virtual_port`; connections that arrive on it belong to `owner`.
     pub fn listen(&self, virtual_port: i32, owner: Arc<dyn Owner>) -> Result<Handle, CoreError> {
         let iface = self.lock_ready()?;
-        // SAFETY: sockets is Steam's singleton (checked by lock_ready); no options are passed.
-        let listener = unsafe { (self.0.api.create_listen)(iface.sockets, virtual_port, 0, std::ptr::null()) };
+        let options = creation_options(&self.0.config);
+        // SAFETY: sockets is Steam's singleton (checked by lock_ready); options is 3 entries of the 16-byte
+        // SteamNetworkingConfigValue_t, which Steam copies before the call returns.
+        let listener = unsafe {
+            (self.0.api.create_listen)(
+                iface.sockets,
+                virtual_port,
+                (options.len() / OPTION_SIZE) as i32,
+                options.as_ptr().cast(),
+            )
+        };
         if listener == 0 {
             return Err(CoreError::Refused(format!(
                 "Steam would not open a listen socket on virtual port {virtual_port} (already in use?)"
@@ -998,9 +1188,17 @@ impl CoreRef {
     pub fn connect(&self, remote: u64, virtual_port: i32, owner: Arc<dyn Owner>) -> Result<Handle, CoreError> {
         let iface = self.lock_ready()?;
         let identity = identity_bytes(remote);
-        // SAFETY: identity is IDENTITY_SIZE bytes in the layout ConnectP2P reads; no options are passed.
+        let options = creation_options(&self.0.config);
+        // SAFETY: identity is IDENTITY_SIZE bytes in the layout ConnectP2P reads; options is 3 entries of the 16-byte
+        // SteamNetworkingConfigValue_t, which Steam copies before the call returns.
         let conn = unsafe {
-            (self.0.api.connect_p2p)(iface.sockets, identity.as_ptr().cast(), virtual_port, 0, std::ptr::null())
+            (self.0.api.connect_p2p)(
+                iface.sockets,
+                identity.as_ptr().cast(),
+                virtual_port,
+                (options.len() / OPTION_SIZE) as i32,
+                options.as_ptr().cast(),
+            )
         };
         if conn == 0 {
             return Err(CoreError::Refused("Steam could not start the connection".into()));
@@ -1018,6 +1216,16 @@ impl CoreRef {
 
     /// Hands one reliable message to Steam. Only an open connection of ours accepts one.
     pub fn send(&self, conn: Handle, data: &[u8]) -> SendOutcome {
+        self.send_flags(conn, data, SEND_RELIABLE)
+    }
+
+    /// One bulk datagram: unreliable, no Nagle delay (it is its own packet). It can be lost; the sender above retransmits.
+    pub fn send_datagram(&self, conn: Handle, data: &[u8]) -> SendOutcome {
+        self.send_flags(conn, data, SEND_UNRELIABLE_NO_NAGLE)
+    }
+
+    /// Hands one message to Steam with the given `k_nSteamNetworkingSend_*` flags.
+    fn send_flags(&self, conn: Handle, data: &[u8], flags: i32) -> SendOutcome {
         if data.len() > MAX_MESSAGE {
             return SendOutcome::TooBig;
         }
@@ -1028,14 +1236,7 @@ impl CoreRef {
         // SAFETY: data is valid for data.len() bytes (at most MAX_MESSAGE, so the u32 cast is lossless); conn is a
         // handle of ours; the iface lock is held.
         let code = unsafe {
-            (self.0.api.send)(
-                iface.sockets,
-                conn,
-                data.as_ptr().cast(),
-                data.len() as u32,
-                SEND_RELIABLE,
-                std::ptr::null_mut(),
-            )
+            (self.0.api.send)(iface.sockets, conn, data.as_ptr().cast(), data.len() as u32, flags, std::ptr::null_mut())
         };
         match code {
             result::OK => SendOutcome::Sent,
@@ -1048,9 +1249,18 @@ impl CoreRef {
     /// As [`CoreRef::send`], but waits while Steam's send buffer is full (it holds 512 KiB, so a stream of savegame
     /// chunks needs this), up to `timeout`.
     pub fn send_reliable(&self, conn: Handle, data: &[u8], timeout: Duration) -> io::Result<()> {
+        self.send_reliable_flags(conn, data, timeout, SEND_RELIABLE)
+    }
+
+    /// As [`CoreRef::send_reliable`] without the Nagle delay: the speed test's chunks.
+    pub fn send_reliable_no_nagle(&self, conn: Handle, data: &[u8], timeout: Duration) -> io::Result<()> {
+        self.send_reliable_flags(conn, data, timeout, SEND_RELIABLE_NO_NAGLE)
+    }
+
+    fn send_reliable_flags(&self, conn: Handle, data: &[u8], timeout: Duration, flags: i32) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.send(conn, data) {
+            match self.send_flags(conn, data, flags) {
                 SendOutcome::Sent => return Ok(()),
                 SendOutcome::Full if Instant::now() < deadline => thread::sleep(FULL_RETRY),
                 SendOutcome::Full => {
@@ -1067,6 +1277,38 @@ impl CoreRef {
                 }
             }
         }
+    }
+
+    /// `FlushMessagesOnConnection`: whatever waits for the Nagle timer goes out now. False when not possible.
+    pub fn flush(&self, conn: Handle) -> bool {
+        let Some(flush) = self.0.api.flush else { return false };
+        let Ok(iface) = self.lock_ready() else { return false };
+        // SAFETY: a handle of ours (or one Steam will refuse); the iface lock is held.
+        unsafe { flush(iface.sockets, conn) == result::OK }
+    }
+
+    /// Steam's own multi-line account of a connection (`GetDetailedConnectionStatus`): the whole text, or `None`.
+    pub fn detailed_status(&self, conn: Handle) -> Option<String> {
+        let detailed = self.0.api.detailed_status?;
+        let iface = self.lock_ready().ok()?;
+        let mut buf = vec![0u8; 16 * 1024];
+        // SAFETY: buf is 16 KiB and the length is passed; the iface lock is held.
+        let code = unsafe { detailed(iface.sockets, conn, buf.as_mut_ptr().cast(), buf.len() as i32) };
+        (code == 0).then(|| c_text_lossy(&buf))
+    }
+
+    /// What setting the connection's own values did at its start: asked, accepted, and what Steam reads back.
+    pub fn config_report(&self, conn: Handle) -> Option<String> {
+        lock(&self.0.registry).conns.get(&conn).map(|t| t.config_report.clone()).filter(|r| !r.is_empty())
+    }
+
+    /// Sets this connection's `SendRateMin` and `SendRateMax` (both, as Valve advises) and reads them back. A bulk
+    /// transfer raises it while it runs and restores [`CoreRef::send_rate_setting`] after. The text says what happened.
+    pub fn set_connection_send_rate(&self, conn: Handle, rate: i32) -> String {
+        let Ok(iface) = self.lock_ready() else { return "Steam is not ready".into() };
+        let values =
+            [("SendRateMin", config_value::SEND_RATE_MIN, rate), ("SendRateMax", config_value::SEND_RATE_MAX, rate)];
+        self.0.set_and_read_back(iface.utils, conn, &values)
     }
 
     /// Closes a connection of ours. What was already sent is still delivered (Steam's "linger"); the owner then
@@ -1252,6 +1494,9 @@ mod win {
                 close: sym!("SteamAPI_ISteamNetworkingSockets_CloseConnection"),
                 connection_info: sym!("SteamAPI_ISteamNetworkingSockets_GetConnectionInfo"),
                 real_time_status: symbol(module, "SteamAPI_ISteamNetworkingSockets_GetConnectionRealTimeStatus\0"),
+                flush: symbol(module, "SteamAPI_ISteamNetworkingSockets_FlushMessagesOnConnection\0"),
+                detailed_status: symbol(module, "SteamAPI_ISteamNetworkingSockets_GetDetailedConnectionStatus\0"),
+                get_config: symbol(module, "SteamAPI_ISteamNetworkingUtils_GetConfigValue\0"),
             })
         }
     }
@@ -1845,9 +2090,9 @@ mod tests {
 
     #[test]
     fn the_send_rate_variable_is_parsed_and_bounded() {
-        assert_eq!(send_rate_setting(None), 1 << 20);
-        assert_eq!(send_rate_setting(Some("")), 1 << 20);
-        assert_eq!(send_rate_setting(Some("fast")), 1 << 20);
+        assert_eq!(send_rate_setting(None), DEFAULT_SEND_RATE);
+        assert_eq!(send_rate_setting(Some("")), DEFAULT_SEND_RATE);
+        assert_eq!(send_rate_setting(Some("fast")), DEFAULT_SEND_RATE);
         assert_eq!(send_rate_setting(Some(" 4194304 ")), 4_194_304);
         assert_eq!(send_rate_setting(Some("1")), 32 * 1024);
         assert_eq!(send_rate_setting(Some("-5")), 32 * 1024);

@@ -15,7 +15,9 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --exclude feverlink3_native
+      # the native tests share process-wide state (hook counters, logs): one thread at a time
+      - run: cargo test -p feverlink3_native -- --test-threads=1
       - run: cargo build --release -p feverlink3_native
       - run: Get-Item target/release/feverlink3_native.dll | Select-Object Name, Length
       - name: The shipped DLL unwinds (the game's exceptions pass through the hooks)

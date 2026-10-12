@@ -6,5 +6,3 @@ contain details of the maintainer's machine, so they are not part of this reposi
 
 If you want to read one of them, ask the maintainer and it can be shared with you individually. Open an issue on the
 repository and say which topic you are interested in (for example town growth, the checksum lanes or the native hooks).
-
-The two files in this folder (`P2P_CONNECTIVITY.md`, `TPF2_COMPARISON.md`) are the research that was published earlier.

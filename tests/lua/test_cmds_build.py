@@ -207,6 +207,7 @@ DEF_TEMPLATE("street/new_small_road.street_template", "small", { { forward = tru
 DEF_TEMPLATE("track/standard.street_template", "track", { { forward = true, modes = { 8 } } })
 DEF_TEMPLATE("track/standard_catenary.street_template", "track", { { forward = true, modes = { 8, 9 } } })
 DEF_TEMPLATE("street/tram_road.street_template", "medium", { { forward = true, modes = { 2, 3 } }, { forward = false, modes = { 2, 3 } }, { forward = true, modes = { 4 } } })
+DEF_TEMPLATE("street/airport/taxiway.street_template", "taxiway", { { forward = true, modes = { 5 } }, { forward = false, modes = { 5 } } })
 function TEMPLATE_LANES(name)
   for _, t in ipairs(TEMPLATES) do if t.name == name then return COPY(t.lanes), t.style end end
   return nil
@@ -880,6 +881,34 @@ function NATIVE_DEPOT_ON_ROAD(spec)
   sp.addedSegments = added
   P.proposal = sp
   P.toAdd = { conEntity({ file = spec.file or "depot/road_depot.con", x = spec.door.x, y = spec.door.y, z = spec.door.z, params = spec.params }) }
+  return P
+end
+
+-- a depot whose entrance reaches a node of the world (real run 2026-10-11, Dunwich: the entrance node at the door and one piece of the
+-- construction's own street template from it to a town node): the tool's own build has both, the construction alone does not
+function NATIVE_DEPOT_ENTRANCE(spec)
+  local pa = NODE_POS(spec.node)
+  local P = D("Proposal")
+  local sp = P.proposal
+  sp.addedNodes = { nodeAndEntity(-1, spec.door) }
+  sp.addedSegments = { segment(-2, -1, spec.node, spec.door, pa, { template = "street/simple.street_template" }) }
+  P.proposal = sp
+  P.toAdd = { conEntity({ file = spec.file or "depot/road_depot.con", x = spec.door.x, y = spec.door.y, z = spec.door.z or 0, params = spec.params }) }
+  return P
+end
+
+-- an airfield (real run 2026-10-11): the construction with its own taxiway pieces and signs on them; the signs' models are
+-- named by the engine only after the build ran, so a tool's preview cannot read them
+function NATIVE_AIRFIELD(spec)
+  local P = D("Proposal")
+  local sp = P.proposal
+  sp.addedNodes = { nodeAndEntity(-1, spec.a), nodeAndEntity(-2, spec.b) }
+  sp.addedSegments = { segment(-3, -1, -2, spec.a, spec.b, { template = "street/airport/taxiway.street_template" }) }
+  local eo = D("EdgeObjectNative", { segmentEntity = -3, param = 0.5, category = 2 })
+  STORE(eo)._model = "signal/sign.mdl"
+  sp.edgeObjectsToAdd = { eo }
+  P.proposal = sp
+  P.toAdd = { conEntity({ file = "airport/airfield.con", x = spec.a.x, y = spec.a.y, z = 0, params = spec.params }) }
   return P
 end
 

@@ -48,6 +48,8 @@ LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
 HOOK_SRC = read_src("feverlink3_uihook.lua")
+TRACE_SRC = read_src("feverlink3_towntrace.lua")
+LVL_SRC = read_src("feverlink3_livevsloaded.lua")
 # the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
 CMDS_SRC = {
     os.path.splitext(f)[0]: read_src(f)
@@ -171,7 +173,7 @@ function MAKE_API()
       GAME.guiQueue[#GAME.guiQueue + 1] = { c, cb }
     end,
   }
-  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd" }) do
+  for _, n in ipairs({ "makeGameSetSpeedCmd", "makeScriptingSendEventCmd", "makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd", "makeJournalBookAssetCmd", "makeTownUpdateSizeCmd", "makeTownUpdateCargoNeedsCmd" }) do
     cmd[n] = mk(n)
   end
   return {
@@ -228,6 +230,8 @@ function LOAD_HALF(label)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_towntrace") then return assert(load(TRACE_SRC, "=towntrace", "t", env))() end
+    if p:find("feverlink3_livevsloaded") then return assert(load(LVL_SRC, "=livevsloaded", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
     if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
     error("no module " .. tostring(p))
@@ -335,6 +339,8 @@ class Game:
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
         g.HOOK_SRC = HOOK_SRC
+        g.TRACE_SRC = TRACE_SRC
+        g.LVL_SRC = LVL_SRC
         cmds = self.L.table()
         for stem, src in CMDS_SRC.items():
             cmds[stem] = src
@@ -417,6 +423,7 @@ class Relay:
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
         self.vetoes = []
+        self.commits = []
         self.started, self.speed, self.pauseAt = False, 0, None
 
     # launcher -> mod
@@ -511,6 +518,12 @@ class Relay:
                     for o in self.games:
                         if o is not g:
                             self.send(o, "build_veto", 0, out)
+                elif rec.kind == "build_commit":
+                    self.commits.append((g.id, int(p.owner), int(p.seq), int(p.stamp)))
+                    out = self.ser({"seq": int(p.seq), "owner": int(p.owner), "stamp": int(p.stamp), "from": g.id})
+                    for o in self.games:
+                        if o is not g:
+                            self.send(o, "build_commit", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
                     if g.id == 0 and p.authority is not None:

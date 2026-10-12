@@ -34,17 +34,20 @@ use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::session::{
     codec, ChecksumOutcome, ChecksumPolicy, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep,
     MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession,
-    PlayerState, ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState,
+    PlayerState, ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState, CAP_BULK_DGRAM, CAP_BULK_PAR,
 };
 
 use crate::gamelink::{self, Line};
 use crate::guard;
 use crate::luatext;
 use crate::net::{
-    ClientNet, ClientTransport, ConnectContext, HostNet, HostTransport, LinkInfo, NetEvent, CONNECT_TIMEOUT,
+    BulkSendJob, BulkSendResult, ClientNet, ClientTransport, ConnectContext, HostNet, HostTransport, LinkInfo,
+    NetEvent, ParContext, ParJob, CONNECT_TIMEOUT,
 };
 use crate::process::Role;
 use crate::resync;
+use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
+use crate::steamnet::par::wire::secret_from_key;
 
 /// Period of the state machines' tick (session broadcast, checksum rounds).
 pub const TICK: Duration = Duration::from_millis(250);
@@ -78,7 +81,7 @@ const fn row(name: &'static str, kind: MessageKind, to_game: bool, from_game: bo
 /// The complete mapping, `docs/PROTOCOL.md` kinds to file-link kinds (documented in `launcher/README.md`).
 /// Names are the snake_case of the message kind, except `peerclock`, which is what the mod already reads.
 /// `resync_chunk` never goes to the game: the launcher streams savegame chunks to disk itself.
-pub const LINE_KINDS: [LineKind; 20] = [
+pub const LINE_KINDS: [LineKind; 21] = [
     row("welcome", MessageKind::Welcome, true, false),
     row("session", MessageKind::Session, true, false),
     row("peerclock", MessageKind::PeerClock, true, false),
@@ -99,6 +102,7 @@ pub const LINE_KINDS: [LineKind; 20] = [
     row("action", MessageKind::Action, true, true),
     row("chat", MessageKind::Chat, true, true),
     row("build_veto", MessageKind::BuildVeto, true, true),
+    row("build_commit", MessageKind::BuildCommit, true, true),
 ];
 
 /// The line kind a message is written as, `None` for kinds that do not go to the game.
@@ -219,6 +223,8 @@ pub struct Status {
     pub reloading: bool,
     /// Player: chunks received and in all of the savegame the host is sending. Host: chunks sent and in all.
     pub transfer: Option<(u32, u32)>,
+    /// A few words about the transfer for the window ("7 connections, 6.9 MB/s"), when it is a parallel one.
+    pub transfer_note: Option<String>,
 }
 
 impl Status {
@@ -237,6 +243,7 @@ impl Status {
             clocks: Vec::new(),
             session: None,
             transfer: None,
+            transfer_note: None,
             last_sync: None,
             actions_relayed: 0,
             dropped: 0,
@@ -274,6 +281,10 @@ struct Shared {
     stop: AtomicBool,
     /// A host that is stopped tells its players (`HostSession::end_session`). [`SessionHandle::crash`] turns that off.
     goodbye: AtomicBool,
+    /// How a host sends savegames to players that can take them another way ([`HostConfig::bulk`]).
+    bulk: Mutex<BulkSettings>,
+    /// The per-transfer secret of parallel transfers, derived from the session key.
+    par_secret: Mutex<[u8; 32]>,
     echo: bool,
 }
 
@@ -285,6 +296,8 @@ impl Shared {
             log_total: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             goodbye: AtomicBool::new(true),
+            bulk: Mutex::new(BulkSettings { mode: BulkMode::Off, ..BulkSettings::default() }),
+            par_secret: Mutex::new([0; 32]),
             echo,
         })
     }
@@ -477,6 +490,9 @@ pub struct HostConfig {
     /// The `save` folders the game writes its savegames to (see [`resync::save_dirs`]); resync reads the host's
     /// save from here.
     pub save_dirs: Vec<PathBuf>,
+    /// How a resync save goes to players that can take it another way than in `ResyncChunk` frames:
+    /// `FEVERLINK3_BULK=par` (the default, parallel Steam connections), `dgram` or `off`.
+    pub bulk: BulkSettings,
     /// Print log lines to stderr as well as keeping them.
     pub echo_log: bool,
 }
@@ -493,13 +509,16 @@ pub fn run_host_over<T: HostTransport>(
     config: HostConfig,
     listen: impl FnOnce(Sender<NetEvent>) -> io::Result<T>,
 ) -> io::Result<SessionHandle> {
-    let HostConfig { name, key, mut link, options, save_dirs, echo_log, .. } = config;
+    let HostConfig { name, key, mut link, options, save_dirs, echo_log, bulk, .. } = config;
     let (net_tx, net_rx) = mpsc::channel();
     let net = listen(net_tx)?;
+    let par_secret = secret_from_key(key.key());
     let local_addr = net.local_addr();
     let mut host = HostSession::new(key, &name, clock_fn(), options);
     link.write_identity(HostSession::HOST_ID, host.host_name(), Role::Host.as_str())?;
     let shared = Shared::new(Status::new(Role::Host, host.host_name()), echo_log);
+    *shared.bulk.lock().unwrap_or_else(|p| p.into_inner()) = bulk;
+    *shared.par_secret.lock().unwrap_or_else(|p| p.into_inner()) = par_secret;
     // the first status already lists the host's own game
     refresh_host_status(&host, &net, &shared);
     shared.log(format!("listening on {}", net.describe()));
@@ -585,6 +604,16 @@ fn host_net_event(host: &mut HostSession, event: NetEvent, shared: &Shared) -> V
             shared.log(format!("connection {conn} closed: {reason}"));
             host.connection_closed(conn)
         }
+        // only a player receives a save
+        NetEvent::BulkSave { conn, .. } | NetEvent::BulkFile { conn, .. } => {
+            shared.log(format!("connection {conn}: a bulk save arrived at the host; ignored"));
+            Vec::new()
+        }
+        NetEvent::BulkProgress { .. } => Vec::new(),
+        NetEvent::Note { text, .. } => {
+            shared.log(text);
+            Vec::new()
+        }
     }
 }
 
@@ -641,6 +670,12 @@ fn host_dispatch(
 
 /// The Transferring step: the host game saved `feverlink3-resync-<id>`; hash it, announce it to the core, then
 /// stream it from disk chunk by chunk (each chunk is sealed, sent and dropped, so a big save never sits in memory).
+///
+/// With `FEVERLINK3_BULK=dgram`, a player whose join announced `bulk-dgram-1` and whose transport can carry it (Steam)
+/// gets the file as bulk datagrams instead, on a thread of its own per player, while the chunks go to the others. The
+/// last chunk, which starts the load, is held back until every bulk transfer has ended; a transfer that failed (no
+/// progress for 10 s, the receiver's SHA-256 did not match, the connection closed) is replaced by the chunks, for that
+/// player only.
 fn stream_save(
     id: i32,
     host: &mut HostSession,
@@ -665,25 +700,174 @@ fn stream_save(
     let outputs = host.resync_file_ready(id, &sha, len);
     host_dispatch(outputs, host, net, link, save_dirs, shared);
     let Some(count) = ResyncLimits::chunk_count(len) else { return };
-    for index in 0..count {
-        shared.update(|s| s.transfer = Some((index, count)));
-        // no other player connected, or the round moved on: nothing more to send
-        if host.resync_state() != ResyncState::Transferring {
-            break;
-        }
-        match resync::read_chunk(&path, len, index) {
-            Ok(data) => {
-                let outputs = host.resync_chunk(id, index, &data);
-                host_dispatch(outputs, host, net, link, save_dirs, shared);
+    let abandon = AtomicBool::new(false);
+    let settings = shared.bulk.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let secret = *shared.par_secret.lock().unwrap_or_else(|p| p.into_inner());
+    thread::scope(|scope| {
+        let mut runs: Vec<(u16, thread::ScopedJoinHandle<'_, BulkSendResult>, &'static str)> = Vec::new();
+        if settings.mode == BulkMode::Par && settings.par.applies_to(len) {
+            if let Some(digest) = sha_bytes(&sha) {
+                let mut players = Vec::new();
+                for player in host.resync_receivers() {
+                    if !host.player_supports(player, CAP_BULK_PAR) {
+                        continue;
+                    }
+                    let Some(sender) = host.player_connection(player).and_then(|c| net.par_sender(c)) else {
+                        shared.log(format!(
+                            "resync {id}: player #{player} announced parallel connections but the transport has none for it; sending chunks"
+                        ));
+                        continue;
+                    };
+                    let job = ParJob {
+                        ctx: id as u32,
+                        path: path.clone(),
+                        sha256: digest,
+                        secret,
+                        cfg: settings.par.clone(),
+                    };
+                    let (abandon, shared) = (&abandon, shared);
+                    let handle = scope.spawn(move || {
+                        let cancelled = || abandon.load(Ordering::Acquire) || shared.stopping();
+                        let progress = |p: &crate::net::ParProgress| {
+                            let sent = (p.bytes / ResyncLimits::CHUNK_SIZE as u64) as u32;
+                            shared.update(|s| {
+                                s.transfer = Some((sent.min(count), count));
+                                s.transfer_note = Some(par_note(p.lanes, p.rate));
+                            });
+                        };
+                        sender(job, &cancelled, &progress)
+                    });
+                    players.push(player);
+                    runs.push((player, handle, "parallel connections"));
+                }
+                if !players.is_empty() {
+                    host.resync_set_bulk(id, &players);
+                    shared.log(format!(
+                        "resync {id}: sending the save ({len} bytes) to {} player(s) over parallel Steam connections (the others get chunks)",
+                        players.len()
+                    ));
+                }
             }
-            Err(e) => {
-                shared.log(format!("resync {id}: reading chunk {index}: {e}"));
-                shared.update(|s| s.transfer = None);
-                return;
+        }
+        if settings.mode == BulkMode::Dgram {
+            if let Some(digest) = sha_bytes(&sha) {
+                let mut players = Vec::new();
+                for player in host.resync_receivers() {
+                    if !host.player_supports(player, CAP_BULK_DGRAM) {
+                        continue;
+                    }
+                    let Some(sender) = host.player_connection(player).and_then(|c| net.bulk_sender(c)) else {
+                        continue;
+                    };
+                    let job = BulkSendJob { ctx: id as u32, path: path.clone(), sha256: digest };
+                    let (abandon, shared) = (&abandon, shared);
+                    let handle = scope.spawn(move || {
+                        let cancelled = || abandon.load(Ordering::Acquire) || shared.stopping();
+                        let progress = |bytes: u64| {
+                            let sent = (bytes / ResyncLimits::CHUNK_SIZE as u64) as u32;
+                            shared.update(|s| s.transfer = Some((sent.min(count), count)));
+                        };
+                        sender(job, &cancelled, &progress)
+                    });
+                    players.push(player);
+                    runs.push((player, handle, "bulk datagrams"));
+                }
+                if !players.is_empty() {
+                    host.resync_set_bulk(id, &players);
+                    shared.log(format!(
+                        "resync {id}: sending the save to {} player(s) as bulk datagrams (the others get chunks)",
+                        players.len()
+                    ));
+                }
+            }
+        }
+        for index in 0..count {
+            shared.update(|s| s.transfer = Some((index, count)));
+            // no other player connected, or the round moved on: nothing more to send
+            if host.resync_state() != ResyncState::Transferring {
+                break;
+            }
+            if index + 1 == count && !runs.is_empty() {
+                finish_bulk(id, std::mem::take(&mut runs), &path, len, count, host, net, link, save_dirs, shared);
+                if host.resync_state() != ResyncState::Transferring {
+                    break;
+                }
+            }
+            match resync::read_chunk(&path, len, index) {
+                Ok(data) => {
+                    let outputs = host.resync_chunk(id, index, &data);
+                    host_dispatch(outputs, host, net, link, save_dirs, shared);
+                }
+                Err(e) => {
+                    shared.log(format!("resync {id}: reading chunk {index}: {e}"));
+                    break;
+                }
+            }
+        }
+        abandon.store(true, Ordering::Release);
+    });
+    shared.update(|s| {
+        s.transfer = None;
+        s.transfer_note = None;
+    });
+}
+
+/// What a parallel transfer reports, as text for the window: "7 connections, 6.9 MB/s".
+pub fn par_note(lanes: usize, rate: f64) -> String {
+    format!("{lanes} connection{}, {:.1} MB/s", if lanes == 1 { "" } else { "s" }, rate / 1e6)
+}
+
+/// Waits for the bulk transfers of a round and, for each that failed, sends that player every chunk the usual way.
+#[allow(clippy::too_many_arguments)]
+fn finish_bulk(
+    id: i32,
+    runs: Vec<(u16, thread::ScopedJoinHandle<'_, BulkSendResult>, &'static str)>,
+    path: &std::path::Path,
+    len: u64,
+    count: u32,
+    host: &mut HostSession,
+    net: &dyn HostTransport,
+    link: &mut gamelink::Session,
+    save_dirs: &[PathBuf],
+    shared: &Shared,
+) {
+    for (player, handle, how) in runs {
+        let who = host.players().get(&player).map_or_else(|| format!("#{player}"), |p| p.name.clone());
+        match handle.join().unwrap_or_else(|_| BulkSendResult::Failed("the sending thread failed".into())) {
+            BulkSendResult::Done { summary } => {
+                shared.log(format!("resync {id}: {who} has the save ({how}): {summary}"));
+            }
+            BulkSendResult::Failed(why) => {
+                shared.log(format!("resync {id}: bulk transfer to {who} failed ({why}); sending the chunks instead"));
+                for index in 0..count {
+                    if host.resync_state() != ResyncState::Transferring {
+                        return;
+                    }
+                    match resync::read_chunk(path, len, index) {
+                        Ok(data) => {
+                            let outputs = host.resync_chunk_to(id, player, index, &data);
+                            host_dispatch(outputs, host, net, link, save_dirs, shared);
+                        }
+                        Err(e) => {
+                            shared.log(format!("resync {id}: reading chunk {index}: {e}"));
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
-    shared.update(|s| s.transfer = None);
+}
+
+fn sha_bytes(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 fn refresh_host_status(host: &HostSession, net: &dyn HostTransport, shared: &Shared) {
@@ -775,15 +959,27 @@ pub fn run_player_over(
         cancelled: &|| false,
         progress,
     })?;
-    let player = PlayerSession::new(config.key.clone(), &config.name, &config.version);
+    let mut player = PlayerSession::new(config.key.clone(), &config.name, &config.version);
+    player.set_capabilities(capabilities_of(first.as_ref(), !config.save_dirs.is_empty()));
+    if first.par_capable() && !config.save_dirs.is_empty() {
+        enable_par(first.as_ref(), &config);
+    }
     let shared = Shared::new(Status::new(Role::Player, &config.name), config.echo_log);
     shared.log(format!("connected to {}", first.describe()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {
         let shared = Arc::clone(&shared);
         thread::Builder::new().name("feverlink3-player".into()).spawn(move || {
-            let mut state =
-                PlayerLoop { config, player, net: Some(first), connect, generation: 1, net_tx, ticket: None };
+            let mut state = PlayerLoop {
+                config,
+                player,
+                net: Some(first),
+                connect,
+                generation: 1,
+                net_tx,
+                ticket: None,
+                par_progress: None,
+            };
             if let Err(why) = guard::guarded(|| state.run(&net_rx, &cmd_rx, &shared)) {
                 shared.log(format!("the player session stopped: {why}"));
                 shared.update(|s| s.error = Some(format!("internal error: {why}")));
@@ -799,6 +995,27 @@ pub fn run_player_over(
     Ok(SessionHandle { shared, commands: cmd_tx, thread: Mutex::new(Some(thread)), local_addr: None })
 }
 
+/// What this player's end announces in its join message: it can take a savegame as bulk datagrams when the transport can
+/// carry them (receiving is always on; the host decides whether to use it, see `FEVERLINK3_BULK`).
+fn capabilities_of(net: &dyn ClientTransport, has_save_dir: bool) -> Vec<String> {
+    let mut caps = Vec::new();
+    if net.bulk_capable() {
+        caps.push(CAP_BULK_DGRAM.to_owned());
+    }
+    if net.par_capable() && has_save_dir {
+        caps.push(CAP_BULK_PAR.to_owned());
+    }
+    caps
+}
+
+/// Lets the host send this player a savegame over parallel connections: the finished file goes into the first
+/// savegame folder. Without a savegame folder there is nowhere to put it, and the host keeps sending chunks.
+fn enable_par(net: &dyn ClientTransport, config: &PlayerConfig) {
+    if let Some(dir) = config.save_dirs.first() {
+        net.enable_par(ParContext { secret: secret_from_key(config.key.key()), dir: dir.clone() });
+    }
+}
+
 struct PlayerLoop {
     config: PlayerConfig,
     player: PlayerSession,
@@ -809,6 +1026,8 @@ struct PlayerLoop {
     net_tx: Sender<NetEvent>,
     /// What the host's welcome granted: the next connection asks for the same id and slot with it.
     ticket: Option<ResumeTicket>,
+    /// How far the parallel receive in progress is: (when last heard, bytes, total bytes, text).
+    par_progress: Option<(Instant, u64, u64, String)>,
 }
 
 impl PlayerLoop {
@@ -831,6 +1050,37 @@ impl PlayerLoop {
                     NetEvent::Opened { .. } => {}
                     NetEvent::Frame { conn, frame } if conn == self.generation => {
                         outputs.extend(self.player.frame_received(&frame));
+                    }
+                    NetEvent::BulkSave { conn, id, sha256, bytes, note } if conn == self.generation => {
+                        shared.log(note);
+                        outputs.extend(self.player.bulk_save_received(id, &sha256, bytes));
+                    }
+                    NetEvent::BulkFile { conn, id, sha256, len, path, note } if conn == self.generation => {
+                        self.par_progress = None;
+                        shared.log(note);
+                        // the file is in the first savegame folder already; the others get a copy
+                        let name = resync::save_name(id);
+                        for dir in self.config.save_dirs.iter().skip(1) {
+                            let copy = std::fs::create_dir_all(dir).and_then(|()| {
+                                let tmp = dir.join(format!("{name}.sav.tmp"));
+                                std::fs::copy(&path, &tmp)?;
+                                std::fs::rename(&tmp, dir.join(format!("{name}.sav")))
+                            });
+                            if let Err(e) = copy {
+                                shared.log(format!(
+                                    "resync {id}: cannot copy the received save to {}: {e}",
+                                    dir.display()
+                                ));
+                            }
+                        }
+                        outputs.extend(self.player.bulk_file_received(id, &sha256, len));
+                    }
+                    NetEvent::BulkProgress { conn, done, total, note, .. } if conn == self.generation => {
+                        self.par_progress = Some((Instant::now(), done, total, note));
+                    }
+                    NetEvent::Note { conn, text } if conn == self.generation => {
+                        self.par_progress = None;
+                        shared.log(text);
                     }
                     NetEvent::Closed { conn, reason } if conn == self.generation => {
                         shared.log(format!("connection closed: {reason}"));
@@ -902,7 +1152,22 @@ impl PlayerLoop {
                 if let Some(session) = self.player.session() {
                     s.session = Some(session.clone());
                 }
-                s.transfer = self.player.transfer_progress();
+                // a parallel receive reports bytes; the window counts in chunks of the resync
+                if self.par_progress.as_ref().is_some_and(|p| p.0.elapsed() > Duration::from_secs(15)) {
+                    self.par_progress = None;
+                }
+                match &self.par_progress {
+                    Some((_, done, total, note)) if *total > 0 => {
+                        let chunks = ResyncLimits::chunk_count(*total).unwrap_or(1);
+                        let got = (*done / ResyncLimits::CHUNK_SIZE as u64) as u32;
+                        s.transfer = Some((got.min(chunks), chunks));
+                        s.transfer_note = Some(note.clone());
+                    }
+                    _ => {
+                        s.transfer = self.player.transfer_progress();
+                        s.transfer_note = None;
+                    }
+                }
                 s.clocks = clocks.iter().map(|(&id, &t)| ClockInfo { id, t, speed: None }).collect();
                 s.links = self.net.as_ref().and_then(|n| n.link()).into_iter().collect();
                 // while a new connection has no welcome yet, the last roster stays: no empty list in between
@@ -976,6 +1241,10 @@ impl PlayerLoop {
                     Some(ticket) => PlayerSession::resuming(key, name, version, ticket),
                     None => PlayerSession::new(key, name, version),
                 };
+                self.player.set_capabilities(capabilities_of(net.as_ref(), !self.config.save_dirs.is_empty()));
+                if net.par_capable() && !self.config.save_dirs.is_empty() {
+                    enable_par(net.as_ref(), &self.config);
+                }
                 self.net = Some(net);
                 // still reconnecting until the host's welcome says so
                 shared.update(|s| s.my_id = None);

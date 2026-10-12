@@ -60,11 +60,23 @@ pub struct JoinMessage {
     pub proof: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<ResumeClaim>,
+    /// What this player's end can do besides the basics (see [`CAP_BULK_DGRAM`]). A host ignores words it does not
+    /// know; a host that predates the field ignores the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
 }
+
+/// Capability: the player can receive a savegame as bulk datagrams (own reliability and congestion control over Steam's
+/// unreliable messages) instead of as `ResyncChunk` frames. Only a Steam transport has it.
+pub const CAP_BULK_DGRAM: &str = "bulk-dgram-1";
+
+/// Capability: the player can receive a savegame over several parallel Steam connections (the host opens them to the
+/// player's second virtual port), written straight to the save file. Only a Steam transport has it.
+pub const CAP_BULK_PAR: &str = "bulk-par-1";
 
 impl JoinMessage {
     pub fn new(name: &str, version: &str, proof: Vec<u8>) -> Self {
-        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None }
+        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None, caps: Vec::new() }
     }
 }
 
@@ -439,6 +451,18 @@ pub struct BuildVetoMessage {
     pub from: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// "Apply it": the commit of a held strict build made in a paused game (`owner`:`seq` names the action; `stamp` is the game time to
+/// apply it at). `from` is set by the host on relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildCommitMessage {
+    pub seq: i64,
+    pub owner: u16,
+    pub stamp: i64,
+    #[serde(default)]
+    pub from: u16,
 }
 
 /// `from` and `name` are set by the host on relay.

@@ -128,6 +128,7 @@ fn a_resync_round_moves_the_hosts_save_to_the_player_and_ends() {
     let host_link = gamelink::Session::create_under(root.path(), "host").unwrap();
     let host_dir = host_link.dir().to_path_buf();
     let host = run_host(HostConfig {
+        bulk: Default::default(),
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         name: "Host".into(),
         key: key.clone(),
@@ -189,6 +190,7 @@ fn a_player_is_marked_reloading_from_the_load_until_its_hello() {
     let host_link = gamelink::Session::create_under(root.path(), "host").unwrap();
     let host_dir = host_link.dir().to_path_buf();
     let host = run_host(HostConfig {
+        bulk: Default::default(),
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         name: "Host".into(),
         key: key.clone(),
@@ -247,6 +249,7 @@ fn permissions_reach_each_game_as_booleans_for_that_player() {
     let host_link = gamelink::Session::create_under(root.path(), "host").unwrap();
     let host_dir = host_link.dir().to_path_buf();
     let host = run_host(HostConfig {
+        bulk: Default::default(),
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         name: "Host".into(),
         key: key.clone(),

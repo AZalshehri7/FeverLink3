@@ -223,8 +223,6 @@ pub struct Controller {
     persona_last: Instant,
     steam_note: Option<String>,
     steam_loop: Arc<Mutex<LoopCheck>>,
-    /// The speed test whose summary line already went to `session.log`.
-    speed_logged: u64,
     /// Puts text on the clipboard (the window's "Copy code"); the tests replace it.
     clipboard: Box<dyn Fn(&str) -> bool + Send>,
     result: Option<CommandResult>,
@@ -277,11 +275,15 @@ impl Controller {
             dir,
             default_name,
             save_dirs,
-            // The host's own game keeps playing in a resync round (only the other games load the saved world): the
-            // paused checksum after the round checks that they still match, and a difference fails the round as ever.
-            // FEVERLINK3_HOST_RELOAD=1 brings the old behaviour back (every game, the host's included, loads the save).
+            // Every game, the host's included, loads the saved world in a resync round: a live world and a freshly
+            // loaded one of the same save drift apart (lab runs E1 vs E2/E3), two fresh loads do not. The host loads
+            // while the players still download. FEVERLINK3_HOST_RELOAD=0 keeps the host's live world (it drifts).
             host_options: HostOptions {
-                host_reloads: std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "1"),
+                host_reloads: !std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "0"),
+                host_loads_early: !std::env::var("FEVERLINK3_HOST_LOAD_EARLY").is_ok_and(|v| v.trim() == "0"),
+                // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
+                // resync is requested", but none is started by itself; only the window's Sync button starts one.
+                auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),
                 ..HostOptions::default()
             },
             commands,
@@ -295,7 +297,6 @@ impl Controller {
             persona_last: Instant::now(),
             steam_note: None,
             steam_loop: Arc::default(),
-            speed_logged: 0,
             clipboard: Box::new(clipboard::set_text),
             result: None,
             log_cursor: 0,
@@ -367,18 +368,19 @@ impl Controller {
         self.publish();
     }
 
-    /// Writes the summary line of a finished (or failed) Steam speed test to `session.log`, once per test.
+    /// Writes what the Steam speed test logged (the summary line of a finished or failed run, Steam's samples and status
+    /// dumps) to `session.log`.
     fn log_speed_test(&mut self) {
-        let Some(speed) = self.steam.as_ref().and_then(|p| p.report().speed) else { return };
-        let Some(line) = speed.log.filter(|_| speed.id != self.speed_logged) else { return };
-        self.speed_logged = speed.id;
+        let Some(lines) = self.steam.as_ref().map(|p| p.take_log()).filter(|l| !l.is_empty()) else { return };
         let path = self.dir.join(SESSION_LOG_FILE);
         if fs::metadata(&path).map(|m| m.len() > SESSION_LOG_MAX).unwrap_or(false) {
             let _ = fs::remove_file(&path);
         }
         use std::io::Write;
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{line}");
+            for line in lines {
+                let _ = writeln!(f, "{line}");
+            }
         }
     }
 
@@ -454,7 +456,12 @@ impl Controller {
                 let speed_mb = params.get("mb").and_then(Value::as_f64).filter(|mb| *mb >= 1.0).map(|mb| mb as u32);
                 match (&mut self.steam, id) {
                     (Some(probe), Some(id)) => match speed_mb {
-                        Some(mb) => probe.speed_test(id, mb),
+                        Some(mb) => {
+                            // `mode`: reliable (default), dgram, both, parallel (reliable on 1, 2 and 4 connections), auto (the resync's
+                            // parallel connections, scaled to the size), all
+                            let mode = params.get("mode").and_then(Value::as_str).unwrap_or("reliable");
+                            probe.start_plan(id, steamnet::specs_for(mode, mb));
+                        }
                         None => probe.test(id),
                     },
                     (Some(_), None) => self.steam_note = Some("that is not a Steam ID (17 digits)".into()),
@@ -603,6 +610,7 @@ impl Controller {
             Err(e) => return self.state = State::Failed(format!("cannot open the session folder: {e}")),
         };
         let config = HostConfig {
+            bulk: steamnet::bulk_io::BulkSettings::from_env(),
             bind: SocketAddr::from(([0, 0, 0, 0], 0)), // not used by Steam
             name,
             key,
@@ -655,6 +663,7 @@ impl Controller {
         let loopback = force_loopback || params.get("bind").and_then(Value::as_str) == Some("loopback");
         let ip = if loopback { [127, 0, 0, 1] } else { [0, 0, 0, 0] };
         let started = session::run_host(HostConfig {
+            bulk: steamnet::bulk_io::BulkSettings::from_env(),
             bind: SocketAddr::from((ip, port)),
             name,
             key,
@@ -955,6 +964,9 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
         if let Some((done, total)) = s.transfer {
             sync["done"] = json!(done);
             sync["total"] = json!(total);
+        }
+        if let Some(note) = &s.transfer_note {
+            sync["note"] = json!(note);
         }
         v["sync"] = sync;
     }
@@ -1280,8 +1292,9 @@ mod tests {
         let summary: Vec<&str> = log.lines().filter(|l| l.starts_with("steam speed test: ")).collect();
         assert_eq!(summary.len(), 1, "{log}");
         assert!(summary[0].contains("2 MB each way") && summary[0].contains("80 MB save about"), "{log}");
-        // only the tester logs
-        assert!(!friend.dir.join(SESSION_LOG_FILE).exists());
+        // only the tester logs a summary; the responder logs its own side (settings, what it sent, Steam's status)
+        let theirs = fs::read_to_string(friend.dir.join(SESSION_LOG_FILE)).unwrap_or_default();
+        assert!(!theirs.lines().any(|l| l.starts_with("steam speed test: ")), "{theirs}");
     }
 
     #[test]
