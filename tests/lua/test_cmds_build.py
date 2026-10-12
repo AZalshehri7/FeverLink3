@@ -1824,6 +1824,46 @@ end
 '''
 
 
+class ReplayIgnoreErrorsBase:
+    """FEVERLINK3_REPLAY_IGNORE_ERRORS: a build that adds and removes constructions is replayed with ignoreErrors on (default off)."""
+
+    switch = None
+
+    def setUp(self):
+        self._old = os.environ.get("FEVERLINK3_REPLAY_IGNORE_ERRORS")
+        if self.switch is None:
+            os.environ.pop("FEVERLINK3_REPLAY_IGNORE_ERRORS", None)
+        else:
+            os.environ["FEVERLINK3_REPLAY_IGNORE_ERRORS"] = self.switch
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        if self._old is None:
+            os.environ.pop("FEVERLINK3_REPLAY_IGNORE_ERRORS", None)
+        else:
+            os.environ["FEVERLINK3_REPLAY_IGNORE_ERRORS"] = self._old
+
+    def replayed_ctx(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
+        self.B.issue("NATIVE_ROAD_MOVING{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 57 }")
+        self.tick(14)
+        return str(self.A.lua("BUILD_CTX[1]"))
+
+class ReplayIgnoreErrorsOffTest(ReplayIgnoreErrorsBase, BuildTest):
+    def test_off_by_default(self):
+        self.assertIn("ie=false", self.replayed_ctx())
+
+
+class ReplayIgnoreErrorsOnTest(ReplayIgnoreErrorsBase, BuildTest):
+    switch = "1"
+
+    def test_on_with_the_switch(self):
+        self.assertIn("ie=true", self.replayed_ctx())
+
+
 class PureBuildTest(unittest.TestCase):
     """The build schema alone, in a mocked world, without the bridge."""
 

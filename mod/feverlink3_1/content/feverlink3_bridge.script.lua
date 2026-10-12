@@ -702,7 +702,7 @@ local function logReplayVerdict(key, a, rec)
 	end
 	if critical or #msgs > 0 or #warns > 0 then
 		logSim(string.format("replay %s: the engine's verdict before applying (critical=%s) messages=[%s] warnings=[%s]%s", key, tostring(critical),
-			table.concat(msgs, "; "), table.concat(warns, "; "), (a[3] == true and ", errors ignored" or ", errors NOT ignored")))
+			table.concat(msgs, "; "), table.concat(warns, "; "), (a[3] == true and ", errors ignored" or ", errors NOT ignored") .. ((Build and Build.REPLAY_IGNORE_ERRORS) and " (FEVERLINK3_REPLAY_IGNORE_ERRORS=1)" or "")))
 	end
 end
 

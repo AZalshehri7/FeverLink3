@@ -155,6 +155,15 @@ impl HostSession {
         }
         self.resync_counter += 1;
         let id = self.resync_counter;
+        // Tell everyone before the games pause: a repair copies the host's world to everybody, so a build that never reached the host
+        // (a kind that is not replicated yet) is lost on the other game.
+        match reason {
+            "session start" | "new player" | "player returned" => {}
+            "manual" => self.announce("A sync starts: everyone gets the host's world."),
+            other => self.announce(&format!(
+                "A repair sync starts ({other}): builds of this kind that did not reach the other game will be lost."
+            )),
+        }
         let resume_speed = if self.state.speed > 0 { self.state.speed } else { self.last_running_speed };
         if self.state.speed == 0 && self.state.pause_at.is_none() {
             // A session that has never run holds at speed 0 with no pause stamp (the games were at different times
@@ -552,6 +561,9 @@ impl HostSession {
         self.set_resync_phase(None);
         self.set_speed_inner(r.resume_speed);
         self.policy.resync_finished(self.now());
+        if !matches!(r.reason.as_str(), "session start" | "new player" | "player returned") {
+            self.announce("The sync is done: everyone has the host's world again.");
+        }
         self.out.push(HostOutput::ResyncProgress {
             id: r.id,
             state: ResyncState::Idle,

@@ -1262,6 +1262,12 @@ impl HostSession {
 
     /// To every player connection and the local game, except `except`. One sealer, so the host's counter stream is
     /// shared by all connections; a receiver only ever sees it increase.
+    /// A chat line from the session itself to every game (the host's own included), named "FeverLink3".
+    pub(super) fn announce(&mut self, text: &str) {
+        let chat = ChatMessage { text: text.to_owned(), from: Self::HOST_ID, name: Some("FeverLink3".to_owned()) };
+        self.broadcast(MessageKind::Chat, &codec::encode(&chat), None);
+    }
+
     fn broadcast(&mut self, kind: MessageKind, payload: &[u8], except: Option<u16>) {
         let targets: Vec<ConnectionId> = self
             .connections

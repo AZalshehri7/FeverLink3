@@ -1078,3 +1078,28 @@ fn a_light_round_with_a_light_difference_still_counts_and_an_old_game_that_sends
     checksum_round(&mut h, &ids, Some("lines")); // light
     assert_ne!(ResyncState::Idle, h.host.resync_state());
 }
+
+// ------------------------------------------------------------------ the chat lines around a repair
+
+#[test]
+fn a_repair_sync_is_announced_before_it_starts_and_its_end_after_it() {
+    let (mut h, ids) = Harness::running(2, 3, quiet());
+    let before = h.p(ids[0]).count(MessageKind::Chat);
+    checksum_round(&mut h, &ids, Some("lines"));
+    checksum_round(&mut h, &ids, Some("lines")); // two rounds in a row: the safety net starts a resync
+    assert_ne!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(before + 1, h.p(ids[0]).count(MessageKind::Chat), "one chat line to every player");
+    let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
+    assert_eq!(Some("FeverLink3"), chat.name.as_deref());
+    assert!(chat.text.contains("repair sync starts") && chat.text.contains("will be lost"), "{}", chat.text);
+    assert!(h.host_game_last::<ChatMessage>(MessageKind::Chat).text.contains("repair sync"), "the host's own game too");
+    let pause_at = h.host.state().pause_at.expect("pause stamp");
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    h.hello_all(pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
+    assert!(chat.text.contains("sync is done"), "{}", chat.text);
+}

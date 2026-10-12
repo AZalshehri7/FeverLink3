@@ -2003,6 +2003,9 @@ end
 -- build (cause unproven). They are replicated as before (hold-and-release) and the player gets an informational chat line. With
 -- FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers) they are refused: not shipped, not replayed. The originator can only cancel such a
 -- build when the native module can fire the tool's completion callback (a cancel without it leaves the tool dead: real session).
+local REPLAY_IGNORE_ERRORS = false
+pcall(function() REPLAY_IGNORE_ERRORS = os.getenv("FEVERLINK3_REPLAY_IGNORE_ERRORS") == "1" end)
+M.REPLAY_IGNORE_ERRORS = REPLAY_IGNORE_ERRORS
 local BLOCK_CONSTRUCTIONS = false
 pcall(function() BLOCK_CONSTRUCTIONS = os.getenv("FEVERLINK3_REMOTE_CONSTRUCTIONS") == "0" end)
 M.CONSTRUCTIONS_BLOCKED_TEXT = "station/depot builds are not supported yet in this test build"
@@ -2048,6 +2051,12 @@ local function decodeBuildUnsafe(body, ctx)
 	if not plan then return nil, whyNot end
 	local R = newResolver(ctx)
 	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src }
+	-- Developer switch (default off): a build that adds constructions AND removes some (a station that takes town buildings away) is
+	-- replayed with ignoreErrors = true. Real session 2026-10-12: such builds created nothing on the receiving game; to A/B whether the
+	-- engine's non-critical errors (a collision with a building this game has and the originator did not) are the reason.
+	if REPLAY_IGNORE_ERRORS and type(rec.cons) == "table" and #rec.cons > 0 and type(rec.rem) == "table" and #rec.rem > 0 then
+		f.ie = true
+	end
 	-- The forms of the plan are tried in order and the engine's factory is the judge, here, before anything is applied: a
 	-- proposal it rejects in every form refuses the action on every game alike.
 	local args, used, lastErr
