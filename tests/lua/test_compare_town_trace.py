@@ -106,7 +106,7 @@ class CompareTest(unittest.TestCase):
 
     def test_a_change_with_no_develop_call_is_a_non_growth_writer_and_commands_are_listed(self):
         r = Run(self)
-        a = BASE + ["t=100 town=60479 n=2 h=aaaa"]
+        a = BASE + ["t=100 town=60479 n=2 h=aaaa", "t=130 town=60479 info dev=1 size=[1,1,1] needs=[[],[],[]]"]
         b = BASE + ["t=120 town=60479 n=2 h=dddd", "~ a.con@1.0,2.0,0.0 L=1>2 D=1 P=1 T=10>1200", "t=118 cmd townUpdateCargoNeeds town=60479 pi=0", "t=119 cmd onPreBuildProposal pi=1"]
         r.write("A", a, [call(1, 100)])
         r.write("B", b, [call(1, 100)])
@@ -121,10 +121,15 @@ class CompareTest(unittest.TestCase):
         r.write("A", BASE + ["t=100 town=60479 n=3 h=bbbb", "+ c.con@5.0,6.0,0.0 L=1 D=1 P=1 T=500"], [call(1, 100)])
         r.write("B", BASE + ["t=101 town=60479 n=3 h=bbbb", "+ c.con@5.0,6.0,0.0 L=1 D=1 P=1 T=500"], [call(1, 100)])
         verdicts, text = r.compare()
-        self.assertIn("agree again from tick 101", text)
-        self.assertIn("timing offset of 1 tick", text)
-        # the difference is still reported at its first tick
-        self.assertIn("first tick at which the state differs: 100", text)
+        # a constant sampling offset is not a divergence
+        self.assertEqual(C.V_NONE, verdicts[60479], text)
+
+    def test_environment_float_jitter_is_not_a_divergence(self):
+        r = Run(self)
+        r.write("A", BASE + ["t=100 town=60479 info dev=1 size=[1,1,1] needs=[[],[],[]] noise=63 poll=3082"], [call(1, 100)])
+        r.write("B", BASE + ["t=100 town=60479 info dev=1 size=[1,1,1] needs=[[],[],[]] noise=63 poll=3075"], [call(1, 100)])
+        verdicts, text = r.compare()
+        self.assertEqual(C.V_NONE, verdicts[60479], text)
 
     def test_all_mode_baseline_without_building_lines_still_compares(self):
         r = Run(self)
