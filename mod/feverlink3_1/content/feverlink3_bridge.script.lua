@@ -662,6 +662,50 @@ end
 -- The engine tells the game script about every build it applies (`apply_command` / `onPreBuildProposal`, just before
 -- it runs; finding from MPFever (MIT)). A replay of an action (a build rebuilt from a shipped record) must not be
 -- shipped again, so each one is counted here when it is sent and spent when its event arrives.
+-- The engine's own verdict on a rebuilt build proposal, without applying it (what a tool's preview reads): critical flag, messages and
+-- warnings of the proposal data's errorState. The second argument of makeProposalData must be a Context (a command whose context
+-- was left out made `bad argument #2 to 'makeProposalData'`): a default one with this game's player is made when the command has none.
+-- Returns `critical, messages, warnings` (lists of strings) or nil and the reason it could not be read. Never raises.
+local function engineVerdict(args)
+	local ok, critical, msgs, warns = pcall(function()
+		local ctx = args[2]
+		if ctx == nil or ctx == false then
+			ctx = api.type.Context.new()
+			pcall(function() ctx.player = api.engine.util.getPlayer() end)
+		end
+		local pd = api.engine.util.proposal.makeProposalData(args[1], ctx)
+		local es = pd and pd.errorState
+		if es == nil then return nil end
+		local function list(l)
+			local out = {}
+			if l ~= nil then for i = 1, math.min(#l, 6) do out[#out + 1] = tostring(l[i]) end end
+			return out
+		end
+		return es.critical == true, list(es.messages), list(es.warnings)
+	end)
+	if not ok then return nil, tostring(critical):sub(1, 160) end
+	if critical == nil then return nil, "no errorState" end
+	return critical, msgs, warns
+end
+
+-- Logged at the replay of a build that adds or removes constructions (a cargo station that takes town buildings away): the engine's own
+-- verdict on the proposal as this game rebuilt it, so that a build the engine refuses has its reason in the log (the simulation state has
+-- no callback, a refused command raises nothing). Observation only; says why once if the game does not let this state ask.
+local REPLAY_VERDICT = { failed = false }
+local function logReplayVerdict(key, a, rec)
+	if REPLAY_VERDICT.failed then return end
+	local critical, msgs, warns = engineVerdict(a)
+	if critical == nil and msgs then
+		REPLAY_VERDICT.failed = true
+		logSim("the engine's verdict on a replayed build cannot be read from this state (" .. tostring(msgs) .. "); no refusal reasons will be logged")
+		return
+	end
+	if critical or #msgs > 0 or #warns > 0 then
+		logSim(string.format("replay %s: the engine's verdict before applying (critical=%s) messages=[%s] warnings=[%s]%s", key, tostring(critical),
+			table.concat(msgs, "; "), table.concat(warns, "; "), (a[3] == true and ", errors ignored" or ", errors NOT ignored")))
+	end
+end
+
 -- `noPlayer` (the command's playerInitiated flag is false: the second command of a construction next to a street) counts in its
 -- own counter, spent only by an event whose playerInitiated is false too; a town's own build has that flag as well, so such a
 -- mark can still be spent by the wrong event, but a real tool build (flag true) can never be swallowed by it.
@@ -924,7 +968,10 @@ local function simApplyAction(st, it, now)
 		ok, e = pcall(function()
 			L.sendNow(args, function(a)
 				local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
-				if isBuild then markReplay(st, now, SIM.state, it.key, a[4] == false) end
+				if isBuild then
+					markReplay(st, now, SIM.state, it.key, a[4] == false)
+					if Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(it.body) then pcall(logReplayVerdict, it.key, a) end
+				end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -1642,23 +1689,18 @@ end
 -- let a script ask (the first call that throws switches this off and says so once)
 local function proposalVerdict(args)
 	if G.noProposalData then return nil end
-	local ok, res = pcall(function()
-		local pd = api.engine.util.proposal.makeProposalData(args[1], args[2])
-		local es = pd and pd.errorState
-		if es == nil then return nil end
-		local msgs = {}
-		for i = 1, math.min(#es.messages, 4) do msgs[#msgs + 1] = tostring(es.messages[i]) end
-		if es.critical == true or (args[3] ~= true and #msgs > 0) then
-			return "engine: " .. (es.critical == true and "critical error " or "errors ") .. table.concat(msgs, ", ")
+	local critical, msgs = engineVerdict(args)
+	if critical == nil then
+		if msgs ~= "no errorState" then
+			G.noProposalData = true
+			logGui("veto check: the engine's errorState cannot be read from a script here (" .. tostring(msgs) .. "); only the references and the command factory are checked")
 		end
-		return false
-	end)
-	if not ok then
-		G.noProposalData = true
-		logGui("veto check: the engine's errorState cannot be read from a script here (" .. tostring(res):sub(1, 120) .. "); only the references and the command factory are checked")
 		return nil
 	end
-	return res or nil
+	if critical or (args[3] ~= true and #msgs > 0) then
+		return "engine: " .. (critical and "critical error " or "errors ") .. table.concat(msgs, ", ")
+	end
+	return nil
 end
 
 -- true: this game can build it (or cannot tell); false and why: it cannot
@@ -2006,7 +2048,18 @@ local function natDecideUnsafe(h, cap)
 		natOrder("release", id)
 	end
 	if not cap then return release("no capture of a tool build") end
-	if not cap.body then return release("the capture of " .. cap.tool .. " failed (" .. tostring(cap.why) .. ")") end
+	if not cap.body then
+		-- A build that cannot be captured cannot be shipped: the others never get it, and the safety net's resync would erase it here
+		-- later (real session 2026-10-12: a guest's bus stops, line and buses). With the tool's callback fireable the build is cancelled and
+		-- the player told; otherwise it still goes through (fail open: the tool would stay dead).
+		if FIRE_DONE and h.done then
+			natSay("held " .. id .. " (site " .. natSite(h) .. "): the capture of " .. tostring(cap.tool) .. " failed (" .. tostring(cap.why) .. "): cancelled, this kind of build is not replicated")
+			natOrder("cancel", id)
+			vetoChat("nocap:" .. tostring(id) .. ":" .. tostring(os.clock()), "This kind of build (" .. tostring(cap.tool) .. ") is not supported yet in this test build; it was cancelled so that it is not lost later. Roads, bulldozing and constructions still work.")
+			return
+		end
+		return release("the capture of " .. cap.tool .. " failed (" .. tostring(cap.why) .. ")")
+	end
 	local body, text = cap.body, cap.text
 	local category = buildCategory(body)
 	if not L.permitted(G.perms, category) then

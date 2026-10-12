@@ -1228,6 +1228,41 @@ class ConstructionBlockTest(StrictTest):
         self.assertSameWorld()
 
 
+class UncapturableBuildTest(StrictTest):
+    """A build whose capture fails cannot be shipped: with the tool's callback fireable it is cancelled with a chat line, otherwise it is
+    released as before (fail open)."""
+
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
+    def broken_capture(self):
+        self.start()
+        self.B.run("FACTORY_REJECT = nil")
+        i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
+        self.B.L.execute("TOOL_ADD(%d, true)" % i)
+        self.tick(14)
+
+    def test_the_build_is_cancelled_and_the_player_told(self):
+        self.broken_capture()
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual(self.B.shipped_count(), 0)
+        self.assertEqual(len(self.relay.chats), 1)
+        self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
+        self.assertSameWorld()
+
+    def test_without_a_fireable_callback_it_is_released_as_before(self):
+        self.fires_off = True
+        self.start()
+        self.B.native.fires = False
+        self.B.run("FACTORY_REJECT = nil")
+        i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
+        self.B.L.execute("TOOL_ADD(%d, true)" % i)
+        self.tick(14)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+
+
 class ConstructionBlockWithoutFireTest(StrictTest):
     extra_env = {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}
     fires = False

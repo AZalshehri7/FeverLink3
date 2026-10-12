@@ -782,6 +782,8 @@ local function newCapture(ctx, opts)
 	function cap.obj(id)
 		if type(id) ~= "number" then fail("an object reference is not an entity id") end
 		if id < 0 then return id end
+		local m = cap.memo["o" .. id]
+		if m then return m end
 		local at = cap.known.objIndex[id]
 		if not at then
 			local edge = A.edgeOfObject(id)
@@ -792,7 +794,18 @@ local function newCapture(ctx, opts)
 			end
 		end
 		if not at then fail("object " .. id .. " is on no known segment") end
-		return { __ref = "obj", edge = cap.edge(at.edge), i = at.i }
+		-- An object read after the build ran, on a segment this build made (its real id aliased to a placeholder): it is a NEW object of
+		-- this build, so it travels as a placeholder like the ones of a tool's own proposal (the n-th placeholder in the segments' object
+		-- lists is the n-th edge object; PLAN.stop). Real run 2026-10-12: a bus stop was shipped as { __ref = "obj", edge = -1, i = 1 }
+		-- and every other game refused the record ("segment 1: bad object").
+		if type(cap.alias["e" .. at.edge]) == "number" then
+			cap.newObjs = (cap.newObjs or 0) + 1
+			m = -400000000 - (cap.newObjs - 1)
+		else
+			m = { __ref = "obj", edge = cap.edge(at.edge), i = at.i }
+		end
+		cap.memo["o" .. id] = m
+		return m
 	end
 
 	function cap.owner(v)
@@ -1068,6 +1081,9 @@ local function captureRecord(proposal, cap)
 		indexWorldObjects(rmSegIds, cap)
 		for i, n in ipairs(A.list(st, names.nodes)) do rec.nodes[i] = readNode(n, cap) end
 		for i, id in ipairs(rmSegIds) do
+			-- (read after the build, a removed segment of the stop tool arrived as the NEGATIVE of its entity id: -33244 in a real record,
+			-- which no other game can resolve; it is the existing segment)
+			if type(id) == "number" and id < -1000 and (A.edgeInfo(-id) or cap.known.edges[-id]) then id = -id; rmSegIds[i] = id end
 			-- a removed segment also says what kind of segment it was (normal, bridge, tunnel ...): a replacement by another
 			-- kind is not an upgrade the engine's replaceSegment can make
 			local ref = cap.edge(id)
@@ -2003,6 +2019,15 @@ function M.constructionsBlocked(body)
 		return constructionsBlocked(rec)
 	end)
 	return ok and blocked == true
+end
+
+-- true when the record adds or removes constructions (a station that takes town buildings away counts)
+function M.addsOrRemovesConstructions(body)
+	local ok, yes = pcall(function()
+		local rec = normalise(body.args[1])
+		return type(rec) == "table" and ((type(rec.cons) == "table" and #rec.cons > 0) or (type(rec.rem) == "table" and #rec.rem > 0))
+	end)
+	return ok and yes == true
 end
 
 -- true when the record adds constructions, whatever the block says

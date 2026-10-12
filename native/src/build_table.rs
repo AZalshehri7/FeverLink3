@@ -128,8 +128,10 @@ pub struct BuildAddrs {
     /// terrain tool is left out on purpose. Finding from MPFever (MIT).
     pub ui_add_sites: &'static [Rva],
     /// `_Do_call` thunks of the completion callbacks (`std::function` of the tools' `done` argument of `CommandList::Add`) that were read
-    /// out of the executable and are safe to call with a command that was never applied (result byte 0): the street tool's and the
-    /// bulldozer's. Any other callback (the construction tool's does real work with the result) is never fired.
+    /// out of the executable and are safe to call with a command that was never applied (result byte 0): the street tool's, the
+    /// bulldozer's and the stop tool's (`0x596a70`, no thunk: the lambda itself; it clears its flag at `+0x2c8` and calls the same hook;
+    /// like the street tool's it first runs a helper pair with the command's result vector, which is empty for a command that never ran:
+    /// read from the disassembly only, not yet seen in a real game). Any other callback (the construction tool's does real work with the result) is never fired.
     pub fire_done_calls: &'static [Rva],
     /// Offset of the command-kind byte (the dispatcher index) inside a command's payload.
     pub kind_offset: Option<u32>,
@@ -291,7 +293,7 @@ pub const BUILDS: &[BuildAddrs] = &[
             0x028a_3024,
             0x028a_3871,
         ],
-        fire_done_calls: &[0x004d_8860, 0x0058_c0b0],
+        fire_done_calls: &[0x004d_8860, 0x0058_c0b0, 0x0059_6a70],
         // movsx rcx, byte [payload + 0x9b8] in apply_command and in Command::~Command
         kind_offset: Some(0x9b8),
         // the dispatcher's case 52 is the handler that references the string "WorldBuildProposal"
