@@ -211,6 +211,19 @@ pub struct ChecksumRequestMessage {
     pub n: i32,
     pub at: i64,
     pub paused: bool,
+    /// False asks for a LIGHT round: every game leaves out the heavy lanes (`ChecksumPolicy::HEAVY_PARTS`: edges, constructions,
+    /// node settings, town buildings), which cost about a second of game thread in a big world. Absent means a full round, so an
+    /// older host's requests and an older game that ignores the flag both stay correct.
+    #[serde(default = "full_by_default", skip_serializing_if = "is_true")]
+    pub full: bool,
+}
+
+fn full_by_default() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

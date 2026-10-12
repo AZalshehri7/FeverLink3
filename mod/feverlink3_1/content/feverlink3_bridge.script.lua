@@ -463,8 +463,8 @@ end
 -- checksum that takes more than CS_SLOW_MS in total logs one line naming the worst parts; every CS_SUMMARY rounds one summary line
 -- (count, average, maximum and the part that was the slowest in the maximum round). Each half (interface, simulation) counts its own.
 local CS_SLOW_MS, CS_SUMMARY = 50, 20
-local CS = { n = 0, sum = 0, max = 0, maxPart = "?", maxWhere = "" }
-local function checksumNote(timing, total, where)
+local CS = { n = 0, sum = 0, max = 0, maxPart = "?", maxWhere = "", nLight = 0, sumLight = 0, maxLight = 0 }
+local function checksumNote(timing, total, where, light)
 	local ok = pcall(function()
 		local ms = total * 1000
 		local names = {}
@@ -473,6 +473,10 @@ local function checksumNote(timing, total, where)
 		local worst = names[1] or "?"
 		CS.n = CS.n + 1
 		CS.sum = CS.sum + ms
+		if light then
+			CS.nLight, CS.sumLight = CS.nLight + 1, CS.sumLight + ms
+			if ms > CS.maxLight then CS.maxLight = ms end
+		end
 		if ms > CS.max then CS.max, CS.maxPart, CS.maxWhere = ms, worst, where end
 		if ms > CS_SLOW_MS then
 			local top = {}
@@ -480,27 +484,29 @@ local function checksumNote(timing, total, where)
 			C.logger(where)(string.format("checksum slow: total %.0f ms: %s", ms, table.concat(top, ", ")))
 		end
 		if CS.n % CS_SUMMARY == 0 then
-			C.logger(where)(string.format("checksum cost over %d rounds: avg %.1f ms, max %.0f ms (%s, slowest part %s)", CS.n, CS.sum / CS.n, CS.max, CS.maxWhere, CS.maxPart))
-			CS.n, CS.sum, CS.max = 0, 0, 0
+			C.logger(where)(string.format("checksum cost over %d rounds: avg %.1f ms, max %.0f ms (%s, slowest part %s); %d light rounds: avg %.1f ms, max %.0f ms",
+				CS.n, CS.sum / CS.n, CS.max, CS.maxWhere, CS.maxPart, CS.nLight, CS.nLight > 0 and CS.sumLight / CS.nLight or 0, CS.maxLight))
+			CS.n, CS.sum, CS.max, CS.nLight, CS.sumLight, CS.maxLight = 0, 0, 0, 0, 0, 0
 		end
 	end)
 	return ok
 end
 
-local function checksumParts(co, where)
+-- `light` (the round asked for no heavy lanes): constructions, edges, node settings and town buildings are not read.
+local function checksumParts(co, where, light)
 	local function clock() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end
 	local t0 = clock()
 	local timing = {}
-	local parts, t = L.checksumParts(engine, C.hashValue, timing)
+	local parts, t = L.checksumParts(engine, C.hashValue, timing, light)
 	local okD, digest = false, nil
 	local t1 = clock()
 	if Co then okD, digest = pcall(Co.digest, co) end
 	if okD and digest ~= nil then parts.companies = C.hashValue(digest) end
 	timing.companies = clock() - t1
 	local t2 = clock()
-	townBuildingsPart(parts)
+	if not light then townBuildingsPart(parts) end
 	timing.townBuildings = clock() - t2
-	checksumNote(timing, clock() - t0, where or "gui")
+	checksumNote(timing, clock() - t0, where or "gui", light == true)
 	return parts, t
 end
 
@@ -1127,7 +1133,7 @@ local function update(userParams, state, dt)
 		local due = L.takeDue(st.queue, now)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" then
-				local parts, t = checksumParts(st.co, "sim")
+				local parts, t = checksumParts(st.co, "sim", it.full == false)
 				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountSnapshot(engine) }
 			elseif it.kind == "action" then
 				simApplyAction(st, it, now)
@@ -1413,7 +1419,7 @@ local natPauseRelease, natHeldRefused, natVeto, vetoChat
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
-		local parts, t = checksumParts(G.co, "gui")
+		local parts, t = checksumParts(G.co, "gui", it.full == false)
 		reportRound(it.n, t, parts, L.accountSnapshot(engine))
 		return
 	end

@@ -745,10 +745,14 @@ end
 -- Each part is hashed separately so the launcher can name the differing one. Entity ids never enter a hash:
 -- constructions are compared by file and position, lines by their stop counts, both sorted.
 -- `timing` (optional table): filled with the seconds each part took (observation only, never part of the result).
-function L.checksumParts(engine, hashFn, timing)
+-- `light` (optional, true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
+-- see ChecksumRequestMessage.full). Each of those costs one component read per edge, node, construction or town building.
+L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true }
+function L.checksumParts(engine, hashFn, timing, light)
 	local parts = {}
 	local clock = timing and function() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end or nil
 	local function part(name, fn)
+		if light and L.HEAVY_LANES[name] then return end
 		local t0 = clock and clock() or 0
 		local ok, v = pcall(fn)
 		parts[name] = ok and hashFn(v) or "error"
@@ -788,7 +792,7 @@ end
 -- A `checksum_request` payload {n, at, paused} as a queue item.
 function L.checksumItem(p)
 	if type(p) ~= "table" or type(p.n) ~= "number" or type(p.at) ~= "number" then return nil end
-	return { kind = "checksum", at = p.at, n = p.n, paused = p.paused == true }
+	return { kind = "checksum", at = p.at, n = p.n, paused = p.paused == true, full = p.full ~= false }
 end
 
 -- An `action` record from the link as a queue item; `from` is the sender id the launcher attached.

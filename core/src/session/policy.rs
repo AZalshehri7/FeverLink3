@@ -26,6 +26,8 @@ impl Default for ChecksumPolicyConfig {
 pub struct ChecksumPolicy {
     config: ChecksumPolicyConfig,
     drift_since: Option<f64>,
+    /// The drift parts of the last round that judged them (kept across light rounds, which do not measure the heavy ones).
+    last_drift: Option<BTreeSet<String>>,
     last_other: Option<BTreeSet<String>>,
     streak: u32,
     last_resync_end: Option<f64>,
@@ -36,6 +38,9 @@ impl ChecksumPolicy {
     pub const DRIFT_PARTS: [&'static str; 5] = ["vehicles", "onboard", "persons", "stocks", "nodeConfigs"];
     /// Corrected through Authority, never a reason to reload. The lanes the script reports are `balance` and `loan`
     /// (`money` is the older name); a rule written for "money" alone let a difference of 180 in `balance` reload the world.
+    /// Lanes that cost much game thread time in a big world (the sum of one component read per edge, node, construction and town
+    /// building): a light round leaves them out. `townBuildings:<town>` is the per-town part of `townBuildings`.
+    pub const HEAVY_PARTS: [&'static str; 4] = ["edges", "constructions", "nodeConfigs", "townBuildings"];
     pub const MONEY_PARTS: [&'static str; 3] = ["money", "balance", "loan"];
 
     pub fn new(config: ChecksumPolicyConfig) -> Self {
@@ -44,6 +49,10 @@ impl ChecksumPolicy {
 
     pub fn config(&self) -> &ChecksumPolicyConfig {
         &self.config
+    }
+
+    pub fn is_heavy_part(part: &str) -> bool {
+        Self::HEAVY_PARTS.contains(&part) || part.starts_with("townBuildings:")
     }
 
     pub fn is_money_part(part: &str) -> bool {
@@ -87,12 +96,26 @@ impl ChecksumPolicy {
         let drift: BTreeSet<String> = parts.iter().filter(|p| Self::is_drift_part(p)).cloned().collect();
         let other: BTreeSet<String> = parts.iter().filter(|p| !Self::is_drift_part(p)).cloned().collect();
 
-        if drift.is_empty() {
+        // A light round did not measure the heavy lanes: what an earlier full round found there stands until the next full round
+        // (a streak made of heavy parts neither grows nor resets on a light round).
+        let all_heavy =
+            |s: &Option<BTreeSet<String>>| s.as_ref().is_some_and(|s| s.iter().all(|p| Self::is_heavy_part(p)));
+        let keep_drift = !outcome.full && drift.is_empty() && all_heavy(&self.last_drift);
+        let keep_other = !outcome.full && other.is_empty() && all_heavy(&self.last_other);
+        if keep_drift {
+            // unchanged
+        } else if drift.is_empty() {
             self.drift_since = None;
-        } else if self.drift_since.is_none() {
-            self.drift_since = Some(now);
+            self.last_drift = None;
+        } else {
+            if self.drift_since.is_none() {
+                self.drift_since = Some(now);
+            }
+            self.last_drift = Some(drift.clone());
         }
-        if other.is_empty() {
+        if keep_other {
+            // unchanged
+        } else if other.is_empty() {
             self.last_other = None;
             self.streak = 0;
         } else if self.last_other.as_ref() == Some(&other) {
@@ -105,9 +128,9 @@ impl ChecksumPolicy {
         let reason = if !other.is_empty() && self.streak >= self.config.consecutive_rounds {
             Some(format!("{} differ in {} checks in a row", join(&other), self.streak))
         } else {
-            self.drift_since
-                .filter(|since| now - since >= self.config.drift_seconds)
-                .map(|since| format!("{} drifted for {:.0} s", join(&drift), now - since))
+            self.drift_since.filter(|since| now - since >= self.config.drift_seconds).map(|since| {
+                format!("{} drifted for {:.0} s", join(self.last_drift.as_ref().unwrap_or(&drift)), now - since)
+            })
         };
         let reason = reason?;
         if self.in_cooldown(now) {
@@ -134,6 +157,7 @@ impl ChecksumPolicy {
 
     fn reset(&mut self) {
         self.drift_since = None;
+        self.last_drift = None;
         self.last_other = None;
         self.streak = 0;
     }

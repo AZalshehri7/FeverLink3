@@ -467,7 +467,7 @@ impl HostSession {
             r.verify_n = Some(n);
         }
         self.enter(ResyncState::Verifying, "comparing the paused checksums".to_owned());
-        let request = ChecksumRequestMessage { n, at, paused: true };
+        let request = ChecksumRequestMessage { n, at, paused: true, full: true };
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
         self.last_checksum = self.now();
     }

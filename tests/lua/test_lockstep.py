@@ -463,8 +463,11 @@ class Relay:
         t = max(self.clocks.values())
         return -(-(t + self.lead) // STEP) * STEP
 
-    def checksum_request(self, n, at, paused):
-        self.broadcast("checksum_request", self.ser({"n": n, "at": at, "paused": paused}))
+    def checksum_request(self, n, at, paused, full=None):
+        body = {"n": n, "at": at, "paused": paused}
+        if full is not None:
+            body["full"] = full   # absent means a full round
+        self.broadcast("checksum_request", self.ser(body))
 
     def send_authority(self, n):
         """The host's authority values of round n, to every other game (what the core does after a round)."""
@@ -685,6 +688,26 @@ class LockstepTest(unittest.TestCase):
         self.relay.checksum_request(3, self.relay.future_stamp(), False)
         self.tick(40, lag_b=True)
         self.assertIn(0, self.relay.reports.get(3, {}))
+
+    def test_a_light_round_leaves_out_the_heavy_lanes_and_a_full_round_has_everything(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        heavy = {"constructions", "edges", "nodeConfigs", "townBuildings"}
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)             # no flag: full
+        self.tick(40, lag_b=True)
+        self.relay.checksum_request(2, self.relay.future_stamp(), False, full=True)
+        self.tick(40, lag_b=True)
+        self.relay.checksum_request(3, self.relay.future_stamp(), False, full=False)
+        self.tick(40, lag_b=True)
+        for n in (1, 2):
+            names = set(self.relay.reports[n][0][1])
+            self.assertTrue(heavy <= names and any(k.startswith("townBuildings:") for k in names), (n, names))
+        for g in (0, 1):
+            names = set(self.relay.reports[3][g][1])
+            self.assertFalse(names & heavy or any(k.startswith("townBuildings:") for k in names), names)
+            self.assertTrue({"time", "balance", "loan", "lines", "stations", "names", "vehicles"} <= names, names)
+        self.assertEqual(self.relay.reports[3][0][1], self.relay.reports[3][1][1])
 
     def test_checksum_rounds(self):
         self.start()

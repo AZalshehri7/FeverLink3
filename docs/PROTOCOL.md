@@ -71,7 +71,7 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | PeerClock | 12 | host → all but origin | `{from, t, ahead}` |
 | PlayerJoined | 13 | host → all but the joiner | `{player: {id, name, ready}}` |
 | PlayerLeft | 14 | host → all | `{id, name, away?}` (`away` = the connection dropped and the slot is held) |
-| ChecksumRequest | 15 | host → all | `{n, at, paused}` |
+| ChecksumRequest | 15 | host → all | `{n, at, paused, full?}` (`full: false` = a light round; absent = full) |
 | Authority | 16 | host → players | `{n, values: {name: number}}` |
 | ResyncSave | 17 | host → its own game | `{id, name}` |
 | ResyncChunk | 18 | host → players | `{id, index, count, sha256, data}` |
@@ -162,6 +162,8 @@ Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused:
 | `ReplayFailed` from any game | at once |
 
 Rounds are judged on their non-money parts, so `money` never hides another difference. A decision resets the counters. **Cooldown:** a decision made less than 120 s after the end of the previous round (finished or failed) is held back; the evidence is kept, so the next round after the cooldown decides at once. The cooldown applies to policy decisions only, not to the host's button or to hot join. A `ReplayFailed` inside the cooldown is not remembered.
+
+**Light and full rounds.** The heavy lanes (`ChecksumPolicy::HEAVY_PARTS`: `edges`, `constructions`, `nodeConfigs`, `townBuildings` with its `townBuildings:<town>` parts) cost about a second of game thread in a big world, so the host asks for them only in every `full_checksum_every`-th round (default 6, `FEVERLINK3_FULL_CHECKSUM_EVERY`, 1 = always; the first round, every paused round and the verification round of a resync are always full). The other rounds carry `full: false`; a game then leaves the heavy lanes out, and the host drops them from the reports of a light round anyway (an older game that sends everything is not a difference). The policy counts a heavy part only over full rounds: a light round neither grows nor resets a streak or a drift clock that consists of heavy parts only; any other part is judged every round as before.
 
 A decision is emitted as `HostOutput::ResyncRequested { reason }` and, with the host option `auto_resync` (default true), the round starts at once. With `auto_resync = false` only the request is emitted and the launcher decides, for example by calling `start_resync(reason)`. Nothing is requested before the session starts or while a round is running.
 

@@ -281,6 +281,12 @@ impl Controller {
             host_options: HostOptions {
                 host_reloads: !std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "0"),
                 host_loads_early: !std::env::var("FEVERLINK3_HOST_LOAD_EARLY").is_ok_and(|v| v.trim() == "0"),
+                // FEVERLINK3_FULL_CHECKSUM_EVERY=<n> (default 6, 1 = every round is a full check)
+                full_checksum_every: std::env::var("FEVERLINK3_FULL_CHECKSUM_EVERY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .filter(|v| *v >= 1)
+                    .unwrap_or(6),
                 // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
                 // resync is requested", but none is started by itself; only the window's Sync button starts one.
                 auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),
