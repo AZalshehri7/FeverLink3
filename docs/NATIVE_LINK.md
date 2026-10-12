@@ -769,6 +769,29 @@ around that tick, the commands seen, and a verdict: `inputs differed before the 
 (nondeterminism inside Develop)` / `a non-growth writer`. The session controller clears the live folder when it starts,
 so start the trace games before the session.
 
+### The live-vs-loaded log (`FEVERLINK3_LIVE_VS_LOADED=1`)
+
+Read-only, default off; `feverlink3_livevsloaded.lua`, called from the sim script's `update` next to the town trace, writes
+`live_vs_loaded.txt` in the game's live folder. It asks why a game that kept running and a game that loaded the same save
+drift apart. Every line starts with the game tick so two games' files can be paired. Queries only, each under `pcall`, at most
+6 reading jobs per step, a source that fails twice is disabled with a comment line, five internal errors switch the log off.
+
+- `t=<tick> L1 town=<id> lu=<bits32> lun=<number> sd=<supply/limit per land use> xp=<experience> lvl=<level>`: every 12 ticks per
+  traced town (the towns of `FEVERLINK3_TOWN_TRACE`, all towns for `all` or when unset): the line usage of `getTownLineUsage`, the
+  per land use sums of `getCargoSupplyAndLimit`, and the town game script's experience and level (read through its
+  `GAME_SCRIPT` component; `-` when that read fails).
+- `t=<tick> L2 count|dest|tn|line id=<id> n=<persons> o=<ordered hash> s=<sorted hash>`: at a resume and then every 60 ticks
+  (`tick % 60 == 0`) for 5 game minutes, for the 20 lowest destination ids, 10 lowest transport networks and 3 lowest lines:
+  the hash of the ids of `getSimPersonsForDestination`, `getSimPersonsAtTerminalForTransportNetwork` and `getSimPersonsForLine`
+  in the order the engine returns them (`o`) and sorted (`s`). Equal `s` and different `o` for the same tick means the same
+  people in another container order; different `s` means another set. A resume is the first step of a Lua state (a loaded game)
+  or a step after a wall clock gap of 5 s (a paused game going on); the sim script is not told about resyncs, so this is the
+  only way to notice one: `t=<tick> resume why=<start|gap>`.
+- `t=<tick> L4 ...`: once, facts about `math.random` that cost no draw (the override installed, its `t` and `n`, whether a chunk
+  compiled with the default environment sees the override). A draw is not compared, because consuming one would shift the
+  draws of the game's own scripts, and the game scripts' Lua states cannot be reached from the sim script.
+
+
 **Command payload (`FEVERLINK3_TOWN_TRACE_CMDS=1`, tools: `FL3_DEMO_TOWN_TRACE_CMDS`).** Tests whether the three size factors and the cargo needs that the game's own growth script hands to the native step differ between the games before that step. The bridge wraps `api.cmd.makeTownUpdateSizeCmd` and `makeTownUpdateCargoNeedsCmd` in the simulation script context; the wrapper logs first (buffered, flushed once per second, never raising; five errors switch the command trace off) and then calls the original with the same arguments and returns what it returned. For each traced town it writes an `mk` line (arguments, the floats as exact bits as float and as double, and as 17-digit numbers), an `in` line (line usage, supply/demand totals, the town component fields, building count and hash) and `order` lines (the order in which the script's town and cargo loops hand out entities, hashed). `python tools/gametest/compare_town_cmds.py <live1> <live2>` pairs the calls and says `payload floats differ` / `inputs differ, payload equal` / `all equal`. Whether the growth script runs in a Lua state that sees the replaced `api.cmd` can only be confirmed in a running game: with the switch on and no `mk` lines, it does not.
 
 ### 11.5 The deep growth log (`FEVERLINK3_LOG_GROWTH_DEEP=1`): payload, rng end state, candidate order

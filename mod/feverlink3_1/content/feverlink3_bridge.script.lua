@@ -464,6 +464,61 @@ end
 local logSim = C.logger("sim")
 local SIM = { rng = nil, subscribed = false }
 
+-- Live vs loaded log (feverlink3_livevsloaded.lua): off unless FEVERLINK3_LIVE_VS_LOADED=1. Observe-only, own guard.
+local LVL = nil
+local LVL_FAILS = 0
+local function livevsloaded()
+	if LVL ~= nil then return LVL or nil end
+	LVL = false
+	local ok, err = pcall(function()
+		if os.getenv("FEVERLINK3_LIVE_VS_LOADED") ~= "1" then return end
+		local okM, M = pcall(ug_require, "feverlink3_livevsloaded.lua")
+		if not okM then okM, M = pcall(ug_require, "feverlink3_1::/feverlink3_livevsloaded.lua") end
+		if not okM or type(M) ~= "table" then error("module not loaded: " .. tostring(M)) end
+		local okT, TT = pcall(ug_require, "feverlink3_towntrace.lua")
+		if not okT then okT, TT = pcall(ug_require, "feverlink3_1::/feverlink3_towntrace.lua") end
+		local bits32 = okT and type(TT) == "table" and TT.bits32 or nil
+		local t = M.new({
+			enabled = true,
+			towns = os.getenv("FEVERLINK3_TOWN_TRACE"),
+			acc = M.apiAccessors(api, engine.entitiesWith),
+			bits32 = bits32,
+			write = function(text) return C.appendFile(C.path(M.FILE), text) end,
+			-- L4: facts about math.random that cost no draw. nil until this script's override is installed.
+			-- The game scripts' own Lua states are not reachable from here, so a draw cannot be compared there.
+			randomProbe = function()
+				if not SIM.rng then return nil end
+				local facts = { installed = 1, rng_t = tostring(SIM.rng.t), rng_n = tostring(SIM.rng.n) }
+				-- the math.random that a chunk compiled with the default environment sees (the VM's global table)
+				local okL, seen = pcall(function() return load("return math.random")() end)
+				facts.global_is_override = (okL and seen == math.random) and 1 or 0
+				facts.package_math_is_ours = (package.loaded.math == nil or package.loaded.math == math) and 1 or 0
+				return facts
+			end,
+		})
+		if t.enabled then
+			LVL = t
+			logSim("live-vs-loaded log on -> " .. M.FILE)
+		end
+	end)
+	if not ok then logSim("live-vs-loaded log failed to start: " .. tostring(err)) end
+	return LVL or nil
+end
+
+local function livevsloadedGuard(fn)
+	local t = livevsloaded()
+	if not t then return end
+	local ok, err = pcall(fn, t)
+	if not ok then
+		LVL_FAILS = LVL_FAILS + 1
+		logSim("live-vs-loaded log error: " .. tostring(err))
+		if LVL_FAILS >= 5 then
+			LVL = false
+			logSim("live-vs-loaded log switched off after 5 errors")
+		end
+	end
+end
+
 local function simState(state)
 	local st = state:get()
 	if type(st) ~= "table" then st = {} end
@@ -906,6 +961,9 @@ end
 local function update(userParams, state, dt)
 	C.poll()
 	townTraceGuard(function(t)
+		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
+	end)
+	livevsloadedGuard(function(t)
 		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
 	end)
 	if not C.ACTIVE then

@@ -10,6 +10,7 @@
         "feverlink3_entry.res.lua",
         "feverlink3_hud.lua",
         "feverlink3_icon.tga",
+        "feverlink3_livevsloaded.lua",
         "feverlink3_lockstep.lua",
         "feverlink3_towntrace.lua",
         "feverlink3_ui.script.lua",
