@@ -667,7 +667,7 @@ end
 -- was left out made `bad argument #2 to 'makeProposalData'`): a default one with this game's player is made when the command has none.
 -- Returns `critical, messages, warnings` (lists of strings) or nil and the reason it could not be read. Never raises.
 local function engineVerdict(args)
-	local ok, critical, msgs, warns = pcall(function()
+	local ok, critical, msgs, warns, coll = pcall(function()
 		local ctx = args[2]
 		if ctx == nil or ctx == false then
 			ctx = api.type.Context.new()
@@ -681,11 +681,37 @@ local function engineVerdict(args)
 			if l ~= nil then for i = 1, math.min(#l, 6) do out[#out + 1] = tostring(l[i]) end end
 			return out
 		end
-		return es.critical == true, list(es.messages), list(es.warnings)
+		-- what collides: the entities named in collisionInfo, as kind and place (the errorState of a refused track build is often only the
+		-- generic "Construction Not Possible"; the collisions say what is in the way)
+		local coll = {}
+		pcall(function()
+			local ci = pd.collisionInfo
+			local l = ci and ci.collisionEntities
+			if l == nil then return end
+			for i = 1, math.min(#l, 4) do
+				local x = l[i]
+				local id = x
+				pcall(function() id = x.entity or x[1] or x end)
+				local d = tostring(id)
+				pcall(function()
+					local be = api.engine.getComponent(id, api.type.ComponentType.BASE_EDGE)
+					if be then
+						local track = api.engine.getComponent(id, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil
+						local function pos(n) local c = api.engine.getComponent(n, api.type.ComponentType.BASE_NODE); return c and string.format("%.0f,%.0f", c.position.x, c.position.y) or "?" end
+						d = string.format("%s %s edge %s-%s", tostring(id), track and "TRACK" or "street", pos(be.node0), pos(be.node1))
+						return
+					end
+					local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+					if co then d = string.format("%s construction %s", tostring(id), tostring(co.fileName)) end
+				end)
+				coll[#coll + 1] = d
+			end
+		end)
+		return es.critical == true, list(es.messages), list(es.warnings), coll
 	end)
 	if not ok then return nil, tostring(critical):sub(1, 160) end
 	if critical == nil then return nil, "no errorState" end
-	return critical, msgs, warns
+	return critical, msgs, warns, coll
 end
 
 -- One log line for EVERY build this game applies, before it is applied (the replay of another game's build, and the originator's own
@@ -712,12 +738,12 @@ local function describeBuild(it, args, role)
 		if sum.rem > 0 or n > 0 then parts[#parts + 1] = string.format("resolved removals %d of %d [%s]", n, sum.rem, table.concat(ids, " ")) end
 		local verdict = "n/a"
 		if not REPLAY_VERDICT.failed then
-			local critical, msgs, warns = engineVerdict(args)
+			local critical, msgs, warns, coll = engineVerdict(args)
 			if critical == nil and msgs then
 				REPLAY_VERDICT.failed = true
 				logSim("the engine's verdict on a rebuilt build cannot be read from this state (" .. tostring(msgs) .. "); the build lines say verdict n/a from now on")
 			elseif critical ~= nil then
-				verdict = string.format("critical=%s messages=[%s] warnings=[%s]", tostring(critical), table.concat(msgs, "; "), table.concat(warns, "; "))
+				verdict = string.format("critical=%s messages=[%s] warnings=[%s] collisions=[%s]", tostring(critical), table.concat(msgs, "; "), table.concat(warns, "; "), table.concat(coll or {}, "; "))
 			end
 		end
 		parts[#parts + 1] = "verdict " .. verdict
@@ -1782,7 +1808,7 @@ end
 -- let a script ask (the first call that throws switches this off and says so once)
 local function proposalVerdict(args)
 	if G.noProposalData then return nil end
-	local critical, msgs = engineVerdict(args)
+	local critical, msgs, _, coll = engineVerdict(args)
 	if critical == nil then
 		if msgs ~= "no errorState" then
 			G.noProposalData = true
@@ -1791,7 +1817,7 @@ local function proposalVerdict(args)
 		return nil
 	end
 	if critical or (args[3] ~= true and #msgs > 0) then
-		return "engine: " .. (critical and "critical error " or "errors ") .. table.concat(msgs, ", ")
+		return "engine: " .. (critical and "critical error " or "errors ") .. table.concat(msgs, ", ") .. ((coll and #coll > 0) and (" (colliding: " .. table.concat(coll, "; ") .. ")") or "")
 	end
 	return nil
 end

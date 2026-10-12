@@ -81,6 +81,7 @@ A.TYPES = {
 	NodeAndEntity = { "type.NodeAndEntity", "type.Proposal.NodeAndEntity" },
 	SegmentAndEntity = { "type.SegmentAndEntity", "type.Proposal.SegmentAndEntity" },
 	BaseEdgeStreet = { "type.BaseEdgeStreet", "engine.Component.BaseEdgeStreet" },
+	BaseEdgeTrack = { "type.BaseEdgeTrack", "engine.Component.BaseEdgeTrack" },
 	PlayerOwned = { "type.PlayerOwned", "engine.Component.PlayerOwned" },
 	LaneConfig = { "type.LaneConfig" },
 	EdgeObject = { "type.SimpleStreetProposal.EdgeObject" },
@@ -915,6 +916,17 @@ local function readSegment(s, cap)
 	end
 	local se = get(s, "streetEdge")
 	local po = get(s, "playerOwned")
+	-- A track segment says what track it is in the SegmentAndEntity's `trackEdge` (track type, catenary), not in its BaseEdge: without
+	-- it a replayed track is a plain street edge and the engine refuses it ("Construction Not Possible"; real session 2026-10-12, every
+	-- track build was refused on both games). Read as it is; the replay sets it only when it differs from a fresh BaseEdgeTrack.
+	local track = nil
+	do
+		local te = get(s, "trackEdge")
+		if te ~= nil then
+			local tt, cat = get(te, "trackType"), get(te, "catenary")
+			if type(tt) == "number" then track = { tt = tt, cat = (cat == true or cat == 1) and 1 or 0 } end
+		end
+	end
 	local seg = {
 		id = cap.edge(get(s, "entity")), type = get(s, "type"),
 		n0 = cap.node(get(c, "node0")), n1 = cap.node(get(c, "node1")),
@@ -926,7 +938,7 @@ local function readSegment(s, cap)
 			p0 = A.xyz(get(c, "position0")), p1 = A.xyz(get(c, "position1")),
 			deco = A.dump(get(c, "edgeDecorations")),
 		},
-		lanes = custom, objects = objects,
+		lanes = custom, objects = objects, track = track,
 		prec = se and { get(se, "precedenceNode0"), get(se, "precedenceNode1") } or nil,
 		owner = po and cap.owner(get(po, "player")) or nil,
 	}
@@ -1357,6 +1369,20 @@ local function newSegmentAndEntity(s, R, notes, placeholder, form)
 	for i, o in ipairs(s.objects or {}) do objects[i] = { R.objOr(o[1]), o[2] } end
 	if #objects > 0 then req(c, "objects", objects) end
 	req(se, "comp", c)
+	if s.track then
+		-- only what differs from a fresh BaseEdgeTrack is set: a road segment (the default) stays exactly as it was
+		local okT, te = pcall(A.new, "BaseEdgeTrack")
+		if okT then
+			local d = A.new("BaseEdgeTrack")
+			local dTT, dCat = get(d, "trackType"), get(d, "catenary")
+			local want, wantCat = s.track.tt, (s.track.cat or 0) == 1
+			if want ~= dTT or wantCat ~= (dCat == true) then
+				opt(notes, te, "trackType", want)
+				opt(notes, te, "catenary", wantCat)
+				opt(notes, se, "trackEdge", te)
+			end
+		end
+	end
 	if form.owner ~= false then
 		if s.prec then
 			local st = se.streetEdge
@@ -1899,6 +1925,7 @@ local function normalise(rec)
 			if type(o) ~= "table" or not okId(o[1], "obj") or (o[2] ~= nil and not isNum(o[2])) then return nil, "segment " .. i .. ": bad object" end
 		end
 		if s.type ~= nil and not isNum(s.type) then return nil, "segment " .. i .. ": bad type" end
+		if s.track ~= nil and (type(s.track) ~= "table" or not isNum(s.track.tt) or (s.track.cat ~= nil and not isNum(s.track.cat))) then return nil, "segment " .. i .. ": bad track" end
 		if s.prec ~= nil and (type(s.prec) ~= "table" or (s.prec[1] ~= nil and not isNum(s.prec[1])) or (s.prec[2] ~= nil and not isNum(s.prec[2]))) then
 			return nil, "segment " .. i .. ": bad precedence"
 		end

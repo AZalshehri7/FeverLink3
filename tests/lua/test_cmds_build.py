@@ -114,8 +114,9 @@ def("BaseEdge", { "node0", "node1", "tangent0", "tangent1", "position0", "positi
 end)
 def("BaseEdgeStreet", { "precedenceNode0", "precedenceNode1" }, function() return { precedenceNode0 = 2, precedenceNode1 = 2 } end)
 def("PlayerOwned", { "player" }, function() return { player = -1 } end)
-def("SegmentAndEntity", { "entity", "type", "comp", "streetEdge", "playerOwned" }, function()
-  return { entity = -1, type = 0, comp = D("BaseEdge"), streetEdge = D("BaseEdgeStreet"), playerOwned = D("PlayerOwned") }
+def("BaseEdgeTrack", { "trackType", "catenary" }, function() return { trackType = 0, catenary = false } end)
+def("SegmentAndEntity", { "entity", "type", "comp", "streetEdge", "trackEdge", "playerOwned" }, function()
+  return { entity = -1, type = 0, comp = D("BaseEdge"), streetEdge = D("BaseEdgeStreet"), trackEdge = D("BaseEdgeTrack"), playerOwned = D("PlayerOwned") }
 end)
 def("EdgeObjectSimple", { "edgeEntity", "param", "oneWay", "left", "model", "playerEntity", "name" }, function()
   return { edgeEntity = -1, param = 0.5, oneWay = false, left = false, model = "", playerEntity = -1, name = "" }
@@ -294,6 +295,7 @@ function MAKE_API()
   T.NodeAndEntity = ctor("NodeAndEntity")
   T.SegmentAndEntity = ctor("SegmentAndEntity")
   T.BaseEdgeStreet = ctor("BaseEdgeStreet")
+  T.BaseEdgeTrack = ctor("BaseEdgeTrack")
   T.PlayerOwned = ctor("PlayerOwned")
   T.LaneConfig = ctor("LaneConfig")
   T.LaneConnection = ctor("LaneConnection")
@@ -700,7 +702,14 @@ local function segment(entity, n0, n1, pa, pb, opts)
   local c = D("BaseEdge", { node0 = n0, node1 = n1, tangent0 = d, tangent1 = d, position0 = V(pa.x, pa.y, pa.z or 0), position1 = V(pb.x, pb.y, pb.z or 0),
     type = 0, typeIndex = 1, roadTemplate = tmpl, roadStyle = style, roadType = opts.track and 1 or 0, laneConfigs = lanes,
     objects = opts.objects or {}, edgeDecorations = opts.deco or {} })
-  return D("SegmentAndEntity", { entity = entity, type = opts.track and 1 or 0, comp = c })
+  local se = D("SegmentAndEntity", { entity = entity, type = opts.track and 1 or 0, comp = c })
+  if opts.trackType then
+    local te = se.trackEdge
+    te.trackType = opts.trackType
+    te.catenary = opts.catenary == true
+    se.trackEdge = te
+  end
+  return se
 end
 
 -- a road between two places (or existing nodes), the way a script builds it
@@ -1822,6 +1831,20 @@ function DECODE(body, resolve)
   return M.commands.makeWorldBuildProposalCmd.decode(body, ctx)
 end
 '''
+
+
+class TrackEdgeTest(BuildTest):
+    """The segment of a track build carries its track type and catenary (SegmentAndEntity.trackEdge): a replay without it is a street edge."""
+
+    def test_the_track_type_and_catenary_travel_and_a_road_keeps_the_default(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, track = true, trackType = 2, catenary = true }")
+        self.tick(14)
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
+        self.tick(14)
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("tostring(GAME.applied[1].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[1].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "2 true", g.label)
+        self.assertEqual(self.A.lua("tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "0 false", "a road stays default")
 
 
 class ReplayIgnoreErrorsBase:
