@@ -49,7 +49,8 @@ pub struct HostOptions {
     pub host_loads_early: bool,
     /// Seconds after the LAST build or bulldoze of a session of two or more games at which the host starts a resync, so
     /// that every game reloads the same saved world (0 turns it off). Lab runs 2026-10-12: two live worlds that applied
-    /// the same builds drift apart about three game minutes later, a reload removes it.
+    /// the same builds drift apart about three game minutes later, a reload removes it. An experiment switch only: it is
+    /// NOT a solution (a reload after every build), so it is off by default.
     pub resync_after_builds_seconds: f64,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
@@ -86,7 +87,7 @@ impl Default for HostOptions {
             auto_resync: true,
             host_reloads: true,
             host_loads_early: true,
-            resync_after_builds_seconds: 60.0,
+            resync_after_builds_seconds: 0.0,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,

@@ -281,12 +281,12 @@ impl Controller {
             host_options: HostOptions {
                 host_reloads: !std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "0"),
                 host_loads_early: !std::env::var("FEVERLINK3_HOST_LOAD_EARLY").is_ok_and(|v| v.trim() == "0"),
-                // FEVERLINK3_RESYNC_AFTER_BUILDS=<seconds> (default 60, 0 off): a resync that long after the last build
+                // FEVERLINK3_RESYNC_AFTER_BUILDS=<seconds> (experiment switch, default 0 = off): a resync that long after the last build
                 resync_after_builds_seconds: std::env::var("FEVERLINK3_RESYNC_AFTER_BUILDS")
                     .ok()
                     .and_then(|v| v.trim().parse::<f64>().ok())
                     .filter(|v| v.is_finite() && *v >= 0.0)
-                    .unwrap_or(60.0),
+                    .unwrap_or(0.0),
                 // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
                 // resync is requested", but none is started by itself; only the window's Sync button starts one.
                 auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),

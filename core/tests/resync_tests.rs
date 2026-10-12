@@ -781,8 +781,9 @@ fn with_host_loads_early_off_the_host_is_told_to_load_together_with_the_players_
 }
 
 #[test]
-fn a_resync_starts_a_minute_after_the_last_build_and_not_for_other_actions() {
-    let (mut h, ids) = Harness::running(2, 1, quiet());
+fn a_resync_starts_a_minute_after_the_last_build_when_asked_and_not_for_other_actions() {
+    let asked = HostOptions { resync_after_builds_seconds: 60.0, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(2, 1, asked);
     let first = ActionMessage::new(30_000, 1, "{}").with_category("build");
     h.player_game(ids[0], MessageKind::Action, &json(&first));
     h.advance(30.0);
@@ -800,15 +801,15 @@ fn a_resync_starts_a_minute_after_the_last_build_and_not_for_other_actions() {
 }
 
 #[test]
-fn no_resync_follows_a_rename_or_an_off_switch() {
-    let (mut h, ids) = Harness::running(2, 1, quiet());
+fn no_resync_follows_a_rename_and_none_follows_a_build_by_default() {
+    let asked = HostOptions { resync_after_builds_seconds: 60.0, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(2, 1, asked);
     let rename = ActionMessage::new(30_000, 1, "{}").with_category("other");
     h.player_game(ids[0], MessageKind::Action, &json(&rename));
     h.advance(120.0);
     h.host_call(HostSession::tick);
     assert_eq!(ResyncState::Idle, h.host.resync_state());
-    let off = HostOptions { resync_after_builds_seconds: 0.0, ..HostOptions::default() };
-    let (mut h, ids) = Harness::running(2, 1, off);
+    let (mut h, ids) = Harness::running(2, 1, HostOptions::default());
     let build = ActionMessage::new(30_000, 1, "{}").with_category("build");
     h.player_game(ids[0], MessageKind::Action, &json(&build));
     h.advance(300.0);
