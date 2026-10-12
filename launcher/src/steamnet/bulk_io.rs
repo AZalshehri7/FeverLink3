@@ -86,10 +86,13 @@ impl BulkSettings {
 
 type Acceptor = Arc<dyn Fn(Handle, u32, Vec<u8>, Channel<Vec<u8>>) + Send + Sync>;
 
+/// The transfers of a hub: (connection, transfer id) to the channel of its datagrams.
+type Endpoints = HashMap<(Handle, u32), SyncSender<Vec<u8>>>;
+
 /// Routes the bulk datagrams of one owner's connections to the transfers they belong to.
 #[derive(Default)]
 pub struct Hub {
-    endpoints: Mutex<HashMap<(Handle, u32), SyncSender<Vec<u8>>>>,
+    endpoints: Mutex<Endpoints>,
     acceptor: Mutex<Option<Acceptor>>,
 }
 

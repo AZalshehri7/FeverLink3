@@ -1125,7 +1125,7 @@ mod tests {
         }
         // a header that never ends within the limit
         let mut long = b"tput up ".to_vec();
-        long.extend(std::iter::repeat(b'1').take(500));
+        long.extend(std::iter::repeat_n(b'1', 500));
         long.push(b'\n');
         assert_eq!(parse(&long), None);
         // a peak that does not fit a u32

@@ -259,9 +259,7 @@ fn body<P: Path>(path: &mut P, s: &mut Summary) -> Result<(), Stop> {
             } else if j.sustainable {
                 s.best[dir.idx()] = rate;
             }
-            if j.sustainable {
-                prev[dir.idx()] = step.speed;
-            } else if rate == RATES[0] {
+            if j.sustainable || rate == RATES[0] {
                 prev[dir.idx()] = step.speed;
             }
             if !j.keep_climbing {

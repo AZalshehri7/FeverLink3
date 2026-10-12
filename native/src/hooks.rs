@@ -1157,7 +1157,7 @@ pub fn attach_from_env(build: &'static BuildAddrs, link: Option<Link>, log: fn(&
     }
     let cfg = HookConfig::from_lookup(get);
     if !cfg.luaseed && std::env::var(plan::LUA_SEED_LOG_VAR).is_ok_and(|v| v.trim() == "1") {
-        log("lua seed: not pinned, the game keeps its own per-process seed (the mod's probe records its effect)");
+        log("lua seed: not pinned (FEVERLINK3_LUA_SEED=0), the game keeps its own per-process seed");
     }
     attach(build, cfg, link, log);
 }

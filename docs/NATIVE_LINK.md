@@ -29,10 +29,10 @@ anything else (unset, empty, `0`, `true`) is off. Try them in this order:
 |---|---|---|---|
 | 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
 | 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
-| 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
+| 3 | on by default; `FEVERLINK3_POOLPATCH=0` turns it off | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
 | 4 | `FEVERLINK3_LOG_TOWN_SEED=1` | A diagnostic hook on the **map-generation** seed (`RandomLocationFactory`'s constructor, `sub_8d4270`, RVA `0x8d4270` in build 40420; NOT town growth, see section 11). It logs one line per call, `mapgen-seed n=<counter> seed=<hex> caller=<rva> a3=<hex> a4=<hex>`, and calls the original with every argument unchanged, returning its result unchanged. Read-only; independent of the other switches (no counters, no control link). Details below. | A detour on one engine function; run in the game on 2026-10-11 (two runs, the maintainer's private research notes). Writes to `native.log` on the thread that calls the function (see below). |
 | 5 | `FEVERLINK3_LOG_GROWTH=1`, `FEVERLINK3_GROWTH_SEED_MODE=derive` (`..._AFTER`, `..._AFTER_GAMETIME`, `..._QUANTUM_MS`) | The town-growth log (a hook on `TownDeveloper::Develop`, RVA `0x8de0b0`, plus a read-only hook on the `TownUpdateSize` handler for the game time) and the seed experiment: after a threshold the random seed `Develop` reads is replaced by a hash of (town, quantized game time). Only which random numbers are drawn changes. Section 11. | Two detours on engine functions; **not run in the game**. |
-| 6 | `FEVERLINK3_LUA_SEED=fixed` | The Lua string-hash seed pinned to a constant (the value is `fixed`, not `1`; see stage 6 below). Off by default until verified in the game. | A patch on the first bytes of Lua's `makeseed`. |
+| 6 | on by default; `FEVERLINK3_LUA_SEED=0` turns it off | The Lua string-hash seed pinned to a constant (see stage 6 below). Lab runs 2026-10-12: with the pin the `pairs`-order probe number was equal in every Lua state of both games, without it every state differed; fail-open on an unknown build or other bytes. | A patch on the first bytes of Lua's `makeseed`. |
 
 `FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
 The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
@@ -502,7 +502,7 @@ Additionally in `native.log`: `hooks: command_list_add: 18 bytes at rva 0x9d4040
 - **H. Reload while held.** Hold a command and load a savegame: the command's list pointer is stale. Expected to be
   unsafe; the mod must `hold_off` first (an item for the mod's resync code).
 
-### Stage 3: the pool patch (`FEVERLINK3_POOLPATCH=1`)
+### Stage 3: the pool patch (on by default, `FEVERLINK3_POOLPATCH=0` turns it off)
 
 Expect:
 
@@ -578,7 +578,7 @@ Needs the mod's strict mode (section 7) and a host and a player in one session, 
 11. **Pings.** Over a 5-minute play with no builds, `native_ctl.log` grows by one `ping` line every 2 s and the module never
     logs `silence`. The file grows without bound (about 45 KB an hour); note whether that matters.
 
-### Stage 6: the Lua string-hash seed (`FEVERLINK3_LUA_SEED=fixed`, observation `FEVERLINK3_LUA_SEED_LOG=1`)
+### Stage 6: the Lua string-hash seed (on by default, `FEVERLINK3_LUA_SEED=0` turns it off; observation `FEVERLINK3_LUA_SEED_LOG=1`)
 
 Lua 5.2 (the game's scripting) hashes short strings with a per-state seed that `lua_newstate` takes from
 `makeseed`: the clock, the address of the new state, of a local and of two module locations. With address-space
@@ -589,7 +589,7 @@ games that are otherwise identical.
 
 | Environment | Effect |
 |---|---|
-| `FEVERLINK3_LUA_SEED=fixed` | Replaces the 26-byte prologue of `makeseed` with `mov eax, 0x464C3353 ; ret` (padded with `int3`). Every process then seeds its Lua states with the same constant (the ASCII of `FL3S`). Any other value, or none, leaves the game's own seed. **Off by default until it has been verified in the game.** |
+| on by default (`FEVERLINK3_LUA_SEED=0` off) | Replaces the 26-byte prologue of `makeseed` with `mov eax, 0x464C3353 ; ret` (padded with `int3`). Every process then seeds its Lua states with the same constant (the ASCII of `FL3S`). `FEVERLINK3_LUA_SEED=0` leaves the game's own seed. On by default since 2026-10-12 (the lab showed the pinned seed equal in all Lua states of both games and no harm in 30-minute runs). |
 | `FEVERLINK3_LUA_SEED_LOG=1` | Observation only. The mod writes one line `luaseed probe order=<n>` to its log at the start of each game: `<n>` folds the order `pairs` visits 30 fixed string keys in, so two games with equal seeds print equal numbers. The module logs `lua seed: not pinned ...` when the pin is off. |
 
 Checks and rules (as for the other patches): the build must have a `lua_makeseed` row in the build table; the 26

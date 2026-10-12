@@ -27,11 +27,13 @@
 //!    See `growth.rs`. An experiment switch, not run in the game.
 //!
 
-//! 6. `FEVERLINK3_LUA_SEED=fixed`: pin the seed of Lua's string hash to a constant (`build_table::LUA_SEED`), so the
+//! 6. Lua string-hash seed pin: pin the seed of Lua's string hash to a constant (`build_table::LUA_SEED`), so the
 //!    iteration order of `pairs` over string keys is the same in every process. A patch, independent of the others.
-//!    Any other value, or none, leaves the game's own per-process seed.
 //!
-//! Anything but the exact value `1` (after trimming blanks; `fixed` for the seed) is off.
+//! Switches 1, 2, 4 and 5 are off unless the value is exactly `1` (after trimming blanks). Two pieces are ON by default
+//! because a session of several games needs them to stay in step: the single-worker script pool (3) and the Lua seed pin
+//! (6); `FEVERLINK3_POOLPATCH=0` and `FEVERLINK3_LUA_SEED=0` turn them off. Both stay fail-open: an unknown build or other
+//! bytes at the site install nothing and the reason is logged.
 
 use crate::build_table::{BuildAddrs, PatchSite, Rva};
 use crate::growth::Settings;
@@ -85,15 +87,16 @@ impl HookConfig {
     /// Reads the switches through `get` (the environment in the module, a map in the tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> HookConfig {
         let on = |name: &str| get(name).is_some_and(|v| v.trim() == "1");
+        let off = |name: &str| get(name).is_some_and(|v| v.trim() == "0");
         let force_seed = forced_seed(&get).ok().flatten();
         HookConfig {
             hooks: on(HOOKS_VAR),
             hold: on(HOLD_VAR),
-            poolpatch: on(POOLPATCH_VAR),
+            poolpatch: !off(POOLPATCH_VAR),
             town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
             force_seed,
             growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
-            luaseed: get(LUA_SEED_VAR).is_some_and(|v| v.trim() == "fixed"),
+            luaseed: !off(LUA_SEED_VAR),
         }
     }
 
@@ -587,23 +590,29 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
         };
-        assert_eq!(HookConfig::from_lookup(env(&[])), HookConfig::default());
+        let defaults = HookConfig { poolpatch: true, luaseed: true, ..Default::default() };
+        assert_eq!(HookConfig::from_lookup(env(&[])), defaults, "the pool patch and the seed pin are on by default");
         assert!(!HookConfig::default().any());
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
-        assert_eq!(all, cfg(true, true, true));
+        assert_eq!(all, HookConfig { luaseed: true, ..cfg(true, true, true) });
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
             let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
-            assert_eq!(c, HookConfig::default(), "{off:?} must not switch anything on");
+            let on_by_default = off.trim() != "0";
+            assert_eq!(
+                c,
+                HookConfig { poolpatch: on_by_default, luaseed: on_by_default, ..Default::default() },
+                "{off:?} must not switch anything else on"
+            );
         }
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=off town_seed=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off");
         assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off luaseed=off town_seed=off");
         let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
-        assert!(seed.any() && seed.town_seed && !seed.hooks && !seed.hold && !seed.poolpatch, "its own switch");
-        assert_eq!(seed.describe(), "hooks=off hold=off poolpatch=off luaseed=off town_seed=on");
-        assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).any(), "only the exact value 1");
+        assert!(seed.any() && seed.town_seed && !seed.hooks && !seed.hold, "its own switch");
+        assert_eq!(seed.describe(), "hooks=off hold=off poolpatch=on luaseed=on town_seed=on");
+        assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).town_seed, "only the exact value 1");
     }
 
     #[test]
@@ -620,9 +629,9 @@ mod tests {
         }
         let c = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "0x10")]));
         assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
-        assert_eq!(c.describe(), "hooks=off hold=off poolpatch=off luaseed=off town_seed=on force_seed=0x00000010");
+        assert_eq!(c.describe(), "hooks=off hold=off poolpatch=on luaseed=on town_seed=on force_seed=0x00000010");
         let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
-        assert_eq!(bad, HookConfig::default(), "an invalid value switches nothing on");
+        assert_eq!(bad, HookConfig::from_lookup(env(&[])), "an invalid value switches nothing on");
         assert!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "nope")])).is_err());
         assert_eq!(forced_seed(env(&[])), Ok(None));
         assert_eq!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "  ")])), Ok(None));
@@ -799,6 +808,7 @@ mod tests {
         let b = select(0x6ac5_0427).unwrap();
         let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
         assert!(deep.any() && deep.growth.deep);
+        let deep = HookConfig { poolpatch: false, luaseed: false, ..deep }; // on by default; not what this test is about
         let p = plan(b, deep, &image_of_40420());
         assert_eq!(
             names(&p),
@@ -822,6 +832,7 @@ mod tests {
         assert!(p.skipped.iter().any(|s| s.name == "town_pick" && s.reason.starts_with("callee: ")), "{:?}", p.skipped);
         // without the deep switch neither is planned
         let log = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH", "1")]));
+        let log = HookConfig { poolpatch: false, luaseed: false, ..log };
         assert_eq!(names(&plan(b, log, &image_of_40420())), ["town_develop", "town_update_size"]);
     }
 
@@ -944,12 +955,14 @@ mod tests {
     }
 
     #[test]
-    fn the_seed_switch_is_exactly_fixed() {
+    fn the_seed_pin_is_on_unless_zero() {
         let env = |v: Option<&'static str>| {
             HookConfig::from_lookup(move |n| if n == LUA_SEED_VAR { v.map(String::from) } else { None })
         };
-        assert!(env(Some("fixed")).luaseed && env(Some(" fixed ")).luaseed);
-        for off in [None, Some(""), Some("0"), Some("1"), Some("FIXED"), Some("on")] {
+        for on in [None, Some(""), Some("fixed"), Some("1"), Some("on")] {
+            assert!(env(on).luaseed, "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0 ")] {
             assert!(!env(off).luaseed, "{off:?}");
         }
         assert!(env(Some("fixed")).any(), "the seed pin alone makes the module touch the game's code");
