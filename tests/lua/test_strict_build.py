@@ -1107,20 +1107,50 @@ class StrictCancelFallbackTest(StrictTest):
         self.assertEqual(self.relay.vetoes, [], "the originator replays it itself: nothing to cancel, the refusal at the stamp is the old one")
 
 
-class DefaultCancelFlowTest(StrictTest):
-    """FEVERLINK3_STRICT_CANCEL unset: road (street, combined) and bulldoze builds are cancelled and replayed on every game."""
+class DefaultHoldAndReleaseTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL unset: every build, host's or guest's, is held and released (the tool gets its callback and keeps its
+    ghost); nothing is cancelled."""
 
     strict_cancel = None
 
-    def test_a_road_build_is_cancelled_and_replayed_everywhere_by_default(self):
+    def test_a_road_build_of_either_game_is_held_and_released_by_default(self):
+        self.start()
+        self.A.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.A.native.released, self.A.native.dropped), ([1], []))
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertNotIn("cancel flow", self.log())
+
+
+class CancelFlowChoiceTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=plans / host: cancel-and-replay for roads and bulldozing, for every originator or the host only."""
+
+    strict_cancel = "plans"
+
+    def test_plans_cancels_the_roads_of_the_guest_too(self):
         self.start()
         self.B.tool(SPLIT, make="NATIVE_SPLIT")
         self.tick(24)
-        self.assertEqual(self.B.native.dropped, [1])
-        self.assertEqual(self.B.native.released, [])
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertSameWorld()
         self.assertIn("cancel flow", self.B.log())
+
+
+class CancelFlowHostOnlyTest(StrictTest):
+    strict_cancel = "host"
+
+    def test_host_cancels_and_a_guest_keeps_hold_and_release(self):
+        self.start()
+        self.A.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.A.native.dropped, self.A.native.released), ([1], []))
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
 
 
 class HoldAndReleaseSwitchTest(StrictTest):
@@ -1132,6 +1162,41 @@ class HoldAndReleaseSwitchTest(StrictTest):
         self.tick(16)
         self.assertEqual(self.B.native.released, [1])
         self.assertEqual(self.B.native.dropped, [])
+        self.assertSameWorld()
+
+
+class ConstructionBlockTest(StrictTest):
+    """FEVERLINK3_REMOTE_CONSTRUCTIONS unset: a build that adds a construction is cancelled at the originator (with a chat line) and
+    replayed by nobody; roads still work."""
+
+    def setUp(self):
+        self._old_rc = os.environ.pop("FEVERLINK3_REMOTE_CONSTRUCTIONS", None)
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        if self._old_rc is not None:
+            os.environ["FEVERLINK3_REMOTE_CONSTRUCTIONS"] = self._old_rc
+
+    DEPOT = "{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }"
+
+    def test_a_depot_build_is_cancelled_with_a_message_and_no_game_builds_it(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        self.assertEqual(self.B.native.dropped, [1], "the originator's command is cancelled")
+        self.assertEqual(self.B.native.released, [])
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+        self.assertEqual(self.B.shipped_count(), 0, "nothing is shipped")
+        self.assertNotIn("C depot/road_depot.con", self.A.sig() + self.B.sig())
+        self.assertIn("not supported yet in this test build", self.B.log())
+        self.assertSameWorld()
+
+    def test_a_road_still_goes_through(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertSameWorld()
 
 

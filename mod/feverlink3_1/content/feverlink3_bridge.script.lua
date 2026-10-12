@@ -56,18 +56,22 @@ end
 local DEV = false
 pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 
--- Strict mode, how the ORIGINATING game applies its own build. Default: for the build kinds real two-game runs proved (the plans in
--- STRICT_CANCEL_PLANS: street, combined, bulldoze) the tool's command is cancelled when the build is shipped and EVERY game, the
--- originator's included, replays the same rebuilt record at the stamp. All worlds then allocate the same entity ids (applying the
--- tool's own command on one game and a rebuilt record on the others gave different ids, and everything keyed by id drifted a few
--- game minutes later). The tool is kept usable by the native module, which fires the tool's completion callback before it drops the
--- command (FEVERLINK3_STRICT_FIRE_DONE, default on in the native module). Every other kind keeps hold-and-release (hold until the
--- stamp, then the engine applies the tool's own command on the originator). FEVERLINK3_STRICT_CANCEL=0 is the developer switch back
--- to hold-and-release for everything; =1 cancels every kind.
-local STRICT_CANCEL = "plans"
+-- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
+--   unset / "0"  DEFAULT: hold-and-release for every build. The tool's command is held until the stamp and then released, so the tool gets its
+--                completion callback and its preview/ghost keeps working. The originator's engine applies the tool's own command while the
+--                other games replay a rebuilt record: they allocate different entity ids for the same build and the worlds drift apart a few
+--                game minutes later (lab runs 2026-10-12), which the checksum safety net repairs with a resync.
+--   "plans"      cancel-and-replay on EVERY game, the originator included, for the plans street, combined and bulldoze (all originators).
+--   "host"       the same, but only when this game is the host (the guest keeps hold-and-release).
+--   "1"          cancel-and-replay for every kind and every originator.
+-- Cancel-and-replay keeps all worlds identical (N0 runs: 0 resyncs in 30 game minutes) but a cancelled command never gives the tool its
+-- completion callback: in the first real two-player session the guest's street tool showed no ghost for the second road he built
+-- (the click still built it). TpF2 fires the callback before it cancels; that is not implemented here (the callback's signature on this
+-- build is unverified), so the cancel flow is opt-in until it is.
+local STRICT_CANCEL = "off"
 pcall(function()
 	local v = os.getenv("FEVERLINK3_STRICT_CANCEL")
-	if v == "0" then STRICT_CANCEL = "off" elseif v == "1" then STRICT_CANCEL = "all" end
+	if v == "1" then STRICT_CANCEL = "all" elseif v == "plans" or v == "host" then STRICT_CANCEL = v end
 end)
 local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
 local CANCEL_EXTRA_STEPS = 6   -- extra steps of lead for a build every game applies at the stamp (see natDecideUnsafe)
@@ -652,9 +656,12 @@ end
 -- The engine tells the game script about every build it applies (`apply_command` / `onPreBuildProposal`, just before
 -- it runs; finding from MPFever (MIT)). A replay of an action (a build rebuilt from a shipped record) must not be
 -- shipped again, so each one is counted here when it is sent and spent when its event arrives.
-local function markReplay(st, now, state, key)
+-- `noPlayer` (the command's playerInitiated flag is false: the second command of a construction next to a street) counts in its
+-- own counter, spent only by an event whose playerInitiated is false too; a town's own build has that flag as well, so such a
+-- mark can still be spent by the wrong event, but a real tool build (flag true) can never be swallowed by it.
+local function markReplay(st, now, state, key, noPlayer)
 	local r = st.replay
-	if type(r) == "table" and r.n > 0 and now - (r.at or 0) > REPLAY_STEPS * STEP then
+	if type(r) == "table" and (r.n > 0 or (r.nf or 0) > 0) and now - (r.at or 0) > REPLAY_STEPS * STEP then
 		-- A mark that no engine event ever spent: the engine did not run the command that was sent (an apply the engine refuses
 		-- raises no event and no error here, the simulation state has no callback). This is the first sign of a world that
 		-- diverges from the originator's, so it is logged and noted for the actions that follow (it ships with them).
@@ -663,9 +670,9 @@ local function markReplay(st, now, state, key)
 		if r.key then st.notes = st.notes or {}; L.addNote(st.notes, now, "the engine did not run the replayed build " .. r.key) end
 		r = nil
 	end
-	if type(r) ~= "table" or now - (r.at or 0) > REPLAY_STEPS * STEP then r = { n = 0, at = now } end
+	if type(r) ~= "table" or now - (r.at or 0) > REPLAY_STEPS * STEP then r = { n = 0, nf = 0, at = now } end
 	if key then r.key = key end
-	r.n = r.n + 1
+	if noPlayer then r.nf = (r.nf or 0) + 1 else r.n = r.n + 1 end
 	r.at = now
 	st.replay = r
 	-- The engine may announce the build while the command is still being sent (seen in a real game: the guest captured its
@@ -682,14 +689,20 @@ local function takeBackEvents(st, state)
 	st.replay, st.out, st.outSeq = fresh.replay, fresh.out or st.out, fresh.outSeq or st.outSeq
 end
 
-local function spendReplay(st, now)
+local function spendReplay(st, now, noPlayer)
 	local r = st.replay
-	if type(r) ~= "table" or r.n <= 0 then return false end
+	if type(r) ~= "table" or (r.n <= 0 and (r.nf or 0) <= 0) then return false end
 	if now - (r.at or 0) > REPLAY_STEPS * STEP then
 		st.replay = nil
 		return false
 	end
-	r.n = r.n - 1
+	if noPlayer then
+		if (r.nf or 0) <= 0 then return false end
+		r.nf = r.nf - 1
+	else
+		if r.n <= 0 then return false end
+		r.n = r.n - 1
+	end
 	return true
 end
 
@@ -767,10 +780,11 @@ local function simCaptureBuild(state, param, post)
 	-- timeout unrecognised and was shipped a second time as 0:7.
 	local piEarly = nil
 	pcall(function() piEarly = param[4] end)
-	-- A replayed record carries playerInitiated = true, so only a build with that flag can be one: a town's own road (false) that the
-	-- engine announces between the mark and the replay's event must not spend the mark, or the replay is taken for a new tool build
-	-- and shipped back (the echo seen in lab runs N0-1 and N0-4: the other game refused the duplicate road).
-	if not post and piEarly ~= false and spendReplay(st, now) then
+	-- A replay that is playerInitiated (the flag of an event) spends only a mark counted for that flag: a town's own road (false) that
+	-- the engine announces between the mark and the replay's event must not spend the mark of a flag-true replay, or the replay is
+	-- taken for a new tool build and shipped back (the echo seen in lab runs N0-1 and N0-4: the other game refused the duplicate
+	-- road). The second command of a construction beside a street has the flag false and is counted apart (markReplay).
+	if not post and spendReplay(st, now, piEarly == false) then
 		state:set(st)
 		return
 	end
@@ -814,6 +828,13 @@ local function simCaptureBuild(state, param, post)
 	end
 	body.native = true
 	body.category = buildCategory(body)
+	if Build.constructionsBlocked and Build.constructionsBlocked(body) then
+		-- degraded mode (no native module): the build is in this world already and cannot be taken back; the others would refuse it
+		logSim("a native build at t=" .. now .. " adds constructions: not shipped in this test build (" .. tostring(Build.CONSTRUCTIONS_BLOCKED_TEXT) .. "); this world will differ until a resync")
+		simNote(st, now, "a build with constructions was not shipped (" .. tostring(Build.CONSTRUCTIONS_BLOCKED_TEXT) .. ")")
+		state:set(st)
+		return
+	end
 	local okS, text = pcall(C.serialize, body)
 	if not okS then
 		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(text))
@@ -897,7 +918,7 @@ local function simApplyAction(st, it, now)
 		ok, e = pcall(function()
 			L.sendNow(args, function(a)
 				local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
-				if isBuild then markReplay(st, now, SIM.state, it.key) end
+				if isBuild then markReplay(st, now, SIM.state, it.key, a[4] == false) end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -1989,6 +2010,14 @@ local function natDecideUnsafe(h, cap)
 		natOrder("cancel", id)
 		return
 	end
+	-- STOP-GAP: a build that adds constructions (depot, station, ...) is not replicated in this test build (see the build module).
+	-- Nothing was applied yet, so the tool's command is cancelled and the player is told in the chat.
+	if Build and Build.constructionsBlocked and Build.constructionsBlocked(body) then
+		natSay("held " .. id .. ": adds constructions (" .. tostring(cap.tool) .. "), not replicated in this test build: cancelled")
+		natOrder("cancel", id)
+		vetoChat("gate:" .. tostring(id) .. ":" .. tostring(os.clock()), "Your build was cancelled: " .. Build.CONSTRUCTIONS_BLOCKED_TEXT .. ". Roads, bulldozing and stops still work. (If the tool stops reacting, press Esc and pick it again.)")
+		return
+	end
 	-- never cancel what this game could not rebuild itself (docs/ARCHITECTURE.md section 6)
 	local wire = C.parse(text)
 	local now = engine.gameTime()
@@ -1998,7 +2027,8 @@ local function natDecideUnsafe(h, cap)
 	local seq = G.seq + 1
 	local at
 	local cancelFlow = STRICT_CANCEL == "all"
-	if STRICT_CANCEL == "plans" then
+	-- "plans": every originator, "host": only the host, for the proven plans (see the comment at STRICT_CANCEL).
+	if STRICT_CANCEL == "plans" or (STRICT_CANCEL == "host" and C.PLAYER_ID == 0) then
 		local okP, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
 		cancelFlow = okP and STRICT_CANCEL_PLANS[plan or ""] == true
 	end
