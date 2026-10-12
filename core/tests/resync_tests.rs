@@ -739,6 +739,27 @@ fn starting_with_games_at_the_same_time_does_not_start_a_round() {
     assert_eq!(Some(10_000), h.host.state().pause_at);
 }
 
+// ------------------------------------------------------------------ a reloading host loads while the players download
+
+#[test]
+fn a_reloading_host_is_told_to_load_when_the_save_is_announced_and_may_say_hello_before_the_players_do() {
+    let (mut h, ids) = Harness::running(2, 3, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let pause_at = h.host.state().pause_at.expect("pause stamp");
+    let id = h.reach_transferring();
+    let bytes = blob(600 * 1024);
+    h.send_file(id, &bytes);
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(1, h.host_game_count(MessageKind::ResyncLoad), "the host's game is told exactly once");
+    for &c in &ids {
+        assert_eq!(1, h.p(c).count(MessageKind::ResyncLoad));
+    }
+    h.hello_all(pause_at, 0);
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    assert_eq!(1, h.host_game_count(MessageKind::ResyncLoad));
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+}
+
 // ------------------------------------------------------------------ a host whose game does not reload
 
 #[test]

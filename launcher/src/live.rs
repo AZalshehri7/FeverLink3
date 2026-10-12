@@ -275,11 +275,11 @@ impl Controller {
             dir,
             default_name,
             save_dirs,
-            // The host's own game keeps playing in a resync round (only the other games load the saved world): the
-            // paused checksum after the round checks that they still match, and a difference fails the round as ever.
-            // FEVERLINK3_HOST_RELOAD=1 brings the old behaviour back (every game, the host's included, loads the save).
+            // Every game, the host's included, loads the saved world in a resync round: a live world and a freshly
+            // loaded one of the same save drift apart (lab runs E1 vs E2/E3), two fresh loads do not. The host loads
+            // while the players still download. FEVERLINK3_HOST_RELOAD=0 keeps the host's live world (it drifts).
             host_options: HostOptions {
-                host_reloads: std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "1"),
+                host_reloads: !std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "0"),
                 // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
                 // resync is requested", but none is started by itself; only the window's Sync button starts one.
                 auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),

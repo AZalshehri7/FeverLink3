@@ -116,7 +116,7 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 
 ## Resync round
 
-A resync makes every other game load the host game's save (and the host's own game too when `HostOptions::host_reloads` is true, the library default; the in-game module sets it to false, see "Host that does not reload" below). It runs in the host's state machine (`resync_state()`: `Idle`, `Pausing`, `Saving`, `Transferring`, `Loading`, `Verifying`), is driven by incoming messages and by `tick()` with the host's clock, and has one round at a time. Each round has an id (1, 2, ...). The session must be started. Every state change is reported to the host's UI as `ResyncProgress`; the session stays paused after a failed round.
+A resync makes every other game load the host game's save (and the host's own game too when `HostOptions::host_reloads` is true, the library default; the in-game module also reloads it unless `FEVERLINK3_HOST_RELOAD=0`, see "Host that does not reload" below). It runs in the host's state machine (`resync_state()`: `Idle`, `Pausing`, `Saving`, `Transferring`, `Loading`, `Verifying`), is driven by incoming messages and by `tick()` with the host's clock, and has one round at a time. Each round has an id (1, 2, ...). The session must be started. Every state change is reported to the host's UI as `ResyncProgress`; the session stays paused after a failed round.
 
 ```
 Pausing       host sets pauseAt (the usual future stamp; a pause already in force is kept) and broadcasts Session.
@@ -134,7 +134,7 @@ Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused:
               Different: ResyncFailed, the session stays paused, round Idle.
 ```
 
-**Host that does not reload (`host_reloads = false`).** The host's game saves the world only to send it and keeps playing its live world, so the host never sees a loading screen; only the players load. The paused checksum in Verifying is then the proof that the host's live world and the players' loaded copies agree: a difference fails the round and leaves the session paused exactly as in the reloading case. The checksum covers money, loan, constructions, lines and time, not every part of the simulation, so a world with many vehicles is the place to watch for drift. `FEVERLINK3_HOST_RELOAD=1` makes the in-game module reload the host too.
+**Host that does not reload (`host_reloads = false`).** The host's game saves the world only to send it and keeps playing its live world, so the host never sees a loading screen; only the players load. The paused checksum in Verifying is then the proof that the host's live world and the players' loaded copies agree: a difference fails the round and leaves the session paused exactly as in the reloading case. The checksum covers money, loan, constructions, lines and time, not every part of the simulation, so a world with many vehicles is the place to watch for drift. `FEVERLINK3_HOST_RELOAD=0` selects this mode in the in-game module; it is not the default because a live world drifts from a freshly loaded one. With `host_reloads` the host is sent its `ResyncLoad` as soon as the save is announced (during `Transferring`), so it reloads while the players download.
 
 **Timeouts.** Pausing, Saving and Transferring end the round with `ResyncFailed` (reason names what was missing). Loading does not fail: the host logs the players that sent no Hello and continues with the ones that did. Verifying fails. Transferring and Verifying timeouts are not in the original design; they exist so a round cannot wait forever.
 

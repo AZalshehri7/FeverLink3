@@ -45,6 +45,9 @@ pub(super) struct ResyncRound {
     verify_n: Option<i32>,
     /// Paused verify rounds that came back not comparable (the games reported different sim times): asked again.
     verify_skews: u8,
+    /// The host's game was sent the load while the players are still receiving the save (it is paused, so it can
+    /// reload in that time instead of after it).
+    host_loading: bool,
 }
 
 impl HostSession {
@@ -183,6 +186,7 @@ impl HostSession {
             bulk: BTreeSet::new(),
             verify_n: None,
             verify_skews: 0,
+            host_loading: false,
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -356,6 +360,7 @@ impl HostSession {
         }
         if remote {
             self.progress(format!("sending {len} bytes in {count} chunk(s)"));
+            self.load_host_early();
         } else {
             self.enter_loading();
             self.resync_step();
@@ -399,8 +404,29 @@ impl HostSession {
         }
     }
 
+    /// With a reloading host the host's game loads its own save now, while the players download it: the host is paused
+    /// and its file is already complete, so the reload costs no extra time after the transfer.
+    fn load_host_early(&mut self) {
+        if !self.options.host_reloads {
+            return;
+        }
+        let Some(r) = self.resync.as_ref() else { return };
+        let (id, sha256) = (r.id, r.file.as_ref().map(|f| f.sha256.clone()).unwrap_or_default());
+        if let Some(p) = self.players.get_mut(&Self::HOST_ID) {
+            p.ready = false;
+        }
+        self.clocks.remove(&Self::HOST_ID);
+        if let Some(r) = self.resync.as_mut() {
+            r.host_loading = true;
+        }
+        let load = ResyncLoadMessage { id, name: format!("feverlink3-resync-{id}"), sha256 };
+        let host: BTreeSet<u16> = [Self::HOST_ID].into_iter().collect();
+        self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &host);
+    }
+
     fn enter_loading(&mut self) {
         let host_reloads = self.options.host_reloads;
+        let host_loading = self.resync.as_ref().is_some_and(|r| r.host_loading);
         if !host_reloads {
             // the host's game keeps its live world: it is not sent the load, owes no new hello and keeps its clock
             if let Some(participants) = self.resync.as_mut().and_then(|r| r.participants.as_mut()) {
@@ -411,16 +437,25 @@ impl HostSession {
         let (id, participants) = (r.id, r.participants.clone().unwrap_or_default());
         let sha256 = r.file.as_ref().map(|f| f.sha256.clone()).unwrap_or_default();
         for p in self.players.values_mut() {
+            if p.id == Self::HOST_ID && host_loading {
+                continue; // loaded early: its hello may already be in
+            }
             p.ready = p.id == Self::HOST_ID && !host_reloads;
         }
-        if host_reloads {
+        if host_loading {
+            self.clocks.retain(|&id, _| id == Self::HOST_ID);
+        } else if host_reloads {
             self.clocks.clear();
         } else {
             self.clocks.retain(|&id, _| id == Self::HOST_ID);
         }
         self.enter(ResyncState::Loading, format!("loading; waiting for {} game(s)", participants.len()));
         let load = ResyncLoadMessage { id, name: format!("feverlink3-resync-{id}"), sha256 };
-        self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &participants);
+        let mut to_load = participants;
+        if host_loading {
+            to_load.remove(&Self::HOST_ID);
+        }
+        self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &to_load);
     }
 
     fn enter_verifying(&mut self) {

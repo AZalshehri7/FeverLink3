@@ -124,7 +124,7 @@ Known residual drift (vehicle positions, passengers) is tolerated: it is compare
 
   Cost per round is one component read per entity (station groups and their terminal nodes, road edges and nodes and edge objects, vehicles, named entities) plus a sort and one hash; roads dominate, so a large map is tens of milliseconds, in the simulation script. Vehicle ids are left out on purpose: ids are not guaranteed equal between games and a permanent false difference would reload every 5 minutes. The launcher log names the lanes ("checksum 12 differs in stations, vehicles (drift)").
 - **Money** is corrected in place from the host's values. **Drift parts** reload only after 5 minutes. **Everything else** reloads after two consecutive differing checks, or at once when a replay fails.
-- **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → every other game loads it (the host's own game keeps playing its live world; `host_reloads` turns the host's reload back on) → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
+- **Resync**: pause at a stamp → wait for all clocks to stop → host saves under a unique name → SHA-256 → stream to players → every game loads it, the host's own game included (it loads while the players still download; a live world and a freshly loaded one drift apart, so `FEVERLINK3_HOST_RELOAD=0` is only for experiments) → paused checksum must match → resume at the previous speed. A joiner goes through the same round.
 
 ## 9. Game builds
 
