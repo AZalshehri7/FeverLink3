@@ -1200,6 +1200,28 @@ class ConstructionDefaultTest(StrictTest):
         self.assertIn("experimental in this test build", self.relay.chats[0][1])
 
 
+class BuildLogLinesTest(StrictTest):
+    """Every build that is applied has one `build <key> (replay|originator): ...` line before it is applied, with the plan, the counts and
+    the engine's verdict, in mod.log of every run (not only when paused)."""
+
+    DEPOT = ConstructionDefaultTest.DEPOT
+
+    def test_the_receiver_logs_a_replay_line_and_the_originator_its_own(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        import re
+        self.assertRegex(self.A.log(), r"build 1:1 \(replay\): plan=\w+ cons=1 rem=0 nodes=\d+ segs=\d+ rmSegs=\d+ objs=\d+; adds \[[^\]]+\]; verdict .*; ie=\w+ pi=\w+")
+        self.assertRegex(self.B.log(), r"build 1:1 \(originator\): plan=\w+ cons=1 ")
+
+    def test_a_road_has_the_line_too_without_the_removal_lists(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertRegex(self.A.log(), r"build 1:1 \(replay\): plan=street cons=0 rem=0 ")
+        self.assertNotIn("removes [", self.A.log())
+
+
 class ConstructionBlockTest(StrictTest):
     """FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers): a build that adds a construction is cancelled at the originator (with a chat line)
     and replayed by nobody, but only when the native module can fire the tool's callback; otherwise it stays hold-and-release."""

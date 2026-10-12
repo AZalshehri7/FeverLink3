@@ -2024,6 +2024,31 @@ function M.constructionsBlocked(body)
 	return ok and blocked == true
 end
 
+-- What a build record holds, for the log: the plan, the counts, the constructions it adds ("file@x,y") and removes ("file@x,y[key]"),
+-- each list cut at 4. Never raises; nil when the body is not a build record.
+function M.recSummary(body)
+	local ok, s = pcall(function()
+		local rec = normalise(body.args[1])
+		if type(rec) ~= "table" then return nil end
+		local function p3(x, y) return string.format("%.1f,%.1f", x or 0, y or 0) end
+		local add, rem = {}, {}
+		for i, c in ipairs(rec.cons or {}) do
+			if i > 4 then add[#add + 1] = "..." break end
+			local t = c.transf or {}
+			add[#add + 1] = tostring(c.file) .. "@" .. p3(t[13], t[14])
+		end
+		for i, r in ipairs(rec.rem or {}) do
+			if i > 4 then rem[#rem + 1] = "..." break end
+			local p = r.p or {}
+			rem[#rem + 1] = tostring(r.file) .. "@" .. p3(p.x, p.y) .. (r.key and ("[" .. tostring(r.key) .. "]") or "")
+		end
+		local plan = M.planOf(body)
+		return { plan = plan or "?", cons = #(rec.cons or {}), rem = #(rec.rem or {}), nodes = #(rec.nodes or {}), segs = #(rec.segs or {}),
+			rmSegs = #(rec.rmSegs or {}), objs = #(rec.objs or {}), add = add, remove = rem }
+	end)
+	return ok and s or nil
+end
+
 -- true when the record adds or removes constructions (a station that takes town buildings away counts)
 function M.addsOrRemovesConstructions(body)
 	local ok, yes = pcall(function()

@@ -688,22 +688,57 @@ local function engineVerdict(args)
 	return critical, msgs, warns
 end
 
--- Logged at the replay of a build that adds or removes constructions (a cargo station that takes town buildings away): the engine's own
--- verdict on the proposal as this game rebuilt it, so that a build the engine refuses has its reason in the log (the simulation state has
--- no callback, a refused command raises nothing). Observation only; says why once if the game does not let this state ask.
+-- One log line for EVERY build this game applies, before it is applied (the replay of another game's build, and the originator's own
+-- build when it is held and released): the plan, the counts, what it adds and removes, how many removals resolved to an entity in THIS
+-- world (and which), and the engine's own verdict on the proposal as this game rebuilt it (errorState), so that a build the engine
+-- refuses has its reason in the log (the simulation state has no callback and a refused command raises nothing).
+--   build <key> (replay|originator): plan=.. cons=.. rem=.. nodes=.. segs=.. rmSegs=.. objs=..; adds [file@x,y ..]; removes [file@x,y[key] ..];
+--   resolved removals <n> of <m> [ids]; verdict critical=<bool> messages=[..] warnings=[..]; ie=<bool> pi=<bool>
+-- Observation only, never raises. Returns what the failure line of the binder needs (the same facts).
 local REPLAY_VERDICT = { failed = false }
-local function logReplayVerdict(key, a, rec)
-	if REPLAY_VERDICT.failed then return end
-	local critical, msgs, warns = engineVerdict(a)
-	if critical == nil and msgs then
-		REPLAY_VERDICT.failed = true
-		logSim("the engine's verdict on a replayed build cannot be read from this state (" .. tostring(msgs) .. "); no refusal reasons will be logged")
-		return
+local function describeBuild(it, args, role)
+	local ok, text, info = pcall(function()
+		local sum = Build and Build.recSummary and Build.recSummary(it.body)
+		if not sum then return nil end
+		local parts = { string.format("plan=%s cons=%d rem=%d nodes=%d segs=%d rmSegs=%d objs=%d", sum.plan, sum.cons, sum.rem, sum.nodes, sum.segs, sum.rmSegs, sum.objs) }
+		if #sum.add > 0 then parts[#parts + 1] = "adds [" .. table.concat(sum.add, " ") .. "]" end
+		if #sum.remove > 0 then parts[#parts + 1] = "removes [" .. table.concat(sum.remove, " ") .. "]" end
+		local ids, n = {}, 0
+		pcall(function()
+			local l = args[1].constructionsToRemove
+			n = #l
+			for i = 1, math.min(n, 6) do ids[#ids + 1] = tostring(l[i]) end
+		end)
+		if sum.rem > 0 or n > 0 then parts[#parts + 1] = string.format("resolved removals %d of %d [%s]", n, sum.rem, table.concat(ids, " ")) end
+		local verdict = "n/a"
+		if not REPLAY_VERDICT.failed then
+			local critical, msgs, warns = engineVerdict(args)
+			if critical == nil and msgs then
+				REPLAY_VERDICT.failed = true
+				logSim("the engine's verdict on a rebuilt build cannot be read from this state (" .. tostring(msgs) .. "); the build lines say verdict n/a from now on")
+			elseif critical ~= nil then
+				verdict = string.format("critical=%s messages=[%s] warnings=[%s]", tostring(critical), table.concat(msgs, "; "), table.concat(warns, "; "))
+			end
+		end
+		parts[#parts + 1] = "verdict " .. verdict
+		parts[#parts + 1] = string.format("ie=%s pi=%s", tostring(args[3] == true), tostring(args[4] == true))
+		return table.concat(parts, "; "), { sum = sum, removed = ids, removedN = n, verdict = verdict }
+	end)
+	if ok and text then
+		logSim(string.format("build %s (%s): %s", it.key, role, text))
+		return info
 	end
-	if critical or #msgs > 0 or #warns > 0 then
-		logSim(string.format("replay %s: the engine's verdict before applying (critical=%s) messages=[%s] warnings=[%s]%s", key, tostring(critical),
-			table.concat(msgs, "; "), table.concat(warns, "; "), (a[3] == true and ", errors ignored" or ", errors NOT ignored") .. ((Build and Build.REPLAY_IGNORE_ERRORS) and " (FEVERLINK3_REPLAY_IGNORE_ERRORS=1)" or "")))
-	end
+	return nil
+end
+
+-- How a CONSTRUCTION entity of this world looks in the log: file@x,y
+local function conLine(e)
+	local ok, t = pcall(function()
+		local c = api.engine.getComponent(e, api.type.ComponentType.CONSTRUCTION)
+		local m = c and c.transf
+		return string.format("%s@%.1f,%.1f", tostring(c and c.fileName), m and m[13] or 0, m and m[14] or 0)
+	end)
+	return ok and t or tostring(e)
 end
 
 -- `noPlayer` (the command's playerInitiated flag is false: the second command of a construction next to a street) counts in its
@@ -964,13 +999,15 @@ local function simApplyAction(st, it, now)
 	-- "#release" result below, after this snapshot (so the new entities are not in it).
 	local held = it.heldId ~= nil and it.from == C.PLAYER_ID
 	local ok, e = true, nil
+	local preInfo = nil
+	if held and it.body.fn == "makeWorldBuildProposalCmd" then preInfo = describeBuild(it, args, "originator") end
 	if not held then
 		ok, e = pcall(function()
 			L.sendNow(args, function(a)
 				local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
 				if isBuild then
 					markReplay(st, now, SIM.state, it.key, a[4] == false)
-					if Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(it.body) then pcall(logReplayVerdict, it.key, a) end
+					if isBuild and not preInfo then preInfo = describeBuild(it, a, "replay") end
 				end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
@@ -985,7 +1022,7 @@ local function simApplyAction(st, it, now)
 	coAfter(ctx, it, spec, category, balance0, logSim)
 	logSim("action " .. it.key .. " " .. it.body.fn .. (held and (" due at t=" .. now .. ": the native module holds this game's own copy (held " .. tostring(it.heldId) .. "), the interface half releases it") or (" applied at t=" .. now)))
 	if bindComps then
-		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0 }
+		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0, pre = preInfo }
 	end
 	if spec.creates then
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
@@ -1077,7 +1114,29 @@ local function simAdvanceBinders(st, now)
 		if complete then
 			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
 		elseif b.steps >= WATCH_STEPS then
-			logSim("action " .. b.key .. ": not every entity it created was found after " .. b.steps .. " steps (a build the engine refuses creates nothing; its reason is only logged for a build applied during a pause)")
+			-- what is missing and why: the counts the record promised against what this world shows now
+			local ok2, why = pcall(function()
+				local pre = b.pre
+				local sum = pre and pre.sum or (Build and Build.recSummary and Build.recSummary(b.body)) or {}
+				local found = {}
+				for _, comp in ipairs(b.comps) do
+					if comp == "CONSTRUCTION" then
+						for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
+							if #found < 6 then found[#found + 1] = conLine(e) end
+						end
+					end
+				end
+				local still, total = 0, 0
+				for _, id in ipairs(pre and pre.removed or {}) do
+					total = total + 1
+					local idn = tonumber(id)
+					if idn and pcall(function() assert(api.engine.getComponent(idn, api.type.ComponentType.CONSTRUCTION)) end) then still = still + 1 end
+				end
+				return string.format("expected %d construction(s) %s, found %d new CONSTRUCTION-like entit%s [%s]; removed buildings still present: %d of %d checked; the engine's verdict before applying: %s",
+					sum.cons or 0, "[" .. table.concat(sum.add or {}, " ") .. "]", #found, #found == 1 and "y" or "ies", table.concat(found, " "), still, total,
+					pre and pre.verdict or "n/a (see the build line)")
+			end)
+			logSim("action " .. b.key .. ": RESULT DIFFERS from the record after " .. b.steps .. " steps: " .. (ok2 and why or ("(" .. tostring(why) .. ")")) .. " [not every entity it created was found; a build the engine refuses creates nothing]")
 			simNote(st, now, "action " .. b.key .. " did not find every entity it created")
 		else
 			keep[#keep + 1] = b
