@@ -47,11 +47,6 @@ pub struct HostOptions {
     /// With a reloading host: send the host's game its load while the players still download (default true) instead of
     /// together with them after the transfer. A lab experiment switch (FEVERLINK3_HOST_LOAD_EARLY=0).
     pub host_loads_early: bool,
-    /// Seconds after the LAST build or bulldoze of a session of two or more games at which the host starts a resync, so
-    /// that every game reloads the same saved world (0 turns it off). Lab runs 2026-10-12: two live worlds that applied
-    /// the same builds drift apart about three game minutes later, a reload removes it. An experiment switch only: it is
-    /// NOT a solution (a reload after every build), so it is off by default.
-    pub resync_after_builds_seconds: f64,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -87,7 +82,6 @@ impl Default for HostOptions {
             auto_resync: true,
             host_reloads: true,
             host_loads_early: true,
-            resync_after_builds_seconds: 0.0,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,
@@ -236,8 +230,6 @@ pub struct HostSession {
     /// stayed lower for a while, so a single quick ping cannot make it too short).
     lead_lower_since: Option<f64>,
     last_checksum: f64,
-    /// When the resync after the latest builds is due (see [`HostOptions::resync_after_builds_seconds`]).
-    build_resync_due: Option<f64>,
     host_name: String,
     state: SessionState,
     actions_relayed: u64,
@@ -307,7 +299,6 @@ impl HostSession {
             last_session_broadcast: f64::NEG_INFINITY,
             lead_lower_since: None,
             last_checksum: f64::NEG_INFINITY,
-            build_resync_due: None,
             host_name,
             state: SessionState {
                 started: false,
@@ -726,12 +717,6 @@ impl HostSession {
                     }
                     self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
                     self.actions_relayed += 1;
-                    if m.allowed
-                        && (m.category == "build" || m.category == "bulldoze")
-                        && self.options.resync_after_builds_seconds > 0.0
-                    {
-                        self.build_resync_due = Some(self.now() + self.options.resync_after_builds_seconds);
-                    }
                 }
             }
 
@@ -916,15 +901,6 @@ impl HostSession {
             && t - self.last_checksum >= self.options.checksum_seconds
         {
             self.request_checksum_inner();
-        }
-        if let Some(due) = self.build_resync_due {
-            if t >= due && self.resync.is_none() {
-                self.build_resync_due = None;
-                if self.state.started && self.players.len() > 1 {
-                    self.log("builds were made: starting a resync so that every game loads the same world".to_string());
-                    self.begin_resync("after builds");
-                }
-            }
         }
         self.drain()
     }

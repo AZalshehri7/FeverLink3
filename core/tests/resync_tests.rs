@@ -780,43 +780,6 @@ fn with_host_loads_early_off_the_host_is_told_to_load_together_with_the_players_
     assert!(h.failures().is_empty(), "{:?}", h.failures());
 }
 
-#[test]
-fn a_resync_starts_a_minute_after_the_last_build_when_asked_and_not_for_other_actions() {
-    let asked = HostOptions { resync_after_builds_seconds: 60.0, ..HostOptions::default() };
-    let (mut h, ids) = Harness::running(2, 1, asked);
-    let first = ActionMessage::new(30_000, 1, "{}").with_category("build");
-    h.player_game(ids[0], MessageKind::Action, &json(&first));
-    h.advance(30.0);
-    h.host_call(HostSession::tick);
-    assert_eq!(ResyncState::Idle, h.host.resync_state(), "a minute has not passed");
-    let second = ActionMessage::new(31_000, 2, "{}").with_category("bulldoze");
-    h.player_game(ids[0], MessageKind::Action, &json(&second)); // restarts the wait
-    h.advance(45.0);
-    h.host_call(HostSession::tick);
-    assert_eq!(ResyncState::Idle, h.host.resync_state(), "the wait counts from the LAST build");
-    h.advance(20.0);
-    h.host_call(HostSession::tick);
-    assert_ne!(ResyncState::Idle, h.host.resync_state(), "a minute after the last build the games reload");
-    assert!(h.host_log.iter().any(|l| l.contains("builds were made")));
-}
-
-#[test]
-fn no_resync_follows_a_rename_and_none_follows_a_build_by_default() {
-    let asked = HostOptions { resync_after_builds_seconds: 60.0, ..HostOptions::default() };
-    let (mut h, ids) = Harness::running(2, 1, asked);
-    let rename = ActionMessage::new(30_000, 1, "{}").with_category("other");
-    h.player_game(ids[0], MessageKind::Action, &json(&rename));
-    h.advance(120.0);
-    h.host_call(HostSession::tick);
-    assert_eq!(ResyncState::Idle, h.host.resync_state());
-    let (mut h, ids) = Harness::running(2, 1, HostOptions::default());
-    let build = ActionMessage::new(30_000, 1, "{}").with_category("build");
-    h.player_game(ids[0], MessageKind::Action, &json(&build));
-    h.advance(300.0);
-    h.host_call(HostSession::tick);
-    assert_eq!(ResyncState::Idle, h.host.resync_state());
-}
-
 // ------------------------------------------------------------------ a host whose game does not reload
 
 #[test]
