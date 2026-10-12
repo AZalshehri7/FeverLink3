@@ -60,6 +60,11 @@ pub struct EngineFns {
     pub handle_destroy: HandleDestroy,
     /// Offset of the command-kind byte inside a command's payload.
     pub kind_offset: usize,
+    /// Absolute addresses of the `_Do_call` thunks of the completion callbacks that may be fired for a command that is dropped
+    /// (the build table's `fire_done_calls`); anything else is never called.
+    pub fire_calls: &'static [usize],
+    /// `FEVERLINK3_STRICT_FIRE_DONE=1`: fire the tool's completion callback before a cancelled command is destroyed.
+    pub fire_done: bool,
 }
 
 impl EngineFns {
@@ -81,8 +86,35 @@ impl EngineFns {
                 command_destroy: core::mem::transmute::<usize, CommandDestroy>(base + command_destroy as usize),
                 handle_destroy: core::mem::transmute::<usize, HandleDestroy>(base + handle_destroy as usize),
                 kind_offset: kind_offset as usize,
+                fire_calls: &[],
+                fire_done: false,
             }
         }
+    }
+}
+
+/// `_Do_call` of the callable inside an MSVC `std::function` of [`FUNCTION_SIZE`] bytes: slot 2 of the implementation's vtable
+/// (`_Copy`, `_Move`, `_Do_call`, `_Target_type`, `_Delete_this`). `None` for an empty function or memory that is not readable.
+///
+/// # Safety
+/// `f` points to a live `std::function` object (or any memory: every read is checked).
+pub unsafe fn done_call_target(f: *const u8) -> Option<usize> {
+    unsafe {
+        let slot = f.wrapping_add(FUNCTION_IMPL);
+        if !mem::readable(slot, core::mem::size_of::<usize>()) {
+            return None;
+        }
+        let callable = *(slot as *const *const u8);
+        if callable.is_null() || !mem::readable(callable, core::mem::size_of::<usize>()) {
+            return None;
+        }
+        let vtable = *(callable as *const *const usize);
+        let entry = vtable.wrapping_add(2);
+        if vtable.is_null() || !mem::readable(entry as *const u8, core::mem::size_of::<usize>()) {
+            return None;
+        }
+        let target = *entry;
+        (target != 0).then_some(target)
     }
 }
 
@@ -118,6 +150,9 @@ pub struct Held {
     cmd: Room<COMMAND_ROOM>,
     done: Room<FUNCTION_SIZE>,
     progress: Room<PROGRESS_SIZE>,
+    /// Cancelling this command fires the tool's completion callback first: the switch is on and the callback's `_Do_call` is one the
+    /// build table lists. Decided when the command is captured.
+    done_ok: bool,
 }
 
 // SAFETY: a Held is plain bytes and engine pointers that are only used on the thread that makes the calls
@@ -127,6 +162,11 @@ unsafe impl Send for Held {}
 impl Held {
     pub fn payload(&self) -> usize {
         self.payload
+    }
+
+    /// Whether dropping this command fires the tool's completion callback first.
+    pub fn done_ok(&self) -> bool {
+        self.done_ok
     }
 }
 
@@ -226,6 +266,9 @@ pub unsafe fn capture(fns: &EngineFns, args: &AddArgs) -> Option<Box<Held>> {
         core::ptr::copy_nonoverlapping(args.progress, held.progress.0.as_mut_ptr(), PROGRESS_SIZE);
         core::ptr::write_bytes(args.progress, 0, PROGRESS_SIZE);
         core::ptr::write_bytes(args.out, 0, HANDLE_SIZE);
+        // the callback was moved with the command: look at what it is now (the target of the moved callable is the same function)
+        held.done_ok = fns.fire_done
+            && done_call_target(held.done.0.as_ptr()).is_some_and(|target| fns.fire_calls.contains(&target));
     }
     Some(held)
 }
@@ -254,16 +297,46 @@ pub unsafe extern "system-unwind" fn release(fns: &EngineFns, mut held: Box<Held
     }
 }
 
-/// Destroys a held command that is not to be queued: the command by the engine's destructor, the callback by its
-/// own. The weak pointer in `progress` is left alone (a leaked weak count is harmless, a wrong release is not).
+/// The `_Do_call` of a tool's completion callback: `(callable, &Command)`. `system-unwind`: tool code can throw, and the exception
+/// must pass through our frame like through any other (see [`release`]).
+type DoCall = unsafe extern "system-unwind" fn(this: *mut u8, cmd: *mut u8) -> usize;
+
+/// Fires the tool's own completion callback for a command that was never applied, as TpF2 Multiplayer does at a cancel (idea only, MIT):
+/// the tool's callback clears its "waiting for the engine" flag and re-arms its preview, which a destroyed callback never does. The
+/// command's result byte is zero (it never ran), so the callback takes its "not applied" path. Called only when [`capture`] found the
+/// callable's `_Do_call` in the build table's list; true when it was called.
+///
+/// # Safety
+/// As for [`discard`].
+unsafe extern "system-unwind" fn fire_done(fns: &EngineFns, held: &mut Held) -> bool {
+    if !held.done_ok {
+        return false;
+    }
+    unsafe {
+        let Some(target) = done_call_target(held.done.0.as_ptr()).filter(|t| fns.fire_calls.contains(t)) else {
+            return false; // changed since the capture: not what was read out of the executable
+        };
+        let callable = *(held.done.0.as_ptr().add(FUNCTION_IMPL) as *const *mut u8);
+        *held.cmd.0.as_mut_ptr().add(RESULT_OFFSET) = 0;
+        let call: DoCall = core::mem::transmute::<usize, DoCall>(target);
+        call(callable, held.cmd.0.as_mut_ptr());
+    }
+    true
+}
+
+/// Destroys a held command that is not to be queued: first, when [`Held::done_ok`], the tool's completion callback is fired (returns
+/// true), then the command by the engine's destructor and the callback by its own. The weak pointer in `progress` is left alone (a
+/// leaked weak count is harmless, a wrong release is not).
 ///
 /// # Safety
 /// As for [`release`], without `add`.
 #[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be destroyed only once
-pub unsafe fn discard(fns: &EngineFns, mut held: Box<Held>) {
+pub unsafe extern "system-unwind" fn discard(fns: &EngineFns, mut held: Box<Held>) -> bool {
     unsafe {
+        let fired = fire_done(fns, &mut held);
         (fns.command_destroy)(held.cmd.0.as_mut_ptr());
         destroy_function(held.done.0.as_mut_ptr());
+        fired
     }
 }
 
@@ -334,7 +407,14 @@ mod tests {
         unsafe { core::ptr::copy_nonoverlapping(this, to, 0x38) };
         to
     }
-    unsafe extern "system" fn vt_call(_this: *mut u8) {}
+    unsafe extern "system" fn vt_call(this: *mut u8, cmd: *mut u8) -> usize {
+        // the tool's completion callback: logs the command it was given and its result byte
+        log(format!("callback called payload={} result={}", unsafe { *(cmd as *const usize) } != 0, unsafe {
+            *cmd.add(RESULT_OFFSET)
+        }));
+        let _ = this;
+        0
+    }
     unsafe extern "system" fn vt_type(_this: *mut u8) {}
     unsafe extern "system" fn vt_delete(this: *mut u8, dealloc: bool) {
         log(format!("callable deleted dealloc={dealloc}"));
@@ -382,12 +462,22 @@ mod tests {
     }
 
     fn fns() -> EngineFns {
+        fns_firing(&[], false)
+    }
+
+    fn fns_firing(calls: &'static [usize], on: bool) -> EngineFns {
         EngineFns {
             command_move: fake_move,
             command_destroy: fake_destroy,
             handle_destroy: fake_handle_destroy,
             kind_offset: 0x9b8,
+            fire_calls: calls,
+            fire_done: on,
         }
+    }
+
+    fn call_address() -> &'static [usize] {
+        Box::leak(vec![vt_call as *const () as usize].into_boxed_slice())
     }
 
     /// A command: 0x38 bytes pointing at a payload of 0x9c0 bytes whose kind byte is `kind`.
@@ -594,5 +684,77 @@ mod tests {
             assert_eq!(p as usize % 16, 0);
         }
         assert_eq!(RESULT_OFFSET + 1, 0x31);
+    }
+
+    #[test]
+    fn a_listed_callback_is_fired_once_before_the_command_is_destroyed_with_a_zero_result() {
+        take_log();
+        let f = fns_firing(call_address(), true);
+        let (mut c, mut cmd, mut done) = (call(), command(52), inline_function());
+        cmd.command.0[RESULT_OFFSET] = 1; // whatever was there: the callback must see "not applied"
+        let a = args(&mut c, &mut cmd, done.0.as_mut_ptr());
+        let held = unsafe { capture(&f, &a) }.expect("captured");
+        assert!(held.done_ok());
+        take_log();
+        assert!(unsafe { discard(&f, held) }, "fired");
+        assert_eq!(
+            take_log(),
+            ["callback called payload=true result=0", "destroy command payload=true", "callable deleted dealloc=false"],
+            "the callback runs once, first, with the held command"
+        );
+    }
+
+    #[test]
+    fn a_callback_that_is_not_listed_or_a_switch_that_is_off_never_calls_it() {
+        for (calls, on) in [(&[][..], true), (call_address(), false), (&[0x1234usize][..], true)] {
+            take_log();
+            let f = fns_firing(calls, on);
+            let (mut c, mut cmd, mut done) = (call(), command(52), inline_function());
+            let a = args(&mut c, &mut cmd, done.0.as_mut_ptr());
+            let held = unsafe { capture(&f, &a) }.expect("captured");
+            assert!(!held.done_ok());
+            take_log();
+            assert!(!unsafe { discard(&f, held) });
+            assert_eq!(take_log(), ["destroy command payload=true", "callable deleted dealloc=false"]);
+        }
+    }
+
+    #[test]
+    fn an_empty_callback_or_one_whose_target_changed_after_the_capture_is_not_called() {
+        take_log();
+        let f = fns_firing(call_address(), true);
+        let (mut c, mut cmd) = (call(), command(52));
+        let mut empty = Room::<FUNCTION_SIZE>([0; FUNCTION_SIZE]);
+        let a = args(&mut c, &mut cmd, empty.0.as_mut_ptr());
+        let held = unsafe { capture(&f, &a) }.expect("captured");
+        assert!(!held.done_ok(), "no callable: nothing to fire");
+        unsafe { discard(&f, held) };
+        take_log();
+        // listed at the capture, another function at the drop (the listed table changed): not called
+        let (mut c, mut cmd, mut done) = (call(), command(52), inline_function());
+        let a = args(&mut c, &mut cmd, done.0.as_mut_ptr());
+        let mut held = unsafe { capture(&f, &a) }.expect("captured");
+        assert!(held.done_ok());
+        let other = fns_firing(&[0x4242usize], true);
+        take_log();
+        assert!(!unsafe { discard(&other, held_clone_flag(&mut held)) });
+        assert!(!take_log().iter().any(|l| l.starts_with("callback")));
+    }
+
+    fn held_clone_flag(h: &mut Box<Held>) -> Box<Held> {
+        // moves the box out for the call above (the flag stays set: the re-check against the table is what refuses the call)
+        std::mem::replace(h, Box::new(unsafe { core::mem::zeroed() }))
+    }
+
+    #[test]
+    fn done_call_target_reads_slot_two_of_the_vtable_and_refuses_unreadable_memory() {
+        let f = inline_function();
+        assert_eq!(unsafe { done_call_target(f.0.as_ptr()) }, Some(vt_call as *const () as usize));
+        let empty = Room::<FUNCTION_SIZE>([0; FUNCTION_SIZE]);
+        assert_eq!(unsafe { done_call_target(empty.0.as_ptr()) }, None);
+        let mut wild = Room::<FUNCTION_SIZE>([0; FUNCTION_SIZE]);
+        unsafe { *(wild.0.as_mut_ptr().add(FUNCTION_IMPL) as *mut usize) = 0x10 };
+        assert_eq!(unsafe { done_call_target(wild.0.as_ptr()) }, None);
+        assert_eq!(unsafe { done_call_target(core::ptr::null()) }, None);
     }
 }

@@ -21,9 +21,9 @@ import unittest
 
 import lupa.lua52 as lupa
 
-# The build module refuses remote constructions unless FEVERLINK3_REMOTE_CONSTRUCTIONS=1 (a stop-gap of the first real session);
-# every test of the construction replay runs with the developer switch on, the tests of the block itself turn it off.
-os.environ.setdefault("FEVERLINK3_REMOTE_CONSTRUCTIONS", "1")
+# The build module only refuses remote constructions with FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (a developer switch);
+# tests of the block set it themselves.
+os.environ.pop("FEVERLINK3_REMOTE_CONSTRUCTIONS", None)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")

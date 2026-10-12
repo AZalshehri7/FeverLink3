@@ -44,6 +44,8 @@ pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
 pub const POOLPATCH_VAR: &str = "FEVERLINK3_POOLPATCH";
 pub const TOWN_SEED_VAR: &str = "FEVERLINK3_LOG_TOWN_SEED";
 pub const FORCE_TOWN_SEED_VAR: &str = "FEVERLINK3_FORCE_TOWN_SEED";
+/// `1` makes a cancelled command fire the tool's own completion callback before it is destroyed (experimental, off by default).
+pub const FIRE_DONE_VAR: &str = "FEVERLINK3_STRICT_FIRE_DONE";
 
 /// Parses the forced seed: decimal or `0x` hex, must fit 32 bits; blanks around it are ignored.
 pub fn parse_seed(text: &str) -> Result<u32, String> {
@@ -75,6 +77,8 @@ pub struct HookConfig {
     pub hooks: bool,
     pub hold: bool,
     pub poolpatch: bool,
+    /// Fire the tool's completion callback at a cancel (`engine::discard`). Only meaningful with the hold hook.
+    pub fire_done: bool,
     /// Log the town developer's random seed (read-only; independent of the other switches).
     pub town_seed: bool,
     /// Replace the seed argument with this value (implies the hook; an invalid value is ignored).
@@ -94,6 +98,7 @@ impl HookConfig {
             hooks: !off(HOOKS_VAR),
             hold: !off(HOLD_VAR),
             poolpatch: !off(POOLPATCH_VAR),
+            fire_done: on(FIRE_DONE_VAR),
             town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
             force_seed,
             growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
@@ -109,12 +114,13 @@ impl HookConfig {
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
         format!(
-            "hooks={} hold={} poolpatch={} luaseed={} town_seed={}{}{}",
+            "hooks={} hold={} poolpatch={} luaseed={} town_seed={} fire_done={}{}{}",
             f(self.hooks),
             f(self.hold),
             f(self.poolpatch),
             f(self.luaseed),
             f(self.town_seed),
+            f(self.fire_done),
             self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default(),
             self.growth.describe()
         )
@@ -625,11 +631,14 @@ mod tests {
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(HOOKS_VAR, "0"), (POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off");
-        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off luaseed=off town_seed=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off fire_done=off");
+        assert_eq!(
+            HookConfig::default().describe(),
+            "hooks=off hold=off poolpatch=off luaseed=off town_seed=off fire_done=off"
+        );
         let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
         assert!(seed.any() && seed.town_seed, "its own switch");
-        assert_eq!(seed.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=on");
+        assert_eq!(seed.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=off");
         assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).town_seed, "only the exact value 1");
     }
 
@@ -647,7 +656,10 @@ mod tests {
         }
         let c = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "0x10")]));
         assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
-        assert_eq!(c.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=on force_seed=0x00000010");
+        assert_eq!(
+            c.describe(),
+            "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=off force_seed=0x00000010"
+        );
         let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
         assert_eq!(bad, HookConfig::from_lookup(env(&[])), "an invalid value switches nothing on");
         assert!(forced_seed(env(&[(FORCE_TOWN_SEED_VAR, "nope")])).is_err());
@@ -912,6 +924,7 @@ mod tests {
         command_destroy: None,
         handle_destroy: None,
         ui_add_sites: &[],
+        fire_done_calls: &[],
         kind_offset: None,
         kinds: &[],
     };

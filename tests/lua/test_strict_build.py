@@ -79,6 +79,7 @@ class FakeNative:
         self.last_valid = None
         self.heard = []          # (time, seq, kind, payload) of every control line it accepted
         self.dropped, self.released, self.held = [], [], []
+        self.fires = False   # the module would fire the tool's completion callback at a cancel (the held event says `done`)
         self.is_open = False
         if link:
             self.open_link()
@@ -208,7 +209,10 @@ class FakeNative:
             self.next_id += 1
             self.ring.append({"id": hid, "phase": "waiting"})
             self.held.append(hid)
-            self.emit("held", {"id": hid, "kind": 52, "site": TOOL_SITE, "ms": int(self.clock.t * 1000)})
+            ev = {"id": hid, "kind": 52, "site": TOOL_SITE, "ms": int(self.clock.t * 1000)}
+            if self.fires:
+                ev["done"] = True
+            self.emit("held", ev)
             return hid
         return 0
 
@@ -340,8 +344,16 @@ class StrictTest(unittest.TestCase):
     # FEVERLINK3_STRICT_CANCEL for the test: "0" = hold-and-release for every build (what most tests here are about), "1" = cancel
     # every kind, None = unset (the default: cancel and replay on every game for street, combined and bulldoze builds)
     strict_cancel = "0"
+    extra_env = {}      # more environment variables for the test (None removes one)
+    fires = False       # the fake module reports `done` in its held events
 
     def setUp(self):
+        self._saved_env = {k: os.environ.get(k) for k in self.extra_env}
+        for k, v in self.extra_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         self._old_cancel = os.environ.get("FEVERLINK3_STRICT_CANCEL")
         if self.strict_cancel is None:
             os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
@@ -352,8 +364,16 @@ class StrictTest(unittest.TestCase):
         self.A = StrictGame("host", 0, self.tmp, 50000, self.clock, native=self.natives[0])
         self.B = StrictGame("client", 1, self.tmp, 51000, self.clock, native=self.natives[1])
         self.relay = T.Relay([self.A, self.B])
+        for g in (self.A, self.B):
+            if g.native:
+                g.native.fires = self.fires
 
     def tearDown(self):
+        for k, v in getattr(self, "_saved_env", {}).items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         if os.environ.get("FEVERLINK3_TEST_VERBOSE"):
             print("\n--- host mod.log ---\n" + self.A.log() + "\n--- client mod.log ---\n" + self.B.log())
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1165,20 +1185,28 @@ class HoldAndReleaseSwitchTest(StrictTest):
         self.assertSameWorld()
 
 
-class ConstructionBlockTest(StrictTest):
-    """FEVERLINK3_REMOTE_CONSTRUCTIONS unset: a build that adds a construction is cancelled at the originator (with a chat line) and
-    replayed by nobody; roads still work."""
-
-    def setUp(self):
-        self._old_rc = os.environ.pop("FEVERLINK3_REMOTE_CONSTRUCTIONS", None)
-        super().setUp()
-
-    def tearDown(self):
-        super().tearDown()
-        if self._old_rc is not None:
-            os.environ["FEVERLINK3_REMOTE_CONSTRUCTIONS"] = self._old_rc
+class ConstructionDefaultTest(StrictTest):
+    """Remote constructions are replicated as before (hold-and-release); the player gets an informational chat line."""
 
     DEPOT = "{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }"
+
+    def test_a_depot_build_is_held_and_released_and_the_player_is_told_it_is_experimental(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertEqual(self.B.shipped_count(), 1)
+        self.assertEqual(len(self.relay.chats), 1)
+        self.assertIn("experimental in this test build", self.relay.chats[0][1])
+
+
+class ConstructionBlockTest(StrictTest):
+    """FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers): a build that adds a construction is cancelled at the originator (with a chat line)
+    and replayed by nobody, but only when the native module can fire the tool's callback; otherwise it stays hold-and-release."""
+
+    extra_env = {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}
+    fires = True
+    DEPOT = ConstructionDefaultTest.DEPOT
 
     def test_a_depot_build_is_cancelled_with_a_message_and_no_game_builds_it(self):
         self.start()
@@ -1189,7 +1217,7 @@ class ConstructionBlockTest(StrictTest):
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
         self.assertEqual(self.B.shipped_count(), 0, "nothing is shipped")
         self.assertNotIn("C depot/road_depot.con", self.A.sig() + self.B.sig())
-        self.assertIn("not supported yet in this test build", self.B.log())
+        self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
         self.assertSameWorld()
 
     def test_a_road_still_goes_through(self):
@@ -1197,6 +1225,43 @@ class ConstructionBlockTest(StrictTest):
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(24)
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+
+
+class ConstructionBlockWithoutFireTest(StrictTest):
+    extra_env = {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}
+    fires = False
+
+    def test_without_a_fireable_callback_the_build_is_not_cancelled(self):
+        self.start()
+        self.B.tool(ConstructionDefaultTest.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []), "a cancel would leave the tool dead")
+
+
+class FireDoneChoiceTest(StrictTest):
+    """FEVERLINK3_STRICT_FIRE_DONE=1 with FEVERLINK3_STRICT_CANCEL=plans: a build is cancelled only when the module says it fires the tool's
+    callback (`done` in the held event); otherwise the build is held and released."""
+
+    strict_cancel = "plans"
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
+    def test_a_road_is_cancelled_when_the_module_fires_the_callback(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+
+    def test_a_road_stays_hold_and_release_when_it_cannot(self):
+        self.start()
+        self.B.native.fires = False
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertIn("cannot fire this tool's callback", self.B.log())
         self.assertSameWorld()
 
 

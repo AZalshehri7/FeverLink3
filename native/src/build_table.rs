@@ -127,6 +127,10 @@ pub struct BuildAddrs {
     /// the returned handle, where other callers (the mod's own `sendCommand` among them) wait for the result. The
     /// terrain tool is left out on purpose. Finding from MPFever (MIT).
     pub ui_add_sites: &'static [Rva],
+    /// `_Do_call` thunks of the completion callbacks (`std::function` of the tools' `done` argument of `CommandList::Add`) that were read
+    /// out of the executable and are safe to call with a command that was never applied (result byte 0): the street tool's and the
+    /// bulldozer's. Any other callback (the construction tool's does real work with the result) is never fired.
+    pub fire_done_calls: &'static [Rva],
     /// Offset of the command-kind byte (the dispatcher index) inside a command's payload.
     pub kind_offset: Option<u32>,
     /// Command kinds the control link may name: (name, kind byte).
@@ -287,6 +291,7 @@ pub const BUILDS: &[BuildAddrs] = &[
             0x028a_3024,
             0x028a_3871,
         ],
+        fire_done_calls: &[0x004d_8860, 0x0058_c0b0],
         // movsx rcx, byte [payload + 0x9b8] in apply_command and in Command::~Command
         kind_offset: Some(0x9b8),
         // the dispatcher's case 52 is the handler that references the string "WorldBuildProposal"
@@ -325,6 +330,7 @@ mod tests {
         command_destroy: None,
         handle_destroy: None,
         ui_add_sites: &[0x1100, 0x1200],
+        fire_done_calls: &[],
         kind_offset: Some(0x20),
         kinds: &[("build_proposal", 7), ("other", 9)],
     }];

@@ -73,6 +73,12 @@ pcall(function()
 	local v = os.getenv("FEVERLINK3_STRICT_CANCEL")
 	if v == "1" then STRICT_CANCEL = "all" elseif v == "plans" or v == "host" then STRICT_CANCEL = v end
 end)
+-- FEVERLINK3_STRICT_FIRE_DONE=1 (default off, experimental): the native module fires the tool's own completion callback before it drops a
+-- cancelled command (the TpF2 recipe; docs/NATIVE_LINK.md), which re-arms the tool: without it the tool's busy flag stays set and its
+-- ghost/preview never comes back. It does so only for the tools whose callback was read out of the exe (street, bulldozer: the held event
+-- says `done = true`). With the switch on, a build is cancelled only when its held command says so; otherwise it stays hold-and-release.
+local FIRE_DONE = false
+pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") == "1" end)
 local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
 local CANCEL_EXTRA_STEPS = 6   -- extra steps of lead for a build every game applies at the stamp (see natDecideUnsafe)
 
@@ -2010,13 +2016,16 @@ local function natDecideUnsafe(h, cap)
 		natOrder("cancel", id)
 		return
 	end
-	-- STOP-GAP: a build that adds constructions (depot, station, ...) is not replicated in this test build (see the build module).
-	-- Nothing was applied yet, so the tool's command is cancelled and the player is told in the chat.
-	if Build and Build.constructionsBlocked and Build.constructionsBlocked(body) then
-		natSay("held " .. id .. ": adds constructions (" .. tostring(cap.tool) .. "), not replicated in this test build: cancelled")
-		natOrder("cancel", id)
-		vetoChat("gate:" .. tostring(id) .. ":" .. tostring(os.clock()), "Your build was cancelled: " .. Build.CONSTRUCTIONS_BLOCKED_TEXT .. ". Roads, bulldozing and stops still work. (If the tool stops reacting, press Esc and pick it again.)")
-		return
+	-- A build that adds constructions (depot, station, ...): the player gets an informational line. With FEVERLINK3_REMOTE_CONSTRUCTIONS=0
+	-- it is cancelled instead, but only when the native module can fire the tool's callback (a cancel without it leaves the tool dead).
+	if Build and Build.addsConstructions and Build.addsConstructions(body) then
+		if Build.constructionsBlocked(body) and h.done then
+			natSay("held " .. id .. ": adds constructions (" .. tostring(cap.tool) .. "), refused in this test build: cancelled")
+			natOrder("cancel", id)
+			vetoChat("gate:" .. tostring(id) .. ":" .. tostring(os.clock()), "Your build was cancelled: " .. Build.CONSTRUCTIONS_BLOCKED_TEXT .. ".")
+			return
+		end
+		vetoChat("info:constructions", Build.CONSTRUCTIONS_INFO_TEXT .. " (a depot or station you build may not reach the other game, or may upset it).")
 	end
 	-- never cancel what this game could not rebuild itself (docs/ARCHITECTURE.md section 6)
 	local wire = C.parse(text)
@@ -2031,6 +2040,10 @@ local function natDecideUnsafe(h, cap)
 	if STRICT_CANCEL == "plans" or (STRICT_CANCEL == "host" and C.PLAYER_ID == 0) then
 		local okP, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
 		cancelFlow = okP and STRICT_CANCEL_PLANS[plan or ""] == true
+	end
+	if cancelFlow and FIRE_DONE and not h.done then
+		natSay("held " .. id .. " (site " .. natSite(h) .. "): the native module cannot fire this tool's callback: hold-and-release instead of cancel")
+		cancelFlow = false
 	end
 	if not cancelFlow then
 		-- the record says it is held: the other games dry-run it and veto it if they cannot build it (see "veto-only validation")
@@ -2236,7 +2249,7 @@ end
 local function natOnHeld(N, p)
 	local id = tonumber(p.id)
 	if not id then return end
-	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames }
+	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true }
 	if not N.holdSent then
 		-- strict mode is being switched off: the module has not caught up; give the command back
 		natSay("held " .. id .. " while strict mode is off; release written")

@@ -1193,7 +1193,18 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     let engine = match (plan.has(Feature::Hold), plan.engine, plan.kind_offset) {
         // SAFETY: the plan verified the prologues of the three helpers against the image.
         (true, Some(e), Some(k)) => {
-            Some(unsafe { EngineFns::at(base, e.command_move, e.command_destroy, e.handle_destroy, k) })
+            let mut fns = unsafe { EngineFns::at(base, e.command_move, e.command_destroy, e.handle_destroy, k) };
+            if cfg.fire_done {
+                let calls: Vec<usize> = build.fire_done_calls.iter().map(|&r| base + r as usize).collect();
+                fns.fire_calls = Box::leak(calls.into_boxed_slice());
+                fns.fire_done = !fns.fire_calls.is_empty();
+                log(&format!(
+                    "hooks: fire_done: {} (tool callbacks that may be fired: {})",
+                    if fns.fire_done { "on" } else { "off: this build has no verified callback" },
+                    build.fire_done_calls.len()
+                ));
+            }
+            Some(fns)
         }
         _ => None,
     };
@@ -1449,6 +1460,7 @@ mod tests {
             command_destroy: Some(helper.clone()),
             handle_destroy: Some(helper.clone()),
             ui_add_sites: &[0x500],
+            fire_done_calls: &[],
             kind_offset: Some(0x9b8),
             kinds: &[("build_proposal", 52)],
         }))
@@ -1989,7 +2001,7 @@ mod tests {
         assert_in_order(
             &logged,
             &[
-                "hooks: switches hooks=on hold=off poolpatch=on luaseed=off",
+                "hooks: switches hooks=on hold=off poolpatch=on luaseed=off town_seed=off fire_done=off",
                 "hooks: self-test: detour, trampoline and stack argument work in this binary",
                 "hooks: self-test: the hook identifies the call site of a detoured function",
                 "hooks: apply_command: 16 bytes at rva 0x100 match the build table",

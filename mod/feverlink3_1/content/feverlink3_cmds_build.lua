@@ -1982,17 +1982,18 @@ function M.planOf(body)
 	return ok and plan or nil
 end
 
--- STOP-GAP (real session 2026-10-12: the host's game died with a UI assertion `it != components.end()` in UI::CGameUi 8 s after it
--- replayed the guest's depot/station build): remote constructions (a build that ADDS constructions: depots, stations, assets,
--- constructions with a street) are neither shipped by the originator (the bridge cancels the tool's command and says so in the
--- chat) nor replayed by any game, until the cause is known. Roads, bulldozing and removals go on. FEVERLINK3_REMOTE_CONSTRUCTIONS=1
--- lifts the block for developers.
-local REMOTE_CONSTRUCTIONS = false
-pcall(function() REMOTE_CONSTRUCTIONS = os.getenv("FEVERLINK3_REMOTE_CONSTRUCTIONS") == "1" end)
+-- Remote constructions (a build that ADDS constructions: depots, stations, assets, constructions with a street). Real session
+-- 2026-10-12: the host's game died with a UI assertion `it != components.end()` in UI::CGameUi 8 s after it replayed the guest's depot
+-- build (cause unproven). They are replicated as before (hold-and-release) and the player gets an informational chat line. With
+-- FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers) they are refused: not shipped, not replayed. The originator can only cancel such a
+-- build when the native module can fire the tool's completion callback (a cancel without it leaves the tool dead: real session).
+local BLOCK_CONSTRUCTIONS = false
+pcall(function() BLOCK_CONSTRUCTIONS = os.getenv("FEVERLINK3_REMOTE_CONSTRUCTIONS") == "0" end)
 M.CONSTRUCTIONS_BLOCKED_TEXT = "station/depot builds are not supported yet in this test build"
+M.CONSTRUCTIONS_INFO_TEXT = "station/depot builds are experimental in this test build"
 
 local function constructionsBlocked(rec)
-	return not REMOTE_CONSTRUCTIONS and type(rec) == "table" and type(rec.cons) == "table" and #rec.cons > 0
+	return BLOCK_CONSTRUCTIONS and type(rec) == "table" and type(rec.cons) == "table" and #rec.cons > 0
 end
 
 -- true when this build record (a body of makeWorldBuildProposalCmd, as captured) adds constructions and the block is on
@@ -2002,6 +2003,15 @@ function M.constructionsBlocked(body)
 		return constructionsBlocked(rec)
 	end)
 	return ok and blocked == true
+end
+
+-- true when the record adds constructions, whatever the block says
+function M.addsConstructions(body)
+	local ok, adds = pcall(function()
+		local rec = normalise(body.args[1])
+		return type(rec) == "table" and type(rec.cons) == "table" and #rec.cons > 0
+	end)
+	return ok and adds == true
 end
 
 local function decodeBuildUnsafe(body, ctx)
