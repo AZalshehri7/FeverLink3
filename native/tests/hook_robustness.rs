@@ -761,7 +761,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
 }
 
 #[test]
-fn the_switches_read_any_text_and_only_a_lone_one_turns_an_opt_in_one_on() {
+fn the_switches_read_any_text_a_lone_zero_turns_a_default_off_and_a_lone_one_an_opt_in_on() {
     let mut r = rng(17);
     for _ in 0..iters(5_000) {
         let value = random_text(&mut r, 6);
@@ -770,10 +770,14 @@ fn the_switches_read_any_text_and_only_a_lone_one_turns_an_opt_in_one_on() {
         // any text is a verdict (a number or an error) for the forced seed, never a panic
         let _ = feverlink3_native::plan::parse_seed(&value);
         let on = value.trim() == "1";
-        // the pool patch and the seed pin are on unless the text is a lone zero
+        // hooks, hold, the pool patch and the seed pin are on unless the text is a lone zero
         let default_on = value.trim() != "0";
-        assert_eq!((cfg.hooks, cfg.hold, cfg.town_seed), (on, on, on), "{value:?}");
-        assert_eq!((cfg.poolpatch, cfg.luaseed), (default_on, default_on), "{value:?}");
+        assert_eq!(cfg.town_seed, on, "{value:?}");
+        assert_eq!(
+            (cfg.hooks, cfg.hold, cfg.poolpatch, cfg.luaseed),
+            (default_on, default_on, default_on, default_on),
+            "{value:?}"
+        );
         assert_eq!(cfg.any(), on || default_on);
         assert!(cfg.describe().starts_with("hooks="));
     }

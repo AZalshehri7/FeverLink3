@@ -4,8 +4,8 @@
 //! imports `WINHTTP.dll` and Windows searches the application folder first. Every WinHTTP function is passed
 //! unchanged to the system library ([`proxy`]). The module does nothing else unless the launcher started the
 //! game with `FEVERLINK3_SESSION_DIR` set (or the game itself hosts the session); then it recognises the game
-//! build ([`build_table`]) and, only for the switches the environment sets to `1` (`FEVERLINK3_HOOKS`,
-//! `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, see [`plan`]), installs the pieces that let construction commands
+//! build ([`build_table`]) and, for the pieces that are on by default (`FEVERLINK3_HOOKS`, `FEVERLINK3_HOLD`,
+//! `FEVERLINK3_POOLPATCH`, `FEVERLINK3_LUA_SEED`; `=0` turns one off, see [`plan`]), installs the pieces that let construction commands
 //! run at the same game time on every game ([`hooks`]), and talks to the Lua mod through two files in the
 //! session folder ([`link`]). `docs/NATIVE_LINK.md` is the design.
 //!
@@ -118,7 +118,7 @@ mod entry {
                     Some(ts) => match build_table::select(ts) {
                         Some(b) => {
                             log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name));
-                            // off unless FEVERLINK3_HOOKS / FEVERLINK3_POOLPATCH say 1; done here, in the quiet
+                            // hooks, hold, pool patch and seed pin are on unless their variable says 0; done here, in the quiet
                             // moment before the game runs the code that is patched
                             let link = match &launched {
                                 Some(dir) => Some(hooks::Link { dir: std::path::PathBuf::from(dir), live: false }),
