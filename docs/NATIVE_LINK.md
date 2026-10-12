@@ -30,6 +30,7 @@ anything else (unset, empty, `0`, `true`) is off. Try them in this order:
 | 1 | `FEVERLINK3_HOOKS=1` | A hook on the simulation's command application (`apply_command`). It counts the commands by kind and calls the original. Read-only. | A detour on one engine function. |
 | 2 | `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also a hook on `CommandList::Add`. It counts adds by caller and holds nothing until a `hold_on` line arrives. | A detour on the function every command passes. |
 | 3 | `FEVERLINK3_POOLPATCH=1` | The single-worker script pool: 22 bytes rewritten in place. Independent of the other two. | A patch inside the game-script system's constructor. |
+| 4 | `FEVERLINK3_LUA_SEED=fixed` | The Lua string-hash seed pinned to a constant (the value is `fixed`, not `1`; see stage 4 below). Off by default until verified in the game. | A patch on the first bytes of Lua's `makeseed`. |
 
 `FEVERLINK3_HOLD=1` without `FEVERLINK3_HOOKS=1` does nothing and says so. The switches are read once, at start.
 The module itself stays inert unless a session folder exists (`FEVERLINK3_SESSION_DIR` from the launcher, or the
@@ -300,6 +301,41 @@ event ready: build 40420, hooks [], poolpatch applied, game clock no
 Questions: does the game start and the scripts run (towns, industries); is the pool really one worker (two games on
 a CPU with 8 or more threads stay in step over a long run, which MPFever reported for this patch); the CPU load of
 the game-script update.
+
+### Stage 4: the Lua string-hash seed (`FEVERLINK3_LUA_SEED=fixed`, observation `FEVERLINK3_LUA_SEED_LOG=1`)
+
+Lua 5.2 (the game's scripting) hashes short strings with a per-state seed that `lua_newstate` takes from
+`makeseed`: the clock, the address of the new state, of a local and of two module locations. With address-space
+randomisation the seed differs from one game process to the next, and so does the order in which `pairs` visits
+string keys of a table. Integer keys are not affected. Scripts that walk string-keyed tables and let the order
+matter (lane numbering of a newly built industry, float sums over penalty reasons) can then differ between two
+games that are otherwise identical.
+
+| Environment | Effect |
+|---|---|
+| `FEVERLINK3_LUA_SEED=fixed` | Replaces the 26-byte prologue of `makeseed` with `mov eax, 0x464C3353 ; ret` (padded with `int3`). Every process then seeds its Lua states with the same constant (the ASCII of `FL3S`). Any other value, or none, leaves the game's own seed. **Off by default until it has been verified in the game.** |
+| `FEVERLINK3_LUA_SEED_LOG=1` | Observation only. The mod writes one line `luaseed probe order=<n>` to its log at the start of each game: `<n>` folds the order `pairs` visits 30 fixed string keys in, so two games with equal seeds print equal numbers. The module logs `lua seed: not pinned ...` when the pin is off. |
+
+Checks and rules (as for the other patches): the build must have a `lua_makeseed` row in the build table; the 26
+bytes in memory must equal the recorded prologue; the patch is written in `DllMain`, before any Lua state exists
+(the only caller is `lua_newstate`); the page protection is lifted, the bytes written and read back, the protection
+restored and the instruction cache flushed. Anything in doubt (unknown build, other bytes, a memory error) does
+nothing and says why; the game then runs as shipped.
+
+Expect in `native.log` with the pin on:
+
+```
+hooks: switches hooks=off hold=off poolpatch=off luaseed=on
+hooks: lua_makeseed: 26 bytes at rva 0x2fc8fe0 match the build table
+lua seed pinned to 0x464c3353 (lua_makeseed: 26 bytes at rva 0x2fc8fe0, page protection restored)
+```
+
+or `lua seed NOT pinned, the game keeps its own seed: <reason>` / `hooks: SKIPPED lua_makeseed (luaseed): <reason>`.
+
+What the experiment should show: without the pin two games print different `luaseed probe order` numbers (the seed
+differs per process; each Lua state of one process has its own seed too); with the pin they print the same number
+in every game and every restart. A pinned seed removes only this source of difference. It does not make a live
+table and a freshly loaded one iterate alike, and it does not affect tables keyed by objects or functions.
 
 ### Not testable offline, for completeness
 

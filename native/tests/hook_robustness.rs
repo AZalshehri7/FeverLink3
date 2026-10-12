@@ -719,7 +719,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 }
             }
             let image = Sparse { planted, readable: r.gen_bool(0.95) };
-            let cfg = HookConfig { hooks: r.gen(), hold: r.gen(), poolpatch: r.gen() };
+            let cfg = HookConfig { hooks: r.gen(), hold: r.gen(), poolpatch: r.gen(), luaseed: r.gen() };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
             with_skips += usize::from(!p.skipped.is_empty());

@@ -485,6 +485,7 @@ mod tests {
             command_list_add: None,
             apply_command: None,
             script_pool: None,
+            lua_makeseed: None,
             command_move: None,
             command_destroy: None,
             handle_destroy: None,

@@ -567,6 +567,11 @@ local function update(userParams, state, dt)
 		L.installRandom(SIM.rng)
 		logSim("deterministic math.random installed")
 	end
+	-- one line per game start for the string-hash seed experiment; inert unless FEVERLINK3_LUA_SEED_LOG=1
+	if not SIM.seedProbed then
+		SIM.seedProbed = true
+		pcall(C.luaSeedProbeOnce, logSim)
+	end
 	if not SIM.subscribed then
 		SIM.subscribed = true
 		pcall(function() state:subscribeToAllEvents() end)

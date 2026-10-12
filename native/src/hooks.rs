@@ -92,6 +92,8 @@ impl Image for ProcessImage {
 pub struct Installed {
     detours: Vec<(&'static str, Detour)>,
     patch: Option<AppliedPatch>,
+    /// The pinned Lua string-hash seed.
+    seed_patch: Option<AppliedPatch>,
 }
 
 impl Installed {
@@ -103,8 +105,12 @@ impl Installed {
         self.patch.as_ref().is_some_and(AppliedPatch::is_applied)
     }
 
+    pub fn lua_seed(&self) -> bool {
+        self.seed_patch.as_ref().is_some_and(AppliedPatch::is_applied)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.detours.is_empty() && self.patch.is_none()
+        self.detours.is_empty() && self.patch.is_none() && self.seed_patch.is_none()
     }
 
     /// Takes everything out again, newest first: the jumps, then the patch.
@@ -120,6 +126,12 @@ impl Installed {
             match unsafe { d.uninstall() } {
                 Ok(()) => lines.push(format!("hooks: {name}: jump removed, original bytes restored")),
                 Err(e) => lines.push(format!("hooks: {name}: jump NOT removed: {e}")),
+            }
+        }
+        if let Some(mut p) = self.seed_patch.take() {
+            match unsafe { p.restore() } {
+                Ok(()) => lines.push("hooks: lua_makeseed: original bytes restored".to_string()),
+                Err(e) => lines.push(format!("hooks: lua_makeseed: original bytes NOT restored: {e}")),
             }
         }
         if let Some(mut p) = self.patch.take() {
@@ -156,9 +168,18 @@ pub unsafe fn execute(
 
     // 1. the pool patch, independent of the detours
     for step in &plan.steps {
-        if let Step::Patch { name, rva, expected, replacement, .. } = step {
+        if let Step::Patch { feature, name, rva, expected, replacement } = step {
             let at = (base + *rva as usize) as *mut u8;
             match unsafe { AppliedPatch::apply(at, expected, replacement) } {
+                Ok(p) if *feature == Feature::LuaSeed => {
+                    lines.push(format!(
+                        "lua seed pinned to {:#010x} (lua_makeseed: {} bytes at rva {rva:#x}, page protection {})",
+                        crate::build_table::LUA_SEED,
+                        expected.len(),
+                        if p.protection_restored() { "restored" } else { "NOT restored" }
+                    ));
+                    inst.seed_patch = Some(p);
+                }
                 Ok(p) => {
                     lines.push(format!(
                         "hooks: {name}: applied, {} bytes at rva {rva:#x}, page protection {}",
@@ -166,6 +187,9 @@ pub unsafe fn execute(
                         if p.protection_restored() { "restored" } else { "NOT restored" }
                     ));
                     inst.patch = Some(p);
+                }
+                Err(e) if *feature == Feature::LuaSeed => {
+                    lines.push(format!("lua seed NOT pinned, the game keeps its own seed: {e}"))
                 }
                 Err(e) => lines.push(format!("hooks: {name}: NOT applied: {e}")),
             }
@@ -209,7 +233,7 @@ pub unsafe fn execute(
     }
     if let Some(why) = failure {
         lines.push(why);
-        let mut undo = Installed { detours: written, patch: None };
+        let mut undo = Installed { detours: written, patch: None, seed_patch: None };
         lines.push("hooks: rolling back the jumps already written".to_string());
         lines.extend(unsafe { undo.uninstall_all() });
     } else {
@@ -277,6 +301,9 @@ fn apply_selftest(p: &mut Plan, report: &selftest::Report, log: fn(&str)) {
 /// Reads the switches from the environment and installs what they ask for.
 pub fn attach_from_env(build: &'static BuildAddrs, link: Option<Link>, log: fn(&str)) {
     let cfg = HookConfig::from_lookup(|name| std::env::var(name).ok());
+    if !cfg.luaseed && std::env::var(plan::LUA_SEED_LOG_VAR).is_ok_and(|v| v.trim() == "1") {
+        log("lua seed: not pinned, the game keeps its own per-process seed (the mod's probe records its effect)");
+    }
     attach(build, cfg, link, log);
 }
 
@@ -440,6 +467,9 @@ mod tests {
     const ADD_RVA: u32 = 0x200;
     const POOL_RVA: u32 = 0x300;
     const MOVE_RVA: u32 = 0x400;
+    const SEED_RVA: u32 = 0x380;
+    const SEED_BEFORE: &[u8] = &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 1, 2, 3, 4, 0x48];
+    static SEED_AFTER: [u8; 14] = crate::build_table::lua_seed_patch(crate::build_table::LUA_SEED);
     const POOL_BEFORE: &[u8] = &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00];
     const POOL_AFTER: &[u8] = &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00];
 
@@ -452,12 +482,15 @@ mod tests {
         }));
         let pool: &'static PatchSite =
             Box::leak(Box::new(PatchSite { rva: POOL_RVA, expected: POOL_BEFORE, replacement: POOL_AFTER }));
+        let seed: &'static PatchSite =
+            Box::leak(Box::new(PatchSite { rva: SEED_RVA, expected: SEED_BEFORE, replacement: &SEED_AFTER }));
         Box::leak(Box::new(BuildAddrs {
             timestamp: 9,
             name: "fake",
             command_list_add: Some(add.clone()),
             apply_command: Some(APPLY.clone()),
             script_pool: Some(pool.clone()),
+            lua_makeseed: Some(seed.clone()),
             command_move: Some(helper.clone()),
             command_destroy: Some(helper.clone()),
             handle_destroy: Some(helper.clone()),
@@ -473,6 +506,7 @@ mod tests {
         g.fill(APPLY_RVA as usize, &SUM);
         g.fill(ADD_RVA as usize, SUM5);
         g.fill(POOL_RVA as usize, POOL_BEFORE);
+        g.fill(SEED_RVA as usize, SEED_BEFORE);
         g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
         g
     }
@@ -493,7 +527,7 @@ mod tests {
     }
 
     fn everything() -> HookConfig {
-        HookConfig { hooks: true, hold: true, poolpatch: true }
+        HookConfig { hooks: true, hold: true, poolpatch: true, luaseed: false }
     }
 
     // the hooks of these tests: they only prove that the game's functions lead to them and that the published
@@ -626,6 +660,47 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("apply_command: NOT installed")), "{lines:?}");
         unsafe { inst.uninstall_all() };
         assert_eq!(game.bytes(ADD_RVA as usize, SUM5.len()), SUM5);
+    }
+
+    #[test]
+    fn the_seed_pin_writes_mov_eax_ret_and_comes_out_again() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { luaseed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.report());
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(inst.lua_seed() && !inst.poolpatch() && inst.hook_names().is_empty(), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("lua seed pinned to 0x464c3353")), "{lines:?}");
+        assert_eq!(game.bytes(SEED_RVA as usize, 14), SEED_AFTER);
+        // the patched function really returns the constant
+        let f: extern "system" fn() -> u32 = unsafe { core::mem::transmute(game.at(SEED_RVA as usize)) };
+        assert_eq!(f(), 0x464C_3353);
+        assert!(unsafe { inst.uninstall_all() }.iter().any(|l| l.contains("lua_makeseed: original bytes restored")));
+        assert_eq!(game.bytes(SEED_RVA as usize, 14), SEED_BEFORE);
+    }
+
+    #[test]
+    fn a_seed_site_that_does_not_match_is_left_alone_and_logged() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { luaseed: true, ..Default::default() };
+        // the planner already refuses other bytes
+        game.fill(SEED_RVA as usize + 3, &[0xFF]);
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert!(plan.steps.is_empty() && plan.skipped[0].name == "lua_makeseed", "{:?}", plan.report());
+        // and the executor refuses them again if the memory changed after planning
+        game.fill(SEED_RVA as usize, SEED_BEFORE);
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        game.fill(SEED_RVA as usize + 3, &[0xFF]);
+        let (inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(!inst.lua_seed() && inst.is_empty());
+        assert!(lines.iter().any(|l| l.starts_with("lua seed NOT pinned")), "{lines:?}");
+        assert_eq!(game.bytes(SEED_RVA as usize + 3, 1), [0xFF], "nothing written");
     }
 
     #[test]
@@ -783,7 +858,7 @@ mod tests {
         let dir = crate::testutil::TempDir::new("attach");
         let (build, game) = (fake_build(), fake_game());
         let base = game.base as usize;
-        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true };
+        let cfg = HookConfig { hooks: true, hold: false, poolpatch: true, luaseed: false };
         let link = Some(Link { dir: dir.path().to_path_buf(), live: false });
         attach_at(base, build, cfg, link, capture);
         let rt = RUNTIME.get().expect("attach set the runtime");
@@ -828,7 +903,7 @@ mod tests {
         assert_in_order(
             &logged,
             &[
-                "hooks: switches hooks=on hold=off poolpatch=on",
+                "hooks: switches hooks=on hold=off poolpatch=on luaseed=off",
                 "hooks: self-test: detour, trampoline and stack argument work in this binary",
                 "hooks: self-test: the hook identifies the call site of a detoured function",
                 "hooks: apply_command: 16 bytes at rva 0x100 match the build table",

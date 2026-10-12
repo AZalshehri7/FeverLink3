@@ -14,13 +14,20 @@
 //!    nothing until the mod (or a person) writes `hold_on` to the control file.
 //! 3. `FEVERLINK3_POOLPATCH=1`: the single-worker script pool. A patch, not a hook: independent of the others.
 //!
-//! Anything but the exact value `1` (after trimming blanks) is off.
+//! 4. `FEVERLINK3_LUA_SEED=fixed`: pin the seed of Lua's string hash to a constant (`build_table::LUA_SEED`), so the
+//!    iteration order of `pairs` over string keys is the same in every process. A patch, independent of the
+//!    others. Any other value, or none, leaves the game's own per-process seed.
+//!
+//! Anything but the exact value `1` (after trimming blanks; `fixed` for the seed) is off.
 
-use crate::build_table::{BuildAddrs, Rva};
+use crate::build_table::{BuildAddrs, PatchSite, Rva};
 
 pub const HOOKS_VAR: &str = "FEVERLINK3_HOOKS";
 pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
 pub const POOLPATCH_VAR: &str = "FEVERLINK3_POOLPATCH";
+pub const LUA_SEED_VAR: &str = "FEVERLINK3_LUA_SEED";
+/// `1` asks the mod's Lua probe (and the module's log) to record the string-hash seed's effect. Observation only.
+pub const LUA_SEED_LOG_VAR: &str = "FEVERLINK3_LUA_SEED_LOG";
 
 /// The switches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,23 +35,35 @@ pub struct HookConfig {
     pub hooks: bool,
     pub hold: bool,
     pub poolpatch: bool,
+    pub luaseed: bool,
 }
 
 impl HookConfig {
     /// Reads the switches through `get` (the environment in the module, a map in the tests).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> HookConfig {
         let on = |name: &str| get(name).is_some_and(|v| v.trim() == "1");
-        HookConfig { hooks: on(HOOKS_VAR), hold: on(HOLD_VAR), poolpatch: on(POOLPATCH_VAR) }
+        HookConfig {
+            hooks: on(HOOKS_VAR),
+            hold: on(HOLD_VAR),
+            poolpatch: on(POOLPATCH_VAR),
+            luaseed: get(LUA_SEED_VAR).is_some_and(|v| v.trim() == "fixed"),
+        }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch
+        self.hooks || self.poolpatch || self.luaseed
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
-        format!("hooks={} hold={} poolpatch={}", f(self.hooks), f(self.hold), f(self.poolpatch))
+        format!(
+            "hooks={} hold={} poolpatch={} luaseed={}",
+            f(self.hooks),
+            f(self.hold),
+            f(self.poolpatch),
+            f(self.luaseed)
+        )
     }
 }
 
@@ -88,6 +107,8 @@ pub enum Feature {
     Hold,
     /// The single-worker script pool.
     PoolPatch,
+    /// The pinned Lua string-hash seed.
+    LuaSeed,
 }
 
 impl Feature {
@@ -96,6 +117,7 @@ impl Feature {
             Feature::Counters => "counters",
             Feature::Hold => "hold",
             Feature::PoolPatch => "poolpatch",
+            Feature::LuaSeed => "luaseed",
         }
     }
 }
@@ -211,25 +233,31 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
         }
     }
     if cfg.poolpatch {
-        match &build.script_pool {
-            None => p.skipped.push(Skip {
-                feature: Feature::PoolPatch,
-                name: "script_pool",
-                reason: "the build table has no script_pool site for this build".into(),
-            }),
-            Some(site) => match verify(image, site.rva, site.expected) {
-                Ok(()) => p.steps.push(Step::Patch {
-                    feature: Feature::PoolPatch,
-                    name: "script_pool",
-                    rva: site.rva,
-                    expected: site.expected,
-                    replacement: site.replacement,
-                }),
-                Err(reason) => p.skipped.push(Skip { feature: Feature::PoolPatch, name: "script_pool", reason }),
-            },
-        }
+        plan_patch(Feature::PoolPatch, "script_pool", &build.script_pool, image, &mut p);
+    }
+    if cfg.luaseed {
+        plan_patch(Feature::LuaSeed, "lua_makeseed", &build.lua_makeseed, image, &mut p);
     }
     p
+}
+
+/// A patch site: a step when the build has it and the image holds the expected bytes, a skip with the reason otherwise.
+fn plan_patch(feature: Feature, name: &'static str, site: &Option<PatchSite>, image: &dyn Image, p: &mut Plan) {
+    match site {
+        None => {
+            p.skipped.push(Skip { feature, name, reason: format!("the build table has no {name} site for this build") })
+        }
+        Some(site) => match verify(image, site.rva, site.expected) {
+            Ok(()) => p.steps.push(Step::Patch {
+                feature,
+                name,
+                rva: site.rva,
+                expected: site.expected,
+                replacement: site.replacement,
+            }),
+            Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+        },
+    }
 }
 
 fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
@@ -301,7 +329,7 @@ mod tests {
     use crate::build_table::{select, CallSite, HookSite, PatchSite};
 
     fn cfg(hooks: bool, hold: bool, poolpatch: bool) -> HookConfig {
-        HookConfig { hooks, hold, poolpatch }
+        HookConfig { hooks, hold, poolpatch, luaseed: false }
     }
 
     /// An image holding exactly the bytes the 40420 row expects, at the row's addresses.
@@ -316,6 +344,8 @@ mod tests {
         }
         let p = b.script_pool.as_ref().unwrap();
         img.write(p.rva, p.expected);
+        let q = b.lua_makeseed.as_ref().unwrap();
+        img.write(q.rva, q.expected);
         img
     }
 
@@ -341,8 +371,8 @@ mod tests {
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on");
-        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=off");
+        assert_eq!(HookConfig::default().describe(), "hooks=off hold=off poolpatch=off luaseed=off");
     }
 
     // ---- planning on the real 40420 row
@@ -491,6 +521,7 @@ mod tests {
         command_list_add: None,
         apply_command: None,
         script_pool: None,
+        lua_makeseed: None,
         command_move: None,
         command_destroy: None,
         handle_destroy: None,
@@ -553,6 +584,48 @@ mod tests {
         assert!(plan(leaked, cfg(false, false, true), &img).steps.is_empty());
         img.write(8, &[1, 2, 3]);
         assert_eq!(names(&plan(leaked, cfg(false, false, true), &img)), ["script_pool"]);
+    }
+
+    #[test]
+    fn the_seed_switch_is_exactly_fixed() {
+        let env = |v: Option<&'static str>| {
+            HookConfig::from_lookup(move |n| if n == LUA_SEED_VAR { v.map(String::from) } else { None })
+        };
+        assert!(env(Some("fixed")).luaseed && env(Some(" fixed ")).luaseed);
+        for off in [None, Some(""), Some("0"), Some("1"), Some("FIXED"), Some("on")] {
+            assert!(!env(off).luaseed, "{off:?}");
+        }
+        assert!(env(Some("fixed")).any(), "the seed pin alone makes the module touch the game's code");
+        assert!(!HookConfig::default().any());
+    }
+
+    #[test]
+    fn the_seed_pin_is_planned_only_when_asked_and_verified() {
+        let img = image_of_40420();
+        let b = select(0x6ac5_0427).unwrap();
+        let on = HookConfig { luaseed: true, ..Default::default() };
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["lua_makeseed"]);
+        let Step::Patch { replacement, expected, feature, .. } = &p.steps[0] else { panic!("not a patch") };
+        assert_eq!(*feature, Feature::LuaSeed);
+        assert_eq!(expected.len(), 26);
+        assert_eq!(&replacement[..6], &[0xB8, 0x53, 0x33, 0x4C, 0x46, 0xC3]);
+        assert!(plan(b, HookConfig::default(), &img).steps.is_empty(), "off by default");
+
+        // other bytes at the site: nothing is planned, the reason is given (fail open)
+        let mut other = img.clone();
+        other.write(b.lua_makeseed.as_ref().unwrap().rva + 7, &[0x00]);
+        let p = plan(b, on, &other);
+        assert!(p.steps.is_empty());
+        assert_eq!((p.skipped[0].name, p.skipped[0].feature), ("lua_makeseed", Feature::LuaSeed));
+        assert!(p.skipped[0].reason.contains("the table expects"), "{}", p.skipped[0].reason);
+
+        // a build without the site
+        let mut bare = BARE.clone();
+        bare.lua_makeseed = None;
+        let leaked: &'static BuildAddrs = Box::leak(Box::new(bare));
+        let p = plan(leaked, on, &img);
+        assert!(p.steps.is_empty() && p.skipped[0].reason.contains("no lua_makeseed site"));
     }
 
     #[test]
