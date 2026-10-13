@@ -57,6 +57,32 @@ pub struct Built {
 
 type R<T> = Result<T, String>;
 
+/// The one allocation of a flat hash set of 4-byte ids (see [`Ty::EntSet`]) holding `ids`, and its capacity. The smallest capacity
+/// `2^k - 1` whose load bound (7/8) holds them. The ids fill the first slots and their control bytes say "full" (0x00); the real
+/// hash bytes cannot be made here (they are the receiving game's hash), and need not be: this table is only ever read by the engine's
+/// copy constructor, which walks the full slots and inserts each id into the engine's own table with that game's hash (b54: the
+/// receiver's copy had other control bytes than the originator's). Empty slots 0x80, the sentinel 0xff, then the first 15 control
+/// bytes cloned for a 16-byte group read.
+pub fn ent_set_table(ids: &[u32]) -> (Vec<u8>, usize) {
+    let mut cap = 1usize;
+    while cap - cap / 8 < ids.len() {
+        cap = cap * 2 + 1;
+    }
+    let off = portable::ent_set_slot_offset(cap);
+    let mut block = vec![0u8; off + cap * 4];
+    for (i, c) in block[..cap].iter_mut().enumerate() {
+        *c = if i < ids.len() { 0x00 } else { 0x80 };
+    }
+    block[cap] = 0xff;
+    for i in 0..15 {
+        block[cap + 1 + i] = if i < cap { block[i] } else { 0x80 };
+    }
+    for (i, v) in ids.iter().enumerate() {
+        block[off + i * 4..off + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    (block, cap)
+}
+
 struct Builder<'a> {
     lines: HashMap<&'a str, &'a str>,
     base: usize,
@@ -178,26 +204,32 @@ impl<'a> Builder<'a> {
         let v = self.val(path);
         match ty {
             Ty::Skip(_) | Ty::Raw(_) | Ty::Pad(_) => Ok(()),
-            Ty::Span => {
-                let v = v.ok_or_else(|| format!("missing line {path}"))?;
-                let body = v.strip_prefix("span:").ok_or_else(|| format!("{path}: {v}"))?;
-                if body == "null" {
+            Ty::EntSet => {
+                let key = format!("{path}.#");
+                let v = self.val(&key).ok_or_else(|| format!("missing line {key}"))?;
+                let body = v.strip_prefix("set:").ok_or_else(|| format!("{key}: {v}"))?;
+                buf[..0x20].fill(0);
+                if let Some(rva) = body.strip_prefix("0,I+") {
+                    // the empty table points at the library's static empty group, as the engine's own empty sets do
+                    let rva = usize::from_str_radix(rva, 16).map_err(|e| format!("{key}: {e}"))?;
+                    buf[0..8].copy_from_slice(&((self.base + rva) as u64).to_le_bytes());
                     return Ok(());
                 }
-                let len: usize = body.parse().map_err(|_| format!("{path}: {v}"))?;
-                if len > 0x1000 {
-                    return Err(format!("{path}: a span of {len} bytes"));
+                let n: usize = body.parse().map_err(|_| format!("{key}: {v}"))?;
+                if n == 0 || n > 0xe00 {
+                    return Err(format!("{key}: a set of {n} ids"));
                 }
-                // a zero-filled block of that length: the bytes are the engine's to regenerate (see the encoder)
-                let data = vec![0u8; len];
-                let begin = if data.is_empty() {
-                    self.blocks += 1;
-                    self.a.alloc(8).ok_or("allocation failed")? as u64
-                } else {
-                    self.block(path, &data)?.0
-                };
-                buf[0..8].copy_from_slice(&begin.to_le_bytes());
-                buf[8..16].copy_from_slice(&(begin + data.len() as u64).to_le_bytes());
+                let mut ids = Vec::with_capacity(n);
+                for i in 0..n {
+                    let l = format!("{path}[{i}]");
+                    ids.push(Self::ent(self.val(&l).ok_or_else(|| format!("missing line {l}"))?)?);
+                }
+                let (block, cap) = ent_set_table(&ids);
+                let ctrl = self.block(path, &block)?.0;
+                buf[0..8].copy_from_slice(&ctrl.to_le_bytes());
+                buf[8..16].copy_from_slice(&(ctrl + portable::ent_set_slot_offset(cap) as u64).to_le_bytes());
+                buf[16..24].copy_from_slice(&(n as u64).to_le_bytes());
+                buf[24..32].copy_from_slice(&(cap as u64).to_le_bytes());
                 Ok(())
             }
             Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => {
@@ -1305,23 +1337,31 @@ mod tests {
     }
 
     #[test]
-    fn residue_in_a_node_configuration_is_never_followed_or_written_whatever_it_looks_like() {
+    fn a_node_configuration_carries_its_crosswalk_set_and_traffic_light_state_and_never_a_residue_pointer() {
         let (fake, at) = synthetic();
         let arena = world(fake.0);
         let readable = arena.add(&[9u8; 0x40]); // a pointer-like word that points at readable memory, as in b46
         let ascii = u64::from_le_bytes(*b"/feverli");
         let mut elem = vec![0u8; 0x80];
-        for off in [0x38usize, 0x68, 0x70] {
+        for off in [0x38usize, 0x70] {
             elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
         }
-        elem[0x40..0x48].copy_from_slice(&ascii.to_le_bytes());
-        // the real bytes of b54 entry 0 (original), and the bytes the engine's copy made of them (rebuilt): only the length is the value
-        let real: Vec<u8> = (0..20)
-            .map(|i| u8::from_str_radix(&"7a2351ff7a235180808080808080808080808044"[i * 2..i * 2 + 2], 16).unwrap())
-            .collect();
-        let span = arena.add(&real); // the owned 20-byte range at +0x18 is typed: it is part of the value
-        elem[0x18..0x20].copy_from_slice(&(span as u64).to_le_bytes());
-        elem[0x20..0x28].copy_from_slice(&(span as u64 + 20).to_le_bytes());
+        elem[0x58..0x60].copy_from_slice(&ascii.to_le_bytes());
+        // the traffic-light state of b39: preference 2 at +0x4c, type -1 at +0x68
+        elem[0x4c..0x50].copy_from_slice(&2u32.to_le_bytes());
+        elem[0x68..0x6c].copy_from_slice(&(-1i32).to_le_bytes());
+        // the real table of b45 entry 0: control bytes 7a 23 51, sentinel, clones and 0x80 fill, one pad byte, the slots -4 -5 -3
+        let real = parse_hex("7a2351ff7a2351808080808080808080808080").unwrap();
+        let mut table = real.clone();
+        table.push(0x73);
+        for v in [-4i32, -5, -3] {
+            table.extend_from_slice(&v.to_le_bytes());
+        }
+        let ctrl = arena.add(&table);
+        elem[0x18..0x20].copy_from_slice(&(ctrl as u64).to_le_bytes());
+        elem[0x20..0x28].copy_from_slice(&(ctrl as u64 + 20).to_le_bytes());
+        elem[0x28..0x30].copy_from_slice(&3u64.to_le_bytes());
+        elem[0x30..0x38].copy_from_slice(&3u64.to_le_bytes());
         elem[0x78..0x7c].copy_from_slice(&(-1i32).to_le_bytes());
         let blk = arena.add(&elem);
         let mut v = Vec::new();
@@ -1329,18 +1369,73 @@ mod tests {
             v.extend_from_slice(&x.to_le_bytes());
         }
         assert!(arena.write(at + 0x60, &v));
-        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes");
-        assert!(
-            !e.text.contains("nodeConfigsToAdd[0].~0x38") && !e.text.contains("nodeConfigsToAdd[0].~0x40"),
-            "{}",
-            e.text
-        );
+        // the injection's settings: typed (a foreign pointer in an unnamed word is not carried)
+        let typed = Settings { typed: true, ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        // the region is carried (here without a differential mask, so the ASCII too), the residue pointers are not
+        let line = e
+            .text
+            .lines()
+            .find(|l| l.starts_with("proposal.nodeConfigsToAdd[0].~0x38"))
+            .expect("the region is written");
+        assert!(line.contains("w:0000000200000000") && line.contains("w:00000000ffffffff"), "{line}");
+        assert!(!line.contains('P') && !line.contains(&format!("{readable:x}")), "{line}");
         assert!(e.unresolved.iter().all(|(m, _)| !m.contains("nodeConfigsToAdd")), "{:?}", e.unresolved);
-        assert!(e.text.contains("nodeConfigsToAdd[0].span	span:20"), "{}", e.text);
+        // the value is the set of ids in id order, not the control bytes (the owner's hash)
+        for l in ["crosswalks.#	set:3", "crosswalks[0]	ent:new#5", "crosswalks[1]	ent:new#4", "crosswalks[2]	ent:new#3"]
+        {
+            assert!(e.text.contains(&format!("nodeConfigsToAdd[0].{l}")), "{l}: {}", e.text);
+        }
+        assert!(!e.text.contains("nodeConfigsToAdd[0].~0x28"), "size and capacity are the set's: {}", e.text);
         let built = build_selected(&e.text, BASE, &arena, None).expect("builds");
         let copy = &built.payload;
         let (b0, e0) = (u64_at(copy, 0x60), u64_at(copy, 0x68));
         assert!(b0 != 0 && e0 - b0 == 0x80, "the element vector is rebuilt");
         assert!(!built.blocked.iter().any(|b| b.path.contains("nodeConfigsToAdd")), "{:?}", built.blocked);
+        let el0 = arena.read(b0 as usize, 0x80).unwrap();
+        assert_eq!(
+            (crate::dump::u32_at(&el0, 0x4c), crate::dump::u32_at(&el0, 0x68), u64_at(&el0, 0x38)),
+            (2, u32::MAX, 0)
+        );
+        // the rebuilt table: one block, slots at +20, size 3, capacity 3, the ids in full slots, a walkable control row
+        let el = arena.read(b0 as usize, 0x80).unwrap();
+        let (c, sl) = (u64_at(&el, 0x18) as usize, u64_at(&el, 0x20) as usize);
+        assert_eq!((sl - c, u64_at(&el, 0x28), u64_at(&el, 0x30)), (20, 3, 3));
+        let t = arena.read(c, 32).unwrap();
+        assert_eq!(&t[..4], &[0, 0, 0, 0xff]);
+        assert!(t[4..7].iter().all(|&b| b == 0) && t[7..19].iter().all(|&b| b == 0x80), "{t:02x?}");
+        let mut ids: Vec<i32> = (0..3).map(|i| crate::dump::u32_at(&t, 20 + i * 4) as i32).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![-5, -4, -3]);
+        // and written as text again it is the same set
+        assert!(arena.write(at + 0x60, &copy[0x60..0x78]));
+        let e2 = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes again");
+        for l in ["crosswalks.#	set:3", "crosswalks[0]	ent:new#5", "crosswalks[2]	ent:new#3"] {
+            assert!(e2.text.contains(&format!("nodeConfigsToAdd[0].{l}")), "{l}: {}", e2.text);
+        }
+    }
+
+    #[test]
+    fn an_entity_set_table_grows_by_the_load_bound_and_an_empty_set_points_at_the_image() {
+        assert_eq!(ent_set_table(&[1]).1, 1);
+        assert_eq!(ent_set_table(&[1, 2, 3, 4, 5, 6, 7]).1, 7);
+        let (b, cap) = ent_set_table(&(0..8).collect::<Vec<u32>>());
+        assert_eq!((cap, b.len()), (15, portable::ent_set_slot_offset(15) + 60));
+        assert_eq!((b[7], b[8], b[15], b[16], b[16 + 7], b[16 + 8]), (0, 0x80, 0xff, 0, 0, 0x80));
+        let arena = Arena::new(0x5000_0000);
+        let mut b = Builder {
+            lines: HashMap::from([("x.#", "set:0,I+367b620")]),
+            base: BASE,
+            a: &arena,
+            blocked: Vec::new(),
+            blocks: 0,
+            select: None,
+            graph: HashMap::new(),
+            made: HashMap::new(),
+            fill: VecDeque::new(),
+        };
+        let mut buf = [0xaau8; 0x20];
+        b.field("x", Ty::EntSet, &mut buf).unwrap();
+        assert_eq!((u64_at(&buf, 0), u64_at(&buf, 8), u64_at(&buf, 24)), ((BASE + 0x367b620) as u64, 0, 0));
     }
 }

@@ -783,14 +783,14 @@ mod tests {
                 alloc: &arena,
                 mem: &mem,
                 base: 0x7ff7_1400_0000,
-                set: settings(),
+                set: Settings { typed: true, ..settings() },
                 build_name: "40420",
             };
             let text = run(&ctx, at, &mut |_| {});
             WORLD.with(|w| w.set(core::ptr::null()));
             assert!(text.contains("STEP 2: MATCH"), "dump #{n}: {text}");
-            // the node configurations' residue words (b45/b46: ASCII text or pointer-like junk, never owned) are padding now, so the stop
-            // pair and the stop bulldozing, which stayed SKIPPED on them, rebuild from their text as well
+            // the node configurations' residue words (b45/b46: ASCII text or pointer-like junk, never owned) are not carried in typed mode
+            // (the injection's), so the stop pair and the stop bulldozing, which stayed SKIPPED on them, rebuild from their text as well
             assert!(!text.contains("STEP 3: DIFF") && !text.contains("nodeConfigsToAdd x"), "dump #{n}: {text}");
             if [1, 13, 19].contains(&n) {
                 assert!(text.contains("STEP 3: MATCH"), "dump #{n}: {text}");

@@ -70,9 +70,10 @@ pub enum Ty {
     Map,
     /// `std::unordered_map/set` (0x40 bytes).
     Hash,
-    /// A begin/end pair (16 bytes) of an owned byte range (at most 0x1000 bytes): only its length is the value (the engine's copy
-    /// constructor regenerates the bytes).
-    Span,
+    /// A flat hash set of 4-byte entity ids (0x20 bytes: control-byte pointer, slot pointer, size, capacity; one allocation of
+    /// `capacity + 16` control bytes, padded to 4, then `capacity` slots). Its value is the set of ids; the control bytes are a hash of
+    /// them made by the game that owns the table (b54: other bytes in the receiver's copy), so they are not part of the value.
+    EntSet,
     /// Bytes of a known length kept structurally.
     Raw(usize),
     /// Bytes that are not part of the command's input (the engine's result): not written.
@@ -91,10 +92,17 @@ impl Ty {
             Ty::Str => 0x20,
             Ty::Res | Ty::Hash => 0x40,
             Ty::Vec(_) | Ty::EntVec | Ty::BlobVec => 0x18,
-            Ty::Map | Ty::Span => 0x10,
+            Ty::Map => 0x10,
+            Ty::EntSet => 0x20,
             Ty::Raw(n) | Ty::Skip(n) | Ty::Pad(n) => n,
         }
     }
+}
+
+/// The byte offset of the slots of an [`Ty::EntSet`] table of `cap` slots from its control bytes: `cap` control bytes, the sentinel,
+/// 15 cloned bytes for a 16-byte group read, padded to the 4-byte slot alignment. [b45: 20 for capacities 1 and 3]
+pub const fn ent_set_slot_offset(cap: usize) -> usize {
+    (cap + 16 + 3) & !3
 }
 
 pub struct F {
@@ -197,14 +205,20 @@ pub static SEGMENT_TAG: Elem = Elem { name: "SegmentTag", stride: 4, fields: &[f
 pub static NODE_CONFIG: Elem = Elem {
     name: "BaseNodeLaneConnectionAndEntity",
     stride: 0x80,
-    // +0x18..0x38 holds a begin/end range (20 bytes) and two small counts; +0x38..0x78 is residue: b45 had ASCII text there (the module's
-    // own log lines, "/feverlink ..."), b46 pointer-like words that stayed `P`. The engine's copy of the very same objects ran in both
-    // without touching them (b45 injected and ran identical on both games), so they are not owned data: not written, not rebuilt.
+    // +0x18..0x38 is a flat hash set of segment ids (the api's `crosswalks`: its size is the crosswalk count the checksum reads).
+    // +0x38..0x78 is NOT all residue: it holds the traffic-light state, which b63/b64 lost when it was typed as padding (the four
+    // node configurations of the depot differed in the checksum: trafficLightPreference 2 on the originator, 0 on the receiver;
+    // trafficLightType -1 against 0). [b39: +0x40 zero, +0x4c the preference 2, +0x50..+0x68 zero, +0x68 the type -1; ASCII or
+    // pointer-like residue at +0x38, +0x48, +0x6c..+0x78 (b41, b46).] It is an unnamed region like any other: the differential mask
+    // keeps the bytes the engine's copy constructor carries and zeroes the rest, and a foreign pointer is never carried.
     fields: &[
         f(0, "laneConnections", Ty::Vec(&LANE_CONNECTION)),
-        // a begin/end pair of an owned range of 20 bytes (b45: B1 B1+14), then two small counts (3, 3 / 1, 1) at +0x28/+0x30
-        f(0x18, "span", Ty::Span),
-        f(0x38, "residue", Ty::Pad(0x40)),
+        // the set (of segment ids; in b45 every segment that meets at the node). [b45 node new#1: control bytes 7a 23 51 ff + clones + 0x80 fill (19), one
+        // pad byte, then the slots -4 -5 -3 at +20; size 3, capacity 3 at +0x28/+0x30; the old node 39878: 39880, -4, 40178, its two
+        // old segments and the new one.] b57 to b62 carried only the 20 control bytes' length and rebuilt zeros with the slot pointer
+        // past the block: the engine's copy then read 3 heap words as segment ids, and the receiver crashed one second later in a map
+        // lookup (`map_util.h(22) Get`, Sim Pool thread).
+        f(0x18, "crosswalks", Ty::EntSet),
         f(0x78, "entity", Ty::Ent),
     ],
     anchors: &[],
@@ -609,19 +623,45 @@ impl Enc<'_> {
     fn field(&mut self, path: &str, ty: Ty, b: &[u8], depth: usize) -> R<()> {
         self.origin = crate::rebuild::member_of(path);
         match ty {
-            Ty::Span => {
-                let (bg, en) = (u64_at(b, 0), u64_at(b, 8));
-                if bg == 0 && en == 0 {
-                    return self.line(path, "span:null");
+            Ty::EntSet => {
+                let (ctrl, slots, size, cap) = (u64_at(b, 0), u64_at(b, 8), u64_at(b, 16), u64_at(b, 24));
+                let image =
+                    |p: u64| (p as usize) >= self.env.image_base && (p as usize) - self.env.image_base < IMAGE_BOUND;
+                if cap == 0 {
+                    // the empty table: its control pointer is the library's static empty group in the game's image
+                    if size != 0 || !image(ctrl) {
+                        return Err(format!("{path}: not an empty set (ctrl {ctrl:#x}, size {size})"));
+                    }
+                    return self
+                        .line(&format!("{path}.#"), &format!("set:0,I+{:x}", ctrl as usize - self.env.image_base));
                 }
-                if !pointer_like(bg) || en < bg || en - bg > 0x1000 {
-                    return Err(format!("{path}: not a span ({bg:#x}..{en:#x})"));
+                let set_err =
+                    || format!("{path}: not a set (ctrl {ctrl:#x}, slots {slots:#x}, size {size}, capacity {cap})");
+                if !pointer_like(ctrl) || !(cap + 1).is_power_of_two() || cap > 0xfff || size > cap {
+                    return Err(set_err());
                 }
-                // only the length is the value: the 20 bytes behind it are regenerated by the engine's copy constructor (b54: 7a2351 ff 7a2351
-                // then 0x80 fill and a stray byte in the original, other bytes in the rebuilt copy, run after run), so they are neither written
-                // nor compared
-                let len = (en - bg) as usize;
-                self.line(path, &format!("span:{len}"))
+                if slots != ctrl + ent_set_slot_offset(cap as usize) as u64 {
+                    return Err(set_err());
+                }
+                let ctl = self.read(ctrl as usize, cap as usize + 1, path)?;
+                if ctl[cap as usize] != 0xff {
+                    return Err(format!("{path}: no sentinel after {cap} control bytes"));
+                }
+                let raw = self.read(slots as usize, cap as usize * 4, path)?;
+                // a control byte with the top bit clear marks a full slot (0x80 empty, 0xfe deleted)
+                let mut ids: Vec<u32> =
+                    (0..cap as usize).filter(|&i| ctl[i] & 0x80 == 0).map(|i| u32_at(&raw, i * 4)).collect();
+                if ids.len() as u64 != size {
+                    return Err(format!("{path}: {} full slots for a size of {size}", ids.len()));
+                }
+                // the value is the set: in id order (the slot order is the owner's hash)
+                ids.sort_unstable();
+                self.line(&format!("{path}.#"), &format!("set:{size}"))?;
+                for (i, v) in ids.into_iter().enumerate() {
+                    let e = self.ent(v);
+                    self.line(&format!("{path}[{i}]"), &e)?;
+                }
+                Ok(())
             }
             Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => self.scalar(path, ty, b),
             Ty::Str => {
@@ -891,12 +931,14 @@ impl Enc<'_> {
                 }
             }
             // a pointer to anything but the game's image is a foreign address in the receiving process, owned or not: no typed member
-            // owns it, so it is not carried
+            // owns it, so it is not carried. Only a word that IS an address here (readable memory of this game) counts: two packed
+            // 32-bit values look pointer-like too (b64: a node configuration's traffic-light preference 2 beside a zero is the word
+            // 0x2_0000_0000, its type -1 beside a zero 0xffff_ffff), and they are data.
             let mut k = 0;
             while from.is_multiple_of(8) && k + 8 <= owned.len() {
                 let w = u64_at(&owned, k);
                 let image = (w as usize) >= self.env.image_base && (w as usize) - self.env.image_base < IMAGE_BOUND;
-                if pointer_like(w) && !image {
+                if pointer_like(w) && !image && self.mem.read(w as usize, 1).is_some() {
                     owned[k..k + 8].fill(0);
                 }
                 k += 8;
