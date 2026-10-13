@@ -918,6 +918,27 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_next_from_a_second_writer_with_the_next_sequence_is_accepted() {
+        // the interface half writes seq 1..3 (hold_on, release, ping), the simulation half continues at 4 right before its command
+        let dir = TempDir::new("link-two-writers");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(
+            &path,
+            &(rec(1, "hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#) + &rec(2, "release", r#"{["id"]=1}"#)),
+        );
+        assert_eq!(r.poll().lines.len(), 2);
+        append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
+        let p = r.poll();
+        assert_eq!(p.lines.len(), 1, "{p:?}");
+        assert_eq!(parse_ctl_line(&p.lines[0]), Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, ttl: 0 }));
+        // a line whose sequence number is not above the last one is dropped, whoever wrote it
+        append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
+        let p = r.poll();
+        assert_eq!((p.lines.len(), p.discarded), (0, 1));
+    }
+
+    #[test]
     fn old_and_repeated_sequence_numbers_are_dropped() {
         let dir = TempDir::new("reader-seq");
         let path = dir.path().join(CTL_FILE);

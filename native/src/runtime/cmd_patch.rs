@@ -34,6 +34,12 @@ impl Runtime {
         self.say("native patch: FEVERLINK3_NATIVE_PATCH is on: a patch_next order from the mod writes frozenNodes into the next script build_proposal command (all checks first; a refusal leaves the command untouched)");
     }
 
+    /// The switch is on and the prerequisites hold (this layout's build, the allocator's prologues): the `ready` event then lists
+    /// `patch_next` among the hooks, which is how the mod learns it may send the order.
+    pub(super) fn patch_ready(&self) -> bool {
+        cp::announces(self.patch.enabled(), self.build.name, || EngineAlloc::at(self.base).is_ok())
+    }
+
     /// A `patch_next` order of the control file.
     pub(super) fn arm_patch(&self, frozen: Vec<u32>, adds: u32, ttl: u64, now: u64) {
         self.patch.arm(frozen, adds, ttl, now);

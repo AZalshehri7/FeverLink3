@@ -433,10 +433,14 @@ impl Runtime {
         let reader = CtlReader::starting_at_end(dir.join(CTL_FILE))?;
         let mut events = EventWriter::open(dir)?;
         let (hooks, poolpatch) = lock(&self.installed).clone();
+        let mut hook_names: Vec<String> = hooks.iter().map(|h| h.to_string()).collect();
+        if self.patch_ready() {
+            hook_names.push(crate::cmd_patch::READY_NAME.to_string()); // the mod reads this string to know it may send `patch_next`
+        }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
             version: self.version.to_string(),
-            hooks: hooks.iter().map(|h| h.to_string()).collect(),
+            hooks: hook_names,
             poolpatch,
             clock: self.clock.is_some(),
             kinds: self.build.kinds.iter().map(|(n, k)| (n.to_string(), *k)).collect(),

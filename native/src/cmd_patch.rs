@@ -24,6 +24,9 @@ use crate::rebuild::Alloc;
 
 pub const PATCH_VAR: &str = "FEVERLINK3_NATIVE_PATCH";
 
+/// The name in the `ready` event's `hooks` list when the order can be carried out.
+pub const READY_NAME: &str = "patch_next";
+
 /// How long an order waits for its command when it names no time.
 pub const DEFAULT_TTL_MS: u64 = 10_000;
 /// The longest an order may wait.
@@ -36,6 +39,11 @@ const PROPOSAL_FROZEN: usize = 0x1d0;
 const TO_ADD: usize = 0x258;
 const CONSTRUCTION_STRIDE: usize = 0xe48;
 const CONSTRUCTION_FROZEN: usize = 0xcd8;
+
+/// Whether `ready` lists [`READY_NAME`]: the switch is on, the layout is this build's, and the allocator's prologues hold (asked last).
+pub fn announces(enabled: bool, build: &str, allocator_ok: impl FnOnce() -> bool) -> bool {
+    enabled && build == crate::portable::LAYOUT_BUILD && allocator_ok()
+}
 
 /// One armed order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +428,15 @@ mod tests {
         let err = apply(&a, &a, &a, p, &order(&[1], 3)).unwrap_err();
         assert!(err.contains("not a vector of 4-byte values"), "{err}");
         assert_eq!(a.read(p, PAYLOAD_SIZE).unwrap(), raw);
+    }
+
+    #[test]
+    fn ready_lists_patch_next_only_when_everything_holds() {
+        let build = crate::portable::LAYOUT_BUILD;
+        assert!(announces(true, build, || true));
+        assert!(!announces(false, build, || panic!("not asked when the switch is off")));
+        assert!(!announces(true, "other", || panic!("not asked for another build")));
+        assert!(!announces(true, build, || false));
     }
 
     #[test]
