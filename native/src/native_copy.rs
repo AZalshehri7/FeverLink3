@@ -190,7 +190,11 @@ fn describe_split(a: &str, b: &str) -> (usize, Vec<String>) {
 }
 
 /// The verdict of a comparison, from the counts: MATCH when no named member differs, else how many do.
-fn verdict(named_diff: usize, what: &str) -> String {
+fn verdict(named_diff: Result<usize, &str>, what: &str) -> String {
+    let named_diff = match named_diff {
+        Ok(n) => n,
+        Err(e) => return format!("NOT COMPARED ({what} could not be written as text: {e})"),
+    };
     if named_diff == 0 {
         format!("MATCH ({what} equals the held one in every named member; only unnamed bytes may differ)")
     } else {
@@ -267,17 +271,23 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
             for l in &lines {
                 put(&mut out, l);
             }
-            nd
+            Ok(nd)
         }
         Err(e) => {
             put(&mut out, &format!("  the copy cannot be written as text: {e}"));
-            usize::MAX
+            Err(e)
         }
     };
     put(&mut out, "  calling the engine destructor on the copy");
     // SAFETY: constructed above, destroyed once. The Context bytes were copied from the source and are not destroyed.
     unsafe { (c.fns.dtor)(s2.ptr()) };
-    put(&mut out, &format!("STEP 2: {}", verdict(step2_diff, "the engine's copy of the Proposal")));
+    put(
+        &mut out,
+        &format!(
+            "STEP 2: {}",
+            verdict(step2_diff.as_ref().map(|n| *n).map_err(|e| e.as_str()), "the engine's copy of the Proposal")
+        ),
+    );
 
     // ---- step 2b
     put(&mut out, "STEP 2b: Proposal::operator=(const Proposal&) from the held command's Proposal into an engine-constructed Proposal");
@@ -295,17 +305,26 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
             for l in &lines {
                 put(&mut out, l);
             }
-            nd
+            Ok(nd)
         }
         Err(e) => {
             put(&mut out, &format!("  the assigned object cannot be written as text: {e}"));
-            usize::MAX
+            Err(e)
         }
     };
     put(&mut out, "  calling the engine destructor");
     // SAFETY: constructed above, destroyed once.
     unsafe { (c.fns.dtor)(s2b.ptr()) };
-    put(&mut out, &format!("STEP 2b: {}", verdict(step2b_diff, "the Proposal after the engine's copy assignment")));
+    put(
+        &mut out,
+        &format!(
+            "STEP 2b: {}",
+            verdict(
+                step2b_diff.as_ref().map(|n| *n).map_err(|e| e.as_str()),
+                "the Proposal after the engine's copy assignment"
+            )
+        ),
+    );
 
     // ---- step 3
     put(
@@ -402,11 +421,11 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
             for l in &lines {
                 put(&mut out, l);
             }
-            nd
+            Ok(nd)
         }
         Err(e) => {
             put(&mut out, &format!("  the copy cannot be written as text: {e}"));
-            usize::MAX
+            Err(e)
         }
     };
     put(&mut out, "  calling the engine destructor on the copy and on the source");
@@ -415,13 +434,29 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
         (c.fns.dtor)(d.ptr());
         (c.fns.dtor)(p.ptr());
     }
-    put(&mut out, &format!("STEP 3: {}", verdict(step3_diff, "the Proposal the engine made from the portable text")));
+    put(
+        &mut out,
+        &format!(
+            "STEP 3: {}",
+            verdict(
+                step3_diff.as_ref().map(|n| *n).map_err(|e| e.as_str()),
+                "the Proposal the engine made from the portable text"
+            )
+        ),
+    );
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verdict_reports_an_error_not_a_count() {
+        let v = verdict(Err("text over the size bound"), "the copy");
+        assert!(v.starts_with("NOT COMPARED") && v.contains("size bound") && !v.contains("1844"));
+        assert!(verdict(Ok(0), "x").starts_with("MATCH") && verdict(Ok(3), "x").contains("3 named"));
+    }
     use crate::portable::testdata::{synthetic, BASE};
     use crate::rebuild::Arena;
     use std::sync::atomic::{AtomicUsize, Ordering};
