@@ -177,7 +177,9 @@ local function serializeNumber(v)
 	if v ~= v then return "(0/0)" end
 	if v == math.huge then return "(1/0)" end
 	if v == -math.huge then return "(-1/0)" end
-	if math.floor(v) == v and math.abs(v) < 9007199254740992 then return string.format("%d", v) end
+	-- "%d" raises "not a number in proper range" above 2^31 in this game's Lua (found by the sweep: a balance of 5 billion made every
+	-- update fail); "%.0f" prints the same digits for every integral double below 2^53 (zero is kept free of a minus sign).
+	if math.floor(v) == v and math.abs(v) < 9007199254740992 then return v == 0 and "0" or string.format("%.0f", v) end
 	return string.format("%.17g", v)
 end
 
