@@ -2117,7 +2117,9 @@ local function dryRun(it)
 		if isVetoReason(why) then return false, tostring(why) end
 		return true, "inconclusive: " .. tostring(why)
 	end
-	local bad = proposalVerdict(args)
+	-- a build that the native module patches at the Add (frozen nodes) is judged by the engine before the patch: the unpatched proposal always collides with the construction's own street piece (b29), so that verdict is no veto
+	local bad = nil
+	if not (type(args) == "table" and args.patch) then bad = proposalVerdict(args) end
 	-- the engine's verdict and the form that was judged, for every build that adds or removes constructions (real session 2026-10-13:
 	-- an underground station entrance was refused with "Construction Not Possible" and the log did not say which plan or form)
 	if args.plan == "construction" or args.plan == "withStreet" or args.plan == "combined" or args.plan == "bulldoze" then
