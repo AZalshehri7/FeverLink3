@@ -218,6 +218,8 @@ pub static CONSTRUCTION: Elem = Elem {
     fields: &[
         f(0, "fileName", Ty::Res),
         f(0xc98, "transf", Ty::M4),
+        // the VALUES are 0-based indices into proposal.addedNodes (not entity ids; the text writes them as `ent:old#N`): the node of the
+        // construction's own piece. [observed in 5 depots/stations: 1, 1, 1, 1, 0; always the added node nearest to the building]
         f(0xcd8, "frozenNodes", Ty::EntVec),
         f(0xe18, "name", Ty::Str),
         f(0xe38, "playerEntity", Ty::Ent),
@@ -250,6 +252,7 @@ pub static PAYLOAD: &[F] = &[
     // game) and the word at +0x28 differs (0 against 1): transient state, so 0x10 bytes of padding.
     f(0x1a0, "proposal.gap1a0", Ty::Raw(0x20)),
     f(0x1c0, "proposal.gap1c0", Ty::Pad(0x10)),
+    // indices into addedNodes, see the construction's `frozenNodes`
     f(0x1d0, "proposal.frozenNodes", Ty::EntVec),
     f(0x1e8, "terrainAlignSkipEdges", Ty::Hash),
     f(0x228, "segmentTags", Ty::Vec(&SEGMENT_TAG)),
@@ -1508,5 +1511,35 @@ mod tests {
         again.set_dir(dir.path());
         assert!(!dir.path().join(PORTABLE_FILE).exists());
         assert!(dir.path().join("native_portable.log.1").exists());
+    }
+
+    /// The rule behind `frozenNodes`: its values index `proposal.addedNodes`, and the segment(s) that touch that node are exactly the
+    /// construction's own piece (entrance_new); every other added segment is a piece of a road the tool split, and
+    /// `new2oldSegments` has one entry for each of those. Read from the real texts of the depots (skipped when they are absent).
+    #[test]
+    fn frozen_nodes_index_the_added_nodes_and_the_segments_at_that_node_are_the_constructions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/research");
+        let mut seen = 0;
+        for f in ["b26-run-20261013/guest/native_input_1.txt", "b24-run-20261013/guest/native_input_1.txt"] {
+            let Ok(t) = std::fs::read_to_string(root.join(f)) else { continue };
+            let val = |k: &str| t.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('\t'))).map(str::to_string);
+            let num = |k: &str| val(k).and_then(|v| v.rsplit(['#', ':']).next().and_then(|x| x.parse::<usize>().ok()));
+            let frozen = num("proposal.frozenNodes[0]").expect("a frozen node");
+            let node = val(&format!("proposal.addedNodes[{frozen}].entity")).expect("an added node at that index");
+            let n_segs = num("proposal.addedSegments.#").expect("segments");
+            let mut touching = Vec::new();
+            for i in 0..n_segs {
+                let at = |m: &str| val(&format!("proposal.addedSegments[{i}].{m}")).unwrap_or_default();
+                if at("node0") == node || at("node1") == node {
+                    touching.push(at("roadTemplate"));
+                }
+            }
+            assert_eq!(touching.len(), 1, "{f}: {touching:?}");
+            assert!(touching[0].contains("entrance_new"), "{f}: {touching:?}");
+            let made = val("proposal.new2oldSegments").and_then(|v| v.strip_prefix("map:size=").and_then(|x| x.parse::<usize>().ok()));
+            assert_eq!(made, Some(n_segs - 1), "{f}: the tool made every other added segment");
+            seen += 1;
+        }
+        eprintln!("frozen-node rule checked on {seen} real text(s)");
     }
 }
