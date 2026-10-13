@@ -76,6 +76,10 @@ pub struct BuildAddrs {
     pub name: &'static str,
     /// `CommandList::Add`: where every engine command enters the queue; construction tools are held here.
     pub command_list_add: Option<HookSite>,
+    /// `scripting::Convert(out optional<Proposal>*, state*, SimpleProposal*)` (proposal_util.cpp): turns a script's `SimpleProposal`
+    /// into the engine's `Proposal` (constructions and all). Hooked only with `FEVERLINK3_NATIVE_PATCH=1`, to write `frozenNodes`
+    /// into the result before anything checks it (`docs/research/SPIKE_NATIVE_COMMAND.md`, "Input-level conversion").
+    pub script_convert: Option<HookSite>,
     /// The simulation's command application: where held commands are counted and released at their stamp.
     pub apply_command: Option<HookSite>,
     /// Inside the game-script system's pool construction: `cmp eax,8 / jge / mov [rsp+20h],1 / call
@@ -189,6 +193,11 @@ pub const BUILDS: &[BuildAddrs] = &[
         town_develop: Some(HookSite {
             rva: 0x008d_e0b0,
             prologue: &[0x44, 0x89, 0x44, 0x24, 0x18, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56],
+        }),
+        // `mov rax,rsp ; push rbx,rsi,rdi,r12,r13,r14,r15` (14 bytes, no rip-relative operand; the next instruction is `sub rsp,0xc00`)
+        script_convert: Some(HookSite {
+            rva: 0x010c_6750,
+            prologue: &[0x48, 0x8B, 0xC4, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57],
         }),
         // `push rbx,rbp,rsi,rdi,r12,r14,r15 ; sub rsp,50h`
         town_update_size: Some(HookSite {
@@ -321,6 +330,7 @@ mod tests {
         town_seed: None,
         town_develop: None,
         town_update_size: None,
+        script_convert: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,
@@ -359,6 +369,7 @@ mod tests {
                 &b.town_seed,
                 &b.town_develop,
                 &b.town_update_size,
+                &b.script_convert,
                 &b.town_candidates,
                 &b.town_edges,
             ]

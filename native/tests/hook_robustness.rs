@@ -728,6 +728,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 force_seed: None,
                 growth: Default::default(),
                 luaseed: r.gen(),
+                native_patch: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());

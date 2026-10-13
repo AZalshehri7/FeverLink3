@@ -944,6 +944,7 @@ mod tests {
             town_seed: None,
             town_develop: None,
             town_update_size: None,
+            script_convert: None,
             town_candidates: None,
             town_edges: None,
             town_sort_call: None,
@@ -1663,5 +1664,105 @@ mod tests {
         let (_, why) = ev.iter().find(|(k, _)| k == "patch_refused").expect("expired");
         assert!(why.contains("3 Add(s), 3 build_proposal, 3 from construction tools"), "{why}");
         assert!(why.contains("kinds [52x3]") && why.contains("at arming: no build_proposal Add yet"), "{why}");
+    }
+
+    /// An `optional<Proposal>` as Convert leaves it: addedNodes of `nodes`, `cons` constructions, the flag at +0x358.
+    struct Out {
+        buf: Vec<u8>,
+        _blocks: Vec<Vec<u8>>,
+    }
+
+    fn out(nodes: usize, cons: usize, has_value: bool) -> Out {
+        let mut buf = vec![0u8; 0x360];
+        let mut blocks = Vec::new();
+        let mut vec_at = |off: usize, n: usize, stride: usize| {
+            let b = vec![0u8; (n * stride).max(8)];
+            let p = b.as_ptr() as u64;
+            buf[off..off + 8].copy_from_slice(&p.to_le_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&(p + (n * stride) as u64).to_le_bytes());
+            buf[off + 16..off + 24].copy_from_slice(&(p + (n * stride) as u64).to_le_bytes());
+            blocks.push(b);
+        };
+        if nodes > 0 {
+            vec_at(0, nodes, 0x40);
+        }
+        if cons > 0 {
+            vec_at(0x258, cons, 0xe48);
+        }
+        buf[0x358] = u8::from(has_value);
+        Out { buf, _blocks: blocks }
+    }
+
+    fn patch_events(dir: &Path) -> Vec<(String, String)> {
+        events(dir).into_iter().filter(|(k, _)| k.starts_with("patch")).collect()
+    }
+
+    #[test]
+    fn a_conversion_that_produced_nothing_or_another_shape_is_logged_and_leaves_the_order_armed() {
+        let dir = TempDir::new("rt-convert-skip");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        let none = out(2, 1, false);
+        rt.on_convert(none.buf.as_ptr() as usize, at(0xe2b1a1));
+        let other = out(3, 1, true);
+        rt.on_convert(other.buf.as_ptr() as usize, at(0xe2b1a1));
+        let roads = out(2, 0, true);
+        rt.on_convert(roads.buf.as_ptr() as usize, None);
+        assert!(rt.patch.pending(), "no conversion described by the order: it keeps waiting");
+        rt.pump();
+        let ev = patch_events(dir.path());
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert!(
+            ev[0].1.contains("no proposal") && ev[1].1.contains("3 added nodes") && ev[2].1.contains("no construction"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn a_matching_conversion_reaches_the_checks_and_a_refusal_consumes_the_order() {
+        let dir = TempDir::new("rt-convert-match");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        let m = out(2, 1, true);
+        rt.on_convert(m.buf.as_ptr() as usize, at(0xe2b1a1));
+        // the test process has no verified engine allocator: the order is refused (the write itself is covered by cmd_patch's tests)
+        assert!(!rt.patch.pending());
+        rt.pump();
+        let ev = patch_events(dir.path());
+        assert!(matches!(ev.as_slice(), [(k, why)] if k == "patch_refused" && why.contains("convert:")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_conversion_reads_an_order_the_service_thread_has_not_seen_yet() {
+        let dir = TempDir::new("rt-convert-late");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        ctl(dir.path(), PATCH_NEXT);
+        let o = out(3, 1, true);
+        rt.on_convert(o.buf.as_ptr() as usize, at(0xe2b1a1));
+        assert!(rt.patch.pending(), "armed by the conversion itself, and 3 nodes are not the order's 2");
+        assert_eq!(patch_events_after(&rt, dir.path()), 1);
+    }
+
+    fn patch_events_after(rt: &Runtime, dir: &Path) -> usize {
+        rt.pump();
+        patch_events(dir).len()
+    }
+
+    #[test]
+    fn a_build_proposal_add_after_a_patched_conversion_just_clears_the_order() {
+        let dir = TempDir::new("rt-convert-add");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        rt.patch.converted_one();
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert_eq!(calls(), ["add kind 52 tag 1"]);
+        assert!(!rt.patch.pending());
+        rt.pump();
+        assert!(patch_events(dir.path()).is_empty(), "no refusal and no second write");
     }
 }

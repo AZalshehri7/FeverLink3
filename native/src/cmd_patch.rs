@@ -73,6 +73,9 @@ struct Seen {
     build_proposals: u64,
     from_tools: u64,
     skip_reported: bool,
+    /// Converted proposals patched while the order was armed (`scripting::Convert`), and the events sent about conversions.
+    converted: u64,
+    convert_events: u64,
     /// Adds since arming by kind byte (`None` = unreadable).
     kinds: std::collections::BTreeMap<Option<u8>, u64>,
     /// The last few Adds since arming, as text.
@@ -98,6 +101,9 @@ impl AddRec {
         format!("k{k}@{r} {dt}ms{}", if self.held { " held" } else { "" })
     }
 }
+
+/// The most events one order's conversions may send (every conversion is in `native.log`).
+pub const MAX_CONVERT_EVENTS: u64 = 16;
 
 const TRAIL_LEN: usize = 64;
 
@@ -207,6 +213,24 @@ impl State {
         Some(reason.to_string())
     }
 
+    /// An order nobody's `Add` took: a refusal, unless conversions were patched (then the proposal was handled and what is missing is
+    /// the command's arrival at the command list, which is reported as a skip with the trail).
+    fn expire(&self, ttl_ms: u64) {
+        let converted = self.converted();
+        if converted == 0 {
+            self.refuse(self.expired_reason(ttl_ms));
+        } else {
+            let why = self.expired_reason(ttl_ms).replacen("expired: no command arrived", "expired after patching", 1);
+            lock(&self.events).push(Event::PatchSkipped {
+                reason: format!(
+                    "{why}; {converted} converted proposal(s) were patched, but no build_proposal Add used the order"
+                ),
+                kind: None,
+                site: None,
+            });
+        }
+    }
+
     fn expired_reason(&self, ttl_ms: u64) -> String {
         let g = lock(&self.seen).clone();
         let kinds: Vec<String> =
@@ -222,13 +246,45 @@ impl State {
         )
     }
 
+    /// The armed order without taking it (the conversion hook patches every matching conversion while it waits): `None` when there
+    /// is none or it has expired (the service thread reports an expiry).
+    pub fn peek(&self, now: u64) -> Option<Order> {
+        lock(&self.order).as_ref().filter(|o| now.saturating_sub(o.armed_ms) <= o.ttl_ms).cloned()
+    }
+
+    /// A converted proposal was patched.
+    pub fn converted_one(&self) {
+        lock(&self.seen).converted += 1;
+    }
+
+    /// How many converted proposals the armed order patched.
+    pub fn converted(&self) -> u64 {
+        lock(&self.seen).converted
+    }
+
+    /// An event about a conversion, at most [`MAX_CONVERT_EVENTS`] per order (the log has every call).
+    pub fn convert_event(&self, event: Event) {
+        let mut g = lock(&self.seen);
+        if g.convert_events < MAX_CONVERT_EVENTS {
+            g.convert_events += 1;
+            drop(g);
+            self.report(event);
+        }
+    }
+
+    /// Drops the armed order without a verdict (a build_proposal Add passed after the conversion patched it).
+    pub fn clear(&self) {
+        lock(&self.order).take();
+        self.pending.store(false, Ordering::Release);
+    }
+
     /// The armed order, once: `None` when there is none or it has expired (which is reported).
     pub fn take(&self, now: u64) -> Option<Order> {
         let order = lock(&self.order).take();
         self.pending.store(false, Ordering::Release);
         let order = order?;
         if now.saturating_sub(order.armed_ms) > order.ttl_ms {
-            self.refuse(self.expired_reason(order.ttl_ms));
+            self.expire(order.ttl_ms);
             return None;
         }
         Some(order)
@@ -246,7 +302,7 @@ impl State {
                 let o = g.take().expect("checked");
                 self.pending.store(false, Ordering::Release);
                 drop(g);
-                self.refuse(self.expired_reason(o.ttl_ms));
+                self.expire(o.ttl_ms);
             }
         }
         std::mem::take(&mut *lock(&self.events))
@@ -274,65 +330,152 @@ struct Plan {
     fresh: bool,
 }
 
-fn triple(bytes: &[u8], off: usize) -> Result<(u64, u64, u64), String> {
-    Ok((u64_at(bytes, off), u64_at(bytes, off + 8), u64_at(bytes, off + 16)))
+fn triple(bytes: &[u8], off: usize) -> (u64, u64, u64) {
+    (u64_at(bytes, off), u64_at(bytes, off + 8), u64_at(bytes, off + 16))
 }
 
-/// The checks and the writes. Reads `payload` through `mem`, takes a block from `alloc` for an empty list, writes through `poke`.
-/// Nothing is written (and nothing stays allocated) unless every check passes.
+/// Why a patch was not carried out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fail {
+    /// The order does not describe this proposal (another number of added nodes, no construction, not the expected layout): at
+    /// the conversion this is a different build than the order's and the order keeps waiting.
+    NotThis(String),
+    /// The order cannot be carried out at all (bad order, allocator, a write failed).
+    Refuse(String),
+}
+
+impl Fail {
+    pub fn into_reason(self) -> String {
+        match self {
+            Fail::NotThis(r) | Fail::Refuse(r) => r,
+        }
+    }
+}
+
+/// Size of a `Proposal` (the part of a command's payload before the kind byte's neighbours): what [`apply_proposal`] reads.
+pub const PROPOSAL_SIZE: usize = 0x358;
+
+/// The checks and the writes on a command's payload. Reads `payload` through `mem`, takes a block from `alloc` for an empty list,
+/// writes through `poke`. Nothing is written (and nothing stays allocated) unless every check passes.
 pub fn apply(mem: &dyn Mem, poke: &dyn Poke, alloc: &dyn Alloc, payload: usize, order: &Order) -> Result<Done, String> {
-    let n = order.frozen.len();
-    if n == 0 || n > MAX_PATCH_FROZEN {
-        return Err(format!("{n} frozen indices"));
+    if order.frozen.is_empty() || order.frozen.len() > MAX_PATCH_FROZEN {
+        return Err(format!("{} frozen indices", order.frozen.len()));
     }
     let bytes = mem.read(payload, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
     if bytes[KIND_OFFSET] != KIND_BUILD_PROPOSAL {
         return Err(format!("the command is kind {}, not build_proposal", bytes[KIND_OFFSET]));
     }
-    // the added nodes: the indices count into this list
-    let (b, e, c) = triple(&bytes, ADDED_NODES)?;
+    apply_bytes(mem, poke, alloc, payload, &bytes, order).map_err(Fail::into_reason)
+}
+
+/// The number of added nodes of the proposal at `proposal`, when its `addedNodes` is a vector (for the log).
+pub fn added_nodes(mem: &dyn Mem, proposal: usize) -> Option<usize> {
+    let bytes = mem.read(proposal + ADDED_NODES, 24)?;
+    let (b, e, c) = triple(&bytes, 0);
+    if b == 0 && e == 0 && c == 0 {
+        Some(0)
+    } else if pointer_like(b) && b <= e && e <= c && ((e - b) as usize).is_multiple_of(NODE_STRIDE) {
+        Some((e - b) as usize / NODE_STRIDE)
+    } else {
+        None
+    }
+}
+
+/// Allocator and writer that give nothing: [`describes`] runs every check against them and writes nothing.
+struct Nothing;
+
+impl Alloc for Nothing {
+    fn alloc(&self, _: usize) -> Option<usize> {
+        None
+    }
+    fn write(&self, _: usize, _: &[u8]) -> bool {
+        false
+    }
+}
+
+impl Poke for Nothing {
+    fn poke(&self, _: usize, _: &[u8]) -> bool {
+        false
+    }
+}
+
+/// Whether `order` describes the proposal at `proposal` (every check of [`apply_proposal`], no write, no allocation).
+pub fn describes(mem: &dyn Mem, proposal: usize, order: &Order) -> Result<(), Fail> {
+    match apply_proposal(mem, &Nothing, &Nothing, proposal, order) {
+        Err(Fail::Refuse(_)) if !order.frozen.is_empty() && order.frozen.len() <= MAX_PATCH_FROZEN => Ok(()), // only the writing failed
+        Err(f) => Err(f),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// The same on a bare `Proposal` (the result of `scripting::Convert`), which has no kind byte.
+pub fn apply_proposal(
+    mem: &dyn Mem,
+    poke: &dyn Poke,
+    alloc: &dyn Alloc,
+    proposal: usize,
+    order: &Order,
+) -> Result<Done, Fail> {
+    if order.frozen.is_empty() || order.frozen.len() > MAX_PATCH_FROZEN {
+        return Err(Fail::Refuse(format!("{} frozen indices", order.frozen.len())));
+    }
+    let bytes = mem.read(proposal, PROPOSAL_SIZE).ok_or(Fail::NotThis("the proposal is not readable".into()))?;
+    apply_bytes(mem, poke, alloc, proposal, &bytes, order)
+}
+
+fn apply_bytes(
+    mem: &dyn Mem,
+    poke: &dyn Poke,
+    alloc: &dyn Alloc,
+    payload: usize,
+    bytes: &[u8],
+    order: &Order,
+) -> Result<Done, Fail> {
+    let n = order.frozen.len();
+    let not_this = |s: String| Fail::NotThis(s);
+    let (b, e, c) = triple(bytes, ADDED_NODES);
     let nodes = if b == 0 && e == 0 && c == 0 {
         0
     } else if pointer_like(b) && b <= e && e <= c && ((e - b) as usize).is_multiple_of(NODE_STRIDE) {
         (e - b) as usize / NODE_STRIDE
     } else {
-        return Err("proposal.addedNodes is not a vector".into());
+        return Err(not_this("proposal.addedNodes is not a vector".into()));
     };
     if nodes != order.adds as usize {
-        return Err(format!("the command has {nodes} added nodes, the order says {}", order.adds));
+        return Err(not_this(format!("the command has {nodes} added nodes, the order says {}", order.adds)));
     }
     if let Some(i) = order.frozen.iter().find(|&&i| i as usize >= nodes) {
-        return Err(format!("frozen index {i} is not below the {nodes} added nodes"));
+        return Err(not_this(format!("frozen index {i} is not below the {nodes} added nodes")));
     }
     // the constructions
-    let (tb, te, tc) = triple(&bytes, TO_ADD)?;
+    let (tb, te, tc) = triple(bytes, TO_ADD);
     if tb == 0 && te == 0 && tc == 0 {
-        return Err("the command adds no construction".into());
+        return Err(not_this("the command adds no construction".into()));
     }
     if !(pointer_like(tb) && tb <= te && te <= tc && ((te - tb) as usize).is_multiple_of(CONSTRUCTION_STRIDE)) {
-        return Err("proposal toAdd is not a vector".into());
+        return Err(not_this("proposal toAdd is not a vector".into()));
     }
     if te == tb {
-        return Err("the command adds no construction".into());
+        return Err(not_this("the command adds no construction".into()));
     }
     let first = tb as usize;
     // the two lists, as they are now
     let mut lists = Vec::new();
     for i in 0..2 {
         let (addr, raw) = if i == 0 {
-            (payload + PROPOSAL_FROZEN, triple(&bytes, PROPOSAL_FROZEN)?)
+            (payload + PROPOSAL_FROZEN, triple(bytes, PROPOSAL_FROZEN))
         } else {
             let a = first + CONSTRUCTION_FROZEN;
-            let t = mem.read(a, 24).ok_or("toAdd[0] is not readable")?;
-            (a, triple(&t, 0)?)
+            let t = mem.read(a, 24).ok_or_else(|| not_this("toAdd[0] is not readable".into()))?;
+            (a, triple(&t, 0))
         };
         let (b, e, c) = raw;
         let empty = b == 0 && e == 0 && c == 0;
         if !empty && !(pointer_like(b) && b % 4 == 0 && b <= e && e <= c && (e - b) % 4 == 0) {
-            return Err(format!(
+            return Err(not_this(format!(
                 "{} is not a vector of 4-byte values",
                 if i == 0 { "proposal.frozenNodes" } else { "toAdd[0].frozenNodes" }
-            ));
+            )));
         }
         lists.push((addr, b, c));
     }
@@ -354,7 +497,7 @@ pub fn apply(mem: &dyn Mem, poke: &dyn Poke, alloc: &dyn Alloc, payload: usize, 
     }
     if let Some(why) = fail {
         alloc.free_all();
-        return Err(why.into());
+        return Err(Fail::Refuse(why.into()));
     }
     // the values go in first, the pointers last: a failure in between leaves a list that still says what it said
     let mut data = Vec::with_capacity(4 * n);
@@ -367,7 +510,7 @@ pub fn apply(mem: &dyn Mem, poke: &dyn Poke, alloc: &dyn Alloc, payload: usize, 
     }
     if !ok {
         alloc.free_all();
-        return Err("a list could not be written".into());
+        return Err(Fail::Refuse("a list could not be written".into()));
     }
     for (p, &(_, _, c)) in plans.iter().zip(&lists) {
         let begin = p.at as u64;
@@ -380,7 +523,7 @@ pub fn apply(mem: &dyn Mem, poke: &dyn Poke, alloc: &dyn Alloc, payload: usize, 
         if !poke.poke(p.triple, &t) {
             // the first list may be done already; its values are valid, so is its triple: keep both, report the second
             alloc.forget_all();
-            return Err("a list's pointers could not be written".into());
+            return Err(Fail::Refuse("a list's pointers could not be written".into()));
         }
     }
     let allocated = plans.iter().any(|p| p.fresh);
@@ -585,5 +728,45 @@ mod tests {
             matches!(s.drain_events(100).as_slice(), [Event::PatchRefused { reason }] if reason.contains("expired"))
         );
         assert!(!s.pending());
+    }
+
+    #[test]
+    fn a_bare_proposal_is_patched_like_a_payload_and_needs_no_kind_byte() {
+        let (a, p) = world(3, 1, None, None);
+        assert!(a.write(p + KIND_OFFSET, &[0]));
+        assert!(apply(&a, &a, &a, p, &order(&[1], 3)).is_err(), "as a command it is not a build_proposal");
+        let done = apply_proposal(&a, &a, &a, p, &order(&[1], 3)).expect("patched");
+        assert_eq!(done, Done { allocated: true });
+        let (x, y) = lists(&a, p);
+        assert_eq!((x.0, y.0), (vec![1], vec![1]));
+        assert_eq!(added_nodes(&a, p), Some(3));
+    }
+
+    #[test]
+    fn a_proposal_the_order_does_not_describe_is_not_this_one_and_stays_untouched() {
+        for (nodes, cons, o) in [(3, 1, order(&[0], 2)), (2, 0, order(&[0], 2)), (3, 1, order(&[5], 3))] {
+            let (a, p) = world(nodes, cons, None, None);
+            let before = a.read(p, PROPOSAL_SIZE).unwrap();
+            let r = apply_proposal(&a, &a, &a, p, &o);
+            assert!(matches!(r, Err(Fail::NotThis(_))), "{nodes} {cons} {r:?}");
+            assert_eq!(a.read(p, PROPOSAL_SIZE).unwrap(), before);
+        }
+        let (a, p) = world(2, 1, None, None);
+        assert!(matches!(apply_proposal(&a, &a, &a, p, &order(&[], 2)), Err(Fail::Refuse(_))));
+    }
+
+    #[test]
+    fn an_order_patched_by_conversions_expires_as_a_skip_not_a_refusal() {
+        let s = State::default();
+        s.enable();
+        s.arm(vec![1], 2, 0, 0);
+        assert!(s.peek(5).is_some() && s.pending(), "peeking does not take");
+        s.converted_one();
+        assert!(s.peek(DEFAULT_TTL_MS + 1).is_none());
+        let ev = s.drain_events(DEFAULT_TTL_MS + 1);
+        assert!(
+            matches!(ev.as_slice(), [Event::PatchSkipped { reason, .. }] if reason.contains("expired after patching") && reason.contains("1 converted")),
+            "{ev:?}"
+        );
     }
 }

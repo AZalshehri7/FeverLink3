@@ -95,19 +95,24 @@ impl Runtime {
             }
         }
         let now = self.now_ms();
+        let converted = self.patch.converted();
         let Some(order) = self.patch.take(now) else { return };
+        if converted > 0 {
+            // the conversion hook already wrote the order into the proposal(s) this build converted; the command made from one of
+            // them is here, so the order is done (nothing is written a second time)
+            self.say(&format!(
+                "native patch: a build_proposal Add arrived (call site rva {:x?}) after {converted} patched conversion(s): the order is cleared",
+                site
+            ));
+            return;
+        }
         // SAFETY: only readable memory is read.
         let Some(payload) = (unsafe { engine::payload_of(args.cmd) }) else {
             self.patch.report(Event::PatchRefused { reason: "the command has no payload".into() });
             return;
         };
-        let result = match EngineAlloc::at(self.base) {
-            Err(why) => Err(format!("the game's allocator was not verified: {why}")),
-            Ok(_) if self.build.name != crate::portable::LAYOUT_BUILD => Err(format!(
-                "the layout is that of game build {}, this is {}",
-                crate::portable::LAYOUT_BUILD,
-                self.build.name
-            )),
+        let result = match self.patch_alloc() {
+            Err(why) => Err(why),
             Ok(alloc) => cp::apply(&crate::dump::LiveMem, &LivePoke, &alloc, payload, &order),
         };
         match result {
@@ -115,6 +120,78 @@ impl Runtime {
                 self.patch.report(Event::Patched { frozen: order.frozen, adds: order.adds, allocated: done.allocated })
             }
             Err(reason) => self.patch.report(Event::PatchRefused { reason }),
+        }
+        self.wake();
+    }
+
+    /// The allocator and layout checks both ways of patching need.
+    fn patch_alloc(&self) -> Result<EngineAlloc, String> {
+        let alloc =
+            EngineAlloc::at(self.base).map_err(|why| format!("the game's allocator was not verified: {why}"))?;
+        if self.build.name != crate::portable::LAYOUT_BUILD {
+            return Err(format!(
+                "the layout is that of game build {}, this is {}",
+                crate::portable::LAYOUT_BUILD,
+                self.build.name
+            ));
+        }
+        Ok(alloc)
+    }
+
+    /// What the hook on `scripting::Convert` does after the original returned: `out` is the `std::optional<Proposal>` it filled
+    /// (the Proposal at +0, "has a value" at +0x358). While a `patch_next` order is armed, a proposal that has a value and that the
+    /// order describes (same number of added nodes, one construction at least) gets its frozenNodes written, before anything checks
+    /// it. The order stays armed (the mod's dry verdict and the build convert separately, and the command's `Add` clears it);
+    /// a conversion the order does not describe leaves both alone. Every call while an order is armed is in `native.log`.
+    pub fn on_convert(&self, out: usize, caller: Option<usize>) {
+        let now = self.now_ms();
+        if !self.patch.pending() {
+            // the mod writes `patch_next` and calls the engine in the same breath: look at the file now
+            self.ingest_patch_order(now);
+            if !self.patch.pending() {
+                return;
+            }
+        }
+        let Some(order) = self.patch.peek(now) else { return }; // expired: the service thread reports it
+        let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
+        let at = site.map_or("?".to_string(), |r| format!("{r:x}"));
+        let mem = crate::dump::LiveMem;
+        let flag = crate::dump::Mem::read(&mem, out + cp::PROPOSAL_SIZE, 1).map(|b| b[0]);
+        let nodes = cp::added_nodes(&mem, out).map_or("?".to_string(), |n| n.to_string());
+        let outcome: Result<cp::Done, cp::Fail> = match flag {
+            None => Err(cp::Fail::NotThis("the result is not readable".into())),
+            Some(0) => Err(cp::Fail::NotThis("Convert produced no proposal (the conversion failed)".into())),
+            // the order must describe this proposal before the allocator matters: another conversion is none of its business
+            Some(_) => cp::describes(&mem, out, &order).and_then(|()| match self.patch_alloc() {
+                Err(why) => Err(cp::Fail::Refuse(why)),
+                Ok(alloc) => cp::apply_proposal(&mem, &LivePoke, &alloc, out, &order),
+            }),
+        };
+        match outcome {
+            Ok(done) => {
+                self.patch.converted_one();
+                self.say(&format!(
+                    "native patch: convert: call site rva {at}, {nodes} added nodes: PATCHED frozenNodes {:?} (new block: {}); the order stays armed until a build_proposal Add or its ttl",
+                    order.frozen, done.allocated
+                ));
+                self.patch.convert_event(Event::Patched {
+                    frozen: order.frozen,
+                    adds: order.adds,
+                    allocated: done.allocated,
+                });
+            }
+            Err(cp::Fail::NotThis(why)) => {
+                self.say(&format!(
+                    "native patch: convert: call site rva {at}, {nodes} added nodes (order: {}): skipped: {why}",
+                    order.adds
+                ));
+                self.patch.convert_event(Event::PatchSkipped { reason: format!("convert: {why}"), kind: None, site });
+            }
+            Err(cp::Fail::Refuse(why)) => {
+                self.patch.take(now);
+                self.say(&format!("native patch: convert: call site rva {at}, {nodes} added nodes: REFUSED: {why}"));
+                self.patch.report(Event::PatchRefused { reason: format!("convert: {why}") });
+            }
         }
         self.wake();
     }

@@ -71,6 +71,37 @@ unsafe extern "system-unwind" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
     }
 }
 
+/// The function `scripting::Convert(out optional<Proposal>*, state*, SimpleProposal*, ..)` is made to jump to: calls the original with
+/// every slot as given (four registers, four stack slots), then lets the runtime write the armed `patch_next` order's frozenNodes
+/// into the proposal it produced. Returns what the original returned. The runtime's part is contained (`log::guarded`); the call
+/// into the game is outside it and may unwind.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system-unwind" fn convert_hook(
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+) -> u64 {
+    // first, before anything can change the frames above us
+    let caller = hook_caller();
+    let original = CONVERT_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0; // unreachable once installed
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline for `Convert`; the extra slots are the caller's own stack words, passed on untouched.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    let ret = unsafe { original(rcx, rdx, r8, r9, a5, a6, a7, a8) };
+    if let Some(rt) = RUNTIME.get() {
+        crate::log::guarded("convert hook", || rt.on_convert(rcx as usize, caller));
+    }
+    ret
+}
+
 /// The unhooked town-seed function (the trampoline), published before the jump is written; 0 until then.
 static TOWN_SEED_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// Base address of the image, for turning the caller into an RVA in the log; 0 until armed.
@@ -147,6 +178,8 @@ unsafe extern "system-unwind" fn town_seed_hook(
 
 /// The unhooked `TownDeveloper::Develop` and `TownUpdateSize` handler (trampolines); 0 until published.
 static GROWTH_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// The unhooked `scripting::Convert` (the trampoline), published before the jump is written; 0 until then.
+static CONVERT_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static GROWTH_CMD_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// Address of the game's `GameTime` getter; 0 when the game time cannot be read.
 static GROWTH_GETTER: AtomicUsize = AtomicUsize::new(0);
@@ -859,6 +892,7 @@ pub struct Targets {
     pub edges: usize,
     pub sort: usize,
     pub pick: usize,
+    pub convert: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -1003,6 +1037,7 @@ pub unsafe fn execute(
                 Feature::GrowthCmd => targets.growth_cmd,
                 Feature::GrowthCands => targets.cands,
                 Feature::GrowthEdges => targets.edges,
+                Feature::Convert => targets.convert,
                 _ => targets.add,
             };
             match unsafe { Detour::prepare(at, expected) } {
@@ -1022,6 +1057,7 @@ pub unsafe fn execute(
     GROWTH_CMD_ORIGINAL.store(original_of("town_update_size"), Ordering::Release);
     CANDS_ORIGINAL.store(original_of("town_candidates"), Ordering::Release);
     EDGES_ORIGINAL.store(original_of("town_edges"), Ordering::Release);
+    CONVERT_ORIGINAL.store(original_of("script_convert"), Ordering::Release);
     observer(Stage::Prepared);
 
     // 4. write the jumps; if one fails, take the others out again
@@ -1263,6 +1299,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         edges: edges_hook as *const () as usize,
         sort: sort_hook as *const () as usize,
         pick: pick_hook as *const () as usize,
+        convert: convert_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1466,6 +1503,7 @@ mod tests {
                 rva: CMD_RVA,
                 prologue: Box::leak(handler_fn().to_vec().into_boxed_slice()),
             }),
+            script_convert: None,
             town_candidates: Some(HookSite {
                 rva: CANDS_RVA,
                 prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()),
@@ -1568,6 +1606,7 @@ mod tests {
             edges: edges_hook as *const () as usize,
             sort: sort_hook as *const () as usize,
             pick: pick_hook as *const () as usize,
+            convert: convert_hook as *const () as usize,
         }
     }
 
