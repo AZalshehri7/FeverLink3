@@ -345,7 +345,9 @@ class StrictTest(unittest.TestCase):
     # FEVERLINK3_STRICT_CANCEL for the test: "0" = hold-and-release for every build (what most tests here are about), "1" = cancel
     # every kind, None = unset (the default: cancel and replay on every game for street, combined and bulldoze builds)
     strict_cancel = "0"
-    extra_env = {}      # more environment variables for the test (None removes one)
+    # more environment variables for the test (None removes one). The firing of the tool's callback is ON by default since 2026-10-13;
+    # most tests here are about the older flows and switch it off (classes that set extra_env themselves say what they need).
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "0"}
     fires = False       # the fake module reports `done` in its held events
 
     def setUp(self):
@@ -1191,6 +1193,40 @@ class DefaultHoldAndReleaseTest(StrictTest):
         self.tick(24)
         self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
         self.assertNotIn("cancel flow", self.log())
+
+
+class DefaultDemolitionTest(StrictTest):
+    """Nothing set: the defaults since 2026-10-13 (FEVERLINK3_STRICT_CANCEL=removals, FEVERLINK3_STRICT_FIRE_DONE on). A demolition is cancelled
+    and replayed at the stamp by every game (real two-window run: 11 of 11 left the checksums identical and the bulldozer usable); roads are
+    held and released as before. =0 on either variable is the opt-out."""
+
+    strict_cancel = None
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": None}
+    fires = True
+
+    def test_a_demolition_is_cancelled_and_a_road_is_held_and_released(self):
+        self.start()
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertSameWorld()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], [2]))
+        self.assertSameWorld()
+
+
+class OptOutTest(DefaultDemolitionTest):
+    """FEVERLINK3_STRICT_FIRE_DONE=0 or FEVERLINK3_STRICT_CANCEL=0: back to hold-and-release for everything."""
+
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "0"}
+
+    def test_a_demolition_is_cancelled_and_a_road_is_held_and_released(self):
+        self.start()
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
 
 
 class CancelFlowChoiceTest(StrictTest):

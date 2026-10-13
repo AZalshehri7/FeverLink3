@@ -57,14 +57,14 @@ local DEV = false
 pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 
 -- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
---   unset / "0"  DEFAULT: hold-and-release for every build. The tool's command is held until the stamp and then released, so the tool gets its
+--   "0"          hold-and-release for every build (developer opt-out; was the default until 2026-10-13). The tool's command is held until the stamp and then released, so the tool gets its
 --                completion callback and its preview/ghost keeps working. The originator's engine applies the tool's own command while the
 --                other games replay a rebuilt record: they allocate different entity ids for the same build and the worlds drift apart a few
 --                game minutes later (lab runs 2026-10-12), which the checksum safety net repairs with a resync.
 --   "plans"      cancel-and-replay on EVERY game, the originator included, for the plans street, combined and bulldoze (all originators).
 --   "host"       the same, but only when this game is the host (the guest keeps hold-and-release).
 --   "1"          cancel-and-replay for every kind and every originator.
---   "removals"   cancel-and-replay ONLY for builds that take things away and add nothing (a bulldozer removing a town building or a
+--   unset / "removals"  DEFAULT. Cancel-and-replay ONLY for builds that take things away and add nothing (a bulldozer removing a town building or a
 --                segment), every originator, and only when the module fires the tool's callback (FEVERLINK3_STRICT_FIRE_DONE=1). Why: in
 --                hold-and-release the originator's engine applies its own command 1000-1600 ms of game time after the stamp (real run
 --                2026-10-13, screenshot pass: stamp 2505800, engine event at 2506800) while every other game applies it AT the stamp; a freed
@@ -74,17 +74,20 @@ pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 -- completion callback: in the first real two-player session the guest's street tool showed no ghost for the second road he built
 -- (the click still built it). TpF2 fires the callback before it cancels; that is not implemented here (the callback's signature on this
 -- build is unverified), so the cancel flow is opt-in until it is.
-local STRICT_CANCEL = "off"
+-- Real two-window test 2026-10-13: 11 of 11 demolitions of town buildings with the bulldozer, cancelled and replayed, left the checksums
+-- identical and the bulldozer usable; in hold-and-release 2 of about 6 drifted (the originator's engine applied 4-5 steps after the stamp).
+local STRICT_CANCEL = "removals"
 pcall(function()
 	local v = os.getenv("FEVERLINK3_STRICT_CANCEL")
-	if v == "1" then STRICT_CANCEL = "all" elseif v == "plans" or v == "host" or v == "removals" then STRICT_CANCEL = v end
+	if v == "0" then STRICT_CANCEL = "off"
+	elseif v == "1" then STRICT_CANCEL = "all" elseif v == "plans" or v == "host" or v == "removals" then STRICT_CANCEL = v end
 end)
--- FEVERLINK3_STRICT_FIRE_DONE=1 (default off, experimental): the native module fires the tool's own completion callback before it drops a
+-- FEVERLINK3_STRICT_FIRE_DONE (default ON since 2026-10-13, =0 switches it off; the native module reads the same variable): the native module fires the tool's own completion callback before it drops a
 -- cancelled command (the TpF2 recipe; docs/NATIVE_LINK.md), which re-arms the tool: without it the tool's busy flag stays set and its
 -- ghost/preview never comes back. It does so only for the tools whose callback was read out of the exe (street, bulldozer: the held event
 -- says `done = true`). With the switch on, a build is cancelled only when its held command says so; otherwise it stays hold-and-release.
-local FIRE_DONE = false
-pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") == "1" end)
+local FIRE_DONE = true
+pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") ~= "0" end)
 local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
 local CANCEL_EXTRA_STEPS = 6   -- extra steps of lead for a build every game applies at the stamp (see natDecideUnsafe)
 

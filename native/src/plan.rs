@@ -44,7 +44,8 @@ pub const HOLD_VAR: &str = "FEVERLINK3_HOLD";
 pub const POOLPATCH_VAR: &str = "FEVERLINK3_POOLPATCH";
 pub const TOWN_SEED_VAR: &str = "FEVERLINK3_LOG_TOWN_SEED";
 pub const FORCE_TOWN_SEED_VAR: &str = "FEVERLINK3_FORCE_TOWN_SEED";
-/// `1` makes a cancelled command fire the tool's own completion callback before it is destroyed (experimental, off by default).
+/// A cancelled command fires the tool's own completion callback before it is destroyed. On by default since 2026-10-13 (real test: 11 of 11
+/// demolitions cancelled this way left the bulldozer usable); `0` switches it off.
 pub const FIRE_DONE_VAR: &str = "FEVERLINK3_STRICT_FIRE_DONE";
 
 /// Parses the forced seed: decimal or `0x` hex, must fit 32 bits; blanks around it are ignored.
@@ -98,7 +99,7 @@ impl HookConfig {
             hooks: !off(HOOKS_VAR),
             hold: !off(HOLD_VAR),
             poolpatch: !off(POOLPATCH_VAR),
-            fire_done: on(FIRE_DONE_VAR),
+            fire_done: !off(FIRE_DONE_VAR),
             town_seed: on(TOWN_SEED_VAR) || force_seed.is_some(),
             force_seed,
             growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
@@ -593,26 +594,27 @@ mod tests {
     // ---- the switches
 
     #[test]
-    fn diagnostic_switches_are_off_unless_exactly_one_and_the_four_defaults_are_on() {
+    fn diagnostic_switches_are_off_unless_exactly_one_and_the_five_defaults_are_on() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
         };
-        let defaults = HookConfig { hooks: true, hold: true, poolpatch: true, luaseed: true, ..Default::default() };
+        let defaults = HookConfig { hooks: true, hold: true, poolpatch: true, luaseed: true, fire_done: true, ..Default::default() };
         assert_eq!(
             HookConfig::from_lookup(env(&[])),
             defaults,
-            "hooks, hold, the pool patch and the seed pin are on by default"
+            "hooks, hold, the pool patch, the seed pin and the firing of the tool callback are on by default"
         );
         let none = HookConfig::from_lookup(env(&[
             (HOOKS_VAR, "0"),
             (HOLD_VAR, "0"),
             (POOLPATCH_VAR, "0"),
             (LUA_SEED_VAR, "0"),
+            (FIRE_DONE_VAR, "0"),
         ]));
         assert_eq!(none, HookConfig::default(), "=0 turns each of them off");
         assert!(!HookConfig::default().any());
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
-        assert_eq!(all, HookConfig { luaseed: true, ..cfg(true, true, true) });
+        assert_eq!(all, HookConfig { luaseed: true, fire_done: true, ..cfg(true, true, true) });
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
             let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
             let on_by_default = off.trim() != "0";
@@ -623,6 +625,7 @@ mod tests {
                     hold: on_by_default,
                     poolpatch: on_by_default,
                     luaseed: on_by_default,
+                    fire_done: on_by_default,
                     ..Default::default()
                 },
                 "{off:?} must not switch anything else on"
@@ -631,14 +634,14 @@ mod tests {
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(HOOKS_VAR, "0"), (POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off fire_done=off");
+        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off fire_done=on");
         assert_eq!(
             HookConfig::default().describe(),
             "hooks=off hold=off poolpatch=off luaseed=off town_seed=off fire_done=off"
         );
         let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
         assert!(seed.any() && seed.town_seed, "its own switch");
-        assert_eq!(seed.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=off");
+        assert_eq!(seed.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=on");
         assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).town_seed, "only the exact value 1");
     }
 
@@ -658,7 +661,7 @@ mod tests {
         assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
         assert_eq!(
             c.describe(),
-            "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=off force_seed=0x00000010"
+            "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=on force_seed=0x00000010"
         );
         let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
         assert_eq!(bad, HookConfig::from_lookup(env(&[])), "an invalid value switches nothing on");
