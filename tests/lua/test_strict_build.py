@@ -595,18 +595,18 @@ class StrictOnTest(StrictTest):
         self.assertNotIn("native build captured", self.B.log())
         self.assertSameWorld()
 
-    def test_a_build_the_originator_refuses_at_the_stamp_is_cancelled_not_left_held(self):
-        # the same rule that refuses it on every other game refuses it here: the held command is destroyed, nothing is built
+    def test_a_build_the_originator_refuses_at_the_stamp_is_released_not_cancelled_when_the_callback_cannot_be_fired(self):
+        # the rule that refuses it on every other game refuses it here too; a cancel would leave the tool dead (the module cannot fire
+        # the callback here), so the command goes back to the engine and the games are repaired
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))
         self.frames(2)
         self.assertEqual(self.B.native.held, [1])
         self.B.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _ in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
         self.tick(14)
-        self.assertEqual(self.B.native.dropped, [1])
-        self.assertEqual(self.B.native.released, [])
-        self.assertIn("was refused at its stamp: cancelled", self.B.log())
-        self.assertEqual(self.B.builds_applied(), 0)
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertEqual(self.B.native.released, [1])
+        self.assertIn("was refused at its stamp but is NOT cancelled", self.B.log())
         self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
 
     # ---- (g) both players building at once
@@ -1048,6 +1048,10 @@ class NativeVersusReplayTest(StrictTest):
 class VetoTest(StrictTest):
     """Veto-only validation: a game that cannot build the record says so; silence means yes. A refused build exists on NO game."""
 
+    # the cancel path needs a tool callback the module can fire (otherwise a cancel leaves the tool dead: see NoCancelWithoutCallbackTest)
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
     def test_the_happy_path_has_no_veto_and_no_extra_message(self):
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))
@@ -1100,6 +1104,24 @@ class VetoTest(StrictTest):
         self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
         self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.B.sig())
         self.assertEqual(self.B.native.released, [2])
+
+
+class NoCancelWithoutCallbackTest(StrictTest):
+    """One rule for every tool kind: a held command is cancelled only when the module can fire the tool's callback. A veto (a game that
+    cannot rebuild the build) then releases the command instead (real session 2026-10-13: a cancelled underground station entrance left the
+    tool dead); the vetoing game dropped it, so the games differ and the host is asked to repair."""
+
+    fires = False
+
+    def test_a_veto_releases_the_build_instead_of_killing_the_tool(self):
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.assertEqual(len(self.relay.vetoes), 1)
+        self.assertEqual(self.B.native.dropped, [], "nothing was cancelled: the tool keeps its callback")
+        self.assertEqual(self.B.native.released, [1], "the command went back to the engine")
+        self.assertIn("NOT cancelled", self.B.log())
 
 
 class StrictCancelFallbackTest(StrictTest):
@@ -1399,6 +1421,10 @@ class PausedGraceTest(StrictTest):
     and park it, and only the originator's commit makes every game apply it (real run 2026-10-11: a veto came too late and the
     guest's game built a road the host could not)."""
 
+    # the cancel path needs a tool callback the module can fire (otherwise a cancel leaves the tool dead: see NoCancelWithoutCallbackTest)
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
     def pause(self):
         self.start(speed=2)
         self.tick(10)
@@ -1566,6 +1592,10 @@ class VetoWordsTest(StrictTest):
 class HeldAcrossResyncTest(StrictTest):
     """Real run 2026-10-11: a held host build was never released at its stamp, a resync saved a world without it and the module's
     30 s limit put it into the world later, shipped a second time."""
+
+    # the cancel path needs a tool callback the module can fire (otherwise a cancel leaves the tool dead: see NoCancelWithoutCallbackTest)
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
 
     def test_a_town_build_is_not_taken_for_the_early_release_of_a_held_command(self):
         self.start()

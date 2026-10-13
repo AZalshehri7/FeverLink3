@@ -1917,6 +1917,12 @@ local function dryRun(it)
 		return true, "inconclusive: " .. tostring(why)
 	end
 	local bad = proposalVerdict(args)
+	-- the engine's verdict and the form that was judged, for every build that adds or removes constructions (real session 2026-10-13:
+	-- an underground station entrance was refused with "Construction Not Possible" and the log did not say which plan or form)
+	if args.plan == "construction" or args.plan == "withStreet" or args.plan == "combined" or args.plan == "bulldoze" then
+		traceGui("build.verdict", string.format("%s plan=%s form=%s %s ie=%s pi=%s", tostring(it.key), tostring(args.plan), tostring(args.form),
+			bad and ("REFUSED " .. bad) or "accepted", tostring(args[3] == true), tostring(args[4] == true)))
+	end
 	if bad then return false, bad end
 	return true
 end
@@ -2178,11 +2184,23 @@ local function natRelease(key)
 	return ok
 end
 
+-- THE rule for every kind of tool (street, track, stop, construction, bulldoze ...): a held command is cancelled only when the module can
+-- fire the tool's completion callback. A cancel without it leaves the tool dead (real runs 2026-10-11 and 2026-10-13), so otherwise the
+-- command goes back to the engine (the build exists on this game, the other games are repaired): what MPFever does for every tool.
+local function natCancelAllowed(h)
+	return h.fireable == true
+end
+
 -- The action was refused at its stamp (the same rule that refuses it on every other game): the held command is destroyed.
 function natHeldRefused(it)
 	local N = G.nat
 	local h = N and N.heldByKey[it.key]
 	if not h or h.released or h.done or h.cancelled then return end
+	if not natCancelAllowed(h) then
+		natSay("held " .. h.id .. " (" .. it.key .. ") was refused at its stamp but is NOT cancelled (the tool's callback cannot be fired): released, the games are repaired")
+		natRelease(it.key)
+		return
+	end
 	h.cancelled = true
 	pcall(toSim, "heldgone", { key = it.key })
 	natSay("held " .. h.id .. " (" .. it.key .. ") was refused at its stamp: cancelled")
@@ -2199,6 +2217,14 @@ function natVeto(key, who, why)
 	if not h then return nil end   -- not a held build of this game
 	if h.released or h.done or h.cancelled then
 		natSay("veto of " .. key .. " by " .. tostring(who) .. " came too late (the command was released already): " .. tostring(why))
+		return false
+	end
+	if not natCancelAllowed(h) then
+		-- The module cannot fire this tool's callback, so a cancel would leave the tool dead (real session 2026-10-13: an underground
+		-- station entrance, the owner got stuck and a resync followed). The command goes back to the engine instead: the build exists
+		-- on this game only (false = "too late" for the caller, which tells the players and asks the host to repair the other game).
+		natSay("held " .. h.id .. " (" .. key .. ") NOT cancelled: this tool's callback cannot be fired, a cancel would leave the tool dead; " .. tostring(who) .. " could not build it (" .. tostring(why) .. "), the build is released here and the other game is repaired")
+		natRelease(key)
 		return false
 	end
 	h.cancelled = true
@@ -2345,7 +2371,7 @@ local function natDecideUnsafe(h, cap)
 	-- simulation half does everything the other games do except sending (simApplyAction, it.heldId) and this half then releases
 	-- the held command (natRelease); every OTHER game replays the build at the stamp.
 	it.heldId = id
-	local rec = { id = id, key = it.key, at = at, t = os.clock() }
+	local rec = { id = id, key = it.key, at = at, t = os.clock(), fireable = FIRE_DONE and h.done == true }
 	N.heldByKey[it.key], N.byId[id] = rec, rec
 	pcall(toSim, "heldout", { key = it.key })
 	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp",
@@ -2438,8 +2464,11 @@ local function heldWatchdog(N, now)
 				G.vetoed[key] = why
 				pcall(toSim, "drop", { key = key, why = why, own = true })
 				send("build_veto", { seq = tonumber(key:match(":(%d+)$")), owner = C.PLAYER_ID, why = why, name = C.PLAYER_NAME })
-				natVeto(key, C.PLAYER_NAME, why)
-				vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
+				if natVeto(key, C.PLAYER_NAME, why) == false then
+					vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build exists on their game only (the game stayed paused too long before it could be applied); the games will be synchronised.")
+				else
+					vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
+				end
 			end
 		end
 	end
