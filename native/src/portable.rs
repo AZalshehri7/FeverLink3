@@ -72,6 +72,8 @@ pub enum Ty {
     Raw(usize),
     /// Bytes that are not part of the command's input (the engine's result): not written.
     Skip(usize),
+    /// Padding inside an element: uninitialised residue (return addresses, stack words), never part of the value; not written.
+    Pad(usize),
 }
 
 impl Ty {
@@ -85,7 +87,7 @@ impl Ty {
             Ty::Res | Ty::Hash => 0x40,
             Ty::Vec(_) | Ty::EntVec | Ty::BlobVec => 0x18,
             Ty::Map => 0x10,
-            Ty::Raw(n) | Ty::Skip(n) => n,
+            Ty::Raw(n) | Ty::Skip(n) | Ty::Pad(n) => n,
         }
     }
 }
@@ -112,7 +114,9 @@ pub struct Elem {
 pub static NODE: Elem = Elem {
     name: "NodeAndEntity",
     stride: 0x40,
-    fields: &[f(0, "entity", Ty::Ent), f(4, "position", Ty::V3)],
+    // entity and position are the node; the other 0x30 bytes are residue (a return address into operator new, 0xaaaaaaab, stale
+    // pointers; different on every game and every run, seen in the spike dumps)
+    fields: &[f(0, "entity", Ty::Ent), f(4, "position", Ty::V3), f(0x10, "padding", Ty::Pad(0x30))],
     anchors: &[(0, 4)],
 };
 
@@ -197,7 +201,9 @@ pub static PAYLOAD: &[F] = &[
     f(0x240, "toRemove", Ty::EntVec),
     f(0x258, "toAdd", Ty::Vec(&CONSTRUCTION)),
     f(0x270, "old2new", Ty::Hash),
-    f(0x2b0, "parcelsToRemove", Ty::Raw(0x28)),
+    // a vector of u32 (copied with sar 2 in the engine's copy constructor) and a std::map whose sentinel is 0x50 bytes
+    f(0x2b0, "parcelsToRemove", Ty::EntVec),
+    f(0x2c8, "parcelsMap", Ty::Map),
     f(0x2d8, "terrain", Ty::Raw(0x80)),
     f(0x358, "context.gatherBuildings", Ty::U8),
     f(0x359, "context.gatherFields", Ty::U8),
@@ -491,7 +497,7 @@ impl Enc<'_> {
                 }
                 Ok(())
             }
-            Ty::Raw(_) | Ty::Skip(_) => Ok(()),
+            Ty::Raw(_) | Ty::Skip(_) | Ty::Pad(_) => Ok(()),
         }
     }
 

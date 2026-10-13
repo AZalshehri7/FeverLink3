@@ -23,6 +23,7 @@ pub mod dump;
 pub mod growth;
 pub mod hold;
 pub mod link;
+pub mod native_copy;
 pub mod patch;
 pub mod pe;
 pub mod plan;

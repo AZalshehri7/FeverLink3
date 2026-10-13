@@ -33,6 +33,12 @@ pub trait Alloc {
     fn alloc(&self, n: usize) -> Option<usize>;
     /// Copies into memory this allocator handed out.
     fn write(&self, addr: usize, data: &[u8]) -> bool;
+    /// Gives back every block still held; the count.
+    fn free_all(&self) -> usize {
+        0
+    }
+    /// Lets go of every block without freeing it: its owner (an engine object it was put into) frees it.
+    fn forget_all(&self) {}
 }
 
 /// Something the module cannot create, with the member it concerns.
@@ -57,6 +63,8 @@ struct Builder<'a> {
     a: &'a dyn Alloc,
     blocked: Vec<Blocked>,
     blocks: usize,
+    /// Which top-level members are built (all when `None`); a member that is not selected is not touched and allocates nothing.
+    select: Option<&'a dyn Fn(&F) -> bool>,
 }
 
 fn parse_hex(s: &str) -> R<Vec<u8>> {
@@ -138,7 +146,9 @@ impl<'a> Builder<'a> {
         } else {
             let mut t = text.to_vec();
             t.push(0);
-            let addr = self.a.alloc(t.len()).ok_or_else(|| format!("{path}: string allocation failed"))?;
+            // the engine frees a string by its capacity (size | 15, plus the terminator)
+            let addr =
+                self.a.alloc((text.len() | 15) + 1).ok_or_else(|| format!("{path}: string allocation failed"))?;
             if !self.a.write(addr, &t) {
                 return Err(format!("{path}: string write failed"));
             }
@@ -161,7 +171,7 @@ impl<'a> Builder<'a> {
     fn field(&mut self, path: &str, ty: Ty, buf: &mut [u8]) -> R<()> {
         let v = self.val(path);
         match ty {
-            Ty::Skip(_) | Ty::Raw(_) => Ok(()),
+            Ty::Skip(_) | Ty::Raw(_) | Ty::Pad(_) => Ok(()),
             Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 match ty {
@@ -287,10 +297,14 @@ impl<'a> Builder<'a> {
         order.sort_by_key(|f| f.off);
         let mut cursor = 0usize;
         for fl in order {
-            if fl.off > cursor {
+            if fl.off > cursor && !(path.is_empty() && self.select.is_some()) {
                 self.gap(path, buf, cursor, fl.off)?;
             }
             let end = fl.off + fl.ty.size();
+            if path.is_empty() && self.select.is_some_and(|sel| !sel(fl)) {
+                cursor = end;
+                continue;
+            }
             let full = if path.is_empty() { fl.name.to_string() } else { format!("{path}.{}", fl.name) };
             if let Ty::Raw(_) = fl.ty {
                 self.gap_named(&full, buf, fl.off, end)?;
@@ -299,7 +313,7 @@ impl<'a> Builder<'a> {
             }
             cursor = end;
         }
-        if cursor < size {
+        if cursor < size && !(path.is_empty() && self.select.is_some()) {
             self.gap(path, buf, cursor, size)?;
         }
         Ok(())
@@ -469,6 +483,11 @@ impl<'a> Builder<'a> {
 
 /// Builds a payload from portable text (one command's block). Allocations go through `a`.
 pub fn build(text: &str, image_base: usize, a: &dyn Alloc) -> R<Built> {
+    build_selected(text, image_base, a, None)
+}
+
+/// [`build`] for the top-level members `select` accepts only (`None`: all of them, and the unnamed bytes too).
+pub fn build_selected(text: &str, image_base: usize, a: &dyn Alloc, select: Option<&dyn Fn(&F) -> bool>) -> R<Built> {
     let mut lines: HashMap<&str, &str> = HashMap::new();
     let mut header_ok = false;
     for l in text.lines() {
@@ -487,7 +506,7 @@ pub fn build(text: &str, image_base: usize, a: &dyn Alloc) -> R<Built> {
     if !header_ok {
         return Err("no portable header".into());
     }
-    let mut b = Builder { lines, base: image_base, a, blocked: Vec::new(), blocks: 0 };
+    let mut b = Builder { lines, base: image_base, a, blocked: Vec::new(), blocks: 0, select };
     let mut payload = vec![0u8; PAYLOAD_SIZE];
     b.fields("", &mut payload, PAYLOAD, PAYLOAD_SIZE)?;
     Ok(Built { payload, blocked: b.blocked, blocks: b.blocks })
@@ -513,12 +532,55 @@ pub fn member_of(path: &str) -> String {
     }
 }
 
-fn body(text: &str) -> BTreeMap<&str, &str> {
+/// The `path -> value` lines of a portable text.
+pub fn lines_of(text: &str) -> BTreeMap<&str, &str> {
     text.lines()
         .filter(|l| !l.starts_with("==="))
         .filter_map(|l| l.split_once('\t'))
         .map(|(p, v)| (p, v.split('\t').next().unwrap_or(v)))
         .collect()
+}
+
+/// Compares two portable texts per member: the report lines (`MATCH` / `DIFF`), the members that match and that differ.
+pub fn compare_texts(a: &str, b: &str) -> (String, usize, usize) {
+    let (x, y) = (lines_of(a), lines_of(b));
+    let mut members: BTreeMap<String, (usize, usize, Option<String>)> = BTreeMap::new();
+    let mut paths: Vec<&str> = x.keys().chain(y.keys()).copied().collect();
+    paths.sort_unstable();
+    paths.dedup();
+    for p in paths {
+        let e = members.entry(member_of(p)).or_default();
+        if x.get(p) == y.get(p) {
+            e.0 += 1;
+        } else {
+            e.1 += 1;
+            if e.2.is_none() {
+                e.2 = Some(format!(
+                    "{p}: {} <> {}",
+                    x.get(p).map_or("(absent)", |v| v),
+                    y.get(p).map_or("(absent)", |v| v)
+                ));
+            }
+        }
+    }
+    let mut out = String::new();
+    let (mut matched, mut differing) = (0, 0);
+    for (m, (ok, bad, first)) in &members {
+        if *bad == 0 {
+            matched += 1;
+            let _ = writeln!(out, "MATCH {m} ({ok} lines)");
+        } else {
+            differing += 1;
+            let f = first.as_deref().unwrap_or("");
+            let _ = writeln!(
+                out,
+                "DIFF  {m} ({bad} of {} lines differ) first: {}",
+                ok + bad,
+                f.chars().take(300).collect::<String>()
+            );
+        }
+    }
+    (out, matched, differing)
 }
 
 /// What the self-check found.
@@ -558,43 +620,8 @@ pub fn roundtrip(
     };
     let again = portable::encode(mem, Env { image_base }, set, portable::LAYOUT_BUILD, &head)
         .map_err(|e| format!("the rebuilt payload cannot be written as text: {e}"))?;
-    let (x, y) = (body(original_text), body(&again.text));
-    let mut members: BTreeMap<String, (usize, usize, Option<String>)> = BTreeMap::new();
-    let mut paths: Vec<&str> = x.keys().chain(y.keys()).copied().collect();
-    paths.sort_unstable();
-    paths.dedup();
-    for p in paths {
-        let e = members.entry(member_of(p)).or_default();
-        if x.get(p) == y.get(p) {
-            e.0 += 1;
-        } else {
-            e.1 += 1;
-            if e.2.is_none() {
-                e.2 = Some(format!(
-                    "{p}: {} <> {}",
-                    x.get(p).map_or("(absent)", |v| v),
-                    y.get(p).map_or("(absent)", |v| v)
-                ));
-            }
-        }
-    }
-    let mut out = String::new();
-    let (mut matched, mut differing) = (0, 0);
-    for (m, (ok, bad, first)) in &members {
-        if *bad == 0 {
-            matched += 1;
-            let _ = writeln!(out, "MATCH {m} ({ok} lines)");
-        } else {
-            differing += 1;
-            let f = first.as_deref().unwrap_or("");
-            let _ = writeln!(
-                out,
-                "DIFF  {m} ({bad} of {} lines differ) first: {}",
-                ok + bad,
-                f.chars().take(300).collect::<String>()
-            );
-        }
-    }
+    let (cmp_text, matched, differing) = compare_texts(original_text, &again.text);
+    let mut out = cmp_text;
     // the words of the payload itself, pointers excluded, outside the engine's result part
     let mut word_diffs = Vec::new();
     let mut ptr_vs_null = 0usize;
@@ -707,7 +734,8 @@ impl Mem for Arena {
 pub struct EngineAlloc {
     new_fn: unsafe extern "system-unwind" fn(usize) -> *mut u8,
     delete_fn: unsafe extern "system-unwind" fn(*mut u8),
-    taken: RefCell<Vec<usize>>,
+    /// (address handed out, address from operator new)
+    taken: RefCell<Vec<(usize, usize)>>,
 }
 
 #[cfg(windows)]
@@ -743,31 +771,51 @@ impl EngineAlloc {
     ) -> EngineAlloc {
         EngineAlloc { new_fn, delete_fn, taken: RefCell::new(Vec::new()) }
     }
-
-    /// Gives everything back.
-    pub fn free_all(&self) -> usize {
-        let v: Vec<usize> = self.taken.borrow_mut().drain(..).collect();
-        for &a in &v {
-            // SAFETY: a block this allocator handed out and has not freed.
-            unsafe { (self.delete_fn)(a as *mut u8) };
-        }
-        v.len()
-    }
 }
 
 #[cfg(windows)]
 impl Alloc for EngineAlloc {
+    /// Gives everything back.
+    fn free_all(&self) -> usize {
+        let v: Vec<(usize, usize)> = self.taken.borrow_mut().drain(..).collect();
+        for &(_, raw) in &v {
+            // SAFETY: a block this allocator got from operator new and has not freed.
+            unsafe { (self.delete_fn)(raw as *mut u8) };
+        }
+        v.len()
+    }
+
+    fn forget_all(&self) {
+        self.taken.borrow_mut().clear();
+    }
+
     fn alloc(&self, n: usize) -> Option<usize> {
-        // SAFETY: the game's operator new; it throws on failure (the caller is a guarded hook).
-        let p = unsafe { (self.new_fn)(n.max(1)) } as usize;
-        (p != 0).then(|| {
-            self.taken.borrow_mut().push(p);
+        let n = n.max(1);
+        // The engine's containers free a block of 0x1000 bytes or more through the pointer stored just below it (the STL's
+        // aligned big allocation: request n + 0x27, align to 32, keep the raw pointer at [ptr - 8]); smaller ones directly.
+        let (raw, p) = if n >= 0x1000 {
+            // SAFETY: the game's operator new; it throws on failure (the caller is a guarded hook).
+            let raw = unsafe { (self.new_fn)(n + 0x27) } as usize;
+            if raw == 0 {
+                return None;
+            }
+            let p = (raw + 0x27) & !0x1f;
+            // SAFETY: inside the block just allocated (p - 8 >= raw + 0x1f).
+            unsafe { core::ptr::write_unaligned((p - 8) as *mut usize, raw) };
+            (raw, p)
+        } else {
+            // SAFETY: as above.
+            let raw = unsafe { (self.new_fn)(n) } as usize;
+            (raw, raw)
+        };
+        (raw != 0).then(|| {
+            self.taken.borrow_mut().push((p, raw));
             p
         })
     }
     fn write(&self, addr: usize, data: &[u8]) -> bool {
         // only at the start of a block this allocator returned (the builder never writes anywhere else)
-        if !self.taken.borrow().contains(&addr) {
+        if !self.taken.borrow().iter().any(|&(p, _)| p == addr) {
             return false;
         }
         // SAFETY: `addr` is the start of a block of at least `data.len()` bytes this allocator returned.
@@ -834,7 +882,7 @@ mod tests {
         assert_eq!(r.text.matches("DIFF").count(), 1, "{}", r.text);
         // the heap pointer inside the construction and the containers the table cannot create
         assert!(r.text.contains("BLOCKED heap pointer x1"), "{}", r.text);
-        assert!(r.text.contains("BLOCKED std::map x6"), "{}", r.text);
+        assert!(r.text.contains("BLOCKED std::map x7"), "{}", r.text);
         assert!(r.text.contains("BLOCKED std::unordered_map x"), "{}", r.text);
         assert!(!r.exact);
     }

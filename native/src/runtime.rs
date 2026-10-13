@@ -35,6 +35,8 @@ use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
 use crate::portable;
 use crate::rebuild;
 
+mod native_copy;
+
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
 /// so declared as one that may unwind.
 pub type ApplyFn = unsafe extern "system-unwind" fn(sim: *mut u8, cmd: *mut u8) -> u64;
@@ -95,6 +97,8 @@ pub struct Runtime {
     portable: OnceLock<portable::Sink>,
     /// The dev-only rebuild self-check (`FEVERLINK3_PORTABLE_REBUILD`); unset in a normal run.
     rebuild: OnceLock<portable::Sink>,
+    /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
+    native_copy: OnceLock<portable::Sink>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -139,6 +143,7 @@ impl Runtime {
             dump: OnceLock::new(),
             portable: OnceLock::new(),
             rebuild: OnceLock::new(),
+            native_copy: OnceLock::new(),
         }
     }
 
@@ -216,7 +221,7 @@ impl Runtime {
             let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &LiveMem, &|b| {
                 Some(b.as_ptr() as usize)
             });
-            let freed = alloc.free_all();
+            let freed = rebuild::Alloc::free_all(&alloc);
             r.map(|r| format!("{}FREED {freed} blocks\n", r.text))
         })();
         let key = hold_id.map_or("none".to_string(), |k| k.to_string());
@@ -424,6 +429,9 @@ impl Runtime {
         if let Some(p) = self.rebuild.get() {
             p.set_dir(dir);
         }
+        if let Some(p) = self.native_copy.get() {
+            p.set_dir(dir);
+        }
         Ok(())
     }
 
@@ -543,6 +551,9 @@ impl Runtime {
             crate::log::guarded("add hook (rebuild)", || {
                 self.rebuild_check("held", job.payload, Some(job.id));
             });
+            crate::log::guarded("add hook (native copy)", || {
+                self.native_copy_check("held", job.payload, Some(job.id));
+            });
         }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
@@ -619,7 +630,8 @@ impl Runtime {
                                 plan.held_here = true;
                                 if (self.dump.get().is_some()
                                     || self.portable.get().is_some()
-                                    || self.rebuild.get().is_some())
+                                    || self.rebuild.get().is_some()
+                                    || self.native_copy.get().is_some())
                                     && self.build.kind_by_name("build_proposal") == Some(kind)
                                 {
                                     plan.dump = Some(DumpJob { id, site: rva, payload });
