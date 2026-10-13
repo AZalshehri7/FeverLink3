@@ -517,6 +517,11 @@ function APPLY_BUILD(p)
   for _, e in ipairs(P.nodesRem) do if not exists(e, "BASE_NODE") then return false, "node " .. tostring(e) .. " does not exist" end end
   for _, e in ipairs(P.consRem) do if not exists(e, "CONSTRUCTION") then return false, "construction " .. tostring(e) .. " does not exist" end end
   for _, e in ipairs(P.objsRem) do if not exists(e, "EDGE_OBJECT") then return false, "edge object " .. tostring(e) .. " does not exist" end end
+  -- the engine does not refuse a removal of a node configuration the node does not have, it aborts (real game: Engine.h:323
+  -- ecs::Engine::GetComponentDataIndex "it != components.end()", Component Type Index 30 = BaseNodeConfig, entity unknown)
+  for _, e in ipairs(P.cfgRem) do
+    if not exists(e, "BASE_NODE_CONFIG") then error("ENGINE ASSERT Engine.h:323 GetComponentDataIndex: Assertion 'it != components.end()' failed (BaseNodeConfig, entity " .. tostring(e) .. ")", 0) end
+  end
   local placeholders = {}
   for _, n in ipairs(P.nodesAdd) do
     local id = n.entity
@@ -542,6 +547,21 @@ function APPLY_BUILD(p)
   for _, o in ipairs(P.objsAdd) do
     local model = STORE(o)._model or o.model
     if model == nil or model == "" then return false, "edge object without model" end
+  end
+
+  -- a new node that joins three or more of the added segments and has no node configuration entry aborts the engine (the sweep harness's
+  -- A3 probe, 2026-10-13: Engine.h:323, BaseNodeConfig on entity 49832 "being added")
+  do
+    local joins, hasCfg = {}, {}
+    for _, n in ipairs(P.cfgAdd) do hasCfg[n.entity] = true end
+    for _, s in ipairs(P.edgesAdd) do
+      for _, nid in ipairs({ s.comp.node0, s.comp.node1 }) do
+        if nid < 0 then joins[nid] = (joins[nid] or 0) + 1 end
+      end
+    end
+    for nid, k in pairs(joins) do
+      if k >= 3 and not hasCfg[nid] then error("ENGINE ASSERT Engine.h:323 GetComponentDataIndex: Assertion 'it != components.end()' failed (BaseNodeConfig, new node " .. nid .. " joins " .. k .. " segments)", 0) end
+    end
   end
 
   local gone = {}
@@ -762,6 +782,8 @@ function NATIVE_SPLIT(spec)
   sp.removedSegments = { D("SegmentAndEntity", { entity = spec.edge, comp = COPY(w.BASE_EDGE), type = w.KIND }) }
   sp.addedNodes = { nodeAndEntity(-1, spec.at), nodeAndEntity(-2, spec.to) }
   sp.addedSegments = { segment(-3, na, -1, pa, spec.at, spec), segment(-4, -1, nb, spec.at, pb, spec), segment(-5, -1, -2, spec.at, spec.to, spec) }
+  -- the real tool always carries an entry for the new junction node (pref 2, no lane connections); the engine aborts without it
+  sp.nodeConfigsToAdd = { D("NodeConfigAndEntity", { entity = -1, comp = D("BaseNodeConfig", { laneConnections = {} }) }) }
   P.proposal = sp
   return P
 end
@@ -1473,7 +1495,7 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(g.lua("STATE:get().bind['1:1#c1']"), g.lua("FIND_CON('depot/road_depot.con')"), "the depot's construction, not the newest one")
             self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split())
 
-    def test_node_configurations_are_dropped_when_the_factory_rejects_them_and_the_engine_makes_its_own(self):
+    def test_a_junction_nodes_configuration_is_kept_in_every_form_so_a_factory_that_rejects_it_refuses_the_build(self):
         self.start()
         split = "WITH_CFG(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }, -1, { { -3, 0, -5, 0 } })"
         self.B.issue(split)
@@ -1484,11 +1506,10 @@ class BuildTest(unittest.TestCase):
             g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' and #parts.cfgAdd > 0 then return 'Unknown exception' end end; CFG_LOG = {}")
         self.B.issue(split.replace("x = 50", "x = 150").replace("edge = 110", "edge = 111") + "")
         self.tick(14)
-        self.assertEqual(self.A.lua("#CFG_LOG"), 0, "second form: the engine makes the lane connections itself")
-        self.assertEqual(self.B.lua("#CFG_LOG"), 0)
-        self.assertSameWorld()
-        self.assertIn("(form 2)", self.A.log())
-        self.assertIsNotNone(self.A.lua("FIND_EDGE(150, 0, 150, 80)"))
+        # a new junction node (three segments) must keep its configuration entry in every form (the engine aborts without one, sweep
+        # 2026-10-13), so the forms that left it out are no way out any more: the build is refused instead of crashing the game
+        self.assertIn("refused", self.A.log())
+        self.assertIsNone(self.A.lua("FIND_EDGE(150, 0, 150, 80)"))
 
     def test_placeholders_are_renumbered_as_a_script_does_when_the_factory_insists(self):
         self.start()
@@ -1784,11 +1805,11 @@ class BuildTest(unittest.TestCase):
         self.tick(14)
         ea1, ea3 = edge(self.A, 0, 0, 50, 0), edge(self.A, 50, 0, 50, 80)
         self.assertNotEqual(ea1, eb1)
-        self.assertEqual(self.A.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (ea1, ea3), "the host's configuration names the host's segments")
-        self.assertEqual(self.B.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (eb1, eb3))
-        self.assertEqual(self.A.lua("CFG_LOG[1].crosswalks"), 1)
-        self.assertTrue(self.A.lua("CFG_LOG[1].dss"))
-        self.assertEqual(self.A.lua("CFG_LOG[1].node"), int(self.A.lua("FIND_NODE(50, 0, 0)")))
+        self.assertEqual(self.A.lua("CFG_LOG[#CFG_LOG].lanes[1]"), "%d>%d" % (ea1, ea3), "the host's configuration names the host's segments")
+        self.assertEqual(self.B.lua("CFG_LOG[#CFG_LOG].lanes[1]"), "%d>%d" % (eb1, eb3))
+        self.assertEqual(self.A.lua("CFG_LOG[#CFG_LOG].crosswalks"), 1)
+        self.assertTrue(self.A.lua("CFG_LOG[#CFG_LOG].dss"))
+        self.assertEqual(self.A.lua("CFG_LOG[#CFG_LOG].node"), int(self.A.lua("FIND_NODE(50, 0, 0)")))
 
     # ---- terrain
 
@@ -2058,6 +2079,51 @@ class PureBuildTest(unittest.TestCase):
         code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_BULLDOZE{ edges = { 110 } }, {}, ctx); "
                 "local rec = body.args[1]; rec.rmSegs[1] = -5; local ok, plan = pcall(M.classify, rec); return ok and 'ok' or 'raised: ' .. tostring(plan) end)()")
         self.assertEqual(self.ev(code), "ok")
+
+    def test_the_guard_drops_node_configuration_and_object_removals_this_game_has_nothing_to_remove(self):
+        # the sweep crash 2026-10-13 (Engine.h:323, BaseNodeConfig): a removal of a node configuration on a node without one aborts the engine.
+        # The mock engine aborts the same way; the guard in front of the factory drops what does not exist, in every plan and form.
+        code = """(function()
+            local rec = WIRE_RECORD(SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }).args[1]
+            local pos = STORE(STORE(WORLD[101].BASE_NODE).position)
+            rec.rmNcfg = { { __ref = 'node', key = 's:101', p = { x = pos.x, y = pos.y, z = pos.z } } }
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            local sp = STORE(STORE(args[1]).streetProposal)
+            local left = #sp.nodeConfigsToRemove
+            local ok, err = pcall(APPLY_BUILD, args[1])
+            return tostring(left) .. '|' .. tostring(ok) .. '|' .. tostring(err)
+        end)()"""
+        self.assertEqual(self.ev(code), "0|true|true")
+        # a node that has a configuration keeps its removal
+        code = code.replace("local pos =", "WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} }); local pos =")
+        self.assertEqual(self.ev(code), "1|true|true")
+
+    def test_the_guard_gives_a_new_junction_node_its_configuration_entry_and_keeps_one_the_record_has(self):
+        # the A3 probe of the sweep (2026-10-13): a split with a new node joining three segments and no node configuration entry aborts the engine
+        base = """(function()
+            local rec = WIRE_RECORD(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }).args[1]
+            %s
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            local sp = STORE(STORE(args[1]).streetProposal)
+            local ok, err = pcall(APPLY_BUILD, args[1])
+            return tostring(#sp.nodeConfigsToAdd) .. '|' .. tostring(ok) .. '|' .. tostring(err):sub(1, 20)
+        end)()"""
+        got = self.ev(base % "rec.ncfg = {}").split("|")
+        self.assertEqual(got[0], "1")           # the guard added the default entry
+        self.assertEqual(got[1], "true")        # and the engine did not abort
+
+    def test_the_guard_keeps_the_entry_a_record_has_for_its_new_junction_node(self):
+        base = """(function()
+            local rec = WIRE_RECORD(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }).args[1]
+            %s
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            local sp = STORE(STORE(args[1]).streetProposal)
+            local ok, err = pcall(APPLY_BUILD, args[1])
+            return tostring(#sp.nodeConfigsToAdd) .. '|' .. tostring(ok) .. '|' .. tostring(err):sub(1, 20)
+        end)()"""
+        own = "rec.ncfg = { { node = rec.nodes[1].id, lc = {}, cw = {}, pref = 2 } }"
+        got = self.ev(base % own).split("|")
+        self.assertEqual(got[:2], ["1", "true"])
 
     def test_the_node_configurations_that_changed_since_a_snapshot_are_a_nodecfg_record(self):
         code = ("(function() local M, C, ctx = PURE(); "

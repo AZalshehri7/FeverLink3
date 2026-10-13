@@ -1368,7 +1368,10 @@ local function newContext(c, default, R)
 	return obj
 end
 
+local guardProposal   -- defined after newNodeConfig
+
 local function commandArgs(proposal, ctxObj, ie, pi, dust)
+	guardProposal(proposal)
 	return { n = 5, proposal, ctxObj, ie, pi, dust }
 end
 
@@ -1504,6 +1507,105 @@ local function newNodeConfig(n, R)
 	pcall(function() cfg.userModifiedLaneConnections = n.user == true end)
 	req(nc, "comp", cfg)
 	return nc
+end
+
+-- The last check before a proposal is handed to the engine, for every plan and every form (commandArgs below): the lists of
+-- node configurations and edge objects it removes or adds must name things THIS game has. The engine does not refuse a removal
+-- of a node configuration that is not there, it aborts the whole game (Engine.h:323 ecs::Engine::GetComponentDataIndex
+-- "it != components.end()", Component Type Index 30 = BaseNodeConfig; sweep run 20261013-044920, guest, entity 49832, and the
+-- host of the real session 2026-10-12/13 after a replayed withStreet build). MPFever does the same existence test before each
+-- removal. A dropped item is logged (trace category build, event build.guard); the rest of the proposal is unchanged.
+-- The forms that leave node configurations out (cfg = false) are covered by the same check: a new node of three or more segments
+-- gets the default entry (preference 2, no lane connections, not user-modified, the real tool's own entry for a new node).
+-- Returns the number of items dropped or added. Never raises.
+guardProposal = function(proposal)
+	local dropped = 0
+	pcall(function()
+		local flavor = flavorOf(proposal)
+		if not flavor then return end
+		local names = NAMES[flavor]
+		local key = flavor == "simple" and "streetProposal" or "proposal"
+		local st = get(proposal, key)
+		if st == nil then return end
+		local trace = C.tracer("build")
+		local changed = false
+		local function entityOf(x)
+			if type(x) == "number" then return x end
+			local e = get(x, "entity")
+			if type(e) == "number" then return e end
+			return nil
+		end
+		local function ids(list)
+			local set = {}
+			for _, x in ipairs(A.list(st, list)) do
+				local e = entityOf(x)
+				if e then set[e] = true end
+			end
+			return set
+		end
+		local newNode, goneNode = ids(names.nodes), ids(names.rmNodes)
+		-- keeps the entries that pass `ok`; the others are logged with `what`
+		local function filter(field, ok, what)
+			local list = A.list(st, field)
+			local keep = {}
+			for _, x in ipairs(list) do
+				local e = entityOf(x)
+				local pass, why = ok(e)
+				if pass then keep[#keep + 1] = x
+				else
+					dropped = dropped + 1
+					trace("build.guard", string.format("dropped %s %s=%s (%s)", field, what, tostring(e), why))
+				end
+			end
+			if #keep < #list then
+				st[field] = keep
+				changed = true
+			end
+		end
+		filter(names.rmNcfg, function(e)
+			if e and A.comp(e, "BASE_NODE_CONFIG") then return true end
+			return false, "no BASE_NODE_CONFIG"
+		end, "node")
+		filter(names.ncfg, function(e)
+			if e and e < 0 and newNode[e] then return true end
+			if e and e >= 0 and not goneNode[e] and A.comp(e, "BASE_NODE") then return true end
+			return false, "no such node in this game or in the proposal"
+		end, "node")
+		filter(names.rmObjs, function(e)
+			if e and A.comp(e, "EDGE_OBJECT") then return true end
+			return false, "no EDGE_OBJECT"
+		end, "object")
+		-- a NEW node that joins three or more of the segments the proposal adds needs an entry (real records: a new node of one or two
+		-- segments has one only sometimes, so the threshold of three is the harness finding, not yet seen in a real record)
+		local joins = {}
+		for _, sg in ipairs(A.list(st, names.segs)) do
+			local c = get(sg, "comp")
+			for _, k in ipairs({ "node0", "node1" }) do
+				local n = c and get(c, k)
+				if type(n) == "number" and n < 0 and newNode[n] then joins[n] = (joins[n] or 0) + 1 end
+			end
+		end
+		local have = ids(names.ncfg)
+		local extra = {}
+		for n, cnt in pairs(joins) do
+			if cnt >= 3 and not have[n] then extra[#extra + 1] = n end
+		end
+		table.sort(extra, function(x, y) return x > y end)
+		if #extra > 0 then
+			local list = A.list(st, names.ncfg)
+			local stub = { nodeOr = function(v) return v end, edgeOr = function(v) return v end }
+			for _, n in ipairs(extra) do
+				list[#list + 1] = newNodeConfig({ node = n, lc = {}, cw = {}, pref = 2 }, stub)
+				dropped = dropped + 1
+				trace("build.guard", string.format("added nodeConfig for new node %d (joins %d segments, no entry in the proposal)", n, joins[n]))
+			end
+			st[names.ncfg] = list
+			changed = true
+		end
+		if changed then proposal[key] = st end
+	end)
+	if dropped > 0 then log("guard: repaired " .. dropped .. " node configuration / edge object entr" .. (dropped == 1 and "y" or "ies") .. " (see build.guard in the trace)") end
+	return dropped
 end
 
 -- A SimpleProposal's street part, read, changed and written back (properties return copies).
