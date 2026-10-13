@@ -1411,6 +1411,26 @@ class ModuleTest(unittest.TestCase):
                        "return args[2] end")(enc)
         self.assertEqual(dec, 90010, "game A's depot, found through A's building")
 
+    def test_a_depot_of_a_building_whose_key_this_game_never_bound_is_found_by_the_buildings_file_and_place(self):
+        # sweep run 20261013-074329 (F2/F3): "unresolved depot reference nil" on the receiving game
+        a = OpsGame("a", 0, self.tmp, 60000, 0, 7)
+        b = OpsGame("b", 1, self.tmp, 61000, 100, 17)
+        a.L.execute("WORLD[90001] = { CONSTRUCTION = { fileName = 'depot2.con', transf = { [13] = 5, [14] = 6, [15] = 0 }, depots = { 90010 }, stations = {} } }; "
+                    "WORLD[90010] = { VEHICLE_DEPOT = {} }")
+        b.L.execute("WORLD[91001] = { CONSTRUCTION = { fileName = 'depot2.con', transf = { [13] = 5, [14] = 6, [15] = 0 }, depots = { 91010 }, stations = {} } }; "
+                    "WORLD[91010] = { VEHICLE_DEPOT = {} }")
+        enc = b.L.eval("function() local ops = GUI_ENV.ug_require('feverlink3_cmds_ops.lua') "
+                       "local C = GUI_ENV.ug_require('feverlink3_common.lua') "
+                       "local ctx = { plain = C.plain, keyOf = function(e) if e == 91001 then return '1:7' end return 's:' .. e end } "
+                       "local body = ops.commands.makeVehicleBuyCmd.encode('makeVehicleBuyCmd', { n = 3, 17, 91010, BUILD_CONFIG(GUI_API, { parts = { { model = 'vehicle/truck.mdl' } } }) }, ctx) "
+                       "return C.serialize(body) end")()
+        dec = a.L.eval("function(text) local ops = GUI_ENV.ug_require('feverlink3_cmds_ops.lua') "
+                       "local C = GUI_ENV.ug_require('feverlink3_common.lua') "
+                       "local body = C.parse(text) "
+                       "local args = ops.commands.makeVehicleBuyCmd.decode(body, { player = 7, resolve = function(k) return nil end }) "
+                       "return args and args[2] or 'refused' end")(enc)
+        self.assertEqual(dec, 90010, "the key '1:7' is unknown here: the building is found by its file and place")
+
     def test_garbage_from_another_player_is_refused_and_never_raises(self):
         # a body that makes the codec raise would stop the simulation half and be retried at every step
         dctx = self.L.eval("{ player = 7, resolve = function(k) return tonumber(k:match('%d+')) end }")

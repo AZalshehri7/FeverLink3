@@ -1031,7 +1031,7 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 	st.outSeq = (st.outSeq or 0) + 1
 	st.out[#st.out + 1] = { n = st.outSeq, at = now, body = text }
 	trim(st.out, OUT_KEEP)
-	pcall(function()
+	local okB, whyB = pcall(function()
 		local spec = L.COMMANDS.makeWorldBuildProposalCmd
 		local comps = spec and L.bindsComp(spec, body)
 		if not comps then return end
@@ -1042,6 +1042,8 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 		SIM.nativeBinds[st.outSeq] = { body = body, comps = comps, before = before }
 		SIM.nativeBinds[st.outSeq - 8] = nil
 	end)
+	-- (sweep run 20261013-074329: the originator's own native builds were never keyed in a real game and nothing said why)
+	if not okB then logSim("native build " .. tostring(st.outSeq) .. ": its entities cannot be keyed here (" .. tostring(whyB) .. ")") end
 	state:set(st)
 	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, " .. string.format("%.3f", os.clock() - t0) .. " s)")
 	-- self-check: could this record be rebuilt here, the way another game will rebuild it? Only the engine's command
@@ -1553,6 +1555,9 @@ local function handleEvent(userParams, state, src, id, name, param)
 			end
 		elseif name == "nativebind" and type(param) == "table" then
 			local nb = SIM.nativeBinds and SIM.nativeBinds[param.n]
+			if not nb then
+				traceSim("native.bind", string.format("%s: no snapshot stored for output %s (nothing to key: a build with no construction or stop, or the snapshot failed)", tostring(param.key), tostring(param.n)))
+			end
 			if nb and type(param.key) == "string" then
 				SIM.nativeBinds[param.n] = nil
 				st.binders[#st.binders + 1] = { key = param.key, fn = "makeWorldBuildProposalCmd", body = nb.body, comps = nb.comps, before = nb.before, steps = 0 }
