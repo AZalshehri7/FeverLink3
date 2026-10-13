@@ -798,6 +798,15 @@ impl Runtime {
             unsafe { engine::payload_of(cmd) }.and_then(|p| self.watch.claim(p))
         })
         .flatten();
+        // the orders of `inject_next` / `patch_next`: the script's command passes here, not the command list's `Add` (see apply_orders)
+        if self.inject.enabled() || self.patch.enabled() {
+            crate::log::guarded("apply hook (orders)", || {
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                // SAFETY: only readable memory is read.
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) };
+                self.apply_orders(cmd, kind, claimed.is_some());
+            });
+        }
         // dev-only dump of a build command before the simulation applies it, and of its result part afterwards
         let dumped = self.dump.get().and_then(|_| {
             crate::log::guarded("apply hook (dump)", || {
@@ -1888,5 +1897,35 @@ mod tests {
         rt.pump();
         let ev = events(dir.path());
         assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("is off")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_script_command_that_only_reaches_apply_takes_the_order_there_and_an_expiry_reports_the_applies_seen() {
+        let dir = TempDir::new("rt-inject-apply");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        let mut sim = [0u8; 8];
+        // the order is written, no Add of the command is ever seen; the simulation applies it
+        ctl(dir.path(), INJECT_NEXT);
+        let mut script = Call::new(52, 7);
+        let before = script.c.payload.to_vec();
+        unsafe { rt.on_apply(sim.as_mut_ptr(), script.c.command.as_mut_ptr()) };
+        assert_eq!(calls().last().map(String::as_str), Some("apply tag 7"), "the original apply still runs");
+        assert_eq!(script.c.payload.to_vec(), before, "refused: untouched");
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("layout")), "{ev:?}");
+        // an order that no script command ever uses: the reason says which applies went by
+        rt.inject.arm(9, 0, rt.now_ms());
+        let mut other = Call::new(17, 1);
+        unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
+        rt.apply_orders(script.c.command.as_mut_ptr(), Some(52), true); // a held one (the tool's)
+        rt.advance(crate::inject::DEFAULT_TTL_MS + 1);
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 9") && w.contains("1 held, 0 not held")),
+            "{ev:?}"
+        );
     }
 }

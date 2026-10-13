@@ -67,6 +67,37 @@ impl Runtime {
         }
     }
 
+    /// The simulation's application of a command (the `apply_command` hook, on the simulation thread): a script's `sendCommand` from the
+    /// simulation state does not pass the command list's `Add` hook (b31 to b41: the engine executed the command, our `Add` hook never
+    /// saw a non-tool kind 52), so the orders are also carried out here, on a `build_proposal` the module did not hold, BEFORE the original
+    /// applies it. Dev-only switches, and like the dev dumps that already run here they read a file and call the engine on this thread;
+    /// everything is checked first and a refusal leaves the command untouched. A construction tool's command that was not held can be
+    /// mistaken for the script's here; the order's own checks (the number of constructions or nodes) guard against that.
+    pub(super) fn apply_orders(&self, cmd: *mut u8, kind: Option<u8>, held: bool) {
+        let bp = kind.is_some() && self.build.kind_by_name("build_proposal") == kind;
+        if !bp {
+            return;
+        }
+        let now = self.now_ms();
+        self.inject.note_apply(held, now);
+        self.patch.note_apply(held, now);
+        if held {
+            return;
+        }
+        let args = AddArgs {
+            list: core::ptr::null_mut(),
+            out: core::ptr::null_mut(),
+            cmd,
+            done: core::ptr::null_mut(),
+            progress: core::ptr::null_mut(),
+        };
+        if self.inject.enabled() {
+            self.inject_add(&args, None);
+        } else if self.patch.enabled() {
+            self.patch_add(&args, None);
+        }
+    }
+
     /// The command list's `Add` of a command that was not held: if an order is armed and this is a script `build_proposal`, carries it
     /// out (once). Runs before the original `Add`, on the thread that queues commands.
     pub(super) fn inject_add(&self, args: &AddArgs, caller: Option<usize>) {

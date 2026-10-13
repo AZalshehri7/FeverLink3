@@ -62,6 +62,7 @@ pub struct State {
     on: AtomicBool,
     pending: AtomicBool,
     order: Mutex<Option<Order>>,
+    applies: Mutex<crate::cmd_patch::ApplyTrail>,
     events: Mutex<Vec<Event>>,
 }
 
@@ -98,10 +99,26 @@ impl State {
             return;
         }
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
+        *lock(&self.applies) = Default::default();
         if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms }) {
             self.refuse(format!("order for key {} replaced by a newer inject_next before a command used it", old.key));
         }
         self.pending.store(true, Ordering::Release);
+    }
+
+    /// A `build_proposal` was applied by the simulation while an order is armed.
+    pub fn note_apply(&self, held: bool, now: u64) {
+        let armed = lock(&self.order).as_ref().map(|o| o.armed_ms);
+        if let Some(armed) = armed {
+            lock(&self.applies).note(held, now as i64 - armed as i64);
+        }
+    }
+
+    fn expired(&self, key: u64, ttl_ms: u64) -> String {
+        format!(
+            "key {key}: expired, no script build_proposal arrived within {ttl_ms} ms; {}",
+            lock(&self.applies).text()
+        )
     }
 
     /// The armed order, once; an expired one is reported and dropped.
@@ -110,10 +127,7 @@ impl State {
         self.pending.store(false, Ordering::Release);
         let order = order?;
         if now.saturating_sub(order.armed_ms) > order.ttl_ms {
-            self.refuse(format!(
-                "key {}: expired, no script build_proposal arrived within {} ms",
-                order.key, order.ttl_ms
-            ));
+            self.refuse(self.expired(order.key, order.ttl_ms));
             return None;
         }
         Some(order)
@@ -127,7 +141,7 @@ impl State {
                 let o = g.take().expect("checked");
                 self.pending.store(false, Ordering::Release);
                 drop(g);
-                self.refuse(format!("key {}: expired, no script build_proposal arrived within {} ms", o.key, o.ttl_ms));
+                self.refuse(self.expired(o.key, o.ttl_ms));
             }
         }
         std::mem::take(&mut *lock(&self.events))

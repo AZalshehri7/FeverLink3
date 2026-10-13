@@ -80,8 +80,42 @@ pub struct State {
     events: Mutex<Vec<Event>>,
 }
 
+/// The `build_proposal` commands the simulation applied while an order was armed (held by us or not): the evidence of whether the
+/// script's command reached `apply_command` at all.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApplyTrail {
+    held: u64,
+    unheld: u64,
+    last: std::collections::VecDeque<String>,
+}
+
+impl ApplyTrail {
+    /// One applied `build_proposal`; `rel_ms` is relative to the arming.
+    pub fn note(&mut self, held: bool, rel_ms: i64) {
+        if held {
+            self.held += 1;
+        } else {
+            self.unheld += 1;
+        }
+        if self.last.len() == 5 {
+            self.last.pop_front();
+        }
+        self.last.push_back(format!("{}{rel_ms:+}ms", if held { "held " } else { "script " }));
+    }
+
+    pub fn text(&self) -> String {
+        format!(
+            "kind-52 applies at apply_command since it was armed: {} held, {} not held; last [{}]",
+            self.held,
+            self.unheld,
+            self.last.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Seen {
+    applies: ApplyTrail,
     adds: u64,
     build_proposals: u64,
     from_tools: u64,
@@ -200,6 +234,14 @@ impl State {
         format!("at arming: {bp}; Adds in the 2 s before (newest first): [{}]", recent.join(", "))
     }
 
+    /// A `build_proposal` was applied by the simulation while an order is armed.
+    pub fn note_apply(&self, held: bool, now: u64) {
+        let armed = lock(&self.order).as_ref().map(|o| o.armed_ms);
+        if let Some(armed) = armed {
+            lock(&self.seen).applies.note(held, now as i64 - armed as i64);
+        }
+    }
+
     /// An `Add` went by while an order is armed (for the diagnostics of an expiry).
     pub fn saw_add(&self, rec: AddRec, build_proposal: bool, from_tool: bool, armed_ms: u64) {
         let mut g = lock(&self.seen);
@@ -251,13 +293,14 @@ impl State {
         let kinds: Vec<String> =
             g.kinds.iter().map(|(k, n)| format!("{}x{n}", k.map_or("?".to_string(), |k| k.to_string()))).collect();
         format!(
-            "expired: no command arrived within {ttl_ms} ms (since it was armed: {} Add(s), {} build_proposal, {} from construction tools; kinds [{}]; last [{}]; {})",
+            "expired: no command arrived within {ttl_ms} ms (since it was armed: {} Add(s), {} build_proposal, {} from construction tools; kinds [{}]; last [{}]; {}; {})",
             g.adds,
             g.build_proposals,
             g.from_tools,
             kinds.join(" "),
             g.last.iter().cloned().collect::<Vec<_>>().join(", "),
-            g.before
+            g.before,
+            g.applies.text()
         )
     }
 
