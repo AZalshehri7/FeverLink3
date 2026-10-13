@@ -122,6 +122,46 @@ pub static NODE: Elem = Elem {
     anchors: &[(0, 4)],
 };
 
+/// `LaneConfig` (0x18 bytes): speed, width, height, forward flag (three padding bytes, residue 0x7f seen), the transport-mode bit set,
+/// offset from the centre. [observed: a 4-lane street, 0x60 bytes: 13.89 / 3.0 / 0.15 / forward 0 / modes 3 / 0.15, then 5.0, -0.5 ...]
+pub static LANE_CONFIG: Elem = Elem {
+    name: "LaneConfig",
+    stride: 0x18,
+    fields: &[
+        f(0, "speed", Ty::F32),
+        f(4, "width", Ty::F32),
+        f(8, "height", Ty::F32),
+        f(0xc, "forward", Ty::U8),
+        f(0xd, "padding", Ty::Pad(3)),
+        f(0x10, "transportModes", Ty::U32),
+        f(0x14, "offset", Ty::F32),
+    ],
+    anchors: &[],
+};
+
+/// `BaseEdge.objects` element (8 bytes): the edge object's entity and its `EdgeObjectType`. [observed: 8 and 0x10 byte vectors
+/// holding an existing stop entity and the value 1 or 0]
+pub static EDGE_OBJECT_REF: Elem =
+    Elem { name: "EdgeObjectRef", stride: 8, fields: &[f(0, "entity", Ty::Ent), f(4, "type", Ty::U32)], anchors: &[] };
+
+/// `LaneConnection` (0x14 bytes), in the order of the api type definition: incoming segment, lane, outgoing segment, lane, the two
+/// flags (two padding bytes). [static: the offset of `laneConnections` is +0 in `BaseNodeConfig` (the binding table); no instance
+/// with entries was seen in the spike dumps]
+pub static LANE_CONNECTION: Elem = Elem {
+    name: "LaneConnection",
+    stride: 0x14,
+    fields: &[
+        f(0, "segment0", Ty::Ent),
+        f(4, "lane0", Ty::I32),
+        f(8, "segment1", Ty::Ent),
+        f(0xc, "lane1", Ty::I32),
+        f(0x10, "withRoad", Ty::U8),
+        f(0x11, "withTram", Ty::U8),
+        f(0x12, "padding", Ty::Pad(2)),
+    ],
+    anchors: &[],
+};
+
 pub static SEGMENT: Elem = Elem {
     name: "SegmentAndEntity",
     stride: 0x350,
@@ -135,9 +175,9 @@ pub static SEGMENT: Elem = Elem {
         f(0x34, "tangent1", Ty::V3),
         f(0x40, "baseType", Ty::U32),
         f(0x44, "typeIndex", Ty::I32),
-        f(0x48, "objects", Ty::BlobVec),
+        f(0x48, "objects", Ty::Vec(&EDGE_OBJECT_REF)),
         f(0x60, "edgeDecorations", Ty::BlobVec),
-        f(0x78, "laneConfigs", Ty::BlobVec),
+        f(0x78, "laneConfigs", Ty::Vec(&LANE_CONFIG)),
         f(0x98, "roadType", Ty::U32),
         f(0xa0, "roadTemplate", Ty::Res),
         f(0xe0, "roadStyle", Ty::Res),
@@ -147,8 +187,12 @@ pub static SEGMENT: Elem = Elem {
     anchors: &[(8, 0x10), (0xc, 0x1c)],
 };
 
-pub static NODE_CONFIG: Elem =
-    Elem { name: "BaseNodeLaneConnectionAndEntity", stride: 0x80, fields: &[f(0x78, "entity", Ty::Ent)], anchors: &[] };
+pub static NODE_CONFIG: Elem = Elem {
+    name: "BaseNodeLaneConnectionAndEntity",
+    stride: 0x80,
+    fields: &[f(0, "laneConnections", Ty::Vec(&LANE_CONNECTION)), f(0x78, "entity", Ty::Ent)],
+    anchors: &[],
+};
 
 pub static EDGE_OBJECT: Elem = Elem {
     name: "EdgeObject",
@@ -1077,6 +1121,29 @@ pub(crate) mod testdata {
         put32(&mut s, 0x1c, 1388.276f32.to_bits());
         put32(&mut s, 0x44, (-1i32) as u32);
         put32(&mut s, 0x98, 1);
+        // two lanes (real values of a town street) and one edge object reference
+        let (lanes, objs) = (HEAP + 0x22000, HEAP + 0x23000);
+        put(&mut s, 0x78, lanes as u64);
+        put(&mut s, 0x80, (lanes + 0x30) as u64);
+        put(&mut s, 0x88, (lanes + 0x30) as u64);
+        put(&mut s, 0x48, objs as u64);
+        put(&mut s, 0x50, (objs + 8) as u64);
+        put(&mut s, 0x58, (objs + 8) as u64);
+        let mut ln = vec![0u8; 0x30];
+        for (i, (w, h, fwd, modes, off)) in
+            [(3.0f32, 0.15f32, 0u8, 3u32, 0.15f32), (5.0, 0.0, 1, 28, -0.5)].iter().enumerate()
+        {
+            put32(&mut ln, i * 0x18, 13.89f32.to_bits());
+            put32(&mut ln, i * 0x18 + 4, w.to_bits());
+            put32(&mut ln, i * 0x18 + 8, h.to_bits());
+            ln[i * 0x18 + 0xc] = *fwd;
+            ln[i * 0x18 + 0xd] = 0x7f; // residue in the padding
+            put32(&mut ln, i * 0x18 + 0x10, *modes);
+            put32(&mut ln, i * 0x18 + 0x14, off.to_bits());
+        }
+        let mut ob = vec![0u8; 8];
+        put32(&mut ob, 0, 39106);
+        put32(&mut ob, 4, 1);
         let t = b"infrastructure/street/town/town_new_small.street_template";
         string(&mut s, 0xa0, b"", 0);
         string(&mut s, 0xa0 + 0x20, t, tmpl);
@@ -1101,6 +1168,8 @@ pub(crate) mod testdata {
                 (nodes, n),
                 (rnodes, rn),
                 (segs, s),
+                (lanes, ln),
+                (objs, ob),
                 (rm, ids),
                 (cons, c),
                 (tmpl, t.iter().copied().chain([0]).collect()),
@@ -1283,6 +1352,34 @@ mod tests {
         }
         assert!(!p.text.lines().skip(1).any(|x| x.contains("	raw:") || x.contains(".~")), "{}", p.text);
         assert!(p.text.len() < full.text.len(), "the construction's description is not carried");
+    }
+
+    #[test]
+    fn lane_configs_and_edge_object_references_are_typed_members() {
+        let (mem, at) = synthetic();
+        let p = encode(&mem, Env { image_base: BASE }, Settings::input_level(), "40420", &head(at)).expect("encodes");
+        let l = lines(&p);
+        let f = |bits: f32| format!("f32:{:08x}", bits.to_bits());
+        for (path, v) in [
+            ("proposal.addedSegments[0].laneConfigs.#", "n:2".to_string()),
+            ("proposal.addedSegments[0].laneConfigs[0].speed", f(13.89)),
+            ("proposal.addedSegments[0].laneConfigs[0].width", f(3.0)),
+            ("proposal.addedSegments[0].laneConfigs[0].forward", "u8:00".to_string()),
+            ("proposal.addedSegments[0].laneConfigs[1].forward", "u8:01".to_string()),
+            ("proposal.addedSegments[0].laneConfigs[1].transportModes", "u32:0000001c".to_string()),
+            ("proposal.addedSegments[0].laneConfigs[1].offset", f(-0.5)),
+            ("proposal.addedSegments[0].objects.#", "n:1".to_string()),
+            ("proposal.addedSegments[0].objects[0].type", "u32:00000001".to_string()),
+        ] {
+            assert!(l.iter().any(|x| *x == format!("{path}	{v}")), "{path} {v} missing in {}", p.text);
+        }
+        assert!(
+            l.iter().any(|x| x.starts_with("proposal.addedSegments[0].objects[0].entity	ent:old#39106")),
+            "{}",
+            p.text
+        );
+        // the padding residue is not part of the value
+        assert!(!p.text.contains("7f"), "{}", p.text);
     }
 
     #[test]
