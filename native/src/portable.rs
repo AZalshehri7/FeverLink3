@@ -305,6 +305,9 @@ pub struct Settings {
     /// Input level (what a SimpleProposal is made of): only the members the table names, no unnamed bytes, no raw blobs, no container
     /// graphs. The text the mod rebuilds a build from (`input.rs`).
     pub input_level: bool,
+    /// Members whose heap graph is not followed (their pointers stay `P`): `toAdd` for the injection text, whose construction is
+    /// the receiver's own (tens of thousands of blocks of the description that are never rebuilt).
+    pub graph_skip: &'static [&'static str],
 }
 
 impl Settings {
@@ -323,6 +326,7 @@ impl Settings {
             max_graph_block_bytes: 0,
             max_graph_bytes: 0,
             input_level: true,
+            graph_skip: &[],
         }
     }
 
@@ -352,6 +356,7 @@ impl Settings {
             max_graph_block_bytes: 1 << 20,
             max_graph_bytes: 16 << 20,
             input_level: false,
+            graph_skip: &[],
         })
     }
 }
@@ -634,7 +639,7 @@ impl Enc<'_> {
     /// A pointer to a live heap block as a token of the heap graph: `B<n>` (the start of block n) or `B<n>+<hex>` (inside it).
     /// The first pointer to a block reads it (its size comes from the heap) and queues its own pointers.
     fn block_token(&mut self, p: usize) -> Option<String> {
-        if !self.set.graph {
+        if !self.set.graph || self.set.graph_skip.contains(&self.origin.as_str()) {
             return None;
         }
         if let Some(&n) = self.by_addr.get(&p) {

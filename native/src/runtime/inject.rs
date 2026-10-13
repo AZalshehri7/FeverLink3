@@ -14,7 +14,9 @@ impl Runtime {
     /// Switches the native injection on (`FEVERLINK3_NATIVE_INJECT=1`). `settings` are the portable text settings the originator's
     /// copy of the text is written with and the receiver's proof is made with.
     pub fn enable_native_inject(&self, settings: portable::Settings) {
-        let _ = self.inject_settings.set(settings);
+        // the construction of the text is the receiver's own (its conversion), so its description's heap graph (tens of thousands of
+        // blocks) is neither written nor needed
+        let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], ..settings });
         self.inject.enable();
         self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and an inject_next order makes the next script build_proposal take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal leaves the command untouched)");
     }
@@ -38,6 +40,7 @@ impl Runtime {
             return;
         }
         let Some(settings) = self.inject_settings.get().copied() else { return };
+        let t0 = std::time::Instant::now();
         let live = LiveHeapMem::new();
         let head = portable::Header {
             seq: 0,
@@ -52,7 +55,8 @@ impl Runtime {
         match portable::encode(&live, Env { image_base: self.base }, settings, self.build.name, &head) {
             Ok(p) => match self.text.write(id, &p.text) {
                 Ok(()) => self.say(&format!(
-                    "native inject: hold {id}: portable text written, {} bytes, {} lines (native_text_{id}.txt); {}",
+                    "native inject: hold {id}: portable text written in {} ms, {} bytes, {} lines (native_text_{id}.txt); {}",
+                    t0.elapsed().as_millis(),
                     p.text.len(),
                     p.text.lines().count(),
                     p.text.lines().last().unwrap_or("")
@@ -127,7 +131,6 @@ impl Runtime {
         let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
         let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
         // the cheap refusals first
-        inj::check_destination(&LiveMem, dest)?;
         let path = dir.join(inj::inject_file_name(key));
         let len =
             std::fs::metadata(&path).map_err(|e| format!("no side file {}: {e}", inj::inject_file_name(key)))?.len();
@@ -136,12 +139,15 @@ impl Runtime {
         }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
+        let constructions = inj::construction_count(&text);
+        inj::check_destination(&LiveMem, dest, constructions)?;
         // an index of the heap's blocks for the proof (refreshed before every text, see LiveHeapMem)
         let live = LiveHeapMem::new();
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
         let mut say = |l: &str| self.say(l);
-        let built = inj::build_verified(&ctx, &text, &mut say);
+        let donor = (constructions > 0).then_some(dest);
+        let built = inj::build_verified(&ctx, &super::cmd_patch::LivePoke, &text, donor, &mut say);
         alloc.free_all();
         let built = built?;
         let stats = (built.nodes, built.segments, built.constructions);

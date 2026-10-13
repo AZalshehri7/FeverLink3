@@ -8,7 +8,7 @@ use crate::link::Event;
 use crate::rebuild::EngineAlloc;
 
 /// Writes into the memory of a live command: only pages that are writable now.
-struct LivePoke;
+pub(super) struct LivePoke;
 
 impl cp::Poke for LivePoke {
     fn poke(&self, addr: usize, data: &[u8]) -> bool {
