@@ -569,6 +569,29 @@ function L.accountSnapshot(engine)
 	return { balance = balance, loan = loan }
 end
 
+-- The snapshot as it crosses from the simulation half to the interface half inside the game-script state: text, never a number. The state
+-- is the engine's own hand-off between two Lua states; a balance above 2^31 (5,035,445,200 in the 2026-10-13 sweep) is the one value in
+-- it that a 32-bit path could mangle, and the rounds that carry it stalled there (UNPROVEN cause, see docs/research). Text survives any
+-- such path; L.accountFromState gives the numbers back exactly (integerText round-trips every double).
+function L.accountForState(a, integerText)
+	if type(a) ~= "table" then return nil end
+	local out = {}
+	for _, key in ipairs({ "balance", "loan" }) do
+		if type(a[key]) == "number" then out[key] = integerText(a[key]) end
+	end
+	return out
+end
+
+function L.accountFromState(a)
+	if type(a) ~= "table" then return nil end
+	local out = {}
+	for _, key in ipairs({ "balance", "loan" }) do
+		local v = tonumber(a[key])
+		if v ~= nil then out[key] = v end
+	end
+	return out
+end
+
 -- Differences host - own for the values both sides have (balance rounded to whole money units, as a journal entry
 -- holds them). Zero differences are left out.
 function L.authorityDeltas(own, host)

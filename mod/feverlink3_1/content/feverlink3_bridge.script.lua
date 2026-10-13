@@ -1391,13 +1391,15 @@ local function update(userParams, state, dt)
 	if SIM.devTick % 4 == 0 then devPoll("sim") end
 	SIM.state = state
 	local ok, err = pcall(function()
+		local stored = nil
 		local st = simState(state)
 		local now = engine.gameTime()
 		local due = L.takeDue(st.queue, now)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" then
 				local parts, t = checksumParts(st.co, "sim", it.full == false)
-				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountSnapshot(engine) }
+				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountForState(L.accountSnapshot(engine), C.integerText) }
+				stored = it.n
 			elseif it.kind == "action" then
 				simApplyAction(st, it, now)
 			end
@@ -1408,6 +1410,17 @@ local function update(userParams, state, dt)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)
 		state:set(st)
+		-- A round just handed over: read the state back once, so a hand-off that loses it is on record (sweep 2026-10-13: the rounds were
+		-- computed here and never reached the interface half; nothing said where they were lost).
+		if stored ~= nil then
+			local okB, back = pcall(function() return state:get() end)
+			local found = false
+			if okB and type(back) == "table" and type(back.reports) == "table" then
+				for _, r in ipairs(back.reports) do if r.n == stored then found = true end end
+			end
+			traceSim("checksum.handoff", "round " .. C.integerText(stored) .. " stored in the game-script state, read back " .. (found and "ok" or ("LOST (" .. (okB and type(back) or tostring(back)) .. ")")))
+			if not found then logSim("checksum round " .. C.integerText(stored) .. " was lost in the game-script state hand-off") end
+		end
 	end)
 	if not ok then logSim("update failed: " .. tostring(err)) end
 end
@@ -3238,7 +3251,16 @@ end
 -- Results, refusals, reports and bindings produced by the simulation half.
 local function collectFromSim(state)
 	local ok, st = pcall(function() return state:get() end)
-	if not ok or type(st) ~= "table" then return end
+	if not ok or type(st) ~= "table" then
+		-- silent before: a state the interface half cannot read stalls every simulation result and checksum round with no trace
+		local why = ok and ("a " .. type(st)) or tostring(st)
+		if G.stateFault ~= why then
+			G.stateFault = why
+			logGui("the game-script state cannot be read: " .. why)
+		end
+		return
+	end
+	G.stateFault = nil
 	-- companies: the mirror takes the state's registry when that is newer; during a pause it is ahead of the state
 	if Co and type(st.co) == "table" and (G.co == nil or (st.co.rev or 0) > (G.co.rev or 0)) then
 		coGuard("mirror", function() G.co = C.plain(st.co) end)
@@ -3279,7 +3301,8 @@ local function collectFromSim(state)
 	end
 	for _, r in ipairs(st.reports or {}) do
 		if not G.reportsSent[r.n] then
-			reportRound(r.n, r.time, r.parts, r.account)
+			traceGui("checksum.collect", "round " .. C.integerText(r.n) .. " read from the game-script state (account " .. tostring(r.account and r.account.balance) .. ")")
+			reportRound(r.n, r.time, r.parts, L.accountFromState(r.account))
 		end
 	end
 	if (st.late or 0) > G.lateSeen then

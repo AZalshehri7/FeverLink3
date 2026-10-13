@@ -209,6 +209,23 @@ debugPrint = function() end
 # ---------------------------------------------------------------- the mod, loaded twice (two Lua states)
 
 HARNESS = r'''
+-- The game's Lua 5.2.2 raises on "%d" (and "%i") for a number beyond the 32-bit range ("bad argument #2 to 'format' (not a number
+-- in proper range)", found by the 2026-10-13 sweep: a balance of 5 billion); lupa's Lua does not, so the limit is emulated here.
+do
+  local real = string.format
+  string.format = function(f, ...)
+    if type(f) == "string" and f:find("%%[%-%+ #0-9.]*[di]") then
+      local args, n = { ... }, 0
+      for spec in f:gsub("%%%%", ""):gmatch("%%[%-%+ #0-9.]*([%a])") do
+        n = n + 1
+        if (spec == "d" or spec == "i") and type(args[n]) == "number" and math.abs(args[n]) >= 2147483648 then
+          error("bad argument #" .. (n + 1) .. " to 'format' (not a number in proper range)", 2)
+        end
+      end
+    end
+    return real(f, ...)
+  end
+end
 local function deepcopy(v)
   if type(v) ~= "table" then return v end
   local out = {}
@@ -713,6 +730,50 @@ class LockstepTest(unittest.TestCase):
             self.assertTrue({"time", "balance", "loan", "lines", "stations", "names", "vehicles"} <= names, names)
         self.assertEqual(self.relay.reports[3][0][1], self.relay.reports[3][1][1])
 
+    def test_checksum_rounds_flow_with_a_balance_above_2_pow_31(self):
+        # Real sweep 2026-10-13: a base save with a balance of 5,035,445,200. The game's Lua raises on "%d" beyond 32 bits (emulated in
+        # the harness); no checksum round after the paused one reached the launcher, and nothing in mod.log said why.
+        for g in (self.A, self.B):
+            g.L.execute("ACCOUNT.balance = 5035445200")
+        self.start()
+        self.tick(10, lag_b=True)
+        for n in (1, 2, 3):
+            self.relay.checksum_request(n, self.relay.future_stamp(), False, full=(n == 1))
+            self.tick(30, lag_b=True)
+            self.assertEqual(sorted(self.relay.reports.get(n, {})), [0, 1], "round %d reached the launcher from both games; host log: %s" % (n, self.A.log()))
+        self.assertEqual(self.relay.authority[3]["balance"], 5035445200)
+        self.assertNotIn("failed", self.A.log() + self.B.log())
+
+    def test_checksum_rounds_survive_a_state_that_mangles_numbers_beyond_32_bits(self):
+        # The hand-off between the two Lua states is the one place the mod does not control. Whatever a 32-bit path does to a number
+        # beyond 2^31 (the cause of the 2026-10-13 stall is not proven), the rounds carry the account as text and still arrive.
+        for g in (self.A, self.B):
+            g.L.execute("""
+              ACCOUNT.balance = 5035445200
+              local plain = STATE.get
+              local function mangle(v)
+                if type(v) == "number" and math.abs(v) >= 2147483648 then return nil end
+                if type(v) ~= "table" then return v end
+                local out = {}
+                for k, x in pairs(v) do out[k] = mangle(x) end
+                return out
+              end
+              STATE.get = function(self) return mangle(plain(self)) end
+            """)
+        self.start()
+        self.tick(10, lag_b=True)
+        for n in (1, 2, 3):
+            self.relay.checksum_request(n, self.relay.future_stamp(), False, full=(n == 1))
+            self.tick(30, lag_b=True)
+            self.assertEqual(sorted(self.relay.reports.get(n, {})), [0, 1], "round %d" % n)
+        self.assertEqual(self.relay.authority[3]["balance"], 5035445200)
+
+    def test_an_unreadable_state_and_a_lost_round_are_logged(self):
+        self.A.L.execute("STATE.get = function(self) error('cannot convert') end")
+        self.tick(5)
+        self.assertIn("the game-script state cannot be read: ", self.A.log())
+        self.assertIn("cannot convert", self.A.log())
+
     def test_checksum_rounds(self):
         self.start()
         self.tick(10, lag_b=True)
@@ -1078,6 +1139,21 @@ class PureTest(unittest.TestCase):
         self.C = self.L.execute(COMMON_SRC)
         self.K = self.L.execute(LOCKSTEP_SRC)
         self.H = self.L.execute(HUD_SRC)
+
+    def test_integer_text_of_money_beyond_32_bits(self):
+        f = self.C.integerText
+        self.assertEqual(f(5035445200), "5035445200")
+        self.assertEqual(f(-5035445200), "-5035445200")
+        self.assertEqual(f(0), "0")
+        self.assertEqual(f(-0.0), "0")
+        self.assertEqual(f(37000000.0), "37000000")
+        self.assertEqual(f(2 ** 60), "1.152921504606847e+18")
+        self.assertEqual(float(f(1234.5678)), 1234.5678, "a fraction round-trips")
+        self.assertEqual(self.C.serialize(5035445200), "5035445200")
+        a = self.K.accountForState(self.L.table(balance=5035445200.25, loan=35624999), self.C.integerText)
+        self.assertEqual((a["balance"], a["loan"]), ("5035445200.25", "35624999"))
+        back = self.K.accountFromState(a)
+        self.assertEqual((back["balance"], back["loan"]), (5035445200.25, 35624999))
 
     def test_serialize_is_order_independent_and_round_trips(self):
         a = self.L.eval('(function() local t = {} t.b = 1 t.a = { 3, 2, x = "q\\t\\"z" } t[1] = 0.1 t[2] = true return t end)()')
