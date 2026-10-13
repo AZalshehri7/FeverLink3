@@ -962,7 +962,7 @@ local function snapshotComps(comps)
 	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end
 	return before
 end
-local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
+local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
 	local st = simState(state)
 	local now = engine.gameTime()
 	-- A build the engine or a game script made on its own (a town growing a road: playerInitiated false) is nobody's tool build:
@@ -1007,12 +1007,13 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 	-- game rebuilds the build with the originator's real flags. The post event passes the result at [3] and no Context at [2].
 	local ctxObj = nil
 	if not post then pcall(function() ctxObj = param[2] end) end
-	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, ctx = ctxObj, result = post and result or nil }, {
+	if post and deferredPre then ctxObj = deferredPre.ctx end   -- read at the pre-build event: the post event carries no Context
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, ctx = ctxObj, cons = post and deferredPre and deferredPre.cons or nil, result = post and result or nil }, {
 		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
 	})
 	if not ok then body, why = nil, tostring(body) end
 	if not body and not post and tostring(why):find("has no model", 1, true) then
-		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)), ie = ignoreErrors }
+		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)), ie = ignoreErrors, pre = Build.preState(proposal, ctxObj) }
 		logSim("a native build at t=" .. now .. " has an edge object that the engine has not made yet: read again after the build")
 		state:set(st)
 		return
@@ -1032,7 +1033,7 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 		return
 	end
 	body.native = true
-	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and "post-event (no context)" or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
+	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and (deferredPre and "pre-build event (read before the deferred build)" or "post-event (no context)") or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
 	body.category = buildCategory(body)
 	if Build.constructionsBlocked and Build.constructionsBlocked(body) then
 		-- degraded mode (no native module): the build is in this world already and cannot be taken back; the others would refuse it
@@ -1548,7 +1549,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		if d and d.at == engine.gameTime() then
 			C.poll()
 			if not C.ACTIVE then return end
-			local ok, err = pcall(simCaptureBuild, state, param, true, d.before, d.ie)
+			local ok, err = pcall(simCaptureBuild, state, param, true, d.before, d.ie, d.pre)
 			if not ok then logSim("onPostBuildProposal capture failed: " .. tostring(err)) end
 		end
 		return

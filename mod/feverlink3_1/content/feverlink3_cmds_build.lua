@@ -737,7 +737,7 @@ end
 -- the state of one capture: how entities are keyed, what the proposal itself knows about entities it removes, and
 -- the references already made
 local function newCapture(ctx, opts)
-	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {} }, memo = {}, result = opts.result, alias = {} }
+	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {}, cons = opts.cons or {} }, memo = {}, result = opts.result, alias = {} }
 
 	function cap.node(id)
 		if type(id) ~= "number" then fail("a node reference is not an entity id") end
@@ -774,7 +774,7 @@ local function newCapture(ctx, opts)
 		if type(id) ~= "number" or id < 0 then fail("a construction reference is not an entity id") end
 		local m = cap.memo["c" .. id]
 		if m then return m end
-		local info = A.conInfo(id)
+		local info = A.conInfo(id) or cap.known.cons[id]   -- (cons: read before the build, when the capture is made after it)
 		if not info then fail("construction " .. id .. " is not in the world") end
 		m = { __ref = "con", key = cap.keyOf and cap.keyOf(id) or nil, file = info.file, p = copyXYZ(info.p) }
 		cap.memo["c" .. id] = m
@@ -1235,6 +1235,7 @@ end
 
 local function captureContext(c)
 	if c == nil or c == false then return false end
+	if type(c) == "table" and c.align ~= nil then return c end   -- already a record's flags (read before the build, see M.preState)
 	return {
 		align = get(c, "checkTerrainAlignment") == true, cleanup = get(c, "cleanupStreetGraph") == true,
 		buildings = get(c, "gatherBuildings") == true, fields = get(c, "gatherFields") == true,
@@ -2368,10 +2369,26 @@ end
 function M.capture(proposal, flags, ctx)
 	flags = flags or {}
 	ctx = ctx or { plain = C.plain, keyOf = function(e) return "s:" .. tostring(e) end }
-	local cap = newCapture(ctx, { result = flags.result })
+	local cap = newCapture(ctx, { result = flags.result, cons = flags.cons })
 	local ok, rec = pcall(captureRecord, proposal, cap)
 	if not ok then return nil, tostring(rec) end
 	return M.bodyOf(rec, flags)
+end
+
+-- What a capture that has to wait for the build (an edge object gets its model only when the build runs) needs from BEFORE it: the
+-- build's Context flags (the event after the build carries none) and the constructions it removes (gone, or going, by then; real run
+-- 2026-10-13: a depot over buildings, "construction 39481 is not in the world"). Never raises.
+function M.preState(proposal, ctxObj)
+	local pre = { ctx = captureContext(ctxObj) or nil, cons = {} }
+	pcall(function()
+		for _, key in ipairs({ "toRemove", "constructionsToRemove" }) do
+			for _, id in ipairs(A.list(proposal, key)) do
+				local info = type(id) == "number" and A.conInfo(id)
+				if info then pre.cons[id] = info end
+			end
+		end
+	end)
+	return pre
 end
 
 -- A captured record as the body of an action line: the body, nil and its wire text, or nil and why not.
