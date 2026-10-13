@@ -173,14 +173,21 @@ local function serializeString(s)
 	return QUOTE .. s:gsub("[%c" .. QUOTE .. BS .. BS .. "]", escapeChar) .. QUOTE
 end
 
+-- THE text of a number that may be integral, for every log line, record and key that can see money or another large value.
+-- "%d" raises "bad argument #2 to 'format' (not a number in proper range)" above 2^31 in this game's Lua 5.2.2 (found by the sweep: a
+-- balance of 5 billion made every update fail), and tostring() prints "5.0" for a float in some builds. "%.0f" prints the same digits
+-- for every integral double below 2^53 (zero is kept free of a minus sign); anything else round-trips with "%.17g". Never use "%d" on a
+-- value that is not a small count (tests/lua/test_mod_files.py guards the modules that carry values).
+function C.integerText(v)
+	if math.floor(v) == v and math.abs(v) < 9007199254740992 then return v == 0 and "0" or string.format("%.0f", v) end
+	return string.format("%.17g", v)
+end
+
 local function serializeNumber(v)
 	if v ~= v then return "(0/0)" end
 	if v == math.huge then return "(1/0)" end
 	if v == -math.huge then return "(-1/0)" end
-	-- "%d" raises "not a number in proper range" above 2^31 in this game's Lua (found by the sweep: a balance of 5 billion made every
-	-- update fail); "%.0f" prints the same digits for every integral double below 2^53 (zero is kept free of a minus sign).
-	if math.floor(v) == v and math.abs(v) < 9007199254740992 then return v == 0 and "0" or string.format("%.0f", v) end
-	return string.format("%.17g", v)
+	return C.integerText(v)
 end
 
 local TYPE_RANK = { number = 1, string = 2, boolean = 3 }
@@ -261,7 +268,7 @@ end
 
 -- seq <TAB> kind <TAB> from <TAB> payload
 function C.formatLine(seq, kind, from, payload)
-	return string.format("%d", seq) .. TAB .. kind .. TAB .. tostring(from) .. TAB .. payload .. NL
+	return C.integerText(seq) .. TAB .. kind .. TAB .. tostring(from) .. TAB .. payload .. NL
 end
 
 function C.parseLine(line)

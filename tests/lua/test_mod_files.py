@@ -15,6 +15,20 @@ class ContentIndexTest(unittest.TestCase):
         self.assertEqual(set(), present - listed, "files the game would not find")
         self.assertEqual(set(), listed - present, "files listed but missing")
 
+    def test_modules_that_carry_values_never_format_with_percent_d(self):
+        # The game's Lua raises on "%d" beyond 32 bits (a balance of 5 billion, sweep 2026-10-13): numbers that may be money or another
+        # large value go through C.integerText (feverlink3_common.lua), never string.format("%d").
+        import re
+        for name in ("feverlink3_common.lua", "feverlink3_cmds_company.lua", "feverlink3_lockstep.lua"):
+            text = open(os.path.join(MOD, "content", name), encoding="utf-8").read()
+            bad = [l.strip() for l in text.splitlines() if re.search(r'format\(\s*"[^"]*%[-+ #0-9.]*[di]', l)]
+            # common.lua keeps one two-digit escape ("%03d" of a byte) and one lane key ("%02d" of a counter): both are small by construction
+            bad = [l for l in bad if not re.search(r'"%0[23]d"', l)]
+            self.assertEqual([], bad, name)
+        # the two trace modules count things with "%d" (small by construction) but prints its sampled values through the helper
+        for name in ("feverlink3_towntrace.lua", "feverlink3_livevsloaded.lua"):
+            self.assertNotIn('format("%d", v)', open(os.path.join(MOD, "content", name), encoding="utf-8").read(), name)
+
 
 if __name__ == "__main__":
     unittest.main()
