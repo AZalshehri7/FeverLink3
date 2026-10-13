@@ -56,6 +56,10 @@ pub enum CtlMessage {
     TerrainApply { id: u64, stamp: u64 },
     /// Liveness; answered with `pong`.
     Ping { n: i64 },
+    /// `FEVERLINK3_NATIVE_PATCH`: patch the NEXT script `build_proposal` command that reaches the command list (not a held one):
+    /// its `frozenNodes` get these indices into `proposal.addedNodes`, which must hold exactly `adds` nodes. Expires after `ttl` ms
+    /// (0: the module's default).
+    PatchNext { frozen: Vec<u32>, adds: u32, ttl: u64 },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -78,6 +82,9 @@ impl std::fmt::Display for CtlError {
         }
     }
 }
+
+/// Most indices one `patch_next` may carry.
+pub const MAX_PATCH_FROZEN: usize = 64;
 
 /// A kind name of the control link: lower-case letters, digits and `_`, 1 to 32 characters.
 pub fn valid_kind_name(s: &str) -> bool {
@@ -142,6 +149,25 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             id: required(&p, "id", "terrain_apply needs a numeric id")?,
             stamp: optional(&p, "stamp", "stamp must be a game time")?,
         }),
+        "patch_next" => {
+            let list =
+                p.get("frozen").and_then(Value::as_array).ok_or(CtlError::BadPayload("frozen must be a list"))?;
+            if list.is_empty() || list.len() > MAX_PATCH_FROZEN {
+                return Err(CtlError::BadPayload("frozen must hold 1 to 64 indices"));
+            }
+            let mut frozen = Vec::with_capacity(list.len());
+            for item in list {
+                let n = whole(item).and_then(|n| u32::try_from(n).ok());
+                frozen.push(n.ok_or(CtlError::BadPayload("a frozen index is not a whole number"))?);
+            }
+            let adds = u32::try_from(required(&p, "adds", "patch_next needs the number of added nodes")?)
+                .map_err(|_| CtlError::BadPayload("adds is too large"))?;
+            Ok(CtlMessage::PatchNext {
+                frozen,
+                adds,
+                ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
+            })
+        }
         "ping" => {
             let n = match p.get("n") {
                 None => 0,
@@ -482,6 +508,17 @@ pub enum Event {
         id: u64,
         ok: bool,
     },
+    /// `patch_next` was carried out on a script command: its frozenNodes now hold `frozen` (`adds` added nodes were verified).
+    Patched {
+        frozen: Vec<u32>,
+        adds: u32,
+        /// A new block was allocated for the proposal's list (else the engine's own capacity was reused).
+        allocated: bool,
+    },
+    /// `patch_next` was not carried out; the command was left untouched.
+    PatchRefused {
+        reason: String,
+    },
     /// Cumulative counts of the commands the simulation applied, by kind byte.
     Audit {
         counts: Vec<(u8, u64)>,
@@ -513,6 +550,8 @@ impl Event {
             Event::Released { .. } => "released",
             Event::Dropped { .. } => "dropped",
             Event::Applied { .. } => "applied",
+            Event::Patched { .. } => "patched",
+            Event::PatchRefused { .. } => "patch_refused",
             Event::Audit { .. } => "audit",
             Event::Holding { .. } => "holding",
             Event::Pong { .. } => "pong",
@@ -539,6 +578,10 @@ impl Event {
                 format!("event holding {} ({reason}) [{}]", if *on { "on" } else { "off" }, kinds.join(", "))
             }
             Event::Error { place, detail } => format!("event error [{place}]: {detail}"),
+            Event::Patched { frozen, adds, allocated } => {
+                format!("event patched: frozenNodes {frozen:?} of {adds} added nodes (new block: {allocated})")
+            }
+            Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
             Event::Audit { .. } | Event::Pong { .. } => return None,
         })
     }
@@ -608,6 +651,12 @@ impl Event {
                 ("reason", Lua::str(*reason)),
             ]),
             Event::Pong { n } => Lua::map([("n", Lua::Int(*n))]),
+            Event::Patched { frozen, adds, allocated } => Lua::map([
+                ("adds", Lua::uint(u64::from(*adds))),
+                ("allocated", Lua::Bool(*allocated)),
+                ("frozen", Lua::List(frozen.iter().map(|n| Lua::uint(u64::from(*n))).collect())),
+            ]),
+            Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::Error { place, detail } => Lua::map([("detail", Lua::str(detail)), ("where", Lua::str(place))]),
         };
         v.text()
@@ -688,6 +737,29 @@ mod tests {
     }
 
     // ---- control messages
+
+    #[test]
+    fn patch_next_parses_and_rejects_bad_payloads() {
+        assert_eq!(
+            parse("patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, ttl: 0 })
+        );
+        assert_eq!(
+            parse("patch_next", r#"{["adds"]=2,["frozen"]={[1]=0,[2]=1},["ttl"]=500}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![0, 1], adds: 2, ttl: 500 })
+        );
+        for bad in [
+            r#"{["adds"]=3}"#,
+            r#"{["frozen"]={[1]=1}}"#,
+            r#"{["adds"]=3,["frozen"]={}}"#,
+            r#"{["adds"]=3,["frozen"]={[1]=-1}}"#,
+        ] {
+            assert!(matches!(parse("patch_next", bad), Err(CtlError::BadPayload(_))), "{bad}");
+        }
+        let e = Event::PatchRefused { reason: "x".into() };
+        assert_eq!((e.kind(), e.payload().as_str()), ("patch_refused", r#"{["reason"]="x"}"#));
+        assert_eq!(Event::Patched { frozen: vec![1], adds: 3, allocated: true }.kind(), "patched");
+    }
 
     #[test]
     fn every_control_kind_parses_from_the_mods_serialiser_output() {

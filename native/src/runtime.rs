@@ -35,6 +35,7 @@ use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
 use crate::portable;
 use crate::rebuild;
 
+mod cmd_patch;
 mod native_copy;
 
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
@@ -101,6 +102,8 @@ pub struct Runtime {
     input: crate::input::InputOut,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
+    /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
+    patch: crate::cmd_patch::State,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -146,6 +149,7 @@ impl Runtime {
             portable: OnceLock::new(),
             rebuild: OnceLock::new(),
             native_copy: OnceLock::new(),
+            patch: Default::default(),
             input: crate::input::InputOut::default(),
         }
     }
@@ -478,6 +482,7 @@ impl Runtime {
         drop(guard);
         for line in &poll.lines {
             match parse_ctl_line(line) {
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, ttl }) => self.arm_patch(frozen, adds, ttl, now),
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -508,6 +513,7 @@ impl Runtime {
         while let Some((id, ok)) = self.watch.next_result() {
             events.push(Event::Applied { id, ok });
         }
+        events.extend(self.patch.drain_events(now));
         for id in self.watch.expire(now) {
             events.push(Event::Error {
                 place: "applied".into(),
@@ -615,6 +621,9 @@ impl Runtime {
         }
         if plan.held_here {
             return args.out;
+        }
+        if self.patch.pending() {
+            crate::log::guarded("add hook (patch)", || self.patch_add(&args, caller));
         }
         // SAFETY: the arguments of the live call that is being hooked.
         unsafe { add(args.list, args.out, args.cmd, args.done, args.progress) }

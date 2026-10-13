@@ -1250,6 +1250,9 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         let dir = link.as_ref().map(|l| l.dir.clone()).or_else(feverlink3_launcher::live::live_dir);
         rt.enable_native_copy(settings, dir.as_deref());
     }
+    if std::env::var(crate::cmd_patch::PATCH_VAR).is_ok_and(|v| v == "1") {
+        rt.enable_native_patch();
+    }
     let targets = Targets {
         apply: apply_hook as *const () as usize,
         add: add_hook as *const () as usize,

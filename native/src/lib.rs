@@ -17,6 +17,7 @@
 #![cfg_attr(not(test), deny(unsafe_op_in_unsafe_fn))]
 
 pub mod build_table;
+pub mod cmd_patch;
 pub mod counters;
 pub mod detour;
 pub mod dump;
