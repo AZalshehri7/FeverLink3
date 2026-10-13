@@ -2617,6 +2617,21 @@ local function proposalVerdict(args)
 			pcall(function() ctx.player = A.player() end)
 		end
 		local pd = api.engine.util.proposal.makeProposalData(args[1], ctx)
+		-- Once per run, for a proposal that carries a construction: what the proposal data offers a script. MPFever's route for a construction
+		-- with street pieces needs the engine's CONVERTED construction (Proposal.toAdd[1]), which it reads from `res.proposal` in the callback
+		-- of a command that is refused on purpose; a simulation-state script has no callbacks. If the data of makeProposalData has a member
+		-- with the conversion (toAddData?), it shows here.
+		if not M.pdDumped and pd ~= nil and #A.list(args[1], "constructionsToAdd") > 0 then
+			M.pdDumped = true
+			pcall(function()
+				local names = {}
+				for _, k in ipairs(A.members(pd) or {}) do names[#names + 1] = tostring(k) end
+				local tad = {}
+				local list = A.list(pd, "toAddData")
+				for _, k in ipairs(list[1] and A.members(list[1]) or {}) do tad[#tad + 1] = tostring(k) end
+				C.tracer("build")("build.pd", string.format("makeProposalData members [%s]; toAddData has %d entr(ies), first member [%s]", table.concat(names, " "), #list, table.concat(tad, " ")))
+			end)
+		end
 		local es = pd and get(pd, "errorState")
 		if es == nil then return nil, "no errorState" end
 		local msgs = {}
