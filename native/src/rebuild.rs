@@ -209,6 +209,9 @@ impl<'a> Builder<'a> {
                 let v = self.val(&key).ok_or_else(|| format!("missing line {key}"))?;
                 let body = v.strip_prefix("set:").ok_or_else(|| format!("{key}: {v}"))?;
                 buf[..0x20].fill(0);
+                if body == "null" {
+                    return Ok(());
+                }
                 if let Some(rva) = body.strip_prefix("0,I+") {
                     // the empty table points at the library's static empty group, as the engine's own empty sets do
                     let rva = usize::from_str_radix(rva, 16).map_err(|e| format!("{key}: {e}"))?;

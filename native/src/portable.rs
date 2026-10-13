@@ -276,7 +276,10 @@ pub static PAYLOAD: &[F] = &[
     // copy constructor (0x4c78c0): an image pointer (constant) or a begin/end range of 20 bytes and two small integers (2, 3) in the
     // stop pair; the word at +0x20 (small integers, a pair of floats, 0x3f800060) is NOT carried (the copy has zeros, seen in the real
     // game) and the word at +0x28 differs (0 against 1): transient state, so 0x10 bytes of padding.
-    f(0x1a0, "proposal.gap1a0", Ty::Raw(0x20)),
+    // (b69: a depot over four town buildings had size 2, capacity 3 here and the typed copy dropped its two heap pointers as residue;
+    // the engine's copy constructor of the receiver's rebuilt source then walked a null control row and the game crashed.) It is the
+    // same kind of flat set of 4-byte ids as a node configuration's `crosswalks` (empty: the image's empty group, I+367b620).
+    f(0x1a0, "proposal.idSet1a0", Ty::EntSet),
     f(0x1c0, "proposal.gap1c0", Ty::Pad(0x10)),
     // indices into addedNodes, see the construction's `frozenNodes`
     f(0x1d0, "proposal.frozenNodes", Ty::EntVec),
@@ -627,6 +630,10 @@ impl Enc<'_> {
                 let (ctrl, slots, size, cap) = (u64_at(b, 0), u64_at(b, 8), u64_at(b, 16), u64_at(b, 24));
                 let image =
                     |p: u64| (p as usize) >= self.env.image_base && (p as usize) - self.env.image_base < IMAGE_BOUND;
+                if ctrl == 0 && slots == 0 && size == 0 && cap == 0 {
+                    // all zero (never seen in the game, whose empty table points at the image; synthetic payloads)
+                    return self.line(&format!("{path}.#"), "set:null");
+                }
                 if cap == 0 {
                     // the empty table: its control pointer is the library's static empty group in the game's image
                     if size != 0 || !image(ctrl) {
@@ -642,6 +649,15 @@ impl Enc<'_> {
                 }
                 if slots != ctrl + ent_set_slot_offset(cap as usize) as u64 {
                     return Err(set_err());
+                }
+                // the slots are 4 bytes: the allocation, when the heap index knows it, is exactly control row + 4 x capacity
+                // [b45: 32 bytes for capacity 3, 24 for capacity 1]
+                if let Some(n) = self.mem.heap_size(ctrl as usize) {
+                    if n != ent_set_slot_offset(cap as usize) + 4 * cap as usize {
+                        return Err(format!(
+                            "{path}: a table of {n} bytes for capacity {cap} does not hold 4-byte ids"
+                        ));
+                    }
                 }
                 let ctl = self.read(ctrl as usize, cap as usize + 1, path)?;
                 if ctl[cap as usize] != 0xff {

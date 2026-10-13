@@ -858,8 +858,8 @@ mod tests {
         put(b, 0x2a0, 7);
         put(b, 0x2a8, 8);
         // two unnamed words of the stop-pair kind: a pointer into the middle of a block and a stack address
-        put(b, 0x1a0, middle as u64);
-        put(b, 0x1a8, &on_stack as *const u64 as u64);
+        put(b, 0x2d8, middle as u64);
+        put(b, 0x2e0, &on_stack as *const u64 as u64);
         let live = LiveHeapMem::new();
         let head_ = Header {
             seq: 0,
@@ -910,7 +910,7 @@ mod tests {
         // SAFETY: the pointer is set by the test to an arena that outlives the call.
         let bytes = unsafe { (*world).read(s as usize, PROPOSAL_SIZE) }.expect("the held payload");
         for (k, b) in bytes.iter().enumerate() {
-            if !(0x1a0..0x1c0).contains(&k) {
+            if !(0x2d8..0x2f8).contains(&k) {
                 unsafe { *d.add(k) = *b };
             }
         }
@@ -922,8 +922,8 @@ mod tests {
         let (arena, at) = world();
         // a value in the gap the copy does not carry (residue), and a readable pointer-like word in it
         let readable = arena.add(&[7u8; 0x40]);
-        arena.write(at + 0x1a0, &0x1111_2222_3333_4444u64.to_le_bytes());
-        arena.write(at + 0x1a8, &(readable as u64).to_le_bytes());
+        arena.write(at + 0x2d8, &0x1111_2222_3333_4444u64.to_le_bytes());
+        arena.write(at + 0x2e0, &(readable as u64).to_le_bytes());
         WORLD.with(|w| w.set(&arena));
         let mem = Both(&arena);
         let mut fns = ProposalFns { ctor: fake_ctor, dtor: fake_dtor, copy: gap_leaving_copy, assign: fake_copy };
@@ -939,7 +939,7 @@ mod tests {
             "two copies, both destroyed"
         );
         assert!(said[0].contains("twice") && said[1].contains("destructor"), "{said:?}");
-        let gap = &info.mask["proposal.gap1a0"];
+        let gap = &info.mask["terrain"];
         assert!(
             gap[..0x20].iter().all(|k| !k),
             "the bytes the copy leaves alone differ between 0x00 and 0xFF: residue"
@@ -958,10 +958,16 @@ mod tests {
         )
         .expect("encodes")
         .text;
-        assert!(!masked.contains("proposal.gap1a0"), "residue is zero, and a zero region has no line: {masked}");
+        assert!(
+            !masked.contains(
+                "
+terrain	"
+            ),
+            "residue is zero, and a zero region has no line: {masked}"
+        );
         // typed without a mask: the value stays a literal, the pointer-like word is never followed or guessed (a foreign address is zero)
         let unmasked = portable::encode(&mem, env, typed, "40420", &head).expect("encodes").text;
-        let line = unmasked.lines().find(|l| l.starts_with("proposal.gap1a0")).expect("a line");
+        let line = unmasked.lines().find(|l| l.starts_with("terrain	")).expect("a line");
         assert!(
             line.contains("w:1111222233334444") && !line.contains(" P") && !line.contains('B') && !line.contains('R'),
             "{line}"
@@ -969,9 +975,9 @@ mod tests {
         // untyped, as before: the same word is a guess (a range, a block, a P)
         let old =
             portable::encode(&mem, env, Settings { typed: false, ..typed }, "40420", &head).expect("encodes").text;
-        let old_line = old.lines().find(|l| l.starts_with("proposal.gap1a0")).expect("a line");
+        let old_line = old.lines().find(|l| l.starts_with("terrain	")).expect("a line");
         assert_ne!(old_line, line, "{old_line}");
         WORLD.with(|w| w.set(core::ptr::null()));
-        assert!(info.carried_ranges("proposal.").contains("gap1a0: none"), "{}", info.carried_ranges("proposal."));
+        assert!(info.carried_ranges("").contains("terrain"), "{}", info.carried_ranges(""));
     }
 }
