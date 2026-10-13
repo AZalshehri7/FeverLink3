@@ -209,8 +209,12 @@ pub static NODE_CONFIG: Elem = Elem {
     // +0x38..0x78 is NOT all residue: it holds the traffic-light state, which b63/b64 lost when it was typed as padding (the four
     // node configurations of the depot differed in the checksum: trafficLightPreference 2 on the originator, 0 on the receiver;
     // trafficLightType -1 against 0). [b39: +0x40 zero, +0x4c the preference 2, +0x50..+0x68 zero, +0x68 the type -1; ASCII or
-    // pointer-like residue at +0x38, +0x48, +0x6c..+0x78 (b41, b46).] It is an unnamed region like any other: the differential mask
-    // keeps the bytes the engine's copy constructor carries and zeroes the rest, and a foreign pointer is never carried.
+    // pointer-like residue at +0x38, +0x48, +0x6c..+0x78 (b41, b46).] The rest of it is an unnamed region like any other: the
+    // differential mask keeps the bytes the engine's copy constructor carries and zeroes the rest, and a foreign pointer is never carried.
+    // The preference and the type are named members: left to the mask, the type was dropped in real run rt2 R3 (2026-10-14, a street
+    // with a junction through a house: the text's +0x68 was zero for all four node configurations, the receiver's checksum had type 0
+    // where every other node of both games has -1, nodeConfigs drifted), while the same build a run later (R4) carried it. A value the
+    // world reads must not depend on what two scratch copies happen to agree on.
     fields: &[
         f(0, "laneConnections", Ty::Vec(&LANE_CONNECTION)),
         // the set (of segment ids; in b45 every segment that meets at the node). [b45 node new#1: control bytes 7a 23 51 ff + clones + 0x80 fill (19), one
@@ -219,6 +223,8 @@ pub static NODE_CONFIG: Elem = Elem {
         // past the block: the engine's copy then read 3 heap words as segment ids, and the receiver crashed one second later in a map
         // lookup (`map_util.h(22) Get`, Sim Pool thread).
         f(0x18, "crosswalks", Ty::EntSet),
+        f(0x4c, "trafficLightPreference", Ty::U32),
+        f(0x68, "trafficLightType", Ty::U32),
         f(0x78, "entity", Ty::Ent),
     ],
     anchors: &[],

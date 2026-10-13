@@ -1375,14 +1375,14 @@ mod tests {
         // the injection's settings: typed (a foreign pointer in an unnamed word is not carried)
         let typed = Settings { typed: true, ..settings() };
         let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
-        // the region is carried (here without a differential mask, so the ASCII too), the residue pointers are not
-        let line = e
-            .text
-            .lines()
-            .find(|l| l.starts_with("proposal.nodeConfigsToAdd[0].~0x38"))
-            .expect("the region is written");
-        assert!(line.contains("w:0000000200000000") && line.contains("w:00000000ffffffff"), "{line}");
-        assert!(!line.contains('P') && !line.contains(&format!("{readable:x}")), "{line}");
+        // the traffic-light preference and type are named members (rt2 R3: left to the mask, the type was dropped), the residue
+        // pointers of the unnamed words around them are not carried
+        for l in ["trafficLightPreference	u32:00000002", "trafficLightType	u32:ffffffff"] {
+            assert!(e.text.contains(&format!("proposal.nodeConfigsToAdd[0].{l}")), "{l}: {}", e.text);
+        }
+        for line in e.text.lines().filter(|l| l.starts_with("proposal.nodeConfigsToAdd[0].~")) {
+            assert!(!line.contains('P') && !line.contains(&format!("{readable:x}")), "{line}");
+        }
         assert!(e.unresolved.iter().all(|(m, _)| !m.contains("nodeConfigsToAdd")), "{:?}", e.unresolved);
         // the value is the set of ids in id order, not the control bytes (the owner's hash)
         for l in ["crosswalks.#	set:3", "crosswalks[0]	ent:new#5", "crosswalks[1]	ent:new#4", "crosswalks[2]	ent:new#3"]
