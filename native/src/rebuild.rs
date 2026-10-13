@@ -184,7 +184,12 @@ impl<'a> Builder<'a> {
                 if body == "null" {
                     return Ok(());
                 }
-                let data = parse_hex(body)?;
+                let len: usize = body.parse().map_err(|_| format!("{path}: {v}"))?;
+                if len > 0x1000 {
+                    return Err(format!("{path}: a span of {len} bytes"));
+                }
+                // a zero-filled block of that length: the bytes are the engine's to regenerate (see the encoder)
+                let data = vec![0u8; len];
                 let begin = if data.is_empty() {
                     self.blocks += 1;
                     self.a.alloc(8).ok_or("allocation failed")? as u64
@@ -1310,7 +1315,11 @@ mod tests {
             elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
         }
         elem[0x40..0x48].copy_from_slice(&ascii.to_le_bytes());
-        let span = arena.add(&[0x80u8; 20]); // the owned 20-byte range at +0x18 is typed: it is part of the value
+        // the real bytes of b54 entry 0 (original), and the bytes the engine's copy made of them (rebuilt): only the length is the value
+        let real: Vec<u8> = (0..20)
+            .map(|i| u8::from_str_radix(&"7a2351ff7a235180808080808080808080808044"[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        let span = arena.add(&real); // the owned 20-byte range at +0x18 is typed: it is part of the value
         elem[0x18..0x20].copy_from_slice(&(span as u64).to_le_bytes());
         elem[0x20..0x28].copy_from_slice(&(span as u64 + 20).to_le_bytes());
         elem[0x78..0x7c].copy_from_slice(&(-1i32).to_le_bytes());
@@ -1327,11 +1336,7 @@ mod tests {
             e.text
         );
         assert!(e.unresolved.iter().all(|(m, _)| !m.contains("nodeConfigsToAdd")), "{:?}", e.unresolved);
-        assert!(
-            e.text.contains("nodeConfigsToAdd[0].span	span:8080808080808080808080808080808080808080"),
-            "{}",
-            e.text
-        );
+        assert!(e.text.contains("nodeConfigsToAdd[0].span	span:20"), "{}", e.text);
         let built = build_selected(&e.text, BASE, &arena, None).expect("builds");
         let copy = &built.payload;
         let (b0, e0) = (u64_at(copy, 0x60), u64_at(copy, 0x68));
