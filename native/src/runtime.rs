@@ -142,8 +142,9 @@ impl Runtime {
         }
         if self.dump.set(dumper).is_ok() {
             self.say(&format!(
-                "dump: FEVERLINK3_DUMP_COMMANDS is on: build commands are decoded into {} (read-only; at most {} held and {} applied dumps)",
+                "dump: FEVERLINK3_DUMP_COMMANDS is on: build commands are decoded into {} (read-only; script commands {}; at most {} held and {} apply/applied dumps)",
                 dump::DUMP_FILE,
+                if settings.scripts { "included" } else { "skipped" },
                 settings.max_held,
                 settings.max_applied
             ));
@@ -193,6 +194,14 @@ impl Runtime {
         if let Err(e) = d.write(&text) {
             self.say(&format!("dump: cannot write {}: {e}", dump::DUMP_FILE));
         }
+        let _ = d.write_index(&format!(
+            "seq={seq} event={event} key={} site={} tool={} payload={payload:#x} bytes={} wall_ms={}",
+            hold_id.map_or("none".to_string(), |k| k.to_string()),
+            site.map_or("none".to_string(), |s| format!("{s:#x}")),
+            head.tool.map_or("none".to_string(), |t| dump::TOOL_NAMES.get(t).copied().unwrap_or("?").to_string()),
+            text.len(),
+            head.wall_ms
+        ));
         Some(seq)
     }
 
@@ -533,6 +542,8 @@ impl Runtime {
                 let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
                 let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
                 (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                // script commands (no hold key) only at level 3
+                (claimed.is_some() || self.dump.get().is_some_and(|d| d.settings.scripts)).then_some(())?;
                 let seq = self.dump_payload("apply", payload, claimed, None, Scope::Whole, Budget::Applied, None)?;
                 Some((payload, seq))
             })
@@ -1059,6 +1070,17 @@ mod tests {
         let mut queued = Box::new([0u8; 0x40]);
         queued[..8].copy_from_slice(&call.payload().to_ne_bytes());
         unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        // a script command (never held, no key) is not dumped at level 1
+        let script = Call::new(52, 77);
+        let mut queued2 = Box::new([0u8; 0x40]);
+        queued2[..8].copy_from_slice(&script.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued2.as_mut_ptr()) };
+        let index = std::fs::read_to_string(dir.path().join(dump::INDEX_FILE)).expect("an index file");
+        assert_eq!(index.lines().count(), 3, "{index}");
+        assert!(
+            index.lines().next().unwrap().starts_with("seq=1 event=held key=1 site=0x4d396f tool=Bulldozer"),
+            "{index}"
+        );
         let text = std::fs::read_to_string(dir.path().join(dump::DUMP_FILE)).expect("a dump file");
         let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("=== dump")).collect();
         assert_eq!(headers.len(), 3, "{headers:?}");

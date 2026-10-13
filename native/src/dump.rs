@@ -32,6 +32,8 @@ use std::sync::Mutex;
 pub const DUMP_VAR: &str = "FEVERLINK3_DUMP_COMMANDS";
 /// Where it goes, next to `native_ctl.log`.
 pub const DUMP_FILE: &str = "native_dump.log";
+/// One summary line per dump, to find the right one in the big file.
+pub const INDEX_FILE: &str = "native_dump_index.log";
 
 /// Size of the engine's command payload object (the kind byte is the last used one, at 0x9b8).
 pub const PAYLOAD_SIZE: usize = 0x9c0;
@@ -71,6 +73,8 @@ pub struct Settings {
     pub max_applied: u32,
     /// The file stops growing here.
     pub max_file_bytes: u64,
+    /// Level 3: also dump script commands (no hold key). Otherwise only commands held for a tool and their application.
+    pub scripts: bool,
 }
 
 impl Settings {
@@ -79,18 +83,21 @@ impl Settings {
         let level = match get(DUMP_VAR)?.trim() {
             "1" => 1,
             "2" => 2,
+            "3" => 3,
             _ => return None,
         };
-        let deep = level == 2;
+        let deep = level >= 2;
         Some(Settings {
             depth: if deep { 6 } else { 4 },
             max_blocks: if deep { 1500 } else { 500 },
             block_bytes: if deep { 2048 } else { 512 },
             big_block_bytes: if deep { 16384 } else { 8192 },
-            max_dump_bytes: if deep { 4 << 20 } else { 1 << 20 },
-            max_held: 80,
-            max_applied: 160,
-            max_file_bytes: 48 << 20,
+            max_dump_bytes: if deep { 600 << 10 } else { 512 << 10 },
+            max_held: 60,
+            // an apply and an applied dump each count: 60 builds
+            max_applied: 120,
+            max_file_bytes: 200 << 20,
+            scripts: level == 3,
         })
     }
 }
@@ -726,9 +733,11 @@ impl Dumper {
         if self.dir.lock().unwrap_or_else(|p| p.into_inner()).as_deref() == Some(dir) {
             return;
         }
-        let path = dir.join(DUMP_FILE);
-        if path.exists() {
-            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+        for file in [DUMP_FILE, INDEX_FILE] {
+            let path = dir.join(file);
+            if path.exists() {
+                let _ = std::fs::rename(&path, path.with_extension("log.1"));
+            }
         }
         *self.dir.lock().unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
     }
@@ -755,14 +764,29 @@ impl Dumper {
 
     /// Appends a text to the file (opened per dump: they are rare, and the session folder may be cleared).
     pub fn write(&self, text: &str) -> std::io::Result<()> {
+        self.append(DUMP_FILE, text)?;
+        self.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Appends one line to the index file.
+    pub fn write_index(&self, line: &str) -> std::io::Result<()> {
+        self.append(
+            INDEX_FILE,
+            &format!(
+                "{line}
+"
+            ),
+        )
+    }
+
+    fn append(&self, file: &str, text: &str) -> std::io::Result<()> {
         use std::io::Write;
         let Some(dir) = self.dir.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return Err(std::io::Error::other("no folder"));
         };
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(DUMP_FILE))?;
-        f.write_all(text.as_bytes())?;
-        self.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
-        Ok(())
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(file))?;
+        f.write_all(text.as_bytes())
     }
 }
 
@@ -816,6 +840,8 @@ mod tests {
         assert!(Settings::from_lookup(|_| None).is_none());
         assert!(Settings::from_lookup(get("0")).is_none());
         assert!(Settings::from_lookup(get("yes")).is_none());
+        assert!(!Settings::from_lookup(get("2")).unwrap().scripts);
+        assert!(Settings::from_lookup(get("3")).unwrap().scripts);
         let (one, two) = (Settings::from_lookup(get("1")).unwrap(), Settings::from_lookup(get(" 2 ")).unwrap());
         assert!(two.depth > one.depth && two.max_dump_bytes > one.max_dump_bytes);
     }
