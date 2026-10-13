@@ -772,7 +772,12 @@ local function describeBuild(it, args, role)
 			n = #l
 			for i = 1, math.min(n, 6) do ids[#ids + 1] = tostring(l[i]) end
 		end)
-		if sum.rem > 0 or n > 0 then parts[#parts + 1] = string.format("resolved removals %d of %d [%s]", n, sum.rem, table.concat(ids, " ")) end
+		if sum.rem > 0 or n > 0 then
+			-- (a build of several commands carries its removals in a later one: the first command's list says nothing about them; see the
+			-- build.removal trace lines for each removal's resolution)
+			local chained = type(args) == "table" and type(args.chain) == "table" and #args.chain > 0
+			parts[#parts + 1] = string.format("resolved removals %d of %d [%s]%s", n, sum.rem, table.concat(ids, " "), (chained and n < sum.rem) and " (first command only; the others are in the chained command)" or "")
+		end
 		local verdict = "n/a"
 		-- (real session 2026-10-13: makeProposalData answered "SimpleProposal expected, got Proposal" for a removal, and the one failure
 		-- switched the reader off for every build. It only fails for the native Proposal type, so only that type is skipped.)

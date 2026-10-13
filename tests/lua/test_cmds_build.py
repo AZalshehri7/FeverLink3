@@ -474,6 +474,7 @@ BUILD_MOCK2 = r'''
 -- ===== applying a proposal =====
 BUILD_LOG, BUILD_REFUSALS, FACTORY_COUNT, HELPER_CALLS, CFG_LOG, BUILD_CTX = {}, {}, 0, {}, {}, {}
 OLD2NEW_LOG, CON_OWNERS = {}, {}
+REUSE_FREED_IDS, FREED_IDS = false, {}   -- a test sets REUSE_FREED_IDS: the engine gives a removed building's id to the construction that replaces it
 BUILD_REFUSE = nil      -- a test sets function(parts) -> message to make the engine refuse a build
 
 DEF_TEMPLATE("street/simple.street_template", "simple", { { forward = true, modes = { 2 } }, { forward = false, modes = { 2 } } })
@@ -583,6 +584,7 @@ function APPLY_BUILD(p)
   local gone = {}
   for old, new in pairs(P.old2new) do OLD2NEW_LOG[#OLD2NEW_LOG + 1] = tostring(old) .. "=" .. tostring(new) end
   for _, e in ipairs(P.consRem) do
+    FREED_IDS[#FREED_IDS + 1] = e
     local c = STORE(WORLD[e].CONSTRUCTION)
     for _, d in ipairs(c.depots) do WORLD[d] = nil end
     for _, s in ipairs(c.stations) do
@@ -650,7 +652,7 @@ function APPLY_BUILD(p)
   local function makeConstructions()
     for _, ce in ipairs(P.consAdd) do
       CON_OWNERS[#CON_OWNERS + 1] = tostring(ce.playerEntity)
-      local id = NEW_ENTITY(nil)
+      local id = (REUSE_FREED_IDS and #FREED_IDS > 0) and table.remove(FREED_IDS, 1) or NEW_ENTITY(nil)
       local comp = D("ConstructionComp", { fileName = ce.fileName, transf = ce.transf, params = ce.params, name = ce.name })
       local cs = STORE(comp)
       if ce.fileName:find("depot") then cs.depots = { NEW_ENTITY({ VEHICLE_DEPOT = {} }) } end
@@ -1476,6 +1478,22 @@ class BuildTest(unittest.TestCase):
         self.tick(14)
         self.assertSameWorld()
         self.assertNotIn("modular_station", self.A.sig())
+
+    def test_a_depot_that_removes_buildings_gets_its_keys_when_the_engine_reuses_a_removed_buildings_id(self):
+        # real run 2026-10-13: a depot over four buildings was built on the receiving game, but no entity was "new" (the id of a removed
+        # building went to the depot), so nothing was keyed and the result was reported as "found new CONSTRUCTION 0"
+        self.start()
+        for g in (self.A, self.B):
+            g.run("REUSE_FREED_IDS = true")
+        self.B.issue("(function() local P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }; "
+                     "P.toRemove = { 56 }; return P end)()")
+        self.tick(24)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertIn("1:1#c1", str(g.lua("BOUND_KEYS()")).split(), g.label)
+            self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
+        # the junction configuration of the street part is kept when the construction's own pieces are left to its script
+        self.assertEqual(self.A.lua("#CFG_LOG"), 1, "the host's replay put the street part's node configuration back")
 
     def test_a_vehicle_is_bought_at_a_depot_the_session_built(self):
         self.start()

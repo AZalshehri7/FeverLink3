@@ -1828,8 +1828,22 @@ local function streetProposal(rec, R, notes, opts)
 		if not (opts.drop and type(o.edge) == "number" and dropped[o.edge]) then objs[#objs + 1] = newEdgeObject(o, R, R.edgeOr(o.edge), notes, opts) end
 	end
 	local cfgs, rmCfgs = {}, {}
-	if not opts.drop and opts.cfg ~= false then
-		for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, R) end
+	if opts.cfg ~= false then
+		for _, n in ipairs(rec.ncfg) do
+			if not opts.drop then
+				cfgs[#cfgs + 1] = newNodeConfig(n, R)
+			elseif type(n.node) ~= "number" or (n.node < 0 and usedNode[n.node]) or n.node >= 0 then
+				-- With `drop` the construction's own pieces are left to its script, but the junction configurations of the street part stay: the
+				-- removals of the old ones below were not matched by any add, and the host lost two node configurations (sweep-free real run
+				-- 2026-10-13, depot with four buildings removed: nodeConfigs 792 against 794). What names a dropped piece is left out; the engine
+				-- makes those connections when the construction's script adds the piece.
+				local function keep(ref) return not (type(ref) == "number" and dropped[ref]) end
+				local lc, cw = {}, {}
+				for _, l in ipairs(n.lc or {}) do if keep(l.s0) and keep(l.s1) then lc[#lc + 1] = l end end
+				for _, x in ipairs(n.cw or {}) do if keep(x) then cw[#cw + 1] = x end end
+				cfgs[#cfgs + 1] = newNodeConfig({ node = n.node, lc = lc, cw = cw, pref = n.pref, dss = n.dss, user = n.user }, R)
+			end
+		end
 	end
 	for i, ref in ipairs(rec.rmNcfg) do rmCfgs[i] = R.node(ref) end
 	withStreet(sp, function(ssp)
@@ -1849,7 +1863,11 @@ end
 local function constructionLists(rec, R)
 	local cons, rem, map = {}, {}, {}
 	for i, c in ipairs(rec.cons) do cons[i] = newConstructionEntity(c, R) end
-	for i, ref in ipairs(rec.rem) do rem[i] = R.con(ref) end
+	local trace = C.tracer("build")
+	for i, ref in ipairs(rec.rem) do
+		rem[i] = R.con(ref)
+		trace("build.removal", string.format("%d of %d: key=%s file=%s -> entity %s", i, #rec.rem, tostring(ref.key), tostring(ref.file), tostring(rem[i])))
+	end
 	for _, pair in ipairs(rec.old2new) do
 		if rem[pair[1]] then map[rem[pair[1]]] = pair[2] end
 	end
@@ -2726,7 +2744,31 @@ local function bindCreated(body, key, made)
 				if g then map[base .. "/g" .. j] = g end
 			end
 		else
-			complete = false
+			-- The engine hands the id of a removed building to the construction that replaces it, so a build that removes buildings and adds a
+			-- construction shows no NEW entity (real run 2026-10-13: a depot over four buildings was built on the host and reported "found new
+			-- CONSTRUCTION 0"). Looked for by file and place among all constructions near the record's position that no other piece took.
+			local alt
+			local list = (#rec.rem > 0) and octree(p, CON_REACH, "CONSTRUCTION") or nil   -- only a build that removed buildings can have had its ids reused
+			for _, e in ipairs(list or {}) do
+				if not used[e] then
+					local info = A.conInfo(e)
+					if info and info.file == c.file and d3(info.p, p) <= TOL_CON then alt = e break end
+				end
+			end
+			if alt then
+				used[alt] = true
+				local base = key .. "#c" .. i
+				map[base] = alt
+				local depots, stations = A.conParts(alt)
+				for j, d in ipairs(depots) do map[base .. "/d" .. j] = d end
+				for j, st in ipairs(stations) do
+					map[base .. "/s" .. j] = st
+					local g = A.stationGroup(st)
+					if g then map[base .. "/g" .. j] = g end
+				end
+			else
+				complete = false
+			end
 		end
 	end
 	-- A stop on a road is an edge object that is a station. Nothing in the record or the world says which of two games'
