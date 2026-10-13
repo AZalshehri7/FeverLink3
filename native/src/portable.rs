@@ -198,9 +198,13 @@ pub static SEGMENT: Elem = Elem {
     anchors: &[(8, 0x10), (0xc, 0x1c)],
 };
 
-/// One word of the proposal's `segmentTags` (32 bytes in a construction's proposal, empty in a road's). [observed: a depot over four buildings and
-/// a street station both hold seven zero words and the value 15 in the seventh, whatever their segments are]
-pub static SEGMENT_TAG: Elem = Elem { name: "SegmentTag", stride: 4, fields: &[f(0, "value", Ty::U32)], anchors: &[] };
+/// One entry of the proposal's `segmentTags`: a `std::string` (32 bytes: buffer or pointer, size, capacity), one per segment of a
+/// construction's proposal, none in a road's. [a depot over four buildings and a street station: one entry, the empty string (seven
+/// zero words and the capacity 15). rt5 R11 / rt6 R12 / rt7 R13 (2026-10-14): a modular train station has 24 entries of 16 characters
+/// on the heap (capacity 31); read as words, the text carried the originator's string pointers, and the receiver's engine copy of
+/// the injected Proposal read freed memory through them and crashed (memcpy under the Proposal copy constructor).]
+pub static SEGMENT_TAG: Elem =
+    Elem { name: "SegmentTag", stride: 0x20, fields: &[f(0, "value", Ty::Str)], anchors: &[] };
 
 pub static NODE_CONFIG: Elem = Elem {
     name: "BaseNodeLaneConnectionAndEntity",
