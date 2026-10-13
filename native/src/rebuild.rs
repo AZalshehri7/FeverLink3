@@ -1098,6 +1098,24 @@ mod tests {
     }
 
     #[test]
+    fn a_map_with_entries_is_walked_without_the_heap_index_and_its_keys_are_a_named_line() {
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        super::testgraph::add_containers(&arena, at);
+        let text =
+            encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
+        // the map's sentinel and its one node are blocks although the heap knows no sizes; the key (77) is a named line
+        assert!(text.contains("parcelsMap.keys	keys:0000004d"), "{text}");
+        assert!(text.contains("parcelsMap.graph	raw:B"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("@B") && l.contains("size=80")).count(), 2, "{text}");
+        // a tree that does not hold `size` nodes is left alone (its pointers stay P)
+        arena.write(at + 0x2c8 + 8, &5u64.to_le_bytes());
+        let bad =
+            encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
+        assert!(!bad.contains("parcelsMap.keys") && bad.contains("parcelsMap.graph	raw:P"), "{bad}");
+    }
+
+    #[test]
     fn containers_with_entries_are_followed_as_a_heap_graph_and_rebuilt_isomorphic() {
         let (fake, at) = synthetic();
         let arena = world(fake.0);

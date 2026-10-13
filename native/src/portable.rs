@@ -430,6 +430,8 @@ struct Enc<'a> {
     blocks: Vec<Blk>,
     by_addr: BTreeMap<usize, usize>,
     graph_bytes: usize,
+    /// Blocks whose size the heap could not tell but that were found by walking an engine `std::map` (see [`Enc::register_map_nodes`]).
+    known_sizes: BTreeMap<usize, usize>,
     /// the member being written (or the member a block was reached from), for the graph's accounting
     origin: String,
     unresolved: Vec<(String, usize)>,
@@ -609,6 +611,12 @@ impl Enc<'_> {
             Ty::Map => {
                 // std::map: head pointer and size; the nodes are heap blocks of the graph
                 self.line(path, &format!("map:size={}", u64_at(b, 8)))?;
+                if let Some(keys) = self.register_map_nodes(u64_at(b, 0) as usize, u64_at(b, 8) as usize) {
+                    // the entries' keys (the first four bytes of each pair), sorted: a named line, so that a rebuilt map's entries are
+                    // part of the comparison (the nodes themselves are unnamed graph blocks; the values are not compared)
+                    let list: Vec<String> = keys.iter().map(|k| format!("{k:08x}")).collect();
+                    self.line(&format!("{path}.keys"), &format!("keys:{}", list.join(",")))?;
+                }
                 self.container_graph(path, b, depth)
             }
             Ty::Hash => {
@@ -636,6 +644,51 @@ impl Enc<'_> {
         self.line(&format!("{path}.graph"), &format!("raw:{t}"))
     }
 
+    /// The nodes of an engine `std::map` with entries, found by walking the tree itself: the heap index does not list every small block
+    /// (b42: the sentinels and nodes of `new2oldSegments` and `old2newSegments` stayed `P`), and a tree can be checked without asking
+    /// the heap. MSVC's layout: a sentinel node (left = leftmost, parent = root, right = rightmost; `isnil` at +0x19 set) and nodes
+    /// of the same size (0x50 bytes here: left, parent, right, colour, isnil, then the pair at +0x20) whose missing children point
+    /// at the sentinel. Registered only when the walk finds exactly `size` readable nodes, each with `isnil` clear and pointers of
+    /// the right kind; else nothing is registered and the pointers stay `P` (and the rebuild refuses).
+    fn register_map_nodes(&mut self, head: usize, size: usize) -> Option<Vec<u32>> {
+        const NODE: usize = 0x50;
+        if size == 0 || size > 4096 || !pointer_like(head as u64) {
+            return None;
+        }
+        let h = self.mem.read(head, NODE)?;
+        if h[0x19] != 1 {
+            return None;
+        }
+        let mut found: Vec<usize> = Vec::new();
+        let mut keys: Vec<u32> = Vec::new();
+        let mut stack = vec![u64_at(&h, 8) as usize];
+        while let Some(a) = stack.pop() {
+            if a == head {
+                continue;
+            }
+            if !pointer_like(a as u64) || found.contains(&a) || found.len() > size {
+                return None;
+            }
+            let n = self.mem.read(a, NODE)?;
+            if n[0x19] != 0 {
+                return None;
+            }
+            found.push(a);
+            keys.push(u32_at(&n, 0x20));
+            stack.push(u64_at(&n, 0) as usize);
+            stack.push(u64_at(&n, 0x10) as usize);
+        }
+        if found.len() != size {
+            return None;
+        }
+        self.known_sizes.insert(head, NODE);
+        for a in found {
+            self.known_sizes.insert(a, NODE);
+        }
+        keys.sort_unstable();
+        Some(keys)
+    }
+
     /// A pointer to a live heap block as a token of the heap graph: `B<n>` (the start of block n) or `B<n>+<hex>` (inside it).
     /// The first pointer to a block reads it (its size comes from the heap) and queues its own pointers.
     fn block_token(&mut self, p: usize) -> Option<String> {
@@ -650,7 +703,7 @@ impl Enc<'_> {
                 return Some(format!("B{n}+{:x}", p - a));
             }
         }
-        let size = self.mem.heap_size(p)?;
+        let size = self.mem.heap_size(p).or_else(|| self.known_sizes.get(&p).copied())?;
         if size > self.set.max_graph_block_bytes
             || self.blocks.len() >= self.set.max_graph_blocks
             || self.graph_bytes + size > self.set.max_graph_bytes
@@ -892,6 +945,7 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         blocks: Vec::new(),
         by_addr: BTreeMap::new(),
         graph_bytes: 0,
+        known_sizes: BTreeMap::new(),
         origin: String::new(),
         unresolved: Vec::new(),
         container_mode: false,
