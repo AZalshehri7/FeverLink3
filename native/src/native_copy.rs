@@ -668,13 +668,11 @@ mod tests {
             let text = run(&ctx, at, &mut |_| {});
             WORLD.with(|w| w.set(core::ptr::null()));
             assert!(text.contains("STEP 2: MATCH"), "dump #{n}: {text}");
-            // this model is a text dump of memory without heap sizes: the engine containers are all empty on the road, the rail
-            // track and the house bulldozing, so they stay the engine's and the source is built from the text and equals the
-            // held command; the stop pair and the stop bulldozing have node-config pointers the model cannot resolve
+            // the node configurations' residue words (b45/b46: ASCII text or pointer-like junk, never owned) are padding now, so the stop
+            // pair and the stop bulldozing, which stayed SKIPPED on them, rebuild from their text as well
+            assert!(!text.contains("STEP 3: DIFF") && !text.contains("nodeConfigsToAdd x"), "dump #{n}: {text}");
             if [1, 13, 19].contains(&n) {
                 assert!(text.contains("STEP 3: MATCH"), "dump #{n}: {text}");
-            } else {
-                assert!(text.contains("STEP 3: SKIPPED"), "dump #{n}: {text}");
             }
             let _ = std::fmt::Write::write_fmt(
                 &mut all,

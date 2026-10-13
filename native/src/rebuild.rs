@@ -1277,4 +1277,33 @@ mod tests {
             built.blocked
         );
     }
+
+    #[test]
+    fn residue_in_a_node_configuration_is_never_followed_or_written_whatever_it_looks_like() {
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        let readable = arena.add(&[9u8; 0x40]); // a pointer-like word that points at readable memory, as in b46
+        let ascii = u64::from_le_bytes(*b"/feverli");
+        let mut elem = vec![0u8; 0x80];
+        for off in [0x38usize, 0x68, 0x70] {
+            elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
+        }
+        elem[0x40..0x48].copy_from_slice(&ascii.to_le_bytes());
+        elem[0x78..0x7c].copy_from_slice(&(-1i32).to_le_bytes());
+        let blk = arena.add(&elem);
+        let mut v = Vec::new();
+        for x in [blk as u64, blk as u64 + 0x80, blk as u64 + 0x80] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        assert!(arena.write(at + 0x60, &v));
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes");
+        assert!(
+            !e.text.contains("nodeConfigsToAdd[0].~0x38") && !e.text.contains("nodeConfigsToAdd[0].~0x40"),
+            "{}",
+            e.text
+        );
+        assert!(e.unresolved.iter().all(|(m, _)| !m.contains("nodeConfigsToAdd")), "{:?}", e.unresolved);
+        let built = build_selected(&e.text, BASE, &arena, None).expect("builds");
+        assert!(!built.blocked.iter().any(|b| b.path.contains("nodeConfigsToAdd")), "{:?}", built.blocked);
+    }
 }

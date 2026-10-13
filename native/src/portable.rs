@@ -194,7 +194,14 @@ pub static SEGMENT_TAG: Elem = Elem { name: "SegmentTag", stride: 4, fields: &[f
 pub static NODE_CONFIG: Elem = Elem {
     name: "BaseNodeLaneConnectionAndEntity",
     stride: 0x80,
-    fields: &[f(0, "laneConnections", Ty::Vec(&LANE_CONNECTION)), f(0x78, "entity", Ty::Ent)],
+    // +0x18..0x38 holds a begin/end range (20 bytes) and two small counts; +0x38..0x78 is residue: b45 had ASCII text there (the module's
+    // own log lines, "/feverlink ..."), b46 pointer-like words that stayed `P`. The engine's copy of the very same objects ran in both
+    // without touching them (b45 injected and ran identical on both games), so they are not owned data: not written, not rebuilt.
+    fields: &[
+        f(0, "laneConnections", Ty::Vec(&LANE_CONNECTION)),
+        f(0x38, "residue", Ty::Pad(0x40)),
+        f(0x78, "entity", Ty::Ent),
+    ],
     anchors: &[],
 };
 
