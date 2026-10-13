@@ -3073,7 +3073,9 @@ local function portableReplay(rec, text, R, f, tkey)
 	local okB, args = pcall(function()
 		local sp = streetProposal(rec2, R, notes, { drop = true })
 		setConstructions(sp, rec2, R)
-		return commandArgs(sp, newContext(f.ctx, R), f.ie, f.pi, f.dust)
+		-- the engine drops a command whose verdict has errors before it reaches the command list when ignoreErrors is off (sweep run 3); this proposal
+		-- is judged before the native patch and always collides with the construction's own street piece (b32: no Add ever seen), so it is sent with errors ignored
+		return commandArgs(sp, newContext(f.ctx, R), f.ie or #frozenIdx > 0, f.pi, f.dust)
 	end)
 	if not okB then return no("not built (" .. tostring(args):sub(1, 160) .. ")") end
 	local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
