@@ -688,10 +688,13 @@ function EXECUTE(cmd, cb)
   return executeBuild(cmd, cb)
 end
 
+BUILD_NEEDS_IE = nil    -- a test sets function(proposal) -> true for a build the engine only accepts with ignoreErrors = true (non-critical messages)
 function executeBuild(cmd, cb)
   local name = cmd.__cmd
   local a = cmd.args
-  local ok, res = APPLY_BUILD(a[1])
+  local ok, res
+  if BUILD_NEEDS_IE and BUILD_NEEDS_IE(a[1]) and a[3] ~= true then ok, res = false, "non-critical messages and ignoreErrors = false"
+  else ok, res = APPLY_BUILD(a[1]) end
   if ok then
     local ents = {}
     for i, e in ipairs(res) do ents[i] = { e, 0 } end

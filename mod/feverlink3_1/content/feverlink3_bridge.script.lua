@@ -782,6 +782,10 @@ local function describeBuild(it, args, role)
 				logSim("the engine's verdict on a rebuilt build cannot be read from this state (" .. tostring(msgs) .. "); the build lines say verdict n/a from now on")
 			elseif critical ~= nil then
 				verdict = string.format("critical=%s messages=[%s] warnings=[%s] collisions=[%s]", tostring(critical), table.concat(msgs, "; "), table.concat(warns, "; "), table.concat(coll or {}, "; "))
+				if critical == false and #msgs > 0 and args[3] ~= true then
+					verdict = verdict .. string.format("; WARNING flag mismatch: the engine reports non-critical messages and this build is applied with ignoreErrors = false, "
+						.. "which refuses it silently (the record carries the originator's flag: %s)", tostring(it.body and it.body.args and it.body.args[3]))
+				end
 			end
 		end
 		parts[#parts + 1] = "verdict " .. verdict
@@ -944,7 +948,7 @@ local function snapshotComps(comps)
 	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end
 	return before
 end
-local function simCaptureBuild(state, param, post, deferredBefore)
+local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 	local st = simState(state)
 	local now = engine.gameTime()
 	-- A build the engine or a game script made on its own (a town growing a road: playerInitiated false) is nobody's tool build:
@@ -972,15 +976,25 @@ local function simCaptureBuild(state, param, post, deferredBefore)
 	local proposal, playerInitiated, result = nil, nil, nil
 	pcall(function() proposal, playerInitiated, result = param[1], param[4], param[3] end)
 	if proposal == nil or playerInitiated == false or not Build then return end
+	-- The flags the originator's engine applies the build with travel in the record: a replay with other flags can be refused where the
+	-- originator's engine accepted (sweep 20261013-061744 B5: sent with ignoreErrors = true after "Empty Construction", replayed with false,
+	-- the host built nothing and the games drifted). Event arguments: (proposal, context, ignoreErrors, playerInitiated); the post event
+	-- carries the result entities at [3], so its flag is the one read before the build.
+	local ignoreErrors = false
+	if post then
+		ignoreErrors = deferredIe == true
+	else
+		pcall(function() ignoreErrors = param[3] == true end)
+	end
 	local rev = {}
 	for key, e in pairs(st.bind) do rev[e] = key end
 	local t0 = os.clock()
-	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, result = post and result or nil }, {
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, result = post and result or nil }, {
 		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
 	})
 	if not ok then body, why = nil, tostring(body) end
 	if not body and not post and tostring(why):find("has no model", 1, true) then
-		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)) }
+		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)), ie = ignoreErrors }
 		logSim("a native build at t=" .. now .. " has an edge object that the engine has not made yet: read again after the build")
 		state:set(st)
 		return
@@ -1490,7 +1504,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		if d and d.at == engine.gameTime() then
 			C.poll()
 			if not C.ACTIVE then return end
-			local ok, err = pcall(simCaptureBuild, state, param, true, d.before)
+			local ok, err = pcall(simCaptureBuild, state, param, true, d.before, d.ie)
 			if not ok then logSim("onPostBuildProposal capture failed: " .. tostring(err)) end
 		end
 		return

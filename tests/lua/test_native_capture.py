@@ -111,6 +111,18 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertIn("native build captured", self.B.log())
         self.assertNotIn("refused", self.A.log() + self.B.log())
 
+    def test_a_build_the_originators_engine_accepted_with_ignore_errors_is_replayed_with_ignore_errors(self):
+        # sweep run 20261013-061744 (B5): the guest applied a construction with ignoreErrors = true after "Empty Construction"; the host replayed it
+        # with false, the engine refused it silently and the games drifted
+        self.start()
+        for g in (self.A, self.B):
+            g.run("BUILD_NEEDS_IE = function(p) return true end")
+        self.B.run("GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, true, true), nil }" % self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertEqual(self.A.builds_applied(), 1)
+
     def test_the_originators_own_native_build_gets_its_keys_like_a_replay(self):
         # a depot the engine built at the click and the capture shipped: the originator keys it too, so that a vehicle bought at it can be
         # named for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here")
