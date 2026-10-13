@@ -2607,6 +2607,32 @@ local function proposalCounts(proposal)
 	return table.concat(parts, " ")
 end
 
+-- The engine's own verdict on a proposal that is not applied (what a tool's preview reads): { critical, messages } or nil and why it
+-- cannot be read (a native Proposal, an engine that does not answer). Never raises.
+local function proposalVerdict(args)
+	local ok, v, why = pcall(function()
+		local ctx = args[2]
+		if ctx == nil or ctx == false then
+			ctx = A.new("Context")
+			pcall(function() ctx.player = A.player() end)
+		end
+		local pd = api.engine.util.proposal.makeProposalData(args[1], ctx)
+		local es = pd and get(pd, "errorState")
+		if es == nil then return nil, "no errorState" end
+		local msgs = {}
+		for i, m in ipairs(A.list(es, "messages")) do if i <= 4 then msgs[#msgs + 1] = tostring(m) end end
+		return { critical = get(es, "critical") == true, messages = msgs }
+	end)
+	if not ok then return nil, tostring(v):sub(1, 100) end
+	return v, why
+end
+
+-- What a proposal about to go to the engine holds, per kind, for the trace (build.cmp) on the originator and on the receivers.
+local function recCounts(rec)
+	return string.format("cons=%d rem=%d nodes=%d segs=%d rmNodes=%d rmSegs=%d objs=%d rmObjs=%d ncfg=%d rmNcfg=%d", #rec.cons, #rec.rem, #rec.nodes, #rec.segs,
+		#rec.rmNodes, #rec.rmSegs, #rec.objs, #rec.rmObjs, #rec.ncfg, #rec.rmNcfg)
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
@@ -2627,6 +2653,27 @@ local function decodeBuildUnsafe(body, ctx)
 	local args, used, lastErr
 	local tkey = ctx and ctx.traceKey
 	local trace = C.tracer("build")
+	trace("build.cmp", string.format("%s plan=%s record[%s] flags ie=%s pi=%s", tostring(tkey or "-"), plan, recCounts(rec), tostring(f.ie), tostring(f.pi)))
+	-- A tool's build that brings a construction together with its street pieces (and perhaps buildings to remove) is ONE proposal in the
+	-- originator's engine. Rebuilt as one SimpleProposal with the record's own flags (plan "combined") it is what the originator applied;
+	-- the guessing plans (construction alone with other flags, street part first then the construction) are used only when the engine
+	-- says that one is not possible. Real run 2026-10-13 (road depot over buildings): "construction" was refused with a critical
+	-- "Construction Not Possible" and "withStreet" ended with other edges and node configurations than the originator's.
+	if rec.src == "native" and #rec.cons > 0 and #rec.segs > 0 and (plan == "construction" or plan == "withStreet") then
+		local okS, built = pcall(PLAN.combined, rec, R, f, {}, {})
+		local okF = okS and pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(built, 1, built.n)) end)
+		local v, whyV
+		if okF then v, whyV = proposalVerdict(built) end
+		trace("build.cmp", string.format("%s single proposal: %s; engine verdict %s", tostring(tkey or "-"), okF and "built" or ("not built (" .. tostring(okS and "factory refused" or built) .. ")"),
+			v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")))
+		if okF and v and not v.critical then
+			plan = "combined"
+			built.plan, built.form = plan, 1
+			log("build " .. plan .. " (single proposal, " .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, " .. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, "
+				.. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects")
+			return built
+		end
+	end
 	for i, form in ipairs(FORMS[plan] or { {} }) do
 		local notes = {}
 		local t0 = os.clock()

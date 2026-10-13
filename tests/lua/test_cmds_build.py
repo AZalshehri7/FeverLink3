@@ -408,7 +408,8 @@ function MAKE_API()
       if not VERDICT_MOCK then error("not available in this mock") end
       local mt = getmetatable(p)
       if mt and mt.__double == "Proposal" then error("bad argument #2 to 'makeProposalData' (SimpleProposal expected, got Proposal)") end
-      return { errorState = { critical = false, messages = {}, warnings = {} } }
+      local crit = VERDICT_CRITICAL and VERDICT_CRITICAL(p) or false
+      return { errorState = { critical = crit, messages = crit and { 'Construction Not Possible' } or {}, warnings = {} } }
     end,
     -- the engine's own upgrade: the segment replaced by one with the template's lanes (finding from MPFever (MIT))
     replaceSegment = function(edge, tmpl)
@@ -2232,6 +2233,38 @@ class PureBuildTest(unittest.TestCase):
             self.assertEqual(self.L.eval(code)(wrong, False), "nil|0,100", "reported %s: the ends of the added segment decide" % wrong)
         self.setUp()
         self.assertTrue(self.L.eval(code)(111, True).startswith("refused: the segment this build replaces"), "no edge with those ends: the record is refused")
+
+    def test_a_depot_with_its_street_pieces_and_removals_is_rebuilt_as_one_proposal_unless_the_engine_says_it_is_not_possible(self):
+        # real run 2026-10-13 (road depot over buildings): construction alone was refused ("Construction Not Possible"), the two-step plan
+        # ended with other edges and node configurations than the originator's; the originator applied ONE proposal with the record's flags
+        code = """(function(setup)
+            local rec = WIRE_RECORD((function() local P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }; P.toRemove = { 56 }; return P end)()).args[1]
+            setup()
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, { native = true }, false, true, false } })
+            if not args then return 'refused' end
+            local sp = STORE(args[1])
+            local ssp = STORE(sp.streetProposal)
+            return tostring(args.plan) .. '|' .. #sp.constructionsToAdd .. '|' .. #sp.constructionsToRemove .. '|' .. #ssp.nodesToAdd .. '|' .. #ssp.edgesToAdd .. '|' .. #ssp.nodeConfigsToAdd .. '|' .. tostring(args[3]) .. tostring(args[4]) .. '|' .. tostring(args.chain ~= nil)
+        end)"""
+        f = self.L.eval(code)
+        # the engine's verdict is fine: one proposal, everything in it, the record's flags (ignoreErrors false, playerInitiated true), no chain
+        got = f(self.L.eval("function() VERDICT_MOCK = true; VERDICT_CRITICAL = nil end")).split("|")
+        self.assertEqual(got[0], "combined")
+        self.assertEqual((got[1], got[2]), ("1", "1"))
+        self.assertGreaterEqual(int(got[3]), 2)
+        self.assertGreaterEqual(int(got[4]), 3)
+        self.assertGreaterEqual(int(got[5]), 1)
+        self.assertEqual((got[6], got[7]), ("falsetrue", "false"))
+        # the engine calls the one proposal not possible: the older plans decide
+        self.setUp()
+        f = self.L.eval(code)
+        got = f(self.L.eval("function() VERDICT_MOCK = true; VERDICT_CRITICAL = function(p) local P = PARTS(p); return #P.consAdd > 0 and #P.edgesAdd > 0 end end")).split("|")
+        self.assertIn(got[0], ("construction", "withStreet"))
+        # no verdict can be read: the older plans decide as before
+        self.setUp()
+        f = self.L.eval(code)
+        got = f(self.L.eval("function() VERDICT_MOCK = nil end")).split("|")
+        self.assertIn(got[0], ("construction", "withStreet"))
 
     def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
         # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
