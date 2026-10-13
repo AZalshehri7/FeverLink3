@@ -178,6 +178,13 @@ impl Runtime {
                 ));
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
             }
+            Err(why) if why.starts_with(inj::NOT_OURS) => {
+                self.say(&format!(
+                    "native inject: key {}: {why}; the order waits for the next build_proposal",
+                    order.key
+                ));
+                self.inject.put_back(order);
+            }
             Err(why) => {
                 // the short reason goes to the log and the event; the full report (every unresolved pointer, every differing line) to a file
                 let (why, report) = match why.split_once(inj::REPORT_MARK) {
@@ -225,7 +232,10 @@ impl Runtime {
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
         let constructions = inj::construction_count(&text);
-        inj::check_destination(&LiveMem, dest, constructions)?;
+        // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
+        inj::check_destination(&LiveMem, dest, constructions)
+            .and_then(|()| inj::same_constructions(&LiveMem, dest, &text))
+            .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
         // an index of the heap's blocks for the proof (refreshed before every text, see LiveHeapMem)
         let live = LiveHeapMem::new();
         let ctx =

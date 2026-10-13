@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::cmd_patch::Poke;
-use crate::dump::{pointer_like, u64_at, Mem, PAYLOAD_SIZE};
+use crate::dump::{pointer_like, u32_at, u64_at, Mem, PAYLOAD_SIZE};
 use crate::link::Event;
 use crate::native_copy::{self as nc, Ctx, Scratch, PROPOSAL_SIZE};
 use crate::portable::{self, Ty, F};
@@ -139,6 +139,15 @@ impl State {
             return None;
         }
         Some(order)
+    }
+
+    /// Puts back an order taken for a command that turned out not to be the mod's (see [`NOT_OURS`]); a newer order wins.
+    pub fn put_back(&self, o: Order) {
+        let mut g = lock(&self.order);
+        if g.is_none() {
+            *g = Some(o);
+            self.pending.store(true, Ordering::Release);
+        }
     }
 
     /// Expires an order nobody used (the service thread calls this) and hands out the events.
@@ -481,6 +490,51 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64) -> Resu
         (want, have) if want == have => Ok(()),
         (want, have) => Err(format!("the command has {have} construction(s), the text has {want}")),
     }
+}
+
+/// The prefix of an error that means "this command is not the one the mod sent": the order is put back and waits for the next
+/// `build_proposal` (until its time to live ends) instead of being refused. b75: a town's own `build_proposal` (applied by the
+/// simulation like the script's, so the apply hook cannot tell them apart by caller) took the order first; its construction was not
+/// the text's, the proof refused it, and the mod's command then went without its order (drift and a resync).
+pub const NOT_OURS: &str = "not the mod's command: ";
+
+/// The command's constructions are the text's: the same file and the same transform, in order. The script builds them from the
+/// originator's record, so the receiver's conversion keeps both; any other command that adds constructions (a town's) differs.
+pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
+    let lines = rebuild::lines_of(text);
+    let n = count(&lines, "toAdd.#") as usize;
+    if n == 0 {
+        return Ok(());
+    }
+    let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
+    let b = u64_at(&bytes, TO_ADD) as usize;
+    for i in 0..n {
+        let e = mem.read(b + i * CONSTRUCTION_STRIDE, CONSTRUCTION_STRIDE).ok_or("a construction is not readable")?;
+        // ResName: the text is the second std::string (+0x20): inline up to 15 bytes, else behind the pointer
+        let (size, cap) = (u64_at(&e, 0x30) as usize, u64_at(&e, 0x38));
+        let file = if cap == 15 && size <= 15 {
+            e[0x20..0x20 + size].to_vec()
+        } else if size <= 4096 {
+            mem.read(u64_at(&e, 0x20) as usize, size).ok_or("a construction's file name is not readable")?
+        } else {
+            return Err(format!("construction {i}: not a file name"));
+        };
+        let want = lines.get(format!("toAdd[{i}].fileName").as_str()).and_then(|v| v.strip_prefix("res:"));
+        let want = want.map(rebuild::unescape).transpose()?.unwrap_or_default();
+        if file != want {
+            return Err(format!(
+                "construction {i} is {:?}, the text's is {:?}",
+                String::from_utf8_lossy(&file),
+                String::from_utf8_lossy(&want)
+            ));
+        }
+        let transf: Vec<String> = (0..16).map(|k| format!("{:08x}", u32_at(&e, 0xc98 + k * 4))).collect();
+        let want = lines.get(format!("toAdd[{i}].transf").as_str()).and_then(|v| v.strip_prefix("m4:")).unwrap_or("");
+        if transf.join(",") != want {
+            return Err(format!("construction {i} stands elsewhere than the text's"));
+        }
+    }
+    Ok(())
 }
 
 /// Puts the verified Proposal into the command's own: the engine's copy assignment.
@@ -834,5 +888,54 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
                 && report.contains("rebuilt:  n:0"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn an_order_taken_for_a_command_that_is_not_the_mods_is_put_back_and_a_town_construction_is_not_the_mods() {
+        let s = State::default();
+        s.enable();
+        s.arm(3, 0, 100);
+        let o = s.take(150).expect("armed");
+        s.put_back(o);
+        assert!(s.pending());
+        assert_eq!(s.take(160).expect("put back").key, 3);
+        // a newer order wins over the one put back
+        s.arm(4, 0, 200);
+        let o = s.take(210).expect("armed");
+        s.arm(5, 0, 220);
+        s.put_back(o);
+        assert_eq!(s.take(230).expect("the newer").key, 5);
+        // the command's construction against the text's: file and transform
+        let arena = Arena::new(0x3000_0000_0000);
+        let mut e = vec![0u8; CONSTRUCTION_STRIDE];
+        e[0x20..0x25].copy_from_slice(b"a.con");
+        e[0x30..0x38].copy_from_slice(&5u64.to_le_bytes());
+        e[0x38..0x40].copy_from_slice(&15u64.to_le_bytes());
+        e[0xc98..0xc9c].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+        let ent = arena.add(&e);
+        let mut payload = vec![0u8; PAYLOAD_SIZE];
+        for (k, v) in [ent, ent + CONSTRUCTION_STRIDE, ent + CONSTRUCTION_STRIDE].iter().enumerate() {
+            payload[TO_ADD + k * 8..TO_ADD + k * 8 + 8].copy_from_slice(&(*v as u64).to_le_bytes());
+        }
+        let dest = arena.add(&payload);
+        let m4 = |x: &str| format!("3f800000{}", ",00000000".repeat(15)).replacen("3f800000", x, 1);
+        let text = |file: &str, t: &str| {
+            format!(
+                "toAdd.#	n:1
+toAdd[0].fileName	res:\"{file}\"
+toAdd[0].transf	m4:{t}
+"
+            )
+        };
+        assert!(same_constructions(&arena, dest, &text("a.con", &m4("3f800000"))).is_ok());
+        assert!(same_constructions(&arena, dest, &text("b.con", &m4("3f800000"))).unwrap_err().contains("b.con"));
+        assert!(same_constructions(&arena, dest, &text("a.con", &m4("40000000"))).unwrap_err().contains("elsewhere"));
+        assert!(same_constructions(
+            &arena,
+            dest,
+            "toAdd.#	n:0
+"
+        )
+        .is_ok());
     }
 }

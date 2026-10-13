@@ -931,7 +931,11 @@ impl Enc<'_> {
         self.origin = crate::rebuild::member_of(name);
         let mut owned = bytes[from..to].to_vec();
         if let Some(c) = self.opts.collect {
-            c.borrow_mut().insert(name.to_string(), owned.clone());
+            // collecting the raw bytes for the differential mask: the text is thrown away, so nothing is tokenised or followed (b75: a
+            // vector-like triple in a scratch copy's unnamed bytes made the structural walk read past its heap bound and the originator
+            // shipped a text without a mask, every unnamed byte zero)
+            c.borrow_mut().insert(name.to_string(), owned);
+            return Ok(());
         }
         if self.set.typed {
             if let Some(mask) = self.opts.mask {
