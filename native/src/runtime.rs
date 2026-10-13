@@ -504,9 +504,31 @@ impl Runtime {
         if !reader.has_news() {
             return;
         }
-        let poll = reader.poll();
+        let mut poll = reader.poll();
+        // the orders are armed before the reader is let go: see `arm_orders`
+        self.arm_orders(&mut poll, now);
         drop(guard);
         self.apply_poll(machine, poll, now);
+    }
+
+    /// Arms the `patch_next` / `inject_next` orders of `poll` and leaves the other lines in it. Called while the reader's lock is held, so
+    /// that an order read from the file is armed before anyone else can look at the file: once the reader has handed out a line, the
+    /// file has no news any more, and the command hook (`ingest_patch_order`) would find neither news nor an armed order. That gap
+    /// (service thread between `poll` and `apply_poll`) let the mod's replay command pass uninjected in real run rt1 R2 (2026-10-14:
+    /// `inject_next key=2` written before the command, the module never saw the command with the order armed, then the order expired
+    /// on town builds) while key 1 a minute earlier was injected.
+    fn arm_orders(&self, poll: &mut crate::link::Poll, now: u64) {
+        let mut rest = Vec::new();
+        for line in std::mem::take(&mut poll.lines) {
+            match parse_ctl_line(&line) {
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
+                    self.arm_patch(frozen, adds, at, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
+                _ => rest.push(line),
+            }
+        }
+        poll.lines = rest;
     }
 
     fn apply_poll(&self, machine: &mut HoldMachine<Box<Held>>, poll: crate::link::Poll, now: u64) {
@@ -535,24 +557,16 @@ impl Runtime {
     /// the machine's lock, nor for holding to be on): reads the control file, arms the order, and keeps the other lines for the
     /// next `ingest`. Takes no lock but the reader's and the backlog's.
     pub(super) fn ingest_patch_order(&self, now: u64) {
-        let Some(mut guard) = try_lock_briefly(&self.reader) else { return };
+        // Waits for the reader instead of giving up after a few spins: the service thread holds it only while it reads the file (and
+        // arms the orders it finds there), and giving up here meant the mod's own command could pass while its order sat in the file.
+        let mut guard = lock(&self.reader);
         let Some(reader) = guard.as_mut() else { return };
         if !reader.has_news() {
             return;
         }
         let mut poll = reader.poll();
+        self.arm_orders(&mut poll, now);
         drop(guard);
-        let mut rest = Vec::new();
-        for line in std::mem::take(&mut poll.lines) {
-            match parse_ctl_line(&line) {
-                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
-                    self.arm_patch(frozen, adds, at, ttl, now)
-                }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
-                _ => rest.push(line),
-            }
-        }
-        poll.lines = rest;
         lock(&self.ctl_backlog).push(poll);
         self.wake();
     }
