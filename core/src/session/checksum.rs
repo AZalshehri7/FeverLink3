@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use super::policy::ChecksumPolicy;
 
 use super::messages::ChecksumReportMessage;
 
@@ -21,6 +23,8 @@ pub struct ChecksumOutcome {
     /// coarsely, so a round stamped for one time is hashed at the first step at or after it, which differs between
     /// games. Such samples are of different worlds: they are not compared (`differences` stays empty).
     pub time_skew: Option<BTreeMap<u16, i64>>,
+    /// False for a light round: the heavy lanes were not compared (see `ChecksumPolicy::HEAVY_PARTS`).
+    pub full: bool,
 }
 
 impl ChecksumOutcome {
@@ -42,6 +46,8 @@ impl ChecksumOutcome {
 #[derive(Debug, Default)]
 pub struct ChecksumRounds {
     rounds: HashMap<i32, BTreeMap<u16, ChecksumReportMessage>>,
+    /// Rounds that were asked as light rounds.
+    light: HashSet<i32>,
 }
 
 impl ChecksumRounds {
@@ -66,6 +72,21 @@ impl ChecksumRounds {
 
     pub fn open(&mut self, n: i32) {
         self.rounds.insert(n, BTreeMap::new());
+        self.light.remove(&n);
+    }
+
+    /// Opens a light round: the heavy lanes are dropped from every report (a game that does not know the flag sends them anyway,
+    /// and a lane that only some games report would read as a difference).
+    pub fn open_light(&mut self, n: i32) {
+        self.rounds.insert(n, BTreeMap::new());
+        self.light.insert(n);
+    }
+
+    fn finish(&mut self, n: i32, round: BTreeMap<u16, ChecksumReportMessage>) -> ChecksumOutcome {
+        let full = !self.light.remove(&n);
+        let mut outcome = Self::compare(n, &round);
+        outcome.full = full;
+        outcome
     }
 
     /// Records a report. Returns the outcome when `expected` reporters have all reported, else `None`. Reports for
@@ -73,6 +94,10 @@ impl ChecksumRounds {
     pub fn report(&mut self, from: u16, report: ChecksumReportMessage, expected: &[u16]) -> Option<ChecksumOutcome> {
         let n = report.n;
         let round = self.rounds.get_mut(&n)?;
+        let mut report = report;
+        if self.light.contains(&n) {
+            report.parts.retain(|part, _| !ChecksumPolicy::is_heavy_part(part));
+        }
         round.insert(from, report);
         self.rounds.retain(|&k, _| k >= n.saturating_sub(Self::KEEP_ROUNDS));
         let round = self.rounds.get(&n)?;
@@ -80,7 +105,7 @@ impl ChecksumRounds {
             return None;
         }
         let round = self.rounds.remove(&n)?;
-        Some(Self::compare(n, &round))
+        Some(self.finish(n, round))
     }
 
     /// Rounds that have a report from every one of `expected` although the last report did not just arrive: the game
@@ -93,7 +118,7 @@ impl ChecksumRounds {
             .map(|(&n, _)| n)
             .collect();
         done.sort_unstable();
-        done.into_iter().filter_map(|n| self.rounds.remove(&n).map(|round| Self::compare(n, &round))).collect()
+        done.into_iter().filter_map(|n| self.rounds.remove(&n).map(|round| self.finish(n, round))).collect()
     }
 
     pub fn compare(n: i32, reports: &BTreeMap<u16, ChecksumReportMessage>) -> ChecksumOutcome {
@@ -101,7 +126,7 @@ impl ChecksumRounds {
         let time = reporters.first().map_or(0, |id| reports[id].time);
         if reports.values().any(|r| r.time != time) {
             let skew = reports.iter().map(|(&id, r)| (id, r.time)).collect();
-            return ChecksumOutcome { n, time, reporters, differences: Vec::new(), time_skew: Some(skew) };
+            return ChecksumOutcome { n, time, reporters, differences: Vec::new(), time_skew: Some(skew), full: true };
         }
         let parts: BTreeSet<&str> = reports.values().flat_map(|r| r.parts.keys().map(String::as_str)).collect();
         let mut differences = Vec::new();
@@ -113,6 +138,6 @@ impl ChecksumRounds {
                 differences.push(ChecksumDifference { part: part.to_owned(), values });
             }
         }
-        ChecksumOutcome { n, time, reporters, differences, time_skew: None }
+        ChecksumOutcome { n, time, reporters, differences, time_skew: None, full: true }
     }
 }

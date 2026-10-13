@@ -111,6 +111,29 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertIn("native build captured", self.B.log())
         self.assertNotIn("refused", self.A.log() + self.B.log())
 
+    def test_a_build_the_originators_engine_accepted_with_ignore_errors_is_replayed_with_ignore_errors(self):
+        # sweep run 20261013-061744 (B5): the guest applied a construction with ignoreErrors = true after "Empty Construction"; the host replayed it
+        # with false, the engine refused it silently and the games drifted
+        self.start()
+        for g in (self.A, self.B):
+            g.run("BUILD_NEEDS_IE = function(p) return true end")
+        self.B.run("GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, true, true), nil }" % self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertEqual(self.A.builds_applied(), 1)
+
+    def test_the_originators_own_native_build_gets_its_keys_like_a_replay(self):
+        # a depot the engine built at the click and the capture shipped: the originator keys it too, so that a vehicle bought at it can be
+        # named for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here")
+        self.start()
+        self.B.run("DEPOT_P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }; "
+                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(DEPOT_P, nil, false, true), nil }")
+        self.tick(20)
+        for g in (self.A, self.B):
+            self.assertIn("1:1#c1", str(g.lua("BOUND_KEYS()")).split(), "%s keyed the depot" % g.label)
+        self.assertIn("this game's own native build is keyed here like a replay", self.B.log())
+
     def test_a_stop_or_signal_without_a_model_before_the_build_is_read_after_it_and_reaches_the_other_game(self):
         # the engine names the model of an edge object only when the build has run (a real game, 2026-10-11: "an edge object has no
         # model" for every stop built with the stop tool, and the other game never got it)
@@ -125,6 +148,19 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
         self.assertIn("signal/signal_a.mdl@0.750k2", self.A.sig())
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.A.shipped_count(), self.B.shipped_count()), (1, 1, 0, 1))
+
+    def test_the_originator_keys_its_own_native_stop_and_a_line_by_the_other_game_names_it(self):
+        # sweep run 20261013-081155 (F1): the guest built two stops natively, never keyed them itself ("native.bind: no snapshot stored"), and
+        # the host's line over them was refused on the guest, "unresolved stationGroup reference 1:12#o1/g"
+        self.start()
+        self.B.run("STOP_P = SIMPLE_STOP{ edge = 110, param = 0.5, left = true }; "
+                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(STOP_P, nil, false, true), nil }")
+        self.tick(24)
+        for g in (self.A, self.B):
+            keys = str(g.lua("BOUND_KEYS()")).split()
+            self.assertIn("1:1#o1", keys, "%s keyed the stop" % g.label)
+            self.assertIn("1:1#o1/g", keys, "%s keyed the stop's group" % g.label)
+        self.assertEqual(self.B.sig(), self.A.sig())
 
     def test_the_same_in_the_other_direction(self):
         self.start()

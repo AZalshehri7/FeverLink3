@@ -47,6 +47,10 @@ pub struct HostOptions {
     /// With a reloading host: send the host's game its load while the players still download (default true) instead of
     /// together with them after the transfer. A lab experiment switch (FEVERLINK3_HOST_LOAD_EARLY=0).
     pub host_loads_early: bool,
+    /// Every Nth checksum round is a FULL one; the rounds in between are light (no edges, constructions, node settings or town
+    /// buildings: about a second of game thread in a big world, see `ChecksumPolicy::HEAVY_PARTS`). 1 makes every round full.
+    /// Paused rounds and the verification round of a resync are always full.
+    pub full_checksum_every: u32,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -82,6 +86,7 @@ impl Default for HostOptions {
             auto_resync: true,
             host_reloads: true,
             host_loads_early: true,
+            full_checksum_every: 6,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,
@@ -969,13 +974,20 @@ impl HostSession {
     fn request_checksum_inner(&mut self) {
         self.checksum_n += 1;
         let n = self.checksum_n;
-        self.checksums.open(n);
         let paused = matches!(self.state.pause_at, Some(p) if self.max_clock() >= p);
+        // Every Nth round (the first one too) and every paused round is a full check; the rounds between leave out the heavy lanes.
+        let every = i64::from(self.options.full_checksum_every.max(1));
+        let full = paused || (i64::from(n) - 1) % every == 0;
+        if full {
+            self.checksums.open(n);
+        } else {
+            self.checksums.open_light(n);
+        }
         let at = match self.state.pause_at {
             Some(p) if paused => p.max(self.clocks.values().map(|c| c.t).max().unwrap_or(0)),
             _ => self.future_stamp(),
         };
-        let request = ChecksumRequestMessage { n, at, paused };
+        let request = ChecksumRequestMessage { n, at, paused, full };
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
         self.last_checksum = self.now();
     }
@@ -1250,6 +1262,12 @@ impl HostSession {
 
     /// To every player connection and the local game, except `except`. One sealer, so the host's counter stream is
     /// shared by all connections; a receiver only ever sees it increase.
+    /// A chat line from the session itself to every game (the host's own included), named "FeverLink3".
+    pub(super) fn announce(&mut self, text: &str) {
+        let chat = ChatMessage { text: text.to_owned(), from: Self::HOST_ID, name: Some("FeverLink3".to_owned()) };
+        self.broadcast(MessageKind::Chat, &codec::encode(&chat), None);
+    }
+
     fn broadcast(&mut self, kind: MessageKind, payload: &[u8], except: Option<u16>) {
         let targets: Vec<ConnectionId> = self
             .connections

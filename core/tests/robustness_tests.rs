@@ -632,7 +632,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
         });
         round_trip(PongMessage { n: rr.gen() });
         round_trip(PeerClockMessage { from: rr.gen(), t: rr.gen(), ahead: rr.gen() });
-        round_trip(ChecksumRequestMessage { n: rr.gen(), at: rr.gen(), paused: rr.gen() });
+        round_trip(ChecksumRequestMessage { n: rr.gen(), at: rr.gen(), paused: rr.gen(), full: rr.gen() });
         round_trip(AuthorityMessage {
             n: rr.gen(),
             values: (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect(),

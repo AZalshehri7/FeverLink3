@@ -29,13 +29,13 @@ Toolchain: stable Rust. Either `x86_64-pc-windows-msvc` (needs the Visual Studio
 
 The module is inert unless the launcher started the game with `FEVERLINK3_SESSION_DIR` set, or the game itself hosts the session (live mode). Then it logs to `native.log`, reads the game's PE timestamp and looks it up in `build_table::BUILDS`. Unknown build: hooks off, logged, mod runs degraded.
 
-On a known build it still touches nothing in the game's code unless the environment switches a piece on, with exactly the value `1`:
+On a known build four pieces are ON by default (hooks, hold, pool patch, Lua seed pin; `=0` turns one off, each is fail-open: an unknown build or other bytes at the site install nothing). The diagnostic pieces are off unless the environment sets them to exactly `1`:
 
 | Environment | Installs |
 |---|---|
-| `FEVERLINK3_HOOKS=1` | The read-only counters: a hook on the simulation's command application. |
-| `FEVERLINK3_HOOKS=1` `FEVERLINK3_HOLD=1` | Also the hold/release hook on the command list (holds nothing until the mod writes `hold_on`). |
-| `FEVERLINK3_POOLPATCH=1` | The single-worker script pool patch; independent of the other two. |
+| `FEVERLINK3_HOOKS` (default on, `=0` off) | The read-only counters: a hook on the simulation's command application. |
+| `FEVERLINK3_HOOKS` and `FEVERLINK3_HOLD` (default on, `=0` off) | Also the hold/release hook on the command list (holds nothing until the mod writes `hold_on`). |
+| `FEVERLINK3_POOLPATCH` (default on, `=0` off) | The single-worker script pool patch; independent of the other two. |
 | `FEVERLINK3_LOG_TOWN_SEED=1` | A read-only diagnostic hook that logs the seed of the **map-generation** location factory (not town growth; `mapgen-seed n=.. seed=.. caller=..` lines in `native.log`) and calls the original unchanged; independent of the others. **Not run in the game.** `src/townseed.rs`, `docs/NATIVE_LINK.md` section 2. |
 | `FEVERLINK3_FORCE_TOWN_SEED=<number>` | **Experiment, has not run in the game.** Decimal or `0x` hex, 32 bit. Installs the same map-generation seed hook and additionally replaces the seed argument with this value before calling the original, so games started with the same value generate the same map (log lines then read `seed=<original> forced=<value>`). An invalid value is ignored and logged. Equal seeds alone may not keep the generators equal after a resync (the generator state advances); a reset of the state at every sync point would be the next step. `docs/NATIVE_LINK.md` section 2. |
 | `FEVERLINK3_LOG_GROWTH=1` | **Not run in the game.** Read-only log of every town-growth call (`growth n=.. town=.. seed=.. t=.. caller=..` lines in `native.log`; the first 2000, then about 1 in 50): a hook on `TownDeveloper::Develop` and one on the `TownUpdateSize` handler for the game time; both call the original unchanged. `src/growth.rs`, `docs/NATIVE_LINK.md` section 11. |

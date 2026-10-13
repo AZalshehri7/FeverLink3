@@ -10,7 +10,7 @@ fn outcome(parts: &[&str]) -> ChecksumOutcome {
             values: BTreeMap::from([(0, Some("a".to_owned())), (1, Some("b".to_owned()))]),
         })
         .collect();
-    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences, time_skew: None }
+    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences, time_skew: None, full: true }
 }
 
 fn policy() -> ChecksumPolicy {
@@ -202,4 +202,45 @@ fn a_difference_in_balance_or_loan_is_corrected_in_place_and_never_reloads() {
     let reason = p.on_outcome(110.0, &outcome(&["balance", "roads"])).expect("roads differ twice");
     assert!(reason.starts_with("roads differ"), "{reason}");
     assert!(ChecksumPolicy::describe_parts(["balance"]).contains("(corrected)"));
+}
+
+fn light(parts: &[&str]) -> ChecksumOutcome {
+    ChecksumOutcome { full: false, ..outcome(parts) }
+}
+
+#[test]
+fn a_light_round_keeps_a_heavy_streak_a_full_round_without_it_ends_it() {
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["edges"])));
+    assert_eq!(None, p.on_outcome(10.0, &light(&[])), "heavy lanes are not measured in a light round");
+    assert!(
+        p.on_outcome(60.0, &outcome(&["edges"])).is_some(),
+        "the second full round with the same difference reloads"
+    );
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["edges"])));
+    assert_eq!(None, p.on_outcome(60.0, &outcome(&[])), "a full round that agrees ends the streak");
+    assert_eq!(None, p.on_outcome(120.0, &outcome(&["edges"])));
+}
+
+#[test]
+fn a_light_round_ends_a_streak_of_a_light_lane_as_before() {
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["roads"])));
+    assert_eq!(None, p.on_outcome(10.0, &light(&[])));
+    assert_eq!(None, p.on_outcome(20.0, &outcome(&["roads"])), "the light round that agreed reset the count");
+}
+
+#[test]
+fn a_heavy_drift_part_keeps_counting_through_light_rounds() {
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["nodeConfigs"])));
+    for t in 1..30 {
+        let o = if t % 6 == 0 { outcome(&["nodeConfigs"]) } else { light(&[]) };
+        let r = p.on_outcome(f64::from(t) * 10.0, &o);
+        if t < 30 {
+            assert!(r.is_none() || r.as_deref().unwrap().contains("drifted"), "{r:?}");
+        }
+    }
+    assert!(p.on_outcome(300.0, &outcome(&["nodeConfigs"])).is_some(), "drift for 300 s reloads");
 }

@@ -47,11 +47,17 @@ local function round(x)
 	return -math.floor(-x + 0.5)
 end
 
--- An integral number as text. "%d" fails above 2^31 in some Lua builds and prints "5.0" for floats in others.
+-- The common module's integral number text (feverlink3_common.lua C.integerText: "%d" raises above 2^31 in the game's Lua); this module
+-- also runs where the common module is not loadable (its own tests), then "%.0f", which is what the helper prints.
+local integerText
+do
+	local okC, C = pcall(ug_require, "feverlink3_common.lua")
+	if not okC then okC, C = pcall(ug_require, "feverlink3_1::/feverlink3_common.lua") end
+	integerText = okC and type(C) == "table" and C.integerText or function(n) return string.format("%.0f", n) end
+end
+
 local function fmt0(n)
-	n = round(n)
-	if n == 0 then return "0" end
-	return string.format("%.0f", n)
+	return integerText(round(n))
 end
 
 -- 1234567 -> "1,234,567"

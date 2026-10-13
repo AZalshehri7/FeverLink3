@@ -287,7 +287,7 @@ fn random_event(r: &mut StdRng) -> Event {
             kinds: (0..r.gen_range(0..5)).map(|_| (random_text(r, 12), r.gen())).collect(),
             sites: r.gen_range(0..1000),
         },
-        1 => Event::Held { id: r.gen(), kind: r.gen(), site: r.gen(), ms: r.gen() },
+        1 => Event::Held { id: r.gen(), kind: r.gen(), site: r.gen(), ms: r.gen(), done: r.gen() },
         2 => Event::Released { id: r.gen(), reason: reasons[r.gen_range(0..6)], ms: r.gen() },
         3 => Event::Dropped { id: r.gen(), reason: reasons[r.gen_range(0..6)] },
         4 => Event::Applied { id: r.gen(), ok: r.gen() },
@@ -723,6 +723,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 hooks: r.gen(),
                 hold: r.gen(),
                 poolpatch: r.gen(),
+                fire_done: r.gen(),
                 town_seed: r.gen(),
                 force_seed: None,
                 growth: Default::default(),
@@ -761,7 +762,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
 }
 
 #[test]
-fn the_switches_read_any_text_and_only_a_lone_one_turns_an_opt_in_one_on() {
+fn the_switches_read_any_text_a_lone_zero_turns_a_default_off_and_a_lone_one_an_opt_in_on() {
     let mut r = rng(17);
     for _ in 0..iters(5_000) {
         let value = random_text(&mut r, 6);
@@ -770,10 +771,14 @@ fn the_switches_read_any_text_and_only_a_lone_one_turns_an_opt_in_one_on() {
         // any text is a verdict (a number or an error) for the forced seed, never a panic
         let _ = feverlink3_native::plan::parse_seed(&value);
         let on = value.trim() == "1";
-        // the pool patch and the seed pin are on unless the text is a lone zero
+        // hooks, hold, the pool patch and the seed pin are on unless the text is a lone zero
         let default_on = value.trim() != "0";
-        assert_eq!((cfg.hooks, cfg.hold, cfg.town_seed), (on, on, on), "{value:?}");
-        assert_eq!((cfg.poolpatch, cfg.luaseed), (default_on, default_on), "{value:?}");
+        assert_eq!(cfg.town_seed, on, "{value:?}");
+        assert_eq!(
+            (cfg.hooks, cfg.hold, cfg.poolpatch, cfg.luaseed),
+            (default_on, default_on, default_on, default_on),
+            "{value:?}"
+        );
         assert_eq!(cfg.any(), on || default_on);
         assert!(cfg.describe().starts_with("hooks="));
     }

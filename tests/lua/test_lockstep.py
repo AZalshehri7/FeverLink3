@@ -21,6 +21,10 @@ import unittest
 
 import lupa.lua52 as lupa
 
+# The build module only refuses remote constructions with FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (a developer switch);
+# tests of the block set it themselves.
+os.environ.pop("FEVERLINK3_REMOTE_CONSTRUCTIONS", None)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
 TAB = "\t"
@@ -205,6 +209,23 @@ debugPrint = function() end
 # ---------------------------------------------------------------- the mod, loaded twice (two Lua states)
 
 HARNESS = r'''
+-- The game's Lua 5.2.2 raises on "%d" (and "%i") for a number beyond the 32-bit range ("bad argument #2 to 'format' (not a number
+-- in proper range)", found by the 2026-10-13 sweep: a balance of 5 billion); lupa's Lua does not, so the limit is emulated here.
+do
+  local real = string.format
+  string.format = function(f, ...)
+    if type(f) == "string" and f:find("%%[%-%+ #0-9.]*[di]") then
+      local args, n = { ... }, 0
+      for spec in f:gsub("%%%%", ""):gmatch("%%[%-%+ #0-9.]*([%a])") do
+        n = n + 1
+        if (spec == "d" or spec == "i") and type(args[n]) == "number" and math.abs(args[n]) >= 2147483648 then
+          error("bad argument #" .. (n + 1) .. " to 'format' (not a number in proper range)", 2)
+        end
+      end
+    end
+    return real(f, ...)
+  end
+end
 local function deepcopy(v)
   if type(v) ~= "table" then return v end
   local out = {}
@@ -463,8 +484,11 @@ class Relay:
         t = max(self.clocks.values())
         return -(-(t + self.lead) // STEP) * STEP
 
-    def checksum_request(self, n, at, paused):
-        self.broadcast("checksum_request", self.ser({"n": n, "at": at, "paused": paused}))
+    def checksum_request(self, n, at, paused, full=None):
+        body = {"n": n, "at": at, "paused": paused}
+        if full is not None:
+            body["full"] = full   # absent means a full round
+        self.broadcast("checksum_request", self.ser(body))
 
     def send_authority(self, n):
         """The host's authority values of round n, to every other game (what the core does after a round)."""
@@ -664,6 +688,91 @@ class LockstepTest(unittest.TestCase):
         self.tick(30)
         self.assertEqual(self.A.applied(), self.B.applied())
         self.assertEqual(self.B.L.eval("GAME.applied[3].args[1]"), self.B.L.eval("GAME.applied[1].entity"))
+
+    def test_the_checksum_cost_is_logged_only_above_the_threshold_and_changes_nothing(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertNotIn("checksum slow", self.A.log() + self.B.log(), "a fast checksum says nothing")
+        # a clock that advances 30 ms per reading makes every checksum cost more than 50 ms on game A
+        self.A.L.execute("local t = 0; os.clock = function() t = t + 0.03; return t end")
+        self.relay.checksum_request(2, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertIn("checksum slow: total ", self.A.log())
+        self.assertRegex(self.A.log(), r"checksum slow: total \d+ ms: \w+ \d+")
+        self.assertNotIn("checksum slow", self.B.log())
+        self.assertEqual(self.relay.reports[2][0][1], self.relay.reports[2][1][1], "timing never enters the parts")
+        # a clock that raises is harmless
+        self.A.L.execute("os.clock = function() error('no clock') end")
+        self.relay.checksum_request(3, self.relay.future_stamp(), False)
+        self.tick(40, lag_b=True)
+        self.assertIn(0, self.relay.reports.get(3, {}))
+
+    def test_a_light_round_leaves_out_the_heavy_lanes_and_a_full_round_has_everything(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        heavy = {"constructions", "edges", "nodeConfigs", "townBuildings"}
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)             # no flag: full
+        self.tick(40, lag_b=True)
+        self.relay.checksum_request(2, self.relay.future_stamp(), False, full=True)
+        self.tick(40, lag_b=True)
+        self.relay.checksum_request(3, self.relay.future_stamp(), False, full=False)
+        self.tick(40, lag_b=True)
+        for n in (1, 2):
+            names = set(self.relay.reports[n][0][1])
+            self.assertTrue(heavy <= names and any(k.startswith("townBuildings:") for k in names), (n, names))
+        for g in (0, 1):
+            names = set(self.relay.reports[3][g][1])
+            self.assertFalse(names & heavy or any(k.startswith("townBuildings:") for k in names), names)
+            self.assertTrue({"time", "balance", "loan", "lines", "stations", "names", "vehicles"} <= names, names)
+        self.assertEqual(self.relay.reports[3][0][1], self.relay.reports[3][1][1])
+
+    def test_checksum_rounds_flow_with_a_balance_above_2_pow_31(self):
+        # Real sweep 2026-10-13: a base save with a balance of 5,035,445,200. The game's Lua raises on "%d" beyond 32 bits (emulated in
+        # the harness); no checksum round after the paused one reached the launcher, and nothing in mod.log said why.
+        for g in (self.A, self.B):
+            g.L.execute("ACCOUNT.balance = 5035445200")
+        self.start()
+        self.tick(10, lag_b=True)
+        for n in (1, 2, 3):
+            self.relay.checksum_request(n, self.relay.future_stamp(), False, full=(n == 1))
+            self.tick(30, lag_b=True)
+            self.assertEqual(sorted(self.relay.reports.get(n, {})), [0, 1], "round %d reached the launcher from both games; host log: %s" % (n, self.A.log()))
+        self.assertEqual(self.relay.authority[3]["balance"], 5035445200)
+        self.assertNotIn("failed", self.A.log() + self.B.log())
+
+    def test_a_state_saved_mid_session_does_not_mask_the_new_sessions_rounds(self):
+        # Sweep 2026-10-13: the base save carried the earlier session's 40 stored reports (rounds 1..40, old accounts); the new session's
+        # interface half read rounds 2..40 from them as its own, marked them sent and never sent the real ones.
+        for g in (self.A, self.B):
+            g.L.execute("""
+              local reports, results, refused = {}, {}, {}
+              for n = 1, 40 do reports[n] = { n = n, time = 1000 + n, parts = { time = "old" .. n, balance = "old" }, account = { balance = 38000000, loan = 0 } } end
+              results[1] = { key = "1:1", at = 5, success = true }
+              refused[1] = { key = "1:2", from = 1, seq = 2, detail = "stale refusal" }
+              STATE:set({ reports = reports, results = results, refused = refused, late = 7, queue = {}, bind = {}, watches = {}, binders = {} })
+            """)
+        self.start()
+        self.tick(10, lag_b=True)
+        for n in (1, 2, 3):
+            self.relay.checksum_request(n, self.relay.future_stamp(), False, full=(n == 1))
+            self.tick(30, lag_b=True)
+            self.assertEqual(sorted(self.relay.reports.get(n, {})), [0, 1], "round %d" % n)
+            for gid in (0, 1):
+                self.assertNotIn("old", str(self.relay.reports[n][gid][1]["time"]), "a stale part reached the launcher")
+            self.assertEqual(self.relay.reports[n][0][1], self.relay.reports[n][1][1])
+        self.assertNotIn("stale refusal", "".join(self.A.lines(self.A.from_game)) + "".join(self.B.lines(self.B.from_game)))
+        self.assertIn("ignoring", self.A.log() + self.B.log(), "the stale outputs are logged once")
+        self.assertNotIn("applied an action late", self.A.log())
+
+    def test_an_unreadable_state_and_a_lost_round_are_logged(self):
+        self.A.L.execute("STATE.get = function(self) error('cannot convert') end")
+        self.tick(5)
+        self.assertIn("the game-script state cannot be read: ", self.A.log())
+        self.assertIn("cannot convert", self.A.log())
 
     def test_checksum_rounds(self):
         self.start()
@@ -1030,6 +1139,17 @@ class PureTest(unittest.TestCase):
         self.C = self.L.execute(COMMON_SRC)
         self.K = self.L.execute(LOCKSTEP_SRC)
         self.H = self.L.execute(HUD_SRC)
+
+    def test_integer_text_of_money_beyond_32_bits(self):
+        f = self.C.integerText
+        self.assertEqual(f(5035445200), "5035445200")
+        self.assertEqual(f(-5035445200), "-5035445200")
+        self.assertEqual(f(0), "0")
+        self.assertEqual(f(-0.0), "0")
+        self.assertEqual(f(37000000.0), "37000000")
+        self.assertEqual(f(2 ** 60), "1.152921504606847e+18")
+        self.assertEqual(float(f(1234.5678)), 1234.5678, "a fraction round-trips")
+        self.assertEqual(self.C.serialize(5035445200), "5035445200")
 
     def test_serialize_is_order_independent_and_round_trips(self):
         a = self.L.eval('(function() local t = {} t.b = 1 t.a = { 3, 2, x = "q\\t\\"z" } t[1] = 0.1 t[2] = true return t end)()')

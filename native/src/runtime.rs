@@ -347,7 +347,13 @@ impl Runtime {
                     // SAFETY: the original Add of this process, called on the thread that queues commands.
                     unsafe { engine::release(&engine, handle, add) };
                 }
-                Action::Drop { handle, .. } => unsafe { engine::discard(&engine, handle) },
+                Action::Drop { id, handle } => {
+                    // SAFETY: as for `release`; the tool's callback is fired only when the capture found it in the build table.
+                    let fired = unsafe { engine::discard(&engine, handle) };
+                    if fired {
+                        crate::log::line(&format!("hold: command {id}: the tool's completion callback was fired before the command was dropped"));
+                    }
+                }
             }
         }
         if let Some(back) = plan.spill {
@@ -389,7 +395,8 @@ impl Runtime {
                 if machine.admit(kind, now) == Admit::Hold {
                     // SAFETY: the arguments of the live call, as the caller guarantees.
                     if let Some(held) = unsafe { engine::capture(&engine, args) } {
-                        match machine.hold(kind, rva, held, now) {
+                        let done = held.done_ok();
+                        match machine.hold_with(kind, rva, done, held, now) {
                             Ok(_) => plan.held_here = true,
                             Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
                         }
@@ -556,6 +563,7 @@ mod tests {
             command_destroy: None,
             handle_destroy: None,
             ui_add_sites: &[SITE_A, SITE_B],
+            fire_done_calls: &[],
             kind_offset: Some(0x9b8),
             kinds: &[("build_proposal", 52)],
         };
@@ -574,6 +582,8 @@ mod tests {
                 command_destroy: e_destroy,
                 handle_destroy: e_handle,
                 kind_offset: 0x9b8,
+                fire_calls: &[],
+                fire_done: false,
             }),
             log: quiet,
             hooks: vec!["apply_command", "command_list_add"],

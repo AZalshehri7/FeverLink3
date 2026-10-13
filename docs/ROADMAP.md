@@ -143,6 +143,10 @@ The hole-punching and STUN items that used to be listed here are replaced by Ste
 - [ ] Players join and leave a world that runs for days
 - [ ] Linux / Proton package for cheap hosting
 
+## Known issues / next
+
+- **Checksum cost grows with the world.** The checksum (constructions, lines, stations, edges, node settings, vehicles, names, town buildings, companies) is computed in the game thread at the checksum stamp. Measured in the lab world (about 3,700 constructions, 3,600 edges, 113 vehicles, 21 towns; lab runs 2026-10-12, 138 rounds per game): about 0.95 s per round on average, up to 1.4 s; the heavy parts are edges (about 0.33 s), town buildings (0.33 s), constructions (0.16 s) and node settings (0.11 s). A round every 10 s is therefore about 10% of the game thread at this size, and a bigger world costs more. Done 2026-10-12: the host asks for the heavy lanes (edges, constructions, node settings, town buildings) only in every 6th round (`FEVERLINK3_FULL_CHECKSUM_EVERY`, protocol `full` flag in `docs/PROTOCOL.md`); the light rounds in between cost about 14 ms (max 21 ms), a full round is still about 0.9 s once a minute. Still to do: spread the full round over several frames or rotate the heavy lanes over the rounds (the cost is the engine component reads, so a snapshot-and-hash-later design does not help), and a longer interval for big worlds. `mod.log` carries the numbers (`checksum slow: total .. ms: <worst parts>` for every round over 50 ms and a `checksum cost over 20 rounds` summary line), so the friend test with a real big save can read them there.
+
 ## Credits
 
 FeverLink3 is a fresh implementation that builds on two earlier MIT-licensed projects: [TpF2 Multiplayer](https://silver2127.github.io/tpf2-multiplayer/) by silver2127 (Transport Fever 2) and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight / arthur (Transport Fever 3). Their licences are in `THIRD_PARTY_NOTICES.md`.

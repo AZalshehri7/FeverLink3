@@ -397,7 +397,7 @@ local HOLDER = { depot = "depots", station = "stations" }
 local function conRef(ctx, st, con)
 	local key = ctx.keyOf(con)
 	st.seen[key] = con
-	return { key = key, f = A.fileOf(con) }
+	return { key = key, f = A.fileOf(con), p = A.positionOf(con) }
 end
 
 local function describe(ctx, st, e, kind)
@@ -438,8 +438,11 @@ end
 local function resolveAt(ctx, r, kind)
 	local at = r.at
 	if type(at) ~= "table" or type(at.con) ~= "table" then return nil end
-	local con = ctx.resolve(at.con.key)
-	if con == nil or not A.isKind(con, "construction") or not matches(con, at.con) then return nil end
+	-- The building by its key, or, when this game has not bound that key (a build of the sender's that was never keyed here, or keyed
+	-- under another name), by its file and place: the same search a construction reference makes. Sweep run 20261013-074329 (F2/F3): the
+	-- purchase at a depot the sender built natively was refused with "unresolved depot reference nil".
+	local con = resolveConstruction(ctx, at.con)
+	if con == nil then return nil end
 	if kind == "depot" then return A.holderEntity(con, "depots", at.i) end
 	local station = A.holderEntity(con, "stations", at.i)
 	if kind == "station" then return station end
@@ -457,7 +460,17 @@ local function decodeRef(ctx, r, kind)
 		e = resolveAt(ctx, r, kind)
 		if e == nil and r.key ~= nil then e = ctx.resolve(r.key) end
 	end
-	if e == nil then return nil, "unresolved " .. kind .. " reference " .. tostring(r.key) end
+	if e == nil then
+		local why = "unresolved " .. kind .. " reference " .. tostring(r.key)
+		if type(r.at) == "table" and type(r.at.con) == "table" then
+			-- which step of the way through the owning building failed
+			local con = resolveConstruction(ctx, r.at.con)
+			why = why .. string.format(" (building key %s, file %s: %s", tostring(r.at.con.key), tostring(r.at.con.f),
+				con == nil and "no such building here by key or by file and place" or ("found as " .. tostring(con) .. " but it has no " .. kind .. " number " .. tostring(r.at.i)))
+			why = why .. ")"
+		end
+		return nil, why
+	end
 	if not A.isKind(e, kind) then
 		local why = kind .. " " .. tostring(r.key) .. " does not exist here"
 		-- an "s:" key is the id the sending game gave the entity: right for what the savegame holds, wrong for anything its

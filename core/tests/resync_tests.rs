@@ -1008,3 +1008,98 @@ fn a_bulk_save_with_the_wrong_hash_is_refused_and_a_load_without_the_save_drops_
     h.pump_player(a, outs);
     assert_eq!(1, h.p(a).saves.len());
 }
+
+// ------------------------------------------------------------------ light and full checksum rounds
+
+/// One ordinary round in which the last player disagrees about `part`; says whether the host asked for a full round.
+fn round_is_full(h: &mut Harness, ids: &[ConnectionId], part: Option<&str>) -> bool {
+    checksum_round(h, ids, part);
+    h.host_game_last::<ChecksumRequestMessage>(MessageKind::ChecksumRequest).full
+}
+
+#[test]
+fn only_every_sixth_checksum_round_is_full_and_the_verification_round_always_is() {
+    let (mut h, ids) = Harness::running(2, 3, quiet());
+    let kinds: Vec<bool> = (0..13).map(|_| round_is_full(&mut h, &ids, None)).collect();
+    let first = kinds.iter().position(|&f| f).expect("a full round");
+    assert!(first < 6);
+    for (i, &full) in kinds.iter().enumerate().skip(first) {
+        assert_eq!(full, (i - first) % 6 == 0, "round {i}: {kinds:?}");
+    }
+    h.host_call(|host| host.start_resync("test"));
+    let pause_at = h.host.state().pause_at.expect("pause stamp");
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    h.hello_all(pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert!(req.paused && req.full, "the check after a reload is a full one");
+}
+
+#[test]
+fn a_difference_in_a_heavy_lane_is_judged_over_full_rounds_only() {
+    let (mut h, ids) = Harness::running(2, 3, quiet());
+    while !round_is_full(&mut h, &ids, Some("edges")) {} // rounds before the first full one: the heavy lane is not compared
+    assert_eq!(ResyncState::Idle, h.host.resync_state(), "one full round is not enough");
+    for _ in 0..5 {
+        assert!(!round_is_full(&mut h, &ids, Some("edges")));
+        assert_eq!(ResyncState::Idle, h.host.resync_state(), "a light round cannot count a heavy lane");
+    }
+    // the next full round differs again: two full checks in a row
+    assert!(round_is_full(&mut h, &ids, Some("edges")));
+    assert_ne!(
+        ResyncState::Idle,
+        h.host.resync_state(),
+        "two full rounds in a row with the same heavy difference reload"
+    );
+}
+
+#[test]
+fn a_light_round_with_a_light_difference_still_counts_and_an_old_game_that_sends_heavy_lanes_is_not_a_difference() {
+    let (mut h, ids) = Harness::running(2, 3, quiet());
+    checksum_round(&mut h, &ids, None); // round 1, full
+                                        // round 2 is light: the host game sends no heavy lane, a game that does not know the flag sends one: still identical
+    h.host_call(HostSession::request_checksum);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert!(!req.full);
+    h.host_game(
+        MessageKind::ChecksumReport,
+        &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "r")]))),
+    );
+    for &c in &ids {
+        h.player_game(
+            c,
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "r"), ("edges", "e")]))),
+        );
+    }
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    // a light lane that differs in two light rounds in a row reloads as before
+    checksum_round(&mut h, &ids, Some("lines")); // light
+    checksum_round(&mut h, &ids, Some("lines")); // light
+    assert_ne!(ResyncState::Idle, h.host.resync_state());
+}
+
+// ------------------------------------------------------------------ the chat lines around a repair
+
+#[test]
+fn a_repair_sync_is_announced_before_it_starts_and_its_end_after_it() {
+    let (mut h, ids) = Harness::running(2, 3, quiet());
+    let before = h.p(ids[0]).count(MessageKind::Chat);
+    checksum_round(&mut h, &ids, Some("lines"));
+    checksum_round(&mut h, &ids, Some("lines")); // two rounds in a row: the safety net starts a resync
+    assert_ne!(ResyncState::Idle, h.host.resync_state());
+    assert_eq!(before + 1, h.p(ids[0]).count(MessageKind::Chat), "one chat line to every player");
+    let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
+    assert_eq!(Some("FeverLink3"), chat.name.as_deref());
+    assert!(chat.text.contains("repair sync starts") && chat.text.contains("will be lost"), "{}", chat.text);
+    assert!(h.host_game_last::<ChatMessage>(MessageKind::Chat).text.contains("repair sync"), "the host's own game too");
+    let pause_at = h.host.state().pause_at.expect("pause stamp");
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    h.hello_all(pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
+    assert!(chat.text.contains("sync is done"), "{}", chat.text);
+}

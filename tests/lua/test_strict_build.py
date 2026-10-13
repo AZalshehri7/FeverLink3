@@ -79,6 +79,8 @@ class FakeNative:
         self.last_valid = None
         self.heard = []          # (time, seq, kind, payload) of every control line it accepted
         self.dropped, self.released, self.held = [], [], []
+        self.site = TOOL_SITE   # the call site the module reports for the next held command
+        self.fires = False   # the module would fire the tool's completion callback at a cancel (the held event says `done`)
         self.is_open = False
         if link:
             self.open_link()
@@ -208,7 +210,10 @@ class FakeNative:
             self.next_id += 1
             self.ring.append({"id": hid, "phase": "waiting"})
             self.held.append(hid)
-            self.emit("held", {"id": hid, "kind": 52, "site": TOOL_SITE, "ms": int(self.clock.t * 1000)})
+            ev = {"id": hid, "kind": 52, "site": self.site, "ms": int(self.clock.t * 1000)}
+            if self.fires:
+                ev["done"] = True
+            self.emit("held", ev)
             return hid
         return 0
 
@@ -337,18 +342,48 @@ class StrictTest(unittest.TestCase):
     """Two games that both have the native module."""
 
     natives = (True, True)
+    # FEVERLINK3_STRICT_CANCEL for the test: "0" = hold-and-release for every build (what most tests here are about), "1" = cancel
+    # every kind, None = unset (the default: cancel and replay on every game for street, combined and bulldoze builds)
+    strict_cancel = "0"
+    # more environment variables for the test (None removes one). The firing of the tool's callback is ON by default since 2026-10-13;
+    # most tests here are about the older flows and switch it off (classes that set extra_env themselves say what they need).
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "0"}
+    fires = False       # the fake module reports `done` in its held events
 
     def setUp(self):
+        self._saved_env = {k: os.environ.get(k) for k in self.extra_env}
+        for k, v in self.extra_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._old_cancel = os.environ.get("FEVERLINK3_STRICT_CANCEL")
+        if self.strict_cancel is None:
+            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
+        else:
+            os.environ["FEVERLINK3_STRICT_CANCEL"] = self.strict_cancel
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-strict-")
         self.clock = Clock()
         self.A = StrictGame("host", 0, self.tmp, 50000, self.clock, native=self.natives[0])
         self.B = StrictGame("client", 1, self.tmp, 51000, self.clock, native=self.natives[1])
         self.relay = T.Relay([self.A, self.B])
+        for g in (self.A, self.B):
+            if g.native:
+                g.native.fires = self.fires
 
     def tearDown(self):
+        for k, v in getattr(self, "_saved_env", {}).items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         if os.environ.get("FEVERLINK3_TEST_VERBOSE"):
             print("\n--- host mod.log ---\n" + self.A.log() + "\n--- client mod.log ---\n" + self.B.log())
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if getattr(self, "_old_cancel", None) is None:
+            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
+        else:
+            os.environ["FEVERLINK3_STRICT_CANCEL"] = self._old_cancel
 
     def frames(self, n=1):
         """n interface frames of 50 ms each: both games, the relay and the fake modules' service threads."""
@@ -494,7 +529,7 @@ class StrictOnTest(StrictTest):
         # action (a vehicle bought at the depot, a line through the station) can name it on every game
         self.start()
         self.B.tool("{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", make="NATIVE_DEPOT_ON_ROAD")
-        self.tick(16)
+        self.tick(48)
         self.assertEqual(self.B.native.released, [1])
         # (the worlds are not compared: the mock engine adds the depot's entrance segment to the tool's own build, while the
         # replay leaves it to the depot's script, which the mock does not run)
@@ -509,7 +544,7 @@ class StrictOnTest(StrictTest):
     def test_a_vehicle_bought_at_the_originators_depot_is_found_on_both_games(self):
         self.start()
         self.B.tool("{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", make="NATIVE_DEPOT_ON_ROAD")
-        self.tick(16)
+        self.tick(48)
         for g in (self.A, self.B):
             self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split())
         self.assertEqual(self.B.native.released, [1])
@@ -563,18 +598,18 @@ class StrictOnTest(StrictTest):
         self.assertNotIn("native build captured", self.B.log())
         self.assertSameWorld()
 
-    def test_a_build_the_originator_refuses_at_the_stamp_is_cancelled_not_left_held(self):
-        # the same rule that refuses it on every other game refuses it here: the held command is destroyed, nothing is built
+    def test_a_build_the_originator_refuses_at_the_stamp_is_released_not_cancelled_when_the_callback_cannot_be_fired(self):
+        # the rule that refuses it on every other game refuses it here too; a cancel would leave the tool dead (the module cannot fire
+        # the callback here), so the command goes back to the engine and the games are repaired
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))
         self.frames(2)
         self.assertEqual(self.B.native.held, [1])
         self.B.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _ in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
         self.tick(14)
-        self.assertEqual(self.B.native.dropped, [1])
-        self.assertEqual(self.B.native.released, [])
-        self.assertIn("was refused at its stamp: cancelled", self.B.log())
-        self.assertEqual(self.B.builds_applied(), 0)
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertEqual(self.B.native.released, [1])
+        self.assertIn("was refused at its stamp but is NOT cancelled", self.B.log())
         self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
 
     # ---- (g) both players building at once
@@ -826,6 +861,32 @@ class StrictOnTest(StrictTest):
         self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
 
+    # ---- (e) a command is paired with the preview of its own tool only; nothing given back is unaccounted for
+
+    def test_a_command_from_a_site_without_a_preview_is_never_paired_with_an_older_preview(self):
+        # real session 2026-10-13: the lane tool (UI::LaneModifier::Apply) sends no preview; its command was shipped as the upgrade tool's
+        # preview of 12 s before
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0), add=False)             # a preview of the street tool, never clicked
+        self.B.native.site = 0x537EE5
+        self.B.L.execute("TOOL_ADD(%d, true)" % 1)
+        self.tick(14)
+        self.assertEqual(self.B.native.released, [1], "given back, not cancelled")
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertNotIn("matched the capture", self.B.log())
+        self.assertIn("(site 0x537ee5, LaneModifier::Apply)", self.B.log(), "named by its site")
+        self.assertIn("accounted for, the simulation half shipped a native build", self.B.log(), "and checked that something shipped it")
+        self.assertSameWorld()
+
+    def test_a_preview_of_another_tool_is_not_paired_with_a_command_of_a_known_site(self):
+        self.start()
+        self.B.native.site = 0x4D396F                                  # the bulldozer's site; the preview is the street tool's
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(14)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertIn("which does not issue commands there; not paired", self.B.log())
+        self.assertNotIn("matched the capture", self.B.log())
+
     def test_a_preview_is_used_once(self):
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))                     # preview and click
@@ -952,7 +1013,7 @@ class NativeVersusReplayTest(StrictTest):
     def test_a_depot_with_its_street_is_keyed_and_placed_the_same_on_both_games(self):
         self.start()
         self.B.tool("{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", make="NATIVE_DEPOT_ON_ROAD")
-        self.tick(16)
+        self.tick(48)
         self.assertEqual(self.B.native.released, [1])
         lines = lambda g, p: sorted(x for x in g.sig().splitlines() if x.startswith(p))
         self.assertEqual(lines(self.A, "C "), lines(self.B, "C "), "the same construction in the same place")
@@ -967,14 +1028,14 @@ class NativeVersusReplayTest(StrictTest):
         self.start()
         n = int(self.B.lua("FIND_NODE(100, 0, 0)"))
         self.B.tool("{ node = %d, door = { x = 150, y = -40, z = 0 }, params = { seed = 261 } }" % n, make="NATIVE_DEPOT_ENTRANCE")
-        self.tick(16)
+        self.tick(48)
         self.assertEqual(self.B.native.released, [1])
         self.assertSameWorld()
         self.assertIn("E 100.00,0.00,0.00 150.00,-40.00,0.00", self.A.sig(), "the entrance piece exists on the replay too")
         self.assertIn("did not make the street connection", self.A.log(), "the log names the first cause on the replaying game")
         nb = int(self.B.lua("FIND_NODE(150, -40, 0)"))
         self.B.tool("{ nodeA = %d, b = { x = 250, y = -80, z = 0 } }" % nb)
-        self.tick(16)
+        self.tick(48)
         self.assertSameWorld()
         self.assertEqual(self.relay.vetoes, [])
         self.assertEqual(self.B.native.released, [1, 2])
@@ -988,7 +1049,7 @@ class NativeVersusReplayTest(StrictTest):
         self.assertEqual(self.B.native.released, [], "still held: the record was shipped first, so a veto can still stop it")
         self.assertEqual(len(self.B.action_records()), 1)
         self.assertNotIn("capture of streetBuilder failed", self.B.log())
-        self.tick(16)
+        self.tick(48)
         self.assertEqual(self.B.native.released, [1])
         self.assertEqual(self.relay.vetoes, [])
         self.assertNotIn("refused", self.log())
@@ -1015,6 +1076,10 @@ class NativeVersusReplayTest(StrictTest):
 
 class VetoTest(StrictTest):
     """Veto-only validation: a game that cannot build the record says so; silence means yes. A refused build exists on NO game."""
+
+    # the cancel path needs a tool callback the module can fire (otherwise a cancel leaves the tool dead: see NoCancelWithoutCallbackTest)
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
 
     def test_the_happy_path_has_no_veto_and_no_extra_message(self):
         self.start()
@@ -1070,20 +1135,28 @@ class VetoTest(StrictTest):
         self.assertEqual(self.B.native.released, [2])
 
 
+class NoCancelWithoutCallbackTest(StrictTest):
+    """One rule for every tool kind: a held command is cancelled only when the module can fire the tool's callback. A veto (a game that
+    cannot rebuild the build) then releases the command instead (real session 2026-10-13: a cancelled underground station entrance left the
+    tool dead); the vetoing game dropped it, so the games differ and the host is asked to repair."""
+
+    fires = False
+
+    def test_a_veto_releases_the_build_instead_of_killing_the_tool(self):
+        self.start()
+        self.A.run("WORLD[110] = nil")
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.assertEqual(len(self.relay.vetoes), 1)
+        self.assertEqual(self.B.native.dropped, [], "nothing was cancelled: the tool keeps its callback")
+        self.assertEqual(self.B.native.released, [1], "the command went back to the engine")
+        self.assertIn("NOT cancelled", self.B.log())
+
+
 class StrictCancelFallbackTest(StrictTest):
     """FEVERLINK3_STRICT_CANCEL=1: the first strict flow, for testing sync independent of the tool."""
 
-    def setUp(self):
-        self._old = os.environ.get("FEVERLINK3_STRICT_CANCEL")
-        os.environ["FEVERLINK3_STRICT_CANCEL"] = "1"
-        super().setUp()
-
-    def tearDown(self):
-        super().tearDown()
-        if self._old is None:
-            os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
-        else:
-            os.environ["FEVERLINK3_STRICT_CANCEL"] = self._old
+    strict_cancel = "1"
 
     def test_the_command_is_cancelled_and_every_game_replays_the_record_so_the_worlds_are_identical(self):
         self.start()
@@ -1093,7 +1166,7 @@ class StrictCancelFallbackTest(StrictTest):
         self.assertEqual(self.B.native.released, [])
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1), "both games applied the same rebuilt record")
         self.assertSameWorld()
-        self.assertIn("FEVERLINK3_STRICT_CANCEL", self.B.log())
+        self.assertIn("cancel flow", self.B.log())
         self.assertEqual(self.relay.vetoes, [])
         self.assertNotIn("held=true", str(self.B.action_records()[0]["body"]).replace(" ", ""), "no held marker in this mode")
 
@@ -1103,6 +1176,316 @@ class StrictCancelFallbackTest(StrictTest):
         self.B.tool(SPLIT, make="NATIVE_SPLIT")
         self.tick(20)
         self.assertEqual(self.relay.vetoes, [], "the originator replays it itself: nothing to cancel, the refusal at the stamp is the old one")
+
+
+class DefaultHoldAndReleaseTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL unset: every build, host's or guest's, is held and released (the tool gets its callback and keeps its
+    ghost); nothing is cancelled."""
+
+    strict_cancel = None
+
+    def test_a_road_build_of_either_game_is_held_and_released_by_default(self):
+        self.start()
+        self.A.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.A.native.released, self.A.native.dropped), ([1], []))
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertNotIn("cancel flow", self.log())
+
+
+class DefaultDemolitionTest(StrictTest):
+    """Nothing set: the defaults since 2026-10-13 (FEVERLINK3_STRICT_CANCEL=removals, FEVERLINK3_STRICT_FIRE_DONE on). A demolition is cancelled
+    and replayed at the stamp by every game (real two-window run: 11 of 11 left the checksums identical and the bulldozer usable); roads are
+    held and released as before. =0 on either variable is the opt-out."""
+
+    strict_cancel = None
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": None}
+    fires = True
+
+    def test_a_demolition_is_cancelled_and_a_road_is_held_and_released(self):
+        self.start()
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertSameWorld()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], [2]))
+        self.assertSameWorld()
+
+
+class OptOutTest(DefaultDemolitionTest):
+    """FEVERLINK3_STRICT_FIRE_DONE=0 or FEVERLINK3_STRICT_CANCEL=0: back to hold-and-release for everything."""
+
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "0"}
+
+    def test_a_demolition_is_cancelled_and_a_road_is_held_and_released(self):
+        self.start()
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
+
+
+class CancelFlowChoiceTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=plans / host: cancel-and-replay for roads and bulldozing, for every originator or the host only."""
+
+    strict_cancel = "plans"
+
+    def test_plans_cancels_the_roads_of_the_guest_too(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+        self.assertIn("cancel flow", self.B.log())
+
+
+class CancelFlowHostOnlyTest(StrictTest):
+    strict_cancel = "host"
+
+    def test_host_cancels_and_a_guest_keeps_hold_and_release(self):
+        self.start()
+        self.A.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.A.native.dropped, self.A.native.released), ([1], []))
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
+
+
+class HoldAndReleaseSwitchTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=0: the developer switch back to hold-and-release for every kind."""
+
+    def test_the_originator_releases_its_own_command(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(16)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertSameWorld()
+
+
+class ConstructionDefaultTest(StrictTest):
+    """Remote constructions are replicated as before (hold-and-release); the player gets an informational chat line."""
+
+    DEPOT = "{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }"
+
+    def test_a_depot_build_is_held_and_released_and_the_player_is_told_it_is_experimental(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertEqual(self.B.shipped_count(), 1)
+        self.assertEqual(len(self.relay.chats), 1)
+        self.assertIn("experimental in this test build", self.relay.chats[0][1])
+
+
+class BuildLogLinesTest(StrictTest):
+    """Every build that is applied has one `build <key> (replay|originator): ...` line before it is applied, with the plan, the counts and
+    the engine's verdict, in mod.log of every run (not only when paused)."""
+
+    DEPOT = ConstructionDefaultTest.DEPOT
+
+    def test_the_receiver_logs_a_replay_line_and_the_originator_its_own(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        import re
+        self.assertRegex(self.A.log(), r"build 1:1 \(replay\): plan=\w+ cons=1 rem=0 nodes=\d+ segs=\d+ rmSegs=\d+ objs=\d+; adds \[[^\]]+\]; verdict .*; ie=\w+ pi=\w+")
+        self.assertRegex(self.B.log(), r"build 1:1 \(originator\): plan=\w+ cons=1 ")
+
+    def test_a_road_has_the_line_too_without_the_removal_lists(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertRegex(self.A.log(), r"build 1:1 \(replay\): plan=street cons=0 rem=0 ")
+        self.assertNotIn("removes [", self.A.log())
+
+
+class TraceLogTest(StrictTest):
+    """trace.log (FEVERLINK3_TRACE, on by default): one self-contained block per build and a line per checksum round, in the session folder."""
+
+    DEPOT = ConstructionDefaultTest.DEPOT
+
+    def trace(self, g):
+        import os as _os
+        path = _os.path.join(g.dir, "trace.log")
+        return open(path, encoding="utf-8").read() if _os.path.exists(path) else ""
+
+    def test_a_build_leaves_its_record_decode_send_result_and_the_originators_ship_line_on_both_games(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(40)
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40)
+        a, b = self.trace(self.A), self.trace(self.B)
+        self.assertRegex(b, r"gui build\.ship 1:1 held=1 site=\S+ done=\w+ tool=\S+ plan=\w+ stamp=\d+ now=\d+ lead=\d+ bytes=\d+ capture_ms=[\d.]+ balance=\S+ record=\{")
+        self.assertRegex(a, r"sim build\.record 1:1 role=replay from=1 stamp=\d+ now=\d+ late=0 balance=\S+ record=\{")
+        self.assertRegex(a, r"sim build\.decode 1:1 ok=true ms=[\d.]+")
+        self.assertRegex(a, r"build\.plan 1:1 plan=\w+ form=1 built ms=[\d.]+")
+        self.assertRegex(a, r"build\.factory 1:1 plan=\w+ form=1 ok ms=[\d.]+ ie=\w+ pi=\w+ dust=\w+ counts\[")
+        self.assertRegex(a, r"sim build\.send 1:1 ie=\w+ pi=\w+ dust=\w+ ctx\{")
+        self.assertRegex(a, r"sim build\.result 1:1 ok=true steps=\d+ made=\d+ \[\d+\{[A-Z_,]+\}")
+        self.assertRegex(a, r"sim checksum t=\d+ light=false lanes=true items\{[^}]*\} parts=\{")
+        self.assertIn("native ", b)
+
+class TraceOffTest(StrictTest):
+    extra_env = {"FEVERLINK3_TRACE": "0"}
+
+    def test_no_trace_file(self):
+        import os as _os
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(30)
+        self.assertFalse(_os.path.exists(_os.path.join(self.A.dir, "trace.log")))
+        self.assertFalse(_os.path.exists(_os.path.join(self.B.dir, "trace.log")))
+
+
+class ConstructionBlockTest(StrictTest):
+    """FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers): a build that adds a construction is cancelled at the originator (with a chat line)
+    and replayed by nobody, but only when the native module can fire the tool's callback; otherwise it stays hold-and-release."""
+
+    extra_env = {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}
+    fires = True
+    DEPOT = ConstructionDefaultTest.DEPOT
+
+    def test_a_depot_build_is_cancelled_with_a_message_and_no_game_builds_it(self):
+        self.start()
+        self.B.tool(self.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        self.assertEqual(self.B.native.dropped, [1], "the originator's command is cancelled")
+        self.assertEqual(self.B.native.released, [])
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+        self.assertEqual(self.B.shipped_count(), 0, "nothing is shipped")
+        self.assertNotIn("C depot/road_depot.con", self.A.sig() + self.B.sig())
+        self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
+        self.assertSameWorld()
+
+    def test_a_road_still_goes_through(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+
+
+class UncapturableBuildTest(StrictTest):
+    """A build whose capture fails cannot be shipped: with the tool's callback fireable it is cancelled with a chat line, otherwise it is
+    released as before (fail open)."""
+
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
+    def broken_capture(self):
+        self.start()
+        self.B.run("FACTORY_REJECT = nil")
+        i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
+        self.B.L.execute("TOOL_ADD(%d, true)" % i)
+        self.tick(14)
+
+    def test_the_build_is_cancelled_and_the_player_told(self):
+        self.broken_capture()
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual(self.B.shipped_count(), 0)
+        self.assertEqual(len(self.relay.chats), 1)
+        self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
+        self.assertSameWorld()
+
+    def test_a_capture_that_only_lacks_the_model_of_an_edge_object_is_released_and_read_after_the_build(self):
+        # a stop or signal gets its model when the build runs: no cancel, the record is read afterwards by the simulation half
+        self.start()
+        self.B.tool("{ edge = 130, param = 0.75 }", make="NATIVE_SIGNAL")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertIn("waits for the build", self.B.log())
+        self.assertEqual(self.relay.chats, [])
+
+    def test_without_a_fireable_callback_it_is_released_as_before(self):
+        self.fires_off = True
+        self.start()
+        self.B.native.fires = False
+        self.B.run("FACTORY_REJECT = nil")
+        i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
+        self.B.L.execute("TOOL_ADD(%d, true)" % i)
+        self.tick(14)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+
+
+class ConstructionBlockWithoutFireTest(StrictTest):
+    extra_env = {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}
+    fires = False
+
+    def test_without_a_fireable_callback_the_build_is_not_cancelled(self):
+        self.start()
+        self.B.tool(ConstructionDefaultTest.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
+        self.tick(20)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []), "a cancel would leave the tool dead")
+
+
+class FireDoneChoiceTest(StrictTest):
+    """FEVERLINK3_STRICT_FIRE_DONE=1 with FEVERLINK3_STRICT_CANCEL=plans: a build is cancelled only when the module says it fires the tool's
+    callback (`done` in the held event); otherwise the build is held and released."""
+
+    strict_cancel = "plans"
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
+    def test_a_road_is_cancelled_when_the_module_fires_the_callback(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+
+    def test_a_road_stays_hold_and_release_when_it_cannot(self):
+        self.start()
+        self.B.native.fires = False
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertIn("cannot fire this tool's callback", self.B.log())
+        self.assertSameWorld()
+
+
+class RemovalsCancelTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=removals with FEVERLINK3_STRICT_FIRE_DONE=1: a build that only takes things away (the bulldozer removing a town
+    building) is cancelled and replayed at the stamp on every game, the originator included; anything that adds stays hold-and-release.
+    (Real run 2026-10-13: the originator's engine applied its held bulldozer command 1000 ms after the stamp, a house regrew differently.)"""
+
+    strict_cancel = "removals"
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
+    def test_a_demolition_is_cancelled_and_applied_at_the_stamp_by_every_game(self):
+        self.start()
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+
+    def test_a_road_is_still_held_and_released(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
+
+    def test_a_demolition_stays_hold_and_release_when_the_module_cannot_fire_the_callback(self):
+        self.start()
+        self.B.native.fires = False
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
 
 
 class ModuleSilentTest(StrictTest):
@@ -1133,6 +1516,10 @@ class PausedGraceTest(StrictTest):
     """A build made while the session is PAUSED: the originator holds its command for a real-time grace, the peers dry-run the record
     and park it, and only the originator's commit makes every game apply it (real run 2026-10-11: a veto came too late and the
     guest's game built a road the host could not)."""
+
+    # the cancel path needs a tool callback the module can fire (otherwise a cancel leaves the tool dead: see NoCancelWithoutCallbackTest)
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
 
     def pause(self):
         self.start(speed=2)
@@ -1251,12 +1638,12 @@ class PausedGraceTest(StrictTest):
         self.pause()
         n = int(self.B.lua("FIND_NODE(100, 0, 0)"))
         self.B.tool("{ node = %d, door = { x = 150, y = -40, z = 0 }, params = { seed = 261 } }" % n, make="NATIVE_DEPOT_ENTRANCE")
-        self.tick(14)
+        self.tick(48)
         self.assertEqual(self.B.native.released, [1])
         self.assertSameWorld()
         nb = int(self.B.lua("FIND_NODE(150, -40, 0)"))
         self.B.tool("{ nodeA = %d, b = { x = 250, y = -80, z = 0 } }" % nb)
-        self.tick(14)
+        self.tick(48)
         self.assertSameWorld()
         self.assertEqual(self.relay.vetoes, [])
         self.assertEqual(self.B.native.released, [1, 2])
@@ -1301,6 +1688,10 @@ class VetoWordsTest(StrictTest):
 class HeldAcrossResyncTest(StrictTest):
     """Real run 2026-10-11: a held host build was never released at its stamp, a resync saved a world without it and the module's
     30 s limit put it into the world later, shipped a second time."""
+
+    # the cancel path needs a tool callback the module can fire (otherwise a cancel leaves the tool dead: see NoCancelWithoutCallbackTest)
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
 
     def test_a_town_build_is_not_taken_for_the_early_release_of_a_held_command(self):
         self.start()

@@ -44,6 +44,15 @@
 -- lines), so the sim never waits on the disk; a failed write drops the buffer, it never raises.
 -- the maintainer's local comparer reads this file together with growth.log.
 
+-- The common module's integral number text (feverlink3_common.lua C.integerText: "%d" raises above 2^31 in the game's Lua); this module
+-- also runs where the common module is not loadable (its own tests), then "%.0f", which is what the helper prints.
+local integerText
+do
+	local okC, C = pcall(ug_require, "feverlink3_common.lua")
+	if not okC then okC, C = pcall(ug_require, "feverlink3_1::/feverlink3_common.lua") end
+	integerText = okC and type(C) == "table" and C.integerText or function(n) return string.format("%.0f", n) end
+end
+
 local M = {}
 
 M.FILE = "town_trace.txt"
@@ -78,7 +87,7 @@ local function flat(v, depth)
 	depth = depth or 0
 	local t = type(v)
 	if t == "number" then
-		if v == math.floor(v) and math.abs(v) < 1e15 then return string.format("%d", v) end
+		if v == math.floor(v) and math.abs(v) < 1e15 then return integerText(v) end
 		return string.format("%.4g", v)
 	elseif t == "boolean" then
 		return v and "1" or "0"
@@ -104,7 +113,7 @@ M.flat = flat
 local function num(v)
 	if type(v) ~= "number" then return tostring(v) end
 	if v ~= v then return "nan" end
-	if v == math.floor(v) and math.abs(v) < 1e15 then return string.format("%d", v) end
+	if v == math.floor(v) and math.abs(v) < 1e15 then return integerText(v) end
 	return string.format("%.17g", v)
 end
 M.num = num

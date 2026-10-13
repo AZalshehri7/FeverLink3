@@ -114,8 +114,9 @@ def("BaseEdge", { "node0", "node1", "tangent0", "tangent1", "position0", "positi
 end)
 def("BaseEdgeStreet", { "precedenceNode0", "precedenceNode1" }, function() return { precedenceNode0 = 2, precedenceNode1 = 2 } end)
 def("PlayerOwned", { "player" }, function() return { player = -1 } end)
-def("SegmentAndEntity", { "entity", "type", "comp", "streetEdge", "playerOwned" }, function()
-  return { entity = -1, type = 0, comp = D("BaseEdge"), streetEdge = D("BaseEdgeStreet"), playerOwned = D("PlayerOwned") }
+def("BaseEdgeTrack", { "trackType", "catenary" }, function() return { trackType = 0, catenary = false } end)
+def("SegmentAndEntity", { "entity", "type", "comp", "streetEdge", "trackEdge", "playerOwned" }, function()
+  return { entity = -1, type = 0, comp = D("BaseEdge"), streetEdge = D("BaseEdgeStreet"), trackEdge = D("BaseEdgeTrack"), playerOwned = D("PlayerOwned") }
 end)
 def("EdgeObjectSimple", { "edgeEntity", "param", "oneWay", "left", "model", "playerEntity", "name" }, function()
   return { edgeEntity = -1, param = 0.5, oneWay = false, left = false, model = "", playerEntity = -1, name = "" }
@@ -206,6 +207,8 @@ DEF_TEMPLATE("street/new_medium_road.street_template", "medium", { { forward = t
 DEF_TEMPLATE("street/new_small_road.street_template", "small", { { forward = true, modes = { 2 } }, { forward = false, modes = { 2 } } })
 DEF_TEMPLATE("track/standard.street_template", "track", { { forward = true, modes = { 8 } } })
 DEF_TEMPLATE("track/standard_catenary.street_template", "track", { { forward = true, modes = { 8, 9 } } })
+-- the template a real trackBuilder segment carries (real session 2026-10-13); its name contains "simple.street_template"
+DEF_TEMPLATE("track/simple/simple.street_template", "track", { { forward = true, modes = { 8 } } })
 DEF_TEMPLATE("street/tram_road.street_template", "medium", { { forward = true, modes = { 2, 3 } }, { forward = false, modes = { 2, 3 } }, { forward = true, modes = { 4 } } })
 DEF_TEMPLATE("street/airport/taxiway.street_template", "taxiway", { { forward = true, modes = { 5 } }, { forward = false, modes = { 5 } } })
 function TEMPLATE_LANES(name)
@@ -294,6 +297,7 @@ function MAKE_API()
   T.NodeAndEntity = ctor("NodeAndEntity")
   T.SegmentAndEntity = ctor("SegmentAndEntity")
   T.BaseEdgeStreet = ctor("BaseEdgeStreet")
+  T.BaseEdgeTrack = ctor("BaseEdgeTrack")
   T.PlayerOwned = ctor("PlayerOwned")
   T.LaneConfig = ctor("LaneConfig")
   T.LaneConnection = ctor("LaneConnection")
@@ -325,6 +329,7 @@ function MAKE_API()
   E.forEachEntityWithComponent = function(fn, t)
     local name = NAMES[t]
     if name == "BASE_NODE" or name == "BASE_EDGE" then error("Cannot loop over this component type") end
+    if name and HIDE_ENUM and HIDE_ENUM[name] then return end   -- a component the engine does not list (sweep 2026-10-13, EDGE_OBJECT)
     if name then
       local ids = {}
       for e, w in pairs(WORLD) do if w[name] then ids[#ids + 1] = e end end
@@ -393,6 +398,18 @@ function MAKE_API()
   }
   HELPER_CALLS = HELPER_CALLS or {}
   E.util.proposal = {
+    -- the engine reads proposal data of a SimpleProposal only (real session 2026-10-13); off unless a test switches it on
+    makeProposalData = function(p, ctx)
+      if SCRIPT_PIECES then   -- a test lets the construction's script add these street pieces (list of { p0, p1 })
+        local segs = {}
+        for i, pc in ipairs(SCRIPT_PIECES(p)) do segs[i] = { comp = { position0 = pc.p0, position1 = pc.p1 } } end
+        return { errorState = { critical = false, messages = {}, warnings = {} }, proposal = { proposal = { addedNodes = {}, addedSegments = segs } } }
+      end
+      if not VERDICT_MOCK then error("not available in this mock") end
+      local mt = getmetatable(p)
+      if mt and mt.__double == "Proposal" then error("bad argument #2 to 'makeProposalData' (SimpleProposal expected, got Proposal)") end
+      return { errorState = { critical = false, messages = {}, warnings = {} } }
+    end,
     -- the engine's own upgrade: the segment replaced by one with the template's lanes (finding from MPFever (MIT))
     replaceSegment = function(edge, tmpl)
       HELPER_CALLS[#HELPER_CALLS + 1] = "replaceSegment " .. tostring(edge)
@@ -506,6 +523,21 @@ function APPLY_BUILD(p)
   for _, e in ipairs(P.nodesRem) do if not exists(e, "BASE_NODE") then return false, "node " .. tostring(e) .. " does not exist" end end
   for _, e in ipairs(P.consRem) do if not exists(e, "CONSTRUCTION") then return false, "construction " .. tostring(e) .. " does not exist" end end
   for _, e in ipairs(P.objsRem) do if not exists(e, "EDGE_OBJECT") then return false, "edge object " .. tostring(e) .. " does not exist" end end
+  -- the engine does not refuse a removal of a node configuration the node does not have, it aborts (real game: Engine.h:323
+  -- ecs::Engine::GetComponentDataIndex "it != components.end()", Component Type Index 30 = BaseNodeConfig, entity unknown)
+  for _, e in ipairs(P.cfgRem) do
+    if not exists(e, "BASE_NODE_CONFIG") then error("ENGINE ASSERT Engine.h:323 GetComponentDataIndex: Assertion 'it != components.end()' failed (BaseNodeConfig, entity " .. tostring(e) .. ")", 0) end
+  end
+  -- a node configuration whose lane connection names a segment the proposal removes is a lookup the engine fails ("Unknown exception")
+  do
+    local goneE = {}
+    for _, e in ipairs(P.edgesRem) do goneE[e] = true end
+    for _, n in ipairs(P.cfgAdd) do
+      for _, l in ipairs(n.comp.laneConnections) do
+        if goneE[l.segment0] or goneE[l.segment1] then return false, "lane connection refers to the removed segment " .. tostring(goneE[l.segment0] and l.segment0 or l.segment1) end
+      end
+    end
+  end
   local placeholders = {}
   for _, n in ipairs(P.nodesAdd) do
     local id = n.entity
@@ -531,6 +563,21 @@ function APPLY_BUILD(p)
   for _, o in ipairs(P.objsAdd) do
     local model = STORE(o)._model or o.model
     if model == nil or model == "" then return false, "edge object without model" end
+  end
+
+  -- a new node that joins three or more of the added segments and has no node configuration entry aborts the engine (the sweep harness's
+  -- A3 probe, 2026-10-13: Engine.h:323, BaseNodeConfig on entity 49832 "being added")
+  do
+    local joins, hasCfg = {}, {}
+    for _, n in ipairs(P.cfgAdd) do hasCfg[n.entity] = true end
+    for _, s in ipairs(P.edgesAdd) do
+      for _, nid in ipairs({ s.comp.node0, s.comp.node1 }) do
+        if nid < 0 then joins[nid] = (joins[nid] or 0) + 1 end
+      end
+    end
+    for nid, k in pairs(joins) do
+      if k >= 3 and not hasCfg[nid] then error("ENGINE ASSERT Engine.h:323 GetComponentDataIndex: Assertion 'it != components.end()' failed (BaseNodeConfig, new node " .. nid .. " joins " .. k .. " segments)", 0) end
+    end
   end
 
   local gone = {}
@@ -646,10 +693,13 @@ function EXECUTE(cmd, cb)
   return executeBuild(cmd, cb)
 end
 
+BUILD_NEEDS_IE = nil    -- a test sets function(proposal) -> true for a build the engine only accepts with ignoreErrors = true (non-critical messages)
 function executeBuild(cmd, cb)
   local name = cmd.__cmd
   local a = cmd.args
-  local ok, res = APPLY_BUILD(a[1])
+  local ok, res
+  if BUILD_NEEDS_IE and BUILD_NEEDS_IE(a[1]) and a[3] ~= true then ok, res = false, "non-critical messages and ignoreErrors = false"
+  else ok, res = APPLY_BUILD(a[1]) end
   if ok then
     local ents = {}
     for i, e in ipairs(res) do ents[i] = { e, 0 } end
@@ -700,7 +750,14 @@ local function segment(entity, n0, n1, pa, pb, opts)
   local c = D("BaseEdge", { node0 = n0, node1 = n1, tangent0 = d, tangent1 = d, position0 = V(pa.x, pa.y, pa.z or 0), position1 = V(pb.x, pb.y, pb.z or 0),
     type = 0, typeIndex = 1, roadTemplate = tmpl, roadStyle = style, roadType = opts.track and 1 or 0, laneConfigs = lanes,
     objects = opts.objects or {}, edgeDecorations = opts.deco or {} })
-  return D("SegmentAndEntity", { entity = entity, type = opts.track and 1 or 0, comp = c })
+  local se = D("SegmentAndEntity", { entity = entity, type = opts.track and 1 or 0, comp = c })
+  if opts.trackType then
+    local te = se.trackEdge
+    te.trackType = opts.trackType
+    te.catenary = opts.catenary == true
+    se.trackEdge = te
+  end
+  return se
 end
 
 -- a road between two places (or existing nodes), the way a script builds it
@@ -744,6 +801,8 @@ function NATIVE_SPLIT(spec)
   sp.removedSegments = { D("SegmentAndEntity", { entity = spec.edge, comp = COPY(w.BASE_EDGE), type = w.KIND }) }
   sp.addedNodes = { nodeAndEntity(-1, spec.at), nodeAndEntity(-2, spec.to) }
   sp.addedSegments = { segment(-3, na, -1, pa, spec.at, spec), segment(-4, -1, nb, spec.at, pb, spec), segment(-5, -1, -2, spec.at, spec.to, spec) }
+  -- the real tool always carries an entry for the new junction node (pref 2, no lane connections); the engine aborts without it
+  sp.nodeConfigsToAdd = { D("NodeConfigAndEntity", { entity = -1, comp = D("BaseNodeConfig", { laneConnections = {} }) }) }
   P.proposal = sp
   return P
 end
@@ -802,6 +861,19 @@ function NATIVE_SIGNAL(spec)
   sp.edgeObjectsToAdd = { eo }
   P.proposal = sp
   return P
+end
+
+-- The proposal as it reads after the build when the removed segment is listed by a negative id (the real session
+-- 2026-10-13-a: -39433): still as a record with its comp (negative = true), or as a bare number ('bare').
+function NEGATE_REMOVED(P, how)
+  local sp = P.proposal
+  local r = sp.removedSegments[1]
+  if how == 'bare' then
+    sp.removedSegments = { -r.entity }
+  else
+    sp.removedSegments = { D("SegmentAndEntity", { entity = -r.entity, comp = r.comp, type = r.type }) }
+  end
+  P.proposal = sp
 end
 
 -- a stop the way a script places one: the segment replaced by itself with one more object, whose model it names
@@ -909,6 +981,20 @@ function NATIVE_AIRFIELD(spec)
   sp.edgeObjectsToAdd = { eo }
   P.proposal = sp
   P.toAdd = { conEntity({ file = "airport/airfield.con", x = spec.a.x, y = spec.a.y, z = 0, params = spec.params }) }
+  return P
+end
+
+-- an underground station entrance (real session 2026-10-13): the construction with its own tunnel pieces, four new nodes and two segments of
+-- an ordinary tram street template that touch no node of the world
+function NATIVE_UNDERGROUND(spec)
+  local P = D("Proposal")
+  local sp = P.proposal
+  local a, b, c, d = { x = spec.x + 30, y = spec.y + 8, z = -13 }, { x = spec.x + 20, y = spec.y + 5, z = -13 }, { x = spec.x - 30, y = spec.y - 8, z = -13 }, { x = spec.x - 20, y = spec.y - 5, z = -13 }
+  sp.addedNodes = { nodeAndEntity(-1, a), nodeAndEntity(-2, b), nodeAndEntity(-3, c), nodeAndEntity(-4, d) }
+  sp.addedSegments = { segment(-5, -1, -2, a, b, { template = spec.template or "street/new_small_road.street_template" }),
+    segment(-6, -3, -4, c, d, { template = spec.template or "street/new_small_road.street_template" }) }
+  P.proposal = sp
+  P.toAdd = { conEntity({ file = "stations/street/underground_station/underground_station.con", x = spec.x, y = spec.y, z = 5 }) }
   return P
 end
 
@@ -1335,6 +1421,20 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % ea)
         self.assertEqual(self.B.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % eb)
 
+    def test_the_replay_verdict_stays_readable_for_simple_proposals_after_a_native_proposal_failed(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("VERDICT_MOCK = true")
+        self.B.issue("NATIVE_BULLDOZE{ edges = { 110 } }")                      # a native Proposal: the engine cannot read its data
+        self.tick(14)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(14)
+        log = self.A.log()
+        self.assertIn("verdict n/a (a native Proposal", log)
+        self.assertIn("builds that rebuild as a native Proposal", log)
+        self.assertNotIn("from now on", log, "the reader is not switched off for every build")
+        self.assertIn("plan=street cons=0 rem=0 nodes=2 segs=1 rmSegs=0 objs=0; verdict critical=false", log)
+
     def test_a_bridge_in_place_of_a_street_is_rebuilt_as_a_street_proposal_on_both_games(self):
         self.start()
         self.B.issue("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_medium_road.street_template' }; local sp = P.proposal; "
@@ -1414,7 +1514,7 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(g.lua("STATE:get().bind['1:1#c1']"), g.lua("FIND_CON('depot/road_depot.con')"), "the depot's construction, not the newest one")
             self.assertIn("1:1#c1/d1", str(g.lua("BOUND_KEYS()")).split())
 
-    def test_node_configurations_are_dropped_when_the_factory_rejects_them_and_the_engine_makes_its_own(self):
+    def test_a_junction_nodes_configuration_is_kept_in_every_form_so_a_factory_that_rejects_it_refuses_the_build(self):
         self.start()
         split = "WITH_CFG(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }, -1, { { -3, 0, -5, 0 } })"
         self.B.issue(split)
@@ -1425,11 +1525,10 @@ class BuildTest(unittest.TestCase):
             g.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' and #parts.cfgAdd > 0 then return 'Unknown exception' end end; CFG_LOG = {}")
         self.B.issue(split.replace("x = 50", "x = 150").replace("edge = 110", "edge = 111") + "")
         self.tick(14)
-        self.assertEqual(self.A.lua("#CFG_LOG"), 0, "second form: the engine makes the lane connections itself")
-        self.assertEqual(self.B.lua("#CFG_LOG"), 0)
-        self.assertSameWorld()
-        self.assertIn("(form 2)", self.A.log())
-        self.assertIsNotNone(self.A.lua("FIND_EDGE(150, 0, 150, 80)"))
+        # a new junction node (three segments) must keep its configuration entry in every form (the engine aborts without one, sweep
+        # 2026-10-13), so the forms that left it out are no way out any more: the build is refused instead of crashing the game
+        self.assertIn("refused", self.A.log())
+        self.assertIsNone(self.A.lua("FIND_EDGE(150, 0, 150, 80)"))
 
     def test_placeholders_are_renumbered_as_a_script_does_when_the_factory_insists(self):
         self.start()
@@ -1569,6 +1668,26 @@ class BuildTest(unittest.TestCase):
         self.assertSameWorld()
         self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig(), "the signal that was there stays, the new one is added")
 
+    def _negative_removed_segment(self, how):
+        # real session 2026-10-13-a: the guest's bus stop shipped rmSegs = { -39433 } and the host refused "removed segment 1:
+        # bad reference". The mock has no native stop, so this covers the capture and the replay of the record, not the engine.
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created; NEGATE_REMOVED(SIGNAL_P, '%s')" % how)
+        body = self.B.lua("CAPTURE_BODY(SIGNAL_P, SIGNAL_CREATED)")
+        self.assertIsInstance(body, str, body)
+        self.assertNotRegex(body, r'rmSegs\\?"\]=\{\[1\]=-', "the removed segment travels as a reference")
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
+        self.tick(12)
+        self.assertNotIn("bad reference", self.A.log())
+        self.assertSameWorld()
+        self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig())
+
+    def test_a_removed_segment_listed_as_a_negative_id_with_its_record_is_named_by_its_ends(self):
+        self._negative_removed_segment("record")
+
+    def test_a_removed_segment_listed_as_a_bare_negative_id_is_named_by_the_added_segment(self):
+        self._negative_removed_segment("bare")
+
     def test_a_signal_is_bulldozed_and_the_one_the_session_added_stays(self):
         self.start()
         self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created")
@@ -1628,6 +1747,54 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(g.lua("STOP_AT('1:1#o1')"), "0.00,0.00,0.00 100.00,0.00,0.00 station/street/bus_stop.mdl grouptrue true")
         ga, gb = self.both("STATE:get().bind['1:1#o1/g']")
         self.assertNotEqual(ga, gb, "another id in each game, one key")
+
+    def test_a_stop_is_found_through_its_new_station_group_when_edge_objects_cannot_be_listed(self):
+        # sweep run 20261013-053645 (B1): the host listed the new STATION_GROUP but no EDGE_OBJECT, the keys were never bound and the
+        # result line read "expected 0 found 0 differs"
+        self.start()
+        for g in (self.A, self.B):
+            g.run("HIDE_ENUM = { EDGE_OBJECT = true }")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1", "1:1#o1/g"], g.label)
+            self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
+
+    def test_a_second_stop_that_joins_an_existing_group_is_keyed_from_the_engines_result_entities(self):
+        # sweep run 20261013-055034 (B2): no new STATION_GROUP, edge objects cannot be listed: only the engine's own result list names the stop
+        self.start()
+        for g in (self.A, self.B):
+            g.run("HIDE_ENUM = { EDGE_OBJECT = true }; WORLD[900] = { STATION_GROUP = { stations = {} } }; JOIN_GROUP = 900")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = false }")
+        self.tick(40)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1"], g.label)
+            self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
+
+    def test_a_result_that_differs_says_what_was_expected_and_found_for_each_kind(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("HIDE_ENUM = { EDGE_OBJECT = true, STATION_GROUP = true }")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(40)
+        log = self.A.log()
+        self.assertIn("RESULT DIFFERS", log)
+        self.assertIn("1 road-side stop(s)", log)
+        self.assertIn("found new by component: [EDGE_OBJECT 0, STATION_GROUP 0, GROUP_STATION 0]", log)
+        self.assertIn("stops keyed 0 of 1", log)
+
+    def test_a_stop_on_a_segment_that_already_has_two_stops_keeps_them_and_logs_both_sides(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("ADD_OBJECT(901, 110, 'station/street/bus_stop.mdl', 0.25, 0); MAKE_STOP(901); ADD_OBJECT(902, 110, 'station/street/bus_stop.mdl', 0.75, 1); MAKE_STOP(902)")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("COUNT('STATION')"), 3, g.label)
+        self.assertRegex(self.A.log(), r"stop: replaced segment \d+: objects here \[901/0 902/1\]")
 
     def test_two_stops_in_one_step_are_not_taken_for_each_others(self):
         self.start()
@@ -1705,11 +1872,11 @@ class BuildTest(unittest.TestCase):
         self.tick(14)
         ea1, ea3 = edge(self.A, 0, 0, 50, 0), edge(self.A, 50, 0, 50, 80)
         self.assertNotEqual(ea1, eb1)
-        self.assertEqual(self.A.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (ea1, ea3), "the host's configuration names the host's segments")
-        self.assertEqual(self.B.lua("CFG_LOG[1].lanes[1]"), "%d>%d" % (eb1, eb3))
-        self.assertEqual(self.A.lua("CFG_LOG[1].crosswalks"), 1)
-        self.assertTrue(self.A.lua("CFG_LOG[1].dss"))
-        self.assertEqual(self.A.lua("CFG_LOG[1].node"), int(self.A.lua("FIND_NODE(50, 0, 0)")))
+        self.assertEqual(self.A.lua("CFG_LOG[#CFG_LOG].lanes[1]"), "%d>%d" % (ea1, ea3), "the host's configuration names the host's segments")
+        self.assertEqual(self.B.lua("CFG_LOG[#CFG_LOG].lanes[1]"), "%d>%d" % (eb1, eb3))
+        self.assertEqual(self.A.lua("CFG_LOG[#CFG_LOG].crosswalks"), 1)
+        self.assertTrue(self.A.lua("CFG_LOG[#CFG_LOG].dss"))
+        self.assertEqual(self.A.lua("CFG_LOG[#CFG_LOG].node"), int(self.A.lua("FIND_NODE(50, 0, 0)")))
 
     # ---- terrain
 
@@ -1824,6 +1991,76 @@ end
 '''
 
 
+class TrackEdgeTest(BuildTest):
+    """The segment of a track build carries its track type and catenary (SegmentAndEntity.trackEdge): a replay without it is a street edge."""
+
+    def test_the_track_type_and_catenary_travel_and_a_road_keeps_the_default(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, track = true, trackType = 2, catenary = true }")
+        self.tick(14)
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
+        self.tick(14)
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("tostring(GAME.applied[1].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[1].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "2 true", g.label)
+        self.assertEqual(self.A.lua("tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "0 false", "a road stays default")
+
+
+class RealTrackTemplateTest(BuildTest):
+    """A user's track has the template ::/infrastructure/track/simple/simple.street_template, whose name contains the text of a
+    construction's own piece. It must still travel with its geometry and track type (real session 2026-10-13: it was captured
+    as a bare piece and refused as "Construction Not Possible" on both games)."""
+
+    def test_a_track_with_the_simple_template_keeps_its_geometry_and_track_type(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, track = true, trackType = 1, catenary = true, template = 'track/simple/simple.street_template' }")
+        self.tick(14)
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("#GAME.applied"), 1, g.label)
+            e = "GAME.applied[1].args[1].streetProposal.edgesToAdd[1]"
+            self.assertEqual(g.lua("tostring(%s.trackEdge.trackType) .. ' ' .. tostring(%s.trackEdge.catenary)" % (e, e)), "1 true", g.label)
+            self.assertEqual(g.lua("tostring(%s.comp.position1.x) .. ' ' .. tostring(%s.comp.tangent0.x)" % (e, e)), "400 100", g.label)
+
+
+class ReplayIgnoreErrorsBase:
+    """FEVERLINK3_REPLAY_IGNORE_ERRORS: a build that adds and removes constructions is replayed with ignoreErrors on (default off)."""
+
+    switch = None
+
+    def setUp(self):
+        self._old = os.environ.get("FEVERLINK3_REPLAY_IGNORE_ERRORS")
+        if self.switch is None:
+            os.environ.pop("FEVERLINK3_REPLAY_IGNORE_ERRORS", None)
+        else:
+            os.environ["FEVERLINK3_REPLAY_IGNORE_ERRORS"] = self.switch
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        if self._old is None:
+            os.environ.pop("FEVERLINK3_REPLAY_IGNORE_ERRORS", None)
+        else:
+            os.environ["FEVERLINK3_REPLAY_IGNORE_ERRORS"] = self._old
+
+    def replayed_ctx(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("WORLD[57] = { CONSTRUCTION = CON_COMP('town/house_a.con', 350, 5, 0) }")
+        self.B.issue("NATIVE_ROAD_MOVING{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 57 }")
+        self.tick(14)
+        return str(self.A.lua("BUILD_CTX[1]"))
+
+class ReplayIgnoreErrorsOffTest(ReplayIgnoreErrorsBase, BuildTest):
+    def test_off_by_default(self):
+        self.assertIn("ie=false", self.replayed_ctx())
+
+
+class ReplayIgnoreErrorsOnTest(ReplayIgnoreErrorsBase, BuildTest):
+    switch = "1"
+
+    def test_on_with_the_switch(self):
+        self.assertIn("ie=true", self.replayed_ctx())
+
+
 class PureBuildTest(unittest.TestCase):
     """The build schema alone, in a mocked world, without the bridge."""
 
@@ -1889,6 +2126,180 @@ class PureBuildTest(unittest.TestCase):
                "local added = sp.addedSegments; local s = added[3]; local c = s.comp; c.node1 = 99999; c.laneConfigs = {}; c.objects = { { 123456, 1 } }; s.comp = c; "
                "added[3] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
         self.assertEqual(self.ev("PLAN_OF(%s)" % odd), "withStreet")
+
+    def test_the_tunnel_pieces_of_an_underground_station_entrance_are_left_to_its_script(self):
+        # real session 2026-10-13: planned "combined", the segments the station's script makes itself were added twice and the engine answered
+        # "Construction Not Possible" on the other game; a free road next to a moved town building stays a street build
+        road = "a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }"
+        self.assertEqual(self.ev("PLAN_OF(NATIVE_UNDERGROUND{ x = 1195, y = 513 })"), "construction")
+        # one piece of it joined to a node of the world is a street
+        joined = ("(function() local P = NATIVE_UNDERGROUND{ x = 100, y = 0 }; local sp = P.proposal; local added = sp.addedSegments; "
+                  "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "withStreet")
+        self.assertEqual(self.ev("PLAN_OF(NATIVE_ROAD_MOVING{ %s, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 54 })" % road), "combined")
+
+    def test_the_pieces_a_construction_brings_are_the_ones_its_dry_run_adds_not_a_guess_by_shape(self):
+        # sweep run 20261013-064236 (B5): the shape guess ("both ends new nodes within 200 m of the construction") decided which tunnel pieces are the
+        # construction's own; the engine's own dry run of the construction now decides, the guess is the fallback
+        joined = ("(function() local P = NATIVE_UNDERGROUND{ x = 100, y = 0 }; local sp = P.proposal; local added = sp.addedSegments; "
+                  "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        pieces = ("SCRIPT_PIECES = function(p) return { { p0 = { x = 130, y = 8, z = -13 }, p1 = { x = 120, y = 5, z = -13 } }, "
+                  "{ p0 = { x = 80, y = -5, z = -13 }, p1 = { x = 70, y = -8, z = -13 } } } end")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "withStreet", "the guess alone takes a piece joined to the world for a street")
+        self.ev("(function() %s end)()" % pieces)
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "construction", "the engine's dry run says both pieces are the construction's own (either way round)")
+        # a dry run that adds none of the record's pieces leaves all of them street (nothing is the construction's own)
+        self.ev("(function() SCRIPT_PIECES = function(p) return { { p0 = { x = 5000, y = 5000, z = 0 }, p1 = { x = 5010, y = 5000, z = 0 } } } end end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "combined")
+        # a dry run that answers with no piece at all falls back to the shape guess
+        self.ev("(function() SCRIPT_PIECES = function(p) return {} end end)()")
+        self.assertEqual(self.ev("PLAN_OF(NATIVE_UNDERGROUND{ x = 1195, y = 513 })"), "construction")
+
+    def test_the_world_readback_of_a_records_segments_names_the_edge_or_says_there_is_none(self):
+        # the trace line both games write after a build (build.pieces), to compare what each ended up with
+        code = """(function()
+            local M, C, ctx = PURE()
+            local P = SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }
+            local body = M.capture(P, {}, ctx)
+            local before = table.concat(M.readPieces(body), '|')
+            APPLY_BUILD(P)
+            return before .. '##' .. table.concat(M.readPieces(body), '|')
+        end)()"""
+        before, after = self.ev(code).split("##")
+        self.assertIn("NO edge with these ends in this game", before)
+        self.assertRegex(after, r"edge \d+ type=\S+ typeIndex=\S+ roadType=\S+ p0=300\.000,0\.000,0\.000 p1=400\.000,0\.000,0\.000")
+
+    def test_a_removed_segment_that_arrives_as_the_bitwise_not_of_its_id_is_the_edge_it_names_not_the_next_one(self):
+        # sweep run 20261013-074329 (B1): read after the build, the stop tool's removed segment 39879 came as -39880; taken as -id it was the edge
+        # 39880 elsewhere and the replay removed that one
+        code = """(function()
+            ADD_EDGE(5000, 100, 101, 0, 'street/new_medium_road.street_template')
+            ADD_EDGE(5001, 101, 102, 0, 'street/new_medium_road.street_template')
+            local M, C, ctx = PURE()
+            local P = NATIVE_BULLDOZE{ edges = { 5000 } }
+            local sp = P.proposal
+            local rm = sp.removedSegments
+            local r = rm[1]
+            r.entity = -5001
+            rm[1] = r
+            sp.removedSegments = rm
+            P.proposal = sp
+            local body = M.capture(P, {}, ctx)
+            return body.args[1].rmSegs[1].key
+        end)()"""
+        self.assertEqual(self.ev(code), "s:5000")
+
+    def test_a_stop_or_signal_takes_its_removed_segment_from_the_added_segments_ends_not_from_the_engines_ids(self):
+        # sweep runs 20261013-074329 / -075916: the removed id read after the build was 1 or 3 off, or a neighbour sharing the end node
+        code = """(function(reported, drop)
+            ADD_EDGE(5003, 120, 100, 0, 'street/new_medium_road.street_template')
+            local M, C, ctx = PURE()
+            local P = NATIVE_SIGNAL{ edge = 110, param = 0.5 }
+            local ok, created = APPLY_BUILD(P)
+            local sp = P.proposal
+            local rm = sp.removedSegments
+            local r = rm[1]
+            r.entity = reported
+            rm[1] = r
+            sp.removedSegments = rm
+            P.proposal = sp
+            if drop then local e = FIND_EDGE(0, 0, 100, 0); if e then WORLD[e] = nil end end
+            local body, why = M.capture(P, { result = created }, ctx)
+            if not body then return 'refused: ' .. tostring(why) end
+            local ref = body.args[1].rmSegs[1]
+            return tostring(ref.key) .. '|' .. tostring(ref.p0.x) .. ',' .. tostring(ref.p1.x)
+        end)"""
+        for wrong in (110, 111, 5003, 113, 107, -111, -5003):
+            self.setUp()   # a world of its own for each
+            self.assertEqual(self.L.eval(code)(wrong, False), "nil|0,100", "reported %s: the ends of the added segment decide" % wrong)
+        self.setUp()
+        self.assertTrue(self.L.eval(code)(111, True).startswith("refused: the segment this build replaces"), "no edge with those ends: the record is refused")
+
+    def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
+        # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
+        code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }, {}, ctx); "
+                "local rec = body.args[1]; rec.rmSegs[1] = -5; local ok, plan = pcall(M.classify, rec); return ok and 'ok:' .. tostring(plan) or 'raised: ' .. tostring(plan) end)()")
+        self.assertEqual(self.ev(code), "ok:street")
+        code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_BULLDOZE{ edges = { 110 } }, {}, ctx); "
+                "local rec = body.args[1]; rec.rmSegs[1] = -5; local ok, plan = pcall(M.classify, rec); return ok and 'ok' or 'raised: ' .. tostring(plan) end)()")
+        self.assertEqual(self.ev(code), "ok")
+
+    def test_the_guard_drops_node_configuration_and_object_removals_this_game_has_nothing_to_remove(self):
+        # the sweep crash 2026-10-13 (Engine.h:323, BaseNodeConfig): a removal of a node configuration on a node without one aborts the engine.
+        # The mock engine aborts the same way; the guard in front of the factory drops what does not exist, in every plan and form.
+        code = """(function()
+            local rec = WIRE_RECORD(SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }).args[1]
+            local pos = STORE(STORE(WORLD[101].BASE_NODE).position)
+            rec.rmNcfg = { { __ref = 'node', key = 's:101', p = { x = pos.x, y = pos.y, z = pos.z } } }
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            local sp = STORE(STORE(args[1]).streetProposal)
+            local left = #sp.nodeConfigsToRemove
+            local ok, err = pcall(APPLY_BUILD, args[1])
+            return tostring(left) .. '|' .. tostring(ok) .. '|' .. tostring(err)
+        end)()"""
+        self.assertEqual(self.ev(code), "0|true|true")
+        # a node that has a configuration keeps its removal
+        code = code.replace("local pos =", "WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} }); local pos =")
+        self.assertEqual(self.ev(code), "1|true|true")
+
+    def test_the_guard_gives_a_new_junction_node_its_configuration_entry_and_keeps_one_the_record_has(self):
+        # the A3 probe of the sweep (2026-10-13): a split with a new node joining three segments and no node configuration entry aborts the engine
+        base = """(function()
+            local rec = WIRE_RECORD(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }).args[1]
+            %s
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            local sp = STORE(STORE(args[1]).streetProposal)
+            local ok, err = pcall(APPLY_BUILD, args[1])
+            return tostring(#sp.nodeConfigsToAdd) .. '|' .. tostring(ok) .. '|' .. tostring(err):sub(1, 20)
+        end)()"""
+        got = self.ev(base % "rec.ncfg = {}").split("|")
+        self.assertEqual(got[0], "1")           # the guard added the default entry
+        self.assertEqual(got[1], "true")        # and the engine did not abort
+
+    def test_the_guard_keeps_the_entry_a_record_has_for_its_new_junction_node(self):
+        base = """(function()
+            local rec = WIRE_RECORD(NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }).args[1]
+            %s
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            local sp = STORE(STORE(args[1]).streetProposal)
+            local ok, err = pcall(APPLY_BUILD, args[1])
+            return tostring(#sp.nodeConfigsToAdd) .. '|' .. tostring(ok) .. '|' .. tostring(err):sub(1, 20)
+        end)()"""
+        own = "rec.ncfg = { { node = rec.nodes[1].id, lc = {}, cw = {}, pref = 2 } }"
+        got = self.ev(base % own).split("|")
+        self.assertEqual(got[:2], ["1", "true"])
+
+    def _stop_with_lane_on_the_replaced_segment(self, extra=""):
+        return """(function()
+            %s
+            local rec = WIRE_RECORD(SIMPLE_STOP{ edge = 110, param = 0.5, left = true }).args[1]
+            local pos = STORE(STORE(WORLD[101].BASE_NODE).position)
+            local node = { __ref = 'node', key = 's:101', p = { x = pos.x, y = pos.y, z = pos.z } }
+            WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} })
+            rec.rmNcfg = { node }
+            rec.ncfg = { { node = node, lc = { { s0 = rec.rmSegs[1], l0 = 0, s1 = -1, l1 = 0, road = true } }, cw = { rec.rmSegs[1] }, pref = 2 } }
+            local args, why = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            if not args then return 'refused: ' .. tostring(why) end
+            local ok, err = APPLY_BUILD(args[1])
+            return tostring(ok) .. '|' .. tostring(err) .. '|' .. (CFG_LOG[1] and CFG_LOG[1].lanes[1] or 'none')
+        end)()""" % extra
+
+    def test_a_stop_maps_the_lane_connections_of_its_replaced_segment_to_the_replacement(self):
+        # sweep run 20261013-060028 (B3): lane connections naming the removed segment by its real key went to the engine and the factory threw
+        got = self.ev(self._stop_with_lane_on_the_replaced_segment())
+        self.assertTrue(got.startswith("true|"), got)
+        self.assertEqual(got.split("|")[2].split(">")[0], "-1")
+
+    def test_the_node_configurations_that_changed_since_a_snapshot_are_a_nodecfg_record(self):
+        code = ("(function() local M, C, ctx = PURE(); "
+                "WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} }); "
+                "local before = M.nodeConfigSnapshot(); "
+                "local none, why = M.nodeConfigDelta(before, ctx); "
+                "local lc = D('LaneConnection', { segment0 = 110, lane0 = 0, segment1 = 111, lane1 = 0, withRoad = true }); "
+                "WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = { lc } }); "
+                "local body = M.nodeConfigDelta(before, ctx); "
+                "return tostring(none) .. '/' .. tostring(why) .. '/' .. tostring(body and M.classify(body.args[1])) .. '/' .. tostring(body and #body.args[1].ncfg) end)()")
+        self.assertEqual(self.ev(code), "nil/no node configuration changed/nodecfg/1")
 
     def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
         def cat(code):

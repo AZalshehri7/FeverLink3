@@ -268,7 +268,7 @@ fn host_only_kinds_from_a_player_are_dropped_and_never_relayed() {
     h.player_game(a, MessageKind::Session, &json(&state));
     let load = ResyncLoadMessage { id: 1, name: "evil".into(), sha256: "00".into() };
     h.player_game(a, MessageKind::ResyncLoad, &json(&load));
-    let request = ChecksumRequestMessage { n: 9, at: 0, paused: false };
+    let request = ChecksumRequestMessage { n: 9, at: 0, paused: false, full: true };
     h.player_game(a, MessageKind::ChecksumRequest, &json(&request));
     assert_eq!(3, h.host.dropped());
     assert_eq!(before, h.p(b).game.len());
