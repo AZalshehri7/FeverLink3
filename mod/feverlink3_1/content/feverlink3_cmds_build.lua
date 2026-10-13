@@ -1575,6 +1575,45 @@ guardProposal = function(proposal)
 			if e and A.comp(e, "EDGE_OBJECT") then return true end
 			return false, "no EDGE_OBJECT"
 		end, "object")
+		-- a lane connection or crosswalk that names a segment this proposal removes is dangling (MPFever: "the engine fails a lookup, map_util Get
+		-- assert"): dropped. The stop plan maps its own replaced segment to the replacement before it gets here.
+		do
+			local goneEdge = ids(names.rmSegs)
+			if next(goneEdge) then
+				local list = A.list(st, names.ncfg)
+				local touched = false
+				for i, nc in ipairs(list) do
+					local comp = get(nc, "comp")
+					if comp ~= nil then
+						local lcs, keepL, cws, keepC = A.list(comp, "laneConnections"), {}, A.list(comp, "crosswalks"), {}
+						for _, l in ipairs(lcs) do
+							local a, b = get(l, "segment0"), get(l, "segment1")
+							if goneEdge[a] or goneEdge[b] then
+								trace("build.guard", string.format("dropped lane connection of node %s (names the removed segment %s)", tostring(get(nc, "entity")), tostring(goneEdge[a] and a or b)))
+								dropped = dropped + 1
+							else keepL[#keepL + 1] = l end
+						end
+						for _, x in ipairs(cws) do
+							if goneEdge[x] then
+								trace("build.guard", string.format("dropped crosswalk of node %s (names the removed segment %s)", tostring(get(nc, "entity")), tostring(x)))
+								dropped = dropped + 1
+							else keepC[#keepC + 1] = x end
+						end
+						if #keepL < #lcs or #keepC < #cws then
+							comp.laneConnections = keepL
+							comp.crosswalks = keepC
+							nc.comp = comp
+							list[i] = nc
+							touched = true
+						end
+					end
+				end
+				if touched then
+					st[names.ncfg] = list
+					changed = true
+				end
+			end
+		end
 		-- a NEW node that joins three or more of the segments the proposal adds needs an entry (real records: a new node of one or two
 		-- segments has one only sometimes, so the threshold of three is the harness finding, not yet seen in a real record)
 		local joins = {}
@@ -1994,7 +2033,34 @@ PLAN.stop = function(rec, R, f, notes, form)
 	req(c, "objects", keep)
 	req(e, "comp", c)
 	local eos, removeIds, cfgs = {}, {}, {}
-	for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, R) end
+	-- What the two games see on the replaced segment, both sides in the log: the objects this game's segment carries (kept), and the objects the
+	-- record's segment carried (placeholders -4e8-k are the new ones). Sweep run 20261013-060028 (B3): a record whose removed segment
+	-- (737,-31 -> 694,-110) was not the segment it added (737,-31 -> 676,2.5) was refused by the factory ("Unknown exception").
+	pcall(function()
+		local mine, theirs = {}, {}
+		for _, o in ipairs(A.objectsOf(edge)) do mine[#mine + 1] = tostring(o[1]) .. "/" .. tostring(o[2]) end
+		for _, o in ipairs(s.objects or {}) do
+			local id = type(o) == "table" and o[1] or o
+			theirs[#theirs + 1] = (type(id) == "table" and tostring(id.key or "ref") or tostring(id)) .. "/" .. tostring(type(o) == "table" and o[2] or "?")
+		end
+		local msg = string.format("replaced segment %d: objects here [%s], in the record [%s]", edge, table.concat(mine, " "), table.concat(theirs, " "))
+		local sc = s.c or {}
+		local function far(a, b) return a and b and (abs(a.x - b.x) > 1 or abs(a.y - b.y) > 1) end
+		if far(sc.p0, info.p0) or far(sc.p1, info.p1) then
+			msg = msg .. string.format("; WARNING the record's new segment (%.0f,%.0f -> %.0f,%.0f) is not the segment it removes (%.0f,%.0f -> %.0f,%.0f)",
+				(sc.p0 or {}).x or 0, (sc.p0 or {}).y or 0, (sc.p1 or {}).x or 0, (sc.p1 or {}).y or 0, info.p0.x, info.p0.y, info.p1.x, info.p1.y)
+		end
+		log("stop: " .. msg)
+		C.tracer("build")("build.stop", msg)
+	end)
+	-- every lane connection and crosswalk of the node configurations that names the replaced segment names its replacement (-1): the removed
+	-- segment is gone once the proposal runs, a configuration that still names it is the dangling lookup the engine fails on
+	local RC = setmetatable({ edgeOr = function(v)
+		local e2 = R.edgeOr(v)
+		if e2 == edge then return -1 end
+		return e2
+	end }, { __index = R })
+	for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, RC) end
 	for i, o in ipairs(rec.objs) do eos[i] = newEdgeObject(o, R, -1, notes, form) end
 	for id in pairs(gone) do removeIds[#removeIds + 1] = id end
 	table.sort(removeIds)

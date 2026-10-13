@@ -523,6 +523,16 @@ function APPLY_BUILD(p)
   for _, e in ipairs(P.cfgRem) do
     if not exists(e, "BASE_NODE_CONFIG") then error("ENGINE ASSERT Engine.h:323 GetComponentDataIndex: Assertion 'it != components.end()' failed (BaseNodeConfig, entity " .. tostring(e) .. ")", 0) end
   end
+  -- a node configuration whose lane connection names a segment the proposal removes is a lookup the engine fails ("Unknown exception")
+  do
+    local goneE = {}
+    for _, e in ipairs(P.edgesRem) do goneE[e] = true end
+    for _, n in ipairs(P.cfgAdd) do
+      for _, l in ipairs(n.comp.laneConnections) do
+        if goneE[l.segment0] or goneE[l.segment1] then return false, "lane connection refers to the removed segment " .. tostring(goneE[l.segment0] and l.segment0 or l.segment1) end
+      end
+    end
+  end
   local placeholders = {}
   for _, n in ipairs(P.nodesAdd) do
     local id = n.entity
@@ -1767,6 +1777,17 @@ class BuildTest(unittest.TestCase):
         self.assertIn("found new by component: [EDGE_OBJECT 0, STATION_GROUP 0, GROUP_STATION 0]", log)
         self.assertIn("stops keyed 0 of 1", log)
 
+    def test_a_stop_on_a_segment_that_already_has_two_stops_keeps_them_and_logs_both_sides(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("ADD_OBJECT(901, 110, 'station/street/bus_stop.mdl', 0.25, 0); MAKE_STOP(901); ADD_OBJECT(902, 110, 'station/street/bus_stop.mdl', 0.75, 1); MAKE_STOP(902)")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("COUNT('STATION')"), 3, g.label)
+        self.assertRegex(self.A.log(), r"stop: replaced segment \d+: objects here \[901/0 902/1\]")
+
     def test_two_stops_in_one_step_are_not_taken_for_each_others(self):
         self.start()
         for g in (self.A, self.B):
@@ -2162,6 +2183,27 @@ class PureBuildTest(unittest.TestCase):
         own = "rec.ncfg = { { node = rec.nodes[1].id, lc = {}, cw = {}, pref = 2 } }"
         got = self.ev(base % own).split("|")
         self.assertEqual(got[:2], ["1", "true"])
+
+    def _stop_with_lane_on_the_replaced_segment(self, extra=""):
+        return """(function()
+            %s
+            local rec = WIRE_RECORD(SIMPLE_STOP{ edge = 110, param = 0.5, left = true }).args[1]
+            local pos = STORE(STORE(WORLD[101].BASE_NODE).position)
+            local node = { __ref = 'node', key = 's:101', p = { x = pos.x, y = pos.y, z = pos.z } }
+            WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} })
+            rec.rmNcfg = { node }
+            rec.ncfg = { { node = node, lc = { { s0 = rec.rmSegs[1], l0 = 0, s1 = -1, l1 = 0, road = true } }, cw = { rec.rmSegs[1] }, pref = 2 } }
+            local args, why = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, false, false, true, false } })
+            if not args then return 'refused: ' .. tostring(why) end
+            local ok, err = APPLY_BUILD(args[1])
+            return tostring(ok) .. '|' .. tostring(err) .. '|' .. (CFG_LOG[1] and CFG_LOG[1].lanes[1] or 'none')
+        end)()""" % extra
+
+    def test_a_stop_maps_the_lane_connections_of_its_replaced_segment_to_the_replacement(self):
+        # sweep run 20261013-060028 (B3): lane connections naming the removed segment by its real key went to the engine and the factory threw
+        got = self.ev(self._stop_with_lane_on_the_replaced_segment())
+        self.assertTrue(got.startswith("true|"), got)
+        self.assertEqual(got.split("|")[2].split(">")[0], "-1")
 
     def test_the_node_configurations_that_changed_since_a_snapshot_are_a_nodecfg_record(self):
         code = ("(function() local M, C, ctx = PURE(); "
