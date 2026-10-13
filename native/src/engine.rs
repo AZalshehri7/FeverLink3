@@ -192,6 +192,45 @@ pub unsafe fn payload_of(cmd: *const u8) -> Option<usize> {
     (payload != 0).then_some(payload)
 }
 
+/// The flags a build command carries: the members of its Context and the two flags after it, as the engine's own Lua binding
+/// names them (`docs/research/SPIKE_NATIVE_COMMAND.md` 3.1; the offsets are the layout table's in `portable.rs`). They tell the mod
+/// how the tool built the command, so every game rebuilds it with the same flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildFlags {
+    pub gather_buildings: bool,
+    pub gather_fields: bool,
+    pub check_terrain_alignment: bool,
+    pub cleanup_street_graph: bool,
+    pub extend_proposal_redo_pillars: bool,
+    pub ignore_errors: bool,
+    pub player_initiated: bool,
+}
+
+/// Offsets inside a build command's payload.
+const FLAG_OFFSETS: [usize; 7] = [0x358, 0x359, 0x360, 0x362, 0x3b2, 0x3d1, 0x3d2];
+
+/// Reads the flags out of a build command's payload; `None` when any of it is not readable memory.
+///
+/// # Safety
+/// `payload` may be any value; only readable bytes are read.
+pub unsafe fn build_flags(payload: usize) -> Option<BuildFlags> {
+    let mut v = [false; 7];
+    for (flag, off) in v.iter_mut().zip(FLAG_OFFSETS) {
+        let at = payload.checked_add(off)?;
+        // SAFETY: readable was checked for exactly this byte.
+        *flag = unsafe { mem::readable(at as *const u8, 1).then(|| *(at as *const u8)) }? != 0;
+    }
+    Some(BuildFlags {
+        gather_buildings: v[0],
+        gather_fields: v[1],
+        check_terrain_alignment: v[2],
+        cleanup_street_graph: v[3],
+        extend_proposal_redo_pillars: v[4],
+        ignore_errors: v[5],
+        player_initiated: v[6],
+    })
+}
+
 /// The verdict byte the apply function wrote into the command at `cmd`: true when it ran. `None` when unreadable.
 ///
 /// # Safety
@@ -493,6 +532,28 @@ mod tests {
         unsafe { *(command.0.as_mut_ptr() as *mut usize) = payload.as_ptr() as usize };
         command.0[0x20] = 0x77; // a field the move must carry along
         Cmd { command, payload }
+    }
+
+    #[test]
+    fn the_flags_of_a_build_command_are_read_at_the_layout_offsets() {
+        let mut c = command(52);
+        for off in [0x359usize, 0x362, 0x3d2] {
+            c.payload[off] = 1;
+        }
+        let f = unsafe { build_flags(c.payload.as_ptr() as usize) }.expect("readable");
+        assert_eq!(
+            f,
+            BuildFlags {
+                gather_buildings: false,
+                gather_fields: true,
+                check_terrain_alignment: false,
+                cleanup_street_graph: true,
+                extend_proposal_redo_pillars: false,
+                ignore_errors: false,
+                player_initiated: true,
+            }
+        );
+        assert!(unsafe { build_flags(0) }.is_none(), "unreadable memory gives nothing");
     }
 
     struct Call {

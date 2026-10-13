@@ -287,7 +287,7 @@ fn random_event(r: &mut StdRng) -> Event {
             kinds: (0..r.gen_range(0..5)).map(|_| (random_text(r, 12), r.gen())).collect(),
             sites: r.gen_range(0..1000),
         },
-        1 => Event::Held { id: r.gen(), kind: r.gen(), site: r.gen(), ms: r.gen(), done: r.gen() },
+        1 => Event::Held { id: r.gen(), kind: r.gen(), site: r.gen(), ms: r.gen(), done: r.gen(), flags: None },
         2 => Event::Released { id: r.gen(), reason: reasons[r.gen_range(0..6)], ms: r.gen() },
         3 => Event::Dropped { id: r.gen(), reason: reasons[r.gen_range(0..6)] },
         4 => Event::Applied { id: r.gen(), ok: r.gen() },

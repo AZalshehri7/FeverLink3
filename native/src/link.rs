@@ -20,6 +20,8 @@ use feverlink3_launcher::gamelink::{self, Line};
 use feverlink3_launcher::luatext;
 use serde_json::Value;
 
+use crate::engine::BuildFlags;
+
 /// The mod writes, the module reads.
 pub const CTL_FILE: &str = "native_ctl.log";
 /// The module writes, the mod reads.
@@ -461,6 +463,8 @@ pub enum Event {
         /// Cancelling this command fires the tool's own completion callback first (`FEVERLINK3_STRICT_FIRE_DONE=1` and a callback that
         /// was read out of the executable).
         done: bool,
+        /// The Context members and flags of a build command, read from the command itself.
+        flags: Option<BuildFlags>,
     },
     /// A held command was handed back to the engine (`reason` says why now).
     Released {
@@ -550,7 +554,7 @@ impl Event {
                 ("sites", Lua::uint(*sites as u64)),
                 ("version", Lua::str(version)),
             ]),
-            Event::Held { id, kind, site, ms, done } => {
+            Event::Held { id, kind, site, ms, done, flags } => {
                 let mut fields = vec![
                     ("id", Lua::uint(*id)),
                     ("kind", Lua::Int(i64::from(*kind))),
@@ -559,6 +563,23 @@ impl Event {
                 ];
                 if *done {
                     fields.insert(0, ("done", Lua::Bool(true)));
+                }
+                if let Some(f) = flags {
+                    fields.insert(
+                        0,
+                        (
+                            "ctx",
+                            Lua::map([
+                                ("align", Lua::Bool(f.check_terrain_alignment)),
+                                ("buildings", Lua::Bool(f.gather_buildings)),
+                                ("cleanup", Lua::Bool(f.cleanup_street_graph)),
+                                ("fields", Lua::Bool(f.gather_fields)),
+                                ("ie", Lua::Bool(f.ignore_errors)),
+                                ("pi", Lua::Bool(f.player_initiated)),
+                                ("redo", Lua::Bool(f.extend_proposal_redo_pillars)),
+                            ]),
+                        ),
+                    );
                 }
                 Lua::Map(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
             }
@@ -991,9 +1012,31 @@ mod tests {
     }
 
     #[test]
+    fn a_held_build_carries_its_flags_to_the_mod() {
+        let flags = BuildFlags {
+            gather_buildings: true,
+            gather_fields: true,
+            check_terrain_alignment: false,
+            cleanup_street_graph: true,
+            extend_proposal_redo_pillars: true,
+            ignore_errors: false,
+            player_initiated: true,
+        };
+        let ev = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: true, flags: Some(flags) };
+        let json: Value = serde_json::from_slice(&luatext::lua_to_json(&ev.payload()).unwrap()).unwrap();
+        assert_eq!(
+            json["ctx"],
+            serde_json::json!({"align": false, "buildings": true, "cleanup": true, "fields": true, "ie": false, "pi": true, "redo": true})
+        );
+        let none = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: false, flags: None };
+        let json: Value = serde_json::from_slice(&luatext::lua_to_json(&none.payload()).unwrap()).unwrap();
+        assert!(json.get("ctx").is_none(), "a command without readable flags says nothing about them");
+    }
+
+    #[test]
     fn every_event_has_a_kind_and_a_payload_the_mod_can_parse() {
         let events = vec![
-            Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 1500, done: false },
+            Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 1500, done: false, flags: None },
             Event::Released { id: 1, reason: "release", ms: 2500 },
             Event::Dropped { id: 2, reason: "cancel" },
             Event::Applied { id: 1, ok: true },
@@ -1054,7 +1097,7 @@ mod tests {
         );
         let line = |e: Event| e.log_line().unwrap();
         assert_eq!(
-            line(Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 5, done: false }),
+            line(Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 5, done: false, flags: None }),
             "event held: command 1, kind 52, from tool site 0x4d396f"
         );
         assert_eq!(line(Event::Released { id: 1, reason: "release", ms: 5 }), "event released: command 1 (release)");
@@ -1084,7 +1127,7 @@ mod tests {
     #[test]
     fn golden_event_lines() {
         assert_eq!(
-            EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120, done: false }),
+            EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120, done: false, flags: None }),
             "1\theld\tnative\t{[\"id\"]=3,[\"kind\"]=52,[\"ms\"]=120,[\"site\"]=5060975}\n"
         );
         assert_eq!(

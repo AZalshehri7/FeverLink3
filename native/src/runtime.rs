@@ -607,7 +607,14 @@ impl Runtime {
                     if let Some(held) = unsafe { engine::capture(&engine, args) } {
                         let done = held.done_ok();
                         let payload = held.payload();
-                        match machine.hold_with(kind, rva, done, held, now) {
+                        // how the tool built the command (Context members, ignoreErrors, playerInitiated): a preview carries none of it
+                        let flags = if self.build.kind_by_name("build_proposal") == Some(kind) {
+                            // SAFETY: only readable memory is read.
+                            unsafe { engine::build_flags(payload) }
+                        } else {
+                            None
+                        };
+                        match machine.hold_with(kind, rva, done, flags, held, now) {
                             Ok(id) => {
                                 plan.held_here = true;
                                 if (self.dump.get().is_some()
