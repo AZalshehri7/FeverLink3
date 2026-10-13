@@ -26,6 +26,7 @@ pub mod link;
 pub mod patch;
 pub mod pe;
 pub mod plan;
+pub mod portable;
 pub mod scan;
 pub mod townseed;
 

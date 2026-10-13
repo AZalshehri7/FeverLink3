@@ -32,6 +32,7 @@ use crate::dump::{self, Budget, Dumper, Env, Header, LiveMem, Scope};
 use crate::engine::{self, AddArgs, AddFn, EngineFns, Held};
 use crate::hold::{Action, Admit, HoldConfig, HoldMachine};
 use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
+use crate::portable;
 
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
 /// so declared as one that may unwind.
@@ -89,6 +90,8 @@ pub struct Runtime {
     clock: Option<fn() -> Option<u64>>,
     /// The dev-only dump of build commands (`FEVERLINK3_DUMP_COMMANDS`); unset in a normal run.
     dump: OnceLock<Dumper>,
+    /// The dev-only portable text of build commands (`FEVERLINK3_PORTABLE_DUMP`); unset in a normal run.
+    portable: OnceLock<portable::Sink>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -131,6 +134,7 @@ impl Runtime {
             waker: OnceLock::new(),
             clock: None,
             dump: OnceLock::new(),
+            portable: OnceLock::new(),
         }
     }
 
@@ -148,6 +152,56 @@ impl Runtime {
                 settings.max_held,
                 settings.max_applied
             ));
+        }
+    }
+
+    /// Switches the dev-only portable text on (`FEVERLINK3_PORTABLE_DUMP`), writing to `dir` when it is known.
+    pub fn enable_portable(&self, settings: portable::Settings, dir: Option<&Path>) {
+        let sink = portable::Sink::new(settings);
+        if let Some(dir) = dir {
+            sink.set_dir(dir);
+        }
+        if self.portable.set(sink).is_ok() {
+            self.say(&format!(
+                "portable: FEVERLINK3_PORTABLE_DUMP is on: build commands are written as portable text into {} (read-only; script commands {}; layout table for game build {})",
+                portable::PORTABLE_FILE,
+                if settings.scripts { "included" } else { "skipped" },
+                portable::LAYOUT_BUILD
+            ));
+        }
+    }
+
+    /// The portable text of the payload at `payload` (or why it is refused) into the portable file.
+    fn portable_payload(&self, event: &str, payload: usize, hold_id: Option<u64>, site: Option<u32>) {
+        let Some(sink) = self.portable.get() else { return };
+        if !sink.has_dir() {
+            return;
+        }
+        let Some(seq) = sink.begin() else { return };
+        let tool =
+            site.and_then(|rva| self.build.ui_site_index(rva)).map(|t| dump::TOOL_NAMES.get(t).copied().unwrap_or("?"));
+        let head = portable::Header {
+            seq,
+            event,
+            hold_id,
+            site_rva: site,
+            tool,
+            t_ms: self.now_ms(),
+            wall_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()),
+            payload,
+        };
+        let text =
+            match portable::encode(&LiveMem, Env { image_base: self.base }, sink.settings, self.build.name, &head) {
+                Ok(p) => p.text,
+                Err(why) => format!(
+                    "=== portable v{} REFUSED event={event} key={} seq={seq} payload={payload:#x}: {why} ===
+",
+                    portable::VERSION,
+                    hold_id.map_or("none".to_string(), |k| k.to_string())
+                ),
+            };
+        if let Err(e) = sink.write(&text) {
+            self.say(&format!("portable: cannot write {}: {e}", portable::PORTABLE_FILE));
         }
     }
 
@@ -304,6 +358,9 @@ impl Runtime {
         if let Some(d) = self.dump.get() {
             d.set_dir(dir);
         }
+        if let Some(p) = self.portable.get() {
+            p.set_dir(dir);
+        }
         Ok(())
     }
 
@@ -417,6 +474,9 @@ impl Runtime {
             crate::log::guarded("add hook (dump)", || {
                 self.dump_payload("held", job.payload, Some(job.id), Some(job.site), Scope::Whole, Budget::Held, None)
             });
+            crate::log::guarded("add hook (portable)", || {
+                self.portable_payload("held", job.payload, Some(job.id), Some(job.site));
+            });
         }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
@@ -484,7 +544,8 @@ impl Runtime {
                         match machine.hold_with(kind, rva, done, held, now) {
                             Ok(id) => {
                                 plan.held_here = true;
-                                if self.dump.get().is_some() && self.build.kind_by_name("build_proposal") == Some(kind)
+                                if (self.dump.get().is_some() || self.portable.get().is_some())
+                                    && self.build.kind_by_name("build_proposal") == Some(kind)
                                 {
                                     plan.dump = Some(DumpJob { id, site: rva, payload });
                                 }
@@ -549,6 +610,19 @@ impl Runtime {
             })
             .flatten()
         });
+        // dev-only portable text of a build command the simulation is about to apply (held ones carry their key)
+        if let Some(sink) = self.portable.get() {
+            crate::log::guarded("apply hook (portable)", || {
+                // SAFETY: only readable memory is read.
+                let payload = unsafe { engine::payload_of(cmd) }?;
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
+                (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                (claimed.is_some() || sink.settings.scripts).then_some(())?;
+                self.portable_payload("apply", payload, claimed, None);
+                Some(())
+            });
+        }
         let result = unsafe { original(sim, cmd) };
         if let Some((payload, seq)) = dumped {
             crate::log::guarded("apply hook (dump after)", || {
@@ -1107,6 +1181,40 @@ mod tests {
         let mut c = Call::new(52, 10);
         unsafe { rt.on_add(c.args(), at(SITE_A)) };
         assert!(!quiet.path().join(dump::DUMP_FILE).exists());
+    }
+
+    #[test]
+    fn the_portable_dump_writes_held_and_released_commands_and_refuses_an_unknown_build() {
+        let dir = TempDir::new("rt-portable");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_lookup(|_| Some("1".into())).unwrap();
+        rt.enable_portable(settings, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let mut call = Call::new(52, 10);
+        unsafe { rt.on_add(call.args(), at(SITE_A)) };
+        ctl(
+            dir.path(),
+            "2	release	1	{[\"id\"]=1}
+",
+        );
+        let mut nop = Call::new(27, 50);
+        unsafe { rt.on_add(nop.args(), at(0x999)) };
+        let mut sim = [0u8; 8];
+        let mut queued = Box::new([0u8; 0x40]);
+        queued[..8].copy_from_slice(&call.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        // a script command is not written at level 1
+        let script = Call::new(52, 77);
+        let mut queued2 = Box::new([0u8; 0x40]);
+        queued2[..8].copy_from_slice(&script.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued2.as_mut_ptr()) };
+        let text = std::fs::read_to_string(dir.path().join(portable::PORTABLE_FILE)).expect("a portable file");
+        let heads: Vec<&str> = text.lines().filter(|l| l.starts_with("=== portable")).collect();
+        // the fake build is not game build 40420: both are refused, with the reason, and nothing is guessed
+        assert_eq!(heads.len(), 2, "{text}");
+        assert!(heads[0].contains("REFUSED event=held key=1") && heads[0].contains("game build 40420"), "{}", heads[0]);
+        assert!(heads[1].contains("REFUSED event=apply key=1"), "{}", heads[1]);
     }
 
     #[test]

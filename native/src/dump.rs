@@ -352,16 +352,16 @@ impl Env {
     }
 }
 
-fn u64_at(b: &[u8], off: usize) -> u64 {
+pub(crate) fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]))
 }
 
-fn u32_at(b: &[u8], off: usize) -> u32 {
+pub(crate) fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap_or([0; 4]))
 }
 
 /// A user-space address that is plausibly a pointer.
-fn pointer_like(w: u64) -> bool {
+pub(crate) fn pointer_like(w: u64) -> bool {
     (0x1_0000..0x0000_8000_0000_0000).contains(&w)
 }
 
