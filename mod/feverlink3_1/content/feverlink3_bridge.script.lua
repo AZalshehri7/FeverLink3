@@ -1238,13 +1238,29 @@ local function simAdvanceBinders(st, now)
 			local ok2, why = pcall(function()
 				local pre = b.pre
 				local sum = pre and pre.sum or (Build and Build.recSummary and Build.recSummary(b.body)) or {}
-				local found = {}
-				for _, comp in ipairs(b.comps) do
-					if comp == "CONSTRUCTION" then
-						for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
-							if #found < 6 then found[#found + 1] = conLine(e) end
-						end
+				-- the counts straight from the record, so the line never depends on the summary reader being there (a missing one read "expected 0")
+				pcall(function()
+					local rec = b.body.args[1]
+					local function n(l) return type(l) == "table" and #l or 0 end
+					local stops = 0
+					for _, o in ipairs(type(rec.objs) == "table" and rec.objs or {}) do
+						if type(o) == "table" and o.kind ~= 2 then stops = stops + 1 end
 					end
+					sum = { cons = n(rec.cons), objs = n(rec.objs), stops = stops, segs = n(rec.segs), rmSegs = n(rec.rmSegs), nodes = n(rec.nodes), add = sum.add }
+				end)
+				local found = {}
+				local counts = {}
+				for _, comp in ipairs(b.comps) do
+					local n = 0
+					for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
+						n = n + 1
+						if comp == "CONSTRUCTION" and #found < 6 then found[#found + 1] = conLine(e) end
+					end
+					counts[#counts + 1] = comp .. " " .. n
+				end
+				local keyed, mine = 0, b.key .. "#o"
+				for k in pairs(st.bind) do
+					if k:sub(1, #mine) == mine and not k:find("/", 1, true) then keyed = keyed + 1 end
 				end
 				local still, total = 0, 0
 				for _, id in ipairs(pre and pre.removed or {}) do
@@ -1252,8 +1268,10 @@ local function simAdvanceBinders(st, now)
 					local idn = tonumber(id)
 					if idn and pcall(function() assert(api.engine.getComponent(idn, api.type.ComponentType.CONSTRUCTION)) end) then still = still + 1 end
 				end
-				return string.format("expected %d construction(s) %s, found %d new CONSTRUCTION-like entit%s [%s]; removed buildings still present: %d of %d checked; the engine's verdict before applying: %s",
-					sum.cons or 0, "[" .. table.concat(sum.add or {}, " ") .. "]", #found, #found == 1 and "y" or "ies", table.concat(found, " "), still, total,
+				return string.format("expected: %d construction(s) %s, %d road-side stop(s) (EDGE_OBJECT + STATION, keyed #o<n>), %d edge object(s) in all, %d segment(s) added / %d removed, %d node(s) added; "
+					.. "found new by component: [%s]; constructions [%s]; stops keyed %d of %d; removed buildings still present: %d of %d checked; the engine's verdict before applying: %s",
+					sum.cons or 0, "[" .. table.concat(sum.add or {}, " ") .. "]", sum.stops or 0, sum.objs or 0, sum.segs or 0, sum.rmSegs or 0, sum.nodes or 0,
+					#counts > 0 and table.concat(counts, ", ") or "nothing was watched", table.concat(found, " "), keyed, sum.stops or 0, still, total,
 					pre and pre.verdict or "n/a (see the build line)")
 			end)
 			pcall(function()

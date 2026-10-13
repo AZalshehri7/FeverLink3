@@ -2287,6 +2287,15 @@ end
 
 -- What a build record holds, for the log: the plan, the counts, the constructions it adds ("file@x,y") and removes ("file@x,y[key]"),
 -- each list cut at 4. Never raises; nil when the body is not a build record.
+-- the stops a record puts on a street: every edge object but a signal (kind 2), as in PLAN.stop
+local function stopCount(rec)
+	local n = 0
+	for _, o in ipairs(type(rec.objs) == "table" and rec.objs or {}) do
+		if type(o) == "table" and o.kind ~= 2 then n = n + 1 end
+	end
+	return n
+end
+
 function M.recSummary(body)
 	local ok, s = pcall(function()
 		local rec = normalise(body.args[1])
@@ -2305,7 +2314,7 @@ function M.recSummary(body)
 		end
 		local plan = M.planOf(body)
 		return { plan = plan or "?", cons = #(rec.cons or {}), rem = #(rec.rem or {}), nodes = #(rec.nodes or {}), segs = #(rec.segs or {}),
-			rmSegs = #(rec.rmSegs or {}), objs = #(rec.objs or {}), add = add, remove = rem }
+			rmSegs = #(rec.rmSegs or {}), objs = #(rec.objs or {}), stops = stopCount(rec), add = add, remove = rem }
 	end)
 	return ok and s or nil
 end
@@ -2446,15 +2455,6 @@ end
 -- is not taken for one of ours. Road-side stops have no building to be named by: <key>#o<n> is the n-th stop the engine
 -- made and <key>#o<n>/g its station group (see below). Returns the map and whether everything expected was found.
 
--- the stops a record puts on a street: every edge object but a signal (kind 2), as in PLAN.stop
-local function stopCount(rec)
-	local n = 0
-	for _, o in ipairs(type(rec.objs) == "table" and rec.objs or {}) do
-		if type(o) == "table" and o.kind ~= 2 then n = n + 1 end
-	end
-	return n
-end
-
 local function bindsComp(body)
 	local rec = body.args and body.args[1]
 	if type(rec) ~= "table" then return nil end
@@ -2507,12 +2507,23 @@ local function bindCreated(body, key, made)
 	-- station's group, which keeps its own key). All or none: a count that is short may mean the engine is not done.
 	local want = stopCount(rec)
 	if want > 0 then
-		local stops, fresh = {}, {}
+		local stops, fresh, have = {}, {}, {}
 		for _, e in ipairs(made) do
 			if A.isStop(e) then
 				stops[#stops + 1] = e
+				have[e] = true
 			elseif A.comp(e, "STATION_GROUP") ~= nil then
 				fresh[e] = true
+			end
+		end
+		-- Sweep run 20261013-053645 (B1, host replay of a bus stop): the new STATION_GROUP was listed but no new EDGE_OBJECT, so the stop
+		-- itself may not be enumerable by component. The new group names its stations: a stop is found there too.
+		for g in pairs(fresh) do
+			for _, st in ipairs(A.list(A.comp(g, "STATION_GROUP"), "stations")) do
+				if type(st) == "number" and not have[st] and A.isStop(st) then
+					have[st] = true
+					stops[#stops + 1] = st
+				end
 			end
 		end
 		table.sort(stops)

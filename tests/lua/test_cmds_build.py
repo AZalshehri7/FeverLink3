@@ -329,6 +329,7 @@ function MAKE_API()
   E.forEachEntityWithComponent = function(fn, t)
     local name = NAMES[t]
     if name == "BASE_NODE" or name == "BASE_EDGE" then error("Cannot loop over this component type") end
+    if name and HIDE_ENUM and HIDE_ENUM[name] then return end   -- a component the engine does not list (sweep 2026-10-13, EDGE_OBJECT)
     if name then
       local ids = {}
       for e, w in pairs(WORLD) do if w[name] then ids[#ids + 1] = e end end
@@ -1728,6 +1729,31 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(g.lua("STOP_AT('1:1#o1')"), "0.00,0.00,0.00 100.00,0.00,0.00 station/street/bus_stop.mdl grouptrue true")
         ga, gb = self.both("STATE:get().bind['1:1#o1/g']")
         self.assertNotEqual(ga, gb, "another id in each game, one key")
+
+    def test_a_stop_is_found_through_its_new_station_group_when_edge_objects_cannot_be_listed(self):
+        # sweep run 20261013-053645 (B1): the host listed the new STATION_GROUP but no EDGE_OBJECT, the keys were never bound and the
+        # result line read "expected 0 found 0 differs"
+        self.start()
+        for g in (self.A, self.B):
+            g.run("HIDE_ENUM = { EDGE_OBJECT = true }")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1", "1:1#o1/g"], g.label)
+            self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
+
+    def test_a_result_that_differs_says_what_was_expected_and_found_for_each_kind(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("HIDE_ENUM = { EDGE_OBJECT = true, STATION_GROUP = true }")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = true }")
+        self.tick(40)
+        log = self.A.log()
+        self.assertIn("RESULT DIFFERS", log)
+        self.assertIn("1 road-side stop(s)", log)
+        self.assertIn("found new by component: [EDGE_OBJECT 0, STATION_GROUP 0]", log)
+        self.assertIn("stops keyed 0 of 1", log)
 
     def test_two_stops_in_one_step_are_not_taken_for_each_others(self):
         self.start()
