@@ -3128,6 +3128,26 @@ local function decodeBuildUnsafe(body, ctx)
 		f.ctx, ctxSource = CTX_FALLBACK, "fallback"
 		log("build " .. plan .. ": the record carries no Context flags (an older record); replayed with the fallback flags")
 	end
+	-- The native module builds the engine's Proposal from the originator's text and swaps it into this command: the command only has to carry
+	-- the constructions (the module takes them from this game's own conversion); its street part is replaced, so no verdict gates it.
+	if ctx and ctx.canInject and type(body.nativeText) == "string" and body.nativeText ~= "" and rec.src == "native" then
+		local okI, built = pcall(function()
+			-- (a build with a construction is sent as the construction alone: the module takes its street part from the text, not from this command)
+			local pl = (#rec.cons > 0 and #rec.rem == 0) and "construction" or plan
+			local form = (FORMS[pl] or { {} })[1]
+			local b = PLAN[pl](rec, R, f, {}, form)
+			if type(b.chain) == "table" and #b.chain > 0 then error("the build needs a chained command", 0) end
+			api.cmd.makeWorldBuildProposalCmd(unpack(b, 1, b.n))
+			return b
+		end)
+		if okI and built then
+			built.plan, built.form, built.ctxSource = plan, 1, ctxSource
+			built.inject = { text = body.nativeText }
+			log("build inject (" .. plan .. "): the engine's proposal comes from the originator's text (" .. #body.nativeText .. " bytes)")
+			return built
+		end
+		log("build inject not used (" .. tostring(built) .. "); the record path builds it")
+	end
 	if PORTABLE_REPLAY and type(body.input) == "string" then
 		local okT, built = pcall(portableReplay, rec, body.input, R, f, ctx and ctx.traceKey)
 		if okT and built then
