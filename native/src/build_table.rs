@@ -80,6 +80,10 @@ pub struct BuildAddrs {
     /// into the engine's `Proposal` (constructions and all). Hooked only with `FEVERLINK3_NATIVE_PATCH=1`, to write `frozenNodes`
     /// into the result before anything checks it (`docs/research/SPIKE_NATIVE_COMMAND.md`, "Input-level conversion").
     pub script_convert: Option<HookSite>,
+    /// `ConstructionUpdate(bool, state*, construction*, ctx*, a5, Proposal* being built)` (0x10c6020, called only from `Convert`, once per
+    /// construction): runs the construction's own update, which adds its entrance street to the proposal. Hooked only with
+    /// `FEVERLINK3_NATIVE_PATCH=1`, to put `frozenNodes` into the proposal before that update runs.
+    pub convert_update: Option<HookSite>,
     /// The simulation's command application: where held commands are counted and released at their stamp.
     pub apply_command: Option<HookSite>,
     /// Inside the game-script system's pool construction: `cmp eax,8 / jge / mov [rsp+20h],1 / call
@@ -198,6 +202,11 @@ pub const BUILDS: &[BuildAddrs] = &[
         script_convert: Some(HookSite {
             rva: 0x010c_6750,
             prologue: &[0x48, 0x8B, 0xC4, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57],
+        }),
+        // `mov [rsp+8],rbx ; push rbp,rsi,rdi,r12,r13,r14` (14 bytes, no rip-relative operand)
+        convert_update: Some(HookSite {
+            rva: 0x010c_6020,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56],
         }),
         // `push rbx,rbp,rsi,rdi,r12,r14,r15 ; sub rsp,50h`
         town_update_size: Some(HookSite {
@@ -331,6 +340,7 @@ mod tests {
         town_develop: None,
         town_update_size: None,
         script_convert: None,
+        convert_update: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,
@@ -370,6 +380,7 @@ mod tests {
                 &b.town_develop,
                 &b.town_update_size,
                 &b.script_convert,
+                &b.convert_update,
                 &b.town_candidates,
                 &b.town_edges,
             ]

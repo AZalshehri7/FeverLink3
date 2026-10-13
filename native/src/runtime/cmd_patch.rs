@@ -126,6 +126,67 @@ impl Runtime {
         self.wake();
     }
 
+    /// Before the construction update inside `Convert` runs: `proposal` is the Proposal being built (it holds the SimpleProposal's
+    /// nodes and segments, not yet the construction's entrance). While an order is armed and describes it (the index form's `adds` is
+    /// the count of nodes the SimpleProposal brought), `proposal.frozenNodes` is written, so that the update sees the nodes the tool's
+    /// own proposal froze. Returns whether anything was armed (the caller then logs what the update left).
+    pub fn before_convert_update(&self, proposal: usize) -> bool {
+        let now = self.now_ms();
+        if !self.patch.pending() {
+            self.ingest_patch_order(now);
+            if !self.patch.pending() {
+                return false;
+            }
+        }
+        let Some(order) = self.patch.peek(now) else { return false };
+        let mem = crate::dump::LiveMem;
+        let nodes = cp::added_nodes(&mem, proposal).map_or("?".to_string(), |n| n.to_string());
+        let outcome = cp::describes_frozen_only(&mem, proposal, &order).and_then(|()| match self.patch_alloc() {
+            Err(why) => Err(cp::Fail::Refuse(why)),
+            Ok(alloc) => cp::apply_proposal_frozen_only(&mem, &LivePoke, &alloc, proposal, &order),
+        });
+        match outcome {
+            Ok(done) => {
+                self.patch.converted_one();
+                self.say(&format!("native patch: convert update: {nodes} nodes before the construction update: PATCHED proposal.frozenNodes {:?} (new block: {})", done.frozen, done.allocated));
+                self.patch.convert_event(Event::Patched {
+                    frozen: done.frozen,
+                    adds: u32::try_from(done.nodes).unwrap_or(u32::MAX),
+                    allocated: done.allocated,
+                });
+            }
+            Err(cp::Fail::NotThis(why)) => {
+                self.say(&format!(
+                    "native patch: convert update: {nodes} nodes before the construction update: skipped: {why}"
+                ));
+                self.patch.convert_event(Event::PatchSkipped {
+                    reason: format!("convert update: {why}"),
+                    kind: None,
+                    site: None,
+                });
+            }
+            Err(cp::Fail::Refuse(why)) => {
+                self.patch.take(now);
+                self.say(&format!(
+                    "native patch: convert update: {nodes} nodes before the construction update: REFUSED: {why}"
+                ));
+                self.patch.report(Event::PatchRefused { reason: format!("convert update: {why}") });
+            }
+        }
+        self.wake();
+        true
+    }
+
+    /// After the construction update: what the proposal holds now (a dump per distinct shape), to see whether the update honoured the
+    /// frozen nodes (no extra nodes of its own) and what it left in the frozen lists.
+    pub fn after_convert_update(&self, proposal: usize) {
+        let (shape, dump) = cp::dump_proposal(&crate::dump::LiveMem, proposal, None);
+        if self.patch.new_shape(&format!("after update: {shape}")) {
+            self.say(&format!("native patch: convert update: after the update: {dump}"));
+            self.patch.convert_event(Event::ConvertDump { text: format!("after the construction update: {dump}") });
+        }
+    }
+
     /// The allocator and layout checks both ways of patching need.
     fn patch_alloc(&self) -> Result<EngineAlloc, String> {
         let alloc =

@@ -189,6 +189,8 @@ pub enum Feature {
     LuaSeed,
     /// The hook on `scripting::Convert` (the native frozenNodes patch).
     Convert,
+    /// The hook on the construction update `Convert` runs (frozenNodes before the entrance is generated).
+    ConvertUpdate,
 }
 
 impl Feature {
@@ -206,6 +208,7 @@ impl Feature {
             Feature::GrowthPick => "town_pick",
             Feature::LuaSeed => "luaseed",
             Feature::Convert => "script_convert",
+            Feature::ConvertUpdate => "script_convert_update",
         }
     }
 }
@@ -409,20 +412,22 @@ fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
 
 /// The hook on `scripting::Convert`: only with the patch switch, and only when the prologue matches.
 fn plan_convert(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
-    let skip = |p: &mut Plan, reason: String| {
-        p.skipped.push(Skip { feature: Feature::Convert, name: "script_convert", reason });
-    };
-    let Some(site) = &build.script_convert else {
-        return skip(p, "the build table has no script_convert site for this build".into());
-    };
-    match verify(image, site.rva, site.prologue) {
-        Ok(()) => p.steps.push(Step::Detour {
-            feature: Feature::Convert,
-            name: "script_convert",
-            rva: site.rva,
-            expected: site.prologue,
-        }),
-        Err(reason) => skip(p, reason),
+    for (feature, name, site) in [
+        (Feature::Convert, "script_convert", &build.script_convert),
+        (Feature::ConvertUpdate, "script_convert_update", &build.convert_update),
+    ] {
+        let Some(site) = site else {
+            p.skipped.push(Skip {
+                feature,
+                name,
+                reason: format!("the build table has no {name} site for this build"),
+            });
+            continue;
+        };
+        match verify(image, site.rva, site.prologue) {
+            Ok(()) => p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue }),
+            Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+        }
     }
 }
 
@@ -592,6 +597,7 @@ mod tests {
             &b.town_develop,
             &b.town_update_size,
             &b.script_convert,
+            &b.convert_update,
             &b.town_candidates,
             &b.town_edges,
         ]
@@ -950,11 +956,12 @@ mod tests {
         assert!(!plan(b, off, &image).has(Feature::Convert));
         let on = HookConfig { native_patch: true, ..Default::default() };
         let p = plan(b, on, &image);
-        assert_eq!(names(&p), ["script_convert"], "{:?}", p.report());
+        assert_eq!(names(&p), ["script_convert", "script_convert_update"], "{:?}", p.report());
         let mut bad = image_of_40420();
         bad.write(b.script_convert.as_ref().unwrap().rva, &[0x90; 14]);
         let p = plan(b, on, &bad);
-        assert!(p.steps.is_empty() && p.skipped[0].name == "script_convert", "{:?}", p.report());
+        assert_eq!(names(&p), ["script_convert_update"]);
+        assert!(p.skipped[0].name == "script_convert", "{:?}", p.report());
         assert!(HookConfig::from_lookup(|k| (k == "FEVERLINK3_NATIVE_PATCH").then(|| "1".to_string())).native_patch);
     }
 
@@ -969,6 +976,7 @@ mod tests {
         town_develop: None,
         town_update_size: None,
         script_convert: None,
+        convert_update: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,

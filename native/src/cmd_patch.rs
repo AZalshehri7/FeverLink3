@@ -441,7 +441,7 @@ pub fn apply(mem: &dyn Mem, poke: &dyn Poke, alloc: &dyn Alloc, payload: usize, 
     if bytes[KIND_OFFSET] != KIND_BUILD_PROPOSAL {
         return Err(format!("the command is kind {}, not build_proposal", bytes[KIND_OFFSET]));
     }
-    apply_bytes(mem, poke, alloc, payload, &bytes, order).map_err(Fail::into_reason)
+    apply_bytes(mem, poke, alloc, payload, &bytes, order, false).map_err(Fail::into_reason)
 }
 
 /// The number of added nodes of the proposal at `proposal`, when its `addedNodes` is a vector (for the log).
@@ -610,7 +610,33 @@ pub fn apply_proposal(
         return Err(Fail::Refuse(format!("{} frozen indices", order.count())));
     }
     let bytes = mem.read(proposal, PROPOSAL_SIZE).ok_or(Fail::NotThis("the proposal is not readable".into()))?;
-    apply_bytes(mem, poke, alloc, proposal, &bytes, order)
+    apply_bytes(mem, poke, alloc, proposal, &bytes, order, false)
+}
+
+/// Only `proposal.frozenNodes` of a proposal that is still being built (the input of the construction update: there is no
+/// construction in it yet, and `toAdd[0].frozenNodes` does not exist).
+pub fn apply_proposal_frozen_only(
+    mem: &dyn Mem,
+    poke: &dyn Poke,
+    alloc: &dyn Alloc,
+    proposal: usize,
+    order: &Order,
+) -> Result<Done, Fail> {
+    if order.count() == 0 || order.count() > MAX_PATCH_FROZEN {
+        return Err(Fail::Refuse(format!("{} frozen indices", order.count())));
+    }
+    let bytes = mem.read(proposal, PROPOSAL_SIZE).ok_or(Fail::NotThis("the proposal is not readable".into()))?;
+    apply_bytes(mem, poke, alloc, proposal, &bytes, order, true)
+}
+
+/// [`describes`] for [`apply_proposal_frozen_only`].
+pub fn describes_frozen_only(mem: &dyn Mem, proposal: usize, order: &Order) -> Result<(), Fail> {
+    match apply_proposal_frozen_only(mem, &Nothing, &Nothing, proposal, order) {
+        Err(Fail::Refuse(r)) if r.starts_with("at[") => Err(Fail::Refuse(r)),
+        Err(Fail::Refuse(_)) if order.count() > 0 && order.count() <= MAX_PATCH_FROZEN => Ok(()),
+        Err(f) => Err(f),
+        Ok(_) => Ok(()),
+    }
 }
 
 fn apply_bytes(
@@ -620,6 +646,7 @@ fn apply_bytes(
     payload: usize,
     bytes: &[u8],
     order: &Order,
+    frozen_only: bool,
 ) -> Result<Done, Fail> {
     let not_this = |s: String| Fail::NotThis(s);
     let (b, e, c) = triple(bytes, ADDED_NODES);
@@ -642,21 +669,23 @@ fn apply_bytes(
         resolve_positions(mem, b as usize, nodes, &order.at)?
     };
     let n = frozen.len();
-    // the constructions
+    // the constructions (not for a proposal still being built)
     let (tb, te, tc) = triple(bytes, TO_ADD);
-    if tb == 0 && te == 0 && tc == 0 {
-        return Err(not_this("the command adds no construction".into()));
-    }
-    if !(pointer_like(tb) && tb <= te && te <= tc && ((te - tb) as usize).is_multiple_of(CONSTRUCTION_STRIDE)) {
-        return Err(not_this("proposal toAdd is not a vector".into()));
-    }
-    if te == tb {
-        return Err(not_this("the command adds no construction".into()));
+    if !frozen_only {
+        if tb == 0 && te == 0 && tc == 0 {
+            return Err(not_this("the command adds no construction".into()));
+        }
+        if !(pointer_like(tb) && tb <= te && te <= tc && ((te - tb) as usize).is_multiple_of(CONSTRUCTION_STRIDE)) {
+            return Err(not_this("proposal toAdd is not a vector".into()));
+        }
+        if te == tb {
+            return Err(not_this("the command adds no construction".into()));
+        }
     }
     let first = tb as usize;
     // the two lists, as they are now
     let mut lists = Vec::new();
-    for i in 0..2 {
+    for i in 0..(if frozen_only { 1 } else { 2 }) {
         let (addr, raw) = if i == 0 {
             (payload + PROPOSAL_FROZEN, triple(bytes, PROPOSAL_FROZEN))
         } else {
@@ -1030,5 +1059,22 @@ mod tests {
         place(&a, p, 0, 9.0, 9.0, 9.0);
         assert_eq!(dump_proposal(&a, p, Some(1)).0, key, "positions are not part of the shape");
         assert!(dump_proposal(&a, p, Some(0)).1.starts_with("NO VALUE (Convert failed)"));
+    }
+
+    #[test]
+    fn a_proposal_still_being_built_gets_only_its_own_list_and_needs_no_construction() {
+        // no toAdd yet: the update has not run
+        let (a, p) = world(2, 0, None, None);
+        let done = apply_proposal_frozen_only(&a, &a, &a, p, &order(&[1], 2)).expect("patched");
+        assert_eq!((done.frozen, done.nodes, done.allocated), (vec![1], 2, true));
+        let own = list(&a, p + PROPOSAL_FROZEN);
+        assert_eq!(own.0, vec![1]);
+        // the full form still refuses the same proposal
+        let (b, q) = world(2, 0, None, None);
+        assert!(matches!(apply_proposal(&b, &b, &b, q, &order(&[1], 2)), Err(Fail::NotThis(_))));
+        // the order's checks hold for the input too: the node count it names
+        let (c, r) = world(4, 0, None, None);
+        assert!(matches!(apply_proposal_frozen_only(&c, &c, &c, r, &order(&[1], 2)), Err(Fail::NotThis(_))));
+        assert!(describes_frozen_only(&a, p, &order(&[1], 2)).is_ok());
     }
 }

@@ -102,6 +102,29 @@ unsafe extern "system-unwind" fn convert_hook(
     ret
 }
 
+/// The function the construction update inside `Convert` (`0x10c6020(bool, state, construction, ctx, a5, Proposal* being built)`) is
+/// made to jump to: lets the runtime put the armed order's frozenNodes into the proposal BEFORE the update adds the construction's
+/// own entrance street, calls the original with every slot as given, and lets the runtime log what the update left.
+unsafe extern "system-unwind" fn convert_update_hook(rcx: u64, rdx: u64, r8: u64, r9: u64, a5: u64, a6: u64) -> u64 {
+    let original = CONVERT_UPDATE_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0; // unreachable once installed
+    }
+    let armed = RUNTIME.get().is_some_and(|rt| {
+        crate::log::guarded("convert update hook", || rt.before_convert_update(a6 as usize)).unwrap_or(false)
+    });
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline for the update, which takes these six slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    let ret = unsafe { original(rcx, rdx, r8, r9, a5, a6) };
+    if armed {
+        if let Some(rt) = RUNTIME.get() {
+            crate::log::guarded("convert update hook", || rt.after_convert_update(a6 as usize));
+        }
+    }
+    ret
+}
+
 /// The unhooked town-seed function (the trampoline), published before the jump is written; 0 until then.
 static TOWN_SEED_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// Base address of the image, for turning the caller into an RVA in the log; 0 until armed.
@@ -180,6 +203,8 @@ unsafe extern "system-unwind" fn town_seed_hook(
 static GROWTH_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// The unhooked `scripting::Convert` (the trampoline), published before the jump is written; 0 until then.
 static CONVERT_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// The unhooked construction update `Convert` runs (the trampoline); 0 until published.
+static CONVERT_UPDATE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static GROWTH_CMD_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// Address of the game's `GameTime` getter; 0 when the game time cannot be read.
 static GROWTH_GETTER: AtomicUsize = AtomicUsize::new(0);
@@ -893,6 +918,7 @@ pub struct Targets {
     pub sort: usize,
     pub pick: usize,
     pub convert: usize,
+    pub convert_update: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -1038,6 +1064,7 @@ pub unsafe fn execute(
                 Feature::GrowthCands => targets.cands,
                 Feature::GrowthEdges => targets.edges,
                 Feature::Convert => targets.convert,
+                Feature::ConvertUpdate => targets.convert_update,
                 _ => targets.add,
             };
             match unsafe { Detour::prepare(at, expected) } {
@@ -1058,6 +1085,7 @@ pub unsafe fn execute(
     CANDS_ORIGINAL.store(original_of("town_candidates"), Ordering::Release);
     EDGES_ORIGINAL.store(original_of("town_edges"), Ordering::Release);
     CONVERT_ORIGINAL.store(original_of("script_convert"), Ordering::Release);
+    CONVERT_UPDATE_ORIGINAL.store(original_of("script_convert_update"), Ordering::Release);
     observer(Stage::Prepared);
 
     // 4. write the jumps; if one fails, take the others out again
@@ -1300,6 +1328,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         sort: sort_hook as *const () as usize,
         pick: pick_hook as *const () as usize,
         convert: convert_hook as *const () as usize,
+        convert_update: convert_update_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1504,6 +1533,7 @@ mod tests {
                 prologue: Box::leak(handler_fn().to_vec().into_boxed_slice()),
             }),
             script_convert: None,
+            convert_update: None,
             town_candidates: Some(HookSite {
                 rva: CANDS_RVA,
                 prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()),
@@ -1607,6 +1637,7 @@ mod tests {
             sort: sort_hook as *const () as usize,
             pick: pick_hook as *const () as usize,
             convert: convert_hook as *const () as usize,
+            convert_update: convert_update_hook as *const () as usize,
         }
     }
 

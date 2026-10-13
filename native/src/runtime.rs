@@ -949,6 +949,7 @@ mod tests {
             town_develop: None,
             town_update_size: None,
             script_convert: None,
+            convert_update: None,
             town_candidates: None,
             town_edges: None,
             town_sort_call: None,
@@ -1795,5 +1796,32 @@ mod tests {
         assert!(dumps[1].1.contains("NO VALUE (Convert failed)"), "{dumps:?}");
         // the matching one reached the allocator check (not verified in the test process) and was refused: that consumes the order
         assert!(ev.iter().any(|(k, w)| k == "patch_refused" && w.contains("convert: the game's allocator")), "{ev:?}");
+    }
+
+    #[test]
+    fn before_the_construction_update_the_order_is_checked_against_the_nodes_built_so_far() {
+        let dir = TempDir::new("rt-convert-update");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        assert!(!rt.before_convert_update(out(2, 0, true).buf.as_ptr() as usize), "nothing armed: untouched");
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        let three = out(3, 0, true);
+        assert!(rt.before_convert_update(three.buf.as_ptr() as usize));
+        assert!(rt.patch.pending(), "another number of nodes: skipped, still armed");
+        let two = out(2, 0, true);
+        assert!(rt.before_convert_update(two.buf.as_ptr() as usize));
+        // the test process has no verified engine allocator: refused after the checks passed (the write is covered by cmd_patch's tests)
+        assert!(!rt.patch.pending());
+        rt.after_convert_update(two.buf.as_ptr() as usize);
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "patch_skipped" && w.contains("convert update: the command has 3 added nodes")),
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter().any(|(k, w)| k == "patch_refused" && w.contains("convert update: the game's allocator")),
+            "{ev:?}"
+        );
     }
 }
