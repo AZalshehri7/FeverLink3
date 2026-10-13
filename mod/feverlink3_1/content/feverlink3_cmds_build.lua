@@ -864,9 +864,13 @@ end
 -- The street segments a construction brings with it (the entrance of a depot or street station, the paths of a rail
 -- station) have templates of their own; the construction's script makes them, so a record does not need their detail
 -- (finding from MPFever (MIT)).
-local function ownTemplate(template)
+-- `withCons` false: the proposal brings no construction, so a "simple.street_template" segment is not a construction's piece.
+-- The template of a user's track (/infrastructure/track/simple/simple.street_template) contains that text too: real session
+-- 2026-10-13 (trace.log 03:02:37, trackBuilder) captured both track segments as pieces "of a construction" with no tangents,
+-- positions or track type, and both games refused the replay ("Construction Not Possible").
+local function ownTemplate(template, withCons)
 	local tpl = tostring(template or "")
-	return tpl:find("/constructions/", 1, true) ~= nil or tpl:find("simple.street_template", 1, true) ~= nil
+	return tpl:find("/constructions/", 1, true) ~= nil or (withCons ~= false and tpl:find("simple.street_template", 1, true) ~= nil)
 		or tpl:find("/airport/", 1, true) ~= nil   -- an airfield's runway and taxiways (real run 2026-10-11: 21 segments of an airfield)
 end
 
@@ -875,7 +879,7 @@ local function readSegment(s, cap)
 	local c = get(s, "comp")
 	if c == nil then fail("a segment to add has no component") end
 	local template = get(c, "roadTemplate")
-	if ownTemplate(template) then
+	if ownTemplate(template, cap.hasCons) then
 		-- noted, not described: what cannot be read about it must not stop the construction from being copied
 		local function nodeRef(k)
 			local ok, r = pcall(cap.node, get(c, k))
@@ -1061,6 +1065,7 @@ local function captureRecord(proposal, cap)
 	for i, ce in ipairs(A.list(proposal, consKey)) do rec.cons[i] = readConstruction(ce, cap) end
 	local remIds = A.list(proposal, remKey)
 	for i, e in ipairs(remIds) do rec.rem[i] = cap.con(e) end
+	cap.hasCons = #rec.cons + #rec.rem > 0
 	-- old2new maps a removed construction to what replaces it; as a table keyed by entity ids it cannot travel, so it
 	-- travels as pairs of ranks in the remove list
 	local o2n = get(proposal, "old2new")
@@ -2379,6 +2384,14 @@ function M.onToolEvent(id, name, param, say)
 		local c = seg and get(seg, "comp")
 		local m = c and A.members(c)
 		if m then say("segment members: " .. table.concat(m, ",")) end
+		-- the SegmentAndEntity itself and its trackEdge (track type, catenary): an unknown member of a track shows here
+		if seg then
+			say("segment entity members: " .. table.concat(A.members(seg) or {}, ",") .. " type " .. tostring(get(seg, "type")))
+			local te = get(seg, "trackEdge")
+			if te ~= nil then
+				say("trackEdge: members " .. table.concat(A.members(te) or {}, ",") .. " value " .. C.serialize(A.dump(te)):sub(1, 300))
+			end
+		end
 		local node = A.list(st, "addedNodes")[1] or A.list(st, "nodesToAdd")[1]
 		m = node and A.members(get(node, "comp"))
 		if m then say("node members: " .. table.concat(m, ",")) end

@@ -207,6 +207,8 @@ DEF_TEMPLATE("street/new_medium_road.street_template", "medium", { { forward = t
 DEF_TEMPLATE("street/new_small_road.street_template", "small", { { forward = true, modes = { 2 } }, { forward = false, modes = { 2 } } })
 DEF_TEMPLATE("track/standard.street_template", "track", { { forward = true, modes = { 8 } } })
 DEF_TEMPLATE("track/standard_catenary.street_template", "track", { { forward = true, modes = { 8, 9 } } })
+-- the template a real trackBuilder segment carries (real session 2026-10-13); its name contains "simple.street_template"
+DEF_TEMPLATE("track/simple/simple.street_template", "track", { { forward = true, modes = { 8 } } })
 DEF_TEMPLATE("street/tram_road.street_template", "medium", { { forward = true, modes = { 2, 3 } }, { forward = false, modes = { 2, 3 } }, { forward = true, modes = { 4 } } })
 DEF_TEMPLATE("street/airport/taxiway.street_template", "taxiway", { { forward = true, modes = { 5 } }, { forward = false, modes = { 5 } } })
 function TEMPLATE_LANES(name)
@@ -1845,6 +1847,22 @@ class TrackEdgeTest(BuildTest):
         for g in (self.A, self.B):
             self.assertEqual(g.lua("tostring(GAME.applied[1].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[1].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "2 true", g.label)
         self.assertEqual(self.A.lua("tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "0 false", "a road stays default")
+
+
+class RealTrackTemplateTest(BuildTest):
+    """A user's track has the template ::/infrastructure/track/simple/simple.street_template, whose name contains the text of a
+    construction's own piece. It must still travel with its geometry and track type (real session 2026-10-13: it was captured
+    as a bare piece and refused as "Construction Not Possible" on both games)."""
+
+    def test_a_track_with_the_simple_template_keeps_its_geometry_and_track_type(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }, track = true, trackType = 1, catenary = true, template = 'track/simple/simple.street_template' }")
+        self.tick(14)
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("#GAME.applied"), 1, g.label)
+            e = "GAME.applied[1].args[1].streetProposal.edgesToAdd[1]"
+            self.assertEqual(g.lua("tostring(%s.trackEdge.trackType) .. ' ' .. tostring(%s.trackEdge.catenary)" % (e, e)), "1 true", g.label)
+            self.assertEqual(g.lua("tostring(%s.comp.position1.x) .. ' ' .. tostring(%s.comp.tangent0.x)" % (e, e)), "400 100", g.label)
 
 
 class ReplayIgnoreErrorsBase:
