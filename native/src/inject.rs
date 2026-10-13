@@ -40,6 +40,14 @@ pub fn text_file_name(hold_id: u64) -> String {
     format!("native_text_{hold_id}.txt")
 }
 
+/// Separates the short reason of a refusal from the full report (`native_inject_report_<key>.txt`) in the error `build_verified` returns.
+pub const REPORT_MARK: &str = "\u{1}REPORT\u{1}";
+
+/// `native_inject_report_<key>.txt`: everything a refused injection knows (every unresolved pointer, every differing line).
+pub fn report_file_name(key: u64) -> String {
+    format!("native_inject_report_{key}.txt")
+}
+
 /// The text a receiver's mod writes before `inject_next` (atomically: a temporary name, then a rename).
 pub fn inject_file_name(key: u64) -> String {
     format!("native_inject_{key}.txt")
@@ -221,11 +229,16 @@ pub fn build_verified(
         .iter()
         .filter(|b| b.kind == "heap pointer" && !(hybrid && rebuild::member_of(&b.path) == "toAdd"))
         .collect();
-    if let Some(first) = unresolved.first() {
+    if !unresolved.is_empty() {
         let n = unresolved.len();
-        let path = first.path.clone();
+        let all: Vec<String> = unresolved.iter().map(|b| b.path.clone()).collect();
         c.alloc.free_all();
-        return Err(format!("{n} heap pointers in the text cannot be resolved (first at {path}); copying a null where the engine expects an object could crash the game"));
+        return Err(format!(
+            "{n} heap pointers in the text cannot be resolved: {}{}; copying a null where the engine expects an object could crash the game{REPORT_MARK}{n} unresolved pointer(s), each at <member or @B block>+<byte offset in it>:\n{}\n",
+            all.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+            if n > 20 { format!(" and {} more", n - 20) } else { String::new() },
+            all.join("\n")
+        ));
     }
     // the engine-made source: its containers are the engine's, the rest comes from the text
     let mut p = Scratch::new();
@@ -283,11 +296,14 @@ pub fn build_verified(
     };
     let (named_diff, detail) = nc::describe_split(text, &again);
     if named_diff != 0 {
+        let all = nc::diff_all(text, &again);
         return fail(
             &mut d,
             format!(
-                "the engine's Proposal differs from the text in {named_diff} named line(s): {}",
-                detail.join(" | ")
+                "the engine's Proposal differs from the text in {named_diff} named line(s): {}{REPORT_MARK}{} differing line(s) between the originator's text and the text of the engine-built Proposal:\n{}\n",
+                detail.join(" | "),
+                all.len(),
+                all.join("\n")
             ),
         );
     }
@@ -675,5 +691,52 @@ mod tests {
         s.arm(1, 0, 0);
         let ev = s.drain_events(DEFAULT_TTL_MS + 1);
         assert!(matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("expired")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_refusal_lists_every_unresolved_pointer_and_every_differing_line_in_the_report() {
+        // a map with entries whose node graph is a bare P: unresolved, at an exact place
+        let (arena, _, text) = world_text(false);
+        let broken = text.replace(
+            "proposal.new2oldNodes	map:size=0",
+            "proposal.new2oldNodes	map:size=2
+proposal.new2oldNodes.graph	raw:P w:0000000000000002",
+        );
+        let broken = if broken.contains("proposal.new2oldNodes.graph	raw:P w:0000000000000002") {
+            broken
+        } else {
+            panic!("{text}")
+        };
+        let mem = Both(&arena);
+        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &broken, None, &mut |_| {});
+        let e = r.err().expect("refused");
+        let (short, report) = e.split_once(REPORT_MARK).expect("a report follows the reason");
+        assert!(short.contains("proposal.new2oldNodes.graph+0x0"), "{short}");
+        assert!(
+            report.contains("1 unresolved pointer(s)") && report.contains("proposal.new2oldNodes.graph+0x0"),
+            "{report}"
+        );
+        // a proof that fails reports every differing line, named or not
+        unsafe extern "system-unwind" fn lossy(d: *mut u8, s: *const u8) -> *mut u8 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(s, d, PROPOSAL_SIZE);
+                core::ptr::write_bytes(d, 0, 24);
+            }
+            d
+        }
+        let mut f = fns();
+        f.copy = lossy;
+        let (arena, _, text) = world_text(false);
+        let mem = Both(&arena);
+        let ctx = Ctx { fns: f, alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let e = build_verified(&ctx, &ArenaPoke(&arena), &text, None, &mut |_| {}).err().expect("refused");
+        let (_, report) = e.split_once(REPORT_MARK).expect("a report");
+        assert!(
+            report.contains("NAMED   proposal.addedNodes.#")
+                && report.contains("original: n:2")
+                && report.contains("rebuilt:  n:0"),
+            "{report}"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! A child module of `runtime` so that it can use the runtime's private fields.
 
 use super::Runtime;
-use crate::dump::{Env, LiveHeapMem, LiveMem};
+use crate::dump::{Env, LiveHeapMem, LiveMem, Mem};
 use crate::engine::{self, AddArgs};
 use crate::inject as inj;
 use crate::link::Event;
@@ -54,6 +54,25 @@ impl Runtime {
         };
         match portable::encode(&live, Env { image_base: self.base }, settings, self.build.name, &head) {
             Ok(p) => match self.text.write(id, &p.text) {
+                Ok(()) if !p.unresolved.is_empty() => {
+                    // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what
+                    // the memory there looks like, so that one run shows everything that stays to be understood
+                    for (member, addr) in p.unresolved.iter().take(40) {
+                        let bytes = LiveMem.read(*addr, 32).map_or("unreadable".to_string(), |b| crate::plan::hex(&b));
+                        self.say(&format!(
+                            "native inject: hold {id}: unresolved pointer in {member} -> {addr:#x} [{}] bytes {bytes}",
+                            live.heap_near(*addr)
+                        ));
+                    }
+                    self.say(&format!(
+                        "native inject: hold {id}: portable text written in {} ms, {} bytes, {} lines (native_text_{id}.txt), {} pointer(s) not followed; {}",
+                        t0.elapsed().as_millis(),
+                        p.text.len(),
+                        p.text.lines().count(),
+                        p.unresolved.len(),
+                        p.text.lines().last().unwrap_or("")
+                    ))
+                }
                 Ok(()) => self.say(&format!(
                     "native inject: hold {id}: portable text written in {} ms, {} bytes, {} lines (native_text_{id}.txt); {}",
                     t0.elapsed().as_millis(),
@@ -140,6 +159,21 @@ impl Runtime {
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
             }
             Err(why) => {
+                // the short reason goes to the log and the event; the full report (every unresolved pointer, every differing line) to a file
+                let (why, report) = match why.split_once(inj::REPORT_MARK) {
+                    Some((w, r)) => (w.to_string(), Some(r.to_string())),
+                    None => (why, None),
+                };
+                if let (Some(report), Some(dir)) = (report, super::lock(&self.inject_dir_path).clone()) {
+                    let name = inj::report_file_name(order.key);
+                    match std::fs::write(dir.join(&name), &report) {
+                        Ok(()) => self.say(&format!("native inject: key {}: full report in {name}", order.key)),
+                        Err(e) => self.say(&format!("native inject: key {}: cannot write {name}: {e}", order.key)),
+                    }
+                    for l in report.lines().take(60) {
+                        self.say(&format!("native inject: report: {l}"));
+                    }
+                }
                 self.say(&format!("native inject: key {}: REFUSED, the command is untouched: {why}", order.key));
                 self.inject.refuse(format!("key {}: {why}", order.key));
             }

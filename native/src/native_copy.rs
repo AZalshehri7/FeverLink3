@@ -204,6 +204,27 @@ pub(crate) fn describe_split(a: &str, b: &str) -> (usize, Vec<String>) {
     (nd, lines)
 }
 
+/// Every differing line of a comparison (named and unnamed), both sides in full up to 400 characters, for a report file.
+pub(crate) fn diff_all(a: &str, b: &str) -> Vec<String> {
+    let (x, y) = (rebuild::lines_of(a), rebuild::lines_of(b));
+    let mut paths: Vec<&str> = x.keys().chain(y.keys()).copied().collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let cut = |v: Option<&&str>| v.map_or("(absent)".to_string(), |v| v.chars().take(400).collect::<String>());
+    paths
+        .into_iter()
+        .filter(|p| x.get(p) != y.get(p))
+        .map(|p| {
+            format!(
+                "{} {p}\n    original: {}\n    rebuilt:  {}",
+                if portable::is_unnamed_path(p) { "unnamed" } else { "NAMED  " },
+                cut(x.get(p)),
+                cut(y.get(p))
+            )
+        })
+        .collect()
+}
+
 /// The verdict of a comparison, from the counts: MATCH when no named member differs, else how many do.
 fn verdict(named_diff: Result<usize, &str>, what: &str) -> String {
     let named_diff = match named_diff {

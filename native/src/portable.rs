@@ -432,9 +432,14 @@ struct Enc<'a> {
     graph_bytes: usize,
     /// Blocks whose size the heap could not tell but that were found by walking an engine `std::map` (see [`Enc::register_map_nodes`]).
     known_sizes: BTreeMap<usize, usize>,
+    /// Heads of the maps walked: their value area is never constructed (residue of earlier users of the memory, pointers among it), so
+    /// the block is written with it zeroed.
+    sentinels: std::collections::BTreeSet<usize>,
     /// the member being written (or the member a block was reached from), for the graph's accounting
     origin: String,
     unresolved: Vec<(String, usize)>,
+    /// where the words being tokenised come from (`@B5`, `<member>.graph`), for the list of unresolved pointers
+    label: String,
     /// inside an engine container's words and the blocks behind them: a pointer is a block of the graph or a `P`, never guessed as a range or vector
     container_mode: bool,
 }
@@ -603,6 +608,7 @@ impl Enc<'_> {
                 self.stats.vectors += 1;
                 self.line(&format!("{path}.bytes"), &format!("n:{}", block.len()))?;
                 if !self.set.input_level && block.iter().any(|&x| x != 0) {
+                    self.label = format!("{path}.raw");
                     let t = self.raw_tokens(&block, depth + 1)?;
                     self.line(&format!("{path}.raw"), &format!("raw:{t}"))?;
                 }
@@ -611,11 +617,10 @@ impl Enc<'_> {
             Ty::Map => {
                 // std::map: head pointer and size; the nodes are heap blocks of the graph
                 self.line(path, &format!("map:size={}", u64_at(b, 8)))?;
-                if let Some(keys) = self.register_map_nodes(u64_at(b, 0) as usize, u64_at(b, 8) as usize) {
-                    // the entries' keys (the first four bytes of each pair), sorted: a named line, so that a rebuilt map's entries are
-                    // part of the comparison (the nodes themselves are unnamed graph blocks; the values are not compared)
-                    let list: Vec<String> = keys.iter().map(|k| format!("{k:08x}")).collect();
-                    self.line(&format!("{path}.keys"), &format!("keys:{}", list.join(",")))?;
+                if let Some(keys) = self.register_map_nodes(path, u64_at(b, 0) as usize, u64_at(b, 8) as usize) {
+                    // the entries' keys (and, for the segment maps, the set each key maps to), sorted: a named line, so that a rebuilt
+                    // map's entries are part of the comparison (the nodes themselves are unnamed graph blocks)
+                    self.line(&format!("{path}.keys"), &format!("keys:{keys}"))?;
                 }
                 self.container_graph(path, b, depth)
             }
@@ -635,6 +640,7 @@ impl Enc<'_> {
             return Ok(());
         }
         let was = std::mem::replace(&mut self.container_mode, true);
+        self.label = format!("{path}.graph");
         let t = self.raw_tokens(bytes, depth + 1);
         self.container_mode = was;
         let t = t?;
@@ -645,48 +651,76 @@ impl Enc<'_> {
     }
 
     /// The nodes of an engine `std::map` with entries, found by walking the tree itself: the heap index does not list every small block
-    /// (b42: the sentinels and nodes of `new2oldSegments` and `old2newSegments` stayed `P`), and a tree can be checked without asking
-    /// the heap. MSVC's layout: a sentinel node (left = leftmost, parent = root, right = rightmost; `isnil` at +0x19 set) and nodes
-    /// of the same size (0x50 bytes here: left, parent, right, colour, isnil, then the pair at +0x20) whose missing children point
-    /// at the sentinel. Registered only when the walk finds exactly `size` readable nodes, each with `isnil` clear and pointers of
-    /// the right kind; else nothing is registered and the pointers stay `P` (and the rebuild refuses).
-    fn register_map_nodes(&mut self, head: usize, size: usize) -> Option<Vec<u32>> {
-        const NODE: usize = 0x50;
-        if size == 0 || size > 4096 || !pointer_like(head as u64) {
+    /// (b42, b43: nodes and the small sentinels of the sets behind the values stayed `P`), and a tree can be checked without asking the
+    /// heap. MSVC's layout: a sentinel node (left = leftmost, parent = root, right = rightmost; `isnil` at +0x19 set) and nodes of
+    /// the same size whose missing children point at the sentinel. Registered only when the walk finds exactly `size` readable
+    /// nodes, each with `isnil` clear; else nothing is registered and the pointers stay `P` (and the rebuild refuses).
+    ///
+    /// The segment maps (`new2oldSegments`, `old2newSegments`) are `std::map<u32, std::set<u32>>`: nodes of 0x38 bytes (key at +0x20,
+    /// the set's head pointer at +0x28 and its size at +0x30; the engine's own copy code allocates 0x38 for the node and builds the set
+    /// copy from a 0x20-byte sentinel, `0x4bd430`/`0x4c2250`/`0x284fc0`), the set's nodes 0x20 bytes with the key at +0x1c. Other maps with
+    /// entries are walked as nodes of 0x50 bytes with the key at +0x20 and the value left to the graph. The line returned is the sorted
+    /// keys (with each set's keys for the segment maps).
+    fn register_map_nodes(&mut self, path: &str, head: usize, size: usize) -> Option<String> {
+        if size == 0 {
+            return None; // an empty engine map is the engine's own; nothing to describe
+        }
+        let sets = path.ends_with("new2oldSegments") || path.ends_with("old2newSegments");
+        let node = if sets { 0x38 } else { 0x50 };
+        let nodes = self.walk_tree(head, size, node)?;
+        let mut register: Vec<(usize, usize)> = vec![(head, node)];
+        let mut entries: Vec<(u32, String)> = Vec::new();
+        for (a, n) in &nodes {
+            register.push((*a, node));
+            let key = u32_at(n, 0x20);
+            let mut inner = String::new();
+            if sets {
+                let (h2, c2) = (u64_at(n, 0x28) as usize, u64_at(n, 0x30) as usize);
+                let tree = self.walk_tree(h2, c2, 0x20)?;
+                register.push((h2, 0x20));
+                register.extend(tree.iter().map(|(a2, _)| (*a2, 0x20)));
+                let mut ks: Vec<u32> = tree.iter().map(|(_, b)| u32_at(b, 0x1c)).collect();
+                ks.sort_unstable();
+                inner = format!("=[{}]", ks.iter().map(|k| format!("{k:08x}")).collect::<Vec<_>>().join(";"));
+            }
+            entries.push((key, inner));
+        }
+        for (a, n) in register {
+            self.known_sizes.insert(a, n);
+        }
+        self.sentinels.insert(head);
+        entries.sort();
+        Some(entries.iter().map(|(k, v)| format!("{k:08x}{v}")).collect::<Vec<_>>().join(","))
+    }
+
+    /// The nodes of the tree at `head` (a sentinel of `node` bytes) as (address, bytes), when it holds exactly `size` of them. A set of
+    /// size 0 is accepted when its sentinel is readable (the engine allocates one for every set).
+    fn walk_tree(&self, head: usize, size: usize, node: usize) -> Option<Vec<(usize, Vec<u8>)>> {
+        if size > 4096 || !pointer_like(head as u64) {
             return None;
         }
-        let h = self.mem.read(head, NODE)?;
+        let h = self.mem.read(head, node)?;
         if h[0x19] != 1 {
             return None;
         }
-        let mut found: Vec<usize> = Vec::new();
-        let mut keys: Vec<u32> = Vec::new();
-        let mut stack = vec![u64_at(&h, 8) as usize];
+        let mut found: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut stack = if size == 0 { Vec::new() } else { vec![u64_at(&h, 8) as usize] };
         while let Some(a) = stack.pop() {
             if a == head {
                 continue;
             }
-            if !pointer_like(a as u64) || found.contains(&a) || found.len() > size {
+            if !pointer_like(a as u64) || found.iter().any(|(f, _)| *f == a) || found.len() > size {
                 return None;
             }
-            let n = self.mem.read(a, NODE)?;
+            let n = self.mem.read(a, node)?;
             if n[0x19] != 0 {
                 return None;
             }
-            found.push(a);
-            keys.push(u32_at(&n, 0x20));
             stack.push(u64_at(&n, 0) as usize);
             stack.push(u64_at(&n, 0x10) as usize);
+            found.push((a, n));
         }
-        if found.len() != size {
-            return None;
-        }
-        self.known_sizes.insert(head, NODE);
-        for a in found {
-            self.known_sizes.insert(a, NODE);
-        }
-        keys.sort_unstable();
-        Some(keys)
+        (found.len() == size).then_some(found)
     }
 
     /// A pointer to a live heap block as a token of the heap graph: `B<n>` (the start of block n) or `B<n>+<hex>` (inside it).
@@ -711,7 +745,10 @@ impl Enc<'_> {
             self.stats.graph_truncated += 1;
             return None;
         }
-        let bytes = self.mem.read(p, size)?;
+        let mut bytes = self.mem.read(p, size)?;
+        if self.sentinels.contains(&p) && bytes.len() > 0x1a {
+            bytes[0x1a..].fill(0); // a sentinel's key and value are never constructed
+        }
         self.graph_bytes += size;
         let origin = self.origin.clone();
         self.blocks.push(Blk { bytes, origin });
@@ -891,8 +928,8 @@ impl Enc<'_> {
                 }
                 if self.mem.read(p, 1).is_some() {
                     self.stats.heap_ptrs += 1;
-                    if self.unresolved.len() < 8 {
-                        self.unresolved.push((self.origin.clone(), p));
+                    if self.unresolved.len() < 40 {
+                        self.unresolved.push((format!("{} {}+{:#x}", self.origin, self.label, i * 8), p));
                     }
                     toks.push("P".into());
                     i += 1;
@@ -946,8 +983,10 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         by_addr: BTreeMap::new(),
         graph_bytes: 0,
         known_sizes: BTreeMap::new(),
+        sentinels: Default::default(),
         origin: String::new(),
         unresolved: Vec::new(),
+        label: String::new(),
         container_mode: false,
     };
     // pass 1: where the elements say their entities are
@@ -975,6 +1014,7 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         let bytes = e.blocks[done].bytes.clone();
         e.container_mode = true;
         e.origin = e.blocks[done].origin.clone();
+        e.label = format!("@B{}", done + 1);
         let tokens = e.raw_tokens(&bytes, 1)?;
         e.container_mode = false;
         let _ = writeln!(block_lines, "@B{}\tsize={}\traw:{}", done + 1, bytes.len(), tokens);
