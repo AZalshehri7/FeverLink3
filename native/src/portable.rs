@@ -237,7 +237,12 @@ pub struct Settings {
 impl Settings {
     /// `None` unless the variable is `1` or `3`.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Settings> {
-        let scripts = match get(PORTABLE_VAR)?.trim() {
+        Settings::from_var(get, PORTABLE_VAR)
+    }
+
+    /// The same switch under another name (the rebuild self-check has its own).
+    pub fn from_var(get: impl Fn(&str) -> Option<String>, var: &str) -> Option<Settings> {
+        let scripts = match get(var)?.trim() {
             "1" => false,
             "3" => true,
             _ => return None,
@@ -670,6 +675,28 @@ impl Enc<'_> {
                     i += 1;
                     continue;
                 }
+                // a range: two pointers into one block, begin and end (no capacity word), a few KB at most
+                if i + 2 <= words {
+                    let e = u64_at(bytes, (i + 1) * 8);
+                    if pointer_like(e) && w <= e && e - w <= 0x1000 && w.is_multiple_of(4) {
+                        let len = (e - w) as usize;
+                        let block =
+                            if len == 0 { self.mem.read(p, 1).map(|_| Vec::new()) } else { self.mem.read(p, len) };
+                        if let Some(block) = block {
+                            self.raw_spent += len;
+                            let inner = if len == 0 {
+                                String::new()
+                            } else if len.is_multiple_of(8) {
+                                self.raw_tokens(&block, depth + 1)?
+                            } else {
+                                format!("b:{}", hex(&block))
+                            };
+                            toks.push(format!("R{len}[{inner}]"));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
                 if self.mem.read(p, 1).is_some() {
                     self.stats.heap_ptrs += 1;
                     toks.push("P".into());
@@ -745,6 +772,7 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
 /// Where the portable texts go, and how many have been written.
 pub struct Sink {
     pub settings: Settings,
+    file: &'static str,
     dir: Mutex<Option<PathBuf>>,
     seq: AtomicU32,
     bytes: AtomicU64,
@@ -752,7 +780,12 @@ pub struct Sink {
 
 impl Sink {
     pub fn new(settings: Settings) -> Sink {
-        Sink { settings, dir: Mutex::new(None), seq: AtomicU32::new(0), bytes: AtomicU64::new(0) }
+        Sink::named(settings, PORTABLE_FILE)
+    }
+
+    /// A sink that writes another file of the live folder.
+    pub fn named(settings: Settings, file: &'static str) -> Sink {
+        Sink { settings, file, dir: Mutex::new(None), seq: AtomicU32::new(0), bytes: AtomicU64::new(0) }
     }
 
     /// Chooses the folder; an earlier run's file is set aside.
@@ -760,7 +793,7 @@ impl Sink {
         if self.dir.lock().unwrap_or_else(|p| p.into_inner()).as_deref() == Some(dir) {
             return;
         }
-        let path = dir.join(PORTABLE_FILE);
+        let path = dir.join(self.file);
         if path.exists() {
             let _ = std::fs::rename(&path, path.with_extension("log.1"));
         }
@@ -785,7 +818,7 @@ impl Sink {
         let Some(dir) = self.dir.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return Err(std::io::Error::other("no folder"));
         };
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(PORTABLE_FILE))?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(self.file))?;
         f.write_all(text.as_bytes())?;
         self.bytes.fetch_add(text.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -793,11 +826,10 @@ impl Sink {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testdata {
     use super::*;
-    use crate::testutil::TempDir;
 
-    struct Fake(Vec<(usize, Vec<u8>)>);
+    pub(crate) struct Fake(pub(crate) Vec<(usize, Vec<u8>)>);
 
     impl Mem for Fake {
         fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
@@ -807,21 +839,17 @@ mod tests {
         }
     }
 
-    fn put(buf: &mut [u8], off: usize, v: u64) {
+    pub(crate) fn put(buf: &mut [u8], off: usize, v: u64) {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
-    fn put32(buf: &mut [u8], off: usize, v: u32) {
+    pub(crate) fn put32(buf: &mut [u8], off: usize, v: u32) {
         buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
 
-    const BASE: usize = 0x1_4000_0000;
-    const HEAP: usize = 0x2000_0000_0000;
+    pub(crate) const BASE: usize = 0x1_4000_0000;
+    pub(crate) const HEAP: usize = 0x2000_0000_0000;
 
-    fn settings() -> Settings {
-        Settings::from_lookup(|_| Some("1".into())).unwrap()
-    }
-
-    fn head(payload: usize) -> Header<'static> {
+    pub(crate) fn head(payload: usize) -> Header<'static> {
         Header {
             seq: 1,
             event: "held",
@@ -835,7 +863,7 @@ mod tests {
     }
 
     /// A std::string at `buf[off..off+0x20]`: inline when short, else pointing at `heap_at` (the caller adds the region).
-    fn string(buf: &mut [u8], off: usize, text: &[u8], heap_at: usize) {
+    pub(crate) fn string(buf: &mut [u8], off: usize, text: &[u8], heap_at: usize) {
         if text.len() <= 15 {
             buf[off..off + text.len()].copy_from_slice(text);
             put(buf, off + 0x10, text.len() as u64);
@@ -849,7 +877,7 @@ mod tests {
 
     /// A depot-like proposal: 2 added nodes (placeholders -1 and -2), a removed node 39112, one added segment between
     /// -1 and the existing node 39106, a template resource name on the heap, a construction, toRemove of two buildings.
-    fn synthetic() -> (Fake, usize) {
+    pub(crate) fn synthetic() -> (Fake, usize) {
         let pay = HEAP;
         let nodes = HEAP + 0x1000;
         let rnodes = HEAP + 0x2000;
@@ -928,6 +956,97 @@ mod tests {
             ]),
             pay,
         )
+    }
+
+    /// The memory the decoder saw in `native_dump.log` (the dump of the earlier spike step), as regions: the payload
+    /// from its HEX rows, every block from its word lines, vector ends and string sizes restored from their
+    /// descriptions, string texts placed behind their pointers.
+    pub(crate) fn model_of(dump: &str) -> (Fake, usize) {
+        let mut regions: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut payload_at = 0usize;
+        let mut payload = vec![0u8; PAYLOAD_SIZE];
+        let mut block: Option<(usize, Vec<u8>)> = None;
+        let num = |t: &str| usize::from_str_radix(t.trim_start_matches("0x"), 16).unwrap();
+        let flush = |b: &mut Option<(usize, Vec<u8>)>, regions: &mut Vec<(usize, Vec<u8>)>| {
+            if let Some(x) = b.take() {
+                regions.push(x);
+            }
+        };
+        for line in dump.lines() {
+            if let Some(rest) = line.strip_prefix("=== dump #") {
+                payload_at = num(rest.split("payload=").nth(1).unwrap().split_whitespace().next().unwrap());
+            } else if let Some(rest) = line.strip_prefix("HEX +") {
+                let (off, bytes) = rest.split_once(' ').unwrap();
+                if let Some((a, _)) = off.split_once("..") {
+                    let _ = a; // a zero range: the buffer is zero already
+                } else {
+                    for (i, h) in bytes.split(' ').enumerate() {
+                        payload[num(off) + i] = u8::from_str_radix(h, 16).unwrap();
+                    }
+                }
+            } else if line.starts_with('B') && line.contains(" @0x") {
+                flush(&mut block, &mut regions);
+                let addr = num(line.split(" @").nth(1).unwrap().split_whitespace().next().unwrap());
+                let read = line.rsplit_once("(0x").map_or(0x1000, |(_, r)| num(r.split(' ').next().unwrap()));
+                block = Some((addr, vec![0u8; read]));
+            } else if let Some(rest) = line.strip_prefix("  +0x") {
+                let Some((_, buf)) = block.as_mut() else { continue };
+                if rest.contains("..") {
+                    continue;
+                }
+                let mut it = rest.splitn(4, ' ');
+                let off = num(it.next().unwrap());
+                let (lo, hi) = (
+                    u32::from_str_radix(it.next().unwrap(), 16).unwrap(),
+                    u32::from_str_radix(it.next().unwrap(), 16).unwrap(),
+                );
+                if off + 8 > buf.len() {
+                    continue;
+                }
+                buf[off..off + 4].copy_from_slice(&lo.to_le_bytes());
+                buf[off + 4..off + 8].copy_from_slice(&hi.to_le_bytes());
+                let desc = it.next().unwrap_or("").trim();
+                let ptr = (u64::from(hi) << 32 | u64::from(lo)) as usize;
+                if let Some(r) = desc.strip_prefix("vector 0x") {
+                    let bytes = usize::from_str_radix(r.split(' ').next().unwrap(), 16).unwrap();
+                    let cap = usize::from_str_radix(r.split("(cap 0x").nth(1).unwrap().split(')').next().unwrap(), 16)
+                        .unwrap();
+                    put(buf, off + 8, (ptr + bytes) as u64);
+                    put(buf, off + 16, (ptr + cap) as u64);
+                } else if let Some(r) = desc.strip_prefix("std::string \"") {
+                    let (text, tail) = r.rsplit_once("\" (size ").unwrap();
+                    let size: usize = tail.split(',').next().unwrap().trim().parse().unwrap();
+                    let cap: usize =
+                        tail.split("cap ").nth(1).unwrap().split(')').next().unwrap().trim().parse().unwrap();
+                    put(buf, off + 16, size as u64);
+                    put(buf, off + 24, cap as u64);
+                    if cap == 15 {
+                        buf[off..off + text.len()].copy_from_slice(text.as_bytes());
+                    } else {
+                        let mut t = text.as_bytes().to_vec();
+                        t.push(0);
+                        regions.push((ptr, t));
+                    }
+                } else if desc.starts_with("std::string \"\"") {
+                    put(buf, off + 16, 0);
+                    put(buf, off + 24, 15);
+                }
+            }
+        }
+        flush(&mut block, &mut regions);
+        regions.push((payload_at, payload));
+        (Fake(regions), payload_at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testdata::*;
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn settings() -> Settings {
+        Settings::from_lookup(|_| Some("1".into())).unwrap()
     }
 
     fn lines(p: &Portable) -> Vec<&str> {
@@ -1051,86 +1170,6 @@ mod tests {
     }
 
     // ---- real data: the commands of the spike run (local research files; skipped when they are not there)
-
-    /// The memory the decoder saw in `native_dump.log` (the dump of the earlier spike step), as regions: the payload
-    /// from its HEX rows, every block from its word lines, vector ends and string sizes restored from their
-    /// descriptions, string texts placed behind their pointers.
-    fn model_of(dump: &str) -> (Fake, usize) {
-        let mut regions: Vec<(usize, Vec<u8>)> = Vec::new();
-        let mut payload_at = 0usize;
-        let mut payload = vec![0u8; PAYLOAD_SIZE];
-        let mut block: Option<(usize, Vec<u8>)> = None;
-        let num = |t: &str| usize::from_str_radix(t.trim_start_matches("0x"), 16).unwrap();
-        let flush = |b: &mut Option<(usize, Vec<u8>)>, regions: &mut Vec<(usize, Vec<u8>)>| {
-            if let Some(x) = b.take() {
-                regions.push(x);
-            }
-        };
-        for line in dump.lines() {
-            if let Some(rest) = line.strip_prefix("=== dump #") {
-                payload_at = num(rest.split("payload=").nth(1).unwrap().split_whitespace().next().unwrap());
-            } else if let Some(rest) = line.strip_prefix("HEX +") {
-                let (off, bytes) = rest.split_once(' ').unwrap();
-                if let Some((a, _)) = off.split_once("..") {
-                    let _ = a; // a zero range: the buffer is zero already
-                } else {
-                    for (i, h) in bytes.split(' ').enumerate() {
-                        payload[num(off) + i] = u8::from_str_radix(h, 16).unwrap();
-                    }
-                }
-            } else if line.starts_with('B') && line.contains(" @0x") {
-                flush(&mut block, &mut regions);
-                let addr = num(line.split(" @").nth(1).unwrap().split_whitespace().next().unwrap());
-                let read = line.rsplit_once("(0x").map_or(0x1000, |(_, r)| num(r.split(' ').next().unwrap()));
-                block = Some((addr, vec![0u8; read]));
-            } else if let Some(rest) = line.strip_prefix("  +0x") {
-                let Some((_, buf)) = block.as_mut() else { continue };
-                if rest.contains("..") {
-                    continue;
-                }
-                let mut it = rest.splitn(4, ' ');
-                let off = num(it.next().unwrap());
-                let (lo, hi) = (
-                    u32::from_str_radix(it.next().unwrap(), 16).unwrap(),
-                    u32::from_str_radix(it.next().unwrap(), 16).unwrap(),
-                );
-                if off + 8 > buf.len() {
-                    continue;
-                }
-                buf[off..off + 4].copy_from_slice(&lo.to_le_bytes());
-                buf[off + 4..off + 8].copy_from_slice(&hi.to_le_bytes());
-                let desc = it.next().unwrap_or("").trim();
-                let ptr = (u64::from(hi) << 32 | u64::from(lo)) as usize;
-                if let Some(r) = desc.strip_prefix("vector 0x") {
-                    let bytes = usize::from_str_radix(r.split(' ').next().unwrap(), 16).unwrap();
-                    let cap = usize::from_str_radix(r.split("(cap 0x").nth(1).unwrap().split(')').next().unwrap(), 16)
-                        .unwrap();
-                    put(buf, off + 8, (ptr + bytes) as u64);
-                    put(buf, off + 16, (ptr + cap) as u64);
-                } else if let Some(r) = desc.strip_prefix("std::string \"") {
-                    let (text, tail) = r.rsplit_once("\" (size ").unwrap();
-                    let size: usize = tail.split(',').next().unwrap().trim().parse().unwrap();
-                    let cap: usize =
-                        tail.split("cap ").nth(1).unwrap().split(')').next().unwrap().trim().parse().unwrap();
-                    put(buf, off + 16, size as u64);
-                    put(buf, off + 24, cap as u64);
-                    if cap == 15 {
-                        buf[off..off + text.len()].copy_from_slice(text.as_bytes());
-                    } else {
-                        let mut t = text.as_bytes().to_vec();
-                        t.push(0);
-                        regions.push((ptr, t));
-                    }
-                } else if desc.starts_with("std::string \"\"") {
-                    put(buf, off + 16, 0);
-                    put(buf, off + 24, 15);
-                }
-            }
-        }
-        flush(&mut block, &mut regions);
-        regions.push((payload_at, payload));
-        (Fake(regions), payload_at)
-    }
 
     #[test]
     fn the_real_commands_of_the_spike_run_are_encoded_or_refused_with_a_reason() {

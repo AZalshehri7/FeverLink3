@@ -33,6 +33,7 @@ use crate::engine::{self, AddArgs, AddFn, EngineFns, Held};
 use crate::hold::{Action, Admit, HoldConfig, HoldMachine};
 use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
 use crate::portable;
+use crate::rebuild;
 
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
 /// so declared as one that may unwind.
@@ -92,6 +93,8 @@ pub struct Runtime {
     dump: OnceLock<Dumper>,
     /// The dev-only portable text of build commands (`FEVERLINK3_PORTABLE_DUMP`); unset in a normal run.
     portable: OnceLock<portable::Sink>,
+    /// The dev-only rebuild self-check (`FEVERLINK3_PORTABLE_REBUILD`); unset in a normal run.
+    rebuild: OnceLock<portable::Sink>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -135,6 +138,7 @@ impl Runtime {
             clock: None,
             dump: OnceLock::new(),
             portable: OnceLock::new(),
+            rebuild: OnceLock::new(),
         }
     }
 
@@ -168,6 +172,62 @@ impl Runtime {
                 if settings.scripts { "included" } else { "skipped" },
                 portable::LAYOUT_BUILD
             ));
+        }
+    }
+
+    /// Switches the rebuild self-check on (`FEVERLINK3_PORTABLE_REBUILD`): a held command is written as portable text, a
+    /// payload is built again from the text in memory from the game allocator, compared, and the memory given back.
+    pub fn enable_rebuild(&self, settings: portable::Settings, dir: Option<&Path>) {
+        let sink = portable::Sink::named(settings, rebuild::REBUILD_FILE);
+        if let Some(dir) = dir {
+            sink.set_dir(dir);
+        }
+        if self.rebuild.set(sink).is_ok() {
+            self.say(&format!(
+                "rebuild: FEVERLINK3_PORTABLE_REBUILD is on: held build commands are rebuilt from their portable text with the game allocator as a self-check, report in {} (nothing is handed to the engine; script commands {})",
+                rebuild::REBUILD_FILE,
+                if settings.scripts { "included" } else { "skipped" }
+            ));
+        }
+    }
+
+    /// The rebuild self-check of the payload at `payload`: report into the rebuild file.
+    fn rebuild_check(&self, event: &str, payload: usize, hold_id: Option<u64>) {
+        let Some(sink) = self.rebuild.get() else { return };
+        if !sink.has_dir() {
+            return;
+        }
+        let Some(seq) = sink.begin() else { return };
+        let report = (|| -> Result<String, String> {
+            let alloc = rebuild::EngineAlloc::at(self.base)?;
+            let head = portable::Header {
+                seq,
+                event,
+                hold_id,
+                site_rva: None,
+                tool: None,
+                t_ms: self.now_ms(),
+                wall_ms: 0,
+                payload,
+            };
+            let env = Env { image_base: self.base };
+            let text = portable::encode(&LiveMem, env, sink.settings, self.build.name, &head)?.text;
+            let original = dump::Mem::read(&LiveMem, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
+            let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &LiveMem, &|b| {
+                Some(b.as_ptr() as usize)
+            });
+            let freed = alloc.free_all();
+            r.map(|r| format!("{}FREED {freed} blocks\n", r.text))
+        })();
+        let key = hold_id.map_or("none".to_string(), |k| k.to_string());
+        let text = match report {
+            Ok(t) => {
+                format!("=== rebuild check #{seq} event={event} key={key} ===\n{t}=== end rebuild check #{seq} ===\n")
+            }
+            Err(why) => format!("=== rebuild check #{seq} event={event} key={key} REFUSED: {why} ===\n"),
+        };
+        if let Err(e) = sink.write(&text) {
+            self.say(&format!("rebuild: cannot write {}: {e}", rebuild::REBUILD_FILE));
         }
     }
 
@@ -361,6 +421,9 @@ impl Runtime {
         if let Some(p) = self.portable.get() {
             p.set_dir(dir);
         }
+        if let Some(p) = self.rebuild.get() {
+            p.set_dir(dir);
+        }
         Ok(())
     }
 
@@ -477,6 +540,9 @@ impl Runtime {
             crate::log::guarded("add hook (portable)", || {
                 self.portable_payload("held", job.payload, Some(job.id), Some(job.site));
             });
+            crate::log::guarded("add hook (rebuild)", || {
+                self.rebuild_check("held", job.payload, Some(job.id));
+            });
         }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
@@ -544,7 +610,9 @@ impl Runtime {
                         match machine.hold_with(kind, rva, done, held, now) {
                             Ok(id) => {
                                 plan.held_here = true;
-                                if (self.dump.get().is_some() || self.portable.get().is_some())
+                                if (self.dump.get().is_some()
+                                    || self.portable.get().is_some()
+                                    || self.rebuild.get().is_some())
                                     && self.build.kind_by_name("build_proposal") == Some(kind)
                                 {
                                     plan.dump = Some(DumpJob { id, site: rva, payload });
@@ -620,6 +688,19 @@ impl Runtime {
                 (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
                 (claimed.is_some() || sink.settings.scripts).then_some(())?;
                 self.portable_payload("apply", payload, claimed, None);
+                Some(())
+            });
+        }
+        if let Some(sink) = self.rebuild.get() {
+            // script commands the module did not hold, with the level-3 switch
+            crate::log::guarded("apply hook (rebuild)", || {
+                // SAFETY: only readable memory is read.
+                let payload = unsafe { engine::payload_of(cmd) }?;
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
+                (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                (claimed.is_none() && sink.settings.scripts).then_some(())?;
+                self.rebuild_check("apply", payload, None);
                 Some(())
             });
         }
@@ -1215,6 +1296,21 @@ mod tests {
         assert_eq!(heads.len(), 2, "{text}");
         assert!(heads[0].contains("REFUSED event=held key=1") && heads[0].contains("game build 40420"), "{}", heads[0]);
         assert!(heads[1].contains("REFUSED event=apply key=1"), "{}", heads[1]);
+    }
+
+    #[test]
+    fn the_rebuild_self_check_refuses_when_the_game_allocator_is_not_where_it_should_be() {
+        let dir = TempDir::new("rt-rebuild");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_var(|_| Some("1".into()), rebuild::REBUILD_VAR).unwrap();
+        rt.enable_rebuild(settings, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let mut call = Call::new(52, 10);
+        unsafe { rt.on_add(call.args(), at(SITE_A)) };
+        let text = std::fs::read_to_string(dir.path().join(rebuild::REBUILD_FILE)).expect("a report");
+        // the fake image has no operator new at the real RVA: nothing is called, the reason is written
+        assert!(text.contains("=== rebuild check #1 event=held key=1 REFUSED:"), "{text}");
     }
 
     #[test]

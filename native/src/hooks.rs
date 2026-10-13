@@ -1239,6 +1239,11 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         let dir = link.as_ref().map(|l| l.dir.clone()).or_else(feverlink3_launcher::live::live_dir);
         rt.enable_portable(settings, dir.as_deref());
     }
+    if let Some(settings) = crate::portable::Settings::from_var(|n| std::env::var(n).ok(), crate::rebuild::REBUILD_VAR)
+    {
+        let dir = link.as_ref().map(|l| l.dir.clone()).or_else(feverlink3_launcher::live::live_dir);
+        rt.enable_rebuild(settings, dir.as_deref());
+    }
     let targets = Targets {
         apply: apply_hook as *const () as usize,
         add: add_hook as *const () as usize,
