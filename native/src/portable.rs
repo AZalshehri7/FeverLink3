@@ -714,6 +714,19 @@ impl Enc<'_> {
     }
 }
 
+/// True when every vector of items in the payload (the table's `Vec` and `EntVec` members: added and removed nodes,
+/// segments, configs, edge objects, constructions, removals) is empty: a command that changes nothing. `None` when the
+/// payload cannot be read. Used to keep no-op script commands out of the level-3 dumps; the rule is the table's, not a kind's.
+pub fn proposal_is_empty(mem: &dyn Mem, payload: usize) -> Option<bool> {
+    let bytes = mem.read(payload, PAYLOAD_SIZE)?;
+    Some(
+        PAYLOAD
+            .iter()
+            .filter(|f| matches!(f.ty, Ty::Vec(_) | Ty::EntVec))
+            .all(|f| u64_at(&bytes, f.off) == u64_at(&bytes, f.off + 8)),
+    )
+}
+
 /// The portable text of the `build_proposal` payload at `head.payload`, or why it is refused.
 pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header) -> Result<Portable, String> {
     if build != LAYOUT_BUILD {
@@ -1112,6 +1125,20 @@ mod tests {
         );
         assert!(l.last().unwrap().starts_with("=== end portable #1"));
         assert_eq!(p.stats.heap_ptrs, 1);
+    }
+
+    #[test]
+    fn a_proposal_with_nothing_to_add_or_remove_is_empty() {
+        let (mem, at) = synthetic();
+        assert_eq!(proposal_is_empty(&mem, at), Some(false));
+        let zero = Fake(vec![(at, vec![0u8; PAYLOAD_SIZE])]);
+        assert_eq!(proposal_is_empty(&zero, at), Some(true));
+        assert_eq!(proposal_is_empty(&Fake(vec![]), at), None);
+        // only the removal of one building: not empty
+        let mut one = vec![0u8; PAYLOAD_SIZE];
+        put(&mut one, 0x240, HEAP as u64 + 0x100);
+        put(&mut one, 0x248, HEAP as u64 + 0x104);
+        assert_eq!(proposal_is_empty(&Fake(vec![(at, one)]), at), Some(false));
     }
 
     #[test]

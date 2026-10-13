@@ -687,6 +687,8 @@ impl Runtime {
                 let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
                 (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
                 (claimed.is_some() || sink.settings.scripts).then_some(())?;
+                // a script command that changes nothing is not worth a dump
+                (claimed.is_some() || portable::proposal_is_empty(&LiveMem, payload) == Some(false)).then_some(())?;
                 self.portable_payload("apply", payload, claimed, None);
                 Some(())
             });
@@ -700,6 +702,7 @@ impl Runtime {
                 let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
                 (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
                 (claimed.is_none() && sink.settings.scripts).then_some(())?;
+                (portable::proposal_is_empty(&LiveMem, payload) == Some(false)).then_some(())?;
                 self.rebuild_check("apply", payload, None);
                 Some(())
             });
@@ -1296,6 +1299,31 @@ mod tests {
         assert_eq!(heads.len(), 2, "{text}");
         assert!(heads[0].contains("REFUSED event=held key=1") && heads[0].contains("game build 40420"), "{}", heads[0]);
         assert!(heads[1].contains("REFUSED event=apply key=1"), "{}", heads[1]);
+    }
+
+    #[test]
+    fn at_level_three_script_commands_are_dumped_only_when_they_change_something() {
+        let dir = TempDir::new("rt-portable3");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_lookup(|_| Some("3".into())).unwrap();
+        rt.enable_portable(settings, Some(dir.path()));
+        let ids: Vec<u32> = vec![62470, 62471];
+        let mut busy = Call::new(52, 20);
+        let (begin, end) = (ids.as_ptr() as usize, ids.as_ptr() as usize + 8);
+        busy.c.payload[0x240..0x248].copy_from_slice(&begin.to_ne_bytes());
+        busy.c.payload[0x248..0x250].copy_from_slice(&end.to_ne_bytes());
+        busy.c.payload[0x250..0x258].copy_from_slice(&end.to_ne_bytes());
+        let idle = Call::new(52, 0); // the fake payload keeps its tag in byte 8: 0 leaves the proposal untouched
+        let mut sim = [0u8; 8];
+        for c in [&idle, &busy, &idle] {
+            let mut queued = Box::new([0u8; 0x40]);
+            queued[..8].copy_from_slice(&c.payload().to_ne_bytes());
+            unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        }
+        let text = std::fs::read_to_string(dir.path().join(portable::PORTABLE_FILE)).expect("a portable file");
+        let heads: Vec<&str> = text.lines().filter(|l| l.starts_with("=== portable")).collect();
+        assert_eq!(heads.len(), 1, "only the command with a removal: {text}");
+        assert!(heads[0].contains("event=apply key=none"), "{}", heads[0]);
     }
 
     #[test]
