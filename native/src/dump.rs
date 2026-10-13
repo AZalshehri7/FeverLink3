@@ -112,9 +112,13 @@ pub trait Mem {
 
     /// The size of the heap allocation that STARTS at `addr`, when `addr` is the start of a live block of the process heap
     /// (the engine's `operator new` is the CRT's, i.e. the process heap). `None` for anything else, and for readers that cannot say.
+    /// Never asks the OS about `addr` itself: the answer comes from an index of the heap's blocks (see [`LiveHeapMem`]).
     fn heap_size(&self, _addr: usize) -> Option<usize> {
         None
     }
+
+    /// Brings what the reader knows about the heap up to date (blocks made since the last call). Called before a text is written.
+    fn refresh(&self) {}
 }
 
 /// `want` bytes at `addr`, or as many as are readable up to the end of the page, or nothing.
@@ -141,27 +145,95 @@ impl Mem for LiveMem {
         // SAFETY: `mem::read` asks the OS whether the range is committed and readable before it copies.
         unsafe { crate::mem::read(addr as *const u8, len) }.ok()
     }
+}
 
-    fn heap_size(&self, addr: usize) -> Option<usize> {
-        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapSize, HeapValidate};
-        // allocations are 16-byte aligned on x64; the header sits just before the block, so it must be readable too
-        // SAFETY: readable only asks the OS about the range.
-        if addr < 0x1_0000
-            || !addr.is_multiple_of(16)
-            || !unsafe { crate::mem::readable((addr - 16) as *const u8, 16 + 8) }
-        {
-            return None;
-        }
-        // SAFETY: HeapValidate and HeapSize only inspect the block header of the pointer they are given and answer FALSE or
-        // -1 for something that is not a block of this heap.
+/// [`LiveMem`] and an index of the live blocks of the process heap, for the heap graph.
+///
+/// The first version asked the heap about each pointer (`HeapValidate`, `HeapSize`). A real run crashed in it: `HeapSize` on a
+/// 16-byte aligned address with a readable header that `HeapValidate` had accepted ran into the heap's block-header decoding with a
+/// null segment (`ntdll` +0x91919, `mov r9d, [r9+0x24]` with `r9 = 0`; the return address on the stack was the `call HeapSize`).
+/// The heap functions are not safe for a value that is not the start of a block, so nothing is asked about values here: the heap is
+/// walked once (`HeapWalk` under `HeapLock`, into memory reserved beforehand so that nothing allocates while the lock is held), and
+/// a pointer is a block only if it equals the start of an entry that walk reported as busy.
+#[cfg(windows)]
+pub struct LiveHeapMem {
+    /// (start, size) of the busy blocks, sorted by start
+    index: std::cell::RefCell<Vec<(usize, usize)>>,
+    /// the walk stopped at the capacity: blocks past it are unknown (their pointers stay `P`)
+    truncated: std::cell::Cell<bool>,
+}
+
+#[cfg(windows)]
+impl LiveHeapMem {
+    /// Most blocks the index holds (16 bytes each, reserved at once).
+    pub const CAPACITY: usize = 3 << 20;
+
+    pub fn new() -> LiveHeapMem {
+        LiveHeapMem { index: std::cell::RefCell::new(Vec::new()), truncated: std::cell::Cell::new(false) }
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated.get()
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.index.borrow().len()
+    }
+
+    fn walk(&self) {
+        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapLock, HeapUnlock, HeapWalk, PROCESS_HEAP_ENTRY};
+        /// `PROCESS_HEAP_ENTRY_BUSY` of winbase.h (windows-sys does not export it)
+        const BUSY: u16 = 0x0004;
+        let mut v = std::mem::take(&mut *self.index.borrow_mut());
+        v.clear();
+        // reserved before the lock: pushing within the capacity does not allocate, and an allocation on this heap while it is
+        // being walked would change what the walk sees
+        v.reserve(Self::CAPACITY);
+        let mut truncated = false;
+        // SAFETY: HeapLock/HeapWalk/HeapUnlock on the process heap with an entry structure the OS fills; the entry starts zeroed
+        // (lpData null = start of the walk), the lock is released on every path, and no allocation happens in between.
         unsafe {
             let heap = GetProcessHeap();
-            if heap.is_null() || HeapValidate(heap, 0, addr as *const core::ffi::c_void) == 0 {
-                return None;
+            if !heap.is_null() && HeapLock(heap) != 0 {
+                let mut e: PROCESS_HEAP_ENTRY = core::mem::zeroed();
+                while HeapWalk(heap, &mut e) != 0 {
+                    if e.wFlags & BUSY != 0 && !e.lpData.is_null() {
+                        if v.len() == Self::CAPACITY {
+                            truncated = true;
+                            break;
+                        }
+                        v.push((e.lpData as usize, e.cbData as usize));
+                    }
+                }
+                HeapUnlock(heap);
             }
-            let n = HeapSize(heap, 0, addr as *const core::ffi::c_void);
-            (n != usize::MAX && n > 0).then_some(n)
         }
+        v.sort_unstable();
+        self.truncated.set(truncated);
+        *self.index.borrow_mut() = v;
+    }
+}
+
+#[cfg(windows)]
+impl Default for LiveHeapMem {
+    fn default() -> Self {
+        LiveHeapMem::new()
+    }
+}
+
+#[cfg(windows)]
+impl Mem for LiveHeapMem {
+    fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
+        LiveMem.read(addr, len)
+    }
+
+    fn heap_size(&self, addr: usize) -> Option<usize> {
+        let index = self.index.borrow();
+        index.binary_search_by_key(&addr, |&(start, _)| start).ok().map(|i| index[i].1).filter(|&n| n > 0)
+    }
+
+    fn refresh(&self) {
+        self.walk();
     }
 }
 
@@ -860,6 +932,30 @@ mod tests {
             payload,
             group: None,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_heap_index_knows_block_starts_only_and_never_asks_the_heap_about_a_value() {
+        let live = LiveHeapMem::new();
+        let block = Box::new([7u8; 100]);
+        let start = block.as_ptr() as usize;
+        let local = 5u64;
+        live.refresh();
+        assert!(live.blocks() > 50, "the process heap has blocks: {}", live.blocks());
+        assert!(!live.truncated());
+        assert!(live.heap_size(start).is_some_and(|n| n >= 100), "{:?}", live.heap_size(start));
+        assert_eq!(live.heap_size(start + 8), None, "inside a block");
+        assert_eq!(live.heap_size(start + 1), None);
+        assert_eq!(live.heap_size(&local as *const u64 as usize), None, "the stack");
+        assert_eq!(live.heap_size(0), None);
+        assert_eq!(live.heap_size(0x7fff_ffff_f000), None);
+        // a block made after the walk is unknown until the next refresh
+        let later = Box::new([1u8; 200]);
+        assert_eq!(live.heap_size(later.as_ptr() as usize), None);
+        live.refresh();
+        assert!(live.heap_size(later.as_ptr() as usize).is_some_and(|n| n >= 200));
+        assert_eq!(live.read(start, 4).unwrap(), [7, 7, 7, 7]);
     }
 
     #[test]

@@ -31,7 +31,7 @@ use crate::dump::{ascii_string, pointer_like, u32_at, u64_at, Env, Mem, IMAGE_BO
 /// `1` = commands the module held (their `held` and `apply`), `3` = also every other `build_proposal` the simulation applies.
 pub const PORTABLE_VAR: &str = "FEVERLINK3_PORTABLE_DUMP";
 pub const PORTABLE_FILE: &str = "native_portable.log";
-/// `=0` leaves pointers to heap blocks as `P` (no `HeapSize` queries); `=1` turns the graph on for the plain portable dump.
+/// `=0` leaves pointers to heap blocks as `P` (no heap index is built); `=1` turns the graph on for the plain portable dump.
 pub const GRAPH_VAR: &str = "FEVERLINK3_PORTABLE_GRAPH";
 /// Format version of the text.
 pub const VERSION: u32 = 1;
@@ -274,7 +274,7 @@ impl Settings {
             max_block_bytes: 8 << 20,
             max_elems: 20_000,
             max_depth: 6,
-            // the graph asks the heap about pointers (HeapSize): on for the rebuild checks and the engine copy, opt-in for the plain dump
+            // the graph walks the heap once per text (HeapWalk): on for the rebuild checks and the engine copy, opt-in for the plain dump
             graph: get(GRAPH_VAR).map_or(var != PORTABLE_VAR, |v| v.trim() != "0"),
             max_graph_blocks: 4096,
             max_graph_block_bytes: 1 << 20,
@@ -772,6 +772,9 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
     let payload = mem.read(head.payload, PAYLOAD_SIZE).ok_or("payload unreadable")?;
     if payload[0x9b8] != KIND_BUILD_PROPOSAL {
         return Err(format!("kind byte {} is not {KIND_BUILD_PROPOSAL}", payload[0x9b8]));
+    }
+    if set.graph {
+        mem.refresh();
     }
     let mut e = Enc {
         mem,

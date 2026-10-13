@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::{portable, rebuild, LiveMem, Runtime};
+use super::{portable, rebuild, Runtime};
 use crate::native_copy as nc;
 use crate::rebuild::Alloc as _;
 
@@ -51,10 +51,12 @@ impl Runtime {
                 return;
             }
         };
+        // an index of the heap's blocks for the graph, refreshed before every text (see LiveHeapMem for why no per-pointer heap query)
+        let live = crate::dump::LiveHeapMem::new();
         let ctx = nc::Ctx {
             fns,
             alloc: &alloc,
-            mem: &LiveMem,
+            mem: &live,
             base: self.base,
             set: sink.settings,
             build_name: self.build.name,

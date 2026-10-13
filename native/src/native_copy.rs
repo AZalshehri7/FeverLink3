@@ -439,7 +439,7 @@ mod tests {
         }
     }
 
-    /// As [`Both`], and the arena's blocks count as heap blocks (what `HeapSize` answers in the game).
+    /// As [`Both`], and the arena's blocks count as heap blocks (what the heap index answers in the game).
     struct BothHeap<'a>(&'a Arena);
     impl Mem for BothHeap<'_> {
         fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
@@ -618,6 +618,51 @@ mod tests {
         assert_eq!(CTORS.load(Ordering::SeqCst) - c0, 3);
         assert_eq!(COPIES.load(Ordering::SeqCst) - k0, 3);
         assert_eq!(DTORS.load(Ordering::SeqCst) - d0, 5);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_memory_with_a_real_heap_graph_is_written_and_a_value_that_is_not_a_block_is_never_asked_about() {
+        use crate::dump::LiveHeapMem;
+        // a payload in plain Rust memory: an unordered_map member whose list head and bucket array are real heap blocks, and
+        // two more words that look like pointers but are not blocks (the middle of a block, an address on the stack)
+        let head = Box::new([0u8; 0x18]);
+        let buckets = Box::new([0u8; 0x80]);
+        let middle = head.as_ptr() as usize + 8;
+        let on_stack = 0u64;
+        let mut s = Scratch::new();
+        let b = s.bytes_mut();
+        b[0x9b8] = portable::KIND_BUILD_PROPOSAL;
+        let put = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        // the list head points to itself; the buckets' end pointer is one past the block
+        let (h, bk) = (head.as_ptr() as u64, buckets.as_ptr() as u64);
+        put(b, 0x270, 1.0f32.to_bits() as u64);
+        put(b, 0x278, h);
+        put(b, 0x288, bk);
+        put(b, 0x290, bk + 0x80);
+        put(b, 0x298, bk + 0x80);
+        put(b, 0x2a0, 7);
+        put(b, 0x2a8, 8);
+        // two unnamed words of the stop-pair kind: a pointer into the middle of a block and a stack address
+        put(b, 0x1a0, middle as u64);
+        put(b, 0x1a8, &on_stack as *const u64 as u64);
+        let live = LiveHeapMem::new();
+        let head_ = Header {
+            seq: 0,
+            event: "t",
+            hold_id: None,
+            site_rva: None,
+            tool: None,
+            t_ms: 0,
+            wall_ms: 0,
+            payload: s.addr(),
+        };
+        let text =
+            portable::encode(&live, Env { image_base: 0x7ff7_1400_0000 }, settings(), "40420", &head_).unwrap().text;
+        assert!(text.contains("old2new.graph	raw:B1 "), "{text}");
+        assert!(text.contains("@B1	size=24	"), "{text}");
+        // the middle of a block and the stack address are not blocks: they stay `P`/words, nothing was asked about them
+        assert!(!text.contains("B3"), "{text}");
     }
 
     #[test]
