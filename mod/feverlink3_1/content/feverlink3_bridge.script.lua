@@ -1398,7 +1398,7 @@ local function update(userParams, state, dt)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" then
 				local parts, t = checksumParts(st.co, "sim", it.full == false)
-				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountForState(L.accountSnapshot(engine), C.integerText) }
+				st.reports[#st.reports + 1] = { n = it.n, time = t, parts = parts, account = L.accountSnapshot(engine) }
 				stored = it.n
 			elseif it.kind == "action" then
 				simApplyAction(st, it, now)
@@ -1471,7 +1471,19 @@ local function handleEvent(userParams, state, src, id, name, param)
 	if name == "nop" then return end   -- strict mode's trigger: a command that makes the native module run its queue (natTrigger)
 	local ok, err = pcall(function()
 		local st = simState(state)
-		if name == "queue" and type(param) == "table" then
+		if name == "session" and type(param) == "table" then
+			-- A new run of the interface half. The state is saved with the game, so a save made in the middle of an earlier session
+			-- carries that session's outputs (sweep 2026-10-13: 40 stored checksum reports, rounds 2..40 of the earlier session, which the
+			-- new session's interface half read as its own rounds 2..40 and so never sent the real ones). The outputs are dropped and the
+			-- state is stamped with the epoch of the interface half that may read it; the queue, the bindings and the registry belong to
+			-- the world and stay.
+			if st.epoch ~= param.epoch then
+				local dropped = #st.reports + #st.results + #st.refused + #(st.out or {})
+				st.reports, st.results, st.refused, st.out, st.notes, st.late = {}, {}, {}, nil, nil, 0
+				st.epoch = param.epoch
+				traceSim("session", "epoch " .. tostring(param.epoch) .. ": dropped " .. C.integerText(dropped) .. " outputs of an earlier session")
+			end
+		elseif name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
 		elseif name == "dumpdetail" and type(param) == "table" then
 			local d = DETAIL.last
@@ -3268,6 +3280,17 @@ local function collectFromSim(state)
 	for key, e in pairs(st.bind or {}) do
 		if G.bind[key] ~= e then G.bind[key] = e; G.rev[e] = key end
 	end
+	-- Outputs of the simulation half belong to the run of this interface half that the state is stamped for: a state still stamped for an
+	-- earlier run (a save made mid-session) holds that run's results, refusals, reports and native builds, none of which may be read.
+	if st.epoch ~= G.epoch then
+		local stale = #(st.reports or {}) + #(st.results or {}) + #(st.refused or {}) + #(st.out or {})
+		if stale > 0 and G.staleSeen ~= stale then
+			G.staleSeen = stale
+			logGui("ignoring " .. C.integerText(stale) .. " stored output(s) (reports, results, refusals, native builds) of an earlier session until the simulation half takes the new session")
+		end
+		if G.frames % 30 == 0 then toSim("session", { epoch = G.epoch }) end
+		return
+	end
 	G.notes = st.notes
 	local highest = nil
 	for _, o in ipairs(st.out or {}) do
@@ -3302,7 +3325,7 @@ local function collectFromSim(state)
 	for _, r in ipairs(st.reports or {}) do
 		if not G.reportsSent[r.n] then
 			traceGui("checksum.collect", "round " .. C.integerText(r.n) .. " read from the game-script state (account " .. tostring(r.account and r.account.balance) .. ")")
-			reportRound(r.n, r.time, r.parts, L.accountFromState(r.account))
+			reportRound(r.n, r.time, r.parts, r.account)
 		end
 	end
 	if (st.late or 0) > G.lateSeen then
@@ -3445,6 +3468,8 @@ local function guiUpdate(userParams, state, guiState)
 		G.nat = okN and nat or nil
 		pcall(function() guiState:subscribeToAllEvents() end)
 		setSpeed(0)
+		G.epoch = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock() * 1000)) .. "-" .. tostring(C.PLAYER_ID)
+		toSim("session", { epoch = G.epoch })
 		send("hello", { time = engine.gameTime(), name = C.PLAYER_NAME })
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end

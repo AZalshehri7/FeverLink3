@@ -744,21 +744,16 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.relay.authority[3]["balance"], 5035445200)
         self.assertNotIn("failed", self.A.log() + self.B.log())
 
-    def test_checksum_rounds_survive_a_state_that_mangles_numbers_beyond_32_bits(self):
-        # The hand-off between the two Lua states is the one place the mod does not control. Whatever a 32-bit path does to a number
-        # beyond 2^31 (the cause of the 2026-10-13 stall is not proven), the rounds carry the account as text and still arrive.
+    def test_a_state_saved_mid_session_does_not_mask_the_new_sessions_rounds(self):
+        # Sweep 2026-10-13: the base save carried the earlier session's 40 stored reports (rounds 1..40, old accounts); the new session's
+        # interface half read rounds 2..40 from them as its own, marked them sent and never sent the real ones.
         for g in (self.A, self.B):
             g.L.execute("""
-              ACCOUNT.balance = 5035445200
-              local plain = STATE.get
-              local function mangle(v)
-                if type(v) == "number" and math.abs(v) >= 2147483648 then return nil end
-                if type(v) ~= "table" then return v end
-                local out = {}
-                for k, x in pairs(v) do out[k] = mangle(x) end
-                return out
-              end
-              STATE.get = function(self) return mangle(plain(self)) end
+              local reports, results, refused = {}, {}, {}
+              for n = 1, 40 do reports[n] = { n = n, time = 1000 + n, parts = { time = "old" .. n, balance = "old" }, account = { balance = 38000000, loan = 0 } } end
+              results[1] = { key = "1:1", at = 5, success = true }
+              refused[1] = { key = "1:2", from = 1, seq = 2, detail = "stale refusal" }
+              STATE:set({ reports = reports, results = results, refused = refused, late = 7, queue = {}, bind = {}, watches = {}, binders = {} })
             """)
         self.start()
         self.tick(10, lag_b=True)
@@ -766,7 +761,12 @@ class LockstepTest(unittest.TestCase):
             self.relay.checksum_request(n, self.relay.future_stamp(), False, full=(n == 1))
             self.tick(30, lag_b=True)
             self.assertEqual(sorted(self.relay.reports.get(n, {})), [0, 1], "round %d" % n)
-        self.assertEqual(self.relay.authority[3]["balance"], 5035445200)
+            for gid in (0, 1):
+                self.assertNotIn("old", str(self.relay.reports[n][gid][1]["time"]), "a stale part reached the launcher")
+            self.assertEqual(self.relay.reports[n][0][1], self.relay.reports[n][1][1])
+        self.assertNotIn("stale refusal", "".join(self.A.lines(self.A.from_game)) + "".join(self.B.lines(self.B.from_game)))
+        self.assertIn("ignoring", self.A.log() + self.B.log(), "the stale outputs are logged once")
+        self.assertNotIn("applied an action late", self.A.log())
 
     def test_an_unreadable_state_and_a_lost_round_are_logged(self):
         self.A.L.execute("STATE.get = function(self) error('cannot convert') end")
@@ -1150,10 +1150,6 @@ class PureTest(unittest.TestCase):
         self.assertEqual(f(2 ** 60), "1.152921504606847e+18")
         self.assertEqual(float(f(1234.5678)), 1234.5678, "a fraction round-trips")
         self.assertEqual(self.C.serialize(5035445200), "5035445200")
-        a = self.K.accountForState(self.L.table(balance=5035445200.25, loan=35624999), self.C.integerText)
-        self.assertEqual((a["balance"], a["loan"]), ("5035445200.25", "35624999"))
-        back = self.K.accountFromState(a)
-        self.assertEqual((back["balance"], back["loan"]), (5035445200.25, 35624999))
 
     def test_serialize_is_order_independent_and_round_trips(self):
         a = self.L.eval('(function() local t = {} t.b = 1 t.a = { 3, 2, x = "q\\t\\"z" } t[1] = 0.1 t[2] = true return t end)()')
