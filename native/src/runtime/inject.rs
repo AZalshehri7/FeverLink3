@@ -216,10 +216,62 @@ impl Runtime {
         alloc.free_all();
         let built = built?;
         let stats = (built.nodes, built.segments, built.constructions);
+        if constructions > 0 {
+            self.inject_donor_report(key, dest, &text, &built, &dir);
+        }
         self.say("native inject: calling the engine copy assignment into the script command's Proposal");
         // SAFETY: `check_destination` passed on this payload moments ago, on the thread that queues the command.
         unsafe { inj::swap_into(&ctx, &built, dest) };
         inj::release(&ctx, built);
         Ok(stats)
+    }
+
+    /// Hybrid injections only (the construction is the receiver's own conversion): writes what that conversion looked like next to the
+    /// originator's text, so that what the two disagree on (unnamed regions, ids) can be read: `native_inject_donor_<key>.txt` (the
+    /// script command's Proposal as portable text, before the swap), `native_inject_final_<key>.txt` (the engine-built Proposal that is
+    /// swapped in) and `native_inject_diff_<key>.txt` (every line where the originator's text and the donor differ).
+    fn inject_donor_report(&self, key: u64, dest: usize, text: &str, built: &inj::Built, dir: &std::path::Path) {
+        let Some(settings) = self.inject_settings.get().copied() else { return };
+        let live = LiveHeapMem::new();
+        let encode = |payload: usize, event: &'static str| {
+            let head = portable::Header {
+                seq: 0,
+                event,
+                hold_id: None,
+                site_rva: None,
+                tool: None,
+                t_ms: self.now_ms(),
+                wall_ms: 0,
+                payload,
+            };
+            portable::encode(&live, Env { image_base: self.base }, settings, self.build.name, &head).map(|p| p.text)
+        };
+        let write = |name: String, body: &str| match std::fs::write(dir.join(&name), body) {
+            Ok(()) => self.say(&format!("native inject: key {key}: wrote {name} ({} bytes)", body.len())),
+            Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
+        };
+        match encode(dest, "donor") {
+            Ok(donor) => {
+                let diff = crate::native_copy::diff_all(text, &donor);
+                let named = diff.iter().filter(|l| l.starts_with("NAMED")).count();
+                self.say(&format!(
+                    "native inject: key {key}: the script command's own conversion differs from the originator's text in {} line(s), {named} named, {} unnamed",
+                    diff.len(),
+                    diff.len() - named
+                ));
+                write(
+                    format!("native_inject_diff_{key}.txt"),
+                    &diff.join(
+                        "
+",
+                    ),
+                );
+                write(format!("native_inject_donor_{key}.txt"), &donor);
+            }
+            Err(e) => self.say(&format!("native inject: key {key}: the donor cannot be written as text: {e}")),
+        }
+        if let Ok(fin) = encode(built.proposal.addr(), "final") {
+            write(format!("native_inject_final_{key}.txt"), &fin);
+        }
     }
 }
