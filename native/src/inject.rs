@@ -311,7 +311,11 @@ pub fn build_verified(
         // R4 (informational): what the two sides' unnamed construction words look like after their differential masks
         r4_report = entity_equivalence(c, text, donor, say);
     }
-    let take = |f: &F| !(hybrid && f.name == "toAdd") && nc::selected(f, &lines);
+    // A container past the Proposal (the Context's `refundableEntities`) is never swapped in (`swap_into` copies the Proposal only; the
+    // command keeps its own Context), so it is neither rebuilt nor proved: rt4 R6 (2026-10-14), the real bulldozer over a town house,
+    // was refused on both games for the 17 list and bucket pointers of a one-entry `refundableEntities` that the injection would not
+    // have used.
+    let take = |f: &F| !(hybrid && f.name == "toAdd") && !outside_proposal_container(f) && nc::selected(f, &lines);
     let built = match rebuild::build_selected(text, c.base, c.alloc, Some(&take)) {
         Ok(b) => b,
         Err(e) => {
@@ -389,9 +393,10 @@ pub fn build_verified(
         Ok(t) => t,
         Err(e) => return fail(&mut d, format!("the engine's Proposal cannot be written as text to be checked: {e}")),
     };
-    let (named_diff, detail) = nc::describe_split(text, &again);
+    let (text_p, again_p) = (without_unswapped(text), without_unswapped(&again));
+    let (named_diff, detail) = nc::describe_split(&text_p, &again_p);
     if named_diff != 0 {
-        let all = nc::diff_all(text, &again);
+        let all = nc::diff_all(&text_p, &again_p);
         return fail(
             &mut d,
             format!(
@@ -550,6 +555,25 @@ pub unsafe fn swap_into(c: &Ctx, b: &Built, dest: usize) {
 /// True for the members `build_verified` would not rebuild; kept next to the rule it mirrors.
 pub fn is_container(f: &F) -> bool {
     matches!(f.ty, Ty::Map | Ty::Hash)
+}
+
+/// A container member of the command that lies past the Proposal: [`swap_into`] never copies it into the command.
+fn outside_proposal_container(f: &F) -> bool {
+    f.off >= PROPOSAL_SIZE && is_container(f)
+}
+
+/// `text` without the lines of the members [`outside_proposal_container`] names (the proof compares only what is swapped in).
+fn without_unswapped(text: &str) -> String {
+    let skip: Vec<&str> = portable::PAYLOAD.iter().filter(|f| outside_proposal_container(f)).map(|f| f.name).collect();
+    text.lines()
+        .filter(|l| {
+            let path = l.split('\t').next().unwrap_or("");
+            !skip
+                .iter()
+                .any(|s| path == *s || path.strip_prefix(s).is_some_and(|r| r.starts_with('.') || r.starts_with('[')))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
