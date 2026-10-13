@@ -8,7 +8,7 @@ title: FeverLink3
 
 > **Early test build, not yet a full multiplayer game.** Last updated 2026-10-10. Two real copies of the game can host and join, the host's world is sent to the guest, and speed, pause and chat from either side show in both games (see the demo below). Building together, hosting and joining over Steam between two accounts, and busy worlds with vehicles have **not** been verified yet. [What is verified and what is not](site/status.html).
 
-[Quick start](#quick-start) · [Download](#download) · [FAQ](site/faq.html) · [Status](site/status.html) · [Security and antivirus](SECURITY_FOR_USERS.html) · [Roadmap](ROADMAP.html) · [Architecture](ARCHITECTURE.html) · [Protocol](PROTOCOL.html) · [Security review](SECURITY.html) · [Source on GitHub](https://github.com/AZalshehri7/FeverLink3)
+[Quick start](#quick-start) · [Download](#download) · [FAQ](site/faq.html) · [Status](site/status.html) · [Changelog](CHANGELOG.html) · [How builds sync](site/how-builds-sync.html) · [Security and antivirus](SECURITY_FOR_USERS.html) · [Roadmap](ROADMAP.html) · [Architecture](ARCHITECTURE.html) · [Protocol](PROTOCOL.html) · [Security review](SECURITY.html) · [Source on GitHub](https://github.com/AZalshehri7/FeverLink3)
 
 ## See it working
 

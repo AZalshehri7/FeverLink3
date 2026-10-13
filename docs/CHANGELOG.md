@@ -1,3 +1,7 @@
+---
+title: FeverLink3 changelog
+---
+
 # Changelog
 
 All notable changes of each release. FeverLink3 is an unfinished test project: read the status in the README before using it.
