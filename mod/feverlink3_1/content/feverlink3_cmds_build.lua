@@ -1190,8 +1190,30 @@ end
 -- on the wire stays as the capture made it.
 local OWN_BY_SHAPE = setmetatable({}, { __mode = "k" })
 
+-- What the engine itself makes with the construction: a dry run of a proposal that holds only the construction (the call the tools' preview
+-- and the verdict line use, makeProposalData), whose proposal data lists the street pieces the construction's script adds. Returns the list
+-- of { p0, p1 } or nil and why it could not be read. Defined after constructionProposal.
+local dryRunPieces
+
 local function markOwnByShape(rec)
 	if rec.src ~= "native" or #rec.cons == 0 or #rec.rem > 0 or #rec.rmSegs > 0 or #rec.rmNodes > 0 then return end
+	-- A segment of the record that the construction's dry run adds too (same ends within 1.5 m, either way round) is the construction's own;
+	-- this replaces the guess below wherever the engine answers with at least one piece. The shape guess stays the fallback (an answer
+	-- of no piece at all may only mean the proposal data has no street part to read).
+	local pieces, whyNot = dryRunPieces(rec)
+	if pieces and #pieces > 0 then
+		local function same(a, b) return a and b and abs(a.x - b.x) <= 1.5 and abs(a.y - b.y) <= 1.5 end
+		local n = 0
+		for _, sg in ipairs(rec.segs) do
+			local c = sg.c or {}
+			for _, pc in ipairs(pieces) do
+				if (same(c.p0, pc.p0) and same(c.p1, pc.p1)) or (same(c.p0, pc.p1) and same(c.p1, pc.p0)) then OWN_BY_SHAPE[sg] = true; n = n + 1 break end
+			end
+		end
+		C.tracer("build")("build.own", string.format("dry run: the construction adds %d street piece(s), %d of the record's %d segment(s) are among them", #pieces, n, #rec.segs))
+		return
+	end
+	C.tracer("build")("build.own", "dry run gave no pieces (" .. tostring(whyNot or "none") .. "): the shape guess decides")
 	-- groups of new nodes joined by the segments to add; a group with an end at a node of the world is a street, not the construction's
 	local parent = {}
 	local function find(x)
@@ -1796,6 +1818,41 @@ local function part(rec, keep)
 	return out
 end
 
+dryRunPieces = function(rec)
+	if #rec.rem > 0 or #rec.old2new > 0 then return nil, "the record removes constructions" end
+	local ok, res = pcall(function()
+		local stub = { owner = function(v) if v == nil or v == "player" then return A.player() end return v end }
+		local sp = constructionProposal(part(rec, { "cons" }), stub)
+		local ctx = A.new("Context")
+		req(ctx, "player", A.player())
+		pcall(function() ctx.checkTerrainAlignment = true end)
+		pcall(function() ctx.gatherBuildings = true end)
+		pcall(function() ctx.gatherFields = true end)
+		local pd = api.engine.util.proposal.makeProposalData(sp, ctx)
+		local prop = get(pd, "proposal")
+		if prop == nil then error("the proposal data has no proposal", 0) end
+		local inner = get(prop, "proposal") or prop
+		local nodePos = {}
+		for _, n in ipairs(A.list(inner, "addedNodes")) do
+			local nc = get(n, "comp")
+			local e = get(n, "entity")
+			if type(e) == "number" and nc then nodePos[e] = A.xyz(get(nc, "position")) end
+		end
+		local out = {}
+		for _, sg in ipairs(A.list(inner, "addedSegments")) do
+			local c = get(sg, "comp")
+			if c then
+				local p0 = A.xyz(get(c, "position0")) or nodePos[get(c, "node0")]
+				local p1 = A.xyz(get(c, "position1")) or nodePos[get(c, "node1")]
+				if p0 and p1 then out[#out + 1] = { p0 = p0, p1 = p1 } end
+			end
+		end
+		return out
+	end)
+	if not ok then return nil, tostring(res):sub(1, 120) end
+	return res
+end
+
 -- Ways to build the proposal of a plan, tried in order until the engine's factory accepts one (a factory that rejects has
 -- no side effect, so every game goes through the same attempts: finding from MPFever (MIT), whose forms these follow). A
 -- form names what to leave out or change. A form that drops content (cfg = false) is only listed where the engine makes
@@ -2340,6 +2397,47 @@ M.CONSTRUCTIONS_INFO_TEXT = "station/depot builds are experimental in this test 
 
 local function constructionsBlocked(rec)
 	return BLOCK_CONSTRUCTIONS and type(rec) == "table" and type(rec.cons) == "table" and #rec.cons > 0
+end
+
+-- What this game's world shows for the segments a record adds, one line each (for the trace, on the originator and on every replay, so the
+-- two can be set side by side: sweep run 20261013-064236 B5, edges and node configurations differed with equal counts). The edge is looked
+-- for by its ends (1.5 m, either way round). Never raises; returns a list of lines.
+function M.readPieces(body)
+	local lines = {}
+	pcall(function()
+		local rec = body.args[1]
+		local function f(v) return string.format("%.3f", v or 0) end
+		local function pt(p) return p and (f(p.x) .. "," .. f(p.y) .. "," .. f(p.z)) or "?" end
+		local function same(a, b) return a and b and abs(a.x - b.x) <= 1.5 and abs(a.y - b.y) <= 1.5 end
+		local function cfg(n)
+			local c = A.comp(n, "BASE_NODE_CONFIG")
+			if not c then return "none" end
+			return string.format("lc%d/cw%d", #A.list(c, "laneConnections"), #A.list(c, "crosswalks"))
+		end
+		for i, sg in ipairs(rec.segs or {}) do
+			if i > 8 then lines[#lines + 1] = "..." break end
+			local c = sg.c or {}
+			local found
+			if c.p0 and c.p1 then
+				local mx, my = (c.p0.x + c.p1.x) / 2, (c.p0.y + c.p1.y) / 2
+				local r = sqrt((c.p0.x - c.p1.x) ^ 2 + (c.p0.y - c.p1.y) ^ 2) / 2 + 5
+				for _, e in ipairs(octree({ x = mx, y = my }, r, "BASE_EDGE") or {}) do
+					local info = A.edgeInfo(e)
+					if info and ((same(info.p0, c.p0) and same(info.p1, c.p1)) or (same(info.p0, c.p1) and same(info.p1, c.p0))) then found = { e = e, info = info } break end
+				end
+			end
+			if found then
+				local ec = A.comp(found.e, "BASE_EDGE")
+				lines[#lines + 1] = string.format("segment %s (%s -> %s, %s): edge %d type=%s typeIndex=%s roadType=%s p0=%s p1=%s t0=%s t1=%s objects=%d cfg0=%s cfg1=%s",
+					tostring(sg.id), pt(c.p0), pt(c.p1), tostring(c.roadTemplate), found.e, tostring(ec and get(ec, "type")), tostring(ec and get(ec, "typeIndex")),
+					tostring(ec and get(ec, "roadType")), pt(found.info.p0), pt(found.info.p1), pt(found.info.t0), pt(found.info.t1), #A.objectsOf(found.e),
+					cfg(found.info.n0), cfg(found.info.n1))
+			else
+				lines[#lines + 1] = string.format("segment %s (%s -> %s, %s): NO edge with these ends in this game", tostring(sg.id), pt(c.p0), pt(c.p1), tostring(c.roadTemplate))
+			end
+		end
+	end)
+	return lines
 end
 
 -- true when this build record (a body of makeWorldBuildProposalCmd, as captured) adds constructions and the block is on

@@ -400,6 +400,11 @@ function MAKE_API()
   E.util.proposal = {
     -- the engine reads proposal data of a SimpleProposal only (real session 2026-10-13); off unless a test switches it on
     makeProposalData = function(p, ctx)
+      if SCRIPT_PIECES then   -- a test lets the construction's script add these street pieces (list of { p0, p1 })
+        local segs = {}
+        for i, pc in ipairs(SCRIPT_PIECES(p)) do segs[i] = { comp = { position0 = pc.p0, position1 = pc.p1 } } end
+        return { errorState = { critical = false, messages = {}, warnings = {} }, proposal = { proposal = { addedNodes = {}, addedSegments = segs } } }
+      end
       if not VERDICT_MOCK then error("not available in this mock") end
       local mt = getmetatable(p)
       if mt and mt.__double == "Proposal" then error("bad argument #2 to 'makeProposalData' (SimpleProposal expected, got Proposal)") end
@@ -2132,6 +2137,37 @@ class PureBuildTest(unittest.TestCase):
                   "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
         self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "withStreet")
         self.assertEqual(self.ev("PLAN_OF(NATIVE_ROAD_MOVING{ %s, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 54 })" % road), "combined")
+
+    def test_the_pieces_a_construction_brings_are_the_ones_its_dry_run_adds_not_a_guess_by_shape(self):
+        # sweep run 20261013-064236 (B5): the shape guess ("both ends new nodes within 200 m of the construction") decided which tunnel pieces are the
+        # construction's own; the engine's own dry run of the construction now decides, the guess is the fallback
+        joined = ("(function() local P = NATIVE_UNDERGROUND{ x = 100, y = 0 }; local sp = P.proposal; local added = sp.addedSegments; "
+                  "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        pieces = ("SCRIPT_PIECES = function(p) return { { p0 = { x = 130, y = 8, z = -13 }, p1 = { x = 120, y = 5, z = -13 } }, "
+                  "{ p0 = { x = 80, y = -5, z = -13 }, p1 = { x = 70, y = -8, z = -13 } } } end")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "withStreet", "the guess alone takes a piece joined to the world for a street")
+        self.ev("(function() %s end)()" % pieces)
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "construction", "the engine's dry run says both pieces are the construction's own (either way round)")
+        # a dry run that adds none of the record's pieces leaves all of them street (nothing is the construction's own)
+        self.ev("(function() SCRIPT_PIECES = function(p) return { { p0 = { x = 5000, y = 5000, z = 0 }, p1 = { x = 5010, y = 5000, z = 0 } } } end end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "combined")
+        # a dry run that answers with no piece at all falls back to the shape guess
+        self.ev("(function() SCRIPT_PIECES = function(p) return {} end end)()")
+        self.assertEqual(self.ev("PLAN_OF(NATIVE_UNDERGROUND{ x = 1195, y = 513 })"), "construction")
+
+    def test_the_world_readback_of_a_records_segments_names_the_edge_or_says_there_is_none(self):
+        # the trace line both games write after a build (build.pieces), to compare what each ended up with
+        code = """(function()
+            local M, C, ctx = PURE()
+            local P = SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }
+            local body = M.capture(P, {}, ctx)
+            local before = table.concat(M.readPieces(body), '|')
+            APPLY_BUILD(P)
+            return before .. '##' .. table.concat(M.readPieces(body), '|')
+        end)()"""
+        before, after = self.ev(code).split("##")
+        self.assertIn("NO edge with these ends in this game", before)
+        self.assertRegex(after, r"edge \d+ type=\S+ typeIndex=\S+ roadType=\S+ p0=300\.000,0\.000,0\.000 p1=400\.000,0\.000,0\.000")
 
     def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
         # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified

@@ -1250,6 +1250,11 @@ local function simAdvanceBinders(st, now)
 		if complete then
 			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
 			pcall(function()
+				if b.fn == "makeWorldBuildProposalCmd" and Build and Build.readPieces then
+					for _, line in ipairs(Build.readPieces(b.body)) do traceSim("build.pieces", b.key .. " " .. line) end
+				end
+			end)
+			pcall(function()
 				local ents = {}
 				for i = 1, math.min(#made, 16) do ents[#ents + 1] = entLine(made[i]) end
 				local keys = {}
@@ -1308,6 +1313,11 @@ local function simAdvanceBinders(st, now)
 				end
 				traceSim("build.result", string.format("%s ok=false steps=%d new entities [%s] money %s -> %s record=%s", b.key, b.steps, table.concat(ents, " "),
 					tostring(b.money0), tostring(engine.account()), C.serialize(b.body)))
+			end)
+			pcall(function()
+				if b.fn == "makeWorldBuildProposalCmd" and Build and Build.readPieces then
+					for _, line in ipairs(Build.readPieces(b.body)) do traceSim("build.pieces", b.key .. " " .. line) end
+				end
 			end)
 			logSim("action " .. b.key .. ": RESULT DIFFERS from the record after " .. b.steps .. " steps: " .. (ok2 and why or ("(" .. tostring(why) .. ")")) .. " [not every entity it created was found; a build the engine refuses creates nothing]")
 			simNote(st, now, "action " .. b.key .. " did not find every entity it created")
