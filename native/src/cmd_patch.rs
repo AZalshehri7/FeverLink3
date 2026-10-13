@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::dump::{pointer_like, u64_at, Mem, PAYLOAD_SIZE};
+use crate::dump::{pointer_like, u32_at, u64_at, Mem, PAYLOAD_SIZE};
 use crate::link::{Event, MAX_PATCH_FROZEN};
 use crate::portable::KIND_BUILD_PROPOSAL;
 use crate::rebuild::Alloc;
@@ -45,11 +45,24 @@ pub fn announces(enabled: bool, build: &str, allocator_ok: impl FnOnce() -> bool
     enabled && build == crate::portable::LAYOUT_BUILD && allocator_ok()
 }
 
+impl Order {
+    /// How many nodes the order freezes.
+    pub fn count(&self) -> usize {
+        if self.at.is_empty() {
+            self.frozen.len()
+        } else {
+            self.at.len()
+        }
+    }
+}
+
 /// One armed order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Order {
     pub frozen: Vec<u32>,
     pub adds: u32,
+    /// Positions of the nodes to freeze; when given they replace `frozen` and `adds` (resolved against the converted proposal).
+    pub at: Vec<[f64; 3]>,
     pub armed_ms: u64,
     pub ttl_ms: u64,
 }
@@ -80,6 +93,8 @@ struct Seen {
     kinds: std::collections::BTreeMap<Option<u8>, u64>,
     /// The last few Adds since arming, as text.
     last: std::collections::VecDeque<String>,
+    /// Shapes of the conversions already dumped for this order.
+    shapes: std::collections::BTreeSet<String>,
     /// What went before the order: the build_proposal gap and the Adds just ahead of it.
     before: String,
 }
@@ -136,7 +151,7 @@ impl State {
     }
 
     /// The mod's `patch_next`. A second order replaces the first (the first is reported as refused).
-    pub fn arm(&self, frozen: Vec<u32>, adds: u32, ttl: u64, now: u64) {
+    pub fn arm(&self, frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64, now: u64) {
         if !self.enabled() {
             self.refuse("FEVERLINK3_NATIVE_PATCH is off");
             return;
@@ -144,7 +159,7 @@ impl State {
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
         let before = self.before_text(now);
         *lock(&self.seen) = Seen { before, ..Seen::default() };
-        let old = lock(&self.order).replace(Order { frozen, adds, armed_ms: now, ttl_ms });
+        let old = lock(&self.order).replace(Order { frozen, adds, at, armed_ms: now, ttl_ms });
         if old.is_some() {
             self.refuse("replaced by a newer patch_next before a command used it");
         }
@@ -252,6 +267,11 @@ impl State {
         lock(&self.order).as_ref().filter(|o| now.saturating_sub(o.armed_ms) <= o.ttl_ms).cloned()
     }
 
+    /// True the first time a conversion of this `shape` is seen while the order is armed.
+    pub fn new_shape(&self, shape: &str) -> bool {
+        lock(&self.seen).shapes.insert(shape.to_string())
+    }
+
     /// A converted proposal was patched.
     pub fn converted_one(&self) {
         lock(&self.seen).converted += 1;
@@ -319,6 +339,62 @@ pub trait Poke {
 pub struct Done {
     /// A new block was allocated for the proposal's list.
     pub allocated: bool,
+    /// The indices written (those of the order, or the ones its positions resolved to).
+    pub frozen: Vec<u32>,
+    /// The number of added nodes the proposal had.
+    pub nodes: usize,
+}
+
+/// Matches one position to a node of `addedNodes` (3-D distance at most this many metres).
+pub const AT_TOLERANCE_M: f64 = 0.05;
+
+/// The index of the one added node at each position. A position that matches none: this is not the proposal (`NotThis`); a
+/// position that matches several: the order cannot be carried out (`Refuse`).
+fn resolve_positions(mem: &dyn Mem, nodes_at: usize, nodes: usize, at: &[[f64; 3]]) -> Result<Vec<u32>, Fail> {
+    let raw = if nodes == 0 {
+        Vec::new()
+    } else {
+        mem.read(nodes_at, nodes * NODE_STRIDE)
+            .ok_or_else(|| Fail::NotThis("proposal.addedNodes is not readable".into()))?
+    };
+    let pos = |i: usize| -> [f64; 3] {
+        let o = i * NODE_STRIDE + 4;
+        [0, 4, 8].map(|d| f64::from(f32::from_bits(u32_at(&raw, o + d))))
+    };
+    let mut out = Vec::with_capacity(at.len());
+    for (k, want) in at.iter().enumerate() {
+        let hits: Vec<usize> = (0..nodes)
+            .filter(|&i| {
+                let p = pos(i);
+                let d2: f64 = (0..3).map(|j| (p[j] - want[j]).powi(2)).sum();
+                d2 <= AT_TOLERANCE_M * AT_TOLERANCE_M
+            })
+            .collect();
+        match hits.as_slice() {
+            [] => {
+                return Err(Fail::NotThis(format!(
+                    "no added node (of {nodes}) lies within {AT_TOLERANCE_M} m of at[{}] ({:.2}, {:.2}, {:.2})",
+                    k + 1,
+                    want[0],
+                    want[1],
+                    want[2]
+                )))
+            }
+            [i] => out.push(*i as u32),
+            more => {
+                return Err(Fail::Refuse(format!(
+                    "at[{}] ({:.2}, {:.2}, {:.2}) matches {} added nodes within {AT_TOLERANCE_M} m ({:?}): not unique",
+                    k + 1,
+                    want[0],
+                    want[1],
+                    want[2],
+                    more.len(),
+                    more
+                )))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One list of u32 about to be written.
@@ -358,8 +434,8 @@ pub const PROPOSAL_SIZE: usize = 0x358;
 /// The checks and the writes on a command's payload. Reads `payload` through `mem`, takes a block from `alloc` for an empty list,
 /// writes through `poke`. Nothing is written (and nothing stays allocated) unless every check passes.
 pub fn apply(mem: &dyn Mem, poke: &dyn Poke, alloc: &dyn Alloc, payload: usize, order: &Order) -> Result<Done, String> {
-    if order.frozen.is_empty() || order.frozen.len() > MAX_PATCH_FROZEN {
-        return Err(format!("{} frozen indices", order.frozen.len()));
+    if order.count() == 0 || order.count() > MAX_PATCH_FROZEN {
+        return Err(format!("{} frozen indices", order.count()));
     }
     let bytes = mem.read(payload, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
     if bytes[KIND_OFFSET] != KIND_BUILD_PROPOSAL {
@@ -402,10 +478,124 @@ impl Poke for Nothing {
 /// Whether `order` describes the proposal at `proposal` (every check of [`apply_proposal`], no write, no allocation).
 pub fn describes(mem: &dyn Mem, proposal: usize, order: &Order) -> Result<(), Fail> {
     match apply_proposal(mem, &Nothing, &Nothing, proposal, order) {
-        Err(Fail::Refuse(_)) if !order.frozen.is_empty() && order.frozen.len() <= MAX_PATCH_FROZEN => Ok(()), // only the writing failed
+        Err(Fail::Refuse(r)) if r.starts_with("at[") => Err(Fail::Refuse(r)), // not unique: that is the order's answer
+        Err(Fail::Refuse(_)) if order.count() > 0 && order.count() <= MAX_PATCH_FROZEN => Ok(()), // only the writing failed
         Err(f) => Err(f),
         Ok(_) => Ok(()),
     }
+}
+
+const ADDED_SEGMENTS: usize = 0x018;
+const SEGMENT_STRIDE: usize = 0x350;
+/// The most nodes / segments / indices a dump lists.
+const DUMP_LIMIT: usize = 24;
+
+/// A vector of `stride`-byte elements at `off` of the proposal bytes: (begin, count), `None` when it is not one.
+fn vector_at(bytes: &[u8], off: usize, stride: usize) -> Option<(usize, usize)> {
+    let (b, e, c) = triple(bytes, off);
+    if b == 0 && e == 0 && c == 0 {
+        return Some((0, 0));
+    }
+    (pointer_like(b) && b <= e && e <= c && ((e - b) as usize).is_multiple_of(stride))
+        .then(|| (b as usize, (e - b) as usize / stride))
+}
+
+/// A list of u32 (`frozenNodes`) as text.
+fn u32_list(mem: &dyn Mem, bytes: &[u8], off: usize) -> String {
+    let (b, e, c) = triple(bytes, off);
+    if b == 0 && e == 0 && c == 0 {
+        return "empty".into();
+    }
+    if !(pointer_like(b) && b % 4 == 0 && b <= e && e <= c && (e - b) % 4 == 0) {
+        return "not a vector".into();
+    }
+    let n = ((e - b) / 4) as usize;
+    match mem.read(b as usize, 4 * n.min(DUMP_LIMIT)) {
+        Some(v) => format!(
+            "{:?}{}",
+            v.chunks(4).map(|x| u32_at(x, 0)).collect::<Vec<_>>(),
+            if n > DUMP_LIMIT { "+" } else { "" }
+        ),
+        None => "unreadable".into(),
+    }
+}
+
+/// What a conversion produced, for the log and the `convert_dump` event: (a key that is equal for equal shapes, the text).
+/// Read-only. `flag` is the "has a value" byte of the `optional<Proposal>`.
+pub fn dump_proposal(mem: &dyn Mem, proposal: usize, flag: Option<u8>) -> (String, String) {
+    let flag_text = match flag {
+        Some(0) => "NO VALUE (Convert failed)".to_string(),
+        Some(_) => "has value".to_string(),
+        None => "flag unreadable".to_string(),
+    };
+    let Some(bytes) = mem.read(proposal, PROPOSAL_SIZE) else {
+        let t = format!("{flag_text}; the proposal is not readable");
+        return (t.clone(), t);
+    };
+    let mut text = flag_text;
+    let mut key = text.clone();
+    let mut ids = Vec::new();
+    match vector_at(&bytes, ADDED_NODES, NODE_STRIDE) {
+        None => text.push_str("; addedNodes: not a vector"),
+        Some((at, n)) => {
+            text.push_str(&format!("; addedNodes {n}:"));
+            key.push_str(&format!("|nodes {n}"));
+            let raw = if n == 0 { Some(Vec::new()) } else { mem.read(at, n.min(DUMP_LIMIT) * NODE_STRIDE) };
+            if let Some(raw) = &raw {
+                for i in 0..n.min(DUMP_LIMIT) {
+                    let o = i * NODE_STRIDE;
+                    let id = u32_at(raw, o) as i32;
+                    ids.push(id);
+                    let p = [4, 8, 12].map(|d| f32::from_bits(u32_at(raw, o + d)));
+                    text.push_str(&format!(" [{i}] id {id} ({:.3}, {:.3}, {:.3})", p[0], p[1], p[2]));
+                }
+            }
+        }
+    }
+    match vector_at(&bytes, ADDED_SEGMENTS, SEGMENT_STRIDE) {
+        None => text.push_str("; addedSegments: not a vector"),
+        Some((at, n)) => {
+            text.push_str(&format!("; addedSegments {n}:"));
+            key.push_str(&format!("|segments {n}"));
+            let raw = if n == 0 { Some(Vec::new()) } else { mem.read(at, n.min(DUMP_LIMIT) * SEGMENT_STRIDE) };
+            let node =
+                |id: i32| ids.iter().position(|&x| x == id).map_or(format!("ent {id}"), |i| format!("node[{i}]"));
+            if let Some(raw) = &raw {
+                for i in 0..n.min(DUMP_LIMIT) {
+                    let o = i * SEGMENT_STRIDE;
+                    text.push_str(&format!(
+                        " [{i}] id {} {} -> {} baseType {} typeIndex {} roadType {} type {}",
+                        u32_at(raw, o) as i32,
+                        node(u32_at(raw, o + 8) as i32),
+                        node(u32_at(raw, o + 0xc) as i32),
+                        u32_at(raw, o + 0x40),
+                        u32_at(raw, o + 0x44) as i32,
+                        u32_at(raw, o + 0x98),
+                        u32_at(raw, o + 0x120),
+                    ));
+                }
+            }
+        }
+    }
+    let own = u32_list(mem, &bytes, PROPOSAL_FROZEN);
+    text.push_str(&format!("; proposal.frozenNodes {own}"));
+    key.push_str(&format!("|frozen {own}"));
+    match vector_at(&bytes, TO_ADD, CONSTRUCTION_STRIDE) {
+        None => text.push_str("; toAdd: not a vector"),
+        Some((_, 0)) => {
+            text.push_str("; toAdd: none");
+            key.push_str("|toAdd 0");
+        }
+        Some((at, n)) => match mem.read(at + CONSTRUCTION_FROZEN, 24) {
+            Some(t) => {
+                let l = u32_list(mem, &t, 0);
+                text.push_str(&format!("; toAdd {n}, toAdd[0].frozenNodes {l}"));
+                key.push_str(&format!("|toAdd {n} {l}"));
+            }
+            None => text.push_str(&format!("; toAdd {n}, toAdd[0].frozenNodes unreadable")),
+        },
+    }
+    (key, text)
 }
 
 /// The same on a bare `Proposal` (the result of `scripting::Convert`), which has no kind byte.
@@ -416,8 +606,8 @@ pub fn apply_proposal(
     proposal: usize,
     order: &Order,
 ) -> Result<Done, Fail> {
-    if order.frozen.is_empty() || order.frozen.len() > MAX_PATCH_FROZEN {
-        return Err(Fail::Refuse(format!("{} frozen indices", order.frozen.len())));
+    if order.count() == 0 || order.count() > MAX_PATCH_FROZEN {
+        return Err(Fail::Refuse(format!("{} frozen indices", order.count())));
     }
     let bytes = mem.read(proposal, PROPOSAL_SIZE).ok_or(Fail::NotThis("the proposal is not readable".into()))?;
     apply_bytes(mem, poke, alloc, proposal, &bytes, order)
@@ -431,7 +621,6 @@ fn apply_bytes(
     bytes: &[u8],
     order: &Order,
 ) -> Result<Done, Fail> {
-    let n = order.frozen.len();
     let not_this = |s: String| Fail::NotThis(s);
     let (b, e, c) = triple(bytes, ADDED_NODES);
     let nodes = if b == 0 && e == 0 && c == 0 {
@@ -441,12 +630,18 @@ fn apply_bytes(
     } else {
         return Err(not_this("proposal.addedNodes is not a vector".into()));
     };
-    if nodes != order.adds as usize {
-        return Err(not_this(format!("the command has {nodes} added nodes, the order says {}", order.adds)));
-    }
-    if let Some(i) = order.frozen.iter().find(|&&i| i as usize >= nodes) {
-        return Err(not_this(format!("frozen index {i} is not below the {nodes} added nodes")));
-    }
+    let frozen: Vec<u32> = if order.at.is_empty() {
+        if nodes != order.adds as usize {
+            return Err(not_this(format!("the command has {nodes} added nodes, the order says {}", order.adds)));
+        }
+        if let Some(i) = order.frozen.iter().find(|&&i| i as usize >= nodes) {
+            return Err(not_this(format!("frozen index {i} is not below the {nodes} added nodes")));
+        }
+        order.frozen.clone()
+    } else {
+        resolve_positions(mem, b as usize, nodes, &order.at)?
+    };
+    let n = frozen.len();
     // the constructions
     let (tb, te, tc) = triple(bytes, TO_ADD);
     if tb == 0 && te == 0 && tc == 0 {
@@ -501,7 +696,7 @@ fn apply_bytes(
     }
     // the values go in first, the pointers last: a failure in between leaves a list that still says what it said
     let mut data = Vec::with_capacity(4 * n);
-    for v in &order.frozen {
+    for v in &frozen {
         data.extend_from_slice(&v.to_le_bytes());
     }
     let mut ok = true;
@@ -528,13 +723,12 @@ fn apply_bytes(
     }
     let allocated = plans.iter().any(|p| p.fresh);
     alloc.forget_all(); // the command's Proposal owns the blocks now
-    Ok(Done { allocated })
+    Ok(Done { allocated, frozen, nodes })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dump::u32_at;
     use crate::rebuild::Arena;
 
     const HEAP: usize = 0x2000_0000_0000;
@@ -591,7 +785,7 @@ mod tests {
     }
 
     fn order(frozen: &[u32], adds: u32) -> Order {
-        Order { frozen: frozen.to_vec(), adds, armed_ms: 0, ttl_ms: 1000 }
+        Order { frozen: frozen.to_vec(), adds, at: vec![], armed_ms: 0, ttl_ms: 1000 }
     }
 
     fn list(a: &Arena, addr: usize) -> (Vec<u32>, u64, u64, u64) {
@@ -617,7 +811,7 @@ mod tests {
     fn empty_lists_get_new_blocks_with_the_indices() {
         let (a, p) = world(3, 1, None, None);
         let done = apply(&a, &a, &a, p, &order(&[1], 3)).expect("patched");
-        assert_eq!(done, Done { allocated: true });
+        assert!(done.allocated);
         let (x, y) = lists(&a, p);
         assert_eq!((x.0.clone(), y.0.clone()), (vec![1], vec![1]));
         assert_eq!(x.2 - x.1, 4);
@@ -630,7 +824,7 @@ mod tests {
         let (a, p) = world(2, 1, Some((4, 16)), Some((0, 16)));
         let before = lists(&a, p);
         let done = apply(&a, &a, &a, p, &order(&[0, 1], 2)).expect("patched");
-        assert_eq!(done, Done { allocated: false });
+        assert!(!done.allocated);
         let after = lists(&a, p);
         assert_eq!(after.0 .0, vec![0, 1]);
         assert_eq!(after.1 .0, vec![0, 1]);
@@ -708,20 +902,20 @@ mod tests {
     #[test]
     fn the_state_arms_expires_and_reports() {
         let s = State::default();
-        s.arm(vec![1], 3, 0, 100);
+        s.arm(vec![1], 3, vec![], 0, 100);
         assert!(!s.pending(), "off: refused");
         assert!(matches!(s.drain_events(100).as_slice(), [Event::PatchRefused { reason }] if reason.contains("off")));
         s.enable();
-        s.arm(vec![1], 3, 0, 100);
+        s.arm(vec![1], 3, vec![], 0, 100);
         assert!(s.pending());
         assert!(s.take(100 + DEFAULT_TTL_MS + 1).is_none());
         assert!(matches!(s.drain_events(0).as_slice(), [Event::PatchRefused { reason }] if reason.contains("expired")));
-        s.arm(vec![1], 3, 50, 100);
-        assert_eq!(s.take(120), Some(Order { frozen: vec![1], adds: 3, armed_ms: 100, ttl_ms: 50 }));
+        s.arm(vec![1], 3, vec![], 50, 100);
+        assert_eq!(s.take(120), Some(Order { frozen: vec![1], adds: 3, at: vec![], armed_ms: 100, ttl_ms: 50 }));
         assert!(!s.pending());
         // a newer order replaces; an unused one expires on the service thread
-        s.arm(vec![1], 3, 10, 0);
-        s.arm(vec![0], 2, 10, 5);
+        s.arm(vec![1], 3, vec![], 10, 0);
+        s.arm(vec![0], 2, vec![], 10, 5);
         let ev = s.drain_events(6);
         assert!(matches!(ev.as_slice(), [Event::PatchRefused { reason }] if reason.contains("replaced")));
         assert!(
@@ -736,7 +930,7 @@ mod tests {
         assert!(a.write(p + KIND_OFFSET, &[0]));
         assert!(apply(&a, &a, &a, p, &order(&[1], 3)).is_err(), "as a command it is not a build_proposal");
         let done = apply_proposal(&a, &a, &a, p, &order(&[1], 3)).expect("patched");
-        assert_eq!(done, Done { allocated: true });
+        assert!(done.allocated);
         let (x, y) = lists(&a, p);
         assert_eq!((x.0, y.0), (vec![1], vec![1]));
         assert_eq!(added_nodes(&a, p), Some(3));
@@ -759,7 +953,7 @@ mod tests {
     fn an_order_patched_by_conversions_expires_as_a_skip_not_a_refusal() {
         let s = State::default();
         s.enable();
-        s.arm(vec![1], 2, 0, 0);
+        s.arm(vec![1], 2, vec![], 0, 0);
         assert!(s.peek(5).is_some() && s.pending(), "peeking does not take");
         s.converted_one();
         assert!(s.peek(DEFAULT_TTL_MS + 1).is_none());
@@ -768,5 +962,73 @@ mod tests {
             matches!(ev.as_slice(), [Event::PatchSkipped { reason, .. }] if reason.contains("expired after patching") && reason.contains("1 converted")),
             "{ev:?}"
         );
+    }
+
+    /// Puts node `i` of the world's addedNodes at (x, y, z) with entity id `-(i+1)`.
+    fn place(a: &Arena, p: usize, i: usize, x: f32, y: f32, z: f32) {
+        let nb = u64_at(&a.read(p, PROPOSAL_SIZE).unwrap(), ADDED_NODES) as usize;
+        let mut n = Vec::new();
+        n.extend_from_slice(&(-(i as i32) - 1).to_le_bytes());
+        for v in [x, y, z] {
+            n.extend_from_slice(&v.to_le_bytes());
+        }
+        assert!(a.write(nb + i * NODE_STRIDE, &n));
+    }
+
+    fn at_order(at: &[[f64; 3]]) -> Order {
+        Order { frozen: vec![], adds: 0, at: at.to_vec(), armed_ms: 0, ttl_ms: 1000 }
+    }
+
+    #[test]
+    fn positions_resolve_to_the_one_added_node_there_and_adds_is_not_checked() {
+        let (a, p) = world(4, 1, None, None);
+        for (i, x) in [10.0f32, 20.0, 30.0, 40.0].into_iter().enumerate() {
+            place(&a, p, i, x, 5.0, 1.0);
+        }
+        // 4 nodes where an index order would have said 2: no `adds` check with positions
+        let done = apply_proposal(&a, &a, &a, p, &at_order(&[[30.03, 5.0, 1.0], [10.0, 5.0, 1.04]])).expect("patched");
+        assert_eq!((done.frozen.clone(), done.nodes), (vec![2, 0], 4));
+        let (x, y) = lists(&a, p);
+        assert_eq!((x.0, y.0), (vec![2, 0], vec![2, 0]));
+    }
+
+    #[test]
+    fn a_position_with_no_node_is_not_this_proposal_and_a_shared_one_is_refused() {
+        let (a, p) = world(3, 1, None, None);
+        place(&a, p, 0, 1.0, 1.0, 1.0);
+        place(&a, p, 1, 2.0, 2.0, 2.0);
+        place(&a, p, 2, 2.0, 2.0, 2.02);
+        let before = a.read(p, PROPOSAL_SIZE).unwrap();
+        let r = apply_proposal(&a, &a, &a, p, &at_order(&[[9.0, 9.0, 9.0]]));
+        assert!(matches!(&r, Err(Fail::NotThis(w)) if w.contains("at[1]")), "{r:?}");
+        let r = apply_proposal(&a, &a, &a, p, &at_order(&[[1.0, 1.0, 1.0], [2.0, 2.0, 2.01]]));
+        assert!(matches!(&r, Err(Fail::Refuse(w)) if w.contains("at[2]") && w.contains("not unique")), "{r:?}");
+        assert!(matches!(describes(&a, p, &at_order(&[[2.0, 2.0, 2.01]])), Err(Fail::Refuse(_))));
+        assert_eq!(a.read(p, PROPOSAL_SIZE).unwrap(), before, "nothing was written");
+        let r = apply_proposal(&a, &a, &a, p, &at_order(&[[1.0, 1.0, 1.06]]));
+        assert!(matches!(r, Err(Fail::NotThis(_))), "0.06 m is outside the tolerance");
+    }
+
+    #[test]
+    fn the_dump_lists_nodes_segments_and_what_the_engine_left_in_the_frozen_lists() {
+        let (a, p) = world(2, 1, Some((8, 8)), None);
+        place(&a, p, 0, 1.5, 2.5, 3.5);
+        place(&a, p, 1, 4.0, 5.0, 6.0);
+        let (key, text) = dump_proposal(&a, p, Some(1));
+        assert!(
+            text.starts_with(
+                "has value; addedNodes 2: [0] id -1 (1.500, 2.500, 3.500) [1] id -2 (4.000, 5.000, 6.000)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("addedSegments 0")
+                && text.contains("proposal.frozenNodes [")
+                && text.contains("toAdd 1, toAdd[0].frozenNodes empty"),
+            "{text}"
+        );
+        place(&a, p, 0, 9.0, 9.0, 9.0);
+        assert_eq!(dump_proposal(&a, p, Some(1)).0, key, "positions are not part of the shape");
+        assert!(dump_proposal(&a, p, Some(0)).1.starts_with("NO VALUE (Convert failed)"));
     }
 }

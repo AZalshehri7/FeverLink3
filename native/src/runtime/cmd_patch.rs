@@ -41,9 +41,9 @@ impl Runtime {
     }
 
     /// A `patch_next` order of the control file.
-    pub(super) fn arm_patch(&self, frozen: Vec<u32>, adds: u32, ttl: u64, now: u64) {
+    pub(super) fn arm_patch(&self, frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64, now: u64) {
         let gap = self.patch.ms_since_build_proposal(now);
-        self.patch.arm(frozen, adds, ttl, now);
+        self.patch.arm(frozen, adds, at, ttl, now);
         self.say(&format!(
             "native patch: patch_next first seen; ms since the previous build_proposal Add: {}",
             gap.map_or("none yet".to_string(), |g| g.to_string())
@@ -116,9 +116,11 @@ impl Runtime {
             Ok(alloc) => cp::apply(&crate::dump::LiveMem, &LivePoke, &alloc, payload, &order),
         };
         match result {
-            Ok(done) => {
-                self.patch.report(Event::Patched { frozen: order.frozen, adds: order.adds, allocated: done.allocated })
-            }
+            Ok(done) => self.patch.report(Event::Patched {
+                frozen: done.frozen,
+                adds: u32::try_from(done.nodes).unwrap_or(u32::MAX),
+                allocated: done.allocated,
+            }),
             Err(reason) => self.patch.report(Event::PatchRefused { reason }),
         }
         self.wake();
@@ -158,6 +160,12 @@ impl Runtime {
         let mem = crate::dump::LiveMem;
         let flag = crate::dump::Mem::read(&mem, out + cp::PROPOSAL_SIZE, 1).map(|b| b[0]);
         let nodes = cp::added_nodes(&mem, out).map_or("?".to_string(), |n| n.to_string());
+        // what this conversion produced, once per distinct shape (the engine's own frozenNodes lists show whether it fills them)
+        let (shape, dump) = cp::dump_proposal(&mem, out, flag);
+        if self.patch.new_shape(&shape) {
+            self.say(&format!("native patch: convert: call site rva {at}: {dump}"));
+            self.patch.convert_event(Event::ConvertDump { text: format!("call site rva {at}: {dump}") });
+        }
         let outcome: Result<cp::Done, cp::Fail> = match flag {
             None => Err(cp::Fail::NotThis("the result is not readable".into())),
             Some(0) => Err(cp::Fail::NotThis("Convert produced no proposal (the conversion failed)".into())),
@@ -171,19 +179,25 @@ impl Runtime {
             Ok(done) => {
                 self.patch.converted_one();
                 self.say(&format!(
-                    "native patch: convert: call site rva {at}, {nodes} added nodes: PATCHED frozenNodes {:?} (new block: {}); the order stays armed until a build_proposal Add or its ttl",
-                    order.frozen, done.allocated
+                    "native patch: convert: call site rva {at}, {nodes} added nodes: PATCHED frozenNodes {:?} (new block: {}){}; the order stays armed until a build_proposal Add or its ttl",
+                    done.frozen,
+                    done.allocated,
+                    if order.at.is_empty() { String::new() } else { format!(", resolved from {} position(s)", order.at.len()) }
                 ));
                 self.patch.convert_event(Event::Patched {
-                    frozen: order.frozen,
-                    adds: order.adds,
+                    frozen: done.frozen,
+                    adds: u32::try_from(done.nodes).unwrap_or(u32::MAX),
                     allocated: done.allocated,
                 });
             }
             Err(cp::Fail::NotThis(why)) => {
                 self.say(&format!(
                     "native patch: convert: call site rva {at}, {nodes} added nodes (order: {}): skipped: {why}",
-                    order.adds
+                    if order.at.is_empty() {
+                        format!("adds {}", order.adds)
+                    } else {
+                        format!("{} position(s)", order.at.len())
+                    }
                 ));
                 self.patch.convert_event(Event::PatchSkipped { reason: format!("convert: {why}"), kind: None, site });
             }

@@ -42,7 +42,7 @@ pub const MAX_EVENTS_BYTES: u64 = 8 * 1024 * 1024;
 // ---------------------------------------------------------------------------------------------------------------
 
 /// One message of `native_ctl.log`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CtlMessage {
     /// Start holding commands of these kinds (names of the build's kind table).
     HoldOn { kinds: Vec<String> },
@@ -59,7 +59,9 @@ pub enum CtlMessage {
     /// `FEVERLINK3_NATIVE_PATCH`: patch the NEXT script `build_proposal` command that reaches the command list (not a held one):
     /// its `frozenNodes` get these indices into `proposal.addedNodes`, which must hold exactly `adds` nodes. Expires after `ttl` ms
     /// (0: the module's default).
-    PatchNext { frozen: Vec<u32>, adds: u32, ttl: u64 },
+    /// `at` (optional, 1 to 64 `{x, y, z}` positions) names the nodes by position instead: each must match exactly one node of the
+    /// converted proposal within 0.05 m, and then `frozen` and `adds` are not needed (and not used).
+    PatchNext { frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64 },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -150,21 +152,43 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             stamp: optional(&p, "stamp", "stamp must be a game time")?,
         }),
         "patch_next" => {
-            let list =
-                p.get("frozen").and_then(Value::as_array).ok_or(CtlError::BadPayload("frozen must be a list"))?;
-            if list.is_empty() || list.len() > MAX_PATCH_FROZEN {
-                return Err(CtlError::BadPayload("frozen must hold 1 to 64 indices"));
+            let mut at = Vec::new();
+            if let Some(v) = p.get("at") {
+                let list = v.as_array().ok_or(CtlError::BadPayload("at must be a list of {x, y, z}"))?;
+                if list.is_empty() || list.len() > MAX_PATCH_FROZEN {
+                    return Err(CtlError::BadPayload("at must hold 1 to 64 positions"));
+                }
+                for item in list {
+                    let xyz = item.as_array().filter(|a| a.len() == 3);
+                    let n: Option<Vec<f64>> = xyz.map(|a| a.iter().filter_map(Value::as_f64).collect());
+                    match n {
+                        Some(n) if n.len() == 3 && n.iter().all(|f| f.is_finite()) => at.push([n[0], n[1], n[2]]),
+                        _ => return Err(CtlError::BadPayload("a position in at is not {x, y, z} of finite numbers")),
+                    }
+                }
             }
-            let mut frozen = Vec::with_capacity(list.len());
-            for item in list {
-                let n = whole(item).and_then(|n| u32::try_from(n).ok());
-                frozen.push(n.ok_or(CtlError::BadPayload("a frozen index is not a whole number"))?);
+            let mut frozen = Vec::new();
+            if at.is_empty() || p.get("frozen").is_some() {
+                let list =
+                    p.get("frozen").and_then(Value::as_array).ok_or(CtlError::BadPayload("frozen must be a list"))?;
+                if list.is_empty() || list.len() > MAX_PATCH_FROZEN {
+                    return Err(CtlError::BadPayload("frozen must hold 1 to 64 indices"));
+                }
+                for item in list {
+                    let n = whole(item).and_then(|n| u32::try_from(n).ok());
+                    frozen.push(n.ok_or(CtlError::BadPayload("a frozen index is not a whole number"))?);
+                }
             }
-            let adds = u32::try_from(required(&p, "adds", "patch_next needs the number of added nodes")?)
-                .map_err(|_| CtlError::BadPayload("adds is too large"))?;
+            let adds = if at.is_empty() || p.get("adds").is_some() {
+                u32::try_from(required(&p, "adds", "patch_next needs the number of added nodes")?)
+                    .map_err(|_| CtlError::BadPayload("adds is too large"))?
+            } else {
+                0
+            };
             Ok(CtlMessage::PatchNext {
                 frozen,
                 adds,
+                at,
                 ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
             })
         }
@@ -526,6 +550,10 @@ pub enum Event {
         /// The call site's offset in the game image.
         site: Option<u32>,
     },
+    /// What a conversion produced while a `patch_next` order was armed (nodes, segments, frozenNodes lists), once per distinct shape.
+    ConvertDump {
+        text: String,
+    },
     /// Cumulative counts of the commands the simulation applied, by kind byte.
     Audit {
         counts: Vec<(u8, u64)>,
@@ -560,6 +588,7 @@ impl Event {
             Event::Patched { .. } => "patched",
             Event::PatchRefused { .. } => "patch_refused",
             Event::PatchSkipped { .. } => "patch_skipped",
+            Event::ConvertDump { .. } => "convert_dump",
             Event::Audit { .. } => "audit",
             Event::Holding { .. } => "holding",
             Event::Pong { .. } => "pong",
@@ -590,6 +619,7 @@ impl Event {
                 format!("event patched: frozenNodes {frozen:?} of {adds} added nodes (new block: {allocated})")
             }
             Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
+            Event::ConvertDump { text } => format!("event convert_dump: {text}"),
             Event::PatchSkipped { reason, kind, site } => {
                 format!("event patch_skipped: {reason} (kind {kind:?}, call site rva {site:x?})")
             }
@@ -668,6 +698,7 @@ impl Event {
                 ("frozen", Lua::List(frozen.iter().map(|n| Lua::uint(u64::from(*n))).collect())),
             ]),
             Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
+            Event::ConvertDump { text } => Lua::map([("text", Lua::str(text))]),
             Event::PatchSkipped { reason, kind, site } => Lua::map([
                 ("kind", Lua::Int(kind.map_or(-1, i64::from))),
                 ("reason", Lua::str(reason)),
@@ -758,13 +789,24 @@ mod tests {
     fn patch_next_parses_and_rejects_bad_payloads() {
         assert_eq!(
             parse("patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#),
-            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, ttl: 0 })
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, at: vec![], ttl: 0 })
         );
         assert_eq!(
             parse("patch_next", r#"{["adds"]=2,["frozen"]={[1]=0,[2]=1},["ttl"]=500}"#),
-            Ok(CtlMessage::PatchNext { frozen: vec![0, 1], adds: 2, ttl: 500 })
+            Ok(CtlMessage::PatchNext { frozen: vec![0, 1], adds: 2, at: vec![], ttl: 500 })
+        );
+        assert_eq!(
+            parse("patch_next", r#"{["adds"]=2,["at"]={[1]={[1]=1.5,[2]=-2,[3]=0.25}},["frozen"]={[1]=1}}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 2, at: vec![[1.5, -2.0, 0.25]], ttl: 0 })
+        );
+        assert_eq!(
+            parse("patch_next", r#"{["at"]={[1]={[1]=1,[2]=2,[3]=3},[2]={[1]=4,[2]=5,[3]=6}},["ttl"]=7}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![], adds: 0, at: vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], ttl: 7 })
         );
         for bad in [
+            r#"{["at"]={}}"#,
+            r#"{["at"]={[1]={[1]=1,[2]=2}}}"#,
+            r#"{["at"]={[1]=5}}"#,
             r#"{["adds"]=3}"#,
             r#"{["frozen"]={[1]=1}}"#,
             r#"{["adds"]=3,["frozen"]={}}"#,
@@ -772,6 +814,8 @@ mod tests {
         ] {
             assert!(matches!(parse("patch_next", bad), Err(CtlError::BadPayload(_))), "{bad}");
         }
+        let d = Event::ConvertDump { text: "t".into() };
+        assert_eq!((d.kind(), d.payload().as_str()), ("convert_dump", r#"{["text"]="t"}"#));
         let e = Event::PatchRefused { reason: "x".into() };
         assert_eq!((e.kind(), e.payload().as_str()), ("patch_refused", r#"{["reason"]="x"}"#));
         assert_eq!(Event::Patched { frozen: vec![1], adds: 3, allocated: true }.kind(), "patched");
@@ -947,7 +991,10 @@ mod tests {
         append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
         let p = r.poll();
         assert_eq!(p.lines.len(), 1, "{p:?}");
-        assert_eq!(parse_ctl_line(&p.lines[0]), Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, ttl: 0 }));
+        assert_eq!(
+            parse_ctl_line(&p.lines[0]),
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, at: vec![], ttl: 0 })
+        );
         // a line whose sequence number is not above the last one is dropped, whoever wrote it
         append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
         let p = r.poll();

@@ -497,7 +497,9 @@ impl Runtime {
     fn apply_poll(&self, machine: &mut HoldMachine<Box<Held>>, poll: crate::link::Poll, now: u64) {
         for line in &poll.lines {
             match parse_ctl_line(line) {
-                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, ttl }) => self.arm_patch(frozen, adds, ttl, now),
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
+                    self.arm_patch(frozen, adds, at, ttl, now)
+                }
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -527,7 +529,9 @@ impl Runtime {
         let mut rest = Vec::new();
         for line in std::mem::take(&mut poll.lines) {
             match parse_ctl_line(&line) {
-                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, ttl }) => self.arm_patch(frozen, adds, ttl, now),
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
+                    self.arm_patch(frozen, adds, at, ttl, now)
+                }
                 _ => rest.push(line),
             }
         }
@@ -1648,7 +1652,7 @@ mod tests {
         let dir = TempDir::new("rt-patch-skip");
         let rt = runtime(Some(dir.path()));
         rt.enable_native_patch();
-        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
         for tag in 1..=3 {
             let mut c = Call::new(52, tag);
             unsafe { rt.on_add(c.args(), at(SITE_A)) };
@@ -1676,7 +1680,12 @@ mod tests {
         let mut buf = vec![0u8; 0x360];
         let mut blocks = Vec::new();
         let mut vec_at = |off: usize, n: usize, stride: usize| {
-            let b = vec![0u8; (n * stride).max(8)];
+            let mut b = vec![0u8; (n * stride).max(8)];
+            if off == 0 {
+                for i in 0..n {
+                    b[i * stride + 4..i * stride + 8].copy_from_slice(&(i as f32 * 10.0).to_le_bytes());
+                }
+            }
             let p = b.as_ptr() as u64;
             buf[off..off + 8].copy_from_slice(&p.to_le_bytes());
             buf[off + 8..off + 16].copy_from_slice(&(p + (n * stride) as u64).to_le_bytes());
@@ -1702,7 +1711,7 @@ mod tests {
         let dir = TempDir::new("rt-convert-skip");
         let rt = runtime(Some(dir.path()));
         rt.enable_native_patch();
-        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
         let none = out(2, 1, false);
         rt.on_convert(none.buf.as_ptr() as usize, at(0xe2b1a1));
         let other = out(3, 1, true);
@@ -1724,7 +1733,7 @@ mod tests {
         let dir = TempDir::new("rt-convert-match");
         let rt = runtime(Some(dir.path()));
         rt.enable_native_patch();
-        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
         let m = out(2, 1, true);
         rt.on_convert(m.buf.as_ptr() as usize, at(0xe2b1a1));
         // the test process has no verified engine allocator: the order is refused (the write itself is covered by cmd_patch's tests)
@@ -1756,7 +1765,7 @@ mod tests {
         let dir = TempDir::new("rt-convert-add");
         let rt = runtime(Some(dir.path()));
         rt.enable_native_patch();
-        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
         rt.patch.converted_one();
         let mut c = Call::new(52, 1);
         unsafe { rt.on_add(c.args(), at(0x777)) };
@@ -1764,5 +1773,27 @@ mod tests {
         assert!(!rt.patch.pending());
         rt.pump();
         assert!(patch_events(dir.path()).is_empty(), "no refusal and no second write");
+    }
+
+    #[test]
+    fn an_order_by_position_skips_a_conversion_without_the_node_and_dumps_every_new_shape_once() {
+        let dir = TempDir::new("rt-convert-at");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![], 0, vec![[10.0, 0.0, 0.0]], 0, rt.now_ms());
+        let elsewhere = out(1, 1, true); // its only node is at x = 0
+        rt.on_convert(elsewhere.buf.as_ptr() as usize, at(0xe2b1a1));
+        rt.on_convert(elsewhere.buf.as_ptr() as usize, at(0xe2b1a1));
+        let failed = out(4, 1, false);
+        rt.on_convert(failed.buf.as_ptr() as usize, at(0xe2b1a1));
+        let four = out(4, 1, true);
+        rt.on_convert(four.buf.as_ptr() as usize, at(0xe2b1a1));
+        rt.pump();
+        let ev = events(dir.path());
+        let dumps: Vec<_> = ev.iter().filter(|(k, _)| k == "convert_dump").collect();
+        assert_eq!(dumps.len(), 3, "{ev:?}"); // 1 node (once), no value, 4 nodes
+        assert!(dumps[1].1.contains("NO VALUE (Convert failed)"), "{dumps:?}");
+        // the matching one reached the allocator check (not verified in the test process) and was refused: that consumes the order
+        assert!(ev.iter().any(|(k, w)| k == "patch_refused" && w.contains("convert: the game's allocator")), "{ev:?}");
     }
 }
