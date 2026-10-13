@@ -1522,7 +1522,9 @@ mod tests {
         let mut seen = 0;
         for f in ["b26-run-20261013/guest/native_input_1.txt", "b24-run-20261013/guest/native_input_1.txt"] {
             let Ok(t) = std::fs::read_to_string(root.join(f)) else { continue };
-            let val = |k: &str| t.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('\t'))).map(str::to_string);
+            let val = |k: &str| {
+                t.lines().find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('\t'))).map(str::to_string)
+            };
             let num = |k: &str| val(k).and_then(|v| v.rsplit(['#', ':']).next().and_then(|x| x.parse::<usize>().ok()));
             let frozen = num("proposal.frozenNodes[0]").expect("a frozen node");
             let node = val(&format!("proposal.addedNodes[{frozen}].entity")).expect("an added node at that index");
@@ -1536,7 +1538,8 @@ mod tests {
             }
             assert_eq!(touching.len(), 1, "{f}: {touching:?}");
             assert!(touching[0].contains("entrance_new"), "{f}: {touching:?}");
-            let made = val("proposal.new2oldSegments").and_then(|v| v.strip_prefix("map:size=").and_then(|x| x.parse::<usize>().ok()));
+            let made = val("proposal.new2oldSegments")
+                .and_then(|v| v.strip_prefix("map:size=").and_then(|x| x.parse::<usize>().ok()));
             assert_eq!(made, Some(n_segs - 1), "{f}: the tool made every other added segment");
             seen += 1;
         }
