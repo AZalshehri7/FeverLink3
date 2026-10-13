@@ -146,6 +146,21 @@ pub fn raw_is_plain(value: &str) -> bool {
     body.starts_with("b:") || !body.split(' ').any(|t| t == "P")
 }
 
+/// Whether the rebuild takes member `f` from the text into an engine-constructed Proposal (step 3's rule, shared with `inject.rs`).
+pub(crate) fn selected(f: &F, lines: &std::collections::BTreeMap<&str, &str>) -> bool {
+    if f.off >= PROPOSAL_SIZE {
+        return true;
+    }
+    match f.ty {
+        Ty::Map | Ty::Hash => {
+            container_entries(lines, f.name) > 0 && lines.contains_key(format!("{}.graph", f.name).as_str())
+        }
+        Ty::Skip(_) => false,
+        Ty::Raw(_) => lines.get(f.name).is_some_and(|v| raw_is_plain(v)),
+        _ => true,
+    }
+}
+
 /// Lines of the comparison split into those of named members and those of unnamed bytes.
 fn split_diff(a: &str, b: &str) -> (usize, usize, usize, usize, Vec<String>) {
     let (x, y) = (rebuild::lines_of(a), rebuild::lines_of(b));
@@ -177,7 +192,7 @@ fn split_diff(a: &str, b: &str) -> (usize, usize, usize, usize, Vec<String>) {
     (named_eq, named_diff, un_eq, un_diff, first)
 }
 
-fn describe_split(a: &str, b: &str) -> (usize, Vec<String>) {
+pub(crate) fn describe_split(a: &str, b: &str) -> (usize, Vec<String>) {
     let (ne, nd, ue, ud, first) = split_diff(a, b);
     let blocks = |t: &str| t.lines().filter(|l| l.starts_with("@B")).count();
     let mut lines = vec![format!(
@@ -202,7 +217,7 @@ fn verdict(named_diff: Result<usize, &str>, what: &str) -> String {
     }
 }
 
-fn encode_scratch(c: &Ctx, s: &Scratch, event: &str) -> Result<String, String> {
+pub(crate) fn encode_scratch(c: &Ctx, s: &Scratch, event: &str) -> Result<String, String> {
     let head =
         Header { seq: 0, event, hold_id: None, site_rva: None, tool: None, t_ms: 0, wall_ms: 0, payload: s.addr() };
     portable::encode(c.mem, Env { image_base: c.base }, c.set, c.build_name, &head).map(|p| p.text)
@@ -335,22 +350,7 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
     // the text (the engine's empty ones stay) and unnamed regions that hold more than plain words (a pointer, a vector, a string there is
     // left to the engine's default); the Context region and the flags are plain scalars.
     let lines = rebuild::lines_of(&src_text);
-    let select = |f: &F| {
-        if f.off >= PROPOSAL_SIZE {
-            return true;
-        }
-        match f.ty {
-            // an engine container is the engine's own: the constructor makes it and the copy re-creates it. Only a container that has
-            // entries is rebuilt from the text (its graph); an empty one stays as the engine made it, its sentinel pointers are not
-            // part of the value
-            Ty::Map | Ty::Hash => {
-                container_entries(&lines, f.name) > 0 && lines.contains_key(format!("{}.graph", f.name).as_str())
-            }
-            Ty::Skip(_) => false,
-            Ty::Raw(_) => lines.get(f.name).is_some_and(|v| raw_is_plain(v)),
-            _ => true,
-        }
-    };
+    let select = |f: &F| selected(f, &lines);
     let built = match rebuild::build_selected(&src_text, c.base, c.alloc, Some(&select)) {
         Ok(b) => b,
         Err(e) => {

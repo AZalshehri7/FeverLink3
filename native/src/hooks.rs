@@ -1317,6 +1317,9 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     if std::env::var(crate::cmd_patch::PATCH_VAR).is_ok_and(|v| v == "1") {
         rt.enable_native_patch();
     }
+    if let Some(settings) = crate::portable::Settings::from_var(|n| std::env::var(n).ok(), crate::inject::INJECT_VAR) {
+        rt.enable_native_inject(settings);
+    }
     let targets = Targets {
         apply: apply_hook as *const () as usize,
         add: add_hook as *const () as usize,

@@ -23,6 +23,7 @@ pub mod detour;
 pub mod dump;
 pub mod growth;
 pub mod hold;
+pub mod inject;
 pub mod input;
 pub mod link;
 pub mod native_copy;

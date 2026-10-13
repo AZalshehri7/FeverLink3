@@ -62,6 +62,9 @@ pub enum CtlMessage {
     /// `at` (optional, 1 to 64 `{x, y, z}` positions) names the nodes by position instead: each must match exactly one node of the
     /// converted proposal within 0.05 m, and then `frozen` and `adds` are not needed (and not used).
     PatchNext { frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64 },
+    /// `FEVERLINK3_NATIVE_INJECT`: the NEXT script `build_proposal` command (a placeholder without construction) gets the engine `Proposal`
+    /// the module builds natively from the portable text in `native_inject_<key>.txt` (`inject.rs`). Expires after `ttl` ms (0: default).
+    InjectNext { key: u64, ttl: u64 },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -192,6 +195,10 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
                 ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
             })
         }
+        "inject_next" => Ok(CtlMessage::InjectNext {
+            key: required(&p, "key", "inject_next needs a numeric key")?,
+            ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
+        }),
         "ping" => {
             let n = match p.get("n") {
                 None => 0,
@@ -554,6 +561,17 @@ pub enum Event {
     ConvertDump {
         text: String,
     },
+    /// `inject_next` was carried out: the command now holds the engine Proposal built from the text of `key`.
+    Injected {
+        key: u64,
+        nodes: u64,
+        segments: u64,
+        constructions: u64,
+    },
+    /// `inject_next` was not carried out; the command was left untouched.
+    InjectRefused {
+        reason: String,
+    },
     /// Cumulative counts of the commands the simulation applied, by kind byte.
     Audit {
         counts: Vec<(u8, u64)>,
@@ -588,6 +606,8 @@ impl Event {
             Event::Patched { .. } => "patched",
             Event::PatchRefused { .. } => "patch_refused",
             Event::PatchSkipped { .. } => "patch_skipped",
+            Event::Injected { .. } => "injected",
+            Event::InjectRefused { .. } => "inject_refused",
             Event::ConvertDump { .. } => "convert_dump",
             Event::Audit { .. } => "audit",
             Event::Holding { .. } => "holding",
@@ -620,6 +640,10 @@ impl Event {
             }
             Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
             Event::ConvertDump { text } => format!("event convert_dump: {text}"),
+            Event::Injected { key, nodes, segments, constructions } => format!(
+                "event injected: key {key}: {nodes} nodes, {segments} segments, {constructions} construction(s)"
+            ),
+            Event::InjectRefused { reason } => format!("event inject_refused: {reason}"),
             Event::PatchSkipped { reason, kind, site } => {
                 format!("event patch_skipped: {reason} (kind {kind:?}, call site rva {site:x?})")
             }
@@ -699,6 +723,13 @@ impl Event {
             ]),
             Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::ConvertDump { text } => Lua::map([("text", Lua::str(text))]),
+            Event::Injected { key, nodes, segments, constructions } => Lua::map([
+                ("constructions", Lua::uint(*constructions)),
+                ("key", Lua::uint(*key)),
+                ("nodes", Lua::uint(*nodes)),
+                ("segments", Lua::uint(*segments)),
+            ]),
+            Event::InjectRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::PatchSkipped { reason, kind, site } => Lua::map([
                 ("kind", Lua::Int(kind.map_or(-1, i64::from))),
                 ("reason", Lua::str(reason)),
@@ -814,6 +845,15 @@ mod tests {
         ] {
             assert!(matches!(parse("patch_next", bad), Err(CtlError::BadPayload(_))), "{bad}");
         }
+        assert_eq!(
+            parse("inject_next", r#"{["key"]=12,["ttl"]=500}"#),
+            Ok(CtlMessage::InjectNext { key: 12, ttl: 500 })
+        );
+        assert_eq!(parse("inject_next", r#"{["key"]=3}"#), Ok(CtlMessage::InjectNext { key: 3, ttl: 0 }));
+        assert!(matches!(parse("inject_next", "{}"), Err(CtlError::BadPayload(_))));
+        let i = Event::InjectRefused { reason: "r".into() };
+        assert_eq!((i.kind(), i.payload().as_str()), ("inject_refused", r#"{["reason"]="r"}"#));
+        assert_eq!(Event::Injected { key: 1, nodes: 2, segments: 3, constructions: 0 }.kind(), "injected");
         let d = Event::ConvertDump { text: "t".into() };
         assert_eq!((d.kind(), d.payload().as_str()), ("convert_dump", r#"{["text"]="t"}"#));
         let e = Event::PatchRefused { reason: "x".into() };

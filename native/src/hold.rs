@@ -289,7 +289,7 @@ impl<H> HoldMachine<H> {
                 self.error("terrain_apply", format!("edit {id}: terrain edits are not copied by this build"), now)
             }
             CtlMessage::Ping { n } => self.push_event(Event::Pong { n: *n }),
-            CtlMessage::PatchNext { .. } => {} // taken by the runtime before the machine (cmd_patch.rs)
+            CtlMessage::PatchNext { .. } | CtlMessage::InjectNext { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject)
         }
     }
 

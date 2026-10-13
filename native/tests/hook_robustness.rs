@@ -164,7 +164,10 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     CtlMessage::Release { id, at } => assert!(id <= 1 << 53 && at <= 1 << 53, "{line:?}"),
                     CtlMessage::Cancel { id } => assert!(id <= 1 << 53, "{line:?}"),
                     CtlMessage::TerrainApply { id, stamp } => assert!(id <= 1 << 53 && stamp <= 1 << 53, "{line:?}"),
-                    CtlMessage::HoldOff | CtlMessage::Ping { .. } | CtlMessage::PatchNext { .. } => {}
+                    CtlMessage::HoldOff
+                    | CtlMessage::Ping { .. }
+                    | CtlMessage::PatchNext { .. }
+                    | CtlMessage::InjectNext { .. } => {}
                 }
             }
             Err(e) => {

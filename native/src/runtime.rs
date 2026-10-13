@@ -36,6 +36,7 @@ use crate::portable;
 use crate::rebuild;
 
 mod cmd_patch;
+mod inject;
 mod native_copy;
 
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
@@ -102,6 +103,11 @@ pub struct Runtime {
     rebuild: OnceLock<portable::Sink>,
     /// The input-level text of every held build command, for the mod (`input.rs`).
     input: crate::input::InputOut,
+    /// `FEVERLINK3_NATIVE_INJECT`: the originator's full portable text of every held command (`native_text_<id>.txt`), and the receiver's order.
+    text: crate::input::InputOut,
+    inject: crate::inject::State,
+    inject_settings: OnceLock<portable::Settings>,
+    inject_dir_path: Mutex<Option<std::path::PathBuf>>,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
@@ -154,6 +160,10 @@ impl Runtime {
             native_copy: OnceLock::new(),
             patch: Default::default(),
             input: crate::input::InputOut::default(),
+            text: crate::input::InputOut::with_prefix("native_text_"),
+            inject: Default::default(),
+            inject_settings: OnceLock::new(),
+            inject_dir_path: Mutex::new(None),
         }
     }
 
@@ -440,6 +450,9 @@ impl Runtime {
         if self.patch_ready() {
             hook_names.push(crate::cmd_patch::READY_NAME.to_string()); // the mod reads this string to know it may send `patch_next`
         }
+        if self.inject_ready() {
+            hook_names.push(crate::inject::READY_NAME.to_string()); // and this one, `inject_next`
+        }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
             version: self.version.to_string(),
@@ -463,6 +476,8 @@ impl Runtime {
         *lock(&self.reader) = Some(reader);
         *lock(&self.writer) = Some(Writer { events, failed_logged: false });
         self.input.set_dir(dir);
+        self.text.set_dir(dir);
+        self.inject_dir(dir);
         if let Some(d) = self.dump.get() {
             d.set_dir(dir);
         }
@@ -500,6 +515,7 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -532,6 +548,7 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
                 _ => rest.push(line),
             }
         }
@@ -556,6 +573,7 @@ impl Runtime {
             events.push(Event::Applied { id, ok });
         }
         events.extend(self.patch.drain_events(now));
+        events.extend(self.inject.drain_events(now));
         for id in self.watch.expire(now) {
             events.push(Event::Error {
                 place: "applied".into(),
@@ -624,6 +642,7 @@ impl Runtime {
             crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
         }
         if let Some(job) = plan.dump.take() {
+            crate::log::guarded("add hook (inject text)", || self.inject_publish_text(job.payload, job.id));
             // dev-only and read-only: the held command's payload, decoded (the command is already out of the engine's hands)
             crate::log::guarded("add hook (dump)", || {
                 self.dump_payload("held", job.payload, Some(job.id), Some(job.site), Scope::Whole, Budget::Held, None)
@@ -666,6 +685,9 @@ impl Runtime {
         }
         if plan.held_here {
             return args.out;
+        }
+        if self.inject.enabled() {
+            crate::log::guarded("add hook (inject)", || self.inject_add(&args, caller));
         }
         if self.patch.enabled() {
             crate::log::guarded("add hook (patch)", || self.patch_add(&args, caller));
@@ -721,7 +743,8 @@ impl Runtime {
                                     }
                                 }
                                 plan.held_here = true;
-                                if (self.dump.get().is_some()
+                                if (self.inject.enabled()
+                                    || self.dump.get().is_some()
                                     || self.portable.get().is_some()
                                     || self.rebuild.get().is_some()
                                     || self.native_copy.get().is_some())
@@ -1823,5 +1846,47 @@ mod tests {
             ev.iter().any(|(k, w)| k == "patch_refused" && w.contains("convert update: the game's allocator")),
             "{ev:?}"
         );
+    }
+
+    const INJECT_NEXT: &str = "1	inject_next	1	{[\"key\"]=5}
+";
+
+    #[test]
+    fn an_inject_next_is_read_by_the_commands_own_add_and_a_refusal_leaves_the_command_alone() {
+        let dir = TempDir::new("rt-inject");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        ctl(dir.path(), INJECT_NEXT);
+        // another kind of command does not take the order
+        let mut other = Call::new(17, 1);
+        unsafe { rt.on_add(other.args(), at(0x777)) };
+        assert!(!rt.inject.pending(), "the file is only read for a build_proposal");
+        // a tool's command is not the mod's
+        let mut tool = Call::new(52, 2);
+        unsafe { rt.on_add(tool.args(), at(SITE_A)) };
+        let mut c = Call::new(52, 3);
+        let before = c.c.payload.to_vec();
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert_eq!(calls().last().map(String::as_str), Some("add kind 52 tag 3"), "the original Add still runs");
+        assert_eq!(c.c.payload.to_vec(), before, "untouched");
+        assert!(!rt.inject.pending());
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("key 5")
+                && w.contains("the layout is that of game build")),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn with_the_switch_off_an_inject_next_is_refused_and_nothing_is_read() {
+        let dir = TempDir::new("rt-inject-off");
+        let rt = runtime(Some(dir.path()));
+        ctl(dir.path(), INJECT_NEXT);
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("is off")), "{ev:?}");
     }
 }

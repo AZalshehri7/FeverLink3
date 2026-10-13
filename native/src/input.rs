@@ -20,9 +20,24 @@ pub fn file_name(id: u64) -> String {
 #[derive(Default)]
 pub struct InputOut {
     dir: Mutex<Option<PathBuf>>,
+    /// The file-name prefix (empty: `native_input_`).
+    prefix: &'static str,
 }
 
 impl InputOut {
+    /// A writer of files named `<prefix><id>.txt` (the same rules: temporary name first, the last [`KEEP`] kept).
+    pub fn with_prefix(prefix: &'static str) -> InputOut {
+        InputOut { dir: Mutex::new(None), prefix }
+    }
+
+    fn name(&self, id: u64) -> String {
+        if self.prefix.is_empty() {
+            file_name(id)
+        } else {
+            format!("{}{id}.txt", self.prefix)
+        }
+    }
+
     pub fn set_dir(&self, dir: &std::path::Path) {
         *self.dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
     }
@@ -32,11 +47,11 @@ impl InputOut {
         let Some(dir) = self.dir.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
             return Ok(());
         };
-        let tmp = dir.join(format!("{}.tmp", file_name(id)));
+        let tmp = dir.join(format!("{}.tmp", self.name(id)));
         fs::write(&tmp, text)?;
-        fs::rename(&tmp, dir.join(file_name(id)))?;
+        fs::rename(&tmp, dir.join(self.name(id)))?;
         if id > KEEP {
-            let _ = fs::remove_file(dir.join(file_name(id - KEEP)));
+            let _ = fs::remove_file(dir.join(self.name(id - KEEP)));
         }
         Ok(())
     }
