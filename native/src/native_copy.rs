@@ -250,6 +250,11 @@ impl MaskInfo {
 /// scratch buffers prefilled with 0x00 and with 0xFF; a byte of an unnamed region that both copies agree on was carried by the copy
 /// (a value), one that differs was left alone by it (residue of the memory the original lives in). Both copies are destroyed on every
 /// path, and nothing of them is handed to the engine. Read only on `held`.
+///
+/// LIMIT (b51 to b53): the mask cannot tell residue from a value for bytes that the engine's copy constructor copies VERBATIM from the
+/// source (a memcpy of a whole element, padding included, puts the same residue into both scratch copies, so it looks carried). It
+/// works for the bytes the copy constructor leaves alone (gaps of the Proposal object, unconstructed padding). Nothing may therefore
+/// rest on it for the unnamed words of a construction entity: that proof rests on named members only (and on b45).
 pub fn residue_mask(
     fns: &ProposalFns,
     mem: &dyn Mem,

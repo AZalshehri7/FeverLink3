@@ -164,6 +164,8 @@ pub struct Built {
     pub constructions: u64,
     /// Heap blocks the rebuild made for the source (the source's destructor freed them).
     pub blocks: usize,
+    /// The informational R4 report (empty when nothing differs); the runtime writes it to the report file.
+    pub r4_report: String,
 }
 
 fn count(lines: &std::collections::BTreeMap<&str, &str>, name: &str) -> u64 {
@@ -192,9 +194,24 @@ fn frozen_of(lines: &std::collections::BTreeMap<&str, &str>, i: u64) -> Result<V
         .collect()
 }
 
-/// R4: the unnamed words of `toAdd[i]` that the receiver's own conversion carries (its differential mask on the donor) against the
-/// originator's text (masked the same way before it was written). Equal, or the injection is refused with the lines that differ.
-fn entity_equivalence(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+/// R4, INFORMATIONAL ONLY: the unnamed words of `toAdd[i]` that the receiver's own conversion carries (its differential mask on the
+/// donor) against the originator's text (masked the same way before it was written). It never refuses. b51 to b53 refused on it and the
+/// differing words changed from run to run (ASCII fragments, `z1` against `w:...`): the differential mask cannot classify bytes that the
+/// engine's copy constructor copies verbatim from the source (the entity's padding is memcpy'd into both scratch copies, so it looks
+/// carried). b45 injected with the donor's unnamed bytes untouched and ran identical on both games, so the engine does not need these
+/// regions from the text. The proof for the unnamed regions of the construction therefore rests on named members only. The lines that
+/// differ are returned for the log and `native_inject_report_<key>.txt` (empty when there are none or the comparison failed).
+fn entity_equivalence(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) -> String {
+    match entity_diffs(c, text, donor, say) {
+        Ok(report) => report,
+        Err(e) => {
+            say(&format!("native inject: R4 construction equivalence (informational) could not be made: {e}"));
+            String::new()
+        }
+    }
+}
+
+fn entity_diffs(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) -> Result<String, String> {
     let info = nc::residue_mask(&c.fns, c.mem, c.base, c.set, c.build_name, donor, say)?;
     let head = portable::Header {
         seq: 0,
@@ -233,22 +250,23 @@ fn entity_equivalence(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&st
         }
     }
     say(&format!(
-        "native inject: R4 construction equivalence: donor residue mask {} carried / {} residue bytes in {} regions ({} ms); {} differing region(s)",
+        "native inject: R4 construction equivalence (INFORMATIONAL, never a refusal): donor residue mask {} carried / {} residue bytes in {} regions ({} ms); {} differing region(s)",
         info.carried,
         info.residue,
         info.regions,
         info.ms,
         diffs.len()
     ));
-    if diffs.is_empty() {
-        return Ok(());
+    for d in &diffs {
+        say(&format!("native inject: R4 (informational) {}", d.lines().next().unwrap_or("")));
     }
-    Err(format!(
-        "the receiver's own conversion of the construction differs from the originator's in {} unnamed region(s) both sides carry: {}{REPORT_MARK}{} region(s):
+    if diffs.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "INFORMATIONAL, NOT A REFUSAL: the receiver's own conversion of the construction differs from the originator's in {} unnamed region(s) that both differential masks carry. Same build, different bytes every run: these are residue the engine's copy constructor copies verbatim, which the 0x00/0xFF mask cannot tell from values. The swapped Proposal keeps the donor's own entity unchanged (only its frozenNodes list is set from the text).
 {}
 ",
-        diffs.len(),
-        diffs.iter().map(|d| d.split(':').next().unwrap_or("").to_string()).collect::<Vec<_>>().join(", "),
         diffs.len(),
         diffs.join("
 ")
@@ -279,10 +297,10 @@ pub fn build_verified(
         ));
     }
     let hybrid = cons > 0;
+    let mut r4_report = String::new();
     if let Some(donor) = donor.filter(|_| hybrid) {
-        // R4: the construction stays the receiver's own, so what it carries must be what the originator's carried. Both sides' unnamed
-        // words of the constructions are masked by a differential copy (residue is zero), and the masked lines must be equal.
-        entity_equivalence(c, text, donor, say)?;
+        // R4 (informational): what the two sides' unnamed construction words look like after their differential masks
+        r4_report = entity_equivalence(c, text, donor, say);
     }
     let take = |f: &F| !(hybrid && f.name == "toAdd") && nc::selected(f, &lines);
     let built = match rebuild::build_selected(text, c.base, c.alloc, Some(&take)) {
@@ -381,6 +399,7 @@ pub fn build_verified(
         segments: count(&lines, "proposal.addedSegments.#"),
         constructions: cons,
         blocks: built.blocks,
+        r4_report,
     })
 }
 
@@ -671,16 +690,19 @@ mod tests {
         let r = build_verified(&ctx, &poke, &text, None, &mut |_| {});
         assert!(matches!(&r, Err(e) if e.contains("needs the script command's own conversion")), "{:?}", r.err());
         assert_eq!(CTORS.load(Ordering::SeqCst), c0, "refused before any engine call");
-        // R4: the donor's conversion carries a word the originator's did not (an unnamed word of the construction): refused before the
-        // source is made, with the region named; the two mask copies are destroyed
+        // R4 is informational: the donor's conversion carries a word the originator's did not (an unnamed word of the construction); the
+        // injection is built all the same and the report names the region
         let begin = u64::from_le_bytes(arena.read(at + 0x258, 8).unwrap().try_into().unwrap()) as usize;
         arena.write(begin + 0xe3d, &[0x5a]);
         WORLD.with(|w| w.set(&arena));
-        let (d0, c1) = (DTORS.load(Ordering::SeqCst), CTORS.load(Ordering::SeqCst));
-        let r = build_verified(&ctx, &poke, &text, Some(at), &mut |_| {});
-        let e = r.err().expect("refused");
-        assert!(e.contains("toAdd[0].~0xe3d") && e.contains(REPORT_MARK), "{e}");
-        assert_eq!((DTORS.load(Ordering::SeqCst) - d0, CTORS.load(Ordering::SeqCst) - c1), (2, 0));
+        let built =
+            build_verified(&ctx, &poke, &text, Some(at), &mut |_| {}).expect("not refused on an unnamed difference");
+        assert!(
+            built.r4_report.contains("INFORMATIONAL, NOT A REFUSAL") && built.r4_report.contains("toAdd[0].~0xe3d"),
+            "{}",
+            built.r4_report
+        );
+        release(&ctx, built);
         // the donor equal again, but a named member of the construction differs: the proof fails
         arena.write(begin + 0xe3d, &[0x00]);
         let other = text.replace("toAdd[0].setAsHeadquarterHack	u8:00", "toAdd[0].setAsHeadquarterHack	u8:01");

@@ -236,6 +236,13 @@ impl Runtime {
         alloc.free_all();
         let built = built?;
         let stats = (built.nodes, built.segments, built.constructions);
+        if !built.r4_report.is_empty() {
+            let name = inj::report_file_name(key);
+            match std::fs::write(dir.join(&name), &built.r4_report) {
+                Ok(()) => self.say(&format!("native inject: key {key}: informational R4 report in {name}")),
+                Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
+            }
+        }
         if constructions > 0 {
             self.inject_donor_report(key, dest, &text, &built, &dir);
         }
