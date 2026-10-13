@@ -936,6 +936,20 @@ function NATIVE_AIRFIELD(spec)
   return P
 end
 
+-- an underground station entrance (real session 2026-10-13): the construction with its own tunnel pieces, four new nodes and two segments of
+-- an ordinary tram street template that touch no node of the world
+function NATIVE_UNDERGROUND(spec)
+  local P = D("Proposal")
+  local sp = P.proposal
+  local a, b, c, d = { x = spec.x + 30, y = spec.y + 8, z = -13 }, { x = spec.x + 20, y = spec.y + 5, z = -13 }, { x = spec.x - 30, y = spec.y - 8, z = -13 }, { x = spec.x - 20, y = spec.y - 5, z = -13 }
+  sp.addedNodes = { nodeAndEntity(-1, a), nodeAndEntity(-2, b), nodeAndEntity(-3, c), nodeAndEntity(-4, d) }
+  sp.addedSegments = { segment(-5, -1, -2, a, b, { template = spec.template or "street/new_small_road.street_template" }),
+    segment(-6, -3, -4, c, d, { template = spec.template or "street/new_small_road.street_template" }) }
+  P.proposal = sp
+  P.toAdd = { conEntity({ file = "stations/street/underground_station/underground_station.con", x = spec.x, y = spec.y, z = 5 }) }
+  return P
+end
+
 -- a node configuration (lane connections between placeholders or segments) added to a proposal that has none
 function WITH_CFG(P, node, lanes)
   local sp = P.proposal
@@ -2003,6 +2017,17 @@ class PureBuildTest(unittest.TestCase):
                "local added = sp.addedSegments; local s = added[3]; local c = s.comp; c.node1 = 99999; c.laneConfigs = {}; c.objects = { { 123456, 1 } }; s.comp = c; "
                "added[3] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
         self.assertEqual(self.ev("PLAN_OF(%s)" % odd), "withStreet")
+
+    def test_the_tunnel_pieces_of_an_underground_station_entrance_are_left_to_its_script(self):
+        # real session 2026-10-13: planned "combined", the segments the station's script makes itself were added twice and the engine answered
+        # "Construction Not Possible" on the other game; a free road next to a moved town building stays a street build
+        road = "a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }"
+        self.assertEqual(self.ev("PLAN_OF(NATIVE_UNDERGROUND{ x = 1195, y = 513 })"), "construction")
+        # one piece of it joined to a node of the world is a street
+        joined = ("(function() local P = NATIVE_UNDERGROUND{ x = 100, y = 0 }; local sp = P.proposal; local added = sp.addedSegments; "
+                  "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "withStreet")
+        self.assertEqual(self.ev("PLAN_OF(NATIVE_ROAD_MOVING{ %s, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 54 })" % road), "combined")
 
     def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
         def cat(code):

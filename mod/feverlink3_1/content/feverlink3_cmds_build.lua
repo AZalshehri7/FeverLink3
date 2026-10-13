@@ -1183,8 +1183,52 @@ end
 -- A record is rebuilt in one of a few ways, chosen by its shape. Each way is a function below that returns the
 -- arguments of the engine command (and, for plans that need more than one command, a chain of further ones).
 
+-- Segments that are a construction's own although their template is an ordinary street one: the tunnel tram pieces of an underground
+-- station entrance (real session 2026-10-13: tunnel type=2, tram_new.street_template, four new nodes, no existing node, 31 m from the
+-- station). Rebuilt as street ("combined"), the segments the station's script makes itself were added twice and the engine
+-- answered "Construction Not Possible" (critical) on the other game. Kept in a weak table keyed by the segment so the record that goes
+-- on the wire stays as the capture made it.
+local OWN_BY_SHAPE = setmetatable({}, { __mode = "k" })
+
+local function markOwnByShape(rec)
+	if rec.src ~= "native" or #rec.cons == 0 or #rec.rem > 0 or #rec.rmSegs > 0 or #rec.rmNodes > 0 then return end
+	-- groups of new nodes joined by the segments to add; a group with an end at a node of the world is a street, not the construction's
+	local parent = {}
+	local function find(x)
+		while parent[x] ~= x do parent[x] = parent[parent[x]]; x = parent[x] end
+		return x
+	end
+	local attached = {}
+	for _, sg in ipairs(rec.segs) do
+		for _, n in ipairs({ sg.n0, sg.n1 }) do
+			if type(n) == "number" and parent[n] == nil then parent[n] = n end
+		end
+	end
+	for _, sg in ipairs(rec.segs) do
+		if type(sg.n0) == "number" and type(sg.n1) == "number" then parent[find(sg.n0)] = find(sg.n1) end
+	end
+	for _, sg in ipairs(rec.segs) do
+		if type(sg.n0) ~= "number" or type(sg.n1) ~= "number" then
+			for _, n in ipairs({ sg.n0, sg.n1 }) do if type(n) == "number" then attached[find(n)] = true end end
+		end
+	end
+	local function nearCon(p)
+		if type(p) ~= "table" then return false end
+		for _, c in ipairs(rec.cons) do
+			local t = c.transf
+			if math.abs(p.x - t[13]) <= 200 and math.abs(p.y - t[14]) <= 200 then return true end
+		end
+		return false
+	end
+	for _, sg in ipairs(rec.segs) do
+		if type(sg.n0) == "number" and type(sg.n1) == "number" and not attached[find(sg.n0)] and nearCon(sg.c and sg.c.p0) and nearCon(sg.c and sg.c.p1) then
+			OWN_BY_SHAPE[sg] = true
+		end
+	end
+end
+
 local function isConstructionSegment(s)
-	return ownTemplate(s.c and s.c.roadTemplate)
+	return OWN_BY_SHAPE[s] == true or ownTemplate(s.c and s.c.roadTemplate)
 end
 
 -- the edge objects of a record that sit on a construction's own segments (made by its script) and the others
@@ -1283,6 +1327,7 @@ local function classify(rec)
 	end
 	if nCons + nRem > 0 then
 		if street == 0 then return "construction" end
+		markOwnByShape(rec)
 		-- the segments a construction brings with it belong to it; its own script makes them
 		local own, foreign = 0, 0
 		for _, s in ipairs(rec.segs) do
@@ -2194,6 +2239,7 @@ local function decodeBuildUnsafe(body, ctx)
 		end
 	end
 	if not args then return nil, lastErr or "no way to build it" end
+	args.plan, args.form = plan, used   -- for the engine-verdict lines of the bridge (which form of which plan was judged)
 	log("build " .. plan .. (used > 1 and (" (form " .. used .. ")") or "") .. " (" .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, "
 		.. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, " .. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects"
 		.. (args.chain and (", " .. #args.chain + 1 .. " commands") or ""))
