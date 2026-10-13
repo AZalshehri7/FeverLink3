@@ -2752,6 +2752,46 @@ def portable_road_text(ax=300.0, bx=400.0, template="street/new_medium_road.stre
     return chr(10).join(k + chr(9) + val for k, val in rows)
 
 
+DEPOT_RECORD_LUA = """(function(txt)
+            local M = PURE()
+            local P = M.portable
+            local tree = P.parse(txt)
+            local pt = tree.proposal
+            local function pos(e) return { x = e.x, y = e.y, z = e.z } end
+            local oldPos = {}
+            for _, s in ipairs(P.list(pt.addedSegments)) do
+                for _, k in ipairs({ 'node0', 'node1' }) do if s[k].old then oldPos[s[k].old] = pos(s[k].pos) end end
+            end
+            local rec = { v = 1, src = 'native', cons = {}, rem = {}, old2new = {}, nodes = {}, segs = {}, rmNodes = {}, rmSegs = {}, objs = {}, rmObjs = {}, ncfg = {}, rmNcfg = {} }
+            local nodeId = {}
+            for i, tn in ipairs(P.list(pt.addedNodes)) do
+                nodeId[tn.entity.new] = -100 - i
+                rec.nodes[i] = { id = -100 - i, pos = pos(tn.position) }
+            end
+            local function end_(e) if e.new then return nodeId[e.new] end return { __ref = 'node', p = pos(e.pos) } end
+            for i, ts in ipairs(P.list(pt.addedSegments)) do
+                local own = ts.roadTemplate:find('/constructions/', 1, true)
+                rec.segs[i] = { id = -200 - i, n0 = end_(ts.node0), n1 = end_(ts.node1), type = 0, owner = 'player',
+                    c = own and { roadTemplate = '::/' .. ts.roadTemplate } or { roadTemplate = '::/' .. ts.roadTemplate, roadStyle = '::/' .. ts.roadStyle, typeIndex = -1, roadType = 1,
+                        p0 = pos(ts.position0), p1 = pos(ts.position1) } }
+            end
+            for i = 1, pt.removedNodes.n do rec.rmNodes[i] = { __ref = 'node', p = pos(pt.removedNodes[i].position) } end
+            for i = 1, pt.removedSegments.n do rec.rmSegs[i] = { __ref = 'edge', p0 = pos(pt.removedSegments[i].position0), p1 = pos(pt.removedSegments[i].position1) } end
+            for i = 1, pt.nodeConfigsToAdd.n do
+                local e = pt.nodeConfigsToAdd[i].entity
+                rec.ncfg[i] = { node = e.new and nodeId[e.new] or { __ref = 'node', p = oldPos[e.old] }, lc = {}, cw = {}, pref = 2 }
+            end
+            rec.ncfg[1].lc[1] = { s0 = rec.segs[1].id, l0 = 1, s1 = rec.segs[2].id, l1 = 2, road = true }
+            rec.ncfg[1].cw[1] = rec.segs[3].id
+            for i = 1, pt.edgeObjectsToAdd.n do rec.objs[i] = { edge = rec.segs[3].id, model = 'station/street/bus_stop.mdl', param = 0.5 } end
+            for i = 1, pt.edgeObjectsToRemove.n do rec.rmObjs[i] = { __ref = 'obj', i = i, edge = rec.rmSegs[1] } end
+            for i = 1, pt.nodeConfigsToRemove.n do rec.rmNcfg[i] = { __ref = 'node', p = oldPos[pt.nodeConfigsToRemove[i].old] or { x = 0, y = 0, z = 0 } } end
+            for i = 1, tree.toRemove.n do rec.rem[i] = { __ref = 'con', file = '::/buildings/x.con', p = { x = 1, y = 2, z = 3 } } end
+            local tc = tree.toAdd[1]
+            rec.cons[1] = { file = '::/' .. tc.fileName, transf = tc.transf, owner = 'player', params = {} }
+"""
+
+
 class PortableReplayBase:
     """FEVERLINK3_PORTABLE_REPLAY: a build that comes with the native module's text is replayed through it (default off)."""
 
@@ -2817,44 +2857,7 @@ class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
         # record numbers its own. The numbers are labels: nodes are matched by position, segments by the ends they join, the construction by
         # file and placement; the new proposal numbers nodes and segments from -1 each, and what refers to them follows.
         text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "depot_input.txt"), encoding="utf-8").read()
-        code = """(function(txt)
-            local M = PURE()
-            local P = M.portable
-            local tree = P.parse(txt)
-            local pt = tree.proposal
-            local function pos(e) return { x = e.x, y = e.y, z = e.z } end
-            local oldPos = {}
-            for _, s in ipairs(P.list(pt.addedSegments)) do
-                for _, k in ipairs({ 'node0', 'node1' }) do if s[k].old then oldPos[s[k].old] = pos(s[k].pos) end end
-            end
-            local rec = { v = 1, src = 'native', cons = {}, rem = {}, old2new = {}, nodes = {}, segs = {}, rmNodes = {}, rmSegs = {}, objs = {}, rmObjs = {}, ncfg = {}, rmNcfg = {} }
-            local nodeId = {}
-            for i, tn in ipairs(P.list(pt.addedNodes)) do
-                nodeId[tn.entity.new] = -100 - i
-                rec.nodes[i] = { id = -100 - i, pos = pos(tn.position) }
-            end
-            local function end_(e) if e.new then return nodeId[e.new] end return { __ref = 'node', p = pos(e.pos) } end
-            for i, ts in ipairs(P.list(pt.addedSegments)) do
-                local own = ts.roadTemplate:find('/constructions/', 1, true)
-                rec.segs[i] = { id = -200 - i, n0 = end_(ts.node0), n1 = end_(ts.node1), type = 0, owner = 'player',
-                    c = own and { roadTemplate = '::/' .. ts.roadTemplate } or { roadTemplate = '::/' .. ts.roadTemplate, roadStyle = '::/' .. ts.roadStyle, typeIndex = -1, roadType = 1,
-                        p0 = pos(ts.position0), p1 = pos(ts.position1) } }
-            end
-            for i = 1, pt.removedNodes.n do rec.rmNodes[i] = { __ref = 'node', p = pos(pt.removedNodes[i].position) } end
-            for i = 1, pt.removedSegments.n do rec.rmSegs[i] = { __ref = 'edge', p0 = pos(pt.removedSegments[i].position0), p1 = pos(pt.removedSegments[i].position1) } end
-            for i = 1, pt.nodeConfigsToAdd.n do
-                local e = pt.nodeConfigsToAdd[i].entity
-                rec.ncfg[i] = { node = e.new and nodeId[e.new] or { __ref = 'node', p = oldPos[e.old] }, lc = {}, cw = {}, pref = 2 }
-            end
-            rec.ncfg[1].lc[1] = { s0 = rec.segs[1].id, l0 = 1, s1 = rec.segs[2].id, l1 = 2, road = true }
-            rec.ncfg[1].cw[1] = rec.segs[3].id
-            for i = 1, pt.edgeObjectsToAdd.n do rec.objs[i] = { edge = rec.segs[3].id, model = 'station/street/bus_stop.mdl', param = 0.5 } end
-            for i = 1, pt.edgeObjectsToRemove.n do rec.rmObjs[i] = { __ref = 'obj', i = i, edge = rec.rmSegs[1] } end
-            for i = 1, pt.nodeConfigsToRemove.n do rec.rmNcfg[i] = { __ref = 'node', p = oldPos[pt.nodeConfigsToRemove[i].old] or { x = 0, y = 0, z = 0 } } end
-            for i = 1, tree.toRemove.n do rec.rem[i] = { __ref = 'con', file = '::/buildings/x.con', p = { x = 1, y = 2, z = 3 } } end
-            local tc = tree.toAdd[1]
-            rec.cons[1] = { file = '::/' .. tc.fileName, transf = tc.transf, owner = 'player', params = {} }
-            local out, why = M.portableRecord(rec, tree)
+        code = DEPOT_RECORD_LUA + """            local out, why = M.portableRecord(rec, tree)
             if not out then return 'NO: ' .. why end
             local ids = {}
             for i, n in ipairs(out.nodes) do ids[#ids + 1] = 'n' .. n.id end
@@ -2867,6 +2870,20 @@ class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
         end)"""
         got = str(self.L.eval(code)(text))
         self.assertEqual(got, "n-1 n-2 n-3 s-1(-1,-2) s-2(ref,-1) s-3(-1,-3) s-4(-3,ref) cfg-1:-1,-2:-3 obj-3 con1")
+
+    def test_the_owner_rule_leaves_out_the_players_own_pieces_the_nodes_only_they_use_and_those_nodes_configurations(self):
+        # EXPERIMENT (FEVERLINK3_PORTABLE_OWN_BY_OWNER): in the real depot samples the entrance piece has the build's player as its owner
+        fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        code = DEPOT_RECORD_LUA + """
+            local out, n, nodesOut, cfgOut = M.ownerRule(rec, tree)
+            if not out then return 'NO: ' .. tostring(n) end
+            local own = {}
+            for i, sg in ipairs(out.segs) do if sg.derived then own[#own + 1] = i end end
+            return n .. ' own=' .. table.concat(own, ',') .. ' nodesOut=' .. nodesOut .. ' cfgOut=' .. cfgOut
+        end)"""
+        for name, want in (("depot_input.txt", "1 own=1 nodesOut=1 cfgOut=1"), ("depot_free_input.txt", "1 own=1 nodesOut=1 cfgOut=1")):
+            text = open(os.path.join(fixtures, name), encoding="utf-8").read()
+            self.assertEqual(str(self.L.eval(code)(text)), want, name)
 
     def test_a_text_that_counts_differently_falls_back_to_the_record_path(self):
         self.assertEqual(self.decoded(portable_road_text(segs=2)), "street|2|1")

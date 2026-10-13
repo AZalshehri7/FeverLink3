@@ -2713,6 +2713,13 @@ end
 local PORTABLE_REPLAY = false
 pcall(function() PORTABLE_REPLAY = os.getenv("FEVERLINK3_PORTABLE_REPLAY") == "1" end)
 M.PORTABLE_REPLAY = PORTABLE_REPLAY
+-- EXPERIMENT (default off, not the final rule): which segments the construction makes itself is read from their owner. In the real depot
+-- samples (b24, b26) the construction's entrance piece has the build's player as its owner and the tool-made pieces an uninitialised
+-- value; a rule on uninitialised memory is not clean, this only teaches the engine's verdict. The final rule is to be decoded from the
+-- construction's own edge lists.
+local OWN_BY_OWNER = false
+pcall(function() OWN_BY_OWNER = os.getenv("FEVERLINK3_PORTABLE_OWN_BY_OWNER") == "1" end)
+M.OWN_BY_OWNER = OWN_BY_OWNER
 local okPT, Portable = pcall(ug_require, "feverlink3_portable.lua")
 if not okPT then okPT, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
 if not okPT or type(Portable) ~= "table" then Portable = nil end
@@ -2938,6 +2945,46 @@ local function markDerived(rec)
 	return n, #pieces
 end
 
+-- the segments of the text whose owner is the build's own player (the experiment above); segment i of the text is segment i of the new record
+local function markOwnedByPlayer(rec, tree)
+	local player = tree.context and tree.context.player and tree.context.player.old
+	if not player then return nil, "the text names no player" end
+	local n = 0
+	for i, ts in ipairs(Portable.list((tree.proposal or {}).addedSegments)) do
+		if ts.playerOwned and ts.playerOwned.old == player and rec.segs[i] then
+			rec.segs[i].derived = true
+			n = n + 1
+		end
+	end
+	return n, n
+end
+
+-- what the left-out (derived) segments take with them: the new nodes only they use and those nodes' configurations
+local function leftOutWith(rec2)
+	local used = {}
+	for _, sg in ipairs(rec2.segs) do
+		if not sg.derived then
+			if type(sg.n0) == "number" then used[sg.n0] = true end
+			if type(sg.n1) == "number" then used[sg.n1] = true end
+		end
+	end
+	local nodesOut, cfgOut = 0, 0
+	for _, n in ipairs(rec2.nodes) do if not used[n.id] then nodesOut = nodesOut + 1 end end
+	for _, n in ipairs(rec2.ncfg) do if type(n.node) == "number" and n.node < 0 and not used[n.node] then cfgOut = cfgOut + 1 end end
+	return nodesOut, cfgOut
+end
+
+-- (for the tests) the record made over by the text with the owner rule applied: the record, how many segments are the player's own, the
+-- nodes and node configurations that leave with them; nil and why otherwise
+function M.ownerRule(rec, tree)
+	local rec2, why = portableRecord(rec, tree)
+	if not rec2 then return nil, why end
+	local n, whyN = markOwnedByPlayer(rec2, tree)
+	if not n then return nil, whyN end
+	local nodesOut, cfgOut = leftOutWith(rec2)
+	return rec2, n, nodesOut, cfgOut
+end
+
 local function portableReplay(rec, text, R, f, tkey)
 	local trace = C.tracer("build")
 	local function no(why)
@@ -2970,8 +3017,18 @@ local function portableReplay(rec, text, R, f, tkey)
 	end)
 	local rec2, whyR = portableRecord(rec, tree)
 	if not rec2 then return no(whyR) end
-	local nDerived, nPieces = markDerived(rec2)
+	local nDerived, nPieces
+	if OWN_BY_OWNER then
+		nDerived, nPieces = markOwnedByPlayer(rec2, tree)
+	else
+		nDerived, nPieces = markDerived(rec2)
+	end
 	if nDerived == nil then return no("the construction's own street pieces cannot be found (" .. tostring(nPieces) .. ")") end
+	if OWN_BY_OWNER then
+		local nodesOut, cfgOut = leftOutWith(rec2)
+		trace("build.portable", string.format("%s owner-rule: %d of %d segment(s) are the player's own pieces and are left out, with %d node(s) and %d node configuration(s) only they use",
+			tostring(tkey or "-"), nDerived, #rec2.segs, nodesOut, cfgOut))
+	end
 	local notes = {}
 	local okB, args = pcall(function()
 		local sp = streetProposal(rec2, R, notes, { drop = true })
@@ -2983,8 +3040,8 @@ local function portableReplay(rec, text, R, f, tkey)
 	if not okF then return no("the engine's factory refused it (" .. tostring(errF):gsub("\nstack traceback:.*", ""):sub(1, 160) .. ")") end
 	local v, whyV = proposalVerdict(args)
 	local verdict = v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")
-	trace("build.portable", string.format("%s portable replay: one proposal, %d construction(s), %d segment(s) of %d left to the construction (%s dry-run pieces); engine verdict %s",
-		tostring(tkey or "-"), #rec2.cons, nDerived, #rec2.segs, tostring(nPieces), verdict))
+	trace("build.portable", string.format("%s portable replay%s: one proposal, %d construction(s), %d segment(s) of %d left to the construction (%s %s); engine verdict %s",
+		tostring(tkey or "-"), OWN_BY_OWNER and " [owner-rule verdict]" or "", #rec2.cons, nDerived, #rec2.segs, tostring(nPieces), OWN_BY_OWNER and "own by owner" or "dry-run pieces", verdict))
 	if v and v.critical then return no("the engine's verdict is critical (" .. verdict .. ")") end
 	logNotes(notes, "build portable")
 	args.plan, args.form = "portable", 1
