@@ -136,6 +136,17 @@ local function entitiesWith(compName)
 			local l = api.engine.system.lineSystem.getLines()
 			for i = 1, #l do ids[#ids + 1] = l[i] end
 		end)
+	elseif compName == "GROUP_STATION" then
+		-- every station (road-side stops included) as the station groups list them: the world scan for EDGE_OBJECT finds none of a stop
+		-- (sweep 20261013-053645/055034), and a stop beside a station joins a group that exists, so no group is new either
+		local groups = {}
+		pcall(api.engine.forEachEntityWithComponent, function(e) groups[#groups + 1] = e end, api.type.ComponentType.STATION_GROUP)
+		for _, g in ipairs(groups) do
+			pcall(function()
+				local sg = api.engine.getComponent(g, api.type.ComponentType.STATION_GROUP)
+				for i = 1, sg and sg.stations and #sg.stations or 0 do ids[#ids + 1] = sg.stations[i] end
+			end)
+		end
 	else
 		pcall(api.engine.forEachEntityWithComponent, function(e) ids[#ids + 1] = e end, api.type.ComponentType[compName])
 	end
@@ -927,7 +938,7 @@ end
 -- BEFORE the build (the pre-build event), the interface half says under which key the record was shipped ("nativebind"), and a binder
 -- like a replay's then keys the new stops and their station groups on this game too: a line or a vehicle bought here can then name
 -- them for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here", "unresolved line reference 1:3").
-local NATIVE_BIND_COMPS = { "CONSTRUCTION", "EDGE_OBJECT", "STATION_GROUP" }
+local NATIVE_BIND_COMPS = { "CONSTRUCTION", "EDGE_OBJECT", "STATION_GROUP", "GROUP_STATION" }
 local function snapshotComps(comps)
 	local before = {}
 	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end

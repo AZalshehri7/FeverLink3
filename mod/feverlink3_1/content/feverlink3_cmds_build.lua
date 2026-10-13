@@ -2463,6 +2463,7 @@ local function bindsComp(body)
 	if stopCount(rec) > 0 then
 		comps[#comps + 1] = "EDGE_OBJECT"
 		comps[#comps + 1] = "STATION_GROUP"
+		comps[#comps + 1] = "GROUP_STATION"   -- the stations the groups list (new ones, also in a group that was there before)
 	end
 	return comps
 end

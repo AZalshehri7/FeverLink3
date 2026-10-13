@@ -1743,6 +1743,18 @@ class BuildTest(unittest.TestCase):
             self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1", "1:1#o1/g"], g.label)
             self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
 
+    def test_a_second_stop_that_joins_an_existing_group_is_keyed_from_the_engines_result_entities(self):
+        # sweep run 20261013-055034 (B2): no new STATION_GROUP, edge objects cannot be listed: only the engine's own result list names the stop
+        self.start()
+        for g in (self.A, self.B):
+            g.run("HIDE_ENUM = { EDGE_OBJECT = true }; WORLD[900] = { STATION_GROUP = { stations = {} } }; JOIN_GROUP = 900")
+        self.B.issue("SIMPLE_STOP{ edge = 110, param = 0.5, left = false }")
+        self.tick(40)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertEqual([k for k in str(g.lua("BOUND_KEYS()")).split() if k.startswith("1:1#")], ["1:1#o1"], g.label)
+            self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
+
     def test_a_result_that_differs_says_what_was_expected_and_found_for_each_kind(self):
         self.start()
         for g in (self.A, self.B):
@@ -1752,7 +1764,7 @@ class BuildTest(unittest.TestCase):
         log = self.A.log()
         self.assertIn("RESULT DIFFERS", log)
         self.assertIn("1 road-side stop(s)", log)
-        self.assertIn("found new by component: [EDGE_OBJECT 0, STATION_GROUP 0]", log)
+        self.assertIn("found new by component: [EDGE_OBJECT 0, STATION_GROUP 0, GROUP_STATION 0]", log)
         self.assertIn("stops keyed 0 of 1", log)
 
     def test_two_stops_in_one_step_are_not_taken_for_each_others(self):
