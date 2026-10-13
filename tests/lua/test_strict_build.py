@@ -1419,6 +1419,39 @@ class FireDoneChoiceTest(StrictTest):
         self.assertSameWorld()
 
 
+class RemovalsCancelTest(StrictTest):
+    """FEVERLINK3_STRICT_CANCEL=removals with FEVERLINK3_STRICT_FIRE_DONE=1: a build that only takes things away (the bulldozer removing a town
+    building) is cancelled and replayed at the stamp on every game, the originator included; anything that adds stays hold-and-release.
+    (Real run 2026-10-13: the originator's engine applied its held bulldozer command 1000 ms after the stamp, a house regrew differently.)"""
+
+    strict_cancel = "removals"
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
+    fires = True
+
+    def test_a_demolition_is_cancelled_and_applied_at_the_stamp_by_every_game(self):
+        self.start()
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertSameWorld()
+
+    def test_a_road_is_still_held_and_released(self):
+        self.start()
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
+
+    def test_a_demolition_stays_hold_and_release_when_the_module_cannot_fire_the_callback(self):
+        self.start()
+        self.B.native.fires = False
+        self.B.tool("{ cons = { 54 } }", make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertSameWorld()
+
+
 class ModuleSilentTest(StrictTest):
     """native_events.log exists but the module never answers (an old file of a crashed run)."""
 

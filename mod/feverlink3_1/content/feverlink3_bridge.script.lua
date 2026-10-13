@@ -64,6 +64,12 @@ pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 --   "plans"      cancel-and-replay on EVERY game, the originator included, for the plans street, combined and bulldoze (all originators).
 --   "host"       the same, but only when this game is the host (the guest keeps hold-and-release).
 --   "1"          cancel-and-replay for every kind and every originator.
+--   "removals"   cancel-and-replay ONLY for builds that take things away and add nothing (a bulldozer removing a town building or a
+--                segment), every originator, and only when the module fires the tool's callback (FEVERLINK3_STRICT_FIRE_DONE=1). Why: in
+--                hold-and-release the originator's engine applies its own command 1000-1600 ms of game time after the stamp (real run
+--                2026-10-13, screenshot pass: stamp 2505800, engine event at 2506800) while every other game applies it AT the stamp; a freed
+--                town lot is then seen by the town's growth logic at different times and a different building grows (constructions /
+--                townBuildings drift, resync). Cancel-and-replay applies it at the stamp on every game.
 -- Cancel-and-replay keeps all worlds identical (N0 runs: 0 resyncs in 30 game minutes) but a cancelled command never gives the tool its
 -- completion callback: in the first real two-player session the guest's street tool showed no ghost for the second road he built
 -- (the click still built it). TpF2 fires the callback before it cancels; that is not implemented here (the callback's signature on this
@@ -71,7 +77,7 @@ pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 local STRICT_CANCEL = "off"
 pcall(function()
 	local v = os.getenv("FEVERLINK3_STRICT_CANCEL")
-	if v == "1" then STRICT_CANCEL = "all" elseif v == "plans" or v == "host" then STRICT_CANCEL = v end
+	if v == "1" then STRICT_CANCEL = "all" elseif v == "plans" or v == "host" or v == "removals" then STRICT_CANCEL = v end
 end)
 -- FEVERLINK3_STRICT_FIRE_DONE=1 (default off, experimental): the native module fires the tool's own completion callback before it drops a
 -- cancelled command (the TpF2 recipe; docs/NATIVE_LINK.md), which re-arms the tool: without it the tool's busy flag stays set and its
@@ -2311,6 +2317,7 @@ local function natRelease(key)
 	local h = N and N.heldByKey[key]
 	if not h or h.released or h.done or h.cancelled then return false end
 	h.released = os.clock()
+	h.releasedAt = engine.gameTime()
 	pcall(toSim, "replay", {})
 	local ok = natOrder("release", h.id)
 	pcall(toSim, "heldgone", { key = key })
@@ -2479,6 +2486,13 @@ local function natDecideUnsafe(h, cap)
 	if STRICT_CANCEL == "plans" or (STRICT_CANCEL == "host" and C.PLAYER_ID == 0) then
 		local okP, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
 		cancelFlow = okP and STRICT_CANCEL_PLANS[plan or ""] == true
+	end
+	if STRICT_CANCEL == "removals" then
+		-- only a build that removes and adds nothing (the bulldozer): the plans "removal" (segments) and "construction" without a construction
+		-- to add (town buildings, industries). The tool's callback must be fireable, or the tool stays dead.
+		local okP, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
+		local addsNothing = okP and (plan == "removal" or (plan == "construction" and not (Build.addsConstructions and Build.addsConstructions(body))))
+		cancelFlow = addsNothing and FIRE_DONE and h.done == true
 	end
 	if cancelFlow and FIRE_DONE and not h.done then
 		natSay("held " .. id .. " (site " .. natSite(h) .. "): the native module cannot fire this tool's callback: hold-and-release instead of cancel")
@@ -2870,6 +2884,12 @@ local function natEvent(N, rec, p, history)
 		if rec then
 			rec.applied = true
 			natSay(string.format("held %d (%s) applied by the engine (accepted %s) at game time %d, stamp %d", id, rec.key, tostring(p.ok), engine.gameTime(), rec.at or 0))
+			-- every other game applied this build AT the stamp: the lag is the time this game's world differed from theirs (town growth
+			-- reacting to a freed lot in that window is the drift of the real run 2026-10-13). FEVERLINK3_STRICT_CANCEL=removals closes it for demolitions.
+			pcall(function()
+				local lag = engine.gameTime() - (rec.at or 0)
+				traceGui("strict.lag", string.format("%s released_at=%s stamp=%s seen_applied_at=%d lag_ms=%d lag_steps=%.1f", rec.key, tostring(rec.releasedAt), tostring(rec.at), engine.gameTime(), lag, lag / STEP))
+			end)
 			if rec.finish then N.finishes[#N.finishes + 1] = { rec = rec, ok = p.ok ~= false, frame = G.frames + 2 } end
 		end
 	elseif kind == "error" then
