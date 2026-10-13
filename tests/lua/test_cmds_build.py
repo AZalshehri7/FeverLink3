@@ -2717,7 +2717,7 @@ class LockstepAdditionsTest(unittest.TestCase):
         self.assertEqual(got, "CONSTRUCTION,nil,nil,LINE,EDGE_OBJECT+STATION_GROUP,nil,nil|77true|nilfalse|nilfalse|niltrue")
 
 
-def portable_road_text(ax=300.0, bx=400.0, template="street/new_medium_road.street_template", segs=1, extra=None):
+def portable_road_text(ax=300.0, bx=400.0, template="street/new_medium_road.street_template", segs=1, extra=None, tangent=None):
     """The input-level text of the road NATIVE_ROAD{ a = (ax, 0), b = (bx, 0) } as the native module writes it (placeholders as the mock numbers them)."""
     import struct as _s
 
@@ -2733,7 +2733,7 @@ def portable_road_text(ax=300.0, bx=400.0, template="street/new_medium_road.stre
         ("proposal.addedSegments.#", "n:%d" % segs), ("proposal.addedSegments[0].entity", "ent:new#3"),
         ("proposal.addedSegments[0].node0", "ent:new#1"), ("proposal.addedSegments[0].node1", "ent:new#2"),
         ("proposal.addedSegments[0].position0", v(ax, 0, 0)), ("proposal.addedSegments[0].position1", v(bx, 0, 0)),
-        ("proposal.addedSegments[0].tangent0", v(bx - ax, 0, 0)), ("proposal.addedSegments[0].tangent1", v(bx - ax, 0, 0)),
+        ("proposal.addedSegments[0].tangent0", v(tangent or bx - ax, 0, 0)), ("proposal.addedSegments[0].tangent1", v(tangent or bx - ax, 0, 0)),
         ("proposal.addedSegments[0].baseType", "u32:00000000"), ("proposal.addedSegments[0].typeIndex", "i32:00000001"),
         ("proposal.addedSegments[0].roadType", "u32:00000000"), ("proposal.addedSegments[0].type", "u32:00000000"),
         ("proposal.addedSegments[0].roadTemplate", 'res:"%s"' % template), ("proposal.addedSegments[0].roadStyle", 'res:"medium"'),
@@ -2787,17 +2787,76 @@ class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
         self.assertEqual(self.decoded(portable_road_text()), "portable|2|1")
 
     def test_the_text_decides_the_geometry(self):
-        # the text says the road ends at x = 450: the engine is given the text's ends, not the record's
+        # the text says the tangent is 123: the engine is given the text's geometry, not the record's
         code = """(function(txt)
             local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } })
             body.input = txt
             local args = DECODE(body)
             local ssp = STORE(STORE(args[1]).streetProposal)
             local c = STORE(STORE(ssp.edgesToAdd[1]).comp)
-            return tostring(args.plan) .. '|' .. c.position1.x
+            return tostring(args.plan) .. '|' .. c.tangent0.x
         end)"""
-        got = str(self.L.eval(code)(portable_road_text(bx=450.0)))
-        self.assertEqual(got, "portable|450")
+        got = str(self.L.eval(code)(portable_road_text(tangent=123.0)))
+        self.assertEqual(got, "portable|123")
+
+    def test_a_node_the_text_does_not_have_where_the_record_has_it_falls_back(self):
+        self.assertEqual(self.decoded(portable_road_text(bx=450.0)), "street|2|1")
+
+    def test_the_depot_text_with_other_numbering_than_the_record_is_matched_by_identity(self):
+        # real run 2026-10-13 (b22): the engine numbers ONE sequence across nodes, segments and the construction (the third node is -6), the
+        # record numbers its own. The numbers are labels: nodes are matched by position, segments by the ends they join, the construction by
+        # file and placement; the new proposal numbers nodes and segments from -1 each, and what refers to them follows.
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "depot_input.txt"), encoding="utf-8").read()
+        code = """(function(txt)
+            local M = PURE()
+            local P = M.portable
+            local tree = P.parse(txt)
+            local pt = tree.proposal
+            local function pos(e) return { x = e.x, y = e.y, z = e.z } end
+            local oldPos = {}
+            for _, s in ipairs(P.list(pt.addedSegments)) do
+                for _, k in ipairs({ 'node0', 'node1' }) do if s[k].old then oldPos[s[k].old] = pos(s[k].pos) end end
+            end
+            local rec = { v = 1, src = 'native', cons = {}, rem = {}, old2new = {}, nodes = {}, segs = {}, rmNodes = {}, rmSegs = {}, objs = {}, rmObjs = {}, ncfg = {}, rmNcfg = {} }
+            local nodeId = {}
+            for i, tn in ipairs(P.list(pt.addedNodes)) do
+                nodeId[tn.entity.new] = -100 - i
+                rec.nodes[i] = { id = -100 - i, pos = pos(tn.position) }
+            end
+            local function end_(e) if e.new then return nodeId[e.new] end return { __ref = 'node', p = pos(e.pos) } end
+            for i, ts in ipairs(P.list(pt.addedSegments)) do
+                local own = ts.roadTemplate:find('/constructions/', 1, true)
+                rec.segs[i] = { id = -200 - i, n0 = end_(ts.node0), n1 = end_(ts.node1), type = 0, owner = 'player',
+                    c = own and { roadTemplate = '::/' .. ts.roadTemplate } or { roadTemplate = '::/' .. ts.roadTemplate, roadStyle = '::/' .. ts.roadStyle, typeIndex = -1, roadType = 1,
+                        p0 = pos(ts.position0), p1 = pos(ts.position1) } }
+            end
+            for i = 1, pt.removedNodes.n do rec.rmNodes[i] = { __ref = 'node', p = pos(pt.removedNodes[i].position) } end
+            for i = 1, pt.removedSegments.n do rec.rmSegs[i] = { __ref = 'edge', p0 = pos(pt.removedSegments[i].position0), p1 = pos(pt.removedSegments[i].position1) } end
+            for i = 1, pt.nodeConfigsToAdd.n do
+                local e = pt.nodeConfigsToAdd[i].entity
+                rec.ncfg[i] = { node = e.new and nodeId[e.new] or { __ref = 'node', p = oldPos[e.old] }, lc = {}, cw = {}, pref = 2 }
+            end
+            rec.ncfg[1].lc[1] = { s0 = rec.segs[1].id, l0 = 1, s1 = rec.segs[2].id, l1 = 2, road = true }
+            rec.ncfg[1].cw[1] = rec.segs[3].id
+            for i = 1, pt.edgeObjectsToAdd.n do rec.objs[i] = { edge = rec.segs[3].id, model = 'station/street/bus_stop.mdl', param = 0.5 } end
+            for i = 1, pt.edgeObjectsToRemove.n do rec.rmObjs[i] = { __ref = 'obj', i = i, edge = rec.rmSegs[1] } end
+            for i = 1, pt.nodeConfigsToRemove.n do rec.rmNcfg[i] = { __ref = 'node', p = oldPos[pt.nodeConfigsToRemove[i].old] or { x = 0, y = 0, z = 0 } } end
+            for i = 1, tree.toRemove.n do rec.rem[i] = { __ref = 'con', file = '::/buildings/x.con', p = { x = 1, y = 2, z = 3 } } end
+            local tc = tree.toAdd[1]
+            rec.cons[1] = { file = '::/' .. tc.fileName, transf = tc.transf, owner = 'player', params = {} }
+            local out, why = M.portableRecord(rec, tree)
+            if not out then return 'NO: ' .. why end
+            local ids = {}
+            for i, n in ipairs(out.nodes) do ids[#ids + 1] = 'n' .. n.id end
+            for i, s in ipairs(out.segs) do ids[#ids + 1] = 's' .. s.id .. '(' .. tostring(type(s.n0) == 'number' and s.n0 or 'ref') .. ',' .. tostring(type(s.n1) == 'number' and s.n1 or 'ref') .. ')' end
+            local nc = out.ncfg[1]
+            ids[#ids + 1] = 'cfg' .. tostring(nc.node) .. ':' .. nc.lc[1].s0 .. ',' .. nc.lc[1].s1 .. ':' .. nc.cw[1]
+            ids[#ids + 1] = 'obj' .. out.objs[1].edge
+            ids[#ids + 1] = 'con' .. #out.cons
+            return table.concat(ids, ' ')
+        end)"""
+        got = str(self.L.eval(code)(text))
+        self.assertEqual(got, "n-1 n-2 n-3 s-1(-1,-2) s-2(ref,-1) s-3(-1,-3) s-4(-3,ref) cfg-1:-1,-2:-3 obj-3 con1")
 
     def test_a_text_that_counts_differently_falls_back_to_the_record_path(self):
         self.assertEqual(self.decoded(portable_road_text(segs=2)), "street|2|1")

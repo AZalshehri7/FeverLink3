@@ -2697,7 +2697,17 @@ local function withPrefix(name)
 	return name
 end
 
--- the record with its street part replaced by the text's; nil and why when the two do not describe the same build
+local function plainName(s)
+	if type(s) == "string" then return (s:gsub("^::/", "")) end
+	return s
+end
+
+-- The record made over by the text. The numbers of the placeholders are labels, not identity: the engine's held proposal numbers ONE sequence
+-- across nodes, segments and the construction, the record numbers its own. So the new proposal takes the TEXT's elements in the text's order
+-- with fresh per-type sequences (nodes -1.., segments -1.., as a script numbers them), and what the record knows about an element (owner,
+-- precedence, track type, objects, lanes; the node configurations' extras; the edge objects) is found by identity: a new node by its position,
+-- a segment by the two ends it joins, a construction by file and placement. An element that cannot be matched uniquely makes the whole
+-- thing fall back, and the reason names it. nil and why when the two do not describe the same build.
 local function portableRecord(rec, tree)
 	local p = tree.proposal or {}
 	local c = Portable.counts(tree)
@@ -2707,30 +2717,92 @@ local function portableRecord(rec, tree)
 	end
 	local function copy(t) local o = {}; for k, v in pairs(t) do o[k] = v end; return o end
 	local function xyz(v) return v and { x = v.x, y = v.y, z = v.z } or nil end
-	local function nodeRef(e, recRef)
-		if type(recRef) == "table" and recRef.__ref == "node" then return recRef end
+	local function pk(v) return string.format("%.2f,%.2f,%.2f", v.x, v.y, v.z or 0) end
+	local textNodes, textSegs = Portable.list(p.addedNodes), Portable.list(p.addedSegments)
+
+	-- new nodes: record id -> text number, by position
+	local nodeByPos = {}
+	for i, tn in ipairs(textNodes) do
+		if not (tn.entity and tn.entity.new and tn.position) then return nil, "node " .. i .. " has no placeholder or position in the text" end
+		local k = pk(tn.position)
+		if nodeByPos[k] then return nil, "node " .. i .. ": two new nodes of the text lie at " .. k end
+		nodeByPos[k] = tn.entity.new
+	end
+	local recNodeToText, used = {}, {}
+	for i, rn in ipairs(rec.nodes) do
+		local tnum = rn.pos and nodeByPos[pk(rn.pos)]
+		if not tnum or used[tnum] then return nil, "the record's new node " .. i .. " is not at one new node of the text" end
+		used[tnum] = true
+		recNodeToText[rn.id] = tnum
+	end
+	-- the per-type sequences of the new proposal
+	local simpleNode, simpleSeg = {}, {}
+	for i, tn in ipairs(textNodes) do simpleNode[tn.entity.new] = -i end
+	for i, ts in ipairs(textSegs) do
+		if not (ts.entity and ts.entity.new and ts.position0 and ts.position1 and ts.tangent0 and ts.tangent1) then return nil, "segment " .. i .. " is incomplete in the text" end
+		simpleSeg[ts.entity.new] = -i
+	end
+
+	-- an end of a segment as an identity: a new node by its text number, an existing one by its position
+	local function textEnd(e)
 		if type(e) ~= "table" then return nil end
-		if e.new then return -e.new end
-		if e.old and e.pos then return { __ref = "node", p = xyz(e.pos) } end
+		if e.new then return "n" .. e.new end
+		if e.pos then return "p" .. pk(e.pos) end
 		return nil
 	end
+	local function recEnd(v)
+		if type(v) == "number" then return recNodeToText[v] and ("n" .. recNodeToText[v]) or nil end
+		if type(v) == "table" and v.p then return "p" .. pk(v.p) end
+		return nil
+	end
+	local function pair(a, b) if a == nil or b == nil then return nil end if a > b then a, b = b, a end return a .. "|" .. b end
+
+	-- segments: by the pair of ends; the ones whose ends the record cannot give (a construction's own pieces) by elimination
+	local textByPair, recMatched, textMatched = {}, {}, {}
+	for i, ts in ipairs(textSegs) do
+		local k = pair(textEnd(ts.node0), textEnd(ts.node1))
+		if k == nil then return nil, "segment " .. i .. " has an end the text does not locate" end
+		if textByPair[k] then return nil, "segment " .. i .. ": two new segments of the text join the same ends (" .. k .. ")" end
+		textByPair[k] = i
+	end
+	local recSegToText, pending = {}, {}
+	for i, rs in ipairs(rec.segs) do
+		local k = pair(recEnd(rs.n0), recEnd(rs.n1))
+		local ti = k and textByPair[k]
+		if ti then
+			if textMatched[ti] then return nil, "the record's segments " .. textMatched[ti] .. " and " .. i .. " join the same ends" end
+			textMatched[ti], recMatched[i] = i, true
+			recSegToText[i] = ti
+		else
+			pending[#pending + 1] = i
+		end
+	end
+	local freeText = {}
+	for i = 1, #textSegs do if not textMatched[i] then freeText[#freeText + 1] = i end end
+	if #pending ~= #freeText then return nil, "the record has " .. #pending .. " segment(s) the text's ends do not name, the text " .. #freeText .. " the record's do not" end
+	if #pending > 1 then return nil, #pending .. " segments cannot be matched by their ends" end
+	if #pending == 1 then
+		textMatched[freeText[1]], recSegToText[pending[1]] = pending[1], freeText[1]
+	end
+	local textToRec = {}
+	for ri, ti in pairs(recSegToText) do textToRec[ti] = ri end
+
 	local out = copy(rec)
 	out.portable, out.nodes, out.segs, out.rmNodes, out.rmSegs = true, {}, {}, {}, {}
-	for i, tn in ipairs(Portable.list(p.addedNodes)) do
-		if not (tn.entity and tn.entity.new and tn.position) then return nil, "node " .. i .. " has no placeholder or position in the text" end
-		if rec.nodes[i].id ~= -tn.entity.new then return nil, "node " .. i .. ": the placeholder differs (record " .. tostring(rec.nodes[i].id) .. ", text " .. -tn.entity.new .. ")" end
-		out.nodes[i] = { id = -tn.entity.new, pos = xyz(tn.position) }
+	for i, tn in ipairs(textNodes) do out.nodes[i] = { id = -i, pos = xyz(tn.position) } end
+	-- an end of the new segment: a new node by its new number, an existing one by the record's reference when it has one there, else by position
+	local function endRef(e, rs)
+		if e.new then return simpleNode[e.new] end
+		for _, r in ipairs({ rs.n0, rs.n1 }) do
+			if type(r) == "table" and r.p and e.pos and pk(r.p) == pk(e.pos) then return r end
+		end
+		return { __ref = "node", p = xyz(e.pos) }
 	end
-	for i, ts in ipairs(Portable.list(p.addedSegments)) do
-		local rs = rec.segs[i]
-		if not (ts.entity and ts.entity.new and ts.position0 and ts.position1 and ts.tangent0 and ts.tangent1) then return nil, "segment " .. i .. " is incomplete in the text" end
-		local n0 = nodeRef(ts.node0, type(rs.n0) == "table" and rs.n0 or nil)
-		local n1 = nodeRef(ts.node1, type(rs.n1) == "table" and rs.n1 or nil)
-		if n0 == nil or n1 == nil then return nil, "segment " .. i .. " has an end the text does not locate" end
-		if rs.id ~= -ts.entity.new then return nil, "segment " .. i .. ": the placeholder differs (record " .. tostring(rs.id) .. ", text " .. -ts.entity.new .. ")" end
+	for i, ts in ipairs(textSegs) do
+		local rs = rec.segs[textToRec[i]]
 		local seg = copy(rs)
 		seg.portable, seg.derived, seg.connector = true, nil, nil
-		seg.id, seg.n0, seg.n1 = -ts.entity.new, n0, n1
+		seg.id, seg.n0, seg.n1 = -i, endRef(ts.node0, rs), endRef(ts.node1, rs)
 		local sc = copy(rs.c or {})
 		sc.p0, sc.p1, sc.t0, sc.t1 = xyz(ts.position0), xyz(ts.position1), xyz(ts.tangent0), xyz(ts.tangent1)
 		sc.type, sc.typeIndex, sc.roadType = ts.type, ts.typeIndex, ts.roadType
@@ -2739,10 +2811,74 @@ local function portableRecord(rec, tree)
 		if seg.type == nil then seg.type = ts.baseType end
 		out.segs[i] = seg
 	end
+	-- what refers to the record's placeholders follows them to the new numbers
+	local function newNode(v)
+		if type(v) ~= "number" or v >= 0 then return v end
+		local t = recNodeToText[v]
+		if not t then return nil end
+		return simpleNode[t]
+	end
+	local function newSeg(v)
+		if type(v) ~= "number" or v >= 0 then return v end
+		for ri, rs in ipairs(rec.segs) do
+			if rs.id == v then return simpleSeg[textSegs[recSegToText[ri]].entity.new] end
+		end
+		return nil
+	end
+	out.objs = {}
+	for i, o in ipairs(rec.objs) do
+		local e = newSeg(o.edge)
+		if e == nil then return nil, "edge object " .. i .. " is on a segment the text does not have" end
+		local no = copy(o)
+		no.edge = e
+		out.objs[i] = no
+	end
+	out.ncfg = {}
+	for i, n in ipairs(rec.ncfg) do
+		local node = newNode(n.node)
+		if node == nil then return nil, "node configuration " .. i .. " belongs to a node the text does not have" end
+		local nn = copy(n)
+		nn.node, nn.lc, nn.cw = node, {}, {}
+		for j, l in ipairs(n.lc or {}) do
+			local s0, s1 = newSeg(l.s0), newSeg(l.s1)
+			if s0 == nil or s1 == nil then return nil, "node configuration " .. i .. " names a segment the text does not have" end
+			local nl = copy(l)
+			nl.s0, nl.s1 = s0, s1
+			nn.lc[j] = nl
+		end
+		for j, x in ipairs(n.cw or {}) do
+			local e = newSeg(x)
+			if e == nil then return nil, "node configuration " .. i .. " has a crosswalk on a segment the text does not have" end
+			nn.cw[j] = e
+		end
+		out.ncfg[i] = nn
+	end
+	-- constructions: by file and placement
+	out.cons = {}
+	local takenCon = {}
+	for i, tc in ipairs(Portable.list(tree.toAdd)) do
+		local found
+		for j, rc in ipairs(rec.cons) do
+			local m = rc.transf
+			if not takenCon[j] and plainName(rc.file) == plainName(tc.fileName) and type(m) == "table" and type(tc.transf) == "table"
+				and abs(m[13] - tc.transf[13]) < 0.05 and abs(m[14] - tc.transf[14]) < 0.05 then
+				if found then return nil, "construction " .. i .. " matches two of the record's" end
+				found = j
+			end
+		end
+		if not found then return nil, "construction " .. i .. " (" .. tostring(tc.fileName) .. ") is not among the record's" end
+		takenCon[found] = true
+		out.cons[i] = rec.cons[found]
+	end
 	for i, tn in ipairs(Portable.list(p.removedNodes)) do
 		local r = rec.rmNodes[i]
-		local ref = nodeRef(tn.entity and { old = tn.entity.old, pos = tn.position }, type(r) == "table" and r or nil)
-		if type(ref) ~= "table" then return nil, "removed node " .. i .. " is not located in the text" end
+		local ref
+		if type(r) == "table" and r.__ref == "node" then
+			ref = r
+		elseif tn.position then
+			ref = { __ref = "node", p = xyz(tn.position) }
+		end
+		if not ref then return nil, "removed node " .. i .. " is not located in the text" end
 		out.rmNodes[i] = ref
 	end
 	for i, ts in ipairs(Portable.list(p.removedSegments)) do
@@ -3156,6 +3292,8 @@ end
 
 M.classify = classify
 M.proposalCounts = proposalCounts
+M.portableRecord = portableRecord   -- (for the tests: the record made over by the native text)
+M.portable = Portable
 M.normalise = normalise
 M.plans = PLAN
 M.resolver = newResolver
