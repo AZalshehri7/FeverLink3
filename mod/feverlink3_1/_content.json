@@ -12,6 +12,7 @@
         "feverlink3_icon.tga",
         "feverlink3_livevsloaded.lua",
         "feverlink3_lockstep.lua",
+        "feverlink3_portable.lua",
         "feverlink3_towntrace.lua",
         "feverlink3_ui.script.lua",
         "feverlink3_uihook.lua"

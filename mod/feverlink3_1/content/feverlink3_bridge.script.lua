@@ -43,6 +43,11 @@ for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverli
 	end
 end
 
+-- The portable text of the native module's held commands as a table (B2); optional, nil without the module.
+local okP, Portable = pcall(ug_require, "feverlink3_portable.lua")
+if not okP then okP, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
+if not okP or type(Portable) ~= "table" then Portable = nil end
+
 -- The construction module captures what the native tools build (see simCaptureBuild).
 local Build = nil
 for _, M in ipairs(CMDS) do
@@ -962,6 +967,21 @@ local function snapshotComps(comps)
 	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end
 	return before
 end
+-- B2.1, shadow: the record against the text the native module read from the held command, member by member (Portable.compare); one
+-- trace line (build.portable) on whichever half has both. Never raises.
+local function shadowCompare(tracer, who, text, rec)
+	pcall(function()
+		local tree, why = Portable.parse(text)
+		if not tree then
+			tracer("build.portable", string.format("%s TEXT UNUSABLE (%s)", who, tostring(why)))
+			return
+		end
+		local diffs = Portable.compare(tree, rec)
+		tracer("build.portable", string.format("%s diffs=%d%s; text counts[%s]", who, #diffs, #diffs > 0 and (" [" .. table.concat(diffs, "; "):sub(1, 700) .. "]") or "",
+			Portable.countsText(Portable.counts(tree))))
+	end)
+end
+
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
 	local st = simState(state)
 	local now = engine.gameTime()
@@ -1033,6 +1053,14 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, d
 		return
 	end
 	body.native = true
+	do
+		local hi = st.heldInput
+		st.heldInput = nil
+		if hi and Portable and os.clock() - hi.wall < 30 then
+			body.input = hi.text
+			shadowCompare(traceSim, "t=" .. now .. " side=originator", hi.text, body.args[1])
+		end
+	end
 	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and (deferredPre and "pre-build event (read before the deferred build)" or "post-event (no context)") or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
 	body.category = buildCategory(body)
 	if Build.constructionsBlocked and Build.constructionsBlocked(body) then
@@ -1175,6 +1203,18 @@ local function simApplyAction(st, it, now)
 								it.key, tostring(a[3]), tostring(a[4]), tostring(a[5]), tostring(c and c.checkTerrainAlignment), tostring(c and c.cleanupStreetGraph),
 								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.extendProposalRedoPillars), tostring(c and c.player),
 								tostring(a.chain and (#a.chain + 1) or 1), tostring(engine.gameTime()), tostring(engine.account())))
+							if Portable and type(it.body.input) == "string" then
+								pcall(function()
+									local tree, why = Portable.parse(it.body.input)
+									if not tree then
+										traceSim("build.portable", string.format("%s side=replay TEXT UNUSABLE (%s)", it.key, tostring(why)))
+										return
+									end
+									local diffs = Portable.compare(tree, Build.normalise(it.body.args[1]))
+									traceSim("build.portable", string.format("%s side=replay diffs=%d%s; text counts[%s]; this game's first proposal counts[%s]", it.key, #diffs,
+										#diffs > 0 and (" [" .. table.concat(diffs, "; "):sub(1, 700) .. "]") or "", Portable.countsText(Portable.counts(tree)), Build.proposalCounts(a[1])))
+								end)
+							end
 							traceSim("build.ctx", string.format("%s side=replay source=%s ctx{%s} ie=%s pi=%s", it.key, tostring(a.ctxSource or "record"), Build.contextText(c), tostring(a[3]), tostring(a[4])))
 						end)
 					end
@@ -1609,6 +1649,9 @@ local function handleEvent(userParams, state, src, id, name, param)
 			end
 		elseif name == "replay" then
 			markReplay(st, engine.gameTime())
+		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
+			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
+			st.heldInput = { text = param.text, wall = os.clock() }
 		elseif name == "heldout" and type(param) == "table" then
 			st.heldOut = st.heldOut or {}
 			st.heldOut[#st.heldOut + 1] = { key = param.key, wall = os.clock() }
@@ -2446,9 +2489,43 @@ local function natUnaccounted(h, why)
 end
 
 -- The held command `h` has the capture `cap`: ship it and cancel the command, or release it.
+-- The input-level text the native module wrote for a held command (native_input_<id>.txt), read and parsed once (h.input = the tree).
+-- Shadow only until the replay uses it: the trace line says what it holds. Never raises.
+local function natInput(h)
+	if h.input ~= nil or not Portable then return h.input end
+	local ok, tree, info = pcall(function()
+		local text = C.readFile(C.path("native_input_" .. h.id .. ".txt"))
+		if not text or text == "" then return nil, "missing" end
+		local t, why = Portable.parse(text)
+		if not t then return nil, why end
+		h.inputText = text
+		return t, { bytes = #text, counts = Portable.countsText(Portable.counts(t)) }
+	end)
+	if not ok then tree, info = nil, tostring(tree) end
+	h.input = tree or false
+	if tree then
+		traceGui("build.input", string.format("held=%d bytes=%d counts[%s]", h.id, info.bytes, info.counts))
+	else
+		traceGui("build.input", string.format("held=%d NOT AVAILABLE (%s)", h.id, tostring(info)))
+	end
+	return h.input
+end
+
+-- B2.1, shadow: the record the capture made against the text the native module read from the held command (member by member), and
+-- the text goes with the record so the other games can make the same comparison. Never changes the record's meaning: the text is an
+-- extra member of the body that nothing reads yet.
+local function natShadow(h, body)
+	local tree = natInput(h)
+	if not (tree and Portable and body and body.args) then return end
+	body.input = h.inputText
+	shadowCompare(traceGui, "held=" .. h.id .. " side=originator", h.inputText, body.args[1])
+	return true
+end
+
 local function natDecideUnsafe(h, cap)
 	local N = G.nat
 	local id = h.id
+	natInput(h)
 	local function release(why) natUnaccounted(h, why) end
 	if not cap then return release("no capture of a tool build") end
 	if not cap.body then
@@ -2458,6 +2535,7 @@ local function natDecideUnsafe(h, cap)
 		if tostring(cap.why):find("has no model", 1, true) then
 			-- an edge object (a stop) gets its model and parameters only when the build runs: the record is read AFTER the build (the
 			-- simulation half's deferred read, SIM.deferredBuild) and shipped then; nothing to cancel
+			if natInput(h) then pcall(toSim, "heldinput", { text = h.inputText }) end
 			return release("the capture of " .. tostring(cap.tool) .. " waits for the build (" .. tostring(cap.why) .. "): the record is read after it ran and shipped then")
 		end
 		if FIRE_DONE and h.done then
@@ -2471,8 +2549,9 @@ local function natDecideUnsafe(h, cap)
 	local body, text = cap.body, cap.text
 	-- The preview the capture was made from carries no Context; the held command does (the native module read it). Its flags replace the
 	-- capture's, so the record that travels has the originator's real Context, ignoreErrors and playerInitiated.
+	local _, shadowed = pcall(natShadow, h, body)
 	local okF, changed = pcall(function() return Build and Build.withHeldFlags and Build.withHeldFlags(body, h.ctx) end)
-	if okF and changed then
+	if (okF and changed) or shadowed then
 		local okS, s = pcall(C.serialize, body)
 		if okS then text = s end
 	end

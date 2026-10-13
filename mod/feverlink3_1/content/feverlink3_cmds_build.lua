@@ -3027,6 +3027,7 @@ function M.onToolEvent(id, name, param, say)
 end
 
 M.classify = classify
+M.proposalCounts = proposalCounts
 M.normalise = normalise
 M.plans = PLAN
 M.resolver = newResolver

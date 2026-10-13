@@ -1207,6 +1207,7 @@ class BuildGame(T.Game):
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = T.COMMON_SRC, T.LOCKSTEP_SRC, T.BRIDGE_SRC, T.HUD_SRC
+        g.PORTABLE_SRC = T.PORTABLE_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
             cmds[stem] = src
