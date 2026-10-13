@@ -616,6 +616,9 @@ impl Runtime {
         // was taken out of the engine's hands must be given back, whatever happens)
         let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None };
         crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
+        if self.patch.enabled() {
+            crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
+        }
         if let Some(job) = plan.dump.take() {
             // dev-only and read-only: the held command's payload, decoded (the command is already out of the engine's hands)
             crate::log::guarded("add hook (dump)", || {
@@ -1659,5 +1662,6 @@ mod tests {
         let ev = events(dir.path());
         let (_, why) = ev.iter().find(|(k, _)| k == "patch_refused").expect("expired");
         assert!(why.contains("3 Add(s), 3 build_proposal, 3 from construction tools"), "{why}");
+        assert!(why.contains("kinds [52x3]") && why.contains("at arming: no build_proposal Add yet"), "{why}");
     }
 }

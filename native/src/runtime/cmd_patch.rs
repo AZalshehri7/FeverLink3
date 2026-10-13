@@ -42,7 +42,23 @@ impl Runtime {
 
     /// A `patch_next` order of the control file.
     pub(super) fn arm_patch(&self, frozen: Vec<u32>, adds: u32, ttl: u64, now: u64) {
+        let gap = self.patch.ms_since_build_proposal(now);
         self.patch.arm(frozen, adds, ttl, now);
+        self.say(&format!(
+            "native patch: patch_next first seen; ms since the previous build_proposal Add: {}",
+            gap.map_or("none yet".to_string(), |g| g.to_string())
+        ));
+    }
+
+    /// Remembers one Add (any kind) for the diagnostics of an order that finds no command.
+    pub(super) fn patch_note_add(&self, args: &AddArgs, caller: Option<usize>, held: bool) {
+        let kind = self.build.kind_offset.and_then(|o| {
+            // SAFETY: only readable memory is read.
+            unsafe { engine::command_kind(args.cmd, o as usize) }
+        });
+        let rva = caller.and_then(|c| c.checked_sub(self.base)).and_then(|r| u32::try_from(r).ok());
+        let is_bp = kind.is_some() && self.build.kind_by_name("build_proposal") == kind;
+        self.patch.note_add(cp::AddRec { kind, rva, ms: self.now_ms(), held }, is_bp);
     }
 
     /// The command list's `Add` of a command that was not held: if an order is armed and this is a script `build_proposal`, carries it
@@ -54,8 +70,9 @@ impl Runtime {
         let is_bp = kind.is_some() && self.build.kind_by_name("build_proposal") == kind;
         let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
         let tool = site.and_then(|rva| self.build.ui_site_index(rva));
-        if self.patch.pending() {
-            self.patch.saw_add(is_bp, tool.is_some());
+        if let Some(armed) = self.patch.armed_ms().filter(|_| self.patch.pending()) {
+            let rec = cp::AddRec { kind, rva: site, ms: self.now_ms(), held: false };
+            self.patch.saw_add(rec, is_bp, tool.is_some(), armed);
         }
         if !is_bp {
             return; // another kind of command: the order keeps waiting

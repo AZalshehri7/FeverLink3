@@ -62,15 +62,49 @@ pub struct State {
     order: Mutex<Option<Order>>,
     /// Diagnostics for the armed order: Adds seen since it was armed (all, build_proposal, from a tool's site), and whether a skip was reported.
     seen: Mutex<Seen>,
+    /// The last Adds of any kind, armed or not (so that an order that arrives late can be compared with what went before).
+    trail: Mutex<Trail>,
     events: Mutex<Vec<Event>>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Seen {
     adds: u64,
     build_proposals: u64,
     from_tools: u64,
     skip_reported: bool,
+    /// Adds since arming by kind byte (`None` = unreadable).
+    kinds: std::collections::BTreeMap<Option<u8>, u64>,
+    /// The last few Adds since arming, as text.
+    last: std::collections::VecDeque<String>,
+    /// What went before the order: the build_proposal gap and the Adds just ahead of it.
+    before: String,
+}
+
+/// One Add, as the trail remembers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddRec {
+    pub kind: Option<u8>,
+    pub rva: Option<u32>,
+    pub ms: u64,
+    pub held: bool,
+}
+
+impl AddRec {
+    fn text(&self, rel_to: u64) -> String {
+        let k = self.kind.map_or("?".to_string(), |k| k.to_string());
+        let r = self.rva.map_or("-".to_string(), |r| format!("{r:x}"));
+        let dt = self.ms as i64 - rel_to as i64;
+        format!("k{k}@{r} {dt}ms{}", if self.held { " held" } else { "" })
+    }
+}
+
+const TRAIL_LEN: usize = 64;
+
+#[derive(Debug, Default)]
+struct Trail {
+    ring: std::collections::VecDeque<AddRec>,
+    last_bp: Option<AddRec>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -102,7 +136,8 @@ impl State {
             return;
         }
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
-        *lock(&self.seen) = Seen::default();
+        let before = self.before_text(now);
+        *lock(&self.seen) = Seen { before, ..Seen::default() };
         let old = lock(&self.order).replace(Order { frozen, adds, armed_ms: now, ttl_ms });
         if old.is_some() {
             self.refuse("replaced by a newer patch_next before a command used it");
@@ -110,12 +145,56 @@ impl State {
         self.pending.store(true, Ordering::Release);
     }
 
+    /// Remembers an Add of any kind (called for every Add while the switch is on).
+    pub fn note_add(&self, rec: AddRec, build_proposal: bool) {
+        let mut t = lock(&self.trail);
+        if t.ring.len() == TRAIL_LEN {
+            t.ring.pop_front();
+        }
+        t.ring.push_back(rec);
+        if build_proposal {
+            t.last_bp = Some(rec);
+        }
+    }
+
+    /// Milliseconds from the last build_proposal Add to `now` (for the log line at arming).
+    pub fn ms_since_build_proposal(&self, now: u64) -> Option<u64> {
+        lock(&self.trail).last_bp.map(|r| now.saturating_sub(r.ms))
+    }
+
+    fn before_text(&self, now: u64) -> String {
+        let t = lock(&self.trail);
+        let bp = t
+            .last_bp
+            .map_or("no build_proposal Add yet".to_string(), |r| format!("last build_proposal Add {}", r.text(now)));
+        let recent: Vec<String> = t
+            .ring
+            .iter()
+            .rev()
+            .take(2000)
+            .filter(|r| now.saturating_sub(r.ms) <= 2000)
+            .take(6)
+            .map(|r| r.text(now))
+            .collect();
+        format!("at arming: {bp}; Adds in the 2 s before (newest first): [{}]", recent.join(", "))
+    }
+
     /// An `Add` went by while an order is armed (for the diagnostics of an expiry).
-    pub fn saw_add(&self, build_proposal: bool, from_tool: bool) {
+    pub fn saw_add(&self, rec: AddRec, build_proposal: bool, from_tool: bool, armed_ms: u64) {
         let mut g = lock(&self.seen);
         g.adds += 1;
         g.build_proposals += u64::from(build_proposal);
         g.from_tools += u64::from(from_tool);
+        *g.kinds.entry(rec.kind).or_insert(0) += 1;
+        if g.last.len() == 5 {
+            g.last.pop_front();
+        }
+        g.last.push_back(rec.text(armed_ms));
+    }
+
+    /// When the armed order was armed.
+    pub fn armed_ms(&self) -> Option<u64> {
+        lock(&self.order).as_ref().map(|o| o.armed_ms)
     }
 
     /// `Some(reason)` the first time it is asked for the armed order (a skip is reported once per order, not once per command).
@@ -129,10 +208,17 @@ impl State {
     }
 
     fn expired_reason(&self, ttl_ms: u64) -> String {
-        let g = *lock(&self.seen);
+        let g = lock(&self.seen).clone();
+        let kinds: Vec<String> =
+            g.kinds.iter().map(|(k, n)| format!("{}x{n}", k.map_or("?".to_string(), |k| k.to_string()))).collect();
         format!(
-            "expired: no command arrived within {ttl_ms} ms (since it was armed: {} Add(s), {} build_proposal, {} from construction tools)",
-            g.adds, g.build_proposals, g.from_tools
+            "expired: no command arrived within {ttl_ms} ms (since it was armed: {} Add(s), {} build_proposal, {} from construction tools; kinds [{}]; last [{}]; {})",
+            g.adds,
+            g.build_proposals,
+            g.from_tools,
+            kinds.join(" "),
+            g.last.iter().cloned().collect::<Vec<_>>().join(", "),
+            g.before
         )
     }
 
