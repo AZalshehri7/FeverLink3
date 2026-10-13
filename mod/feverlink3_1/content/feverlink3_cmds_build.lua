@@ -1898,9 +1898,34 @@ dryRunPieces = function(rec, anyRemovals)
 		pcall(function() ctx.gatherBuildings = true end)
 		pcall(function() ctx.gatherFields = true end)
 		local pd = api.engine.util.proposal.makeProposalData(sp, ctx)
-		local prop = get(pd, "proposal")
-		if prop == nil then error("the proposal data has no proposal", 0) end
-		local inner = get(prop, "proposal") or prop
+		-- The converted proposal: the member of the proposal data that holds street nodes and segments. The data has no member named `proposal` in
+		-- this game (real runs 2026-10-13: parallelProposal collisionInfo toAddData entity2tn tpNetLinkProposal costs errorState ...), so every
+		-- member is looked at, one level down too, for one with an addedSegments list; what each member holds is traced once.
+		local inner
+		local seen = {}
+		local function keysOf(o)
+			local m = A.members(o)
+			if m then return m end
+			local out = {}
+			if type(o) == "table" and getmetatable(o) == nil then for k in pairs(o) do out[#out + 1] = k end end
+			return out
+		end
+		for _, name in ipairs(keysOf(pd)) do
+			local m = get(pd, tostring(name))
+			if type(m) == "table" or type(m) == "userdata" then
+				local sub = get(m, "proposal")
+				local cand = (get(m, "addedSegments") ~= nil and m) or (sub ~= nil and get(sub, "addedSegments") ~= nil and sub) or nil
+				local inside = {}
+				for _, k in ipairs(keysOf(m)) do inside[#inside + 1] = tostring(k) end
+				seen[#seen + 1] = tostring(name) .. "{" .. table.concat(inside, ",") .. "}" .. (cand and "*" or "")
+				if cand and not inner then inner = cand end
+			end
+		end
+		if not M.pdProbed then
+			M.pdProbed = true
+			C.tracer("build")("build.pd", "the proposal data's members: " .. table.concat(seen, " ") .. (inner and " (the converted proposal is the starred one)" or " (none holds street segments)"))
+		end
+		if inner == nil then error("the proposal data holds no converted proposal", 0) end
 		local nodePos = {}
 		for _, n in ipairs(A.list(inner, "addedNodes")) do
 			local nc = get(n, "comp")
@@ -2922,6 +2947,27 @@ local function portableReplay(rec, text, R, f, tkey)
 	if not Portable then return no("no portable module") end
 	local tree, why = Portable.parse(text)
 	if not tree then return no("the text is unusable (" .. tostring(why) .. ")") end
+	-- what the held command says about each segment and the construction, for the next analysis (segmentTags and frozenNodes are what the engine's
+	-- conversion sets for a construction; whether they say which segments it made is not known)
+	pcall(function()
+		local pt = tree.proposal or {}
+		local parts = {}
+		for i, ts in ipairs(Portable.list(pt.addedSegments)) do
+			local function e(x) return x and (x.new and ("new" .. x.new) or ("old" .. tostring(x.old))) or "?" end
+			parts[#parts + 1] = string.format("seg%d(new%s %s-%s owner=%s %s)", i, tostring(ts.entity and ts.entity.new), e(ts.node0), e(ts.node1),
+				tostring(ts.playerOwned and ts.playerOwned.old), tostring(ts.roadTemplate):match("([^/]+)$") or "?")
+		end
+		local tags, frozen, cfrozen = {}, {}, {}
+		for _, t in ipairs(Portable.list(pt.segmentTags)) do tags[#tags + 1] = tostring(t.value) end
+		for _, t in ipairs(Portable.list(pt.frozenNodes)) do frozen[#frozen + 1] = tostring(t.old or ("new" .. tostring(t.new))) end
+		for _, c in ipairs(Portable.list(tree.toAdd)) do
+			for _, t in ipairs(Portable.list(c.frozenNodes)) do cfrozen[#cfrozen + 1] = tostring(t.old or ("new" .. tostring(t.new))) end
+		end
+		if #tags > 0 or #frozen > 0 or #cfrozen > 0 or #parts > 1 then
+			trace("build.roles", string.format("%s %s; segmentTags[%s] proposal.frozenNodes[%s] construction.frozenNodes[%s]", tostring(tkey or "-"), table.concat(parts, " "),
+				table.concat(tags, ","), table.concat(frozen, ","), table.concat(cfrozen, ",")))
+		end
+	end)
 	local rec2, whyR = portableRecord(rec, tree)
 	if not rec2 then return no(whyR) end
 	local nDerived, nPieces = markDerived(rec2)

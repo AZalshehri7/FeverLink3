@@ -237,8 +237,8 @@ function M.compare(tree, rec)
 		end
 	end
 	if (c.frozen or 0) > 0 then diff("frozenNodes in the text: %d (the record has no such member)", c.frozen) end
-	local tags = p.segmentTags and p.segmentTags.bytes or 0
-	if tags > 0 then diff("segmentTags in the text: %d bytes (the record has no such member)", tags) end
+	local tags = p.segmentTags and (p.segmentTags.n or 0) or 0
+	if tags > 0 then diff("segmentTags in the text: %d words (the record has no such member)", tags) end
 	return d
 end
 

@@ -187,6 +187,10 @@ pub static SEGMENT: Elem = Elem {
     anchors: &[(8, 0x10), (0xc, 0x1c)],
 };
 
+/// One word of the proposal's `segmentTags` (32 bytes in a construction's proposal, empty in a road's). [observed: a depot over four buildings and
+/// a street station both hold seven zero words and the value 15 in the seventh, whatever their segments are]
+pub static SEGMENT_TAG: Elem = Elem { name: "SegmentTag", stride: 4, fields: &[f(0, "value", Ty::U32)], anchors: &[] };
+
 pub static NODE_CONFIG: Elem = Elem {
     name: "BaseNodeLaneConnectionAndEntity",
     stride: 0x80,
@@ -248,7 +252,7 @@ pub static PAYLOAD: &[F] = &[
     f(0x1c0, "proposal.gap1c0", Ty::Pad(0x10)),
     f(0x1d0, "proposal.frozenNodes", Ty::EntVec),
     f(0x1e8, "terrainAlignSkipEdges", Ty::Hash),
-    f(0x228, "segmentTags", Ty::BlobVec),
+    f(0x228, "segmentTags", Ty::Vec(&SEGMENT_TAG)),
     f(0x240, "toRemove", Ty::EntVec),
     f(0x258, "toAdd", Ty::Vec(&CONSTRUCTION)),
     f(0x270, "old2new", Ty::Hash),

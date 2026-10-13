@@ -403,7 +403,9 @@ function MAKE_API()
       if SCRIPT_PIECES then   -- a test lets the construction's script add these street pieces (list of { p0, p1 })
         local segs = {}
         for i, pc in ipairs(SCRIPT_PIECES(p)) do segs[i] = { comp = { position0 = pc.p0, position1 = pc.p1 } } end
-        return { errorState = { critical = false, messages = {}, warnings = {} }, proposal = { proposal = { addedNodes = {}, addedSegments = segs } } }
+        local pd = { errorState = { critical = false, messages = {}, warnings = {} } }
+        pd[SCRIPT_PIECES_MEMBER or 'proposal'] = { proposal = { addedNodes = {}, addedSegments = segs } }
+        return pd
       end
       if not VERDICT_MOCK then error("not available in this mock") end
       local mt = getmetatable(p)
@@ -2230,6 +2232,14 @@ class PureBuildTest(unittest.TestCase):
         # a dry run that answers with no piece at all falls back to the shape guess
         self.ev("(function() SCRIPT_PIECES = function(p) return {} end end)()")
         self.assertEqual(self.ev("PLAN_OF(NATIVE_UNDERGROUND{ x = 1195, y = 513 })"), "construction")
+
+    def test_the_converted_proposal_is_found_in_whichever_member_of_the_proposal_data_holds_it(self):
+        # real runs 2026-10-13: the proposal data of this game has no member `proposal` (parallelProposal collisionInfo toAddData ...)
+        joined = ("(function() local P = NATIVE_UNDERGROUND{ x = 100, y = 0 }; local sp = P.proposal; local added = sp.addedSegments; "
+                  "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.ev("(function() SCRIPT_PIECES_MEMBER = 'parallelProposal'; SCRIPT_PIECES = function(p) return { { p0 = { x = 130, y = 8, z = -13 }, p1 = { x = 120, y = 5, z = -13 } }, "
+                "{ p0 = { x = 80, y = -5, z = -13 }, p1 = { x = 70, y = -8, z = -13 } } } end end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "construction")
 
     def test_the_world_readback_of_a_records_segments_names_the_edge_or_says_there_is_none(self):
         # the trace line both games write after a build (build.pieces), to compare what each ended up with
