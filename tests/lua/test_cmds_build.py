@@ -2189,6 +2189,32 @@ class PureBuildTest(unittest.TestCase):
         end)()"""
         self.assertEqual(self.ev(code), "s:5000")
 
+    def test_a_stop_or_signal_takes_its_removed_segment_from_the_added_segments_ends_not_from_the_engines_ids(self):
+        # sweep runs 20261013-074329 / -075916: the removed id read after the build was 1 or 3 off, or a neighbour sharing the end node
+        code = """(function(reported, drop)
+            ADD_EDGE(5003, 120, 100, 0, 'street/new_medium_road.street_template')
+            local M, C, ctx = PURE()
+            local P = NATIVE_SIGNAL{ edge = 110, param = 0.5 }
+            local ok, created = APPLY_BUILD(P)
+            local sp = P.proposal
+            local rm = sp.removedSegments
+            local r = rm[1]
+            r.entity = reported
+            rm[1] = r
+            sp.removedSegments = rm
+            P.proposal = sp
+            if drop then local e = FIND_EDGE(0, 0, 100, 0); if e then WORLD[e] = nil end end
+            local body, why = M.capture(P, { result = created }, ctx)
+            if not body then return 'refused: ' .. tostring(why) end
+            local ref = body.args[1].rmSegs[1]
+            return tostring(ref.key) .. '|' .. tostring(ref.p0.x) .. ',' .. tostring(ref.p1.x)
+        end)"""
+        for wrong in (110, 111, 5003, 113, 107, -111, -5003):
+            self.setUp()   # a world of its own for each
+            self.assertEqual(self.L.eval(code)(wrong, False), "nil|0,100", "reported %s: the ends of the added segment decide" % wrong)
+        self.setUp()
+        self.assertTrue(self.L.eval(code)(111, True).startswith("refused: the segment this build replaces"), "no edge with those ends: the record is refused")
+
     def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
         # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
         code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }, {}, ctx); "

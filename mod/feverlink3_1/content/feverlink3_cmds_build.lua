@@ -1067,6 +1067,42 @@ local function removedEdgeFromAdded(rec)
 		t0 = c.t0 and copyXYZ(c.t0) or nil, t1 = c.t1 and copyXYZ(c.t1) or nil }
 end
 
+-- A stop or a signal REPLACES a segment by one with the same two ends and more objects, so by meaning the removed segment is the one with the
+-- added segment's ends. The ids of the engine's removed list are not trusted when the build is read after it ran: sweep runs 20261013-074329
+-- (B1: 39880 for 39879) and -075916 (B3: 49957 for 49954, the A3 branch that shares the end node) named a neighbour, and the replay removed
+-- that one. With one segment added, one removed and edge objects added, the reported edge is kept only if its ends are the added segment's
+-- ends; otherwise the removed segment is described by the added segment's ends (position and tangents, no key), and the record is refused
+-- when no edge with those ends exists in this world (before the build: the old one, after it: the replacement).
+local function settleInPlaceRemoval(rec, reported)
+	if #rec.segs ~= 1 or #rec.rmSegs ~= 1 or #rec.objs == 0 then return end
+	local c = rec.segs[1].c
+	if type(c) ~= "table" or not c.p0 or not c.p1 then return end
+	local function same(p, q) return p and q and abs(p.x - q.x) <= 1.5 and abs(p.y - q.y) <= 1.5 end
+	local function ends(info) return (same(info.p0, c.p0) and same(info.p1, c.p1)) or (same(info.p0, c.p1) and same(info.p1, c.p0)) end
+	local trace = C.tracer("build")
+	local info = type(reported) == "number" and reported >= 0 and A.edgeInfo(reported) or nil
+	if info and ends(info) then
+		trace("stop.rm", string.format("engine=%s derived=%s (same ends: kept)", tostring(reported), tostring(reported)))
+		return
+	end
+	local found
+	local mx, my = (c.p0.x + c.p1.x) / 2, (c.p0.y + c.p1.y) / 2
+	local r = sqrt((c.p0.x - c.p1.x) ^ 2 + (c.p0.y - c.p1.y) ^ 2) / 2 + 5
+	for _, e in ipairs(octree({ x = mx, y = my }, r, "BASE_EDGE") or {}) do
+		local inf = A.edgeInfo(e)
+		if inf and ends(inf) then found = e break end
+	end
+	if not found then
+		fail(string.format("the segment this build replaces (the engine says %s) has no edge with the ends of the added segment (%.0f,%.0f -> %.0f,%.0f) in this world",
+			tostring(reported), c.p0.x, c.p0.y, c.p1.x, c.p1.y))
+	end
+	rec.rmSegs[1] = { __ref = "edge", p0 = copyXYZ(c.p0), p1 = copyXYZ(c.p1), t0 = c.t0 and copyXYZ(c.t0) or nil, t1 = c.t1 and copyXYZ(c.t1) or nil,
+		ty = c.type, ti = c.typeIndex, rt = c.roadType }
+	local msg = string.format("engine=%s derived=edge with the added segment's ends (%.1f,%.1f -> %.1f,%.1f), found %d", tostring(reported), c.p0.x, c.p0.y, c.p1.x, c.p1.y, found)
+	trace("stop.rm", msg)
+	log("stop: the engine's removed-segment id " .. tostring(reported) .. " does not have the added segment's ends; the removed segment is taken from them (" .. msg .. ")")
+end
+
 local function captureRecord(proposal, cap)
 	local flavor = flavorOf(proposal)
 	if not flavor then fail("not a proposal (neither streetProposal nor proposal / toAdd found)") end
@@ -1192,6 +1228,7 @@ local function captureRecord(proposal, cap)
 		for i, id in ipairs(A.list(st, names.rmObjs)) do rec.rmObjs[i] = cap.obj(id) end
 		for i, n in ipairs(A.list(st, names.ncfg)) do rec.ncfg[i] = readNodeConfig(n, cap) end
 		for i, id in ipairs(A.list(st, names.rmNcfg)) do rec.rmNcfg[i] = cap.node(id) end
+		settleInPlaceRemoval(rec, rmSegIds[1])
 	end
 	rec.terrain = readTerrain(proposal)
 	return rec
