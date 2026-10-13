@@ -997,7 +997,7 @@ end
 local function sendPatchOrder(patch, key)
 	local ok, err = pcall(function()
 		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "patch_next", { frozen = patch.frozen, adds = patch.adds })
+		local sent, why = C.writerSend(w, "patch_next", { frozen = patch.frozen, adds = patch.adds, at = patch.at })
 		if not sent then error(why, 0) end
 	end)
 	traceSim("build.patch", string.format("%s patch_next frozen=[%s] adds=%d %s", tostring(key), table.concat(patch.frozen, ","), patch.adds or -1,

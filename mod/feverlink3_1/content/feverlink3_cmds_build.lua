@@ -2995,11 +2995,17 @@ local function patchFor(rec2, frozenIds)
 			pos[n.id] = k - 1
 		end
 	end
-	local frozen = {}
+	local frozen, at = {}, {}
 	for _, id in ipairs(frozenIds) do
-		if pos[id] ~= nil then frozen[#frozen + 1] = pos[id] end
+		if pos[id] ~= nil then
+			frozen[#frozen + 1] = pos[id]
+			for _, n in ipairs(rec2.nodes) do
+				if n.id == id and type(n.pos) == "table" then at[#at + 1] = { n.pos.x, n.pos.y, n.pos.z or 0 } end
+			end
+		end
 	end
-	return frozen, k
+	-- (`at`: the same nodes by position; the converted proposal has more added nodes than this one, so the module finds them by place)
+	return frozen, k, at
 end
 
 -- (for the tests) the record made over by the text with THE rule applied: the record, how many segments are the construction's own, the nodes and
@@ -3053,6 +3059,13 @@ local function portableReplay(rec, text, R, f, tkey)
 	if not rec2 then return no(whyR) end
 	local nDerived, frozenNums = markByFrozenNodes(rec2, tree)
 	if nDerived == nil then return no("the construction's own street pieces cannot be found (" .. tostring(frozenNums) .. ")") end
+	-- With the native module patching the SimpleProposal's frozenNodes before the engine converts it, the tool's own input is sent whole: the
+	-- construction's entrance stays in it and the frozen node keeps it as it is (b36: left out, the engine regenerated an entrance 3 m off the
+	-- junction that collided with the street piece).
+	if f.canPatch and nDerived > 0 then
+		for _, sg in ipairs(rec2.segs) do sg.derived = nil end
+		nDerived = 0
+	end
 	local nodesOut, cfgOut = leftOutWith(rec2)
 	local owned = ownedByPlayer(tree)
 	local agree = "n/a"
@@ -3062,7 +3075,7 @@ local function portableReplay(rec, text, R, f, tkey)
 	end
 	trace("build.portable", string.format("%s frozen-node rule: %d of %d segment(s) touch a frozen node (%d frozen) and are left to the construction, with %d node(s) and %d node configuration(s) only they use; cross-check owner vs frozen: %s",
 		tostring(tkey or "-"), nDerived, #rec2.segs, #frozenNums, nodesOut, cfgOut, agree))
-	local frozenIdx, expectAdds = patchFor(rec2, frozenNums)
+	local frozenIdx, expectAdds, frozenAt = patchFor(rec2, frozenNums)
 	if #frozenNums > 0 and #frozenIdx == 0 then
 		trace("build.patch", string.format("%s the frozen node is not used by any remaining segment: nothing to patch", tostring(tkey or "-")))
 	end
@@ -3094,7 +3107,7 @@ local function portableReplay(rec, text, R, f, tkey)
 		-- engine's Convert keeps the SimpleProposal's node order, `adds` lets the module check it
 		local adds = expectAdds
 		pcall(function() adds = #A.list(get(args[1], "streetProposal"), "nodesToAdd") end)
-		args.patch = { frozen = frozenIdx, adds = adds }
+		args.patch = { frozen = frozenIdx, adds = adds, at = (#frozenAt == #frozenIdx and #frozenAt > 0) and frozenAt or nil }
 		trace("build.patch", string.format("%s patch_next frozen=[%s] adds=%d (the text's frozen node(s) as indices into this proposal's nodesToAdd, %d expected)",
 			tostring(tkey or "-"), table.concat(frozenIdx, ","), adds, expectAdds))
 	end
