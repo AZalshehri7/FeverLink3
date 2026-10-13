@@ -598,7 +598,14 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
         };
-        let defaults = HookConfig { hooks: true, hold: true, poolpatch: true, luaseed: true, fire_done: true, ..Default::default() };
+        let defaults = HookConfig {
+            hooks: true,
+            hold: true,
+            poolpatch: true,
+            luaseed: true,
+            fire_done: true,
+            ..Default::default()
+        };
         assert_eq!(
             HookConfig::from_lookup(env(&[])),
             defaults,
