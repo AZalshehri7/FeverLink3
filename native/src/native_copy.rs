@@ -204,6 +204,122 @@ pub(crate) fn describe_split(a: &str, b: &str) -> (usize, Vec<String>) {
     (nd, lines)
 }
 
+/// What [`residue_mask`] found.
+pub struct MaskInfo {
+    pub mask: portable::Mask,
+    /// Bytes of unnamed regions that both copies agree on / that differ (residue), and the number of regions.
+    pub carried: usize,
+    pub residue: usize,
+    pub regions: usize,
+    pub ms: u128,
+}
+
+impl MaskInfo {
+    /// The carried byte ranges of the regions whose path starts with `prefix` (for the log), e.g. `toAdd[0].`.
+    pub fn carried_ranges(&self, prefix: &str) -> String {
+        let mut out = Vec::new();
+        for (name, m) in self.mask.range(prefix.to_string()..).take_while(|(n, _)| n.starts_with(prefix)) {
+            let base = name
+                .rsplit_once(".~")
+                .and_then(|(_, o)| usize::from_str_radix(o.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            let mut k = 0;
+            let mut ranges = Vec::new();
+            while k < m.len() {
+                if m[k] {
+                    let from = k;
+                    while k < m.len() && m[k] {
+                        k += 1;
+                    }
+                    ranges.push(format!("{:#x}-{:#x}", base + from, base + k));
+                } else {
+                    k += 1;
+                }
+            }
+            out.push(format!(
+                "{}: {}",
+                name.trim_start_matches(prefix),
+                if ranges.is_empty() { "none".into() } else { ranges.join(",") }
+            ));
+        }
+        out.join("; ")
+    }
+}
+
+/// The differential residue mask of the held command at `held`: the engine's copy constructor makes two copies of its Proposal into
+/// scratch buffers prefilled with 0x00 and with 0xFF; a byte of an unnamed region that both copies agree on was carried by the copy
+/// (a value), one that differs was left alone by it (residue of the memory the original lives in). Both copies are destroyed on every
+/// path, and nothing of them is handed to the engine. Read only on `held`.
+pub fn residue_mask(
+    fns: &ProposalFns,
+    mem: &dyn Mem,
+    base: usize,
+    set: Settings,
+    build_name: &str,
+    held: usize,
+    say: &mut dyn FnMut(&str),
+) -> Result<MaskInfo, String> {
+    let t0 = std::time::Instant::now();
+    let src = mem.read(held, PAYLOAD_SIZE).ok_or("the held payload is not readable")?;
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    b.bytes_mut().fill(0xFF);
+    say("native inject: residue mask: calling the engine copy constructor twice (scratch prefilled 0x00 and 0xFF)");
+    // SAFETY: `held` is a live payload (only read by a copy constructor); the destinations are scratch buffers.
+    unsafe {
+        (fns.copy)(a.ptr(), held as *const u8);
+        (fns.copy)(b.ptr(), held as *const u8);
+    }
+    for c in [&mut a, &mut b] {
+        c.bytes_mut()[PROPOSAL_SIZE..].copy_from_slice(&src[PROPOSAL_SIZE..]);
+    }
+    let plain = Settings { graph: false, typed: false, ..set };
+    let collect = |s: &Scratch| -> Result<portable::Regions, String> {
+        let cell = std::cell::RefCell::new(portable::Regions::new());
+        let head = Header {
+            seq: 0,
+            event: "mask",
+            hold_id: None,
+            site_rva: None,
+            tool: None,
+            t_ms: 0,
+            wall_ms: 0,
+            payload: s.addr(),
+        };
+        portable::encode_with(
+            mem,
+            Env { image_base: base },
+            plain,
+            build_name,
+            &head,
+            portable::EncodeOpts { collect: Some(&cell), mask: None },
+        )?;
+        Ok(cell.into_inner())
+    };
+    let ra = collect(&a);
+    let rb = collect(&b);
+    say("native inject: residue mask: calling the engine destructor on both copies");
+    // SAFETY: both were constructed above and are destroyed once, on every path.
+    unsafe {
+        (fns.dtor)(a.ptr());
+        (fns.dtor)(b.ptr());
+    }
+    let (ra, rb) = (ra?, rb?);
+    let mut info = MaskInfo { mask: portable::Mask::new(), carried: 0, residue: 0, regions: 0, ms: 0 };
+    for (name, x) in &ra {
+        let m: Vec<bool> = match rb.get(name) {
+            Some(y) if y.len() == x.len() => x.iter().zip(y).map(|(p, q)| p == q).collect(),
+            _ => vec![false; x.len()],
+        };
+        info.carried += m.iter().filter(|k| **k).count();
+        info.residue += m.iter().filter(|k| !**k).count();
+        info.regions += 1;
+        info.mask.insert(name.clone(), m);
+    }
+    info.ms = t0.elapsed().as_millis();
+    Ok(info)
+}
+
 /// Every differing line of a comparison (named and unnamed), both sides in full up to 400 characters, for a report file.
 pub(crate) fn diff_all(a: &str, b: &str) -> Vec<String> {
     let (x, y) = (rebuild::lines_of(a), rebuild::lines_of(b));
@@ -780,5 +896,77 @@ mod tests {
         assert_eq!(PROPOSAL_CTOR_BYTES.len(), 23);
         assert_eq!(PROPOSAL_DTOR_BYTES.len(), 20);
         assert_eq!(PROPOSAL_COPY_BYTES.len(), 24);
+    }
+
+    /// An engine copy that, like the real one, leaves the unconstructed bytes 0x1a0..0x1c0 (the gap) alone.
+    unsafe extern "system-unwind" fn gap_leaving_copy(d: *mut u8, s: *const u8) -> *mut u8 {
+        COPIES.fetch_add(1, Ordering::SeqCst);
+        let world = WORLD.with(|w| w.get());
+        // SAFETY: the pointer is set by the test to an arena that outlives the call.
+        let bytes = unsafe { (*world).read(s as usize, PROPOSAL_SIZE) }.expect("the held payload");
+        for (k, b) in bytes.iter().enumerate() {
+            if !(0x1a0..0x1c0).contains(&k) {
+                unsafe { *d.add(k) = *b };
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn the_residue_mask_comes_from_two_copies_prefilled_differently_and_a_typed_text_carries_only_what_they_agree_on() {
+        let (arena, at) = world();
+        // a value in the gap the copy does not carry (residue), and a readable pointer-like word in it
+        let readable = arena.add(&[7u8; 0x40]);
+        arena.write(at + 0x1a0, &0x1111_2222_3333_4444u64.to_le_bytes());
+        arena.write(at + 0x1a8, &(readable as u64).to_le_bytes());
+        WORLD.with(|w| w.set(&arena));
+        let mem = Both(&arena);
+        let mut fns = ProposalFns { ctor: fake_ctor, dtor: fake_dtor, copy: gap_leaving_copy, assign: fake_copy };
+        fns.dtor = fake_dtor;
+        let (d0, k0) = (DTORS.load(Ordering::SeqCst), COPIES.load(Ordering::SeqCst));
+        let typed = Settings { typed: true, graph_skip: &["toAdd"], ..settings() };
+        let mut said = Vec::new();
+        let info =
+            residue_mask(&fns, &mem, BASE, typed, "40420", at, &mut |l| said.push(l.to_string())).expect("a mask");
+        assert_eq!(
+            (COPIES.load(Ordering::SeqCst) - k0, DTORS.load(Ordering::SeqCst) - d0),
+            (2, 2),
+            "two copies, both destroyed"
+        );
+        assert!(said[0].contains("twice") && said[1].contains("destructor"), "{said:?}");
+        let gap = &info.mask["proposal.gap1a0"];
+        assert!(
+            gap[..0x20].iter().all(|k| !k),
+            "the bytes the copy leaves alone differ between 0x00 and 0xFF: residue"
+        );
+        assert!(info.residue >= 0x20 && info.carried > 0 && info.regions > 0);
+        let head =
+            Header { seq: 0, event: "t", hold_id: None, site_rva: None, tool: None, t_ms: 0, wall_ms: 0, payload: at };
+        let env = Env { image_base: BASE };
+        let masked = portable::encode_with(
+            &mem,
+            env,
+            typed,
+            "40420",
+            &head,
+            portable::EncodeOpts { collect: None, mask: Some(&info.mask) },
+        )
+        .expect("encodes")
+        .text;
+        assert!(!masked.contains("proposal.gap1a0"), "residue is zero, and a zero region has no line: {masked}");
+        // typed without a mask: the value stays a literal, the pointer-like word is never followed or guessed (a foreign address is zero)
+        let unmasked = portable::encode(&mem, env, typed, "40420", &head).expect("encodes").text;
+        let line = unmasked.lines().find(|l| l.starts_with("proposal.gap1a0")).expect("a line");
+        assert!(
+            line.contains("w:1111222233334444") && !line.contains(" P") && !line.contains('B') && !line.contains('R'),
+            "{line}"
+        );
+        // untyped, as before: the same word is a guess (a range, a block, a P)
+        let old =
+            portable::encode(&mem, env, Settings { typed: false, ..typed }, "40420", &head).expect("encodes").text;
+        let old_line = old.lines().find(|l| l.starts_with("proposal.gap1a0")).expect("a line");
+        assert_ne!(old_line, line, "{old_line}");
+        WORLD.with(|w| w.set(core::ptr::null()));
+        assert!(info.carried_ranges("proposal.").contains("gap1a0: none"), "{}", info.carried_ranges("proposal."));
     }
 }

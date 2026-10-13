@@ -16,7 +16,7 @@ impl Runtime {
     pub fn enable_native_inject(&self, settings: portable::Settings) {
         // the construction of the text is the receiver's own (its conversion), so its description's heap graph (tens of thousands of
         // blocks) is neither written nor needed
-        let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], ..settings });
+        let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], typed: true, ..settings });
         self.inject.enable();
         self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and an inject_next order makes the next script build_proposal take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal leaves the command untouched)");
     }
@@ -52,7 +52,27 @@ impl Runtime {
             wall_ms: 0,
             payload,
         };
-        match portable::encode(&live, Env { image_base: self.base }, settings, self.build.name, &head) {
+        // R2: which unnamed bytes of the held command are values and which residue, by a differential engine copy (both copies destroyed)
+        let mask = nc::ProposalFns::at(self.base)
+            .and_then(|fns| {
+                nc::residue_mask(&fns, &live, self.base, settings, self.build.name, payload, &mut |l| self.say(l))
+            })
+            .map_err(|e| {
+                self.say(&format!("native inject: hold {id}: no residue mask, unnamed words are not carried: {e}"))
+            })
+            .ok();
+        if let Some(m) = &mask {
+            self.say(&format!(
+                "native inject: hold {id}: residue mask: {} carried / {} residue bytes in {} unnamed regions ({} ms); toAdd[0] carried ranges: {}",
+                m.carried,
+                m.residue,
+                m.regions,
+                m.ms,
+                m.carried_ranges("toAdd[0].")
+            ));
+        }
+        let opts = portable::EncodeOpts { collect: None, mask: mask.as_ref().map(|m| &m.mask) };
+        match portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts) {
             Ok(p) => match self.text.write(id, &p.text) {
                 Ok(()) if !p.unresolved.is_empty() => {
                     // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what

@@ -178,6 +178,23 @@ impl<'a> Builder<'a> {
         let v = self.val(path);
         match ty {
             Ty::Skip(_) | Ty::Raw(_) | Ty::Pad(_) => Ok(()),
+            Ty::Span => {
+                let v = v.ok_or_else(|| format!("missing line {path}"))?;
+                let body = v.strip_prefix("span:").ok_or_else(|| format!("{path}: {v}"))?;
+                if body == "null" {
+                    return Ok(());
+                }
+                let data = parse_hex(body)?;
+                let begin = if data.is_empty() {
+                    self.blocks += 1;
+                    self.a.alloc(8).ok_or("allocation failed")? as u64
+                } else {
+                    self.block(path, &data)?.0
+                };
+                buf[0..8].copy_from_slice(&begin.to_le_bytes());
+                buf[8..16].copy_from_slice(&(begin + data.len() as u64).to_le_bytes());
+                Ok(())
+            }
             Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 match ty {
@@ -1243,6 +1260,8 @@ mod tests {
             w(&mut n, off, hd as u64);
         }
         n[0x20..0x24].copy_from_slice(&0xffff_fffbu32.to_le_bytes());
+        n[0x1a..0x20].copy_from_slice(b"/town_"); // colour and isnil are at +0x18/+0x19; what follows is residue (b43: ASCII from a log buffer)
+        n[0x24..0x28].copy_from_slice(b"stre");
         w(&mut n, 0x28, sh as u64);
         w(&mut n, 0x30, 2);
         arena.write(node, &n);
@@ -1258,6 +1277,7 @@ mod tests {
             w(&mut b, 8, parent as u64);
             w(&mut b, 0x10, right as u64);
             b[0x1c..0x20].copy_from_slice(&key.to_le_bytes());
+            b[0x1a..0x1c].copy_from_slice(b"ab");
             arena.write(a, &b);
         }
         let mut map = vec![0u8; 0x10];
@@ -1268,6 +1288,7 @@ mod tests {
             encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
         assert!(text.contains("proposal.new2oldSegments.keys	keys:fffffffb=[00000007;00000009]"), "{text}");
         // the sentinel's residue pointer was zeroed, and the set's blocks are in the graph: nothing of this map stays P
+        assert!(!text.contains("5f6e776f742f") && !text.contains("65727473"), "residue bytes are not carried: {text}");
         let line = text.lines().find(|l| l.starts_with("proposal.new2oldSegments.graph")).unwrap();
         assert!(!line.contains('P'), "{line}");
         let built = build_selected(&text, BASE, &arena, None).expect("builds");
@@ -1289,6 +1310,9 @@ mod tests {
             elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
         }
         elem[0x40..0x48].copy_from_slice(&ascii.to_le_bytes());
+        let span = arena.add(&[0x80u8; 20]); // the owned 20-byte range at +0x18 is typed: it is part of the value
+        elem[0x18..0x20].copy_from_slice(&(span as u64).to_le_bytes());
+        elem[0x20..0x28].copy_from_slice(&(span as u64 + 20).to_le_bytes());
         elem[0x78..0x7c].copy_from_slice(&(-1i32).to_le_bytes());
         let blk = arena.add(&elem);
         let mut v = Vec::new();
@@ -1303,7 +1327,15 @@ mod tests {
             e.text
         );
         assert!(e.unresolved.iter().all(|(m, _)| !m.contains("nodeConfigsToAdd")), "{:?}", e.unresolved);
+        assert!(
+            e.text.contains("nodeConfigsToAdd[0].span	span:8080808080808080808080808080808080808080"),
+            "{}",
+            e.text
+        );
         let built = build_selected(&e.text, BASE, &arena, None).expect("builds");
+        let copy = &built.payload;
+        let (b0, e0) = (u64_at(copy, 0x60), u64_at(copy, 0x68));
+        assert!(b0 != 0 && e0 - b0 == 0x80, "the element vector is rebuilt");
         assert!(!built.blocked.iter().any(|b| b.path.contains("nodeConfigsToAdd")), "{:?}", built.blocked);
     }
 }

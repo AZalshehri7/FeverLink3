@@ -192,6 +192,69 @@ fn frozen_of(lines: &std::collections::BTreeMap<&str, &str>, i: u64) -> Result<V
         .collect()
 }
 
+/// R4: the unnamed words of `toAdd[i]` that the receiver's own conversion carries (its differential mask on the donor) against the
+/// originator's text (masked the same way before it was written). Equal, or the injection is refused with the lines that differ.
+fn entity_equivalence(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+    let info = nc::residue_mask(&c.fns, c.mem, c.base, c.set, c.build_name, donor, say)?;
+    let head = portable::Header {
+        seq: 0,
+        event: "donor",
+        hold_id: None,
+        site_rva: None,
+        tool: None,
+        t_ms: 0,
+        wall_ms: 0,
+        payload: donor,
+    };
+    let set = portable::Settings { graph: false, ..c.set };
+    let opts = portable::EncodeOpts { collect: None, mask: Some(&info.mask) };
+    let donor_text =
+        portable::encode_with(c.mem, crate::dump::Env { image_base: c.base }, set, c.build_name, &head, opts)?.text;
+    let (theirs, mine) = (rebuild::lines_of(text), rebuild::lines_of(&donor_text));
+    let entity = |p: &&str| p.starts_with("toAdd[") && p.contains(".~");
+    let mut paths: Vec<&str> = theirs.keys().chain(mine.keys()).copied().filter(entity).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let mut diffs = Vec::new();
+    for p in paths {
+        let (a, b) = (theirs.get(p).copied().unwrap_or("(absent)"), mine.get(p).copied().unwrap_or("(absent)"));
+        if a != b {
+            let (ta, tb): (Vec<&str>, Vec<&str>) = (a.split(' ').collect(), b.split(' ').collect());
+            let first = (0..ta.len().max(tb.len())).find(|&i| ta.get(i) != tb.get(i)).unwrap_or(0);
+            diffs.push(format!(
+                "{p}: first difference at token {first}: originator {:?}, receiver's donor {:?}
+    originator: {}
+    donor:      {}",
+                ta.get(first).unwrap_or(&"-"),
+                tb.get(first).unwrap_or(&"-"),
+                a.chars().take(400).collect::<String>(),
+                b.chars().take(400).collect::<String>()
+            ));
+        }
+    }
+    say(&format!(
+        "native inject: R4 construction equivalence: donor residue mask {} carried / {} residue bytes in {} regions ({} ms); {} differing region(s)",
+        info.carried,
+        info.residue,
+        info.regions,
+        info.ms,
+        diffs.len()
+    ));
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the receiver's own conversion of the construction differs from the originator's in {} unnamed region(s) both sides carry: {}{REPORT_MARK}{} region(s):
+{}
+",
+        diffs.len(),
+        diffs.iter().map(|d| d.split(':').next().unwrap_or("").to_string()).collect::<Vec<_>>().join(", "),
+        diffs.len(),
+        diffs.join("
+")
+    ))
+}
+
 /// Builds the engine `Proposal` of `text` and proves it equal to the text (see the module documentation). `say` gets one line per
 /// stage, BEFORE the engine function it announces is called.
 ///
@@ -216,6 +279,11 @@ pub fn build_verified(
         ));
     }
     let hybrid = cons > 0;
+    if let Some(donor) = donor.filter(|_| hybrid) {
+        // R4: the construction stays the receiver's own, so what it carries must be what the originator's carried. Both sides' unnamed
+        // words of the constructions are masked by a differential copy (residue is zero), and the masked lines must be equal.
+        entity_equivalence(c, text, donor, say)?;
+    }
     let take = |f: &F| !(hybrid && f.name == "toAdd") && nc::selected(f, &lines);
     let built = match rebuild::build_selected(text, c.base, c.alloc, Some(&take)) {
         Ok(b) => b,
@@ -583,7 +651,7 @@ mod tests {
         // source constructor, donor copy, source copy, destructors for the donor copy and the source
         assert_eq!(
             (CTORS.load(Ordering::SeqCst) - c0, COPIES.load(Ordering::SeqCst) - k0, DTORS.load(Ordering::SeqCst) - d0),
-            (1, 2, 2)
+            (1, 4, 4) // the donor's two mask copies come first, then the donor copy and the source copy
         );
         assert_eq!((built.nodes, built.segments, built.constructions), (2, 1, 1));
         // the destination must carry the same number of constructions
@@ -603,21 +671,27 @@ mod tests {
         let r = build_verified(&ctx, &poke, &text, None, &mut |_| {});
         assert!(matches!(&r, Err(e) if e.contains("needs the script command's own conversion")), "{:?}", r.err());
         assert_eq!(CTORS.load(Ordering::SeqCst), c0, "refused before any engine call");
-        // the donor's construction is another one (its name differs): a named member of the construction differs, the proof fails
+        // R4: the donor's conversion carries a word the originator's did not (an unnamed word of the construction): refused before the
+        // source is made, with the region named; the two mask copies are destroyed
         let begin = u64::from_le_bytes(arena.read(at + 0x258, 8).unwrap().try_into().unwrap()) as usize;
-        let name_off = begin + 0xe3d;
-        arena.write(name_off, &[0x5a]);
+        arena.write(begin + 0xe3d, &[0x5a]);
         WORLD.with(|w| w.set(&arena));
-        let mut other = text.clone();
-        other = other.replace("toAdd[0].setAsHeadquarterHack\tu8:00", "toAdd[0].setAsHeadquarterHack\tu8:01");
+        let (d0, c1) = (DTORS.load(Ordering::SeqCst), CTORS.load(Ordering::SeqCst));
+        let r = build_verified(&ctx, &poke, &text, Some(at), &mut |_| {});
+        let e = r.err().expect("refused");
+        assert!(e.contains("toAdd[0].~0xe3d") && e.contains(REPORT_MARK), "{e}");
+        assert_eq!((DTORS.load(Ordering::SeqCst) - d0, CTORS.load(Ordering::SeqCst) - c1), (2, 0));
+        // the donor equal again, but a named member of the construction differs: the proof fails
+        arena.write(begin + 0xe3d, &[0x00]);
+        let other = text.replace("toAdd[0].setAsHeadquarterHack	u8:00", "toAdd[0].setAsHeadquarterHack	u8:01");
         let d0 = DTORS.load(Ordering::SeqCst);
         let r = build_verified(&ctx, &poke, &other, Some(at), &mut |_| {});
         WORLD.with(|w| w.set(core::ptr::null()));
         assert!(matches!(&r, Err(e) if e.contains("differs from the text")), "{:?}", r.err());
         assert_eq!(
             DTORS.load(Ordering::SeqCst) - d0,
-            3,
-            "the donor's copy, the source and the failed copy are all destroyed"
+            5,
+            "the two mask copies, the donor's copy, the source and the failed copy are all destroyed"
         );
     }
 

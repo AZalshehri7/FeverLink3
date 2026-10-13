@@ -70,6 +70,8 @@ pub enum Ty {
     Map,
     /// `std::unordered_map/set` (0x40 bytes).
     Hash,
+    /// A begin/end pair (16 bytes) of an owned byte range (at most 0x1000 bytes): the range is part of the value.
+    Span,
     /// Bytes of a known length kept structurally.
     Raw(usize),
     /// Bytes that are not part of the command's input (the engine's result): not written.
@@ -88,7 +90,7 @@ impl Ty {
             Ty::Str => 0x20,
             Ty::Res | Ty::Hash => 0x40,
             Ty::Vec(_) | Ty::EntVec | Ty::BlobVec => 0x18,
-            Ty::Map => 0x10,
+            Ty::Map | Ty::Span => 0x10,
             Ty::Raw(n) | Ty::Skip(n) | Ty::Pad(n) => n,
         }
     }
@@ -199,6 +201,8 @@ pub static NODE_CONFIG: Elem = Elem {
     // without touching them (b45 injected and ran identical on both games), so they are not owned data: not written, not rebuilt.
     fields: &[
         f(0, "laneConnections", Ty::Vec(&LANE_CONNECTION)),
+        // a begin/end pair of an owned range of 20 bytes (b45: B1 B1+14), then two small counts (3, 3 / 1, 1) at +0x28/+0x30
+        f(0x18, "span", Ty::Span),
         f(0x38, "residue", Ty::Pad(0x40)),
         f(0x78, "entity", Ty::Ent),
     ],
@@ -315,6 +319,9 @@ pub struct Settings {
     /// Members whose heap graph is not followed (their pointers stay `P`): `toAdd` for the injection text, whose construction is
     /// the receiver's own (tens of thousands of blocks of the description that are never rebuilt).
     pub graph_skip: &'static [&'static str],
+    /// Typed copy (`inject.rs`): pointers are followed only through typed members; in the bytes the table does not name every pointer
+    /// to something other than the game's image is zeroed (it is a foreign address, owned or not), and an empty engine container writes no graph.
+    pub typed: bool,
 }
 
 impl Settings {
@@ -334,6 +341,7 @@ impl Settings {
             max_graph_bytes: 0,
             input_level: true,
             graph_skip: &[],
+            typed: false,
         }
     }
 
@@ -364,6 +372,7 @@ impl Settings {
             max_graph_bytes: 16 << 20,
             input_level: false,
             graph_skip: &[],
+            typed: false,
         })
     }
 }
@@ -408,6 +417,20 @@ pub fn is_unnamed_path(path: &str) -> bool {
         || PAYLOAD.iter().any(|f| matches!(f.ty, Ty::Raw(_)) && f.name == path)
 }
 
+/// The unnamed regions of an object as bytes, by the path of their line (what [`EncodeOpts::collect`] gathers).
+pub type Regions = BTreeMap<String, Vec<u8>>;
+/// Which bytes of each unnamed region are carried (true) and which are residue (false), by the path of the region's line.
+pub type Mask = BTreeMap<String, Vec<bool>>;
+
+/// What a text is made with besides the settings.
+#[derive(Default, Clone, Copy)]
+pub struct EncodeOpts<'a> {
+    /// Gather the bytes of every unnamed region (also the all-zero ones) here.
+    pub collect: Option<&'a std::cell::RefCell<Regions>>,
+    /// Typed copy: bytes of unnamed regions that the mask does not carry are written as zero (a region the mask does not know: all zero).
+    pub mask: Option<&'a Mask>,
+}
+
 pub struct Header<'a> {
     pub seq: u32,
     pub event: &'a str,
@@ -425,6 +448,9 @@ pub struct Header<'a> {
 
 struct Enc<'a> {
     mem: &'a dyn Mem,
+    opts: EncodeOpts<'a>,
+    /// What the blocks found by walking a typed engine container are (see [`Kind`]).
+    kinds: BTreeMap<usize, Kind>,
     env: Env,
     set: Settings,
     out: String,
@@ -454,6 +480,18 @@ struct Enc<'a> {
 struct Blk {
     bytes: Vec<u8>,
     origin: String,
+    kind: Option<Kind>,
+}
+
+/// A block of a typed engine container: which of its words are pointers (the rest are literals; padding is zeroed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// The sentinel of a tree: left, parent, right; nothing else is constructed.
+    Sentinel,
+    /// A node of a `std::set<u32>`: left, parent, right, colour, isnil, key at +0x1c.
+    SetNode,
+    /// A node of the segment maps: left, parent, right, colour, isnil, key at +0x20, the set (head pointer +0x28, size +0x30).
+    MapNode,
 }
 
 type R<T> = Result<T, String>;
@@ -570,6 +608,19 @@ impl Enc<'_> {
     fn field(&mut self, path: &str, ty: Ty, b: &[u8], depth: usize) -> R<()> {
         self.origin = crate::rebuild::member_of(path);
         match ty {
+            Ty::Span => {
+                let (bg, en) = (u64_at(b, 0), u64_at(b, 8));
+                if bg == 0 && en == 0 {
+                    return self.line(path, "span:null");
+                }
+                if !pointer_like(bg) || en < bg || en - bg > 0x1000 {
+                    return Err(format!("{path}: not a span ({bg:#x}..{en:#x})"));
+                }
+                let len = (en - bg) as usize;
+                let block = if len == 0 { Some(Vec::new()) } else { self.mem.read(bg as usize, len) };
+                let block = block.ok_or_else(|| format!("{path}: the span is not readable"))?;
+                self.line(path, &format!("span:{}", hex(&block)))
+            }
             Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => self.scalar(path, ty, b),
             Ty::Str => {
                 let s = self.string_parts(b, path)?;
@@ -615,9 +666,13 @@ impl Enc<'_> {
                 self.stats.vectors += 1;
                 self.line(&format!("{path}.bytes"), &format!("n:{}", block.len()))?;
                 if !self.set.input_level && block.iter().any(|&x| x != 0) {
-                    self.label = format!("{path}.raw");
-                    let t = self.raw_tokens(&block, depth + 1)?;
-                    self.line(&format!("{path}.raw"), &format!("raw:{t}"))?;
+                    if self.set.typed {
+                        self.line(&format!("{path}.raw"), &format!("raw:b:{}", hex(&block)))?;
+                    } else {
+                        self.label = format!("{path}.raw");
+                        let t = self.raw_tokens(&block, depth + 1)?;
+                        self.line(&format!("{path}.raw"), &format!("raw:{t}"))?;
+                    }
                 }
                 Ok(())
             }
@@ -629,21 +684,21 @@ impl Enc<'_> {
                     // map's entries are part of the comparison (the nodes themselves are unnamed graph blocks)
                     self.line(&format!("{path}.keys"), &format!("keys:{keys}"))?;
                 }
-                self.container_graph(path, b, depth)
+                self.container_graph(path, b, depth, u64_at(b, 8))
             }
             Ty::Hash => {
                 // std::unordered_map/set: load factor (the other four bytes of its word are padding), then the list head, size,
                 // bucket vector, mask and maximum index; the nodes are heap blocks of the graph
                 self.line(path, &format!("hash:size={},load={:08x}", u64_at(b, 0x10), u32_at(b, 0)))?;
-                self.container_graph(path, &b[8..], depth)
+                self.container_graph(path, &b[8..], depth, u64_at(b, 0x10))
             }
             Ty::Raw(_) | Ty::Skip(_) | Ty::Pad(_) => Ok(()),
         }
     }
 
     /// The words of an engine container written structurally (`path.graph`): its pointers become blocks of the heap graph.
-    fn container_graph(&mut self, path: &str, bytes: &[u8], depth: usize) -> R<()> {
-        if self.set.input_level || bytes.iter().all(|&x| x == 0) {
+    fn container_graph(&mut self, path: &str, bytes: &[u8], depth: usize, entries: u64) -> R<()> {
+        if self.set.input_level || bytes.iter().all(|&x| x == 0) || (self.set.typed && entries == 0) {
             return Ok(());
         }
         let was = std::mem::replace(&mut self.container_mode, true);
@@ -676,16 +731,20 @@ impl Enc<'_> {
         let node = if sets { 0x38 } else { 0x50 };
         let nodes = self.walk_tree(head, size, node)?;
         let mut register: Vec<(usize, usize)> = vec![(head, node)];
+        let mut kinds: Vec<(usize, Kind)> = vec![(head, Kind::Sentinel)];
         let mut entries: Vec<(u32, String)> = Vec::new();
         for (a, n) in &nodes {
             register.push((*a, node));
+            kinds.push((*a, if sets { Kind::MapNode } else { Kind::Sentinel }));
             let key = u32_at(n, 0x20);
             let mut inner = String::new();
             if sets {
                 let (h2, c2) = (u64_at(n, 0x28) as usize, u64_at(n, 0x30) as usize);
                 let tree = self.walk_tree(h2, c2, 0x20)?;
                 register.push((h2, 0x20));
+                kinds.push((h2, Kind::Sentinel));
                 register.extend(tree.iter().map(|(a2, _)| (*a2, 0x20)));
+                kinds.extend(tree.iter().map(|(a2, _)| (*a2, Kind::SetNode)));
                 let mut ks: Vec<u32> = tree.iter().map(|(_, b)| u32_at(b, 0x1c)).collect();
                 ks.sort_unstable();
                 inner = format!("=[{}]", ks.iter().map(|k| format!("{k:08x}")).collect::<Vec<_>>().join(";"));
@@ -694,6 +753,10 @@ impl Enc<'_> {
         }
         for (a, n) in register {
             self.known_sizes.insert(a, n);
+        }
+        if sets {
+            // the segment maps are typed: their nodes are written word by word by kind. Other maps keep the generic walk
+            self.kinds.extend(kinds);
         }
         self.sentinels.insert(head);
         entries.sort();
@@ -758,7 +821,8 @@ impl Enc<'_> {
         }
         self.graph_bytes += size;
         let origin = self.origin.clone();
-        self.blocks.push(Blk { bytes, origin });
+        let kind = self.kinds.get(&p).copied();
+        self.blocks.push(Blk { bytes, origin, kind });
         let n = self.blocks.len();
         self.by_addr.insert(p, n);
         Some(format!("B{n}"))
@@ -807,7 +871,36 @@ impl Enc<'_> {
             return Ok(());
         }
         self.origin = crate::rebuild::member_of(name);
-        let part = &bytes[from..to];
+        let mut owned = bytes[from..to].to_vec();
+        if let Some(c) = self.opts.collect {
+            c.borrow_mut().insert(name.to_string(), owned.clone());
+        }
+        if self.set.typed {
+            if let Some(mask) = self.opts.mask {
+                match mask.get(name) {
+                    Some(m) if m.len() == owned.len() => {
+                        for (b, keep) in owned.iter_mut().zip(m) {
+                            if !keep {
+                                *b = 0;
+                            }
+                        }
+                    }
+                    _ => owned.fill(0),
+                }
+            }
+            // a pointer to anything but the game's image is a foreign address in the receiving process, owned or not: no typed member
+            // owns it, so it is not carried
+            let mut k = 0;
+            while from.is_multiple_of(8) && k + 8 <= owned.len() {
+                let w = u64_at(&owned, k);
+                let image = (w as usize) >= self.env.image_base && (w as usize) - self.env.image_base < IMAGE_BOUND;
+                if pointer_like(w) && !image {
+                    owned[k..k + 8].fill(0);
+                }
+                k += 8;
+            }
+        }
+        let part = &owned[..];
         if part.iter().all(|&b| b == 0) {
             return Ok(());
         }
@@ -820,6 +913,58 @@ impl Enc<'_> {
     }
 
     // ---- structural bytes
+
+    /// The tokens of a block of a typed engine container: pointers only at the words the kind names (blocks of the graph, or the game's
+    /// image), every other word a literal, padding zeroed. Never a guess.
+    fn typed_tokens(&mut self, bytes: &[u8], kind: Kind) -> String {
+        let mut b = bytes.to_vec();
+        let (pad, ptrs): (&[(usize, usize)], &[usize]) = match kind {
+            Kind::Sentinel => (&[(0x1a, usize::MAX)], &[0, 8, 0x10]),
+            Kind::SetNode => (&[(0x1a, 0x1c)], &[0, 8, 0x10]),
+            Kind::MapNode => (&[(0x1a, 0x20), (0x24, 0x28)], &[0, 8, 0x10, 0x28]),
+        };
+        for &(from, to) in pad {
+            let to = to.min(b.len());
+            if from < to {
+                b[from..to].fill(0);
+            }
+        }
+        let mut toks: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i + 8 <= b.len() {
+            let w = u64_at(&b, i);
+            if w == 0 {
+                let mut j = i;
+                while j + 8 <= b.len() && u64_at(&b, j) == 0 {
+                    j += 8;
+                }
+                toks.push(format!("z{}", (j - i) / 8));
+                i = j;
+                continue;
+            }
+            if ptrs.contains(&i) && pointer_like(w) {
+                let p = w as usize;
+                if p >= self.env.image_base && p - self.env.image_base < IMAGE_BOUND {
+                    toks.push(format!("I+{:x}", p - self.env.image_base));
+                } else if let Some(t) = self.block_token(p) {
+                    toks.push(t);
+                } else {
+                    self.stats.heap_ptrs += 1;
+                    if self.unresolved.len() < 40 {
+                        self.unresolved.push((format!("{} {}+{:#x}", self.origin, self.label, i), p));
+                    }
+                    toks.push("P".into());
+                }
+            } else {
+                toks.push(format!("w:{w:016x}"));
+            }
+            i += 8;
+        }
+        if !b.len().is_multiple_of(8) {
+            toks.push(format!("b:{}", hex(&b[b.len() - b.len() % 8..])));
+        }
+        toks.join(" ")
+    }
 
     /// Tokens for `bytes` (a multiple of 8 long, or the tail as `b:`).
     fn raw_tokens(&mut self, bytes: &[u8], depth: usize) -> R<String> {
@@ -968,6 +1113,18 @@ pub fn proposal_is_empty(mem: &dyn Mem, payload: usize) -> Option<bool> {
 
 /// The portable text of the `build_proposal` payload at `head.payload`, or why it is refused.
 pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header) -> Result<Portable, String> {
+    encode_with(mem, env, set, build, head, EncodeOpts::default())
+}
+
+/// [`encode`] with the options of a typed copy.
+pub fn encode_with(
+    mem: &dyn Mem,
+    env: Env,
+    set: Settings,
+    build: &str,
+    head: &Header,
+    opts: EncodeOpts,
+) -> Result<Portable, String> {
     if build != LAYOUT_BUILD {
         return Err(format!("layout table is for game build {LAYOUT_BUILD}, this is {build}"));
     }
@@ -980,6 +1137,8 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
     }
     let mut e = Enc {
         mem,
+        opts,
+        kinds: BTreeMap::new(),
         env,
         set,
         out: String::new(),
@@ -1022,7 +1181,10 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         e.container_mode = true;
         e.origin = e.blocks[done].origin.clone();
         e.label = format!("@B{}", done + 1);
-        let tokens = e.raw_tokens(&bytes, 1)?;
+        let tokens = match e.blocks[done].kind {
+            Some(kind) => e.typed_tokens(&bytes, kind),
+            None => e.raw_tokens(&bytes, 1)?,
+        };
         e.container_mode = false;
         let _ = writeln!(block_lines, "@B{}\tsize={}\traw:{}", done + 1, bytes.len(), tokens);
         done += 1;
