@@ -1776,6 +1776,9 @@ local function streetProposal(rec, R, notes, opts)
 	end
 	local nodes, edges, objs = {}, {}, {}
 	for _, n in ipairs(rec.nodes) do
+		if n.keep and type(n.id) == "number" then usedNode[n.id] = true end   -- (a frozen node of the construction stays whatever uses it)
+	end
+	for _, n in ipairs(rec.nodes) do
 		if not opts.drop or type(n.id) ~= "number" or usedNode[n.id] then nodes[#nodes + 1] = newNodeAndEntity(n, R) end
 	end
 	-- Lenient ends: a segment to add that ends at a node of the world which this game does not have (the shipped result says where
@@ -1887,8 +1890,8 @@ local function part(rec, keep)
 	return out
 end
 
-dryRunPieces = function(rec, anyRemovals)
-	if not anyRemovals and (#rec.rem > 0 or #rec.old2new > 0) then return nil, "the record removes constructions" end
+dryRunPieces = function(rec)
+	if #rec.rem > 0 or #rec.old2new > 0 then return nil, "the record removes constructions" end
 	local ok, res = pcall(function()
 		local stub = { owner = function(v) if v == nil or v == "player" then return A.player() end return v end }
 		local sp = constructionProposal(part(rec, { "cons" }), stub)
@@ -2713,13 +2716,6 @@ end
 local PORTABLE_REPLAY = false
 pcall(function() PORTABLE_REPLAY = os.getenv("FEVERLINK3_PORTABLE_REPLAY") == "1" end)
 M.PORTABLE_REPLAY = PORTABLE_REPLAY
--- EXPERIMENT (default off, not the final rule): which segments the construction makes itself is read from their owner. In the real depot
--- samples (b24, b26) the construction's entrance piece has the build's player as its owner and the tool-made pieces an uninitialised
--- value; a rule on uninitialised memory is not clean, this only teaches the engine's verdict. The final rule is to be decoded from the
--- construction's own edge lists.
-local OWN_BY_OWNER = false
-pcall(function() OWN_BY_OWNER = os.getenv("FEVERLINK3_PORTABLE_OWN_BY_OWNER") == "1" end)
-M.OWN_BY_OWNER = OWN_BY_OWNER
 local okPT, Portable = pcall(ug_require, "feverlink3_portable.lua")
 if not okPT then okPT, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
 if not okPT or type(Portable) ~= "table" then Portable = nil end
@@ -2926,37 +2922,44 @@ local function portableRecord(rec, tree)
 	return out
 end
 
--- the segments of the record that a dry run of its constructions makes too (by geometry): the construction's own, not input
-local function markDerived(rec)
-	if #rec.cons == 0 then return 0, 0 end
-	local pieces, why = dryRunPieces(rec, true)
-	if not pieces then return nil, why end
-	local function same(a, b) return a and b and abs(a.x - b.x) <= 1.5 and abs(a.y - b.y) <= 1.5 end
-	local n = 0
-	for _, sg in ipairs(rec.segs) do
-		for _, pc in ipairs(pieces) do
-			if (same(sg.c.p0, pc.p0) and same(sg.c.p1, pc.p1)) or (same(sg.c.p0, pc.p1) and same(sg.c.p1, pc.p0)) then
-				sg.derived = true
-				n = n + 1
-				break
-			end
-		end
+-- THE rule for the segments a construction makes itself (Track A, docs/research/SPIKE_NATIVE_COMMAND.md "Which segments does the construction
+-- own?", 6 of 6 real samples): `proposal.frozenNodes` holds 0-based INDICES into the proposal's added nodes, and the added segments that touch a
+-- frozen node are the construction's own piece (the tool-made pieces hang on the other end). The frozen node itself stays in the proposal (the
+-- tool pieces use it); the construction's piece is left to the engine's Convert. Segment i of the text is segment i of the new record.
+-- Returns how many segments are own and the frozen nodes' ids in the new record, or nil and why.
+local function markByFrozenNodes(rec, tree)
+	local pt = tree.proposal or {}
+	local textNodes, textSegs = Portable.list(pt.addedNodes), Portable.list(pt.addedSegments)
+	local frozen, ids = {}, {}
+	for _, fz in ipairs(Portable.list(pt.frozenNodes)) do
+		local idx = fz.old
+		local node = type(idx) == "number" and textNodes[idx + 1]
+		if not (node and node.entity and node.entity.new) then return nil, "frozen node index " .. tostring(idx) .. " is not one of the " .. #textNodes .. " added nodes" end
+		frozen[node.entity.new] = true
+		ids[#ids + 1] = -(idx + 1)   -- (the node's id in the new record, which numbers the text's nodes -1.. in order)
+		if rec.nodes[idx + 1] then rec.nodes[idx + 1].keep = true end
 	end
-	return n, #pieces
-end
-
--- the segments of the text whose owner is the build's own player (the experiment above); segment i of the text is segment i of the new record
-local function markOwnedByPlayer(rec, tree)
-	local player = tree.context and tree.context.player and tree.context.player.old
-	if not player then return nil, "the text names no player" end
 	local n = 0
-	for i, ts in ipairs(Portable.list((tree.proposal or {}).addedSegments)) do
-		if ts.playerOwned and ts.playerOwned.old == player and rec.segs[i] then
+	for i, ts in ipairs(textSegs) do
+		local a, b = ts.node0 and ts.node0.new, ts.node1 and ts.node1.new
+		if rec.segs[i] and ((a and frozen[a]) or (b and frozen[b])) then
 			rec.segs[i].derived = true
 			n = n + 1
 		end
 	end
-	return n, n
+	return n, ids
+end
+
+-- Cross-check only (the first rule tried, from the real depot samples): the segments whose owner is the build's own player. The pieces the
+-- construction makes have the player as owner and the tool-made ones an uninitialised value; the frozen-node rule must name the same ones.
+local function ownedByPlayer(tree)
+	local player = tree.context and tree.context.player and tree.context.player.old
+	local set = {}
+	if not player then return nil end
+	for i, ts in ipairs(Portable.list((tree.proposal or {}).addedSegments)) do
+		if ts.playerOwned and ts.playerOwned.old == player then set[i] = true end
+	end
+	return set
 end
 
 -- what the left-out (derived) segments take with them: the new nodes only they use and those nodes' configurations
@@ -2968,21 +2971,52 @@ local function leftOutWith(rec2)
 			if type(sg.n1) == "number" then used[sg.n1] = true end
 		end
 	end
+	for _, n in ipairs(rec2.nodes) do if n.keep then used[n.id] = true end end
 	local nodesOut, cfgOut = 0, 0
 	for _, n in ipairs(rec2.nodes) do if not used[n.id] then nodesOut = nodesOut + 1 end end
 	for _, n in ipairs(rec2.ncfg) do if type(n.node) == "number" and n.node < 0 and not used[n.node] then cfgOut = cfgOut + 1 end end
 	return nodesOut, cfgOut
 end
 
--- (for the tests) the record made over by the text with the owner rule applied: the record, how many segments are the player's own, the
--- nodes and node configurations that leave with them; nil and why otherwise
-function M.ownerRule(rec, tree)
+-- The new proposal's frozen nodes: the 0-based index of each frozen node in the SimpleProposal's nodesToAdd (the kept nodes in the record's order:
+-- those a segment that stays uses), and how many nodes the SimpleProposal adds. A frozen node no remaining segment uses is not in the proposal.
+local function patchFor(rec2, frozenIds)
+	local used = {}
+	for _, sg in ipairs(rec2.segs) do
+		if not sg.derived then
+			if type(sg.n0) == "number" then used[sg.n0] = true end
+			if type(sg.n1) == "number" then used[sg.n1] = true end
+		end
+	end
+	local pos, k = {}, 0
+	for _, n in ipairs(rec2.nodes) do
+		if used[n.id] or n.keep then
+			k = k + 1
+			pos[n.id] = k - 1
+		end
+	end
+	local frozen = {}
+	for _, id in ipairs(frozenIds) do
+		if pos[id] ~= nil then frozen[#frozen + 1] = pos[id] end
+	end
+	return frozen, k
+end
+
+-- (for the tests) the record made over by the text with THE rule applied: the record, how many segments are the construction's own, the nodes and
+-- node configurations that leave with them, the patch the native module needs (frozen indices, adds) and whether the owner cross-check agrees
+function M.ownRule(rec, tree)
 	local rec2, why = portableRecord(rec, tree)
 	if not rec2 then return nil, why end
-	local n, whyN = markOwnedByPlayer(rec2, tree)
-	if not n then return nil, whyN end
+	local n, frozenNums = markByFrozenNodes(rec2, tree)
+	if not n then return nil, frozenNums end
 	local nodesOut, cfgOut = leftOutWith(rec2)
-	return rec2, n, nodesOut, cfgOut
+	local frozen, adds = patchFor(rec2, frozenNums)
+	local owned = ownedByPlayer(tree)
+	local agree = owned ~= nil
+	if owned then
+		for i, sg in ipairs(rec2.segs) do if (sg.derived == true) ~= (owned[i] == true) then agree = false end end
+	end
+	return rec2, n, nodesOut, cfgOut, { frozen = frozen, adds = adds }, agree
 end
 
 local function portableReplay(rec, text, R, f, tkey)
@@ -3017,17 +3051,23 @@ local function portableReplay(rec, text, R, f, tkey)
 	end)
 	local rec2, whyR = portableRecord(rec, tree)
 	if not rec2 then return no(whyR) end
-	local nDerived, nPieces
-	if OWN_BY_OWNER then
-		nDerived, nPieces = markOwnedByPlayer(rec2, tree)
-	else
-		nDerived, nPieces = markDerived(rec2)
+	local nDerived, frozenNums = markByFrozenNodes(rec2, tree)
+	if nDerived == nil then return no("the construction's own street pieces cannot be found (" .. tostring(frozenNums) .. ")") end
+	local nodesOut, cfgOut = leftOutWith(rec2)
+	local owned = ownedByPlayer(tree)
+	local agree = "n/a"
+	if owned then
+		agree = "agree"
+		for i, sg in ipairs(rec2.segs) do if (sg.derived == true) ~= (owned[i] == true) then agree = "disagree" end end
 	end
-	if nDerived == nil then return no("the construction's own street pieces cannot be found (" .. tostring(nPieces) .. ")") end
-	if OWN_BY_OWNER then
-		local nodesOut, cfgOut = leftOutWith(rec2)
-		trace("build.portable", string.format("%s owner-rule: %d of %d segment(s) are the player's own pieces and are left out, with %d node(s) and %d node configuration(s) only they use",
-			tostring(tkey or "-"), nDerived, #rec2.segs, nodesOut, cfgOut))
+	trace("build.portable", string.format("%s frozen-node rule: %d of %d segment(s) touch a frozen node (%d frozen) and are left to the construction, with %d node(s) and %d node configuration(s) only they use; cross-check owner vs frozen: %s",
+		tostring(tkey or "-"), nDerived, #rec2.segs, #frozenNums, nodesOut, cfgOut, agree))
+	local frozenIdx, expectAdds = patchFor(rec2, frozenNums)
+	if #frozenNums > 0 and #frozenIdx == 0 then
+		trace("build.patch", string.format("%s the frozen node is not used by any remaining segment: nothing to patch", tostring(tkey or "-")))
+	end
+	if #frozenIdx > 0 and not f.canPatch then
+		return no("the construction's frozen nodes must be set by the native module (FEVERLINK3_NATIVE_PATCH=1 and a module with the patch capability), which is not available")
 	end
 	local notes = {}
 	local okB, args = pcall(function()
@@ -3040,11 +3080,20 @@ local function portableReplay(rec, text, R, f, tkey)
 	if not okF then return no("the engine's factory refused it (" .. tostring(errF):gsub("\nstack traceback:.*", ""):sub(1, 160) .. ")") end
 	local v, whyV = proposalVerdict(args)
 	local verdict = v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")
-	trace("build.portable", string.format("%s portable replay%s: one proposal, %d construction(s), %d segment(s) of %d left to the construction (%s %s); engine verdict %s",
-		tostring(tkey or "-"), OWN_BY_OWNER and " [owner-rule verdict]" or "", #rec2.cons, nDerived, #rec2.segs, tostring(nPieces), OWN_BY_OWNER and "own by owner" or "dry-run pieces", verdict))
+	trace("build.portable", string.format("%s portable replay: one proposal, %d construction(s), %d segment(s) of %d left to the construction (frozen-node rule); engine verdict %s",
+		tostring(tkey or "-"), #rec2.cons, nDerived, #rec2.segs, verdict))
 	if v and v.critical then return no("the engine's verdict is critical (" .. verdict .. ")") end
 	logNotes(notes, "build portable")
 	args.plan, args.form = "portable", 1
+	if #frozenIdx > 0 then
+		-- the converted proposal's frozenNodes cannot be set from Lua: the native module patches them at the Add of this command (patch_next); the
+		-- engine's Convert keeps the SimpleProposal's node order, `adds` lets the module check it
+		local adds = expectAdds
+		pcall(function() adds = #A.list(get(args[1], "streetProposal"), "nodesToAdd") end)
+		args.patch = { frozen = frozenIdx, adds = adds }
+		trace("build.patch", string.format("%s patch_next frozen=[%s] adds=%d (the text's frozen node(s) as indices into this proposal's nodesToAdd, %d expected)",
+			tostring(tkey or "-"), table.concat(frozenIdx, ","), adds, expectAdds))
+	end
 	return args
 end
 
@@ -3056,7 +3105,7 @@ local function decodeBuildUnsafe(body, ctx)
 	local plan, whyNot = classify(rec)
 	if not plan then return nil, whyNot end
 	local R = newResolver(ctx)
-	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src }
+	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src, canPatch = ctx and ctx.canPatch == true }
 	local ctxSource = "record"
 	if type(f.ctx) == "table" and f.ctx.native then
 		f.ctx, ctxSource = CTX_FALLBACK, "fallback"

@@ -81,6 +81,9 @@ class FakeNative:
         self.dropped, self.released, self.held = [], [], []
         self.site = TOOL_SITE   # the call site the module reports for the next held command
         self.input_text = None   # the input-level text the module writes for every held command (native_input_<id>.txt); None = an old module
+        self.patch_cap = False   # the module reports the patch_next capability in `ready`
+        self.patch_refuse = None  # a reason: the module answers patch_next with patch_refused
+        self.patches = []        # the patch_next orders it accepted
         self.held_flags = None   # the flags the module read out of the held command (the `ctx` of the held event); None = an old module
         self.fires = False   # the module would fire the tool's completion callback at a cancel (the held event says `done`)
         self.is_open = False
@@ -119,7 +122,7 @@ class FakeNative:
                 if line.split(TAB)[0].isdigit():
                     self.ctl_seq = max(self.ctl_seq, int(line.split(TAB)[0]))
         self.emit("ready", {"build": "40420", "version": "0.1.0", "hooks": self.hooks, "poolpatch": False, "clock": False,
-                            "kinds": {"build_proposal": 52}, "sites": 12})
+                            "kinds": {"build_proposal": 52}, "sites": 12, "patch": self.patch_cap})
         self.flush_events()
 
     def read_ctl(self):
@@ -162,6 +165,12 @@ class FakeNative:
                 if e["phase"] == "waiting":
                     e["phase"], e["reason"] = "release", "hold_off"
             self.emit("holding", {"on": False, "kinds": [], "reason": "hold_off"})
+        elif kind == "patch_next":
+            if self.patch_refuse:
+                self.emit("patch_refused", {"reason": self.patch_refuse})
+            else:
+                self.patches.append(p)
+                self.emit("patched", {"adds": int(p.get("adds", -1))})
         elif kind in ("release", "cancel"):
             e = next((e for e in self.ring if e["id"] == int(p.get("id", -1))), None)
             if e is None:
@@ -1392,6 +1401,41 @@ class TraceLogTest(StrictTest):
         self.tick(20)
         self.assertIn("build.input held=1 NOT AVAILABLE (missing)", self.trace(self.B))
         self.assertEqual(self.B.builds_applied(), 1)
+
+    def external_ctl_line(self, g, kind, payload_text):
+        """A control line written by someone else than the interface half (the simulation half writes patch_next), in the file's own shape."""
+        path = g.native.ctl
+        last = 0
+        if os.path.exists(path):
+            for line in open(path, encoding="utf-8").read().splitlines():
+                head = line.split(TAB)[0]
+                if head.isdigit():
+                    last = max(last, int(head))
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            f.write(TAB.join([str(last + 1), kind, str(g.player_id if hasattr(g, "player_id") else 1), payload_text]) + chr(10))
+
+    def test_a_control_line_written_by_the_simulation_half_does_not_make_the_interface_halfs_next_order_stale(self):
+        # patch_next is written from the simulation half with a writer of its own; the interface half's writer continues after it
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.external_ctl_line(self.B, "patch_next", '{["adds"]=3,["frozen"]={[1]=1}}')
+        self.tick(2)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual(self.B.native.patches, [{"adds": 3, "frozen": [1]}])
+        self.assertEqual(self.B.native.released, [1], "the release written after it was heard")
+
+    def test_the_modules_answers_to_a_patch_are_traced(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.external_ctl_line(self.B, "patch_next", '{["adds"]=2,["frozen"]={[1]=1}}')
+        self.tick(4)
+        self.assertIn('build.patch patched', self.trace(self.B))
+        self.B.native.patch_refuse = "the node count differs"
+        self.external_ctl_line(self.B, "patch_next", '{["adds"]=5,["frozen"]={[1]=1}}')
+        self.tick(4)
+        self.assertIn('build.patch patch_refused', self.trace(self.B))
+        self.assertIn("the node count differs", self.trace(self.B))
 
     def test_an_old_native_module_without_flags_keeps_the_captures_guess_and_says_so(self):
         self.start()

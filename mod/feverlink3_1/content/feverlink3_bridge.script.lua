@@ -61,6 +61,12 @@ end
 local DEV = false
 pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 
+-- FEVERLINK3_NATIVE_PATCH=1 (default off): the native module may set the converted proposal's frozenNodes at the Add of the next build command (the
+-- control order patch_next, docs/NATIVE_LINK.md), which a SimpleProposal cannot carry. Only with it, and with a module that reports the capability,
+-- the portable replay builds a construction (its frozen node); without either the build falls back to the record path.
+local NATIVE_PATCH = false
+pcall(function() NATIVE_PATCH = os.getenv("FEVERLINK3_NATIVE_PATCH") == "1" end)
+
 -- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
 --   "0"          hold-and-release for every build (developer opt-out; was the default until 2026-10-13). The tool's command is held until the stamp and then released, so the tool gets its
 --                completion callback and its preview/ghost keeps working. The originator's engine applies the tool's own command while the
@@ -650,7 +656,9 @@ local function actionCtx(it, co, resolve)
 end
 
 local function simCtx(st, it)
-	return actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
+	local ctx = actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
+	ctx.canPatch = NATIVE_PATCH and st.nativePatch == true   -- (told by the interface half when the module reported the capability)
+	return ctx
 end
 
 -- companies. Guarded calls into the company module: a fault in that layer is logged and the action goes ahead, since
@@ -983,6 +991,19 @@ local function shadowCompare(tracer, who, text, rec)
 	end)
 end
 
+-- The control order that makes the native module set the converted proposal's frozenNodes at the Add of the command sent next (patch_next:
+-- frozen = 0-based indices into the proposal's added nodes, adds = how many nodes it adds). Written from the simulation half, right before the
+-- command, with a writer of its own whose sequence continues the file's (the interface half refreshes its own before each write, natSend).
+local function sendPatchOrder(patch, key)
+	local ok, err = pcall(function()
+		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
+		local sent, why = C.writerSend(w, "patch_next", { frozen = patch.frozen, adds = patch.adds })
+		if not sent then error(why, 0) end
+	end)
+	traceSim("build.patch", string.format("%s patch_next frozen=[%s] adds=%d %s", tostring(key), table.concat(patch.frozen, ","), patch.adds or -1,
+		ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+end
+
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
 	local st = simState(state)
 	local now = engine.gameTime()
@@ -1214,6 +1235,7 @@ local function simApplyAction(st, it, now)
 						end)
 					end
 				end
+				if a.patch then sendPatchOrder(a.patch, it.key) end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -1644,6 +1666,8 @@ local function handleEvent(userParams, state, src, id, name, param)
 			end
 		elseif name == "replay" then
 			markReplay(st, engine.gameTime())
+		elseif name == "nativecaps" and type(param) == "table" then
+			st.nativePatch = param.patch == true
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = os.clock() }
@@ -1775,7 +1799,9 @@ local function setSpeed(sp)
 end
 
 local function guiCtx(it)
-	return actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
+	local ctx = actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
+	ctx.canPatch = NATIVE_PATCH and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.patch == true
+	return ctx
 end
 
 -- What the engine says when it refuses a command (errorState of the result), for the log: without it a refused build is
@@ -2294,6 +2320,9 @@ local function natSend(kind, payload)
 	local N = G.nat
 	if not N then return false end
 	if not N.writer then N.writer = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID) end
+	-- the simulation half writes to the same file (patch_next): this writer's sequence continues after whatever is in it now
+	local inFile = C.lastSeqInFile(C.path("native_ctl.log"))
+	if inFile > N.writer.seq then N.writer.seq = inFile end
 	local ok, err = C.writerSend(N.writer, kind, payload)
 	if ok then
 		N.lastWrite = os.clock()
@@ -2908,7 +2937,11 @@ local function natEvent(N, rec, p, history)
 	if kind == "ready" then
 		local hooks = {}
 		for _, h in ipairs(type(p.hooks) == "table" and p.hooks or {}) do hooks[#hooks + 1] = tostring(h) end
-		N.ready = { build = p.build, hooks = hooks }
+		N.ready = { build = p.build, hooks = hooks, patch = p.patch == true }
+		for _, h in ipairs(hooks) do
+			if h == "patch_next" then N.ready.patch = true end
+		end
+		pcall(toSim, "nativecaps", { patch = N.ready.patch })
 		N.hookOk = false
 		for _, h in ipairs(hooks) do
 			if h == "command_list_add" then N.hookOk = true end
@@ -2951,6 +2984,9 @@ local function natEvent(N, rec, p, history)
 		return   -- held / released / dropped / audit of an earlier run of this script: not news
 	elseif kind == "held" then
 		natOnHeld(N, p)
+	elseif kind == "patched" or kind == "patch_refused" then
+		traceGui("build.patch", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
+		if kind == "patch_refused" then natSay("the native module refused the frozen-node patch: " .. tostring(p.reason or p.detail)) end
 	elseif kind == "released" or kind == "dropped" then
 		local id = tonumber(p.id)
 		if id then

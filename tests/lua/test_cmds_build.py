@@ -2771,7 +2771,7 @@ DEPOT_RECORD_LUA = """(function(txt)
             local function end_(e) if e.new then return nodeId[e.new] end return { __ref = 'node', p = pos(e.pos) } end
             for i, ts in ipairs(P.list(pt.addedSegments)) do
                 local own = ts.roadTemplate:find('/constructions/', 1, true)
-                rec.segs[i] = { id = -200 - i, n0 = end_(ts.node0), n1 = end_(ts.node1), type = 0, owner = 'player',
+                rec.segs[i] = { id = -200 - i, n0 = end_(ts.node0), n1 = end_(ts.node1), type = 0, owner = 'player', objects = {},
                     c = own and { roadTemplate = '::/' .. ts.roadTemplate } or { roadTemplate = '::/' .. ts.roadTemplate, roadStyle = '::/' .. ts.roadStyle, typeIndex = -1, roadType = 1,
                         p0 = pos(ts.position0), p1 = pos(ts.position1) } }
             end
@@ -2871,19 +2871,56 @@ class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
         got = str(self.L.eval(code)(text))
         self.assertEqual(got, "n-1 n-2 n-3 s-1(-1,-2) s-2(ref,-1) s-3(-1,-3) s-4(-3,ref) cfg-1:-1,-2:-3 obj-3 con1")
 
-    def test_the_owner_rule_leaves_out_the_players_own_pieces_the_nodes_only_they_use_and_those_nodes_configurations(self):
-        # EXPERIMENT (FEVERLINK3_PORTABLE_OWN_BY_OWNER): in the real depot samples the entrance piece has the build's player as its owner
+    def test_the_frozen_node_rule_names_the_constructions_own_piece_and_the_patch_the_native_module_needs(self):
+        # Track A (SPIKE_NATIVE_COMMAND.md): proposal.frozenNodes are 0-based indices into the added nodes; the added segments that touch a frozen node
+        # are the construction's own piece. The owner rule (the player is the owner of exactly that piece in the real samples) must agree.
         fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
         code = DEPOT_RECORD_LUA + """
-            local out, n, nodesOut, cfgOut = M.ownerRule(rec, tree)
+            local out, n, nodesOut, cfgOut, patch, agree = M.ownRule(rec, tree)
             if not out then return 'NO: ' .. tostring(n) end
             local own = {}
             for i, sg in ipairs(out.segs) do if sg.derived then own[#own + 1] = i end end
             return n .. ' own=' .. table.concat(own, ',') .. ' nodesOut=' .. nodesOut .. ' cfgOut=' .. cfgOut
+                .. ' frozen=' .. table.concat(patch.frozen, ',') .. ' adds=' .. patch.adds .. ' ' .. (agree and 'agree' or 'disagree')
         end)"""
-        for name, want in (("depot_input.txt", "1 own=1 nodesOut=1 cfgOut=1"), ("depot_free_input.txt", "1 own=1 nodesOut=1 cfgOut=1")):
+        # the frozen node (index 1) is the entrance's end at the building; it stays in the proposal, so the patch names its place among the kept nodes
+        for name, want in (("depot_input.txt", "1 own=1 nodesOut=0 cfgOut=0 frozen=1 adds=3 agree"),
+                           ("depot_free_input.txt", "1 own=1 nodesOut=0 cfgOut=0 frozen=1 adds=2 agree")):
             text = open(os.path.join(fixtures, name), encoding="utf-8").read()
             self.assertEqual(str(self.L.eval(code)(text)), want, name)
+
+    def test_a_construction_needs_the_native_patch_for_its_frozen_node_and_falls_back_without_it(self):
+        fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        text = open(os.path.join(fixtures, "depot_free_input.txt"), encoding="utf-8").read()
+        code = DEPOT_RECORD_LUA + """
+            local body = { fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, { align = true, cleanup = false, buildings = true, fields = true }, false, true, false }, input = txt }
+            local ctx = { player = 7, traceKey = 'k', canPatch = CAN, resolve = function(key) return nil end }
+            M.commands.makeWorldBuildProposalCmd.decode(body, ctx)
+        end)"""
+        def trace():
+            out = ""
+            for root, _, files in os.walk(self.tmp):
+                for fn in files:
+                    if fn == "trace.log":
+                        out += open(os.path.join(root, fn), encoding="utf-8").read()
+            return out
+        self.L.eval(code.replace("CAN", "false"))(text)
+        self.assertIn("frozen nodes must be set by the native module", trace())
+        self.assertIn("cross-check owner vs frozen: agree", trace())
+        before = trace()
+        self.L.eval(code.replace("CAN", "true"))(text)
+        # with the capability the build goes on to the proposal itself (the mock has no street templates, so it stops there, for another reason)
+        self.assertNotIn("frozen nodes must be set by the native module", trace()[len(before):])
+
+    def test_a_frozen_index_outside_the_added_nodes_is_refused(self):
+        fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        text = open(os.path.join(fixtures, "depot_free_input.txt"), encoding="utf-8").read()
+        text = text.replace("proposal.frozenNodes[0]" + chr(9) + "ent:old#1", "proposal.frozenNodes[0]" + chr(9) + "ent:old#9")
+        code = DEPOT_RECORD_LUA + """
+            local out, why = M.ownRule(rec, tree)
+            return out and 'built' or why
+        end)"""
+        self.assertIn("frozen node index 9 is not one of the 2 added nodes", str(self.L.eval(code)(text)))
 
     def test_a_text_that_counts_differently_falls_back_to_the_record_path(self):
         self.assertEqual(self.decoded(portable_road_text(segs=2)), "street|2|1")
