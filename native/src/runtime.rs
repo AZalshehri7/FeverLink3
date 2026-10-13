@@ -82,6 +82,8 @@ pub struct Runtime {
     live: AtomicBool,
     machine: Mutex<HoldMachine<Box<Held>>>,
     reader: Mutex<Option<CtlReader>>,
+    /// Control-file polls read by the command hook (to arm a `patch_next` at once) whose other lines the machine has not seen yet.
+    ctl_backlog: Mutex<Vec<crate::link::Poll>>,
     writer: Mutex<Option<Writer>>,
     audit: Mutex<Audit>,
     counters: Counters,
@@ -137,6 +139,7 @@ impl Runtime {
             live: AtomicBool::new(false),
             machine: Mutex::new(HoldMachine::new(init.hold, table)),
             reader: Mutex::new(None),
+            ctl_backlog: Mutex::new(Vec::new()),
             writer: Mutex::new(None),
             audit: Mutex::new(Audit::new(AUDIT_INTERVAL_MS, 0)),
             counters: Counters::new(),
@@ -477,6 +480,10 @@ impl Runtime {
 
     /// Reads whatever the mod has added to the control file and applies it to the machine.
     fn ingest(&self, machine: &mut HoldMachine<Box<Held>>, now: u64) {
+        let backlog = std::mem::take(&mut *lock(&self.ctl_backlog));
+        for poll in backlog {
+            self.apply_poll(machine, poll, now);
+        }
         let Some(mut guard) = try_lock_briefly(&self.reader) else { return };
         let Some(reader) = guard.as_mut() else { return };
         if !reader.has_news() {
@@ -484,6 +491,10 @@ impl Runtime {
         }
         let poll = reader.poll();
         drop(guard);
+        self.apply_poll(machine, poll, now);
+    }
+
+    fn apply_poll(&self, machine: &mut HoldMachine<Box<Held>>, poll: crate::link::Poll, now: u64) {
         for line in &poll.lines {
             match parse_ctl_line(line) {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, ttl }) => self.arm_patch(frozen, adds, ttl, now),
@@ -500,6 +511,29 @@ impl Runtime {
         if poll.gone {
             machine.ctl_gone(now);
         }
+    }
+
+    /// For the command hook, which needs a `patch_next` the mod wrote an instant ago and cannot wait for the service thread (nor for
+    /// the machine's lock, nor for holding to be on): reads the control file, arms the order, and keeps the other lines for the
+    /// next `ingest`. Takes no lock but the reader's and the backlog's.
+    pub(super) fn ingest_patch_order(&self, now: u64) {
+        let Some(mut guard) = try_lock_briefly(&self.reader) else { return };
+        let Some(reader) = guard.as_mut() else { return };
+        if !reader.has_news() {
+            return;
+        }
+        let mut poll = reader.poll();
+        drop(guard);
+        let mut rest = Vec::new();
+        for line in std::mem::take(&mut poll.lines) {
+            match parse_ctl_line(&line) {
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, ttl }) => self.arm_patch(frozen, adds, ttl, now),
+                _ => rest.push(line),
+            }
+        }
+        poll.lines = rest;
+        lock(&self.ctl_backlog).push(poll);
+        self.wake();
     }
 
     // ---- the service thread
@@ -626,7 +660,7 @@ impl Runtime {
         if plan.held_here {
             return args.out;
         }
-        if self.patch.pending() {
+        if self.patch.enabled() {
             crate::log::guarded("add hook (patch)", || self.patch_add(&args, caller));
         }
         // SAFETY: the arguments of the live call that is being hooked.
@@ -1561,5 +1595,69 @@ mod tests {
         let mut c = Call::new(52, 1);
         unsafe { rt.on_add(c.args(), at(SITE_A)) };
         assert_eq!(calls(), ["add kind 52 tag 1"]);
+    }
+
+    const PATCH_NEXT: &str = "1	patch_next	1	{[\"adds\"]=2,[\"frozen\"]={[1]=1}}
+";
+
+    #[test]
+    fn a_patch_next_written_just_before_the_command_is_seen_by_its_add_with_holding_off_and_no_pump() {
+        let dir = TempDir::new("rt-patch-late");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        ctl(dir.path(), PATCH_NEXT);
+        assert!(!rt.live.load(Relaxed), "holding is off: the hold path does not look at the file");
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert_eq!(calls(), ["add kind 52 tag 1"], "the original Add still runs");
+        rt.pump();
+        let ev = events(dir.path());
+        let refused: Vec<_> = ev.iter().filter(|(k, _)| k == "patch_refused").collect();
+        assert_eq!(refused.len(), 1, "{ev:?}");
+        assert!(!refused[0].1.contains("expired"), "the order was taken by this very Add: {refused:?}");
+        assert!(!rt.patch.pending());
+    }
+
+    #[test]
+    fn lines_the_command_hook_read_for_the_patch_order_still_reach_the_machine() {
+        let dir = TempDir::new("rt-patch-backlog");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        ctl(
+            dir.path(),
+            &format!(
+                "{PATCH_NEXT}2	hold_on	1	{{[\"kinds\"]={{[1]=\"build_proposal\"}}}}
+"
+            ),
+        );
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert!(!rt.patch.pending(), "the order was read in and taken by this Add");
+        calls();
+        rt.pump();
+        assert!(rt.live.load(Relaxed), "hold_on was not lost");
+        assert!(kinds(dir.path()).contains(&"holding".to_string()));
+    }
+
+    #[test]
+    fn a_build_proposal_from_a_tool_site_is_reported_once_as_skipped_and_the_order_stays() {
+        let dir = TempDir::new("rt-patch-skip");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, 0, rt.now_ms());
+        for tag in 1..=3 {
+            let mut c = Call::new(52, tag);
+            unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        }
+        calls();
+        assert!(rt.patch.pending());
+        rt.pump();
+        let skipped = events(dir.path()).into_iter().filter(|(k, _)| k == "patch_skipped").count();
+        assert_eq!(skipped, 1);
+        rt.advance(crate::cmd_patch::DEFAULT_TTL_MS + 1);
+        rt.pump();
+        let ev = events(dir.path());
+        let (_, why) = ev.iter().find(|(k, _)| k == "patch_refused").expect("expired");
+        assert!(why.contains("3 Add(s), 3 build_proposal, 3 from construction tools"), "{why}");
     }
 }

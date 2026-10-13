@@ -48,16 +48,34 @@ impl Runtime {
     /// The command list's `Add` of a command that was not held: if an order is armed and this is a script `build_proposal`, carries it
     /// out (once). Runs before the original `Add`, on the thread that queues commands.
     pub(super) fn patch_add(&self, args: &AddArgs, caller: Option<usize>) {
-        // a command of a construction tool is never the mod's (the tool's own commands are held or pass untouched)
-        let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
-        if site.and_then(|rva| self.build.ui_site_index(rva)).is_some() {
-            return;
-        }
         let Some(kind_offset) = self.build.kind_offset else { return };
         // SAFETY: only readable memory is read.
-        let Some(kind) = (unsafe { engine::command_kind(args.cmd, kind_offset as usize) }) else { return };
-        if self.build.kind_by_name("build_proposal") != Some(kind) {
+        let kind = unsafe { engine::command_kind(args.cmd, kind_offset as usize) };
+        let is_bp = kind.is_some() && self.build.kind_by_name("build_proposal") == kind;
+        let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
+        let tool = site.and_then(|rva| self.build.ui_site_index(rva));
+        if self.patch.pending() {
+            self.patch.saw_add(is_bp, tool.is_some());
+        }
+        if !is_bp {
             return; // another kind of command: the order keeps waiting
+        }
+        // a command of a construction tool is never the mod's (the tool's own commands are held or pass untouched)
+        if tool.is_some() {
+            if self.patch.pending() {
+                if let Some(reason) = self.patch.skip_once("a build_proposal from a construction tool's call site") {
+                    self.patch.report(Event::PatchSkipped { reason, kind, site });
+                }
+            }
+            return;
+        }
+        // the mod writes `patch_next` and then sends the command: the order may still be in the file (the service thread has not
+        // read it, holding may be off so the hold path did not look, the machine's lock may be taken)
+        if !self.patch.pending() {
+            self.ingest_patch_order(self.now_ms());
+            if !self.patch.pending() {
+                return;
+            }
         }
         let now = self.now_ms();
         let Some(order) = self.patch.take(now) else { return };

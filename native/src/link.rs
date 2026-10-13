@@ -519,6 +519,13 @@ pub enum Event {
     PatchRefused {
         reason: String,
     },
+    /// A `build_proposal` went by while an order was armed and was not used (diagnostic; the order stays armed).
+    PatchSkipped {
+        reason: String,
+        kind: Option<u8>,
+        /// The call site's offset in the game image.
+        site: Option<u32>,
+    },
     /// Cumulative counts of the commands the simulation applied, by kind byte.
     Audit {
         counts: Vec<(u8, u64)>,
@@ -552,6 +559,7 @@ impl Event {
             Event::Applied { .. } => "applied",
             Event::Patched { .. } => "patched",
             Event::PatchRefused { .. } => "patch_refused",
+            Event::PatchSkipped { .. } => "patch_skipped",
             Event::Audit { .. } => "audit",
             Event::Holding { .. } => "holding",
             Event::Pong { .. } => "pong",
@@ -582,6 +590,9 @@ impl Event {
                 format!("event patched: frozenNodes {frozen:?} of {adds} added nodes (new block: {allocated})")
             }
             Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
+            Event::PatchSkipped { reason, kind, site } => {
+                format!("event patch_skipped: {reason} (kind {kind:?}, call site rva {site:x?})")
+            }
             Event::Audit { .. } | Event::Pong { .. } => return None,
         })
     }
@@ -657,6 +668,11 @@ impl Event {
                 ("frozen", Lua::List(frozen.iter().map(|n| Lua::uint(u64::from(*n))).collect())),
             ]),
             Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
+            Event::PatchSkipped { reason, kind, site } => Lua::map([
+                ("kind", Lua::Int(kind.map_or(-1, i64::from))),
+                ("reason", Lua::str(reason)),
+                ("site", Lua::Int(site.map_or(-1, i64::from))),
+            ]),
             Event::Error { place, detail } => Lua::map([("detail", Lua::str(detail)), ("where", Lua::str(place))]),
         };
         v.text()

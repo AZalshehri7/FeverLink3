@@ -60,7 +60,17 @@ pub struct State {
     on: AtomicBool,
     pending: AtomicBool,
     order: Mutex<Option<Order>>,
+    /// Diagnostics for the armed order: Adds seen since it was armed (all, build_proposal, from a tool's site), and whether a skip was reported.
+    seen: Mutex<Seen>,
     events: Mutex<Vec<Event>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    adds: u64,
+    build_proposals: u64,
+    from_tools: u64,
+    skip_reported: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -92,11 +102,38 @@ impl State {
             return;
         }
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
+        *lock(&self.seen) = Seen::default();
         let old = lock(&self.order).replace(Order { frozen, adds, armed_ms: now, ttl_ms });
         if old.is_some() {
             self.refuse("replaced by a newer patch_next before a command used it");
         }
         self.pending.store(true, Ordering::Release);
+    }
+
+    /// An `Add` went by while an order is armed (for the diagnostics of an expiry).
+    pub fn saw_add(&self, build_proposal: bool, from_tool: bool) {
+        let mut g = lock(&self.seen);
+        g.adds += 1;
+        g.build_proposals += u64::from(build_proposal);
+        g.from_tools += u64::from(from_tool);
+    }
+
+    /// `Some(reason)` the first time it is asked for the armed order (a skip is reported once per order, not once per command).
+    pub fn skip_once(&self, reason: &str) -> Option<String> {
+        let mut g = lock(&self.seen);
+        if g.skip_reported {
+            return None;
+        }
+        g.skip_reported = true;
+        Some(reason.to_string())
+    }
+
+    fn expired_reason(&self, ttl_ms: u64) -> String {
+        let g = *lock(&self.seen);
+        format!(
+            "expired: no command arrived within {ttl_ms} ms (since it was armed: {} Add(s), {} build_proposal, {} from construction tools)",
+            g.adds, g.build_proposals, g.from_tools
+        )
     }
 
     /// The armed order, once: `None` when there is none or it has expired (which is reported).
@@ -105,7 +142,7 @@ impl State {
         self.pending.store(false, Ordering::Release);
         let order = order?;
         if now.saturating_sub(order.armed_ms) > order.ttl_ms {
-            self.refuse(format!("expired: no command arrived within {} ms", order.ttl_ms));
+            self.refuse(self.expired_reason(order.ttl_ms));
             return None;
         }
         Some(order)
@@ -123,7 +160,7 @@ impl State {
                 let o = g.take().expect("checked");
                 self.pending.store(false, Ordering::Release);
                 drop(g);
-                self.refuse(format!("expired: no command arrived within {} ms", o.ttl_ms));
+                self.refuse(self.expired_reason(o.ttl_ms));
             }
         }
         std::mem::take(&mut *lock(&self.events))
