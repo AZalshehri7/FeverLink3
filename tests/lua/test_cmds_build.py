@@ -874,9 +874,9 @@ function NEGATE_REMOVED(P, how)
   local sp = P.proposal
   local r = sp.removedSegments[1]
   if how == 'bare' then
-    sp.removedSegments = { -r.entity }
+    sp.removedSegments = { -r.entity - 1 }
   else
-    sp.removedSegments = { D("SegmentAndEntity", { entity = -r.entity, comp = r.comp, type = r.type }) }
+    sp.removedSegments = { D("SegmentAndEntity", { entity = -r.entity - 1, comp = r.comp, type = r.type }) }
   end
   P.proposal = sp
 end
@@ -1180,6 +1180,7 @@ function LOAD_BUILD()
   env.package = { loaded = {} }
   env.ug_require = function(p)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
     if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
     error("no module " .. tostring(p))
@@ -1410,6 +1411,19 @@ class BuildTest(unittest.TestCase):
         self.tick(14)
         self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=false buildings=true fields=true player=7 ie=false pi=true")
         self.assertIn("carries no Context flags", self.A.log())
+
+    def test_a_removed_node_read_after_the_build_ran_is_the_bitwise_not_of_its_id(self):
+        # real run 2026-10-13 (depot over buildings): rmNodes was [-39113] where the held command says 39112, and the other game refused
+        # "removed node 1: bad reference". One rule for every removal list: a negative id of a removed entity is -id - 1.
+        self.start()
+        code = ("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; "
+                "local pos = NODE_POS(101); "
+                "local sp = P.proposal; sp.removedNodes = { D('NodeAndEntity', { entity = -101 - 1, comp = D('BaseNode', { position = V(pos.x, pos.y, pos.z) }) }) }; P.proposal = sp; "
+                "return CAPTURE_BODY(P) end)()")
+        text = str(self.A.lua(code))
+        self.assertIn('["rmNodes"]={[1]={["__ref"]="node"', text)
+        self.assertNotIn('["rmNodes"]={[1]=-', text)
+        self.assertIn('["key"]="s:101"', text[text.index('["rmNodes"]'):text.index('["rmNodes"]') + 80])
 
     def test_upgrade_of_segments_the_session_built(self):
         self.start()
@@ -2133,7 +2147,7 @@ class PureBuildTest(unittest.TestCase):
         os.environ.update(FEVERLINK3_SESSION_DIR=self.tmp, FEVERLINK3_PLAYER_ID="1", FEVERLINK3_PLAYER_NAME="pure")
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
-        g.COMMON_SRC = T.COMMON_SRC
+        g.COMMON_SRC, g.PORTABLE_SRC = T.COMMON_SRC, T.PORTABLE_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
             cmds[stem] = src
@@ -2701,6 +2715,102 @@ class LockstepAdditionsTest(unittest.TestCase):
           return a .. "|" .. map["1:2#c1"] .. tostring(complete) .. "|" .. tostring(next(none)) .. tostring(incomplete) .. "|" .. tostring(next(bad)) .. tostring(badComplete) .. "|" .. tostring(next(plain)) .. tostring(plainComplete)
         end""")(self.K)
         self.assertEqual(got, "CONSTRUCTION,nil,nil,LINE,EDGE_OBJECT+STATION_GROUP,nil,nil|77true|nilfalse|nilfalse|niltrue")
+
+
+def portable_road_text(ax=300.0, bx=400.0, template="street/new_medium_road.street_template", segs=1, extra=None):
+    """The input-level text of the road NATIVE_ROAD{ a = (ax, 0), b = (bx, 0) } as the native module writes it (placeholders as the mock numbers them)."""
+    import struct as _s
+
+    def f(x):
+        return "%08x" % _s.unpack("<I", _s.pack("<f", x))[0]
+
+    def v(x, y, z):
+        return "v3:%s,%s,%s" % (f(x), f(y), f(z))
+
+    rows = [
+        ("proposal.addedNodes.#", "n:2"), ("proposal.addedNodes[0].entity", "ent:new#1"), ("proposal.addedNodes[0].position", v(ax, 0, 0)),
+        ("proposal.addedNodes[1].entity", "ent:new#2"), ("proposal.addedNodes[1].position", v(bx, 0, 0)),
+        ("proposal.addedSegments.#", "n:%d" % segs), ("proposal.addedSegments[0].entity", "ent:new#3"),
+        ("proposal.addedSegments[0].node0", "ent:new#1"), ("proposal.addedSegments[0].node1", "ent:new#2"),
+        ("proposal.addedSegments[0].position0", v(ax, 0, 0)), ("proposal.addedSegments[0].position1", v(bx, 0, 0)),
+        ("proposal.addedSegments[0].tangent0", v(bx - ax, 0, 0)), ("proposal.addedSegments[0].tangent1", v(bx - ax, 0, 0)),
+        ("proposal.addedSegments[0].baseType", "u32:00000000"), ("proposal.addedSegments[0].typeIndex", "i32:00000001"),
+        ("proposal.addedSegments[0].roadType", "u32:00000000"), ("proposal.addedSegments[0].type", "u32:00000000"),
+        ("proposal.addedSegments[0].roadTemplate", 'res:"%s"' % template), ("proposal.addedSegments[0].roadStyle", 'res:"medium"'),
+        ("toRemove.#", "n:0"), ("toAdd.#", "n:0"), ("kind", "u8:34"),
+    ] + (extra or [])
+    return chr(10).join(k + chr(9) + val for k, val in rows)
+
+
+class PortableReplayBase:
+    """FEVERLINK3_PORTABLE_REPLAY: a build that comes with the native module's text is replayed through it (default off)."""
+
+    switch = None
+
+    def setUp(self):
+        self._old = os.environ.get("FEVERLINK3_PORTABLE_REPLAY")
+        if self.switch is None:
+            os.environ.pop("FEVERLINK3_PORTABLE_REPLAY", None)
+        else:
+            os.environ["FEVERLINK3_PORTABLE_REPLAY"] = self.switch
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        if self._old is None:
+            os.environ.pop("FEVERLINK3_PORTABLE_REPLAY", None)
+        else:
+            os.environ["FEVERLINK3_PORTABLE_REPLAY"] = self._old
+
+    def decoded(self, text, proposal="NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }"):
+        code = """(function(txt)
+            local body = WIRE_RECORD(%s)
+            body.input = txt
+            local args = DECODE(body)
+            if not args then return 'refused' end
+            local sp = STORE(args[1])
+            local ssp = STORE(sp.streetProposal)
+            return tostring(args.plan) .. '|' .. #ssp.nodesToAdd .. '|' .. #ssp.edgesToAdd
+        end)""" % proposal
+        return str(self.L.eval(code)(text))
+
+
+class PortableReplayOffTest(PortableReplayBase, PureBuildTest):
+    def test_off_by_default_the_record_path_builds_it(self):
+        self.assertEqual(self.decoded(portable_road_text()), "street|2|1")
+
+
+class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
+    switch = "1"
+
+    def test_a_road_is_built_from_the_text_as_one_proposal(self):
+        self.assertEqual(self.decoded(portable_road_text()), "portable|2|1")
+
+    def test_the_text_decides_the_geometry(self):
+        # the text says the road ends at x = 450: the engine is given the text's ends, not the record's
+        code = """(function(txt)
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } })
+            body.input = txt
+            local args = DECODE(body)
+            local ssp = STORE(STORE(args[1]).streetProposal)
+            local c = STORE(STORE(ssp.edgesToAdd[1]).comp)
+            return tostring(args.plan) .. '|' .. c.position1.x
+        end)"""
+        got = str(self.L.eval(code)(portable_road_text(bx=450.0)))
+        self.assertEqual(got, "portable|450")
+
+    def test_a_text_that_counts_differently_falls_back_to_the_record_path(self):
+        self.assertEqual(self.decoded(portable_road_text(segs=2)), "street|2|1")
+
+    def test_a_text_that_cannot_be_read_falls_back_to_the_record_path(self):
+        self.assertEqual(self.decoded("this is not a portable text"), "street|2|1")
+
+    def test_a_build_without_a_text_is_built_by_the_record_path(self):
+        code = """(function()
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } })
+            return tostring(DECODE(body).plan)
+        end)"""
+        self.assertEqual(str(self.L.eval(code)()), "street")
 
 
 if __name__ == "__main__":

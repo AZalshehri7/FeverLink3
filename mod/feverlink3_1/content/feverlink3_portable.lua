@@ -150,6 +150,13 @@ end
 
 local function n(t) return type(t) == "table" and t.n or 0 end
 
+-- the elements 1..n of a vector of the tree (an empty list for a member that is not there)
+function M.list(t)
+	local out = {}
+	for i = 1, n(t) do out[i] = t[i] end
+	return out
+end
+
 -- The input counted the way the build record is counted (recCounts), for the shadow comparison.
 function M.counts(tree)
 	local p = tree.proposal or {}
@@ -169,6 +176,9 @@ end
 -- What the record path carries against what the native module read from the held command, member by member. Observation only: it
 -- says where the record is lossy (a construction's own street pieces have no geometry in it, the lane configurations are not in the
 -- text), it changes nothing. Returns a list of difference lines (empty = the record has everything the text names).
+
+-- the engine's resource names in the record carry a "::/" prefix that the text does not
+local function plainName(s) return type(s) == "string" and (s:gsub("^::/", "")) or s end
 
 local function near(a, b) return type(a) == "number" and type(b) == "number" and math.abs(a - b) < 0.02 end
 local function nearPos(p, q) return type(p) == "table" and type(q) == "table" and near(p.x, q.x) and near(p.y, q.y) and near(p.z, q.z) end
@@ -190,8 +200,8 @@ function M.compare(tree, rec)
 	for i = 1, math.min(c.segs, rc.segs) do
 		local ts, rs = p.addedSegments[i], rec.segs[i]
 		local rcmp = rs.c or {}
-		if ts.roadTemplate ~= rcmp.roadTemplate then diff("segment %d: template text %s, record %s", i, tostring(ts.roadTemplate), tostring(rcmp.roadTemplate)) end
-		if ts.roadStyle ~= rcmp.roadStyle then diff("segment %d: style text %s, record %s", i, tostring(ts.roadStyle), tostring(rcmp.roadStyle)) end
+		if ts.roadTemplate ~= plainName(rcmp.roadTemplate) then diff("segment %d: template text %s, record %s", i, tostring(ts.roadTemplate), tostring(rcmp.roadTemplate)) end
+		if ts.roadStyle ~= plainName(rcmp.roadStyle) then diff("segment %d: style text %s, record %s", i, tostring(ts.roadStyle), tostring(rcmp.roadStyle)) end
 		if rcmp.typeIndex ~= nil and ts.typeIndex ~= rcmp.typeIndex then diff("segment %d: typeIndex text %s, record %s", i, tostring(ts.typeIndex), tostring(rcmp.typeIndex)) end
 		if rcmp.roadType ~= nil and ts.roadType ~= rcmp.roadType then diff("segment %d: roadType text %s, record %s", i, tostring(ts.roadType), tostring(rcmp.roadType)) end
 		if rcmp.p0 then
@@ -204,10 +214,26 @@ function M.compare(tree, rec)
 	if noGeometry > 0 then diff("segments without geometry in the record: %d of %d (the text has positions, tangents and lane bytes for all)", noGeometry, c.segs) end
 	for i = 1, math.min(c.cons, rc.cons) do
 		local tc, rcn = tree.toAdd[i], rec.cons[i]
-		if tc.fileName ~= rcn.file then diff("construction %d: file text %s, record %s", i, tostring(tc.fileName), tostring(rcn.file)) end
+		if tc.fileName ~= plainName(rcn.file) then diff("construction %d: file text %s, record %s", i, tostring(tc.fileName), tostring(rcn.file)) end
 		local m = rcn.transf
 		if type(m) == "table" and type(tc.transf) == "table" and not (near(tc.transf[13], m[13]) and near(tc.transf[14], m[14]) and near(tc.transf[15], m[15])) then
 			diff("construction %d: placement differs", i)
+		end
+	end
+	for i = 1, math.min(c.rmNodes, rc.rmNodes) do
+		local r = rec.rmNodes[i]
+		if type(r) ~= "table" then
+			diff("removed node %d: the record has a bare id (%s) where the text says node %s", i, tostring(r), tostring(p.removedNodes[i].entity and p.removedNodes[i].entity.old))
+		elseif not nearPos(r.p, p.removedNodes[i].position) then
+			diff("removed node %d: position differs", i)
+		end
+	end
+	for i = 1, math.min(c.rmSegs, rc.rmSegs) do
+		local r, t = rec.rmSegs[i], p.removedSegments[i]
+		if type(r) ~= "table" then
+			diff("removed segment %d: the record has a bare id (%s) where the text says segment %s", i, tostring(r), tostring(t.entity and t.entity.old))
+		elseif not (nearPos(r.p0, t.position0) and nearPos(r.p1, t.position1)) then
+			diff("removed segment %d: end positions differ", i)
 		end
 	end
 	if (c.frozen or 0) > 0 then diff("frozenNodes in the text: %d (the record has no such member)", c.frozen) end

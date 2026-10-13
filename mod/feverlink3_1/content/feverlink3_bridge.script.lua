@@ -979,6 +979,7 @@ local function shadowCompare(tracer, who, text, rec)
 		local diffs = Portable.compare(tree, rec)
 		tracer("build.portable", string.format("%s diffs=%d%s; text counts[%s]", who, #diffs, #diffs > 0 and (" [" .. table.concat(diffs, "; "):sub(1, 700) .. "]") or "",
 			Portable.countsText(Portable.counts(tree))))
+		if #diffs > 0 then tracer("build.portable.all", who .. " " .. table.concat(diffs, "; "):sub(1, 6000)) end
 	end)
 end
 
@@ -1204,15 +1205,9 @@ local function simApplyAction(st, it, now)
 								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.extendProposalRedoPillars), tostring(c and c.player),
 								tostring(a.chain and (#a.chain + 1) or 1), tostring(engine.gameTime()), tostring(engine.account())))
 							if Portable and type(it.body.input) == "string" then
+								shadowCompare(traceSim, it.key .. " side=replay", it.body.input, Build.normalise(it.body.args[1]))
 								pcall(function()
-									local tree, why = Portable.parse(it.body.input)
-									if not tree then
-										traceSim("build.portable", string.format("%s side=replay TEXT UNUSABLE (%s)", it.key, tostring(why)))
-										return
-									end
-									local diffs = Portable.compare(tree, Build.normalise(it.body.args[1]))
-									traceSim("build.portable", string.format("%s side=replay diffs=%d%s; text counts[%s]; this game's first proposal counts[%s]", it.key, #diffs,
-										#diffs > 0 and (" [" .. table.concat(diffs, "; "):sub(1, 700) .. "]") or "", Portable.countsText(Portable.counts(tree)), Build.proposalCounts(a[1])))
+									traceSim("build.portable", string.format("%s side=replay this game's first proposal counts[%s]", it.key, Build.proposalCounts(a[1])))
 								end)
 							end
 							traceSim("build.ctx", string.format("%s side=replay source=%s ctx{%s} ie=%s pi=%s", it.key, tostring(a.ctxSource or "record"), Build.contextText(c), tostring(a[3]), tostring(a[4])))

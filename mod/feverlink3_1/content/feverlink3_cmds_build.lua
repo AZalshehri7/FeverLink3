@@ -728,6 +728,15 @@ local function idOf(x)
 	fail("a list entry is neither an entity id nor an entity record")
 end
 
+-- The id of an entity a proposal REMOVES, as it is read from the proposal. Read after the build ran, the list entries that are records
+-- (NodeAndEntity / SegmentAndEntity of the removed lists) carry the bitwise NOT of the entity id, -id - 1 (real data: a removed node
+-- -39113 where the held command's text says 39112; sweeps 20261013-060028 B3 and -074329 B1 for a removed segment; before the build ran the
+-- id is plain). One rule for every removal list; added entities keep their negative placeholders and never pass through here.
+local function removedId(id)
+	if type(id) == "number" and id < 0 then return -id - 1 end
+	return id
+end
+
 local function flavorOf(p)
 	if get(p, "streetProposal") ~= nil or get(p, "constructionsToAdd") ~= nil then return "simple" end
 	if get(p, "proposal") ~= nil or get(p, "toAdd") ~= nil then return "native" end
@@ -1021,14 +1030,14 @@ end
 local function learnRemoved(st, names, cap)
 	for _, n in ipairs(A.list(st, names.rmNodes)) do
 		if type(n) ~= "number" then
-			local id = get(n, "entity")
+			local id = removedId(get(n, "entity"))
 			local p = A.xyz(get(get(n, "comp"), "position"))
 			if type(id) == "number" and p then cap.known.nodes[id] = p end
 		end
 	end
 	for _, s in ipairs(A.list(st, names.rmSegs)) do
 		if type(s) ~= "number" then
-			local id, c = get(s, "entity"), get(s, "comp")
+			local id, c = removedId(get(s, "entity")), get(s, "comp")
 			if type(id) == "number" and c then
 				local p0 = A.xyz(get(c, "position0")) or A.nodePos(get(c, "node0"))
 				local p1 = A.xyz(get(c, "position1")) or A.nodePos(get(c, "node1"))
@@ -1113,7 +1122,7 @@ local function captureRecord(proposal, cap)
 
 	for i, ce in ipairs(A.list(proposal, consKey)) do rec.cons[i] = readConstruction(ce, cap) end
 	local remIds = A.list(proposal, remKey)
-	for i, e in ipairs(remIds) do rec.rem[i] = cap.con(e) end
+	for i, e in ipairs(remIds) do rec.rem[i] = cap.con(removedId(e)) end
 	cap.hasCons = #rec.cons + #rec.rem > 0
 	-- old2new maps a removed construction to what replaces it; as a table keyed by entity ids it cannot travel, so it
 	-- travels as pairs of ranks in the remove list
@@ -1143,40 +1152,16 @@ local function captureRecord(proposal, cap)
 			end
 		end
 		local rmSegIds = {}
-		for i, s in ipairs(A.list(st, names.rmSegs)) do rmSegIds[i] = idOf(s) end
+		for i, s in ipairs(A.list(st, names.rmSegs)) do
+			local raw = idOf(s)
+			local real = removedId(raw)
+			-- a bare id of a segment nothing describes any more stays as it is: removedEdgeFromAdded names it from the added segment's ends
+			if raw < 0 and not (A.edgeInfo(real) or cap.known.edges[real]) then real = raw end
+			rmSegIds[i] = real
+		end
 		indexWorldObjects(rmSegIds, cap)
 		for i, n in ipairs(A.list(st, names.nodes)) do rec.nodes[i] = readNode(n, cap) end
 		for i, id in ipairs(rmSegIds) do
-			-- (read after the build, a removed segment of the stop tool arrived as the NEGATIVE of its entity id: -33244 in a real record,
-			-- which no other game can resolve; it is the existing segment)
-			-- (Sweep runs 20261013-060028 B3 and -074329 B1: the number is the bitwise NOT of the id, -id - 1, not -id: the record named the next
-			-- entity, a different edge, and the replay removed a segment elsewhere; the probe reported 39879 where the record said s:39880. Both
-			-- readings are tried; with one segment added the one whose ends are the added segment's ends wins, otherwise -id - 1.)
-			if type(id) == "number" and id < -1000 then
-				local function exists(e) return A.edgeInfo(e) or cap.known.edges[e] end
-				local notId, negId = -id - 1, -id
-				local pick
-				if exists(notId) and exists(negId) then
-					local added = A.list(st, names.segs)
-					if #added == 1 then
-						local c = get(added[1], "comp")
-						local function ends(e)
-							local inf = A.edgeInfo(e)
-							return inf and { inf.p0, inf.p1 } or nil
-						end
-						local a0, a1 = c and A.xyz(get(c, "position0")), c and A.xyz(get(c, "position1"))
-						local function near(p, q) return p and q and abs(p.x - q.x) <= 1.5 and abs(p.y - q.y) <= 1.5 end
-						for _, cand in ipairs({ notId, negId }) do
-							local e = ends(cand)
-							if e and a0 and a1 and ((near(e[1], a0) and near(e[2], a1)) or (near(e[1], a1) and near(e[2], a0))) then pick = cand break end
-						end
-					end
-					pick = pick or notId
-				else
-					pick = exists(notId) and notId or (exists(negId) and negId or nil)
-				end
-				if pick then id = pick; rmSegIds[i] = id end
-			end
 			-- a removed segment also says what kind of segment it was (normal, bridge, tunnel ...): a replacement by another
 			-- kind is not an upgrade the engine's replaceSegment can make
 			local ref = cap.edge(id)
@@ -1188,7 +1173,7 @@ local function captureRecord(proposal, cap)
 			if t and type(ref) == "table" then ref.ty, ref.ti, ref.rt, ref.st = t.ty, t.ti, t.rt, t.st end
 			rec.rmSegs[i] = ref
 		end
-		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(idOf(n)) end
+		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(removedId(idOf(n))) end
 		for i, s in ipairs(A.list(st, names.segs)) do rec.segs[i] = readSegment(s, cap) end
 		removedEdgeFromAdded(rec)
 		local ownEdge = {}
@@ -1224,9 +1209,9 @@ local function captureRecord(proposal, cap)
 				if o.kind == nil then o.kind = kinds[i] end
 			end
 		end
-		for i, id in ipairs(A.list(st, names.rmObjs)) do rec.rmObjs[i] = cap.obj(id) end
+		for i, id in ipairs(A.list(st, names.rmObjs)) do rec.rmObjs[i] = cap.obj(removedId(id)) end
 		for i, n in ipairs(A.list(st, names.ncfg)) do rec.ncfg[i] = readNodeConfig(n, cap) end
-		for i, id in ipairs(A.list(st, names.rmNcfg)) do rec.rmNcfg[i] = cap.node(id) end
+		for i, id in ipairs(A.list(st, names.rmNcfg)) do rec.rmNcfg[i] = cap.node(removedId(id)) end
 		settleInPlaceRemoval(rec, rmSegIds[1])
 	end
 	rec.terrain = readTerrain(proposal)
@@ -1315,6 +1300,7 @@ local function markOwnByShape(rec)
 end
 
 local function isConstructionSegment(s)
+	if s.portable then return s.derived == true end   -- (a record made from the native text: derived = the construction's own conversion makes it)
 	return OWN_BY_SHAPE[s] == true or ownTemplate(s.c and s.c.roadTemplate)
 end
 
@@ -1901,8 +1887,8 @@ local function part(rec, keep)
 	return out
 end
 
-dryRunPieces = function(rec)
-	if #rec.rem > 0 or #rec.old2new > 0 then return nil, "the record removes constructions" end
+dryRunPieces = function(rec, anyRemovals)
+	if not anyRemovals and (#rec.rem > 0 or #rec.old2new > 0) then return nil, "the record removes constructions" end
 	local ok, res = pcall(function()
 		local stub = { owner = function(v) if v == nil or v == "player" then return A.player() end return v end }
 		local sp = constructionProposal(part(rec, { "cons" }), stub)
@@ -2692,6 +2678,137 @@ local function recCounts(rec)
 		#rec.rmNodes, #rec.rmSegs, #rec.objs, #rec.rmObjs, #rec.ncfg, #rec.rmNcfg)
 end
 
+-- ---- the replay through the portable text (B2.2)
+-- One mechanism for every build kind: the street part is the text's own (nodes, segments with their exact ends, tangents, template names,
+-- the removed nodes and segments), the construction INPUT (file, parameters, placement, name, owner), the edge objects, the lanes and the
+-- node configuration details are the Lua capture's (the lane values of the text are not used until their transport-mode bits are verified
+-- against the engine's reading), and ONE SimpleProposal is handed to the engine, which converts it itself. A segment that the construction's
+-- own conversion makes (found by a dry run of the construction, by geometry) is not input and is left out. Off unless
+-- FEVERLINK3_PORTABLE_REPLAY=1; anything it cannot do falls back to the record path, logged.
+local PORTABLE_REPLAY = false
+pcall(function() PORTABLE_REPLAY = os.getenv("FEVERLINK3_PORTABLE_REPLAY") == "1" end)
+M.PORTABLE_REPLAY = PORTABLE_REPLAY
+local okPT, Portable = pcall(ug_require, "feverlink3_portable.lua")
+if not okPT then okPT, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
+if not okPT or type(Portable) ~= "table" then Portable = nil end
+
+local function withPrefix(name)
+	if type(name) == "string" and name:sub(1, 3) ~= "::/" then return "::/" .. name end
+	return name
+end
+
+-- the record with its street part replaced by the text's; nil and why when the two do not describe the same build
+local function portableRecord(rec, tree)
+	local p = tree.proposal or {}
+	local c = Portable.counts(tree)
+	if c.nodes ~= #rec.nodes or c.segs ~= #rec.segs or c.rmNodes ~= #rec.rmNodes or c.rmSegs ~= #rec.rmSegs or c.cons ~= #rec.cons or c.rem ~= #rec.rem
+		or c.objs ~= #rec.objs or c.rmObjs ~= #rec.rmObjs or c.ncfg ~= #rec.ncfg or c.rmNcfg ~= #rec.rmNcfg then
+		return nil, "the text and the record count differently (" .. Portable.countsText(c) .. ")"
+	end
+	local function copy(t) local o = {}; for k, v in pairs(t) do o[k] = v end; return o end
+	local function xyz(v) return v and { x = v.x, y = v.y, z = v.z } or nil end
+	local function nodeRef(e, recRef)
+		if type(recRef) == "table" and recRef.__ref == "node" then return recRef end
+		if type(e) ~= "table" then return nil end
+		if e.new then return -e.new end
+		if e.old and e.pos then return { __ref = "node", p = xyz(e.pos) } end
+		return nil
+	end
+	local out = copy(rec)
+	out.portable, out.nodes, out.segs, out.rmNodes, out.rmSegs = true, {}, {}, {}, {}
+	for i, tn in ipairs(Portable.list(p.addedNodes)) do
+		if not (tn.entity and tn.entity.new and tn.position) then return nil, "node " .. i .. " has no placeholder or position in the text" end
+		if rec.nodes[i].id ~= -tn.entity.new then return nil, "node " .. i .. ": the placeholder differs (record " .. tostring(rec.nodes[i].id) .. ", text " .. -tn.entity.new .. ")" end
+		out.nodes[i] = { id = -tn.entity.new, pos = xyz(tn.position) }
+	end
+	for i, ts in ipairs(Portable.list(p.addedSegments)) do
+		local rs = rec.segs[i]
+		if not (ts.entity and ts.entity.new and ts.position0 and ts.position1 and ts.tangent0 and ts.tangent1) then return nil, "segment " .. i .. " is incomplete in the text" end
+		local n0 = nodeRef(ts.node0, type(rs.n0) == "table" and rs.n0 or nil)
+		local n1 = nodeRef(ts.node1, type(rs.n1) == "table" and rs.n1 or nil)
+		if n0 == nil or n1 == nil then return nil, "segment " .. i .. " has an end the text does not locate" end
+		if rs.id ~= -ts.entity.new then return nil, "segment " .. i .. ": the placeholder differs (record " .. tostring(rs.id) .. ", text " .. -ts.entity.new .. ")" end
+		local seg = copy(rs)
+		seg.portable, seg.derived, seg.connector = true, nil, nil
+		seg.id, seg.n0, seg.n1 = -ts.entity.new, n0, n1
+		local sc = copy(rs.c or {})
+		sc.p0, sc.p1, sc.t0, sc.t1 = xyz(ts.position0), xyz(ts.position1), xyz(ts.tangent0), xyz(ts.tangent1)
+		sc.type, sc.typeIndex, sc.roadType = ts.type, ts.typeIndex, ts.roadType
+		sc.roadTemplate, sc.roadStyle = withPrefix(ts.roadTemplate), withPrefix(ts.roadStyle)
+		seg.c = sc
+		if seg.type == nil then seg.type = ts.baseType end
+		out.segs[i] = seg
+	end
+	for i, tn in ipairs(Portable.list(p.removedNodes)) do
+		local r = rec.rmNodes[i]
+		local ref = nodeRef(tn.entity and { old = tn.entity.old, pos = tn.position }, type(r) == "table" and r or nil)
+		if type(ref) ~= "table" then return nil, "removed node " .. i .. " is not located in the text" end
+		out.rmNodes[i] = ref
+	end
+	for i, ts in ipairs(Portable.list(p.removedSegments)) do
+		local r = rec.rmSegs[i]
+		if type(r) == "table" then
+			out.rmSegs[i] = r
+		elseif ts.position0 and ts.position1 then
+			out.rmSegs[i] = { __ref = "edge", p0 = xyz(ts.position0), p1 = xyz(ts.position1), t0 = xyz(ts.tangent0), t1 = xyz(ts.tangent1) }
+		else
+			return nil, "removed segment " .. i .. " is not located in the text"
+		end
+	end
+	return out
+end
+
+-- the segments of the record that a dry run of its constructions makes too (by geometry): the construction's own, not input
+local function markDerived(rec)
+	if #rec.cons == 0 then return 0, 0 end
+	local pieces, why = dryRunPieces(rec, true)
+	if not pieces then return nil, why end
+	local function same(a, b) return a and b and abs(a.x - b.x) <= 1.5 and abs(a.y - b.y) <= 1.5 end
+	local n = 0
+	for _, sg in ipairs(rec.segs) do
+		for _, pc in ipairs(pieces) do
+			if (same(sg.c.p0, pc.p0) and same(sg.c.p1, pc.p1)) or (same(sg.c.p0, pc.p1) and same(sg.c.p1, pc.p0)) then
+				sg.derived = true
+				n = n + 1
+				break
+			end
+		end
+	end
+	return n, #pieces
+end
+
+local function portableReplay(rec, text, R, f, tkey)
+	local trace = C.tracer("build")
+	local function no(why)
+		trace("build.portable", string.format("%s portable replay NOT used: %s; the record path builds it", tostring(tkey or "-"), why))
+		return nil, why
+	end
+	if not Portable then return no("no portable module") end
+	local tree, why = Portable.parse(text)
+	if not tree then return no("the text is unusable (" .. tostring(why) .. ")") end
+	local rec2, whyR = portableRecord(rec, tree)
+	if not rec2 then return no(whyR) end
+	local nDerived, nPieces = markDerived(rec2)
+	if nDerived == nil then return no("the construction's own street pieces cannot be found (" .. tostring(nPieces) .. ")") end
+	local notes = {}
+	local okB, args = pcall(function()
+		local sp = streetProposal(rec2, R, notes, { drop = true })
+		setConstructions(sp, rec2, R)
+		return commandArgs(sp, newContext(f.ctx, R), f.ie, f.pi, f.dust)
+	end)
+	if not okB then return no("not built (" .. tostring(args):sub(1, 160) .. ")") end
+	local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
+	if not okF then return no("the engine's factory refused it (" .. tostring(errF):gsub("\nstack traceback:.*", ""):sub(1, 160) .. ")") end
+	local v, whyV = proposalVerdict(args)
+	local verdict = v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")
+	trace("build.portable", string.format("%s portable replay: one proposal, %d construction(s), %d segment(s) of %d left to the construction (%s dry-run pieces); engine verdict %s",
+		tostring(tkey or "-"), #rec2.cons, nDerived, #rec2.segs, tostring(nPieces), verdict))
+	if v and v.critical then return no("the engine's verdict is critical (" .. verdict .. ")") end
+	logNotes(notes, "build portable")
+	args.plan, args.form = "portable", 1
+	return args
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
@@ -2705,6 +2822,17 @@ local function decodeBuildUnsafe(body, ctx)
 	if type(f.ctx) == "table" and f.ctx.native then
 		f.ctx, ctxSource = CTX_FALLBACK, "fallback"
 		log("build " .. plan .. ": the record carries no Context flags (an older record); replayed with the fallback flags")
+	end
+	if PORTABLE_REPLAY and type(body.input) == "string" then
+		local okT, built = pcall(portableReplay, rec, body.input, R, f, ctx and ctx.traceKey)
+		if okT and built then
+			built.ctxSource = ctxSource
+			log("build portable (" .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, " .. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, "
+				.. #rec.segs .. "+" .. #rec.rmSegs .. " segments")
+			return built
+		elseif not okT then
+			log("portable replay failed (" .. tostring(built) .. "); the record path builds it")
+		end
 	end
 	-- Developer switch (default off): a build that adds constructions AND removes some (a station that takes town buildings away) is
 	-- replayed with ignoreErrors = true. Real session 2026-10-12: such builds created nothing on the receiving game; to A/B whether the
