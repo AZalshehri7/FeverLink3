@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use crate::build_table::BuildAddrs;
 use crate::counters::{audit_log_line, AddSource, AppliedWatch, Audit, Counters};
+use crate::dump::{self, Budget, Dumper, Env, Header, LiveMem, Scope};
 use crate::engine::{self, AddArgs, AddFn, EngineFns, Held};
 use crate::hold::{Action, Admit, HoldConfig, HoldMachine};
 use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
@@ -86,6 +87,8 @@ pub struct Runtime {
     waker: OnceLock<Thread>,
     /// Reads the game time, when this build has a way to. None for now: a scheduled release is due at once.
     clock: Option<fn() -> Option<u64>>,
+    /// The dev-only dump of build commands (`FEVERLINK3_DUMP_COMMANDS`); unset in a normal run.
+    dump: OnceLock<Dumper>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -127,7 +130,70 @@ impl Runtime {
             orig_apply: AtomicUsize::new(0),
             waker: OnceLock::new(),
             clock: None,
+            dump: OnceLock::new(),
         }
+    }
+
+    /// Switches the dev-only command dump on (`FEVERLINK3_DUMP_COMMANDS`), writing to `dir` when it is known.
+    pub fn enable_dump(&self, settings: dump::Settings, dir: Option<&Path>) {
+        let dumper = Dumper::new(settings);
+        if let Some(dir) = dir {
+            dumper.set_dir(dir);
+        }
+        if self.dump.set(dumper).is_ok() {
+            self.say(&format!(
+                "dump: FEVERLINK3_DUMP_COMMANDS is on: build commands are decoded into {} (read-only; at most {} held and {} applied dumps)",
+                dump::DUMP_FILE,
+                settings.max_held,
+                settings.max_applied
+            ));
+        }
+    }
+
+    /// One dump of the payload at `payload`; returns its sequence number, `None` when switched off, out of budget or
+    /// without a folder. Reads only through [`LiveMem`], which checks every range.
+    #[allow(clippy::too_many_arguments)]
+    fn dump_payload(
+        &self,
+        event: &str,
+        payload: usize,
+        hold_id: Option<u64>,
+        site: Option<u32>,
+        scope: Scope,
+        budget: Budget,
+        group: Option<u32>,
+    ) -> Option<u32> {
+        let d = self.dump.get()?;
+        if !d.has_dir() {
+            return None;
+        }
+        let seq = d.begin(budget)?;
+        let kind = self
+            .build
+            .kind_offset
+            .and_then(|o| payload.checked_add(o as usize))
+            // SAFETY: the byte is read only after its range is checked.
+            .and_then(|at| unsafe { crate::mem::readable(at as *const u8, 1).then(|| *(at as *const u8)) })
+            .unwrap_or(255);
+        let head = Header {
+            seq,
+            event,
+            hold_id,
+            site_rva: site,
+            tool: site.and_then(|rva| self.build.ui_site_index(rva)),
+            kind,
+            kind_name: self.build.kind_name(kind).unwrap_or("?"),
+            t_ms: self.now_ms(),
+            wall_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()),
+            thread: current_thread_id(),
+            payload,
+            group,
+        };
+        let text = dump::render(&LiveMem, Env { image_base: self.base }, d.settings, &head, scope);
+        if let Err(e) = d.write(&text) {
+            self.say(&format!("dump: cannot write {}: {e}", dump::DUMP_FILE));
+        }
+        Some(seq)
     }
 
     pub fn counters(&self) -> &Counters {
@@ -226,6 +292,9 @@ impl Runtime {
         }
         *lock(&self.reader) = Some(reader);
         *lock(&self.writer) = Some(Writer { events, failed_logged: false });
+        if let Some(d) = self.dump.get() {
+            d.set_dir(dir);
+        }
         Ok(())
     }
 
@@ -332,8 +401,14 @@ impl Runtime {
         let add = self.add_fn();
         // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
         // was taken out of the engine's hands must be given back, whatever happens)
-        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0 };
+        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None };
         crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
+        if let Some(job) = plan.dump.take() {
+            // dev-only and read-only: the held command's payload, decoded (the command is already out of the engine's hands)
+            crate::log::guarded("add hook (dump)", || {
+                self.dump_payload("held", job.payload, Some(job.id), Some(job.site), Scope::Whole, Budget::Held, None)
+            });
+        }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
             // SAFETY: the arguments of the live call that is being hooked.
@@ -396,8 +471,15 @@ impl Runtime {
                     // SAFETY: the arguments of the live call, as the caller guarantees.
                     if let Some(held) = unsafe { engine::capture(&engine, args) } {
                         let done = held.done_ok();
+                        let payload = held.payload();
                         match machine.hold_with(kind, rva, done, held, now) {
-                            Ok(_) => plan.held_here = true,
+                            Ok(id) => {
+                                plan.held_here = true;
+                                if self.dump.get().is_some() && self.build.kind_by_name("build_proposal") == Some(kind)
+                                {
+                                    plan.dump = Some(DumpJob { id, site: rva, payload });
+                                }
+                            }
                             Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
                         }
                     }
@@ -443,7 +525,25 @@ impl Runtime {
             unsafe { engine::payload_of(cmd) }.and_then(|p| self.watch.claim(p))
         })
         .flatten();
+        // dev-only dump of a build command before the simulation applies it, and of its result part afterwards
+        let dumped = self.dump.get().and_then(|_| {
+            crate::log::guarded("apply hook (dump)", || {
+                // SAFETY: only readable memory is read.
+                let payload = unsafe { engine::payload_of(cmd) }?;
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
+                (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                let seq = self.dump_payload("apply", payload, claimed, None, Scope::Whole, Budget::Applied, None)?;
+                Some((payload, seq))
+            })
+            .flatten()
+        });
         let result = unsafe { original(sim, cmd) };
+        if let Some((payload, seq)) = dumped {
+            crate::log::guarded("apply hook (dump after)", || {
+                self.dump_payload("applied", payload, claimed, None, Scope::Result, Budget::Applied, Some(seq))
+            });
+        }
         if let Some(id) = claimed {
             crate::log::guarded("apply hook (result)", || {
                 let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
@@ -463,6 +563,21 @@ struct AddPlan {
     /// The current command was held: the caller gets an empty handle and the original is not called.
     held_here: bool,
     now: u64,
+    /// A held `build_proposal` command to dump (only with `FEVERLINK3_DUMP_COMMANDS`).
+    dump: Option<DumpJob>,
+}
+
+/// What the dump needs to know about a command that was just held.
+struct DumpJob {
+    id: u64,
+    site: u32,
+    payload: usize,
+}
+
+/// The id of the calling thread, for the dump header.
+fn current_thread_id() -> u32 {
+    // SAFETY: no arguments; returns the calling thread's id.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
 }
 
 #[cfg(test)]
@@ -913,6 +1028,63 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn the_dev_dump_decodes_a_held_build_command_and_its_application_and_is_off_without_the_switch() {
+        let dir = TempDir::new("rt-dump");
+        let rt = runtime(Some(dir.path()));
+        let settings = dump::Settings::from_lookup(|_| Some("1".into())).unwrap();
+        rt.enable_dump(settings, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        // a build whose toRemove vector holds two entity ids
+        let ids: Vec<u32> = vec![62470, 62471];
+        let mut call = Call::new(52, 10);
+        let (begin, end) = (ids.as_ptr() as usize, ids.as_ptr() as usize + 8);
+        call.c.payload[0x240..0x248].copy_from_slice(&begin.to_ne_bytes());
+        call.c.payload[0x248..0x250].copy_from_slice(&end.to_ne_bytes());
+        call.c.payload[0x250..0x258].copy_from_slice(&end.to_ne_bytes());
+        let mut other = Call::new(17, 3);
+        unsafe { rt.on_add(call.args(), at(SITE_A)) };
+        unsafe { rt.on_add(other.args(), at(SITE_B)) };
+        ctl(
+            dir.path(),
+            "2	release	1	{[\"id\"]=1}
+",
+        );
+        let mut nop = Call::new(27, 50);
+        unsafe { rt.on_add(nop.args(), at(0x999)) };
+        let mut sim = [0u8; 8];
+        let mut queued = Box::new([0u8; 0x40]);
+        queued[..8].copy_from_slice(&call.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        let text = std::fs::read_to_string(dir.path().join(dump::DUMP_FILE)).expect("a dump file");
+        let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("=== dump")).collect();
+        assert_eq!(headers.len(), 3, "{headers:?}");
+        assert!(
+            headers[0]
+                .starts_with("=== dump #1 event=held key=1 site=0x4d396f tool=0 Bulldozer kind=52 (build_proposal)"),
+            "{}",
+            headers[0]
+        );
+        assert!(headers[1].starts_with("=== dump #2 event=apply key=1 site=none tool=none kind=52"), "{}", headers[1]);
+        assert!(
+            headers[2].starts_with("=== dump #3 event=applied key=1") && headers[2].contains("group=2"),
+            "{}",
+            headers[2]
+        );
+        assert!(text.contains("ent?62470 ent?62471"), "the vector behind the pointer is decoded");
+        assert!(text.contains("KNOWN +0x0240 toRemove: vector<Entity>"));
+
+        // without the switch nothing is created
+        let quiet = TempDir::new("rt-nodump");
+        let rt = runtime(Some(quiet.path()));
+        ctl(quiet.path(), HOLD_ON);
+        rt.pump();
+        let mut c = Call::new(52, 10);
+        unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        assert!(!quiet.path().join(dump::DUMP_FILE).exists());
     }
 
     #[test]

@@ -19,6 +19,7 @@
 pub mod build_table;
 pub mod counters;
 pub mod detour;
+pub mod dump;
 pub mod growth;
 pub mod hold;
 pub mod link;

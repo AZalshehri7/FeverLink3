@@ -1230,6 +1230,11 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         return;
     }
     let Some(rt) = RUNTIME.get() else { return };
+    // dev-only (FEVERLINK3_DUMP_COMMANDS=1|2): decode the build commands the module holds and the simulation applies
+    if let Some(settings) = crate::dump::Settings::from_lookup(|n| std::env::var(n).ok()) {
+        let dir = link.as_ref().map(|l| l.dir.clone()).or_else(feverlink3_launcher::live::live_dir);
+        rt.enable_dump(settings, dir.as_deref());
+    }
     let targets = Targets {
         apply: apply_hook as *const () as usize,
         add: add_hook as *const () as usize,
