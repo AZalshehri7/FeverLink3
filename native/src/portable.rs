@@ -31,6 +31,8 @@ use crate::dump::{ascii_string, pointer_like, u32_at, u64_at, Env, Mem, IMAGE_BO
 /// `1` = commands the module held (their `held` and `apply`), `3` = also every other `build_proposal` the simulation applies.
 pub const PORTABLE_VAR: &str = "FEVERLINK3_PORTABLE_DUMP";
 pub const PORTABLE_FILE: &str = "native_portable.log";
+/// `=0` leaves pointers to heap blocks as `P` (no `HeapSize` queries); `=1` turns the graph on for the plain portable dump.
+pub const GRAPH_VAR: &str = "FEVERLINK3_PORTABLE_GRAPH";
 /// Format version of the text.
 pub const VERSION: u32 = 1;
 /// The only game build whose layout table this is.
@@ -194,7 +196,12 @@ pub static PAYLOAD: &[F] = &[
     f(0x170, "proposal.old2newSegments", Ty::Map),
     f(0x180, "proposal.new2oldEdgeObjects", Ty::Map),
     f(0x190, "proposal.old2newEdgeObjects", Ty::Map),
-    f(0x1a0, "proposal.gap1a0", Ty::Raw(0x30)),
+    // the tail of the StreetProposal that the Lua binding does not register. The first 0x20 bytes are carried by the engine's own
+    // copy constructor (0x4c78c0): an image pointer (constant) or a begin/end range of 20 bytes and two small integers (2, 3) in the
+    // stop pair; the word at +0x20 (small integers, a pair of floats, 0x3f800060) is NOT carried (the copy has zeros, seen in the real
+    // game) and the word at +0x28 differs (0 against 1): transient state, so 0x10 bytes of padding.
+    f(0x1a0, "proposal.gap1a0", Ty::Raw(0x20)),
+    f(0x1c0, "proposal.gap1c0", Ty::Pad(0x10)),
     f(0x1d0, "proposal.frozenNodes", Ty::EntVec),
     f(0x1e8, "terrainAlignSkipEdges", Ty::Hash),
     f(0x228, "segmentTags", Ty::BlobVec),
@@ -238,6 +245,12 @@ pub struct Settings {
     pub max_block_bytes: usize,
     pub max_elems: usize,
     pub max_depth: usize,
+    /// Follow pointers to live heap blocks and write the blocks (the heap graph): `FEVERLINK3_PORTABLE_GRAPH=0` turns it off.
+    pub graph: bool,
+    /// Bounds of the heap graph: blocks, bytes of one block, bytes in all. A pointer past a bound stays a `P`.
+    pub max_graph_blocks: usize,
+    pub max_graph_block_bytes: usize,
+    pub max_graph_bytes: usize,
 }
 
 impl Settings {
@@ -261,6 +274,11 @@ impl Settings {
             max_block_bytes: 8 << 20,
             max_elems: 20_000,
             max_depth: 6,
+            // the graph asks the heap about pointers (HeapSize): on for the rebuild checks and the engine copy, opt-in for the plain dump
+            graph: get(GRAPH_VAR).map_or(var != PORTABLE_VAR, |v| v.trim() != "0"),
+            max_graph_blocks: 4096,
+            max_graph_block_bytes: 1 << 20,
+            max_graph_bytes: 8 << 20,
         })
     }
 }
@@ -277,6 +295,11 @@ pub struct Stats {
     pub unlocated_refs: usize,
     /// Containers whose entries the table cannot yet read (non-empty hash containers, unknown map entries).
     pub unread_entries: usize,
+    /// Heap blocks written as `@B` lines and their bytes (the heap graph behind the pointers).
+    pub blocks: usize,
+    pub block_bytes: usize,
+    /// Pointers left as `P` because a bound of the graph was reached.
+    pub graph_truncated: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +333,17 @@ struct Enc<'a> {
     pos: HashMap<u32, [u32; 3]>,
     /// bytes of heap memory read for the structural dump so far
     raw_spent: usize,
+    /// the heap graph: blocks reached by pointers, in the order they were found (block `n` is `blocks[n - 1]`)
+    blocks: Vec<Blk>,
+    by_addr: HashMap<usize, usize>,
+    graph_bytes: usize,
+    /// inside an engine container's words and the blocks behind them: a pointer is a block of the graph or a `P`, never guessed as a range or vector
+    container_mode: bool,
+}
+
+struct Blk {
+    addr: usize,
+    bytes: Vec<u8>,
 }
 
 type R<T> = Result<T, String>;
@@ -476,72 +510,63 @@ impl Enc<'_> {
                 Ok(())
             }
             Ty::Map => {
-                // entries are read as far as the node layout (inferred) holds; a failure leaves the size and says so
-                let mark = (self.out.len(), self.stats.lines);
-                if let Err(e) = self.map(path, b, depth) {
-                    self.out.truncate(mark.0);
-                    self.stats.lines = mark.1;
-                    self.stats.unread_entries += 1;
-                    self.line(path, &format!("map:size={},entries=unread", u64_at(b, 8)))?;
-                    let why = e.replace(char::is_control, " ");
-                    self.line(&format!("{path}.why"), &format!("note:{why}"))?;
-                }
-                Ok(())
+                // std::map: head pointer and size; the nodes are heap blocks of the graph
+                self.line(path, &format!("map:size={}", u64_at(b, 8)))?;
+                self.container_graph(path, b, depth)
             }
             Ty::Hash => {
-                let size = u64_at(b, 0x10);
-                self.line(path, &format!("hash:size={size},load={:08x}", u32_at(b, 0)))?;
-                if size != 0 {
-                    self.stats.unread_entries += 1;
-                    self.line(&format!("{path}.entries"), "unread")?;
-                }
-                Ok(())
+                // std::unordered_map/set: load factor (the other four bytes of its word are padding), then the list head, size,
+                // bucket vector, mask and maximum index; the nodes are heap blocks of the graph
+                self.line(path, &format!("hash:size={},load={:08x}", u64_at(b, 0x10), u32_at(b, 0)))?;
+                self.container_graph(path, &b[8..], depth)
             }
             Ty::Raw(_) | Ty::Skip(_) | Ty::Pad(_) => Ok(()),
         }
     }
 
-    /// `std::map`: head pointer and size; the entries are walked in order (node: left, parent, right, colour, isnil, key at +0x20).
-    fn map(&mut self, path: &str, b: &[u8], depth: usize) -> R<()> {
-        let (head, size) = (u64_at(b, 0), u64_at(b, 8));
-        self.line(path, &format!("map:size={size}"))?;
-        if size == 0 {
+    /// The words of an engine container written structurally (`path.graph`): its pointers become blocks of the heap graph.
+    fn container_graph(&mut self, path: &str, bytes: &[u8], depth: usize) -> R<()> {
+        if bytes.iter().all(|&x| x == 0) {
             return Ok(());
         }
-        if size > 100_000 || !pointer_like(head) {
-            return Err(format!("{path}: map of size {size} with head {head:#x}"));
+        let was = std::mem::replace(&mut self.container_mode, true);
+        let t = self.raw_tokens(bytes, depth + 1);
+        self.container_mode = was;
+        let t = t?;
+        if t.split(' ').any(|x| x == "P") {
+            self.stats.unread_entries += 1;
         }
-        let h = self.read(head as usize, 0x20, path)?;
-        let mut stack: Vec<usize> = Vec::new();
-        let mut cur = u64_at(&h, 8) as usize; // the root
-        let mut seen = 0u64;
-        let mut index = 0usize;
-        loop {
-            while cur != 0 && cur != head as usize {
-                let n = self.read(cur, 0x40, path)?;
-                if n[0x19] != 0 {
-                    break; // the sentinel
-                }
-                stack.push(cur);
-                cur = u64_at(&n, 0) as usize;
+        self.line(&format!("{path}.graph"), &format!("raw:{t}"))
+    }
+
+    /// A pointer to a live heap block as a token of the heap graph: `B<n>` (the start of block n) or `B<n>+<hex>` (inside it).
+    /// The first pointer to a block reads it (its size comes from the heap) and queues its own pointers.
+    fn block_token(&mut self, p: usize) -> Option<String> {
+        if !self.set.graph {
+            return None;
+        }
+        if let Some(&n) = self.by_addr.get(&p) {
+            return Some(format!("B{n}"));
+        }
+        for (i, b) in self.blocks.iter().enumerate() {
+            if p > b.addr && p <= b.addr + b.bytes.len() {
+                return Some(format!("B{}+{:x}", i + 1, p - b.addr));
             }
-            let Some(node) = stack.pop() else { break };
-            let n = self.read(node, 0x40, path)?;
-            seen += 1;
-            if seen > size + 1 {
-                return Err(format!("{path}: more map nodes than its size {size}"));
-            }
-            let key = self.ent(u32_at(&n, 0x20));
-            self.line(&format!("{path}[{index}].key"), &key)?;
-            let t = self.raw_tokens(&n[0x20..0x40], depth + 1)?;
-            self.line(&format!("{path}[{index}].entry"), &format!("raw:{t}"))?;
-            index += 1;
-            cur = u64_at(&n, 0x10) as usize;
         }
-        if seen != size {
-            return Err(format!("{path}: walked {seen} map nodes, size says {size}"));
+        let size = self.mem.heap_size(p)?;
+        if size > self.set.max_graph_block_bytes
+            || self.blocks.len() >= self.set.max_graph_blocks
+            || self.graph_bytes + size > self.set.max_graph_bytes
+        {
+            self.stats.graph_truncated += 1;
+            return None;
         }
-        Ok(())
+        let bytes = self.mem.read(p, size)?;
+        self.graph_bytes += size;
+        self.blocks.push(Blk { addr: p, bytes });
+        let n = self.blocks.len();
+        self.by_addr.insert(p, n);
+        Some(format!("B{n}"))
     }
 
     /// The members of a record of `size` bytes, and the structural dump of the bytes the table does not name.
@@ -622,7 +647,7 @@ impl Enc<'_> {
                 if cap >= 15 && size <= cap && size <= (1 << 16) {
                     let inline =
                         cap == 15 && bytes[i * 8..i * 8 + size as usize].iter().all(|&b| (0x20..0x7f).contains(&b));
-                    let heap = cap > 15 && pointer_like(w);
+                    let heap = cap > 15 && cap % 16 == 15 && pointer_like(w);
                     let text = if inline {
                         Some(bytes[i * 8..i * 8 + size as usize].to_vec())
                     } else if heap {
@@ -641,7 +666,7 @@ impl Enc<'_> {
                 }
             }
             // a vector: begin, end, capacity
-            if i + 3 <= words {
+            if i + 3 <= words && depth < self.set.max_depth && !self.container_mode {
                 let (b, e, c) = (w, u64_at(bytes, (i + 1) * 8), u64_at(bytes, (i + 2) * 8));
                 if pointer_like(b)
                     && b <= e
@@ -681,8 +706,14 @@ impl Enc<'_> {
                     i += 1;
                     continue;
                 }
+                // with the heap graph on, a pointer to a live block is a block reference, whatever its neighbours are
+                if let Some(t) = self.block_token(p) {
+                    toks.push(t);
+                    i += 1;
+                    continue;
+                }
                 // a range: two pointers into one block, begin and end (no capacity word), a few KB at most
-                if i + 2 <= words {
+                if i + 2 <= words && depth < self.set.max_depth && !self.container_mode {
                     let e = u64_at(bytes, (i + 1) * 8);
                     if pointer_like(e) && w <= e && e - w <= 0x1000 && w.is_multiple_of(4) {
                         let len = (e - w) as usize;
@@ -742,7 +773,19 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
     if payload[0x9b8] != KIND_BUILD_PROPOSAL {
         return Err(format!("kind byte {} is not {KIND_BUILD_PROPOSAL}", payload[0x9b8]));
     }
-    let mut e = Enc { mem, env, set, out: String::new(), stats: Stats::default(), pos: HashMap::new(), raw_spent: 0 };
+    let mut e = Enc {
+        mem,
+        env,
+        set,
+        out: String::new(),
+        stats: Stats::default(),
+        pos: HashMap::new(),
+        raw_spent: 0,
+        blocks: Vec::new(),
+        by_addr: HashMap::new(),
+        graph_bytes: 0,
+        container_mode: false,
+    };
     // pass 1: where the elements say their entities are
     for fl in PAYLOAD {
         if let Ty::Vec(elem) = fl.ty {
@@ -761,6 +804,24 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         }
     }
     e.record("", &payload, PAYLOAD, PAYLOAD_SIZE, 0)?;
+    // the heap graph: every block found, written in the order found (writing one can find more)
+    let mut block_lines = String::new();
+    let mut done = 0usize;
+    while done < e.blocks.len() {
+        let bytes = e.blocks[done].bytes.clone();
+        e.container_mode = true;
+        let tokens = e.raw_tokens(&bytes, 1)?;
+        e.container_mode = false;
+        let _ = writeln!(block_lines, "@B{}\tsize={}\traw:{}", done + 1, bytes.len(), tokens);
+        done += 1;
+        if block_lines.len() + e.out.len() > e.set.max_text_bytes {
+            return Err("text over the size bound".into());
+        }
+    }
+    e.stats.blocks = e.blocks.len();
+    e.stats.block_bytes = e.graph_bytes;
+    e.stats.lines += e.blocks.len();
+    e.out.push_str(&block_lines);
     let mut text = String::new();
     let _ = writeln!(
         text,
@@ -778,8 +839,17 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
     let s = e.stats;
     let _ = writeln!(
         text,
-        "=== end portable #{} lines={} strings={} vectors={} heap_ptrs_not_followed={} unlocated_refs={} unread_entries={} ===",
-        head.seq, s.lines, s.strings, s.vectors, s.heap_ptrs, s.unlocated_refs, s.unread_entries
+        "=== end portable #{} lines={} strings={} vectors={} heap_ptrs_not_followed={} unlocated_refs={} unread_entries={} blocks={} block_bytes={} graph_truncated={} ===",
+        head.seq,
+        s.lines,
+        s.strings,
+        s.vectors,
+        s.heap_ptrs,
+        s.unlocated_refs,
+        s.unread_entries,
+        s.blocks,
+        s.block_bytes,
+        s.graph_truncated
     );
     Ok(Portable { text, stats: s })
 }

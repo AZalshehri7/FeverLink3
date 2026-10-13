@@ -11,7 +11,7 @@
 //! One general rule, as in the decoder: the table drives it for every kind of build; there is no per-tool code.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 
 use crate::dump::{pointer_like, u64_at, Env, Mem, PAYLOAD_SIZE};
@@ -65,6 +65,12 @@ struct Builder<'a> {
     blocks: usize,
     /// Which top-level members are built (all when `None`); a member that is not selected is not touched and allocates nothing.
     select: Option<&'a dyn Fn(&F) -> bool>,
+    /// the heap graph of the text: block number -> (size, tokens)
+    graph: HashMap<usize, (usize, &'a str)>,
+    /// block number -> address of the block made for it (made when first referenced)
+    made: HashMap<usize, usize>,
+    /// blocks made and not yet filled
+    fill: VecDeque<usize>,
 }
 
 fn parse_hex(s: &str) -> R<Vec<u8>> {
@@ -257,11 +263,20 @@ impl<'a> Builder<'a> {
                     .and_then(|x| x.parse().ok())
                     .ok_or_else(|| format!("{path}: {v}"))?;
                 buf[8..16].copy_from_slice(&size.to_le_bytes());
-                self.blocked.push(Blocked {
-                    kind: "std::map",
-                    path: path.to_string(),
-                    why: "the sentinel head node (size and constructor of the tree node) is not known; entries need red-black linkage",
-                });
+                if let Some(g) = self.val(&format!("{path}.graph")) {
+                    // the head pointer and the size, with the tree's nodes made as blocks of the heap graph
+                    let bytes = self.raw_value(&format!("{path}.graph"), g)?;
+                    if bytes.len() != 0x10 {
+                        return Err(format!("{path}: map graph has {} bytes, not 16", bytes.len()));
+                    }
+                    buf[..0x10].copy_from_slice(&bytes);
+                } else {
+                    self.blocked.push(Blocked {
+                        kind: "std::map",
+                        path: path.to_string(),
+                        why: "the text has no heap graph for it (the sentinel head node is not described)",
+                    });
+                }
                 Ok(())
             }
             Ty::Hash => {
@@ -275,13 +290,20 @@ impl<'a> Builder<'a> {
                 let load = hex32(v.split("load=").nth(1).ok_or("load")?)?;
                 buf[0..4].copy_from_slice(&load.to_le_bytes());
                 buf[0x10..0x18].copy_from_slice(&size.to_le_bytes());
-                buf[0x30..0x38].copy_from_slice(&7u64.to_le_bytes());
-                buf[0x38..0x40].copy_from_slice(&8u64.to_le_bytes());
-                self.blocked.push(Blocked {
-                    kind: "std::unordered_map",
-                    path: path.to_string(),
-                    why: "the list sentinel and the 16-slot bucket array are not created (node size and hashing unknown)",
-                });
+                if let Some(g) = self.val(&format!("{path}.graph")) {
+                    // list head, size, bucket vector, mask and maximum index, with the list nodes as blocks of the heap graph
+                    let bytes = self.raw_value(&format!("{path}.graph"), g)?;
+                    if bytes.len() != 0x38 {
+                        return Err(format!("{path}: hash graph has {} bytes, not 56", bytes.len()));
+                    }
+                    buf[8..0x40].copy_from_slice(&bytes);
+                } else {
+                    self.blocked.push(Blocked {
+                        kind: "std::unordered_map",
+                        path: path.to_string(),
+                        why: "the text has no heap graph for it (the list sentinel and the bucket array are not described)",
+                    });
+                }
                 Ok(())
             }
         }
@@ -422,6 +444,19 @@ impl<'a> Builder<'a> {
                     out.extend_from_slice(&(a + n as u64).to_le_bytes());
                     i = next;
                 }
+                b'B' => {
+                    i += 1;
+                    let n = Self::number(s, &mut i)?;
+                    let mut off = 0usize;
+                    if b.get(i) == Some(&b'+') {
+                        i += 1;
+                        let end = s[i..].find(' ').map_or(s.len(), |p| i + p);
+                        off = usize::from_str_radix(&s[i..end], 16).map_err(|e| e.to_string())?;
+                        i = end;
+                    }
+                    let addr = self.block_addr(path, n)?;
+                    out.extend_from_slice(&((addr + off) as u64).to_le_bytes());
+                }
                 b'I' => {
                     let end = s[i..].find(' ').map_or(s.len(), |p| i + p);
                     let rva = usize::from_str_radix(s.get(i + 2..end).ok_or("short I token")?, 16)
@@ -447,6 +482,36 @@ impl<'a> Builder<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// The address of block `n` of the heap graph: made (from the allocator) the first time it is referenced.
+    fn block_addr(&mut self, path: &str, n: usize) -> R<usize> {
+        if let Some(&a) = self.made.get(&n) {
+            return Ok(a);
+        }
+        let (size, _) = *self.graph.get(&n).ok_or_else(|| format!("{path}: block B{n} is not in the text"))?;
+        let addr = self.a.alloc(size).ok_or_else(|| format!("{path}: allocation of block B{n} failed"))?;
+        self.blocks += 1;
+        self.made.insert(n, addr);
+        self.fill.push_back(n);
+        Ok(addr)
+    }
+
+    /// Writes the contents of every block made so far (writing one can make more).
+    fn fill_blocks(&mut self) -> R<()> {
+        while let Some(n) = self.fill.pop_front() {
+            let (size, tokens) = self.graph[&n];
+            let name = format!("@B{n}");
+            let bytes = self.raw_value(&name, tokens)?;
+            if bytes.len() != size {
+                return Err(format!("{name}: {} bytes of tokens for a block of {size}", bytes.len()));
+            }
+            let addr = self.made[&n];
+            if !self.a.write(addr, &bytes) {
+                return Err(format!("{name}: writing the block failed"));
+            }
+        }
+        Ok(())
     }
 
     /// The text between the `[` at `at` and its closing `]`, and the index after it.
@@ -489,6 +554,7 @@ pub fn build(text: &str, image_base: usize, a: &dyn Alloc) -> R<Built> {
 /// [`build`] for the top-level members `select` accepts only (`None`: all of them, and the unnamed bytes too).
 pub fn build_selected(text: &str, image_base: usize, a: &dyn Alloc, select: Option<&dyn Fn(&F) -> bool>) -> R<Built> {
     let mut lines: HashMap<&str, &str> = HashMap::new();
+    let mut graph: HashMap<usize, (usize, &str)> = HashMap::new();
     let mut header_ok = false;
     for l in text.lines() {
         if l.starts_with("=== portable v") {
@@ -500,15 +566,36 @@ pub fn build_selected(text: &str, image_base: usize, a: &dyn Alloc, select: Opti
         } else if l.starts_with("===") {
             continue;
         } else if let Some((p, v)) = l.split_once('\t') {
-            lines.insert(p, v.split('\t').next().unwrap_or(v));
+            if let Some(n) = p.strip_prefix("@B") {
+                // @B<n> TAB size=<bytes> TAB raw:<tokens>
+                let (size, tokens) = v.split_once('\t').ok_or_else(|| format!("bad block line {p}"))?;
+                let size: usize = size
+                    .strip_prefix("size=")
+                    .and_then(|x| x.parse().ok())
+                    .ok_or_else(|| format!("bad size in {p}"))?;
+                graph.insert(n.parse().map_err(|_| format!("bad block number in {p}"))?, (size, tokens));
+            } else {
+                lines.insert(p, v.split('\t').next().unwrap_or(v));
+            }
         }
     }
     if !header_ok {
         return Err("no portable header".into());
     }
-    let mut b = Builder { lines, base: image_base, a, blocked: Vec::new(), blocks: 0, select };
+    let mut b = Builder {
+        lines,
+        base: image_base,
+        a,
+        blocked: Vec::new(),
+        blocks: 0,
+        select,
+        graph,
+        made: HashMap::new(),
+        fill: VecDeque::new(),
+    };
     let mut payload = vec![0u8; PAYLOAD_SIZE];
     b.fields("", &mut payload, PAYLOAD, PAYLOAD_SIZE)?;
+    b.fill_blocks()?;
     Ok(Built { payload, blocked: b.blocked, blocks: b.blocks })
 }
 
@@ -517,6 +604,10 @@ pub fn member_of(path: &str) -> String {
     if path.starts_with('~') {
         return "(unnamed bytes)".into();
     }
+    if path.starts_with("@B") {
+        return "(heap graph)".into();
+    }
+    let path = path.strip_suffix(".graph").unwrap_or(path);
     let head = path.split(['[', '#']).next().unwrap_or(path).trim_end_matches('.');
     let head = head.strip_suffix(".bytes").unwrap_or(head);
     let head = head.split(".~").next().unwrap_or(head);
@@ -537,7 +628,7 @@ pub fn lines_of(text: &str) -> BTreeMap<&str, &str> {
     text.lines()
         .filter(|l| !l.starts_with("==="))
         .filter_map(|l| l.split_once('\t'))
-        .map(|(p, v)| (p, v.split('\t').next().unwrap_or(v)))
+        .map(|(p, v)| if p.starts_with("@B") { (p, v) } else { (p, v.split('\t').next().unwrap_or(v)) })
         .collect()
 }
 
@@ -722,6 +813,10 @@ impl Alloc for Arena {
 }
 
 impl Mem for Arena {
+    fn heap_size(&self, addr: usize) -> Option<usize> {
+        self.blocks.borrow().iter().find(|(s, _)| *s == addr).map(|(_, b)| b.len())
+    }
+
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
         self.blocks.borrow().iter().find_map(|(s, b)| {
             (addr >= *s && addr + len <= *s + b.len()).then(|| b[addr - *s..addr - *s + len].to_vec())
@@ -824,6 +919,70 @@ impl Alloc for EngineAlloc {
     }
 }
 
+/// A payload with engine-style containers that have entries, for the tests: an unordered map with a two-node list and a
+/// bucket vector, and a map with a head and one node, all in the arena (whose blocks count as heap blocks).
+#[cfg(test)]
+pub(crate) mod testgraph {
+    use super::*;
+
+    fn w(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    pub(crate) fn add_containers(arena: &Arena, payload: usize) {
+        // list of the hash: head H, nodes N1 and N2 (next, prev, key, value)
+        let (h, n1, n2) = (arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x30]), arena.add(&[0u8; 0x30]));
+        let link = |a: usize, next: usize, prev: usize, key: u32| {
+            let mut b = vec![0u8; if a == h { 0x18 } else { 0x30 }];
+            w(&mut b, 0, next as u64);
+            w(&mut b, 8, prev as u64);
+            if a != h {
+                b[0x10..0x14].copy_from_slice(&key.to_le_bytes());
+                b[0x18..0x1c].copy_from_slice(&(key + 1).to_le_bytes());
+            }
+            assert!(arena.write(a, &b));
+        };
+        link(h, n1, n2, 0);
+        link(n1, n2, h, 0xffff_fffd);
+        link(n2, h, n1, 0xffff_fffc);
+        // 16 bucket slots (first, last) of node pointers
+        let mut slots = vec![0u8; 0x80];
+        for (i, node) in [n1, n1, n2, n2, h, h].iter().enumerate() {
+            w(&mut slots, i * 8, *node as u64);
+        }
+        let buckets = arena.add(&slots);
+        let mut hash = vec![0u8; 0x40];
+        hash[..4].copy_from_slice(&1.0f32.to_le_bytes());
+        w(&mut hash, 8, h as u64);
+        w(&mut hash, 0x10, 2);
+        w(&mut hash, 0x18, buckets as u64);
+        w(&mut hash, 0x20, (buckets + 0x80) as u64);
+        w(&mut hash, 0x28, (buckets + 0x80) as u64);
+        w(&mut hash, 0x30, 7);
+        w(&mut hash, 0x38, 8);
+        assert!(arena.write(payload + 0x270, &hash));
+        // a map: head (left, parent, right, colour and isnil) and one node
+        let (mh, mn) = (arena.add(&[0u8; 0x50]), arena.add(&[0u8; 0x50]));
+        let mut head = vec![0u8; 0x50];
+        for off in [0, 8, 0x10] {
+            w(&mut head, off, mn as u64);
+        }
+        head[0x18] = 1;
+        head[0x19] = 1;
+        assert!(arena.write(mh, &head));
+        let mut node = vec![0u8; 0x50];
+        for off in [0, 8, 0x10] {
+            w(&mut node, off, mh as u64);
+        }
+        node[0x20..0x24].copy_from_slice(&77u32.to_le_bytes());
+        assert!(arena.write(mn, &node));
+        let mut map = vec![0u8; 0x10];
+        w(&mut map, 0, mh as u64);
+        w(&mut map, 8, 1);
+        assert!(arena.write(payload + 0x2c8, &map));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,10 +1002,19 @@ mod tests {
         a
     }
 
+    /// The arena as plain memory: it cannot tell heap blocks (the graph is off), as for a reader without a heap.
+    struct NoHeap<'a>(&'a Arena);
+    impl Mem for NoHeap<'_> {
+        fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
+            self.0.read(addr, len)
+        }
+    }
+
     fn roundtrip_of(arena: &Arena, at: usize) -> (String, Report) {
-        let text = encode(arena, Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
+        let plain = NoHeap(arena);
+        let text = encode(&plain, Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
         let payload = arena.read(at, PAYLOAD_SIZE).unwrap();
-        let r = roundtrip(&text, &payload, BASE, settings(), arena, arena, &|b| Some(arena.add(b))).expect("rebuilds");
+        let r = roundtrip(&text, &payload, BASE, settings(), arena, &plain, &|b| Some(arena.add(b))).expect("rebuilds");
         (text, r)
     }
 
@@ -920,6 +1088,37 @@ mod tests {
         assert_eq!(member_of("segmentTags.bytes"), "segmentTags");
         assert_eq!(member_of("~0x35a"), "(unnamed bytes)");
         assert_eq!(member_of("proposal.edgeObjectsToAdd.#"), "proposal.edgeObjectsToAdd");
+    }
+
+    #[test]
+    fn containers_with_entries_are_followed_as_a_heap_graph_and_rebuilt_isomorphic() {
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        super::testgraph::add_containers(&arena, at);
+        let text = encode(&arena, Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
+        // the construction's name string, the hash list (head, two nodes, the bucket array) and the map (head, one node) are blocks
+        assert_eq!(text.lines().filter(|l| l.starts_with("@B")).count(), 7, "{text}");
+        assert!(text.contains("old2new.graph	raw:B2 w:0000000000000002 B"), "{text}");
+        assert!(text.contains("parcelsMap.graph	raw:B"), "{text}");
+        let payload = arena.read(at, PAYLOAD_SIZE).unwrap();
+        let r =
+            roundtrip(&text, &payload, BASE, settings(), &arena, &arena, &|b| Some(arena.add(b))).expect("rebuilds");
+        // no container is blocked any more; what differs is only what the synthetic construction's pointer leaves
+        assert!(!r.text.contains("BLOCKED std::map") || r.text.contains("BLOCKED std::map x6"), "{}", r.text);
+        assert!(!r.text.contains("DIFF  old2new") && !r.text.contains("DIFF  parcelsMap"), "{}", r.text);
+        assert!(r.text.contains("MATCH old2new") && r.text.contains("MATCH parcelsMap"), "{}", r.text);
+        // the rebuilt graph is a different set of blocks with the same shape
+        let rebuilt = build(&text, BASE, &arena).unwrap();
+        let (old, new) = (u64_at(&payload, 0x270 + 8), u64_at(&rebuilt.payload, 0x270 + 8));
+        assert_ne!(old, new);
+        let head = arena.read(new as usize, 0x18).unwrap();
+        let (first, last) = (u64_at(&head, 0) as usize, u64_at(&head, 8) as usize);
+        let n1 = arena.read(first, 0x30).unwrap();
+        assert_eq!(u64_at(&n1, 8), new, "the first node points back to the head");
+        assert_eq!(u32::from_le_bytes(n1[0x10..0x14].try_into().unwrap()), 0xffff_fffd);
+        let n2 = arena.read(last, 0x30).unwrap();
+        assert_eq!(u64_at(&n2, 0), new, "the last node points on to the head");
+        assert_eq!(u64_at(&n1, 0) as usize, last);
     }
 
     #[test]

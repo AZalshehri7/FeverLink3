@@ -109,6 +109,12 @@ impl Settings {
 /// A reader that never faults: `None` when any byte is not readable.
 pub trait Mem {
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>>;
+
+    /// The size of the heap allocation that STARTS at `addr`, when `addr` is the start of a live block of the process heap
+    /// (the engine's `operator new` is the CRT's, i.e. the process heap). `None` for anything else, and for readers that cannot say.
+    fn heap_size(&self, _addr: usize) -> Option<usize> {
+        None
+    }
 }
 
 /// `want` bytes at `addr`, or as many as are readable up to the end of the page, or nothing.
@@ -134,6 +140,28 @@ impl Mem for LiveMem {
         }
         // SAFETY: `mem::read` asks the OS whether the range is committed and readable before it copies.
         unsafe { crate::mem::read(addr as *const u8, len) }.ok()
+    }
+
+    fn heap_size(&self, addr: usize) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapSize, HeapValidate};
+        // allocations are 16-byte aligned on x64; the header sits just before the block, so it must be readable too
+        // SAFETY: readable only asks the OS about the range.
+        if addr < 0x1_0000
+            || !addr.is_multiple_of(16)
+            || !unsafe { crate::mem::readable((addr - 16) as *const u8, 16 + 8) }
+        {
+            return None;
+        }
+        // SAFETY: HeapValidate and HeapSize only inspect the block header of the pointer they are given and answer FALSE or
+        // -1 for something that is not a block of this heap.
+        unsafe {
+            let heap = GetProcessHeap();
+            if heap.is_null() || HeapValidate(heap, 0, addr as *const core::ffi::c_void) == 0 {
+                return None;
+            }
+            let n = HeapSize(heap, 0, addr as *const core::ffi::c_void);
+            (n != usize::MAX && n > 0).then_some(n)
+        }
     }
 }
 
