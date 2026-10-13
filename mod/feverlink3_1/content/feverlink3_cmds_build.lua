@@ -755,13 +755,17 @@ local function newCapture(ctx, opts)
 
 	function cap.edge(id)
 		if type(id) ~= "number" then fail("a segment reference is not an entity id") end
-		if id < 0 then return id end
 		if cap.alias["e" .. id] then return cap.alias["e" .. id] end
 		local m = cap.memo["e" .. id]
 		if m then return m end
 		local info = A.edgeInfo(id) or cap.known.edges[id]
+		-- A negative id is a placeholder of the proposal, except where the proposal's own record of a segment it removes
+		-- (learnRemoved) carries it: the real session 2026-10-13-a listed a bus stop's removed segment as -39433 and the
+		-- peer got a bare number where a reference by ends belongs ("removed segment 1: bad reference"). Why the id is
+		-- negative: unproven.
+		if id < 0 and not info then return id end
 		if not info then fail("segment " .. id .. " has no ends") end
-		m = { __ref = "edge", key = cap.keyOf and cap.keyOf(id) or nil, p0 = copyXYZ(info.p0), p1 = copyXYZ(info.p1),
+		m = { __ref = "edge", key = id >= 0 and cap.keyOf and cap.keyOf(id) or nil, p0 = copyXYZ(info.p0), p1 = copyXYZ(info.p1),
 			t0 = info.t0 and copyXYZ(info.t0) or nil, t1 = info.t1 and copyXYZ(info.t1) or nil }
 		cap.memo["e" .. id] = m
 		return m
@@ -1053,6 +1057,16 @@ local function indexWorldObjects(ids, cap)
 	end
 end
 
+-- Last resort for a removed segment that is still a bare negative id: a stop (or signal) replaces its segment by one
+-- with the same ends and tangents, so the single added segment names the single removed one.
+local function removedEdgeFromAdded(rec)
+	if #rec.rmSegs ~= 1 or #rec.segs ~= 1 or type(rec.rmSegs[1]) ~= "number" or rec.rmSegs[1] >= 0 then return end
+	local c = rec.segs[1].c
+	if type(c) ~= "table" or not c.p0 or not c.p1 then return end
+	rec.rmSegs[1] = { __ref = "edge", p0 = copyXYZ(c.p0), p1 = copyXYZ(c.p1),
+		t0 = c.t0 and copyXYZ(c.t0) or nil, t1 = c.t1 and copyXYZ(c.t1) or nil }
+end
+
 local function captureRecord(proposal, cap)
 	local flavor = flavorOf(proposal)
 	if not flavor then fail("not a proposal (neither streetProposal nor proposal / toAdd found)") end
@@ -1114,6 +1128,7 @@ local function captureRecord(proposal, cap)
 		end
 		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(idOf(n)) end
 		for i, s in ipairs(A.list(st, names.segs)) do rec.segs[i] = readSegment(s, cap) end
+		removedEdgeFromAdded(rec)
 		local ownEdge = {}
 		for _, sg in ipairs(rec.segs) do
 			if ownTemplate(sg.c and sg.c.roadTemplate) and type(sg.id) == "number" then ownEdge[sg.id] = true end
@@ -1828,7 +1843,8 @@ PLAN.stop = function(rec, R, f, notes, form)
 	req(c, "position1", A.vec3(info.p1.x, info.p1.y, info.p1.z))
 	req(c, "objects", keep)
 	req(e, "comp", c)
-	local eos, removeIds = {}, {}
+	local eos, removeIds, cfgs = {}, {}, {}
+	for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, R) end
 	for i, o in ipairs(rec.objs) do eos[i] = newEdgeObject(o, R, -1, notes, form) end
 	for id in pairs(gone) do removeIds[#removeIds + 1] = id end
 	table.sort(removeIds)
@@ -1842,6 +1858,10 @@ PLAN.stop = function(rec, R, f, notes, form)
 		req(ssp, "edgeObjectsToAdd", eos)
 		if #removeIds > 0 then req(ssp, "edgeObjectsToRemove", removeIds) end
 		if #nodeCfg > 0 then opt(notes, ssp, "nodeConfigsToRemove", nodeCfg) end
+		-- the stop build removes the junction configurations of the segment's two ends and adds new ones; a replay that
+		-- does not add them leaves the junctions short (finding from MPFever (MIT)). The record's own placeholder for the
+		-- segment is -1, the same as here.
+		if #cfgs > 0 then opt(notes, ssp, "nodeConfigsToAdd", cfgs) end
 	end)
 	return commandArgs(sp, newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
 end

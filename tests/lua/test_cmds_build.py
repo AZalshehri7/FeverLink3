@@ -815,6 +815,19 @@ function NATIVE_SIGNAL(spec)
   return P
 end
 
+-- The proposal as it reads after the build when the removed segment is listed by a negative id (the real session
+-- 2026-10-13-a: -39433): still as a record with its comp (negative = true), or as a bare number ('bare').
+function NEGATE_REMOVED(P, how)
+  local sp = P.proposal
+  local r = sp.removedSegments[1]
+  if how == 'bare' then
+    sp.removedSegments = { -r.entity }
+  else
+    sp.removedSegments = { D("SegmentAndEntity", { entity = -r.entity, comp = r.comp, type = r.type }) }
+  end
+  P.proposal = sp
+end
+
 -- a stop the way a script places one: the segment replaced by itself with one more object, whose model it names
 function SIMPLE_STOP(spec)
   local w = WORLD[spec.edge]
@@ -1579,6 +1592,26 @@ class BuildTest(unittest.TestCase):
         self.tick(12)
         self.assertSameWorld()
         self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig(), "the signal that was there stays, the new one is added")
+
+    def _negative_removed_segment(self, how):
+        # real session 2026-10-13-a: the guest's bus stop shipped rmSegs = { -39433 } and the host refused "removed segment 1:
+        # bad reference". The mock has no native stop, so this covers the capture and the replay of the record, not the engine.
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; local ok, created = APPLY_BUILD(SIGNAL_P); SIGNAL_CREATED = created; NEGATE_REMOVED(SIGNAL_P, '%s')" % how)
+        body = self.B.lua("CAPTURE_BODY(SIGNAL_P, SIGNAL_CREATED)")
+        self.assertIsInstance(body, str, body)
+        self.assertNotRegex(body, r'rmSegs\\?"\]=\{\[1\]=-', "the removed segment travels as a reference")
+        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.A.time() + 6 * STEP, "seq": 1, "body": body, "from": 1}))
+        self.tick(12)
+        self.assertNotIn("bad reference", self.A.log())
+        self.assertSameWorld()
+        self.assertIn("[signal/signal_a.mdl@0.250k2;signal/signal_a.mdl@0.750k2]", self.A.sig())
+
+    def test_a_removed_segment_listed_as_a_negative_id_with_its_record_is_named_by_its_ends(self):
+        self._negative_removed_segment("record")
+
+    def test_a_removed_segment_listed_as_a_bare_negative_id_is_named_by_the_added_segment(self):
+        self._negative_removed_segment("bare")
 
     def test_a_signal_is_bulldozed_and_the_one_the_session_added_stays(self):
         self.start()
