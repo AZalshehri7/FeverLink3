@@ -263,6 +263,10 @@ impl<'a> Builder<'a> {
                     .and_then(|x| x.parse().ok())
                     .ok_or_else(|| format!("{path}: {v}"))?;
                 buf[8..16].copy_from_slice(&size.to_le_bytes());
+                if size == 0 {
+                    // an empty container is the engine's own: its constructor makes the sentinel, nothing is described or blocked
+                    return Ok(());
+                }
                 if let Some(g) = self.val(&format!("{path}.graph")) {
                     // the head pointer and the size, with the tree's nodes made as blocks of the heap graph
                     let bytes = self.raw_value(&format!("{path}.graph"), g)?;
@@ -290,6 +294,9 @@ impl<'a> Builder<'a> {
                 let load = hex32(v.split("load=").nth(1).ok_or("load")?)?;
                 buf[0..4].copy_from_slice(&load.to_le_bytes());
                 buf[0x10..0x18].copy_from_slice(&size.to_le_bytes());
+                if size == 0 {
+                    return Ok(());
+                }
                 if let Some(g) = self.val(&format!("{path}.graph")) {
                     // list head, size, bucket vector, mask and maximum index, with the list nodes as blocks of the heap graph
                     let bytes = self.raw_value(&format!("{path}.graph"), g)?;
@@ -1050,8 +1057,8 @@ mod tests {
         assert_eq!(r.text.matches("DIFF").count(), 1, "{}", r.text);
         // the heap pointer inside the construction and the containers the table cannot create
         assert!(r.text.contains("BLOCKED heap pointer x1"), "{}", r.text);
-        assert!(r.text.contains("BLOCKED std::map x7"), "{}", r.text);
-        assert!(r.text.contains("BLOCKED std::unordered_map x"), "{}", r.text);
+        // empty engine containers are the engine's own: not blocked
+        assert!(!r.text.contains("BLOCKED std::map") && !r.text.contains("BLOCKED std::unordered_map"), "{}", r.text);
         assert!(!r.exact);
     }
 

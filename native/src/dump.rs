@@ -117,6 +117,16 @@ pub trait Mem {
         None
     }
 
+    /// One line about what the reader knows of the heap (for the logs).
+    fn heap_summary(&self) -> String {
+        "no heap index".into()
+    }
+
+    /// Where `addr` lies relative to the blocks the reader knows (for the logs): nothing is asked about `addr` itself.
+    fn heap_near(&self, _addr: usize) -> String {
+        String::new()
+    }
+
     /// Brings what the reader knows about the heap up to date (blocks made since the last call). Called before a text is written.
     fn refresh(&self) {}
 }
@@ -234,6 +244,35 @@ impl Mem for LiveHeapMem {
 
     fn refresh(&self) {
         self.walk();
+    }
+
+    fn heap_summary(&self) -> String {
+        let index = self.index.borrow();
+        format!(
+            "heap index: {} busy blocks{}, from {:#x} to {:#x}",
+            index.len(),
+            if self.truncated.get() { " (TRUNCATED at the capacity)" } else { "" },
+            index.first().map_or(0, |b| b.0),
+            index.last().map_or(0, |b| b.0 + b.1)
+        )
+    }
+
+    fn heap_near(&self, addr: usize) -> String {
+        let index = self.index.borrow();
+        let i = index.partition_point(|&(start, _)| start <= addr);
+        let below = i.checked_sub(1).map(|k| index[k]);
+        let above = index.get(i).copied();
+        let fmt = |b: Option<(usize, usize)>| b.map_or("none".to_string(), |(s, n)| format!("[{s:#x}, +{n:#x})"));
+        format!(
+            "block at or below {}, next block {}{}",
+            fmt(below),
+            fmt(above),
+            match below {
+                Some((s, n)) if addr < s + n => ", so it is INSIDE that block (not its start)",
+                Some(_) => ", so it is in no known block",
+                None => "",
+            }
+        )
     }
 }
 

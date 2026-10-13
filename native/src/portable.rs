@@ -20,7 +20,7 @@
 //! does not fit the table) is refused with a reason, never guessed. The text carries no heap address, so two games
 //! that built the same thing produce the same text except where the games differ.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -276,9 +276,9 @@ impl Settings {
             max_depth: 6,
             // the graph walks the heap once per text (HeapWalk): on for the rebuild checks and the engine copy, opt-in for the plain dump
             graph: get(GRAPH_VAR).map_or(var != PORTABLE_VAR, |v| v.trim() != "0"),
-            max_graph_blocks: 4096,
+            max_graph_blocks: 32_768,
             max_graph_block_bytes: 1 << 20,
-            max_graph_bytes: 8 << 20,
+            max_graph_bytes: 16 << 20,
         })
     }
 }
@@ -306,6 +306,21 @@ pub struct Stats {
 pub struct Portable {
     pub text: String,
     pub stats: Stats,
+    /// Where the heap graph's blocks were first reached from: (member, blocks, bytes), the largest first.
+    pub origins: Vec<(String, usize, usize)>,
+    /// The first pointers that stayed `P`: (member they were found in, address). Addresses are for diagnostics only; they are
+    /// not in the text.
+    pub unresolved: Vec<(String, usize)>,
+}
+
+/// True for the lines of a portable text that are not named members: padding gaps, unregistered regions of the table
+/// (`Raw` members), the heap graph and the graph of an engine container. Their bytes may differ between two equal objects.
+pub fn is_unnamed_path(path: &str) -> bool {
+    path.starts_with('~')
+        || path.contains(".~")
+        || path.starts_with("@B")
+        || path.ends_with(".graph")
+        || PAYLOAD.iter().any(|f| matches!(f.ty, Ty::Raw(_)) && f.name == path)
 }
 
 pub struct Header<'a> {
@@ -335,15 +350,18 @@ struct Enc<'a> {
     raw_spent: usize,
     /// the heap graph: blocks reached by pointers, in the order they were found (block `n` is `blocks[n - 1]`)
     blocks: Vec<Blk>,
-    by_addr: HashMap<usize, usize>,
+    by_addr: BTreeMap<usize, usize>,
     graph_bytes: usize,
+    /// the member being written (or the member a block was reached from), for the graph's accounting
+    origin: String,
+    unresolved: Vec<(String, usize)>,
     /// inside an engine container's words and the blocks behind them: a pointer is a block of the graph or a `P`, never guessed as a range or vector
     container_mode: bool,
 }
 
 struct Blk {
-    addr: usize,
     bytes: Vec<u8>,
+    origin: String,
 }
 
 type R<T> = Result<T, String>;
@@ -458,6 +476,7 @@ impl Enc<'_> {
     }
 
     fn field(&mut self, path: &str, ty: Ty, b: &[u8], depth: usize) -> R<()> {
+        self.origin = crate::rebuild::member_of(path);
         match ty {
             Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => self.scalar(path, ty, b),
             Ty::Str => {
@@ -548,9 +567,9 @@ impl Enc<'_> {
         if let Some(&n) = self.by_addr.get(&p) {
             return Some(format!("B{n}"));
         }
-        for (i, b) in self.blocks.iter().enumerate() {
-            if p > b.addr && p <= b.addr + b.bytes.len() {
-                return Some(format!("B{}+{:x}", i + 1, p - b.addr));
+        if let Some((&a, &n)) = self.by_addr.range(..p).next_back() {
+            if p <= a + self.blocks[n - 1].bytes.len() {
+                return Some(format!("B{n}+{:x}", p - a));
             }
         }
         let size = self.mem.heap_size(p)?;
@@ -563,7 +582,8 @@ impl Enc<'_> {
         }
         let bytes = self.mem.read(p, size)?;
         self.graph_bytes += size;
-        self.blocks.push(Blk { addr: p, bytes });
+        let origin = self.origin.clone();
+        self.blocks.push(Blk { bytes, origin });
         let n = self.blocks.len();
         self.by_addr.insert(p, n);
         Some(format!("B{n}"))
@@ -608,6 +628,7 @@ impl Enc<'_> {
     }
 
     fn gap_named(&mut self, name: &str, bytes: &[u8], from: usize, to: usize, depth: usize) -> R<()> {
+        self.origin = crate::rebuild::member_of(name);
         let part = &bytes[from..to];
         if part.iter().all(|&b| b == 0) {
             return Ok(());
@@ -736,6 +757,9 @@ impl Enc<'_> {
                 }
                 if self.mem.read(p, 1).is_some() {
                     self.stats.heap_ptrs += 1;
+                    if self.unresolved.len() < 8 {
+                        self.unresolved.push((self.origin.clone(), p));
+                    }
                     toks.push("P".into());
                     i += 1;
                     continue;
@@ -785,8 +809,10 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         pos: HashMap::new(),
         raw_spent: 0,
         blocks: Vec::new(),
-        by_addr: HashMap::new(),
+        by_addr: BTreeMap::new(),
         graph_bytes: 0,
+        origin: String::new(),
+        unresolved: Vec::new(),
         container_mode: false,
     };
     // pass 1: where the elements say their entities are
@@ -813,6 +839,7 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
     while done < e.blocks.len() {
         let bytes = e.blocks[done].bytes.clone();
         e.container_mode = true;
+        e.origin = e.blocks[done].origin.clone();
         let tokens = e.raw_tokens(&bytes, 1)?;
         e.container_mode = false;
         let _ = writeln!(block_lines, "@B{}\tsize={}\traw:{}", done + 1, bytes.len(), tokens);
@@ -839,10 +866,18 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         head.payload
     );
     text.push_str(&e.out);
+    let mut by_origin: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for b in &e.blocks {
+        let o = by_origin.entry(b.origin.clone()).or_default();
+        o.0 += 1;
+        o.1 += b.bytes.len();
+    }
+    let mut origins: Vec<(String, usize, usize)> = by_origin.into_iter().map(|(k, (n, by))| (k, n, by)).collect();
+    origins.sort_by_key(|o| std::cmp::Reverse(o.2));
     let s = e.stats;
     let _ = writeln!(
         text,
-        "=== end portable #{} lines={} strings={} vectors={} heap_ptrs_not_followed={} unlocated_refs={} unread_entries={} blocks={} block_bytes={} graph_truncated={} ===",
+        "=== end portable #{} lines={} strings={} vectors={} heap_ptrs_not_followed={} unlocated_refs={} unread_entries={} blocks={} block_bytes={} graph_truncated={} origins=[{}] ===",
         head.seq,
         s.lines,
         s.strings,
@@ -852,9 +887,10 @@ pub fn encode(mem: &dyn Mem, env: Env, set: Settings, build: &str, head: &Header
         s.unread_entries,
         s.blocks,
         s.block_bytes,
-        s.graph_truncated
+        s.graph_truncated,
+        origins.iter().take(6).map(|(m, n, b)| format!("{m}:{n}/{b}")).collect::<Vec<_>>().join(" ")
     );
-    Ok(Portable { text, stats: s })
+    Ok(Portable { text, stats: s, origins, unresolved: e.unresolved })
 }
 
 // ---------------------------------------------------------------------------------------------------------------

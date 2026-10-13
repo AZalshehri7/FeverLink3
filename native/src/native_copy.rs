@@ -129,6 +129,16 @@ pub struct Ctx<'a> {
     pub build_name: &'a str,
 }
 
+/// The entry count the text gives for an engine container (`map:size=N` or `hash:size=N,...`), 0 when it has no line.
+pub fn container_entries(lines: &std::collections::BTreeMap<&str, &str>, name: &str) -> u64 {
+    lines
+        .get(name)
+        .and_then(|v| v.split("size=").nth(1))
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// True for the text of an unnamed region that the rebuild can make completely: no `P` (a pointer to something the text does not
 /// describe) in it. Words, zero runs, image offsets, strings, vectors and references to blocks of the heap graph are fine.
 pub fn raw_is_plain(value: &str) -> bool {
@@ -146,7 +156,7 @@ fn split_diff(a: &str, b: &str) -> (usize, usize, usize, usize, Vec<String>) {
     let mut first: Vec<String> = Vec::new();
     for p in paths {
         // unnamed: padding gaps, and the heap graph behind container pointers (node padding differs on every run)
-        let unnamed = p.starts_with('~') || p.contains(".~") || p.starts_with("@B") || p.ends_with(".graph");
+        let unnamed = portable::is_unnamed_path(p);
         let same = x.get(p) == y.get(p);
         match (unnamed, same) {
             (false, true) => named_eq += 1,
@@ -205,13 +215,14 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
     };
     let head =
         Header { seq: 0, event: "held", hold_id: None, site_rva: None, tool: None, t_ms: 0, wall_ms: 0, payload: src };
-    let src_text = match portable::encode(c.mem, Env { image_base: c.base }, c.set, c.build_name, &head) {
-        Ok(p) => p.text,
-        Err(e) => {
-            put(&mut out, &format!("REFUSED: the held command cannot be written as portable text: {e}"));
-            return out;
-        }
-    };
+    let (src_text, src_origins, src_unresolved) =
+        match portable::encode(c.mem, Env { image_base: c.base }, c.set, c.build_name, &head) {
+            Ok(p) => (p.text, p.origins, p.unresolved),
+            Err(e) => {
+                put(&mut out, &format!("REFUSED: the held command cannot be written as portable text: {e}"));
+                return out;
+            }
+        };
     let Some(src_bytes) = c.mem.read(src, PAYLOAD_SIZE) else {
         put(&mut out, "REFUSED: the held payload is not readable");
         return out;
@@ -310,8 +321,12 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
             return true;
         }
         match f.ty {
-            // an engine container is rebuilt from the text when the text has its heap graph; otherwise the engine's empty one stays
-            Ty::Map | Ty::Hash => lines.contains_key(format!("{}.graph", f.name).as_str()),
+            // an engine container is the engine's own: the constructor makes it and the copy re-creates it. Only a container that has
+            // entries is rebuilt from the text (its graph); an empty one stays as the engine made it, its sentinel pointers are not
+            // part of the value
+            Ty::Map | Ty::Hash => {
+                container_entries(&lines, f.name) > 0 && lines.contains_key(format!("{}.graph", f.name).as_str())
+            }
             Ty::Skip(_) => false,
             Ty::Raw(_) => lines.get(f.name).is_some_and(|v| raw_is_plain(v)),
             _ => true,
@@ -336,6 +351,25 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
         let first = unresolved.first().map_or(String::new(), |b| b.path.clone());
         c.alloc.free_all();
         put(&mut out, &format!("  text: {}", src_text.lines().last().unwrap_or("")));
+        put(&mut out, &format!("  {}", c.mem.heap_summary()));
+        let ent: Vec<String> = lines
+            .keys()
+            .filter(|k| k.ends_with(".graph"))
+            .filter_map(|k| {
+                let name = &k[..k.len() - 6];
+                let n = container_entries(&lines, name);
+                (n > 0).then(|| format!("{name} has {n} entries"))
+            })
+            .collect();
+        if !ent.is_empty() {
+            put(&mut out, &format!("  containers with entries: {}", ent.join(", ")));
+        }
+        let origins: Vec<String> =
+            src_origins.iter().take(6).map(|(m, n, b)| format!("{m} {n} blocks/{b} bytes")).collect();
+        put(&mut out, &format!("  heap graph reached from: {}", origins.join("; ")));
+        for (member, addr) in src_unresolved.iter().take(6) {
+            put(&mut out, &format!("  pointer {addr:#x} in {member} stayed P: {}", c.mem.heap_near(*addr)));
+        }
         put(
             &mut out,
             &format!("STEP 3: SKIPPED, {n} heap pointers in the text cannot be resolved ({}; first at {first}); copying a null where the engine expects an object could crash the game", members.join(", ")),
@@ -578,9 +612,14 @@ mod tests {
             let text = run(&ctx, at, &mut |_| {});
             WORLD.with(|w| w.set(core::ptr::null()));
             assert!(text.contains("STEP 2: MATCH"), "dump #{n}: {text}");
-            // this model is a text dump of memory without heap sizes, so the engine containers' pointers stay `P` and step 3 is
-            // refused with its reason; the mechanism with a heap is tested on the synthetic world
-            assert!(text.contains("STEP 3: SKIPPED"), "dump #{n}: {text}");
+            // this model is a text dump of memory without heap sizes: the engine containers are all empty on the road, the rail
+            // track and the house bulldozing, so they stay the engine's and the source is built from the text and equals the
+            // held command; the stop pair and the stop bulldozing have node-config pointers the model cannot resolve
+            if [1, 13, 19].contains(&n) {
+                assert!(text.contains("STEP 3: MATCH"), "dump #{n}: {text}");
+            } else {
+                assert!(text.contains("STEP 3: SKIPPED"), "dump #{n}: {text}");
+            }
             let _ = std::fmt::Write::write_fmt(
                 &mut all,
                 format_args!(
