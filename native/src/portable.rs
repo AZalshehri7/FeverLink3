@@ -251,9 +251,30 @@ pub struct Settings {
     pub max_graph_blocks: usize,
     pub max_graph_block_bytes: usize,
     pub max_graph_bytes: usize,
+    /// Input level (what a SimpleProposal is made of): only the members the table names, no unnamed bytes, no raw blobs, no container
+    /// graphs. The text the mod rebuilds a build from (`input.rs`).
+    pub input_level: bool,
 }
 
 impl Settings {
+    /// The settings of the input-level text that goes to the mod with every held build command.
+    pub fn input_level() -> Settings {
+        Settings {
+            scripts: false,
+            max_commands: u32::MAX,
+            max_file_bytes: u64::MAX,
+            max_text_bytes: 1 << 20,
+            max_block_bytes: 8 << 20,
+            max_elems: 20_000,
+            max_depth: 6,
+            graph: false,
+            max_graph_blocks: 0,
+            max_graph_block_bytes: 0,
+            max_graph_bytes: 0,
+            input_level: true,
+        }
+    }
+
     /// `None` unless the variable is `1` or `3`.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Settings> {
         Settings::from_var(get, PORTABLE_VAR)
@@ -279,6 +300,7 @@ impl Settings {
             max_graph_blocks: 32_768,
             max_graph_block_bytes: 1 << 20,
             max_graph_bytes: 16 << 20,
+            input_level: false,
         })
     }
 }
@@ -522,7 +544,7 @@ impl Enc<'_> {
                 let block = self.vec_block(b, 1, path)?;
                 self.stats.vectors += 1;
                 self.line(&format!("{path}.bytes"), &format!("n:{}", block.len()))?;
-                if block.iter().any(|&x| x != 0) {
+                if !self.set.input_level && block.iter().any(|&x| x != 0) {
                     let t = self.raw_tokens(&block, depth + 1)?;
                     self.line(&format!("{path}.raw"), &format!("raw:{t}"))?;
                 }
@@ -545,7 +567,7 @@ impl Enc<'_> {
 
     /// The words of an engine container written structurally (`path.graph`): its pointers become blocks of the heap graph.
     fn container_graph(&mut self, path: &str, bytes: &[u8], depth: usize) -> R<()> {
-        if bytes.iter().all(|&x| x == 0) {
+        if self.set.input_level || bytes.iter().all(|&x| x == 0) {
             return Ok(());
         }
         let was = std::mem::replace(&mut self.container_mode, true);
@@ -628,6 +650,9 @@ impl Enc<'_> {
     }
 
     fn gap_named(&mut self, name: &str, bytes: &[u8], from: usize, to: usize, depth: usize) -> R<()> {
+        if self.set.input_level {
+            return Ok(());
+        }
         self.origin = crate::rebuild::member_of(name);
         let part = &bytes[from..to];
         if part.iter().all(|&b| b == 0) {
@@ -1240,6 +1265,24 @@ mod tests {
         );
         assert!(l.last().unwrap().starts_with("=== end portable #1"));
         assert_eq!(p.stats.heap_ptrs, 1);
+    }
+
+    #[test]
+    fn the_input_level_text_has_the_named_members_and_nothing_structural() {
+        let (mem, at) = synthetic();
+        let full = encode(&mem, Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes");
+        let p = encode(&mem, Env { image_base: BASE }, Settings::input_level(), "40420", &head(at)).expect("encodes");
+        let l = lines(&p);
+        for named in [
+            "proposal.addedNodes.#	n:2",
+            "toAdd[0].fileName	res:\"depots/road/road_depot/road_depot.con\"",
+            "toRemove.#	n:2",
+            "context.gatherBuildings	u8:01",
+        ] {
+            assert!(l.contains(&named), "{named} missing in {}", p.text);
+        }
+        assert!(!p.text.lines().skip(1).any(|x| x.contains("	raw:") || x.contains(".~")), "{}", p.text);
+        assert!(p.text.len() < full.text.len(), "the construction's description is not carried");
     }
 
     #[test]

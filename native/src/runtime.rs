@@ -97,6 +97,8 @@ pub struct Runtime {
     portable: OnceLock<portable::Sink>,
     /// The dev-only rebuild self-check (`FEVERLINK3_PORTABLE_REBUILD`); unset in a normal run.
     rebuild: OnceLock<portable::Sink>,
+    /// The input-level text of every held build command, for the mod (`input.rs`).
+    input: crate::input::InputOut,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
 }
@@ -144,6 +146,7 @@ impl Runtime {
             portable: OnceLock::new(),
             rebuild: OnceLock::new(),
             native_copy: OnceLock::new(),
+            input: crate::input::InputOut::default(),
         }
     }
 
@@ -238,6 +241,33 @@ impl Runtime {
     }
 
     /// The portable text of the payload at `payload` (or why it is refused) into the portable file.
+    /// The input-level text of the build command at `payload`; `None` (and a line in the log) when the layout table refuses it.
+    fn input_text(&self, payload: usize) -> Option<String> {
+        let head = portable::Header {
+            seq: 0,
+            event: "input",
+            hold_id: None,
+            site_rva: None,
+            tool: None,
+            t_ms: self.now_ms(),
+            wall_ms: 0,
+            payload,
+        };
+        match portable::encode(
+            &LiveMem,
+            Env { image_base: self.base },
+            portable::Settings::input_level(),
+            self.build.name,
+            &head,
+        ) {
+            Ok(p) => Some(p.text),
+            Err(why) => {
+                self.say(&format!("input: the layout table refuses this command: {why}"));
+                None
+            }
+        }
+    }
+
     fn portable_payload(&self, event: &str, payload: usize, hold_id: Option<u64>, site: Option<u32>) {
         let Some(sink) = self.portable.get() else { return };
         if !sink.has_dir() {
@@ -421,6 +451,7 @@ impl Runtime {
         }
         *lock(&self.reader) = Some(reader);
         *lock(&self.writer) = Some(Writer { events, failed_logged: false });
+        self.input.set_dir(dir);
         if let Some(d) = self.dump.get() {
             d.set_dir(dir);
         }
@@ -626,8 +657,15 @@ impl Runtime {
                         } else {
                             None
                         };
+                        // the input-level text of the same command (what a SimpleProposal is made of), for the mod
+                        let input = flags.is_some().then(|| self.input_text(payload)).flatten();
                         match machine.hold_with(kind, rva, done, flags, held, now) {
                             Ok(id) => {
+                                if let Some(text) = &input {
+                                    if let Err(e) = self.input.write(id, text) {
+                                        self.say(&format!("input: cannot write {}: {e}", crate::input::file_name(id)));
+                                    }
+                                }
                                 plan.held_here = true;
                                 if (self.dump.get().is_some()
                                     || self.portable.get().is_some()
