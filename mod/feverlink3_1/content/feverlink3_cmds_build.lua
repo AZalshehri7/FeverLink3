@@ -1114,7 +1114,34 @@ local function captureRecord(proposal, cap)
 		for i, id in ipairs(rmSegIds) do
 			-- (read after the build, a removed segment of the stop tool arrived as the NEGATIVE of its entity id: -33244 in a real record,
 			-- which no other game can resolve; it is the existing segment)
-			if type(id) == "number" and id < -1000 and (A.edgeInfo(-id) or cap.known.edges[-id]) then id = -id; rmSegIds[i] = id end
+			-- (Sweep runs 20261013-060028 B3 and -074329 B1: the number is the bitwise NOT of the id, -id - 1, not -id: the record named the next
+			-- entity, a different edge, and the replay removed a segment elsewhere; the probe reported 39879 where the record said s:39880. Both
+			-- readings are tried; with one segment added the one whose ends are the added segment's ends wins, otherwise -id - 1.)
+			if type(id) == "number" and id < -1000 then
+				local function exists(e) return A.edgeInfo(e) or cap.known.edges[e] end
+				local notId, negId = -id - 1, -id
+				local pick
+				if exists(notId) and exists(negId) then
+					local added = A.list(st, names.segs)
+					if #added == 1 then
+						local c = get(added[1], "comp")
+						local function ends(e)
+							local inf = A.edgeInfo(e)
+							return inf and { inf.p0, inf.p1 } or nil
+						end
+						local a0, a1 = c and A.xyz(get(c, "position0")), c and A.xyz(get(c, "position1"))
+						local function near(p, q) return p and q and abs(p.x - q.x) <= 1.5 and abs(p.y - q.y) <= 1.5 end
+						for _, cand in ipairs({ notId, negId }) do
+							local e = ends(cand)
+							if e and a0 and a1 and ((near(e[1], a0) and near(e[2], a1)) or (near(e[1], a1) and near(e[2], a0))) then pick = cand break end
+						end
+					end
+					pick = pick or notId
+				else
+					pick = exists(notId) and notId or (exists(negId) and negId or nil)
+				end
+				if pick then id = pick; rmSegIds[i] = id end
+			end
 			-- a removed segment also says what kind of segment it was (normal, bridge, tunnel ...): a replacement by another
 			-- kind is not an upgrade the engine's replaceSegment can make
 			local ref = cap.edge(id)

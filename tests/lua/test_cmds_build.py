@@ -2169,6 +2169,26 @@ class PureBuildTest(unittest.TestCase):
         self.assertIn("NO edge with these ends in this game", before)
         self.assertRegex(after, r"edge \d+ type=\S+ typeIndex=\S+ roadType=\S+ p0=300\.000,0\.000,0\.000 p1=400\.000,0\.000,0\.000")
 
+    def test_a_removed_segment_that_arrives_as_the_bitwise_not_of_its_id_is_the_edge_it_names_not_the_next_one(self):
+        # sweep run 20261013-074329 (B1): read after the build, the stop tool's removed segment 39879 came as -39880; taken as -id it was the edge
+        # 39880 elsewhere and the replay removed that one
+        code = """(function()
+            ADD_EDGE(5000, 100, 101, 0, 'street/new_medium_road.street_template')
+            ADD_EDGE(5001, 101, 102, 0, 'street/new_medium_road.street_template')
+            local M, C, ctx = PURE()
+            local P = NATIVE_BULLDOZE{ edges = { 5000 } }
+            local sp = P.proposal
+            local rm = sp.removedSegments
+            local r = rm[1]
+            r.entity = -5001
+            rm[1] = r
+            sp.removedSegments = rm
+            P.proposal = sp
+            local body = M.capture(P, {}, ctx)
+            return body.args[1].rmSegs[1].key
+        end)()"""
+        self.assertEqual(self.ev(code), "s:5000")
+
     def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
         # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
         code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }, {}, ctx); "
