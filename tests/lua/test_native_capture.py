@@ -149,6 +149,19 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertIn("signal/signal_a.mdl@0.750k2", self.A.sig())
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.A.shipped_count(), self.B.shipped_count()), (1, 1, 0, 1))
 
+    def test_the_originator_keys_its_own_native_stop_and_a_line_by_the_other_game_names_it(self):
+        # sweep run 20261013-081155 (F1): the guest built two stops natively, never keyed them itself ("native.bind: no snapshot stored"), and
+        # the host's line over them was refused on the guest, "unresolved stationGroup reference 1:12#o1/g"
+        self.start()
+        self.B.run("STOP_P = SIMPLE_STOP{ edge = 110, param = 0.5, left = true }; "
+                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(STOP_P, nil, false, true), nil }")
+        self.tick(24)
+        for g in (self.A, self.B):
+            keys = str(g.lua("BOUND_KEYS()")).split()
+            self.assertIn("1:1#o1", keys, "%s keyed the stop" % g.label)
+            self.assertIn("1:1#o1/g", keys, "%s keyed the stop's group" % g.label)
+        self.assertEqual(self.B.sig(), self.A.sig())
+
     def test_the_same_in_the_other_direction(self):
         self.start()
         self.A.native(self.road(0, 300, 0, 400))

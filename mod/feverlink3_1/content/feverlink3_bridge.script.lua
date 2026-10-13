@@ -1034,13 +1034,25 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 	local okB, whyB = pcall(function()
 		local spec = L.COMMANDS.makeWorldBuildProposalCmd
 		local comps = spec and L.bindsComp(spec, body)
-		if not comps then return end
+		if not comps then
+			traceSim("native.snapshot", string.format("output %d: nothing to key (%s)", st.outSeq, spec and "no stop or construction in the record" or "no command schema"))
+			return
+		end
 		local before = deferredBefore
 		if not before and not post then before = snapshotComps(comps) end
-		if type(before) ~= "table" then return end
+		if type(before) ~= "table" then
+			traceSim("native.snapshot", string.format("output %d: NO SNAPSHOT (deferred=%s post=%s before=%s)", st.outSeq, tostring(deferredBefore ~= nil), tostring(post), tostring(before)))
+			return
+		end
 		SIM.nativeBinds = SIM.nativeBinds or {}
 		SIM.nativeBinds[st.outSeq] = { body = body, comps = comps, before = before }
 		SIM.nativeBinds[st.outSeq - 8] = nil
+		-- also in the saved state, which the interface half's key message finds whatever happened to the table above (sweep run
+		-- 20261013-081155: no snapshot was found for any native build of a real game, stops and constructions included)
+		st.nbinds = st.nbinds or {}
+		st.nbinds[tostring(st.outSeq)] = { comps = comps, before = before, text = text }
+		st.nbinds[tostring(st.outSeq - 8)] = nil
+		traceSim("native.snapshot", string.format("output %d: snapshot of [%s] stored", st.outSeq, table.concat(comps, " ")))
 	end)
 	-- (sweep run 20261013-074329: the originator's own native builds were never keyed in a real game and nothing said why)
 	if not okB then logSim("native build " .. tostring(st.outSeq) .. ": its entities cannot be keyed here (" .. tostring(whyB) .. ")") end
@@ -1555,11 +1567,22 @@ local function handleEvent(userParams, state, src, id, name, param)
 			end
 		elseif name == "nativebind" and type(param) == "table" then
 			local nb = SIM.nativeBinds and SIM.nativeBinds[param.n]
-			if not nb then
-				traceSim("native.bind", string.format("%s: no snapshot stored for output %s (nothing to key: a build with no construction or stop, or the snapshot failed)", tostring(param.key), tostring(param.n)))
+			local saved = st.nbinds and st.nbinds[tostring(param.n)]
+			if not nb and saved then
+				local okP, body = pcall(C.parse, saved.text)
+				if okP and type(body) == "table" then nb = { body = body, comps = saved.comps, before = saved.before } end
 			end
+			if not nb then
+				local have = {}
+				for k in pairs(SIM.nativeBinds or {}) do have[#have + 1] = tostring(k) end
+				local haveSaved = {}
+				for k in pairs(st.nbinds or {}) do haveSaved[#haveSaved + 1] = tostring(k) end
+				traceSim("native.bind", string.format("%s: no snapshot for output %s (type %s; in memory [%s], in the state [%s]; see native.snapshot for why none was taken)",
+					tostring(param.key), tostring(param.n), type(param.n), table.concat(have, " "), table.concat(haveSaved, " ")))
+			end
+			if st.nbinds then st.nbinds[tostring(param.n)] = nil end
 			if nb and type(param.key) == "string" then
-				SIM.nativeBinds[param.n] = nil
+				if SIM.nativeBinds then SIM.nativeBinds[param.n] = nil end
 				st.binders[#st.binders + 1] = { key = param.key, fn = "makeWorldBuildProposalCmd", body = nb.body, comps = nb.comps, before = nb.before, steps = 0 }
 				logSim("action " .. param.key .. ": this game's own native build is keyed here like a replay (" .. table.concat(nb.comps, "/") .. ")")
 			end
