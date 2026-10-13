@@ -3082,7 +3082,9 @@ local function portableReplay(rec, text, R, f, tkey)
 	local verdict = v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")
 	trace("build.portable", string.format("%s portable replay: one proposal, %d construction(s), %d segment(s) of %d left to the construction (frozen-node rule); engine verdict %s",
 		tostring(tkey or "-"), #rec2.cons, nDerived, #rec2.segs, verdict))
-	if v and v.critical then return no("the engine's verdict is critical (" .. verdict .. ")") end
+	-- with a native patch the dry verdict is of the unpatched proposal: the construction collides with its own street piece until the frozen nodes are set (b28), so it only gates when no patch follows
+	if v and v.critical and #frozenIdx == 0 then return no("the engine's verdict is critical (" .. verdict .. ")") end
+	if v and v.critical then trace("build.portable", string.format("%s the critical verdict is not gating: the native patch sets the frozen nodes at the Add", tostring(tkey or "-"))) end
 	logNotes(notes, "build portable")
 	args.plan, args.form = "portable", 1
 	if #frozenIdx > 0 then

@@ -657,7 +657,7 @@ end
 
 local function simCtx(st, it)
 	local ctx = actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
-	ctx.canPatch = NATIVE_PATCH and st.nativePatch == true   -- (told by the interface half when the module reported the capability)
+	ctx.canPatch = NATIVE_PATCH and SIM.nativePatch == true   -- (told by the interface half when the module reported the capability; not in the saved state, a load would lose it)
 	return ctx
 end
 
@@ -1667,7 +1667,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		elseif name == "replay" then
 			markReplay(st, engine.gameTime())
 		elseif name == "nativecaps" and type(param) == "table" then
-			st.nativePatch = param.patch == true
+			SIM.nativePatch = param.patch == true
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = os.clock() }
@@ -3711,6 +3711,7 @@ local function guiUpdate(userParams, state, guiState)
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
+	if G.frames % 60 == 0 and G.nat and G.nat.ready and G.nat.ready.patch then pcall(toSim, "nativecaps", { patch = true }) end
 	local ok, err = pcall(function()
 		readLink()
 		serviceWindow()
