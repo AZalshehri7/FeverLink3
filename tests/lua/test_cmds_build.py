@@ -153,8 +153,8 @@ def("Terrain", { "baseHeightMod" }, function() return { baseHeightMod = D("GridV
 def("Proposal", { "toAdd", "toRemove", "old2new", "proposal", "terrain" }, function()
   return { toAdd = {}, toRemove = {}, old2new = {}, proposal = D("StreetProposal"), terrain = D("Terrain") }
 end)
-def("Context", { "player", "checkTerrainAlignment", "cleanupStreetGraph", "gatherBuildings", "gatherFields", "refundableEntities" }, function()
-  return { player = -1, checkTerrainAlignment = false, cleanupStreetGraph = false, gatherBuildings = false, gatherFields = false, refundableEntities = {} }
+def("Context", { "player", "checkTerrainAlignment", "cleanupStreetGraph", "gatherBuildings", "gatherFields", "extendProposalRedoPillars", "refundableEntities" }, function()
+  return { player = -1, checkTerrainAlignment = false, cleanupStreetGraph = false, gatherBuildings = false, gatherFields = false, extendProposalRedoPillars = false, refundableEntities = {} }
 end)
 def("EdgeObjectComp", { "edgeObjectConstruction", "param", "params" }, function() return { edgeObjectConstruction = "", param = 0, params = {} } end)
 def("ConstructionComp", { "fileName", "transf", "params", "name", "depots", "stations" }, function()
@@ -696,12 +696,14 @@ function EXECUTE(cmd, cb)
   return executeBuild(cmd, cb)
 end
 
+CTX_REFUSE = nil        -- a test sets function(context) -> true for a Context the engine builds differently (it refuses the build here)
 BUILD_NEEDS_IE = nil    -- a test sets function(proposal) -> true for a build the engine only accepts with ignoreErrors = true (non-critical messages)
 function executeBuild(cmd, cb)
   local name = cmd.__cmd
   local a = cmd.args
   local ok, res
   if BUILD_NEEDS_IE and BUILD_NEEDS_IE(a[1]) and a[3] ~= true then ok, res = false, "non-critical messages and ignoreErrors = false"
+  elseif CTX_REFUSE and a[2] and CTX_REFUSE(a[2]) then ok, res = false, "the engine refuses this Context"
   else ok, res = APPLY_BUILD(a[1]) end
   if ok then
     local ents = {}
@@ -1027,8 +1029,8 @@ function NATIVE_NODECFG(spec)
   return P
 end
 
-function CONTEXT(align, cleanup, buildings, fields)
-  return D("Context", { player = 7, checkTerrainAlignment = align, cleanupStreetGraph = cleanup, gatherBuildings = buildings, gatherFields = fields })
+function CONTEXT(align, cleanup, buildings, fields, redo)
+  return D("Context", { player = 7, checkTerrainAlignment = align, cleanupStreetGraph = cleanup, gatherBuildings = buildings, gatherFields = fields, extendProposalRedoPillars = redo == true })
 end
 
 -- what the module makes of a proposal that a tool applied natively (the body for an action line), as a string
@@ -1367,6 +1369,46 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=true buildings=false fields=true player=7 ie=true pi=false")
         self.assertEqual(self.A.lua("BUILD_CTX[2]"), "nil ie=false pi=true", "no context stays no context")
         self.assertEqual(self.B.lua("BUILD_CTX[1]"), self.A.lua("BUILD_CTX[1]"))
+
+    def test_every_build_kind_is_replayed_with_the_originators_own_context(self):
+        # one rule for every plan (the stop tool builds with 0/0/0, the road tools with 1/1/1): the replay never substitutes flags of its own.
+        # The mock engine refuses a Context whose cleanupStreetGraph differs from the one the tool used, as the real engine builds another graph.
+        cases = [
+            ("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", 1),
+            ("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }", 1),
+            ("NATIVE_BULLDOZE{ edges = { 110 } }", 1),
+            ("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }", 2),
+            ("NATIVE_UPGRADE{ edges = { 110, 111 }, template = 'street/new_small_road.street_template' }", 2),
+        ]
+        for proposal, commands in cases:
+            for flags in ("false, false, false, true, false", "true, true, true, true, true", "false, true, false, true, false"):
+                with self.subTest(proposal=proposal[:30], flags=flags):
+                    self.setUp()
+                    self.start()
+                    cleanup = flags.split(", ")[1]
+                    for g in (self.A, self.B):
+                        g.run("CTX_REFUSE = function(c) return c.cleanupStreetGraph ~= %s end" % cleanup)
+                    self.B.issue(proposal, ctx="CONTEXT(%s)" % flags)
+                    self.tick(16)
+                    self.assertEqual(self.A.lua("#BUILD_CTX"), commands, "the replay was refused: %s" % self.A.lua("BUILD_REFUSALS[1]"))
+                    want = "align=%s cleanup=%s buildings=%s fields=%s" % tuple(flags.split(", ")[:4])
+                    for i in range(1, commands + 1):
+                        self.assertTrue(str(self.A.lua("BUILD_CTX[%d]" % i)).startswith(want), self.A.lua("BUILD_CTX[%d]" % i))
+                    self.assertSameWorld()
+                    self.tearDown()
+
+    def test_the_redo_pillars_flag_travels_too(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", ctx="CONTEXT(true, true, true, true, true)")
+        self.tick(14)
+        self.assertEqual(self.A.lua("GAME.applied[#GAME.applied].args[2].extendProposalRedoPillars"), True)
+
+    def test_a_record_without_context_flags_is_replayed_with_the_fallback_and_says_so(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")   # no Context at all: the record is marked "native"
+        self.tick(14)
+        self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=false buildings=true fields=true player=7 ie=false pi=true")
+        self.assertIn("carries no Context flags", self.A.log())
 
     def test_upgrade_of_segments_the_session_built(self):
         self.start()

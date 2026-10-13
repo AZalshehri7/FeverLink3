@@ -46,10 +46,9 @@ local TOL_SAME, TOL_NODE, TOL_CON = 0.5, 1.0, 3.0
 local CON_REACH, EDGE_REACH = 200, 250
 local LIMIT = { cons = 200, nodes = 4000, segs = 4000, objs = 1000, ncfg = 2000, rem = 4000, bytes = 600000, text = 400 }
 
--- contexts the native tools build with (finding from MPFever (MIT); "terrain" and "plain" are its names)
-local CTX_NATIVE = { align = true, cleanup = false, buildings = true, fields = true } -- terrainNoCleanup
-local CTX_TERRAIN = { align = true, cleanup = true, buildings = true, fields = true }
-local CTX_PLAIN = { align = false, cleanup = true, buildings = false, fields = true }
+-- The Context flags of a record that carries none (written by an older version, or captured where the engine's real flags could not be
+-- read). Every record of this version carries the originator's real Context; a replay of an old one is logged (decodeBuildUnsafe).
+local CTX_FALLBACK = { align = true, cleanup = false, buildings = true, fields = true }
 
 -- ================================================================== adapter (the only code that calls the engine)
 
@@ -1239,6 +1238,7 @@ local function captureContext(c)
 	return {
 		align = get(c, "checkTerrainAlignment") == true, cleanup = get(c, "cleanupStreetGraph") == true,
 		buildings = get(c, "gatherBuildings") == true, fields = get(c, "gatherFields") == true,
+		redo = get(c, "extendProposalRedoPillars") == true,
 	}
 end
 
@@ -1439,18 +1439,18 @@ end
 
 -- ---- pieces the plans share
 
--- The Context of the command: none when the original had none; the plan's default when the build comes from a native
--- tool (whose context a script cannot see); otherwise the original's flags. Always for this game's player.
-local function newContext(c, default, R)
+-- The Context of the command: none when the original had none, otherwise the originator's flags as the record carries them (one rule
+-- for every plan; decodeBuildUnsafe has put the fallback in for a record that carries none). Always for this game's player.
+local function newContext(c, R)
 	if type(c) ~= "table" then return nil end
-	local f = c.native and default or c
-	if f == nil then return nil end
+	local f = c
 	local obj = A.new("Context")
 	req(obj, "player", R.owner("player"))
 	pcall(function() obj.checkTerrainAlignment = f.align == true end)
 	pcall(function() obj.cleanupStreetGraph = f.cleanup == true end)
 	pcall(function() obj.gatherBuildings = f.buildings == true end)
 	pcall(function() obj.gatherFields = f.fields == true end)
+	if f.redo ~= nil then pcall(function() obj.extendProposalRedoPillars = f.redo == true end) end
 	return obj
 end
 
@@ -2011,7 +2011,7 @@ local function connectorStep(rec, R, f, notes)
 		if #mini.segs == 0 then return false end
 		local okP, args = pcall(function()
 			local sp = streetProposal(mini, R, notes, { cfg = false })
-			return commandArgs(sp, newContext(f.ctx, CTX_NATIVE, R), true, false, f.dust)
+			return commandArgs(sp, newContext(f.ctx, R), true, false, f.dust)
 		end)
 		if okP then
 			local okF, why = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
@@ -2037,7 +2037,7 @@ PLAN.construction = function(rec, R, f, notes)
 			if isConstructionSegment(s) then ie, pi = true, false break end
 		end
 	end
-	local first = commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), ie, pi, f.dust)
+	local first = commandArgs(constructionProposal(rec, R), newContext(f.ctx, R), ie, pi, f.dust)
 	if rec.src == "native" then
 		for _, s in ipairs(rec.segs) do
 			if s.connector then
@@ -2053,10 +2053,10 @@ end
 -- refuses both in one proposal). The construction's own paths are left to its script; the second command ignores the
 -- non-critical collision with its own street connection.
 PLAN.withStreet = function(rec, R, f, notes, form)
-	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	local conOnly = part(rec, { "cons", "rem", "old2new" })
 	first.chain = { function()
-		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, CTX_NATIVE, R), true, false, f.dust)
+		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, R), true, false, f.dust)
 	end }
 	return first
 end
@@ -2066,26 +2066,26 @@ end
 PLAN.combined = function(rec, R, f, notes, form)
 	local sp = streetProposal(rec, R, notes, form)
 	setConstructions(sp, rec, R)
-	return commandArgs(sp, newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	return commandArgs(sp, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 -- A bulldozing that takes constructions and street pieces: the constructions first, then the segments (the order the
 -- game's own industry removal uses).
 PLAN.bulldoze = function(rec, R, f, notes)
-	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
+	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	local list = removalList(rec)
 	if list then
 		first.chain = { function()
 			local edges = {}
 			for i, ref in ipairs(list) do edges[i] = R.edge(ref) end
-			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
+			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 		end }
 	end
 	return first
 end
 
 PLAN.street = function(rec, R, f, notes, form)
-	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 PLAN.nodecfg = PLAN.street
@@ -2095,7 +2095,7 @@ PLAN.removal = function(rec, R, f, notes)
 	for i, ref in ipairs(removalList(rec)) do edges[i] = R.edge(ref) end
 	local P = A.removeSegmentsProposal(edges)
 	if P == nil then fail("the engine made no removal proposal") end
-	return commandArgs(P, newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
+	return commandArgs(P, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 -- Upgrades one segment per command with the engine's replaceSegment, as the upgrade tool does (finding from MPFever
@@ -2130,7 +2130,7 @@ PLAN.upgrade = function(rec, R, f, notes)
 			sp.addedSegments = list
 			P.proposal = sp
 		end
-		return commandArgs(P, newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
+		return commandArgs(P, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	end
 	local first = stepArgs(1)
 	if #steps > 1 then
@@ -2218,7 +2218,7 @@ PLAN.stop = function(rec, R, f, notes, form)
 		-- segment is -1, the same as here.
 		if #cfgs > 0 then opt(notes, ssp, "nodeConfigsToAdd", cfgs) end
 	end)
-	return commandArgs(sp, newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
+	return commandArgs(sp, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 -- ================================================================== validation (nothing from the wire is trusted)
@@ -2454,6 +2454,33 @@ function M.captureToolBuild(id, name, param, ctx)
 	return body, why, text
 end
 
+-- The Context flags of a build as one line for the trace (build.ctx): a record's flags, an engine Context, or "none".
+function M.contextText(c)
+	if c == nil or c == false then return "none" end
+	local function flag(...)
+		for _, k in ipairs({ ... }) do
+			local v = get(c, k)
+			if v ~= nil then return tostring(v) end
+		end
+		return "?"
+	end
+	return string.format("align=%s cleanup=%s buildings=%s fields=%s redo=%s", flag("align", "checkTerrainAlignment"), flag("cleanup", "cleanupStreetGraph"),
+		flag("buildings", "gatherBuildings"), flag("fields", "gatherFields"), flag("redo", "extendProposalRedoPillars"))
+end
+
+-- The held command's own flags (the native module read them from the command it holds: Context members, ignoreErrors, playerInitiated) go
+-- into a captured body, replacing what the capture of the tool's preview could only guess (a preview carries no Context). `flags` is the
+-- table of the `held` event's ctx. Returns true when the body was changed.
+function M.withHeldFlags(body, flags)
+	local args = type(body) == "table" and body.args
+	if type(flags) ~= "table" or type(args) ~= "table" then return false end
+	args[2] = { align = flags.align == true, cleanup = flags.cleanup == true, buildings = flags.buildings == true, fields = flags.fields == true,
+		redo = flags.redo == true }
+	if type(flags.ie) == "boolean" then args[3] = flags.ie end
+	if type(flags.pi) == "boolean" then args[4] = flags.pi end
+	return true
+end
+
 -- The plan (street, combined, bulldoze, construction, ...) a captured build body falls under; nil when it cannot be told.
 -- The bridge's strict mode cancels and replays only the plans that real games proved (see STRICT_CANCEL_PLANS there).
 function M.planOf(body)
@@ -2657,6 +2684,11 @@ local function decodeBuildUnsafe(body, ctx)
 	if not plan then return nil, whyNot end
 	local R = newResolver(ctx)
 	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src }
+	local ctxSource = "record"
+	if type(f.ctx) == "table" and f.ctx.native then
+		f.ctx, ctxSource = CTX_FALLBACK, "fallback"
+		log("build " .. plan .. ": the record carries no Context flags (an older record); replayed with the fallback flags")
+	end
 	-- Developer switch (default off): a build that adds constructions AND removes some (a station that takes town buildings away) is
 	-- replayed with ignoreErrors = true. Real session 2026-10-12: such builds created nothing on the receiving game; to A/B whether the
 	-- engine's non-critical errors (a collision with a building this game has and the originator did not) are the reason.
@@ -2683,7 +2715,7 @@ local function decodeBuildUnsafe(body, ctx)
 			v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")))
 		if okF and v and not v.critical then
 			plan = "combined"
-			built.plan, built.form = plan, 1
+			built.plan, built.form, built.ctxSource = plan, 1, ctxSource
 			log("build " .. plan .. " (single proposal, " .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, " .. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, "
 				.. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects")
 			return built
@@ -2720,6 +2752,7 @@ local function decodeBuildUnsafe(body, ctx)
 		end
 	end
 	if not args then return nil, lastErr or "no way to build it" end
+	args.ctxSource = ctxSource
 	args.plan, args.form = plan, used   -- for the engine-verdict lines of the bridge (which form of which plan was judged)
 	log("build " .. plan .. (used > 1 and (" (form " .. used .. ")") or "") .. " (" .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, "
 		.. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, " .. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects"
@@ -2980,6 +3013,5 @@ M.classify = classify
 M.normalise = normalise
 M.plans = PLAN
 M.resolver = newResolver
-M.CTX = { native = CTX_NATIVE, terrain = CTX_TERRAIN, plain = CTX_PLAIN }
 
 return M

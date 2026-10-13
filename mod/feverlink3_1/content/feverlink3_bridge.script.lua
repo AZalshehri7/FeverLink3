@@ -1003,7 +1003,11 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 	local rev = {}
 	for key, e in pairs(st.bind) do rev[e] = key end
 	local t0 = os.clock()
-	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, result = post and result or nil }, {
+	-- The Context is the event's second argument (a userdata with the flags the tool built the command with); the record carries it, so every
+	-- game rebuilds the build with the originator's real flags. The post event passes the result at [3] and no Context at [2].
+	local ctxObj = nil
+	if not post then pcall(function() ctxObj = param[2] end) end
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, ctx = ctxObj, result = post and result or nil }, {
 		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
 	})
 	if not ok then body, why = nil, tostring(body) end
@@ -1028,6 +1032,7 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 		return
 	end
 	body.native = true
+	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and "post-event (no context)" or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
 	body.category = buildCategory(body)
 	if Build.constructionsBlocked and Build.constructionsBlocked(body) then
 		-- degraded mode (no native module): the build is in this world already and cannot be taken back; the others would refuse it
@@ -1165,10 +1170,11 @@ local function simApplyAction(st, it, now)
 					if isBuild then
 						pcall(function()
 							local c = a[2]
-							traceSim("build.send", string.format("%s ie=%s pi=%s dust=%s ctx{align=%s cleanup=%s buildings=%s fields=%s player=%s} chain=%s now=%s balance=%s",
+							traceSim("build.send", string.format("%s ie=%s pi=%s dust=%s ctx{align=%s cleanup=%s buildings=%s fields=%s redo=%s player=%s} chain=%s now=%s balance=%s",
 								it.key, tostring(a[3]), tostring(a[4]), tostring(a[5]), tostring(c and c.checkTerrainAlignment), tostring(c and c.cleanupStreetGraph),
-								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.player), tostring(a.chain and (#a.chain + 1) or 1),
-								tostring(engine.gameTime()), tostring(engine.account())))
+								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.extendProposalRedoPillars), tostring(c and c.player),
+								tostring(a.chain and (#a.chain + 1) or 1), tostring(engine.gameTime()), tostring(engine.account())))
+							traceSim("build.ctx", string.format("%s side=replay source=%s ctx{%s} ie=%s pi=%s", it.key, tostring(a.ctxSource or "record"), Build.contextText(c), tostring(a[3]), tostring(a[4])))
 						end)
 					end
 				end
@@ -2462,6 +2468,17 @@ local function natDecideUnsafe(h, cap)
 		return release("the capture of " .. cap.tool .. " failed (" .. tostring(cap.why) .. ")")
 	end
 	local body, text = cap.body, cap.text
+	-- The preview the capture was made from carries no Context; the held command does (the native module read it). Its flags replace the
+	-- capture's, so the record that travels has the originator's real Context, ignoreErrors and playerInitiated.
+	local okF, changed = pcall(function() return Build and Build.withHeldFlags and Build.withHeldFlags(body, h.ctx) end)
+	if okF and changed then
+		local okS, s = pcall(C.serialize, body)
+		if okS then text = s end
+	end
+	pcall(function()
+		traceGui("build.ctx", string.format("held=%d side=originator source=%s ctx{%s} ie=%s pi=%s", id, (okF and changed) and "held command" or "none (old native module: capture's guess)",
+			Build and Build.contextText(body.args[2]) or "?", tostring(body.args[3]), tostring(body.args[4])))
+	end)
 	local category = buildCategory(body)
 	if not L.permitted(G.perms, category) then
 		-- refused before stamping, like the wrapped sendCommand: nothing was built yet, so nothing is sent to the others
@@ -2765,7 +2782,7 @@ end
 local function natOnHeld(N, p)
 	local id = tonumber(p.id)
 	if not id then return end
-	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true }
+	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true, ctx = type(p.ctx) == "table" and p.ctx or nil }
 	if not N.holdSent then
 		-- strict mode is being switched off: the module has not caught up; give the command back
 		natSay("held " .. id .. " while strict mode is off; release written")

@@ -80,6 +80,7 @@ class FakeNative:
         self.heard = []          # (time, seq, kind, payload) of every control line it accepted
         self.dropped, self.released, self.held = [], [], []
         self.site = TOOL_SITE   # the call site the module reports for the next held command
+        self.held_flags = None   # the flags the module read out of the held command (the `ctx` of the held event); None = an old module
         self.fires = False   # the module would fire the tool's completion callback at a cancel (the held event says `done`)
         self.is_open = False
         if link:
@@ -213,6 +214,8 @@ class FakeNative:
             ev = {"id": hid, "kind": 52, "site": self.site, "ms": int(self.clock.t * 1000)}
             if self.fires:
                 ev["done"] = True
+            if self.held_flags:
+                ev["ctx"] = dict(self.held_flags)
             self.emit("held", ev)
             return hid
         return 0
@@ -1316,6 +1319,26 @@ class TraceLogTest(StrictTest):
         import os as _os
         path = _os.path.join(g.dir, "trace.log")
         return open(path, encoding="utf-8").read() if _os.path.exists(path) else ""
+
+    def test_the_record_carries_the_flags_of_the_held_command_not_the_previews_guess(self):
+        # the preview a build is captured from has no Context; the native module reads the held command's own flags (a stop tool builds with
+        # cleanup = false, a road tool with true) and the shipped record, and so every game's replay, uses them
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.native.held_flags = {"align": False, "cleanup": True, "buildings": False, "fields": True, "redo": True, "ie": True, "pi": True}
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        body = self.B.action_records()[0]["body"]
+        self.assertIn('[2]={["align"]=false,["buildings"]=false,["cleanup"]=true,["fields"]=true,["redo"]=true},[3]=true,[4]=true', str(body))
+        self.assertIn("side=originator source=held command ctx{align=false cleanup=true buildings=false fields=true redo=true} ie=true pi=true", self.trace(self.B))
+        self.assertIn("side=replay source=record ctx{align=false cleanup=true buildings=false fields=true redo=true}", self.trace(self.A))
+
+    def test_an_old_native_module_without_flags_keeps_the_captures_guess_and_says_so(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertIn("source=none (old native module", self.trace(self.B))
 
     def test_a_build_leaves_its_record_decode_send_result_and_the_originators_ship_line_on_both_games(self):
         self.start()
