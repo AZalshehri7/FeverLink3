@@ -164,7 +164,10 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     CtlMessage::Release { id, at } => assert!(id <= 1 << 53 && at <= 1 << 53, "{line:?}"),
                     CtlMessage::Cancel { id } => assert!(id <= 1 << 53, "{line:?}"),
                     CtlMessage::TerrainApply { id, stamp } => assert!(id <= 1 << 53 && stamp <= 1 << 53, "{line:?}"),
-                    CtlMessage::HoldOff | CtlMessage::Ping { .. } => {}
+                    CtlMessage::HoldOff
+                    | CtlMessage::Ping { .. }
+                    | CtlMessage::PatchNext { .. }
+                    | CtlMessage::InjectNext { .. } => {}
                 }
             }
             Err(e) => {
@@ -287,7 +290,7 @@ fn random_event(r: &mut StdRng) -> Event {
             kinds: (0..r.gen_range(0..5)).map(|_| (random_text(r, 12), r.gen())).collect(),
             sites: r.gen_range(0..1000),
         },
-        1 => Event::Held { id: r.gen(), kind: r.gen(), site: r.gen(), ms: r.gen(), done: r.gen() },
+        1 => Event::Held { id: r.gen(), kind: r.gen(), site: r.gen(), ms: r.gen(), done: r.gen(), flags: None },
         2 => Event::Released { id: r.gen(), reason: reasons[r.gen_range(0..6)], ms: r.gen() },
         3 => Event::Dropped { id: r.gen(), reason: reasons[r.gen_range(0..6)] },
         4 => Event::Applied { id: r.gen(), ok: r.gen() },
@@ -728,6 +731,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 force_seed: None,
                 growth: Default::default(),
                 luaseed: r.gen(),
+                native_patch: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());

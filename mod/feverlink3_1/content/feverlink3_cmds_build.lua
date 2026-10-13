@@ -46,10 +46,9 @@ local TOL_SAME, TOL_NODE, TOL_CON = 0.5, 1.0, 3.0
 local CON_REACH, EDGE_REACH = 200, 250
 local LIMIT = { cons = 200, nodes = 4000, segs = 4000, objs = 1000, ncfg = 2000, rem = 4000, bytes = 600000, text = 400 }
 
--- contexts the native tools build with (finding from MPFever (MIT); "terrain" and "plain" are its names)
-local CTX_NATIVE = { align = true, cleanup = false, buildings = true, fields = true } -- terrainNoCleanup
-local CTX_TERRAIN = { align = true, cleanup = true, buildings = true, fields = true }
-local CTX_PLAIN = { align = false, cleanup = true, buildings = false, fields = true }
+-- The Context flags of a record that carries none (written by an older version, or captured where the engine's real flags could not be
+-- read). Every record of this version carries the originator's real Context; a replay of an old one is logged (decodeBuildUnsafe).
+local CTX_FALLBACK = { align = true, cleanup = false, buildings = true, fields = true }
 
 -- ================================================================== adapter (the only code that calls the engine)
 
@@ -729,6 +728,15 @@ local function idOf(x)
 	fail("a list entry is neither an entity id nor an entity record")
 end
 
+-- The id of an entity a proposal REMOVES, as it is read from the proposal. Read after the build ran, the list entries that are records
+-- (NodeAndEntity / SegmentAndEntity of the removed lists) carry the bitwise NOT of the entity id, -id - 1 (real data: a removed node
+-- -39113 where the held command's text says 39112; sweeps 20261013-060028 B3 and -074329 B1 for a removed segment; before the build ran the
+-- id is plain). One rule for every removal list; added entities keep their negative placeholders and never pass through here.
+local function removedId(id)
+	if type(id) == "number" and id < 0 then return -id - 1 end
+	return id
+end
+
 local function flavorOf(p)
 	if get(p, "streetProposal") ~= nil or get(p, "constructionsToAdd") ~= nil then return "simple" end
 	if get(p, "proposal") ~= nil or get(p, "toAdd") ~= nil then return "native" end
@@ -738,7 +746,7 @@ end
 -- the state of one capture: how entities are keyed, what the proposal itself knows about entities it removes, and
 -- the references already made
 local function newCapture(ctx, opts)
-	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {} }, memo = {}, result = opts.result, alias = {} }
+	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {}, cons = opts.cons or {} }, memo = {}, result = opts.result, alias = {} }
 
 	function cap.node(id)
 		if type(id) ~= "number" then fail("a node reference is not an entity id") end
@@ -775,7 +783,7 @@ local function newCapture(ctx, opts)
 		if type(id) ~= "number" or id < 0 then fail("a construction reference is not an entity id") end
 		local m = cap.memo["c" .. id]
 		if m then return m end
-		local info = A.conInfo(id)
+		local info = A.conInfo(id) or cap.known.cons[id]   -- (cons: read before the build, when the capture is made after it)
 		if not info then fail("construction " .. id .. " is not in the world") end
 		m = { __ref = "con", key = cap.keyOf and cap.keyOf(id) or nil, file = info.file, p = copyXYZ(info.p) }
 		cap.memo["c" .. id] = m
@@ -1022,14 +1030,14 @@ end
 local function learnRemoved(st, names, cap)
 	for _, n in ipairs(A.list(st, names.rmNodes)) do
 		if type(n) ~= "number" then
-			local id = get(n, "entity")
+			local id = removedId(get(n, "entity"))
 			local p = A.xyz(get(get(n, "comp"), "position"))
 			if type(id) == "number" and p then cap.known.nodes[id] = p end
 		end
 	end
 	for _, s in ipairs(A.list(st, names.rmSegs)) do
 		if type(s) ~= "number" then
-			local id, c = get(s, "entity"), get(s, "comp")
+			local id, c = removedId(get(s, "entity")), get(s, "comp")
 			if type(id) == "number" and c then
 				local p0 = A.xyz(get(c, "position0")) or A.nodePos(get(c, "node0"))
 				local p1 = A.xyz(get(c, "position1")) or A.nodePos(get(c, "node1"))
@@ -1114,7 +1122,7 @@ local function captureRecord(proposal, cap)
 
 	for i, ce in ipairs(A.list(proposal, consKey)) do rec.cons[i] = readConstruction(ce, cap) end
 	local remIds = A.list(proposal, remKey)
-	for i, e in ipairs(remIds) do rec.rem[i] = cap.con(e) end
+	for i, e in ipairs(remIds) do rec.rem[i] = cap.con(removedId(e)) end
 	cap.hasCons = #rec.cons + #rec.rem > 0
 	-- old2new maps a removed construction to what replaces it; as a table keyed by entity ids it cannot travel, so it
 	-- travels as pairs of ranks in the remove list
@@ -1144,40 +1152,16 @@ local function captureRecord(proposal, cap)
 			end
 		end
 		local rmSegIds = {}
-		for i, s in ipairs(A.list(st, names.rmSegs)) do rmSegIds[i] = idOf(s) end
+		for i, s in ipairs(A.list(st, names.rmSegs)) do
+			local raw = idOf(s)
+			local real = removedId(raw)
+			-- a bare id of a segment nothing describes any more stays as it is: removedEdgeFromAdded names it from the added segment's ends
+			if raw < 0 and not (A.edgeInfo(real) or cap.known.edges[real]) then real = raw end
+			rmSegIds[i] = real
+		end
 		indexWorldObjects(rmSegIds, cap)
 		for i, n in ipairs(A.list(st, names.nodes)) do rec.nodes[i] = readNode(n, cap) end
 		for i, id in ipairs(rmSegIds) do
-			-- (read after the build, a removed segment of the stop tool arrived as the NEGATIVE of its entity id: -33244 in a real record,
-			-- which no other game can resolve; it is the existing segment)
-			-- (Sweep runs 20261013-060028 B3 and -074329 B1: the number is the bitwise NOT of the id, -id - 1, not -id: the record named the next
-			-- entity, a different edge, and the replay removed a segment elsewhere; the probe reported 39879 where the record said s:39880. Both
-			-- readings are tried; with one segment added the one whose ends are the added segment's ends wins, otherwise -id - 1.)
-			if type(id) == "number" and id < -1000 then
-				local function exists(e) return A.edgeInfo(e) or cap.known.edges[e] end
-				local notId, negId = -id - 1, -id
-				local pick
-				if exists(notId) and exists(negId) then
-					local added = A.list(st, names.segs)
-					if #added == 1 then
-						local c = get(added[1], "comp")
-						local function ends(e)
-							local inf = A.edgeInfo(e)
-							return inf and { inf.p0, inf.p1 } or nil
-						end
-						local a0, a1 = c and A.xyz(get(c, "position0")), c and A.xyz(get(c, "position1"))
-						local function near(p, q) return p and q and abs(p.x - q.x) <= 1.5 and abs(p.y - q.y) <= 1.5 end
-						for _, cand in ipairs({ notId, negId }) do
-							local e = ends(cand)
-							if e and a0 and a1 and ((near(e[1], a0) and near(e[2], a1)) or (near(e[1], a1) and near(e[2], a0))) then pick = cand break end
-						end
-					end
-					pick = pick or notId
-				else
-					pick = exists(notId) and notId or (exists(negId) and negId or nil)
-				end
-				if pick then id = pick; rmSegIds[i] = id end
-			end
 			-- a removed segment also says what kind of segment it was (normal, bridge, tunnel ...): a replacement by another
 			-- kind is not an upgrade the engine's replaceSegment can make
 			local ref = cap.edge(id)
@@ -1189,7 +1173,7 @@ local function captureRecord(proposal, cap)
 			if t and type(ref) == "table" then ref.ty, ref.ti, ref.rt, ref.st = t.ty, t.ti, t.rt, t.st end
 			rec.rmSegs[i] = ref
 		end
-		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(idOf(n)) end
+		for i, n in ipairs(A.list(st, names.rmNodes)) do rec.rmNodes[i] = cap.node(removedId(idOf(n))) end
 		for i, s in ipairs(A.list(st, names.segs)) do rec.segs[i] = readSegment(s, cap) end
 		removedEdgeFromAdded(rec)
 		local ownEdge = {}
@@ -1225,9 +1209,9 @@ local function captureRecord(proposal, cap)
 				if o.kind == nil then o.kind = kinds[i] end
 			end
 		end
-		for i, id in ipairs(A.list(st, names.rmObjs)) do rec.rmObjs[i] = cap.obj(id) end
+		for i, id in ipairs(A.list(st, names.rmObjs)) do rec.rmObjs[i] = cap.obj(removedId(id)) end
 		for i, n in ipairs(A.list(st, names.ncfg)) do rec.ncfg[i] = readNodeConfig(n, cap) end
-		for i, id in ipairs(A.list(st, names.rmNcfg)) do rec.rmNcfg[i] = cap.node(id) end
+		for i, id in ipairs(A.list(st, names.rmNcfg)) do rec.rmNcfg[i] = cap.node(removedId(id)) end
 		settleInPlaceRemoval(rec, rmSegIds[1])
 	end
 	rec.terrain = readTerrain(proposal)
@@ -1236,9 +1220,11 @@ end
 
 local function captureContext(c)
 	if c == nil or c == false then return false end
+	if type(c) == "table" and c.align ~= nil then return c end   -- already a record's flags (read before the build, see M.preState)
 	return {
 		align = get(c, "checkTerrainAlignment") == true, cleanup = get(c, "cleanupStreetGraph") == true,
 		buildings = get(c, "gatherBuildings") == true, fields = get(c, "gatherFields") == true,
+		redo = get(c, "extendProposalRedoPillars") == true,
 	}
 end
 
@@ -1314,6 +1300,7 @@ local function markOwnByShape(rec)
 end
 
 local function isConstructionSegment(s)
+	if s.portable then return s.derived == true end   -- (a record made from the native text: derived = the construction's own conversion makes it)
 	return OWN_BY_SHAPE[s] == true or ownTemplate(s.c and s.c.roadTemplate)
 end
 
@@ -1439,18 +1426,18 @@ end
 
 -- ---- pieces the plans share
 
--- The Context of the command: none when the original had none; the plan's default when the build comes from a native
--- tool (whose context a script cannot see); otherwise the original's flags. Always for this game's player.
-local function newContext(c, default, R)
+-- The Context of the command: none when the original had none, otherwise the originator's flags as the record carries them (one rule
+-- for every plan; decodeBuildUnsafe has put the fallback in for a record that carries none). Always for this game's player.
+local function newContext(c, R)
 	if type(c) ~= "table" then return nil end
-	local f = c.native and default or c
-	if f == nil then return nil end
+	local f = c
 	local obj = A.new("Context")
 	req(obj, "player", R.owner("player"))
 	pcall(function() obj.checkTerrainAlignment = f.align == true end)
 	pcall(function() obj.cleanupStreetGraph = f.cleanup == true end)
 	pcall(function() obj.gatherBuildings = f.buildings == true end)
 	pcall(function() obj.gatherFields = f.fields == true end)
+	if f.redo ~= nil then pcall(function() obj.extendProposalRedoPillars = f.redo == true end) end
 	return obj
 end
 
@@ -1789,6 +1776,9 @@ local function streetProposal(rec, R, notes, opts)
 	end
 	local nodes, edges, objs = {}, {}, {}
 	for _, n in ipairs(rec.nodes) do
+		if n.keep and type(n.id) == "number" then usedNode[n.id] = true end   -- (a frozen node of the construction stays whatever uses it)
+	end
+	for _, n in ipairs(rec.nodes) do
 		if not opts.drop or type(n.id) ~= "number" or usedNode[n.id] then nodes[#nodes + 1] = newNodeAndEntity(n, R) end
 	end
 	-- Lenient ends: a segment to add that ends at a node of the world which this game does not have (the shipped result says where
@@ -1828,8 +1818,22 @@ local function streetProposal(rec, R, notes, opts)
 		if not (opts.drop and type(o.edge) == "number" and dropped[o.edge]) then objs[#objs + 1] = newEdgeObject(o, R, R.edgeOr(o.edge), notes, opts) end
 	end
 	local cfgs, rmCfgs = {}, {}
-	if not opts.drop and opts.cfg ~= false then
-		for i, n in ipairs(rec.ncfg) do cfgs[i] = newNodeConfig(n, R) end
+	if opts.cfg ~= false then
+		for _, n in ipairs(rec.ncfg) do
+			if not opts.drop then
+				cfgs[#cfgs + 1] = newNodeConfig(n, R)
+			elseif type(n.node) ~= "number" or (n.node < 0 and usedNode[n.node]) or n.node >= 0 then
+				-- With `drop` the construction's own pieces are left to its script, but the junction configurations of the street part stay: the
+				-- removals of the old ones below were not matched by any add, and the host lost two node configurations (sweep-free real run
+				-- 2026-10-13, depot with four buildings removed: nodeConfigs 792 against 794). What names a dropped piece is left out; the engine
+				-- makes those connections when the construction's script adds the piece.
+				local function keep(ref) return not (type(ref) == "number" and dropped[ref]) end
+				local lc, cw = {}, {}
+				for _, l in ipairs(n.lc or {}) do if keep(l.s0) and keep(l.s1) then lc[#lc + 1] = l end end
+				for _, x in ipairs(n.cw or {}) do if keep(x) then cw[#cw + 1] = x end end
+				cfgs[#cfgs + 1] = newNodeConfig({ node = n.node, lc = lc, cw = cw, pref = n.pref, dss = n.dss, user = n.user }, R)
+			end
+		end
 	end
 	for i, ref in ipairs(rec.rmNcfg) do rmCfgs[i] = R.node(ref) end
 	withStreet(sp, function(ssp)
@@ -1849,7 +1853,11 @@ end
 local function constructionLists(rec, R)
 	local cons, rem, map = {}, {}, {}
 	for i, c in ipairs(rec.cons) do cons[i] = newConstructionEntity(c, R) end
-	for i, ref in ipairs(rec.rem) do rem[i] = R.con(ref) end
+	local trace = C.tracer("build")
+	for i, ref in ipairs(rec.rem) do
+		rem[i] = R.con(ref)
+		trace("build.removal", string.format("%d of %d: key=%s file=%s -> entity %s", i, #rec.rem, tostring(ref.key), tostring(ref.file), tostring(rem[i])))
+	end
 	for _, pair in ipairs(rec.old2new) do
 		if rem[pair[1]] then map[rem[pair[1]]] = pair[2] end
 	end
@@ -1893,9 +1901,34 @@ dryRunPieces = function(rec)
 		pcall(function() ctx.gatherBuildings = true end)
 		pcall(function() ctx.gatherFields = true end)
 		local pd = api.engine.util.proposal.makeProposalData(sp, ctx)
-		local prop = get(pd, "proposal")
-		if prop == nil then error("the proposal data has no proposal", 0) end
-		local inner = get(prop, "proposal") or prop
+		-- The converted proposal: the member of the proposal data that holds street nodes and segments. The data has no member named `proposal` in
+		-- this game (real runs 2026-10-13: parallelProposal collisionInfo toAddData entity2tn tpNetLinkProposal costs errorState ...), so every
+		-- member is looked at, one level down too, for one with an addedSegments list; what each member holds is traced once.
+		local inner
+		local seen = {}
+		local function keysOf(o)
+			local m = A.members(o)
+			if m then return m end
+			local out = {}
+			if type(o) == "table" and getmetatable(o) == nil then for k in pairs(o) do out[#out + 1] = k end end
+			return out
+		end
+		for _, name in ipairs(keysOf(pd)) do
+			local m = get(pd, tostring(name))
+			if type(m) == "table" or type(m) == "userdata" then
+				local sub = get(m, "proposal")
+				local cand = (get(m, "addedSegments") ~= nil and m) or (sub ~= nil and get(sub, "addedSegments") ~= nil and sub) or nil
+				local inside = {}
+				for _, k in ipairs(keysOf(m)) do inside[#inside + 1] = tostring(k) end
+				seen[#seen + 1] = tostring(name) .. "{" .. table.concat(inside, ",") .. "}" .. (cand and "*" or "")
+				if cand and not inner then inner = cand end
+			end
+		end
+		if not M.pdProbed then
+			M.pdProbed = true
+			C.tracer("build")("build.pd", "the proposal data's members: " .. table.concat(seen, " ") .. (inner and " (the converted proposal is the starred one)" or " (none holds street segments)"))
+		end
+		if inner == nil then error("the proposal data holds no converted proposal", 0) end
 		local nodePos = {}
 		for _, n in ipairs(A.list(inner, "addedNodes")) do
 			local nc = get(n, "comp")
@@ -1993,7 +2026,7 @@ local function connectorStep(rec, R, f, notes)
 		if #mini.segs == 0 then return false end
 		local okP, args = pcall(function()
 			local sp = streetProposal(mini, R, notes, { cfg = false })
-			return commandArgs(sp, newContext(f.ctx, CTX_NATIVE, R), true, false, f.dust)
+			return commandArgs(sp, newContext(f.ctx, R), true, false, f.dust)
 		end)
 		if okP then
 			local okF, why = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
@@ -2019,7 +2052,7 @@ PLAN.construction = function(rec, R, f, notes)
 			if isConstructionSegment(s) then ie, pi = true, false break end
 		end
 	end
-	local first = commandArgs(constructionProposal(rec, R), newContext(f.ctx, CTX_NATIVE, R), ie, pi, f.dust)
+	local first = commandArgs(constructionProposal(rec, R), newContext(f.ctx, R), ie, pi, f.dust)
 	if rec.src == "native" then
 		for _, s in ipairs(rec.segs) do
 			if s.connector then
@@ -2035,10 +2068,10 @@ end
 -- refuses both in one proposal). The construction's own paths are left to its script; the second command ignores the
 -- non-critical collision with its own street connection.
 PLAN.withStreet = function(rec, R, f, notes, form)
-	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	local conOnly = part(rec, { "cons", "rem", "old2new" })
 	first.chain = { function()
-		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, CTX_NATIVE, R), true, false, f.dust)
+		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, R), true, false, f.dust)
 	end }
 	return first
 end
@@ -2048,26 +2081,26 @@ end
 PLAN.combined = function(rec, R, f, notes, form)
 	local sp = streetProposal(rec, R, notes, form)
 	setConstructions(sp, rec, R)
-	return commandArgs(sp, newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	return commandArgs(sp, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 -- A bulldozing that takes constructions and street pieces: the constructions first, then the segments (the order the
 -- game's own industry removal uses).
 PLAN.bulldoze = function(rec, R, f, notes)
-	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
+	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	local list = removalList(rec)
 	if list then
 		first.chain = { function()
 			local edges = {}
 			for i, ref in ipairs(list) do edges[i] = R.edge(ref) end
-			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
+			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 		end }
 	end
 	return first
 end
 
 PLAN.street = function(rec, R, f, notes, form)
-	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, CTX_NATIVE, R), f.ie, f.pi, f.dust)
+	return commandArgs(streetProposal(rec, R, notes, form), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 PLAN.nodecfg = PLAN.street
@@ -2077,7 +2110,7 @@ PLAN.removal = function(rec, R, f, notes)
 	for i, ref in ipairs(removalList(rec)) do edges[i] = R.edge(ref) end
 	local P = A.removeSegmentsProposal(edges)
 	if P == nil then fail("the engine made no removal proposal") end
-	return commandArgs(P, newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
+	return commandArgs(P, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 -- Upgrades one segment per command with the engine's replaceSegment, as the upgrade tool does (finding from MPFever
@@ -2112,7 +2145,7 @@ PLAN.upgrade = function(rec, R, f, notes)
 			sp.addedSegments = list
 			P.proposal = sp
 		end
-		return commandArgs(P, newContext(f.ctx, CTX_TERRAIN, R), f.ie, f.pi, f.dust)
+		return commandArgs(P, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	end
 	local first = stepArgs(1)
 	if #steps > 1 then
@@ -2200,7 +2233,7 @@ PLAN.stop = function(rec, R, f, notes, form)
 		-- segment is -1, the same as here.
 		if #cfgs > 0 then opt(notes, ssp, "nodeConfigsToAdd", cfgs) end
 	end)
-	return commandArgs(sp, newContext(f.ctx, CTX_PLAIN, R), f.ie, f.pi, f.dust)
+	return commandArgs(sp, newContext(f.ctx, R), f.ie, f.pi, f.dust)
 end
 
 -- ================================================================== validation (nothing from the wire is trusted)
@@ -2350,10 +2383,26 @@ end
 function M.capture(proposal, flags, ctx)
 	flags = flags or {}
 	ctx = ctx or { plain = C.plain, keyOf = function(e) return "s:" .. tostring(e) end }
-	local cap = newCapture(ctx, { result = flags.result })
+	local cap = newCapture(ctx, { result = flags.result, cons = flags.cons })
 	local ok, rec = pcall(captureRecord, proposal, cap)
 	if not ok then return nil, tostring(rec) end
 	return M.bodyOf(rec, flags)
+end
+
+-- What a capture that has to wait for the build (an edge object gets its model only when the build runs) needs from BEFORE it: the
+-- build's Context flags (the event after the build carries none) and the constructions it removes (gone, or going, by then; real run
+-- 2026-10-13: a depot over buildings, "construction 39481 is not in the world"). Never raises.
+function M.preState(proposal, ctxObj)
+	local pre = { ctx = captureContext(ctxObj) or nil, cons = {} }
+	pcall(function()
+		for _, key in ipairs({ "toRemove", "constructionsToRemove" }) do
+			for _, id in ipairs(A.list(proposal, key)) do
+				local info = type(id) == "number" and A.conInfo(id)
+				if info then pre.cons[id] = info end
+			end
+		end
+	end)
+	return pre
 end
 
 -- A captured record as the body of an action line: the body, nil and its wire text, or nil and why not.
@@ -2434,6 +2483,33 @@ function M.captureToolBuild(id, name, param, ctx)
 	local ok, body, why, text = pcall(M.capture, proposal, { playerInitiated = true }, ctx)
 	if not ok then return nil, "the build could not be read: " .. tostring(body) end
 	return body, why, text
+end
+
+-- The Context flags of a build as one line for the trace (build.ctx): a record's flags, an engine Context, or "none".
+function M.contextText(c)
+	if c == nil or c == false then return "none" end
+	local function flag(...)
+		for _, k in ipairs({ ... }) do
+			local v = get(c, k)
+			if v ~= nil then return tostring(v) end
+		end
+		return "?"
+	end
+	return string.format("align=%s cleanup=%s buildings=%s fields=%s redo=%s", flag("align", "checkTerrainAlignment"), flag("cleanup", "cleanupStreetGraph"),
+		flag("buildings", "gatherBuildings"), flag("fields", "gatherFields"), flag("redo", "extendProposalRedoPillars"))
+end
+
+-- The held command's own flags (the native module read them from the command it holds: Context members, ignoreErrors, playerInitiated) go
+-- into a captured body, replacing what the capture of the tool's preview could only guess (a preview carries no Context). `flags` is the
+-- table of the `held` event's ctx. Returns true when the body was changed.
+function M.withHeldFlags(body, flags)
+	local args = type(body) == "table" and body.args
+	if type(flags) ~= "table" or type(args) ~= "table" then return false end
+	args[2] = { align = flags.align == true, cleanup = flags.cleanup == true, buildings = flags.buildings == true, fields = flags.fields == true,
+		redo = flags.redo == true }
+	if type(flags.ie) == "boolean" then args[3] = flags.ie end
+	if type(flags.pi) == "boolean" then args[4] = flags.pi end
+	return true
 end
 
 -- The plan (street, combined, bulldoze, construction, ...) a captured build body falls under; nil when it cannot be told.
@@ -2589,6 +2665,455 @@ local function proposalCounts(proposal)
 	return table.concat(parts, " ")
 end
 
+-- The engine's own verdict on a proposal that is not applied (what a tool's preview reads): { critical, messages } or nil and why it
+-- cannot be read (a native Proposal, an engine that does not answer). Never raises.
+local function proposalVerdict(args)
+	local ok, v, why = pcall(function()
+		local ctx = args[2]
+		if ctx == nil or ctx == false then
+			ctx = A.new("Context")
+			pcall(function() ctx.player = A.player() end)
+		end
+		local pd = api.engine.util.proposal.makeProposalData(args[1], ctx)
+		-- Once per run, for a proposal that carries a construction: what the proposal data offers a script. MPFever's route for a construction
+		-- with street pieces needs the engine's CONVERTED construction (Proposal.toAdd[1]), which it reads from `res.proposal` in the callback
+		-- of a command that is refused on purpose; a simulation-state script has no callbacks. If the data of makeProposalData has a member
+		-- with the conversion (toAddData?), it shows here.
+		if not M.pdDumped and pd ~= nil and #A.list(args[1], "constructionsToAdd") > 0 then
+			M.pdDumped = true
+			pcall(function()
+				local names = {}
+				for _, k in ipairs(A.members(pd) or {}) do names[#names + 1] = tostring(k) end
+				local tad = {}
+				local list = A.list(pd, "toAddData")
+				for _, k in ipairs(list[1] and A.members(list[1]) or {}) do tad[#tad + 1] = tostring(k) end
+				C.tracer("build")("build.pd", string.format("makeProposalData members [%s]; toAddData has %d entr(ies), first member [%s]", table.concat(names, " "), #list, table.concat(tad, " ")))
+			end)
+		end
+		local es = pd and get(pd, "errorState")
+		if es == nil then return nil, "no errorState" end
+		local msgs = {}
+		for i, m in ipairs(A.list(es, "messages")) do if i <= 4 then msgs[#msgs + 1] = tostring(m) end end
+		return { critical = get(es, "critical") == true, messages = msgs }
+	end)
+	if not ok then return nil, tostring(v):sub(1, 100) end
+	return v, why
+end
+
+-- What a proposal about to go to the engine holds, per kind, for the trace (build.cmp) on the originator and on the receivers.
+local function recCounts(rec)
+	return string.format("cons=%d rem=%d nodes=%d segs=%d rmNodes=%d rmSegs=%d objs=%d rmObjs=%d ncfg=%d rmNcfg=%d", #rec.cons, #rec.rem, #rec.nodes, #rec.segs,
+		#rec.rmNodes, #rec.rmSegs, #rec.objs, #rec.rmObjs, #rec.ncfg, #rec.rmNcfg)
+end
+
+-- ---- the replay through the portable text (B2.2)
+-- One mechanism for every build kind: the street part is the text's own (nodes, segments with their exact ends, tangents, template names,
+-- the removed nodes and segments), the construction INPUT (file, parameters, placement, name, owner), the edge objects, the lanes and the
+-- node configuration details are the Lua capture's (the lane values of the text are not used until their transport-mode bits are verified
+-- against the engine's reading), and ONE SimpleProposal is handed to the engine, which converts it itself. A segment that the construction's
+-- own conversion makes (found by a dry run of the construction, by geometry) is not input and is left out. Off unless
+-- FEVERLINK3_PORTABLE_REPLAY=1; anything it cannot do falls back to the record path, logged.
+local PORTABLE_REPLAY = false
+pcall(function() PORTABLE_REPLAY = os.getenv("FEVERLINK3_PORTABLE_REPLAY") == "1" end)
+M.PORTABLE_REPLAY = PORTABLE_REPLAY
+local okPT, Portable = pcall(ug_require, "feverlink3_portable.lua")
+if not okPT then okPT, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
+if not okPT or type(Portable) ~= "table" then Portable = nil end
+
+local function withPrefix(name)
+	if type(name) == "string" and name:sub(1, 3) ~= "::/" then return "::/" .. name end
+	return name
+end
+
+local function plainName(s)
+	if type(s) == "string" then return (s:gsub("^::/", "")) end
+	return s
+end
+
+-- The record made over by the text. The numbers of the placeholders are labels, not identity: the engine's held proposal numbers ONE sequence
+-- across nodes, segments and the construction, the record numbers its own. So the new proposal takes the TEXT's elements in the text's order
+-- with fresh per-type sequences (nodes -1.., segments -1.., as a script numbers them), and what the record knows about an element (owner,
+-- precedence, track type, objects, lanes; the node configurations' extras; the edge objects) is found by identity: a new node by its position,
+-- a segment by the two ends it joins, a construction by file and placement. An element that cannot be matched uniquely makes the whole
+-- thing fall back, and the reason names it. nil and why when the two do not describe the same build.
+local function portableRecord(rec, tree)
+	local p = tree.proposal or {}
+	local c = Portable.counts(tree)
+	if c.nodes ~= #rec.nodes or c.segs ~= #rec.segs or c.rmNodes ~= #rec.rmNodes or c.rmSegs ~= #rec.rmSegs or c.cons ~= #rec.cons or c.rem ~= #rec.rem
+		or c.objs ~= #rec.objs or c.rmObjs ~= #rec.rmObjs or c.ncfg ~= #rec.ncfg or c.rmNcfg ~= #rec.rmNcfg then
+		return nil, "the text and the record count differently (" .. Portable.countsText(c) .. ")"
+	end
+	local function copy(t) local o = {}; for k, v in pairs(t) do o[k] = v end; return o end
+	local function xyz(v) return v and { x = v.x, y = v.y, z = v.z } or nil end
+	local function pk(v) return string.format("%.2f,%.2f,%.2f", v.x, v.y, v.z or 0) end
+	local textNodes, textSegs = Portable.list(p.addedNodes), Portable.list(p.addedSegments)
+
+	-- new nodes: record id -> text number, by position
+	local nodeByPos = {}
+	for i, tn in ipairs(textNodes) do
+		if not (tn.entity and tn.entity.new and tn.position) then return nil, "node " .. i .. " has no placeholder or position in the text" end
+		local k = pk(tn.position)
+		if nodeByPos[k] then return nil, "node " .. i .. ": two new nodes of the text lie at " .. k end
+		nodeByPos[k] = tn.entity.new
+	end
+	local recNodeToText, used = {}, {}
+	for i, rn in ipairs(rec.nodes) do
+		local tnum = rn.pos and nodeByPos[pk(rn.pos)]
+		if not tnum or used[tnum] then return nil, "the record's new node " .. i .. " is not at one new node of the text" end
+		used[tnum] = true
+		recNodeToText[rn.id] = tnum
+	end
+	-- the per-type sequences of the new proposal
+	local simpleNode, simpleSeg = {}, {}
+	for i, tn in ipairs(textNodes) do simpleNode[tn.entity.new] = -i end
+	for i, ts in ipairs(textSegs) do
+		if not (ts.entity and ts.entity.new and ts.position0 and ts.position1 and ts.tangent0 and ts.tangent1) then return nil, "segment " .. i .. " is incomplete in the text" end
+		simpleSeg[ts.entity.new] = -i
+	end
+
+	-- an end of a segment as an identity: a new node by its text number, an existing one by its position
+	local function textEnd(e)
+		if type(e) ~= "table" then return nil end
+		if e.new then return "n" .. e.new end
+		if e.pos then return "p" .. pk(e.pos) end
+		return nil
+	end
+	local function recEnd(v)
+		if type(v) == "number" then return recNodeToText[v] and ("n" .. recNodeToText[v]) or nil end
+		if type(v) == "table" and v.p then return "p" .. pk(v.p) end
+		return nil
+	end
+	local function pair(a, b) if a == nil or b == nil then return nil end if a > b then a, b = b, a end return a .. "|" .. b end
+
+	-- segments: by the pair of ends; the ones whose ends the record cannot give (a construction's own pieces) by elimination
+	local textByPair, recMatched, textMatched = {}, {}, {}
+	for i, ts in ipairs(textSegs) do
+		local k = pair(textEnd(ts.node0), textEnd(ts.node1))
+		if k == nil then return nil, "segment " .. i .. " has an end the text does not locate" end
+		if textByPair[k] then return nil, "segment " .. i .. ": two new segments of the text join the same ends (" .. k .. ")" end
+		textByPair[k] = i
+	end
+	local recSegToText, pending = {}, {}
+	for i, rs in ipairs(rec.segs) do
+		local k = pair(recEnd(rs.n0), recEnd(rs.n1))
+		local ti = k and textByPair[k]
+		if ti then
+			if textMatched[ti] then return nil, "the record's segments " .. textMatched[ti] .. " and " .. i .. " join the same ends" end
+			textMatched[ti], recMatched[i] = i, true
+			recSegToText[i] = ti
+		else
+			pending[#pending + 1] = i
+		end
+	end
+	local freeText = {}
+	for i = 1, #textSegs do if not textMatched[i] then freeText[#freeText + 1] = i end end
+	if #pending ~= #freeText then return nil, "the record has " .. #pending .. " segment(s) the text's ends do not name, the text " .. #freeText .. " the record's do not" end
+	if #pending > 1 then return nil, #pending .. " segments cannot be matched by their ends" end
+	if #pending == 1 then
+		textMatched[freeText[1]], recSegToText[pending[1]] = pending[1], freeText[1]
+	end
+	local textToRec = {}
+	for ri, ti in pairs(recSegToText) do textToRec[ti] = ri end
+
+	local out = copy(rec)
+	out.portable, out.nodes, out.segs, out.rmNodes, out.rmSegs = true, {}, {}, {}, {}
+	for i, tn in ipairs(textNodes) do out.nodes[i] = { id = -i, pos = xyz(tn.position) } end
+	-- an end of the new segment: a new node by its new number, an existing one by the record's reference when it has one there, else by position
+	local function endRef(e, rs)
+		if e.new then return simpleNode[e.new] end
+		for _, r in ipairs({ rs.n0, rs.n1 }) do
+			if type(r) == "table" and r.p and e.pos and pk(r.p) == pk(e.pos) then return r end
+		end
+		return { __ref = "node", p = xyz(e.pos) }
+	end
+	for i, ts in ipairs(textSegs) do
+		local rs = rec.segs[textToRec[i]]
+		local seg = copy(rs)
+		seg.portable, seg.derived, seg.connector = true, nil, nil
+		seg.id, seg.n0, seg.n1 = -i, endRef(ts.node0, rs), endRef(ts.node1, rs)
+		local sc = copy(rs.c or {})
+		sc.p0, sc.p1, sc.t0, sc.t1 = xyz(ts.position0), xyz(ts.position1), xyz(ts.tangent0), xyz(ts.tangent1)
+		sc.type, sc.typeIndex, sc.roadType = ts.type, ts.typeIndex, ts.roadType
+		sc.roadTemplate, sc.roadStyle = withPrefix(ts.roadTemplate), withPrefix(ts.roadStyle)
+		seg.c = sc
+		if seg.type == nil then seg.type = ts.baseType end
+		out.segs[i] = seg
+	end
+	-- what refers to the record's placeholders follows them to the new numbers
+	local function newNode(v)
+		if type(v) ~= "number" or v >= 0 then return v end
+		local t = recNodeToText[v]
+		if not t then return nil end
+		return simpleNode[t]
+	end
+	local function newSeg(v)
+		if type(v) ~= "number" or v >= 0 then return v end
+		for ri, rs in ipairs(rec.segs) do
+			if rs.id == v then return simpleSeg[textSegs[recSegToText[ri]].entity.new] end
+		end
+		return nil
+	end
+	out.objs = {}
+	for i, o in ipairs(rec.objs) do
+		local e = newSeg(o.edge)
+		if e == nil then return nil, "edge object " .. i .. " is on a segment the text does not have" end
+		local no = copy(o)
+		no.edge = e
+		out.objs[i] = no
+	end
+	out.ncfg = {}
+	for i, n in ipairs(rec.ncfg) do
+		local node = newNode(n.node)
+		if node == nil then return nil, "node configuration " .. i .. " belongs to a node the text does not have" end
+		local nn = copy(n)
+		nn.node, nn.lc, nn.cw = node, {}, {}
+		for j, l in ipairs(n.lc or {}) do
+			local s0, s1 = newSeg(l.s0), newSeg(l.s1)
+			if s0 == nil or s1 == nil then return nil, "node configuration " .. i .. " names a segment the text does not have" end
+			local nl = copy(l)
+			nl.s0, nl.s1 = s0, s1
+			nn.lc[j] = nl
+		end
+		for j, x in ipairs(n.cw or {}) do
+			local e = newSeg(x)
+			if e == nil then return nil, "node configuration " .. i .. " has a crosswalk on a segment the text does not have" end
+			nn.cw[j] = e
+		end
+		out.ncfg[i] = nn
+	end
+	-- constructions: by file and placement
+	out.cons = {}
+	local takenCon = {}
+	for i, tc in ipairs(Portable.list(tree.toAdd)) do
+		local found
+		for j, rc in ipairs(rec.cons) do
+			local m = rc.transf
+			if not takenCon[j] and plainName(rc.file) == plainName(tc.fileName) and type(m) == "table" and type(tc.transf) == "table"
+				and abs(m[13] - tc.transf[13]) < 0.05 and abs(m[14] - tc.transf[14]) < 0.05 then
+				if found then return nil, "construction " .. i .. " matches two of the record's" end
+				found = j
+			end
+		end
+		if not found then return nil, "construction " .. i .. " (" .. tostring(tc.fileName) .. ") is not among the record's" end
+		takenCon[found] = true
+		out.cons[i] = rec.cons[found]
+	end
+	for i, tn in ipairs(Portable.list(p.removedNodes)) do
+		local r = rec.rmNodes[i]
+		local ref
+		if type(r) == "table" and r.__ref == "node" then
+			ref = r
+		elseif tn.position then
+			ref = { __ref = "node", p = xyz(tn.position) }
+		end
+		if not ref then return nil, "removed node " .. i .. " is not located in the text" end
+		out.rmNodes[i] = ref
+	end
+	for i, ts in ipairs(Portable.list(p.removedSegments)) do
+		local r = rec.rmSegs[i]
+		if type(r) == "table" then
+			out.rmSegs[i] = r
+		elseif ts.position0 and ts.position1 then
+			out.rmSegs[i] = { __ref = "edge", p0 = xyz(ts.position0), p1 = xyz(ts.position1), t0 = xyz(ts.tangent0), t1 = xyz(ts.tangent1) }
+		else
+			return nil, "removed segment " .. i .. " is not located in the text"
+		end
+	end
+	return out
+end
+
+-- THE rule for the segments a construction makes itself (Track A, docs/research/SPIKE_NATIVE_COMMAND.md "Which segments does the construction
+-- own?", 6 of 6 real samples): `proposal.frozenNodes` holds 0-based INDICES into the proposal's added nodes, and the added segments that touch a
+-- frozen node are the construction's own piece (the tool-made pieces hang on the other end). The frozen node itself stays in the proposal (the
+-- tool pieces use it); the construction's piece is left to the engine's Convert. Segment i of the text is segment i of the new record.
+-- Returns how many segments are own and the frozen nodes' ids in the new record, or nil and why.
+local function markByFrozenNodes(rec, tree)
+	local pt = tree.proposal or {}
+	local textNodes, textSegs = Portable.list(pt.addedNodes), Portable.list(pt.addedSegments)
+	local frozen, ids = {}, {}
+	for _, fz in ipairs(Portable.list(pt.frozenNodes)) do
+		local idx = fz.old
+		local node = type(idx) == "number" and textNodes[idx + 1]
+		if not (node and node.entity and node.entity.new) then return nil, "frozen node index " .. tostring(idx) .. " is not one of the " .. #textNodes .. " added nodes" end
+		frozen[node.entity.new] = true
+		ids[#ids + 1] = -(idx + 1)   -- (the node's id in the new record, which numbers the text's nodes -1.. in order)
+		if rec.nodes[idx + 1] then rec.nodes[idx + 1].keep = true end
+	end
+	local n = 0
+	for i, ts in ipairs(textSegs) do
+		local a, b = ts.node0 and ts.node0.new, ts.node1 and ts.node1.new
+		if rec.segs[i] and ((a and frozen[a]) or (b and frozen[b])) then
+			rec.segs[i].derived = true
+			n = n + 1
+		end
+	end
+	return n, ids
+end
+
+-- Cross-check only (the first rule tried, from the real depot samples): the segments whose owner is the build's own player. The pieces the
+-- construction makes have the player as owner and the tool-made ones an uninitialised value; the frozen-node rule must name the same ones.
+local function ownedByPlayer(tree)
+	local player = tree.context and tree.context.player and tree.context.player.old
+	local set = {}
+	if not player then return nil end
+	for i, ts in ipairs(Portable.list((tree.proposal or {}).addedSegments)) do
+		if ts.playerOwned and ts.playerOwned.old == player then set[i] = true end
+	end
+	return set
+end
+
+-- what the left-out (derived) segments take with them: the new nodes only they use and those nodes' configurations
+local function leftOutWith(rec2)
+	local used = {}
+	for _, sg in ipairs(rec2.segs) do
+		if not sg.derived then
+			if type(sg.n0) == "number" then used[sg.n0] = true end
+			if type(sg.n1) == "number" then used[sg.n1] = true end
+		end
+	end
+	for _, n in ipairs(rec2.nodes) do if n.keep then used[n.id] = true end end
+	local nodesOut, cfgOut = 0, 0
+	for _, n in ipairs(rec2.nodes) do if not used[n.id] then nodesOut = nodesOut + 1 end end
+	for _, n in ipairs(rec2.ncfg) do if type(n.node) == "number" and n.node < 0 and not used[n.node] then cfgOut = cfgOut + 1 end end
+	return nodesOut, cfgOut
+end
+
+-- The new proposal's frozen nodes: the 0-based index of each frozen node in the SimpleProposal's nodesToAdd (the kept nodes in the record's order:
+-- those a segment that stays uses), and how many nodes the SimpleProposal adds. A frozen node no remaining segment uses is not in the proposal.
+local function patchFor(rec2, frozenIds)
+	local used = {}
+	for _, sg in ipairs(rec2.segs) do
+		if not sg.derived then
+			if type(sg.n0) == "number" then used[sg.n0] = true end
+			if type(sg.n1) == "number" then used[sg.n1] = true end
+		end
+	end
+	local pos, k = {}, 0
+	for _, n in ipairs(rec2.nodes) do
+		if used[n.id] or n.keep then
+			k = k + 1
+			pos[n.id] = k - 1
+		end
+	end
+	local frozen, at = {}, {}
+	for _, id in ipairs(frozenIds) do
+		if pos[id] ~= nil then
+			frozen[#frozen + 1] = pos[id]
+			for _, n in ipairs(rec2.nodes) do
+				if n.id == id and type(n.pos) == "table" then at[#at + 1] = { n.pos.x, n.pos.y, n.pos.z or 0 } end
+			end
+		end
+	end
+	-- (`at`: the same nodes by position; the converted proposal has more added nodes than this one, so the module finds them by place)
+	return frozen, k, at
+end
+
+-- (for the tests) the record made over by the text with THE rule applied: the record, how many segments are the construction's own, the nodes and
+-- node configurations that leave with them, the patch the native module needs (frozen indices, adds) and whether the owner cross-check agrees
+function M.ownRule(rec, tree)
+	local rec2, why = portableRecord(rec, tree)
+	if not rec2 then return nil, why end
+	local n, frozenNums = markByFrozenNodes(rec2, tree)
+	if not n then return nil, frozenNums end
+	local nodesOut, cfgOut = leftOutWith(rec2)
+	local frozen, adds = patchFor(rec2, frozenNums)
+	local owned = ownedByPlayer(tree)
+	local agree = owned ~= nil
+	if owned then
+		for i, sg in ipairs(rec2.segs) do if (sg.derived == true) ~= (owned[i] == true) then agree = false end end
+	end
+	return rec2, n, nodesOut, cfgOut, { frozen = frozen, adds = adds }, agree
+end
+
+local function portableReplay(rec, text, R, f, tkey)
+	local trace = C.tracer("build")
+	local function no(why)
+		trace("build.portable", string.format("%s portable replay NOT used: %s; the record path builds it", tostring(tkey or "-"), why))
+		return nil, why
+	end
+	if not Portable then return no("no portable module") end
+	local tree, why = Portable.parse(text)
+	if not tree then return no("the text is unusable (" .. tostring(why) .. ")") end
+	-- what the held command says about each segment and the construction, for the next analysis (segmentTags and frozenNodes are what the engine's
+	-- conversion sets for a construction; whether they say which segments it made is not known)
+	pcall(function()
+		local pt = tree.proposal or {}
+		local parts = {}
+		for i, ts in ipairs(Portable.list(pt.addedSegments)) do
+			local function e(x) return x and (x.new and ("new" .. x.new) or ("old" .. tostring(x.old))) or "?" end
+			parts[#parts + 1] = string.format("seg%d(new%s %s-%s owner=%s %s)", i, tostring(ts.entity and ts.entity.new), e(ts.node0), e(ts.node1),
+				tostring(ts.playerOwned and ts.playerOwned.old), tostring(ts.roadTemplate):match("([^/]+)$") or "?")
+		end
+		local tags, frozen, cfrozen = {}, {}, {}
+		for _, t in ipairs(Portable.list(pt.segmentTags)) do tags[#tags + 1] = tostring(t.value) end
+		for _, t in ipairs(Portable.list(pt.frozenNodes)) do frozen[#frozen + 1] = tostring(t.old or ("new" .. tostring(t.new))) end
+		for _, c in ipairs(Portable.list(tree.toAdd)) do
+			for _, t in ipairs(Portable.list(c.frozenNodes)) do cfrozen[#cfrozen + 1] = tostring(t.old or ("new" .. tostring(t.new))) end
+		end
+		if #tags > 0 or #frozen > 0 or #cfrozen > 0 or #parts > 1 then
+			trace("build.roles", string.format("%s %s; segmentTags[%s] proposal.frozenNodes[%s] construction.frozenNodes[%s]", tostring(tkey or "-"), table.concat(parts, " "),
+				table.concat(tags, ","), table.concat(frozen, ","), table.concat(cfrozen, ",")))
+		end
+	end)
+	local rec2, whyR = portableRecord(rec, tree)
+	if not rec2 then return no(whyR) end
+	local nDerived, frozenNums = markByFrozenNodes(rec2, tree)
+	if nDerived == nil then return no("the construction's own street pieces cannot be found (" .. tostring(frozenNums) .. ")") end
+	-- With the native module patching the SimpleProposal's frozenNodes before the engine converts it, the tool's own input is sent whole: the
+	-- construction's entrance stays in it and the frozen node keeps it as it is (b36: left out, the engine regenerated an entrance 3 m off the
+	-- junction that collided with the street piece).
+	if f.canPatch and nDerived > 0 then
+		for _, sg in ipairs(rec2.segs) do sg.derived = nil end
+		nDerived = 0
+	end
+	local nodesOut, cfgOut = leftOutWith(rec2)
+	local owned = ownedByPlayer(tree)
+	local agree = "n/a"
+	if owned then
+		agree = "agree"
+		for i, sg in ipairs(rec2.segs) do if (sg.derived == true) ~= (owned[i] == true) then agree = "disagree" end end
+	end
+	trace("build.portable", string.format("%s frozen-node rule: %d of %d segment(s) touch a frozen node (%d frozen) and are left to the construction, with %d node(s) and %d node configuration(s) only they use; cross-check owner vs frozen: %s",
+		tostring(tkey or "-"), nDerived, #rec2.segs, #frozenNums, nodesOut, cfgOut, agree))
+	local frozenIdx, expectAdds, frozenAt = patchFor(rec2, frozenNums)
+	if #frozenNums > 0 and #frozenIdx == 0 then
+		trace("build.patch", string.format("%s the frozen node is not used by any remaining segment: nothing to patch", tostring(tkey or "-")))
+	end
+	if #frozenIdx > 0 and not f.canPatch then
+		return no("the construction's frozen nodes must be set by the native module (FEVERLINK3_NATIVE_PATCH=1 and a module with the patch capability), which is not available")
+	end
+	local notes = {}
+	local okB, args = pcall(function()
+		local sp = streetProposal(rec2, R, notes, { drop = true })
+		setConstructions(sp, rec2, R)
+		-- the engine drops a command whose verdict has errors before it reaches the command list when ignoreErrors is off (sweep run 3); this proposal
+		-- is judged before the native patch and always collides with the construction's own street piece (b32: no Add ever seen), so it is sent with errors ignored
+		return commandArgs(sp, newContext(f.ctx, R), f.ie or #frozenIdx > 0, f.pi, f.dust)
+	end)
+	if not okB then return no("not built (" .. tostring(args):sub(1, 160) .. ")") end
+	local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(args, 1, args.n)) end)
+	if not okF then return no("the engine's factory refused it (" .. tostring(errF):gsub("\nstack traceback:.*", ""):sub(1, 160) .. ")") end
+	local v, whyV = proposalVerdict(args)
+	local verdict = v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")
+	trace("build.portable", string.format("%s portable replay: one proposal, %d construction(s), %d segment(s) of %d left to the construction (frozen-node rule); engine verdict %s",
+		tostring(tkey or "-"), #rec2.cons, nDerived, #rec2.segs, verdict))
+	-- with a native patch the dry verdict is of the unpatched proposal: the construction collides with its own street piece until the frozen nodes are set (b28), so it only gates when no patch follows
+	if v and v.critical and #frozenIdx == 0 then return no("the engine's verdict is critical (" .. verdict .. ")") end
+	if v and v.critical then trace("build.portable", string.format("%s the critical verdict is not gating: the native patch sets the frozen nodes at the Add", tostring(tkey or "-"))) end
+	logNotes(notes, "build portable")
+	args.plan, args.form = "portable", 1
+	if #frozenIdx > 0 then
+		-- the converted proposal's frozenNodes cannot be set from Lua: the native module patches them at the Add of this command (patch_next); the
+		-- engine's Convert keeps the SimpleProposal's node order, `adds` lets the module check it
+		local adds = expectAdds
+		pcall(function() adds = #A.list(get(args[1], "streetProposal"), "nodesToAdd") end)
+		args.patch = { frozen = frozenIdx, adds = adds, at = (#frozenAt == #frozenIdx and #frozenAt > 0) and frozenAt or nil }
+		trace("build.patch", string.format("%s patch_next frozen=[%s] adds=%d (the text's frozen node(s) as indices into this proposal's nodesToAdd, %d expected)",
+			tostring(tkey or "-"), table.concat(frozenIdx, ","), adds, expectAdds))
+	end
+	return args
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
@@ -2597,7 +3122,50 @@ local function decodeBuildUnsafe(body, ctx)
 	local plan, whyNot = classify(rec)
 	if not plan then return nil, whyNot end
 	local R = newResolver(ctx)
-	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src }
+	local f = { ctx = a[2] or nil, ie = a[3] == true, pi = a[4] == true, dust = a[5] == true, src = rec.src, canPatch = ctx and ctx.canPatch == true }
+	local ctxSource = "record"
+	if type(f.ctx) == "table" and f.ctx.native then
+		f.ctx, ctxSource = CTX_FALLBACK, "fallback"
+		log("build " .. plan .. ": the record carries no Context flags (an older record); replayed with the fallback flags")
+	end
+	-- The native module builds the engine's Proposal from the originator's text and swaps it into this command: the command only has to carry
+	-- the constructions (the module takes them from this game's own conversion); its street part is replaced, so no verdict gates it.
+	if ctx and ctx.canInject and type(body.nativeText) == "string" and body.nativeText ~= "" and rec.src == "native" then
+		local okI, built = pcall(function()
+			-- A build with constructions is sent as its added constructions alone: the module takes the street part, the removed constructions
+			-- and every flag from the text, and only the added constructions from this command's own conversion (the "donor"). b68: a depot
+			-- over four town buildings went to the chained withStreet plan, which cannot be injected, and drifted; b70: with the removals in
+			-- it, this game's conversion made 3 constructions of the text's 1 and the module refused. Errors are ignored so that the command
+			-- reaches the command list (its verdict is of a proposal that is replaced at the apply).
+			local b
+			if #rec.cons > 0 then
+				b = commandArgs(constructionProposal(part(rec, { "cons" }), R), newContext(f.ctx, R), true, false, f.dust)
+			else
+				b = PLAN[plan](rec, R, f, {}, (FORMS[plan] or { {} })[1])
+			end
+			if type(b.chain) == "table" and #b.chain > 0 then error("the build needs a chained command", 0) end
+			api.cmd.makeWorldBuildProposalCmd(unpack(b, 1, b.n))
+			return b
+		end)
+		if okI and built then
+			built.plan, built.form, built.ctxSource = plan, 1, ctxSource
+			built.inject = { text = body.nativeText }
+			log("build inject (" .. plan .. "): the engine's proposal comes from the originator's text (" .. #body.nativeText .. " bytes)")
+			return built
+		end
+		log("build inject not used (" .. tostring(built) .. "); the record path builds it")
+	end
+	if PORTABLE_REPLAY and type(body.input) == "string" then
+		local okT, built = pcall(portableReplay, rec, body.input, R, f, ctx and ctx.traceKey)
+		if okT and built then
+			built.ctxSource = ctxSource
+			log("build portable (" .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, " .. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, "
+				.. #rec.segs .. "+" .. #rec.rmSegs .. " segments")
+			return built
+		elseif not okT then
+			log("portable replay failed (" .. tostring(built) .. "); the record path builds it")
+		end
+	end
 	-- Developer switch (default off): a build that adds constructions AND removes some (a station that takes town buildings away) is
 	-- replayed with ignoreErrors = true. Real session 2026-10-12: such builds created nothing on the receiving game; to A/B whether the
 	-- engine's non-critical errors (a collision with a building this game has and the originator did not) are the reason.
@@ -2609,6 +3177,27 @@ local function decodeBuildUnsafe(body, ctx)
 	local args, used, lastErr
 	local tkey = ctx and ctx.traceKey
 	local trace = C.tracer("build")
+	trace("build.cmp", string.format("%s plan=%s record[%s] flags ie=%s pi=%s", tostring(tkey or "-"), plan, recCounts(rec), tostring(f.ie), tostring(f.pi)))
+	-- A tool's build that brings a construction together with its street pieces (and perhaps buildings to remove) is ONE proposal in the
+	-- originator's engine. Rebuilt as one SimpleProposal with the record's own flags (plan "combined") it is what the originator applied;
+	-- the guessing plans (construction alone with other flags, street part first then the construction) are used only when the engine
+	-- says that one is not possible. Real run 2026-10-13 (road depot over buildings): "construction" was refused with a critical
+	-- "Construction Not Possible" and "withStreet" ended with other edges and node configurations than the originator's.
+	if rec.src == "native" and #rec.cons > 0 and #rec.segs > 0 and (plan == "construction" or plan == "withStreet") then
+		local okS, built = pcall(PLAN.combined, rec, R, f, {}, {})
+		local okF = okS and pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(built, 1, built.n)) end)
+		local v, whyV
+		if okF then v, whyV = proposalVerdict(built) end
+		trace("build.cmp", string.format("%s single proposal: %s; engine verdict %s", tostring(tkey or "-"), okF and "built" or ("not built (" .. tostring(okS and "factory refused" or built) .. ")"),
+			v and ((v.critical and "CRITICAL " or "ok ") .. table.concat(v.messages, "; ")) or ("unknown (" .. tostring(whyV) .. ")")))
+		if okF and v and not v.critical then
+			plan = "combined"
+			built.plan, built.form, built.ctxSource = plan, 1, ctxSource
+			log("build " .. plan .. " (single proposal, " .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, " .. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, "
+				.. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects")
+			return built
+		end
+	end
 	for i, form in ipairs(FORMS[plan] or { {} }) do
 		local notes = {}
 		local t0 = os.clock()
@@ -2640,6 +3229,7 @@ local function decodeBuildUnsafe(body, ctx)
 		end
 	end
 	if not args then return nil, lastErr or "no way to build it" end
+	args.ctxSource = ctxSource
 	args.plan, args.form = plan, used   -- for the engine-verdict lines of the bridge (which form of which plan was judged)
 	log("build " .. plan .. (used > 1 and (" (form " .. used .. ")") or "") .. " (" .. tostring(rec.src) .. "): " .. #rec.cons .. "+" .. #rec.rem .. " constructions, "
 		.. #rec.nodes .. "+" .. #rec.rmNodes .. " nodes, " .. #rec.segs .. "+" .. #rec.rmSegs .. " segments, " .. #rec.objs .. "+" .. #rec.rmObjs .. " objects"
@@ -2726,7 +3316,31 @@ local function bindCreated(body, key, made)
 				if g then map[base .. "/g" .. j] = g end
 			end
 		else
-			complete = false
+			-- The engine hands the id of a removed building to the construction that replaces it, so a build that removes buildings and adds a
+			-- construction shows no NEW entity (real run 2026-10-13: a depot over four buildings was built on the host and reported "found new
+			-- CONSTRUCTION 0"). Looked for by file and place among all constructions near the record's position that no other piece took.
+			local alt
+			local list = (#rec.rem > 0) and octree(p, CON_REACH, "CONSTRUCTION") or nil   -- only a build that removed buildings can have had its ids reused
+			for _, e in ipairs(list or {}) do
+				if not used[e] then
+					local info = A.conInfo(e)
+					if info and info.file == c.file and d3(info.p, p) <= TOL_CON then alt = e break end
+				end
+			end
+			if alt then
+				used[alt] = true
+				local base = key .. "#c" .. i
+				map[base] = alt
+				local depots, stations = A.conParts(alt)
+				for j, d in ipairs(depots) do map[base .. "/d" .. j] = d end
+				for j, st in ipairs(stations) do
+					map[base .. "/s" .. j] = st
+					local g = A.stationGroup(st)
+					if g then map[base .. "/g" .. j] = g end
+				end
+			else
+				complete = false
+			end
 		end
 	end
 	-- A stop on a road is an edge object that is a station. Nothing in the record or the world says which of two games'
@@ -2873,9 +3487,11 @@ function M.onToolEvent(id, name, param, say)
 end
 
 M.classify = classify
+M.proposalCounts = proposalCounts
+M.portableRecord = portableRecord   -- (for the tests: the record made over by the native text)
+M.portable = Portable
 M.normalise = normalise
 M.plans = PLAN
 M.resolver = newResolver
-M.CTX = { native = CTX_NATIVE, terrain = CTX_TERRAIN, plain = CTX_PLAIN }
 
 return M

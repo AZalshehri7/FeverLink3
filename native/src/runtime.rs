@@ -28,9 +28,16 @@ use std::time::Instant;
 
 use crate::build_table::BuildAddrs;
 use crate::counters::{audit_log_line, AddSource, AppliedWatch, Audit, Counters};
+use crate::dump::{self, Budget, Dumper, Env, Header, LiveMem, Scope};
 use crate::engine::{self, AddArgs, AddFn, EngineFns, Held};
 use crate::hold::{Action, Admit, HoldConfig, HoldMachine};
 use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
+use crate::portable;
+use crate::rebuild;
+
+mod cmd_patch;
+mod inject;
+mod native_copy;
 
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
 /// so declared as one that may unwind.
@@ -76,6 +83,8 @@ pub struct Runtime {
     live: AtomicBool,
     machine: Mutex<HoldMachine<Box<Held>>>,
     reader: Mutex<Option<CtlReader>>,
+    /// Control-file polls read by the command hook (to arm a `patch_next` at once) whose other lines the machine has not seen yet.
+    ctl_backlog: Mutex<Vec<crate::link::Poll>>,
     writer: Mutex<Option<Writer>>,
     audit: Mutex<Audit>,
     counters: Counters,
@@ -86,6 +95,23 @@ pub struct Runtime {
     waker: OnceLock<Thread>,
     /// Reads the game time, when this build has a way to. None for now: a scheduled release is due at once.
     clock: Option<fn() -> Option<u64>>,
+    /// The dev-only dump of build commands (`FEVERLINK3_DUMP_COMMANDS`); unset in a normal run.
+    dump: OnceLock<Dumper>,
+    /// The dev-only portable text of build commands (`FEVERLINK3_PORTABLE_DUMP`); unset in a normal run.
+    portable: OnceLock<portable::Sink>,
+    /// The dev-only rebuild self-check (`FEVERLINK3_PORTABLE_REBUILD`); unset in a normal run.
+    rebuild: OnceLock<portable::Sink>,
+    /// The input-level text of every held build command, for the mod (`input.rs`).
+    input: crate::input::InputOut,
+    /// `FEVERLINK3_NATIVE_INJECT`: the originator's full portable text of every held command (`native_text_<id>.txt`), and the receiver's order.
+    text: crate::input::InputOut,
+    inject: crate::inject::State,
+    inject_settings: OnceLock<portable::Settings>,
+    inject_dir_path: Mutex<Option<std::path::PathBuf>>,
+    /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
+    native_copy: OnceLock<portable::Sink>,
+    /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
+    patch: crate::cmd_patch::State,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -119,6 +145,7 @@ impl Runtime {
             live: AtomicBool::new(false),
             machine: Mutex::new(HoldMachine::new(init.hold, table)),
             reader: Mutex::new(None),
+            ctl_backlog: Mutex::new(Vec::new()),
             writer: Mutex::new(None),
             audit: Mutex::new(Audit::new(AUDIT_INTERVAL_MS, 0)),
             counters: Counters::new(),
@@ -127,7 +154,222 @@ impl Runtime {
             orig_apply: AtomicUsize::new(0),
             waker: OnceLock::new(),
             clock: None,
+            dump: OnceLock::new(),
+            portable: OnceLock::new(),
+            rebuild: OnceLock::new(),
+            native_copy: OnceLock::new(),
+            patch: Default::default(),
+            input: crate::input::InputOut::default(),
+            text: crate::input::InputOut::with_prefix("native_text_"),
+            inject: Default::default(),
+            inject_settings: OnceLock::new(),
+            inject_dir_path: Mutex::new(None),
         }
+    }
+
+    /// Switches the dev-only command dump on (`FEVERLINK3_DUMP_COMMANDS`), writing to `dir` when it is known.
+    pub fn enable_dump(&self, settings: dump::Settings, dir: Option<&Path>) {
+        let dumper = Dumper::new(settings);
+        if let Some(dir) = dir {
+            dumper.set_dir(dir);
+        }
+        if self.dump.set(dumper).is_ok() {
+            self.say(&format!(
+                "dump: FEVERLINK3_DUMP_COMMANDS is on: build commands are decoded into {} (read-only; script commands {}; at most {} held and {} apply/applied dumps)",
+                dump::DUMP_FILE,
+                if settings.scripts { "included" } else { "skipped" },
+                settings.max_held,
+                settings.max_applied
+            ));
+        }
+    }
+
+    /// Switches the dev-only portable text on (`FEVERLINK3_PORTABLE_DUMP`), writing to `dir` when it is known.
+    pub fn enable_portable(&self, settings: portable::Settings, dir: Option<&Path>) {
+        let sink = portable::Sink::new(settings);
+        if let Some(dir) = dir {
+            sink.set_dir(dir);
+        }
+        if self.portable.set(sink).is_ok() {
+            self.say(&format!(
+                "portable: FEVERLINK3_PORTABLE_DUMP is on: build commands are written as portable text into {} (read-only; script commands {}; layout table for game build {})",
+                portable::PORTABLE_FILE,
+                if settings.scripts { "included" } else { "skipped" },
+                portable::LAYOUT_BUILD
+            ));
+        }
+    }
+
+    /// Switches the rebuild self-check on (`FEVERLINK3_PORTABLE_REBUILD`): a held command is written as portable text, a
+    /// payload is built again from the text in memory from the game allocator, compared, and the memory given back.
+    pub fn enable_rebuild(&self, settings: portable::Settings, dir: Option<&Path>) {
+        let sink = portable::Sink::named(settings, rebuild::REBUILD_FILE);
+        if let Some(dir) = dir {
+            sink.set_dir(dir);
+        }
+        if self.rebuild.set(sink).is_ok() {
+            self.say(&format!(
+                "rebuild: FEVERLINK3_PORTABLE_REBUILD is on: held build commands are rebuilt from their portable text with the game allocator as a self-check, report in {} (nothing is handed to the engine; script commands {})",
+                rebuild::REBUILD_FILE,
+                if settings.scripts { "included" } else { "skipped" }
+            ));
+        }
+    }
+
+    /// The rebuild self-check of the payload at `payload`: report into the rebuild file.
+    fn rebuild_check(&self, event: &str, payload: usize, hold_id: Option<u64>) {
+        let Some(sink) = self.rebuild.get() else { return };
+        if !sink.has_dir() {
+            return;
+        }
+        let Some(seq) = sink.begin() else { return };
+        let report = (|| -> Result<String, String> {
+            let alloc = rebuild::EngineAlloc::at(self.base)?;
+            let head = portable::Header {
+                seq,
+                event,
+                hold_id,
+                site_rva: None,
+                tool: None,
+                t_ms: self.now_ms(),
+                wall_ms: 0,
+                payload,
+            };
+            let env = Env { image_base: self.base };
+            let live = dump::LiveHeapMem::new();
+            let text = portable::encode(&live, env, sink.settings, self.build.name, &head)?.text;
+            let original = dump::Mem::read(&live, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
+            let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &live, &|b| {
+                Some(b.as_ptr() as usize)
+            });
+            let freed = rebuild::Alloc::free_all(&alloc);
+            r.map(|r| format!("{}FREED {freed} blocks\n", r.text))
+        })();
+        let key = hold_id.map_or("none".to_string(), |k| k.to_string());
+        let text = match report {
+            Ok(t) => {
+                format!("=== rebuild check #{seq} event={event} key={key} ===\n{t}=== end rebuild check #{seq} ===\n")
+            }
+            Err(why) => format!("=== rebuild check #{seq} event={event} key={key} REFUSED: {why} ===\n"),
+        };
+        if let Err(e) = sink.write(&text) {
+            self.say(&format!("rebuild: cannot write {}: {e}", rebuild::REBUILD_FILE));
+        }
+    }
+
+    /// The portable text of the payload at `payload` (or why it is refused) into the portable file.
+    /// The input-level text of the build command at `payload`; `None` (and a line in the log) when the layout table refuses it.
+    fn input_text(&self, payload: usize) -> Option<String> {
+        let head = portable::Header {
+            seq: 0,
+            event: "input",
+            hold_id: None,
+            site_rva: None,
+            tool: None,
+            t_ms: self.now_ms(),
+            wall_ms: 0,
+            payload,
+        };
+        match portable::encode(
+            &LiveMem,
+            Env { image_base: self.base },
+            portable::Settings::input_level(),
+            self.build.name,
+            &head,
+        ) {
+            Ok(p) => Some(p.text),
+            Err(why) => {
+                self.say(&format!("input: the layout table refuses this command: {why}"));
+                None
+            }
+        }
+    }
+
+    fn portable_payload(&self, event: &str, payload: usize, hold_id: Option<u64>, site: Option<u32>) {
+        let Some(sink) = self.portable.get() else { return };
+        if !sink.has_dir() {
+            return;
+        }
+        let Some(seq) = sink.begin() else { return };
+        let tool =
+            site.and_then(|rva| self.build.ui_site_index(rva)).map(|t| dump::TOOL_NAMES.get(t).copied().unwrap_or("?"));
+        let head = portable::Header {
+            seq,
+            event,
+            hold_id,
+            site_rva: site,
+            tool,
+            t_ms: self.now_ms(),
+            wall_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()),
+            payload,
+        };
+        let text =
+            match portable::encode(&LiveMem, Env { image_base: self.base }, sink.settings, self.build.name, &head) {
+                Ok(p) => p.text,
+                Err(why) => format!(
+                    "=== portable v{} REFUSED event={event} key={} seq={seq} payload={payload:#x}: {why} ===
+",
+                    portable::VERSION,
+                    hold_id.map_or("none".to_string(), |k| k.to_string())
+                ),
+            };
+        if let Err(e) = sink.write(&text) {
+            self.say(&format!("portable: cannot write {}: {e}", portable::PORTABLE_FILE));
+        }
+    }
+
+    /// One dump of the payload at `payload`; returns its sequence number, `None` when switched off, out of budget or
+    /// without a folder. Reads only through [`LiveMem`], which checks every range.
+    #[allow(clippy::too_many_arguments)]
+    fn dump_payload(
+        &self,
+        event: &str,
+        payload: usize,
+        hold_id: Option<u64>,
+        site: Option<u32>,
+        scope: Scope,
+        budget: Budget,
+        group: Option<u32>,
+    ) -> Option<u32> {
+        let d = self.dump.get()?;
+        if !d.has_dir() {
+            return None;
+        }
+        let seq = d.begin(budget)?;
+        let kind = self
+            .build
+            .kind_offset
+            .and_then(|o| payload.checked_add(o as usize))
+            // SAFETY: the byte is read only after its range is checked.
+            .and_then(|at| unsafe { crate::mem::readable(at as *const u8, 1).then(|| *(at as *const u8)) })
+            .unwrap_or(255);
+        let head = Header {
+            seq,
+            event,
+            hold_id,
+            site_rva: site,
+            tool: site.and_then(|rva| self.build.ui_site_index(rva)),
+            kind,
+            kind_name: self.build.kind_name(kind).unwrap_or("?"),
+            t_ms: self.now_ms(),
+            wall_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()),
+            thread: current_thread_id(),
+            payload,
+            group,
+        };
+        let text = dump::render(&LiveMem, Env { image_base: self.base }, d.settings, &head, scope);
+        if let Err(e) = d.write(&text) {
+            self.say(&format!("dump: cannot write {}: {e}", dump::DUMP_FILE));
+        }
+        let _ = d.write_index(&format!(
+            "seq={seq} event={event} key={} site={} tool={} payload={payload:#x} bytes={} wall_ms={}",
+            hold_id.map_or("none".to_string(), |k| k.to_string()),
+            site.map_or("none".to_string(), |s| format!("{s:#x}")),
+            head.tool.map_or("none".to_string(), |t| dump::TOOL_NAMES.get(t).copied().unwrap_or("?").to_string()),
+            text.len(),
+            head.wall_ms
+        ));
+        Some(seq)
     }
 
     pub fn counters(&self) -> &Counters {
@@ -204,10 +446,17 @@ impl Runtime {
         let reader = CtlReader::starting_at_end(dir.join(CTL_FILE))?;
         let mut events = EventWriter::open(dir)?;
         let (hooks, poolpatch) = lock(&self.installed).clone();
+        let mut hook_names: Vec<String> = hooks.iter().map(|h| h.to_string()).collect();
+        if self.patch_ready() {
+            hook_names.push(crate::cmd_patch::READY_NAME.to_string()); // the mod reads this string to know it may send `patch_next`
+        }
+        if self.inject_ready() {
+            hook_names.push(crate::inject::READY_NAME.to_string()); // and this one, `inject_next`
+        }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
             version: self.version.to_string(),
-            hooks: hooks.iter().map(|h| h.to_string()).collect(),
+            hooks: hook_names,
             poolpatch,
             clock: self.clock.is_some(),
             kinds: self.build.kinds.iter().map(|(n, k)| (n.to_string(), *k)).collect(),
@@ -226,11 +475,30 @@ impl Runtime {
         }
         *lock(&self.reader) = Some(reader);
         *lock(&self.writer) = Some(Writer { events, failed_logged: false });
+        self.input.set_dir(dir);
+        self.text.set_dir(dir);
+        self.inject_dir(dir);
+        if let Some(d) = self.dump.get() {
+            d.set_dir(dir);
+        }
+        if let Some(p) = self.portable.get() {
+            p.set_dir(dir);
+        }
+        if let Some(p) = self.rebuild.get() {
+            p.set_dir(dir);
+        }
+        if let Some(p) = self.native_copy.get() {
+            p.set_dir(dir);
+        }
         Ok(())
     }
 
     /// Reads whatever the mod has added to the control file and applies it to the machine.
     fn ingest(&self, machine: &mut HoldMachine<Box<Held>>, now: u64) {
+        let backlog = std::mem::take(&mut *lock(&self.ctl_backlog));
+        for poll in backlog {
+            self.apply_poll(machine, poll, now);
+        }
         let Some(mut guard) = try_lock_briefly(&self.reader) else { return };
         let Some(reader) = guard.as_mut() else { return };
         if !reader.has_news() {
@@ -238,8 +506,16 @@ impl Runtime {
         }
         let poll = reader.poll();
         drop(guard);
+        self.apply_poll(machine, poll, now);
+    }
+
+    fn apply_poll(&self, machine: &mut HoldMachine<Box<Held>>, poll: crate::link::Poll, now: u64) {
         for line in &poll.lines {
             match parse_ctl_line(line) {
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
+                    self.arm_patch(frozen, adds, at, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -253,6 +529,32 @@ impl Runtime {
         if poll.gone {
             machine.ctl_gone(now);
         }
+    }
+
+    /// For the command hook, which needs a `patch_next` the mod wrote an instant ago and cannot wait for the service thread (nor for
+    /// the machine's lock, nor for holding to be on): reads the control file, arms the order, and keeps the other lines for the
+    /// next `ingest`. Takes no lock but the reader's and the backlog's.
+    pub(super) fn ingest_patch_order(&self, now: u64) {
+        let Some(mut guard) = try_lock_briefly(&self.reader) else { return };
+        let Some(reader) = guard.as_mut() else { return };
+        if !reader.has_news() {
+            return;
+        }
+        let mut poll = reader.poll();
+        drop(guard);
+        let mut rest = Vec::new();
+        for line in std::mem::take(&mut poll.lines) {
+            match parse_ctl_line(&line) {
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
+                    self.arm_patch(frozen, adds, at, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
+                _ => rest.push(line),
+            }
+        }
+        poll.lines = rest;
+        lock(&self.ctl_backlog).push(poll);
+        self.wake();
     }
 
     // ---- the service thread
@@ -270,6 +572,8 @@ impl Runtime {
         while let Some((id, ok)) = self.watch.next_result() {
             events.push(Event::Applied { id, ok });
         }
+        events.extend(self.patch.drain_events(now));
+        events.extend(self.inject.drain_events(now));
         for id in self.watch.expire(now) {
             events.push(Event::Error {
                 place: "applied".into(),
@@ -332,8 +636,27 @@ impl Runtime {
         let add = self.add_fn();
         // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
         // was taken out of the engine's hands must be given back, whatever happens)
-        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0 };
+        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None };
         crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
+        if self.patch.enabled() {
+            crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
+        }
+        if let Some(job) = plan.dump.take() {
+            crate::log::guarded("add hook (inject text)", || self.inject_publish_text(job.payload, job.id));
+            // dev-only and read-only: the held command's payload, decoded (the command is already out of the engine's hands)
+            crate::log::guarded("add hook (dump)", || {
+                self.dump_payload("held", job.payload, Some(job.id), Some(job.site), Scope::Whole, Budget::Held, None)
+            });
+            crate::log::guarded("add hook (portable)", || {
+                self.portable_payload("held", job.payload, Some(job.id), Some(job.site));
+            });
+            crate::log::guarded("add hook (rebuild)", || {
+                self.rebuild_check("held", job.payload, Some(job.id));
+            });
+            crate::log::guarded("add hook (native copy)", || {
+                self.native_copy_check("held", job.payload, Some(job.id));
+            });
+        }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
             // SAFETY: the arguments of the live call that is being hooked.
@@ -362,6 +685,12 @@ impl Runtime {
         }
         if plan.held_here {
             return args.out;
+        }
+        if self.inject.enabled() {
+            crate::log::guarded("add hook (inject)", || self.inject_add(&args, caller));
+        }
+        if self.patch.enabled() {
+            crate::log::guarded("add hook (patch)", || self.patch_add(&args, caller));
         }
         // SAFETY: the arguments of the live call that is being hooked.
         unsafe { add(args.list, args.out, args.cmd, args.done, args.progress) }
@@ -396,8 +725,34 @@ impl Runtime {
                     // SAFETY: the arguments of the live call, as the caller guarantees.
                     if let Some(held) = unsafe { engine::capture(&engine, args) } {
                         let done = held.done_ok();
-                        match machine.hold_with(kind, rva, done, held, now) {
-                            Ok(_) => plan.held_here = true,
+                        let payload = held.payload();
+                        // how the tool built the command (Context members, ignoreErrors, playerInitiated): a preview carries none of it
+                        let flags = if self.build.kind_by_name("build_proposal") == Some(kind) {
+                            // SAFETY: only readable memory is read.
+                            unsafe { engine::build_flags(payload) }
+                        } else {
+                            None
+                        };
+                        // the input-level text of the same command (what a SimpleProposal is made of), for the mod
+                        let input = flags.is_some().then(|| self.input_text(payload)).flatten();
+                        match machine.hold_with(kind, rva, done, flags, held, now) {
+                            Ok(id) => {
+                                if let Some(text) = &input {
+                                    if let Err(e) = self.input.write(id, text) {
+                                        self.say(&format!("input: cannot write {}: {e}", crate::input::file_name(id)));
+                                    }
+                                }
+                                plan.held_here = true;
+                                if (self.inject.enabled()
+                                    || self.dump.get().is_some()
+                                    || self.portable.get().is_some()
+                                    || self.rebuild.get().is_some()
+                                    || self.native_copy.get().is_some())
+                                    && self.build.kind_by_name("build_proposal") == Some(kind)
+                                {
+                                    plan.dump = Some(DumpJob { id, site: rva, payload });
+                                }
+                            }
                             Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
                         }
                     }
@@ -443,7 +798,65 @@ impl Runtime {
             unsafe { engine::payload_of(cmd) }.and_then(|p| self.watch.claim(p))
         })
         .flatten();
+        // the orders of `inject_next` / `patch_next`: the script's command passes here, not the command list's `Add` (see apply_orders)
+        if self.inject.enabled() || self.patch.enabled() {
+            crate::log::guarded("apply hook (orders)", || {
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                // SAFETY: only readable memory is read.
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) };
+                self.apply_orders(cmd, kind, claimed.is_some());
+            });
+        }
+        // dev-only dump of a build command before the simulation applies it, and of its result part afterwards
+        let dumped = self.dump.get().and_then(|_| {
+            crate::log::guarded("apply hook (dump)", || {
+                // SAFETY: only readable memory is read.
+                let payload = unsafe { engine::payload_of(cmd) }?;
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
+                (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                // script commands (no hold key) only at level 3
+                (claimed.is_some() || self.dump.get().is_some_and(|d| d.settings.scripts)).then_some(())?;
+                let seq = self.dump_payload("apply", payload, claimed, None, Scope::Whole, Budget::Applied, None)?;
+                Some((payload, seq))
+            })
+            .flatten()
+        });
+        // dev-only portable text of a build command the simulation is about to apply (held ones carry their key)
+        if let Some(sink) = self.portable.get() {
+            crate::log::guarded("apply hook (portable)", || {
+                // SAFETY: only readable memory is read.
+                let payload = unsafe { engine::payload_of(cmd) }?;
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
+                (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                (claimed.is_some() || sink.settings.scripts).then_some(())?;
+                // a script command that changes nothing is not worth a dump
+                (claimed.is_some() || portable::proposal_is_empty(&LiveMem, payload) == Some(false)).then_some(())?;
+                self.portable_payload("apply", payload, claimed, None);
+                Some(())
+            });
+        }
+        if let Some(sink) = self.rebuild.get() {
+            // script commands the module did not hold, with the level-3 switch
+            crate::log::guarded("apply hook (rebuild)", || {
+                // SAFETY: only readable memory is read.
+                let payload = unsafe { engine::payload_of(cmd) }?;
+                let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
+                let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
+                (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
+                (claimed.is_none() && sink.settings.scripts).then_some(())?;
+                (portable::proposal_is_empty(&LiveMem, payload) == Some(false)).then_some(())?;
+                self.rebuild_check("apply", payload, None);
+                Some(())
+            });
+        }
         let result = unsafe { original(sim, cmd) };
+        if let Some((payload, seq)) = dumped {
+            crate::log::guarded("apply hook (dump after)", || {
+                self.dump_payload("applied", payload, claimed, None, Scope::Result, Budget::Applied, Some(seq))
+            });
+        }
         if let Some(id) = claimed {
             crate::log::guarded("apply hook (result)", || {
                 let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
@@ -463,6 +876,21 @@ struct AddPlan {
     /// The current command was held: the caller gets an empty handle and the original is not called.
     held_here: bool,
     now: u64,
+    /// A held `build_proposal` command to dump (only with `FEVERLINK3_DUMP_COMMANDS`).
+    dump: Option<DumpJob>,
+}
+
+/// What the dump needs to know about a command that was just held.
+struct DumpJob {
+    id: u64,
+    site: u32,
+    payload: usize,
+}
+
+/// The id of the calling thread, for the dump header.
+fn current_thread_id() -> u32 {
+    // SAFETY: no arguments; returns the calling thread's id.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
 }
 
 #[cfg(test)]
@@ -552,6 +980,8 @@ mod tests {
             town_seed: None,
             town_develop: None,
             town_update_size: None,
+            script_convert: None,
+            convert_update: None,
             town_candidates: None,
             town_edges: None,
             town_sort_call: None,
@@ -916,6 +1346,148 @@ mod tests {
     }
 
     #[test]
+    fn the_dev_dump_decodes_a_held_build_command_and_its_application_and_is_off_without_the_switch() {
+        let dir = TempDir::new("rt-dump");
+        let rt = runtime(Some(dir.path()));
+        let settings = dump::Settings::from_lookup(|_| Some("1".into())).unwrap();
+        rt.enable_dump(settings, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        // a build whose toRemove vector holds two entity ids
+        let ids: Vec<u32> = vec![62470, 62471];
+        let mut call = Call::new(52, 10);
+        let (begin, end) = (ids.as_ptr() as usize, ids.as_ptr() as usize + 8);
+        call.c.payload[0x240..0x248].copy_from_slice(&begin.to_ne_bytes());
+        call.c.payload[0x248..0x250].copy_from_slice(&end.to_ne_bytes());
+        call.c.payload[0x250..0x258].copy_from_slice(&end.to_ne_bytes());
+        let mut other = Call::new(17, 3);
+        unsafe { rt.on_add(call.args(), at(SITE_A)) };
+        unsafe { rt.on_add(other.args(), at(SITE_B)) };
+        ctl(
+            dir.path(),
+            "2	release	1	{[\"id\"]=1}
+",
+        );
+        let mut nop = Call::new(27, 50);
+        unsafe { rt.on_add(nop.args(), at(0x999)) };
+        let mut sim = [0u8; 8];
+        let mut queued = Box::new([0u8; 0x40]);
+        queued[..8].copy_from_slice(&call.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        // a script command (never held, no key) is not dumped at level 1
+        let script = Call::new(52, 77);
+        let mut queued2 = Box::new([0u8; 0x40]);
+        queued2[..8].copy_from_slice(&script.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued2.as_mut_ptr()) };
+        let index = std::fs::read_to_string(dir.path().join(dump::INDEX_FILE)).expect("an index file");
+        assert_eq!(index.lines().count(), 3, "{index}");
+        assert!(
+            index.lines().next().unwrap().starts_with("seq=1 event=held key=1 site=0x4d396f tool=Bulldozer"),
+            "{index}"
+        );
+        let text = std::fs::read_to_string(dir.path().join(dump::DUMP_FILE)).expect("a dump file");
+        let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("=== dump")).collect();
+        assert_eq!(headers.len(), 3, "{headers:?}");
+        assert!(
+            headers[0]
+                .starts_with("=== dump #1 event=held key=1 site=0x4d396f tool=0 Bulldozer kind=52 (build_proposal)"),
+            "{}",
+            headers[0]
+        );
+        assert!(headers[1].starts_with("=== dump #2 event=apply key=1 site=none tool=none kind=52"), "{}", headers[1]);
+        assert!(
+            headers[2].starts_with("=== dump #3 event=applied key=1") && headers[2].contains("group=2"),
+            "{}",
+            headers[2]
+        );
+        assert!(text.contains("ent?62470 ent?62471"), "the vector behind the pointer is decoded");
+        assert!(text.contains("KNOWN +0x0240 toRemove: vector<Entity>"));
+
+        // without the switch nothing is created
+        let quiet = TempDir::new("rt-nodump");
+        let rt = runtime(Some(quiet.path()));
+        ctl(quiet.path(), HOLD_ON);
+        rt.pump();
+        let mut c = Call::new(52, 10);
+        unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        assert!(!quiet.path().join(dump::DUMP_FILE).exists());
+    }
+
+    #[test]
+    fn the_portable_dump_writes_held_and_released_commands_and_refuses_an_unknown_build() {
+        let dir = TempDir::new("rt-portable");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_lookup(|_| Some("1".into())).unwrap();
+        rt.enable_portable(settings, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let mut call = Call::new(52, 10);
+        unsafe { rt.on_add(call.args(), at(SITE_A)) };
+        ctl(
+            dir.path(),
+            "2	release	1	{[\"id\"]=1}
+",
+        );
+        let mut nop = Call::new(27, 50);
+        unsafe { rt.on_add(nop.args(), at(0x999)) };
+        let mut sim = [0u8; 8];
+        let mut queued = Box::new([0u8; 0x40]);
+        queued[..8].copy_from_slice(&call.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        // a script command is not written at level 1
+        let script = Call::new(52, 77);
+        let mut queued2 = Box::new([0u8; 0x40]);
+        queued2[..8].copy_from_slice(&script.payload().to_ne_bytes());
+        unsafe { rt.on_apply(sim.as_mut_ptr(), queued2.as_mut_ptr()) };
+        let text = std::fs::read_to_string(dir.path().join(portable::PORTABLE_FILE)).expect("a portable file");
+        let heads: Vec<&str> = text.lines().filter(|l| l.starts_with("=== portable")).collect();
+        // the fake build is not game build 40420: both are refused, with the reason, and nothing is guessed
+        assert_eq!(heads.len(), 2, "{text}");
+        assert!(heads[0].contains("REFUSED event=held key=1") && heads[0].contains("game build 40420"), "{}", heads[0]);
+        assert!(heads[1].contains("REFUSED event=apply key=1"), "{}", heads[1]);
+    }
+
+    #[test]
+    fn at_level_three_script_commands_are_dumped_only_when_they_change_something() {
+        let dir = TempDir::new("rt-portable3");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_lookup(|_| Some("3".into())).unwrap();
+        rt.enable_portable(settings, Some(dir.path()));
+        let ids: Vec<u32> = vec![62470, 62471];
+        let mut busy = Call::new(52, 20);
+        let (begin, end) = (ids.as_ptr() as usize, ids.as_ptr() as usize + 8);
+        busy.c.payload[0x240..0x248].copy_from_slice(&begin.to_ne_bytes());
+        busy.c.payload[0x248..0x250].copy_from_slice(&end.to_ne_bytes());
+        busy.c.payload[0x250..0x258].copy_from_slice(&end.to_ne_bytes());
+        let idle = Call::new(52, 0); // the fake payload keeps its tag in byte 8: 0 leaves the proposal untouched
+        let mut sim = [0u8; 8];
+        for c in [&idle, &busy, &idle] {
+            let mut queued = Box::new([0u8; 0x40]);
+            queued[..8].copy_from_slice(&c.payload().to_ne_bytes());
+            unsafe { rt.on_apply(sim.as_mut_ptr(), queued.as_mut_ptr()) };
+        }
+        let text = std::fs::read_to_string(dir.path().join(portable::PORTABLE_FILE)).expect("a portable file");
+        let heads: Vec<&str> = text.lines().filter(|l| l.starts_with("=== portable")).collect();
+        assert_eq!(heads.len(), 1, "only the command with a removal: {text}");
+        assert!(heads[0].contains("event=apply key=none"), "{}", heads[0]);
+    }
+
+    #[test]
+    fn the_rebuild_self_check_refuses_when_the_game_allocator_is_not_where_it_should_be() {
+        let dir = TempDir::new("rt-rebuild");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_var(|_| Some("1".into()), rebuild::REBUILD_VAR).unwrap();
+        rt.enable_rebuild(settings, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let mut call = Call::new(52, 10);
+        unsafe { rt.on_add(call.args(), at(SITE_A)) };
+        let text = std::fs::read_to_string(dir.path().join(rebuild::REBUILD_FILE)).expect("a report");
+        // the fake image has no operator new at the real RVA: nothing is called, the reason is written
+        assert!(text.contains("=== rebuild check #1 event=held key=1 REFUSED:"), "{text}");
+    }
+
+    #[test]
     fn the_audit_event_goes_out_after_its_interval() {
         let dir = TempDir::new("rt-audit");
         let rt = runtime(Some(dir.path()));
@@ -1064,5 +1636,296 @@ mod tests {
         let mut c = Call::new(52, 1);
         unsafe { rt.on_add(c.args(), at(SITE_A)) };
         assert_eq!(calls(), ["add kind 52 tag 1"]);
+    }
+
+    const PATCH_NEXT: &str = "1	patch_next	1	{[\"adds\"]=2,[\"frozen\"]={[1]=1}}
+";
+
+    #[test]
+    fn a_patch_next_written_just_before_the_command_is_seen_by_its_add_with_holding_off_and_no_pump() {
+        let dir = TempDir::new("rt-patch-late");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        ctl(dir.path(), PATCH_NEXT);
+        assert!(!rt.live.load(Relaxed), "holding is off: the hold path does not look at the file");
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert_eq!(calls(), ["add kind 52 tag 1"], "the original Add still runs");
+        rt.pump();
+        let ev = events(dir.path());
+        let refused: Vec<_> = ev.iter().filter(|(k, _)| k == "patch_refused").collect();
+        assert_eq!(refused.len(), 1, "{ev:?}");
+        assert!(!refused[0].1.contains("expired"), "the order was taken by this very Add: {refused:?}");
+        assert!(!rt.patch.pending());
+    }
+
+    #[test]
+    fn lines_the_command_hook_read_for_the_patch_order_still_reach_the_machine() {
+        let dir = TempDir::new("rt-patch-backlog");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        ctl(
+            dir.path(),
+            &format!(
+                "{PATCH_NEXT}2	hold_on	1	{{[\"kinds\"]={{[1]=\"build_proposal\"}}}}
+"
+            ),
+        );
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert!(!rt.patch.pending(), "the order was read in and taken by this Add");
+        calls();
+        rt.pump();
+        assert!(rt.live.load(Relaxed), "hold_on was not lost");
+        assert!(kinds(dir.path()).contains(&"holding".to_string()));
+    }
+
+    #[test]
+    fn a_build_proposal_from_a_tool_site_is_reported_once_as_skipped_and_the_order_stays() {
+        let dir = TempDir::new("rt-patch-skip");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        for tag in 1..=3 {
+            let mut c = Call::new(52, tag);
+            unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        }
+        calls();
+        assert!(rt.patch.pending());
+        rt.pump();
+        let skipped = events(dir.path()).into_iter().filter(|(k, _)| k == "patch_skipped").count();
+        assert_eq!(skipped, 1);
+        rt.advance(crate::cmd_patch::DEFAULT_TTL_MS + 1);
+        rt.pump();
+        let ev = events(dir.path());
+        let (_, why) = ev.iter().find(|(k, _)| k == "patch_refused").expect("expired");
+        assert!(why.contains("3 Add(s), 3 build_proposal, 3 from construction tools"), "{why}");
+        assert!(why.contains("kinds [52x3]") && why.contains("at arming: no build_proposal Add yet"), "{why}");
+    }
+
+    /// An `optional<Proposal>` as Convert leaves it: addedNodes of `nodes`, `cons` constructions, the flag at +0x358.
+    struct Out {
+        buf: Vec<u8>,
+        _blocks: Vec<Vec<u8>>,
+    }
+
+    fn out(nodes: usize, cons: usize, has_value: bool) -> Out {
+        let mut buf = vec![0u8; 0x360];
+        let mut blocks = Vec::new();
+        let mut vec_at = |off: usize, n: usize, stride: usize| {
+            let mut b = vec![0u8; (n * stride).max(8)];
+            if off == 0 {
+                for i in 0..n {
+                    b[i * stride + 4..i * stride + 8].copy_from_slice(&(i as f32 * 10.0).to_le_bytes());
+                }
+            }
+            let p = b.as_ptr() as u64;
+            buf[off..off + 8].copy_from_slice(&p.to_le_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&(p + (n * stride) as u64).to_le_bytes());
+            buf[off + 16..off + 24].copy_from_slice(&(p + (n * stride) as u64).to_le_bytes());
+            blocks.push(b);
+        };
+        if nodes > 0 {
+            vec_at(0, nodes, 0x40);
+        }
+        if cons > 0 {
+            vec_at(0x258, cons, 0xe48);
+        }
+        buf[0x358] = u8::from(has_value);
+        Out { buf, _blocks: blocks }
+    }
+
+    fn patch_events(dir: &Path) -> Vec<(String, String)> {
+        events(dir).into_iter().filter(|(k, _)| k.starts_with("patch")).collect()
+    }
+
+    #[test]
+    fn a_conversion_that_produced_nothing_or_another_shape_is_logged_and_leaves_the_order_armed() {
+        let dir = TempDir::new("rt-convert-skip");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        let none = out(2, 1, false);
+        rt.on_convert(none.buf.as_ptr() as usize, at(0xe2b1a1));
+        let other = out(3, 1, true);
+        rt.on_convert(other.buf.as_ptr() as usize, at(0xe2b1a1));
+        let roads = out(2, 0, true);
+        rt.on_convert(roads.buf.as_ptr() as usize, None);
+        assert!(rt.patch.pending(), "no conversion described by the order: it keeps waiting");
+        rt.pump();
+        let ev = patch_events(dir.path());
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert!(
+            ev[0].1.contains("no proposal") && ev[1].1.contains("3 added nodes") && ev[2].1.contains("no construction"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn a_matching_conversion_reaches_the_checks_and_a_refusal_consumes_the_order() {
+        let dir = TempDir::new("rt-convert-match");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        let m = out(2, 1, true);
+        rt.on_convert(m.buf.as_ptr() as usize, at(0xe2b1a1));
+        // the test process has no verified engine allocator: the order is refused (the write itself is covered by cmd_patch's tests)
+        assert!(!rt.patch.pending());
+        rt.pump();
+        let ev = patch_events(dir.path());
+        assert!(matches!(ev.as_slice(), [(k, why)] if k == "patch_refused" && why.contains("convert:")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_conversion_reads_an_order_the_service_thread_has_not_seen_yet() {
+        let dir = TempDir::new("rt-convert-late");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        ctl(dir.path(), PATCH_NEXT);
+        let o = out(3, 1, true);
+        rt.on_convert(o.buf.as_ptr() as usize, at(0xe2b1a1));
+        assert!(rt.patch.pending(), "armed by the conversion itself, and 3 nodes are not the order's 2");
+        assert_eq!(patch_events_after(&rt, dir.path()), 1);
+    }
+
+    fn patch_events_after(rt: &Runtime, dir: &Path) -> usize {
+        rt.pump();
+        patch_events(dir).len()
+    }
+
+    #[test]
+    fn a_build_proposal_add_after_a_patched_conversion_just_clears_the_order() {
+        let dir = TempDir::new("rt-convert-add");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        rt.patch.converted_one();
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert_eq!(calls(), ["add kind 52 tag 1"]);
+        assert!(!rt.patch.pending());
+        rt.pump();
+        assert!(patch_events(dir.path()).is_empty(), "no refusal and no second write");
+    }
+
+    #[test]
+    fn an_order_by_position_skips_a_conversion_without_the_node_and_dumps_every_new_shape_once() {
+        let dir = TempDir::new("rt-convert-at");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        rt.arm_patch(vec![], 0, vec![[10.0, 0.0, 0.0]], 0, rt.now_ms());
+        let elsewhere = out(1, 1, true); // its only node is at x = 0
+        rt.on_convert(elsewhere.buf.as_ptr() as usize, at(0xe2b1a1));
+        rt.on_convert(elsewhere.buf.as_ptr() as usize, at(0xe2b1a1));
+        let failed = out(4, 1, false);
+        rt.on_convert(failed.buf.as_ptr() as usize, at(0xe2b1a1));
+        let four = out(4, 1, true);
+        rt.on_convert(four.buf.as_ptr() as usize, at(0xe2b1a1));
+        rt.pump();
+        let ev = events(dir.path());
+        let dumps: Vec<_> = ev.iter().filter(|(k, _)| k == "convert_dump").collect();
+        assert_eq!(dumps.len(), 3, "{ev:?}"); // 1 node (once), no value, 4 nodes
+        assert!(dumps[1].1.contains("NO VALUE (Convert failed)"), "{dumps:?}");
+        // the matching one reached the allocator check (not verified in the test process) and was refused: that consumes the order
+        assert!(ev.iter().any(|(k, w)| k == "patch_refused" && w.contains("convert: the game's allocator")), "{ev:?}");
+    }
+
+    #[test]
+    fn before_the_construction_update_the_order_is_checked_against_the_nodes_built_so_far() {
+        let dir = TempDir::new("rt-convert-update");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_patch();
+        assert!(!rt.before_convert_update(out(2, 0, true).buf.as_ptr() as usize), "nothing armed: untouched");
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        let three = out(3, 0, true);
+        assert!(rt.before_convert_update(three.buf.as_ptr() as usize));
+        assert!(rt.patch.pending(), "another number of nodes: skipped, still armed");
+        let two = out(2, 0, true);
+        assert!(rt.before_convert_update(two.buf.as_ptr() as usize));
+        // the test process has no verified engine allocator: refused after the checks passed (the write is covered by cmd_patch's tests)
+        assert!(!rt.patch.pending());
+        rt.after_convert_update(two.buf.as_ptr() as usize);
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "patch_skipped" && w.contains("convert update: the command has 3 added nodes")),
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter().any(|(k, w)| k == "patch_refused" && w.contains("convert update: the game's allocator")),
+            "{ev:?}"
+        );
+    }
+
+    const INJECT_NEXT: &str = "1	inject_next	1	{[\"key\"]=5}
+";
+
+    #[test]
+    fn an_inject_next_is_read_by_the_commands_own_add_and_a_refusal_leaves_the_command_alone() {
+        let dir = TempDir::new("rt-inject");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        ctl(dir.path(), INJECT_NEXT);
+        // another kind of command does not take the order
+        let mut other = Call::new(17, 1);
+        unsafe { rt.on_add(other.args(), at(0x777)) };
+        assert!(!rt.inject.pending(), "the file is only read for a build_proposal");
+        // a tool's command is not the mod's
+        let mut tool = Call::new(52, 2);
+        unsafe { rt.on_add(tool.args(), at(SITE_A)) };
+        let mut c = Call::new(52, 3);
+        let before = c.c.payload.to_vec();
+        unsafe { rt.on_add(c.args(), at(0x777)) };
+        assert_eq!(calls().last().map(String::as_str), Some("add kind 52 tag 3"), "the original Add still runs");
+        assert_eq!(c.c.payload.to_vec(), before, "untouched");
+        assert!(!rt.inject.pending());
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("key 5")
+                && w.contains("the layout is that of game build")),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn with_the_switch_off_an_inject_next_is_refused_and_nothing_is_read() {
+        let dir = TempDir::new("rt-inject-off");
+        let rt = runtime(Some(dir.path()));
+        ctl(dir.path(), INJECT_NEXT);
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("is off")), "{ev:?}");
+    }
+
+    #[test]
+    fn a_script_command_that_only_reaches_apply_takes_the_order_there_and_an_expiry_reports_the_applies_seen() {
+        let dir = TempDir::new("rt-inject-apply");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        let mut sim = [0u8; 8];
+        // the order is written, no Add of the command is ever seen; the simulation applies it
+        ctl(dir.path(), INJECT_NEXT);
+        let mut script = Call::new(52, 7);
+        let before = script.c.payload.to_vec();
+        unsafe { rt.on_apply(sim.as_mut_ptr(), script.c.command.as_mut_ptr()) };
+        assert_eq!(calls().last().map(String::as_str), Some("apply tag 7"), "the original apply still runs");
+        assert_eq!(script.c.payload.to_vec(), before, "refused: untouched");
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("layout")), "{ev:?}");
+        // an order that no script command ever uses: the reason says which applies went by
+        rt.inject.arm(9, 0, rt.now_ms());
+        let mut other = Call::new(17, 1);
+        unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
+        rt.apply_orders(script.c.command.as_mut_ptr(), Some(52), true); // a held one (the tool's)
+        rt.advance(crate::inject::DEFAULT_TTL_MS + 1);
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 9") && w.contains("1 held, 0 not held")),
+            "{ev:?}"
+        );
     }
 }

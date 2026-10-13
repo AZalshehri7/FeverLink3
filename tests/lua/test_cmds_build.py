@@ -153,8 +153,8 @@ def("Terrain", { "baseHeightMod" }, function() return { baseHeightMod = D("GridV
 def("Proposal", { "toAdd", "toRemove", "old2new", "proposal", "terrain" }, function()
   return { toAdd = {}, toRemove = {}, old2new = {}, proposal = D("StreetProposal"), terrain = D("Terrain") }
 end)
-def("Context", { "player", "checkTerrainAlignment", "cleanupStreetGraph", "gatherBuildings", "gatherFields", "refundableEntities" }, function()
-  return { player = -1, checkTerrainAlignment = false, cleanupStreetGraph = false, gatherBuildings = false, gatherFields = false, refundableEntities = {} }
+def("Context", { "player", "checkTerrainAlignment", "cleanupStreetGraph", "gatherBuildings", "gatherFields", "extendProposalRedoPillars", "refundableEntities" }, function()
+  return { player = -1, checkTerrainAlignment = false, cleanupStreetGraph = false, gatherBuildings = false, gatherFields = false, extendProposalRedoPillars = false, refundableEntities = {} }
 end)
 def("EdgeObjectComp", { "edgeObjectConstruction", "param", "params" }, function() return { edgeObjectConstruction = "", param = 0, params = {} } end)
 def("ConstructionComp", { "fileName", "transf", "params", "name", "depots", "stations" }, function()
@@ -403,12 +403,15 @@ function MAKE_API()
       if SCRIPT_PIECES then   -- a test lets the construction's script add these street pieces (list of { p0, p1 })
         local segs = {}
         for i, pc in ipairs(SCRIPT_PIECES(p)) do segs[i] = { comp = { position0 = pc.p0, position1 = pc.p1 } } end
-        return { errorState = { critical = false, messages = {}, warnings = {} }, proposal = { proposal = { addedNodes = {}, addedSegments = segs } } }
+        local pd = { errorState = { critical = false, messages = {}, warnings = {} } }
+        pd[SCRIPT_PIECES_MEMBER or 'proposal'] = { proposal = { addedNodes = {}, addedSegments = segs } }
+        return pd
       end
       if not VERDICT_MOCK then error("not available in this mock") end
       local mt = getmetatable(p)
       if mt and mt.__double == "Proposal" then error("bad argument #2 to 'makeProposalData' (SimpleProposal expected, got Proposal)") end
-      return { errorState = { critical = false, messages = {}, warnings = {} } }
+      local crit = VERDICT_CRITICAL and VERDICT_CRITICAL(p) or false
+      return { errorState = { critical = crit, messages = crit and { 'Construction Not Possible' } or {}, warnings = {} } }
     end,
     -- the engine's own upgrade: the segment replaced by one with the template's lanes (finding from MPFever (MIT))
     replaceSegment = function(edge, tmpl)
@@ -474,6 +477,7 @@ BUILD_MOCK2 = r'''
 -- ===== applying a proposal =====
 BUILD_LOG, BUILD_REFUSALS, FACTORY_COUNT, HELPER_CALLS, CFG_LOG, BUILD_CTX = {}, {}, 0, {}, {}, {}
 OLD2NEW_LOG, CON_OWNERS = {}, {}
+REUSE_FREED_IDS, FREED_IDS = false, {}   -- a test sets REUSE_FREED_IDS: the engine gives a removed building's id to the construction that replaces it
 BUILD_REFUSE = nil      -- a test sets function(parts) -> message to make the engine refuse a build
 
 DEF_TEMPLATE("street/simple.street_template", "simple", { { forward = true, modes = { 2 } }, { forward = false, modes = { 2 } } })
@@ -583,6 +587,7 @@ function APPLY_BUILD(p)
   local gone = {}
   for old, new in pairs(P.old2new) do OLD2NEW_LOG[#OLD2NEW_LOG + 1] = tostring(old) .. "=" .. tostring(new) end
   for _, e in ipairs(P.consRem) do
+    FREED_IDS[#FREED_IDS + 1] = e
     local c = STORE(WORLD[e].CONSTRUCTION)
     for _, d in ipairs(c.depots) do WORLD[d] = nil end
     for _, s in ipairs(c.stations) do
@@ -650,7 +655,7 @@ function APPLY_BUILD(p)
   local function makeConstructions()
     for _, ce in ipairs(P.consAdd) do
       CON_OWNERS[#CON_OWNERS + 1] = tostring(ce.playerEntity)
-      local id = NEW_ENTITY(nil)
+      local id = (REUSE_FREED_IDS and #FREED_IDS > 0) and table.remove(FREED_IDS, 1) or NEW_ENTITY(nil)
       local comp = D("ConstructionComp", { fileName = ce.fileName, transf = ce.transf, params = ce.params, name = ce.name })
       local cs = STORE(comp)
       if ce.fileName:find("depot") then cs.depots = { NEW_ENTITY({ VEHICLE_DEPOT = {} }) } end
@@ -693,12 +698,14 @@ function EXECUTE(cmd, cb)
   return executeBuild(cmd, cb)
 end
 
+CTX_REFUSE = nil        -- a test sets function(context) -> true for a Context the engine builds differently (it refuses the build here)
 BUILD_NEEDS_IE = nil    -- a test sets function(proposal) -> true for a build the engine only accepts with ignoreErrors = true (non-critical messages)
 function executeBuild(cmd, cb)
   local name = cmd.__cmd
   local a = cmd.args
   local ok, res
   if BUILD_NEEDS_IE and BUILD_NEEDS_IE(a[1]) and a[3] ~= true then ok, res = false, "non-critical messages and ignoreErrors = false"
+  elseif CTX_REFUSE and a[2] and CTX_REFUSE(a[2]) then ok, res = false, "the engine refuses this Context"
   else ok, res = APPLY_BUILD(a[1]) end
   if ok then
     local ents = {}
@@ -869,9 +876,9 @@ function NEGATE_REMOVED(P, how)
   local sp = P.proposal
   local r = sp.removedSegments[1]
   if how == 'bare' then
-    sp.removedSegments = { -r.entity }
+    sp.removedSegments = { -r.entity - 1 }
   else
-    sp.removedSegments = { D("SegmentAndEntity", { entity = -r.entity, comp = r.comp, type = r.type }) }
+    sp.removedSegments = { D("SegmentAndEntity", { entity = -r.entity - 1, comp = r.comp, type = r.type }) }
   end
   P.proposal = sp
 end
@@ -1024,8 +1031,8 @@ function NATIVE_NODECFG(spec)
   return P
 end
 
-function CONTEXT(align, cleanup, buildings, fields)
-  return D("Context", { player = 7, checkTerrainAlignment = align, cleanupStreetGraph = cleanup, gatherBuildings = buildings, gatherFields = fields })
+function CONTEXT(align, cleanup, buildings, fields, redo)
+  return D("Context", { player = 7, checkTerrainAlignment = align, cleanupStreetGraph = cleanup, gatherBuildings = buildings, gatherFields = fields, extendProposalRedoPillars = redo == true })
 end
 
 -- what the module makes of a proposal that a tool applied natively (the body for an action line), as a string
@@ -1175,6 +1182,7 @@ function LOAD_BUILD()
   env.package = { loaded = {} }
   env.ug_require = function(p)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
     if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
     error("no module " .. tostring(p))
@@ -1202,6 +1210,7 @@ class BuildGame(T.Game):
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = T.COMMON_SRC, T.LOCKSTEP_SRC, T.BRIDGE_SRC, T.HUD_SRC
+        g.PORTABLE_SRC = T.PORTABLE_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
             cmds[stem] = src
@@ -1365,6 +1374,59 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("BUILD_CTX[2]"), "nil ie=false pi=true", "no context stays no context")
         self.assertEqual(self.B.lua("BUILD_CTX[1]"), self.A.lua("BUILD_CTX[1]"))
 
+    def test_every_build_kind_is_replayed_with_the_originators_own_context(self):
+        # one rule for every plan (the stop tool builds with 0/0/0, the road tools with 1/1/1): the replay never substitutes flags of its own.
+        # The mock engine refuses a Context whose cleanupStreetGraph differs from the one the tool used, as the real engine builds another graph.
+        cases = [
+            ("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", 1),
+            ("NATIVE_SPLIT{ edge = 110, at = { x = 50, y = 0, z = 0 }, to = { x = 50, y = 80, z = 0 } }", 1),
+            ("NATIVE_BULLDOZE{ edges = { 110 } }", 1),
+            ("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }", 2),
+            ("NATIVE_UPGRADE{ edges = { 110, 111 }, template = 'street/new_small_road.street_template' }", 2),
+        ]
+        for proposal, commands in cases:
+            for flags in ("false, false, false, true, false", "true, true, true, true, true", "false, true, false, true, false"):
+                with self.subTest(proposal=proposal[:30], flags=flags):
+                    self.setUp()
+                    self.start()
+                    cleanup = flags.split(", ")[1]
+                    for g in (self.A, self.B):
+                        g.run("CTX_REFUSE = function(c) return c.cleanupStreetGraph ~= %s end" % cleanup)
+                    self.B.issue(proposal, ctx="CONTEXT(%s)" % flags)
+                    self.tick(16)
+                    self.assertEqual(self.A.lua("#BUILD_CTX"), commands, "the replay was refused: %s" % self.A.lua("BUILD_REFUSALS[1]"))
+                    want = "align=%s cleanup=%s buildings=%s fields=%s" % tuple(flags.split(", ")[:4])
+                    for i in range(1, commands + 1):
+                        self.assertTrue(str(self.A.lua("BUILD_CTX[%d]" % i)).startswith(want), self.A.lua("BUILD_CTX[%d]" % i))
+                    self.assertSameWorld()
+                    self.tearDown()
+
+    def test_the_redo_pillars_flag_travels_too(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }", ctx="CONTEXT(true, true, true, true, true)")
+        self.tick(14)
+        self.assertEqual(self.A.lua("GAME.applied[#GAME.applied].args[2].extendProposalRedoPillars"), True)
+
+    def test_a_record_without_context_flags_is_replayed_with_the_fallback_and_says_so(self):
+        self.start()
+        self.B.issue("NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")   # no Context at all: the record is marked "native"
+        self.tick(14)
+        self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=true cleanup=false buildings=true fields=true player=7 ie=false pi=true")
+        self.assertIn("carries no Context flags", self.A.log())
+
+    def test_a_removed_node_read_after_the_build_ran_is_the_bitwise_not_of_its_id(self):
+        # real run 2026-10-13 (depot over buildings): rmNodes was [-39113] where the held command says 39112, and the other game refused
+        # "removed node 1: bad reference". One rule for every removal list: a negative id of a removed entity is -id - 1.
+        self.start()
+        code = ("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; "
+                "local pos = NODE_POS(101); "
+                "local sp = P.proposal; sp.removedNodes = { D('NodeAndEntity', { entity = -101 - 1, comp = D('BaseNode', { position = V(pos.x, pos.y, pos.z) }) }) }; P.proposal = sp; "
+                "return CAPTURE_BODY(P) end)()")
+        text = str(self.A.lua(code))
+        self.assertIn('["rmNodes"]={[1]={["__ref"]="node"', text)
+        self.assertNotIn('["rmNodes"]={[1]=-', text)
+        self.assertIn('["key"]="s:101"', text[text.index('["rmNodes"]'):text.index('["rmNodes"]') + 80])
+
     def test_upgrade_of_segments_the_session_built(self):
         self.start()
         self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
@@ -1476,6 +1538,22 @@ class BuildTest(unittest.TestCase):
         self.tick(14)
         self.assertSameWorld()
         self.assertNotIn("modular_station", self.A.sig())
+
+    def test_a_depot_that_removes_buildings_gets_its_keys_when_the_engine_reuses_a_removed_buildings_id(self):
+        # real run 2026-10-13: a depot over four buildings was built on the receiving game, but no entity was "new" (the id of a removed
+        # building went to the depot), so nothing was keyed and the result was reported as "found new CONSTRUCTION 0"
+        self.start()
+        for g in (self.A, self.B):
+            g.run("REUSE_FREED_IDS = true")
+        self.B.issue("(function() local P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }; "
+                     "P.toRemove = { 56 }; return P end)()")
+        self.tick(24)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertIn("1:1#c1", str(g.lua("BOUND_KEYS()")).split(), g.label)
+            self.assertNotIn("RESULT DIFFERS", g.log(), g.label)
+        # the junction configuration of the street part is kept when the construction's own pieces are left to its script
+        self.assertEqual(self.A.lua("#CFG_LOG"), 1, "the host's replay put the street part's node configuration back")
 
     def test_a_vehicle_is_bought_at_a_depot_the_session_built(self):
         self.start()
@@ -2071,7 +2149,7 @@ class PureBuildTest(unittest.TestCase):
         os.environ.update(FEVERLINK3_SESSION_DIR=self.tmp, FEVERLINK3_PLAYER_ID="1", FEVERLINK3_PLAYER_NAME="pure")
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
-        g.COMMON_SRC = T.COMMON_SRC
+        g.COMMON_SRC, g.PORTABLE_SRC = T.COMMON_SRC, T.PORTABLE_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
             cmds[stem] = src
@@ -2155,6 +2233,14 @@ class PureBuildTest(unittest.TestCase):
         self.ev("(function() SCRIPT_PIECES = function(p) return {} end end)()")
         self.assertEqual(self.ev("PLAN_OF(NATIVE_UNDERGROUND{ x = 1195, y = 513 })"), "construction")
 
+    def test_the_converted_proposal_is_found_in_whichever_member_of_the_proposal_data_holds_it(self):
+        # real runs 2026-10-13: the proposal data of this game has no member `proposal` (parallelProposal collisionInfo toAddData ...)
+        joined = ("(function() local P = NATIVE_UNDERGROUND{ x = 100, y = 0 }; local sp = P.proposal; local added = sp.addedSegments; "
+                  "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
+        self.ev("(function() SCRIPT_PIECES_MEMBER = 'parallelProposal'; SCRIPT_PIECES = function(p) return { { p0 = { x = 130, y = 8, z = -13 }, p1 = { x = 120, y = 5, z = -13 } }, "
+                "{ p0 = { x = 80, y = -5, z = -13 }, p1 = { x = 70, y = -8, z = -13 } } } end end)()")
+        self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "construction")
+
     def test_the_world_readback_of_a_records_segments_names_the_edge_or_says_there_is_none(self):
         # the trace line both games write after a build (build.pieces), to compare what each ended up with
         code = """(function()
@@ -2214,6 +2300,38 @@ class PureBuildTest(unittest.TestCase):
             self.assertEqual(self.L.eval(code)(wrong, False), "nil|0,100", "reported %s: the ends of the added segment decide" % wrong)
         self.setUp()
         self.assertTrue(self.L.eval(code)(111, True).startswith("refused: the segment this build replaces"), "no edge with those ends: the record is refused")
+
+    def test_a_depot_with_its_street_pieces_and_removals_is_rebuilt_as_one_proposal_unless_the_engine_says_it_is_not_possible(self):
+        # real run 2026-10-13 (road depot over buildings): construction alone was refused ("Construction Not Possible"), the two-step plan
+        # ended with other edges and node configurations than the originator's; the originator applied ONE proposal with the record's flags
+        code = """(function(setup)
+            local rec = WIRE_RECORD((function() local P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }; P.toRemove = { 56 }; return P end)()).args[1]
+            setup()
+            local args = DECODE({ fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, { native = true }, false, true, false } })
+            if not args then return 'refused' end
+            local sp = STORE(args[1])
+            local ssp = STORE(sp.streetProposal)
+            return tostring(args.plan) .. '|' .. #sp.constructionsToAdd .. '|' .. #sp.constructionsToRemove .. '|' .. #ssp.nodesToAdd .. '|' .. #ssp.edgesToAdd .. '|' .. #ssp.nodeConfigsToAdd .. '|' .. tostring(args[3]) .. tostring(args[4]) .. '|' .. tostring(args.chain ~= nil)
+        end)"""
+        f = self.L.eval(code)
+        # the engine's verdict is fine: one proposal, everything in it, the record's flags (ignoreErrors false, playerInitiated true), no chain
+        got = f(self.L.eval("function() VERDICT_MOCK = true; VERDICT_CRITICAL = nil end")).split("|")
+        self.assertEqual(got[0], "combined")
+        self.assertEqual((got[1], got[2]), ("1", "1"))
+        self.assertGreaterEqual(int(got[3]), 2)
+        self.assertGreaterEqual(int(got[4]), 3)
+        self.assertGreaterEqual(int(got[5]), 1)
+        self.assertEqual((got[6], got[7]), ("falsetrue", "false"))
+        # the engine calls the one proposal not possible: the older plans decide
+        self.setUp()
+        f = self.L.eval(code)
+        got = f(self.L.eval("function() VERDICT_MOCK = true; VERDICT_CRITICAL = function(p) local P = PARTS(p); return #P.consAdd > 0 and #P.edgesAdd > 0 end end")).split("|")
+        self.assertIn(got[0], ("construction", "withStreet"))
+        # no verdict can be read: the older plans decide as before
+        self.setUp()
+        f = self.L.eval(code)
+        got = f(self.L.eval("function() VERDICT_MOCK = nil end")).split("|")
+        self.assertIn(got[0], ("construction", "withStreet"))
 
     def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
         # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
@@ -2607,6 +2725,215 @@ class LockstepAdditionsTest(unittest.TestCase):
           return a .. "|" .. map["1:2#c1"] .. tostring(complete) .. "|" .. tostring(next(none)) .. tostring(incomplete) .. "|" .. tostring(next(bad)) .. tostring(badComplete) .. "|" .. tostring(next(plain)) .. tostring(plainComplete)
         end""")(self.K)
         self.assertEqual(got, "CONSTRUCTION,nil,nil,LINE,EDGE_OBJECT+STATION_GROUP,nil,nil|77true|nilfalse|nilfalse|niltrue")
+
+
+def portable_road_text(ax=300.0, bx=400.0, template="street/new_medium_road.street_template", segs=1, extra=None, tangent=None):
+    """The input-level text of the road NATIVE_ROAD{ a = (ax, 0), b = (bx, 0) } as the native module writes it (placeholders as the mock numbers them)."""
+    import struct as _s
+
+    def f(x):
+        return "%08x" % _s.unpack("<I", _s.pack("<f", x))[0]
+
+    def v(x, y, z):
+        return "v3:%s,%s,%s" % (f(x), f(y), f(z))
+
+    rows = [
+        ("proposal.addedNodes.#", "n:2"), ("proposal.addedNodes[0].entity", "ent:new#1"), ("proposal.addedNodes[0].position", v(ax, 0, 0)),
+        ("proposal.addedNodes[1].entity", "ent:new#2"), ("proposal.addedNodes[1].position", v(bx, 0, 0)),
+        ("proposal.addedSegments.#", "n:%d" % segs), ("proposal.addedSegments[0].entity", "ent:new#3"),
+        ("proposal.addedSegments[0].node0", "ent:new#1"), ("proposal.addedSegments[0].node1", "ent:new#2"),
+        ("proposal.addedSegments[0].position0", v(ax, 0, 0)), ("proposal.addedSegments[0].position1", v(bx, 0, 0)),
+        ("proposal.addedSegments[0].tangent0", v(tangent or bx - ax, 0, 0)), ("proposal.addedSegments[0].tangent1", v(tangent or bx - ax, 0, 0)),
+        ("proposal.addedSegments[0].baseType", "u32:00000000"), ("proposal.addedSegments[0].typeIndex", "i32:00000001"),
+        ("proposal.addedSegments[0].roadType", "u32:00000000"), ("proposal.addedSegments[0].type", "u32:00000000"),
+        ("proposal.addedSegments[0].roadTemplate", 'res:"%s"' % template), ("proposal.addedSegments[0].roadStyle", 'res:"medium"'),
+        ("toRemove.#", "n:0"), ("toAdd.#", "n:0"), ("kind", "u8:34"),
+    ] + (extra or [])
+    return chr(10).join(k + chr(9) + val for k, val in rows)
+
+
+DEPOT_RECORD_LUA = """(function(txt)
+            local M = PURE()
+            local P = M.portable
+            local tree = P.parse(txt)
+            local pt = tree.proposal
+            local function pos(e) return { x = e.x, y = e.y, z = e.z } end
+            local oldPos = {}
+            for _, s in ipairs(P.list(pt.addedSegments)) do
+                for _, k in ipairs({ 'node0', 'node1' }) do if s[k].old then oldPos[s[k].old] = pos(s[k].pos) end end
+            end
+            local rec = { v = 1, src = 'native', cons = {}, rem = {}, old2new = {}, nodes = {}, segs = {}, rmNodes = {}, rmSegs = {}, objs = {}, rmObjs = {}, ncfg = {}, rmNcfg = {} }
+            local nodeId = {}
+            for i, tn in ipairs(P.list(pt.addedNodes)) do
+                nodeId[tn.entity.new] = -100 - i
+                rec.nodes[i] = { id = -100 - i, pos = pos(tn.position) }
+            end
+            local function end_(e) if e.new then return nodeId[e.new] end return { __ref = 'node', p = pos(e.pos) } end
+            for i, ts in ipairs(P.list(pt.addedSegments)) do
+                local own = ts.roadTemplate:find('/constructions/', 1, true)
+                rec.segs[i] = { id = -200 - i, n0 = end_(ts.node0), n1 = end_(ts.node1), type = 0, owner = 'player', objects = {},
+                    c = own and { roadTemplate = '::/' .. ts.roadTemplate } or { roadTemplate = '::/' .. ts.roadTemplate, roadStyle = '::/' .. ts.roadStyle, typeIndex = -1, roadType = 1,
+                        p0 = pos(ts.position0), p1 = pos(ts.position1) } }
+            end
+            for i = 1, pt.removedNodes.n do rec.rmNodes[i] = { __ref = 'node', p = pos(pt.removedNodes[i].position) } end
+            for i = 1, pt.removedSegments.n do rec.rmSegs[i] = { __ref = 'edge', p0 = pos(pt.removedSegments[i].position0), p1 = pos(pt.removedSegments[i].position1) } end
+            for i = 1, pt.nodeConfigsToAdd.n do
+                local e = pt.nodeConfigsToAdd[i].entity
+                rec.ncfg[i] = { node = e.new and nodeId[e.new] or { __ref = 'node', p = oldPos[e.old] }, lc = {}, cw = {}, pref = 2 }
+            end
+            rec.ncfg[1].lc[1] = { s0 = rec.segs[1].id, l0 = 1, s1 = rec.segs[2].id, l1 = 2, road = true }
+            rec.ncfg[1].cw[1] = rec.segs[3].id
+            for i = 1, pt.edgeObjectsToAdd.n do rec.objs[i] = { edge = rec.segs[3].id, model = 'station/street/bus_stop.mdl', param = 0.5 } end
+            for i = 1, pt.edgeObjectsToRemove.n do rec.rmObjs[i] = { __ref = 'obj', i = i, edge = rec.rmSegs[1] } end
+            for i = 1, pt.nodeConfigsToRemove.n do rec.rmNcfg[i] = { __ref = 'node', p = oldPos[pt.nodeConfigsToRemove[i].old] or { x = 0, y = 0, z = 0 } } end
+            for i = 1, tree.toRemove.n do rec.rem[i] = { __ref = 'con', file = '::/buildings/x.con', p = { x = 1, y = 2, z = 3 } } end
+            local tc = tree.toAdd[1]
+            rec.cons[1] = { file = '::/' .. tc.fileName, transf = tc.transf, owner = 'player', params = {} }
+"""
+
+
+class PortableReplayBase:
+    """FEVERLINK3_PORTABLE_REPLAY: a build that comes with the native module's text is replayed through it (default off)."""
+
+    switch = None
+
+    def setUp(self):
+        self._old = os.environ.get("FEVERLINK3_PORTABLE_REPLAY")
+        if self.switch is None:
+            os.environ.pop("FEVERLINK3_PORTABLE_REPLAY", None)
+        else:
+            os.environ["FEVERLINK3_PORTABLE_REPLAY"] = self.switch
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        if self._old is None:
+            os.environ.pop("FEVERLINK3_PORTABLE_REPLAY", None)
+        else:
+            os.environ["FEVERLINK3_PORTABLE_REPLAY"] = self._old
+
+    def decoded(self, text, proposal="NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }"):
+        code = """(function(txt)
+            local body = WIRE_RECORD(%s)
+            body.input = txt
+            local args = DECODE(body)
+            if not args then return 'refused' end
+            local sp = STORE(args[1])
+            local ssp = STORE(sp.streetProposal)
+            return tostring(args.plan) .. '|' .. #ssp.nodesToAdd .. '|' .. #ssp.edgesToAdd
+        end)""" % proposal
+        return str(self.L.eval(code)(text))
+
+
+class PortableReplayOffTest(PortableReplayBase, PureBuildTest):
+    def test_off_by_default_the_record_path_builds_it(self):
+        self.assertEqual(self.decoded(portable_road_text()), "street|2|1")
+
+
+class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
+    switch = "1"
+
+    def test_a_road_is_built_from_the_text_as_one_proposal(self):
+        self.assertEqual(self.decoded(portable_road_text()), "portable|2|1")
+
+    def test_the_text_decides_the_geometry(self):
+        # the text says the tangent is 123: the engine is given the text's geometry, not the record's
+        code = """(function(txt)
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } })
+            body.input = txt
+            local args = DECODE(body)
+            local ssp = STORE(STORE(args[1]).streetProposal)
+            local c = STORE(STORE(ssp.edgesToAdd[1]).comp)
+            return tostring(args.plan) .. '|' .. c.tangent0.x
+        end)"""
+        got = str(self.L.eval(code)(portable_road_text(tangent=123.0)))
+        self.assertEqual(got, "portable|123")
+
+    def test_a_node_the_text_does_not_have_where_the_record_has_it_falls_back(self):
+        self.assertEqual(self.decoded(portable_road_text(bx=450.0)), "street|2|1")
+
+    def test_the_depot_text_with_other_numbering_than_the_record_is_matched_by_identity(self):
+        # real run 2026-10-13 (b22): the engine numbers ONE sequence across nodes, segments and the construction (the third node is -6), the
+        # record numbers its own. The numbers are labels: nodes are matched by position, segments by the ends they join, the construction by
+        # file and placement; the new proposal numbers nodes and segments from -1 each, and what refers to them follows.
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "depot_input.txt"), encoding="utf-8").read()
+        code = DEPOT_RECORD_LUA + """            local out, why = M.portableRecord(rec, tree)
+            if not out then return 'NO: ' .. why end
+            local ids = {}
+            for i, n in ipairs(out.nodes) do ids[#ids + 1] = 'n' .. n.id end
+            for i, s in ipairs(out.segs) do ids[#ids + 1] = 's' .. s.id .. '(' .. tostring(type(s.n0) == 'number' and s.n0 or 'ref') .. ',' .. tostring(type(s.n1) == 'number' and s.n1 or 'ref') .. ')' end
+            local nc = out.ncfg[1]
+            ids[#ids + 1] = 'cfg' .. tostring(nc.node) .. ':' .. nc.lc[1].s0 .. ',' .. nc.lc[1].s1 .. ':' .. nc.cw[1]
+            ids[#ids + 1] = 'obj' .. out.objs[1].edge
+            ids[#ids + 1] = 'con' .. #out.cons
+            return table.concat(ids, ' ')
+        end)"""
+        got = str(self.L.eval(code)(text))
+        self.assertEqual(got, "n-1 n-2 n-3 s-1(-1,-2) s-2(ref,-1) s-3(-1,-3) s-4(-3,ref) cfg-1:-1,-2:-3 obj-3 con1")
+
+    def test_the_frozen_node_rule_names_the_constructions_own_piece_and_the_patch_the_native_module_needs(self):
+        # Track A (SPIKE_NATIVE_COMMAND.md): proposal.frozenNodes are 0-based indices into the added nodes; the added segments that touch a frozen node
+        # are the construction's own piece. The owner rule (the player is the owner of exactly that piece in the real samples) must agree.
+        fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        code = DEPOT_RECORD_LUA + """
+            local out, n, nodesOut, cfgOut, patch, agree = M.ownRule(rec, tree)
+            if not out then return 'NO: ' .. tostring(n) end
+            local own = {}
+            for i, sg in ipairs(out.segs) do if sg.derived then own[#own + 1] = i end end
+            return n .. ' own=' .. table.concat(own, ',') .. ' nodesOut=' .. nodesOut .. ' cfgOut=' .. cfgOut
+                .. ' frozen=' .. table.concat(patch.frozen, ',') .. ' adds=' .. patch.adds .. ' ' .. (agree and 'agree' or 'disagree')
+        end)"""
+        # the frozen node (index 1) is the entrance's end at the building; it stays in the proposal, so the patch names its place among the kept nodes
+        for name, want in (("depot_input.txt", "1 own=1 nodesOut=0 cfgOut=0 frozen=1 adds=3 agree"),
+                           ("depot_free_input.txt", "1 own=1 nodesOut=0 cfgOut=0 frozen=1 adds=2 agree")):
+            text = open(os.path.join(fixtures, name), encoding="utf-8").read()
+            self.assertEqual(str(self.L.eval(code)(text)), want, name)
+
+    def test_a_construction_needs_the_native_patch_for_its_frozen_node_and_falls_back_without_it(self):
+        fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        text = open(os.path.join(fixtures, "depot_free_input.txt"), encoding="utf-8").read()
+        code = DEPOT_RECORD_LUA + """
+            local body = { fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, { align = true, cleanup = false, buildings = true, fields = true }, false, true, false }, input = txt }
+            local ctx = { player = 7, traceKey = 'k', canPatch = CAN, resolve = function(key) return nil end }
+            M.commands.makeWorldBuildProposalCmd.decode(body, ctx)
+        end)"""
+        def trace():
+            out = ""
+            for root, _, files in os.walk(self.tmp):
+                for fn in files:
+                    if fn == "trace.log":
+                        out += open(os.path.join(root, fn), encoding="utf-8").read()
+            return out
+        self.L.eval(code.replace("CAN", "false"))(text)
+        self.assertIn("frozen nodes must be set by the native module", trace())
+        self.assertIn("cross-check owner vs frozen: agree", trace())
+        before = trace()
+        self.L.eval(code.replace("CAN", "true"))(text)
+        # with the capability the build goes on to the proposal itself (the mock has no street templates, so it stops there, for another reason)
+        self.assertNotIn("frozen nodes must be set by the native module", trace()[len(before):])
+
+    def test_a_frozen_index_outside_the_added_nodes_is_refused(self):
+        fixtures = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        text = open(os.path.join(fixtures, "depot_free_input.txt"), encoding="utf-8").read()
+        text = text.replace("proposal.frozenNodes[0]" + chr(9) + "ent:old#1", "proposal.frozenNodes[0]" + chr(9) + "ent:old#9")
+        code = DEPOT_RECORD_LUA + """
+            local out, why = M.ownRule(rec, tree)
+            return out and 'built' or why
+        end)"""
+        self.assertIn("frozen node index 9 is not one of the 2 added nodes", str(self.L.eval(code)(text)))
+
+    def test_a_text_that_counts_differently_falls_back_to_the_record_path(self):
+        self.assertEqual(self.decoded(portable_road_text(segs=2)), "street|2|1")
+
+    def test_a_text_that_cannot_be_read_falls_back_to_the_record_path(self):
+        self.assertEqual(self.decoded("this is not a portable text"), "street|2|1")
+
+    def test_a_build_without_a_text_is_built_by_the_record_path(self):
+        code = """(function()
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } })
+            return tostring(DECODE(body).plan)
+        end)"""
+        self.assertEqual(str(self.L.eval(code)()), "street")
 
 
 if __name__ == "__main__":

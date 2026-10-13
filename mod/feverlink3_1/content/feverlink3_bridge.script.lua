@@ -43,6 +43,11 @@ for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverli
 	end
 end
 
+-- The portable text of the native module's held commands as a table (B2); optional, nil without the module.
+local okP, Portable = pcall(ug_require, "feverlink3_portable.lua")
+if not okP then okP, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
+if not okP or type(Portable) ~= "table" then Portable = nil end
+
 -- The construction module captures what the native tools build (see simCaptureBuild).
 local Build = nil
 for _, M in ipairs(CMDS) do
@@ -55,6 +60,16 @@ end
 -- the engine's objects are looked at without restarting the game for every question. Inert without the variable.
 local DEV = false
 pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
+
+-- FEVERLINK3_NATIVE_PATCH=1 (default off): the native module may set the converted proposal's frozenNodes at the Add of the next build command (the
+-- control order patch_next, docs/NATIVE_LINK.md), which a SimpleProposal cannot carry. Only with it, and with a module that reports the capability,
+-- the portable replay builds a construction (its frozen node); without either the build falls back to the record path.
+local NATIVE_PATCH = false
+pcall(function() NATIVE_PATCH = os.getenv("FEVERLINK3_NATIVE_PATCH") == "1" end)
+-- FEVERLINK3_NATIVE_INJECT=1 (default off, track A): the originator ships the native module's portable text of the held command and the others
+-- have the module build the engine's Proposal from it and swap it into the replay's command (inject_next, docs/NATIVE_LINK.md)
+local NATIVE_INJECT = false
+pcall(function() NATIVE_INJECT = os.getenv("FEVERLINK3_NATIVE_INJECT") == "1" end)
 
 -- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
 --   "0"          hold-and-release for every build (developer opt-out; was the default until 2026-10-13). The tool's command is held until the stamp and then released, so the tool gets its
@@ -645,7 +660,10 @@ local function actionCtx(it, co, resolve)
 end
 
 local function simCtx(st, it)
-	return actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
+	local ctx = actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
+	ctx.canInject = NATIVE_INJECT and SIM.nativeInject == true
+	ctx.canPatch = NATIVE_PATCH and SIM.nativePatch == true   -- (told by the interface half when the module reported the capability; not in the saved state, a load would lose it)
+	return ctx
 end
 
 -- companies. Guarded calls into the company module: a fault in that layer is logged and the action goes ahead, since
@@ -772,7 +790,12 @@ local function describeBuild(it, args, role)
 			n = #l
 			for i = 1, math.min(n, 6) do ids[#ids + 1] = tostring(l[i]) end
 		end)
-		if sum.rem > 0 or n > 0 then parts[#parts + 1] = string.format("resolved removals %d of %d [%s]", n, sum.rem, table.concat(ids, " ")) end
+		if sum.rem > 0 or n > 0 then
+			-- (a build of several commands carries its removals in a later one: the first command's list says nothing about them; see the
+			-- build.removal trace lines for each removal's resolution)
+			local chained = type(args) == "table" and type(args.chain) == "table" and #args.chain > 0
+			parts[#parts + 1] = string.format("resolved removals %d of %d [%s]%s", n, sum.rem, table.concat(ids, " "), (chained and n < sum.rem) and " (first command only; the others are in the chained command)" or "")
+		end
 		local verdict = "n/a"
 		-- (real session 2026-10-13: makeProposalData answered "SimpleProposal expected, got Proposal" for a removal, and the one failure
 		-- switched the reader off for every build. It only fails for the native Proposal type, so only that type is skipped.)
@@ -957,7 +980,50 @@ local function snapshotComps(comps)
 	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end
 	return before
 end
-local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
+-- B2.1, shadow: the record against the text the native module read from the held command, member by member (Portable.compare); one
+-- trace line (build.portable) on whichever half has both. Never raises.
+local function shadowCompare(tracer, who, text, rec)
+	pcall(function()
+		local tree, why = Portable.parse(text)
+		if not tree then
+			tracer("build.portable", string.format("%s TEXT UNUSABLE (%s)", who, tostring(why)))
+			return
+		end
+		local diffs = Portable.compare(tree, rec)
+		tracer("build.portable", string.format("%s diffs=%d%s; text counts[%s]", who, #diffs, #diffs > 0 and (" [" .. table.concat(diffs, "; "):sub(1, 700) .. "]") or "",
+			Portable.countsText(Portable.counts(tree))))
+		if #diffs > 0 then tracer("build.portable.all", who .. " " .. table.concat(diffs, "; "):sub(1, 6000)) end
+	end)
+end
+
+-- The control order that makes the native module set the converted proposal's frozenNodes at the Add of the command sent next (patch_next:
+-- frozen = 0-based indices into the proposal's added nodes, adds = how many nodes it adds). Written from the simulation half, right before the
+-- command, with a writer of its own whose sequence continues the file's (the interface half refreshes its own before each write, natSend).
+local function sendPatchOrder(patch, key)
+	local ok, err = pcall(function()
+		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
+		local sent, why = C.writerSend(w, "patch_next", { frozen = patch.frozen, adds = patch.adds, at = patch.at })
+		if not sent then error(why, 0) end
+	end)
+	traceSim("build.patch", string.format("%s patch_next frozen=[%s] adds=%d %s", tostring(key), table.concat(patch.frozen, ","), patch.adds or -1,
+		ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+end
+
+-- The inject order: the shipped text goes to native_inject_<n>.txt (closed before the order is written), then `inject_next {key=n}`, then the caller
+-- sends the replay's command at once (nothing in between). The module answers `injected` / `inject_refused` in native_events.log.
+local function sendInjectOrder(inj, key)
+	SIM.injectN = (SIM.injectN or 0) + 1
+	local n = SIM.injectN
+	local ok, err = pcall(function()
+		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
+		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
+		local sent, why = C.writerSend(w, "inject_next", { key = n })
+		if not sent then error(why, 0) end
+	end)
+	traceSim("build.inject", string.format("%s inject_next key=%d (%d bytes of text) %s", tostring(key), n, #inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+end
+
+local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
 	local st = simState(state)
 	local now = engine.gameTime()
 	-- A build the engine or a game script made on its own (a town growing a road: playerInitiated false) is nobody's tool build:
@@ -998,12 +1064,17 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 	local rev = {}
 	for key, e in pairs(st.bind) do rev[e] = key end
 	local t0 = os.clock()
-	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, result = post and result or nil }, {
+	-- The Context is the event's second argument (a userdata with the flags the tool built the command with); the record carries it, so every
+	-- game rebuilds the build with the originator's real flags. The post event passes the result at [3] and no Context at [2].
+	local ctxObj = nil
+	if not post then pcall(function() ctxObj = param[2] end) end
+	if post and deferredPre then ctxObj = deferredPre.ctx end   -- read at the pre-build event: the post event carries no Context
+	local ok, body, why = pcall(Build.capture, proposal, { playerInitiated = true, ignoreErrors = ignoreErrors, ctx = ctxObj, cons = post and deferredPre and deferredPre.cons or nil, result = post and result or nil }, {
 		plain = C.plain, keyOf = function(e) return L.keyFor(rev, e) end,
 	})
 	if not ok then body, why = nil, tostring(body) end
 	if not body and not post and tostring(why):find("has no model", 1, true) then
-		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)), ie = ignoreErrors }
+		SIM.deferredBuild = { at = now, before = select(2, pcall(snapshotComps, NATIVE_BIND_COMPS)), ie = ignoreErrors, pre = Build.preState(proposal, ctxObj) }
 		logSim("a native build at t=" .. now .. " has an edge object that the engine has not made yet: read again after the build")
 		state:set(st)
 		return
@@ -1023,6 +1094,15 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe)
 		return
 	end
 	body.native = true
+	do
+		local hi = st.heldInput
+		st.heldInput = nil
+		if hi and Portable and os.clock() - hi.wall < 30 then
+			body.input = hi.text
+			shadowCompare(traceSim, "t=" .. now .. " side=originator", hi.text, body.args[1])
+		end
+	end
+	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and (deferredPre and "pre-build event (read before the deferred build)" or "post-event (no context)") or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
 	body.category = buildCategory(body)
 	if Build.constructionsBlocked and Build.constructionsBlocked(body) then
 		-- degraded mode (no native module): the build is in this world already and cannot be taken back; the others would refuse it
@@ -1160,13 +1240,22 @@ local function simApplyAction(st, it, now)
 					if isBuild then
 						pcall(function()
 							local c = a[2]
-							traceSim("build.send", string.format("%s ie=%s pi=%s dust=%s ctx{align=%s cleanup=%s buildings=%s fields=%s player=%s} chain=%s now=%s balance=%s",
+							traceSim("build.send", string.format("%s ie=%s pi=%s dust=%s ctx{align=%s cleanup=%s buildings=%s fields=%s redo=%s player=%s} chain=%s now=%s balance=%s",
 								it.key, tostring(a[3]), tostring(a[4]), tostring(a[5]), tostring(c and c.checkTerrainAlignment), tostring(c and c.cleanupStreetGraph),
-								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.player), tostring(a.chain and (#a.chain + 1) or 1),
-								tostring(engine.gameTime()), tostring(engine.account())))
+								tostring(c and c.gatherBuildings), tostring(c and c.gatherFields), tostring(c and c.extendProposalRedoPillars), tostring(c and c.player),
+								tostring(a.chain and (#a.chain + 1) or 1), tostring(engine.gameTime()), tostring(engine.account())))
+							if Portable and type(it.body.input) == "string" then
+								shadowCompare(traceSim, it.key .. " side=replay", it.body.input, Build.normalise(it.body.args[1]))
+								pcall(function()
+									traceSim("build.portable", string.format("%s side=replay this game's first proposal counts[%s]", it.key, Build.proposalCounts(a[1])))
+								end)
+							end
+							traceSim("build.ctx", string.format("%s side=replay source=%s ctx{%s} ie=%s pi=%s", it.key, tostring(a.ctxSource or "record"), Build.contextText(c), tostring(a[3]), tostring(a[4])))
 						end)
 					end
 				end
+				if a.patch then sendPatchOrder(a.patch, it.key) end
+				if a.inject then sendInjectOrder(a.inject, it.key) end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -1537,7 +1626,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		if d and d.at == engine.gameTime() then
 			C.poll()
 			if not C.ACTIVE then return end
-			local ok, err = pcall(simCaptureBuild, state, param, true, d.before, d.ie)
+			local ok, err = pcall(simCaptureBuild, state, param, true, d.before, d.ie, d.pre)
 			if not ok then logSim("onPostBuildProposal capture failed: " .. tostring(err)) end
 		end
 		return
@@ -1597,6 +1686,12 @@ local function handleEvent(userParams, state, src, id, name, param)
 			end
 		elseif name == "replay" then
 			markReplay(st, engine.gameTime())
+		elseif name == "nativecaps" and type(param) == "table" then
+			SIM.nativePatch = param.patch == true
+			SIM.nativeInject = param.inject == true
+		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
+			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
+			st.heldInput = { text = param.text, wall = os.clock() }
 		elseif name == "heldout" and type(param) == "table" then
 			st.heldOut = st.heldOut or {}
 			st.heldOut[#st.heldOut + 1] = { key = param.key, wall = os.clock() }
@@ -1725,7 +1820,10 @@ local function setSpeed(sp)
 end
 
 local function guiCtx(it)
-	return actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
+	local ctx = actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
+	ctx.canPatch = NATIVE_PATCH and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.patch == true
+	ctx.canInject = NATIVE_INJECT and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.inject == true
+	return ctx
 end
 
 -- What the engine says when it refuses a command (errorState of the result), for the log: without it a refused build is
@@ -2041,7 +2139,9 @@ local function dryRun(it)
 		if isVetoReason(why) then return false, tostring(why) end
 		return true, "inconclusive: " .. tostring(why)
 	end
-	local bad = proposalVerdict(args)
+	-- a build that the native module patches at the Add (frozen nodes) is judged by the engine before the patch: the unpatched proposal always collides with the construction's own street piece (b29), so that verdict is no veto
+	local bad = nil
+	if not (type(args) == "table" and (args.patch or args.inject)) then bad = proposalVerdict(args) end
 	-- the engine's verdict and the form that was judged, for every build that adds or removes constructions (real session 2026-10-13:
 	-- an underground station entrance was refused with "Construction Not Possible" and the log did not say which plan or form)
 	if args.plan == "construction" or args.plan == "withStreet" or args.plan == "combined" or args.plan == "bulldoze" then
@@ -2244,6 +2344,9 @@ local function natSend(kind, payload)
 	local N = G.nat
 	if not N then return false end
 	if not N.writer then N.writer = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID) end
+	-- the simulation half writes to the same file (patch_next): this writer's sequence continues after whatever is in it now
+	local inFile = C.lastSeqInFile(C.path("native_ctl.log"))
+	if inFile > N.writer.seq then N.writer.seq = inFile end
 	local ok, err = C.writerSend(N.writer, kind, payload)
 	if ok then
 		N.lastWrite = os.clock()
@@ -2434,9 +2537,52 @@ local function natUnaccounted(h, why)
 end
 
 -- The held command `h` has the capture `cap`: ship it and cancel the command, or release it.
+-- The input-level text the native module wrote for a held command (native_input_<id>.txt), read and parsed once (h.input = the tree).
+-- Shadow only until the replay uses it: the trace line says what it holds. Never raises.
+local function natInput(h)
+	if h.input ~= nil or not Portable then return h.input end
+	local ok, tree, info = pcall(function()
+		local text = C.readFile(C.path("native_input_" .. h.id .. ".txt"))
+		if not text or text == "" then return nil, "missing" end
+		local t, why = Portable.parse(text)
+		if not t then return nil, why end
+		h.inputText = text
+		return t, { bytes = #text, counts = Portable.countsText(Portable.counts(t)) }
+	end)
+	if not ok then tree, info = nil, tostring(tree) end
+	h.input = tree or false
+	if tree then
+		traceGui("build.input", string.format("held=%d bytes=%d counts[%s]", h.id, info.bytes, info.counts))
+	else
+		traceGui("build.input", string.format("held=%d NOT AVAILABLE (%s)", h.id, tostring(info)))
+	end
+	return h.input
+end
+
+-- B2.1, shadow: the record the capture made against the text the native module read from the held command (member by member), and
+-- the text goes with the record so the other games can make the same comparison. Never changes the record's meaning: the text is an
+-- extra member of the body that nothing reads yet.
+local function natShadow(h, body)
+	local tree = natInput(h)
+	if not (tree and Portable and body and body.args) then return end
+	body.input = h.inputText
+	if NATIVE_INJECT then
+		local okT, text = pcall(C.readFile, C.path("native_text_" .. h.id .. ".txt"))
+		if okT and type(text) == "string" and text ~= "" then
+			body.nativeText = text
+			traceGui("build.inject", string.format("held=%d the native module's text of the command goes with the record (%d bytes)", h.id, #text))
+		else
+			traceGui("build.inject", string.format("held=%d NO native text (native_text_%d.txt missing): the record path builds it", h.id, h.id))
+		end
+	end
+	shadowCompare(traceGui, "held=" .. h.id .. " side=originator", h.inputText, body.args[1])
+	return true
+end
+
 local function natDecideUnsafe(h, cap)
 	local N = G.nat
 	local id = h.id
+	natInput(h)
 	local function release(why) natUnaccounted(h, why) end
 	if not cap then return release("no capture of a tool build") end
 	if not cap.body then
@@ -2446,6 +2592,7 @@ local function natDecideUnsafe(h, cap)
 		if tostring(cap.why):find("has no model", 1, true) then
 			-- an edge object (a stop) gets its model and parameters only when the build runs: the record is read AFTER the build (the
 			-- simulation half's deferred read, SIM.deferredBuild) and shipped then; nothing to cancel
+			if natInput(h) then pcall(toSim, "heldinput", { text = h.inputText }) end
 			return release("the capture of " .. tostring(cap.tool) .. " waits for the build (" .. tostring(cap.why) .. "): the record is read after it ran and shipped then")
 		end
 		if FIRE_DONE and h.done then
@@ -2457,6 +2604,18 @@ local function natDecideUnsafe(h, cap)
 		return release("the capture of " .. cap.tool .. " failed (" .. tostring(cap.why) .. ")")
 	end
 	local body, text = cap.body, cap.text
+	-- The preview the capture was made from carries no Context; the held command does (the native module read it). Its flags replace the
+	-- capture's, so the record that travels has the originator's real Context, ignoreErrors and playerInitiated.
+	local _, shadowed = pcall(natShadow, h, body)
+	local okF, changed = pcall(function() return Build and Build.withHeldFlags and Build.withHeldFlags(body, h.ctx) end)
+	if (okF and changed) or shadowed then
+		local okS, s = pcall(C.serialize, body)
+		if okS then text = s end
+	end
+	pcall(function()
+		traceGui("build.ctx", string.format("held=%d side=originator source=%s ctx{%s} ie=%s pi=%s", id, (okF and changed) and "held command" or "none (old native module: capture's guess)",
+			Build and Build.contextText(body.args[2]) or "?", tostring(body.args[3]), tostring(body.args[4])))
+	end)
 	local category = buildCategory(body)
 	if not L.permitted(G.perms, category) then
 		-- refused before stamping, like the wrapped sendCommand: nothing was built yet, so nothing is sent to the others
@@ -2760,7 +2919,7 @@ end
 local function natOnHeld(N, p)
 	local id = tonumber(p.id)
 	if not id then return end
-	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true }
+	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true, ctx = type(p.ctx) == "table" and p.ctx or nil }
 	if not N.holdSent then
 		-- strict mode is being switched off: the module has not caught up; give the command back
 		natSay("held " .. id .. " while strict mode is off; release written")
@@ -2811,7 +2970,12 @@ local function natEvent(N, rec, p, history)
 	if kind == "ready" then
 		local hooks = {}
 		for _, h in ipairs(type(p.hooks) == "table" and p.hooks or {}) do hooks[#hooks + 1] = tostring(h) end
-		N.ready = { build = p.build, hooks = hooks }
+		N.ready = { build = p.build, hooks = hooks, patch = p.patch == true }
+		for _, h in ipairs(hooks) do
+			if h == "patch_next" then N.ready.patch = true end
+			if h == "inject_next" then N.ready.inject = true end
+		end
+		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject })
 		N.hookOk = false
 		for _, h in ipairs(hooks) do
 			if h == "command_list_add" then N.hookOk = true end
@@ -2854,6 +3018,12 @@ local function natEvent(N, rec, p, history)
 		return   -- held / released / dropped / audit of an earlier run of this script: not news
 	elseif kind == "held" then
 		natOnHeld(N, p)
+	elseif kind == "injected" or kind == "inject_refused" then
+		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
+		if kind == "inject_refused" then natSay("the native module refused to inject the engine's proposal: " .. tostring(p.reason or p.detail)) end
+	elseif kind == "patched" or kind == "patch_refused" then
+		traceGui("build.patch", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
+		if kind == "patch_refused" then natSay("the native module refused the frozen-node patch: " .. tostring(p.reason or p.detail)) end
 	elseif kind == "released" or kind == "dropped" then
 		local id = tonumber(p.id)
 		if id then
@@ -3578,6 +3748,7 @@ local function guiUpdate(userParams, state, guiState)
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
+	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject }) end
 	local ok, err = pcall(function()
 		readLink()
 		serviceWindow()

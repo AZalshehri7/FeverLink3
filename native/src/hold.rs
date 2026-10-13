@@ -18,6 +18,7 @@
 
 use std::collections::VecDeque;
 
+use crate::engine::BuildFlags;
 use crate::link::{CtlMessage, Event};
 
 pub type HoldId = u64;
@@ -288,6 +289,7 @@ impl<H> HoldMachine<H> {
                 self.error("terrain_apply", format!("edit {id}: terrain edits are not copied by this build"), now)
             }
             CtlMessage::Ping { n } => self.push_event(Event::Pong { n: *n }),
+            CtlMessage::PatchNext { .. } | CtlMessage::InjectNext { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject)
         }
     }
 
@@ -356,18 +358,26 @@ impl<H> HoldMachine<H> {
     /// Takes a captured command into the ring. `Err` gives it back when it may no longer be held (checked again
     /// here, so a caller that captured after [`admit`](Self::admit) cannot overfill the ring or hold while off).
     pub fn hold(&mut self, kind: u8, site: u32, handle: H, now: u64) -> Result<HoldId, H> {
-        self.hold_with(kind, site, false, handle, now)
+        self.hold_with(kind, site, false, None, handle, now)
     }
 
     /// As [`hold`](Self::hold); `done` tells the mod that cancelling this command fires the tool's completion callback first.
-    pub fn hold_with(&mut self, kind: u8, site: u32, done: bool, handle: H, now: u64) -> Result<HoldId, H> {
+    pub fn hold_with(
+        &mut self,
+        kind: u8,
+        site: u32,
+        done: bool,
+        flags: Option<BuildFlags>,
+        handle: H,
+        now: u64,
+    ) -> Result<HoldId, H> {
         if !self.enabled || !self.kinds.contains(&kind) || self.entries.len() >= self.cfg.capacity {
             return Err(handle);
         }
         let id = self.next_id;
         self.next_id += 1;
         self.entries.push_back(Entry { id, kind, held_ms: now, phase: Phase::Waiting, handle });
-        self.push_event(Event::Held { id, kind, site, ms: now, done });
+        self.push_event(Event::Held { id, kind, site, ms: now, done, flags });
         Ok(id)
     }
 
@@ -513,8 +523,8 @@ mod tests {
         assert_eq!(
             m.drain_events(),
             [
-                Event::Held { id: 1, kind: BUILD, site: 77, ms: 10, done: false },
-                Event::Held { id: 2, kind: BUILD, site: 77, ms: 20, done: false }
+                Event::Held { id: 1, kind: BUILD, site: 77, ms: 10, done: false, flags: None },
+                Event::Held { id: 2, kind: BUILD, site: 77, ms: 20, done: false, flags: None }
             ]
         );
     }

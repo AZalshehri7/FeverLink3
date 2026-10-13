@@ -87,6 +87,8 @@ pub struct HookConfig {
     /// The town-growth log and seed experiment (`growth.rs`).
     pub growth: Settings,
     pub luaseed: bool,
+    /// `FEVERLINK3_NATIVE_PATCH=1`: also hook `scripting::Convert`, to write `frozenNodes` into a script's converted proposal.
+    pub native_patch: bool,
 }
 
 impl HookConfig {
@@ -104,12 +106,13 @@ impl HookConfig {
             force_seed,
             growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
             luaseed: !off(LUA_SEED_VAR),
+            native_patch: on(crate::cmd_patch::PATCH_VAR),
         }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch || self.town_seed || self.growth.active() || self.luaseed
+        self.hooks || self.poolpatch || self.native_patch || self.town_seed || self.growth.active() || self.luaseed
     }
 
     pub fn describe(&self) -> String {
@@ -184,6 +187,10 @@ pub enum Feature {
     GrowthPick,
     /// The pinned Lua string-hash seed.
     LuaSeed,
+    /// The hook on `scripting::Convert` (the native frozenNodes patch).
+    Convert,
+    /// The hook on the construction update `Convert` runs (frozenNodes before the entrance is generated).
+    ConvertUpdate,
 }
 
 impl Feature {
@@ -200,6 +207,8 @@ impl Feature {
             Feature::GrowthSort => "town_sort",
             Feature::GrowthPick => "town_pick",
             Feature::LuaSeed => "luaseed",
+            Feature::Convert => "script_convert",
+            Feature::ConvertUpdate => "script_convert_update",
         }
     }
 }
@@ -346,6 +355,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
             plan_growth_calls(build, image, &mut p);
         }
     }
+    if cfg.native_patch {
+        plan_convert(build, image, &mut p);
+    }
     if cfg.poolpatch {
         plan_patch(Feature::PoolPatch, "script_pool", &build.script_pool, image, &mut p);
     }
@@ -395,6 +407,27 @@ fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
             p.kind_offset = Some(kind_offset);
         }
         Err(reason) => skip(p, reason),
+    }
+}
+
+/// The hook on `scripting::Convert`: only with the patch switch, and only when the prologue matches.
+fn plan_convert(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    for (feature, name, site) in [
+        (Feature::Convert, "script_convert", &build.script_convert),
+        (Feature::ConvertUpdate, "script_convert_update", &build.convert_update),
+    ] {
+        let Some(site) = site else {
+            p.skipped.push(Skip {
+                feature,
+                name,
+                reason: format!("the build table has no {name} site for this build"),
+            });
+            continue;
+        };
+        match verify(image, site.rva, site.prologue) {
+            Ok(()) => p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue }),
+            Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+        }
     }
 }
 
@@ -563,6 +596,8 @@ mod tests {
             &b.town_seed,
             &b.town_develop,
             &b.town_update_size,
+            &b.script_convert,
+            &b.convert_update,
             &b.town_candidates,
             &b.town_edges,
         ]
@@ -913,6 +948,23 @@ mod tests {
         assert!(p.skipped.iter().all(|s| s.reason.contains("not readable")), "{:?}", p.skipped);
     }
 
+    #[test]
+    fn the_convert_hook_is_planned_only_with_the_patch_switch_and_a_matching_prologue() {
+        let b = select(0x6ac5_0427).unwrap();
+        let image = image_of_40420();
+        let off = HookConfig { hooks: true, ..Default::default() };
+        assert!(!plan(b, off, &image).has(Feature::Convert));
+        let on = HookConfig { native_patch: true, ..Default::default() };
+        let p = plan(b, on, &image);
+        assert_eq!(names(&p), ["script_convert", "script_convert_update"], "{:?}", p.report());
+        let mut bad = image_of_40420();
+        bad.write(b.script_convert.as_ref().unwrap().rva, &[0x90; 14]);
+        let p = plan(b, on, &bad);
+        assert_eq!(names(&p), ["script_convert_update"]);
+        assert!(p.skipped[0].name == "script_convert", "{:?}", p.report());
+        assert!(HookConfig::from_lookup(|k| (k == "FEVERLINK3_NATIVE_PATCH").then(|| "1".to_string())).native_patch);
+    }
+
     // ---- planning on made-up rows
 
     static BARE: BuildAddrs = BuildAddrs {
@@ -923,6 +975,8 @@ mod tests {
         town_seed: None,
         town_develop: None,
         town_update_size: None,
+        script_convert: None,
+        convert_update: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,

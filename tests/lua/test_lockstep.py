@@ -53,6 +53,7 @@ BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
 HOOK_SRC = read_src("feverlink3_uihook.lua")
 TRACE_SRC = read_src("feverlink3_towntrace.lua")
+PORTABLE_SRC = read_src("feverlink3_portable.lua")
 LVL_SRC = read_src("feverlink3_livevsloaded.lua")
 # the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
 CMDS_SRC = {
@@ -250,6 +251,7 @@ function LOAD_HALF(label)
   env.ug_require = function(p)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
+    if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
     if p:find("feverlink3_towntrace") then return assert(load(TRACE_SRC, "=towntrace", "t", env))() end
     if p:find("feverlink3_livevsloaded") then return assert(load(LVL_SRC, "=livevsloaded", "t", env))() end
@@ -281,6 +283,7 @@ function UI_HOOK_NEW()
   env.ug_require = function(p)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
+    if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
     if p:find("feverlink3_uihook") then return assert(load(HOOK_SRC, "=uihook", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
@@ -299,6 +302,7 @@ function UI_ENV_NEW()
   env.package = { loaded = {} }
   env.ug_require = function(p)
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
+    if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
     error("no module " .. tostring(p))
   end
@@ -361,6 +365,7 @@ class Game:
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
         g.HOOK_SRC = HOOK_SRC
         g.TRACE_SRC = TRACE_SRC
+        g.PORTABLE_SRC = PORTABLE_SRC
         g.LVL_SRC = LVL_SRC
         cmds = self.L.table()
         for stem, src in CMDS_SRC.items():

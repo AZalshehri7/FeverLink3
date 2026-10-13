@@ -36,7 +36,7 @@ function EXECUTE(cmd, cb)
   return BASE_EXECUTE_BUILD(cmd, function(res, ok, ents)
     if cb then cb(res, ok, ents) end
     if ANNOUNCE_BUILDS and cmd.__cmd == "makeWorldBuildProposalCmd" and ok then
-      SIM_EVENT(0, "apply_command", "onPostBuildProposal", { a[1], a[2], ents, a[4] })
+      SIM_EVENT(0, "apply_command", "onPostBuildProposal", { a[1], nil, ents, a[4] })   -- (the real post event carries no Context)
     end
   end)
 end
@@ -148,6 +148,17 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
         self.assertIn("signal/signal_a.mdl@0.750k2", self.A.sig())
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.A.shipped_count(), self.B.shipped_count()), (1, 1, 0, 1))
+
+    def test_a_build_read_after_it_ran_keeps_the_context_of_the_pre_build_event_and_the_constructions_it_removes(self):
+        # real run 2026-10-13: the stop tool's deferred record was replayed with the fallback flags (the post event has no Context), and a depot
+        # over buildings could not be read after the build ("construction ... is not in the world")
+        self.start()
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; "
+                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIGNAL_P, CONTEXT(false, false, false, true), false, true), nil }")
+        self.tick(16)
+        self.assertNotIn("is not replicated", self.B.log())
+        self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=false cleanup=false buildings=false fields=true player=7 ie=false pi=true")
+        self.assertNotIn("carries no Context flags", self.A.log())
 
     def test_the_originator_keys_its_own_native_stop_and_a_line_by_the_other_game_names_it(self):
         # sweep run 20261013-081155 (F1): the guest built two stops natively, never keyed them itself ("native.bind: no snapshot stored"), and

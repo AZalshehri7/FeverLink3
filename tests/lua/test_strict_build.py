@@ -80,6 +80,11 @@ class FakeNative:
         self.heard = []          # (time, seq, kind, payload) of every control line it accepted
         self.dropped, self.released, self.held = [], [], []
         self.site = TOOL_SITE   # the call site the module reports for the next held command
+        self.input_text = None   # the input-level text the module writes for every held command (native_input_<id>.txt); None = an old module
+        self.patch_cap = False   # the module reports the patch_next capability in `ready`
+        self.patch_refuse = None  # a reason: the module answers patch_next with patch_refused
+        self.patches = []        # the patch_next orders it accepted
+        self.held_flags = None   # the flags the module read out of the held command (the `ctx` of the held event); None = an old module
         self.fires = False   # the module would fire the tool's completion callback at a cancel (the held event says `done`)
         self.is_open = False
         if link:
@@ -117,7 +122,7 @@ class FakeNative:
                 if line.split(TAB)[0].isdigit():
                     self.ctl_seq = max(self.ctl_seq, int(line.split(TAB)[0]))
         self.emit("ready", {"build": "40420", "version": "0.1.0", "hooks": self.hooks, "poolpatch": False, "clock": False,
-                            "kinds": {"build_proposal": 52}, "sites": 12})
+                            "kinds": {"build_proposal": 52}, "sites": 12, "patch": self.patch_cap})
         self.flush_events()
 
     def read_ctl(self):
@@ -160,6 +165,12 @@ class FakeNative:
                 if e["phase"] == "waiting":
                     e["phase"], e["reason"] = "release", "hold_off"
             self.emit("holding", {"on": False, "kinds": [], "reason": "hold_off"})
+        elif kind == "patch_next":
+            if self.patch_refuse:
+                self.emit("patch_refused", {"reason": self.patch_refuse})
+            else:
+                self.patches.append(p)
+                self.emit("patched", {"adds": int(p.get("adds", -1))})
         elif kind in ("release", "cancel"):
             e = next((e for e in self.ring if e["id"] == int(p.get("id", -1))), None)
             if e is None:
@@ -213,6 +224,11 @@ class FakeNative:
             ev = {"id": hid, "kind": 52, "site": self.site, "ms": int(self.clock.t * 1000)}
             if self.fires:
                 ev["done"] = True
+            if self.held_flags:
+                ev["ctx"] = dict(self.held_flags)
+            if self.input_text:
+                with open(os.path.join(self.game.dir, "native_input_%d.txt" % hid), "w", encoding="utf-8", newline="") as f:
+                    f.write(self.input_text)
             self.emit("held", ev)
             return hid
         return 0
@@ -1316,6 +1332,117 @@ class TraceLogTest(StrictTest):
         import os as _os
         path = _os.path.join(g.dir, "trace.log")
         return open(path, encoding="utf-8").read() if _os.path.exists(path) else ""
+
+    def test_the_record_carries_the_flags_of_the_held_command_not_the_previews_guess(self):
+        # the preview a build is captured from has no Context; the native module reads the held command's own flags (a stop tool builds with
+        # cleanup = false, a road tool with true) and the shipped record, and so every game's replay, uses them
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.native.held_flags = {"align": False, "cleanup": True, "buildings": False, "fields": True, "redo": True, "ie": True, "pi": True}
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        body = self.B.action_records()[0]["body"]
+        self.assertIn('[2]={["align"]=false,["buildings"]=false,["cleanup"]=true,["fields"]=true,["redo"]=true},[3]=true,[4]=true', str(body))
+        self.assertIn("side=originator source=held command ctx{align=false cleanup=true buildings=false fields=true redo=true} ie=true pi=true", self.trace(self.B))
+        self.assertIn("side=replay source=record ctx{align=false cleanup=true buildings=false fields=true redo=true}", self.trace(self.A))
+
+    def test_the_input_level_text_of_a_held_command_is_read_and_counted_in_the_trace(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.native.input_text = chr(10).join(["proposal.addedNodes.#" + chr(9) + "n:2", "proposal.addedSegments.#" + chr(9) + "n:1", "toRemove.#" + chr(9) + "n:0", "kind" + chr(9) + "u8:34"])
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertIn("build.input held=1 bytes=", self.trace(self.B))
+        self.assertIn("counts[cons=0 rem=0 nodes=2 segs=1 rmNodes=0", self.trace(self.B))
+
+    @staticmethod
+    def road_text(template="street/new_medium_road.street_template"):
+        import struct as _s
+        def f(x):
+            return "%08x" % _s.unpack("<I", _s.pack("<f", x))[0]
+        def v(x, y, z):
+            return "v3:%s,%s,%s" % (f(x), f(y), f(z))
+        rows = [
+            ("proposal.addedNodes.#", "n:2"), ("proposal.addedNodes[0].entity", "ent:new#1"), ("proposal.addedNodes[0].position", v(300, 0, 0)),
+            ("proposal.addedNodes[1].entity", "ent:new#2"), ("proposal.addedNodes[1].position", v(400, 0, 0)),
+            ("proposal.addedSegments.#", "n:1"), ("proposal.addedSegments[0].entity", "ent:new#3"),
+            ("proposal.addedSegments[0].position0", v(300, 0, 0)), ("proposal.addedSegments[0].position1", v(400, 0, 0)),
+            ("proposal.addedSegments[0].tangent0", v(100, 0, 0)), ("proposal.addedSegments[0].tangent1", v(100, 0, 0)),
+            ("proposal.addedSegments[0].typeIndex", "i32:00000001"), ("proposal.addedSegments[0].roadType", "u32:00000000"),
+            ("proposal.addedSegments[0].roadTemplate", 'res:"%s"' % template), ("proposal.addedSegments[0].roadStyle", 'res:"medium"'),
+            ("proposal.frozenNodes.#", "n:1"), ("proposal.frozenNodes[0]", "ent:old#5"),
+            ("toRemove.#", "n:0"), ("toAdd.#", "n:0"), ("kind", "u8:34"),
+        ]
+        return chr(10).join(k + chr(9) + val for k, val in rows)
+
+    def test_the_text_is_compared_with_the_record_and_shipped_with_it(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.native.input_text = self.road_text()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        tb, ta = self.trace(self.B), self.trace(self.A)
+        self.assertIn("build.portable held=1 side=originator diffs=1 [frozenNodes in the text: 1 (the record has no such member)]", tb)
+        self.assertIn("build.portable 1:1 side=replay diffs=1 [frozenNodes in the text", ta)
+        self.assertIn("this game's first proposal counts[", ta)
+
+    def test_a_difference_between_the_text_and_the_record_is_named(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.native.input_text = self.road_text("street/other.street_template")
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertIn("segment 1: template text street/other.street_template, record street/new_medium_road.street_template", self.trace(self.B))
+
+    def test_a_held_command_without_an_input_text_says_so_and_nothing_else_changes(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertIn("build.input held=1 NOT AVAILABLE (missing)", self.trace(self.B))
+        self.assertEqual(self.B.builds_applied(), 1)
+
+    def external_ctl_line(self, g, kind, payload_text):
+        """A control line written by someone else than the interface half (the simulation half writes patch_next), in the file's own shape."""
+        path = g.native.ctl
+        last = 0
+        if os.path.exists(path):
+            for line in open(path, encoding="utf-8").read().splitlines():
+                head = line.split(TAB)[0]
+                if head.isdigit():
+                    last = max(last, int(head))
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            f.write(TAB.join([str(last + 1), kind, str(g.player_id if hasattr(g, "player_id") else 1), payload_text]) + chr(10))
+
+    def test_a_control_line_written_by_the_simulation_half_does_not_make_the_interface_halfs_next_order_stale(self):
+        # patch_next is written from the simulation half with a writer of its own; the interface half's writer continues after it
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.external_ctl_line(self.B, "patch_next", '{["adds"]=3,["frozen"]={[1]=1}}')
+        self.tick(2)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        self.assertEqual(self.B.native.patches, [{"adds": 3, "frozen": [1]}])
+        self.assertEqual(self.B.native.released, [1], "the release written after it was heard")
+
+    def test_the_modules_answers_to_a_patch_are_traced(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.external_ctl_line(self.B, "patch_next", '{["adds"]=2,["frozen"]={[1]=1}}')
+        self.tick(4)
+        self.assertIn('build.patch patched', self.trace(self.B))
+        self.B.native.patch_refuse = "the node count differs"
+        self.external_ctl_line(self.B, "patch_next", '{["adds"]=5,["frozen"]={[1]=1}}')
+        self.tick(4)
+        self.assertIn('build.patch patch_refused', self.trace(self.B))
+        self.assertIn("the node count differs", self.trace(self.B))
+
+    def test_an_old_native_module_without_flags_keeps_the_captures_guess_and_says_so(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertIn("source=none (old native module", self.trace(self.B))
 
     def test_a_build_leaves_its_record_decode_send_result_and_the_originators_ship_line_on_both_games(self):
         self.start()

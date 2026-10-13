@@ -17,14 +17,21 @@
 #![cfg_attr(not(test), deny(unsafe_op_in_unsafe_fn))]
 
 pub mod build_table;
+pub mod cmd_patch;
 pub mod counters;
 pub mod detour;
+pub mod dump;
 pub mod growth;
 pub mod hold;
+pub mod inject;
+pub mod input;
 pub mod link;
+pub mod native_copy;
 pub mod patch;
 pub mod pe;
 pub mod plan;
+pub mod portable;
+pub mod rebuild;
 pub mod scan;
 pub mod townseed;
 

@@ -20,6 +20,8 @@ use feverlink3_launcher::gamelink::{self, Line};
 use feverlink3_launcher::luatext;
 use serde_json::Value;
 
+use crate::engine::BuildFlags;
+
 /// The mod writes, the module reads.
 pub const CTL_FILE: &str = "native_ctl.log";
 /// The module writes, the mod reads.
@@ -40,7 +42,7 @@ pub const MAX_EVENTS_BYTES: u64 = 8 * 1024 * 1024;
 // ---------------------------------------------------------------------------------------------------------------
 
 /// One message of `native_ctl.log`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CtlMessage {
     /// Start holding commands of these kinds (names of the build's kind table).
     HoldOn { kinds: Vec<String> },
@@ -54,6 +56,15 @@ pub enum CtlMessage {
     TerrainApply { id: u64, stamp: u64 },
     /// Liveness; answered with `pong`.
     Ping { n: i64 },
+    /// `FEVERLINK3_NATIVE_PATCH`: patch the NEXT script `build_proposal` command that reaches the command list (not a held one):
+    /// its `frozenNodes` get these indices into `proposal.addedNodes`, which must hold exactly `adds` nodes. Expires after `ttl` ms
+    /// (0: the module's default).
+    /// `at` (optional, 1 to 64 `{x, y, z}` positions) names the nodes by position instead: each must match exactly one node of the
+    /// converted proposal within 0.05 m, and then `frozen` and `adds` are not needed (and not used).
+    PatchNext { frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64 },
+    /// `FEVERLINK3_NATIVE_INJECT`: the NEXT script `build_proposal` command (a placeholder without construction) gets the engine `Proposal`
+    /// the module builds natively from the portable text in `native_inject_<key>.txt` (`inject.rs`). Expires after `ttl` ms (0: default).
+    InjectNext { key: u64, ttl: u64 },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -76,6 +87,9 @@ impl std::fmt::Display for CtlError {
         }
     }
 }
+
+/// Most indices one `patch_next` may carry.
+pub const MAX_PATCH_FROZEN: usize = 64;
 
 /// A kind name of the control link: lower-case letters, digits and `_`, 1 to 32 characters.
 pub fn valid_kind_name(s: &str) -> bool {
@@ -139,6 +153,51 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
         "terrain_apply" => Ok(CtlMessage::TerrainApply {
             id: required(&p, "id", "terrain_apply needs a numeric id")?,
             stamp: optional(&p, "stamp", "stamp must be a game time")?,
+        }),
+        "patch_next" => {
+            let mut at = Vec::new();
+            if let Some(v) = p.get("at") {
+                let list = v.as_array().ok_or(CtlError::BadPayload("at must be a list of {x, y, z}"))?;
+                if list.is_empty() || list.len() > MAX_PATCH_FROZEN {
+                    return Err(CtlError::BadPayload("at must hold 1 to 64 positions"));
+                }
+                for item in list {
+                    let xyz = item.as_array().filter(|a| a.len() == 3);
+                    let n: Option<Vec<f64>> = xyz.map(|a| a.iter().filter_map(Value::as_f64).collect());
+                    match n {
+                        Some(n) if n.len() == 3 && n.iter().all(|f| f.is_finite()) => at.push([n[0], n[1], n[2]]),
+                        _ => return Err(CtlError::BadPayload("a position in at is not {x, y, z} of finite numbers")),
+                    }
+                }
+            }
+            let mut frozen = Vec::new();
+            if at.is_empty() || p.get("frozen").is_some() {
+                let list =
+                    p.get("frozen").and_then(Value::as_array).ok_or(CtlError::BadPayload("frozen must be a list"))?;
+                if list.is_empty() || list.len() > MAX_PATCH_FROZEN {
+                    return Err(CtlError::BadPayload("frozen must hold 1 to 64 indices"));
+                }
+                for item in list {
+                    let n = whole(item).and_then(|n| u32::try_from(n).ok());
+                    frozen.push(n.ok_or(CtlError::BadPayload("a frozen index is not a whole number"))?);
+                }
+            }
+            let adds = if at.is_empty() || p.get("adds").is_some() {
+                u32::try_from(required(&p, "adds", "patch_next needs the number of added nodes")?)
+                    .map_err(|_| CtlError::BadPayload("adds is too large"))?
+            } else {
+                0
+            };
+            Ok(CtlMessage::PatchNext {
+                frozen,
+                adds,
+                at,
+                ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
+            })
+        }
+        "inject_next" => Ok(CtlMessage::InjectNext {
+            key: required(&p, "key", "inject_next needs a numeric key")?,
+            ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
         }),
         "ping" => {
             let n = match p.get("n") {
@@ -461,6 +520,8 @@ pub enum Event {
         /// Cancelling this command fires the tool's own completion callback first (`FEVERLINK3_STRICT_FIRE_DONE=1` and a callback that
         /// was read out of the executable).
         done: bool,
+        /// The Context members and flags of a build command, read from the command itself.
+        flags: Option<BuildFlags>,
     },
     /// A held command was handed back to the engine (`reason` says why now).
     Released {
@@ -477,6 +538,39 @@ pub enum Event {
     Applied {
         id: u64,
         ok: bool,
+    },
+    /// `patch_next` was carried out on a script command: its frozenNodes now hold `frozen` (`adds` added nodes were verified).
+    Patched {
+        frozen: Vec<u32>,
+        adds: u32,
+        /// A new block was allocated for the proposal's list (else the engine's own capacity was reused).
+        allocated: bool,
+    },
+    /// `patch_next` was not carried out; the command was left untouched.
+    PatchRefused {
+        reason: String,
+    },
+    /// A `build_proposal` went by while an order was armed and was not used (diagnostic; the order stays armed).
+    PatchSkipped {
+        reason: String,
+        kind: Option<u8>,
+        /// The call site's offset in the game image.
+        site: Option<u32>,
+    },
+    /// What a conversion produced while a `patch_next` order was armed (nodes, segments, frozenNodes lists), once per distinct shape.
+    ConvertDump {
+        text: String,
+    },
+    /// `inject_next` was carried out: the command now holds the engine Proposal built from the text of `key`.
+    Injected {
+        key: u64,
+        nodes: u64,
+        segments: u64,
+        constructions: u64,
+    },
+    /// `inject_next` was not carried out; the command was left untouched.
+    InjectRefused {
+        reason: String,
     },
     /// Cumulative counts of the commands the simulation applied, by kind byte.
     Audit {
@@ -509,6 +603,12 @@ impl Event {
             Event::Released { .. } => "released",
             Event::Dropped { .. } => "dropped",
             Event::Applied { .. } => "applied",
+            Event::Patched { .. } => "patched",
+            Event::PatchRefused { .. } => "patch_refused",
+            Event::PatchSkipped { .. } => "patch_skipped",
+            Event::Injected { .. } => "injected",
+            Event::InjectRefused { .. } => "inject_refused",
+            Event::ConvertDump { .. } => "convert_dump",
             Event::Audit { .. } => "audit",
             Event::Holding { .. } => "holding",
             Event::Pong { .. } => "pong",
@@ -535,6 +635,18 @@ impl Event {
                 format!("event holding {} ({reason}) [{}]", if *on { "on" } else { "off" }, kinds.join(", "))
             }
             Event::Error { place, detail } => format!("event error [{place}]: {detail}"),
+            Event::Patched { frozen, adds, allocated } => {
+                format!("event patched: frozenNodes {frozen:?} of {adds} added nodes (new block: {allocated})")
+            }
+            Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
+            Event::ConvertDump { text } => format!("event convert_dump: {text}"),
+            Event::Injected { key, nodes, segments, constructions } => format!(
+                "event injected: key {key}: {nodes} nodes, {segments} segments, {constructions} construction(s)"
+            ),
+            Event::InjectRefused { reason } => format!("event inject_refused: {reason}"),
+            Event::PatchSkipped { reason, kind, site } => {
+                format!("event patch_skipped: {reason} (kind {kind:?}, call site rva {site:x?})")
+            }
             Event::Audit { .. } | Event::Pong { .. } => return None,
         })
     }
@@ -550,7 +662,7 @@ impl Event {
                 ("sites", Lua::uint(*sites as u64)),
                 ("version", Lua::str(version)),
             ]),
-            Event::Held { id, kind, site, ms, done } => {
+            Event::Held { id, kind, site, ms, done, flags } => {
                 let mut fields = vec![
                     ("id", Lua::uint(*id)),
                     ("kind", Lua::Int(i64::from(*kind))),
@@ -559,6 +671,23 @@ impl Event {
                 ];
                 if *done {
                     fields.insert(0, ("done", Lua::Bool(true)));
+                }
+                if let Some(f) = flags {
+                    fields.insert(
+                        0,
+                        (
+                            "ctx",
+                            Lua::map([
+                                ("align", Lua::Bool(f.check_terrain_alignment)),
+                                ("buildings", Lua::Bool(f.gather_buildings)),
+                                ("cleanup", Lua::Bool(f.cleanup_street_graph)),
+                                ("fields", Lua::Bool(f.gather_fields)),
+                                ("ie", Lua::Bool(f.ignore_errors)),
+                                ("pi", Lua::Bool(f.player_initiated)),
+                                ("redo", Lua::Bool(f.extend_proposal_redo_pillars)),
+                            ]),
+                        ),
+                    );
                 }
                 Lua::Map(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
             }
@@ -587,6 +716,25 @@ impl Event {
                 ("reason", Lua::str(*reason)),
             ]),
             Event::Pong { n } => Lua::map([("n", Lua::Int(*n))]),
+            Event::Patched { frozen, adds, allocated } => Lua::map([
+                ("adds", Lua::uint(u64::from(*adds))),
+                ("allocated", Lua::Bool(*allocated)),
+                ("frozen", Lua::List(frozen.iter().map(|n| Lua::uint(u64::from(*n))).collect())),
+            ]),
+            Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
+            Event::ConvertDump { text } => Lua::map([("text", Lua::str(text))]),
+            Event::Injected { key, nodes, segments, constructions } => Lua::map([
+                ("constructions", Lua::uint(*constructions)),
+                ("key", Lua::uint(*key)),
+                ("nodes", Lua::uint(*nodes)),
+                ("segments", Lua::uint(*segments)),
+            ]),
+            Event::InjectRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
+            Event::PatchSkipped { reason, kind, site } => Lua::map([
+                ("kind", Lua::Int(kind.map_or(-1, i64::from))),
+                ("reason", Lua::str(reason)),
+                ("site", Lua::Int(site.map_or(-1, i64::from))),
+            ]),
             Event::Error { place, detail } => Lua::map([("detail", Lua::str(detail)), ("where", Lua::str(place))]),
         };
         v.text()
@@ -667,6 +815,51 @@ mod tests {
     }
 
     // ---- control messages
+
+    #[test]
+    fn patch_next_parses_and_rejects_bad_payloads() {
+        assert_eq!(
+            parse("patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, at: vec![], ttl: 0 })
+        );
+        assert_eq!(
+            parse("patch_next", r#"{["adds"]=2,["frozen"]={[1]=0,[2]=1},["ttl"]=500}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![0, 1], adds: 2, at: vec![], ttl: 500 })
+        );
+        assert_eq!(
+            parse("patch_next", r#"{["adds"]=2,["at"]={[1]={[1]=1.5,[2]=-2,[3]=0.25}},["frozen"]={[1]=1}}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 2, at: vec![[1.5, -2.0, 0.25]], ttl: 0 })
+        );
+        assert_eq!(
+            parse("patch_next", r#"{["at"]={[1]={[1]=1,[2]=2,[3]=3},[2]={[1]=4,[2]=5,[3]=6}},["ttl"]=7}"#),
+            Ok(CtlMessage::PatchNext { frozen: vec![], adds: 0, at: vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], ttl: 7 })
+        );
+        for bad in [
+            r#"{["at"]={}}"#,
+            r#"{["at"]={[1]={[1]=1,[2]=2}}}"#,
+            r#"{["at"]={[1]=5}}"#,
+            r#"{["adds"]=3}"#,
+            r#"{["frozen"]={[1]=1}}"#,
+            r#"{["adds"]=3,["frozen"]={}}"#,
+            r#"{["adds"]=3,["frozen"]={[1]=-1}}"#,
+        ] {
+            assert!(matches!(parse("patch_next", bad), Err(CtlError::BadPayload(_))), "{bad}");
+        }
+        assert_eq!(
+            parse("inject_next", r#"{["key"]=12,["ttl"]=500}"#),
+            Ok(CtlMessage::InjectNext { key: 12, ttl: 500 })
+        );
+        assert_eq!(parse("inject_next", r#"{["key"]=3}"#), Ok(CtlMessage::InjectNext { key: 3, ttl: 0 }));
+        assert!(matches!(parse("inject_next", "{}"), Err(CtlError::BadPayload(_))));
+        let i = Event::InjectRefused { reason: "r".into() };
+        assert_eq!((i.kind(), i.payload().as_str()), ("inject_refused", r#"{["reason"]="r"}"#));
+        assert_eq!(Event::Injected { key: 1, nodes: 2, segments: 3, constructions: 0 }.kind(), "injected");
+        let d = Event::ConvertDump { text: "t".into() };
+        assert_eq!((d.kind(), d.payload().as_str()), ("convert_dump", r#"{["text"]="t"}"#));
+        let e = Event::PatchRefused { reason: "x".into() };
+        assert_eq!((e.kind(), e.payload().as_str()), ("patch_refused", r#"{["reason"]="x"}"#));
+        assert_eq!(Event::Patched { frozen: vec![1], adds: 3, allocated: true }.kind(), "patched");
+    }
 
     #[test]
     fn every_control_kind_parses_from_the_mods_serialiser_output() {
@@ -822,6 +1015,30 @@ mod tests {
         assert_eq!(p.lines.len(), 2);
         assert_eq!(p.discarded, 0);
         assert_eq!(p.lines[0].payload, "{}");
+    }
+
+    #[test]
+    fn a_patch_next_from_a_second_writer_with_the_next_sequence_is_accepted() {
+        // the interface half writes seq 1..3 (hold_on, release, ping), the simulation half continues at 4 right before its command
+        let dir = TempDir::new("link-two-writers");
+        let path = dir.path().join(CTL_FILE);
+        let mut r = CtlReader::new(path.clone());
+        append(
+            &path,
+            &(rec(1, "hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#) + &rec(2, "release", r#"{["id"]=1}"#)),
+        );
+        assert_eq!(r.poll().lines.len(), 2);
+        append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
+        let p = r.poll();
+        assert_eq!(p.lines.len(), 1, "{p:?}");
+        assert_eq!(
+            parse_ctl_line(&p.lines[0]),
+            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, at: vec![], ttl: 0 })
+        );
+        // a line whose sequence number is not above the last one is dropped, whoever wrote it
+        append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
+        let p = r.poll();
+        assert_eq!((p.lines.len(), p.discarded), (0, 1));
     }
 
     #[test]
@@ -991,9 +1208,31 @@ mod tests {
     }
 
     #[test]
+    fn a_held_build_carries_its_flags_to_the_mod() {
+        let flags = BuildFlags {
+            gather_buildings: true,
+            gather_fields: true,
+            check_terrain_alignment: false,
+            cleanup_street_graph: true,
+            extend_proposal_redo_pillars: true,
+            ignore_errors: false,
+            player_initiated: true,
+        };
+        let ev = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: true, flags: Some(flags) };
+        let json: Value = serde_json::from_slice(&luatext::lua_to_json(&ev.payload()).unwrap()).unwrap();
+        assert_eq!(
+            json["ctx"],
+            serde_json::json!({"align": false, "buildings": true, "cleanup": true, "fields": true, "ie": false, "pi": true, "redo": true})
+        );
+        let none = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: false, flags: None };
+        let json: Value = serde_json::from_slice(&luatext::lua_to_json(&none.payload()).unwrap()).unwrap();
+        assert!(json.get("ctx").is_none(), "a command without readable flags says nothing about them");
+    }
+
+    #[test]
     fn every_event_has_a_kind_and_a_payload_the_mod_can_parse() {
         let events = vec![
-            Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 1500, done: false },
+            Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 1500, done: false, flags: None },
             Event::Released { id: 1, reason: "release", ms: 2500 },
             Event::Dropped { id: 2, reason: "cancel" },
             Event::Applied { id: 1, ok: true },
@@ -1054,7 +1293,7 @@ mod tests {
         );
         let line = |e: Event| e.log_line().unwrap();
         assert_eq!(
-            line(Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 5, done: false }),
+            line(Event::Held { id: 1, kind: 52, site: 0x4d396f, ms: 5, done: false, flags: None }),
             "event held: command 1, kind 52, from tool site 0x4d396f"
         );
         assert_eq!(line(Event::Released { id: 1, reason: "release", ms: 5 }), "event released: command 1 (release)");
@@ -1084,7 +1323,7 @@ mod tests {
     #[test]
     fn golden_event_lines() {
         assert_eq!(
-            EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120, done: false }),
+            EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120, done: false, flags: None }),
             "1\theld\tnative\t{[\"id\"]=3,[\"kind\"]=52,[\"ms\"]=120,[\"site\"]=5060975}\n"
         );
         assert_eq!(
