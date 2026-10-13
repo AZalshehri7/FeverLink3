@@ -3132,10 +3132,17 @@ local function decodeBuildUnsafe(body, ctx)
 	-- the constructions (the module takes them from this game's own conversion); its street part is replaced, so no verdict gates it.
 	if ctx and ctx.canInject and type(body.nativeText) == "string" and body.nativeText ~= "" and rec.src == "native" then
 		local okI, built = pcall(function()
-			-- (a build with a construction is sent as the construction alone: the module takes its street part from the text, not from this command)
-			local pl = (#rec.cons > 0 and #rec.rem == 0) and "construction" or plan
-			local form = (FORMS[pl] or { {} })[1]
-			local b = PLAN[pl](rec, R, f, {}, form)
+			-- A build with constructions is sent as its added constructions alone: the module takes the street part, the removed constructions
+			-- and every flag from the text, and only the added constructions from this command's own conversion (the "donor"). b68: a depot
+			-- over four town buildings went to the chained withStreet plan, which cannot be injected, and drifted; b70: with the removals in
+			-- it, this game's conversion made 3 constructions of the text's 1 and the module refused. Errors are ignored so that the command
+			-- reaches the command list (its verdict is of a proposal that is replaced at the apply).
+			local b
+			if #rec.cons > 0 then
+				b = commandArgs(constructionProposal(part(rec, { "cons" }), R), newContext(f.ctx, R), true, false, f.dust)
+			else
+				b = PLAN[plan](rec, R, f, {}, (FORMS[plan] or { {} })[1])
+			end
 			if type(b.chain) == "table" and #b.chain > 0 then error("the build needs a chained command", 0) end
 			api.cmd.makeWorldBuildProposalCmd(unpack(b, 1, b.n))
 			return b
