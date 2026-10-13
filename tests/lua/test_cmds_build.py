@@ -397,6 +397,13 @@ function MAKE_API()
   }
   HELPER_CALLS = HELPER_CALLS or {}
   E.util.proposal = {
+    -- the engine reads proposal data of a SimpleProposal only (real session 2026-10-13); off unless a test switches it on
+    makeProposalData = function(p, ctx)
+      if not VERDICT_MOCK then error("not available in this mock") end
+      local mt = getmetatable(p)
+      if mt and mt.__double == "Proposal" then error("bad argument #2 to 'makeProposalData' (SimpleProposal expected, got Proposal)") end
+      return { errorState = { critical = false, messages = {}, warnings = {} } }
+    end,
     -- the engine's own upgrade: the segment replaced by one with the template's lanes (finding from MPFever (MIT))
     replaceSegment = function(edge, tmpl)
       HELPER_CALLS[#HELPER_CALLS + 1] = "replaceSegment " .. tostring(edge)
@@ -1373,6 +1380,20 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % ea)
         self.assertEqual(self.B.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % eb)
 
+    def test_the_replay_verdict_stays_readable_for_simple_proposals_after_a_native_proposal_failed(self):
+        self.start()
+        for g in (self.A, self.B):
+            g.run("VERDICT_MOCK = true")
+        self.B.issue("NATIVE_BULLDOZE{ edges = { 110 } }")                      # a native Proposal: the engine cannot read its data
+        self.tick(14)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(14)
+        log = self.A.log()
+        self.assertIn("verdict n/a (a native Proposal", log)
+        self.assertIn("builds that rebuild as a native Proposal", log)
+        self.assertNotIn("from now on", log, "the reader is not switched off for every build")
+        self.assertIn("plan=street cons=0 rem=0 nodes=2 segs=1 rmSegs=0 objs=0; verdict critical=false", log)
+
     def test_a_bridge_in_place_of_a_street_is_rebuilt_as_a_street_proposal_on_both_games(self):
         self.start()
         self.B.issue("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_medium_road.street_template' }; local sp = P.proposal; "
@@ -2028,6 +2049,26 @@ class PureBuildTest(unittest.TestCase):
                   "local s = added[1]; local c = s.comp; c.node1 = 101; s.comp = c; added[1] = s; sp.addedSegments = added; P.proposal = sp; return P end)()")
         self.assertEqual(self.ev("PLAN_OF(%s)" % joined), "withStreet")
         self.assertEqual(self.ev("PLAN_OF(NATIVE_ROAD_MOVING{ %s, moveFile = 'town/house_a.con', moveTo = { x = 350, y = 40 }, remove = 54 })" % road), "combined")
+
+    def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
+        # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
+        code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }, {}, ctx); "
+                "local rec = body.args[1]; rec.rmSegs[1] = -5; local ok, plan = pcall(M.classify, rec); return ok and 'ok:' .. tostring(plan) or 'raised: ' .. tostring(plan) end)()")
+        self.assertEqual(self.ev(code), "ok:street")
+        code = ("(function() local M, C, ctx = PURE(); local body = M.capture(NATIVE_BULLDOZE{ edges = { 110 } }, {}, ctx); "
+                "local rec = body.args[1]; rec.rmSegs[1] = -5; local ok, plan = pcall(M.classify, rec); return ok and 'ok' or 'raised: ' .. tostring(plan) end)()")
+        self.assertEqual(self.ev(code), "ok")
+
+    def test_the_node_configurations_that_changed_since_a_snapshot_are_a_nodecfg_record(self):
+        code = ("(function() local M, C, ctx = PURE(); "
+                "WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = {} }); "
+                "local before = M.nodeConfigSnapshot(); "
+                "local none, why = M.nodeConfigDelta(before, ctx); "
+                "local lc = D('LaneConnection', { segment0 = 110, lane0 = 0, segment1 = 111, lane1 = 0, withRoad = true }); "
+                "WORLD[101].BASE_NODE_CONFIG = D('BaseNodeConfig', { laneConnections = { lc } }); "
+                "local body = M.nodeConfigDelta(before, ctx); "
+                "return tostring(none) .. '/' .. tostring(why) .. '/' .. tostring(body and M.classify(body.args[1])) .. '/' .. tostring(body and #body.args[1].ncfg) end)()")
+        self.assertEqual(self.ev(code), "nil/no node configuration changed/nodecfg/1")
 
     def test_permission_category_follows_what_the_proposal_takes_and_gives(self):
         def cat(code):

@@ -1259,6 +1259,9 @@ local function samePlace(a, b) return a and b and d3(a, b) <= TOL_NODE end
 
 -- the removed segment and the added one are of the same kind (a bridge in place of a street is no upgrade)
 local function sameKind(rm, s)
+	-- (a capture read AFTER the build ran can hold a removed segment as a bare number, an id with no place: real session
+	-- 2026-10-13, "attempt to index local 'rm' (a number value)"; such a record is no upgrade the shape test can vouch for)
+	if type(rm) ~= "table" then return false end
 	local c = s.c or {}
 	local function same(a, b) return a == nil or b == nil or a == b end
 	return same(rm.ty, c.type) and same(rm.ti, c.typeIndex) and same(rm.rt, c.roadType) and same(rm.st, s.type)
@@ -1275,7 +1278,7 @@ local function upgradeSteps(rec)
 		if not a then return nil end
 		local match
 		for j, rm in ipairs(rec.rmSegs) do
-			if not used[j] and sameKind(rm, s) and ((samePlace(rm.p0, a) and samePlace(rm.p1, b)) or (samePlace(rm.p0, b) and samePlace(rm.p1, a))) then
+			if not used[j] and type(rm) == "table" and sameKind(rm, s) and ((samePlace(rm.p0, a) and samePlace(rm.p1, b)) or (samePlace(rm.p0, b) and samePlace(rm.p1, a))) then
 				match = j
 				break
 			end
@@ -1300,9 +1303,9 @@ local function removalList(rec)
 	end
 	local list = {}
 	for _, rm in ipairs(rec.rmSegs) do
-		local touches = false
+		local touches = type(rm) ~= "table"   -- a bare id has no place to compare: not listed
 		for _, p in ipairs(ends) do
-			if samePlace(rm.p0, p) or samePlace(rm.p1, p) then touches = true end
+			if type(rm) == "table" and (samePlace(rm.p0, p) or samePlace(rm.p1, p)) then touches = true end
 		end
 		if not touches then list[#list + 1] = rm end
 	end
@@ -2061,6 +2064,12 @@ function M.capture(proposal, flags, ctx)
 	local cap = newCapture(ctx, { result = flags.result })
 	local ok, rec = pcall(captureRecord, proposal, cap)
 	if not ok then return nil, tostring(rec) end
+	return M.bodyOf(rec, flags)
+end
+
+-- A captured record as the body of an action line: the body, nil and its wire text, or nil and why not.
+function M.bodyOf(rec, flags)
+	flags = flags or {}
 	local plan, why = classify(rec)
 	if not plan then return nil, why end
 	local body = { fn = "makeWorldBuildProposalCmd", args = { n = 5, rec, captureContext(flags.ctx) or (rec.src == "native" and { native = true } or false),
@@ -2069,6 +2078,59 @@ function M.capture(proposal, flags, ctx)
 	if not okS then return nil, "the build record is not plain data: " .. tostring(text) end
 	if #text > LIMIT.bytes then return nil, "the build is too large to send (" .. #text .. " bytes)" end
 	return body, nil, text
+end
+
+-- ---- node configurations read from the world
+-- Some tools (the lane / crosswalk / traffic-light tools: UI::LaneModifier::Apply) send no preview event to the interface, so
+-- the proposal they apply cannot be captured before the build. What they change is node configurations only; the world says
+-- what it holds before and after, and the difference is the record.
+local function nodeConfigSig(nc)
+	local lcs, cw = {}, {}
+	for _, l in ipairs(A.list(nc, "laneConnections")) do
+		lcs[#lcs + 1] = table.concat({ tostring(get(l, "segment0")), tostring(get(l, "lane0")), tostring(get(l, "segment1")), tostring(get(l, "lane1")),
+			tostring(get(l, "withRoad")), tostring(get(l, "withTram")) }, ",")
+	end
+	for _, x in ipairs(A.list(nc, "crosswalks")) do cw[#cw + 1] = tostring(x) end
+	table.sort(lcs)
+	table.sort(cw)
+	return table.concat(lcs, ";") .. "|" .. table.concat(cw, ",") .. "|" .. tostring(get(nc, "trafficLightPreference")) .. "|"
+		.. tostring(get(nc, "doubleSlipSwitch")) .. "|" .. tostring(get(nc, "userModifiedLaneConnections"))
+end
+
+-- node entity -> signature of its configuration, for every node of the street graph; or nil and why not
+function M.nodeConfigSnapshot()
+	local ok, map = pcall(function() return api.engine.system.streetSystem.getNode2SegmentMap() end)
+	if not ok or map == nil then return nil, "the street graph cannot be listed" end
+	local snap = {}
+	pcall(function()
+		for node in pairs(map) do
+			local nc = A.comp(node, "BASE_NODE_CONFIG")
+			if nc then snap[node] = nodeConfigSig(nc) end
+		end
+	end)
+	return snap
+end
+
+-- The build that turned `before` (a snapshot) into the world as it is now: the configurations of the nodes whose signature
+-- changed. Returns the body, nil and its wire text; or nil and why not (nothing changed included).
+function M.nodeConfigDelta(before, ctx)
+	local after, why = M.nodeConfigSnapshot()
+	if not after then return nil, why end
+	ctx = ctx or { plain = C.plain, keyOf = function(e) return "s:" .. tostring(e) end }
+	local cap = newCapture(ctx, {})
+	local rec = emptyRecord("native")
+	local nodes = {}
+	for node, sig in pairs(after) do
+		if before[node] ~= sig then nodes[#nodes + 1] = node end
+	end
+	table.sort(nodes)
+	for _, node in ipairs(nodes) do
+		local ok, cfg = pcall(readNodeConfig, { entity = node, comp = A.comp(node, "BASE_NODE_CONFIG") }, cap)
+		if not ok then return nil, "node configuration of " .. tostring(node) .. ": " .. tostring(cfg) end
+		rec.ncfg[#rec.ncfg + 1] = cfg
+	end
+	if #rec.ncfg == 0 then return nil, "no node configuration changed" end
+	return M.bodyOf(rec, { playerInitiated = true })
 end
 
 -- The capture of one applied tool event (builder.proposalApply) for the bridge's strict mode: the native module has held

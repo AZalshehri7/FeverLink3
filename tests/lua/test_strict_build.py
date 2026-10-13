@@ -79,6 +79,7 @@ class FakeNative:
         self.last_valid = None
         self.heard = []          # (time, seq, kind, payload) of every control line it accepted
         self.dropped, self.released, self.held = [], [], []
+        self.site = TOOL_SITE   # the call site the module reports for the next held command
         self.fires = False   # the module would fire the tool's completion callback at a cancel (the held event says `done`)
         self.is_open = False
         if link:
@@ -209,7 +210,7 @@ class FakeNative:
             self.next_id += 1
             self.ring.append({"id": hid, "phase": "waiting"})
             self.held.append(hid)
-            ev = {"id": hid, "kind": 52, "site": TOOL_SITE, "ms": int(self.clock.t * 1000)}
+            ev = {"id": hid, "kind": 52, "site": self.site, "ms": int(self.clock.t * 1000)}
             if self.fires:
                 ev["done"] = True
             self.emit("held", ev)
@@ -857,6 +858,32 @@ class StrictOnTest(StrictTest):
         self.assertIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig(), "the clicked road, not the earlier preview's")
         self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+
+    # ---- (e) a command is paired with the preview of its own tool only; nothing given back is unaccounted for
+
+    def test_a_command_from_a_site_without_a_preview_is_never_paired_with_an_older_preview(self):
+        # real session 2026-10-13: the lane tool (UI::LaneModifier::Apply) sends no preview; its command was shipped as the upgrade tool's
+        # preview of 12 s before
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0), add=False)             # a preview of the street tool, never clicked
+        self.B.native.site = 0x537EE5
+        self.B.L.execute("TOOL_ADD(%d, true)" % 1)
+        self.tick(14)
+        self.assertEqual(self.B.native.released, [1], "given back, not cancelled")
+        self.assertEqual(self.B.native.dropped, [])
+        self.assertNotIn("matched the capture", self.B.log())
+        self.assertIn("(site 0x537ee5, LaneModifier::Apply)", self.B.log(), "named by its site")
+        self.assertIn("accounted for, the simulation half shipped a native build", self.B.log(), "and checked that something shipped it")
+        self.assertSameWorld()
+
+    def test_a_preview_of_another_tool_is_not_paired_with_a_command_of_a_known_site(self):
+        self.start()
+        self.B.native.site = 0x4D396F                                  # the bulldozer's site; the preview is the street tool's
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(14)
+        self.assertEqual(self.B.native.released, [1])
+        self.assertIn("which does not issue commands there; not paired", self.B.log())
+        self.assertNotIn("matched the capture", self.B.log())
 
     def test_a_preview_is_used_once(self):
         self.start()

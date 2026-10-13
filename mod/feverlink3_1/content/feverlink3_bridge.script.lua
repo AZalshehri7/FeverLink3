@@ -754,9 +754,19 @@ local function describeBuild(it, args, role)
 		end)
 		if sum.rem > 0 or n > 0 then parts[#parts + 1] = string.format("resolved removals %d of %d [%s]", n, sum.rem, table.concat(ids, " ")) end
 		local verdict = "n/a"
-		if not REPLAY_VERDICT.failed then
+		-- (real session 2026-10-13: makeProposalData answered "SimpleProposal expected, got Proposal" for a removal, and the one failure
+		-- switched the reader off for every build. It only fails for the native Proposal type, so only that type is skipped.)
+		local nativeType = false
+		pcall(function() nativeType = args[1].toAdd ~= nil end)
+		if nativeType and REPLAY_VERDICT.nativeNoData then
+			verdict = "n/a (a native Proposal: the engine reads proposal data of a SimpleProposal only)"
+		elseif not REPLAY_VERDICT.failed then
 			local critical, msgs, warns, coll = engineVerdict(args)
-			if critical == nil and msgs then
+			if critical == nil and msgs and tostring(msgs):find("SimpleProposal expected", 1, true) then
+				REPLAY_VERDICT.nativeNoData = true
+				verdict = "n/a (a native Proposal: the engine reads proposal data of a SimpleProposal only)"
+				logSim("the engine reads proposal data of a SimpleProposal only; builds that rebuild as a native Proposal (removal, upgrade, bulldoze, node configurations) show no replay verdict; the originator's line carries the tool's own verdict")
+			elseif critical == nil and msgs then
 				REPLAY_VERDICT.failed = true
 				logSim("the engine's verdict on a rebuilt build cannot be read from this state (" .. tostring(msgs) .. "); the build lines say verdict n/a from now on")
 			elseif critical ~= nil then
@@ -1970,6 +1980,7 @@ local function shipNative(o)
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
 	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
+	G.nativeShipped = (G.nativeShipped or 0) + 1
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
 	recordOriginator(body, G.seq, at, category)
 	pcall(toSim, "nativebind", { n = o.n, key = L.itemKey(C.PLAYER_ID, G.seq) })
@@ -2062,8 +2073,26 @@ local NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within thi
 local NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
 local NAT_WATCHDOG = 8.0  -- no pong for this long while holding: the module is gone
 
+-- The interface's calls of CommandList::Add that the module may hold (build 40420, names from the address tool's report) and the
+-- tool ids whose preview (builder.proposalCreate) can belong to a command added there; the pairs are the ones real sessions showed.
+-- `tools = {}`: the site's tool sends NO preview, so there is nothing to pair (real session 2026-10-13: the lane / crosswalk tool,
+-- UI::LaneModifier::Apply, was paired with a 12 s old preview of the upgrade tool and shipped as that upgrade). `delta`: what that tool
+-- changes is node configurations only, which the world can say after the build ran (Build.nodeConfigDelta). A site that is not listed
+-- is paired as before.
+local SITES = {
+	[0x4d396f] = { name = "Bulldozer::Apply", tools = { bulldozer = true } },
+	[0x51b56c] = { name = "ConstructionBuilder::MousePressed", tools = { constructionBuilder = true } },
+	[0x5891b4] = { name = "StreetBuilder::UpdateEngine", tools = { streetBuilder = true, trackBuilder = true } },
+	[0x5948dd] = { name = "stop tool", tools = { streetTerminalBuilder = true } },
+	[0x5bf08d] = { name = "TrackModifier::Build", tools = { streetTrackModifier = true } },
+	[0x537ee5] = { name = "LaneModifier::Apply", tools = {}, delta = true },
+	[0x538649] = { name = "LaneModifier::Apply", tools = {}, delta = true },
+	[0x5387cd] = { name = "LaneModifier::Apply", tools = {}, delta = true },
+}
+
 local function natNew()
 	return {
+		unaccounted = {},   -- held id -> a command given back with no record of its own, until it is known whether anything shipped it
 		reader = C.newReader(C.path("native_events.log")), writer = nil,
 		seen = false, read = false,   -- native_events.log has records / its first batch (history) was read
 		ready = nil, hookOk = nil,    -- the latest `ready`; true/false: command_list_add is / is not among its hooks; nil: no `ready` seen
@@ -2271,14 +2300,28 @@ local function natSite(h)
 	return type(h.site) == "number" and string.format("0x%x", h.site) or "?"
 end
 
+-- A command this half gives back WITHOUT a record of its own enters this world and nobody else's, unless the simulation half's capture of
+-- native builds ships it (shipNative). Nothing may be missed silently: it is written down with the name of its site, and when the
+-- engine reports it applied, `natLedger` says whether something shipped it. For a site whose changes the world can describe afterwards
+-- (SITES.delta) the state before is kept, and the difference is shipped when nothing else did.
+local function natUnaccounted(h, why)
+	local N = G.nat
+	local info = SITES[h.site]
+	local u = { id = h.id, site = natSite(h), name = info and info.name or "a site the table does not know", why = why, t = os.clock(), shipped0 = G.nativeShipped or 0 }
+	if info and info.delta and Build and Build.nodeConfigSnapshot then
+		local ok, snap = pcall(Build.nodeConfigSnapshot)
+		if ok then u.before = snap end
+	end
+	N.unaccounted[h.id] = u
+	natSay("held " .. h.id .. " (site " .. u.site .. ", " .. u.name .. "): " .. why .. "; release written, the native build goes through")
+	natOrder("release", h.id)
+end
+
 -- The held command `h` has the capture `cap`: ship it and cancel the command, or release it.
 local function natDecideUnsafe(h, cap)
 	local N = G.nat
 	local id = h.id
-	local function release(why)
-		natSay("held " .. id .. " (site " .. natSite(h) .. "): " .. why .. "; release written, the native build goes through")
-		natOrder("release", id)
-	end
+	local function release(why) natUnaccounted(h, why) end
 	if not cap then return release("no capture of a tool build") end
 	if not cap.body then
 		-- A build that cannot be captured cannot be shipped: the others never get it, and the safety net's resync would erase it here
@@ -2374,8 +2417,8 @@ local function natDecideUnsafe(h, cap)
 	local rec = { id = id, key = it.key, at = at, t = os.clock(), fireable = FIRE_DONE and h.done == true }
 	N.heldByKey[it.key], N.byId[id] = rec, rec
 	pcall(toSim, "heldout", { key = it.key })
-	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp",
-		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now))
+	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp; the tool's verdict %s",
+		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now, tostring(cap.verdict or "n/a")))
 	if wire.commit then
 		local ms, rtt = graceMs()
 		if Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body) then ms = math.max(ms, CONSTRUCTION_GRACE_MS) end
@@ -2499,6 +2542,36 @@ local function commitPump()
 	end
 end
 
+-- Every command given back without a record of its own (natUnaccounted) is accounted for: shipped by the simulation half's capture of native
+-- builds, shipped here as a node-configuration difference, or named as NOT REPLICATED. Called every frame.
+local NAT_LEDGER_WAIT = 2.0    -- the simulation half's capture ships within this after the engine's `applied`
+local NAT_LEDGER_GIVEUP = 20.0 -- no `applied` within this: the command was destroyed or never ran
+local function natLedger(N, now)
+	for id, u in pairs(N.unaccounted) do
+		local done
+		if u.applied and now - u.applied >= NAT_LEDGER_WAIT then
+			if (G.nativeShipped or 0) > u.shipped0 then
+				natSay(string.format("held %d (site %s, %s): accounted for, the simulation half shipped a native build", id, u.site, u.name))
+			elseif u.before then
+				local body, why, text = Build.nodeConfigDelta(u.before, { plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end })
+				if body then
+					shipNative({ body = text, at = engine.gameTime() })
+					natSay(string.format("held %d (site %s, %s): nothing shipped it, the node configurations that changed (%s) were shipped", id, u.site, u.name, tostring(#body.args[1].ncfg)))
+				else
+					natSay(string.format("held %d (site %s, %s): NOT REPLICATED, applied here only (%s)", id, u.site, u.name, tostring(why)))
+				end
+			else
+				natSay(string.format("held %d (site %s, %s): NOT REPLICATED, applied here only (%s, and no simulation capture shipped it)", id, u.site, u.name, u.why))
+			end
+			done = true
+		elseif now - u.t >= NAT_LEDGER_GIVEUP and not u.applied then
+			natSay(string.format("held %d (site %s, %s): never reported applied within %.0f s", id, u.site, u.name, NAT_LEDGER_GIVEUP))
+			done = true
+		end
+		if done then N.unaccounted[id] = nil end
+	end
+end
+
 -- Drops the captures that waited longer than NAT_CAP_TTL for their `held` (the native build went through unheld).
 local function natExpire(now)
 	local N = G.nat
@@ -2534,13 +2607,30 @@ local function natPair()
 		end
 		return
 	end
-	while N.parked[1] and (N.caps[1] or (N.preview and now - N.preview.t <= NAT_PREVIEW_TTL)) do
-		local h, cap = table.remove(N.parked, 1), table.remove(N.caps, 1)
-		if not cap then
-			cap = N.preview
-			N.preview = nil
+	-- A command is paired with the preview of ITS tool only: a site whose tool sends no preview gets none, and a preview of another tool stays
+	-- for its own command (the command is given back and written down, natUnaccounted).
+	local keep = {}
+	for _, h in ipairs(N.parked) do
+		local info = SITES[h.site]
+		if info and next(info.tools) == nil then
+			natDecide(h, nil)
+		else
+			keep[#keep + 1] = h
 		end
-		natDecide(h, cap)
+	end
+	N.parked = keep
+	while N.parked[1] and (N.caps[1] or (N.preview and now - N.preview.t <= NAT_PREVIEW_TTL)) do
+		local h = table.remove(N.parked, 1)
+		local cap, fromList = N.caps[1], true
+		if not cap then cap, fromList = N.preview, false end
+		local info = SITES[h.site]
+		if info and not info.tools[cap.tool] then
+			natSay(string.format("held %d (site %s, %s): the newest preview is the %s tool's, which does not issue commands there; not paired", h.id, natSite(h), info.name, tostring(cap.tool)))
+			natDecide(h, nil)
+		else
+			if fromList then table.remove(N.caps, 1) else N.preview = nil end
+			natDecide(h, cap)
+		end
 	end
 end
 
@@ -2577,6 +2667,13 @@ local function natCapture(id, name, param)
 	end
 	cap.t = os.clock()
 	cap.ms = (cap.t - t0) * 1000
+	-- the tool's own verdict: the preview event carries the ProposalData the tool made (the only place a native Proposal's verdict can be read)
+	pcall(function()
+		local es = (param[2] or param.data).errorState
+		local msgs = {}
+		for i = 1, math.min(#es.messages, 4) do msgs[#msgs + 1] = tostring(es.messages[i]) end
+		cap.verdict = string.format("critical=%s messages=[%s]", tostring(es.critical == true), table.concat(msgs, "; "))
+	end)
 	-- only the newest preview is kept, and a preview that could not be captured replaces a good one before it: a `held`
 	-- must never be paired with the record of an older preview than the one on screen
 	N.preview = cap
@@ -2661,6 +2758,8 @@ local function natEvent(N, rec, p, history)
 		end
 	elseif kind == "applied" then
 		local id = tonumber(p.id)
+		local u = id and N.unaccounted[id]
+		if u and not u.applied then u.applied, u.ok = os.clock(), p.ok ~= false end
 		local rec = id and N.byId[id]
 		if rec then
 			rec.applied = true
@@ -2706,6 +2805,8 @@ local function natTick()
 	if N.lastTick and now - N.lastTick > 3 then N.watchFrom = now end   -- the game stood still (a load, a save): the module could not be answered either
 	N.lastTick = now
 	natExpire(now)
+	local okL, errL = pcall(natLedger, N, now)
+	if not okL then natFault("ledger", errL) end
 	local usable = Build ~= nil and type(Build.captureToolBuild) == "function"
 	local reason = nil
 	if N.dead then reason = "faults"
@@ -3350,8 +3451,20 @@ end
 -- The engine's tool events (builder.proposalCreate / builder.proposalApply, id = the tool): the construction schema logs
 -- what it sees and what it would capture, so that the first game run shows the real shapes (finding from MPFever (MIT):
 -- these events reach guiHandleEvent). Nothing is replicated from them except in strict mode (natCapture).
+local seenOtherEvents, seenOtherN = {}, 0
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
-	if not C.ACTIVE or type(name) ~= "string" or not name:find("^builder%.") then return end
+	if not C.ACTIVE or type(name) ~= "string" then return end
+	if not name:find("^builder%.") then
+		-- A tool whose events are not "builder.*" is invisible to everything below. Each such event that smells of a tool is named once
+		-- (real session 2026-10-13: the lane / crosswalk tool produced no event at all that any log shows).
+		local key = tostring(id) .. "/" .. name
+		if seenOtherN < 40 and not seenOtherEvents[key] and (key:find("[Mm]odifier") or key:find("[Ll]ane") or key:find("[Cc]ross") or key:find("[Tt]raffic") or key:find("[Bb]uilder") or key:find("[Tt]ool")) then
+			seenOtherEvents[key] = true
+			seenOtherN = seenOtherN + 1
+			logGui("gui event outside the builder family: " .. key)
+		end
+		return
+	end
 	for _, M in ipairs(CMDS) do
 		if type(M.onToolEvent) == "function" then
 			local ok, err = pcall(M.onToolEvent, id, name, param, logGui)
