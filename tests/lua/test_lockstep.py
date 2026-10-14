@@ -791,7 +791,7 @@ class LockstepTest(unittest.TestCase):
         (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
         self.assertEqual(pa, pb, "identical worlds give identical parts")
-        self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
+        self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names", "ids"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
         self.assertTrue(pa["townBuildings"].startswith("3/") and pa["townBuildings:90"].startswith("2/") and pa["townBuildings:91"].startswith("1/"), pa)
         # paused round: the games are stopped, the interface half answers
         self.relay.pauseAt = self.relay.future_stamp()

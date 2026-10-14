@@ -209,6 +209,12 @@ local function entitiesWith(compName)
 end
 
 local engine = {
+	-- the entity ids of the world's edges, constructions and town buildings (sorted): the `ids` checksum lane. Every game hands out ids
+	-- from the same free-id FIFO, so they are equal while every build is applied at the same step everywhere; a build applied at
+	-- another step on one game (any path that misses the stamp rule) makes them differ, and the lane detects that for a repair.
+	entityIds = function()
+		return { edges = entitiesWith("BASE_EDGE"), constructions = entitiesWith("CONSTRUCTION"), townBuildings = entitiesWith("TOWN_BUILDING") }
+	end,
 	gameTime = function()
 		return api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.GAME_TIME).gameTime
 	end,

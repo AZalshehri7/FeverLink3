@@ -737,17 +737,32 @@ local function namesLane(engine)
 	return out
 end
 
+-- entity ids (a heavy lane, the only one that hashes ids): edges, constructions and town buildings, each sorted. The engine takes every new
+-- entity's id from one FIFO of free ids, so the ids are equal on every game only while every build is applied at the same step on every
+-- game (the stamp rule); any path that misses it shifts all later ids (native id trace, 2026-10-14) and a later build naming such an
+-- entity would touch another one. The content lanes cannot see that; this lane makes it a difference the host repairs.
+local function idsLane(engine)
+	local all, items = engine.entityIds(), {}
+	for _, kind in ipairs({ "edges", "constructions", "townBuildings" }) do
+		local list = all[kind] or {}
+		local s = {}
+		for i = 1, #list do s[i] = tostring(list[i]) end
+		items[#items + 1] = kind .. "#" .. #list .. ":" .. table.concat(s, ",")
+	end
+	return { n = #items, items = items }
+end
+
 -- Parts over an engine accessor:
 --   engine.gameTime()       -> number
 --   engine.account()        -> balance, loan
 --   engine.constructions()  -> list of { file = string, x, y, z }
 --   engine.lines()          -> list of { stops = number }
--- Each part is hashed separately so the launcher can name the differing one. Entity ids never enter a hash:
+-- Each part is hashed separately so the launcher can name the differing one. Entity ids enter only the `ids` lane:
 -- constructions are compared by file and position, lines by their stop counts, both sorted.
 -- `timing` (optional table): filled with the seconds each part took (observation only, never part of the result).
 -- `light` (optional, true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
 -- see ChecksumRequestMessage.full). Each of those costs one component read per edge, node, construction or town building.
-L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true }
+L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true, ids = true }
 function L.checksumParts(engine, hashFn, timing, light, detail)
 	local parts = {}
 	local clock = timing and function() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end or nil
@@ -787,6 +802,7 @@ function L.checksumParts(engine, hashFn, timing, light, detail)
 	lane("nodeConfigs", nodeConfigsLane)
 	lane("vehicles", vehiclesLane)
 	lane("names", namesLane)
+	if engine.entityIds then part("ids", function() return idsLane(engine) end) end
 	return parts, t
 end
 
