@@ -2682,6 +2682,17 @@ local function natDecideUnsafe(h, cap)
 		local okA, addsNothing = pcall(function() return Build and Build.addsNothing and Build.addsNothing(body) end)
 		cancelFlow = okA and addsNothing == true and FIRE_DONE and h.done == true
 	end
+	-- With the native copy on, every game applies the build at the stamp through the engine Proposal built from this text, this game too:
+	-- the held command is cancelled (its tool callback fired) and replayed like everywhere else. Why: every entity the simulation creates
+	-- takes its id from one FIFO of free ids (ecs::Engine::AddEntity takes the front, EndModification appends the removed ids), so a build
+	-- applied at another step than on the other games shifts every later id, town growth's included. Native id trace (FEVERLINK3_ID_TRACE,
+	-- 2026-10-14): loading and idle play hand out identical ids on both games; a hold-and-release road applied 3 steps late on the originator
+	-- and a stop applied 7 steps early gave other ids from that build on; the same road cancelled and injected at the stamp on both games
+	-- gave identical id streams (every AddEntity/RemoveEntity equal). General: no plan or tool filter, only "the tool's callback can be fired".
+	if NATIVE_INJECT and STRICT_CANCEL ~= "off" and N.ready and N.ready.inject and type(body.nativeText) == "string" and body.nativeText ~= ""
+		and FIRE_DONE and h.done == true then
+		cancelFlow = true
+	end
 	if cancelFlow and FIRE_DONE and not h.done then
 		natSay("held " .. id .. " (site " .. natSite(h) .. "): the native module cannot fire this tool's callback: hold-and-release instead of cancel")
 		cancelFlow = false
