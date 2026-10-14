@@ -39,6 +39,7 @@ Tested so far with two games on one PC (a scripted test that builds, bulldozes a
 - The test logs now have one timing line per build (from the click to the moment every game applied it).
 - The world check now also notices when the two games number their objects differently, and repairs it.
 - Builds appear faster: the short freeze of about a third of a second at each build click is gone, and on the other game a station or depot no longer stalls the game for up to a second when it arrives. At 3x speed a build now appears on both games about 0.6 seconds after the click (before: 1.2 to 1.7 seconds).
+- Builds appear sooner at normal speed: the waiting time before every game applies a build now adapts to what the games measure instead of a fixed safety margin. After the first few builds of a session, a build appears about 0.8 to 1.1 seconds after the click at 1x speed (before: about 1.8 seconds) and 0.3 to 0.7 seconds at 3x, tested with simulated network delays up to 0.1 seconds each way. Tested on one PC only, not yet over the internet.
 
 ### Known gaps
 Known bugs in one line: a few corner cases are untested, a world closed to the main menu is not saved first, no internet test yet.
