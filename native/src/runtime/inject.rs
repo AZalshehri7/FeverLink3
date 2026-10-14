@@ -231,9 +231,10 @@ impl Runtime {
         }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
-        let constructions = inj::construction_count(&text);
+        let counts = inj::donor_counts(&text);
+        let (edge_objects, constructions) = (counts[0], counts[1]);
         // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
-        inj::check_destination(&LiveMem, dest, constructions)
+        inj::check_destination(&LiveMem, dest, constructions, edge_objects)
             .and_then(|()| inj::same_constructions(&LiveMem, dest, &text))
             .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
         // an index of the heap's blocks for the proof (refreshed before every text, see LiveHeapMem)
@@ -241,7 +242,7 @@ impl Runtime {
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
         let mut say = |l: &str| self.say(l);
-        let donor = (constructions > 0).then_some(dest);
+        let donor = counts.iter().any(|&n| n > 0).then_some(dest);
         let built = inj::build_verified(&ctx, &super::cmd_patch::LivePoke, &text, donor, &mut say);
         alloc.free_all();
         let built = built?;
@@ -253,7 +254,7 @@ impl Runtime {
                 Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
             }
         }
-        if constructions > 0 {
+        if donor.is_some() {
             self.inject_donor_report(key, dest, &text, &built, &dir);
         }
         self.say("native inject: calling the engine copy assignment into the script command's Proposal");

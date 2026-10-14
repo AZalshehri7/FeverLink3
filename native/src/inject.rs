@@ -189,6 +189,28 @@ pub fn construction_count(text: &str) -> u64 {
 const TO_ADD: usize = 0x258;
 const CONSTRUCTION_STRIDE: usize = 0xe48;
 const CONSTRUCTION_FROZEN: usize = 0xcd8;
+const EDGE_OBJECTS_TO_ADD: usize = 0x128;
+const EDGE_OBJECT_STRIDE: usize = 0x1a0;
+
+/// The members whose elements the receiving game takes from its own conversion of the same build (the script command, the "donor"),
+/// never from the text: (member, offset in the payload, element stride). Their elements own engine objects that the text does not carry:
+/// a construction's description (tens of thousands of heap blocks), and an edge object's model instance, whose +0xb0 member is an engine
+/// btree (root, rightmost, size; nodes with 0x50-byte slots and child pointers, copied by 0x63c10 from the EdgeObject copy 0x4c5fa0) and
+/// whose +0xd8 member is an owned vector. inj3/inj4 (2026-10-14, a stop replacing a stop): the typed text zeroed the btree's root beside
+/// its size 2 and the receiver crashed in the engine's copy of the injected Proposal (AV reading 0 at TF3+0x63c2f). The proof still
+/// compares every named member of these elements with the text.
+pub const DONOR_MEMBERS: &[(&str, usize, usize)] =
+    &[("proposal.edgeObjectsToAdd", EDGE_OBJECTS_TO_ADD, EDGE_OBJECT_STRIDE), ("toAdd", TO_ADD, CONSTRUCTION_STRIDE)];
+
+fn is_donor_member(name: &str) -> bool {
+    DONOR_MEMBERS.iter().any(|m| m.0 == name)
+}
+
+/// How many elements of each [`DONOR_MEMBERS`] member the text's proposal adds, in that order.
+pub fn donor_counts(text: &str) -> Vec<u64> {
+    let lines = rebuild::lines_of(text);
+    DONOR_MEMBERS.iter().map(|m| count(&lines, &format!("{}.#", m.0))).collect()
+}
 
 /// The `frozenNodes` values of construction `i` in the text (`toAdd[i].frozenNodes[k]`, printed as `ent:old#N`: the value is the index).
 fn frozen_of(lines: &std::collections::BTreeMap<&str, &str>, i: u64) -> Result<Vec<u32>, String> {
@@ -300,14 +322,16 @@ pub fn build_verified(
 ) -> Result<Built, String> {
     let lines = rebuild::lines_of(text);
     let cons = count(&lines, "toAdd.#");
-    if cons > 0 && donor.is_none() {
+    let wanted = donor_counts(text);
+    let hybrid = wanted.iter().any(|&n| n > 0);
+    if hybrid && donor.is_none() {
         return Err(format!(
-            "the text adds {cons} construction(s): it needs the script command's own conversion of them"
+            "the text adds {}: it needs the script command's own conversion of them",
+            DONOR_MEMBERS.iter().zip(&wanted).map(|(m, n)| format!("{n} {}", m.0)).collect::<Vec<_>>().join(", ")
         ));
     }
-    let hybrid = cons > 0;
     let mut r4_report = String::new();
-    if let Some(donor) = donor.filter(|_| hybrid) {
+    if let Some(donor) = donor.filter(|_| cons > 0) {
         // R4 (informational): what the two sides' unnamed construction words look like after their differential masks
         r4_report = entity_equivalence(c, text, donor, say);
     }
@@ -315,7 +339,8 @@ pub fn build_verified(
     // command keeps its own Context), so it is neither rebuilt nor proved: rt4 R6 (2026-10-14), the real bulldozer over a town house,
     // was refused on both games for the 17 list and bucket pointers of a one-entry `refundableEntities` that the injection would not
     // have used.
-    let take = |f: &F| !(hybrid && f.name == "toAdd") && !outside_proposal_container(f) && nc::selected(f, &lines);
+    let take =
+        |f: &F| !(hybrid && is_donor_member(f.name)) && !outside_proposal_container(f) && nc::selected(f, &lines);
     let built = match rebuild::build_selected(text, c.base, c.alloc, Some(&take)) {
         Ok(b) => b,
         Err(e) => {
@@ -326,7 +351,7 @@ pub fn build_verified(
     let unresolved: Vec<&rebuild::Blocked> = built
         .blocked
         .iter()
-        .filter(|b| b.kind == "heap pointer" && !(hybrid && rebuild::member_of(&b.path) == "toAdd"))
+        .filter(|b| b.kind == "heap pointer" && !(hybrid && is_donor_member(&rebuild::member_of(&b.path))))
         .collect();
     if !unresolved.is_empty() {
         let n = unresolved.len();
@@ -350,22 +375,36 @@ pub fn build_verified(
     }
     c.alloc.forget_all(); // the blocks belong to the source object now; its destructor frees them
     if let Some(donor) = donor.filter(|_| hybrid) {
-        if p.bytes()[TO_ADD..TO_ADD + 24].iter().any(|&b| b != 0) {
+        if DONOR_MEMBERS.iter().any(|m| p.bytes()[m.1..m.1 + 24].iter().any(|&b| b != 0)) {
             // SAFETY: constructed above, destroyed once.
             unsafe { (c.fns.dtor)(p.ptr()) };
-            return Err("the engine-made source already holds constructions".into());
+            return Err("the engine-made source already holds elements the script command's conversion supplies".into());
         }
         let mut z = Scratch::new();
-        say("inject: calling the engine copy constructor on the script command's own Proposal (its conversion of the constructions)");
+        say("inject: calling the engine copy constructor on the script command's own Proposal (its conversion of the constructions and edge objects)");
         // SAFETY: `donor` is the live command's payload (only read by a copy constructor); `z` is scratch.
         unsafe { (c.fns.copy)(z.ptr(), donor as *const u8) };
-        // the constructions move into the source; the donor's copy keeps an empty list and is destroyed
-        let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
-        pb[TO_ADD..TO_ADD + 24].copy_from_slice(&zb[TO_ADD..TO_ADD + 24]);
-        zb[TO_ADD..TO_ADD + 24].fill(0);
+        let mismatch = DONOR_MEMBERS.iter().zip(&wanted).find_map(|(m, &n)| {
+            let (b, e) = (u64_at(z.bytes(), m.1), u64_at(z.bytes(), m.1 + 8));
+            let have = if e >= b { (e - b) / m.2 as u64 } else { u64::MAX };
+            (have != n).then(|| format!("the conversion in the script command has {have} {}, the text has {n}", m.0))
+        });
+        // the donated elements move into the source (on a mismatch they stay and die with the donor's copy); the donor's copy keeps empty lists
+        if mismatch.is_none() {
+            let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
+            for m in DONOR_MEMBERS {
+                pb[m.1..m.1 + 24].copy_from_slice(&zb[m.1..m.1 + 24]);
+                zb[m.1..m.1 + 24].fill(0);
+            }
+        }
         say("inject: calling the engine destructor on the donor's copy");
-        // SAFETY: constructed above, destroyed once; its constructions now belong to `p`.
+        // SAFETY: constructed above, destroyed once; the moved elements now belong to `p`.
         unsafe { (c.fns.dtor)(z.ptr()) };
+        if let Some(why) = mismatch {
+            // SAFETY: constructed above, destroyed once.
+            unsafe { (c.fns.dtor)(p.ptr()) };
+            return Err(why);
+        }
     }
     let mut d = Scratch::new();
     say("inject: calling the engine copy constructor on the source");
@@ -381,7 +420,7 @@ pub fn build_verified(
         unsafe { (c.fns.dtor)(d.ptr()) };
         Err(why)
     };
-    if hybrid {
+    if cons > 0 {
         if let Err(why) = set_construction_frozen(c, poke, d.bytes(), &lines, cons) {
             c.alloc.free_all();
             return fail(&mut d, why);
@@ -478,7 +517,7 @@ fn sane(t: (u64, u64, u64), stride: usize) -> bool {
 
 /// The command the script sent must be a `build_proposal` with sane vectors, and carry exactly `constructions` constructions: none for a
 /// text without (a placeholder), the receiver's own conversion of them for a text with.
-pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64) -> Result<(), String> {
+pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_objects: u64) -> Result<(), String> {
     let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
     if bytes[0x9b8] != portable::KIND_BUILD_PROPOSAL {
         return Err(format!("the command is kind {}, not build_proposal", bytes[0x9b8]));
@@ -487,6 +526,15 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64) -> Resu
     let to_add = tri(TO_ADD);
     if !sane(tri(0x000), 0x40) || !sane(tri(0x018), 0x350) || !sane(to_add, CONSTRUCTION_STRIDE) {
         return Err("the command's proposal has a vector that is not one".into());
+    }
+    let objects = tri(EDGE_OBJECTS_TO_ADD);
+    if !sane(objects, EDGE_OBJECT_STRIDE) {
+        return Err("the command's proposal has a vector that is not one".into());
+    }
+    // the edge objects are the receiver's own conversion as well (see DONOR_MEMBERS): the command carries the text's number of them
+    let have_objects = (objects.1 - objects.0) / EDGE_OBJECT_STRIDE as u64;
+    if have_objects != edge_objects {
+        return Err(format!("the command has {have_objects} edge object(s), the text has {edge_objects}"));
     }
     let have = (to_add.1 - to_add.0) / CONSTRUCTION_STRIDE as u64;
     match (constructions, have) {
@@ -718,7 +766,7 @@ mod tests {
         );
         assert_eq!((built.nodes, built.segments, built.constructions), (2, 1, 0));
         let mut dest = placeholder(false);
-        check_destination(&mem, dest.addr(), 0).expect("a placeholder");
+        check_destination(&mem, dest.addr(), 0, 0).expect("a placeholder");
         let a0 = ASSIGNS.load(Ordering::SeqCst);
         // SAFETY: the stand-in assignment copies 0x358 bytes between two buffers of this test.
         unsafe { swap_into(&ctx, &built, dest.addr()) };
@@ -753,7 +801,7 @@ mod tests {
         assert_eq!((built.nodes, built.segments, built.constructions), (2, 1, 1));
         // the destination must carry the same number of constructions
         let mut dest = placeholder(false);
-        assert!(check_destination(&mem, dest.addr(), 1).unwrap_err().contains("0 construction(s), the text has 1"));
+        assert!(check_destination(&mem, dest.addr(), 1, 0).unwrap_err().contains("0 construction(s), the text has 1"));
         release(&ctx, built);
         let _ = dest.ptr();
     }
@@ -822,20 +870,48 @@ mod tests {
         let arena = Arena::new(0x3000_0000_0000);
         let mem = Both(&arena);
         let ok = placeholder(false);
-        assert!(check_destination(&mem, ok.addr(), 0).is_ok());
+        assert!(check_destination(&mem, ok.addr(), 0, 0).is_ok());
         let mut other = placeholder(false);
         other.bytes_mut()[0x9b8] = 17;
-        assert!(check_destination(&mem, other.addr(), 0).unwrap_err().contains("not build_proposal"));
+        assert!(check_destination(&mem, other.addr(), 0, 0).unwrap_err().contains("not build_proposal"));
         let mut cons = placeholder(true);
         // toAdd with one element
         cons.bytes_mut()[0x258..0x260].copy_from_slice(&0x2000_0000_1000u64.to_le_bytes());
         cons.bytes_mut()[0x260..0x268].copy_from_slice(&(0x2000_0000_1000u64 + 0xe48).to_le_bytes());
         cons.bytes_mut()[0x268..0x270].copy_from_slice(&(0x2000_0000_1000u64 + 0xe48).to_le_bytes());
-        assert!(check_destination(&mem, cons.addr(), 0).unwrap_err().contains("already adds a construction"));
+        assert!(check_destination(&mem, cons.addr(), 0, 0).unwrap_err().contains("already adds a construction"));
         let mut bad = placeholder(false);
         bad.bytes_mut()[0..8].copy_from_slice(&5u64.to_le_bytes());
-        assert!(check_destination(&mem, bad.addr(), 0).unwrap_err().contains("not one"));
-        assert!(check_destination(&mem, 0x10, 0).is_err());
+        assert!(check_destination(&mem, bad.addr(), 0, 0).unwrap_err().contains("not one"));
+        assert!(check_destination(&mem, 0x10, 0, 0).is_err());
+    }
+
+    #[test]
+    fn edge_objects_come_from_the_script_commands_conversion() {
+        // a stop's text: its edge object is the receiver's own conversion, so a text with one needs the donor (refused before any engine call)
+        let (arena, _, text) = world_text(false);
+        let stop =
+            format!("{text}proposal.edgeObjectsToAdd.#\tn:1\n").replace("proposal.edgeObjectsToAdd.#\tn:0\n", "");
+        assert_eq!(donor_counts(&stop), vec![1, 0]);
+        let mem = Both(&arena);
+        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let c0 = CTORS.load(Ordering::SeqCst);
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &stop, None, &mut |_| {});
+        assert!(
+            matches!(&r, Err(e) if e.contains("1 proposal.edgeObjectsToAdd") && e.contains("own conversion")),
+            "{:?}",
+            r.err()
+        );
+        assert_eq!(CTORS.load(Ordering::SeqCst), c0);
+        // the destination must carry the text's number of edge objects (a placeholder without the stop is not the mod's command)
+        let mut dest = placeholder(false);
+        assert!(check_destination(&mem, dest.addr(), 0, 1).unwrap_err().contains("0 edge object(s), the text has 1"));
+        let b = 0x2000_0000_2000u64;
+        dest.bytes_mut()[0x128..0x130].copy_from_slice(&b.to_le_bytes());
+        dest.bytes_mut()[0x130..0x138].copy_from_slice(&(b + 0x1a0).to_le_bytes());
+        dest.bytes_mut()[0x138..0x140].copy_from_slice(&(b + 0x1a0).to_le_bytes());
+        assert!(check_destination(&mem, dest.addr(), 0, 1).is_ok());
+        assert!(check_destination(&mem, dest.addr(), 0, 0).unwrap_err().contains("1 edge object(s), the text has 0"));
     }
 
     #[test]
