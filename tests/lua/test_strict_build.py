@@ -1648,12 +1648,114 @@ class ModuleSilentTest(StrictTest):
         self.tick(80)
         kinds = self.B.native.ctl_kinds()
         self.assertNotIn("hold_on", kinds)
-        self.assertLessEqual(len(kinds), 6, "a few pings, then it waits")
+        self.assertEqual(set(kinds), {"ping"})
+        # six pings 2.5 s apart, then one every 5 s while it waits for an answer (16 s here)
+        self.assertLessEqual(len(kinds), 8, "a few pings, then it only asks now and then")
         self.assertIn("does not answer pings", self.B.log())
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(16)
         self.assertSameWorld()
         self.assertEqual(self.B.shipped_count(), 1, "the old path")
+
+    def test_a_module_that_answers_late_is_armed_when_it_answers(self):
+        self.start()
+        self.tick(80)
+        self.assertIn("does not answer pings", self.B.log())
+        self.assertFalse(self.B.native.holding)
+        self.B.native.is_open = True   # the module starts reading: the pings in the file are answered
+        self.tick(40)
+        self.assertIn("mode re-armed", self.B.log())
+        self.strict_on(self.B)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertEqual(self.B.native.held, [1], "the build is held again")
+        self.assertSameWorld()
+
+
+class WatchdogTest(StrictTest):
+    """Real run 2026-10-14 (rail-crash): the host built every 2-3 s; every build wrote defer / inject_next / release lines, so the mod never
+    pinged (it pinged only after NAT_PING s without any line), no pong came, the watchdog switched strict mode off after 8 s with the module
+    alive, and gave up for good. The next station was applied at the click, the worlds forked, and the guest's next track crashed the host."""
+
+    def build_every(self, game, seconds, count, x0=300):
+        for i in range(count):
+            game.tool(self.road(x0 + 200 * i, 0, x0 + 200 * i + 100, 0))
+            self.tick(int(round(seconds / 0.2)))
+
+    def test_fast_building_keeps_the_pings_and_strict_mode_on(self):
+        self.start()
+        self.strict_on(self.A, self.B)
+        t0 = self.clock.t
+        self.build_every(self.B, 1.4, 14)   # ~20 s, a release line every 1.4 s
+        self.tick(20)
+        self.assertGreater(self.clock.t - t0, 20)
+        self.strict_on(self.A, self.B)
+        self.assertNotIn("stopped answering", self.log())
+        self.assertNotIn("mode is off", self.log())
+        self.assertEqual(self.B.native.ctl_kinds().count("hold_on"), 1, "never switched off and on again")
+        times = [t for t, _, kind, _ in self.B.native.heard if kind == "ping" and t >= t0]
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertGreaterEqual(len(times), 9, "pings went on while builds wrote the file")
+        self.assertLessEqual(max(gaps), 2.2, gaps)
+        self.assertEqual(self.B.native.held, list(range(1, 15)), "every build held")
+        self.assertEqual(self.B.native.released, list(range(1, 15)), "and released at its stamp")
+        self.assertSameWorld()
+
+    def test_any_event_of_the_module_keeps_the_watchdog_alive(self):
+        self.start()
+        self.strict_on(self.B)
+        # the module stops answering pings (a lost pong) but keeps writing events: no switch-off
+        native = self.B.native
+        orig = native.handle
+
+        def no_pong(seq, kind, p):
+            if kind == "ping":
+                native.last_valid = self.clock.t
+                native.heard.append((self.clock.t, seq, kind, p))
+                native.emit("timing", {"id": 0, "what": "alive", "detail": "n=%s" % p.get("n")})
+                return
+            orig(seq, kind, p)
+
+        native.handle = no_pong
+        self.tick(80)   # 16 s
+        self.assertNotIn("stopped answering", self.B.log())
+        self.strict_on(self.B)
+
+    def test_a_silent_module_is_switched_off_and_re_armed_when_it_answers_again(self):
+        self.start()
+        self.strict_on(self.B)
+        self.B.native.is_open = False   # the module reads nothing and writes nothing (but it keeps its state)
+        self.tick(50)   # 10 s
+        self.assertIn("stopped answering", self.B.log())
+        self.assertIn("hold_off", self.B.native.ctl_kinds(), "hold_off written when it gave up")
+        self.B.native.is_open = True    # it reads the file again: hold_off, then the pings, each answered
+        self.tick(40)   # 8 s: the back-off (5 s) is over and a pong came
+        self.assertIn("mode re-armed", self.B.log())
+        self.strict_on(self.B)
+        self.assertEqual(self.B.native.ctl_kinds().count("hold_on"), 2)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(20)
+        self.assertEqual(self.B.native.held, [1], "a build after the re-arm is held")
+        self.assertEqual(self.B.native.released, [1])
+        self.assertSameWorld()
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+
+    def test_three_faults_switch_strict_mode_off_for_a_while_not_for_good(self):
+        self.start()
+        for i in range(3):
+            self.B.tool(self.road(300 + 200 * i, 0, 400 + 200 * i, 0))
+            self.B.run("FAIL_NEXT_PLAYER = true")
+            self.tick(14)
+        self.assertIn("three faults", self.B.log())
+        self.assertFalse(self.B.native.holding)
+        self.tick(320)   # 64 s
+        self.assertIn("mode re-armed after three faults", self.B.log())
+        self.strict_on(self.B)
+        n = len(self.B.native.held)
+        self.B.tool(self.road(1100, 0, 1200, 0))
+        self.tick(20)
+        self.assertEqual(len(self.B.native.held), n + 1, "held again")
+        self.assertSameWorld()
 
 
 class PausedGraceTest(StrictTest):

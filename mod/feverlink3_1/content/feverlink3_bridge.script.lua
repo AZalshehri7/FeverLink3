@@ -2460,7 +2460,9 @@ end
 --   native_events.log appears -> its records are read; the first batch is history (state, never news)
 --   `ready` with "command_list_add" in hooks (or no `ready` at all in a trimmed file) -> ping, wait for the `pong`
 --   `pong` -> hold_on {kinds = {"build_proposal"}} -> `holding {on = true}` -> strict mode is on
---   while it is on: a line at least every NAT_PING seconds (the module switches holding off after 10 s of silence)
+--   while it is on: a ping at least every NAT_PING seconds, whatever else is written (the module switches holding off after 10 s of
+--   silence; the mod's watchdog needs a pong or another event of the module within NAT_WATCHDOG seconds)
+--   switched off by the mod for want of an answer: pinged every X.NAT_REARM_PING s and armed again when the module answers (natGiveUp)
 -- Switching it off (hold_off): before a resync load, when the session ends (identity.txt says idle), when the mod is not
 -- active, on a fault, when the module stops answering, and when the module itself says `holding {on = false}` (it retries
 -- with a back-off). Without native_events.log nothing of this runs and nothing is written.
@@ -2472,7 +2474,18 @@ local NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its cap
 local NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
 local NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
 local NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
-local NAT_WATCHDOG = 8.0  -- no pong for this long while holding: the module is gone
+local NAT_WATCHDOG = 8.0  -- no proof of life (a pong or any other event) for this long while holding: the module is gone
+-- Strict mode switched off by the mod (no answer, hold_on not confirmed, the watchdog, the module's own switch-offs) is not off for
+-- good: the mod keeps pinging every X.NAT_REARM_PING s and, when the module answers again, arms strict mode again (hold_on), after a
+-- back-off of X.NAT_REARM_MIN s that doubles with every re-arm up to X.NAT_REARM_MAX s (reset after a minute of holding). Real run
+-- 2026-10-14 (rail-crash): the watchdog fired on a live module during fast building (no ping went out while builds wrote the file, so
+-- no pong came) and the session went on unheld for good; the host's next station was applied at the click, the worlds forked and the
+-- guest's next track crashed the host.
+-- (fields of X, not locals: the bridge's main chunk is at the game's limit of 200 locals; real run rc1 2026-10-14 did not load with 6 more)
+X.NAT_REARM_PING = 5.0
+X.NAT_REARM_MIN = 5.0
+X.NAT_REARM_MAX = 60.0
+X.NAT_FAULT_COOL = 60.0  -- three faults switch strict mode off for this long, then it is armed again with the fault count reset
 
 -- The interface's calls of CommandList::Add that the module may hold (build 40420, names from the address tool's report) and the
 -- tool ids whose preview (builder.proposalCreate) can belong to a command added there; the pairs are the ones real sessions showed.
@@ -2498,8 +2511,11 @@ local function natNew()
 		seen = false, read = false,   -- native_events.log has records / its first batch (history) was read
 		ready = nil, hookOk = nil,    -- the latest `ready`; true/false: command_list_add is / is not among its hooks; nil: no `ready` seen
 		pingN = 0, pingAt = -100, pingsTried = 0, pongAt = nil, watchFrom = nil, lastTick = nil, lastWrite = -100,
+		aliveAt = nil,      -- the newest proof of life of the module: any event of this run read from native_events.log (a pong among them)
 		holdSent = false, holdAt = 0, active = false, activeSince = 0,
 		retryAt = nil, retries = 0, gaveUp = false,
+		gaveUpAt = nil, gaveUpWhy = nil, rearms = 0, rearmPingAt = -100,   -- strict mode given up: when, why, how often it was re-armed
+		deadAt = nil,       -- three faults switched strict mode off at this time (re-armed after X.NAT_FAULT_COOL)
 		caps = {}, parked = {}, awaiting = {}, owed = {}, deferred = {},
 		heldCaps = {},      -- held id -> the capture of that command's own proposal (the native module's preview `held:<id>`, natCapture)
 		heldByKey = {}, byId = {}, finishes = {},   -- shipped builds whose own copy is held: by action key / by held id; pause-path completions
@@ -2572,16 +2588,29 @@ local function natStop(why)
 	N.holdSent, N.active, N.parked, N.caps, N.owed = false, false, {}, {}, {}
 end
 
--- A fault in strict mode never reaches the bridge: it is logged, and the third one switches strict mode off for good.
+-- A fault in strict mode never reaches the bridge: it is logged, and the third one switches strict mode off for X.NAT_FAULT_COOL
+-- seconds (natTick arms it again afterwards, with the count reset).
 local function natFault(where, err)
 	local N = G.nat
 	if not N then return end
 	N.faults = N.faults + 1
 	natSay("fault in " .. where .. ": " .. tostring(err))
 	if N.faults >= 3 and not N.dead then
-		N.dead = true
+		N.dead, N.deadAt = true, os.clock()
 		pcall(natStop, "three faults")
+		natSay("mode is off (three faults): it is armed again in " .. X.NAT_FAULT_COOL .. " s")
 	end
+end
+
+-- Strict mode is given up for now (no answer, no confirmation, the watchdog, the module's own switch-offs): one line says why and when it
+-- may come back. natTick re-arms it when the module answers again (natRearm).
+function X.natGiveUp(why)
+	local N = G.nat
+	if not N then return end
+	local now = os.clock()
+	N.gaveUp, N.gaveUpAt, N.gaveUpWhy = true, now, why
+	natSay(string.format("mode is off: %s; holding is off until the native module answers again (re-armed after at least %.0f s)", why,
+		math.min(X.NAT_REARM_MAX, X.NAT_REARM_MIN * 2 ^ math.min(N.rearms, 4))))
 end
 
 local function natPing()
@@ -3298,6 +3327,8 @@ end
 local function natEvent(N, rec, p, history)
 	local kind = rec.kind
 	local now = os.clock()
+	-- any line the module wrote while this script runs proves it is alive (a `completed`, an `injected`, a `timing` as much as a `pong`)
+	if not history then N.aliveAt = now end
 	if kind == "timing" and p.what == "clock" then
 		-- written right after `ready` (history too): the wall clock of this process's C runtime clock, for the timing lines
 		local detail = tostring(p.detail or "")
@@ -3327,6 +3358,7 @@ local function natEvent(N, rec, p, history)
 		for _, h in pairs(N.heldByKey) do h.done = true end
 		-- a (new) module link: the handshake starts again
 		N.holdSent, N.active, N.pongAt, N.pingsTried, N.gaveUp, N.retryAt, N.retries = false, false, nil, 0, false, nil, 0
+		N.gaveUpAt, N.gaveUpWhy, N.rearms = nil, nil, 0
 		if N.hookOk then
 			natSay("native module found (build " .. tostring(p.build) .. ", hooks " .. table.concat(hooks, ",") .. ")")
 			traceGui("version", string.format("player=%s name=%s role=%s native_build=%s native_version=%s hooks=%s record_version=%s strict_cancel=%s fire_done=%s", tostring(C.PLAYER_ID),
@@ -3353,8 +3385,7 @@ local function natEvent(N, rec, p, history)
 				N.holdSent, N.active, N.parked, N.caps, N.owed = false, false, {}, {}, {}
 				N.retries = N.retries + 1
 				if N.retries > 3 then
-					N.gaveUp = true
-					natSay("mode is off: the native module switched holding off (" .. tostring(p.reason) .. ") " .. N.retries .. " times; giving up until it reports ready again")
+					X.natGiveUp("the native module switched holding off (" .. tostring(p.reason) .. ") " .. N.retries .. " times")
 				else
 					N.retryAt = now + 3 * N.retries
 					natSay("mode is off: the native module switched holding off (" .. tostring(p.reason) .. "); trying again in " .. (3 * N.retries) .. " s")
@@ -3472,7 +3503,13 @@ end
 -- Every frame (guarded by the caller). Does nothing until native_events.log has a record.
 local function natTick()
 	local N = G.nat
-	if not N or N.dead then return end
+	if not N then return end
+	if N.dead then
+		-- three faults: off for X.NAT_FAULT_COOL s, then armed again with the count reset (the handshake below starts over)
+		if not (N.deadAt and os.clock() - N.deadAt >= X.NAT_FAULT_COOL) then return end
+		N.dead, N.deadAt, N.faults = false, nil, 0
+		natSay("mode re-armed after three faults (" .. X.NAT_FAULT_COOL .. " s ago); the handshake starts again")
+	end
 	if not N.seen then
 		-- without the module there is no file: look for it a few times a second, not every frame
 		local t = os.clock()
@@ -3523,14 +3560,24 @@ local function natTick()
 	if reason then
 		if N.holdSent then natStop(reason) end
 	elseif N.gaveUp then
-		-- waiting for a new `ready`
+		-- given up for now: keep asking (a ping every X.NAT_REARM_PING s); a pong newer than the give-up, after the back-off, arms it again
+		-- (a new `ready` does too, see natEvent)
+		local wait = math.min(X.NAT_REARM_MAX, X.NAT_REARM_MIN * 2 ^ math.min(N.rearms, 4))
+		if N.pongAt and N.gaveUpAt and N.pongAt > N.gaveUpAt and now - N.gaveUpAt >= wait then
+			N.rearms = N.rearms + 1
+			natSay(string.format("mode re-armed: the native module answers again (pong %.1f s ago); it was off for %.0f s (%s); hold_on follows (re-arm %d)",
+				now - N.pongAt, now - N.gaveUpAt, tostring(N.gaveUpWhy), N.rearms))
+			traceGui("native", string.format("rearm n=%d off_s=%.1f why=%s", N.rearms, now - N.gaveUpAt, tostring(N.gaveUpWhy)))
+			N.gaveUp, N.gaveUpAt, N.gaveUpWhy, N.pingsTried, N.retries, N.retryAt = false, nil, nil, 0, 0, nil
+		elseif now - N.pingAt >= X.NAT_REARM_PING then
+			natPing()
+		end
 	elseif not N.holdSent then
 		if not (N.retryAt and now < N.retryAt) then
 			if not (N.pongAt and now - N.pongAt < NAT_ALIVE) then
 				if now - N.pingAt >= 2.5 then
 					if N.pingsTried >= 6 then
-						N.gaveUp = true
-						natSay("mode is off: the native module does not answer pings; waiting for it to report ready")
+						X.natGiveUp("the native module does not answer pings")
 					else
 						N.pingsTried = N.pingsTried + 1
 						natPing()
@@ -3546,19 +3593,21 @@ local function natTick()
 			end
 		end
 	else
-		if now - N.lastWrite >= NAT_PING then natPing() end
+		-- a ping every NAT_PING s whatever else is written: the module answers only pings with a pong, so a session that writes other
+		-- lines all the time (a build every 2 s: defer, inject_next, release) must still ping, or the watchdog below starves (rail-crash run)
+		if now - N.lastWrite >= NAT_PING or now - N.pingAt >= NAT_PING then natPing() end
 		if not N.active then
 			if now - N.holdAt > NAT_CONFIRM then
-				natSay("mode is off: hold_on was not confirmed within " .. NAT_CONFIRM .. " s (is the hold hook installed?)")
-				N.gaveUp = true
+				X.natGiveUp("hold_on was not confirmed within " .. NAT_CONFIRM .. " s (is the hold hook installed?)")
 				natStop("hold_on not confirmed")
 			end
-		elseif now - math.max(N.pongAt or 0, N.watchFrom or 0, N.activeSince or 0) > NAT_WATCHDOG then
-			natSay("mode is off: the native module stopped answering pings")
-			N.gaveUp = true
+		elseif now - math.max(N.pongAt or 0, N.aliveAt or 0, N.watchFrom or 0, N.activeSince or 0) > NAT_WATCHDOG then
+			X.natGiveUp(string.format("the native module stopped answering (no pong and no other event for %.1f s; last pong %.1f s ago)",
+				now - math.max(N.pongAt or 0, N.aliveAt or 0), N.pongAt and (now - N.pongAt) or -1))
 			natStop("the native module stopped answering")
-		elseif N.retries > 0 and now - N.activeSince > 30 then
-			N.retries = 0
+		else
+			if N.retries > 0 and now - N.activeSince > 30 then N.retries = 0 end
+			if N.rearms > 0 and now - N.activeSince > 60 then N.rearms = 0 end
 		end
 	end
 	-- a `held` whose capture did not come: released after the grace; an order whose Add did not come: another trigger
