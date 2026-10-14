@@ -1320,7 +1320,15 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     if std::env::var(crate::cmd_patch::PATCH_VAR).is_ok_and(|v| v == "1") {
         rt.enable_native_patch();
     }
-    if let Some(settings) = crate::portable::Settings::from_var(|n| std::env::var(n).ok(), crate::inject::INJECT_VAR) {
+    // the native copy is the default build path (owner, 2026-10-14): unset means on, `FEVERLINK3_NATIVE_INJECT=0` switches it off
+    if let Some(settings) = crate::portable::Settings::from_var(
+        |n| match std::env::var(n) {
+            Ok(v) => Some(v),
+            Err(_) if n == crate::inject::INJECT_VAR => Some("1".to_string()),
+            Err(_) => None,
+        },
+        crate::inject::INJECT_VAR,
+    ) {
         rt.enable_native_inject(settings);
     }
     let targets = Targets {

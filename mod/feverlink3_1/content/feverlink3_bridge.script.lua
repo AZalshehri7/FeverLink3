@@ -66,10 +66,11 @@ pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
 -- the portable replay builds a construction (its frozen node); without either the build falls back to the record path.
 local NATIVE_PATCH = false
 pcall(function() NATIVE_PATCH = os.getenv("FEVERLINK3_NATIVE_PATCH") == "1" end)
--- FEVERLINK3_NATIVE_INJECT=1 (default off, track A): the originator ships the native module's portable text of the held command and the others
--- have the module build the engine's Proposal from it and swap it into the replay's command (inject_next, docs/NATIVE_LINK.md)
-local NATIVE_INJECT = false
-pcall(function() NATIVE_INJECT = os.getenv("FEVERLINK3_NATIVE_INJECT") == "1" end)
+-- FEVERLINK3_NATIVE_INJECT (default ON since 2026-10-14, owner; `=0` switches it off): the originator ships the native module's portable text of
+-- the held command and every game has the module build the engine's Proposal from it and swap it into its replay's command (inject_next,
+-- docs/NATIVE_LINK.md). The old record path still serves what does not go through injection (no native text, a module without the capability).
+local NATIVE_INJECT = true
+pcall(function() NATIVE_INJECT = os.getenv("FEVERLINK3_NATIVE_INJECT") ~= "0" end)
 -- the largest native text a record released without one of its own carries (a complete text of a station is ~80 KB)
 local NATIVE_TEXT_MAX = 1024 * 1024
 
