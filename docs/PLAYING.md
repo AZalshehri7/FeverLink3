@@ -1,4 +1,4 @@
-# Playing FeverLink3 (test version 0.2.0-test5)
+# Playing FeverLink3 (test version 0.2.0-pre1)
 
 FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. Players connect to each other through Steam's own peer-to-peer networking: by design that means no port forwarding, no router settings, no VPN and nothing to open in the firewall. A first test between two Steam accounts reached through Steam's relay servers; the full host-and-join test is what this build is for. This is an early test build: expect rough edges, and tell the maintainer (Discord `azalshehri`) what happens.
 

@@ -7,7 +7,7 @@ title: FeverLink3 changelog
 All notable changes of each release. FeverLink3 is an unfinished test project: read the status in the README before using it.
 Only changes that matter to a player or tester are listed here.
 
-## Unreleased (towards 0.1.1)
+## 0.2.0-pre1
 
 Tested so far with two games on one PC (a scripted test that builds, bulldozes and checks both worlds), not yet with two players over the internet.
 
@@ -46,6 +46,7 @@ Known bugs in one line: a few corner cases are untested, a world closed to the m
 - A world closed to the main menu with "Return to Main Menu" is not saved by FeverLink3 first (the game offers no save there; use Save Game in the pause menu before leaving).
 - If a game ever has to rebuild a depot or station another way instead of copying it (seen only in a test that forces this), the games differ for a moment and a repair sync follows.
 - Two players building at the very same moment has not been tested.
+- Separate companies and sharing terrain edits come after this first alpha.
 - Stop styles or options picked in the stop tool may arrive with default settings on the other game (not verified).
 - Terrain editing, ground paint, trees and rocks are not shared yet (bulldozing a tree is refused).
 - A full session between two players over the internet has not been verified since these changes.
