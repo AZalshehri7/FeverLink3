@@ -125,6 +125,36 @@ unsafe extern "system-unwind" fn convert_update_hook(rcx: u64, rdx: u64, r8: u64
     ret
 }
 
+/// The function the interface's `builder.proposalCreate` emitter is made to jump to: keeps its first five arguments (the interface and
+/// script objects of the newest tool preview, [`Runtime::note_preview_args`]) and calls the original with all nine slots as given.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system-unwind" fn preview_hook(
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    tool: u64,
+    proposal: u64,
+    data: u64,
+    out: u64,
+) -> u64 {
+    let original = PREVIEW_ORIGINAL.load(Ordering::Acquire);
+    if original == 0 {
+        return 0; // unreachable once installed
+    }
+    if let Some(rt) = RUNTIME.get() {
+        crate::log::guarded("preview hook", || rt.note_preview_args([a, b, c, d, e]));
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the trampoline of the emitter, which takes these nine slots.
+    let original: Original = unsafe { core::mem::transmute(original) };
+    unsafe { original(a, b, c, d, e, tool, proposal, data, out) }
+}
+
+/// The unhooked `builder.proposalCreate` emitter (the trampoline), published before the jump is written; 0 until then.
+static PREVIEW_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+
 /// The unhooked town-seed function (the trampoline), published before the jump is written; 0 until then.
 static TOWN_SEED_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 /// Base address of the image, for turning the caller into an RVA in the log; 0 until armed.
@@ -919,6 +949,7 @@ pub struct Targets {
     pub pick: usize,
     pub convert: usize,
     pub convert_update: usize,
+    pub preview: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -1065,6 +1096,7 @@ pub unsafe fn execute(
                 Feature::GrowthEdges => targets.edges,
                 Feature::Convert => targets.convert,
                 Feature::ConvertUpdate => targets.convert_update,
+                Feature::PreviewEvent => targets.preview,
                 _ => targets.add,
             };
             match unsafe { Detour::prepare(at, expected) } {
@@ -1086,6 +1118,8 @@ pub unsafe fn execute(
     EDGES_ORIGINAL.store(original_of("town_edges"), Ordering::Release);
     CONVERT_ORIGINAL.store(original_of("script_convert"), Ordering::Release);
     CONVERT_UPDATE_ORIGINAL.store(original_of("script_convert_update"), Ordering::Release);
+    PREVIEW_ORIGINAL.store(original_of("preview_event"), Ordering::Release);
+    rt.set_preview_original(original_of("preview_event"));
     observer(Stage::Prepared);
 
     // 4. write the jumps; if one fails, take the others out again
@@ -1197,7 +1231,7 @@ fn apply_selftest(p: &mut Plan, report: &selftest::Report, log: fn(&str)) {
     };
     let mut skipped = Vec::new();
     p.steps.retain(|s| {
-        let remove = matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && *feature == Feature::Hold))
+        let remove = matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && matches!(feature, Feature::Hold | Feature::PreviewEvent)))
             || matches!(s, Step::CallPatch { .. } if drop_all);
         if remove {
             skipped.push(Skip { feature: s.feature(), name: s.name(), reason: why(s.feature()).to_string() });
@@ -1343,6 +1377,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         pick: pick_hook as *const () as usize,
         convert: convert_hook as *const () as usize,
         convert_update: convert_update_hook as *const () as usize,
+        preview: preview_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1548,6 +1583,7 @@ mod tests {
             }),
             script_convert: None,
             convert_update: None,
+            preview_event: None,
             town_candidates: Some(HookSite {
                 rva: CANDS_RVA,
                 prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()),
@@ -1652,6 +1688,7 @@ mod tests {
             pick: pick_hook as *const () as usize,
             convert: convert_hook as *const () as usize,
             convert_update: convert_update_hook as *const () as usize,
+            preview: preview_hook as *const () as usize,
         }
     }
 

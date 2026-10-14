@@ -46,6 +46,9 @@ pub type ApplyFn = unsafe extern "system-unwind" fn(sim: *mut u8, cmd: *mut u8) 
 /// How often the audit event is written when the counts changed.
 pub const AUDIT_INTERVAL_MS: u64 = 30_000;
 
+/// Offset of the engine's result (`ProposalData`) inside a `build_proposal` payload (see `portable::PAYLOAD`, member `result`).
+const PAYLOAD_RESULT_DATA: usize = 0x3d8;
+
 /// What a [`Runtime`] is built from.
 pub struct Init {
     pub build: &'static BuildAddrs,
@@ -115,6 +118,13 @@ pub struct Runtime {
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
     patch: crate::cmd_patch::State,
+    /// The unhooked `builder.proposalCreate` emitter (`preview_event`), 0 when it is not hooked.
+    preview_fn: AtomicUsize,
+    /// The first five arguments of the newest tool preview (the interface and script objects the emitter needs), kept while holding is
+    /// on; dropped whenever holding switches on or off (a resync loads another world: its objects are new).
+    preview_args: Mutex<Option<[u64; 5]>>,
+    /// Holding as `sync_flags` last saw it.
+    preview_holding: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -168,6 +178,9 @@ impl Runtime {
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
             defer_link: Mutex::new(None),
+            preview_fn: AtomicUsize::new(0),
+            preview_args: Mutex::new(None),
+            preview_holding: AtomicBool::new(false),
         }
     }
 
@@ -419,6 +432,81 @@ impl Runtime {
         }
     }
 
+    /// The unhooked `builder.proposalCreate` emitter (`preview_event`); 0 leaves held commands without a preview of their own.
+    pub fn set_preview_original(&self, f: usize) {
+        self.preview_fn.store(f, Release);
+    }
+
+    /// Called by the hook on the emitter for every tool preview: its first five arguments are what a held command's preview needs.
+    pub fn note_preview_args(&self, args: [u64; 5]) {
+        if !self.preview_holding.load(Relaxed) {
+            return;
+        }
+        if let Some(mut g) = try_lock_briefly(&self.preview_args) {
+            *g = Some(args);
+        }
+    }
+
+    /// Gives the held build command `id` to the game scripts as the preview of the tool `held:<id>`, through the engine's own emitter of
+    /// `builder.proposalCreate` with the arguments of the newest tool preview, its own Proposal (the payload's start) and the ProposalData
+    /// slot of its payload (`+0x3d8`, empty before the apply). The scripts' `guiHandleEvent` runs inside this call, so the mod has the
+    /// record of the command before the `held` event reaches it. Why: a tool that sends no preview (UI::ModuleBuilder, a station module
+    /// added via Configure: run s4 2026-10-14) left the mod without a record before the build, so its command was released at once and
+    /// applied 7 steps before the stamp on this game alone (entity ids then differ between the games). Called on the thread of the tool
+    /// that added the command (the interface's), where the tools call the emitter themselves. Nothing happens without a preview seen
+    /// since holding was switched on.
+    ///
+    /// # Safety
+    /// `payload` is the payload of a live held `build_proposal` command.
+    #[allow(improper_ctypes_definitions)]
+    unsafe extern "system-unwind" fn give_preview(&self, id: crate::hold::HoldId, payload: usize) {
+        type Emit = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, *const u8, usize, usize, *mut u8) -> u64;
+        let emit = self.preview_fn.load(Acquire);
+        let args = crate::log::guarded("preview of a held command", || *lock(&self.preview_args)).flatten();
+        let (Some(a), true) = (args, emit != 0) else {
+            crate::log::line(&format!(
+                "hold: command {id}: no preview of its own (no tool preview seen since holding was switched on)"
+            ));
+            return;
+        };
+        // a std::string in its short form (MSVC x64: 16 bytes of text, size, capacity 15)
+        let name = format!("held:{id}");
+        let mut text = [0u64; 4];
+        let bytes = name.as_bytes();
+        if bytes.len() > 15 {
+            return;
+        }
+        // SAFETY: 32 writable bytes; the text and its terminator fit the first 16.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), text.as_mut_ptr() as *mut u8, bytes.len());
+        }
+        text[2] = bytes.len() as u64;
+        text[3] = 15;
+        let mut handled = 0u8;
+        crate::log::line(&format!(
+            "hold: command {id}: giving it to the game scripts as the preview of the tool {name}"
+        ));
+        // SAFETY: the emitter of this build (prologue checked when it was hooked), with the objects of the newest tool preview of this
+        // session, the held command's Proposal and its ProposalData slot; the call into the scripts is synchronous.
+        let emit: Emit = unsafe { core::mem::transmute::<usize, Emit>(emit) };
+        unsafe {
+            emit(
+                a[0],
+                a[1],
+                a[2],
+                a[3],
+                a[4],
+                text.as_ptr() as *const u8,
+                payload,
+                payload + PAYLOAD_RESULT_DATA,
+                &mut handled,
+            )
+        };
+        crate::log::line(&format!(
+            "hold: command {id}: given to the game scripts as the preview of the tool {name} (handled {handled})"
+        ));
+    }
+
     /// The thread to wake when the add hook queued something for the mod.
     pub fn set_waker(&self, thread: Thread) {
         let _ = self.waker.set(thread);
@@ -440,6 +528,10 @@ impl Runtime {
 
     fn sync_flags(&self, machine: &HoldMachine<Box<Held>>) {
         self.live.store(machine.enabled() || !machine.is_empty(), Relaxed);
+        let on = machine.enabled();
+        if self.preview_holding.swap(on, Relaxed) != on {
+            *lock(&self.preview_args) = None;
+        }
     }
 
     // ---- the link
@@ -655,7 +747,7 @@ impl Runtime {
         let add = self.add_fn();
         // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
         // was taken out of the engine's hands must be given back, whatever happens)
-        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None };
+        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None, preview: None };
         crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
         if self.patch.enabled() {
             crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
@@ -675,6 +767,10 @@ impl Runtime {
             crate::log::guarded("add hook (native copy)", || {
                 self.native_copy_check("held", job.payload, Some(job.id));
             });
+        }
+        if let Some((id, payload)) = plan.preview.take() {
+            // SAFETY: the payload of the command held just now; it stays held while the scripts read it.
+            unsafe { self.give_preview(id, payload) };
         }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
@@ -770,6 +866,9 @@ impl Runtime {
                                     }
                                 }
                                 plan.held_here = true;
+                                if self.build.kind_by_name("build_proposal") == Some(kind) {
+                                    plan.preview = Some((id, payload));
+                                }
                                 if (self.inject.enabled()
                                     || self.dump.get().is_some()
                                     || self.portable.get().is_some()
@@ -908,6 +1007,8 @@ struct AddPlan {
     now: u64,
     /// A held `build_proposal` command to dump (only with `FEVERLINK3_DUMP_COMMANDS`).
     dump: Option<DumpJob>,
+    /// A held `build_proposal` command to give to the scripts as a preview (`give_preview`): its id and payload.
+    preview: Option<(crate::hold::HoldId, usize)>,
 }
 
 /// What the dump needs to know about a command that was just held.
@@ -1012,6 +1113,7 @@ mod tests {
             town_update_size: None,
             script_convert: None,
             convert_update: None,
+            preview_event: None,
             town_candidates: None,
             town_edges: None,
             town_sort_call: None,
