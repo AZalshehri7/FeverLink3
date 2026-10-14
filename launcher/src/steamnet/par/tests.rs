@@ -434,23 +434,36 @@ fn a_wrong_sha_fails_at_both_ends_and_leaves_no_file() {
 
 #[test]
 fn ten_seconds_without_progress_ends_the_transfer() {
+    assert_eq!(ParConfig::default().stall, Duration::from_secs(10), "the limit this test is named after");
     let rig = Rig::new();
     rig.sender.set_caps(MB, 0.0);
-    // the receiver stops reading after a moment: no acknowledgement ever comes back
-    let stall = std::thread::scope(|scope| {
-        let h = scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(1500));
+    // the receiver stops reading as soon as the first bytes are acknowledged (not after a guessed delay, which a busy
+    // machine can stretch past the end of the transfer): no acknowledgement ever comes back
+    let stalled_at = Mutex::new(None::<Instant>);
+    let spec = rig.spec(12, 30_000_000, ParConfig { forced: Some(3), ..ParConfig::default() });
+    let report = run_send(&rig.core(), spec, &|| false, &|p| {
+        let mut at = stalled_at.lock().unwrap();
+        if p.bytes > 0 && at.is_none() {
             rig.receiver.stall_receive(true);
-        });
-        let started = Instant::now();
-        let report = rig.send(rig.spec(12, 30_000_000, ParConfig { forced: Some(3), ..ParConfig::default() }));
-        h.join().unwrap();
-        (report, started.elapsed())
+            *at = Some(Instant::now());
+        }
     });
-    let (report, took) = stall;
+    let took = stalled_at.lock().unwrap().expect("the transfer got going before it stalled").elapsed();
     assert!(!report.ok);
-    assert!(report.error.as_deref().unwrap().contains("no progress for 10 s"), "{report:?}");
-    assert!(took > Duration::from_secs(10) && took < Duration::from_secs(20), "{took:?}");
+    // Both ends watch the same ten seconds: the sender from the last acknowledgement, the receiver from the last data
+    // (a little earlier, but its watchdog looks only every quarter second). Whichever fires first ends the transfer,
+    // and the other one's report is the same stall seen from its side.
+    let error = report.error.as_deref().unwrap();
+    if !error.contains("no progress for 10 s") {
+        assert!(error.contains("the receiver aborted"), "{report:?}");
+        assert!(
+            rig.wait_event(Duration::from_secs(5), |e| { e.iter().any(|x| matches!(x, ParEvent::Failed { .. })) }),
+            "{report:?}"
+        );
+        assert!(rig.failed().iter().any(|f| f.contains("no data for 10 s")), "{:?}", rig.failed());
+    }
+    // the limit counts from the last acknowledgement, a moment before the stall; the upper bound only catches a hang
+    assert!(took >= Duration::from_secs(8) && took < Duration::from_secs(60), "{took:?}");
 }
 
 #[test]

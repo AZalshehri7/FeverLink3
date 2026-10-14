@@ -235,6 +235,8 @@ pub struct Controller {
     notice: Option<String>,
     /// How long the local game may be silent before its world counts as closed; `None` turns the check off.
     heartbeat: Option<Duration>,
+    /// What the heartbeat reads as "now"; tests replace it with a clock they advance themselves.
+    clock: Box<dyn Fn() -> Instant + Send>,
     /// Watching the game of the running session; `None` outside one.
     pulse: Option<Pulse>,
     published: String,
@@ -310,6 +312,7 @@ impl Controller {
             log_cursor: 0,
             notice: None,
             heartbeat: heartbeat_setting(std::env::var(HEARTBEAT_ENV).ok().as_deref()),
+            clock: Box::new(Instant::now),
             pulse: None,
             published: String::new(),
             version: 0,
@@ -322,6 +325,13 @@ impl Controller {
     /// [`HEARTBEAT_SECONDS`] (or the `FEVERLINK3_HEARTBEAT_SECONDS` value). Zero turns the check off. For tests.
     pub fn with_heartbeat(mut self, silence: Duration) -> Controller {
         self.heartbeat = (!silence.is_zero()).then_some(silence);
+        self
+    }
+
+    /// The clock the heartbeat reads instead of the system's (tests drive it by hand, so no timing depends on how busy
+    /// the machine is).
+    pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + 'static) -> Controller {
+        self.clock = Box::new(now);
         self
     }
 
@@ -788,7 +798,7 @@ impl Controller {
             }
         };
         let Some(limit) = self.heartbeat else { return };
-        let now = Instant::now();
+        let now = (self.clock)();
         let path = self.dir.join(gamelink::FROM_GAME);
         let pulse = self.pulse.get_or_insert_with(|| Pulse::start(path, now));
         if pulse.silent(limit, reloading, now) {
@@ -1731,6 +1741,24 @@ mod tests {
 
     /// How long the games of these tests may be silent before their world counts as closed.
     const BEAT: Duration = Duration::from_millis(1000);
+    /// One step of the heartbeat tests' own clock: every [`until_games`] / [`watch_games`] round is this long on the
+    /// controllers' heartbeat clock and for the games, whatever the real time it takes. So "silent for `BEAT`" is a
+    /// number of rounds, never a race against a busy machine.
+    const TICK: Duration = Duration::from_millis(20);
+
+    thread_local! {
+        static TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static ORIGIN: Instant = Instant::now();
+    }
+
+    /// The heartbeat clock of a test: its origin plus the rounds run so far on this thread.
+    fn test_now() -> Instant {
+        ORIGIN.with(|o| *o) + TICK * TICKS.with(|t| t.get())
+    }
+
+    fn tick_clock() {
+        TICKS.with(|t| t.set(t.get() + 1));
+    }
     const CLOCK: &str = "{[\"t\"]=18600,[\"speed\"]=0,[\"ahead\"]=3}";
 
     /// The mod, reduced to its pulse. While its world is open it appends a `clock` line to `from_game.log` about every
@@ -1748,9 +1776,11 @@ mod tests {
         held_save: Option<i64>,
         /// How long a player's game is silent after it was told to load.
         load_silence: Duration,
-        hello_at: Option<Instant>,
+        hello_at: Option<u32>,
         loads: u32,
-        beat_at: Instant,
+        /// Rounds this game has run, and the round of its last `clock` line.
+        round: u32,
+        beat_round: u32,
     }
 
     impl Game {
@@ -1767,7 +1797,8 @@ mod tests {
                 load_silence: Duration::from_millis(500),
                 hello_at: None,
                 loads: 0,
-                beat_at: Instant::now(),
+                round: 0,
+                beat_round: 0,
             }
         }
 
@@ -1796,6 +1827,7 @@ mod tests {
             if !self.open {
                 return;
             }
+            self.round += 1;
             for line in self.to_game.poll().unwrap_or_default() {
                 match line.kind.as_str() {
                     "resync_save" if self.is_host => {
@@ -1811,7 +1843,7 @@ mod tests {
                     }
                     "resync_load" => {
                         self.loads += 1;
-                        self.hello_at = Some(Instant::now() + self.load_silence);
+                        self.hello_at = Some(self.round + (self.load_silence.as_millis() / TICK.as_millis()) as u32);
                     }
                     "checksum_request" => {
                         let n = number_after(&line.payload, "[\"n\"]=").unwrap();
@@ -1823,14 +1855,14 @@ mod tests {
                 }
             }
             if let Some(at) = self.hello_at {
-                if Instant::now() < at {
+                if self.round < at {
                     return; // loading: the world is not there
                 }
                 self.hello_at = None;
                 self.announce();
             }
-            if self.beat_at.elapsed() >= Duration::from_millis(100) {
-                self.beat_at = Instant::now();
+            if self.round - self.beat_round >= (Duration::from_millis(100).as_millis() / TICK.as_millis()) as u32 {
+                self.beat_round = self.round;
                 self.say("clock", CLOCK);
             }
         }
@@ -1856,18 +1888,42 @@ mod tests {
     ) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            for g in games.iter_mut() {
-                g.step();
-            }
-            for c in controllers.iter_mut() {
-                c.step();
-            }
-            if done() {
+            if round(controllers, games, &mut done) {
                 return true;
             }
-            thread::sleep(Duration::from_millis(20));
         }
         done()
+    }
+
+    /// One round: the games, then the controllers, one [`TICK`] later on the heartbeat clock.
+    fn round(controllers: &mut [&mut Controller], games: &mut [&mut Game], done: &mut impl FnMut() -> bool) -> bool {
+        tick_clock();
+        for g in games.iter_mut() {
+            g.step();
+        }
+        for c in controllers.iter_mut() {
+            c.step();
+        }
+        let finished = done();
+        if !finished {
+            thread::sleep(Duration::from_millis(20));
+        }
+        finished
+    }
+
+    /// Runs the rounds of `span` on the heartbeat clock, however long that takes in real time. True when `done` held
+    /// after any of them (so a negative check "nothing happened in a `span`" cannot be cut short by a busy machine).
+    fn watch_games(
+        controllers: &mut [&mut Controller],
+        games: &mut [&mut Game],
+        span: Duration,
+        mut done: impl FnMut() -> bool,
+    ) -> bool {
+        let mut seen = false;
+        for _ in 0..(span.as_millis() / TICK.as_millis()) {
+            seen |= round(controllers, games, &mut done);
+        }
+        seen
     }
 
     fn loopback_host_payload() -> &'static str {
@@ -1882,7 +1938,7 @@ mod tests {
     fn a_host_whose_world_is_closed_stops_hosting_and_its_player_is_told_the_host_ended_it() {
         let root = tempfile::tempdir().unwrap();
         let (host, player, mut hw, mut pw, join) = start_pair(root.path(), quick());
-        let (mut host, mut player) = (host.with_heartbeat(BEAT), player.with_heartbeat(BEAT));
+        let (mut host, mut player) = (host.with_heartbeat(BEAT).with_clock(test_now), player.with_heartbeat(BEAT));
         let (mut hg, mut pg) =
             (Game::new(&root.path().join("host"), true), Game::new(&root.path().join("player"), false));
         pw.send("join", &join);
@@ -1891,12 +1947,12 @@ mod tests {
 
         // no line from either game yet: the worlds may still be loading, and nothing ends however long that takes
         assert!(
-            !until_games(&mut [&mut host, &mut player], &mut [], 2 * BEAT, || !alive(&hw, &pw)),
+            !watch_games(&mut [&mut host, &mut player], &mut [], 2 * BEAT, || !alive(&hw, &pw)),
             "the session ended before its games had said anything"
         );
         // both games talk: still nothing ends
         assert!(
-            !until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], 2 * BEAT, || !alive(&hw, &pw)),
+            !watch_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], 2 * BEAT, || !alive(&hw, &pw)),
             "{:?} {:?}",
             hw.status(),
             pw.status()
@@ -1925,7 +1981,7 @@ mod tests {
         assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
         assert!(hw.status()["notice"].is_null(), "{:?}", hw.status());
         assert!(
-            !until_games(&mut [&mut host, &mut player], &mut [], 2 * BEAT, || hw.status()["state"] != "hosting"),
+            !watch_games(&mut [&mut host, &mut player], &mut [], 2 * BEAT, || hw.status()["state"] != "hosting"),
             "an earlier session's lines ended the new one"
         );
     }
@@ -1934,7 +1990,8 @@ mod tests {
     fn a_player_whose_world_is_closed_leaves_and_the_host_goes_on() {
         let root = tempfile::tempdir().unwrap();
         let (host, player, hw, mut pw, join) = start_pair(root.path(), quick());
-        let (mut host, mut player) = (host.with_heartbeat(BEAT), player.with_heartbeat(BEAT));
+        let (mut host, mut player) =
+            (host.with_heartbeat(BEAT).with_clock(test_now), player.with_heartbeat(BEAT).with_clock(test_now));
         let (mut hg, mut pg) =
             (Game::new(&root.path().join("host"), true), Game::new(&root.path().join("player"), false));
         pw.send("join", &join);
@@ -1942,7 +1999,7 @@ mod tests {
         assert!(until(&mut [&mut host, &mut player], Duration::from_secs(10), || {
             hw.status()["players"].as_array().is_some_and(|p| p.len() == 2)
         }));
-        assert!(!until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], 2 * BEAT, || {
+        assert!(!watch_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], 2 * BEAT, || {
             pw.status()["state"] != "joined"
         }));
 
@@ -1960,7 +2017,7 @@ mod tests {
         assert!(until_games(&mut [&mut host, &mut player], &mut [&mut hg], Duration::from_secs(10), || {
             hw.status()["players"].as_array().is_some_and(|p| p.len() == 1)
         }));
-        assert!(!until_games(&mut [&mut host, &mut player], &mut [&mut hg], 2 * BEAT, || {
+        assert!(!watch_games(&mut [&mut host, &mut player], &mut [&mut hg], 2 * BEAT, || {
             hw.status()["state"] != "hosting"
         }));
         assert!(hw.status()["notice"].is_null());
@@ -1971,7 +2028,8 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut host = Controller::new(t.path().to_path_buf(), "Host".into(), vec![t.path().join("save")])
             .unwrap()
-            .with_heartbeat(BEAT);
+            .with_heartbeat(BEAT)
+            .with_clock(test_now);
         let mut hw = Window::new(t.path());
         hw.send("host", loopback_host_payload());
         assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
@@ -1989,13 +2047,13 @@ mod tests {
             "{:?}",
             hw.status()
         );
-        until_games(&mut [&mut host], &mut [&mut hg], Duration::from_millis(300), || false);
+        watch_games(&mut [&mut host], &mut [&mut hg], Duration::from_millis(300), || false);
         assert!(hg.held_save.is_some(), "the game took the save request");
 
         // the game says nothing for several times the limit (a big save, a world being replaced): the round excuses it
         hg.open = false;
         assert!(
-            !until_games(&mut [&mut host], &mut [], 2 * BEAT, || hw.status()["state"] != "hosting"),
+            !watch_games(&mut [&mut host], &mut [], 2 * BEAT, || hw.status()["state"] != "hosting"),
             "ended during a round: {:?}",
             hw.status()
         );
@@ -2020,7 +2078,8 @@ mod tests {
         let saves = (root.path().join("host-user").join("save"), root.path().join("player-user").join("save"));
         let (host, player, mut hw, mut pw, join) =
             start_pair_saving(root.path(), quick(), vec![saves.0.clone()], vec![saves.1.clone()]);
-        let (mut host, mut player) = (host.with_heartbeat(BEAT), player.with_heartbeat(BEAT));
+        let (mut host, mut player) =
+            (host.with_heartbeat(BEAT).with_clock(test_now), player.with_heartbeat(BEAT).with_clock(test_now));
         let mut hg = Game::new(&root.path().join("host"), true);
         hg.save_dir = saves.0.clone();
         let mut pg = Game::new(&root.path().join("player"), false);
@@ -2033,7 +2092,7 @@ mod tests {
         assert!(until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_secs(10), || {
             hw.status()["players"].as_array().is_some_and(|p| p.len() == 2 && p.iter().all(|e| e["ready"] == true))
         }));
-        until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_millis(500), || false);
+        watch_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_millis(500), || false);
         hw.send("start", "{}");
         assert!(until_games(&mut [&mut host, &mut player], &mut [&mut hg, &mut pg], Duration::from_secs(10), || {
             hw.status()["started"] == true
