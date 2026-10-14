@@ -1013,16 +1013,17 @@ end
 
 -- The inject order: the shipped text goes to native_inject_<n>.txt (closed before the order is written), then `inject_next {key=n}`, then the caller
 -- sends the replay's command at once (nothing in between). The module answers `injected` / `inject_refused` in native_events.log.
-local function sendInjectOrder(inj, key)
+-- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result.
+local function sendInjectOrder(inj, key, held)
 	SIM.injectN = (SIM.injectN or 0) + 1
 	local n = SIM.injectN
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
 		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "inject_next", { key = n })
+		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held })
 		if not sent then error(why, 0) end
 	end)
-	traceSim("build.inject", string.format("%s inject_next key=%d (%d bytes of text) %s", tostring(key), n, #inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	traceSim("build.inject", string.format("%s inject_next key=%d held=%s (%d bytes of text) %s", tostring(key), n, tostring(held), #inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
 end
 
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
@@ -1263,7 +1264,11 @@ local function simApplyAction(st, it, now)
 					end
 				end
 				if a.patch then sendPatchOrder(a.patch, it.key) end
-				if a.inject then sendInjectOrder(a.inject, it.key) end
+				if a.inject then
+					sendInjectOrder(a.inject, it.key, it.deferId)
+				elseif it.deferId then
+					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred but this replay is not injected: the module drops it after its age limit")
+				end
 				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -2325,7 +2330,7 @@ local function natNew()
 		pingN = 0, pingAt = -100, pingsTried = 0, pongAt = nil, watchFrom = nil, lastTick = nil, lastWrite = -100,
 		holdSent = false, holdAt = 0, active = false, activeSince = 0,
 		retryAt = nil, retries = 0, gaveUp = false,
-		caps = {}, parked = {}, awaiting = {}, owed = {},
+		caps = {}, parked = {}, awaiting = {}, owed = {}, deferred = {},
 		heldByKey = {}, byId = {}, finishes = {},   -- shipped builds whose own copy is held: by action key / by held id; pause-path completions
 		sessionOn = true, sessionAt = -100,
 		logWin = -100, logN = 0, logLost = 0, faults = 0, dead = false,
@@ -2614,6 +2619,26 @@ local function natDecideUnsafe(h, cap)
 		-- A build that cannot be captured cannot be shipped: the others never get it, and the safety net's resync would erase it here
 		-- later (real session 2026-10-12: a guest's bus stops, line and buses). With the tool's callback fireable the build is cancelled and
 		-- the player told; otherwise it still goes through (fail open: the tool would stay dead).
+		-- With the native copy on, the record is completed from the held command instead (its model, name and position along the
+		-- segment are in the module's input text), so a stop is shipped before the build and applied at the stamp like every build.
+		if cap.partial and tostring(cap.why):find("has no model", 1, true) then
+			local tree = natInput(h)
+			local objs = tree and tree.proposal and Portable and Portable.list(tree.proposal.edgeObjectsToAdd) or {}
+			local okF, done, whyF = pcall(Build.fillPendingObjects, cap.partial, objs)
+			local okS, s2 = false, nil
+			if okF and done then
+				cap.partial.category = buildCategory(cap.partial)
+				okS, s2 = pcall(C.serialize, cap.partial)
+			end
+			if okS then
+				traceGui("build.capture", string.format("held=%d the edge object(s) of the preview were completed from the held command's text (%d object(s)): shipped before the build", id, #objs))
+				cap = { tool = cap.tool, body = cap.partial, text = s2, t = cap.t, ms = cap.ms, verdict = cap.verdict }
+			else
+				traceGui("build.capture", string.format("held=%d completing the edge object(s) from the held command's text failed: %s", id, tostring(okF and whyF or done)))
+			end
+		end
+	end
+	if not cap.body then
 		if tostring(cap.why):find("has no model", 1, true) then
 			-- an edge object (a stop) gets its model and parameters only when the build runs: the record is read AFTER the build (the
 			-- simulation half's deferred read, SIM.deferredBuild) and shipped then; nothing to cancel
@@ -2693,7 +2718,14 @@ local function natDecideUnsafe(h, cap)
 		and FIRE_DONE and h.done == true then
 		cancelFlow = true
 	end
-	if cancelFlow and FIRE_DONE and not h.done then
+	-- Deferred completion (the general form of the rule above, for every tool): the held command stays held until this game's own stamp
+	-- apply of the injected build, then takes that apply's result and its tool callback is fired with it, as the engine itself does after
+	-- applying a command. No empty-result callback (the construction tool's callback, its configure mode included, cannot take one) and
+	-- no build applied at another step than on the other games: the originator applies at the stamp like everyone (ids stay equal).
+	local deferFlow = NATIVE_INJECT and STRICT_CANCEL ~= "off" and N.ready and N.ready.inject and N.ready.defer
+		and type(body.nativeText) == "string" and body.nativeText ~= ""
+	if deferFlow then cancelFlow = true end
+	if cancelFlow and not deferFlow and FIRE_DONE and not h.done then
 		natSay("held " .. id .. " (site " .. natSite(h) .. "): the native module cannot fire this tool's callback: hold-and-release instead of cancel")
 		cancelFlow = false
 	end
@@ -2719,6 +2751,16 @@ local function natDecideUnsafe(h, cap)
 	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
 		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), #text,
 		cap.ms or 0, tostring(engine.account()), text))
+	if cancelFlow and deferFlow then
+		wire.held = nil
+		local okD = natSend("defer", { id = id })
+		it.deferId = id
+		N.deferred[id] = { key = it.key, at = at, t = os.clock() }
+		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), deferred: %s",
+			id, natSite(h), cap.tool, #text, it.key, at, now, okD and "kept until this game's own stamp apply, then completed with its result" or "DEFER NOT WRITTEN"))
+		route(it)
+		return
+	end
 	if cancelFlow then
 		-- cancel flow: the first strict flow. The command is cancelled, every game (this one too) replays the record.
 		wire.held = nil
@@ -2978,6 +3020,15 @@ local function natCapture(id, name, param)
 	})
 	if not ok then body, why = nil, tostring(body) end
 	local cap = { tool = tostring(id), why = why }
+	if NATIVE_INJECT and not body and tostring(why):find("has no model", 1, true) and Build.fillPendingObjects then
+		-- the preview of an edge object (a stop) has no model yet; the held command that follows the click has it: the record is captured
+		-- now with the edge objects marked and completed from that command's text (natDecideUnsafe). The event's proposal cannot be read
+		-- again later (real run s2 2026-10-14: "nothing to build" a frame after the click).
+		local okP, partial = pcall(Build.captureToolBuild, id, name, param, {
+			plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end, pendingModels = true,
+		})
+		if okP and type(partial) == "table" then cap.partial = partial end
+	end
 	if body then
 		body.category = buildCategory(body)
 		local okS, s = pcall(C.serialize, body)
@@ -3011,6 +3062,7 @@ local function natEvent(N, rec, p, history)
 		for _, h in ipairs(hooks) do
 			if h == "patch_next" then N.ready.patch = true end
 			if h == "inject_next" then N.ready.inject = true end
+			if h == "defer" then N.ready.defer = true end
 		end
 		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject })
 		N.hookOk = false
@@ -3058,6 +3110,12 @@ local function natEvent(N, rec, p, history)
 	elseif kind == "injected" or kind == "inject_refused" then
 		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
 		if kind == "inject_refused" then natSay("the native module refused to inject the engine's proposal: " .. tostring(p.reason or p.detail)) end
+	elseif kind == "completed" then
+		local id = tonumber(p.id)
+		local d = id and N.deferred[id]
+		if id then N.deferred[id] = nil end
+		natSay(string.format("held %s (%s) completed with this game's stamp apply (accepted %s, tool callback fired %s) at game time %d, stamp %s",
+			tostring(id), d and d.key or "?", tostring(p.ok), tostring(p.fired), engine.gameTime(), d and tostring(d.at) or "?"))
 	elseif kind == "patched" or kind == "patch_refused" then
 		traceGui("build.patch", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
 		if kind == "patch_refused" then natSay("the native module refused the frozen-node patch: " .. tostring(p.reason or p.detail)) end
@@ -3065,6 +3123,10 @@ local function natEvent(N, rec, p, history)
 		local id = tonumber(p.id)
 		if id then
 			N.awaiting[id] = nil
+			if N.deferred[id] then
+				natSay("held " .. id .. " (" .. N.deferred[id].key .. ") was deferred and is " .. kind .. " (" .. tostring(p.reason) .. ") without its completion")
+				N.deferred[id] = nil
+			end
 			for i, h in ipairs(N.parked) do
 				if h.id == id then
 					table.remove(N.parked, i)
@@ -3138,6 +3200,18 @@ local function natTick()
 	natReadEvents(N)
 	if not N.seen then return end
 	local now = os.clock()
+	-- a deferred command completes at the next CommandList::Add after this game's stamp apply: give it one, a few times a second
+	if next(N.deferred) then
+		local gt = engine.gameTime()
+		for id, d in pairs(N.deferred) do
+			if now - d.t > 40 then
+				N.deferred[id] = nil
+			elseif gt >= d.at and now - (d.trig or 0) > 0.15 then
+				d.trig = now
+				natTrigger()
+			end
+		end
+	end
 	if N.lastTick and now - N.lastTick > 3 then N.watchFrom = now end   -- the game stood still (a load, a save): the module could not be answered either
 	N.lastTick = now
 	natExpire(now)

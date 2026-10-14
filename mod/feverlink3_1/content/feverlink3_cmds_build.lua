@@ -746,7 +746,7 @@ end
 -- the state of one capture: how entities are keyed, what the proposal itself knows about entities it removes, and
 -- the references already made
 local function newCapture(ctx, opts)
-	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {}, cons = opts.cons or {} }, memo = {}, result = opts.result, alias = {} }
+	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {}, cons = opts.cons or {} }, memo = {}, result = opts.result, alias = {}, eoPending = ctx.pendingModels == true }
 
 	function cap.node(id)
 		if type(id) ~= "number" then fail("a node reference is not an entity id") end
@@ -992,6 +992,12 @@ local function readEdgeObject(o, i, cap)
 			out.param = out.param or get(ec, "param")
 			out.params = A.dump(get(ec, "params"))
 		end
+	end
+	-- before the build, for a caller that completes the record from the held command that follows the click (ctx.pendingModels: the
+	-- native module's input text names model, name and position; M.fillPendingObjects): marked, never shipped as it is
+	if cap.eoPending and out.model == nil then
+		out.model, out.pending = M.PENDING_MODEL, true
+		if out.param == nil then out.param = 0 end
 	end
 	if type(out.model) ~= "string" then fail("an edge object has no model (captured before the build ran?)") end
 	return out
@@ -2475,6 +2481,29 @@ end
 -- the tool's command, so the world is still as the tool saw it and the references resolve. `ctx` names entities the way the
 -- bridge keys them (see M.capture). Returns the body, nil and its serialised text (the wire form), or nil and why not. Never
 -- raises. The logging of the same events stays in M.onToolEvent.
+M.PENDING_MODEL = "?pending"
+
+-- Completes a record captured with ctx.pendingModels from the held command's input text (`objs`: its edgeObjectsToAdd, parsed by
+-- feverlink3_portable): model, name and position along the segment of each marked edge object, by index. Returns true when no edge
+-- object is left marked (the body can then be shipped like any other), or false and why.
+function M.fillPendingObjects(body, objs)
+	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1]
+	if type(rec) ~= "table" or type(rec.objs) ~= "table" then return false, "no record" end
+	for i, o in ipairs(rec.objs) do
+		if o.pending then
+			local t = objs and objs[i]
+			local m = type(t) == "table" and t.modelName
+			if type(m) ~= "string" or m == "" or type(t.param) ~= "number" then return false, "edge object " .. i .. ": the held command's text has no model or position" end
+			o.model = "::/" .. (m:gsub("^::/", ""))
+			o.param = t.param
+			if (o.name == nil or o.name == "") and type(t.name) == "string" then o.name = t.name end
+			o.pending = nil
+		end
+		if o.model == M.PENDING_MODEL then return false, "edge object " .. i .. " has no model" end
+	end
+	return true
+end
+
 function M.captureToolBuild(id, name, param, ctx)
 	if name ~= "builder.proposalApply" and name ~= "builder.proposalCreate" then return nil, "not a build event: " .. tostring(name) end
 	if type(param) ~= "table" then return nil, "the event carries no data" end
