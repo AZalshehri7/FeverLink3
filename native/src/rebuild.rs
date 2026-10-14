@@ -1456,7 +1456,7 @@ mod tests {
         for off in [0x10usize, 0x18, 0x20] {
             elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
         }
-        elem[0x30..0x38].copy_from_slice(&0x3f3f_fab3u64.to_le_bytes()); // data beside it stays
+        elem[0x0c..0x10].copy_from_slice(&0x3f3f_fab3u32.to_le_bytes()); // data beside it stays
         for s in [0x90usize, 0x168] {
             elem[s + 0x18..s + 0x20].copy_from_slice(&15u64.to_le_bytes()); // empty std::string (small buffer, capacity 15)
         }

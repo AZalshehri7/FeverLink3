@@ -241,6 +241,10 @@ pub static EDGE_OBJECT: Elem = Elem {
         f(0, "resultEntity", Ty::Ent),
         f(4, "category", Ty::U32),
         f(8, "segmentEntity", Ty::Ent),
+        // the position along the segment (0..1) the stop tool puts in the held command before the build runs; the tool's preview has
+        // no model yet, so a stop's record takes model, name and this from the held command's input text [observed inj7 2026-10-14:
+        // 0x3e2e9c82 = 0.1705189 at +0x28 in all three stop objects, the post-build record's param of the same stops]
+        f(0x28, "param", Ty::F32),
         f(0x90, "modelName", Ty::Str),
         f(0x168, "name", Ty::Str),
         f(0x188, "playerEntity", Ty::Ent),
