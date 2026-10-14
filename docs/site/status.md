@@ -4,7 +4,7 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-11. The project started on 2026-10-09. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html)
+Last updated 2026-10-14. The project started on 2026-10-09. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html)
 
 FeverLink3 is an early test build and not yet a full multiplayer game: two real copies of the game can host and join and follow each other's speed, pause and chat commands, and a thin slice of building (roads, bulldozing, loans, lines) has been seen working between two games; stations, rail, vehicles and terrain have not been tried. This page keeps three things apart: what has been seen working in the real game, what has only been tested without the game, and what has not been done.
 
@@ -26,6 +26,8 @@ Game build 40420, the maintainer's PC.
 | 2026-10-10 | The session buttons in two real games: the guest's **Leave the session** returns it to the start screen and the host's list drops it; the host's **Remove** next to a player removes it and the guest sees why; a returning guest is synced again (hot join); when the host returns to the main menu the host's session ends by itself and the guest sees "The host ended the session". |
 | 2026-10-10 | Town growth: two real games resynced to one world and left running with no action drifted apart within about 90 s (other building variants and levels in the same places, a house on one side only, one more street piece), also with pollution and noise neutralised as MPFever does. A test that held growth still made the worlds identical, but that approach was removed on 2026-10-11 because it removes a game mechanic; the fix has to keep growth working. |
 | 2026-10-11 | Town growth, measured in two real games with seed hooks: town growth is native code. A seed forced for map generation did not change growth. The seed given to the growth step is the same on both games at every logged call (1,717 calls, including the towns that still drifted), so the seed is not the cause; the cause is being traced (a per-step trace of the drifting towns and an analysis of the game executable). Growth is not switched off and no rating is changed. |
+| 2026-10-14 | Two real games on one PC (the developer connection on the loopback address; scripted sweep plus builds made by clicking with the real tools): roads, junctions, bridges, tunnels, traffic lights, crosswalks, bulldozing, bus stops, stations and their modules, road and rail depots, rail track, switches, signals, one-way lane changes, lines, vehicles and loans built by one game show on the other with the same entity ids and identical checksum rounds. Every game applies a build at the same step; the game's own build command is copied natively (capture and rebuild a few milliseconds each). A build appears on the other game after about 0.5 to 0.7 s at game speed x3 and 0.8 to 1.1 s at x1, also with a test delay of up to 100 ms one way. Not tested over the internet. |
+| 2026-10-14 | The maintainer's own first two-window test: the host crashed during fast building. Cause found in the logs (a watchdog switched the build sync off for the rest of the session after about 8 s of fast building, then a build naming stale objects crashed the game). Fixed; the fix was tried in two real games with 17 alternating builds in 64 s, not yet repeated by the maintainer. |
 
 ## Tested without the game
 
@@ -42,10 +44,10 @@ Written and covered by automated tests (unit tests, loopback sessions, two simul
 
 - Hosting and joining a whole session over Steam between two accounts (the connection test worked; carrying a session over it is the next test with a friend).
 - A busy world: every resync now reloads the host's game too, because a world that kept running drifts from a freshly loaded copy (measured in a lab with two games on one PC). This has not been checked in a real two-player game yet.
-- Not yet exercised in the system test: stations, depots, other constructions, rail tracks, buying vehicles and assigning them to lines, terrain editing (its height grid cannot be read from a script, so it is not replicated), and the effect of the host's permissions on a player's actions. The same capture and replay path carried a road, a construction (warehouse, port), a bulldozing and a line, so these are expected to work, but that is not shown.
+- Not yet verified: terrain editing (its height grid cannot be read from a script, so it is not replicated), separate companies, two players building at the very same moment, and long sessions of many minutes of fast building.
 - Town growth is native and not the same on two games (see `ARCHITECTURE.md` section 7): towns drift apart within about 90 s and a build through a town can then fail on the other game. Towns are never switched off or changed to hide this. Measured so far (2026-10-11): the growth generator is seeded once per process, and forcing the same seed in both games kept constructions identical for about 13 checksum rounds before they differed; the cause of the original difference is not established, and resetting the generator at every sync point is the next step (in progress).
 - Money after a bulldozing: the refund the native tool books is not part of the replayed build, so the two games differ by that amount until the host's money correction (about 20 s).
-- The native hooks that hold construction commands back so every game builds at the same moment: the code exists but is switched off by default and has never run in the real game.
+- The native hooks that hold construction commands back so every game builds at the same moment are on by default and ran in two real games on one PC (see the table above); they have not run in a game between two PCs.
 - Separate companies and a dedicated server. The installer's double-click menu has been tested on a fake PC only, not yet on a clean PC.
 
 ## What would change this page
