@@ -649,7 +649,7 @@ pub unsafe fn swap_into(c: &Ctx, b: &Built, dest: usize) {
 
 /// True for the members `build_verified` would not rebuild; kept next to the rule it mirrors.
 pub fn is_container(f: &F) -> bool {
-    matches!(f.ty, Ty::Map | Ty::Hash)
+    matches!(f.ty, Ty::Map | Ty::Hash(_))
 }
 
 /// A container member of the command that lies past the Proposal: [`swap_into`] never copies it into the command.

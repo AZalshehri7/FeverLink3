@@ -31,7 +31,7 @@ use crate::dump::{ascii_string, pointer_like, u32_at, u64_at, Env, Mem, IMAGE_BO
 /// `1` = commands the module held (their `held` and `apply`), `3` = also every other `build_proposal` the simulation applies.
 pub const PORTABLE_VAR: &str = "FEVERLINK3_PORTABLE_DUMP";
 pub const PORTABLE_FILE: &str = "native_portable.log";
-/// `=0` leaves pointers to heap blocks as `P` (no heap index is built); `=1` turns the graph on for the plain portable dump.
+/// `=0` leaves pointers to heap blocks as `P`; `=1` turns the graph on for the plain portable dump.
 pub const GRAPH_VAR: &str = "FEVERLINK3_PORTABLE_GRAPH";
 /// Format version of the text.
 pub const VERSION: u32 = 1;
@@ -68,8 +68,10 @@ pub enum Ty {
     BlobVec,
     /// `std::map` (0x10 bytes: head pointer, size).
     Map,
-    /// `std::unordered_map/set` (0x40 bytes).
-    Hash,
+    /// `std::unordered_map/set` (0x40 bytes) whose list nodes (and the list's sentinel, the same type) are `n` bytes: next, prev, value.
+    /// The node size is the container's element type, so every block of its graph has a size known from the layout (no heap query).
+    /// [b45, c10c, inj3: sentinels of 24 bytes for the four Proposal sets and `old2new`, 40 for `refundableEntities`]
+    Hash(usize),
     /// A flat hash set of 4-byte entity ids (0x20 bytes: control-byte pointer, slot pointer, size, capacity; one allocation of
     /// `capacity + 16` control bytes, padded to 4, then `capacity` slots). Its value is the set of ids; the control bytes are a hash of
     /// them made by the game that owns the table (b54: other bytes in the receiver's copy), so they are not part of the value.
@@ -90,7 +92,7 @@ impl Ty {
             Ty::V3 => 12,
             Ty::M4 => 64,
             Ty::Str => 0x20,
-            Ty::Res | Ty::Hash => 0x40,
+            Ty::Res | Ty::Hash(_) => 0x40,
             Ty::Vec(_) | Ty::EntVec | Ty::BlobVec => 0x18,
             Ty::Map => 0x10,
             Ty::EntSet => 0x20,
@@ -276,8 +278,8 @@ pub static PAYLOAD: &[F] = &[
     f(0x048, "proposal.removedSegments", Ty::Vec(&SEGMENT)),
     f(0x060, "proposal.nodeConfigsToAdd", Ty::Vec(&NODE_CONFIG)),
     f(0x078, "proposal.nodeConfigsToRemove", Ty::EntVec),
-    f(0x090, "proposal.hash90", Ty::Hash),
-    f(0x0d0, "proposal.hashd0", Ty::Hash),
+    f(0x090, "proposal.hash90", Ty::Hash(0x18)),
+    f(0x0d0, "proposal.hashd0", Ty::Hash(0x18)),
     f(0x110, "proposal.edgeObjectsToRemove", Ty::EntVec),
     f(0x128, "proposal.edgeObjectsToAdd", Ty::Vec(&EDGE_OBJECT)),
     f(0x140, "proposal.new2oldNodes", Ty::Map),
@@ -297,11 +299,11 @@ pub static PAYLOAD: &[F] = &[
     f(0x1c0, "proposal.gap1c0", Ty::Pad(0x10)),
     // indices into addedNodes, see the construction's `frozenNodes`
     f(0x1d0, "proposal.frozenNodes", Ty::EntVec),
-    f(0x1e8, "terrainAlignSkipEdges", Ty::Hash),
+    f(0x1e8, "terrainAlignSkipEdges", Ty::Hash(0x18)),
     f(0x228, "segmentTags", Ty::Vec(&SEGMENT_TAG)),
     f(0x240, "toRemove", Ty::EntVec),
     f(0x258, "toAdd", Ty::Vec(&CONSTRUCTION)),
-    f(0x270, "old2new", Ty::Hash),
+    f(0x270, "old2new", Ty::Hash(0x18)),
     // a vector of u32 (copied with sar 2 in the engine's copy constructor) and a std::map whose sentinel is 0x50 bytes
     f(0x2b0, "parcelsToRemove", Ty::EntVec),
     f(0x2c8, "parcelsMap", Ty::Map),
@@ -312,7 +314,7 @@ pub static PAYLOAD: &[F] = &[
     f(0x362, "context.cleanupStreetGraph", Ty::U8),
     f(0x36c, "context.player", Ty::Ent),
     // an unordered container (load factor 1.0 at +0, bucket vector, mask 7, maxidx 8 seen at +0x30, +0x38 of it)
-    f(0x370, "context.refundableEntities", Ty::Hash),
+    f(0x370, "context.refundableEntities", Ty::Hash(0x28)),
     f(0x3b2, "context.extendProposalRedoPillars", Ty::U8),
     f(0x3d0, "withCostRep", Ty::U8),
     f(0x3d1, "ignoreErrors", Ty::U8),
@@ -407,7 +409,7 @@ impl Settings {
             max_block_bytes: 8 << 20,
             max_elems: 20_000,
             max_depth: 6,
-            // the graph walks the heap once per text (HeapWalk): on for the rebuild checks and the engine copy, opt-in for the plain dump
+            // the graph: on for the rebuild checks and the engine copy, opt-in for the plain dump
             graph: get(GRAPH_VAR).map_or(var != PORTABLE_VAR, |v| v.trim() != "0"),
             max_graph_blocks: 32_768,
             max_graph_block_bytes: 1 << 20,
@@ -534,6 +536,13 @@ enum Kind {
     SetNode,
     /// A node of the segment maps: left, parent, right, colour, isnil, key at +0x20, the set (head pointer +0x28, size +0x30).
     MapNode,
+    /// The sentinel of a hash container's list: next, prev; its value is never constructed (residue: b45 hashd0's pointed at a
+    /// foreign block), so it is written as zero.
+    ListSentinel,
+    /// A node of a hash container's list: next, prev, the value (literal words; a word that is an address in this game is a `P`).
+    ListNode,
+    /// The bucket vector of a hash container: every word points at a node of its list (or the sentinel).
+    Buckets,
 }
 
 type R<T> = Result<T, String>;
@@ -674,7 +683,7 @@ impl Enc<'_> {
                 if slots != ctrl + ent_set_slot_offset(cap as usize) as u64 {
                     return Err(set_err());
                 }
-                // the slots are 4 bytes: the allocation, when the heap index knows it, is exactly control row + 4 x capacity
+                // the slots are 4 bytes: the allocation, when the reader knows it (test arenas), is exactly control row + 4 x capacity
                 // [b45: 32 bytes for capacity 3, 24 for capacity 1]
                 if let Some(n) = self.mem.heap_size(ctrl as usize) {
                     if n != ent_set_slot_offset(cap as usize) + 4 * cap as usize {
@@ -768,10 +777,11 @@ impl Enc<'_> {
                 }
                 self.container_graph(path, b, depth, u64_at(b, 8))
             }
-            Ty::Hash => {
+            Ty::Hash(node) => {
                 // std::unordered_map/set: load factor (the other four bytes of its word are padding), then the list head, size,
                 // bucket vector, mask and maximum index; the nodes are heap blocks of the graph
                 self.line(path, &format!("hash:size={},load={:08x}", u64_at(b, 0x10), u32_at(b, 0)))?;
+                self.register_hash_list(u64_at(b, 8) as usize, u64_at(b, 0x10) as usize, node);
                 self.register_hash_buckets(
                     u64_at(b, 0x18) as usize,
                     u64_at(b, 0x20) as usize,
@@ -867,6 +877,41 @@ impl Enc<'_> {
             && self.mem.read(begin, bytes).is_some()
         {
             self.known_sizes.entry(begin).or_insert(bytes);
+            self.kinds.entry(begin).or_insert(Kind::Buckets);
+        }
+    }
+
+    /// The list of an engine hash container (MSVC: a doubly linked list through a sentinel of the node type; `next` at +0, `prev` at
+    /// +8, the value after them), walked from its sentinel: registered only when the walk comes back to the sentinel after exactly `size`
+    /// readable nodes whose `prev` links agree; else nothing is registered and the pointers stay `P` (the rebuild refuses). The sizes
+    /// come from the container's type, so the graph needs no heap index (the whole-heap walk it replaces took 220-320 ms per text and
+    /// stopped at 3,145,728 blocks, missing blocks past it: b45 `refundableEntities` sentinel, inj7 its list head, inj3/inj8 buckets).
+    fn register_hash_list(&mut self, head: usize, size: usize, node: usize) {
+        if size > self.set.max_elems || !pointer_like(head as u64) || node < 0x10 {
+            return;
+        }
+        let Some(h) = self.mem.read(head, node) else { return };
+        let mut found: Vec<usize> = Vec::new();
+        let (mut prev, mut at) = (head, u64_at(&h, 0) as usize);
+        while at != head {
+            if found.len() >= size || !pointer_like(at as u64) || found.contains(&at) {
+                return;
+            }
+            let Some(n) = self.mem.read(at, node) else { return };
+            if u64_at(&n, 8) as usize != prev {
+                return;
+            }
+            found.push(at);
+            (prev, at) = (at, u64_at(&n, 0) as usize);
+        }
+        if found.len() != size || u64_at(&h, 8) as usize != prev {
+            return;
+        }
+        self.known_sizes.insert(head, node);
+        self.kinds.insert(head, Kind::ListSentinel);
+        for a in found {
+            self.known_sizes.insert(a, node);
+            self.kinds.insert(a, Kind::ListNode);
         }
     }
 
@@ -901,7 +946,7 @@ impl Enc<'_> {
     }
 
     /// A pointer to a live heap block as a token of the heap graph: `B<n>` (the start of block n) or `B<n>+<hex>` (inside it).
-    /// The first pointer to a block reads it (its size comes from the heap) and queues its own pointers.
+    /// The first pointer to a block reads it (its size comes from the container it was found in) and queues its own pointers.
     fn block_token(&mut self, p: usize) -> Option<String> {
         if !self.set.graph || self.set.graph_skip.contains(&self.origin.as_str()) {
             return None;
@@ -914,7 +959,13 @@ impl Enc<'_> {
                 return Some(format!("B{n}+{:x}", p - a));
             }
         }
-        let size = self.mem.heap_size(p).or_else(|| self.known_sizes.get(&p).copied())?;
+        // the size comes from the container the block was found in (map and set nodes, hash lists and buckets); a typed text never
+        // asks the reader about the heap, and the live reader cannot answer anyway (no whole-heap index any more)
+        let size = match self.known_sizes.get(&p) {
+            Some(&n) => n,
+            None if self.set.typed => return None,
+            None => self.mem.heap_size(p)?,
+        };
         if size > self.set.max_graph_block_bytes
             || self.blocks.len() >= self.set.max_graph_blocks
             || self.graph_bytes + size > self.set.max_graph_bytes
@@ -1034,10 +1085,14 @@ impl Enc<'_> {
     /// image), every other word a literal, padding zeroed. Never a guess.
     fn typed_tokens(&mut self, bytes: &[u8], kind: Kind) -> String {
         let mut b = bytes.to_vec();
+        let all: Vec<usize> = (0..b.len() / 8).map(|i| i * 8).collect();
         let (pad, ptrs): (&[(usize, usize)], &[usize]) = match kind {
             Kind::Sentinel => (&[(0x1a, usize::MAX)], &[0, 8, 0x10]),
             Kind::SetNode => (&[(0x1a, 0x1c)], &[0, 8, 0x10]),
             Kind::MapNode => (&[(0x1a, 0x20), (0x24, 0x28)], &[0, 8, 0x10, 0x28]),
+            Kind::ListSentinel => (&[(0x10, usize::MAX)], &[0, 8]),
+            Kind::ListNode => (&[], &[0, 8]),
+            Kind::Buckets => (&[], &all),
         };
         for &(from, to) in pad {
             let to = to.min(b.len());
@@ -1071,6 +1126,18 @@ impl Enc<'_> {
                     }
                     toks.push("P".into());
                 }
+            } else if kind == Kind::ListNode
+                && pointer_like(w)
+                && !((w as usize) >= self.env.image_base && (w as usize) - self.env.image_base < IMAGE_BOUND)
+                && self.mem.read(w as usize, 1).is_some()
+            {
+                // a value word that is an address in this game: not carried as a literal (a foreign address in the receiver); the
+                // rebuild refuses a `P`, so such a container goes the record path instead of a guess
+                self.stats.heap_ptrs += 1;
+                if self.unresolved.len() < 40 {
+                    self.unresolved.push((format!("{} {}+{:#x}", self.origin, self.label, i), w as usize));
+                }
+                toks.push("P".into());
             } else {
                 toks.push(format!("w:{w:016x}"));
             }
@@ -1247,9 +1314,6 @@ pub fn encode_with(
     let payload = mem.read(head.payload, PAYLOAD_SIZE).ok_or("payload unreadable")?;
     if payload[0x9b8] != KIND_BUILD_PROPOSAL {
         return Err(format!("kind byte {} is not {KIND_BUILD_PROPOSAL}", payload[0x9b8]));
-    }
-    if set.graph {
-        mem.refresh();
     }
     let mut e = Enc {
         mem,

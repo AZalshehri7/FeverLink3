@@ -2945,9 +2945,9 @@ local function natDecideUnsafe(h, cap)
 		local c0, c1 = cap:match("start=(%d+)"), cap:match("end=(%d+)")
 		-- every number through %s of a whole value: the interface's game time can be fractional, and %d refuses that in Lua 5.2 (r1: no text)
 		local function whole(v) return string.format("%.0f", tonumber(v) or 0) end
-		wire.tm = string.format("held=%s click=%s@g%s cap=%s..%s cap_ms=%s bytes=%s mask_ms=%s encode_ms=%s heap_walk_ms=%s heap_blocks=%s write_ms=%s input_ms=%s seen=%s ship=%s@g%s",
+		wire.tm = string.format("held=%s click=%s@g%s cap=%s..%s cap_ms=%s bytes=%s mask_ms=%s encode_ms=%s write_ms=%s input_ms=%s seen=%s ship=%s@g%s",
 			whole(id), c0 or whole(h.wSeen), whole(h.gClick), c0 or "?", c1 or "?", cap:match("ms=([%d.]+)") or "?", cap:match("bytes=(%d+)") or "?",
-			cap:match("mask_ms=([%d.]+)") or "?", cap:match("encode_ms=([%d.]+)") or "?", cap:match("heap_walk_ms=([%d.]+)") or "?", cap:match("heap_blocks=(%d+)") or "?",
+			cap:match("mask_ms=([%d.]+)") or "?", cap:match("encode_ms=([%d.]+)") or "?",
 			cap:match("write_ms=([%d.]+)") or "?", (t.input or ""):match("input_ms=([%d.]+)") or "?", whole(h.wSeen), whole(wShip), whole(now))
 		if N.timing then N.timing[id] = nil end
 		text = C.serialize(wire)

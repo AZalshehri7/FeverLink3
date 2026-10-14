@@ -2,7 +2,7 @@
 //! A child module of `runtime` so that it can use the runtime's private fields.
 
 use super::Runtime;
-use crate::dump::{Env, LiveHeapMem, LiveMem, Mem};
+use crate::dump::{Env, LiveMem, Mem};
 use crate::engine::{self, AddArgs};
 use crate::inject as inj;
 use crate::link::Event;
@@ -44,7 +44,7 @@ impl Runtime {
         let Some(settings) = self.inject_settings.get().copied() else { return };
         let t0 = std::time::Instant::now();
         let wall0 = wall_ms();
-        let live = LiveHeapMem::new();
+        let live = LiveMem;
         let head = portable::Header {
             seq: 0,
             event: "inject",
@@ -83,16 +83,14 @@ impl Runtime {
         let t_write = std::time::Instant::now();
         let written: Option<std::io::Result<()>> = encoded.as_ref().ok().map(|p| self.text.write(id, &p.text));
         let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
-        let walk_ms = live.last_walk_ms();
         let bytes = encoded.as_ref().map_or(0, |p| p.text.len());
         self.inject.report(Event::Timing {
             what: "capture",
             id,
             detail: format!(
-                "held={id} start={wall0} end={} ms={:.1} bytes={bytes} mask_ms={mask_ms:.1} encode_ms={encode_ms:.1} heap_walk_ms={walk_ms:.1} heap_blocks={} write_ms={write_ms:.1}",
+                "held={id} start={wall0} end={} ms={:.1} bytes={bytes} mask_ms={mask_ms:.1} encode_ms={encode_ms:.1} write_ms={write_ms:.1}",
                 wall_ms(),
-                t0.elapsed().as_secs_f64() * 1000.0,
-                live.blocks()
+                t0.elapsed().as_secs_f64() * 1000.0
             ),
         });
         match encoded.map(|p| (written, p)) {
@@ -102,10 +100,7 @@ impl Runtime {
                     // the memory there looks like, so that one run shows everything that stays to be understood
                     for (member, addr) in p.unresolved.iter().take(40) {
                         let bytes = LiveMem.read(*addr, 32).map_or("unreadable".to_string(), |b| crate::plan::hex(&b));
-                        self.say(&format!(
-                            "native inject: hold {id}: unresolved pointer in {member} -> {addr:#x} [{}] bytes {bytes}",
-                            live.heap_near(*addr)
-                        ));
+                        self.say(&format!("native inject: hold {id}: unresolved pointer in {member} -> {addr:#x} bytes {bytes}"));
                     }
                     self.say(&format!(
                         "native inject: hold {id}: portable text written in {} ms, {} bytes, {} lines (native_text_{id}.txt), {} pointer(s) not followed; {}",
@@ -356,8 +351,7 @@ impl Runtime {
         inj::check_destination(&LiveMem, dest, constructions, edge_objects)
             .and_then(|()| inj::same_constructions(&LiveMem, dest, &text))
             .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
-        // an index of the heap's blocks for the proof (refreshed before every text, see LiveHeapMem)
-        let live = LiveHeapMem::new();
+        let live = LiveMem;
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
         let mut say = |l: &str| self.say(l);
@@ -389,7 +383,7 @@ impl Runtime {
     /// swapped in) and `native_inject_diff_<key>.txt` (every line where the originator's text and the donor differ).
     fn inject_donor_report(&self, key: u64, dest: usize, text: &str, built: &inj::Built, dir: &std::path::Path) {
         let Some(settings) = self.inject_settings.get().copied() else { return };
-        let live = LiveHeapMem::new();
+        let live = LiveMem;
         let encode = |payload: usize, event: &'static str| {
             let head = portable::Header {
                 seq: 0,

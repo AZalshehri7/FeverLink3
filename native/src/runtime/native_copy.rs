@@ -51,8 +51,8 @@ impl Runtime {
                 return;
             }
         };
-        // an index of the heap's blocks for the graph, refreshed before every text (see LiveHeapMem for why no per-pointer heap query)
-        let live = crate::dump::LiveHeapMem::new();
+        // the graph's block sizes come from the containers (see `Mem::heap_size` for why nothing asks the heap)
+        let live = crate::dump::LiveMem;
         let ctx = nc::Ctx {
             fns,
             alloc: &alloc,

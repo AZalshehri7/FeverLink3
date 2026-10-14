@@ -340,7 +340,7 @@ impl<'a> Builder<'a> {
                 }
                 Ok(())
             }
-            Ty::Hash => {
+            Ty::Hash(_) => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 let size: u64 = v
                     .split("size=")
@@ -994,15 +994,15 @@ pub(crate) mod testgraph {
     }
 
     pub(crate) fn add_containers(arena: &Arena, payload: usize) {
-        // list of the hash: head H, nodes N1 and N2 (next, prev, key, value)
-        let (h, n1, n2) = (arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x30]), arena.add(&[0u8; 0x30]));
+        // list of the hash: head H, nodes N1 and N2 (next, prev, key, value), all of the node type (24 bytes, as `old2new`'s in the game)
+        let (h, n1, n2) = (arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x18]));
         let link = |a: usize, next: usize, prev: usize, key: u32| {
-            let mut b = vec![0u8; if a == h { 0x18 } else { 0x30 }];
+            let mut b = vec![0u8; 0x18];
             w(&mut b, 0, next as u64);
             w(&mut b, 8, prev as u64);
             if a != h {
                 b[0x10..0x14].copy_from_slice(&key.to_le_bytes());
-                b[0x18..0x1c].copy_from_slice(&(key + 1).to_le_bytes());
+                b[0x14..0x18].copy_from_slice(&(key + 1).to_le_bytes());
             }
             assert!(arena.write(a, &b));
         };
@@ -1195,10 +1195,10 @@ mod tests {
         assert_ne!(old, new);
         let head = arena.read(new as usize, 0x18).unwrap();
         let (first, last) = (u64_at(&head, 0) as usize, u64_at(&head, 8) as usize);
-        let n1 = arena.read(first, 0x30).unwrap();
+        let n1 = arena.read(first, 0x18).unwrap();
         assert_eq!(u64_at(&n1, 8), new, "the first node points back to the head");
         assert_eq!(u32::from_le_bytes(n1[0x10..0x14].try_into().unwrap()), 0xffff_fffd);
-        let n2 = arena.read(last, 0x30).unwrap();
+        let n2 = arena.read(last, 0x18).unwrap();
         assert_eq!(u64_at(&n2, 0), new, "the last node points on to the head");
         assert_eq!(u64_at(&n1, 0) as usize, last);
     }
@@ -1294,6 +1294,47 @@ mod tests {
             encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
         let line = text.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
         assert!(line.contains("B") && !line.contains('P'), "{line}");
+    }
+
+    #[test]
+    fn a_typed_hash_list_is_written_from_the_container_alone_and_rebuilt_without_any_heap_query() {
+        // r1-r6: the whole-heap index took 220-320 ms per text and stopped at 3,145,728 blocks; the typed text now sizes the list's
+        // sentinel and nodes from the member's node type and never asks the reader (NoHeap answers nothing)
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        super::testgraph::add_containers(&arena, at);
+        let h = u64::from_le_bytes(arena.read(at + 0x278, 8).unwrap().try_into().unwrap()) as usize;
+        // residue in the sentinel's value (b45: hashd0's pointed at a foreign block) is not carried
+        assert!(arena.write(h + 0x10, &(h as u64 + 8).to_le_bytes()));
+        let typed = Settings { typed: true, ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        let line = e.text.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
+        assert!(!line.contains('P'), "{line}\n{}", e.text);
+        let blocks: Vec<&str> = e.text.lines().filter(|l| l.starts_with("@B")).collect();
+        // sentinel, two nodes and the bucket array; every bucket word is a node
+        assert!(blocks.iter().any(|l| l.contains("size=24\traw:B") && l.ends_with(" z1")), "the sentinel: {blocks:?}");
+        assert!(blocks.iter().all(|l| !l.contains('P')), "{blocks:?}");
+        assert!(blocks.iter().any(|l| l.contains("size=128")), "{blocks:?}");
+        assert!(e.text.contains("w:fffffffefffffffd"), "the node's key and value are literals: {}", e.text);
+        let payload = arena.read(at, PAYLOAD_SIZE).unwrap();
+        let r = roundtrip(&e.text, &payload, BASE, typed, &arena, &NoHeap(&arena), &|b| Some(arena.add(b)))
+            .expect("rebuilds");
+        assert!(r.text.contains("MATCH old2new") && !r.text.contains("DIFF  old2new"), "{}", r.text);
+        // a list whose links disagree is not registered: its pointers stay P and the rebuild refuses
+        let n1 = u64::from_le_bytes(arena.read(h, 8).unwrap().try_into().unwrap()) as usize;
+        assert!(arena.write(n1 + 8, &0x1234_5678u64.to_le_bytes()));
+        let bad = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes").text;
+        let line = bad.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
+        assert!(line.starts_with("old2new.graph\traw:P "), "{line}");
+        // a value word that is an address in this game is a P, never a literal
+        assert!(arena.write(n1 + 8, &(h as u64).to_le_bytes()));
+        assert!(arena.write(n1 + 0x10, &(h as u64).to_le_bytes()));
+        let addr = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        assert!(
+            addr.stats.heap_ptrs > 0 && addr.text.lines().any(|l| l.starts_with("@B") && l.contains(" P")),
+            "{}",
+            addr.text
+        );
     }
 
     #[test]

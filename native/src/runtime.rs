@@ -260,7 +260,7 @@ impl Runtime {
                 payload,
             };
             let env = Env { image_base: self.base };
-            let live = dump::LiveHeapMem::new();
+            let live = dump::LiveMem;
             let text = portable::encode(&live, env, sink.settings, self.build.name, &head)?.text;
             let original = dump::Mem::read(&live, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
             let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &live, &|b| {
