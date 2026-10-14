@@ -225,8 +225,31 @@ function L.marginNeed(m, speed)
 	return marginSlot(m, speed).need
 end
 
--- The extra steps a build stamped now gets: the largest need of the peers (0 with no peer: nobody to wait for).
-function L.marginExtra(peers, speed)
+-- TEST-ONLY switches (never set by a player) to measure what the margin buys (owner, 2026-10-14): the values of
+-- FEVERLINK3_TEST_NO_MARGIN and FEVERLINK3_TEST_NO_LEAD. NO_MARGIN "1": the extra is 0 (no measured need, no headroom, no growth after a
+-- late apply); "extra:N": a fixed extra of N steps instead of the measured one. NO_LEAD "1" (stage 2): also the host's lead is gone, the
+-- stamp is one step past the fastest known clock (the floor of leadOf), with the extra of NO_MARGIN (0 when that is unset).
+-- nil: neither is set, nothing changes.
+function L.testMargin(noMargin, noLead)
+	local t = nil
+	local v = type(noMargin) == "string" and noMargin:match("^%s*(.-)%s*$") or ""
+	if v == "1" then
+		t = { extra = 0 }
+	else
+		local n = tonumber(v:match("^extra:(%d+)$") or "")
+		if n then t = { extra = math.min(L.MARGIN_MAX, n) } end
+	end
+	if type(noLead) == "string" and noLead:match("^%s*1%s*$") then
+		t = t or { extra = 0 }
+		t.noLead = true
+	end
+	return t
+end
+
+-- The extra steps a build stamped now gets: the largest need of the peers (0 with no peer: nobody to wait for). `test`
+-- (L.testMargin) replaces the measured extra by its fixed one.
+function L.marginExtra(peers, speed, test)
+	if type(test) == "table" and next(peers) ~= nil then return test.extra end
 	local x = nil
 	for _, pc in pairs(peers) do
 		if type(pc) == "table" then

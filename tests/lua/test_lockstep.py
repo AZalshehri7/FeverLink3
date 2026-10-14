@@ -1421,6 +1421,24 @@ class PureTest(unittest.TestCase):
         K.applyPeerClock(peers, L.table_from({"from": 2, "t": 1400, "ahead": 3, "need": -3}), 0)
         self.assertEqual(K.marginExtra(peers, 1), 1)
 
+    def test_the_test_margin_switches_fix_the_extra_and_change_nothing_unset(self):
+        K, L = self.K, self.L
+        self.assertIsNone(K.testMargin(None, None), "unset: nothing changes")
+        self.assertIsNone(K.testMargin("0", "0"))
+        self.assertIsNone(K.testMargin("extra:x", None))
+        t = K.testMargin("1", None)
+        self.assertEqual((t.extra, t.noLead), (0, None))
+        self.assertEqual(K.testMargin("extra:3", None).extra, 3)
+        self.assertEqual(K.testMargin("extra:99", None).extra, K.MARGIN_MAX)
+        t = K.testMargin(None, "1")
+        self.assertEqual((t.extra, t.noLead), (0, True), "no lead alone: no extra either")
+        peers = L.table()
+        self.assertEqual(K.marginExtra(peers, 3, K.testMargin("extra:2", None)), 0, "no peer: nobody to wait for")
+        K.applyPeerClock(peers, L.table_from({"from": 1, "t": 1000, "ahead": 3, "need": 9}), 0)
+        self.assertEqual(K.marginExtra(peers, 3, K.testMargin("1", None)), 0, "the measured need is ignored")
+        self.assertEqual(K.marginExtra(peers, 3, K.testMargin("extra:2", None)), 2)
+        self.assertEqual(K.marginExtra(peers, 3, None), 9, "without the switch: the measured need")
+
     def test_pace_lands_batches_on_checksum_stamps(self):
         K, L = self.K, self.L
         s = K.newSession()

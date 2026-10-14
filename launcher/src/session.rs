@@ -49,6 +49,7 @@ use crate::process::Role;
 use crate::resync;
 use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
 use crate::steamnet::par::wire::secret_from_key;
+use crate::testmargin;
 
 /// Period of the state machines' tick (session broadcast, checksum rounds).
 pub const TICK: Duration = Duration::from_millis(250);
@@ -532,6 +533,9 @@ pub fn run_host_over<T: HostTransport>(
             d.as_millis()
         ));
     }
+    if let Some(line) = testmargin::note_from_env() {
+        shared.log(line);
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {
         let shared = Arc::clone(&shared);
@@ -984,6 +988,9 @@ pub fn run_player_over(
             netdelay::ENV,
             d.as_millis()
         ));
+    }
+    if let Some(line) = testmargin::note_from_env() {
+        shared.log(line);
     }
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {

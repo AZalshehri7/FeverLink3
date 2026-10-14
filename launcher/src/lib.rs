@@ -35,6 +35,7 @@ pub mod steam;
 pub mod steam_persona;
 pub mod steam_transport;
 pub mod steamnet;
+pub mod testmargin;
 pub mod update;
 
 /// Steam app id of Transport Fever 3.

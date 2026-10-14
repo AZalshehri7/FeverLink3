@@ -118,6 +118,10 @@ pcall(function()
 	local v = os.getenv("FEVERLINK3_DEBUG_REFUSE_INJECT")
 	if v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
 end)
+-- Test switches (never set by a player): FEVERLINK3_TEST_NO_MARGIN / FEVERLINK3_TEST_NO_LEAD take the measured stamp margin (and the host's
+-- lead) away from deferred builds, to measure what they buy (L.testMargin). Unset: nil, nothing changes.
+X.TEST_MARGIN = nil
+pcall(function() X.TEST_MARGIN = L.testMargin(os.getenv("FEVERLINK3_TEST_NO_MARGIN"), os.getenv("FEVERLINK3_TEST_NO_LEAD")) end)
 local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
 
 local function devPoll(half)
@@ -2939,8 +2943,10 @@ local function natDecideUnsafe(h, cap)
 		-- with the record, so every receiver can measure what it would have needed.
 		at = stampAfterFastest(now)
 		if not pausedNow() and next(G.peers) ~= nil then
-			wire.xs = L.marginExtra(G.peers, G.session.speed)
+			wire.xs = L.marginExtra(G.peers, G.session.speed, X.TEST_MARGIN)
 			at = at + wire.xs * STEP
+			-- test switch FEVERLINK3_TEST_NO_LEAD: the host's lead goes too, down to leadOf's floor of one step past the fastest clock
+			if X.TEST_MARGIN and X.TEST_MARGIN.noLead then at = at - (L.leadOf(G.session) - STEP) end
 			text = C.serialize(wire)
 		end
 	end
