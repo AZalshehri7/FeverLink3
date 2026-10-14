@@ -3469,10 +3469,18 @@ local function natTick()
 	natReadEvents(N)
 	if not N.seen then return end
 	local now = os.clock()
-	-- a deferred command completes at the next CommandList::Add after this game's stamp apply: give it one, a few times a second
+	-- a deferred command completes at a CommandList::Add after this game's stamp apply, once this interface's world has that apply: the
+	-- tool's callback reads the entities of its result here. The interface's game time past the stamp says so (`release` of the
+	-- deferred id); then give it an Add, a few times a second. (h1/h2, 2026-10-14: with a fast capture and rebuild the callback came
+	-- at the first Add after the simulation's apply, before the interface had it; the road tool read a removed house and the game
+	-- stopped.)
 	if next(N.deferred) then
 		local gt = engine.gameTime()
 		for id, d in pairs(N.deferred) do
+			if gt > d.at and not d.ready then
+				d.ready = true
+				natSend("release", { id = id })
+			end
 			if gt >= d.at and not d.dueSeen then d.dueSeen = now end
 			if d.dueSeen and gt >= d.at + X.DEFER_GRACE_GAME_MS and now - d.dueSeen > X.DEFER_GRACE_S and not d.failed then
 				-- this game is well past the stamp (game time, so a pause menu does not count) and the build's stamp apply never completed

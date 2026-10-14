@@ -26,6 +26,11 @@
 //! - A deferred command never leaves without its tool callback: completed with the result of this game's stamp apply,
 //!   or, on every other way out (`fail`, `cancel`, holding off, the age limit, the control file gone), failed: the callback
 //!   is fired with the command's own "not applied" result, so a tool is never left busy.
+//! - The completion with the stamp apply's result waits until the mod says that the interface's world has that apply
+//!   (`release` of the deferred id, sent once the interface's game time is past the stamp): the tool's callback reads the
+//!   entities of its result in the interface's world, which copies the simulation's changes a little later (h1/h2,
+//!   2026-10-14: with a 3 ms capture and a 2 ms rebuild, the next Add came before that copy, the road tool's callback asked
+//!   for a component of a removed town building in the interface's world and the game stopped on `it != components.end()`).
 
 use std::collections::VecDeque;
 
@@ -128,7 +133,7 @@ enum Phase {
     Cancelled,
     /// Kept until this game's own stamp apply of the same build ([`HoldMachine::complete`]); never released.
     Deferred,
-    /// Took the result of that apply: its callback is fired at the next [`HoldMachine::take_due`].
+    /// Took the result of that apply: its callback is fired at the next [`HoldMachine::take_due`] once the entry is `ready`.
     Completed { ok: bool },
     /// Leaves without a stamp apply: its callback is fired with a failed result at the next [`HoldMachine::take_due`].
     Failed(&'static str),
@@ -142,6 +147,9 @@ struct Entry<H> {
     /// The machine's silent time when this entry was held: the age of an entry leaves out the time the mod was silent.
     silent_at_hold: u64,
     phase: Phase,
+    /// The interface's world has this game's stamp apply (the mod's `release` of a deferred entry, or no mod left to say it): a
+    /// completed entry's callback may be fired.
+    ready: bool,
     handle: H,
 }
 
@@ -326,6 +334,8 @@ impl<H> HoldMachine<H> {
                 Some(e) => {
                     if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) {
                         e.phase = Phase::Scheduled { at: *at };
+                    } else if matches!(e.phase, Phase::Deferred | Phase::Completed { .. }) {
+                        e.ready = true; // a deferred command is never released: the interface's world has the stamp apply
                     } // already leaving: a second release is harmless
                 }
                 None => self.error("release", format!("no held command {id}"), now),
@@ -364,6 +374,7 @@ impl<H> HoldMachine<H> {
 
     fn release_all(&mut self, reason: ReleaseReason) {
         for e in &mut self.entries {
+            e.ready = true; // nobody is left to say when the interface's world is ready: a completed entry fires as before
             if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) {
                 e.phase = Phase::Due(reason);
             } else if e.phase == Phase::Deferred {
@@ -427,7 +438,7 @@ impl<H> HoldMachine<H> {
             return; // nothing ages while the mod is silent
         }
         let max = self.cfg.max_hold_ms;
-        let mut timed_out = Vec::new();
+        let (mut timed_out, mut unconfirmed) = (Vec::new(), Vec::new());
         let ages: Vec<u64> = self.entries.iter().map(|e| self.age(e, now)).collect();
         for (e, age) in self.entries.iter_mut().zip(ages) {
             if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) && age >= max {
@@ -436,10 +447,20 @@ impl<H> HoldMachine<H> {
             } else if e.phase == Phase::Deferred && age >= max {
                 e.phase = Phase::Failed("timeout"); // never completed: not applied a second time, its tool callback fired as failed
                 timed_out.push(e.id);
+            } else if matches!(e.phase, Phase::Completed { .. }) && !e.ready && age >= max {
+                e.ready = true; // the mod never said the interface's world was ready: the callback is fired now, not never
+                unconfirmed.push(e.id);
             }
         }
         for id in timed_out {
             self.error("hold", format!("command {id} held for {max} ms: released"), now);
+        }
+        for id in unconfirmed {
+            self.error(
+                "hold",
+                format!("command {id} completed but not confirmed by the mod for {max} ms: its callback is fired now"),
+                now,
+            );
         }
     }
 
@@ -498,22 +519,31 @@ impl<H> HoldMachine<H> {
         let id = self.next_id;
         self.next_id += 1;
         let silent_at_hold = self.silent_total;
-        self.entries.push_back(Entry { id, kind, held_ms: now, silent_at_hold, phase: Phase::Waiting, handle });
+        self.entries.push_back(Entry {
+            id,
+            kind,
+            held_ms: now,
+            silent_at_hold,
+            phase: Phase::Waiting,
+            ready: false,
+            handle,
+        });
         self.push_event(Event::Held { id, kind, site, ms: now, done, flags });
         Ok(id)
     }
 
-    fn is_due(phase: Phase, clock: Option<u64>) -> bool {
-        match phase {
+    fn is_due(e: &Entry<H>, clock: Option<u64>) -> bool {
+        match e.phase {
             Phase::Waiting | Phase::Deferred => false,
             Phase::Scheduled { at } => at == 0 || clock.is_none_or(|c| c >= at),
-            Phase::Due(_) | Phase::Cancelled | Phase::Completed { .. } | Phase::Failed(_) => true,
+            Phase::Completed { .. } => e.ready,
+            Phase::Due(_) | Phase::Cancelled | Phase::Failed(_) => true,
         }
     }
 
     /// Whether [`take_due`](Self::take_due) would return something.
     pub fn has_due(&self, clock: Option<u64>) -> bool {
-        self.entries.iter().any(|e| Self::is_due(e.phase, clock))
+        self.entries.iter().any(|e| Self::is_due(e, clock))
     }
 
     /// Removes and returns what is to leave the ring now, in `(game time, id)` order. `clock` is the game time
@@ -522,7 +552,7 @@ impl<H> HoldMachine<H> {
         let mut due: Vec<(u64, Entry<H>)> = Vec::new();
         let mut keep = VecDeque::with_capacity(self.entries.len());
         for e in self.entries.drain(..) {
-            if Self::is_due(e.phase, clock) {
+            if Self::is_due(&e, clock) {
                 let key = match e.phase {
                     Phase::Scheduled { at } => at,
                     _ => 0,
@@ -557,7 +587,8 @@ impl<H> HoldMachine<H> {
     }
 
     /// This game applied the build of deferred command `id` at the stamp (another command, on the simulation thread): `adopt` gives the
-    /// held command that apply's result, and its callback is fired at the next [`take_due`](Self::take_due). False (and `adopt` not
+    /// held command that apply's result, and its callback is fired at the [`take_due`](Self::take_due) after the mod's `release` of it
+    /// (the interface's world has the apply). False (and `adopt` not
     /// called) when `id` is not deferred (dropped meanwhile, or never deferred).
     pub fn complete(&mut self, id: HoldId, ok: bool, adopt: impl FnOnce(&mut H)) -> bool {
         match self.entries.iter_mut().find(|e| e.id == id && e.phase == Phase::Deferred) {
@@ -808,6 +839,37 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_command_fires_only_once_the_mod_says_the_interface_has_the_apply() {
+        // h1/h2 (2026-10-14): the callback fired at the first Add after the simulation's apply, before the interface's world had it; the
+        // road tool read a removed town building there and the game stopped
+        let mut m = machine();
+        hold_on(&mut m, &["build_proposal"], 0);
+        let a = hold(&mut m, BUILD, 1);
+        m.handle(&CtlMessage::Defer { id: a }, 2);
+        assert!(m.complete(a, true, |_| {}));
+        assert!(!m.has_due(None) && m.take_due(None, 3).is_empty(), "completed, but the interface has not said so");
+        m.handle(&CtlMessage::Release { id: a, at: 0 }, 4);
+        assert_eq!(m.take_due(None, 5), [Action::Complete { id: a, handle: a, ok: true }]);
+        // the mod gone (holding off): a completed entry fires as before
+        let b = hold(&mut m, BUILD, 6);
+        m.handle(&CtlMessage::Defer { id: b }, 7);
+        assert!(m.complete(b, true, |_| {}));
+        m.handle(&CtlMessage::HoldOff, 8);
+        assert_eq!(m.take_due(None, 9), [Action::Complete { id: b, handle: b, ok: true }]);
+        // the mod never confirms: the age limit fires it, it is never left busy
+        hold_on(&mut m, &["build_proposal"], 10);
+        let c = hold(&mut m, BUILD, 10);
+        m.handle(&CtlMessage::Defer { id: c }, 11);
+        assert!(m.complete(c, false, |_| {}));
+        m.handle(&CtlMessage::Ping { n: 1 }, 30_000);
+        m.tick(30_000);
+        assert!(m.take_due(None, 30_000).is_empty());
+        m.handle(&CtlMessage::Ping { n: 2 }, 30_010);
+        m.tick(30_010);
+        assert_eq!(m.take_due(None, 30_010), [Action::Complete { id: c, handle: c, ok: false }]);
+    }
+
+    #[test]
     fn fail_and_cancel_free_a_deferred_tool_at_once() {
         let mut m = machine();
         hold_on(&mut m, &["build_proposal"], 0);
@@ -845,6 +907,7 @@ mod tests {
         m.tick(56_200);
         assert!(m.take_due(None, 56_200).is_empty(), "about 0.1 s of age counted before the pause, not 55 s");
         assert!(m.complete(a, true, |_| {}));
+        m.handle(&CtlMessage::Release { id: a, at: 0 }, 56_250); // the interface's world has the apply
         assert_eq!(m.take_due(None, 56_300), [Action::Complete { id: a, handle: a, ok: true }]);
         // and the age limit still holds for time the mod spoke: 30 s after the resume
         let b = hold(&mut m, BUILD, 57_000);
