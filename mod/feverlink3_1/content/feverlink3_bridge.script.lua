@@ -3231,6 +3231,10 @@ local function natEvent(N, rec, p, history)
 			if N.holdSent and not history and not N.active then
 				N.active, N.activeSince = true, now
 				natSay("mode ON (the native module holds build commands; hold_on confirmed)")
+			elseif p.reason == "resume" and not history and not N.holdSent and not N.gaveUp then
+				-- the module held again on this game's first line after a silence (the pause menu stops every script): same as a confirmed hold_on
+				N.holdSent, N.holdAt, N.active, N.activeSince, N.retryAt = true, now, true, now, nil
+				natSay("mode ON again (the native module resumed holding after a silence: the game's scripts had stopped, e.g. the pause menu)")
 			end
 		elseif p.on == false and not history and p.reason ~= "hold_off" then
 			-- the module switched holding off by itself (silence, control file gone): ours to notice, and to try again later

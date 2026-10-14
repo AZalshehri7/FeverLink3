@@ -57,9 +57,11 @@ pub const DEFAULT_PORT: u16 = 28090;
 
 /// Seconds without a line from the game, after the game had spoken, before its world counts as closed and the session
 /// ends. The mod appends a `clock` line to `from_game.log` at least every 30 frames (about half a second) while its
-/// script runs, paused or not, so eight seconds is many missed beats. `FEVERLINK3_HEARTBEAT_SECONDS` changes it for
-/// tests; `0` turns the check off.
-pub const HEARTBEAT_SECONDS: f64 = 8.0;
+/// script runs, paused or not. But the game's pause menu (Escape) stops every game script while the world stays loaded
+/// (real runs inj7 and s3, 2026-10-14: with 8 s the player who opened the menu "left" the session and its builds went
+/// the old way afterwards), so silence alone says little about a closed world: the limit is two minutes, longer than a
+/// visit to the menu. `FEVERLINK3_HEARTBEAT_SECONDS` changes it for tests; `0` turns the check off.
+pub const HEARTBEAT_SECONDS: f64 = 120.0;
 /// The environment variable that changes [`HEARTBEAT_SECONDS`].
 pub const HEARTBEAT_ENV: &str = "FEVERLINK3_HEARTBEAT_SECONDS";
 /// How long a world reload (the game was told to load the host's save, or the host's resync round runs) may silence the

@@ -173,8 +173,11 @@ those entries, they are not at the table.
 A session lives in the world of each game. When a player closes the save to the main menu, the mod's script is gone and
 nothing tells the controller, so the controller watches `from_game.log`: the mod appends a `clock` line to it at least
 every 30 frames (about half a second) while its script runs, even when the game is paused. A game that **has spoken in
-this session** (at least one new line since the session started) and then falls **silent for 8 seconds** has no world
-any more, and the controller ends the session by itself:
+this session** (at least one new line since the session started) and then falls **silent for 120 seconds** has no world
+any more, and the controller ends the session by itself. The limit is long because the game's **pause menu** (Escape)
+stops every game script while the world is still loaded: with the earlier 8 seconds a player who opened the pause menu
+was taken out of the session (real runs, 2026-10-14). While the menu is open that game's simulation stands still; the
+others go on, and it catches up at the stamps when the menu closes.
 
 - a **host** stops hosting. Every connected player is told first (the sealed `Kicked` frame with reason `ended`,
   `docs/PROTOCOL.md`), so each player's controller ends its own session at once: `state` `failed`, `message` "the host
@@ -193,7 +196,7 @@ What does **not** end a session:
   the host's load command to the game's next hello does (`Status::reloading` in `launcher/src/session.rs`). The silence
   counts again from the end of the round. A round or a load that lasts more than 5 minutes no longer excuses it.
 
-`FEVERLINK3_HEARTBEAT_SECONDS` (environment of the game process, read when the controller starts) changes the 8
+`FEVERLINK3_HEARTBEAT_SECONDS` (environment of the game process, read when the controller starts) changes the 120
 seconds, for tests: a number of seconds, `0` turns the check off. `Controller::with_heartbeat` does the same from a test.
 
 The verification is by the tests in `launcher/src/live.rs` (a host and a player controller wired through loopback with

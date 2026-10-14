@@ -15,6 +15,10 @@
 //! - Nothing can be held forever. Holding switches itself off after [`HoldConfig::silence_ms`] without a line
 //!   from the mod (implicit `hold_off`), and an entry older than [`HoldConfig::max_hold_ms`] is released on its
 //!   own. When holding goes off, every entry is released in order.
+//! - A silence is not a `hold_off`: the next line from the mod switches holding on again with the same kinds
+//!   (`holding {on = true, reason = "resume"}`). The game's pause menu stops every game script, so the mod falls
+//!   silent while the world is still there (real runs inj7 and s3, 2026-10-14: holding went off at the menu and was
+//!   never on again afterwards; builds then went the old way and the worlds drifted).
 
 use std::collections::VecDeque;
 
@@ -166,6 +170,8 @@ pub struct HoldMachine<H> {
     entries: VecDeque<Entry<H>>,
     next_id: HoldId,
     last_ctl_ms: u64,
+    /// The kinds that were held when a silence switched holding off: the mod's next line holds them again.
+    suspended: Option<Vec<u8>>,
     events: Vec<Event>,
     lost_events: u64,
     errors: ErrorLimiter,
@@ -181,6 +187,7 @@ impl<H> HoldMachine<H> {
             entries: VecDeque::new(),
             next_id: 1,
             last_ctl_ms: 0,
+            suspended: None,
             events: Vec::new(),
             lost_events: 0,
             errors: ErrorLimiter::default(),
@@ -246,6 +253,15 @@ impl<H> HoldMachine<H> {
     /// Applies a line of the control file. Every valid line proves the mod is alive.
     pub fn handle(&mut self, msg: &CtlMessage, now: u64) {
         self.last_ctl_ms = now;
+        if let Some(kinds) = self.suspended.take() {
+            // the mod speaks again after a silence: holding comes back as it was, unless this line says otherwise
+            if !matches!(msg, CtlMessage::HoldOn { .. } | CtlMessage::HoldOff) && !self.enabled && !kinds.is_empty() {
+                self.enabled = true;
+                self.kinds = kinds;
+                let kinds = self.held_kind_names();
+                self.push_event(Event::Holding { on: true, kinds, reason: "resume" });
+            }
+        }
         match msg {
             CtlMessage::HoldOn { kinds } => {
                 let mut wanted: Vec<u8> = Vec::new();
@@ -339,6 +355,7 @@ impl<H> HoldMachine<H> {
 
     /// The control file is gone: nobody can ask for a release any more.
     pub fn ctl_gone(&mut self, now: u64) {
+        self.suspended = None;
         if self.enabled || !self.entries.is_empty() {
             self.stop("control_gone", ReleaseReason::ControlGone, now);
         }
@@ -347,6 +364,7 @@ impl<H> HoldMachine<H> {
     /// Time passes: silence switches holding off, an old entry is released.
     pub fn tick(&mut self, now: u64) {
         if self.enabled && now.saturating_sub(self.last_ctl_ms) >= self.cfg.silence_ms {
+            self.suspended = Some(self.kinds.clone());
             self.stop("silence", ReleaseReason::Silence, now);
         }
         let max = self.cfg.max_hold_ms;
@@ -750,6 +768,34 @@ mod tests {
         assert_eq!(ids(&out), [a, b]);
         assert!(out.iter().all(|x| matches!(x, Action::Release { reason: ReleaseReason::Silence, .. })));
         assert_eq!(m.admit(BUILD, 11_002), Admit::Off, "new commands pass again");
+    }
+
+    #[test]
+    fn the_mods_next_line_after_a_silence_switches_holding_on_again() {
+        // the pause menu stops the mod's script: holding goes off, and comes back with the first ping afterwards
+        let mut m = machine();
+        hold_on(&mut m, &["build_proposal"], 0);
+        m.tick(10_000);
+        assert!(!m.enabled());
+        m.drain_events();
+        m.handle(&CtlMessage::Ping { n: 7 }, 60_000);
+        assert!(m.enabled(), "resumed");
+        let ev = m.drain_events();
+        assert!(matches!(&ev[0], Event::Holding { on: true, reason: "resume", .. }), "{ev:?}");
+        assert_eq!(ev[1], Event::Pong { n: 7 });
+        assert_eq!(m.held_kind_names(), ["build_proposal"]);
+        assert_eq!(m.admit(BUILD, 60_001), Admit::Hold);
+        // a hold_off is final: no resume after it
+        m.handle(&CtlMessage::HoldOff, 60_002);
+        m.drain_events();
+        m.handle(&CtlMessage::Ping { n: 8 }, 60_003);
+        assert!(!m.enabled());
+        // nor after the control file went away
+        hold_on(&mut m, &["build_proposal"], 70_000);
+        m.tick(80_000);
+        m.ctl_gone(80_001);
+        m.handle(&CtlMessage::Ping { n: 9 }, 80_002);
+        assert!(!m.enabled());
     }
 
     #[test]
