@@ -2632,6 +2632,21 @@ function M.addsOrRemovesConstructions(body)
 	return ok and yes == true
 end
 
+-- true when the record only takes things away: constructions, town buildings, segments, nodes or edge objects removed, and no construction,
+-- node, segment or edge object added (node configurations the engine re-adds where a removal merges two segments do not count). Whatever
+-- the plan that rebuilds it: a bulldozing of town buildings together with a street piece (plan "bulldoze") is as much a removal as one of
+-- a lone segment (plan "removal").
+function M.addsNothing(body)
+	local ok, yes = pcall(function()
+		local rec = normalise(body.args[1])
+		if type(rec) ~= "table" then return false end
+		local function n(k) return type(rec[k]) == "table" and #rec[k] or 0 end
+		if n("cons") + n("nodes") + n("segs") + n("objs") > 0 then return false end
+		return n("rem") + n("rmSegs") + n("rmNodes") + n("rmObjs") > 0
+	end)
+	return ok and yes == true
+end
+
 -- true when the record adds constructions, whatever the block says
 function M.addsConstructions(body)
 	local ok, adds = pcall(function()

@@ -2650,11 +2650,12 @@ local function natDecideUnsafe(h, cap)
 		cancelFlow = okP and STRICT_CANCEL_PLANS[plan or ""] == true
 	end
 	if STRICT_CANCEL == "removals" then
-		-- only a build that removes and adds nothing (the bulldozer): the plans "removal" (segments) and "construction" without a construction
-		-- to add (town buildings, industries). The tool's callback must be fireable, or the tool stays dead.
-		local okP, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
-		local addsNothing = okP and (plan == "removal" or (plan == "construction" and not (Build.addsConstructions and Build.addsConstructions(body))))
-		cancelFlow = addsNothing and FIRE_DONE and h.done == true
+		-- only a build that removes and adds nothing (the bulldozer), judged by what the record holds, not by the plan that rebuilds it: the
+		-- plan test it replaced ("removal" or "construction" without an add) missed a bulldozing of town buildings together with a street
+		-- piece (plan "bulldoze"), which then went hold-and-release, was applied 1000 ms after the stamp on the originator and drifted (sweep
+		-- 20261013-234802, real bulldozer over two houses and a road end). The tool's callback must be fireable, or the tool stays dead.
+		local okA, addsNothing = pcall(function() return Build and Build.addsNothing and Build.addsNothing(body) end)
+		cancelFlow = okA and addsNothing == true and FIRE_DONE and h.done == true
 	end
 	if cancelFlow and FIRE_DONE and not h.done then
 		natSay("held " .. id .. " (site " .. natSite(h) .. "): the native module cannot fire this tool's callback: hold-and-release instead of cancel")
