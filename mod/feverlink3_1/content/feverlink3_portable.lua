@@ -172,6 +172,79 @@ function M.countsText(c)
 		c.rmNodes, c.rmSegs, c.objs, c.rmObjs, c.ncfg, c.rmNcfg, c.frozen)
 end
 
+-- ---- the existing entities a text names (the receiver checks them before the injection)
+-- The text names an existing entity by its id (`ent:old#ID`, with the node's position where the proposal locates it). The engine takes
+-- the id as it is: on a game whose ids differ (a fork) the id is another entity, and the engine asserts on a component it lacks (real
+-- run 2026-10-14, rail-crash: a track's start node 50395 was an edge on the forked host, `it != components.end()`, BaseNode, the game
+-- stopped). What kind each member names (by its path, element indices left out); a member not listed is not checked (frozenNodes hold
+-- indices, the player members are the player and may hold residue, the sets and hashes are not entity references the rebuild reads).
+local REF_KINDS = {
+	["proposal.addedNodes.entity"] = "node",
+	["proposal.removedNodes.entity"] = "node",
+	["proposal.addedSegments.node0"] = "node",
+	["proposal.addedSegments.node1"] = "node",
+	["proposal.removedSegments.node0"] = "node",
+	["proposal.removedSegments.node1"] = "node",
+	["proposal.nodeConfigsToAdd.entity"] = "node",
+	["proposal.nodeConfigsToRemove"] = "node",
+	["proposal.addedSegments.entity"] = "edge",
+	["proposal.removedSegments.entity"] = "edge",
+	["proposal.nodeConfigsToAdd.laneConnections.segment0"] = "edge",
+	["proposal.nodeConfigsToAdd.laneConnections.segment1"] = "edge",
+	["proposal.nodeConfigsToAdd.crosswalks"] = "edge",
+	["proposal.nodeConfigsToAdd.segments"] = "edge",
+	["proposal.edgeObjectsToAdd.segmentEntity"] = "edge",
+	["proposal.addedSegments.objects.entity"] = "edgeObject",
+	["proposal.removedSegments.objects.entity"] = "edgeObject",
+	["proposal.edgeObjectsToRemove"] = "edgeObject",
+	["proposal.edgeObjectsToAdd.resultEntity"] = "edgeObject",
+	["toRemove"] = "construction",
+}
+-- the id maps of the proposal (`keys:` lines: every id in them, keys and values; new ids are placeholders and not checked)
+local MAP_KINDS = { Nodes = "node", Segments = "edge", EdgeObjects = "edgeObject" }
+
+M.REF_KINDS = REF_KINDS
+
+-- Every existing entity the text names as a member the receiver can check: a list of { path, id, kind, pos }, one per (id, kind)
+-- (the first path that names it). Pure: the caller asks the world.
+function M.oldRefs(text)
+	local out, seen = {}, {}
+	local function add(path, id, kind, pos)
+		local k = id .. "/" .. kind
+		if seen[k] then
+			if pos and not seen[k].pos then seen[k].pos = pos end
+			return
+		end
+		local r = { path = path, id = id, kind = kind, pos = pos }
+		seen[k] = r
+		out[#out + 1] = r
+	end
+	if type(text) ~= "string" then return out end
+	for line in text:gmatch("[^\r\n]+") do
+		local path, value = line:match("^([^\t]+)\t([^\t]*)")
+		if path then
+			local old = value:match("^ent:old#(%d+)")
+			if old then
+				local kind = REF_KINDS[(path:gsub("%[%d+%]", ""))]
+				if kind then
+					local e = M.value(value)
+					add(path, tonumber(old), kind, e and e.pos)
+				end
+			else
+				local which = path:match("^proposal%.new2old(%a+)%.keys$") or path:match("^proposal%.old2new(%a+)%.keys$")
+				local kind = which and MAP_KINDS[which]
+				if kind and value:sub(1, 5) == "keys:" then
+					for h in value:sub(6):gmatch("%x+") do
+						local id = tonumber(h, 16)
+						if id and id > 0 and id < 0x80000000 then add(path, id, kind, nil) end
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
 -- ---- shadow comparison with the build record (B2.1)
 -- What the record path carries against what the native module read from the held command, member by member. Observation only: it
 -- says where the record is lossy (a construction's own street pieces have no geometry in it, the lane configurations are not in the

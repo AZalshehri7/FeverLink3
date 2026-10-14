@@ -139,6 +139,33 @@ class PortableTest(unittest.TestCase):
             self.assertIsNotNone(t, info)
             self.assertEqual(t.kind, 52)
 
+    def refs(self, text):
+        out = []
+        for r in self.M.oldRefs(text).values():
+            pos = r.pos and (round(r.pos.x, 2), round(r.pos.y, 2), round(r.pos.z, 2))
+            out.append((str(r.path), int(r.id), str(r.kind), pos))
+        return out
+
+    def test_the_existing_entities_a_text_names_with_their_kind(self):
+        text = DEPOT + "\nproposal.old2newSegments.keys\tkeys:000098c9=[fffffffb;fffffffc]\nproposal.new2oldNodes.keys\tkeys:fffffffa=[00009a00]\n"
+        self.assertEqual(self.refs(text), [
+            ("proposal.addedSegments[0].node0", 39106, "node", (1369.5, 300.0, 5.0)),
+            ("toRemove[0]", 39259, "construction", None),
+            ("toRemove[1]", 39481, "construction", None),
+            ("proposal.old2newSegments.keys", 0x98c9, "edge", None),
+            ("proposal.new2oldNodes.keys", 0x9a00, "node", None),
+        ], "playerOwned, playerEntity and frozenNodes are not checked; node 39106 is named twice and listed once")
+
+    CRASH = os.path.join(HERE, "..", "..", "docs", "research", "rail-crash-run-20261014", "host", "native_inject_3.txt")
+
+    @unittest.skipUnless(os.path.exists(CRASH), "local research file")
+    def test_the_track_of_the_rail_crash_names_one_existing_node(self):
+        with open(self.CRASH, encoding="utf-8") as f:
+            text = f.read()
+        refs = self.refs(text)
+        self.assertEqual([(p, i, k) for p, i, k, _ in refs], [("proposal.addedSegments[0].node0", 50395, "node")])
+        self.assertIsNotNone(refs[0][3], "with the position the receiver compares")
+
 
 if __name__ == "__main__":
     unittest.main()

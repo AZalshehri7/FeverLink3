@@ -2936,5 +2936,105 @@ class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
         self.assertEqual(str(self.L.eval(code)()), "street")
 
 
+def _f32(x):
+    import struct
+    return "%08x" % struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def inject_text(node0=101, pos=(100.0, 0.0, 0.0), extra=()):
+    """A native text of a street from an existing node of the savegame (101 at 100,0,0) to a new node, in the shape of the real one of
+    the rail-crash run (2026-10-14): the start node is named by its id with the position of the segment's end."""
+    lines = [
+        "=== portable v1 layout=40420 event=inject key=1 site=none tool=none seq=0 t_ms=1 wall_ms=0 payload=0x1 ===",
+        "proposal.addedNodes.#\tn:1",
+        "proposal.addedNodes[0].entity\tent:new#1",
+        "proposal.addedNodes[0].position\tv3:%s,%s,%s" % (_f32(200.0), _f32(80.0), _f32(0.0)),
+        "proposal.addedSegments.#\tn:1",
+        "proposal.addedSegments[0].entity\tent:new#2",
+        "proposal.addedSegments[0].node0\tent:old#%d@%s,%s,%s" % (node0, _f32(pos[0]), _f32(pos[1]), _f32(pos[2])),
+        "proposal.addedSegments[0].node1\tent:new#1",
+        "proposal.addedSegments[0].playerOwned\tent:old#753655272",   # residue in the real texts: not checked
+        "proposal.frozenNodes.#\tn:1",
+        "proposal.frozenNodes[0]\tent:old#0",                        # an index, not an id: not checked
+        "context.player\tent:old#34135",
+    ] + list(extra)
+    return "\n".join(lines) + "\n=== end portable #0 ===\n"
+
+
+class InjectReferenceCheckTest(PureBuildTest):
+    """Before the native module injects the engine's Proposal from the originator's text, every existing entity the text names must be one
+    of the kind the member needs in THIS game (real run 2026-10-14, rail-crash: node 50395 of the guest's track was an edge on the forked
+    host and the engine's assertion stopped the host). A mismatch refuses the build here; nothing is applied."""
+
+    def check(self, text):
+        r = self.L.eval("function(t) local M = PURE(); local bad, n = M.checkInjectRefs(t); return tostring(bad), n end")(text)
+        return str(r[0]), int(r[1])
+
+    def test_a_text_whose_entities_are_the_same_here_passes(self):
+        text = inject_text(extra=[
+            "proposal.nodeConfigsToAdd.#\tn:1",
+            "proposal.nodeConfigsToAdd[0].entity\tent:old#101@%s,%s,%s" % (_f32(100.0), _f32(0.0), _f32(0.0)),
+            "proposal.nodeConfigsToAdd[0].crosswalks[0]\tent:old#110",
+            "proposal.nodeConfigsToAdd[0].laneConnections[0].segment0\tent:old#111",
+            "proposal.removedSegments[0].objects[0].entity\tent:old#140",
+            "toRemove[0]\tent:old#54",
+            "proposal.old2newSegments.keys\tkeys:0000006e=[fffffffb;fffffffc]",
+        ])
+        self.assertEqual(self.check(text), ("nil", 5), "node 101, edges 110 and 111, the signal 140, the construction 54")
+
+    def test_a_node_reference_that_is_an_edge_here_is_refused(self):
+        bad, _ = self.check(inject_text(node0=110))
+        self.assertIn("proposal.addedSegments[0].node0 names node 110, which is not a node here (it is: edge)", bad)
+
+    def test_a_node_reference_to_another_node_is_refused_by_its_position(self):
+        bad, _ = self.check(inject_text(node0=102))   # node 102 is at 200,0,0, the text says 100,0,0
+        self.assertIn("names node 102 at 100.00,0.00,0.00; that node is at 200.00,0.00,0.00 here (100.00 m away)", bad)
+
+    def test_an_entity_that_does_not_exist_here_is_refused(self):
+        bad, _ = self.check(inject_text(node0=99999))
+        self.assertIn("names node 99999, which does not exist here", bad)
+
+    def test_the_id_maps_are_checked_too(self):
+        bad, _ = self.check(inject_text(extra=["proposal.new2oldSegments.keys\tkeys:fffffffb=[00000065]"]))
+        self.assertIn("names edge 101, which is not a edge here (it is: node)", bad)
+
+    def test_a_fork_that_only_permutes_ids_is_found_by_the_originators_prints(self):
+        # runs n1/e3 (2026-10-14): a late apply left the same SET of ids with other entities behind them; the kind is right, the place is not
+        text = inject_text(extra=[
+            "proposal.nodeConfigsToAdd.#\tn:1",
+            "proposal.nodeConfigsToAdd[0].crosswalks[0]\tent:old#110",
+            "toRemove[0]\tent:old#54",
+        ])
+        f = self.L.eval("""function(t, permute)
+            local M = PURE()
+            local prints = M.refPrints(t)
+            local n = 0
+            for _ in pairs(prints) do n = n + 1 end
+            if permute then WORLD[110] = nil; ADD_EDGE(110, 101, 102, 0, "street/new_medium_road.street_template") end
+            local bad = M.checkInjectRefs(t, prints)
+            return tostring(bad), n
+        end""")
+        ok = f(text, False)
+        self.assertEqual((str(ok[0]), int(ok[1])), ("nil", 3), "node 101, edge 110 and construction 54 located; the same world passes")
+        bad = str(f(text, True)[0])
+        self.assertIn("proposal.nodeConfigsToAdd[0].crosswalks[0] names edge 110, which the originator has at 0.00,0.00,0.00,100.00,0.00,0.00 and this game at "
+                      "100.00,0.00,0.00,200.00,0.00,0.00", bad)
+
+    def test_the_build_is_refused_at_the_decode_and_nothing_is_built_from_it(self):
+        code = """(function(txt)
+            local M, C, ctx = PURE()
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 100, y = 0, z = 0 }, b = { x = 200, y = 80, z = 0 } })
+            body.nativeText = txt
+            local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '1:1',
+                resolve = function(key) local n = tostring(key):match('^s:(%d+)$'); return n and tonumber(n) or nil end })
+            if not args then return 'refused: ' .. tostring(why) end
+            return 'built ' .. tostring(args.plan) .. (args.inject and ' inject' or '')
+        end)"""
+        f = self.L.eval(code)
+        self.assertEqual(str(f(inject_text())), "built street inject")
+        got = str(f(inject_text(node0=110)))
+        self.assertTrue(got.startswith("refused: inject_refused: proposal.addedSegments[0].node0 names node 110"), got)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

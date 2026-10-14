@@ -3170,6 +3170,103 @@ local function portableReplay(rec, text, R, f, tkey)
 	return args
 end
 
+-- The components that make an entity of each kind the text names (Portable.oldRefs).
+local REF_COMPS = { node = { "BASE_NODE" }, edge = { "BASE_EDGE" }, edgeObject = { "EDGE_OBJECT" }, construction = { "CONSTRUCTION" } }
+local REF_POS_TOL = 0.25   -- metres: a node the text locates must be where the text says (two node ends of a station piece lie 2 m apart)
+
+-- Before the native module injects the engine's Proposal built from the originator's text: every existing entity the text names must be,
+-- in THIS game, an entity of the kind the member needs (a node where a node is named, with the node at the text's position when the text
+-- gives one), or the injection is refused and nothing is applied here (the worlds differ: the ids lane and the resync repair that). The
+-- engine itself does not check: real run 2026-10-14 (rail-crash), the host's world had forked, the guest's track named node 50395, which was
+-- a station track piece (an edge) on the host, and the engine's assertion (`it != components.end()`, BaseNode) stopped the game.
+-- The kind alone does not find a fork that only PERMUTES ids (a late apply: the same set of ids, other entities behind them; runs n1/e3
+-- 2026-10-14, the ids lane hashed the sorted sets and saw nothing, and the next stop on the forked road stopped the host on the same
+-- assertion). So the originator also sends where each named entity IS in its world (M.refPrints, `body.refPrints`): a node's position,
+-- a segment's two ends, an edge object's segment ends, a construction's place. The receiver compares them with its own entity of that id.
+
+-- where entity `id` of `kind` is in this world: a flat list of numbers (nil when it cannot be read)
+local function refPrint(kind, id)
+	if kind == "node" then
+		local p = A.nodePos(id)
+		return p and { p.x, p.y, p.z } or nil
+	elseif kind == "edge" or kind == "edgeObject" then
+		local e = id
+		if kind == "edgeObject" then e = A.edgeOfObject(id) end
+		local i = e and A.edgeInfo(e)
+		return i and { i.p0.x, i.p0.y, i.p0.z, i.p1.x, i.p1.y, i.p1.z } or nil
+	elseif kind == "construction" then
+		local c = A.conInfo(id)
+		return c and { c.p.x, c.p.y, c.p.z } or nil
+	end
+	return nil
+end
+
+-- The originator's prints of every existing entity its text names, read in its world before the build runs: { ["kind:id"] = numbers }.
+function M.refPrints(text)
+	local out = {}
+	if not Portable or type(Portable.oldRefs) ~= "function" then return out end
+	for _, r in ipairs(Portable.oldRefs(text)) do
+		local ok, p = pcall(refPrint, r.kind, r.id)
+		if ok and p then out[r.kind .. ":" .. r.id] = p end
+	end
+	return out
+end
+
+local function printText(p)
+	local t = {}
+	for i, v in ipairs(p) do t[i] = string.format("%.2f", v) end
+	return table.concat(t, ",")
+end
+
+-- Returns nil when every reference holds, else the reason; `checked` = how many references were looked at. `prints` = the originator's
+-- body.refPrints (may be nil: a record of an older version, then the kind and the text's node positions are checked).
+function M.checkInjectRefs(text, prints)
+	if not Portable or type(Portable.oldRefs) ~= "function" then return nil, 0 end
+	local refs = Portable.oldRefs(text)
+	for _, r in ipairs(refs) do
+		if not A.exists(r.id) then
+			return string.format("%s names %s %d, which does not exist here", r.path, r.kind, r.id), #refs
+		end
+		local has = false
+		for _, comp in ipairs(REF_COMPS[r.kind] or {}) do
+			if A.comp(r.id, comp) ~= nil then has = true break end
+		end
+		if not has then
+			local what = {}
+			for kind, comps in pairs(REF_COMPS) do
+				for _, comp in ipairs(comps) do
+					if kind ~= r.kind and A.comp(r.id, comp) ~= nil then what[#what + 1] = kind end
+				end
+			end
+			table.sort(what)
+			return string.format("%s names %s %d, which is not a %s here (it is: %s)", r.path, r.kind, r.id, r.kind, #what > 0 and table.concat(what, "/") or "neither"), #refs
+		end
+		if r.kind == "node" and r.pos then
+			local q = A.nodePos(r.id)
+			if q then
+				local d = sqrt((q.x - r.pos.x) ^ 2 + (q.y - r.pos.y) ^ 2 + (q.z - r.pos.z) ^ 2)
+				if d > REF_POS_TOL then
+					return string.format("%s names node %d at %.2f,%.2f,%.2f; that node is at %.2f,%.2f,%.2f here (%.2f m away)", r.path, r.id, r.pos.x, r.pos.y,
+						r.pos.z, q.x, q.y, q.z, d), #refs
+				end
+			end
+		end
+		local want = type(prints) == "table" and prints[r.kind .. ":" .. r.id] or nil
+		if type(want) == "table" then
+			local have = refPrint(r.kind, r.id)
+			local same = have ~= nil and #have == #want
+			for i = 1, (same and #want or 0) do
+				if type(want[i]) ~= "number" or math.abs(have[i] - want[i]) > REF_POS_TOL then same = false break end
+			end
+			if not same then
+				return string.format("%s names %s %d, which the originator has at %s and this game at %s", r.path, r.kind, r.id, printText(want),
+					have and printText(have) or "(unreadable)"), #refs
+			end
+		end
+	end
+	return nil, #refs
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
@@ -3187,6 +3284,16 @@ local function decodeBuildUnsafe(body, ctx)
 	-- The native module builds the engine's Proposal from the originator's text and swaps it into this command: the command only has to carry
 	-- the constructions (the module takes them from this game's own conversion); its street part is replaced, so no verdict gates it.
 	if ctx and ctx.canInject and type(body.nativeText) == "string" and body.nativeText ~= "" and rec.src == "native" then
+		-- the text's ids must be the same entities here (M.checkInjectRefs); if not, the build is refused on this game and nothing is applied
+		local okR, bad, nRefs = pcall(M.checkInjectRefs, body.nativeText, body.refPrints)
+		if not okR then bad = "the check failed (" .. tostring(bad) .. ")" end
+		if bad then
+			local why = "inject_refused: " .. tostring(bad) .. " (this world differs from the originator's; nothing is applied here, the ids check and the resync repair it)"
+			log("build inject (" .. plan .. ") REFUSED: " .. why)
+			C.tracer("build")("build.inject", string.format("%s inject_refused refs=%s reason=%s", tostring(ctx.traceKey or "-"), tostring(nRefs), tostring(bad)))
+			return nil, why
+		end
+		C.tracer("build")("build.inject", string.format("%s references checked: %d existing entities, each of the kind the text names", tostring(ctx.traceKey or "-"), nRefs or 0))
 		local okI, built = pcall(function()
 			-- A build with constructions is sent as its added constructions alone: the module takes the street part, the removed constructions
 			-- and every flag from the text, and only the added constructions from this command's own conversion (the "donor"). b68: a depot

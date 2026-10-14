@@ -1019,6 +1019,21 @@ local function snapshotComps(comps)
 	for _, comp in ipairs(comps) do before[comp] = engine.entitiesWith(comp) end
 	return before
 end
+-- Where each existing entity the native text names is in this (the originator's) world, read before the build runs: every receiver checks
+-- its own entity of that id against it before the injection (Build.checkInjectRefs). Never raises; a build without prints is still
+-- checked by kind and by the text's node positions.
+function X.natRefPrints(tracer, who, body, text)
+	local ok, prints = pcall(function() return Build and Build.refPrints and Build.refPrints(text) end)
+	if ok and type(prints) == "table" then
+		body.refPrints = prints
+		local n = 0
+		for _ in pairs(prints) do n = n + 1 end
+		tracer("build.inject", string.format("%s reference prints: %d existing entities located for the receivers' check", who, n))
+	else
+		tracer("build.inject", string.format("%s reference prints NOT made (%s)", who, tostring(prints)))
+	end
+end
+
 -- B2.1, shadow: the record against the text the native module read from the held command, member by member (Portable.compare); one
 -- trace line (build.portable) on whichever half has both. Never raises.
 local function shadowCompare(tracer, who, text, rec)
@@ -1166,6 +1181,7 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, d
 		if hn and os.clock() - hn.wall < 30 then
 			body.nativeText = hn.text
 			traceSim("build.inject", string.format("t=%d held=%s the native text of the released command goes with the record (%d bytes)", now, tostring(hn.id), #hn.text))
+			X.natRefPrints(traceSim, "t=" .. now .. " held=" .. tostring(hn.id), body, hn.text)
 		end
 	end
 	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and (deferredPre and "pre-build event (read before the deferred build)" or "post-event (no context)") or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
@@ -1340,6 +1356,8 @@ local function simApplyAction(st, it, now)
 		err = L.refusalDetail(err, it.body)
 		logSim("action " .. it.key .. " refused: " .. tostring(err))
 		traceSim("build.refused", it.key .. " " .. tostring(err))
+		-- this game's own deferred command gets no stamp apply: it fails now (tool callback fired), not after the grace
+		if it.deferId and it.from == C.PLAYER_ID then X.sendHeldOrder("fail", { id = it.deferId }, it.key) end
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err }
 		return
 	end
@@ -2801,6 +2819,7 @@ local function natShadow(h, body)
 		if okT and type(text) == "string" and text ~= "" then
 			body.nativeText = text
 			traceGui("build.inject", string.format("held=%d the native module's text of the command goes with the record (%d bytes)", h.id, #text))
+			X.natRefPrints(traceGui, "held=" .. h.id, body, text)
 		else
 			traceGui("build.inject", string.format("held=%d NO native text (native_text_%d.txt missing): the record path builds it", h.id, h.id))
 		end
