@@ -1419,6 +1419,37 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_pointer_in_an_unnamed_region_that_starts_between_two_words_is_not_carried() {
+        // inj3 (2026-10-14): an EdgeObject's region ~0xc (after segmentEntity at +8) held a vector's three words at +0x10..+0x28
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        let readable = arena.add(&[9u8; 0x40]);
+        let mut elem = vec![0u8; 0x1a0];
+        for off in [0x10usize, 0x18, 0x20] {
+            elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
+        }
+        elem[0x30..0x38].copy_from_slice(&0x3f3f_fab3u64.to_le_bytes()); // data beside it stays
+        for s in [0x90usize, 0x168] {
+            elem[s + 0x18..s + 0x20].copy_from_slice(&15u64.to_le_bytes()); // empty std::string (small buffer, capacity 15)
+        }
+        let blk = arena.add(&elem);
+        let mut v = Vec::new();
+        for x in [blk as u64, blk as u64 + 0x1a0, blk as u64 + 0x1a0] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        assert!(arena.write(at + 0x128, &v));
+        let typed = Settings { typed: true, ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        let line = e
+            .text
+            .lines()
+            .find(|l| l.starts_with("proposal.edgeObjectsToAdd[0].~0xc"))
+            .unwrap_or_else(|| panic!("the region is written: {}", e.text));
+        let hex: String = (readable as u64).to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!line.contains(&hex) && line.contains("b3fa3f3f"), "{line}");
+    }
+
+    #[test]
     fn an_entity_set_table_grows_by_the_load_bound_and_an_empty_set_points_at_the_image() {
         assert_eq!(ent_set_table(&[1]).1, 1);
         assert_eq!(ent_set_table(&[1, 2, 3, 4, 5, 6, 7]).1, 7);

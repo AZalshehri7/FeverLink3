@@ -964,8 +964,11 @@ impl Enc<'_> {
             // owns it, so it is not carried. Only a word that IS an address here (readable memory of this game) counts: two packed
             // 32-bit values look pointer-like too (b64: a node configuration's traffic-light preference 2 beside a zero is the word
             // 0x2_0000_0000, its type -1 beside a zero 0xffff_ffff), and they are data.
-            let mut k = 0;
-            while from.is_multiple_of(8) && k + 8 <= owned.len() {
+            // The words are read at the record's 8-byte boundaries, also in a region that starts between two (inj3, 2026-10-14: a stop's
+            // EdgeObject region ~0xc carried the three words of a vector at +0x10..+0x28, the receiving game copied the injected Proposal
+            // with the originator's heap addresses in it and its simulation thread died).
+            let mut k = (8 - from % 8) % 8;
+            while k + 8 <= owned.len() {
                 let w = u64_at(&owned, k);
                 let image = (w as usize) >= self.env.image_base && (w as usize) - self.env.image_base < IMAGE_BOUND;
                 if pointer_like(w) && !image && self.mem.read(w as usize, 1).is_some() {
