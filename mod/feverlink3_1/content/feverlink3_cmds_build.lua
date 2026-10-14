@@ -3199,7 +3199,14 @@ local function decodeBuildUnsafe(body, ctx)
 			else
 				b = PLAN[plan](rec, R, f, {}, (FORMS[plan] or { {} })[1])
 			end
-			if type(b.chain) == "table" and #b.chain > 0 then error("the build needs a chained command", 0) end
+			-- The injected Proposal replaces this command's whole content (only added constructions come from it, and those are sent alone
+			-- above), so a chain the record path would need is not: its first command is the donor. Real run 2026-10-14 (bulldozing a modular
+			-- station, a removal and its 24 track pieces, 2 commands on the record path): the inject was skipped, the record path rebuilt it on
+			-- every game, and the originator's deferred command never took a stamp apply's result (dropped after its age limit).
+			if type(b.chain) == "table" and #b.chain > 0 then
+				if #rec.cons > 0 then error("the build needs a chained command", 0) end
+				b.chain = nil
+			end
 			api.cmd.makeWorldBuildProposalCmd(unpack(b, 1, b.n))
 			return b
 		end)
