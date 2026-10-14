@@ -198,6 +198,65 @@ impl Pulse {
     }
 }
 
+/// The mod's presence lock (`world.lock` in the session folder): the mod's interface script opens it once and never closes it, so the
+/// handle lives exactly as long as the script's Lua state, which the game destroys with the world. The pause menu only stops the
+/// script (the handle stays open); closing the world to the main menu frees it. A file that can be opened without sharing is held by
+/// nobody: a positive sign that the world is closed, seconds after the fact instead of the heartbeat's two minutes.
+pub const WORLD_LOCK_FILE: &str = "world.lock";
+
+/// Watches [`WORLD_LOCK_FILE`]: true once the lock was seen held in this session and is free now.
+struct PresenceLock {
+    path: PathBuf,
+    held_seen: bool,
+    next_look: Instant,
+}
+
+impl PresenceLock {
+    const EVERY: Duration = Duration::from_millis(500);
+
+    fn new(path: PathBuf, now: Instant) -> PresenceLock {
+        PresenceLock { path, held_seen: false, next_look: now }
+    }
+
+    /// `reloading`: a resync load replaces the script's state, so the lock is free for a moment; it must be seen held again first.
+    fn world_gone(&mut self, reloading: bool, now: Instant) -> bool {
+        if reloading {
+            self.held_seen = false;
+            return false;
+        }
+        if now < self.next_look {
+            return false;
+        }
+        self.next_look = now + Self::EVERY;
+        match lock_is_held(&self.path) {
+            Some(true) => {
+                self.held_seen = true;
+                false
+            }
+            Some(false) => self.held_seen,
+            None => false,
+        }
+    }
+}
+
+/// `Some(true)` when another handle holds the file (a sharing violation), `Some(false)` when it opens without sharing, `None` when it
+/// does not exist or cannot be judged.
+#[cfg(windows)]
+fn lock_is_held(path: &Path) -> Option<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match fs::OpenOptions::new().read(true).share_mode(0).open(path) {
+        Ok(_) => Some(false),
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Some(true),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn lock_is_held(_path: &Path) -> Option<bool> {
+    None
+}
+
 /// The local game's world is being replaced, or is about to be: it told to load a save and has not said hello since, or
 /// (host) a resync round is running, in which it saves, may stall for a while on a big map and, with
 /// `HostOptions::host_reloads`, loads too.
@@ -239,6 +298,8 @@ pub struct Controller {
     clock: Box<dyn Fn() -> Instant + Send>,
     /// Watching the game of the running session; `None` outside one.
     pulse: Option<Pulse>,
+    /// The mod's presence lock, watched while a session runs (see [`PresenceLock`]).
+    presence: Option<PresenceLock>,
     published: String,
     version: u64,
 }
@@ -314,6 +375,7 @@ impl Controller {
             heartbeat: heartbeat_setting(std::env::var(HEARTBEAT_ENV).ok().as_deref()),
             clock: Box::new(Instant::now),
             pulse: None,
+            presence: None,
             published: String::new(),
             version: 0,
         };
@@ -384,6 +446,15 @@ impl Controller {
         self.log_speed_test();
         self.write_session_log();
         self.publish();
+    }
+
+    /// One line of the controller's own in `session.log`.
+    fn append_session_log(&self, line: &str) {
+        use std::io::Write;
+        let path = self.dir.join(SESSION_LOG_FILE);
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
     }
 
     /// Writes what the Steam speed test logged (the summary line of a finished or failed run, Steam's samples and status
@@ -585,6 +656,7 @@ impl Controller {
         }
         self.notice = None;
         self.pulse = None;
+        self.presence = None;
         // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
         // a relay as the fallback). The direct TCP transport is for development and tests and must be asked for by
         // name.
@@ -721,6 +793,7 @@ impl Controller {
         }
         self.notice = None;
         self.pulse = None;
+        self.presence = None;
         let name = self.name_from(params);
         let password = params.get("password").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_owned);
         let text = params.get("code").and_then(Value::as_str).unwrap_or("");
@@ -766,6 +839,7 @@ impl Controller {
         self.result = None;
         self.notice = None;
         self.pulse = None;
+        self.presence = None;
         // stopping a host tells every player the host ended the session (`HostSession::end_session`); a player says
         // goodbye so that the host frees its slot at once
         match std::mem::replace(&mut self.state, State::Idle) {
@@ -794,11 +868,20 @@ impl Controller {
             State::Joined { handle } => game_is_reloading(&handle.status()),
             _ => {
                 self.pulse = None;
+                self.presence = None;
+                self.presence = None;
                 return;
             }
         };
-        let Some(limit) = self.heartbeat else { return };
         let now = (self.clock)();
+        let lock_path = self.dir.join(WORLD_LOCK_FILE);
+        let lock = self.presence.get_or_insert_with(|| PresenceLock::new(lock_path, now));
+        if lock.world_gone(reloading, now) {
+            self.append_session_log("the game's world is closed (the mod's presence lock is free): the session ends");
+            self.world_closed();
+            return;
+        }
+        let Some(limit) = self.heartbeat else { return };
         let path = self.dir.join(gamelink::FROM_GAME);
         let pulse = self.pulse.get_or_insert_with(|| Pulse::start(path, now));
         if pulse.silent(limit, reloading, now) {
@@ -816,6 +899,8 @@ impl Controller {
                 self.notice = Some(sentence(&why));
                 self.state = State::Failed(why);
                 self.pulse = None;
+                self.presence = None;
+                self.presence = None;
                 if let Ok(link) = gamelink::Session::open(&self.dir) {
                     let _ = link.write_identity(0, &self.default_name, "idle");
                 }

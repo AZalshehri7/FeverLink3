@@ -4091,6 +4091,39 @@ local function syncLocalCompany()
 	end
 end
 
+-- The presence lock: world.lock in the session folder, opened once by this interface script and never closed, so the handle lives exactly as
+-- long as this script's Lua state. The session controller (launcher/src/live.rs, PresenceLock) takes a lock that nobody holds as the
+-- positive sign that the world was closed to the main menu; the pause menu only stops the script, the handle stays open.
+X.WORLD_LOCK = nil
+function X.holdWorldLock()
+	if X.WORLD_LOCK or not C.IO then return end
+	X.WORLD_LOCK = C.IO.open(C.path("world.lock"), "ab")
+	if X.WORLD_LOCK then logGui("presence lock world.lock held for the life of this world's script") end
+end
+
+-- A guest whose session ends while its world is still there (the host stopped, it was removed, the connection was lost, it left) saves its
+-- world first with the game's own save, so nothing it built is lost; the game itself is never closed by FeverLink3.
+function X.guestSaveOnEnd()
+	local now = os.clock()
+	if now < (G.roleAt or 0) then return end
+	G.roleAt = now + 1
+	local text = C.readFile(C.path("identity.txt"))
+	local role = text and text:match("role=([%a]+)") or nil
+	if not role then return end
+	local was = G.lastRole
+	G.lastRole = role
+	if was == "player" and role == "idle" and not G.guestSaved then
+		G.guestSaved = true
+		local name = "FeverLink3 guest " .. os.date("%Y-%m-%d %H-%M-%S")
+		logGui("the session ended for this guest while its world is open: saving it as '" .. name .. "' first")
+		engine.saveGame(name, function(ok, err)
+			logGui("guest save '" .. name .. "': " .. (ok and "saved" or ("FAILED: " .. tostring(err))))
+		end)
+	elseif role == "player" then
+		G.guestSaved = false
+	end
+end
+
 local function guiUpdate(userParams, state, guiState)
 	C.poll()
 	if not C.ACTIVE then
@@ -4098,6 +4131,8 @@ local function guiUpdate(userParams, state, guiState)
 		return
 	end
 	G.frames = G.frames + 1
+	pcall(X.holdWorldLock)
+	pcall(X.guestSaveOnEnd)
 	if not G.started then
 		G.started = true
 		G.reader = C.newReader(C.path(C.TO_GAME))
