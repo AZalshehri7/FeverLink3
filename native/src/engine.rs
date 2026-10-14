@@ -379,6 +379,64 @@ pub unsafe extern "system-unwind" fn discard(fns: &EngineFns, mut held: Box<Held
     }
 }
 
+/// Where a `Command` keeps the vector the tool's callback reads besides the payload (the construction tool's configure mode, lambda
+/// 0x5123e0 of build 40420, reads `cmd+8` and `payload+0x998`).
+pub const COMMAND_VEC: usize = 0x08;
+const VEC_SIZE: usize = 0x18;
+
+/// What [`adopt_result`] moved, for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    pub ok: bool,
+    /// Bytes in the applied command's vector at [`COMMAND_VEC`] (end - begin) that went to the held command.
+    pub vec_bytes: u64,
+}
+
+/// Gives the held command the result of a command the simulation has just applied (this game's own stamp apply of the same build):
+/// their payload pointers are exchanged (each `Command` owns its payload; the engine's destructor of each frees what it then holds),
+/// as are the vectors at [`COMMAND_VEC`], and the verdict byte is copied. The applied command keeps the held one's unapplied payload,
+/// which nobody reads after the apply. Called on the simulation thread right after the apply returned, with the machine's lock held.
+///
+/// # Safety
+/// `applied` is the live `Command` the apply function was just called with; `held` is not in use on another thread.
+pub unsafe fn adopt_result(held: &mut Held, applied: *mut u8) -> Adopted {
+    unsafe {
+        let mine = held.cmd.0.as_mut_ptr();
+        core::ptr::swap_nonoverlapping(mine as *mut usize, applied as *mut usize, 1);
+        core::ptr::swap_nonoverlapping(mine.add(COMMAND_VEC), applied.add(COMMAND_VEC), VEC_SIZE);
+        let ok = *applied.add(RESULT_OFFSET);
+        *mine.add(RESULT_OFFSET) = ok;
+        held.payload = *(mine as *const usize);
+        let begin = *(mine.add(COMMAND_VEC) as *const u64);
+        let end = *(mine.add(COMMAND_VEC + 8) as *const u64);
+        Adopted { ok: ok != 0, vec_bytes: end.saturating_sub(begin) }
+    }
+}
+
+/// Destroys a held command that took a real result ([`adopt_result`]): the tool's completion callback is fired with it first, as the
+/// engine fires it after its own apply, so every tool (the construction tool's configure mode too) takes its normal path. Any non-empty
+/// callback is fired: the build table's list only guards the empty-result firing of [`discard`]. True when it was fired.
+///
+/// # Safety
+/// As for [`release`], without `add`.
+#[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be destroyed only once
+pub unsafe extern "system-unwind" fn complete(fns: &EngineFns, mut held: Box<Held>) -> bool {
+    unsafe {
+        let fired = match done_call_target(held.done.0.as_ptr()) {
+            Some(target) => {
+                let callable = *(held.done.0.as_ptr().add(FUNCTION_IMPL) as *const *mut u8);
+                let call: DoCall = core::mem::transmute::<usize, DoCall>(target);
+                call(callable, held.cmd.0.as_mut_ptr());
+                true
+            }
+            None => false,
+        };
+        (fns.command_destroy)(held.cmd.0.as_mut_ptr());
+        destroy_function(held.done.0.as_mut_ptr());
+        fired
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +858,31 @@ mod tests {
         take_log();
         assert!(!unsafe { discard(&other, held_clone_flag(&mut held)) });
         assert!(!take_log().iter().any(|l| l.starts_with("callback")));
+    }
+
+    #[test]
+    fn a_completed_command_takes_the_applied_payload_and_fires_any_callback_with_it() {
+        let f = fns(); // nothing listed: completing does not need the list
+        let (mut c, mut cmd, mut done) = (call(), command(52), inline_function());
+        let held_payload = cmd.payload.as_ptr() as usize;
+        let a = args(&mut c, &mut cmd, done.0.as_mut_ptr());
+        let mut held = unsafe { capture(&f, &a) }.expect("captured");
+        assert!(!held.done_ok());
+        let mut applied = command(52);
+        let applied_payload = applied.payload.as_ptr() as usize;
+        applied.command.0[RESULT_OFFSET] = 1;
+        let got = unsafe { adopt_result(&mut held, applied.command.0.as_mut_ptr()) };
+        assert!(got.ok);
+        assert_eq!(held.payload(), applied_payload);
+        assert_eq!(
+            unsafe { *(applied.command.0.as_ptr() as *const usize) },
+            held_payload,
+            "the applied command owns the held one's payload now"
+        );
+        take_log();
+        assert!(unsafe { complete(&f, held) }, "fired");
+        let log = take_log();
+        assert!(log.iter().any(|l| l == "callback called payload=true result=1"), "{log:?}");
     }
 
     fn held_clone_flag(h: &mut Box<Held>) -> Box<Held> {

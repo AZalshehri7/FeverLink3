@@ -108,6 +108,9 @@ pub struct Runtime {
     inject: crate::inject::State,
     inject_settings: OnceLock<portable::Settings>,
     inject_dir_path: Mutex<Option<std::path::PathBuf>>,
+    /// The script command an `inject_next` with `held` was used for (its payload) and that deferred held command: when the simulation
+    /// has applied the script command, the held command takes its result (`engine::adopt_result`).
+    defer_link: Mutex<Option<(usize, u64)>>,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
@@ -164,6 +167,7 @@ impl Runtime {
             inject: Default::default(),
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
+            defer_link: Mutex::new(None),
         }
     }
 
@@ -452,6 +456,7 @@ impl Runtime {
         }
         if self.inject_ready() {
             hook_names.push(crate::inject::READY_NAME.to_string()); // and this one, `inject_next`
+            hook_names.push("defer".to_string()); // and `defer` + `inject_next {held}`: the deferred completion of a held command
         }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
@@ -524,7 +529,7 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held }) => self.inject.arm(key, ttl, held, now),
                 _ => rest.push(line),
             }
         }
@@ -537,7 +542,7 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held }) => self.inject.arm(key, ttl, held, now),
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -690,6 +695,14 @@ impl Runtime {
                     if fired {
                         crate::log::line(&format!("hold: command {id}: the tool's completion callback was fired before the command was dropped"));
                     }
+                }
+                Action::Complete { id, handle, ok } => {
+                    // SAFETY: as for `release`; the held command carries the result of this game's own stamp apply (adopt_result).
+                    let fired = unsafe { engine::complete(&engine, handle) };
+                    crate::log::line(&format!(
+                        "hold: command {id}: completed with this game's stamp apply (accepted {ok}), tool callback fired: {fired}"
+                    ));
+                    self.inject.report(Event::Completed { id, ok, fired, ms: plan.now });
                 }
             }
         }
@@ -866,6 +879,9 @@ impl Runtime {
             });
         }
         let result = unsafe { original(sim, cmd) };
+        if self.inject.enabled() {
+            crate::log::guarded("apply hook (deferred completion)", || self.complete_deferred(cmd));
+        }
         if let Some((payload, seq)) = dumped {
             crate::log::guarded("apply hook (dump after)", || {
                 self.dump_payload("applied", payload, claimed, None, Scope::Result, Budget::Applied, Some(seq))
@@ -1930,7 +1946,7 @@ mod tests {
         let ev = events(dir.path());
         assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("layout")), "{ev:?}");
         // an order that no script command ever uses: the reason says which applies went by
-        rt.inject.arm(9, 0, rt.now_ms());
+        rt.inject.arm(9, 0, 0, rt.now_ms());
         let mut other = Call::new(17, 1);
         unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
         rt.apply_orders(script.c.command.as_mut_ptr(), Some(52), true); // a held one (the tool's)

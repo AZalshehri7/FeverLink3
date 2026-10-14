@@ -52,6 +52,10 @@ pub enum CtlMessage {
     Release { id: u64, at: u64 },
     /// Drop held command `id`.
     Cancel { id: u64 },
+    /// Keep held command `id` until this game's own apply of the same build at the stamp (the `inject_next` that names it as `held`), then
+    /// fire the tool's callback with that apply's result instead of applying the held command. Never released after this line: a
+    /// deferred command that is not completed is dropped (holding off, timeout), so the build cannot be applied twice.
+    Defer { id: u64 },
     /// Apply the staged terrain edit `id` at `stamp` (stage 0.4: parsed, not acted on).
     TerrainApply { id: u64, stamp: u64 },
     /// Liveness; answered with `pong`.
@@ -64,7 +68,8 @@ pub enum CtlMessage {
     PatchNext { frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64 },
     /// `FEVERLINK3_NATIVE_INJECT`: the NEXT script `build_proposal` command (a placeholder without construction) gets the engine `Proposal`
     /// the module builds natively from the portable text in `native_inject_<key>.txt` (`inject.rs`). Expires after `ttl` ms (0: default).
-    InjectNext { key: u64, ttl: u64 },
+    /// `held` (0: none) is this game's deferred held command of the same build (`defer`): it completes with this command's result.
+    InjectNext { key: u64, ttl: u64, held: u64 },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -150,6 +155,7 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             at: optional(&p, "at", "at must be a game time")?,
         }),
         "cancel" => Ok(CtlMessage::Cancel { id: required(&p, "id", "cancel needs a numeric id")? }),
+        "defer" => Ok(CtlMessage::Defer { id: required(&p, "id", "defer needs a numeric id")? }),
         "terrain_apply" => Ok(CtlMessage::TerrainApply {
             id: required(&p, "id", "terrain_apply needs a numeric id")?,
             stamp: optional(&p, "stamp", "stamp must be a game time")?,
@@ -198,6 +204,7 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
         "inject_next" => Ok(CtlMessage::InjectNext {
             key: required(&p, "key", "inject_next needs a numeric key")?,
             ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
+            held: optional(&p, "held", "held must be a held command id")?,
         }),
         "ping" => {
             let n = match p.get("n") {
@@ -539,6 +546,14 @@ pub enum Event {
         id: u64,
         ok: bool,
     },
+    /// A deferred held command took the result of this game's own stamp apply of the same build and its tool callback was fired
+    /// (`fired`); the held command itself was never applied.
+    Completed {
+        id: u64,
+        ok: bool,
+        fired: bool,
+        ms: u64,
+    },
     /// `patch_next` was carried out on a script command: its frozenNodes now hold `frozen` (`adds` added nodes were verified).
     Patched {
         frozen: Vec<u32>,
@@ -603,6 +618,7 @@ impl Event {
             Event::Released { .. } => "released",
             Event::Dropped { .. } => "dropped",
             Event::Applied { .. } => "applied",
+            Event::Completed { .. } => "completed",
             Event::Patched { .. } => "patched",
             Event::PatchRefused { .. } => "patch_refused",
             Event::PatchSkipped { .. } => "patch_skipped",
@@ -631,6 +647,9 @@ impl Event {
             Event::Released { id, reason, .. } => format!("event released: command {id} ({reason})"),
             Event::Dropped { id, reason } => format!("event dropped: command {id} ({reason})"),
             Event::Applied { id, ok } => format!("event applied: command {id}, accepted by the engine: {ok}"),
+            Event::Completed { id, ok, fired, .. } => format!(
+                "event completed: command {id} took the result of this game's stamp apply (accepted: {ok}), tool callback fired: {fired}"
+            ),
             Event::Holding { on, kinds, reason } => {
                 format!("event holding {} ({reason}) [{}]", if *on { "on" } else { "off" }, kinds.join(", "))
             }
@@ -696,6 +715,12 @@ impl Event {
             }
             Event::Dropped { id, reason } => Lua::map([("id", Lua::uint(*id)), ("reason", Lua::str(*reason))]),
             Event::Applied { id, ok } => Lua::map([("id", Lua::uint(*id)), ("ok", Lua::Bool(*ok))]),
+            Event::Completed { id, ok, fired, ms } => Lua::map([
+                ("fired", Lua::Bool(*fired)),
+                ("id", Lua::uint(*id)),
+                ("ms", Lua::uint(*ms)),
+                ("ok", Lua::Bool(*ok)),
+            ]),
             Event::Audit { counts, total, unreadable, adds, sites } => Lua::map([
                 (
                     "adds",
@@ -847,9 +872,14 @@ mod tests {
         }
         assert_eq!(
             parse("inject_next", r#"{["key"]=12,["ttl"]=500}"#),
-            Ok(CtlMessage::InjectNext { key: 12, ttl: 500 })
+            Ok(CtlMessage::InjectNext { key: 12, ttl: 500, held: 0 })
         );
-        assert_eq!(parse("inject_next", r#"{["key"]=3}"#), Ok(CtlMessage::InjectNext { key: 3, ttl: 0 }));
+        assert_eq!(parse("inject_next", r#"{["key"]=3}"#), Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 0 }));
+        assert_eq!(
+            parse("inject_next", r#"{["key"]=3,["held"]=9}"#),
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9 })
+        );
+        assert_eq!(parse("defer", r#"{["id"]=4}"#), Ok(CtlMessage::Defer { id: 4 }));
         assert!(matches!(parse("inject_next", "{}"), Err(CtlError::BadPayload(_))));
         let i = Event::InjectRefused { reason: "r".into() };
         assert_eq!((i.kind(), i.payload().as_str()), ("inject_refused", r#"{["reason"]="r"}"#));

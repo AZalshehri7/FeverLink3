@@ -86,12 +86,15 @@ pub enum Action<H> {
     Release { id: HoldId, handle: H, reason: ReleaseReason },
     /// Destroy it: the mod cancelled it.
     Drop { id: HoldId, handle: H },
+    /// A deferred command whose build this game applied at the stamp: fire its tool callback with that result (the handle already
+    /// holds it), then destroy it. The command itself is never applied.
+    Complete { id: HoldId, handle: H, ok: bool },
 }
 
 impl<H> Action<H> {
     pub fn id(&self) -> HoldId {
         match self {
-            Action::Release { id, .. } | Action::Drop { id, .. } => *id,
+            Action::Release { id, .. } | Action::Drop { id, .. } | Action::Complete { id, .. } => *id,
         }
     }
 }
@@ -106,6 +109,10 @@ enum Phase {
     Due(ReleaseReason),
     /// To be destroyed at the next [`HoldMachine::take_due`].
     Cancelled,
+    /// Kept until this game's own stamp apply of the same build ([`HoldMachine::complete`]); never released.
+    Deferred,
+    /// Took the result of that apply: its callback is fired at the next [`HoldMachine::take_due`].
+    Completed { ok: bool },
 }
 
 #[derive(Debug)]
@@ -282,8 +289,20 @@ impl<H> HoldMachine<H> {
                 None => self.error("release", format!("no held command {id}"), now),
             },
             CtlMessage::Cancel { id } => match self.entries.iter_mut().find(|e| e.id == *id) {
-                Some(e) => e.phase = Phase::Cancelled,
+                Some(e) => {
+                    if !matches!(e.phase, Phase::Completed { .. }) {
+                        e.phase = Phase::Cancelled; // a completed command's callback is fired with its real result instead
+                    }
+                }
                 None => self.error("cancel", format!("no held command {id}"), now),
+            },
+            CtlMessage::Defer { id } => match self.entries.iter_mut().find(|e| e.id == *id) {
+                Some(e) => {
+                    if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) {
+                        e.phase = Phase::Deferred;
+                    }
+                }
+                None => self.error("defer", format!("no held command {id}"), now),
             },
             CtlMessage::TerrainApply { id, .. } => {
                 self.error("terrain_apply", format!("edit {id}: terrain edits are not copied by this build"), now)
@@ -297,6 +316,9 @@ impl<H> HoldMachine<H> {
         for e in &mut self.entries {
             if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) {
                 e.phase = Phase::Due(reason);
+            } else if e.phase == Phase::Deferred {
+                // its build is applied at the stamp by this game's own replay: releasing it would build it twice
+                e.phase = Phase::Cancelled;
             }
         }
     }
@@ -332,6 +354,9 @@ impl<H> HoldMachine<H> {
         for e in &mut self.entries {
             if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) && now.saturating_sub(e.held_ms) >= max {
                 e.phase = Phase::Due(ReleaseReason::Timeout);
+                timed_out.push(e.id);
+            } else if e.phase == Phase::Deferred && now.saturating_sub(e.held_ms) >= max {
+                e.phase = Phase::Cancelled; // never completed: dropped, not applied a second time
                 timed_out.push(e.id);
             }
         }
@@ -383,9 +408,9 @@ impl<H> HoldMachine<H> {
 
     fn is_due(phase: Phase, clock: Option<u64>) -> bool {
         match phase {
-            Phase::Waiting => false,
+            Phase::Waiting | Phase::Deferred => false,
             Phase::Scheduled { at } => at == 0 || clock.is_none_or(|c| c >= at),
-            Phase::Due(_) | Phase::Cancelled => true,
+            Phase::Due(_) | Phase::Cancelled | Phase::Completed { .. } => true,
         }
     }
 
@@ -419,6 +444,7 @@ impl<H> HoldMachine<H> {
                     self.push_event(Event::Dropped { id: e.id, reason: "cancel" });
                     out.push(Action::Drop { id: e.id, handle: e.handle });
                 }
+                Phase::Completed { ok } => out.push(Action::Complete { id: e.id, handle: e.handle, ok }),
                 phase => {
                     let reason = match phase {
                         Phase::Due(r) => r,
@@ -430,6 +456,20 @@ impl<H> HoldMachine<H> {
             }
         }
         out
+    }
+
+    /// This game applied the build of deferred command `id` at the stamp (another command, on the simulation thread): `adopt` gives the
+    /// held command that apply's result, and its callback is fired at the next [`take_due`](Self::take_due). False (and `adopt` not
+    /// called) when `id` is not deferred (dropped meanwhile, or never deferred).
+    pub fn complete(&mut self, id: HoldId, ok: bool, adopt: impl FnOnce(&mut H)) -> bool {
+        match self.entries.iter_mut().find(|e| e.id == id && e.phase == Phase::Deferred) {
+            Some(e) => {
+                adopt(&mut e.handle);
+                e.phase = Phase::Completed { ok };
+                true
+            }
+            None => false,
+        }
     }
 
     /// For the tests and diagnostics: the held entries as `(id, kind)`.
@@ -640,6 +680,33 @@ mod tests {
         m.handle(&CtlMessage::Cancel { id: b }, 6);
         m.handle(&CtlMessage::Release { id: b, at: 0 }, 7);
         assert_eq!(m.take_due(None, 8), [Action::Drop { id: b, handle: b }]);
+    }
+
+    #[test]
+    fn a_deferred_command_is_never_released_and_completes_with_the_stamp_applys_result() {
+        let mut m = machine();
+        hold_on(&mut m, &["build_proposal"], 0);
+        let a = hold(&mut m, BUILD, 1);
+        let b = hold(&mut m, BUILD, 2);
+        m.handle(&CtlMessage::Defer { id: a }, 3);
+        m.handle(&CtlMessage::Release { id: a, at: 0 }, 4);
+        assert!(m.take_due(None, 5).is_empty(), "a release does not undo a defer");
+        let mut adopted = 0;
+        assert!(m.complete(a, true, |h| adopted = *h));
+        assert_eq!(adopted, a);
+        assert!(!m.complete(a, true, |_| panic!("once")), "completed already");
+        assert!(!m.complete(b, true, |_| panic!("not deferred")));
+        assert_eq!(m.take_due(None, 6), [Action::Complete { id: a, handle: a, ok: true }]);
+        // holding off or a timeout drops a deferred command instead of releasing it
+        m.handle(&CtlMessage::Defer { id: b }, 7);
+        m.handle(&CtlMessage::HoldOff, 8);
+        assert_eq!(m.take_due(None, 9), [Action::Drop { id: b, handle: b }]);
+        hold_on(&mut m, &["build_proposal"], 10);
+        let c = hold(&mut m, BUILD, 10);
+        m.handle(&CtlMessage::Defer { id: c }, 11);
+        m.handle(&CtlMessage::Ping { n: 1 }, 30_000);
+        m.tick(30_010);
+        assert_eq!(m.take_due(None, 30_010), [Action::Drop { id: c, handle: c }]);
     }
 
     #[test]

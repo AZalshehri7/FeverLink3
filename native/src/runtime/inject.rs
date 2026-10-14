@@ -168,6 +168,9 @@ impl Runtime {
             self.wake();
             return;
         };
+        // a deferred held command of the same build takes this command's result once the simulation has applied it, injected or not
+        // (a refusal leaves the command to the record path, which is still this game's stamp apply of the build)
+        let link = (order.held != 0).then_some((dest, order.held));
         let t0 = std::time::Instant::now();
         match self.inject_run(order.key, dest) {
             Ok((nodes, segments, constructions)) => {
@@ -184,6 +187,8 @@ impl Runtime {
                     order.key
                 ));
                 self.inject.put_back(order);
+                self.wake();
+                return;
             }
             Err(why) => {
                 // the short reason goes to the log and the event; the full report (every unresolved pointer, every differing line) to a file
@@ -204,6 +209,45 @@ impl Runtime {
                 self.say(&format!("native inject: key {}: REFUSED, the command is untouched: {why}", order.key));
                 self.inject.refuse(format!("key {}: {why}", order.key));
             }
+        }
+        if let Some((payload, held)) = link {
+            self.say(&format!(
+                "native inject: key {}: held command {held} completes with this command's result after the apply",
+                order.key
+            ));
+            *super::lock(&self.defer_link) = Some((payload, held));
+        }
+        self.wake();
+    }
+
+    /// After the simulation applied `cmd` (simulation thread): when it is the script command a deferred held command waits for, the held
+    /// command takes its result and is due for completion (its tool callback is fired at the next `Add`, on the interface thread).
+    pub(super) fn complete_deferred(&self, cmd: *mut u8) {
+        // SAFETY: only readable memory is read.
+        let Some(payload) = (unsafe { engine::payload_of(cmd) }) else { return };
+        let link = {
+            let mut g = super::lock(&self.defer_link);
+            match *g {
+                Some((p, _)) if p == payload => g.take(),
+                _ => None,
+            }
+        };
+        let Some((_, held)) = link else { return };
+        let mut adopted = None;
+        let done = {
+            let mut machine = super::lock(&self.machine);
+            // SAFETY: `cmd` is the command the apply function was just called with; the held command is only touched under this lock.
+            let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
+            machine.complete(held, ok, |h| adopted = Some(unsafe { engine::adopt_result(h, cmd) }))
+        };
+        match adopted {
+            Some(a) if done => self.say(&format!(
+                "deferred completion: held command {held} took the result of this game's stamp apply (accepted {}, {} bytes in the command's vector); its tool callback is fired at the next Add",
+                a.ok, a.vec_bytes
+            )),
+            _ => self.say(&format!(
+                "deferred completion: held command {held} is no longer deferred (dropped before the stamp apply): nothing to complete"
+            )),
         }
         self.wake();
     }

@@ -62,6 +62,8 @@ pub struct Order {
     pub key: u64,
     pub armed_ms: u64,
     pub ttl_ms: u64,
+    /// This game's deferred held command of the same build (0: none): it takes the result of the command the order is used for.
+    pub held: u64,
 }
 
 /// The switch, the armed order, the events for the mod.
@@ -101,14 +103,14 @@ impl State {
     }
 
     /// The mod's `inject_next`. A second order replaces the first (reported as refused).
-    pub fn arm(&self, key: u64, ttl: u64, now: u64) {
+    pub fn arm(&self, key: u64, ttl: u64, held: u64, now: u64) {
         if !self.enabled() {
             self.refuse(format!("{INJECT_VAR} is off"));
             return;
         }
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
         *lock(&self.applies) = Default::default();
-        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms }) {
+        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms, held }) {
             self.refuse(format!("order for key {} replaced by a newer inject_next before a command used it", old.key));
         }
         self.pending.store(true, Ordering::Release);
@@ -917,16 +919,16 @@ mod tests {
     #[test]
     fn an_order_is_taken_once_expires_and_is_replaced() {
         let s = State::default();
-        s.arm(7, 0, 0);
+        s.arm(7, 0, 0, 0);
         assert!(!s.pending(), "off: refused");
         assert!(matches!(s.drain_events(0).as_slice(), [Event::InjectRefused { reason }] if reason.contains("is off")));
         s.enable();
-        s.arm(7, 0, 100);
+        s.arm(7, 0, 0, 100);
         assert!(s.pending());
-        assert_eq!(s.take(150), Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS }));
+        assert_eq!(s.take(150), Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS, held: 0 }));
         assert_eq!((s.take(150), s.pending()), (None, false));
-        s.arm(8, 50, 0);
-        s.arm(9, 50, 10);
+        s.arm(8, 50, 0, 0);
+        s.arm(9, 50, 0, 10);
         let ev = s.drain_events(10);
         assert!(
             matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("key 8") && reason.contains("replaced")),
@@ -938,7 +940,7 @@ mod tests {
             matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("key 9") && reason.contains("expired")),
             "{ev:?}"
         );
-        s.arm(1, 0, 0);
+        s.arm(1, 0, 0, 0);
         let ev = s.drain_events(DEFAULT_TTL_MS + 1);
         assert!(matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("expired")), "{ev:?}");
     }
@@ -994,15 +996,15 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
     fn an_order_taken_for_a_command_that_is_not_the_mods_is_put_back_and_a_town_construction_is_not_the_mods() {
         let s = State::default();
         s.enable();
-        s.arm(3, 0, 100);
+        s.arm(3, 0, 0, 100);
         let o = s.take(150).expect("armed");
         s.put_back(o);
         assert!(s.pending());
         assert_eq!(s.take(160).expect("put back").key, 3);
         // a newer order wins over the one put back
-        s.arm(4, 0, 200);
+        s.arm(4, 0, 0, 200);
         let o = s.take(210).expect("armed");
-        s.arm(5, 0, 220);
+        s.arm(5, 0, 0, 220);
         s.put_back(o);
         assert_eq!(s.take(230).expect("the newer").key, 5);
         // the command's construction against the text's: file and transform
