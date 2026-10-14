@@ -70,6 +70,8 @@ pcall(function() NATIVE_PATCH = os.getenv("FEVERLINK3_NATIVE_PATCH") == "1" end)
 -- have the module build the engine's Proposal from it and swap it into the replay's command (inject_next, docs/NATIVE_LINK.md)
 local NATIVE_INJECT = false
 pcall(function() NATIVE_INJECT = os.getenv("FEVERLINK3_NATIVE_INJECT") == "1" end)
+-- the largest native text a record released without one of its own carries (a complete text of a station is ~80 KB)
+local NATIVE_TEXT_MAX = 1024 * 1024
 
 -- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
 --   "0"          hold-and-release for every build (developer opt-out; was the default until 2026-10-13). The tool's command is held until the stamp and then released, so the tool gets its
@@ -1101,6 +1103,12 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, d
 			body.input = hi.text
 			shadowCompare(traceSim, "t=" .. now .. " side=originator", hi.text, body.args[1])
 		end
+		local hn = st.heldNative
+		st.heldNative = nil
+		if hn and os.clock() - hn.wall < 30 then
+			body.nativeText = hn.text
+			traceSim("build.inject", string.format("t=%d held=%s the native text of the released command goes with the record (%d bytes)", now, tostring(hn.id), #hn.text))
+		end
 	end
 	traceSim("build.ctx", string.format("t=%d side=originator source=%s ctx{%s} ie=%s", now, post and (deferredPre and "pre-build event (read before the deferred build)" or "post-event (no context)") or "pre-build event", Build.contextText(body.args[2]), tostring(body.args[3])))
 	body.category = buildCategory(body)
@@ -1692,6 +1700,9 @@ local function handleEvent(userParams, state, src, id, name, param)
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = os.clock() }
+		elseif name == "heldnative" and type(param) == "table" and type(param.text) == "string" then
+			-- the engine's own held command (native_text_<id>.txt) of a command released without a record: the capture ships it along
+			st.heldNative = { text = param.text, id = param.id, wall = os.clock() }
 		elseif name == "heldout" and type(param) == "table" then
 			st.heldOut = st.heldOut or {}
 			st.heldOut[#st.heldOut + 1] = { key = param.key, wall = os.clock() }
@@ -2532,6 +2543,20 @@ local function natUnaccounted(h, why)
 		if ok then u.before = snap end
 	end
 	N.unaccounted[h.id] = u
+	-- With the native copy on, the engine's own held command goes with the record the simulation half captures, so the other games
+	-- inject that command instead of rebuilding the record (run inj2, 2026-10-14: a station configure from a site the table does not
+	-- know and a stop replacing a stop were released here and rebuilt from the record: factory "Unknown exception" on both games).
+	if NATIVE_INJECT then
+		local okT, text = pcall(C.readFile, C.path("native_text_" .. h.id .. ".txt"))
+		if okT and type(text) == "string" and #text > NATIVE_TEXT_MAX then
+			-- inj3: a station configure's text was 7.6 MB (the old/new node maps' values walked into the world, 32768 blocks, truncated:
+			-- the rebuild cannot take it anyway) and the record never reached the host
+			traceGui("build.inject", string.format("held=%d released without a record: its native text (%d bytes) is over %d bytes, not shipped; the record path builds it", h.id, #text, NATIVE_TEXT_MAX))
+		elseif okT and type(text) == "string" and text ~= "" then
+			pcall(toSim, "heldnative", { text = text, id = h.id })
+			traceGui("build.inject", string.format("held=%d released without a record: its native text (%d bytes) goes to the simulation half's capture", h.id, #text))
+		end
+	end
 	natSay("held " .. h.id .. " (site " .. u.site .. ", " .. u.name .. "): " .. why .. "; release written, the native build goes through")
 	natOrder("release", h.id)
 end
