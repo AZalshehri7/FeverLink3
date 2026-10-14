@@ -25,6 +25,7 @@ pub mod install;
 pub mod live;
 pub mod luatext;
 pub mod net;
+pub mod netdelay;
 pub mod process;
 pub mod resync;
 pub mod selftest;
@@ -34,6 +35,7 @@ pub mod steam;
 pub mod steam_persona;
 pub mod steam_transport;
 pub mod steamnet;
+pub mod testmargin;
 pub mod update;
 
 /// Steam app id of Transport Fever 3.

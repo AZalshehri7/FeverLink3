@@ -152,7 +152,7 @@ pub(crate) fn selected(f: &F, lines: &std::collections::BTreeMap<&str, &str>) ->
         return true;
     }
     match f.ty {
-        Ty::Map | Ty::Hash => {
+        Ty::Map | Ty::Hash(_) => {
             container_entries(lines, f.name) > 0 && lines.contains_key(format!("{}.graph", f.name).as_str())
         }
         Ty::Skip(_) => false,
@@ -512,7 +512,6 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
         let first = unresolved.first().map_or(String::new(), |b| b.path.clone());
         c.alloc.free_all();
         put(&mut out, &format!("  text: {}", src_text.lines().last().unwrap_or("")));
-        put(&mut out, &format!("  {}", c.mem.heap_summary()));
         let ent: Vec<String> = lines
             .keys()
             .filter(|k| k.ends_with(".graph"))
@@ -529,7 +528,7 @@ pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
             src_origins.iter().take(6).map(|(m, n, b)| format!("{m} {n} blocks/{b} bytes")).collect();
         put(&mut out, &format!("  heap graph reached from: {}", origins.join("; ")));
         for (member, addr) in src_unresolved.iter().take(6) {
-            put(&mut out, &format!("  pointer {addr:#x} in {member} stayed P: {}", c.mem.heap_near(*addr)));
+            put(&mut out, &format!("  pointer {addr:#x} in {member} stayed P"));
         }
         put(
             &mut out,
@@ -650,7 +649,7 @@ mod tests {
         }
     }
 
-    /// As [`Both`], and the arena's blocks count as heap blocks (what the heap index answers in the game).
+    /// As [`Both`], and the arena's blocks count as heap blocks (the untyped graph's fallback for blocks no container sizes).
     struct BothHeap<'a>(&'a Arena);
     impl Mem for BothHeap<'_> {
         fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
@@ -836,11 +835,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn real_memory_with_a_real_heap_graph_is_written_and_a_value_that_is_not_a_block_is_never_asked_about() {
-        use crate::dump::LiveHeapMem;
+    fn real_memory_with_a_real_heap_graph_is_written_from_the_container_alone_and_a_value_that_is_not_a_block_is_never_followed(
+    ) {
         // a payload in plain Rust memory: an unordered_map member whose list head and bucket array are real heap blocks, and
         // two more words that look like pointers but are not blocks (the middle of a block, an address on the stack)
-        let head = Box::new([0u8; 0x18]);
+        let mut head = Box::new([0u8; 0x18]);
         let buckets = Box::new([0u8; 0x80]);
         let middle = head.as_ptr() as usize + 8;
         let on_stack = 0u64;
@@ -850,6 +849,8 @@ mod tests {
         let put = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
         // the list head points to itself; the buckets' end pointer is one past the block
         let (h, bk) = (head.as_ptr() as u64, buckets.as_ptr() as u64);
+        head[..8].copy_from_slice(&h.to_le_bytes());
+        head[8..16].copy_from_slice(&h.to_le_bytes());
         put(b, 0x270, 1.0f32.to_bits() as u64);
         put(b, 0x278, h);
         put(b, 0x288, bk);
@@ -860,7 +861,7 @@ mod tests {
         // two unnamed words of the stop-pair kind: a pointer into the middle of a block and a stack address
         put(b, 0x2d8, middle as u64);
         put(b, 0x2e0, &on_stack as *const u64 as u64);
-        let live = LiveHeapMem::new();
+        let live = crate::dump::LiveMem;
         let head_ = Header {
             seq: 0,
             event: "t",

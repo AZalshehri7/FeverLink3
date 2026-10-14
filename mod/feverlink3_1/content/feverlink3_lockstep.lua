@@ -50,7 +50,9 @@ end
 -- Applies a `peerclock` payload {from, t, ahead}; the game's own clock, relayed back, is ignored.
 function L.applyPeerClock(peers, p, selfId)
 	if type(p) ~= "table" or type(p.t) ~= "number" or p.from == nil or p.from == selfId then return false end
-	peers[p.from] = { t = p.t, ahead = tonumber(p.ahead) }
+	local need = tonumber(p.need)
+	if need then need = math.max(0, math.min(L.MARGIN_MAX, math.floor(need))) end
+	peers[p.from] = { t = p.t, ahead = tonumber(p.ahead), need = need }
 	return true
 end
 
@@ -129,6 +131,133 @@ function L.stampFor(s, now, minLead)
 	local at = L.roundUpStep(now + L.leadOf(s, minLead))
 	if at <= now then at = now + L.STEP end
 	return at
+end
+
+-- ------------------------------------------------------------------ measured stamp margin
+--
+-- A build every game applies at its stamp (the native copy's deferred flow) must reach every game before that game's simulation passes
+-- the stamp: one applied late takes other entity ids from the engine's free-id FIFO and forces a resync. The stamp is the fastest known
+-- clock plus the host's lead (lead_for: half the slowest round trip and handling, in steps) plus an EXTRA, in steps, for what neither
+-- covers: the age of the fastest clock report (a peer kept running while its report travelled) and the hand-off into the receiver's
+-- simulation (a frame batches `speed` steps at x2-x4). The extra is measured, not a constant (owner, 2026-10-14):
+--   * every receiver measures, for each build it gets, its slack = (stamp - its own game time at arrival) / STEP, and from it the extra
+--     that build would have needed to arrive exactly `marginTarget(speed)` steps early: sample = extra used + target - slack, and
+--     wants that plus marginHeadroom(speed);
+--   * its need grows AT ONCE to any larger want, and on a late apply by the lateness plus two steps; it shrinks only after
+--     MARGIN_WINDOW builds and MARGIN_SHRINK_S real seconds below it, to the largest want of that window (as the host's adapt_lead:
+--     longer at once, shorter after eight seconds);
+--   * it reports the need with its clock (`need`, relayed by the host as peerclock.need); the stamping game uses the largest need
+--     of its peers (a peer that has measured nothing at this speed counts as marginDefault(speed)).
+-- Floor 0: the stamp is still at least the fastest clock plus the host's lead, the stamp rule of every other action.
+L.MARGIN_WINDOW = 4
+L.MARGIN_SHRINK_S = 8
+L.MARGIN_MAX = 24
+
+-- The slack (steps between arrival and stamp) a receiver is content with: a frame's batch of `speed` steps (the interface sees the
+-- game time of its last frame), one step for the script event that hands the build to the simulation, one step of margin.
+function L.marginTarget(speed)
+	return math.max(1, math.min(4, speed or 1)) + 2
+end
+
+-- Steps kept on top of every sample, for a clock phase the window did not see: one step per speed unit. Real run m5 (x3, 100 ms one way):
+-- with the extra shrunk to the window's largest sample (3), the slack of builds at the same extra swung from 5 to 8 steps with the
+-- peer's position inside its pacing room, and the next build arrived with 3 steps and was applied 1 step late. The swing in steps
+-- grows with the speed (more steps per frame and per network millisecond), so the headroom does too.
+function L.marginHeadroom(speed)
+	return math.max(1, math.min(4, speed or 1))
+end
+
+-- The extra before anything is measured at a speed: the pacing room a peer may run past the slowest clock, plus one step.
+function L.marginDefault(speed)
+	return L.aheadFor(speed) + 1
+end
+
+function L.newMargin()
+	return { bySpeed = {} }
+end
+
+local function marginSlot(m, speed)
+	local k = math.max(1, math.min(4, speed or 1))
+	local s = m.bySpeed[k]
+	if not s then
+		s = { need = L.marginDefault(k), measured = false, window = {} }
+		m.bySpeed[k] = s
+	end
+	return s
+end
+
+-- A build this game received: stamped `at` with `xs` extra steps, arrived at this game's time `gRecv`; `wall` = real seconds.
+-- Returns the sample, the slack, the need now and what happened ("grow", "shrink", "keep").
+function L.marginSample(m, speed, xs, at, gRecv, wall)
+	local s = marginSlot(m, speed)
+	local slack = math.floor((at - gRecv) / L.STEP)
+	local sample = math.max(0, math.min(L.MARGIN_MAX, math.floor(xs) + L.marginTarget(speed) - slack))
+	local want = math.min(L.MARGIN_MAX, sample + L.marginHeadroom(speed))
+	s.measured = true
+	if want > s.need then
+		s.need, s.window = want, {}
+		return sample, slack, s.need, "grow"
+	end
+	s.window[#s.window + 1] = { v = want, t = wall }
+	if #s.window >= L.MARGIN_WINDOW and wall - s.window[1].t >= L.MARGIN_SHRINK_S then
+		local mx = 0
+		for _, w in ipairs(s.window) do if w.v > mx then mx = w.v end end
+		s.window = {}
+		if mx < s.need then
+			s.need = mx
+			return sample, slack, s.need, "shrink"
+		end
+	end
+	return sample, slack, s.need, "keep"
+end
+
+-- This game applied an action `late` steps after its stamp: never again; the need grows at once and the window starts over.
+function L.marginLate(m, speed, late)
+	local s = marginSlot(m, speed)
+	s.measured = true
+	s.need = math.min(L.MARGIN_MAX, s.need + math.max(1, math.ceil(late or 1)) + 2)
+	s.window = {}
+	return s.need
+end
+
+-- What this game reports with its clock at this speed.
+function L.marginNeed(m, speed)
+	return marginSlot(m, speed).need
+end
+
+-- TEST-ONLY switches (never set by a player) to measure what the margin buys (owner, 2026-10-14): the values of
+-- FEVERLINK3_TEST_NO_MARGIN and FEVERLINK3_TEST_NO_LEAD. NO_MARGIN "1": the extra is 0 (no measured need, no headroom, no growth after a
+-- late apply); "extra:N": a fixed extra of N steps instead of the measured one. NO_LEAD "1" (stage 2): also the host's lead is gone, the
+-- stamp is one step past the fastest known clock (the floor of leadOf), with the extra of NO_MARGIN (0 when that is unset).
+-- nil: neither is set, nothing changes.
+function L.testMargin(noMargin, noLead)
+	local t = nil
+	local v = type(noMargin) == "string" and noMargin:match("^%s*(.-)%s*$") or ""
+	if v == "1" then
+		t = { extra = 0 }
+	else
+		local n = tonumber(v:match("^extra:(%d+)$") or "")
+		if n then t = { extra = math.min(L.MARGIN_MAX, n) } end
+	end
+	if type(noLead) == "string" and noLead:match("^%s*1%s*$") then
+		t = t or { extra = 0 }
+		t.noLead = true
+	end
+	return t
+end
+
+-- The extra steps a build stamped now gets: the largest need of the peers (0 with no peer: nobody to wait for). `test`
+-- (L.testMargin) replaces the measured extra by its fixed one.
+function L.marginExtra(peers, speed, test)
+	if type(test) == "table" and next(peers) ~= nil then return test.extra end
+	local x = nil
+	for _, pc in pairs(peers) do
+		if type(pc) == "table" then
+			local n = tonumber(pc.need) or L.marginDefault(speed)
+			if x == nil or n > x then x = n end
+		end
+	end
+	return math.max(0, math.min(L.MARGIN_MAX, x or 0))
 end
 
 -- ------------------------------------------------------------------ queue
@@ -737,17 +866,32 @@ local function namesLane(engine)
 	return out
 end
 
+-- entity ids (a heavy lane, the only one that hashes ids): edges, constructions and town buildings, each sorted. The engine takes every new
+-- entity's id from one FIFO of free ids, so the ids are equal on every game only while every build is applied at the same step on every
+-- game (the stamp rule); any path that misses it shifts all later ids (native id trace, 2026-10-14) and a later build naming such an
+-- entity would touch another one. The content lanes cannot see that; this lane makes it a difference the host repairs.
+local function idsLane(engine)
+	local all, items = engine.entityIds(), {}
+	for _, kind in ipairs({ "edges", "constructions", "townBuildings" }) do
+		local list = all[kind] or {}
+		local s = {}
+		for i = 1, #list do s[i] = tostring(list[i]) end
+		items[#items + 1] = kind .. "#" .. #list .. ":" .. table.concat(s, ",")
+	end
+	return { n = #items, items = items }
+end
+
 -- Parts over an engine accessor:
 --   engine.gameTime()       -> number
 --   engine.account()        -> balance, loan
 --   engine.constructions()  -> list of { file = string, x, y, z }
 --   engine.lines()          -> list of { stops = number }
--- Each part is hashed separately so the launcher can name the differing one. Entity ids never enter a hash:
+-- Each part is hashed separately so the launcher can name the differing one. Entity ids enter only the `ids` lane:
 -- constructions are compared by file and position, lines by their stop counts, both sorted.
 -- `timing` (optional table): filled with the seconds each part took (observation only, never part of the result).
 -- `light` (optional, true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
 -- see ChecksumRequestMessage.full). Each of those costs one component read per edge, node, construction or town building.
-L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true }
+L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true, ids = true }
 function L.checksumParts(engine, hashFn, timing, light, detail)
 	local parts = {}
 	local clock = timing and function() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end or nil
@@ -787,6 +931,7 @@ function L.checksumParts(engine, hashFn, timing, light, detail)
 	lane("nodeConfigs", nodeConfigsLane)
 	lane("vehicles", vehiclesLane)
 	lane("names", namesLane)
+	if engine.entityIds then part("ids", function() return idsLane(engine) end) end
 	return parts, t
 end
 

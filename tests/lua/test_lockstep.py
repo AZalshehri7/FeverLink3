@@ -517,7 +517,10 @@ class Relay:
                     p = p[0]
                 if rec.kind == "clock":
                     self.clocks[g.id], self.aheads[g.id] = int(p.t), int(p.ahead)
-                    self.broadcast("peerclock", self.ser({"from": g.id, "t": int(p.t), "ahead": int(p.ahead)}), exclude=g)
+                    pc = {"from": g.id, "t": int(p.t), "ahead": int(p.ahead)}
+                    if p.need is not None:
+                        pc["need"] = max(0, min(24, int(p.need)))   # the host relays the measured margin clamped (host.rs)
+                    self.broadcast("peerclock", self.ser(pc), exclude=g)
                 elif rec.kind == "action":
                     p["from"] = g.id
                     payload = self.C.serialize(p)
@@ -791,7 +794,7 @@ class LockstepTest(unittest.TestCase):
         (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual((ta, tb), (at, at), "both hashed at the requested stamp")
         self.assertEqual(pa, pb, "identical worlds give identical parts")
-        self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
+        self.assertEqual(set(pa) - {"stations", "edges", "nodeConfigs", "vehicles", "names", "ids"}, {"time", "balance", "loan", "constructions", "lines", "townBuildings", "townBuildings:90", "townBuildings:91"})
         self.assertTrue(pa["townBuildings"].startswith("3/") and pa["townBuildings:90"].startswith("2/") and pa["townBuildings:91"].startswith("1/"), pa)
         # paused round: the games are stopped, the interface half answers
         self.relay.pauseAt = self.relay.future_stamp()
@@ -1375,6 +1378,66 @@ class PureTest(unittest.TestCase):
         self.assertEqual(K.stampFor(s, 1050), 2400, "rounded up to a step")
         self.assertEqual(K.stampFor(s, 1000, 2000), 3000, "a game may raise the lead")
         self.assertEqual(K.stampFor(s, 1000, 400), 2200, "never lower it")
+
+    def test_measured_stamp_margin_grows_at_once_and_shrinks_after_a_window(self):
+        K, L = self.K, self.L
+        m = K.newMargin()
+        self.assertEqual(K.marginNeed(m, 1), 4, "nothing measured at x1: aheadFor(1) + 1")
+        self.assertEqual(K.marginNeed(m, 3), 6, "x3: aheadFor(3) + 1")
+        self.assertEqual(K.marginTarget(1), 3)
+        self.assertEqual(K.marginTarget(3), 5)
+        # x1, stamped with 4 extra, arrived 7 steps early: 4 + 3 - 7 = 0 would have done; kept until the window is full and old
+        for i, wall in enumerate([0.0, 2.0, 4.0]):
+            sample, slack, need, how = K.marginSample(m, 1, 4, 10000, 10000 - 7 * 200, wall)
+            self.assertEqual((sample, slack, need, how), (0, 7, 4, "keep"), i)
+        sample, slack, need, how = K.marginSample(m, 1, 4, 10000, 10000 - 6 * 200, 6.0)
+        self.assertEqual((sample, need, how), (1, 4, "keep"), "four builds but only 6 s: not yet")
+        sample, slack, need, how = K.marginSample(m, 1, 4, 10000, 10000 - 7 * 200, 9.0)
+        self.assertEqual((need, how), (2, "shrink"), "five builds over 9 s: the largest sample of the window plus one step of headroom")
+        # a build that arrives with too little slack: the need grows at once
+        sample, slack, need, how = K.marginSample(m, 1, 1, 10000, 10000 - 1 * 200, 10.0)
+        self.assertEqual((sample, slack, need, how), (3, 1, 4, "grow"), "the sample plus the headroom, at once")
+        # a late apply grows it by the lateness plus two at once
+        self.assertEqual(K.marginLate(m, 1, 2), 8)
+        self.assertEqual(K.marginNeed(m, 3), 6, "each speed has its own need")
+        # never negative, never above the maximum
+        sample, _, _, _ = K.marginSample(m, 3, 0, 10000, 10000 - 40 * 200, 0.0)
+        self.assertEqual(sample, 0)
+        sample, _, need, _ = K.marginSample(m, 3, 24, 10000, 10000 + 10 * 200, 0.0)
+        self.assertEqual((sample, need), (K.MARGIN_MAX, K.MARGIN_MAX))
+
+    def test_measured_stamp_margin_uses_the_largest_need_of_the_peers(self):
+        K, L = self.K, self.L
+        peers = L.table()
+        self.assertEqual(K.marginExtra(peers, 1), 0, "no peer: nobody to wait for")
+        K.applyPeerClock(peers, L.table_from({"from": 1, "t": 1000, "ahead": 3}), 0)
+        self.assertEqual(K.marginExtra(peers, 1), 4, "a peer without a measurement counts as the default")
+        K.applyPeerClock(peers, L.table_from({"from": 1, "t": 1200, "ahead": 3, "need": 1}), 0)
+        self.assertEqual(K.marginExtra(peers, 1), 1)
+        K.applyPeerClock(peers, L.table_from({"from": 2, "t": 1200, "ahead": 3, "need": 2}), 0)
+        self.assertEqual(K.marginExtra(peers, 1), 2)
+        K.applyPeerClock(peers, L.table_from({"from": 2, "t": 1400, "ahead": 3, "need": 99}), 0)
+        self.assertEqual(K.marginExtra(peers, 1), K.MARGIN_MAX, "clamped")
+        K.applyPeerClock(peers, L.table_from({"from": 2, "t": 1400, "ahead": 3, "need": -3}), 0)
+        self.assertEqual(K.marginExtra(peers, 1), 1)
+
+    def test_the_test_margin_switches_fix_the_extra_and_change_nothing_unset(self):
+        K, L = self.K, self.L
+        self.assertIsNone(K.testMargin(None, None), "unset: nothing changes")
+        self.assertIsNone(K.testMargin("0", "0"))
+        self.assertIsNone(K.testMargin("extra:x", None))
+        t = K.testMargin("1", None)
+        self.assertEqual((t.extra, t.noLead), (0, None))
+        self.assertEqual(K.testMargin("extra:3", None).extra, 3)
+        self.assertEqual(K.testMargin("extra:99", None).extra, K.MARGIN_MAX)
+        t = K.testMargin(None, "1")
+        self.assertEqual((t.extra, t.noLead), (0, True), "no lead alone: no extra either")
+        peers = L.table()
+        self.assertEqual(K.marginExtra(peers, 3, K.testMargin("extra:2", None)), 0, "no peer: nobody to wait for")
+        K.applyPeerClock(peers, L.table_from({"from": 1, "t": 1000, "ahead": 3, "need": 9}), 0)
+        self.assertEqual(K.marginExtra(peers, 3, K.testMargin("1", None)), 0, "the measured need is ignored")
+        self.assertEqual(K.marginExtra(peers, 3, K.testMargin("extra:2", None)), 2)
+        self.assertEqual(K.marginExtra(peers, 3, None), 9, "without the switch: the measured need")
 
     def test_pace_lands_batches_on_checksum_stamps(self):
         K, L = self.K, self.L

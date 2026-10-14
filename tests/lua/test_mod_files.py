@@ -29,6 +29,22 @@ class ContentIndexTest(unittest.TestCase):
         for name in ("feverlink3_towntrace.lua", "feverlink3_livevsloaded.lua"):
             self.assertNotIn('format("%d", v)', open(os.path.join(MOD, "content", name), encoding="utf-8").read(), name)
 
+    def test_the_bridge_keeps_room_below_the_games_limit_of_200_locals(self):
+        # The game's Lua refused the bridge with "too many local variables (limit is 200) in main function" when six top-level locals were
+        # added (real run rc1, 2026-10-14; lupa compiled it): 191 declared names loaded, 197 did not (the game counts some more of its own).
+        # New module-level state goes into the X table instead.
+        import re
+        n = 0
+        with open(os.path.join(MOD, "content", "feverlink3_bridge.script.lua"), encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                if re.match(r"^local\s+function\s+\w+", line):
+                    n += 1
+                    continue
+                m = re.match(r"^local\s+([\w\s,]+?)(=|$|--)", line)
+                if m:
+                    n += len([x for x in m.group(1).split(",") if x.strip()])
+        self.assertLessEqual(n, 191, "top-level local names of the bridge")
+
 
 if __name__ == "__main__":
     unittest.main()

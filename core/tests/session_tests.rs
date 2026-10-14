@@ -331,7 +331,7 @@ fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50000, speed: 1, ahead: 3 }));
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: None }));
     let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
     assert_eq!(h.p(a).session.id().unwrap(), pc.from);
     assert_eq!(50000, pc.t);
@@ -343,13 +343,28 @@ fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
 }
 
 #[test]
+fn a_measured_stamp_margin_is_relayed_with_the_clock_and_clamped() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 49800, speed: 1, ahead: 3, need: None }));
+    assert_eq!(None, h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need, "nothing measured: none relayed");
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: Some(2) }));
+    assert_eq!(Some(2), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50200, speed: 1, ahead: 3, need: Some(1_000_000) }));
+    assert_eq!(Some(ClockMessage::MAX_NEED), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50400, speed: 1, ahead: 3, need: Some(-5) }));
+    assert_eq!(Some(0), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
+}
+
+#[test]
 fn start_speed_and_pause_are_broadcast_and_speed_requests_obeyed() {
     let mut h = Harness::new();
     let a = h.connect("A");
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(18600)));
-    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 18600, speed: 0, ahead: 3 }));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None }));
     h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(18600)));
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 18600, speed: 0, ahead: 3 }));
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None }));
 
     h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 2 }));
     assert!(!h.host.state().started); // ignored before start
@@ -463,7 +478,7 @@ fn disconnect_removes_the_player_and_tells_the_others() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 5, speed: 1, ahead: 3 }));
+    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None }));
     h.disconnect(a);
     assert_eq!(2, h.host.players().len());
     assert!(h.host.clocks().is_empty());

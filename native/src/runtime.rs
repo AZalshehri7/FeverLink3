@@ -46,6 +46,9 @@ pub type ApplyFn = unsafe extern "system-unwind" fn(sim: *mut u8, cmd: *mut u8) 
 /// How often the audit event is written when the counts changed.
 pub const AUDIT_INTERVAL_MS: u64 = 30_000;
 
+/// Offset of the engine's result (`ProposalData`) inside a `build_proposal` payload (see `portable::PAYLOAD`, member `result`).
+const PAYLOAD_RESULT_DATA: usize = 0x3d8;
+
 /// What a [`Runtime`] is built from.
 pub struct Init {
     pub build: &'static BuildAddrs,
@@ -108,10 +111,25 @@ pub struct Runtime {
     inject: crate::inject::State,
     inject_settings: OnceLock<portable::Settings>,
     inject_dir_path: Mutex<Option<std::path::PathBuf>>,
+    /// The script command an `inject_next` with `held` was used for (its payload) and that deferred held command: when the simulation
+    /// has applied the script command, the held command takes its result (`engine::adopt_result`).
+    defer_link: Mutex<Option<(usize, u64)>>,
+    /// The script command an order was used for and its timing so far (the mod's `tm`, the rebuild's wall-clock start and end and how it
+    /// went): after the simulation applied that command, one `timing apply` line is written (`timing_after_apply`).
+    stamp_timing: Mutex<Option<StampTiming>>,
+    /// The key of the order whose injection succeeded just now (for the timing record's `how`).
+    inject_last_ok: Mutex<Option<u64>>,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
     patch: crate::cmd_patch::State,
+    /// The unhooked `builder.proposalCreate` emitter (`preview_event`), 0 when it is not hooked.
+    preview_fn: AtomicUsize,
+    /// The first five arguments of the newest tool preview (the interface and script objects the emitter needs), kept while holding is
+    /// on; dropped whenever holding switches on or off (a resync loads another world: its objects are new).
+    preview_args: Mutex<Option<[u64; 5]>>,
+    /// Holding as `sync_flags` last saw it.
+    preview_holding: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -164,6 +182,12 @@ impl Runtime {
             inject: Default::default(),
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
+            defer_link: Mutex::new(None),
+            stamp_timing: Mutex::new(None),
+            inject_last_ok: Mutex::new(None),
+            preview_fn: AtomicUsize::new(0),
+            preview_args: Mutex::new(None),
+            preview_holding: AtomicBool::new(false),
         }
     }
 
@@ -236,7 +260,7 @@ impl Runtime {
                 payload,
             };
             let env = Env { image_base: self.base };
-            let live = dump::LiveHeapMem::new();
+            let live = dump::LiveMem;
             let text = portable::encode(&live, env, sink.settings, self.build.name, &head)?.text;
             let original = dump::Mem::read(&live, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
             let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &live, &|b| {
@@ -415,6 +439,81 @@ impl Runtime {
         }
     }
 
+    /// The unhooked `builder.proposalCreate` emitter (`preview_event`); 0 leaves held commands without a preview of their own.
+    pub fn set_preview_original(&self, f: usize) {
+        self.preview_fn.store(f, Release);
+    }
+
+    /// Called by the hook on the emitter for every tool preview: its first five arguments are what a held command's preview needs.
+    pub fn note_preview_args(&self, args: [u64; 5]) {
+        if !self.preview_holding.load(Relaxed) {
+            return;
+        }
+        if let Some(mut g) = try_lock_briefly(&self.preview_args) {
+            *g = Some(args);
+        }
+    }
+
+    /// Gives the held build command `id` to the game scripts as the preview of the tool `held:<id>`, through the engine's own emitter of
+    /// `builder.proposalCreate` with the arguments of the newest tool preview, its own Proposal (the payload's start) and the ProposalData
+    /// slot of its payload (`+0x3d8`, empty before the apply). The scripts' `guiHandleEvent` runs inside this call, so the mod has the
+    /// record of the command before the `held` event reaches it. Why: a tool that sends no preview (UI::ModuleBuilder, a station module
+    /// added via Configure: run s4 2026-10-14) left the mod without a record before the build, so its command was released at once and
+    /// applied 7 steps before the stamp on this game alone (entity ids then differ between the games). Called on the thread of the tool
+    /// that added the command (the interface's), where the tools call the emitter themselves. Nothing happens without a preview seen
+    /// since holding was switched on.
+    ///
+    /// # Safety
+    /// `payload` is the payload of a live held `build_proposal` command.
+    #[allow(improper_ctypes_definitions)]
+    unsafe extern "system-unwind" fn give_preview(&self, id: crate::hold::HoldId, payload: usize) {
+        type Emit = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, *const u8, usize, usize, *mut u8) -> u64;
+        let emit = self.preview_fn.load(Acquire);
+        let args = crate::log::guarded("preview of a held command", || *lock(&self.preview_args)).flatten();
+        let (Some(a), true) = (args, emit != 0) else {
+            crate::log::line(&format!(
+                "hold: command {id}: no preview of its own (no tool preview seen since holding was switched on)"
+            ));
+            return;
+        };
+        // a std::string in its short form (MSVC x64: 16 bytes of text, size, capacity 15)
+        let name = format!("held:{id}");
+        let mut text = [0u64; 4];
+        let bytes = name.as_bytes();
+        if bytes.len() > 15 {
+            return;
+        }
+        // SAFETY: 32 writable bytes; the text and its terminator fit the first 16.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), text.as_mut_ptr() as *mut u8, bytes.len());
+        }
+        text[2] = bytes.len() as u64;
+        text[3] = 15;
+        let mut handled = 0u8;
+        crate::log::line(&format!(
+            "hold: command {id}: giving it to the game scripts as the preview of the tool {name}"
+        ));
+        // SAFETY: the emitter of this build (prologue checked when it was hooked), with the objects of the newest tool preview of this
+        // session, the held command's Proposal and its ProposalData slot; the call into the scripts is synchronous.
+        let emit: Emit = unsafe { core::mem::transmute::<usize, Emit>(emit) };
+        unsafe {
+            emit(
+                a[0],
+                a[1],
+                a[2],
+                a[3],
+                a[4],
+                text.as_ptr() as *const u8,
+                payload,
+                payload + PAYLOAD_RESULT_DATA,
+                &mut handled,
+            )
+        };
+        crate::log::line(&format!(
+            "hold: command {id}: given to the game scripts as the preview of the tool {name} (handled {handled})"
+        ));
+    }
+
     /// The thread to wake when the add hook queued something for the mod.
     pub fn set_waker(&self, thread: Thread) {
         let _ = self.waker.set(thread);
@@ -436,6 +535,10 @@ impl Runtime {
 
     fn sync_flags(&self, machine: &HoldMachine<Box<Held>>) {
         self.live.store(machine.enabled() || !machine.is_empty(), Relaxed);
+        let on = machine.enabled();
+        if self.preview_holding.swap(on, Relaxed) != on {
+            *lock(&self.preview_args) = None;
+        }
     }
 
     // ---- the link
@@ -452,6 +555,8 @@ impl Runtime {
         }
         if self.inject_ready() {
             hook_names.push(crate::inject::READY_NAME.to_string()); // and this one, `inject_next`
+            hook_names.push("defer".to_string()); // and `defer` + `inject_next {held}`: the deferred completion of a held command
+            hook_names.push("fail".to_string()); // and `fail` + `complete_next`: a deferred command never waits for the age limit
         }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
@@ -471,6 +576,13 @@ impl Runtime {
             first_seq
         ));
         if let Some(line) = ready.log_line() {
+            self.say(&line);
+        }
+        // the wall clock and the C runtime's clock at one instant: the mod's `os.clock()` becomes wall-clock time with it
+        let clock =
+            Event::Timing { what: "clock", id: 0, detail: format!("wall={} clock={}", wall_ms(), crt_clock_ms()) };
+        events.append(std::slice::from_ref(&clock))?;
+        if let Some(line) = clock.log_line() {
             self.say(&line);
         }
         *lock(&self.reader) = Some(reader);
@@ -504,9 +616,34 @@ impl Runtime {
         if !reader.has_news() {
             return;
         }
-        let poll = reader.poll();
+        let mut poll = reader.poll();
+        // the orders are armed before the reader is let go: see `arm_orders`
+        self.arm_orders(&mut poll, now);
         drop(guard);
         self.apply_poll(machine, poll, now);
+    }
+
+    /// Arms the `patch_next` / `inject_next` orders of `poll` and leaves the other lines in it. Called while the reader's lock is held, so
+    /// that an order read from the file is armed before anyone else can look at the file: once the reader has handed out a line, the
+    /// file has no news any more, and the command hook (`ingest_patch_order`) would find neither news nor an armed order. That gap
+    /// (service thread between `poll` and `apply_poll`) let the mod's replay command pass uninjected in real run rt1 R2 (2026-10-14:
+    /// `inject_next key=2` written before the command, the module never saw the command with the order armed, then the order expired
+    /// on town builds) while key 1 a minute earlier was injected.
+    fn arm_orders(&self, poll: &mut crate::link::Poll, now: u64) {
+        let mut rest = Vec::new();
+        for line in std::mem::take(&mut poll.lines) {
+            match parse_ctl_line(&line) {
+                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
+                    self.arm_patch(frozen, adds, at, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, now)
+                }
+                Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
+                _ => rest.push(line),
+            }
+        }
+        poll.lines = rest;
     }
 
     fn apply_poll(&self, machine: &mut HoldMachine<Box<Held>>, poll: crate::link::Poll, now: u64) {
@@ -515,7 +652,10 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, now)
+                }
+                Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -535,24 +675,16 @@ impl Runtime {
     /// the machine's lock, nor for holding to be on): reads the control file, arms the order, and keeps the other lines for the
     /// next `ingest`. Takes no lock but the reader's and the backlog's.
     pub(super) fn ingest_patch_order(&self, now: u64) {
-        let Some(mut guard) = try_lock_briefly(&self.reader) else { return };
+        // Waits for the reader instead of giving up after a few spins: the service thread holds it only while it reads the file (and
+        // arms the orders it finds there), and giving up here meant the mod's own command could pass while its order sat in the file.
+        let mut guard = lock(&self.reader);
         let Some(reader) = guard.as_mut() else { return };
         if !reader.has_news() {
             return;
         }
         let mut poll = reader.poll();
+        self.arm_orders(&mut poll, now);
         drop(guard);
-        let mut rest = Vec::new();
-        for line in std::mem::take(&mut poll.lines) {
-            match parse_ctl_line(&line) {
-                Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
-                    self.arm_patch(frozen, adds, at, ttl, now)
-                }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl }) => self.inject.arm(key, ttl, now),
-                _ => rest.push(line),
-            }
-        }
-        poll.lines = rest;
         lock(&self.ctl_backlog).push(poll);
         self.wake();
     }
@@ -565,6 +697,13 @@ impl Runtime {
         let mut events = {
             let mut machine = lock(&self.machine);
             self.ingest(&mut machine, now);
+            // an order of a deferred command that no command will use: the command fails now (tool callback fired), not after 30 s
+            for held in self.inject.take_failed(now) {
+                self.say(&format!(
+                    "hold: deferred command {held}: its order was refused before any command used it: failed now"
+                ));
+                machine.handle(&crate::link::CtlMessage::Fail { id: held }, now);
+            }
             machine.tick(now);
             self.sync_flags(&machine);
             machine.drain_events()
@@ -636,7 +775,7 @@ impl Runtime {
         let add = self.add_fn();
         // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
         // was taken out of the engine's hands must be given back, whatever happens)
-        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None };
+        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None, preview: None };
         crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
         if self.patch.enabled() {
             crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
@@ -657,6 +796,10 @@ impl Runtime {
                 self.native_copy_check("held", job.payload, Some(job.id));
             });
         }
+        if let Some((id, payload)) = plan.preview.take() {
+            // SAFETY: the payload of the command held just now; it stays held while the scripts read it.
+            unsafe { self.give_preview(id, payload) };
+        }
         let Some(add) = add else { return args.out };
         let Some(engine) = self.engine else {
             // SAFETY: the arguments of the live call that is being hooked.
@@ -676,6 +819,22 @@ impl Runtime {
                     if fired {
                         crate::log::line(&format!("hold: command {id}: the tool's completion callback was fired before the command was dropped"));
                     }
+                }
+                Action::Complete { id, handle, ok } => {
+                    // SAFETY: as for `release`; the held command carries the result of this game's own stamp apply (adopt_result).
+                    let fired = unsafe { engine::complete(&engine, handle) };
+                    crate::log::line(&format!(
+                        "hold: command {id}: completed with this game's stamp apply (accepted {ok}), tool callback fired: {fired}"
+                    ));
+                    self.inject.report(Event::Completed { id, ok, fired, ms: plan.now, reason: "stamp_apply" });
+                }
+                Action::Fail { id, handle, reason } => {
+                    // SAFETY: as for `release`; the held command was never applied, so its result byte says "not applied".
+                    let fired = unsafe { engine::fail(&engine, handle) };
+                    crate::log::line(&format!(
+                        "hold: command {id}: failed without a stamp apply ({reason}), tool callback fired with a failed result: {fired}"
+                    ));
+                    self.inject.report(Event::Completed { id, ok: false, fired, ms: plan.now, reason });
                 }
             }
         }
@@ -721,7 +880,12 @@ impl Runtime {
         if let (Some(rva), Some(_)) = (site, tool) {
             // SAFETY: the kind is read only from readable memory.
             if let Some(kind) = unsafe { engine::command_kind(args.cmd, engine.kind_offset) } {
-                if machine.admit(kind, now) == Admit::Hold {
+                let admit = machine.admit(kind, now);
+                if admit == Admit::Off {
+                    machine.tool_while_silent(kind, now); // a tool at work while the mod is silent: not a pause menu
+                    plan.due.extend(machine.take_due(self.game_time(), now)); // given back before this command passes
+                }
+                if admit == Admit::Hold {
                     // SAFETY: the arguments of the live call, as the caller guarantees.
                     if let Some(held) = unsafe { engine::capture(&engine, args) } {
                         let done = held.done_ok();
@@ -734,15 +898,27 @@ impl Runtime {
                             None
                         };
                         // the input-level text of the same command (what a SimpleProposal is made of), for the mod
+                        let t_input = std::time::Instant::now();
                         let input = flags.is_some().then(|| self.input_text(payload)).flatten();
+                        let input_ms = t_input.elapsed().as_secs_f64() * 1000.0;
                         match machine.hold_with(kind, rva, done, flags, held, now) {
                             Ok(id) => {
+                                if input.is_some() {
+                                    self.inject.report(Event::Timing {
+                                        what: "input",
+                                        id,
+                                        detail: format!("held={id} wall={} input_ms={input_ms:.1}", wall_ms()),
+                                    });
+                                }
                                 if let Some(text) = &input {
                                     if let Err(e) = self.input.write(id, text) {
                                         self.say(&format!("input: cannot write {}: {e}", crate::input::file_name(id)));
                                     }
                                 }
                                 plan.held_here = true;
+                                if self.build.kind_by_name("build_proposal") == Some(kind) {
+                                    plan.preview = Some((id, payload));
+                                }
                                 if (self.inject.enabled()
                                     || self.dump.get().is_some()
                                     || self.portable.get().is_some()
@@ -852,6 +1028,11 @@ impl Runtime {
             });
         }
         let result = unsafe { original(sim, cmd) };
+        if self.inject.enabled() {
+            // the timing first: the deferred completion swaps the applied command's payload with the held one's
+            crate::log::guarded("apply hook (timing)", || self.timing_after_apply(cmd));
+            crate::log::guarded("apply hook (deferred completion)", || self.complete_deferred(cmd));
+        }
         if let Some((payload, seq)) = dumped {
             crate::log::guarded("apply hook (dump after)", || {
                 self.dump_payload("applied", payload, claimed, None, Scope::Result, Budget::Applied, Some(seq))
@@ -867,6 +1048,30 @@ impl Runtime {
     }
 }
 
+/// The timing of an ordered script command until its stamp apply (see `Runtime::stamp_timing`).
+pub(crate) struct StampTiming {
+    pub payload: usize,
+    pub key: u64,
+    pub held: u64,
+    pub tm: String,
+    pub rebuild: String,
+}
+
+/// Milliseconds since 1970 (the wall clock every timing line uses, so that two games' lines can be compared).
+pub(crate) fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The C runtime's `clock()` in milliseconds: what the game's Lua `os.clock()` reads (both use the process's one C runtime), so the mod can
+/// turn its own clock into wall-clock time (`timing clock`).
+pub(crate) fn crt_clock_ms() -> i64 {
+    unsafe extern "C" {
+        fn clock() -> i32;
+    }
+    // SAFETY: `clock` takes nothing and only reads the C runtime's start time.
+    i64::from(unsafe { clock() })
+}
+
 /// What [`Runtime::plan_add`] decided: the engine is touched according to it, after the lock is gone.
 struct AddPlan {
     /// Held commands to hand back or destroy, in order.
@@ -878,6 +1083,8 @@ struct AddPlan {
     now: u64,
     /// A held `build_proposal` command to dump (only with `FEVERLINK3_DUMP_COMMANDS`).
     dump: Option<DumpJob>,
+    /// A held `build_proposal` command to give to the scripts as a preview (`give_preview`): its id and payload.
+    preview: Option<(crate::hold::HoldId, usize)>,
 }
 
 /// What the dump needs to know about a command that was just held.
@@ -982,6 +1189,7 @@ mod tests {
             town_update_size: None,
             script_convert: None,
             convert_update: None,
+            preview_event: None,
             town_candidates: None,
             town_edges: None,
             town_sort_call: None,
@@ -1090,9 +1298,28 @@ mod tests {
             .unwrap();
     }
 
+    /// The events of the link, without the diagnostic `timing` records (see `timing_records`).
     fn events(dir: &Path) -> Vec<(String, String)> {
+        all_events(dir).into_iter().filter(|(k, _)| k != "timing").collect()
+    }
+
+    fn all_events(dir: &Path) -> Vec<(String, String)> {
         let mut r = CtlReader::new(dir.join(crate::link::EVENTS_FILE));
         r.poll().lines.into_iter().map(|l| (l.kind, l.payload)).collect()
+    }
+
+    #[test]
+    fn the_link_opens_with_the_wall_clock_of_the_c_runtime_clock_for_the_timing_lines() {
+        let dir = TempDir::new("rt-clock");
+        let _rt = runtime(Some(dir.path()));
+        let ev = all_events(dir.path());
+        assert_eq!(ev[0].0, "ready");
+        assert_eq!(ev[1].0, "timing", "{ev:?}");
+        assert!(
+            ev[1].1.contains("\"what\"]=\"clock\"") && ev[1].1.contains("wall=") && ev[1].1.contains("clock="),
+            "{}",
+            ev[1].1
+        );
     }
 
     fn kinds(dir: &Path) -> Vec<String> {
@@ -1916,7 +2143,7 @@ mod tests {
         let ev = events(dir.path());
         assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("layout")), "{ev:?}");
         // an order that no script command ever uses: the reason says which applies went by
-        rt.inject.arm(9, 0, rt.now_ms());
+        rt.inject.arm(9, 0, 0, rt.now_ms());
         let mut other = Call::new(17, 1);
         unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
         rt.apply_orders(script.c.command.as_mut_ptr(), Some(52), true); // a held one (the tool's)

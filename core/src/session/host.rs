@@ -262,9 +262,12 @@ impl HostSession {
     /// Connections waiting to introduce themselves at once. The next one is closed on arrival, so a flood of
     /// connections cannot grow the host's tables.
     pub const MAX_PENDING: usize = 32;
-    /// Longest `body` of an Action a player may send (bytes). Real bodies are a few hundred; the limit keeps one
-    /// player from making the host relay and write a megabyte for everyone, repeatedly.
-    pub const MAX_ACTION_BODY: usize = 256 * 1024;
+    /// Longest `body` of an Action a player may send (bytes): what fits one Steam message (512 KiB, `steam_core::MAX_MESSAGE`) with
+    /// room for the frame header, the sealed channel's tag and the action's other fields. A build carries the engine's own command as
+    /// text: a modular station is about 150 KB, a module added to one via Configure 298 KB (run c10b 2026-10-14: dropped at the old
+    /// 256 KiB, the other game never built it and a resync followed). The limit still keeps one player from making the host relay
+    /// and write megabytes for everyone, repeatedly.
+    pub const MAX_ACTION_BODY: usize = 480 * 1024;
     /// Messages and drop reasons logged once are remembered up to this many; then the memory is cleared.
     const MAX_REMEMBERED: usize = 1024;
 
@@ -695,7 +698,9 @@ impl HostSession {
                     } else {
                         self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
                         self.resync_step();
-                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead };
+                        // a player cannot push every other game's stamps into the far future with an absurd margin
+                        let need = m.need.map(|n| n.clamp(0, ClockMessage::MAX_NEED));
+                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead, need };
                         self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
                     }
                 }

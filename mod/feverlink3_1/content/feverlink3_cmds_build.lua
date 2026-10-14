@@ -746,7 +746,7 @@ end
 -- the state of one capture: how entities are keyed, what the proposal itself knows about entities it removes, and
 -- the references already made
 local function newCapture(ctx, opts)
-	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {}, cons = opts.cons or {} }, memo = {}, result = opts.result, alias = {} }
+	local cap = { keyOf = ctx.keyOf, plain = ctx.plain, known = { nodes = {}, edges = {}, edgeTypes = {}, objIndex = {}, cons = opts.cons or {} }, memo = {}, result = opts.result, alias = {}, eoPending = ctx.pendingModels == true }
 
 	function cap.node(id)
 		if type(id) ~= "number" then fail("a node reference is not an entity id") end
@@ -992,6 +992,12 @@ local function readEdgeObject(o, i, cap)
 			out.param = out.param or get(ec, "param")
 			out.params = A.dump(get(ec, "params"))
 		end
+	end
+	-- before the build, for a caller that completes the record from the held command that follows the click (ctx.pendingModels: the
+	-- native module's input text names model, name and position; M.fillPendingObjects): marked, never shipped as it is
+	if cap.eoPending and out.model == nil then
+		out.model, out.pending = M.PENDING_MODEL, true
+		if out.param == nil then out.param = 0 end
 	end
 	if type(out.model) ~= "string" then fail("an edge object has no model (captured before the build ran?)") end
 	return out
@@ -2405,6 +2411,18 @@ function M.preState(proposal, ctxObj)
 	return pre
 end
 
+-- The record of a proposal read and nothing more (no classification: that runs the engine's dry run, makeProposalData): for a held command's
+-- own proposal, which the native module gives to the interface's scripts from inside the tool's mouse handler (run c10a 2026-10-14: a dry
+-- run there was followed by an engine assertion in UI::CSelector, ModelInstanceList of a preview entity missing). M.bodyOf makes the body
+-- later, outside the tool. Returns the record, or nil and why not.
+function M.captureRaw(proposal, ctx)
+	ctx = ctx or { plain = C.plain, keyOf = function(e) return "s:" .. tostring(e) end }
+	local cap = newCapture(ctx, {})
+	local ok, rec = pcall(captureRecord, proposal, cap)
+	if not ok then return nil, tostring(rec) end
+	return rec
+end
+
 -- A captured record as the body of an action line: the body, nil and its wire text, or nil and why not.
 function M.bodyOf(rec, flags)
 	flags = flags or {}
@@ -2475,6 +2493,29 @@ end
 -- the tool's command, so the world is still as the tool saw it and the references resolve. `ctx` names entities the way the
 -- bridge keys them (see M.capture). Returns the body, nil and its serialised text (the wire form), or nil and why not. Never
 -- raises. The logging of the same events stays in M.onToolEvent.
+M.PENDING_MODEL = "?pending"
+
+-- Completes a record captured with ctx.pendingModels from the held command's input text (`objs`: its edgeObjectsToAdd, parsed by
+-- feverlink3_portable): model, name and position along the segment of each marked edge object, by index. Returns true when no edge
+-- object is left marked (the body can then be shipped like any other), or false and why.
+function M.fillPendingObjects(body, objs)
+	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1]
+	if type(rec) ~= "table" or type(rec.objs) ~= "table" then return false, "no record" end
+	for i, o in ipairs(rec.objs) do
+		if o.pending then
+			local t = objs and objs[i]
+			local m = type(t) == "table" and t.modelName
+			if type(m) ~= "string" or m == "" or type(t.param) ~= "number" then return false, "edge object " .. i .. ": the held command's text has no model or position" end
+			o.model = "::/" .. (m:gsub("^::/", ""))
+			o.param = t.param
+			if (o.name == nil or o.name == "") and type(t.name) == "string" then o.name = t.name end
+			o.pending = nil
+		end
+		if o.model == M.PENDING_MODEL then return false, "edge object " .. i .. " has no model" end
+	end
+	return true
+end
+
 function M.captureToolBuild(id, name, param, ctx)
 	if name ~= "builder.proposalApply" and name ~= "builder.proposalCreate" then return nil, "not a build event: " .. tostring(name) end
 	if type(param) ~= "table" then return nil, "the event carries no data" end
@@ -2628,6 +2669,21 @@ function M.addsOrRemovesConstructions(body)
 	local ok, yes = pcall(function()
 		local rec = normalise(body.args[1])
 		return type(rec) == "table" and ((type(rec.cons) == "table" and #rec.cons > 0) or (type(rec.rem) == "table" and #rec.rem > 0))
+	end)
+	return ok and yes == true
+end
+
+-- true when the record only takes things away: constructions, town buildings, segments, nodes or edge objects removed, and no construction,
+-- node, segment or edge object added (node configurations the engine re-adds where a removal merges two segments do not count). Whatever
+-- the plan that rebuilds it: a bulldozing of town buildings together with a street piece (plan "bulldoze") is as much a removal as one of
+-- a lone segment (plan "removal").
+function M.addsNothing(body)
+	local ok, yes = pcall(function()
+		local rec = normalise(body.args[1])
+		if type(rec) ~= "table" then return false end
+		local function n(k) return type(rec[k]) == "table" and #rec[k] or 0 end
+		if n("cons") + n("nodes") + n("segs") + n("objs") > 0 then return false end
+		return n("rem") + n("rmSegs") + n("rmNodes") + n("rmObjs") > 0
 	end)
 	return ok and yes == true
 end
@@ -3114,6 +3170,103 @@ local function portableReplay(rec, text, R, f, tkey)
 	return args
 end
 
+-- The components that make an entity of each kind the text names (Portable.oldRefs).
+local REF_COMPS = { node = { "BASE_NODE" }, edge = { "BASE_EDGE" }, edgeObject = { "EDGE_OBJECT" }, construction = { "CONSTRUCTION" } }
+local REF_POS_TOL = 0.25   -- metres: a node the text locates must be where the text says (two node ends of a station piece lie 2 m apart)
+
+-- Before the native module injects the engine's Proposal built from the originator's text: every existing entity the text names must be,
+-- in THIS game, an entity of the kind the member needs (a node where a node is named, with the node at the text's position when the text
+-- gives one), or the injection is refused and nothing is applied here (the worlds differ: the ids lane and the resync repair that). The
+-- engine itself does not check: real run 2026-10-14 (rail-crash), the host's world had forked, the guest's track named node 50395, which was
+-- a station track piece (an edge) on the host, and the engine's assertion (`it != components.end()`, BaseNode) stopped the game.
+-- The kind alone does not find a fork that only PERMUTES ids (a late apply: the same set of ids, other entities behind them; runs n1/e3
+-- 2026-10-14, the ids lane hashed the sorted sets and saw nothing, and the next stop on the forked road stopped the host on the same
+-- assertion). So the originator also sends where each named entity IS in its world (M.refPrints, `body.refPrints`): a node's position,
+-- a segment's two ends, an edge object's segment ends, a construction's place. The receiver compares them with its own entity of that id.
+
+-- where entity `id` of `kind` is in this world: a flat list of numbers (nil when it cannot be read)
+local function refPrint(kind, id)
+	if kind == "node" then
+		local p = A.nodePos(id)
+		return p and { p.x, p.y, p.z } or nil
+	elseif kind == "edge" or kind == "edgeObject" then
+		local e = id
+		if kind == "edgeObject" then e = A.edgeOfObject(id) end
+		local i = e and A.edgeInfo(e)
+		return i and { i.p0.x, i.p0.y, i.p0.z, i.p1.x, i.p1.y, i.p1.z } or nil
+	elseif kind == "construction" then
+		local c = A.conInfo(id)
+		return c and { c.p.x, c.p.y, c.p.z } or nil
+	end
+	return nil
+end
+
+-- The originator's prints of every existing entity its text names, read in its world before the build runs: { ["kind:id"] = numbers }.
+function M.refPrints(text)
+	local out = {}
+	if not Portable or type(Portable.oldRefs) ~= "function" then return out end
+	for _, r in ipairs(Portable.oldRefs(text)) do
+		local ok, p = pcall(refPrint, r.kind, r.id)
+		if ok and p then out[r.kind .. ":" .. r.id] = p end
+	end
+	return out
+end
+
+local function printText(p)
+	local t = {}
+	for i, v in ipairs(p) do t[i] = string.format("%.2f", v) end
+	return table.concat(t, ",")
+end
+
+-- Returns nil when every reference holds, else the reason; `checked` = how many references were looked at. `prints` = the originator's
+-- body.refPrints (may be nil: a record of an older version, then the kind and the text's node positions are checked).
+function M.checkInjectRefs(text, prints)
+	if not Portable or type(Portable.oldRefs) ~= "function" then return nil, 0 end
+	local refs = Portable.oldRefs(text)
+	for _, r in ipairs(refs) do
+		if not A.exists(r.id) then
+			return string.format("%s names %s %d, which does not exist here", r.path, r.kind, r.id), #refs
+		end
+		local has = false
+		for _, comp in ipairs(REF_COMPS[r.kind] or {}) do
+			if A.comp(r.id, comp) ~= nil then has = true break end
+		end
+		if not has then
+			local what = {}
+			for kind, comps in pairs(REF_COMPS) do
+				for _, comp in ipairs(comps) do
+					if kind ~= r.kind and A.comp(r.id, comp) ~= nil then what[#what + 1] = kind end
+				end
+			end
+			table.sort(what)
+			return string.format("%s names %s %d, which is not a %s here (it is: %s)", r.path, r.kind, r.id, r.kind, #what > 0 and table.concat(what, "/") or "neither"), #refs
+		end
+		if r.kind == "node" and r.pos then
+			local q = A.nodePos(r.id)
+			if q then
+				local d = sqrt((q.x - r.pos.x) ^ 2 + (q.y - r.pos.y) ^ 2 + (q.z - r.pos.z) ^ 2)
+				if d > REF_POS_TOL then
+					return string.format("%s names node %d at %.2f,%.2f,%.2f; that node is at %.2f,%.2f,%.2f here (%.2f m away)", r.path, r.id, r.pos.x, r.pos.y,
+						r.pos.z, q.x, q.y, q.z, d), #refs
+				end
+			end
+		end
+		local want = type(prints) == "table" and prints[r.kind .. ":" .. r.id] or nil
+		if type(want) == "table" then
+			local have = refPrint(r.kind, r.id)
+			local same = have ~= nil and #have == #want
+			for i = 1, (same and #want or 0) do
+				if type(want[i]) ~= "number" or math.abs(have[i] - want[i]) > REF_POS_TOL then same = false break end
+			end
+			if not same then
+				return string.format("%s names %s %d, which the originator has at %s and this game at %s", r.path, r.kind, r.id, printText(want),
+					have and printText(have) or "(unreadable)"), #refs
+			end
+		end
+	end
+	return nil, #refs
+end
+
 local function decodeBuildUnsafe(body, ctx)
 	local a = body.args
 	local rec, why = normalise(a[1])
@@ -3131,6 +3284,16 @@ local function decodeBuildUnsafe(body, ctx)
 	-- The native module builds the engine's Proposal from the originator's text and swaps it into this command: the command only has to carry
 	-- the constructions (the module takes them from this game's own conversion); its street part is replaced, so no verdict gates it.
 	if ctx and ctx.canInject and type(body.nativeText) == "string" and body.nativeText ~= "" and rec.src == "native" then
+		-- the text's ids must be the same entities here (M.checkInjectRefs); if not, the build is refused on this game and nothing is applied
+		local okR, bad, nRefs = pcall(M.checkInjectRefs, body.nativeText, body.refPrints)
+		if not okR then bad = "the check failed (" .. tostring(bad) .. ")" end
+		if bad then
+			local why = "inject_refused: " .. tostring(bad) .. " (this world differs from the originator's; nothing is applied here, the ids check and the resync repair it)"
+			log("build inject (" .. plan .. ") REFUSED: " .. why)
+			C.tracer("build")("build.inject", string.format("%s inject_refused refs=%s reason=%s", tostring(ctx.traceKey or "-"), tostring(nRefs), tostring(bad)))
+			return nil, why
+		end
+		C.tracer("build")("build.inject", string.format("%s references checked: %d existing entities, each of the kind the text names", tostring(ctx.traceKey or "-"), nRefs or 0))
 		local okI, built = pcall(function()
 			-- A build with constructions is sent as its added constructions alone: the module takes the street part, the removed constructions
 			-- and every flag from the text, and only the added constructions from this command's own conversion (the "donor"). b68: a depot
@@ -3143,7 +3306,14 @@ local function decodeBuildUnsafe(body, ctx)
 			else
 				b = PLAN[plan](rec, R, f, {}, (FORMS[plan] or { {} })[1])
 			end
-			if type(b.chain) == "table" and #b.chain > 0 then error("the build needs a chained command", 0) end
+			-- The injected Proposal replaces this command's whole content (only added constructions come from it, and those are sent alone
+			-- above), so a chain the record path would need is not: its first command is the donor. Real run 2026-10-14 (bulldozing a modular
+			-- station, a removal and its 24 track pieces, 2 commands on the record path): the inject was skipped, the record path rebuilt it on
+			-- every game, and the originator's deferred command never took a stamp apply's result (dropped after its age limit).
+			if type(b.chain) == "table" and #b.chain > 0 then
+				if #rec.cons > 0 then error("the build needs a chained command", 0) end
+				b.chain = nil
+			end
 			api.cmd.makeWorldBuildProposalCmd(unpack(b, 1, b.n))
 			return b
 		end)

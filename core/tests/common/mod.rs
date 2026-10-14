@@ -170,7 +170,7 @@ impl Harness {
     /// Every game says Hello and reports a clock.
     pub fn hello_all(&mut self, t: i64, speed: i32) {
         self.host_game(MessageKind::Hello, &json(&HelloMessage::new(t)));
-        self.host_game(MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3 }));
+        self.host_game(MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3, need: None }));
         let ids: Vec<ConnectionId> = self.players.keys().copied().collect();
         for c in ids {
             self.hello_player(c, t, speed);
@@ -179,15 +179,15 @@ impl Harness {
 
     pub fn hello_player(&mut self, c: ConnectionId, t: i64, speed: i32) {
         self.player_game(c, MessageKind::Hello, &json(&HelloMessage::new(t)));
-        self.player_game(c, MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3 }));
+        self.player_game(c, MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3, need: None }));
     }
 
     /// Every game reports a stopped clock at `t`.
     pub fn stop_all_at(&mut self, t: i64) {
-        self.host_game(MessageKind::Clock, &json(&ClockMessage { t, speed: 0, ahead: 3 }));
+        self.host_game(MessageKind::Clock, &json(&ClockMessage { t, speed: 0, ahead: 3, need: None }));
         let ids: Vec<ConnectionId> = self.players.keys().copied().collect();
         for c in ids {
-            self.player_game(c, MessageKind::Clock, &json(&ClockMessage { t, speed: 0, ahead: 3 }));
+            self.player_game(c, MessageKind::Clock, &json(&ClockMessage { t, speed: 0, ahead: 3, need: None }));
         }
     }
 

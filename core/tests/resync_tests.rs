@@ -82,7 +82,7 @@ fn pausing_waits_for_every_ready_game_to_stop_and_ignores_unready_ones() {
     let late = h.connect("Late"); // never says hello
     h.host_call(|host| host.start_resync("t"));
     let pause_at = h.host.state().pause_at.unwrap();
-    let c = |t: i64, speed: i32| json(&ClockMessage { t, speed, ahead: 3 });
+    let c = |t: i64, speed: i32| json(&ClockMessage { t, speed, ahead: 3, need: None });
     h.host_game(MessageKind::Clock, &c(pause_at, 0));
     h.player_game(ids[0], MessageKind::Clock, &c(pause_at, 0));
     assert_eq!(ResyncState::Pausing, h.host.resync_state()); // second player still moving
@@ -676,7 +676,7 @@ fn started_at_different_times() -> (Harness, ConnectionId) {
     let mut h = Harness::with(quiet());
     let p = h.connect("Guest");
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
-    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3 }));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3, need: None }));
     h.hello_player(p, 183_600, 0);
     h.host_call(HostSession::start);
     (h, p)
@@ -698,9 +698,9 @@ fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_a
 
     // the player's game was already past the stamp and holds; the host's game runs up to the stamp and stops there
     assert_eq!(ResyncState::Pausing, h.host.resync_state(), "the host's game is still behind the stamp");
-    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 1, ahead: 3 }));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 1, ahead: 3, need: None }));
     assert_eq!(ResyncState::Pausing, h.host.resync_state(), "still running");
-    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 0, ahead: 3 }));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: pause_at, speed: 0, ahead: 3, need: None }));
     assert_eq!(ResyncState::Saving, h.host.resync_state());
 
     let id = h.host.resync_id().unwrap();
@@ -722,7 +722,7 @@ fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_a
 fn starting_with_one_game_does_not_start_a_round() {
     let mut h = Harness::with(quiet());
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
-    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3 }));
+    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3, need: None }));
     h.host_call(HostSession::start);
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     assert_eq!(Some(87_000), h.host.state().pause_at);

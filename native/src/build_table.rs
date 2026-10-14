@@ -84,6 +84,14 @@ pub struct BuildAddrs {
     /// construction): runs the construction's own update, which adds its entrance street to the proposal. Hooked only with
     /// `FEVERLINK3_NATIVE_PATCH=1`, to put `frozenNodes` into the proposal before that update runs.
     pub convert_update: Option<HookSite>,
+    /// The interface's emitter of the tool event `builder.proposalCreate` (the preview every builder tool gives the game scripts'
+    /// `guiHandleEvent`): `(a, b, c, dispatcher, e, const std::string* tool, const Proposal*, const ProposalData*, bool* out)`, the
+    /// event name built inside, the call into the scripts synchronous. Hooked with holding: its first five arguments are kept from each
+    /// tool preview, and a held build command is then given to the scripts the same way, as the preview of the tool `held:<id>` (its
+    /// own Proposal and the ProposalData slot of its payload), so the mod has the record of every held command BEFORE the build, also
+    /// for a tool that sends no preview (UI::ModuleBuilder, the station configure: run s4 2026-10-14). Static analysis of build 40420:
+    /// the only function that references the string, called by one listener lambda per builder tool.
+    pub preview_event: Option<HookSite>,
     /// The simulation's command application: where held commands are counted and released at their stamp.
     pub apply_command: Option<HookSite>,
     /// Inside the game-script system's pool construction: `cmp eax,8 / jge / mov [rsp+20h],1 / call
@@ -207,6 +215,11 @@ pub const BUILDS: &[BuildAddrs] = &[
         convert_update: Some(HookSite {
             rva: 0x010c_6020,
             prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56],
+        }),
+        // `mov [rsp+8],rbx ; mov [rsp+10h],rsi ; push rbp,rdi,r14` (14 bytes, no rip-relative operand; next `lea rbp,[rsp-1Fh]`)
+        preview_event: Some(HookSite {
+            rva: 0x00f4_4c00,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x55, 0x57, 0x41, 0x56],
         }),
         // `push rbx,rbp,rsi,rdi,r12,r14,r15 ; sub rsp,50h`
         town_update_size: Some(HookSite {
@@ -341,6 +354,7 @@ mod tests {
         town_update_size: None,
         script_convert: None,
         convert_update: None,
+        preview_event: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,
@@ -381,6 +395,7 @@ mod tests {
                 &b.town_update_size,
                 &b.script_convert,
                 &b.convert_update,
+                &b.preview_event,
                 &b.town_candidates,
                 &b.town_edges,
             ]

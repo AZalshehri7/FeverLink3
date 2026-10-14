@@ -97,8 +97,8 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 - [x] Native module skeleton in Rust: winhttp proxy, PE parsing, signature scanner, detour maths, build table, `cargo test`
 - [x] Address tool (`tools/addr`): finds hook sites in a game executable and prints a build-table row; first run against build 40420 in `tools/addr/out/6ac50427.txt`
 - [~] Native module logic *(native hooks)*, off unless switched on: counters on the simulation's command application, hold/release hook on the command list with the control file (`native_ctl.log` / `native_events.log`), single-worker script pool patch; installed all-or-none from `DllMain` behind `FEVERLINK3_HOOKS` / `FEVERLINK3_HOLD` / `FEVERLINK3_POOLPATCH`; tested on fake game functions, never run in the real game (`docs/NATIVE_LINK.md`)
-- [ ] Native module verified in the game: counters, hold/release with each construction tool, pool patch (`docs/NATIVE_LINK.md` section 8; P10)
-- [ ] Lua mod strict mode: `hold_on`, ping, match `held`, stop at the stamp, `release` + trigger command, `cancel`, `hold_off` before a resync (`docs/NATIVE_LINK.md` section 7)
+- [x] Native module verified in the game (2026-10-14, two real games on one PC): hold, copy and release with each construction tool (street, track, station and module, depot, stop, bulldozer, lane, crosswalk), pool patch; the game's own build command is copied natively and applied at the same step on every game
+- [x] Lua mod strict mode (2026-10-14, two real games on one PC; the watchdog was fixed after the first fast-building test): `hold_on`, ping, match `held`, stop at the stamp, `release` + trigger command, `cancel`, `hold_off` before a resync (`docs/NATIVE_LINK.md` section 7)
 - [ ] Native module size: `no_std` + `alloc` with a HeapAlloc allocator once the hook set is fixed
 - [~] Lua mod: stamping, barrier, replay, checksums, deterministic random. All of it runs in the two-game lupa test; in the real game the mod loads, the window opens, and save/load work (P1 to P3); replaying commands between two real games is not verified (P9)
 - [x] Lua lockstep test with lupa
@@ -107,8 +107,8 @@ First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater ski
 
 ## 0.4 — Everything a player does *(construction and operations replication)*
 
-- [ ] Constructions against streets, upgrades, signals, decorations, terrain
-- [ ] Lines, vehicle orders, renames, colours
+- [~] Constructions against streets, upgrades, signals, decorations, terrain: roads, junctions, bridges, tunnels, rail, stations and modules, depots, stops, signals, lanes and crosswalks are seen working in two real games on one PC; terrain is not shared yet
+- [~] Lines, vehicle orders, renames, colours: lines, vehicles bought at a depot, renames and loans are seen working in two real games on one PC; orders and colours are not tested
 - [~] In-game player list and chat: the model and the window exist and are tested with mocks; not run with two real games
 - [~] 3 to 8 players: host limit of 8 games, ids, fan-out, flood limit, ping and round-trip times, a resync round and a kick with eight games are done in the core and the launcher and tested over loopback; waits for a game run
 

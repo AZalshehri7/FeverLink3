@@ -68,7 +68,7 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Reject | 3 | host → connection | `{reason, detail?}` |
 | Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session, resume?: {token, epoch}, resumed?}` |
 | Session | 11 | host → all | `{started, speed, pauseAt?, lead}` |
-| PeerClock | 12 | host → all but origin | `{from, t, ahead}` |
+| PeerClock | 12 | host → all but origin | `{from, t, ahead, need?}` |
 | PlayerJoined | 13 | host → all but the joiner | `{player: {id, name, ready}}` |
 | PlayerLeft | 14 | host → all | `{id, name, away?}` (`away` = the connection dropped and the slot is held) |
 | ChecksumRequest | 15 | host → all | `{n, at, paused, full?}` (`full: false` = a light round; absent = full) |
@@ -80,7 +80,7 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Ping | 21 | host → player | `{n, rtt?: {id: ms}}`, answered by the player's session layer; never given to the game |
 | Kicked | 22 | host → player | `{reason, detail?}` (the shape of Reject), sealed: the host ended this player's session |
 | Hello | 30 | game → host | `{time, save?}` |
-| Clock | 31 | game → host | `{t, speed, ahead}` |
+| Clock | 31 | game → host | `{t, speed, ahead, need?}` |
 | SpeedRequest | 32 | game → host | `{speed}` 0 = pause |
 | ChecksumReport | 33 | game → host | `{n, time, parts: {name: hash}, authority?: {name: number}}` |
 | SaveDone | 34 | host's game → host | `{id, ok, detail?}` |
@@ -98,14 +98,14 @@ A player may send kinds 30 to 38 and 50 to 52. Anything else from a player is dr
 What the host does with the content of those kinds, beyond decoding them (a message that does not decode is ignored, as always):
 
 - **Clock** with `t` outside `0..=2^50` or `speed` outside `0..=16` is dropped, counted and logged once per player: the host builds every stamp and pause from the clocks it holds.
-- **Action** with a `body` over 256 KiB is dropped; **Chat** text is cut to 500 characters.
+- **Action** with a `body` over 480 KiB is dropped (it must fit one Steam message of 512 KiB); **Chat** text is cut to 500 characters.
 - **ChecksumReport** with more than 128 parts, or a part name or hash over 128 characters, or more than 128 `authority` entries, is ignored.
 - Text a player chose (Hello, ReplayFailed, the version of a Join) is cut before it reaches a log line or a Reject.
 
 ## Session rules
 
 - **Session state** is broadcast on every change and at least every 3 s. `lead` is what a game adds to its clock when stamping a local action, in game-time units (a multiple of 200). The host computes it from the slowest connected player's measured round trip and the speed: `200 × clamp(ceil((rtt/2 + 0.06 s) × 6 × speed) + 2, 3, 24)`, where 6 is the steps a second at normal speed (measured). It lengthens at once when a player turns out to be slow and shortens only after eight seconds of the wanted lead staying lower. On a good connection that is 3 steps, about half a second at normal speed.
-- **Clock**: a game reports `{t, speed, ahead}` regularly. The host extrapolates `t + elapsed × speed × 1000` and relays it as PeerClock. Every game holds (speed 0) when it is more than `ahead` steps past the slowest peer.
+- **Clock**: a game reports `{t, speed, ahead, need?}` regularly. The host extrapolates `t + elapsed × speed × 1000` and relays it as PeerClock. Every game holds (speed 0) when it is more than `ahead` steps past the slowest peer. `need` (optional, steps, clamped by the host to 0..24) is the stamp margin the game measured it needs to receive a build before its stamp; a game stamping a build adds the largest `need` of its peers to the fastest clock plus the lead (mod: `L.marginSample`, `L.marginExtra`).
 - **Stamps** are multiples of 200. A future stamp chosen by the host is `roundUp(maxClock + lead)`.
 - **Start**: `started = true`, `speed = 0`, `pauseAt` = the games' common time when they agree, and a checksum round is requested at once.
 - **Pause** is a stamp: `pauseAt = futureStamp`; every game stops at exactly that step. **Speed** 1..4 clears `pauseAt`.
@@ -225,7 +225,7 @@ Every `ping_seconds` (2 s) the host sends each connected player `Ping { n, rtt? 
 ## Limits
 
 - **Frames per second.** Every connection has a token bucket: `max_frames_per_second` (500) refilled per second, `frame_burst` (2000) held at most; every frame received on the connection takes one token, whatever it is (an unintroduced connection included). The frame that finds the bucket empty is dropped and counted and the connection is ended with reason `flood` and detail `more than N frames per second`: an unsealed Reject before the join, a sealed Kicked after it. The player loses its slot. A game that sends a clock line per rendered frame (240 a second) and a long road's worth of actions at once stays far inside; `0` turns the limit off. The host's own game is never limited. Over TCP the refusal is best effort: a peer that keeps writing while the host closes may see a reset instead.
-- **Bytes per second.** The same bucket counts bytes beside frames: `max_bytes_per_second` (2 MiB) refilled per second, `byte_burst` (8 MiB) held at most; a frame takes its header and body (a frame bigger than the burst takes the whole burst). Over the limit: the same `flood` refusal, with detail `more than N bytes per second`. A player's traffic is small (actions, clocks, reports), and the limit is what stops 256 KiB actions at 500 a second from filling the host's disk; `0` turns it off. At most 32 connections wait for their Join at once (`HostSession::MAX_PENDING`); the next is closed on arrival.
+- **Bytes per second.** The same bucket counts bytes beside frames: `max_bytes_per_second` (2 MiB) refilled per second, `byte_burst` (8 MiB) held at most; a frame takes its header and body (a frame bigger than the burst takes the whole burst). Over the limit: the same `flood` refusal, with detail `more than N bytes per second`. A player's traffic is small (actions, clocks, reports), and the limit is what stops 480 KiB actions at 500 a second from filling the host's disk; `0` turns it off. At most 32 connections wait for their Join at once (`HostSession::MAX_PENDING`); the next is closed on arrival.
 - **Silence.** A joined connection from which nothing arrived for `idle_timeout_seconds` (30 s) is closed by the host; its slot is held like any dropped connection's. Pings keep a healthy one far inside the limit, and any frame counts, so a game that only sends clocks needs no pong. Turning the pings off turns this off, since a quiet lobby is not a dead connection. 
 - **A host that was away.** A call into the host more than 5 s after the previous one means the host itself was stalled (its process suspended, its thread stuck in a write to a peer that stopped reading), and the frames of every connection are read in one go afterwards. The host then forgives the stall: nobody is timed out for the silence, the frame budgets are full again and not enforced for as long as the stall lasted (at most 60 s) while the backlog is read, the slots held for players who dropped keep their whole window, and the pings sent before it are forgotten, so no round-trip time measures it.
 - **Reports.** A ChecksumReport counts only from a game that said Hello since its last load; one from a game that did not (a returner still running its old world) is ignored, logged once. A report that completes a round is not the only way a round completes: when the game a round was waiting for leaves, a round that has every other report is completed then.

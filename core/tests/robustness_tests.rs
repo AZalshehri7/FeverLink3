@@ -631,7 +631,12 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             rtt: (0..rr.gen_range(0..6)).map(|_| (rr.gen(), finite_f64(rr))).collect(),
         });
         round_trip(PongMessage { n: rr.gen() });
-        round_trip(PeerClockMessage { from: rr.gen(), t: rr.gen(), ahead: rr.gen() });
+        round_trip(PeerClockMessage {
+            from: rr.gen(),
+            t: rr.gen(),
+            ahead: rr.gen(),
+            need: rr.gen_bool(0.5).then(|| rr.gen()),
+        });
         round_trip(ChecksumRequestMessage { n: rr.gen(), at: rr.gen(), paused: rr.gen(), full: rr.gen() });
         round_trip(AuthorityMessage {
             n: rr.gen(),
@@ -647,7 +652,12 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
         });
         round_trip(ResyncLoadMessage { id: rr.gen(), name: random_text(rr, 20), sha256: random_text(rr, 64) });
         round_trip(HelloMessage { time: rr.gen(), save: rr.gen_bool(0.5).then(|| random_text(rr, 20)) });
-        round_trip(ClockMessage { t: rr.gen(), speed: rr.gen(), ahead: rr.gen() });
+        round_trip(ClockMessage {
+            t: rr.gen(),
+            speed: rr.gen(),
+            ahead: rr.gen(),
+            need: rr.gen_bool(0.5).then(|| rr.gen()),
+        });
         round_trip(SpeedRequestMessage { speed: rr.gen() });
         round_trip(ChecksumReportMessage {
             n: rr.gen(),
@@ -764,7 +774,12 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
         0 => random_bytes(r, 300),
         1 => serde_json::to_vec(&json_value(r, 0)).unwrap(),
         2 => {
-            let mut b = codec::encode(&ClockMessage { t: r.gen_range(0..1 << 30), speed: r.gen_range(0..5), ahead: 3 });
+            let mut b = codec::encode(&ClockMessage {
+                t: r.gen_range(0..1 << 30),
+                speed: r.gen_range(0..5),
+                ahead: 3,
+                need: None,
+            });
             mutate(r, &mut b);
             b
         }
@@ -783,6 +798,7 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
             t: [i64::MIN, -1, 0, 1 << 50, 1 << 51, i64::MAX][r.gen_range(0..6)],
             speed: [i32::MIN, -1, 0, 1, 16, 17, i32::MAX][r.gen_range(0..7)],
             ahead: r.gen(),
+            need: None,
         }),
         _ => codec::encode(&SpeedRequestMessage { speed: r.gen_range(-3..8) }),
     }

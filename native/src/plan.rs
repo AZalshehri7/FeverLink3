@@ -191,6 +191,8 @@ pub enum Feature {
     Convert,
     /// The hook on the construction update `Convert` runs (frozenNodes before the entrance is generated).
     ConvertUpdate,
+    /// The hook on the interface's `builder.proposalCreate` emitter (a held build command given to the scripts as a preview).
+    PreviewEvent,
 }
 
 impl Feature {
@@ -209,6 +211,7 @@ impl Feature {
             Feature::LuaSeed => "luaseed",
             Feature::Convert => "script_convert",
             Feature::ConvertUpdate => "script_convert_update",
+            Feature::PreviewEvent => "preview_event",
         }
     }
 }
@@ -572,8 +575,21 @@ fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
             p.kind_offset = Some(kind_offset);
             p.engine =
                 Some(EngineAddrs { command_move: mv.rva, command_destroy: destroy.rva, handle_destroy: handle.rva });
+            plan_preview_event(build, image, p);
         }
         Err(reason) => skip(p, reason),
+    }
+}
+
+/// The hook on the `builder.proposalCreate` emitter, part of holding: without it a held command is only recorded from its tool's own
+/// preview (and a tool that sends none, the station configure, is released at once).
+fn plan_preview_event(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let (feature, name) = (Feature::PreviewEvent, "preview_event");
+    // a build without the site holds as before (a tool without a preview of its own is then released at once)
+    let Some(site) = &build.preview_event else { return };
+    match verify(image, site.rva, site.prologue) {
+        Ok(()) => p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue }),
+        Err(reason) => p.skipped.push(Skip { feature, name, reason }),
     }
 }
 
@@ -598,6 +614,7 @@ mod tests {
             &b.town_update_size,
             &b.script_convert,
             &b.convert_update,
+            &b.preview_event,
             &b.town_candidates,
             &b.town_edges,
         ]
@@ -768,7 +785,7 @@ mod tests {
     fn hold_adds_the_command_list_hook_after_the_counters() {
         let b = select(0x6ac5_0427).unwrap();
         let p = plan(b, cfg(true, true, false), &image_of_40420());
-        assert_eq!(names(&p), ["apply_command", "command_list_add"]);
+        assert_eq!(names(&p), ["apply_command", "command_list_add", "preview_event"]);
         assert_eq!(
             p.engine,
             Some(EngineAddrs { command_move: 0x9d0430, command_destroy: 0x9d0670, handle_destroy: 0x3040c90 })
@@ -784,6 +801,7 @@ mod tests {
             [
                 "hooks: apply_command: 14 bytes at rva 0x9e33b0 match the build table",
                 "hooks: command_list_add: 18 bytes at rva 0x9d4040 match the build table",
+                "hooks: preview_event: 14 bytes at rva 0xf44c00 match the build table",
                 "hooks: script_pool: 22 bytes at rva 0xab00fc match the build table",
             ]
         );
@@ -814,7 +832,7 @@ mod tests {
             other => panic!("not a patch: {other:?}"),
         }
         let all = plan(b, cfg(true, true, true), &image_of_40420());
-        assert_eq!(names(&all), ["apply_command", "command_list_add", "script_pool"]);
+        assert_eq!(names(&all), ["apply_command", "command_list_add", "preview_event", "script_pool"]);
     }
 
     #[test]
@@ -824,7 +842,7 @@ mod tests {
         let apply = b.apply_command.as_ref().unwrap();
         img.write(apply.rva + 3, &[0x90]);
         let p = plan(b, cfg(true, true, true), &img);
-        assert_eq!(names(&p), ["command_list_add", "script_pool"], "the others are still installed");
+        assert_eq!(names(&p), ["command_list_add", "preview_event", "script_pool"], "the others are still installed");
         assert_eq!(p.skipped.len(), 1);
         let s = &p.skipped[0];
         assert_eq!((s.feature, s.name), (Feature::Counters, "apply_command"));
@@ -977,6 +995,7 @@ mod tests {
         town_update_size: None,
         script_convert: None,
         convert_update: None,
+        preview_event: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,

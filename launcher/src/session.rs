@@ -44,10 +44,12 @@ use crate::net::{
     BulkSendJob, BulkSendResult, ClientNet, ClientTransport, ConnectContext, HostNet, HostTransport, LinkInfo,
     NetEvent, ParContext, ParJob, CONNECT_TIMEOUT,
 };
+use crate::netdelay;
 use crate::process::Role;
 use crate::resync;
 use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
 use crate::steamnet::par::wire::secret_from_key;
+use crate::testmargin;
 
 /// Period of the state machines' tick (session broadcast, checksum rounds).
 pub const TICK: Duration = Duration::from_millis(250);
@@ -510,7 +512,9 @@ pub fn run_host_over<T: HostTransport>(
     listen: impl FnOnce(Sender<NetEvent>) -> io::Result<T>,
 ) -> io::Result<SessionHandle> {
     let HostConfig { name, key, mut link, options, save_dirs, echo_log, bulk, .. } = config;
-    let (net_tx, net_rx) = mpsc::channel();
+    // test switch FEVERLINK3_TEST_NET_DELAY_MS: everything the transport delivers reaches this thread that much later (crate::netdelay)
+    let test_delay = netdelay::from_env();
+    let (net_tx, net_rx) = netdelay::channel(test_delay);
     let net = listen(net_tx)?;
     let par_secret = secret_from_key(key.key());
     let local_addr = net.local_addr();
@@ -522,6 +526,16 @@ pub fn run_host_over<T: HostTransport>(
     // the first status already lists the host's own game
     refresh_host_status(&host, &net, &shared);
     shared.log(format!("listening on {}", net.describe()));
+    if let Some(d) = test_delay {
+        shared.log(format!(
+            "TEST: {} = {} ms: every message from the players arrives that much later",
+            netdelay::ENV,
+            d.as_millis()
+        ));
+    }
+    if let Some(line) = testmargin::note_from_env() {
+        shared.log(line);
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {
         let shared = Arc::clone(&shared);
@@ -951,7 +965,9 @@ pub fn run_player_over(
     progress: &mut dyn FnMut(&str),
 ) -> io::Result<SessionHandle> {
     let mut connect: Connector = Box::new(connect);
-    let (net_tx, net_rx) = mpsc::channel();
+    // test switch FEVERLINK3_TEST_NET_DELAY_MS, as on the host (crate::netdelay): reconnects keep using the same delayed channel
+    let test_delay = netdelay::from_env();
+    let (net_tx, net_rx) = netdelay::channel(test_delay);
     let first = connect(ConnectContext {
         conn: 1,
         tx: net_tx.clone(),
@@ -966,6 +982,16 @@ pub fn run_player_over(
     }
     let shared = Shared::new(Status::new(Role::Player, &config.name), config.echo_log);
     shared.log(format!("connected to {}", first.describe()));
+    if let Some(d) = test_delay {
+        shared.log(format!(
+            "TEST: {} = {} ms: every message from the host arrives that much later",
+            netdelay::ENV,
+            d.as_millis()
+        ));
+    }
+    if let Some(line) = testmargin::note_from_env() {
+        shared.log(line);
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let thread = {
         let shared = Arc::clone(&shared);

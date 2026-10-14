@@ -340,7 +340,7 @@ impl<'a> Builder<'a> {
                 }
                 Ok(())
             }
-            Ty::Hash => {
+            Ty::Hash(_) => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 let size: u64 = v
                     .split("size=")
@@ -994,15 +994,15 @@ pub(crate) mod testgraph {
     }
 
     pub(crate) fn add_containers(arena: &Arena, payload: usize) {
-        // list of the hash: head H, nodes N1 and N2 (next, prev, key, value)
-        let (h, n1, n2) = (arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x30]), arena.add(&[0u8; 0x30]));
+        // list of the hash: head H, nodes N1 and N2 (next, prev, key, value), all of the node type (24 bytes, as `old2new`'s in the game)
+        let (h, n1, n2) = (arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x18]));
         let link = |a: usize, next: usize, prev: usize, key: u32| {
-            let mut b = vec![0u8; if a == h { 0x18 } else { 0x30 }];
+            let mut b = vec![0u8; 0x18];
             w(&mut b, 0, next as u64);
             w(&mut b, 8, prev as u64);
             if a != h {
                 b[0x10..0x14].copy_from_slice(&key.to_le_bytes());
-                b[0x18..0x1c].copy_from_slice(&(key + 1).to_le_bytes());
+                b[0x14..0x18].copy_from_slice(&(key + 1).to_le_bytes());
             }
             assert!(arena.write(a, &b));
         };
@@ -1195,10 +1195,10 @@ mod tests {
         assert_ne!(old, new);
         let head = arena.read(new as usize, 0x18).unwrap();
         let (first, last) = (u64_at(&head, 0) as usize, u64_at(&head, 8) as usize);
-        let n1 = arena.read(first, 0x30).unwrap();
+        let n1 = arena.read(first, 0x18).unwrap();
         assert_eq!(u64_at(&n1, 8), new, "the first node points back to the head");
         assert_eq!(u32::from_le_bytes(n1[0x10..0x14].try_into().unwrap()), 0xffff_fffd);
-        let n2 = arena.read(last, 0x30).unwrap();
+        let n2 = arena.read(last, 0x18).unwrap();
         assert_eq!(u64_at(&n2, 0), new, "the last node points on to the head");
         assert_eq!(u64_at(&n1, 0) as usize, last);
     }
@@ -1277,66 +1277,135 @@ mod tests {
     }
 
     #[test]
-    fn the_segment_maps_are_walked_with_their_sets_and_the_sentinels_residue_is_not_a_pointer() {
+    fn a_hash_containers_bucket_vector_is_a_block_of_its_own_size_without_the_heap_index() {
+        // inj8 C10: the 128-byte bucket block of `old2new` (8 buckets) was not in the heap index and its three words stayed P
         let (fake, at) = synthetic();
         let arena = world(fake.0);
-        // std::map<u32, std::set<u32>>: sentinel (0x38), one node (key at +0x20, set head at +0x28, set size at +0x30), the set's
-        // sentinel and two nodes (0x20 bytes, key at +0x1c)
-        let w = |b: &mut Vec<u8>, off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
-        let (hd, node) = (arena.add(&[0u8; 0x38]), arena.add(&[0u8; 0x38]));
-        let (sh, s1, s2) = (arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]));
-        let residue = arena.add(&[7u8; 16]); // what the sentinel's unconstructed value area may still hold
-        let mut h = vec![0u8; 0x38];
-        for off in [0, 8, 0x10] {
-            w(&mut h, off, node as u64);
+        let buckets = arena.add(&[0u8; 0x80]);
+        let mut h = vec![0u8; 0x40];
+        h[0..4].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+        for (off, v) in [(0x18, buckets), (0x20, buckets + 0x80), (0x28, buckets + 0x80)] {
+            h[off..off + 8].copy_from_slice(&(v as u64).to_le_bytes());
         }
-        h[0x18] = 1;
-        h[0x19] = 1;
-        w(&mut h, 0x28, residue as u64);
-        w(&mut h, 0x30, 1);
-        arena.write(hd, &h);
-        let mut n = vec![0u8; 0x38];
-        for off in [0, 8, 0x10] {
-            w(&mut n, off, hd as u64);
-        }
-        n[0x20..0x24].copy_from_slice(&0xffff_fffbu32.to_le_bytes());
-        n[0x1a..0x20].copy_from_slice(b"/town_"); // colour and isnil are at +0x18/+0x19; what follows is residue (b43: ASCII from a log buffer)
-        n[0x24..0x28].copy_from_slice(b"stre");
-        w(&mut n, 0x28, sh as u64);
-        w(&mut n, 0x30, 2);
-        arena.write(node, &n);
-        let mut sent = vec![0u8; 0x20];
-        for (off, v) in [(0, s1), (8, s2), (0x10, s2)] {
-            w(&mut sent, off, v as u64);
-        }
-        sent[0x19] = 1;
-        arena.write(sh, &sent);
-        for (a, parent, left, right, key) in [(s1, s2, sh, sh, 7u32), (s2, sh, s1, sh, 9u32)] {
-            let mut b = vec![0u8; 0x20];
-            w(&mut b, 0, left as u64);
-            w(&mut b, 8, parent as u64);
-            w(&mut b, 0x10, right as u64);
-            b[0x1c..0x20].copy_from_slice(&key.to_le_bytes());
-            b[0x1a..0x1c].copy_from_slice(b"ab");
-            arena.write(a, &b);
-        }
-        let mut map = vec![0u8; 0x10];
-        w(&mut map, 0, hd as u64);
-        w(&mut map, 8, 1);
-        assert!(arena.write(at + 0x160, &map));
+        h[0x30..0x38].copy_from_slice(&7u64.to_le_bytes());
+        h[0x38..0x40].copy_from_slice(&8u64.to_le_bytes());
+        assert!(arena.write(at + 0x270, &h));
         let text =
             encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
-        assert!(text.contains("proposal.new2oldSegments.keys	keys:fffffffb=[00000007;00000009]"), "{text}");
-        // the sentinel's residue pointer was zeroed, and the set's blocks are in the graph: nothing of this map stays P
-        assert!(!text.contains("5f6e776f742f") && !text.contains("65727473"), "residue bytes are not carried: {text}");
-        let line = text.lines().find(|l| l.starts_with("proposal.new2oldSegments.graph")).unwrap();
-        assert!(!line.contains('P'), "{line}");
-        let built = build_selected(&text, BASE, &arena, None).expect("builds");
+        let line = text.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
+        assert!(line.contains("B") && !line.contains('P'), "{line}");
+    }
+
+    #[test]
+    fn a_typed_hash_list_is_written_from_the_container_alone_and_rebuilt_without_any_heap_query() {
+        // r1-r6: the whole-heap index took 220-320 ms per text and stopped at 3,145,728 blocks; the typed text now sizes the list's
+        // sentinel and nodes from the member's node type and never asks the reader (NoHeap answers nothing)
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        super::testgraph::add_containers(&arena, at);
+        let h = u64::from_le_bytes(arena.read(at + 0x278, 8).unwrap().try_into().unwrap()) as usize;
+        // residue in the sentinel's value (b45: hashd0's pointed at a foreign block) is not carried
+        assert!(arena.write(h + 0x10, &(h as u64 + 8).to_le_bytes()));
+        let typed = Settings { typed: true, ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        let line = e.text.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
+        assert!(!line.contains('P'), "{line}\n{}", e.text);
+        let blocks: Vec<&str> = e.text.lines().filter(|l| l.starts_with("@B")).collect();
+        // sentinel, two nodes and the bucket array; every bucket word is a node
+        assert!(blocks.iter().any(|l| l.contains("size=24\traw:B") && l.ends_with(" z1")), "the sentinel: {blocks:?}");
+        assert!(blocks.iter().all(|l| !l.contains('P')), "{blocks:?}");
+        assert!(blocks.iter().any(|l| l.contains("size=128")), "{blocks:?}");
+        assert!(e.text.contains("w:fffffffefffffffd"), "the node's key and value are literals: {}", e.text);
+        let payload = arena.read(at, PAYLOAD_SIZE).unwrap();
+        let r = roundtrip(&e.text, &payload, BASE, typed, &arena, &NoHeap(&arena), &|b| Some(arena.add(b)))
+            .expect("rebuilds");
+        assert!(r.text.contains("MATCH old2new") && !r.text.contains("DIFF  old2new"), "{}", r.text);
+        // a list whose links disagree is not registered: its pointers stay P and the rebuild refuses
+        let n1 = u64::from_le_bytes(arena.read(h, 8).unwrap().try_into().unwrap()) as usize;
+        assert!(arena.write(n1 + 8, &0x1234_5678u64.to_le_bytes()));
+        let bad = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes").text;
+        let line = bad.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
+        assert!(line.starts_with("old2new.graph\traw:P "), "{line}");
+        // a value word that is an address in this game is a P, never a literal
+        assert!(arena.write(n1 + 8, &(h as u64).to_le_bytes()));
+        assert!(arena.write(n1 + 0x10, &(h as u64).to_le_bytes()));
+        let addr = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
         assert!(
-            !built.blocked.iter().any(|b| b.kind == "heap pointer" && b.path.contains("new2oldSegments")),
-            "{:?}",
-            built.blocked
+            addr.stats.heap_ptrs > 0 && addr.text.lines().any(|l| l.starts_with("@B") && l.contains(" P")),
+            "{}",
+            addr.text
         );
+    }
+
+    #[test]
+    fn the_id_maps_are_walked_with_their_sets_and_the_sentinels_residue_is_not_a_pointer() {
+        // all six id maps are std::map<u32, std::set<u32>> (the Proposal copy constructor copies each with 0x4bc8d0); inj3: the node maps
+        // walked as generic maps followed their sets into the world (a 7.6 MB text)
+        for (off, name) in [(0x160usize, "proposal.new2oldSegments"), (0x150, "proposal.old2newNodes")] {
+            let (fake, at) = synthetic();
+            let arena = world(fake.0);
+            // std::map<u32, std::set<u32>>: sentinel (0x38), one node (key at +0x20, set head at +0x28, set size at +0x30), the set's
+            // sentinel and two nodes (0x20 bytes, key at +0x1c)
+            let w = |b: &mut Vec<u8>, off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            let (hd, node) = (arena.add(&[0u8; 0x38]), arena.add(&[0u8; 0x38]));
+            let (sh, s1, s2) = (arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]));
+            let residue = arena.add(&[7u8; 16]); // what the sentinel's unconstructed value area may still hold
+            let mut h = vec![0u8; 0x38];
+            for off in [0, 8, 0x10] {
+                w(&mut h, off, node as u64);
+            }
+            h[0x18] = 1;
+            h[0x19] = 1;
+            w(&mut h, 0x28, residue as u64);
+            w(&mut h, 0x30, 1);
+            arena.write(hd, &h);
+            let mut n = vec![0u8; 0x38];
+            for off in [0, 8, 0x10] {
+                w(&mut n, off, hd as u64);
+            }
+            n[0x20..0x24].copy_from_slice(&0xffff_fffbu32.to_le_bytes());
+            n[0x1a..0x20].copy_from_slice(b"/town_"); // colour and isnil are at +0x18/+0x19; what follows is residue (b43: ASCII from a log buffer)
+            n[0x24..0x28].copy_from_slice(b"stre");
+            w(&mut n, 0x28, sh as u64);
+            w(&mut n, 0x30, 2);
+            arena.write(node, &n);
+            let mut sent = vec![0u8; 0x20];
+            for (off, v) in [(0, s1), (8, s2), (0x10, s2)] {
+                w(&mut sent, off, v as u64);
+            }
+            sent[0x19] = 1;
+            arena.write(sh, &sent);
+            for (a, parent, left, right, key) in [(s1, s2, sh, sh, 7u32), (s2, sh, s1, sh, 9u32)] {
+                let mut b = vec![0u8; 0x20];
+                w(&mut b, 0, left as u64);
+                w(&mut b, 8, parent as u64);
+                w(&mut b, 0x10, right as u64);
+                b[0x1c..0x20].copy_from_slice(&key.to_le_bytes());
+                b[0x1a..0x1c].copy_from_slice(b"ab");
+                arena.write(a, &b);
+            }
+            let mut map = vec![0u8; 0x10];
+            w(&mut map, 0, hd as u64);
+            w(&mut map, 8, 1);
+            assert!(arena.write(at + off, &map));
+            let text = encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at))
+                .expect("encodes")
+                .text;
+            assert!(text.contains(&format!("{name}.keys	keys:fffffffb=[00000007;00000009]")), "{text}");
+            // the sentinel's residue pointer was zeroed, and the set's blocks are in the graph: nothing of this map stays P
+            assert!(
+                !text.contains("5f6e776f742f") && !text.contains("65727473"),
+                "residue bytes are not carried: {text}"
+            );
+            let line = text.lines().find(|l| l.starts_with(&format!("{name}.graph"))).unwrap();
+            assert!(!line.contains('P'), "{line}");
+            let built = build_selected(&text, BASE, &arena, None).expect("builds");
+            assert!(
+                !built.blocked.iter().any(|b| b.kind == "heap pointer" && b.path.contains(name)),
+                "{:?}",
+                built.blocked
+            );
+        }
     }
 
     #[test]
@@ -1375,14 +1444,14 @@ mod tests {
         // the injection's settings: typed (a foreign pointer in an unnamed word is not carried)
         let typed = Settings { typed: true, ..settings() };
         let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
-        // the region is carried (here without a differential mask, so the ASCII too), the residue pointers are not
-        let line = e
-            .text
-            .lines()
-            .find(|l| l.starts_with("proposal.nodeConfigsToAdd[0].~0x38"))
-            .expect("the region is written");
-        assert!(line.contains("w:0000000200000000") && line.contains("w:00000000ffffffff"), "{line}");
-        assert!(!line.contains('P') && !line.contains(&format!("{readable:x}")), "{line}");
+        // the traffic-light preference and type are named members (rt2 R3: left to the mask, the type was dropped), the residue
+        // pointers of the unnamed words around them are not carried
+        for l in ["trafficLightPreference	u32:00000002", "trafficLightType	u32:ffffffff"] {
+            assert!(e.text.contains(&format!("proposal.nodeConfigsToAdd[0].{l}")), "{l}: {}", e.text);
+        }
+        for line in e.text.lines().filter(|l| l.starts_with("proposal.nodeConfigsToAdd[0].~")) {
+            assert!(!line.contains('P') && !line.contains(&format!("{readable:x}")), "{line}");
+        }
         assert!(e.unresolved.iter().all(|(m, _)| !m.contains("nodeConfigsToAdd")), "{:?}", e.unresolved);
         // the value is the set of ids in id order, not the control bytes (the owner's hash)
         for l in ["crosswalks.#	set:3", "crosswalks[0]	ent:new#5", "crosswalks[1]	ent:new#4", "crosswalks[2]	ent:new#3"]
@@ -1416,6 +1485,37 @@ mod tests {
         for l in ["crosswalks.#	set:3", "crosswalks[0]	ent:new#5", "crosswalks[2]	ent:new#3"] {
             assert!(e2.text.contains(&format!("nodeConfigsToAdd[0].{l}")), "{l}: {}", e2.text);
         }
+    }
+
+    #[test]
+    fn a_foreign_pointer_in_an_unnamed_region_that_starts_between_two_words_is_not_carried() {
+        // inj3 (2026-10-14): an EdgeObject's region ~0xc (after segmentEntity at +8) held a vector's three words at +0x10..+0x28
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        let readable = arena.add(&[9u8; 0x40]);
+        let mut elem = vec![0u8; 0x1a0];
+        for off in [0x10usize, 0x18, 0x20] {
+            elem[off..off + 8].copy_from_slice(&(readable as u64).to_le_bytes());
+        }
+        elem[0x0c..0x10].copy_from_slice(&0x3f3f_fab3u32.to_le_bytes()); // data beside it stays
+        for s in [0x90usize, 0x168] {
+            elem[s + 0x18..s + 0x20].copy_from_slice(&15u64.to_le_bytes()); // empty std::string (small buffer, capacity 15)
+        }
+        let blk = arena.add(&elem);
+        let mut v = Vec::new();
+        for x in [blk as u64, blk as u64 + 0x1a0, blk as u64 + 0x1a0] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        assert!(arena.write(at + 0x128, &v));
+        let typed = Settings { typed: true, ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        let line = e
+            .text
+            .lines()
+            .find(|l| l.starts_with("proposal.edgeObjectsToAdd[0].~0xc"))
+            .unwrap_or_else(|| panic!("the region is written: {}", e.text));
+        let hex: String = (readable as u64).to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!line.contains(&hex) && line.contains("b3fa3f3f"), "{line}");
     }
 
     #[test]

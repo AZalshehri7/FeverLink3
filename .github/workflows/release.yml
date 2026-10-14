@@ -51,8 +51,14 @@ jobs:
           $sha = (Get-Content "dist/$zip.sha256").Split(' ')[0]
           $signed = Test-Path dist/manifest.json.sig
           $sigLine = if ($signed) { "The manifest is signed with Ed25519 (manifest.json.sig)." } else { "This build is UNSIGNED: the signing key was not configured, so the in-app updater will refuse it." }
+          $log = Get-Content docs/CHANGELOG.md -Raw
+          $m = [regex]::Match($log, "(?ms)^## $([regex]::Escape($version))\b[^\n]*\r?\n(.*?)(?=^## |\z)")
+          if (-not $m.Success) { $m = [regex]::Match($log, "(?ms)^## Unreleased[^\n]*\r?\n(.*?)(?=^## |\z)") }
+          $changes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "See docs/CHANGELOG.md." }
           $notes = @"
           FeverLink3 $version
+
+          $changes
 
           SHA-256 of ${zip}:
 

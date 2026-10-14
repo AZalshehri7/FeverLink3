@@ -40,7 +40,9 @@ impl ChecksumPolicy {
     /// (`money` is the older name); a rule written for "money" alone let a difference of 180 in `balance` reload the world.
     /// Lanes that cost much game thread time in a big world (the sum of one component read per edge, node, construction and town
     /// building): a light round leaves them out. `townBuildings:<town>` is the per-town part of `townBuildings`.
-    pub const HEAVY_PARTS: [&'static str; 4] = ["edges", "constructions", "nodeConfigs", "townBuildings"];
+    /// `ids` (the entity ids of edges, constructions and town buildings) is heavy too, and an ordinary part: ids that differ mean a build
+    /// was applied at another step on one game, which the stamp rule should never let happen; the repair is a resync.
+    pub const HEAVY_PARTS: [&'static str; 5] = ["edges", "constructions", "nodeConfigs", "townBuildings", "ids"];
     pub const MONEY_PARTS: [&'static str; 3] = ["money", "balance", "loan"];
 
     pub fn new(config: ChecksumPolicyConfig) -> Self {

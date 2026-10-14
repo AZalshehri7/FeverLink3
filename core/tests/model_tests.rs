@@ -176,7 +176,11 @@ impl Model {
                     match self.rng.below(3) {
                         0 => self.n.send(c, MessageKind::Chat, &json(&ChatMessage::new("hi"))),
                         1 => self.n.hello(c, 20_000, 1),
-                        _ => self.n.send(c, MessageKind::Clock, &json(&ClockMessage { t: 21_000, speed: 1, ahead: 3 })),
+                        _ => self.n.send(
+                            c,
+                            MessageKind::Clock,
+                            &json(&ClockMessage { t: 21_000, speed: 1, ahead: 3, need: None }),
+                        ),
                     }
                 }
             }

@@ -305,6 +305,8 @@ struct Link {
 /// A reader or writer that finds nothing to do naps this long, doubling up to [`NAP_MAX`] while it stays idle.
 const NAP_MIN: Duration = Duration::from_micros(200);
 const NAP_MAX: Duration = Duration::from_millis(5);
+/// How long a closed connection's reader waits for the peer to close too before it shuts the socket down.
+const LINGER: Duration = Duration::from_secs(1);
 /// A frame is given at least this much time per byte to be written, on top of the write timeout: a link slower than
 /// 32 KiB/s cannot take a savegame, and a peer that drips its reads is cut off in bounded time.
 const MIN_WRITE_RATE: u64 = 32 * 1024;
@@ -338,11 +340,32 @@ impl Link {
         result
     }
 
-    /// Shuts the socket down in both directions; the reader thread then ends and reports `Closed`.
+    /// Ends the connection politely: what was written is delivered, then the peer sees the end of the stream. The
+    /// reader thread notices the flag, reports `Closed` and then finishes the close (see [`Link::linger`]). Shutting
+    /// down both directions here instead would reset the connection whenever the peer sends something in that moment
+    /// (Windows then throws away what the peer had not read yet): the host's last word, "the host ended the session",
+    /// got lost that way and the player went on reconnecting for five minutes.
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
-            let _ = self.stream.shutdown(Shutdown::Both);
+            let _ = self.stream.shutdown(Shutdown::Write);
         }
+    }
+
+    /// The second half of [`Link::close`], on the reader thread: reads and drops what the peer still sends until it
+    /// closes too (or [`LINGER`] has passed), so that closing the socket does not reset it, then shuts it down.
+    fn linger(&self, stream: &mut TcpStream) {
+        let until = Instant::now() + LINGER;
+        let mut sink = [0u8; 4096];
+        while Instant::now() < until {
+            match stream.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(NAP_MAX),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -457,6 +480,7 @@ fn read_loop(conn: ConnectionId, link: &Link, tx: &Sender<NetEvent>, policy: Rea
     };
     link.close();
     let _ = tx.send(NetEvent::Closed { conn, reason });
+    link.linger(&mut stream);
 }
 
 fn spawn_reader(

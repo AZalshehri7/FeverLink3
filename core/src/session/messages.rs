@@ -203,6 +203,9 @@ pub struct PeerClockMessage {
     pub from: u16,
     pub t: i64,
     pub ahead: i32,
+    /// The stamp margin this game measured it needs (ClockMessage::need), relayed as the host received it (clamped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub need: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +302,16 @@ pub struct ClockMessage {
     pub t: i64,
     pub speed: i32,
     pub ahead: i32,
+    /// Steps of stamp margin, beyond the lead, that this game measured it needs to receive a build before its stamp (the mod's
+    /// L.marginNeed: from the slack between each received build's arrival and its stamp, and any late apply). `None`: nothing
+    /// measured yet at this speed; the stamping game then uses its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub need: Option<i32>,
+}
+
+impl ClockMessage {
+    /// The most margin a game may ask for, in steps (the lead's own ceiling): a larger value would only delay every build.
+    pub const MAX_NEED: i32 = 24;
 }
 
 /// 0 asks for a pause.

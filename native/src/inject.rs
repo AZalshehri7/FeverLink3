@@ -62,6 +62,12 @@ pub struct Order {
     pub key: u64,
     pub armed_ms: u64,
     pub ttl_ms: u64,
+    /// This game's deferred held command of the same build (0: none): it takes the result of the command the order is used for.
+    pub held: u64,
+    /// `complete_next`: nothing is injected, the command (the record's rebuild) only gives its result to `held`.
+    pub link_only: bool,
+    /// The mod's timing text of the build (`tm`), written back with the rebuild and apply times at the stamp apply.
+    pub tm: String,
 }
 
 /// The switch, the armed order, the events for the mod.
@@ -72,6 +78,9 @@ pub struct State {
     order: Mutex<Option<Order>>,
     applies: Mutex<crate::cmd_patch::ApplyTrail>,
     events: Mutex<Vec<Event>>,
+    /// Deferred held commands whose order was refused before any command used it (expired, replaced, the switch off): they get no stamp
+    /// apply result, so the runtime fails them at once (their tool callback fired), instead of leaving the tool busy until the age limit.
+    failed: Mutex<Vec<u64>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -100,16 +109,47 @@ impl State {
         self.report(Event::InjectRefused { reason: reason.into() });
     }
 
+    /// An order of deferred command `held` (0: none) will never be used: the command is to be failed.
+    fn fail_held(&self, held: u64) {
+        if held != 0 {
+            lock(&self.failed).push(held);
+        }
+    }
+
+    /// The deferred held commands to fail now (see [`State::fail_held`]); expires an unused order first.
+    pub fn take_failed(&self, now: u64) -> Vec<u64> {
+        self.expire(now);
+        std::mem::take(&mut *lock(&self.failed))
+    }
+
     /// The mod's `inject_next`. A second order replaces the first (reported as refused).
-    pub fn arm(&self, key: u64, ttl: u64, now: u64) {
+    pub fn arm(&self, key: u64, ttl: u64, held: u64, now: u64) {
+        self.arm_order(key, ttl, held, false, String::new(), now)
+    }
+
+    /// As [`State::arm`], with the mod's timing text of the build.
+    pub fn arm_timed(&self, key: u64, ttl: u64, held: u64, tm: String, now: u64) {
+        self.arm_order(key, ttl, held, false, tm, now)
+    }
+
+    /// The mod's `complete_next`: the next script `build_proposal` gives its result to deferred command `held`, nothing is injected.
+    pub fn arm_link(&self, held: u64, ttl: u64, tm: String, now: u64) {
+        self.arm_order(0, ttl, held, true, tm, now)
+    }
+
+    fn arm_order(&self, key: u64, ttl: u64, held: u64, link_only: bool, tm: String, now: u64) {
         if !self.enabled() {
             self.refuse(format!("{INJECT_VAR} is off"));
+            self.fail_held(held);
             return;
         }
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
         *lock(&self.applies) = Default::default();
-        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms }) {
+        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms, held, link_only, tm }) {
             self.refuse(format!("order for key {} replaced by a newer inject_next before a command used it", old.key));
+            if old.held != held {
+                self.fail_held(old.held);
+            }
         }
         self.pending.store(true, Ordering::Release);
     }
@@ -136,6 +176,7 @@ impl State {
         let order = order?;
         if now.saturating_sub(order.armed_ms) > order.ttl_ms {
             self.refuse(self.expired(order.key, order.ttl_ms));
+            self.fail_held(order.held);
             return None;
         }
         Some(order)
@@ -150,8 +191,8 @@ impl State {
         }
     }
 
-    /// Expires an order nobody used (the service thread calls this) and hands out the events.
-    pub fn drain_events(&self, now: u64) -> Vec<Event> {
+    /// Expires an order nobody used.
+    fn expire(&self, now: u64) {
         if self.pending() {
             let mut g = lock(&self.order);
             if g.as_ref().is_some_and(|o| now.saturating_sub(o.armed_ms) > o.ttl_ms) {
@@ -159,8 +200,14 @@ impl State {
                 self.pending.store(false, Ordering::Release);
                 drop(g);
                 self.refuse(self.expired(o.key, o.ttl_ms));
+                self.fail_held(o.held);
             }
         }
+    }
+
+    /// Expires an order nobody used (the service thread calls this) and hands out the events.
+    pub fn drain_events(&self, now: u64) -> Vec<Event> {
+        self.expire(now);
         std::mem::take(&mut *lock(&self.events))
     }
 }
@@ -189,6 +236,28 @@ pub fn construction_count(text: &str) -> u64 {
 const TO_ADD: usize = 0x258;
 const CONSTRUCTION_STRIDE: usize = 0xe48;
 const CONSTRUCTION_FROZEN: usize = 0xcd8;
+const EDGE_OBJECTS_TO_ADD: usize = 0x128;
+const EDGE_OBJECT_STRIDE: usize = 0x1a0;
+
+/// The members whose elements the receiving game takes from its own conversion of the same build (the script command, the "donor"),
+/// never from the text: (member, offset in the payload, element stride). Their elements own engine objects that the text does not carry:
+/// a construction's description (tens of thousands of heap blocks), and an edge object's model instance, whose +0xb0 member is an engine
+/// btree (root, rightmost, size; nodes with 0x50-byte slots and child pointers, copied by 0x63c10 from the EdgeObject copy 0x4c5fa0) and
+/// whose +0xd8 member is an owned vector. inj3/inj4 (2026-10-14, a stop replacing a stop): the typed text zeroed the btree's root beside
+/// its size 2 and the receiver crashed in the engine's copy of the injected Proposal (AV reading 0 at TF3+0x63c2f). The proof still
+/// compares every named member of these elements with the text.
+pub const DONOR_MEMBERS: &[(&str, usize, usize)] =
+    &[("proposal.edgeObjectsToAdd", EDGE_OBJECTS_TO_ADD, EDGE_OBJECT_STRIDE), ("toAdd", TO_ADD, CONSTRUCTION_STRIDE)];
+
+fn is_donor_member(name: &str) -> bool {
+    DONOR_MEMBERS.iter().any(|m| m.0 == name)
+}
+
+/// How many elements of each [`DONOR_MEMBERS`] member the text's proposal adds, in that order.
+pub fn donor_counts(text: &str) -> Vec<u64> {
+    let lines = rebuild::lines_of(text);
+    DONOR_MEMBERS.iter().map(|m| count(&lines, &format!("{}.#", m.0))).collect()
+}
 
 /// The `frozenNodes` values of construction `i` in the text (`toAdd[i].frozenNodes[k]`, printed as `ent:old#N`: the value is the index).
 fn frozen_of(lines: &std::collections::BTreeMap<&str, &str>, i: u64) -> Result<Vec<u32>, String> {
@@ -300,18 +369,25 @@ pub fn build_verified(
 ) -> Result<Built, String> {
     let lines = rebuild::lines_of(text);
     let cons = count(&lines, "toAdd.#");
-    if cons > 0 && donor.is_none() {
+    let wanted = donor_counts(text);
+    let hybrid = wanted.iter().any(|&n| n > 0);
+    if hybrid && donor.is_none() {
         return Err(format!(
-            "the text adds {cons} construction(s): it needs the script command's own conversion of them"
+            "the text adds {}: it needs the script command's own conversion of them",
+            DONOR_MEMBERS.iter().zip(&wanted).map(|(m, n)| format!("{n} {}", m.0)).collect::<Vec<_>>().join(", ")
         ));
     }
-    let hybrid = cons > 0;
     let mut r4_report = String::new();
-    if let Some(donor) = donor.filter(|_| hybrid) {
+    if let Some(donor) = donor.filter(|_| cons > 0) {
         // R4 (informational): what the two sides' unnamed construction words look like after their differential masks
         r4_report = entity_equivalence(c, text, donor, say);
     }
-    let take = |f: &F| !(hybrid && f.name == "toAdd") && nc::selected(f, &lines);
+    // A container past the Proposal (the Context's `refundableEntities`) is never swapped in (`swap_into` copies the Proposal only; the
+    // command keeps its own Context), so it is neither rebuilt nor proved: rt4 R6 (2026-10-14), the real bulldozer over a town house,
+    // was refused on both games for the 17 list and bucket pointers of a one-entry `refundableEntities` that the injection would not
+    // have used.
+    let take =
+        |f: &F| !(hybrid && is_donor_member(f.name)) && !outside_proposal_container(f) && nc::selected(f, &lines);
     let built = match rebuild::build_selected(text, c.base, c.alloc, Some(&take)) {
         Ok(b) => b,
         Err(e) => {
@@ -322,7 +398,7 @@ pub fn build_verified(
     let unresolved: Vec<&rebuild::Blocked> = built
         .blocked
         .iter()
-        .filter(|b| b.kind == "heap pointer" && !(hybrid && rebuild::member_of(&b.path) == "toAdd"))
+        .filter(|b| b.kind == "heap pointer" && !(hybrid && is_donor_member(&rebuild::member_of(&b.path))))
         .collect();
     if !unresolved.is_empty() {
         let n = unresolved.len();
@@ -346,22 +422,36 @@ pub fn build_verified(
     }
     c.alloc.forget_all(); // the blocks belong to the source object now; its destructor frees them
     if let Some(donor) = donor.filter(|_| hybrid) {
-        if p.bytes()[TO_ADD..TO_ADD + 24].iter().any(|&b| b != 0) {
+        if DONOR_MEMBERS.iter().any(|m| p.bytes()[m.1..m.1 + 24].iter().any(|&b| b != 0)) {
             // SAFETY: constructed above, destroyed once.
             unsafe { (c.fns.dtor)(p.ptr()) };
-            return Err("the engine-made source already holds constructions".into());
+            return Err("the engine-made source already holds elements the script command's conversion supplies".into());
         }
         let mut z = Scratch::new();
-        say("inject: calling the engine copy constructor on the script command's own Proposal (its conversion of the constructions)");
+        say("inject: calling the engine copy constructor on the script command's own Proposal (its conversion of the constructions and edge objects)");
         // SAFETY: `donor` is the live command's payload (only read by a copy constructor); `z` is scratch.
         unsafe { (c.fns.copy)(z.ptr(), donor as *const u8) };
-        // the constructions move into the source; the donor's copy keeps an empty list and is destroyed
-        let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
-        pb[TO_ADD..TO_ADD + 24].copy_from_slice(&zb[TO_ADD..TO_ADD + 24]);
-        zb[TO_ADD..TO_ADD + 24].fill(0);
+        let mismatch = DONOR_MEMBERS.iter().zip(&wanted).find_map(|(m, &n)| {
+            let (b, e) = (u64_at(z.bytes(), m.1), u64_at(z.bytes(), m.1 + 8));
+            let have = if e >= b { (e - b) / m.2 as u64 } else { u64::MAX };
+            (have != n).then(|| format!("the conversion in the script command has {have} {}, the text has {n}", m.0))
+        });
+        // the donated elements move into the source (on a mismatch they stay and die with the donor's copy); the donor's copy keeps empty lists
+        if mismatch.is_none() {
+            let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
+            for m in DONOR_MEMBERS {
+                pb[m.1..m.1 + 24].copy_from_slice(&zb[m.1..m.1 + 24]);
+                zb[m.1..m.1 + 24].fill(0);
+            }
+        }
         say("inject: calling the engine destructor on the donor's copy");
-        // SAFETY: constructed above, destroyed once; its constructions now belong to `p`.
+        // SAFETY: constructed above, destroyed once; the moved elements now belong to `p`.
         unsafe { (c.fns.dtor)(z.ptr()) };
+        if let Some(why) = mismatch {
+            // SAFETY: constructed above, destroyed once.
+            unsafe { (c.fns.dtor)(p.ptr()) };
+            return Err(why);
+        }
     }
     let mut d = Scratch::new();
     say("inject: calling the engine copy constructor on the source");
@@ -377,7 +467,7 @@ pub fn build_verified(
         unsafe { (c.fns.dtor)(d.ptr()) };
         Err(why)
     };
-    if hybrid {
+    if cons > 0 {
         if let Err(why) = set_construction_frozen(c, poke, d.bytes(), &lines, cons) {
             c.alloc.free_all();
             return fail(&mut d, why);
@@ -389,9 +479,10 @@ pub fn build_verified(
         Ok(t) => t,
         Err(e) => return fail(&mut d, format!("the engine's Proposal cannot be written as text to be checked: {e}")),
     };
-    let (named_diff, detail) = nc::describe_split(text, &again);
+    let (text_p, again_p) = (without_unswapped(text), without_unswapped(&again));
+    let (named_diff, detail) = nc::describe_split(&text_p, &again_p);
     if named_diff != 0 {
-        let all = nc::diff_all(text, &again);
+        let all = nc::diff_all(&text_p, &again_p);
         return fail(
             &mut d,
             format!(
@@ -473,7 +564,7 @@ fn sane(t: (u64, u64, u64), stride: usize) -> bool {
 
 /// The command the script sent must be a `build_proposal` with sane vectors, and carry exactly `constructions` constructions: none for a
 /// text without (a placeholder), the receiver's own conversion of them for a text with.
-pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64) -> Result<(), String> {
+pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_objects: u64) -> Result<(), String> {
     let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
     if bytes[0x9b8] != portable::KIND_BUILD_PROPOSAL {
         return Err(format!("the command is kind {}, not build_proposal", bytes[0x9b8]));
@@ -482,6 +573,15 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64) -> Resu
     let to_add = tri(TO_ADD);
     if !sane(tri(0x000), 0x40) || !sane(tri(0x018), 0x350) || !sane(to_add, CONSTRUCTION_STRIDE) {
         return Err("the command's proposal has a vector that is not one".into());
+    }
+    let objects = tri(EDGE_OBJECTS_TO_ADD);
+    if !sane(objects, EDGE_OBJECT_STRIDE) {
+        return Err("the command's proposal has a vector that is not one".into());
+    }
+    // the edge objects are the receiver's own conversion as well (see DONOR_MEMBERS): the command carries the text's number of them
+    let have_objects = (objects.1 - objects.0) / EDGE_OBJECT_STRIDE as u64;
+    if have_objects != edge_objects {
+        return Err(format!("the command has {have_objects} edge object(s), the text has {edge_objects}"));
     }
     let have = (to_add.1 - to_add.0) / CONSTRUCTION_STRIDE as u64;
     match (constructions, have) {
@@ -549,7 +649,26 @@ pub unsafe fn swap_into(c: &Ctx, b: &Built, dest: usize) {
 
 /// True for the members `build_verified` would not rebuild; kept next to the rule it mirrors.
 pub fn is_container(f: &F) -> bool {
-    matches!(f.ty, Ty::Map | Ty::Hash)
+    matches!(f.ty, Ty::Map | Ty::Hash(_))
+}
+
+/// A container member of the command that lies past the Proposal: [`swap_into`] never copies it into the command.
+fn outside_proposal_container(f: &F) -> bool {
+    f.off >= PROPOSAL_SIZE && is_container(f)
+}
+
+/// `text` without the lines of the members [`outside_proposal_container`] names (the proof compares only what is swapped in).
+fn without_unswapped(text: &str) -> String {
+    let skip: Vec<&str> = portable::PAYLOAD.iter().filter(|f| outside_proposal_container(f)).map(|f| f.name).collect();
+    text.lines()
+        .filter(|l| {
+            let path = l.split('\t').next().unwrap_or("");
+            !skip
+                .iter()
+                .any(|s| path == *s || path.strip_prefix(s).is_some_and(|r| r.starts_with('.') || r.starts_with('[')))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -694,7 +813,7 @@ mod tests {
         );
         assert_eq!((built.nodes, built.segments, built.constructions), (2, 1, 0));
         let mut dest = placeholder(false);
-        check_destination(&mem, dest.addr(), 0).expect("a placeholder");
+        check_destination(&mem, dest.addr(), 0, 0).expect("a placeholder");
         let a0 = ASSIGNS.load(Ordering::SeqCst);
         // SAFETY: the stand-in assignment copies 0x358 bytes between two buffers of this test.
         unsafe { swap_into(&ctx, &built, dest.addr()) };
@@ -729,7 +848,7 @@ mod tests {
         assert_eq!((built.nodes, built.segments, built.constructions), (2, 1, 1));
         // the destination must carry the same number of constructions
         let mut dest = placeholder(false);
-        assert!(check_destination(&mem, dest.addr(), 1).unwrap_err().contains("0 construction(s), the text has 1"));
+        assert!(check_destination(&mem, dest.addr(), 1, 0).unwrap_err().contains("0 construction(s), the text has 1"));
         release(&ctx, built);
         let _ = dest.ptr();
     }
@@ -798,35 +917,83 @@ mod tests {
         let arena = Arena::new(0x3000_0000_0000);
         let mem = Both(&arena);
         let ok = placeholder(false);
-        assert!(check_destination(&mem, ok.addr(), 0).is_ok());
+        assert!(check_destination(&mem, ok.addr(), 0, 0).is_ok());
         let mut other = placeholder(false);
         other.bytes_mut()[0x9b8] = 17;
-        assert!(check_destination(&mem, other.addr(), 0).unwrap_err().contains("not build_proposal"));
+        assert!(check_destination(&mem, other.addr(), 0, 0).unwrap_err().contains("not build_proposal"));
         let mut cons = placeholder(true);
         // toAdd with one element
         cons.bytes_mut()[0x258..0x260].copy_from_slice(&0x2000_0000_1000u64.to_le_bytes());
         cons.bytes_mut()[0x260..0x268].copy_from_slice(&(0x2000_0000_1000u64 + 0xe48).to_le_bytes());
         cons.bytes_mut()[0x268..0x270].copy_from_slice(&(0x2000_0000_1000u64 + 0xe48).to_le_bytes());
-        assert!(check_destination(&mem, cons.addr(), 0).unwrap_err().contains("already adds a construction"));
+        assert!(check_destination(&mem, cons.addr(), 0, 0).unwrap_err().contains("already adds a construction"));
         let mut bad = placeholder(false);
         bad.bytes_mut()[0..8].copy_from_slice(&5u64.to_le_bytes());
-        assert!(check_destination(&mem, bad.addr(), 0).unwrap_err().contains("not one"));
-        assert!(check_destination(&mem, 0x10, 0).is_err());
+        assert!(check_destination(&mem, bad.addr(), 0, 0).unwrap_err().contains("not one"));
+        assert!(check_destination(&mem, 0x10, 0, 0).is_err());
+    }
+
+    #[test]
+    fn edge_objects_come_from_the_script_commands_conversion() {
+        // a stop's text: its edge object is the receiver's own conversion, so a text with one needs the donor (refused before any engine call)
+        let (arena, _, text) = world_text(false);
+        let stop =
+            format!("{text}proposal.edgeObjectsToAdd.#\tn:1\n").replace("proposal.edgeObjectsToAdd.#\tn:0\n", "");
+        assert_eq!(donor_counts(&stop), vec![1, 0]);
+        let mem = Both(&arena);
+        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let c0 = CTORS.load(Ordering::SeqCst);
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &stop, None, &mut |_| {});
+        assert!(
+            matches!(&r, Err(e) if e.contains("1 proposal.edgeObjectsToAdd") && e.contains("own conversion")),
+            "{:?}",
+            r.err()
+        );
+        assert_eq!(CTORS.load(Ordering::SeqCst), c0);
+        // the destination must carry the text's number of edge objects (a placeholder without the stop is not the mod's command)
+        let mut dest = placeholder(false);
+        assert!(check_destination(&mem, dest.addr(), 0, 1).unwrap_err().contains("0 edge object(s), the text has 1"));
+        let b = 0x2000_0000_2000u64;
+        dest.bytes_mut()[0x128..0x130].copy_from_slice(&b.to_le_bytes());
+        dest.bytes_mut()[0x130..0x138].copy_from_slice(&(b + 0x1a0).to_le_bytes());
+        dest.bytes_mut()[0x138..0x140].copy_from_slice(&(b + 0x1a0).to_le_bytes());
+        assert!(check_destination(&mem, dest.addr(), 0, 1).is_ok());
+        assert!(check_destination(&mem, dest.addr(), 0, 0).unwrap_err().contains("1 edge object(s), the text has 0"));
+    }
+
+    #[test]
+    fn an_order_of_a_deferred_command_that_no_command_uses_fails_that_command() {
+        let s = State::default();
+        s.arm(1, 0, 4, 0);
+        assert_eq!(s.take_failed(0), [4], "the switch is off: the deferred command can never get its result");
+        s.enable();
+        s.arm(2, 0, 5, 10);
+        s.arm(3, 0, 6, 20); // replaces the first before a command used it
+        assert_eq!(s.take_failed(20), [5]);
+        assert!(s.take_failed(20 + DEFAULT_TTL_MS).is_empty(), "not expired yet");
+        assert_eq!(s.take_failed(21 + DEFAULT_TTL_MS), [6], "expired unused");
+        s.arm_link(8, 0, "key=1:1".into(), 100);
+        let o = s.take(110).expect("armed");
+        assert!(o.link_only && o.held == 8 && o.tm == "key=1:1");
+        assert!(s.take_failed(110).is_empty(), "used: it completes with that command's result");
     }
 
     #[test]
     fn an_order_is_taken_once_expires_and_is_replaced() {
         let s = State::default();
-        s.arm(7, 0, 0);
+        s.arm(7, 0, 0, 0);
         assert!(!s.pending(), "off: refused");
         assert!(matches!(s.drain_events(0).as_slice(), [Event::InjectRefused { reason }] if reason.contains("is off")));
         s.enable();
-        s.arm(7, 0, 100);
+        s.arm(7, 0, 0, 100);
         assert!(s.pending());
-        assert_eq!(s.take(150), Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS }));
+        assert_eq!(
+            s.take(150),
+            Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS, held: 0, link_only: false, tm: String::new() })
+        );
         assert_eq!((s.take(150), s.pending()), (None, false));
-        s.arm(8, 50, 0);
-        s.arm(9, 50, 10);
+        s.arm(8, 50, 0, 0);
+        s.arm(9, 50, 0, 10);
         let ev = s.drain_events(10);
         assert!(
             matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("key 8") && reason.contains("replaced")),
@@ -838,7 +1005,7 @@ mod tests {
             matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("key 9") && reason.contains("expired")),
             "{ev:?}"
         );
-        s.arm(1, 0, 0);
+        s.arm(1, 0, 0, 0);
         let ev = s.drain_events(DEFAULT_TTL_MS + 1);
         assert!(matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("expired")), "{ev:?}");
     }
@@ -894,15 +1061,15 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
     fn an_order_taken_for_a_command_that_is_not_the_mods_is_put_back_and_a_town_construction_is_not_the_mods() {
         let s = State::default();
         s.enable();
-        s.arm(3, 0, 100);
+        s.arm(3, 0, 0, 100);
         let o = s.take(150).expect("armed");
         s.put_back(o);
         assert!(s.pending());
         assert_eq!(s.take(160).expect("put back").key, 3);
         // a newer order wins over the one put back
-        s.arm(4, 0, 200);
+        s.arm(4, 0, 0, 200);
         let o = s.take(210).expect("armed");
-        s.arm(5, 0, 220);
+        s.arm(5, 0, 0, 220);
         s.put_back(o);
         assert_eq!(s.take(230).expect("the newer").key, 5);
         // the command's construction against the text's: file and transform

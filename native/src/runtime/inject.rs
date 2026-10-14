@@ -2,13 +2,15 @@
 //! A child module of `runtime` so that it can use the runtime's private fields.
 
 use super::Runtime;
-use crate::dump::{Env, LiveHeapMem, LiveMem, Mem};
+use crate::dump::{Env, LiveMem, Mem};
 use crate::engine::{self, AddArgs};
 use crate::inject as inj;
 use crate::link::Event;
 use crate::native_copy as nc;
 use crate::portable;
 use crate::rebuild::{Alloc, EngineAlloc};
+
+use super::{wall_ms, StampTiming};
 
 impl Runtime {
     /// Switches the native injection on (`FEVERLINK3_NATIVE_INJECT=1`). `settings` are the portable text settings the originator's
@@ -41,7 +43,8 @@ impl Runtime {
         }
         let Some(settings) = self.inject_settings.get().copied() else { return };
         let t0 = std::time::Instant::now();
-        let live = LiveHeapMem::new();
+        let wall0 = wall_ms();
+        let live = LiveMem;
         let head = portable::Header {
             seq: 0,
             event: "inject",
@@ -71,18 +74,33 @@ impl Runtime {
                 m.carried_ranges("toAdd[0].")
             ));
         }
+        let mask_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let opts = portable::EncodeOpts { collect: None, mask: mask.as_ref().map(|m| &m.mask) };
-        match portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts) {
-            Ok(p) => match self.text.write(id, &p.text) {
+        let t_enc = std::time::Instant::now();
+        let encoded =
+            portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts);
+        let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+        let t_write = std::time::Instant::now();
+        let written: Option<std::io::Result<()>> = encoded.as_ref().ok().map(|p| self.text.write(id, &p.text));
+        let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+        let bytes = encoded.as_ref().map_or(0, |p| p.text.len());
+        self.inject.report(Event::Timing {
+            what: "capture",
+            id,
+            detail: format!(
+                "held={id} start={wall0} end={} ms={:.1} bytes={bytes} mask_ms={mask_ms:.1} encode_ms={encode_ms:.1} write_ms={write_ms:.1}",
+                wall_ms(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            ),
+        });
+        match encoded.map(|p| (written, p)) {
+            Ok((Some(w), p)) => match w {
                 Ok(()) if !p.unresolved.is_empty() => {
                     // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what
                     // the memory there looks like, so that one run shows everything that stays to be understood
                     for (member, addr) in p.unresolved.iter().take(40) {
                         let bytes = LiveMem.read(*addr, 32).map_or("unreadable".to_string(), |b| crate::plan::hex(&b));
-                        self.say(&format!(
-                            "native inject: hold {id}: unresolved pointer in {member} -> {addr:#x} [{}] bytes {bytes}",
-                            live.heap_near(*addr)
-                        ));
+                        self.say(&format!("native inject: hold {id}: unresolved pointer in {member} -> {addr:#x} bytes {bytes}"));
                     }
                     self.say(&format!(
                         "native inject: hold {id}: portable text written in {} ms, {} bytes, {} lines (native_text_{id}.txt), {} pointer(s) not followed; {}",
@@ -102,6 +120,7 @@ impl Runtime {
                 )),
                 Err(e) => self.say(&format!("native inject: hold {id}: cannot write the text: {e}")),
             },
+            Ok((None, _)) => {}
             Err(why) => self.say(&format!("native inject: hold {id}: the layout table refuses this command: {why}")),
         }
     }
@@ -168,8 +187,23 @@ impl Runtime {
             self.wake();
             return;
         };
+        // a deferred held command of the same build takes this command's result once the simulation has applied it, injected or not
+        // (a refusal leaves the command to the record path, which is still this game's stamp apply of the build)
+        let link = (order.held != 0).then_some((dest, order.held));
         let t0 = std::time::Instant::now();
-        match self.inject_run(order.key, dest) {
+        let rb0 = wall_ms();
+        let run = if order.link_only {
+            Err(String::new()) // complete_next: the record's own command is this game's stamp apply; nothing to inject
+        } else {
+            self.inject_run(order.key, dest)
+        };
+        match run {
+            Err(why) if order.link_only && why.is_empty() => {
+                self.say(&format!(
+                    "native inject: complete_next held {}: this script build_proposal is this game's stamp apply (record path)",
+                    order.held
+                ));
+            }
             Ok((nodes, segments, constructions)) => {
                 self.say(&format!(
                     "native inject: key {}: INJECTED the engine Proposal built from the text ({nodes} nodes, {segments} segments, {constructions} construction(s)) in {} ms",
@@ -177,6 +211,7 @@ impl Runtime {
                     t0.elapsed().as_millis()
                 ));
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
+                *super::lock(&self.inject_last_ok) = Some(order.key);
             }
             Err(why) if why.starts_with(inj::NOT_OURS) => {
                 self.say(&format!(
@@ -184,6 +219,8 @@ impl Runtime {
                     order.key
                 ));
                 self.inject.put_back(order);
+                self.wake();
+                return;
             }
             Err(why) => {
                 // the short reason goes to the log and the event; the full report (every unresolved pointer, every differing line) to a file
@@ -204,6 +241,83 @@ impl Runtime {
                 self.say(&format!("native inject: key {}: REFUSED, the command is untouched: {why}", order.key));
                 self.inject.refuse(format!("key {}: {why}", order.key));
             }
+        }
+        let how = if order.link_only {
+            "record (complete_next)"
+        } else if super::lock(&self.inject_last_ok).take() == Some(order.key) {
+            "injected"
+        } else {
+            "refused (record path)"
+        };
+        *super::lock(&self.stamp_timing) = Some(StampTiming {
+            payload: dest,
+            key: order.key,
+            held: order.held,
+            tm: order.tm.clone(),
+            rebuild: format!(
+                "rebuild={rb0}..{} rebuild_ms={:.1} how={how}",
+                wall_ms(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            ),
+        });
+        if let Some((payload, held)) = link {
+            self.say(&format!(
+                "native inject: key {}: held command {held} completes with this command's result after the apply",
+                order.key
+            ));
+            *super::lock(&self.defer_link) = Some((payload, held));
+        }
+        self.wake();
+    }
+
+    /// After the simulation applied `cmd`: when it is the command an order was used for, one `timing apply` record with the mod's timing
+    /// text, the rebuild's times and the apply's wall-clock time (the mod writes it into its trace as the build's timing line).
+    pub(super) fn timing_after_apply(&self, cmd: *mut u8) {
+        // SAFETY: only readable memory is read.
+        let Some(payload) = (unsafe { engine::payload_of(cmd) }) else { return };
+        let t = {
+            let mut g = super::lock(&self.stamp_timing);
+            match &*g {
+                Some(t) if t.payload == payload => g.take(),
+                _ => None,
+            }
+        };
+        let Some(t) = t else { return };
+        let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
+        let detail = format!("{} {} apply={} accepted={ok}", t.tm, t.rebuild, wall_ms());
+        let id = if t.held != 0 { t.held } else { t.key };
+        self.inject.report(Event::Timing { what: "apply", id, detail });
+        self.wake();
+    }
+
+    /// After the simulation applied `cmd` (simulation thread): when it is the script command a deferred held command waits for, the held
+    /// command takes its result and is due for completion (its tool callback is fired at the next `Add`, on the interface thread).
+    pub(super) fn complete_deferred(&self, cmd: *mut u8) {
+        // SAFETY: only readable memory is read.
+        let Some(payload) = (unsafe { engine::payload_of(cmd) }) else { return };
+        let link = {
+            let mut g = super::lock(&self.defer_link);
+            match *g {
+                Some((p, _)) if p == payload => g.take(),
+                _ => None,
+            }
+        };
+        let Some((_, held)) = link else { return };
+        let mut adopted = None;
+        let done = {
+            let mut machine = super::lock(&self.machine);
+            // SAFETY: `cmd` is the command the apply function was just called with; the held command is only touched under this lock.
+            let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
+            machine.complete(held, ok, |h| adopted = Some(unsafe { engine::adopt_result(h, cmd) }))
+        };
+        match adopted {
+            Some(a) if done => self.say(&format!(
+                "deferred completion: held command {held} took the result of this game's stamp apply (accepted {}, {} bytes in the command's vector); its tool callback is fired at the next Add",
+                a.ok, a.vec_bytes
+            )),
+            _ => self.say(&format!(
+                "deferred completion: held command {held} is no longer deferred (dropped before the stamp apply): nothing to complete"
+            )),
         }
         self.wake();
     }
@@ -231,17 +345,17 @@ impl Runtime {
         }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
-        let constructions = inj::construction_count(&text);
+        let counts = inj::donor_counts(&text);
+        let (edge_objects, constructions) = (counts[0], counts[1]);
         // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
-        inj::check_destination(&LiveMem, dest, constructions)
+        inj::check_destination(&LiveMem, dest, constructions, edge_objects)
             .and_then(|()| inj::same_constructions(&LiveMem, dest, &text))
             .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
-        // an index of the heap's blocks for the proof (refreshed before every text, see LiveHeapMem)
-        let live = LiveHeapMem::new();
+        let live = LiveMem;
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
         let mut say = |l: &str| self.say(l);
-        let donor = (constructions > 0).then_some(dest);
+        let donor = counts.iter().any(|&n| n > 0).then_some(dest);
         let built = inj::build_verified(&ctx, &super::cmd_patch::LivePoke, &text, donor, &mut say);
         alloc.free_all();
         let built = built?;
@@ -253,7 +367,7 @@ impl Runtime {
                 Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
             }
         }
-        if constructions > 0 {
+        if donor.is_some() {
             self.inject_donor_report(key, dest, &text, &built, &dir);
         }
         self.say("native inject: calling the engine copy assignment into the script command's Proposal");
@@ -269,7 +383,7 @@ impl Runtime {
     /// swapped in) and `native_inject_diff_<key>.txt` (every line where the originator's text and the donor differ).
     fn inject_donor_report(&self, key: u64, dest: usize, text: &str, built: &inj::Built, dir: &std::path::Path) {
         let Some(settings) = self.inject_settings.get().copied() else { return };
-        let live = LiveHeapMem::new();
+        let live = LiveMem;
         let encode = |payload: usize, event: &'static str| {
             let head = portable::Header {
                 seq: 0,
