@@ -24,15 +24,14 @@ Tested so far with two games on one PC (a scripted test that builds, bulldozes a
 - Very large money amounts (billions) no longer break the mod.
 - Demolishing a building no longer makes the games drift apart (a rare town-growth difference after a demolition).
 
-- Builds are now copied from the game's own build and applied at the same moment on every game, the game you clicked in included (on by default; testers can switch it off with `FEVERLINK3_NATIVE_INJECT=0`). In two-window tests on one PC, roads (also through houses), bus stops (also a stop replacing a stop), road depots over houses and a train station stayed identical on both games, with no repair sync, no crash, and the tool still usable after the build.
+- Builds are now copied from the game's own build and applied at the same moment on every game, the game you clicked in included (on by default; testers can switch it off with `FEVERLINK3_NATIVE_INJECT=0`). In two-window tests on one PC, roads (also through houses), bus stops (also a stop replacing a stop), road depots over houses, a train station and a module added to that station with Configure stayed identical on both games, with no repair sync, no crash, and the tool still usable after the build.
 
 ### Changed
 - The logs are much more detailed during the test phase (every build, its result and the checks), so that a problem can be explained from the logs alone.
 
 ### Known gaps
-Known bugs in one line: a build next to something built earlier can fail on the other game (repaired by a sync), station modules added later arrive a moment early, the pause menu can drop a player, rail and harbours untested with the new build copy, no internet test yet.
+Known bugs in one line: a build next to something built earlier can fail on the other game (repaired by a sync), the pause menu can drop a player, rail and harbours untested with the new build copy, no internet test yet.
 - A build that touches something built earlier in the same session (for example a depot next to a new bus stop) can fail on the other game; the games then repair themselves with a sync and that build is lost. Seen once, after a long automated test.
-- Adding a module to an existing station (Configure) reaches the other game but is applied a moment early on your own game; the host corrects the money.
 - Opening the pause menu during a session switches the build sync off on that game and can drop that player from the session.
 - Rail track (also splitting a track), harbours and their bulldozing have not been tested with the new build copy.
 - Two players building at the very same moment has not been tested.

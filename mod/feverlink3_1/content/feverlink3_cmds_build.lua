@@ -2411,6 +2411,18 @@ function M.preState(proposal, ctxObj)
 	return pre
 end
 
+-- The record of a proposal read and nothing more (no classification: that runs the engine's dry run, makeProposalData): for a held command's
+-- own proposal, which the native module gives to the interface's scripts from inside the tool's mouse handler (run c10a 2026-10-14: a dry
+-- run there was followed by an engine assertion in UI::CSelector, ModelInstanceList of a preview entity missing). M.bodyOf makes the body
+-- later, outside the tool. Returns the record, or nil and why not.
+function M.captureRaw(proposal, ctx)
+	ctx = ctx or { plain = C.plain, keyOf = function(e) return "s:" .. tostring(e) end }
+	local cap = newCapture(ctx, {})
+	local ok, rec = pcall(captureRecord, proposal, cap)
+	if not ok then return nil, tostring(rec) end
+	return rec
+end
+
 -- A captured record as the body of an action line: the body, nil and its wire text, or nil and why not.
 function M.bodyOf(rec, flags)
 	flags = flags or {}

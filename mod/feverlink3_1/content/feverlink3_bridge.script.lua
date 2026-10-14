@@ -73,6 +73,8 @@ local NATIVE_INJECT = true
 pcall(function() NATIVE_INJECT = os.getenv("FEVERLINK3_NATIVE_INJECT") ~= "0" end)
 -- the largest native text a record released without one of its own carries (a complete text of a station is ~80 KB)
 local NATIVE_TEXT_MAX = 1024 * 1024
+-- the longest action body the host relays (core HostSession::MAX_ACTION_BODY): a longer one is dropped there and reaches no other game
+local ACTION_BODY_MAX = 480 * 1024
 
 -- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
 --   "0"          hold-and-release for every build (developer opt-out; was the default until 2026-10-13). The tool's command is held until the stamp and then released, so the tool gets its
@@ -2332,6 +2334,7 @@ local function natNew()
 		holdSent = false, holdAt = 0, active = false, activeSince = 0,
 		retryAt = nil, retries = 0, gaveUp = false,
 		caps = {}, parked = {}, awaiting = {}, owed = {}, deferred = {},
+		heldCaps = {},      -- held id -> the capture of that command's own proposal (the native module's preview `held:<id>`, natCapture)
 		heldByKey = {}, byId = {}, finishes = {},   -- shipped builds whose own copy is held: by action key / by held id; pause-path completions
 		sessionOn = true, sessionAt = -100,
 		logWin = -100, logN = 0, logLost = 0, faults = 0, dead = false,
@@ -2615,7 +2618,28 @@ local function natDecideUnsafe(h, cap)
 	local id = h.id
 	natInput(h)
 	local function release(why) natUnaccounted(h, why) end
-	if not cap then return release("no capture of a tool build") end
+	-- A command whose tool gave no preview is recorded from its own proposal: the native module gives every held build command to this
+	-- script as the preview of the tool `held:<id>` before announcing it (natCapture keeps it in N.heldCaps). One rule for every tool;
+	-- run s4 2026-10-14: a station module added via Configure (UI::ModuleBuilder, site 0x542eba) sends no preview, was released at once
+	-- and applied 7 steps before the stamp here only (other entity ids than on the other games from then on).
+	local own = N.heldCaps[id]
+	N.heldCaps[id] = nil
+	if not cap and own and own.raw and Build.bodyOf then
+		local okB, body, whyB, text = pcall(Build.bodyOf, own.raw, { playerInitiated = true })
+		if not okB then body, whyB = nil, tostring(body) end
+		if body then
+			body.category = buildCategory(body)
+			local okS, s2 = pcall(C.serialize, body)
+			if okS then own.body, own.text = body, s2 else own.why = tostring(s2) end
+		else
+			own.why = whyB
+		end
+	end
+	if not cap and own and own.body then
+		traceGui("build.capture", string.format("held=%d site=%s: no tool preview; recorded from the held command's own proposal (%d bytes, %.1f ms)", id, natSite(h), #(own.text or ""), own.ms or 0))
+		cap = own
+	end
+	if not cap then return release("no capture of a tool build" .. ((own and own.why) and (" (its own proposal: " .. tostring(own.why) .. ")") or "")) end
 	if not cap.body then
 		-- A build that cannot be captured cannot be shipped: the others never get it, and the safety net's resync would erase it here
 		-- later (real session 2026-10-12: a guest's bus stops, line and buses). With the tool's callback fireable the build is cancelled and
@@ -2688,6 +2712,13 @@ local function natDecideUnsafe(h, cap)
 	end
 	-- never cancel what this game could not rebuild itself (docs/ARCHITECTURE.md section 6)
 	local wire = C.parse(text)
+	if #text > ACTION_BODY_MAX and type(wire.input) == "string" then
+		-- the input-level text is a diagnostic and a fallback; the native text and the record are what the other games build from
+		wire.input = nil
+		text = C.serialize(wire)
+		traceGui("build.ship", string.format("held=%d the record was over %d bytes: sent without its input-level text (%d bytes now)", id, ACTION_BODY_MAX, #text))
+	end
+	if #text > ACTION_BODY_MAX then return release(string.format("its record (%d bytes) is over the %d bytes an action may have", #text, ACTION_BODY_MAX)) end
 	local now = engine.gameTime()
 	local okD, args, whyD = pcall(L.decodeCommand, wire, guiCtx({ kind = "action", at = now, from = C.PLAYER_ID, seq = 0, key = "strict-check" }))
 	if not okD then args, whyD = nil, tostring(args) end
@@ -2974,7 +3005,10 @@ local function natPair()
 	local keep = {}
 	for _, h in ipairs(N.parked) do
 		local info = SITES[h.site]
-		if info and next(info.tools) == nil then
+		local own = N.heldCaps[h.id]
+		if (info and next(info.tools) == nil) or (not info and own and own.raw) then
+			-- no preview of its tool can belong to it (or the site is unknown and its own proposal was recorded: no guess from the
+			-- newest preview of another tool); natDecideUnsafe takes the command's own record
 			natDecide(h, nil)
 		else
 			keep[#keep + 1] = h
@@ -3016,6 +3050,23 @@ local function natCapture(id, name, param)
 	if not N or N.dead or not N.holdSent or name ~= "builder.proposalCreate" then return end
 	if not (Build and Build.captureToolBuild) then return end
 	local t0 = os.clock()
+	local heldId = tonumber(tostring(id):match("^held:(%d+)$"))
+	if heldId then
+		-- the held command's own proposal, given by the native module from inside the tool's mouse handler (Runtime::give_preview), before its
+		-- `held` event: only read here (Build.captureRaw, no dry run); the record's body is made in natDecideUnsafe. Kept for exactly that
+		-- command, never as a tool's preview.
+		traceGui("build.capture", string.format("held=%d own proposal: reading", heldId))
+		local okR, rec, whyR = pcall(function() return Build.captureRaw((param[1] or param.proposal), { plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end }) end)
+		if not okR then rec, whyR = nil, tostring(rec) end
+		local own = { tool = tostring(id), raw = rec, why = whyR, t = os.clock() }
+		own.ms = (own.t - t0) * 1000
+		N.heldCaps[heldId] = own
+		for k, c in pairs(N.heldCaps) do
+			if own.t - c.t > NAT_PREVIEW_TTL then N.heldCaps[k] = nil end
+		end
+		traceGui("build.capture", string.format("held=%d own proposal read: %s (%.1f ms)", heldId, rec and "record read" or ("no record: " .. tostring(whyR)), own.ms))
+		return
+	end
 	local ok, body, why, text = pcall(Build.captureToolBuild, id, name, param, {
 		plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end,
 	})
@@ -3900,7 +3951,8 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 		end
 		return
 	end
-	for _, M in ipairs(CMDS) do
+	local ownPreview = tostring(id):find("^held:") ~= nil   -- a held command's own proposal (natCapture), not a tool's
+	for _, M in ipairs(ownPreview and {} or CMDS) do
 		if type(M.onToolEvent) == "function" then
 			local ok, err = pcall(M.onToolEvent, id, name, param, logGui)
 			if not ok then logGui("tool event handler failed: " .. tostring(err)) end
