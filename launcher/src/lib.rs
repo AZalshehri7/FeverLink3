@@ -25,6 +25,7 @@ pub mod install;
 pub mod live;
 pub mod luatext;
 pub mod net;
+pub mod netdelay;
 pub mod process;
 pub mod resync;
 pub mod selftest;
