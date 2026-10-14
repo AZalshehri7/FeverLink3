@@ -1238,6 +1238,9 @@ pub fn attach(build: &'static BuildAddrs, cfg: HookConfig, link: Option<Link>, l
         log("hooks: cannot find the game's image: nothing installed");
         return;
     }
+    // diagnostic, off unless FEVERLINK3_ID_TRACE=1
+    let ids_dir = link.as_ref().map(|l| l.dir.clone()).or_else(feverlink3_launcher::live::live_dir);
+    crate::ids::install(build.name, base, ids_dir, log);
     attach_at(base, build, cfg, link, log);
 }
 

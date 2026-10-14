@@ -23,6 +23,7 @@ pub mod detour;
 pub mod dump;
 pub mod growth;
 pub mod hold;
+pub mod ids;
 pub mod inject;
 pub mod input;
 pub mod link;
