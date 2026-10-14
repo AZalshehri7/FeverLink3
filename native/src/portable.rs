@@ -319,6 +319,16 @@ pub static PAYLOAD: &[F] = &[
     f(0x9b8, "kind", Ty::U8),
 ];
 
+/// The Proposal's maps of ids, each a `std::map<u32, std::set<u32>>` (see [`Enc::register_map_nodes`]).
+pub const ID_MAPS: &[&str] = &[
+    "proposal.new2oldNodes",
+    "proposal.old2newNodes",
+    "proposal.new2oldSegments",
+    "proposal.old2newSegments",
+    "proposal.new2oldEdgeObjects",
+    "proposal.old2newEdgeObjects",
+];
+
 // ---------------------------------------------------------------------------------------------------------------
 // limits and results
 // ---------------------------------------------------------------------------------------------------------------
@@ -758,6 +768,11 @@ impl Enc<'_> {
                 // std::unordered_map/set: load factor (the other four bytes of its word are padding), then the list head, size,
                 // bucket vector, mask and maximum index; the nodes are heap blocks of the graph
                 self.line(path, &format!("hash:size={},load={:08x}", u64_at(b, 0x10), u32_at(b, 0)))?;
+                self.register_hash_buckets(
+                    u64_at(b, 0x18) as usize,
+                    u64_at(b, 0x20) as usize,
+                    u64_at(b, 0x28) as usize,
+                );
                 self.container_graph(path, &b[8..], depth, u64_at(b, 0x10))
             }
             Ty::Raw(_) | Ty::Skip(_) | Ty::Pad(_) => Ok(()),
@@ -786,16 +801,19 @@ impl Enc<'_> {
     /// the same size whose missing children point at the sentinel. Registered only when the walk finds exactly `size` readable
     /// nodes, each with `isnil` clear; else nothing is registered and the pointers stay `P` (and the rebuild refuses).
     ///
-    /// The segment maps (`new2oldSegments`, `old2newSegments`) are `std::map<u32, std::set<u32>>`: nodes of 0x38 bytes (key at +0x20,
-    /// the set's head pointer at +0x28 and its size at +0x30; the engine's own copy code allocates 0x38 for the node and builds the set
-    /// copy from a 0x20-byte sentinel, `0x4bd430`/`0x4c2250`/`0x284fc0`), the set's nodes 0x20 bytes with the key at +0x1c. Other maps with
-    /// entries are walked as nodes of 0x50 bytes with the key at +0x20 and the value left to the graph. The line returned is the sorted
-    /// keys (with each set's keys for the segment maps).
+    /// The six id maps of the Proposal (nodes, segments, edge objects; new to old and old to new) are `std::map<u32, std::set<u32>>`:
+    /// nodes of 0x38 bytes (key at +0x20, the set's head pointer at +0x28 and its size at +0x30; the engine's own copy code allocates 0x38
+    /// for the node and builds the set copy from a 0x20-byte sentinel, `0x4bd430`/`0x4c2250`/`0x284fc0`), the set's nodes 0x20 bytes with
+    /// the key at +0x1c. The Proposal's copy constructor (0x4c78c0) copies all six with the same function (0x4bc8d0) from a 0x38-byte
+    /// sentinel each. Only the segment maps used to be typed: the node maps of a station configure (inj3, 2026-10-14) were walked as
+    /// generic maps of 0x50-byte nodes with their values left to the graph, and the walk followed the sets and the words beside them
+    /// into the world (32768 blocks, a 7.6 MB text). Other maps with entries are walked as nodes of 0x50 bytes with the key at +0x20 and
+    /// the value left to the graph. The line returned is the sorted keys (with each set's keys for the id maps).
     fn register_map_nodes(&mut self, path: &str, head: usize, size: usize) -> Option<String> {
         if size == 0 {
             return None; // an empty engine map is the engine's own; nothing to describe
         }
-        let sets = path.ends_with("new2oldSegments") || path.ends_with("old2newSegments");
+        let sets = ID_MAPS.contains(&path);
         let node = if sets { 0x38 } else { 0x50 };
         let nodes = self.walk_tree(head, size, node)?;
         let mut register: Vec<(usize, usize)> = vec![(head, node)];
@@ -823,12 +841,29 @@ impl Enc<'_> {
             self.known_sizes.insert(a, n);
         }
         if sets {
-            // the segment maps are typed: their nodes are written word by word by kind. Other maps keep the generic walk
+            // the id maps are typed: their nodes are written word by word by kind. Other maps keep the generic walk
             self.kinds.extend(kinds);
         }
         self.sentinels.insert(head);
         entries.sort();
         Some(entries.iter().map(|(k, v)| format!("{k:08x}{v}")).collect::<Vec<_>>().join(","))
+    }
+
+    /// The bucket vector of an engine hash container (MSVC: begin, end, capacity at +0x18 of the member; two list pointers per bucket)
+    /// is one block of `capacity - begin` bytes: its size is known from the container itself, so it does not depend on the heap index.
+    /// C10 run inj8 (2026-10-14, a module added to a modular station): the heap index did not list the 128-byte bucket block of the
+    /// Proposal's `old2new` (one entry, 8 buckets), its three words stayed `P` and the receiver refused the injection.
+    fn register_hash_buckets(&mut self, begin: usize, end: usize, cap: usize) {
+        let bytes = cap.wrapping_sub(begin);
+        if pointer_like(begin as u64)
+            && begin < end
+            && end <= cap
+            && bytes.is_multiple_of(16)
+            && bytes <= self.set.max_graph_block_bytes
+            && self.mem.read(begin, bytes).is_some()
+        {
+            self.known_sizes.entry(begin).or_insert(bytes);
+        }
     }
 
     /// The nodes of the tree at `head` (a sentinel of `node` bytes) as (address, bytes), when it holds exactly `size` of them. A set of

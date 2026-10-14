@@ -1277,66 +1277,94 @@ mod tests {
     }
 
     #[test]
-    fn the_segment_maps_are_walked_with_their_sets_and_the_sentinels_residue_is_not_a_pointer() {
+    fn a_hash_containers_bucket_vector_is_a_block_of_its_own_size_without_the_heap_index() {
+        // inj8 C10: the 128-byte bucket block of `old2new` (8 buckets) was not in the heap index and its three words stayed P
         let (fake, at) = synthetic();
         let arena = world(fake.0);
-        // std::map<u32, std::set<u32>>: sentinel (0x38), one node (key at +0x20, set head at +0x28, set size at +0x30), the set's
-        // sentinel and two nodes (0x20 bytes, key at +0x1c)
-        let w = |b: &mut Vec<u8>, off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
-        let (hd, node) = (arena.add(&[0u8; 0x38]), arena.add(&[0u8; 0x38]));
-        let (sh, s1, s2) = (arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]));
-        let residue = arena.add(&[7u8; 16]); // what the sentinel's unconstructed value area may still hold
-        let mut h = vec![0u8; 0x38];
-        for off in [0, 8, 0x10] {
-            w(&mut h, off, node as u64);
+        let buckets = arena.add(&[0u8; 0x80]);
+        let mut h = vec![0u8; 0x40];
+        h[0..4].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+        for (off, v) in [(0x18, buckets), (0x20, buckets + 0x80), (0x28, buckets + 0x80)] {
+            h[off..off + 8].copy_from_slice(&(v as u64).to_le_bytes());
         }
-        h[0x18] = 1;
-        h[0x19] = 1;
-        w(&mut h, 0x28, residue as u64);
-        w(&mut h, 0x30, 1);
-        arena.write(hd, &h);
-        let mut n = vec![0u8; 0x38];
-        for off in [0, 8, 0x10] {
-            w(&mut n, off, hd as u64);
-        }
-        n[0x20..0x24].copy_from_slice(&0xffff_fffbu32.to_le_bytes());
-        n[0x1a..0x20].copy_from_slice(b"/town_"); // colour and isnil are at +0x18/+0x19; what follows is residue (b43: ASCII from a log buffer)
-        n[0x24..0x28].copy_from_slice(b"stre");
-        w(&mut n, 0x28, sh as u64);
-        w(&mut n, 0x30, 2);
-        arena.write(node, &n);
-        let mut sent = vec![0u8; 0x20];
-        for (off, v) in [(0, s1), (8, s2), (0x10, s2)] {
-            w(&mut sent, off, v as u64);
-        }
-        sent[0x19] = 1;
-        arena.write(sh, &sent);
-        for (a, parent, left, right, key) in [(s1, s2, sh, sh, 7u32), (s2, sh, s1, sh, 9u32)] {
-            let mut b = vec![0u8; 0x20];
-            w(&mut b, 0, left as u64);
-            w(&mut b, 8, parent as u64);
-            w(&mut b, 0x10, right as u64);
-            b[0x1c..0x20].copy_from_slice(&key.to_le_bytes());
-            b[0x1a..0x1c].copy_from_slice(b"ab");
-            arena.write(a, &b);
-        }
-        let mut map = vec![0u8; 0x10];
-        w(&mut map, 0, hd as u64);
-        w(&mut map, 8, 1);
-        assert!(arena.write(at + 0x160, &map));
+        h[0x30..0x38].copy_from_slice(&7u64.to_le_bytes());
+        h[0x38..0x40].copy_from_slice(&8u64.to_le_bytes());
+        assert!(arena.write(at + 0x270, &h));
         let text =
             encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at)).expect("encodes").text;
-        assert!(text.contains("proposal.new2oldSegments.keys	keys:fffffffb=[00000007;00000009]"), "{text}");
-        // the sentinel's residue pointer was zeroed, and the set's blocks are in the graph: nothing of this map stays P
-        assert!(!text.contains("5f6e776f742f") && !text.contains("65727473"), "residue bytes are not carried: {text}");
-        let line = text.lines().find(|l| l.starts_with("proposal.new2oldSegments.graph")).unwrap();
-        assert!(!line.contains('P'), "{line}");
-        let built = build_selected(&text, BASE, &arena, None).expect("builds");
-        assert!(
-            !built.blocked.iter().any(|b| b.kind == "heap pointer" && b.path.contains("new2oldSegments")),
-            "{:?}",
-            built.blocked
-        );
+        let line = text.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
+        assert!(line.contains("B") && !line.contains('P'), "{line}");
+    }
+
+    #[test]
+    fn the_id_maps_are_walked_with_their_sets_and_the_sentinels_residue_is_not_a_pointer() {
+        // all six id maps are std::map<u32, std::set<u32>> (the Proposal copy constructor copies each with 0x4bc8d0); inj3: the node maps
+        // walked as generic maps followed their sets into the world (a 7.6 MB text)
+        for (off, name) in [(0x160usize, "proposal.new2oldSegments"), (0x150, "proposal.old2newNodes")] {
+            let (fake, at) = synthetic();
+            let arena = world(fake.0);
+            // std::map<u32, std::set<u32>>: sentinel (0x38), one node (key at +0x20, set head at +0x28, set size at +0x30), the set's
+            // sentinel and two nodes (0x20 bytes, key at +0x1c)
+            let w = |b: &mut Vec<u8>, off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            let (hd, node) = (arena.add(&[0u8; 0x38]), arena.add(&[0u8; 0x38]));
+            let (sh, s1, s2) = (arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]), arena.add(&[0u8; 0x20]));
+            let residue = arena.add(&[7u8; 16]); // what the sentinel's unconstructed value area may still hold
+            let mut h = vec![0u8; 0x38];
+            for off in [0, 8, 0x10] {
+                w(&mut h, off, node as u64);
+            }
+            h[0x18] = 1;
+            h[0x19] = 1;
+            w(&mut h, 0x28, residue as u64);
+            w(&mut h, 0x30, 1);
+            arena.write(hd, &h);
+            let mut n = vec![0u8; 0x38];
+            for off in [0, 8, 0x10] {
+                w(&mut n, off, hd as u64);
+            }
+            n[0x20..0x24].copy_from_slice(&0xffff_fffbu32.to_le_bytes());
+            n[0x1a..0x20].copy_from_slice(b"/town_"); // colour and isnil are at +0x18/+0x19; what follows is residue (b43: ASCII from a log buffer)
+            n[0x24..0x28].copy_from_slice(b"stre");
+            w(&mut n, 0x28, sh as u64);
+            w(&mut n, 0x30, 2);
+            arena.write(node, &n);
+            let mut sent = vec![0u8; 0x20];
+            for (off, v) in [(0, s1), (8, s2), (0x10, s2)] {
+                w(&mut sent, off, v as u64);
+            }
+            sent[0x19] = 1;
+            arena.write(sh, &sent);
+            for (a, parent, left, right, key) in [(s1, s2, sh, sh, 7u32), (s2, sh, s1, sh, 9u32)] {
+                let mut b = vec![0u8; 0x20];
+                w(&mut b, 0, left as u64);
+                w(&mut b, 8, parent as u64);
+                w(&mut b, 0x10, right as u64);
+                b[0x1c..0x20].copy_from_slice(&key.to_le_bytes());
+                b[0x1a..0x1c].copy_from_slice(b"ab");
+                arena.write(a, &b);
+            }
+            let mut map = vec![0u8; 0x10];
+            w(&mut map, 0, hd as u64);
+            w(&mut map, 8, 1);
+            assert!(arena.write(at + off, &map));
+            let text = encode(&NoHeap(&arena), Env { image_base: BASE }, settings(), "40420", &head(at))
+                .expect("encodes")
+                .text;
+            assert!(text.contains(&format!("{name}.keys	keys:fffffffb=[00000007;00000009]")), "{text}");
+            // the sentinel's residue pointer was zeroed, and the set's blocks are in the graph: nothing of this map stays P
+            assert!(
+                !text.contains("5f6e776f742f") && !text.contains("65727473"),
+                "residue bytes are not carried: {text}"
+            );
+            let line = text.lines().find(|l| l.starts_with(&format!("{name}.graph"))).unwrap();
+            assert!(!line.contains('P'), "{line}");
+            let built = build_selected(&text, BASE, &arena, None).expect("builds");
+            assert!(
+                !built.blocked.iter().any(|b| b.kind == "heap pointer" && b.path.contains(name)),
+                "{:?}",
+                built.blocked
+            );
+        }
     }
 
     #[test]
