@@ -1188,6 +1188,21 @@ class StrictCancelFallbackTest(StrictTest):
         self.assertEqual(self.relay.vetoes, [])
         self.assertNotIn("held=true", str(self.B.action_records()[0]["body"]).replace(" ", ""), "no held marker in this mode")
 
+    def test_the_stamp_margin_is_measured_by_the_receiver_and_reported_back(self):
+        self.start()
+        self.tick(4)   # clocks (and the receiver's default need) reach the other game
+        self.B.tool(SPLIT, make="NATIVE_SPLIT")
+        self.tick(16)
+        body = self.B.action_records()[0]["body"]
+        self.assertIn('["xs"]=', body, "the record carries the extra it was stamped with")
+        a_trace = self.trace(self.A)
+        self.assertRegex(a_trace, r"build\.margin 1:1 recv g\d+ stamp \d+ slack=-?\d+ steps extra_used=\d+ target=\d+ sample=\d+ need=\d+ \((grow|keep|shrink)\)")
+        self.assertSameWorld()
+
+    def trace(self, g):
+        path = os.path.join(g.dir, "trace.log")
+        return open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+
     def test_no_dry_run_veto_in_this_mode(self):
         self.start()
         self.A.run("WORLD[110] = nil")
@@ -1453,7 +1468,7 @@ class TraceLogTest(StrictTest):
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(40)
         a, b = self.trace(self.A), self.trace(self.B)
-        self.assertRegex(b, r"gui build\.ship 1:1 held=1 site=\S+ done=\w+ tool=\S+ plan=\w+ stamp=\d+ now=\d+ lead=\d+ bytes=\d+ capture_ms=[\d.]+ balance=\S+ record=\{")
+        self.assertRegex(b, r"gui build\.ship 1:1 held=1 site=\S+ done=\w+ tool=\S+ plan=\w+ stamp=\d+ now=\d+ lead=\d+ extra=\w+ bytes=\d+ capture_ms=[\d.]+ balance=\S+ record=\{")
         self.assertRegex(a, r"sim build\.record 1:1 role=replay from=1 stamp=\d+ now=\d+ late=0 balance=\S+ record=\{")
         self.assertRegex(a, r"sim build\.decode 1:1 ok=true ms=[\d.]+")
         self.assertRegex(a, r"build\.plan 1:1 plan=\w+ form=1 built ms=[\d.]+")

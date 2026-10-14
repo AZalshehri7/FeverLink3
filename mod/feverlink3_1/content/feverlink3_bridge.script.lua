@@ -119,7 +119,6 @@ pcall(function()
 	if v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
 end)
 local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
-local CANCEL_EXTRA_STEPS = 6   -- extra steps of lead for a build every game applies at the stamp (see natDecideUnsafe)
 
 local function devPoll(half)
 	if not DEV then return end
@@ -1308,6 +1307,7 @@ local function simApplyAction(st, it, now)
 	if it.lateSteps and it.lateSteps > 0 and not it.waited then
 		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
 		st.late = (st.late or 0) + 1
+		st.lateLast = it.lateSteps
 	end
 	local ctx = simCtx(st, it)
 	local tDecode = os.clock()
@@ -1938,6 +1938,7 @@ local G = {
 	tags = setmetatable({}, { __mode = "k" }),  -- command object -> { name, args }
 	lastSpeedSet = nil, lastClock = nil,
 	resultsSeen = {}, reportsSent = {}, refusedSent = {}, lateSeen = 0,
+	margin = L.newMargin(),   -- the measured stamp margin of builds (L.marginSample): this game's need as a receiver
 	outSeen = {},             -- native builds the simulation half captured that this half already shipped
 	uiSeq = {},               -- id of a command record from the UI-state hook -> the sequence number it was shipped as
 	graces = {},              -- key -> a held build of a PAUSED game that waits for vetoes before it is committed
@@ -2933,9 +2934,15 @@ local function natDecideUnsafe(h, cap)
 	else
 		-- every game applies the record at the stamp, the originator too, and a game that has passed the stamp applies it late and
 		-- allocates other entity ids (real run A1-1: the host was 1.8 game s ahead of the guest's clock when the guest's build
-		-- arrived, 3 steps late). A game may run `aheadFor(speed)` steps plus a batch past the slowest clock, so the lead gets that
-		-- on top.
-		at = stampAfterFastest(now, CANCEL_EXTRA_STEPS)
+		-- arrived, 3 steps late). The stamp is the fastest known clock plus the host's lead plus the MEASURED extra (L.marginExtra: the
+		-- largest need the peers report from the slack of the builds they received; was a fixed 6 steps, 1.8 s at x1). The extra goes
+		-- with the record, so every receiver can measure what it would have needed.
+		at = stampAfterFastest(now)
+		if not pausedNow() and next(G.peers) ~= nil then
+			wire.xs = L.marginExtra(G.peers, G.session.speed)
+			at = at + wire.xs * STEP
+			text = C.serialize(wire)
+		end
 	end
 	-- the build's timing so far (click and the native capture from the module, ship now), carried with the record to every game
 	local wShip = X.wallNow()
@@ -2958,8 +2965,8 @@ local function natDecideUnsafe(h, cap)
 	G.seq = seq
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq), tRecv = wShip, gRecv = now }
 	noteBuild(it.key, at)
-	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
-		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), #text,
+	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s extra=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
+		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), tostring(wire.xs), #text,
 		cap.ms or 0, tostring(engine.account()), text))
 	if cancelFlow and deferFlow then
 		wire.held = nil
@@ -3805,6 +3812,14 @@ H.action = function(rec, p)
 	if G.vetoed[it.key] then logGui("action " .. it.key .. " was vetoed already: dropped"); return end
 	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
 		noteBuild(it.key, it.at)
+		if type(it.body.xs) == "number" and not pausedNow() then
+			-- the measured stamp margin (L.marginSample): how early this build arrived, and what that says about the margin needed
+			local okM, sample, slack, need, how = pcall(L.marginSample, G.margin, G.session.speed, it.body.xs, it.at, it.gRecv, os.clock())
+			if okM then
+				traceGui("build.margin", string.format("%s recv g%s stamp %s slack=%d steps extra_used=%s target=%d sample=%d need=%d (%s) x%s", it.key,
+					string.format("%.0f", it.gRecv), tostring(it.at), slack, tostring(it.body.xs), L.marginTarget(G.session.speed), sample, need, how, tostring(G.session.speed)))
+			end
+		end
 		if it.body.held == true then
 			-- the originator holds its command until the stamp and cancels it on a veto: dry-run now, veto when this game cannot build it
 			local now = engine.gameTime()
@@ -4000,6 +4015,9 @@ local function collectFromSim(state)
 	if (st.late or 0) > G.lateSeen then
 		G.lateSeen = st.late
 		logGui("the simulation applied an action late (" .. st.late .. " so far)")
+		-- the measured stamp margin grows at once (see L.marginSample): a late apply must not happen twice
+		local need = L.marginLate(G.margin, G.session.speed, st.lateLast)
+		traceGui("build.margin", string.format("late apply (%s steps late): need now %d steps at x%s", tostring(st.lateLast), need, tostring(G.session.speed)))
 	end
 end
 
@@ -4195,7 +4213,7 @@ local function guiUpdate(userParams, state, guiState)
 		setSpeed(L.pace(G.session, G.peers, now, ahead, G.marks))
 		if now ~= G.lastClock or G.frames % 30 == 0 then
 			G.lastClock = now
-			send("clock", { t = now, speed = engine.speed(), ahead = ahead })
+			send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed) })
 		end
 	end)
 	if not ok then logGui("frame failed: " .. tostring(err)) end

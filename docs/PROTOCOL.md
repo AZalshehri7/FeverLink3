@@ -68,7 +68,7 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Reject | 3 | host → connection | `{reason, detail?}` |
 | Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session, resume?: {token, epoch}, resumed?}` |
 | Session | 11 | host → all | `{started, speed, pauseAt?, lead}` |
-| PeerClock | 12 | host → all but origin | `{from, t, ahead}` |
+| PeerClock | 12 | host → all but origin | `{from, t, ahead, need?}` |
 | PlayerJoined | 13 | host → all but the joiner | `{player: {id, name, ready}}` |
 | PlayerLeft | 14 | host → all | `{id, name, away?}` (`away` = the connection dropped and the slot is held) |
 | ChecksumRequest | 15 | host → all | `{n, at, paused, full?}` (`full: false` = a light round; absent = full) |
@@ -80,7 +80,7 @@ Before a connection has joined, the host reads its first frame with a limit of 4
 | Ping | 21 | host → player | `{n, rtt?: {id: ms}}`, answered by the player's session layer; never given to the game |
 | Kicked | 22 | host → player | `{reason, detail?}` (the shape of Reject), sealed: the host ended this player's session |
 | Hello | 30 | game → host | `{time, save?}` |
-| Clock | 31 | game → host | `{t, speed, ahead}` |
+| Clock | 31 | game → host | `{t, speed, ahead, need?}` |
 | SpeedRequest | 32 | game → host | `{speed}` 0 = pause |
 | ChecksumReport | 33 | game → host | `{n, time, parts: {name: hash}, authority?: {name: number}}` |
 | SaveDone | 34 | host's game → host | `{id, ok, detail?}` |
@@ -105,7 +105,7 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 ## Session rules
 
 - **Session state** is broadcast on every change and at least every 3 s. `lead` is what a game adds to its clock when stamping a local action, in game-time units (a multiple of 200). The host computes it from the slowest connected player's measured round trip and the speed: `200 × clamp(ceil((rtt/2 + 0.06 s) × 6 × speed) + 2, 3, 24)`, where 6 is the steps a second at normal speed (measured). It lengthens at once when a player turns out to be slow and shortens only after eight seconds of the wanted lead staying lower. On a good connection that is 3 steps, about half a second at normal speed.
-- **Clock**: a game reports `{t, speed, ahead}` regularly. The host extrapolates `t + elapsed × speed × 1000` and relays it as PeerClock. Every game holds (speed 0) when it is more than `ahead` steps past the slowest peer.
+- **Clock**: a game reports `{t, speed, ahead, need?}` regularly. The host extrapolates `t + elapsed × speed × 1000` and relays it as PeerClock. Every game holds (speed 0) when it is more than `ahead` steps past the slowest peer. `need` (optional, steps, clamped by the host to 0..24) is the stamp margin the game measured it needs to receive a build before its stamp; a game stamping a build adds the largest `need` of its peers to the fastest clock plus the lead (mod: `L.marginSample`, `L.marginExtra`).
 - **Stamps** are multiples of 200. A future stamp chosen by the host is `roundUp(maxClock + lead)`.
 - **Start**: `started = true`, `speed = 0`, `pauseAt` = the games' common time when they agree, and a checksum round is requested at once.
 - **Pause** is a stamp: `pauseAt = futureStamp`; every game stops at exactly that step. **Speed** 1..4 clears `pauseAt`.

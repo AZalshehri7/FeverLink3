@@ -698,7 +698,9 @@ impl HostSession {
                     } else {
                         self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
                         self.resync_step();
-                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead };
+                        // a player cannot push every other game's stamps into the far future with an absurd margin
+                        let need = m.need.map(|n| n.clamp(0, ClockMessage::MAX_NEED));
+                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead, need };
                         self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
                     }
                 }

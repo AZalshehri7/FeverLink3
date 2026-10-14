@@ -107,7 +107,7 @@ fn a_clock_goes_to_every_other_game_and_the_host_keeps_all_eight() {
     let cs = seven(&mut n);
     for t in 1..=5 {
         for &c in &cs {
-            n.send(c, MessageKind::Clock, &json(&ClockMessage { t: t * 200, speed: 1, ahead: 3 }));
+            n.send(c, MessageKind::Clock, &json(&ClockMessage { t: t * 200, speed: 1, ahead: 3, need: None }));
         }
     }
     for (i, &c) in cs.iter().enumerate() {
