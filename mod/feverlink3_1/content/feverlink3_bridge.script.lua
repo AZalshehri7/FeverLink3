@@ -108,6 +108,16 @@ end)
 -- says `done = true`). With the switch on, a build is cancelled only when its held command says so; otherwise it stays hold-and-release.
 local FIRE_DONE = true
 pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") ~= "0" end)
+-- The few module-level values added by the 2026-10-14 work live in one table: the main chunk is at Lua's limit of 200 locals.
+local X = {}
+-- Test switch (never set by a player): FEVERLINK3_DEBUG_REFUSE_INJECT=link makes this game's own replay of its deferred build go the record
+-- path as if its injection had been refused (the held command takes that apply's result); =fail also tells the module that the held
+-- command gets no stamp apply result (its tool callback is fired with a failed result). Proves that no refusal leaves a tool busy.
+X.DEBUG_REFUSE_INJECT = nil
+pcall(function()
+	local v = os.getenv("FEVERLINK3_DEBUG_REFUSE_INJECT")
+	if v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
+end)
 local STRICT_CANCEL_PLANS = { street = true, combined = true, bulldoze = true }
 local CANCEL_EXTRA_STEPS = 6   -- extra steps of lead for a build every game applies at the stamp (see natDecideUnsafe)
 
@@ -143,6 +153,21 @@ local function devPoll(half)
 end
 
 local STEP = L.STEP
+-- A deferred held command not completed this long after its stamp (game time AND real seconds since the stamp was reached) fails.
+X.DEFER_GRACE_GAME_MS = 10 * L.STEP
+X.DEFER_GRACE_S = 3
+
+-- ---- per-build timing (one `build.timing` line per build on every game, test builds; owner 2026-10-14)
+-- Every stage time is wall-clock milliseconds since 1970, so the lines of two games compare. The native module gives the wall clock and
+-- the C runtime's clock at one instant (`timing clock`); os.clock() reads that same C runtime clock, so wall = X.WALL0 + os.clock() * 1000.
+-- The format is fixed: "timing key=<k> held=<id> click=<wall>@g<game time> cap=<start>..<end> cap_ms=<ms> bytes=<n> ... ship=<wall>@g<t>
+-- recv=<wall>@g<t> stamp=<t> step=<t> ... rebuild=<start>..<end> rebuild_ms=<ms> how=<injected|refused (record path)|record (complete_next)>
+-- apply=<wall> accepted=<bool> total_ms=<apply - click> late_steps=<(step - stamp) / STEP>".
+X.WALL0 = nil
+function X.wallNow()
+	if not X.WALL0 then return 0 end
+	return math.floor(X.WALL0 + os.clock() * 1000 + 0.5)
+end
 local REPLAY_STEPS = 12 -- a replayed build's engine event is expected within this many steps of the command
 local OUT_KEEP = 40
 local RESULT_KEEP = 60
@@ -1014,16 +1039,36 @@ local function sendPatchOrder(patch, key)
 		ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
 end
 
+-- A held-command order from the simulation half (`complete_next {held}`: this replay's command is this game's stamp apply of deferred
+-- command `held`; `fail {id}`: that command gets no stamp apply result), written right before the command like the inject order.
+-- The build's timing text as this game's simulation half applies it at the stamp (see X.wallNow): the record's own stages plus this game's.
+function X.timingText(it, now)
+	local b = it.body or {}
+	local function whole(v) return string.format("%.0f", tonumber(v) or 0) end
+	return string.format("key=%s %s recv=%s@g%s stamp=%s step=%s", tostring(it.key), type(b.tm) == "string" and b.tm or "held=- click=0@g0",
+		whole(it.tRecv), whole(it.gRecv), whole(it.at), whole(now))
+end
+
+function X.sendHeldOrder(kind, payload, key)
+	local ok, err = pcall(function()
+		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
+		local sent, why = C.writerSend(w, kind, payload)
+		if not sent then error(why, 0) end
+	end)
+	traceSim("build.inject", string.format("%s %s %s %s", tostring(key), kind, C.serialize(payload), ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	return ok
+end
+
 -- The inject order: the shipped text goes to native_inject_<n>.txt (closed before the order is written), then `inject_next {key=n}`, then the caller
 -- sends the replay's command at once (nothing in between). The module answers `injected` / `inject_refused` in native_events.log.
 -- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result.
-local function sendInjectOrder(inj, key, held)
+local function sendInjectOrder(inj, key, held, tm)
 	SIM.injectN = (SIM.injectN or 0) + 1
 	local n = SIM.injectN
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
 		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held })
+		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held, tm = tm })
 		if not sent then error(why, 0) end
 	end)
 	traceSim("build.inject", string.format("%s inject_next key=%d held=%s (%d bytes of text) %s", tostring(key), n, tostring(held), #inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
@@ -1344,10 +1389,25 @@ local function simApplyAction(st, it, now)
 					end
 				end
 				if a.patch then sendPatchOrder(a.patch, it.key) end
+				if a.inject and it.deferId and X.DEBUG_REFUSE_INJECT then
+					logSim("action " .. it.key .. ": FEVERLINK3_DEBUG_REFUSE_INJECT=" .. X.DEBUG_REFUSE_INJECT .. ": this game's own replay is not injected (a forced refusal)")
+					a.inject = nil
+				end
+				local tm = isBuild and X.timingText(it, now) or nil
 				if a.inject then
-					sendInjectOrder(a.inject, it.key, it.deferId)
+					sendInjectOrder(a.inject, it.key, it.deferId, tm)
+				elseif it.deferId and X.DEBUG_REFUSE_INJECT == "fail" then
+					-- the forced refusal of the test switch: the held command gets no result of its own (as if nothing could be linked)
+					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: fail (test switch), its tool callback is fired with a failed result")
+					X.sendHeldOrder("fail", { id = it.deferId }, it.key)
 				elseif it.deferId then
-					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred but this replay is not injected: the module drops it after its age limit")
+					-- not injected (the record path: a chain, a refusal): this replay's command is still this game's stamp apply of the build, so
+					-- the held command takes its result (run rt1 C12: without this the bulldozer stayed busy until the 30 s age limit)
+					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: it completes with this replay's result")
+					X.sendHeldOrder("complete_next", { held = it.deferId, tm = tm }, it.key)
+				elseif isBuild then
+					-- no order: the record's rebuild is applied by the engine without the module's help; the line ends at the send
+					traceSim("build.timing", string.format("timing %s rebuild=- how=record (no order) apply=%.0f accepted=? total_ms=? late_steps=%s", tm, X.wallNow(), tostring((now - it.at) / STEP)))
 				end
 				simSendCommand(it.body.fn, a)
 				if isBuild then takeBackEvents(st, SIM.state) end
@@ -1355,6 +1415,10 @@ local function simApplyAction(st, it, now)
 		end)
 	end
 	if not ok then
+		if it.deferId then
+			-- no stamp apply on this game: the deferred held command fails now (tool callback fired), it does not wait for the age limit
+			X.sendHeldOrder("fail", { id = it.deferId }, it.key)
+		end
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
 		traceSim("build.error", string.format("%s type=%s value=%s", it.key, type(e), tostring(e)))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e) }
@@ -1789,6 +1853,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 		elseif name == "nativecaps" and type(param) == "table" then
 			SIM.nativePatch = param.patch == true
 			SIM.nativeInject = param.inject == true
+			if type(param.wall0) == "number" then X.WALL0 = param.wall0 end
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = os.clock() }
@@ -2866,10 +2931,26 @@ local function natDecideUnsafe(h, cap)
 		-- on top.
 		at = stampAfterFastest(now, CANCEL_EXTRA_STEPS)
 	end
+	-- the build's timing so far (click and the native capture from the module, ship now), carried with the record to every game
+	local wShip = X.wallNow()
+	local okT, errT = pcall(function()
+		local t = N.timing and N.timing[id] or {}
+		local cap = t.capture or ""
+		local c0, c1 = cap:match("start=(%d+)"), cap:match("end=(%d+)")
+		-- every number through %s of a whole value: the interface's game time can be fractional, and %d refuses that in Lua 5.2 (r1: no text)
+		local function whole(v) return string.format("%.0f", tonumber(v) or 0) end
+		wire.tm = string.format("held=%s click=%s@g%s cap=%s..%s cap_ms=%s bytes=%s mask_ms=%s encode_ms=%s heap_walk_ms=%s heap_blocks=%s write_ms=%s input_ms=%s seen=%s ship=%s@g%s",
+			whole(id), c0 or whole(h.wSeen), whole(h.gClick), c0 or "?", c1 or "?", cap:match("ms=([%d.]+)") or "?", cap:match("bytes=(%d+)") or "?",
+			cap:match("mask_ms=([%d.]+)") or "?", cap:match("encode_ms=([%d.]+)") or "?", cap:match("heap_walk_ms=([%d.]+)") or "?", cap:match("heap_blocks=(%d+)") or "?",
+			cap:match("write_ms=([%d.]+)") or "?", (t.input or ""):match("input_ms=([%d.]+)") or "?", whole(h.wSeen), whole(wShip), whole(now))
+		if N.timing then N.timing[id] = nil end
+		text = C.serialize(wire)
+	end)
+	if not okT then traceGui("build.timing", "held=" .. tostring(id) .. " the timing text could not be made: " .. tostring(errT)) end
 	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
 	if not okS then return release("the action cannot be sent (" .. tostring(errS) .. ")") end
 	G.seq = seq
-	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq) }
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq), tRecv = wShip, gRecv = now }
 	noteBuild(it.key, at)
 	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
 		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), #text,
@@ -3124,7 +3205,7 @@ end
 local function natOnHeld(N, p)
 	local id = tonumber(p.id)
 	if not id then return end
-	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true, ctx = type(p.ctx) == "table" and p.ctx or nil }
+	local h = { id = id, site = tonumber(p.site), t = os.clock(), frame = G.frames, done = p.done == true, ctx = type(p.ctx) == "table" and p.ctx or nil, gClick = engine.gameTime(), wSeen = X.wallNow() }
 	if not N.holdSent then
 		-- strict mode is being switched off: the module has not caught up; give the command back
 		natSay("held " .. id .. " while strict mode is off; release written")
@@ -3198,6 +3279,17 @@ end
 local function natEvent(N, rec, p, history)
 	local kind = rec.kind
 	local now = os.clock()
+	if kind == "timing" and p.what == "clock" then
+		-- written right after `ready` (history too): the wall clock of this process's C runtime clock, for the timing lines
+		local detail = tostring(p.detail or "")
+		local w, c = tonumber(detail:match("wall=(%d+)")), tonumber(detail:match("clock=(%-?%d+)"))
+		if w and c then
+			X.WALL0 = w - c
+			pcall(toSim, "nativecaps", { patch = N.ready and N.ready.patch, inject = N.ready and N.ready.inject, wall0 = X.WALL0 })
+			traceGui("build.timing", string.format("clock wall0=%.0f (native wall=%.0f clock=%.0f; this script's os.clock()=%.3f -> wall %.0f)", X.WALL0, w, c, os.clock(), X.wallNow()))
+		end
+		return
+	end
 	if kind == "ready" then
 		local hooks = {}
 		for _, h in ipairs(type(p.hooks) == "table" and p.hooks or {}) do hooks[#hooks + 1] = tostring(h) end
@@ -3207,7 +3299,7 @@ local function natEvent(N, rec, p, history)
 			if h == "inject_next" then N.ready.inject = true end
 			if h == "defer" then N.ready.defer = true end
 		end
-		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject })
+		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, wall0 = X.WALL0 })
 		N.hookOk = false
 		for _, h in ipairs(hooks) do
 			if h == "command_list_add" then N.hookOk = true end
@@ -3257,12 +3349,36 @@ local function natEvent(N, rec, p, history)
 	elseif kind == "injected" or kind == "inject_refused" then
 		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
 		if kind == "inject_refused" then natSay("the native module refused to inject the engine's proposal: " .. tostring(p.reason or p.detail)) end
+	elseif kind == "timing" then
+		local what, detail = tostring(p.what), tostring(p.detail or "")
+		if what == "capture" or what == "input" then
+			local id = tonumber(p.id)
+			if id then
+				N.timing = N.timing or {}
+				local t = N.timing[id] or {}
+				N.timing[id] = t
+				t[what] = detail
+			end
+			traceGui("build.timing", what .. " " .. detail)
+		elseif what == "apply" then
+			-- the build's one timing line on this game: the mod's stages (shipped with the record), the rebuild and the apply
+			local click = tonumber(detail:match("click=(%d+)"))
+			local apply = tonumber(detail:match("apply=(%d+)"))
+			local stamp, step = tonumber(detail:match("stamp=(%d+)")), tonumber(detail:match("step=(%d+)"))
+			traceGui("build.timing", string.format("timing %s total_ms=%s late_steps=%s", detail,
+				(click and apply and click > 0) and tostring(apply - click) or "?", (stamp and step) and tostring((step - stamp) / STEP) or "?"))
+		end
 	elseif kind == "completed" then
 		local id = tonumber(p.id)
 		local d = id and N.deferred[id]
 		if id then N.deferred[id] = nil end
-		natSay(string.format("held %s (%s) completed with this game's stamp apply (accepted %s, tool callback fired %s) at game time %d, stamp %s",
-			tostring(id), d and d.key or "?", tostring(p.ok), tostring(p.fired), engine.gameTime(), d and tostring(d.at) or "?"))
+		if p.reason ~= nil and p.reason ~= "stamp_apply" then
+			natSay(string.format("held %s (%s) FAILED without a stamp apply (%s): tool callback fired with a failed result %s at game time %d, stamp %s",
+				tostring(id), d and d.key or "?", tostring(p.reason), tostring(p.fired), engine.gameTime(), d and tostring(d.at) or "?"))
+		else
+			natSay(string.format("held %s (%s) completed with this game's stamp apply (accepted %s, tool callback fired %s) at game time %d, stamp %s",
+				tostring(id), d and d.key or "?", tostring(p.ok), tostring(p.fired), engine.gameTime(), d and tostring(d.at) or "?"))
+		end
 	elseif kind == "patched" or kind == "patch_refused" then
 		traceGui("build.patch", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
 		if kind == "patch_refused" then natSay("the native module refused the frozen-node patch: " .. tostring(p.reason or p.detail)) end
@@ -3351,8 +3467,14 @@ local function natTick()
 	if next(N.deferred) then
 		local gt = engine.gameTime()
 		for id, d in pairs(N.deferred) do
-			if now - d.t > 40 then
-				N.deferred[id] = nil
+			if gt >= d.at and not d.dueSeen then d.dueSeen = now end
+			if d.dueSeen and gt >= d.at + X.DEFER_GRACE_GAME_MS and now - d.dueSeen > X.DEFER_GRACE_S and not d.failed then
+				-- this game is well past the stamp (game time, so a pause menu does not count) and the build's stamp apply never completed
+				-- the held command (the replay was refused, dropped or never ran): it fails now, its tool callback fired, instead of
+				-- leaving the tool busy until the module's age limit
+				d.failed = true
+				natSay(string.format("held %d (%s) was not completed %d ms of game time after its stamp %d: fail written (tool callback fired with a failed result)", id, d.key, gt - d.at, d.at))
+				natSend("fail", { id = id })
 			elseif gt >= d.at and now - (d.trig or 0) > 0.15 then
 				d.trig = now
 				natTrigger()
@@ -3664,6 +3786,7 @@ H.action = function(rec, p)
 	end
 	local it, err = L.actionItem(p, rec.from, C.parse)
 	if not it then logGui("action from " .. tostring(rec.from) .. " dropped: " .. tostring(err)); return end
+	it.tRecv, it.gRecv = X.wallNow(), engine.gameTime()
 	if type(p.from) == "number" and p.from ~= rec.from then logGui("action payload claims sender " .. p.from .. ", launcher says " .. tostring(rec.from)) end
 	if G.vetoed[it.key] then logGui("action " .. it.key .. " was vetoed already: dropped"); return end
 	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
@@ -4006,7 +4129,7 @@ local function guiUpdate(userParams, state, guiState)
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
-	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject }) end
+	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject, wall0 = X.WALL0 }) end
 	local ok, err = pcall(function()
 		readLink()
 		serviceWindow()

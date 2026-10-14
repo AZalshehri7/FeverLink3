@@ -478,6 +478,8 @@ class StrictOnTest(StrictTest):
         self.assertEqual(body["category"], "build")
         self.assertNotIn("native=true", str(body["body"]).replace(" ", "").lower(), "the shipped record is not marked as already applied")
         self.assertNotIn("heldid", str(body).lower(), "the local release mark never goes on the wire")
+        # the build's timing text travels with the record (owner 2026-10-14: one timing line per build on every game)
+        self.assertRegex(str(body["body"]), r"tm.{0,8}held=1 click=", str(body["body"])[:400])
 
     def test_the_originators_tool_is_alive_after_each_build(self):
         # the tool's own callback runs when its command is released: the fake tool is "alive" when its held command went back

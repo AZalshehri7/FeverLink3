@@ -171,6 +171,8 @@ pub struct LiveHeapMem {
     index: std::cell::RefCell<Vec<(usize, usize)>>,
     /// the walk stopped at the capacity: blocks past it are unknown (their pointers stay `P`)
     truncated: std::cell::Cell<bool>,
+    /// how long the last walk took (milliseconds), for the timing record
+    walk_ms: std::cell::Cell<f64>,
 }
 
 #[cfg(windows)]
@@ -179,7 +181,16 @@ impl LiveHeapMem {
     pub const CAPACITY: usize = 3 << 20;
 
     pub fn new() -> LiveHeapMem {
-        LiveHeapMem { index: std::cell::RefCell::new(Vec::new()), truncated: std::cell::Cell::new(false) }
+        LiveHeapMem {
+            index: std::cell::RefCell::new(Vec::new()),
+            truncated: std::cell::Cell::new(false),
+            walk_ms: std::cell::Cell::new(0.0),
+        }
+    }
+
+    /// How long the last walk of the heap took, in milliseconds (0 before the first).
+    pub fn last_walk_ms(&self) -> f64 {
+        self.walk_ms.get()
     }
 
     pub fn truncated(&self) -> bool {
@@ -194,6 +205,7 @@ impl LiveHeapMem {
         use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapLock, HeapUnlock, HeapWalk, PROCESS_HEAP_ENTRY};
         /// `PROCESS_HEAP_ENTRY_BUSY` of winbase.h (windows-sys does not export it)
         const BUSY: u16 = 0x0004;
+        let t0 = std::time::Instant::now();
         let mut v = std::mem::take(&mut *self.index.borrow_mut());
         v.clear();
         // reserved before the lock: pushing within the capacity does not allocate, and an allocation on this heap while it is
@@ -221,6 +233,7 @@ impl LiveHeapMem {
         v.sort_unstable();
         self.truncated.set(truncated);
         *self.index.borrow_mut() = v;
+        self.walk_ms.set(t0.elapsed().as_secs_f64() * 1000.0);
     }
 }
 

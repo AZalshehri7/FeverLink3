@@ -10,6 +10,8 @@ use crate::native_copy as nc;
 use crate::portable;
 use crate::rebuild::{Alloc, EngineAlloc};
 
+use super::{wall_ms, StampTiming};
+
 impl Runtime {
     /// Switches the native injection on (`FEVERLINK3_NATIVE_INJECT=1`). `settings` are the portable text settings the originator's
     /// copy of the text is written with and the receiver's proof is made with.
@@ -41,6 +43,7 @@ impl Runtime {
         }
         let Some(settings) = self.inject_settings.get().copied() else { return };
         let t0 = std::time::Instant::now();
+        let wall0 = wall_ms();
         let live = LiveHeapMem::new();
         let head = portable::Header {
             seq: 0,
@@ -71,9 +74,29 @@ impl Runtime {
                 m.carried_ranges("toAdd[0].")
             ));
         }
+        let mask_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let opts = portable::EncodeOpts { collect: None, mask: mask.as_ref().map(|m| &m.mask) };
-        match portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts) {
-            Ok(p) => match self.text.write(id, &p.text) {
+        let t_enc = std::time::Instant::now();
+        let encoded =
+            portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts);
+        let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+        let t_write = std::time::Instant::now();
+        let written: Option<std::io::Result<()>> = encoded.as_ref().ok().map(|p| self.text.write(id, &p.text));
+        let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+        let walk_ms = live.last_walk_ms();
+        let bytes = encoded.as_ref().map_or(0, |p| p.text.len());
+        self.inject.report(Event::Timing {
+            what: "capture",
+            id,
+            detail: format!(
+                "held={id} start={wall0} end={} ms={:.1} bytes={bytes} mask_ms={mask_ms:.1} encode_ms={encode_ms:.1} heap_walk_ms={walk_ms:.1} heap_blocks={} write_ms={write_ms:.1}",
+                wall_ms(),
+                t0.elapsed().as_secs_f64() * 1000.0,
+                live.blocks()
+            ),
+        });
+        match encoded.map(|p| (written, p)) {
+            Ok((Some(w), p)) => match w {
                 Ok(()) if !p.unresolved.is_empty() => {
                     // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what
                     // the memory there looks like, so that one run shows everything that stays to be understood
@@ -102,6 +125,7 @@ impl Runtime {
                 )),
                 Err(e) => self.say(&format!("native inject: hold {id}: cannot write the text: {e}")),
             },
+            Ok((None, _)) => {}
             Err(why) => self.say(&format!("native inject: hold {id}: the layout table refuses this command: {why}")),
         }
     }
@@ -172,7 +196,19 @@ impl Runtime {
         // (a refusal leaves the command to the record path, which is still this game's stamp apply of the build)
         let link = (order.held != 0).then_some((dest, order.held));
         let t0 = std::time::Instant::now();
-        match self.inject_run(order.key, dest) {
+        let rb0 = wall_ms();
+        let run = if order.link_only {
+            Err(String::new()) // complete_next: the record's own command is this game's stamp apply; nothing to inject
+        } else {
+            self.inject_run(order.key, dest)
+        };
+        match run {
+            Err(why) if order.link_only && why.is_empty() => {
+                self.say(&format!(
+                    "native inject: complete_next held {}: this script build_proposal is this game's stamp apply (record path)",
+                    order.held
+                ));
+            }
             Ok((nodes, segments, constructions)) => {
                 self.say(&format!(
                     "native inject: key {}: INJECTED the engine Proposal built from the text ({nodes} nodes, {segments} segments, {constructions} construction(s)) in {} ms",
@@ -180,6 +216,7 @@ impl Runtime {
                     t0.elapsed().as_millis()
                 ));
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
+                *super::lock(&self.inject_last_ok) = Some(order.key);
             }
             Err(why) if why.starts_with(inj::NOT_OURS) => {
                 self.say(&format!(
@@ -210,6 +247,24 @@ impl Runtime {
                 self.inject.refuse(format!("key {}: {why}", order.key));
             }
         }
+        let how = if order.link_only {
+            "record (complete_next)"
+        } else if super::lock(&self.inject_last_ok).take() == Some(order.key) {
+            "injected"
+        } else {
+            "refused (record path)"
+        };
+        *super::lock(&self.stamp_timing) = Some(StampTiming {
+            payload: dest,
+            key: order.key,
+            held: order.held,
+            tm: order.tm.clone(),
+            rebuild: format!(
+                "rebuild={rb0}..{} rebuild_ms={:.1} how={how}",
+                wall_ms(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            ),
+        });
         if let Some((payload, held)) = link {
             self.say(&format!(
                 "native inject: key {}: held command {held} completes with this command's result after the apply",
@@ -217,6 +272,26 @@ impl Runtime {
             ));
             *super::lock(&self.defer_link) = Some((payload, held));
         }
+        self.wake();
+    }
+
+    /// After the simulation applied `cmd`: when it is the command an order was used for, one `timing apply` record with the mod's timing
+    /// text, the rebuild's times and the apply's wall-clock time (the mod writes it into its trace as the build's timing line).
+    pub(super) fn timing_after_apply(&self, cmd: *mut u8) {
+        // SAFETY: only readable memory is read.
+        let Some(payload) = (unsafe { engine::payload_of(cmd) }) else { return };
+        let t = {
+            let mut g = super::lock(&self.stamp_timing);
+            match &*g {
+                Some(t) if t.payload == payload => g.take(),
+                _ => None,
+            }
+        };
+        let Some(t) = t else { return };
+        let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
+        let detail = format!("{} {} apply={} accepted={ok}", t.tm, t.rebuild, wall_ms());
+        let id = if t.held != 0 { t.held } else { t.key };
+        self.inject.report(Event::Timing { what: "apply", id, detail });
         self.wake();
     }
 

@@ -114,6 +114,11 @@ pub struct Runtime {
     /// The script command an `inject_next` with `held` was used for (its payload) and that deferred held command: when the simulation
     /// has applied the script command, the held command takes its result (`engine::adopt_result`).
     defer_link: Mutex<Option<(usize, u64)>>,
+    /// The script command an order was used for and its timing so far (the mod's `tm`, the rebuild's wall-clock start and end and how it
+    /// went): after the simulation applied that command, one `timing apply` line is written (`timing_after_apply`).
+    stamp_timing: Mutex<Option<StampTiming>>,
+    /// The key of the order whose injection succeeded just now (for the timing record's `how`).
+    inject_last_ok: Mutex<Option<u64>>,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
@@ -178,6 +183,8 @@ impl Runtime {
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
             defer_link: Mutex::new(None),
+            stamp_timing: Mutex::new(None),
+            inject_last_ok: Mutex::new(None),
             preview_fn: AtomicUsize::new(0),
             preview_args: Mutex::new(None),
             preview_holding: AtomicBool::new(false),
@@ -549,6 +556,7 @@ impl Runtime {
         if self.inject_ready() {
             hook_names.push(crate::inject::READY_NAME.to_string()); // and this one, `inject_next`
             hook_names.push("defer".to_string()); // and `defer` + `inject_next {held}`: the deferred completion of a held command
+            hook_names.push("fail".to_string()); // and `fail` + `complete_next`: a deferred command never waits for the age limit
         }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
@@ -568,6 +576,13 @@ impl Runtime {
             first_seq
         ));
         if let Some(line) = ready.log_line() {
+            self.say(&line);
+        }
+        // the wall clock and the C runtime's clock at one instant: the mod's `os.clock()` becomes wall-clock time with it
+        let clock =
+            Event::Timing { what: "clock", id: 0, detail: format!("wall={} clock={}", wall_ms(), crt_clock_ms()) };
+        events.append(std::slice::from_ref(&clock))?;
+        if let Some(line) = clock.log_line() {
             self.say(&line);
         }
         *lock(&self.reader) = Some(reader);
@@ -621,7 +636,10 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held }) => self.inject.arm(key, ttl, held, now),
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, now)
+                }
+                Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 _ => rest.push(line),
             }
         }
@@ -634,7 +652,10 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held }) => self.inject.arm(key, ttl, held, now),
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, now)
+                }
+                Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
             }
@@ -676,6 +697,13 @@ impl Runtime {
         let mut events = {
             let mut machine = lock(&self.machine);
             self.ingest(&mut machine, now);
+            // an order of a deferred command that no command will use: the command fails now (tool callback fired), not after 30 s
+            for held in self.inject.take_failed(now) {
+                self.say(&format!(
+                    "hold: deferred command {held}: its order was refused before any command used it: failed now"
+                ));
+                machine.handle(&crate::link::CtlMessage::Fail { id: held }, now);
+            }
             machine.tick(now);
             self.sync_flags(&machine);
             machine.drain_events()
@@ -798,7 +826,15 @@ impl Runtime {
                     crate::log::line(&format!(
                         "hold: command {id}: completed with this game's stamp apply (accepted {ok}), tool callback fired: {fired}"
                     ));
-                    self.inject.report(Event::Completed { id, ok, fired, ms: plan.now });
+                    self.inject.report(Event::Completed { id, ok, fired, ms: plan.now, reason: "stamp_apply" });
+                }
+                Action::Fail { id, handle, reason } => {
+                    // SAFETY: as for `release`; the held command was never applied, so its result byte says "not applied".
+                    let fired = unsafe { engine::fail(&engine, handle) };
+                    crate::log::line(&format!(
+                        "hold: command {id}: failed without a stamp apply ({reason}), tool callback fired with a failed result: {fired}"
+                    ));
+                    self.inject.report(Event::Completed { id, ok: false, fired, ms: plan.now, reason });
                 }
             }
         }
@@ -844,7 +880,12 @@ impl Runtime {
         if let (Some(rva), Some(_)) = (site, tool) {
             // SAFETY: the kind is read only from readable memory.
             if let Some(kind) = unsafe { engine::command_kind(args.cmd, engine.kind_offset) } {
-                if machine.admit(kind, now) == Admit::Hold {
+                let admit = machine.admit(kind, now);
+                if admit == Admit::Off {
+                    machine.tool_while_silent(kind, now); // a tool at work while the mod is silent: not a pause menu
+                    plan.due.extend(machine.take_due(self.game_time(), now)); // given back before this command passes
+                }
+                if admit == Admit::Hold {
                     // SAFETY: the arguments of the live call, as the caller guarantees.
                     if let Some(held) = unsafe { engine::capture(&engine, args) } {
                         let done = held.done_ok();
@@ -857,9 +898,18 @@ impl Runtime {
                             None
                         };
                         // the input-level text of the same command (what a SimpleProposal is made of), for the mod
+                        let t_input = std::time::Instant::now();
                         let input = flags.is_some().then(|| self.input_text(payload)).flatten();
+                        let input_ms = t_input.elapsed().as_secs_f64() * 1000.0;
                         match machine.hold_with(kind, rva, done, flags, held, now) {
                             Ok(id) => {
+                                if input.is_some() {
+                                    self.inject.report(Event::Timing {
+                                        what: "input",
+                                        id,
+                                        detail: format!("held={id} wall={} input_ms={input_ms:.1}", wall_ms()),
+                                    });
+                                }
                                 if let Some(text) = &input {
                                     if let Err(e) = self.input.write(id, text) {
                                         self.say(&format!("input: cannot write {}: {e}", crate::input::file_name(id)));
@@ -979,6 +1029,8 @@ impl Runtime {
         }
         let result = unsafe { original(sim, cmd) };
         if self.inject.enabled() {
+            // the timing first: the deferred completion swaps the applied command's payload with the held one's
+            crate::log::guarded("apply hook (timing)", || self.timing_after_apply(cmd));
             crate::log::guarded("apply hook (deferred completion)", || self.complete_deferred(cmd));
         }
         if let Some((payload, seq)) = dumped {
@@ -994,6 +1046,30 @@ impl Runtime {
         }
         result
     }
+}
+
+/// The timing of an ordered script command until its stamp apply (see `Runtime::stamp_timing`).
+pub(crate) struct StampTiming {
+    pub payload: usize,
+    pub key: u64,
+    pub held: u64,
+    pub tm: String,
+    pub rebuild: String,
+}
+
+/// Milliseconds since 1970 (the wall clock every timing line uses, so that two games' lines can be compared).
+pub(crate) fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The C runtime's `clock()` in milliseconds: what the game's Lua `os.clock()` reads (both use the process's one C runtime), so the mod can
+/// turn its own clock into wall-clock time (`timing clock`).
+pub(crate) fn crt_clock_ms() -> i64 {
+    unsafe extern "C" {
+        fn clock() -> i32;
+    }
+    // SAFETY: `clock` takes nothing and only reads the C runtime's start time.
+    i64::from(unsafe { clock() })
 }
 
 /// What [`Runtime::plan_add`] decided: the engine is touched according to it, after the lock is gone.
@@ -1222,9 +1298,28 @@ mod tests {
             .unwrap();
     }
 
+    /// The events of the link, without the diagnostic `timing` records (see `timing_records`).
     fn events(dir: &Path) -> Vec<(String, String)> {
+        all_events(dir).into_iter().filter(|(k, _)| k != "timing").collect()
+    }
+
+    fn all_events(dir: &Path) -> Vec<(String, String)> {
         let mut r = CtlReader::new(dir.join(crate::link::EVENTS_FILE));
         r.poll().lines.into_iter().map(|l| (l.kind, l.payload)).collect()
+    }
+
+    #[test]
+    fn the_link_opens_with_the_wall_clock_of_the_c_runtime_clock_for_the_timing_lines() {
+        let dir = TempDir::new("rt-clock");
+        let _rt = runtime(Some(dir.path()));
+        let ev = all_events(dir.path());
+        assert_eq!(ev[0].0, "ready");
+        assert_eq!(ev[1].0, "timing", "{ev:?}");
+        assert!(
+            ev[1].1.contains("\"what\"]=\"clock\"") && ev[1].1.contains("wall=") && ev[1].1.contains("clock="),
+            "{}",
+            ev[1].1
+        );
     }
 
     fn kinds(dir: &Path) -> Vec<String> {

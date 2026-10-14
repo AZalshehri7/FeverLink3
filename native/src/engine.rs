@@ -379,6 +379,21 @@ pub unsafe extern "system-unwind" fn discard(fns: &EngineFns, mut held: Box<Held
     }
 }
 
+/// Destroys a held command that leaves without a stamp apply of its own (its replay was refused or failed, it got too old, holding went
+/// off): the tool's completion callback is fired first with the command's own result, which says "not applied" (the command never ran,
+/// its result byte is cleared), as the engine fires it for a command it could not apply. Any non-empty callback is fired, as in
+/// [`complete`]: the tool must never stay busy waiting for a command that will not come back. True when it was fired.
+///
+/// # Safety
+/// As for [`release`], without `add`.
+#[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be destroyed only once
+pub unsafe extern "system-unwind" fn fail(fns: &EngineFns, mut held: Box<Held>) -> bool {
+    unsafe {
+        *held.cmd.0.as_mut_ptr().add(RESULT_OFFSET) = 0;
+        complete(fns, held)
+    }
+}
+
 /// Where a `Command` keeps the vector the tool's callback reads besides the payload (the construction tool's configure mode, lambda
 /// 0x5123e0 of build 40420, reads `cmd+8` and `payload+0x998`).
 pub const COMMAND_VEC: usize = 0x08;

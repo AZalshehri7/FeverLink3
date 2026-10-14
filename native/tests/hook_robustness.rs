@@ -162,12 +162,15 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                         assert!(kinds.iter().all(|k| valid_kind_name(k)), "{line:?}");
                     }
                     CtlMessage::Release { id, at } => assert!(id <= 1 << 53 && at <= 1 << 53, "{line:?}"),
-                    CtlMessage::Cancel { id } | CtlMessage::Defer { id } => assert!(id <= 1 << 53, "{line:?}"),
+                    CtlMessage::Cancel { id } | CtlMessage::Defer { id } | CtlMessage::Fail { id } => {
+                        assert!(id <= 1 << 53, "{line:?}")
+                    }
                     CtlMessage::TerrainApply { id, stamp } => assert!(id <= 1 << 53 && stamp <= 1 << 53, "{line:?}"),
                     CtlMessage::HoldOff
                     | CtlMessage::Ping { .. }
                     | CtlMessage::PatchNext { .. }
-                    | CtlMessage::InjectNext { .. } => {}
+                    | CtlMessage::InjectNext { .. }
+                    | CtlMessage::CompleteNext { .. } => {}
                 }
             }
             Err(e) => {
@@ -428,7 +431,8 @@ fn the_hold_machine_never_loses_or_duplicates_a_command() {
                     for a in actions {
                         let (Action::Release { handle, .. }
                         | Action::Drop { handle, .. }
-                        | Action::Complete { handle, .. }) = a;
+                        | Action::Complete { handle, .. }
+                        | Action::Fail { handle, .. }) = a;
                         assert!(inside.remove(&handle), "handle {handle} came back twice or never went in");
                     }
                 }
@@ -452,7 +456,10 @@ fn the_hold_machine_never_loses_or_duplicates_a_command() {
         // switching holding off sends everything back: nothing is stuck in the ring
         m.handle(&CtlMessage::HoldOff, now);
         for a in m.take_due(None, now) {
-            let (Action::Release { handle, .. } | Action::Drop { handle, .. } | Action::Complete { handle, .. }) = a;
+            let (Action::Release { handle, .. }
+            | Action::Drop { handle, .. }
+            | Action::Complete { handle, .. }
+            | Action::Fail { handle, .. }) = a;
             assert!(inside.remove(&handle));
         }
         assert!(m.is_empty() && inside.is_empty());

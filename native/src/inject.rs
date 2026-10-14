@@ -64,6 +64,10 @@ pub struct Order {
     pub ttl_ms: u64,
     /// This game's deferred held command of the same build (0: none): it takes the result of the command the order is used for.
     pub held: u64,
+    /// `complete_next`: nothing is injected, the command (the record's rebuild) only gives its result to `held`.
+    pub link_only: bool,
+    /// The mod's timing text of the build (`tm`), written back with the rebuild and apply times at the stamp apply.
+    pub tm: String,
 }
 
 /// The switch, the armed order, the events for the mod.
@@ -74,6 +78,9 @@ pub struct State {
     order: Mutex<Option<Order>>,
     applies: Mutex<crate::cmd_patch::ApplyTrail>,
     events: Mutex<Vec<Event>>,
+    /// Deferred held commands whose order was refused before any command used it (expired, replaced, the switch off): they get no stamp
+    /// apply result, so the runtime fails them at once (their tool callback fired), instead of leaving the tool busy until the age limit.
+    failed: Mutex<Vec<u64>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -102,16 +109,47 @@ impl State {
         self.report(Event::InjectRefused { reason: reason.into() });
     }
 
+    /// An order of deferred command `held` (0: none) will never be used: the command is to be failed.
+    fn fail_held(&self, held: u64) {
+        if held != 0 {
+            lock(&self.failed).push(held);
+        }
+    }
+
+    /// The deferred held commands to fail now (see [`State::fail_held`]); expires an unused order first.
+    pub fn take_failed(&self, now: u64) -> Vec<u64> {
+        self.expire(now);
+        std::mem::take(&mut *lock(&self.failed))
+    }
+
     /// The mod's `inject_next`. A second order replaces the first (reported as refused).
     pub fn arm(&self, key: u64, ttl: u64, held: u64, now: u64) {
+        self.arm_order(key, ttl, held, false, String::new(), now)
+    }
+
+    /// As [`State::arm`], with the mod's timing text of the build.
+    pub fn arm_timed(&self, key: u64, ttl: u64, held: u64, tm: String, now: u64) {
+        self.arm_order(key, ttl, held, false, tm, now)
+    }
+
+    /// The mod's `complete_next`: the next script `build_proposal` gives its result to deferred command `held`, nothing is injected.
+    pub fn arm_link(&self, held: u64, ttl: u64, tm: String, now: u64) {
+        self.arm_order(0, ttl, held, true, tm, now)
+    }
+
+    fn arm_order(&self, key: u64, ttl: u64, held: u64, link_only: bool, tm: String, now: u64) {
         if !self.enabled() {
             self.refuse(format!("{INJECT_VAR} is off"));
+            self.fail_held(held);
             return;
         }
         let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
         *lock(&self.applies) = Default::default();
-        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms, held }) {
+        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms, held, link_only, tm }) {
             self.refuse(format!("order for key {} replaced by a newer inject_next before a command used it", old.key));
+            if old.held != held {
+                self.fail_held(old.held);
+            }
         }
         self.pending.store(true, Ordering::Release);
     }
@@ -138,6 +176,7 @@ impl State {
         let order = order?;
         if now.saturating_sub(order.armed_ms) > order.ttl_ms {
             self.refuse(self.expired(order.key, order.ttl_ms));
+            self.fail_held(order.held);
             return None;
         }
         Some(order)
@@ -152,8 +191,8 @@ impl State {
         }
     }
 
-    /// Expires an order nobody used (the service thread calls this) and hands out the events.
-    pub fn drain_events(&self, now: u64) -> Vec<Event> {
+    /// Expires an order nobody used.
+    fn expire(&self, now: u64) {
         if self.pending() {
             let mut g = lock(&self.order);
             if g.as_ref().is_some_and(|o| now.saturating_sub(o.armed_ms) > o.ttl_ms) {
@@ -161,8 +200,14 @@ impl State {
                 self.pending.store(false, Ordering::Release);
                 drop(g);
                 self.refuse(self.expired(o.key, o.ttl_ms));
+                self.fail_held(o.held);
             }
         }
+    }
+
+    /// Expires an order nobody used (the service thread calls this) and hands out the events.
+    pub fn drain_events(&self, now: u64) -> Vec<Event> {
+        self.expire(now);
         std::mem::take(&mut *lock(&self.events))
     }
 }
@@ -917,6 +962,23 @@ mod tests {
     }
 
     #[test]
+    fn an_order_of_a_deferred_command_that_no_command_uses_fails_that_command() {
+        let s = State::default();
+        s.arm(1, 0, 4, 0);
+        assert_eq!(s.take_failed(0), [4], "the switch is off: the deferred command can never get its result");
+        s.enable();
+        s.arm(2, 0, 5, 10);
+        s.arm(3, 0, 6, 20); // replaces the first before a command used it
+        assert_eq!(s.take_failed(20), [5]);
+        assert!(s.take_failed(20 + DEFAULT_TTL_MS).is_empty(), "not expired yet");
+        assert_eq!(s.take_failed(21 + DEFAULT_TTL_MS), [6], "expired unused");
+        s.arm_link(8, 0, "key=1:1".into(), 100);
+        let o = s.take(110).expect("armed");
+        assert!(o.link_only && o.held == 8 && o.tm == "key=1:1");
+        assert!(s.take_failed(110).is_empty(), "used: it completes with that command's result");
+    }
+
+    #[test]
     fn an_order_is_taken_once_expires_and_is_replaced() {
         let s = State::default();
         s.arm(7, 0, 0, 0);
@@ -925,7 +987,10 @@ mod tests {
         s.enable();
         s.arm(7, 0, 0, 100);
         assert!(s.pending());
-        assert_eq!(s.take(150), Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS, held: 0 }));
+        assert_eq!(
+            s.take(150),
+            Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS, held: 0, link_only: false, tm: String::new() })
+        );
         assert_eq!((s.take(150), s.pending()), (None, false));
         s.arm(8, 50, 0, 0);
         s.arm(9, 50, 0, 10);
