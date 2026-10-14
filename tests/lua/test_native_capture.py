@@ -111,6 +111,31 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertIn("native build captured", self.B.log())
         self.assertNotIn("refused", self.A.log() + self.B.log())
 
+    def test_a_scripts_build_command_is_applied_at_the_stamp_on_every_game_the_sender_included(self):
+        # real defaults run 2026-10-14: a script's build (the sweep's probes, sent in the simulation state) ran at once on the sending game
+        # and at the stamp on the other, in another step; the free-id lists of the two engines then differed and a later real depot failed
+        self.start()
+        self.B.run("SIM_ENV.api.cmd.sendCommand(SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, false, true))" % self.road(300, 0, 400, 0))
+        self.assertEqual(self.B.builds_applied(), 0, "not sent at once on the sending game")
+        self.tick(20)
+        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        when = "(function() for _, a in ipairs(GAME.applied) do if a.name == 'makeWorldBuildProposalCmd' then return a.time end end end)()"
+        self.assertEqual(self.A.lua(when), self.B.lua(when), "applied in the same step on both games")
+        self.assertIn("a script's command: not sent here", self.B.log())
+        self.assertEqual(self.A.shipped_count(), 0, "a replay is not shipped again")
+        self.assertNotIn("refused", self.A.log() + self.B.log())
+
+    def test_a_game_scripts_own_world_build_is_not_taken_by_the_script_path(self):
+        # the game's own scripts share the simulation state's api.cmd (terrain/reforestation.script, real run 2026-10-14) and send builds
+        # every game makes by itself (playerInitiated false): they stay native and are not shipped
+        self.start()
+        self.B.run("SIM_ENV.api.cmd.sendCommand(SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, false, false))" % self.road(300, 0, 400, 0))
+        self.tick(12)
+        self.assertNotIn("a script's command", self.B.log())
+        self.assertEqual(self.B.shipped_count(), 0)
+
     def test_a_build_the_originators_engine_accepted_with_ignore_errors_is_replayed_with_ignore_errors(self):
         # sweep run 20261013-061744 (B5): the guest applied a construction with ignoreErrors = true after "Empty Construction"; the host replayed it
         # with false, the engine refused it silently and the games drifted

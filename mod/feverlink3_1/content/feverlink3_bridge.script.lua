@@ -1171,6 +1171,83 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, d
 	end
 end
 
+-- A build command a script sends in this (simulation) state: the simulation state runs a command as it is sent, so the build used to
+-- land on the sending game at once and on every other game at the stamp, in another step (real defaults run 2026-10-14: the sweep's
+-- scripted probes left the free-id lists of the two engine copies different, and the next real depot named an id the host did not
+-- have: "Collision with 52163", resync). Now a script's player build goes the way every tool build goes: it is NOT sent here; its
+-- record is handed to the interface half (st.out, `script = true`), which stamps and ships it and queues it on this game too, so the
+-- simulation half applies it at the stamp from the record exactly as every other game does (simApplyAction, role replay). The mod's
+-- own sends (replays at the stamp) use SIMO, the unwrapped functions. Only player builds (playerInitiated = true, the rule of
+-- simCaptureBuild): the game's own scripts share this state's api.cmd and send world builds that every game makes by itself
+-- (terrain/reforestation.script, playerInitiated false: real run 2026-10-14), which stay native. Outside a session (C.ACTIVE false)
+-- everything passes through. The game-script state cannot be read from inside another script's call (state:get raised "Unknown
+-- exception" there), so the record waits in SIMO.pending until this script's own update hands it on (simFlushScriptBuilds).
+local SIMO = { send = nil, factory = nil, tags = setmetatable({}, { __mode = "k" }), cbs = {}, pending = {} }
+
+local function simScriptBuild(cmd, cb)
+	local tag = SIMO.tags[cmd]
+	if not (tag and C.ACTIVE and Build) or tag.args[4] ~= true then return false end
+	local body, why = L.encodeCommand("makeWorldBuildProposalCmd", tag.args, { plain = C.plain, keyOf = function(e) return L.keyFor(SIMO.rev or {}, e) end })
+	if not body then
+		logSim("a script's build command is sent natively (it cannot be recorded: " .. tostring(why) .. ")")
+		return false
+	end
+	body.category = buildCategory(body)
+	local okS, text = pcall(C.serialize, body)
+	if not okS then return false end
+	local now = engine.gameTime()
+	SIMO.pending[#SIMO.pending + 1] = { at = now, text = text, cb = cb }
+	logSim("native build captured at t=" .. now .. " (" .. #text .. " bytes, a script's command: not sent here, every game applies it at the stamp)")
+	return true
+end
+
+-- In this script's own update: the script builds waiting since the last one go to the interface half.
+local function simFlushScriptBuilds(st)
+	local rev = {}
+	for key, e in pairs(st.bind) do rev[e] = key end
+	SIMO.rev = rev
+	if #SIMO.pending == 0 then return end
+	st.out = st.out or {}
+	for _, p in ipairs(SIMO.pending) do
+		st.outSeq = (st.outSeq or 0) + 1
+		st.out[#st.out + 1] = { n = st.outSeq, at = p.at, body = p.text, script = true }
+		if p.cb then SIMO.cbs[st.outSeq] = p.cb end
+	end
+	SIMO.pending = {}
+	trim(st.out, OUT_KEEP)
+end
+
+local function simWrapCommands()
+	if SIMO.send then return end
+	local okI = pcall(function()
+		SIMO.send, SIMO.factory = api.cmd.sendCommand, api.cmd.makeWorldBuildProposalCmd
+		if not (SIMO.send and SIMO.factory) then error("no sendCommand / makeWorldBuildProposalCmd") end
+		api.cmd.makeWorldBuildProposalCmd = function(...)
+			local cmd = SIMO.factory(...)
+			if cmd ~= nil then SIMO.tags[cmd] = { args = { n = select("#", ...), ... } } end
+			return cmd
+		end
+		api.cmd.sendCommand = function(cmd, cb, ...)
+			if cmd ~= nil and SIMO.tags[cmd] then
+				local okB, taken = pcall(simScriptBuild, cmd, cb)
+				if okB and taken then return end
+				if not okB then logSim("a script's build command is sent natively (" .. tostring(taken) .. ")") end
+			end
+			return SIMO.send(cmd, cb, ...)
+		end
+	end)
+	if not okI then
+		SIMO.send, SIMO.factory = nil, nil
+		logSim("script build commands stay native here: the command functions cannot be wrapped")
+	end
+end
+
+-- the mod's own sends of the simulation half: never through the wrapper above
+local function simSendCommand(fn, a)
+	local factory = (fn == "makeWorldBuildProposalCmd" and SIMO.factory) or api.cmd[fn]
+	return (SIMO.send or api.cmd.sendCommand)(factory(unpack(a, 1, a.n)))
+end
+
 local function simApplyAction(st, it, now)
 	if it.body and it.body.native and it.from == C.PLAYER_ID then
 		-- the engine applied this build when its player made it; the record only exists to reach the other games
@@ -1272,7 +1349,7 @@ local function simApplyAction(st, it, now)
 				elseif it.deferId then
 					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred but this replay is not injected: the module drops it after its age limit")
 				end
-				api.cmd.sendCommand(api.cmd[it.body.fn](unpack(a, 1, a.n)))
+				simSendCommand(it.body.fn, a)
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
 		end)
@@ -1295,6 +1372,11 @@ local function simApplyAction(st, it, now)
 	end
 	if held then
 		st.results[#st.results + 1] = { key = it.key .. "#release" .. tostring(it.heldId), of = it.key, at = now, success = true, release = it.heldId }
+	end
+	local scb = it.scriptOut and SIMO.cbs[it.scriptOut]
+	if scb then
+		SIMO.cbs[it.scriptOut] = nil
+		pcall(scb, nil, true)
 	end
 end
 
@@ -1568,6 +1650,7 @@ local function update(userParams, state, dt)
 		SIM.subscribed = true
 		pcall(function() state:subscribeToAllEvents() end)
 	end
+	simWrapCommands()
 	SIM.devTick = (SIM.devTick or 0) + 1
 	if SIM.devTick % 4 == 0 then devPoll("sim") end
 	SIM.state = state
@@ -1587,6 +1670,7 @@ local function update(userParams, state, dt)
 		end
 		simAdvanceWatches(st, now)
 		simAdvanceBinders(st, now)
+		simFlushScriptBuilds(st)
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)
@@ -2215,6 +2299,13 @@ local function shipNative(o)
 	local at = stampAfterFastest(now)
 	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
 	G.nativeShipped = (G.nativeShipped or 0) + 1
+	if o.script then
+		-- a script's build command (simScriptBuild): not applied anywhere yet, so this game queues it like every other game does
+		local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), scriptOut = o.n }
+		logGui("native build " .. it.key .. " (a script's command) stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes): applied at the stamp on this game too")
+		route(it)
+		return true
+	end
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
 	recordOriginator(body, G.seq, at, category)
 	pcall(toSim, "nativebind", { n = o.n, key = L.itemKey(C.PLAYER_ID, G.seq) })
