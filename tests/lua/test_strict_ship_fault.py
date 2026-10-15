@@ -70,7 +70,7 @@ CMDS_SRC.feverlink3_cmds_build = "local M = (function(...)\n" .. src .. "\nend)(
 '''
 
 
-class ShipFaultTest(S.StrictTest):
+class ShipFaultBase(S.StrictTest):
     fail_capable = True   # the module reports `defer` (and with it `fail`) in its ready hooks
 
     def setUp(self):
@@ -105,6 +105,8 @@ class ShipFaultTest(S.StrictTest):
         self.assertIn("FAILED after the ship", self.B.log())
         self.assertIn("NOT released, nothing is applied on this game", self.B.log())
 
+
+class ShipFaultTest(ShipFaultBase):
     # ---- a fault in what used to run after the ship: now made before it, harmless
 
     def test_a_fault_in_the_plan_of_the_ship_line_does_not_release_the_command_at_the_click(self):
@@ -199,6 +201,72 @@ class ShipFaultOldModuleTest(ShipFaultTest):
         self.assertEqual(self.B.native.dropped, [1])
         self.assertFailedNotApplied()
         self.assertIn("this module cannot fire the tool's callback", self.B.log())
+
+
+class ShippedHeldWatchdogTest(ShipFaultBase):
+    """The held watchdog and the commit of a paused build: a shipped command is failed, never released late."""
+
+    def assertFailedOnB(self, failed=True):
+        self.assertNeverReleasedAtTheClick(self.B)
+        if failed:
+            self.assertEqual(self.B.native.failed, [1], "failed: callback fired, nothing applied")
+        self.assertEqual(self.B.builds_applied(), 0, "nothing applied on the originator")
+        self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "the command does not stay held")
+        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1), "shipped once")
+        self.assertNotIn("native build captured", self.B.log())
+
+    def test_a_held_build_whose_stamp_passed_without_a_release_is_failed_not_released_late(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        stamp = self.B.action_records()[0]["stamp"]
+        # the interface half never sees the simulation half's release result
+        self.B.L.execute("local g = STATE.get; STATE.get = function(self) local v = g(self); if v and v.results then local k = {}; for _, r in ipairs(v.results) do if not r.release then k[#k + 1] = r end end; v.results = k end; return v end")
+        self.tick(24)
+        self.assertIn("WATCHDOG: the stamp", self.B.log())
+        self.assertIn("FAILED, NOT released: fail written", self.B.log())
+        self.assertFailedOnB()
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stamp], "the other game applied it at the stamp")
+        self.assertTrue(any(gid == 1 and "was shipped but failed on its originator" in d for gid, d in self.relay.replay_failed),
+                        self.relay.replay_failed)
+
+    def pause(self):
+        self.start(speed=2)
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(18)
+
+    def test_a_build_held_too_long_in_a_paused_game_is_failed_not_released_when_its_callback_cannot_be_fired(self):
+        # natVeto released such a command (the tool would stay dead after a cancel): the build then existed on this game only
+        self.start(speed=2)
+        self.tick(6)
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.frames(500)   # the game is stopped (frames go on, the clock does not) for longer than the limit
+        self.assertIn("FAILED by the watchdog, NOT released", self.B.log())
+        self.assertFailedOnB()
+        self.assertEqual(self.A.builds_applied(), 0, "the other game dropped it on the veto")
+        self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats))
+
+    def test_a_fault_after_the_commit_of_a_paused_build_fails_it_and_asks_for_a_repair(self):
+        self.pause()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(1)
+        self.assertEqual(self.relay.commits, [])
+        self.relay.pauseAt = None   # unpaused during the grace: the commit gives a new stamp and routes it to the queue
+        self.relay.session()
+        self.B.run("FAIL_NEXT_QUEUE = true")
+        self.tick(30)
+        self.assertEqual(len(self.relay.commits), 1, "the commit was sent")
+        stamp = self.relay.commits[0][3]
+        self.assertIn("FAILED at its commit (after the commit was sent", self.B.log())
+        self.assertFailedOnB()
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stamp], "the other game applied it at the commit's stamp")
+        self.assertTrue(any(gid == 1 and "was shipped but failed on its originator" in d for gid, d in self.relay.replay_failed),
+                        self.relay.replay_failed)
+        self.assertNotIn("WATCHDOG", self.B.log())
 
 
 if __name__ == "__main__":

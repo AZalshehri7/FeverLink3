@@ -3125,6 +3125,36 @@ local function natDecideUnsafe(h, cap)
 	ship.step, ship.routed = nil, true
 end
 
+-- THE rule for a held command whose action was SHIPPED (every other game applies it at the stamp) and that cannot be applied at the stamp
+-- here: it is failed, never released (a release applies it at another time than on the other games: other entity ids from then on, and
+-- the simulation half may ship it a second time). `fail` fires the tool's callback with a failed result (the module that can defer has it:
+-- native runtime, both or neither); an older module gets a cancel (its callback fired only where the module can). This game's replay is
+-- dropped. Returns what was done, for the caller's log line. Used by the verdict (natDecide), the commit of a paused build (natCommit) and
+-- the held watchdog.
+function X.natFailHeld(id, key, at, fireable, rec, cancelledAlready)
+	local N = G.nat
+	if rec then rec.cancelled = true end   -- natRelease never gives it back at the stamp now
+	G.graces[key] = nil
+	pcall(toSim, "drop", { key = key, why = "its originator failed it after the ship", own = true })
+	pcall(toSim, "heldgone", { key = key })
+	if cancelledAlready then return "cancelled already" end
+	if N and N.ready and N.ready.defer then
+		N.deferred[id] = { key = key, at = at, t = os.clock(), ready = true, failed = true }
+		local ok = natSend("fail", { id = id })
+		natTrigger()
+		return ok and "fail written (tool callback fired with a failed result)" or "FAIL NOT WRITTEN"
+	end
+	if N then N.deferred[id] = nil end
+	local ok = natOrder("cancel", id)
+	return (ok and "cancel written" or "CANCEL NOT WRITTEN") .. ((FIRE_DONE and fireable) and " (the tool's callback is fired)" or " (this module cannot fire the tool's callback: the tool may stay busy)")
+end
+
+-- The other games have a build this game failed after shipping it: the host is asked to repair them (and the player told).
+function X.natShippedRepair(key, why)
+	send("replay_failed", { detail = "build " .. key .. " was shipped but failed on its originator (" .. tostring(why):sub(1, 100) .. "): the other games have it" })
+	pcall(vetoChat, "shipfail:" .. key, "Your build could not be applied on your own game after it was sent; the games will be synchronised.")
+end
+
 -- A fault AFTER the action was shipped (natDecideUnsafe, h.ship): the other games apply the build at the stamp, so this game must not
 -- apply it at the click. Its command is failed instead: the tool's callback is fired with a failed result (`fail`, the module that can
 -- defer) or the command is cancelled (an older module; the tool's callback is fired only where the module can), nothing is applied here,
@@ -3144,32 +3174,14 @@ local function natFailShipped(h, err)
 		natSay(string.format("held %d (%s): a fault after the ship (%s), but it was released at its stamp already: nothing changed", id, key, tostring(err)))
 		return
 	end
-	if ship.rec then ship.rec.cancelled = true end   -- natRelease never gives it back at the stamp now
-	G.graces[key] = nil
-	pcall(toSim, "drop", { key = key, why = "its originator failed it after the ship", own = true })
-	pcall(toSim, "heldgone", { key = key })
-	local how
-	if ship.verdict == "cancel" then
-		how = "cancelled already"
-	elseif N and N.ready and N.ready.defer then
-		-- the module knows `fail` together with `defer` (native runtime: both or neither): a waiting or deferred command fails, callback fired
-		N.deferred[id] = { key = key, at = it.at, t = os.clock(), ready = true, failed = true }
-		local ok = natSend("fail", { id = id })
-		natTrigger()
-		how = ok and "fail written (tool callback fired with a failed result)" or "FAIL NOT WRITTEN"
-	else
-		N.deferred[id] = nil
-		local ok = natOrder("cancel", id)
-		how = (ok and "cancel written" or "CANCEL NOT WRITTEN") .. ((FIRE_DONE and h.done == true) and " (the tool's callback is fired)" or " (this module cannot fire the tool's callback: the tool may stay busy)")
-	end
+	local how = X.natFailHeld(id, key, it.at, h.done == true, ship.rec, ship.verdict == "cancel")
 	natSay(string.format("held %d (%s) FAILED after the ship at step %s of the %s flow (%s): NOT released, nothing is applied on this game; %s",
 		id, key, tostring(ship.step), ship.flow, tostring(err), how))
 	if it.body and it.body.commit and not ship.routed then
 		natSay("held " .. id .. " (" .. key .. "): its commit was never sent, the other games drop the parked record: no repair needed")
 		return
 	end
-	send("replay_failed", { detail = "build " .. key .. " was shipped but failed on its originator (" .. tostring(err):sub(1, 100) .. "): the other games have it" })
-	pcall(vetoChat, "shipfail:" .. key, "Your build could not be applied on your own game after it was sent; the games will be synchronised.")
+	X.natShippedRepair(key, err)
 end
 
 -- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): before the ship
@@ -3195,10 +3207,10 @@ local natSettle, commitPump, natCapture, natTick
 do -- section: strict mode: commits, the ledger, events (not indented, see SECTIONS at the top)
 -- The grace of a paused game's held build is over (or a resync / the end of the session cuts it short): tell the others to apply it
 -- and release this game's own command. If the game was unpaused meanwhile the normal stamp logic takes over: a new stamp ahead.
-local function natCommit(key, why)
-	local g = G.graces[key]
-	if not g then return end
-	G.graces[key] = nil
+-- The commit is an irreversible send like the action itself (natDecide): after it the other games apply the build at the stamp, so this
+-- game routes it to its own stamp apply or fails its command (X.natFailHeld), never leaves it held for the watchdog to release late. A
+-- fault BEFORE the commit fails it too, without a repair: the other games drop the parked record when no commit comes (PARK_MAX).
+local function natCommitUnsafe(key, why, g, st)
 	local it = g.it
 	local now = engine.gameTime()
 	if not pausedNow() then
@@ -3206,11 +3218,38 @@ local function natCommit(key, why)
 		noteBuild(key, it.at)
 		local h = G.nat and G.nat.heldByKey[key]
 		if h then h.at = it.at end
-		logGui("commit of " .. key .. ": the game is no longer paused, the build gets the stamp " .. it.at .. " (now " .. now .. ")")
+		pcall(logGui, "commit of " .. key .. ": the game is no longer paused, the build gets the stamp " .. tostring(it.at) .. " (now " .. tostring(now) .. ")")
 	end
+	st.sent = true
 	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at })
-	logGui("commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. it.at)
+	pcall(logGui, "commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. tostring(it.at))
 	route(it)
+	st.routed = true
+end
+
+local function natCommit(key, why)
+	local g = G.graces[key]
+	if not g then return end
+	G.graces[key] = nil
+	local st = {}
+	local ok, err = pcall(natCommitUnsafe, key, why, g, st)
+	if ok or st.routed then return end
+	local N = G.nat
+	local rec = N and N.heldByKey[key]
+	if rec and (rec.released or rec.done) then
+		-- a paused game applies at once (route -> guiApplyNow -> natPauseRelease): it went back at its stamp before the fault
+		pcall(natSay, "commit of " .. key .. ": a fault (" .. tostring(err) .. ") after the command was released at its stamp: nothing changed")
+		return
+	end
+	local okF, how = true, "no held command of it here"
+	if rec and not rec.cancelled then okF, how = pcall(X.natFailHeld, rec.id, key, g.it and g.it.at, rec.fireable == true, rec, false) end
+	pcall(natSay, string.format("held %s (%s) FAILED at its commit (%s, %s): NOT released, nothing is applied on this game; %s", tostring(rec and rec.id), key,
+		st.sent and "after the commit was sent" or "before the commit was sent", tostring(err), okF and tostring(how) or ("the failure itself failed: " .. tostring(how))))
+	if st.sent then
+		pcall(X.natShippedRepair, key, err)
+	else
+		pcall(natSay, "commit of " .. key .. " was never sent: the other games drop the parked record, no repair needed")
+	end
 end
 
 -- Before the game is saved for a resync: no build may stay held across the save. A grace is cut short (committed); a build whose
@@ -3253,19 +3292,27 @@ local function heldWatchdog(N, now)
 	for key, h in pairs(N.heldByKey) do
 		if not (h.released or h.done or h.cancelled) and not G.graces[key] and h.at then
 			if gt >= h.at + HELD_STUCK_STEPS * STEP and now - h.t > 2 then
-				natSay(string.format("WATCHDOG: the stamp %d of held %d (%s) passed %d ms ago (game time %d) and the command is still held; the simulation half's release result %s; releasing it now",
-					h.at, h.id, key, gt - h.at, gt, G.resultsSeen[key .. "#release" .. tostring(h.id)] and "WAS seen" or "was not seen"))
-				natRelease(key)
+				-- Every command in heldByKey was shipped: the other games applied it at its stamp. A release now would apply it here at
+				-- another step (other entity ids from then on, and the simulation half could ship it again): it is failed and the games
+				-- repaired instead (X.natFailHeld, the same rule as a fault after the ship). Was a release until 2026-10-15.
+				local how = X.natFailHeld(h.id, key, h.at, h.fireable == true, h, false)
+				natSay(string.format("WATCHDOG: the stamp %s of held %s (%s) passed %s ms ago (game time %s) and the command is still held; the simulation half's release result %s; FAILED, NOT released: %s",
+					tostring(h.at), tostring(h.id), key, tostring(gt - h.at), tostring(gt), G.resultsSeen[key .. "#release" .. tostring(h.id)] and "WAS seen" or "was not seen", how))
+				X.natShippedRepair(key, "its stamp passed while it was still held")
 			elseif gt < h.at and now - h.t > HELD_PAUSED_MAX then
 				local why = "held for " .. HELD_PAUSED_MAX .. " s and its stamp still lies ahead (the game is paused)"
 				G.vetoed[key] = why
 				pcall(toSim, "drop", { key = key, why = why, own = true })
 				send("build_veto", { seq = tonumber(key:match(":(%d+)$")), owner = C.PLAYER_ID, why = why, name = C.PLAYER_NAME })
-				if natVeto(key, C.PLAYER_NAME, why) == false then
-					vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build exists on their game only (the game stayed paused too long before it could be applied); the games will be synchronised.")
+				if h.fireable == true then
+					natVeto(key, C.PLAYER_NAME, why)
 				else
-					vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
+					-- natVeto would RELEASE a command whose callback cannot be fired (the build on this game only): failed instead, as the
+					-- other games drop it on the veto (no repair needed)
+					local how = X.natFailHeld(h.id, key, h.at, false, h, false)
+					natSay("held " .. h.id .. " (" .. key .. ") FAILED by the watchdog, NOT released (" .. why .. "): " .. how)
 				end
+				vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
 			end
 		end
 	end

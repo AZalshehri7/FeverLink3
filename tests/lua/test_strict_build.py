@@ -1972,18 +1972,22 @@ class HeldAcrossResyncTest(StrictTest):
         self.assertEqual(self.A.shipped_count(), 1)
         self.assertNotIn("native build captured", self.A.log())
 
-    def test_a_held_build_whose_stamp_passed_without_a_release_is_released_by_the_watchdog(self):
+    def test_a_held_build_whose_stamp_passed_without_a_release_is_failed_by_the_watchdog_never_released_late(self):
+        # 2026-10-15: a release here applied the build steps after the stamp the other game used (other entity ids); the command is
+        # failed instead (here a cancel with the callback fired: this fake module has no `fail`) and the games are repaired
         self.start()
         self.A.tool(self.road(300, 0, 400, 0))
         self.tick(1)
         # the interface half never sees the simulation half's release result
         self.A.L.execute("local g = STATE.get; STATE.get = function(self) local v = g(self); if v and v.results then local k = {}; for _, r in ipairs(v.results) do if not r.release then k[#k + 1] = r end end; v.results = k end; return v end")
         self.tick(24)
-        self.assertEqual(self.A.native.released, [1])
+        self.assertEqual(self.A.native.released, [], "never released late")
+        self.assertEqual(self.A.native.dropped, [1])
         self.assertIn("WATCHDOG: the stamp", self.A.log())
-        self.assertSameWorld()
-        self.assertEqual(self.A.builds_applied(), 1)
+        self.assertIn("FAILED, NOT released: cancel written (the tool's callback is fired)", self.A.log())
+        self.assertEqual(self.A.builds_applied(), 0)
         self.assertEqual(self.B.builds_applied(), 1)
+        self.assertTrue(any(gid == 0 and "was shipped but failed on its originator" in d for gid, d in self.relay.replay_failed), self.relay.replay_failed)
         self.assertEqual(self.A.shipped_count(), 1)
         self.assertNotIn("native build captured", self.A.log())
 
