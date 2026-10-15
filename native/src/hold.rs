@@ -606,6 +606,14 @@ impl<H> HoldMachine<H> {
         self.entries.iter().find(|e| e.id == id).map(|e| &e.handle)
     }
 
+    /// Held command `id` is still held and not leaving (waiting, scheduled or deferred; not failed, cancelled, completed or gone): a
+    /// stamp apply of its build may still be due for it.
+    pub fn is_kept(&self, id: HoldId) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.id == id && matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. } | Phase::Deferred))
+    }
+
     /// For the tests and diagnostics: the held entries as `(id, kind)`.
     pub fn held(&self) -> Vec<(HoldId, u8)> {
         self.entries.iter().map(|e| (e.id, e.kind)).collect()

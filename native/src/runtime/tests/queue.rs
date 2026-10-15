@@ -153,8 +153,11 @@ fn two_deferred(rt: &Runtime, dir: &Path) -> Vec<(Call, Box<[u8; 0x40]>)> {
 }
 
 /// The mod's release of both deferred commands (the interface world has the apply), then any Add: the callbacks fire.
-fn release_both(rt: &Runtime, dir: &Path) {
-    ctl(dir, "6\trelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n7\trelease\t1\t{[\"at\"]=0,[\"id\"]=2}\n");
+fn release_both(rt: &Runtime, dir: &Path, seq: u64) {
+    ctl(
+        dir,
+        &format!("{seq}\trelease\t1\t{{[\"at\"]=0,[\"id\"]=1}}\n{}\trelease\t1\t{{[\"at\"]=0,[\"id\"]=2}}\n", seq + 1),
+    );
     rt.pump();
     let mut nop = Call::new(27, 50);
     unsafe { rt.on_add(nop.args(), at(0x999)) };
@@ -184,7 +187,7 @@ fn each_held_command_takes_the_result_of_its_own_builds_apply_when_two_are_due_i
     // waited for the age limit.
     assert_eq!(payload_now(&r1), held[0].0.payload(), "build 1's apply went to held command 1");
     assert_eq!(payload_now(&r2), held[1].0.payload(), "build 2's apply went to held command 2");
-    release_both(&rt, dir.path());
+    release_both(&rt, dir.path(), 6);
     let done: Vec<_> = completions(dir.path()).into_iter().map(|(id, _, why)| (id, why)).collect();
     assert_eq!(done, [(1, "stamp_apply".to_string()), (2, "stamp_apply".to_string())], "{:?}", events(dir.path()));
     assert!(refusals(dir.path()).is_empty());
@@ -215,13 +218,47 @@ fn commands_the_interface_adds_keep_their_order_until_their_apply_and_a_reused_a
     apply(&rt, &mut r1);
     assert_eq!(lock(&rt.added).len(), 1, "the record stays: nothing completes held 1 with the other build's result");
     assert_eq!(payload_now(&r1), r1_payload, "the other build's result went to nobody");
-    // the record expires: held 1 fails (its tool callback fired with a failed result), not left busy
-    rt.advance(crate::inject::MAX_TTL_MS + 1);
+    // the mod fails held 1 (its build got no apply here): the record goes with it at the next look, nothing else fails
+    ctl(dir.path(), "6\tfail\t1\t{[\"id\"]=1}\n");
+    rt.pump();
     let (mut later, _l) = road(700.0);
     apply(&rt, &mut later);
     assert!(lock(&rt.added).is_empty());
-    release_both(&rt, dir.path());
+    release_both(&rt, dir.path(), 7);
     let done = completions(dir.path());
     assert!(done.iter().any(|(id, _, why)| *id == 2 && why == "stamp_apply"), "{done:?}");
     assert!(done.contains(&(1, false, "fail".to_string())), "a failed result: {done:?}");
+}
+
+#[test]
+fn a_deferred_link_waiting_five_minutes_of_wall_time_in_a_pause_is_still_completed() {
+    let dir = TempDir::new("rt-queue-pause");
+    let rt = runtime(Some(dir.path()));
+    rt.enable_native_inject(settings());
+    let held = two_deferred(&rt, dir.path());
+    // the interface half applies build 2 during a pause: its command took its order at the Add and waits for the simulation's apply
+    let (mut r2, _m2) = road(200.0);
+    unsafe { rt.on_add(r2.args(), at(0x777)) };
+    assert_eq!(lock(&rt.added).len(), 1);
+    // the pause lasts five minutes of wall time (the pause menu stops the mod's script: no line); the service thread keeps running and
+    // other build commands are applied meanwhile (each looks at the records)
+    for i in 0..300u32 {
+        rt.advance(1_000);
+        rt.pump();
+        if i % 60 == 0 {
+            let (mut town, _t) = road(900.0 + i as f32);
+            apply(&rt, &mut town);
+        }
+    }
+    assert_eq!(lock(&rt.added).len(), 1, "no wall-clock expiry: the record waits as long as its held command is kept");
+    assert!(completions(dir.path()).is_empty(), "nothing was failed during the pause: {:?}", events(dir.path()));
+    // the session resumes: the mod speaks again and the simulation applies the build
+    ctl(dir.path(), "6\tping\t1\t{[\"n\"]=1}\n");
+    rt.pump();
+    apply(&rt, &mut r2);
+    assert!(lock(&rt.added).is_empty());
+    assert_eq!(payload_now(&r2), held[1].0.payload(), "build 2's apply went to held command 2");
+    release_both(&rt, dir.path(), 7);
+    let done = completions(dir.path());
+    assert!(done.iter().any(|(id, _, why)| *id == 2 && why == "stamp_apply"), "{done:?}");
 }

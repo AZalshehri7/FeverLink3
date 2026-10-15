@@ -196,12 +196,11 @@ impl Runtime {
             // SAFETY: only readable memory is read.
             let Some(payload) = (unsafe { engine::payload_of(args.cmd) }) else { return };
             let identity = inj::identity(&LiveMem, payload);
-            let now = self.now_ms();
             let mut added = super::lock(&self.added);
-            self.prune_added(&mut added, now);
+            self.prune_added(&mut added);
             match identity {
                 Ok(identity) => {
-                    added.insert(used.seq, Added { payload, identity, at_ms: now, used });
+                    added.insert(used.seq, Added { payload, identity, used });
                 }
                 Err(why) => {
                     drop(added);
@@ -226,7 +225,7 @@ impl Runtime {
         if added.is_empty() {
             return None;
         }
-        self.prune_added(&mut added, self.now_ms());
+        self.prune_added(&mut added);
         // SAFETY: only readable memory is read.
         let payload = unsafe { engine::payload_of(cmd) }?;
         let seq = {
@@ -238,20 +237,37 @@ impl Runtime {
         added.remove(&seq).map(|a| a.used)
     }
 
-    /// Drops the records of commands the simulation never applied within [`inj::MAX_TTL_MS`] (the command list was discarded, a load):
-    /// their held command fails (tool callback fired) rather than waiting for the age limit.
-    fn prune_added(&self, added: &mut std::collections::BTreeMap<u64, Added>, now: u64) {
-        let old: Vec<u64> =
-            added.iter().filter(|(_, a)| now.saturating_sub(a.at_ms) > inj::MAX_TTL_MS).map(|(s, _)| *s).collect();
-        for seq in old {
+    /// Drops the records no apply can need any more, by no wall clock: a pause can last minutes (the host waits for every game's stop
+    /// report and a round trip) and keeps a paused build deferred all that time, so a record waits as long as its deferred held command
+    /// is kept. The hold machine owns that lifetime (its age stands still while the mod is silent, and its own end of a held command
+    /// fires the tool's callback): a record whose held command is failed, cancelled or gone is dropped (nothing to complete, nothing
+    /// failed here).
+    /// A record without a held command (timing only) is dropped when more than [`MAX_ADDED`] wait, the oldest first. Before (until
+    /// 2026-10-15), a record older than 60 s of wall time failed its held command: a long pause failed a paused build's tool.
+    fn prune_added(&self, added: &mut std::collections::BTreeMap<u64, Added>) {
+        let gone: Vec<u64> = {
+            let machine = super::lock(&self.machine);
+            added
+                .iter()
+                .filter(|(_, a)| a.used.link.is_some_and(|held| !machine.is_kept(held)))
+                .map(|(s, _)| *s)
+                .collect()
+        };
+        for seq in gone {
             let Some(a) = added.remove(&seq) else { continue };
             self.say(&format!(
-                "native inject: key {}: the command the order was used for at Add was not applied within {} ms: dropped",
+                "native inject: key {}: held command {} is no longer kept (failed, cancelled or gone): the record of its command (added, not yet applied) is dropped",
                 a.used.timing.key,
-                inj::MAX_TTL_MS
+                a.used.link.unwrap_or(0)
             ));
-            if let Some(held) = a.used.link {
-                self.inject.fail_held(held);
+        }
+        while added.values().filter(|a| a.used.link.is_none()).count() > MAX_ADDED {
+            let Some(seq) = added.iter().find(|(_, a)| a.used.link.is_none()).map(|(s, _)| *s) else { break };
+            if let Some(a) = added.remove(&seq) {
+                self.say(&format!(
+                    "native inject: key {}: more than {MAX_ADDED} added commands wait for their apply: the oldest record (timing only) is dropped",
+                    a.used.timing.key
+                ));
             }
         }
     }
@@ -682,13 +698,15 @@ pub(crate) struct Used {
     pub link: Option<u64>,
 }
 
+/// The most records of added commands without a held command (timing only) kept until their apply (see `Runtime::prune_added`).
+const MAX_ADDED: usize = 64;
+
 /// A command the command list's `Add` carried an order out on, until the simulation applies it (`Runtime::added`, keyed by the order's
 /// number). The payload alone does not identify it: the engine may free it and give the address to another command; the identity
 /// after the order (`inject::identity`) must be the same too.
 pub(crate) struct Added {
     pub payload: usize,
     pub identity: inj::Identity,
-    pub at_ms: u64,
     pub used: Used,
 }
 
