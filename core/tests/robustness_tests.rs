@@ -685,6 +685,8 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             from: rr.gen(),
             category: random_text(rr, 8),
             allowed: rr.gen(),
+            pause: rr.gen(),
+            pause_seq: if rr.gen() { Some(rr.gen()) } else { None },
         });
         round_trip(Permissions {
             build: player_set(rr),
@@ -797,6 +799,8 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
                 from: r.gen(),
                 category: random_text(r, 8),
                 allowed: r.gen(),
+                pause: r.gen(),
+                pause_seq: if r.gen() { Some(r.gen()) } else { None },
             };
             codec::encode(&m)
         }

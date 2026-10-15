@@ -143,6 +143,7 @@ function EXECUTE(cmd, cb)
   local rec = { name = name, time = GAME.time, args = a }
   local created = nil
   if name == "makeVehicleBuyCmd" then
+    if NO_MONEY then error("not enough money") end   -- a test sets it on every game: the engine refuses the purchase
     assert(a[1] == 7, "player entity expected, got " .. tostring(a[1]))
     assert(WORLD[a[2]] and WORLD[a[2]].VEHICLE_DEPOT, "no depot " .. tostring(a[2]))
     GAME.nextEntity = GAME.nextEntity + 1
@@ -327,7 +328,11 @@ function UI_VIEW()
 end
 
 function SIM_EVENT(src, id, name, param) SIM.handleEvent(nil, STATE, src, id, name, param) end
-function FRAME() GUI.guiUpdate(nil, STATE, GSTATE) end
+-- a frame: the bridge's interface half, then the window state's refresh (the UI hook's held commands get their stamp applies)
+function FRAME()
+  GUI.guiUpdate(nil, STATE, GSTATE)
+  if UI_HOOK and UI_HOOK.HookModule.poll then UI_HOOK.HookModule.poll() end
+end
 function SIMSTEP()
   local cbs = SAVE_CBS
   SAVE_CBS = {}
@@ -450,6 +455,7 @@ class Relay:
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
         self.vetoes = []
         self.commits = []
+        self.pause_seq = 0   # the host's pause order
         self.safes, self.drop_promises = {}, False
         self.started, self.speed, self.pauseAt = False, 0, None
 
@@ -531,9 +537,14 @@ class Relay:
                     self.broadcast("peerclock", self.ser(pc), exclude=g)
                 elif rec.kind == "action":
                     p["from"] = g.id
+                    p["pauseSeq"] = None
+                    if p.pause:
+                        # the pause order (host.rs pause_order): numbered, and sent to every game, the sender included
+                        self.pause_seq += 1
+                        p["pauseSeq"] = self.pause_seq
                     payload = self.C.serialize(p)
                     for o in self.games:
-                        if o is not g:
+                        if o is not g or p.pause:
                             self.send(o, "action", g.id, payload)
                 elif rec.kind == "hello":
                     self.hello[g.id] = int(p.time)
@@ -560,9 +571,13 @@ class Relay:
                             self.send(o, "build_veto", 0, out)
                 elif rec.kind == "build_commit":
                     self.commits.append((g.id, int(p.owner), int(p.seq), int(p.stamp)))
-                    out = self.ser({"seq": int(p.seq), "owner": int(p.owner), "stamp": int(p.stamp), "from": g.id})
+                    c = {"seq": int(p.seq), "owner": int(p.owner), "stamp": int(p.stamp), "from": g.id}
+                    if p.pause:
+                        self.pause_seq += 1
+                        c["pause"], c["pauseSeq"] = True, self.pause_seq
+                    out = self.ser(c)
                     for o in self.games:
-                        if o is not g:
+                        if o is not g or p.pause:
                             self.send(o, "build_commit", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
@@ -1148,6 +1163,190 @@ class LockstepTest(unittest.TestCase):
         self.assertIn('["speed"]=3', b[0])
         self.assertEqual(len(a), 1, a)
         self.assertIn('["speed"]=0', a[0])
+
+
+BUY_IN_WINDOW = ('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }),'
+                 ' function(d, s, e) %s = { s, d and d.resultVehicleEntity } end)')
+
+
+class StampedEverywhereTest(unittest.TestCase):
+    """Every game, the originator included, applies a command at its stamp, in stamp order: then the engine hands out the same
+    entity ids on every game. Both mocked games here allocate ids from the SAME base (in LockstepTest they differ on purpose), so
+    an action applied at another step, or in another order, on one game shows as different ids."""
+
+    tearDown = LockstepTest.tearDown
+    tick = LockstepTest.tick
+    start = LockstepTest.start
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="feverlink3-")
+        self.A = Game("host", 0, self.tmp, 50000)
+        self.B = Game("client", 1, self.tmp, 50000)
+        self.relay = Relay([self.A, self.B])
+
+    def entities(self, g):
+        return g.L.eval("(function() local r = {} for i, a in ipairs(GAME.applied) do r[i] = tostring(a.entity) end return table.concat(r, ',') end)()")
+
+    def assertSameApplies(self, n):
+        a, b = self.A.applied(), self.B.applied()
+        self.assertEqual(len(a), n, a)
+        self.assertEqual(a, b, "the same commands at the same steps in the same order")
+        self.assertEqual(self.entities(self.A), self.entities(self.B), "the same entity ids")
+
+    def test_a_vehicle_bought_and_a_line_made_in_a_window_are_applied_at_their_stamp_on_the_originator_too(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.A.window(BUY_IN_WINDOW % "BUY")
+        # the other player buys from the bridge's own state a moment later: the two purchases interleave by stamp
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(1)
+        self.assertEqual(self.A.applied(), [], "not applied at the click")
+        self.assertTrue(self.A.L.eval("BUY == nil"), "the window's callback waits for the stamp apply")
+        self.tick(40, lag_b=True)
+        self.assertSameApplies(2)
+        own = [i for i in (1, 2) if int(self.A.L.eval("GAME.applied[%d].args[2]" % i)) == 55]
+        self.assertTrue(self.A.L.eval("BUY ~= nil and BUY[1] == true"))
+        self.assertIn(int(self.A.L.eval("BUY[2]")), [int(self.A.L.eval("GAME.applied[%d].entity" % i)) for i in own])
+        self.assertIn("held until its stamp", self.A.log())
+        self.assertIn("applied at its stamp", self.A.log())
+        # a line from a window of the client, then the vehicle the host bought put on it from the host's window
+        self.B.window('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) LINE = e[1][1] end)')
+        self.tick(40, lag_b=True)
+        self.assertSameApplies(3)
+        line = int(self.B.L.eval("LINE"))
+        self.assertEqual(line, int(self.B.L.eval("GAME.applied[3].entity")))
+        self.A.window("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, %d, 0), function(d, s) SET = s end)" % (int(self.A.L.eval("BUY[2]")), line))
+        self.tick(40, lag_b=True)
+        self.assertSameApplies(4)
+        self.assertTrue(self.A.L.eval("SET == true"))
+        self.assertFalse(any("LATE" in g.log() for g in (self.A, self.B)))
+
+    def test_a_purchase_refused_at_its_stamp_is_refused_on_every_game_and_the_window_hears_it(self):
+        self.start()
+        self.tick(5)
+        for g in (self.A, self.B):
+            g.L.execute("NO_MONEY = true")
+        self.A.window(BUY_IN_WINDOW % "BUY")
+        self.tick(40)
+        self.assertEqual((self.A.applied(), self.B.applied()), ([], []))
+        self.assertTrue(self.A.L.eval("BUY ~= nil and BUY[1] == false"), "the callback ran with the refusal")
+        for g in (self.A, self.B):
+            self.assertIn("refused by the engine: ", g.log())
+        self.assertIn("REFUSED at its stamp", self.A.log())
+
+    def test_commands_of_two_players_during_a_pause_are_applied_in_the_same_order_on_both_games(self):
+        self.start(speed=2)
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40, lag_b=True)
+        paused_at = self.relay.pauseAt
+        self.assertEqual((self.A.time(), self.B.time()), (paused_at, paused_at))
+        # each player acts during the pause: before, each game applied its own first (arrival order) and the ids crossed. Now every
+        # game, the originator too, applies them in the host's pause order, during the pause
+        self.A.window(BUY_IN_WINDOW % "A_BUY")
+        self.B.send_gui(BUY_IN_WINDOW % "B_BUY")
+        self.B.window('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function() end)')
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("M", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function() end)')
+        self.tick(8)
+        self.assertSameApplies(4)
+        self.assertTrue(all(x.endswith("@%d" % paused_at) for x in self.A.applied()), self.A.applied())
+        self.assertEqual((self.A.time(), self.B.time()), (paused_at, paused_at), "still paused: built during the pause")
+        self.assertEqual(self.relay.pause_seq, 4)
+        self.assertTrue(self.A.L.eval("A_BUY ~= nil and A_BUY[1] == true"), "the window's callback ran during the pause")
+        self.assertTrue(self.B.L.eval("B_BUY ~= nil and B_BUY[1] == true"))
+        for g in (self.A, self.B):
+            self.assertIn("pause order #4", g.log())
+        self.relay.pauseAt, self.relay.speed = None, 2
+        self.relay.session()
+        self.tick(20)
+        self.assertGreater(self.A.time(), paused_at)
+        self.assertSameApplies(4)
+        self.assertFalse(any("LATE" in g.log() or "PAUSE ORDER" in g.log() for g in (self.A, self.B)))
+
+    def test_a_paused_action_that_reaches_the_host_after_its_resume_is_applied_at_the_pause_time_everywhere(self):
+        self.start(speed=2)
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40)
+        paused_at = self.relay.pauseAt
+        self.B.send_gui(BUY_IN_WINDOW % "B_BUY")   # stamped at the pause, in B's outbox, not yet at the host
+        self.A.send_gui(BUY_IN_WINDOW % "A_BUY")
+        # the host resumes before it reads them: the resume line goes out first, the paused actions are numbered after it
+        self.relay.pauseAt, self.relay.speed = None, 2
+        self.relay.session()
+        self.tick(20)
+        for g in (self.A, self.B):
+            lines = self.relay.history[g.id]
+            kinds = [ln.split(TAB)[1] for ln in lines]
+            last_pause = max(i for i, ln in enumerate(lines) if "pauseAt" in ln)
+            resume = kinds.index("session", last_pause + 1)
+            first_action = kinds.index("action", last_pause + 1)
+            self.assertGreater(first_action, resume, "the paused actions reached this game after the resume line")
+        self.assertSameApplies(2)
+        self.assertTrue(all(x.endswith("@%d" % paused_at) for x in self.A.applied()), "both at the pause time: %s" % self.A.applied())
+        self.assertGreater(min(self.A.time(), self.B.time()), paused_at, "and then both went on")
+        self.assertTrue(self.B.L.eval("B_BUY ~= nil and B_BUY[1] == true"))
+        self.assertTrue(self.A.L.eval("A_BUY ~= nil and A_BUY[1] == true"))
+        self.assertFalse(any("LATE" in g.log() or "PAUSE ORDER" in g.log() for g in (self.A, self.B)))
+
+
+class ThreeGamesPauseOrderTest(unittest.TestCase):
+    """Three games, one id base: every player buys and makes lines in one pause, interleaved; every game applies them in the host's
+    pause order, the originators included, with the same entity ids."""
+
+    tearDown = LockstepTest.tearDown
+    entities = StampedEverywhereTest.entities
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="feverlink3-")
+        self.A = Game("host", 0, self.tmp, 50000)
+        self.B = Game("client", 1, self.tmp, 50000)
+        self.C = Game("third", 2, self.tmp, 50000)
+        self.games = (self.A, self.B, self.C)
+        self.relay = Relay(list(self.games))
+
+    def tick(self, n=1):
+        for _ in range(n):
+            for _ in range(4):
+                for g in self.games:
+                    g.frame()
+                self.relay.pump()
+            for g in self.games:
+                g.step()
+
+    def test_three_players_in_one_pause(self):
+        self.tick(5)
+        self.relay.started, self.relay.speed = True, 2
+        self.relay.session()
+        self.tick(10)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(30)
+        paused_at = self.relay.pauseAt
+        self.assertEqual([g.time() for g in self.games], [paused_at] * 3)
+        line = 'api.cmd.sendCommand(api.cmd.makeLineCreateCmd("%s", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function() end)'
+        self.C.send_gui(BUY_IN_WINDOW % "C1")
+        self.A.window(line % "A")
+        self.B.send_gui(BUY_IN_WINDOW % "B1")
+        self.C.window(line % "C")
+        self.A.send_gui(BUY_IN_WINDOW % "A1")
+        self.tick(8)
+        a = self.A.applied()
+        self.assertEqual(len(a), 5, a)
+        for g in (self.B, self.C):
+            self.assertEqual(g.applied(), a, "the same pause order on every game")
+            self.assertEqual(self.entities(g), self.entities(self.A), "the same entity ids")
+        self.assertEqual([g.time() for g in self.games], [paused_at] * 3)
+        self.relay.pauseAt, self.relay.speed = None, 2
+        self.relay.session()
+        self.tick(20)
+        self.assertTrue(all(g.time() > paused_at for g in self.games))
+        self.assertFalse(any("LATE" in g.log() or "PAUSE ORDER" in g.log() for g in self.games))
 
 
 class PureTest(unittest.TestCase):
