@@ -93,7 +93,15 @@ end
 function L.pace(s, peers, now, ahead, marks)
 	if not s.started then return 0 end
 	local want = s.speed or 0
-	if want <= 0 then return 0 end
+	-- standing at a pause, with an action of the pause the host stamped further on (pauseRun: one step past the furthest place a game
+	-- stands, see the bridge's pause order): run on to it, one step a batch, the least the pause's world can move. The simulation applies
+	-- it at its stamp, so overshooting it changes nothing.
+	local run = s.pauseAt ~= nil and now >= s.pauseAt and type(s.pauseRun) == "number" and now < s.pauseRun
+	if run then
+		want = 1
+	elseif want <= 0 then
+		return 0
+	end
 	local bar = L.barrier(s, peers)
 	if bar then
 		-- no shortened last step here (the pause's math.max(room, 1) below): one step too far is the late apply itself
@@ -101,7 +109,7 @@ function L.pace(s, peers, now, ahead, marks)
 		if room < 1 then return 0 end
 		if room < want then want = room end
 	end
-	local stopAt = s.pauseAt
+	local stopAt = run and s.pauseRun or s.pauseAt
 	local slowest = L.slowestPeer(peers)
 	if slowest then
 		local limit = slowest + (ahead or L.aheadFor(want)) * L.STEP
@@ -199,7 +207,9 @@ function L.barrier(s, peers)
 	local b = nil
 	for _, pc in pairs(peers) do
 		if type(pc) == "table" and type(pc.safe) == "number" then
-			local lim = pc.pause and pc.safe or (pc.safe - keep)
+			-- a pause promise: up to the pause, or to the stamp the host gave an action of the pause past it (pauseRun: every item that
+			-- game ships while paused is such an action, stamped by the host past every game)
+			local lim = pc.pause and math.max(pc.safe, s.pauseRun or pc.safe) or (pc.safe - keep)
 			if b == nil or lim < b then b = lim end
 		end
 	end

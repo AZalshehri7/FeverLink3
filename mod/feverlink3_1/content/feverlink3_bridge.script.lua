@@ -2054,7 +2054,8 @@ function X.reportClock(now)
 	local safe, floor, pause = L.promise(G.session, now, G.promiseFloor)
 	G.promiseFloor, G.promisePause = floor, pause
 	local ahead = L.aheadFor(G.session.speed)
-	send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed), safe = safe, pause = pause or nil })
+	send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed), safe = safe, pause = pause or nil,
+		stop = (pause and X.curStop == now) and now or nil })
 end
 
 -- A game stopped at a pause promises the pause time itself, and it must have said so before it ships the first item stamped there:
@@ -2307,15 +2308,16 @@ end
 
 -- ---- the pause order (docs/PROTOCOL.md, "The pause order")
 --
--- During a pause every game applies the actions made in it at once, from this (the interface) state. In the order they reached each game
--- that was not one order: the originator's own came first (two players acting in one pause gave the engine's free-id FIFO A1,B1 on one game
--- and B1,A1 on the other). Now an action made while the session stands at its pause is shipped flagged `pause`; the host numbers it and
--- sends it to EVERY game, its sender included, and every game applies paused actions only in that numbered order (one queue, X.pauseQ).
--- The originator keeps its own until it comes back (G.pauseOwn): one round trip to the host. Checksums stamped at the pause go through the
--- same queue, so each sees the same paused actions applied on every game.
--- The resume: the host's resume line follows every number it gave before it; a paused action that reaches the host after its resume is
--- numbered after it. No game leaves the pause time while it waits for one of its own (G.pauseOwn) or has one queued (X.pauseCap); the
--- other games are held there by the originator's pause promise (the input barrier) until its next clock, which comes after the action.
+-- An action made while the session stands at its pause is shipped flagged `pause` and this game keeps it (G.pauseOwn) until the host
+-- sends it back. Applied at once from this state in arrival order, the actions of a pause were in a different order on each game (the
+-- originator's own first); applied at the pause stamp, they were late on every game, because no game stands AT the pause: speed 0
+-- takes effect a few steps late, by a different amount on each game (real run pause3, 2026-10-15: pauseAt 534400, both games stood at
+-- 535000, "PAUSE ORDER LATE" and a resync for every paused build). So every game says where it really stands still (X.stopAt, the
+-- clock's `stop`), the host stamps the action one step past the furthest of those places and sends it, numbered, to every game, this
+-- one included (X.pauseArrived). Every game applies it at that stamp through the simulation like any action, exactly there whatever its
+-- own overshoot; a game standing still runs on to it (L.pace, pauseRun), a step or a few: the pause's world moves that little for each
+-- build, and the build shows a round trip and that step later. The next stamp waits until every game stands still again at or past it.
+-- At the resume the host gives a held one a normal stamp; one that reaches it after the resume gets one too.
 X.GUI_INJECT_BASE = 1000000000
 
 -- an item stamped at the session's pause: a pause action
@@ -2332,53 +2334,31 @@ function X.routeOwn(it)
 	logGui("action " .. it.key .. " made during the pause (t=" .. tostring(it.at) .. "): applied when the host's pause order brings it back")
 end
 
--- An item of the pause order, in the order the host's link brings them (a number that is not the next one is logged: it cannot happen on
--- one ordered link, it would mean a lost line).
-function X.pauseEnqueue(it)
-	G.pauseQ = G.pauseQ or {}
-	if it.pauseSeq then
-		local want = (G.pauseLast or (it.pauseSeq - 1)) + 1
-		if it.pauseSeq ~= want then logGui("PAUSE ORDER GAP: expected #" .. tostring(want) .. ", got #" .. tostring(it.pauseSeq) .. " (" .. tostring(it.key) .. ")") end
-		G.pauseLast = it.pauseSeq
+-- Where this game really stands during a pause (ClockMessage.stop: the host stamps the actions of the pause one step past the furthest):
+-- its time once it has not moved for X.STOP_SECONDS of real time and X.STOP_FRAMES frames with speed 0 set (the interface sees the time
+-- of the last frame the simulation finished; a few frames of one time prove nothing at x1). nil while it may still move.
+X.STOP_SECONDS, X.STOP_FRAMES = 0.5, 5
+pcall(function() X.STOP_SECONDS = tonumber(os.getenv("FEVERLINK3_TEST_STOP_SECONDS")) or X.STOP_SECONDS end)   -- test switch
+function X.stopAt(now, sp)
+	local s = G.session
+	local W = G.still or {}
+	G.still = W
+	if not (s.started and s.pauseAt and now >= s.pauseAt and sp == 0) then
+		W.t = nil
+		return nil
 	end
-	G.pauseQ[#G.pauseQ + 1] = it
-	X.pausePump()
+	if W.t ~= now then
+		W.t, W.n, W.since = now, 0, os.clock()
+		return nil
+	end
+	W.n = W.n + 1
+	if W.n >= X.STOP_FRAMES and os.clock() - W.since >= X.STOP_SECONDS then return now end
+	return nil
 end
 
--- Applies the queued pause items, strictly in order, once this game stands at their time (a slower game lands there first, X.pauseCap).
-function X.pausePump()
-	local q = G.pauseQ
-	while q and q[1] do
-		local it = q[1]
-		local now = engine.gameTime()
-		if now < it.at then return end
-		table.remove(q, 1)
-		if now > it.at then
-			-- cannot happen while X.pauseCap holds the game: applied by the simulation, late (a fork, repaired as every late apply)
-			logGui("PAUSE ORDER LATE: " .. tostring(it.key) .. " for the pause at t=" .. tostring(it.at) .. " reached this game at t=" .. tostring(now))
-			toSim("queue", it)
-		else
-			if it.pauseSeq then logGui("pause order #" .. tostring(it.pauseSeq) .. ": " .. tostring(it.key) .. " applied at t=" .. tostring(now)) end
-			guiApplyNow(it, now)
-		end
-	end
-end
-
--- The engine speed allowed while pause items wait: none at or past their time (this game's own not yet back, or queued), and a slower
--- game lands exactly on it.
-function X.pauseCap(now, sp)
-	local first = nil
-	for _, it in pairs(G.pauseOwn or {}) do
-		if type(it.at) == "number" and (first == nil or it.at < first) then first = it.at end
-	end
-	local q = G.pauseQ
-	if q and q[1] and (first == nil or q[1].at < first) then first = q[1].at end
-	if first == nil or sp <= 0 then return sp end
-	if now >= first then return 0 end
-	return math.min(sp, math.floor((first - now) / STEP))
-end
-
--- A paused action came back numbered from the host (`pauseSeq`): this game's own (it waited in G.pauseOwn) or another player's.
+-- An action of the pause came back from the host, numbered and STAMPED (one step past the furthest place a game stands still at the
+-- pause, real run pause3: no game stands at the pause stamp itself): this game's own (it waited in G.pauseOwn) or another player's.
+-- Every game applies it at that stamp through the simulation like any action; a game standing still runs on to it (L.pace, pauseRun).
 function X.pauseArrived(it, n)
 	it.pauseSeq = n
 	if it.from == C.PLAYER_ID then
@@ -2387,23 +2367,52 @@ function X.pauseArrived(it, n)
 			logGui("pause order #" .. tostring(n) .. ": " .. it.key .. " is this game's own but nothing waits for it here (made before a reload?): applied as received")
 		else
 			G.pauseOwn[it.key] = nil
-			own.pauseSeq = n
+			own.pauseSeq, own.at = n, it.at
 			it = own
 		end
-	elseif it.body and it.body.fn == "makeWorldBuildProposalCmd" then
-		noteBuild(it.key, it.at)
 	end
-	X.pauseEnqueue(it)
+	X.pauseStamped(it)
+	route(it)
+end
+
+-- The host's stamp of an action of the pause: the native module's bookkeeping of this game's own held build follows it, and the game
+-- runs on to it while paused.
+function X.pauseStamped(it)
+	local s = G.session
+	if it.pauseSeq then
+		-- one ordered link from the host: a number that is not the next one would mean a lost line
+		local want = (G.pauseLast or (it.pauseSeq - 1)) + 1
+		if it.pauseSeq ~= want then logGui("PAUSE ORDER GAP: expected #" .. tostring(want) .. ", got #" .. tostring(it.pauseSeq) .. " (" .. tostring(it.key) .. ")") end
+		G.pauseLast = it.pauseSeq
+	end
+	-- to the stamp and one step on: the simulation finds what the action created (a bought vehicle shows a step after its command) and
+	-- keys it, so the window's callback runs and a later action of the pause can name it
+	s.pauseRun = math.max(s.pauseRun or 0, it.at + STEP)
+	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then noteBuild(it.key, it.at) end
+	local N = G.nat
+	if N and it.from == C.PLAYER_ID then
+		if it.deferId and N.deferred[it.deferId] then N.deferred[it.deferId].at = it.at end
+		local h = N.heldByKey[it.key]
+		if h then h.at = it.at end
+	end
+	logGui("pause order #" .. tostring(it.pauseSeq) .. ": " .. tostring(it.key) .. " stamped " .. tostring(it.at) .. " by the host (pause " .. tostring(s.pauseAt or s.lastPauseAt) .. ", this game at t=" .. tostring(engine.gameTime()) .. ")")
 end
 
 function route(it)
 	local now = engine.gameTime()
-	-- a checksum round at the pause: after exactly the paused actions the host ordered before it, on every game (the pause order); an
-	-- unflagged action that finds this game stopped at its time (the barrier breached) is applied there in arrival order, as before
+	-- a checksum round at a pause is stamped where the furthest game stands still: a game behind runs on to it (pauseRun). An item at or
+	-- before the time this game stands at, at a pause, is applied from here in arrival order (a checksum, or the barrier breached)
 	local s = G.session
-	if (it.kind == "checksum" and type(it.at) == "number" and (it.at == s.pauseAt or it.at == s.lastPauseAt) and now <= it.at)
-		or L.applyNow(s, now, it) then
-		X.pauseEnqueue(it)
+	if it.kind == "checksum" and s.pauseAt and type(it.at) == "number" and it.at > now then s.pauseRun = math.max(s.pauseRun or 0, it.at) end
+	if L.applyNow(s, now, it) then
+		if it.kind == "checksum" or it.at == now then
+			guiApplyNow(it, now)
+		else
+			-- an action stamped before the time this game stands at (the barrier breached): applied by the simulation, late (a fork,
+			-- repaired as every late apply)
+			logGui("PAUSE LATE: action " .. tostring(it.key) .. " for t=" .. tostring(it.at) .. " reached this game standing at t=" .. tostring(now))
+			toSim("queue", it)
+		end
 		return
 	end
 	if it.kind == "action" and type(it.at) == "number" and it.at <= now and not (it.body and it.body.native and it.from == C.PLAYER_ID) then
@@ -2815,7 +2824,7 @@ function natSend(kind, payload)
 	return ok
 end
 
--- A paused game applied the build of deferred held command `id` from this state (X.pausePump -> guiApplyNow): this interface's world
+-- A paused game applied the build of deferred held command `id` from this state (route -> guiApplyNow): this interface's world
 -- has the apply now, which a running game learns from its game time passing the stamp (natTick). The module completes the command.
 function X.deferApplied(id)
 	local N = G.nat
@@ -4419,10 +4428,10 @@ H.build_commit = function(rec, p)
 		end
 		if not it or G.vetoed[key] then logGui("commit of " .. key .. " (pause order #" .. p.pauseSeq .. "): nothing to apply here (vetoed, expired or not received)"); return end
 		if type(p.stamp) == "number" then it.at = p.stamp end
-		noteBuild(key, it.at)
 		logGui("build " .. key .. " committed by its originator during the pause: pause order #" .. p.pauseSeq)
 		it.pauseSeq = p.pauseSeq
-		X.pauseEnqueue(it)
+		X.pauseStamped(it)
+		route(it)
 		return
 	end
 	local pk = G.parked[key]
@@ -4735,12 +4744,12 @@ local function guiUpdate(userParams, state, guiState)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
 		local sp = L.pace(G.session, G.peers, now, ahead, G.marks)
-		-- the pause order: a slower game lands on the pause items' time, and no game leaves it before they are applied (X.pauseCap)
-		X.pausePump()
-		sp = X.pauseCap(now, sp)
 		setSpeed(sp)
 		X.barrierWatch(now, sp)
-		if now ~= G.lastClock or G.frames % 30 == 0 then
+		-- where this game really stands at a pause, for the host's stamps of the pause's actions (said at once when it changes)
+		X.curStop = X.stopAt(now, sp)
+		if now ~= G.lastClock or G.frames % 30 == 0 or X.curStop ~= G.lastStop then
+			G.lastStop = X.curStop
 			G.lastClock = now
 			X.reportClock(now)
 		end
