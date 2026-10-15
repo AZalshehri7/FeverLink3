@@ -77,8 +77,10 @@ pub enum CtlMessage {
     CompleteNext { held: u64, ttl: u64, tm: String },
     /// Apply the staged terrain edit `id` at `stamp` (stage 0.4: parsed, not acted on).
     TerrainApply { id: u64, stamp: u64 },
-    /// Liveness; answered with `pong`.
-    Ping { n: i64 },
+    /// Liveness; answered with `pong`. `paused` (optional, absent: false): the session's game time stands still right now (the session
+    /// stands at its pause, or its speed is 0): what is held does not age meanwhile (`hold.rs`). Every ping says it, and the mod pings
+    /// at once when it changes, so a lost line is corrected by the next ping.
+    Ping { n: i64, paused: bool },
     /// `FEVERLINK3_NATIVE_PATCH`: patch the NEXT script `build_proposal` command that reaches the command list (not a held one):
     /// its `frozenNodes` get these indices into `proposal.addedNodes`, which must hold exactly `adds` nodes. Expires after `ttl` ms
     /// (0: the module's default).
@@ -273,7 +275,11 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
                     .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && f.abs() <= 9.0e15).map(|f| f as i64))
                     .ok_or(CtlError::BadPayload("n must be a whole number"))?,
             };
-            Ok(CtlMessage::Ping { n })
+            let paused = match p.get("paused") {
+                None => false,
+                Some(v) => v.as_bool().ok_or(CtlError::BadPayload("paused must be true or false"))?,
+            };
+            Ok(CtlMessage::Ping { n, paused })
         }
         other => Err(CtlError::UnknownKind(other.chars().take(40).collect())),
     }
@@ -1170,7 +1176,9 @@ mod tests {
             parse("terrain_apply", r#"{["id"]=2,["stamp"]=400}"#),
             Ok(CtlMessage::TerrainApply { id: 2, stamp: 400 })
         );
-        assert_eq!(parse("ping", r#"{["n"]=-4}"#), Ok(CtlMessage::Ping { n: -4 }));
+        assert_eq!(parse("ping", r#"{["n"]=-4}"#), Ok(CtlMessage::Ping { n: -4, paused: false }));
+        assert_eq!(parse("ping", r#"{["n"]=5,["paused"]=true}"#), Ok(CtlMessage::Ping { n: 5, paused: true }));
+        assert!(matches!(parse("ping", r#"{["n"]=5,["paused"]=1}"#), Err(CtlError::BadPayload(_))));
     }
 
     #[test]
@@ -1188,7 +1196,7 @@ mod tests {
             messages,
             [
                 CtlMessage::HoldOn { kinds: vec!["build_proposal".into()] },
-                CtlMessage::Ping { n: 3 },
+                CtlMessage::Ping { n: 3, paused: false },
                 CtlMessage::Release { id: 3, at: 12400 },
                 CtlMessage::Cancel { id: 7 },
                 CtlMessage::HoldOff,
@@ -1205,7 +1213,7 @@ mod tests {
         );
         assert_eq!(parse("hold_off", ""), Ok(CtlMessage::HoldOff));
         assert_eq!(parse("release", "{id=1}"), Ok(CtlMessage::Release { id: 1, at: 0 }), "at defaults to now");
-        assert_eq!(parse("ping", "{}"), Ok(CtlMessage::Ping { n: 0 }));
+        assert_eq!(parse("ping", "{}"), Ok(CtlMessage::Ping { n: 0, paused: false }));
         assert_eq!(parse("release", r#"{["id"]=1.0,["at"]=2e3}"#), Ok(CtlMessage::Release { id: 1, at: 2000 }));
     }
 
