@@ -106,7 +106,11 @@ fn clocks_that_are_not_game_times_are_dropped() {
     for (t, speed) in
         [(i64::MAX, 1), (i64::MIN, 1), (-1, 1), (1 << 51, 1), (10_000, 1000), (10_000, -1), (10_000, i32::MAX)]
     {
-        h.player_game(liar, MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3, need: None }));
+        h.player_game(
+            liar,
+            MessageKind::Clock,
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false }),
+        );
     }
     assert_eq!(h.host.dropped(), dropped + 7);
     assert_eq!(h.p(other).count(MessageKind::PeerClock), peer_clocks, "nothing was relayed");
@@ -116,7 +120,7 @@ fn clocks_that_are_not_game_times_are_dropped() {
     h.player_game(
         liar,
         MessageKind::Clock,
-        &json(&ClockMessage { t: PlayerClock::MAX_TIME, speed: 16, ahead: 3, need: None }),
+        &json(&ClockMessage { t: PlayerClock::MAX_TIME, speed: 16, ahead: 3, need: None, safe: None, pause: false }),
     );
     assert_eq!(h.host.dropped(), dropped + 7);
     // and the host's own arithmetic holds at the edge

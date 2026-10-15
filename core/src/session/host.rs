@@ -696,11 +696,21 @@ impl HostSession {
                             self.log(format!("clock of {} dropped (t {}, speed {})", self.name(from), m.t, m.speed));
                         }
                     } else {
-                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
+                        // relayed in the order it came, after every action its game shipped before it: the input barrier
+                        // (the mod's L.barrier) counts on that
+                        let safe = m.bounded_safe();
+                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now(), safe });
                         self.resync_step();
                         // a player cannot push every other game's stamps into the far future with an absurd margin
                         let need = m.need.map(|n| n.clamp(0, ClockMessage::MAX_NEED));
-                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead, need };
+                        let peer = PeerClockMessage {
+                            from,
+                            t: m.t,
+                            ahead: m.ahead,
+                            need,
+                            safe,
+                            pause: m.pause && safe.is_some(),
+                        };
                         self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
                     }
                 }
@@ -1006,9 +1016,15 @@ impl HostSession {
         self.clocks.values().map(|c| c.estimate(now)).fold(f64::NEG_INFINITY, f64::max) as i64
     }
 
-    /// A stamp every game reaches after receiving a message sent now.
+    /// A stamp every game reaches after receiving a message sent now. Never before a promise a game has made (ClockMessage::safe):
+    /// a game may run up to the smallest promise of the others, so no game has passed the largest one, and a pause or a checksum
+    /// stamped there is never late on any game, whatever lead each of them used.
     pub fn future_stamp(&self) -> i64 {
-        Lockstep::round_up_to_step(self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64)
+        let by_lead = Lockstep::round_up_to_step(
+            self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64,
+        );
+        let promised = self.clocks.values().filter_map(|c| c.safe).max().unwrap_or(by_lead);
+        by_lead.max(Lockstep::round_up_to_step(promised as f64))
     }
 
     fn broadcast_session(&mut self) {

@@ -331,7 +331,11 @@ fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: None }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+    );
     let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
     assert_eq!(h.p(a).session.id().unwrap(), pc.from);
     assert_eq!(50000, pc.t);
@@ -347,14 +351,81 @@ fn a_measured_stamp_margin_is_relayed_with_the_clock_and_clamped() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 49800, speed: 1, ahead: 3, need: None }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 49800, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+    );
     assert_eq!(None, h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need, "nothing measured: none relayed");
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: Some(2) }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: Some(2), safe: None, pause: false }),
+    );
     assert_eq!(Some(2), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50200, speed: 1, ahead: 3, need: Some(1_000_000) }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 50200, speed: 1, ahead: 3, need: Some(1_000_000), safe: None, pause: false }),
+    );
     assert_eq!(Some(ClockMessage::MAX_NEED), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 50400, speed: 1, ahead: 3, need: Some(-5) }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 50400, speed: 1, ahead: 3, need: Some(-5), safe: None, pause: false }),
+    );
     assert_eq!(Some(0), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
+}
+
+#[test]
+fn the_input_barriers_promise_is_relayed_after_the_actions_shipped_before_it_and_bounded() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    let clock =
+        |t: i64, safe: Option<i64>, pause: bool| ClockMessage { t, speed: 1, ahead: 3, need: None, safe, pause };
+    // an action, then the clock whose promise covers it: the other game gets them in that order (the barrier counts on it)
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(51_400, 1, "{x}")));
+    h.player_game(a, MessageKind::Clock, &json(&clock(50_000, Some(51_400), false)));
+    let kinds: Vec<MessageKind> =
+        h.p(b).game.iter().map(|g| g.0).filter(|k| matches!(k, MessageKind::Action | MessageKind::PeerClock)).collect();
+    assert_eq!(vec![MessageKind::Action, MessageKind::PeerClock], kinds);
+    let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
+    assert_eq!((Some(51_400), false), (pc.safe, pc.pause));
+    // a pause stop is relayed with its flag
+    h.player_game(a, MessageKind::Clock, &json(&clock(52_000, Some(52_000), true)));
+    let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
+    assert_eq!((Some(52_000), true), (pc.safe, pc.pause));
+    // a promise far past its clock would let the others run into steps it may still stamp: cut down; one below it only holds them more
+    h.player_game(a, MessageKind::Clock, &json(&clock(52_200, Some(i64::MAX), false)));
+    assert_eq!(
+        Some(52_200 + ClockMessage::MAX_SAFE_AHEAD),
+        h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).safe
+    );
+    h.player_game(a, MessageKind::Clock, &json(&clock(52_400, Some(-7), false)));
+    assert_eq!(Some(-7), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).safe);
+    // none: an older mod, none relayed
+    h.player_game(a, MessageKind::Clock, &json(&clock(52_600, None, true)));
+    let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
+    assert_eq!((None, false), (pc.safe, pc.pause));
+}
+
+#[test]
+fn a_pause_or_checksum_stamp_is_never_before_a_promise_a_game_made() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let clock = |t: i64, safe: Option<i64>| ClockMessage { t, speed: 1, ahead: 3, need: None, safe, pause: false };
+    h.host_game(MessageKind::Clock, &json(&clock(50_000, Some(50_000 + 2 * Lockstep::STEP))));
+    h.player_game(a, MessageKind::Clock, &json(&clock(50_000, None)));
+    let by_lead = Lockstep::round_up_to_step((50_000 + Lockstep::lead_units(1)) as f64);
+    assert_eq!(by_lead, h.host.future_stamp(), "a promise inside the lead changes nothing");
+    // a game promised more (a longer lead it has not given up yet, the barrier's extra): another game may run up to it
+    h.player_game(a, MessageKind::Clock, &json(&clock(50_000, Some(54_000))));
+    assert_eq!(54_000, h.host.future_stamp());
+    h.host_call(HostSession::start);
+    h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 1 }));
+    h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 0 }));
+    assert!(h.host.state().pause_at.unwrap() >= 54_000, "the pause lies where no game can have passed it");
 }
 
 #[test]
@@ -362,9 +433,16 @@ fn start_speed_and_pause_are_broadcast_and_speed_requests_obeyed() {
     let mut h = Harness::new();
     let a = h.connect("A");
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(18600)));
-    h.host_game(MessageKind::Clock, &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None }));
+    h.host_game(
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false }),
+    );
     h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(18600)));
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false }),
+    );
 
     h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 2 }));
     assert!(!h.host.state().started); // ignored before start
@@ -478,7 +556,11 @@ fn disconnect_removes_the_player_and_tells_the_others() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    h.player_game(a, MessageKind::Clock, &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None }));
+    h.player_game(
+        a,
+        MessageKind::Clock,
+        &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+    );
     h.disconnect(a);
     assert_eq!(2, h.host.players().len());
     assert!(h.host.clocks().is_empty());

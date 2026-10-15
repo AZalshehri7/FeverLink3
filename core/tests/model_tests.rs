@@ -179,7 +179,14 @@ impl Model {
                         _ => self.n.send(
                             c,
                             MessageKind::Clock,
-                            &json(&ClockMessage { t: 21_000, speed: 1, ahead: 3, need: None }),
+                            &json(&ClockMessage {
+                                t: 21_000,
+                                speed: 1,
+                                ahead: 3,
+                                need: None,
+                                safe: None,
+                                pause: false,
+                            }),
                         ),
                     }
                 }

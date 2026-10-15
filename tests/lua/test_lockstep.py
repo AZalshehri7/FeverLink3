@@ -450,6 +450,7 @@ class Relay:
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
         self.vetoes = []
         self.commits = []
+        self.safes, self.drop_promises = {}, False
         self.started, self.speed, self.pauseAt = False, 0, None
 
     # launcher -> mod
@@ -487,7 +488,8 @@ class Relay:
 
     def future_stamp(self):
         t = max(self.clocks.values())
-        return -(-(t + self.lead) // STEP) * STEP
+        # as host.rs: never before a promise a game has made, so no game has passed the stamp (the input barrier)
+        return max([-(-(t + self.lead) // STEP) * STEP] + list(self.safes.values()))
 
     def checksum_request(self, n, at, paused, full=None):
         body = {"n": n, "at": at, "paused": paused}
@@ -520,6 +522,12 @@ class Relay:
                     pc = {"from": g.id, "t": int(p.t), "ahead": int(p.ahead)}
                     if p.need is not None:
                         pc["need"] = max(0, min(24, int(p.need)))   # the host relays the measured margin clamped (host.rs)
+                    if p.safe is not None and not self.drop_promises:
+                        # the input barrier's promise, relayed as it came (host.rs drops an implausible one)
+                        pc["safe"] = int(p.safe)
+                        self.safes[g.id] = int(p.safe)
+                        if p.pause:
+                            pc["pause"] = True
                     self.broadcast("peerclock", self.ser(pc), exclude=g)
                 elif rec.kind == "action":
                     p["from"] = g.id
@@ -855,6 +863,10 @@ class LockstepTest(unittest.TestCase):
         self.tick(5)
         self.assertEqual(len(self.A.applied()), 1)
         self.assertIn("LATE", self.A.log())
+        # a late apply is a fork, never silent: the arrival is named and the host is asked for the repair
+        self.assertIn("INPUT BARRIER BREACHED: action 1:7", self.A.log())
+        self.relay.pump()
+        self.assertTrue(any("late apply of 1:7" in d for g, d in self.relay.replay_failed if g == 0), self.relay.replay_failed)
 
     def test_a_command_from_a_window_state_reaches_the_other_game_once(self):
         # The windows live in a Lua state of their own (seen in a real game: a loan taken in the window never reached the
