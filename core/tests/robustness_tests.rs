@@ -636,6 +636,8 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             t: rr.gen(),
             ahead: rr.gen(),
             need: rr.gen_bool(0.5).then(|| rr.gen()),
+            safe: rr.gen_bool(0.5).then(|| rr.gen()),
+            pause: rr.gen(),
         });
         round_trip(ChecksumRequestMessage { n: rr.gen(), at: rr.gen(), paused: rr.gen(), full: rr.gen() });
         round_trip(AuthorityMessage {
@@ -657,6 +659,8 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             speed: rr.gen(),
             ahead: rr.gen(),
             need: rr.gen_bool(0.5).then(|| rr.gen()),
+            safe: rr.gen_bool(0.5).then(|| rr.gen()),
+            pause: rr.gen(),
         });
         round_trip(SpeedRequestMessage { speed: rr.gen() });
         round_trip(ChecksumReportMessage {
@@ -779,6 +783,8 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
                 speed: r.gen_range(0..5),
                 ahead: 3,
                 need: None,
+                safe: r.gen_bool(0.5).then(|| r.gen()),
+                pause: r.gen(),
             });
             mutate(r, &mut b);
             b
@@ -799,6 +805,8 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
             speed: [i32::MIN, -1, 0, 1, 16, 17, i32::MAX][r.gen_range(0..7)],
             ahead: r.gen(),
             need: None,
+            safe: [None, Some(i64::MIN), Some(i64::MAX)][r.gen_range(0..3)],
+            pause: r.gen(),
         }),
         _ => codec::encode(&SpeedRequestMessage { speed: r.gen_range(-3..8) }),
     }
@@ -1103,7 +1111,7 @@ fn small_pure_functions_take_any_input() {
         // time arithmetic with floats of every kind
         let stamp = Lockstep::round_up_to_step(f64::from_bits(r.gen()));
         assert!(stamp % Lockstep::STEP == 0 || stamp == i64::MAX || stamp == i64::MIN, "stamp {stamp}");
-        let clock = PlayerClock { t: r.gen(), speed: r.gen(), at: f64::from_bits(r.gen()) };
+        let clock = PlayerClock { t: r.gen(), speed: r.gen(), at: f64::from_bits(r.gen()), safe: r.gen() };
         let _ = clock.estimate(f64::from_bits(r.gen()));
         let _ = PlayerClock::plausible(r.gen(), r.gen());
         assert!(Lockstep::lead_units(r.gen()) >= Lockstep::STEP * Lockstep::MIN_LEAD_STEPS);

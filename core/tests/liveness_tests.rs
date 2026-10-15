@@ -175,7 +175,7 @@ fn a_stalled_host_times_nobody_out() {
 
 #[test]
 fn any_frame_counts_as_a_sign_of_life() {
-    let clock = json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None });
+    let clock = json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false });
     // pings 100 s apart: between them, only what the game itself sends can show the connection is alive
     let options = HostOptions { ping_seconds: 100.0, ..HostOptions::default() };
     let mut n = Net::with(options.clone());

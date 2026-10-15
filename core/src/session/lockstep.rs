@@ -48,6 +48,8 @@ pub struct PlayerClock {
     pub speed: i32,
     /// Host time (seconds) at which the report arrived.
     pub at: f64,
+    /// The input barrier's promise that came with it (ClockMessage::safe, bounded), if any.
+    pub safe: Option<i64>,
 }
 
 impl PlayerClock {

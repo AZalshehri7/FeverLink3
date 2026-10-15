@@ -206,6 +206,12 @@ pub struct PeerClockMessage {
     /// The stamp margin this game measured it needs (ClockMessage::need), relayed as the host received it (clamped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need: Option<i32>,
+    /// The input barrier's promise (ClockMessage::safe), relayed as the host received it; `None` when absent or implausible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe: Option<i64>,
+    /// `safe` is the pause the game is stopped at (ClockMessage::pause).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pause: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,11 +313,28 @@ pub struct ClockMessage {
     /// measured yet at this speed; the stamping game then uses its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need: Option<i32>,
+    /// The input barrier's promise (the mod's L.promise): every item this game ships after this message is stamped at or after
+    /// `safe`, so every other game may simulate the steps before it (less a hand-off allowance) without waiting. `None`: an older
+    /// mod, paced as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe: Option<i64>,
+    /// The game is stopped at a pause and `safe` is that pause: the others may reach it exactly and not pass it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pause: bool,
 }
 
 impl ClockMessage {
     /// The most margin a game may ask for, in steps (the lead's own ceiling): a larger value would only delay every build.
     pub const MAX_NEED: i32 = 24;
+    /// The furthest a promise may lie past its clock, in game time: the longest lead and the largest extra with room to spare.
+    pub const MAX_SAFE_AHEAD: i64 = 64 * 200;
+
+    /// The promise as the host relays it: one further past the clock than [`Self::MAX_SAFE_AHEAD`] is cut down to that (a
+    /// shorter promise only makes the others wait more; a longer one would let them run into steps its sender may still stamp
+    /// something for). A smaller one, even below the clock, is relayed as it is, for the same reason.
+    pub fn bounded_safe(&self) -> Option<i64> {
+        self.safe.map(|s| s.min(self.t.saturating_add(Self::MAX_SAFE_AHEAD)))
+    }
 }
 
 /// 0 asks for a pause.
