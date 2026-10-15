@@ -1153,7 +1153,7 @@ fn what_is_relayed_while_the_save_travels_reaches_the_participants_after_their_l
 
     // mid-transfer: one player builds, the other's game reports its clock
     h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(12_000, 1, "mid")));
-    let clock = ClockMessage { t: 11_000, speed: 0, ahead: 3, need: None, safe: Some(11_000), pause: false };
+    let clock = ClockMessage { t: 11_000, speed: 0, ahead: 3, need: None, safe: Some(11_000), pause: false, stop: None };
     let peer_clocks = h.p(ids[0]).count(MessageKind::PeerClock);
     h.player_game(ids[1], MessageKind::Clock, &json(&clock));
     assert_eq!(None, action_position(&h.p(ids[1]).game, "mid"), "held for the participant");
