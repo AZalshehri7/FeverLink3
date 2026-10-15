@@ -1335,9 +1335,13 @@ local function simApplyAction(st, it, now)
 		return
 	end
 	if it.lateSteps and it.lateSteps > 0 and not it.waited then
-		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
+		-- the input barrier makes this impossible by construction; if it still happens the entity ids have most likely forked (runs
+		-- n1-n6, e1-e7: 9 of 10 first late applies did). Applied all the same (the other games have it), but never silently: the
+		-- interface half asks the host for the repair (collectFromSim).
+		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late): a FORK, the repair is requested")
 		st.late = (st.late or 0) + 1
 		st.lateLast = it.lateSteps
+		st.lateKey = it.key
 	end
 	local ctx = simCtx(st, it)
 	local tDecode = os.clock()
@@ -2027,6 +2031,51 @@ local function setSpeed(sp)
 	end
 end
 
+-- This game's clock line with its promise (L.promise, the input barrier): every item it ships after this line is stamped at or after
+-- `safe`; `pause` = stopped at a pause, `safe` is the pause time and the peers may reach it exactly. Sent every frame the clock moved,
+-- every 30 frames anyway, and before the first item stamped at a pause (X.promisePause).
+function X.reportClock(now)
+	local safe, floor, pause = L.promise(G.session, now, G.promiseFloor)
+	G.promiseFloor, G.promisePause = floor, pause
+	local ahead = L.aheadFor(G.session.speed)
+	send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed), safe = safe, pause = pause or nil })
+end
+
+-- A game stopped at a pause promises the pause time itself, and it must have said so before it ships the first item stamped there:
+-- a peer still holding its earlier promise could otherwise leave the pause (the host's resume) and pass the stamp before the item.
+function X.promisePause(now)
+	if G.session.pauseAt and now >= G.session.pauseAt and not G.promisePause then X.reportClock(now) end
+end
+
+-- The waits of the input barrier, for the logs: a hold is a stretch of frames in which a running game stands still because its next
+-- step would pass the barrier (a peer's clock is late: jitter, a stalled frame, a slow link). Every hold is traced (`barrier`); one
+-- longer than a second also goes to mod.log, and a count every minute.
+function X.barrierWatch(now, sp)
+	local s = G.session
+	local bar = (s.started and (s.speed or 0) > 0) and L.barrier(s, G.peers) or nil
+	local held = bar ~= nil and sp == 0 and now + STEP > bar and not (s.pauseAt and now >= s.pauseAt)
+	local B = G.barrier or { n = 0, wait = 0, logged = os.clock() }
+	G.barrier = B
+	local clock = os.clock()
+	if held and not B.since then
+		B.since, B.at = clock, now
+		B.who, B.safe = L.barrierPeer(G.peers)
+		traceGui("barrier", string.format("hold at t=%s: the next step passes the barrier %s (player %s promised %s) x%s",
+			C.integerText(now), C.integerText(bar), tostring(B.who), tostring(B.safe), tostring(s.speed)))
+	elseif not held and B.since then
+		local d = clock - B.since
+		B.n, B.wait, B.since = B.n + 1, B.wait + d, nil
+		traceGui("barrier", string.format("released at t=%s after %.3f s (player %s)", C.integerText(now), d, tostring(B.who)))
+		if d >= 1 then
+			logGui(string.format("input barrier: held %.2f s at t=%s waiting for player %s's clock (its promise %s)", d, C.integerText(B.at), tostring(B.who), tostring(B.safe)))
+		end
+	end
+	if clock - B.logged >= 60 and B.n > 0 then
+		logGui(string.format("input barrier: %d hold(s), %.2f s in all, in the last %.0f s", B.n, B.wait, clock - B.logged))
+		B.n, B.wait, B.logged = 0, 0, clock
+	end
+end
+
 local function guiCtx(it)
 	local ctx = actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
 	ctx.canPatch = NATIVE_PATCH and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.patch == true
@@ -2224,7 +2273,14 @@ end
 
 function route(it)
 	local now = engine.gameTime()
-	if L.applyNow(G.session, now, it) then guiApplyNow(it, now) else toSim("queue", it) end
+	if L.applyNow(G.session, now, it) then guiApplyNow(it, now); return end
+	if it.kind == "action" and type(it.at) == "number" and it.at <= now and not (it.body and it.body.native and it.from == C.PLAYER_ID) then
+		-- the input barrier should make this impossible: the simulation is at or past the stamp already, so it applies the item late
+		-- (a fork; the simulation half logs LATE and this half asks for the repair)
+		logGui("INPUT BARRIER BREACHED: action " .. tostring(it.key) .. " stamped " .. C.integerText(it.at) .. " arrived at t=" .. C.integerText(now)
+			.. " (promise of player " .. tostring(it.from) .. ": " .. tostring(G.peers[it.from] and G.peers[it.from].safe) .. ")")
+	end
+	toSim("queue", it)
 end
 
 -- A build the player made with a native tool, captured by the simulation half (simCaptureBuild): stamped and shipped
@@ -2249,7 +2305,9 @@ function stampAfterFastest(now, extraSteps)
 		-- fixed handling. The host's lead grows with the slowest round trip, so the extra grows with it (half the lead, one step at least).
 		at = at + math.max(extraSteps, math.floor(L.leadOf(G.session) / STEP / 2)) * STEP
 	end
-	return at
+	-- the input barrier: never before what this game promised its peers (L.clampStamp); at a pause, the pause stop is promised first
+	X.promisePause(now)
+	return L.clampStamp(G.session, now, at, G.promiseFloor)
 end
 
 -- ---- a held build in a PAUSED game
@@ -4116,7 +4174,8 @@ function collectFromSim(state)
 	end
 	if (st.late or 0) > G.lateSeen then
 		G.lateSeen = st.late
-		logGui("the simulation applied an action late (" .. st.late .. " so far)")
+		logGui("the simulation applied an action late (" .. st.late .. " so far): the worlds may have forked, asking the host for a repair")
+		send("replay_failed", { detail = "late apply of " .. tostring(st.lateKey) .. " (" .. tostring(st.lateLast) .. " step(s) after its stamp): the input barrier was breached, the entity ids may have forked" })
 		-- the measured stamp margin grows at once (see L.marginSample): a late apply must not happen twice
 		local need = L.marginLate(G.margin, G.session.speed, st.lateLast)
 		traceGui("build.margin", string.format("late apply (%s steps late): need now %d steps at x%s", tostring(st.lateLast), need, tostring(G.session.speed)))
@@ -4296,6 +4355,8 @@ local function guiUpdate(userParams, state, guiState)
 		G.epoch = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock() * 1000)) .. "-" .. tostring(C.PLAYER_ID)
 		toSim("session", { epoch = G.epoch })
 		send("hello", { time = engine.gameTime(), name = C.PLAYER_NAME })
+		-- the promise goes out with the hello, before anything this game could ship (the input barrier, L.promise)
+		X.reportClock(engine.gameTime())
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
@@ -4313,10 +4374,12 @@ local function guiUpdate(userParams, state, guiState)
 		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
-		setSpeed(L.pace(G.session, G.peers, now, ahead, G.marks))
+		local sp = L.pace(G.session, G.peers, now, ahead, G.marks)
+		setSpeed(sp)
+		X.barrierWatch(now, sp)
 		if now ~= G.lastClock or G.frames % 30 == 0 then
 			G.lastClock = now
-			send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed) })
+			X.reportClock(now)
 		end
 	end)
 	if not ok then logGui("frame failed: " .. tostring(err)) end
