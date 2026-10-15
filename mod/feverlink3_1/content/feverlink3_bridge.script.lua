@@ -2163,7 +2163,7 @@ local function coToSim(it, ok, cost, category)
 	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost, category = category })
 end
 
--- An action this game applied natively when its player made it (a build with a native tool, a command from a window): every
+-- An action this game applied natively when its player made it (a build with a native tool that was not held): every
 -- OTHER game runs the company layer when it applies the action at its stamp (the ledger of who built and spent what is part of
 -- the checksum), so this game must run it too, with the same stamp, or its ledger is the only one without the action and the
 -- games "differ in companies" until a resync copies everything (seen in a real game: a reload every two minutes).
@@ -2184,7 +2184,7 @@ local natPauseRelease, natHeldRefused, natVeto, vetoChat
 
 -- used outside this section:
 local route, stampAfterFastest, PARK_MAX, pausedNow, graceMs, VETO_STEPS, CONSTRUCTION_VETO_STEPS, CONSTRUCTION_GRACE_MS, noteBuild,
-	pendingBefore, vetoCheck, dryPump, shipNative, shipUiCommand, shipLocal
+	pendingBefore, vetoCheck, dryPump, shipNative, shipUiCommand, shipLocal, uiReply
 do -- section: applying items, the veto, shipping (not indented, see SECTIONS at the top)
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
@@ -2492,28 +2492,54 @@ function shipNative(o)
 	return true
 end
 
--- A command a window issued, recorded by the UI-state hook (feverlink3_uihook.lua), which applied it natively already:
--- stamped and shipped; the other games apply it at the stamp.
+-- The answer to the UI-state hook about a window command it holds (ui_in.log, read by Hook.poll): applied or refused at the
+-- stamp, the entity it created and its key. The window's callback runs on that answer.
+function uiReply(id, key, data, success, entities, detail)
+	if not G.uiInbox then G.uiInbox = C.newWriter(C.path("ui_in.log"), C.PLAYER_ID) end
+	local e = nil
+	if success and key then e = G.bind[key] end
+	if e == nil and success and data ~= nil then
+		local fn = G.uiFn and G.uiFn[key]
+		local spec = fn and L.COMMANDS[fn]
+		if spec and spec.result then pcall(function() e = data[spec.result] end) end
+		if type(e) ~= "number" then e = nil end
+	end
+	local okE, list = pcall(C.plain, entities)
+	if G.uiFn and key then G.uiFn[key] = nil end
+	local ok, err = C.writerSend(G.uiInbox, "result", { id = id, key = key, success = success == true, e = e,
+		entities = (okE and type(list) == "table" and next(list) ~= nil) and list or nil, detail = detail })
+	logGui("window command #" .. tostring(id) .. " (" .. tostring(key) .. ") " .. (success and "applied" or "REFUSED") .. " at its stamp"
+		.. (e and (", created " .. tostring(e)) or "") .. ": answered to the window" .. (ok and "" or (" - CANNOT WRITE ui_in.log: " .. tostring(err))))
+end
+
+-- A command a window issued, recorded and HELD by the UI-state hook (feverlink3_uihook.lua): stamped, shipped and queued here
+-- like every other action (shipLocal), so this game applies it at the stamp through the same queue as the other games. Applied at
+-- the click instead, it took entity ids from the engine's free-id FIFO at another step than everywhere else, and every later id
+-- could differ (the rule at the deferred completion of builds). The window's callback runs on uiReply, after the stamp apply.
 function shipUiCommand(p)
 	local body = C.parse(p.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
+	body.native = nil   -- nothing of it was applied here
 	local now = engine.gameTime()
 	-- entities a window command made a moment ago travel under the key of the record that made them (L.rewriteUiKeys)
-	local text = p.body
 	local note = L.recentNotes(G.notes, now)
-	if text:find("ui:", 1, true) or #note > 0 then
+	if p.body:find("ui:", 1, true) then
 		local okR, missing = L.rewriteUiKeys(body, function(id) return G.uiSeq[id] end, C.PLAYER_ID)
 		if not okR then return false, "it names the entity window command #" .. tostring(missing) .. " made, which was never shipped" end
-		if #note > 0 then body.diverged = note end
-		text = C.serialize(body)
 	end
+	if #note > 0 then body.diverged = note end
+	local text = C.serialize(body)
 	G.seq = G.seq + 1
 	G.uiSeq[p.id] = G.seq
 	local at = stampAfterFastest(now)
 	local category = type(p.category) == "string" and p.category or "other"
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
 	send("action", { stamp = at, seq = G.seq, body = text, category = category })
-	logGui("window command " .. tostring(body.fn) .. " " .. L.itemKey(C.PLAYER_ID, G.seq) .. " stamped " .. at .. " (now " .. now .. ")")
-	recordOriginator(body, G.seq, at, category)
+	G.uiFn = G.uiFn or {}
+	G.uiFn[it.key] = body.fn
+	G.pending[it.key] = function(data, success, entities) uiReply(p.id, it.key, data, success, entities) end
+	logGui("window command " .. tostring(body.fn) .. " #" .. tostring(p.id) .. " " .. it.key .. " stamped " .. at .. " (now " .. now .. "): held in the window, applied here at the stamp too")
+	route(it)
 	return true
 end
 
@@ -4403,16 +4429,8 @@ function serviceWindow()
 				local okN, okShip, whyShip = pcall(shipUiCommand, p)
 				if not okN then logGui("shipping a window command failed: " .. tostring(okShip))
 				elseif not okShip then logGui("a window command was not shipped: " .. tostring(whyShip)) end
-			end
-		elseif rec.kind == "bind" then
-			-- the entity a window command created here, named by the key the other games give theirs
-			local p = C.parse(rec.payload)
-			local seq = type(p) == "table" and G.uiSeq[p.id] or nil
-			if seq and type(p.e) == "number" then
-				local key = L.itemKey(C.PLAYER_ID, seq)
-				G.bind[key] = p.e
-				G.rev[p.e] = key
-				toSim("bind", { key = key, e = p.e })
+				-- the window holds it: it learns that it was applied nowhere (its callback runs with a failure)
+				if not (okN and okShip) then pcall(uiReply, p.id, nil, nil, false, {}, tostring(okN and whyShip or okShip)) end
 			end
 		elseif rec.kind == "speed" then
 			-- a speed button of the window: the session speed is the host's to decide, so it is a request, like the

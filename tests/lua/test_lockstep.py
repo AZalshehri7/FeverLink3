@@ -143,6 +143,7 @@ function EXECUTE(cmd, cb)
   local rec = { name = name, time = GAME.time, args = a }
   local created = nil
   if name == "makeVehicleBuyCmd" then
+    if NO_MONEY then error("not enough money") end   -- a test sets it on every game: the engine refuses the purchase
     assert(a[1] == 7, "player entity expected, got " .. tostring(a[1]))
     assert(WORLD[a[2]] and WORLD[a[2]].VEHICLE_DEPOT, "no depot " .. tostring(a[2]))
     GAME.nextEntity = GAME.nextEntity + 1
@@ -327,7 +328,11 @@ function UI_VIEW()
 end
 
 function SIM_EVENT(src, id, name, param) SIM.handleEvent(nil, STATE, src, id, name, param) end
-function FRAME() GUI.guiUpdate(nil, STATE, GSTATE) end
+-- a frame: the bridge's interface half, then the window state's refresh (the UI hook's held commands get their stamp applies)
+function FRAME()
+  GUI.guiUpdate(nil, STATE, GSTATE)
+  if UI_HOOK and UI_HOOK.HookModule.poll then UI_HOOK.HookModule.poll() end
+end
 function SIMSTEP()
   local cbs = SAVE_CBS
   SAVE_CBS = {}
@@ -1148,6 +1153,101 @@ class LockstepTest(unittest.TestCase):
         self.assertIn('["speed"]=3', b[0])
         self.assertEqual(len(a), 1, a)
         self.assertIn('["speed"]=0', a[0])
+
+
+BUY_IN_WINDOW = ('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }),'
+                 ' function(d, s, e) %s = { s, d and d.resultVehicleEntity } end)')
+
+
+class StampedEverywhereTest(unittest.TestCase):
+    """Every game, the originator included, applies a command at its stamp, in stamp order: then the engine hands out the same
+    entity ids on every game. Both mocked games here allocate ids from the SAME base (in LockstepTest they differ on purpose), so
+    an action applied at another step, or in another order, on one game shows as different ids."""
+
+    tearDown = LockstepTest.tearDown
+    tick = LockstepTest.tick
+    start = LockstepTest.start
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="feverlink3-")
+        self.A = Game("host", 0, self.tmp, 50000)
+        self.B = Game("client", 1, self.tmp, 50000)
+        self.relay = Relay([self.A, self.B])
+
+    def entities(self, g):
+        return g.L.eval("(function() local r = {} for i, a in ipairs(GAME.applied) do r[i] = tostring(a.entity) end return table.concat(r, ',') end)()")
+
+    def assertSameApplies(self, n):
+        a, b = self.A.applied(), self.B.applied()
+        self.assertEqual(len(a), n, a)
+        self.assertEqual(a, b, "the same commands at the same steps in the same order")
+        self.assertEqual(self.entities(self.A), self.entities(self.B), "the same entity ids")
+
+    def test_a_vehicle_bought_and_a_line_made_in_a_window_are_applied_at_their_stamp_on_the_originator_too(self):
+        self.start()
+        self.tick(10, lag_b=True)
+        self.A.window(BUY_IN_WINDOW % "BUY")
+        # the other player buys from the bridge's own state a moment later: the two purchases interleave by stamp
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(1)
+        self.assertEqual(self.A.applied(), [], "not applied at the click")
+        self.assertTrue(self.A.L.eval("BUY == nil"), "the window's callback waits for the stamp apply")
+        self.tick(40, lag_b=True)
+        self.assertSameApplies(2)
+        own = [i for i in (1, 2) if int(self.A.L.eval("GAME.applied[%d].args[2]" % i)) == 55]
+        self.assertTrue(self.A.L.eval("BUY ~= nil and BUY[1] == true"))
+        self.assertIn(int(self.A.L.eval("BUY[2]")), [int(self.A.L.eval("GAME.applied[%d].entity" % i)) for i in own])
+        self.assertIn("held until its stamp", self.A.log())
+        self.assertIn("applied at its stamp", self.A.log())
+        # a line from a window of the client, then the vehicle the host bought put on it from the host's window
+        self.B.window('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) LINE = e[1][1] end)')
+        self.tick(40, lag_b=True)
+        self.assertSameApplies(3)
+        line = int(self.B.L.eval("LINE"))
+        self.assertEqual(line, int(self.B.L.eval("GAME.applied[3].entity")))
+        self.A.window("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, %d, 0), function(d, s) SET = s end)" % (int(self.A.L.eval("BUY[2]")), line))
+        self.tick(40, lag_b=True)
+        self.assertSameApplies(4)
+        self.assertTrue(self.A.L.eval("SET == true"))
+        self.assertFalse(any("LATE" in g.log() for g in (self.A, self.B)))
+
+    def test_a_purchase_refused_at_its_stamp_is_refused_on_every_game_and_the_window_hears_it(self):
+        self.start()
+        self.tick(5)
+        for g in (self.A, self.B):
+            g.L.execute("NO_MONEY = true")
+        self.A.window(BUY_IN_WINDOW % "BUY")
+        self.tick(40)
+        self.assertEqual((self.A.applied(), self.B.applied()), ([], []))
+        self.assertTrue(self.A.L.eval("BUY ~= nil and BUY[1] == false"), "the callback ran with the refusal")
+        for g in (self.A, self.B):
+            self.assertIn("refused by the engine: ", g.log())
+        self.assertIn("REFUSED at its stamp", self.A.log())
+
+    def test_commands_of_two_players_during_a_pause_are_applied_in_the_same_order_on_both_games(self):
+        self.start(speed=2)
+        self.tick(10, lag_b=True)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40, lag_b=True)
+        paused_at = self.relay.pauseAt
+        self.assertEqual((self.A.time(), self.B.time()), (paused_at, paused_at))
+        # each player acts during the pause: before, each game applied its own first (arrival order) and the ids crossed
+        self.A.window(BUY_IN_WINDOW % "A_BUY")
+        self.B.send_gui(BUY_IN_WINDOW % "B_BUY")
+        self.B.window('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function() end)')
+        self.A.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("M", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function() end)')
+        self.tick(8)
+        self.assertEqual((self.A.applied(), self.B.applied()), ([], []), "nothing during the pause")
+        self.relay.pauseAt, self.relay.speed = None, 2
+        self.relay.session()
+        self.tick(20)
+        self.assertSameApplies(4)
+        self.assertTrue(all(x.endswith("@%d" % (paused_at + STEP)) for x in self.A.applied()), self.A.applied())
+        self.assertTrue(self.A.L.eval("A_BUY ~= nil and A_BUY[1] == true"))
+        self.assertTrue(self.B.L.eval("B_BUY ~= nil and B_BUY[1] == true"))
+        self.assertFalse(any("LATE" in g.log() for g in (self.A, self.B)))
 
 
 class PureTest(unittest.TestCase):
