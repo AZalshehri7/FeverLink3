@@ -145,6 +145,8 @@ Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused:
 
 **During a round** SpeedRequest from players, and `set_speed` and `pause` from the host's UI, are ignored (logged). Actions are relayed as usual. Periodic checksum rounds do not run because the session is paused.
 
+**While the save travels** (Transferring, after `resync_file_ready`) the host keeps relaying, but a participant's game is about to replace its world by the save: every message for it except the session layer's own (Ping, ResyncChunk, ResyncLoad, Kicked) is held (Action, BuildCommit, BuildVeto, PeerClock, Session, Chat, roster lines...) and sealed and sent right after its ResyncLoad, in the order it was made, so the reloaded game reads it after its load line. The same holds for the host's own game when it reloads after the transfer; a host sent its load early (or one that does not reload) gets everything at once. A round that fails in Transferring sends what was held then; a participant that leaves is forgotten with what was held for it. The launcher streams the save without stopping the host's loop (`launcher/src/session/transfer.rs`).
+
 **Participants.** The players present when the file is announced are the round's participants: they get the chunks and the ResyncLoad and must say Hello again. A player who connects later waits for the next round (below).
 
 ## Hot join

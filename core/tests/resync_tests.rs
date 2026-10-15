@@ -1115,3 +1115,113 @@ fn a_repair_sync_is_announced_before_it_starts_and_its_end_after_it() {
     let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
     assert!(chat.text.contains("sync is done"), "{}", chat.text);
 }
+
+// ------------------------------------------------------------------ messages made while the save travels
+
+fn position(game: &[(MessageKind, Vec<u8>)], kind: MessageKind) -> Option<usize> {
+    game.iter().position(|(k, _)| *k == kind)
+}
+
+/// Where the action with this body is in a game's lines.
+fn action_position(game: &[(MessageKind, Vec<u8>)], body: &str) -> Option<usize> {
+    game.iter().position(|(k, p)| {
+        *k == MessageKind::Action && codec::try_decode::<ActionMessage>(p).is_some_and(|m| m.body == body)
+    })
+}
+
+/// Announces a three-chunk save and sends its first chunk; returns the chunks.
+fn start_transfer(h: &mut Harness, id: i32, bytes: &[u8]) -> Vec<Vec<u8>> {
+    let sha = sha256_hex(bytes);
+    h.host_call(|host| host.resync_file_ready(id, &sha, bytes.len() as u64));
+    let chunks: Vec<Vec<u8>> = bytes.chunks(ResyncLimits::CHUNK_SIZE).map(<[u8]>::to_vec).collect();
+    h.host_call(|host| host.resync_chunk(id, 0, &chunks[0]));
+    chunks
+}
+
+/// The launcher sends the save without stopping the host's loop, so the host relays while the save travels. A
+/// participant's game is about to replace its world by the save: what it is sent meanwhile (an action, a clock) is held
+/// and goes out right after its ResyncLoad, the order the old blocking transfer produced. The host's own game, sent its
+/// load early, gets it at once (its load line is already written).
+#[test]
+fn what_is_relayed_while_the_save_travels_reaches_the_participants_after_their_load() {
+    let (mut h, ids) = Harness::running(2, 2, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let id = h.reach_transferring();
+    let chunks = start_transfer(&mut h, id, &blob(600 * 1024));
+
+    // mid-transfer: one player builds, the other's game reports its clock
+    h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(12_000, 1, "mid")));
+    let clock = ClockMessage { t: 11_000, speed: 0, ahead: 3, need: None, safe: Some(11_000), pause: false };
+    let peer_clocks = h.p(ids[0]).count(MessageKind::PeerClock);
+    h.player_game(ids[1], MessageKind::Clock, &json(&clock));
+    assert_eq!(None, action_position(&h.p(ids[1]).game, "mid"), "held for the participant");
+    assert_eq!(peer_clocks, h.p(ids[0]).count(MessageKind::PeerClock), "held as well");
+    let host_load = position(&h.host_game, MessageKind::ResyncLoad).expect("the host loads early");
+    assert!(action_position(&h.host_game, "mid").expect("the host's game has it") > host_load);
+
+    h.host_call(|host| host.resync_chunk(id, 1, &chunks[1]));
+    h.host_call(|host| host.resync_chunk(id, 2, &chunks[2]));
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    let receiver = &h.p(ids[1]).game;
+    let load = position(receiver, MessageKind::ResyncLoad).expect("loaded");
+    assert!(action_position(receiver, "mid").expect("released") > load, "the action comes after the load line");
+    let other = &h.p(ids[0]).game;
+    assert_eq!(peer_clocks + 1, h.p(ids[0]).count(MessageKind::PeerClock), "the clock too");
+    let last_clock = other.iter().rposition(|(k, _)| *k == MessageKind::PeerClock).unwrap();
+    assert!(last_clock > position(other, MessageKind::ResyncLoad).unwrap(), "after the load");
+    assert!(
+        h.host_log.iter().any(|l| l.contains("held during the save transfer sent after the load")),
+        "{:?}",
+        h.host_log
+    );
+}
+
+/// A host that loads together with the players gets what it is sent meanwhile after its load as well.
+#[test]
+fn a_host_that_loads_after_the_transfer_gets_what_was_relayed_meanwhile_after_its_load() {
+    let options = HostOptions { host_loads_early: false, ..HostOptions::default() };
+    let (mut h, ids) = Harness::running(1, 2, options);
+    h.host_call(|host| host.start_resync("test"));
+    let id = h.reach_transferring();
+    let chunks = start_transfer(&mut h, id, &blob(600 * 1024));
+    h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(12_000, 1, "mid")));
+    assert_eq!(None, action_position(&h.host_game, "mid"));
+    h.host_call(|host| host.resync_chunk(id, 1, &chunks[1]));
+    h.host_call(|host| host.resync_chunk(id, 2, &chunks[2]));
+    let load = position(&h.host_game, MessageKind::ResyncLoad).expect("loaded");
+    assert!(action_position(&h.host_game, "mid").expect("released") > load);
+}
+
+/// A round that fails during the transfer loads nothing: what was held goes out then, to the worlds the games keep.
+#[test]
+fn a_transfer_that_times_out_releases_what_was_held() {
+    let (mut h, ids) = Harness::running(1, 2, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let id = h.reach_transferring();
+    start_transfer(&mut h, id, &blob(600 * 1024));
+    h.host_game(MessageKind::Action, &json(&ActionMessage::new(12_000, 1, "hostbuild")));
+    assert_eq!(None, action_position(&h.p(ids[0]).game, "hostbuild"));
+    h.advance(601.0);
+    h.host_call(HostSession::tick);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(action_position(&h.p(ids[0]).game, "hostbuild").is_some(), "released when the round failed");
+    assert_eq!(0, h.p(ids[0]).count(MessageKind::ResyncLoad));
+}
+
+/// A participant that leaves mid-transfer is forgotten by the round with what was held for it; the others go on.
+#[test]
+fn a_participant_that_leaves_mid_transfer_is_dropped_from_the_round_and_the_others_get_the_save() {
+    let (mut h, ids) = Harness::running(2, 2, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let id = h.reach_transferring();
+    let chunks = start_transfer(&mut h, id, &blob(600 * 1024));
+    h.host_game(MessageKind::Action, &json(&ActionMessage::new(12_000, 1, "x")));
+    h.disconnect(ids[0]);
+    assert_eq!(1, h.host.resync_receivers().len());
+    h.host_call(|host| host.resync_chunk(id, 1, &chunks[1]));
+    h.host_call(|host| host.resync_chunk(id, 2, &chunks[2]));
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(1, h.p(ids[1]).saves.len());
+    assert!(action_position(&h.p(ids[1]).game, "x").is_some());
+    assert_eq!(None, action_position(&h.p(ids[0]).game, "x"), "nothing for the one that left");
+}

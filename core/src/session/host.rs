@@ -1323,11 +1323,22 @@ impl HostSession {
             self.send(connection, kind, payload);
         }
         if except != Some(Self::HOST_ID) {
-            self.out.push(HostOutput::DeliverToLocalGame { kind, payload: payload.to_vec() });
+            if self.holds_for_load(Self::HOST_ID, kind) {
+                self.hold_for_load(Self::HOST_ID, kind, payload);
+            } else {
+                self.out.push(HostOutput::DeliverToLocalGame { kind, payload: payload.to_vec() });
+            }
         }
     }
 
     fn send(&mut self, connection: ConnectionId, kind: MessageKind, payload: &[u8]) {
+        // sealed only when it is sent: a frame sealed now and sent later would arrive behind newer counters (replay window)
+        if let Some(to) = self.connections.get(&connection).and_then(|c| c.player) {
+            if self.holds_for_load(to, kind) {
+                self.hold_for_load(to, kind, payload);
+                return;
+            }
+        }
         match self.sealer.try_seal(kind.into(), payload) {
             Ok(frame) => self.out.push(HostOutput::SendToConnection { connection, frame }),
             // a relayed message that grew past the frame limit when the host added its fields, say
