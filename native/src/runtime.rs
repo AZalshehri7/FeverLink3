@@ -31,7 +31,7 @@ use crate::counters::{audit_log_line, AddSource, AppliedWatch, Audit, Counters};
 use crate::dump::{self, Budget, Dumper, Env, Header, LiveMem, Scope};
 use crate::engine::{self, AddArgs, AddFn, EngineFns, Held};
 use crate::hold::{Action, Admit, HoldConfig, HoldMachine};
-use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter, CTL_FILE};
+use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter};
 use crate::portable;
 use crate::rebuild;
 
@@ -570,7 +570,7 @@ impl Runtime {
     /// Opens the control link in a session folder and tells the mod what is active (`ready`). Everything the
     /// control file holds at this moment is history from an earlier run and is not acted on.
     pub fn open_link(&self, dir: &Path) -> std::io::Result<()> {
-        let reader = CtlReader::starting_at_end(dir.join(CTL_FILE))?;
+        let reader = CtlReader::writers_at_end(dir)?;
         let mut events = EventWriter::open(dir)?;
         let (hooks, poolpatch) = lock(&self.installed).clone();
         let mut hook_names: Vec<String> = hooks.iter().map(|h| h.to_string()).collect();
@@ -594,9 +594,9 @@ impl Runtime {
         let first_seq = events.next_seq();
         events.append(std::slice::from_ref(&ready))?;
         self.say(&format!(
-            "link: opened {} (control file from seq {}, events from seq {})",
+            "link: opened {} (control files from {}; events from seq {})",
             dir.display(),
-            reader.last_seq(),
+            reader.describe(),
             first_seq
         ));
         if let Some(line) = ready.log_line() {
@@ -1187,6 +1187,7 @@ fn current_thread_id() -> u32 {
 mod tests {
     use super::*;
     use crate::engine::{AddArgs, EngineFns, COMMAND_SIZE, HANDLE_SIZE, PROGRESS_SIZE};
+    use crate::link::CTL_FILE;
     use crate::testutil::TempDir;
     use std::cell::RefCell;
 
