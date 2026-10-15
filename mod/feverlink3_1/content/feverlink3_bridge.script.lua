@@ -108,7 +108,13 @@ end)
 -- says `done = true`). With the switch on, a build is cancelled only when its held command says so; otherwise it stays hold-and-release.
 local FIRE_DONE = true
 pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") ~= "0" end)
--- The few module-level values added by the 2026-10-14 work live in one table: the main chunk is at Lua's limit of 200 locals.
+-- SECTIONS. Lua allows 200 locals per function and the main chunk of this file is one function: the game refused the bridge with "too
+-- many local variables (limit is 200) in main function" at 197 top-level names (real run rc1, 2026-10-14; the game counts a few more than
+-- lupa does), and every entry point then failed. So the larger sections below sit in `do ... end` blocks, not indented to keep diffs
+-- small: a name declared in a section is local to that section, and the names other sections use are declared just above its `do`
+-- (`local a, b` there, `function a()` / `a = ...` inside). A new helper goes into the section that uses it (declared above the `do` only
+-- when another section needs it), new module-level state into X. tests/lua/test_mod_files.py measures the peak with the compiler.
+-- The few module-level values added by the 2026-10-14 work live in one table.
 local X = {}
 -- Test switch (never set by a player): FEVERLINK3_DEBUG_REFUSE_INJECT=link makes this game's own replay of its deferred build go the record
 -- path as if its injection had been refused (the held command takes that apply's result); =fail also tells the module that the held
@@ -442,6 +448,10 @@ do
 	end
 end
 
+-- used outside this section:
+local traceSim, traceGui, checksumParts, actionCtx, coBefore, coEffects, coBalance, coAfter, engineVerdict, buildCategory, actionCategory,
+	shadowCompare, update, handleEvent
+do -- section: the simulation half (not indented, see SECTIONS at the top)
 -- The town-buildings lane: what the towns have grown, hashed per town so a log can name the town that differs. Idea from
 -- MPFever (MIT, see THIRD_PARTY_NOTICES.md): a `townBuildings` part. Read-only: only components are read, nothing is
 -- changed. A TOWN_BUILDING component gives its town, level (1-4), depth, timeBuilt and its CONSTRUCTION entity; that
@@ -551,7 +561,7 @@ end
 -- Checksum cost (observation only, never raises, behaviour unchanged): the seconds of every part are measured with os.clock. A
 -- checksum that takes more than CS_SLOW_MS in total logs one line naming the worst parts; every CS_SUMMARY rounds one summary line
 -- (count, average, maximum and the part that was the slowest in the maximum round). Each half (interface, simulation) counts its own.
-local traceSim, traceGui = C.tracer("sim"), C.tracer("gui")   -- trace.log (docs/TRACE.md)
+traceSim, traceGui = C.tracer("sim"), C.tracer("gui")   -- trace.log (docs/TRACE.md)
 local DETAIL = {}   -- the itemised keys of the last full checksum round of this state (dumped when a resync starts)
 local CS_SLOW_MS, CS_SUMMARY = 50, 20
 local CS = { n = 0, sum = 0, max = 0, maxPart = "?", maxWhere = "", nLight = 0, sumLight = 0, maxLight = 0 }
@@ -584,7 +594,7 @@ local function checksumNote(timing, total, where, light)
 end
 
 -- `light` (the round asked for no heavy lanes): constructions, edges, node settings and town buildings are not read.
-local function checksumParts(co, where, light)
+function checksumParts(co, where, light)
 	local function clock() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end
 	local t0 = clock()
 	local timing = {}
@@ -691,7 +701,7 @@ end
 
 -- The context an action is decoded and applied in: the player entity its `player` arguments become (this game's own; in a
 -- company session the acting player's company, see Co.actor), the sender, the stamp, the action key and the registry.
-local function actionCtx(it, co, resolve)
+function actionCtx(it, co, resolve)
 	local ctx = { player = engine.canonicalPlayer and engine.canonicalPlayer() or engine.player(), resolve = resolve, co = co }
 	if it then ctx.from, ctx.at, ctx.key = it.from, it.at, it.key end
 	if Co then pcall(Co.actor, ctx) end
@@ -707,7 +717,7 @@ end
 
 -- companies. Guarded calls into the company module: a fault in that layer is logged and the action goes ahead, since
 -- losing a player's action is worse than a missing ledger line.
-local function coBefore(ctx, it, spec, args, category, log)
+function coBefore(ctx, it, spec, args, category, log)
 	if not Co then return true end
 	local ok, a, b = pcall(Co.beforeApply, ctx, it, spec, args, category)
 	if not ok then
@@ -717,7 +727,7 @@ local function coBefore(ctx, it, spec, args, category, log)
 	return a, b
 end
 
-local function coEffects(ctx, fx, log)
+function coEffects(ctx, fx, log)
 	if not (Co and fx) then return end
 	if fx.note then log("company: " .. fx.note) end
 	if fx.postings then
@@ -731,7 +741,7 @@ local function coEffects(ctx, fx, log)
 end
 
 -- The balance an action's cost lands on (the acting company's account); nil when it cannot be read.
-local function coBalance(ctx)
+function coBalance(ctx)
 	if not Co or not engine.balanceOf then return nil end
 	local ok, v = pcall(engine.balanceOf, ctx.player)
 	if ok and type(v) == "number" and v == v then return v end
@@ -739,7 +749,7 @@ local function coBalance(ctx)
 end
 
 -- After the engine command went out: the ledger, with the cost measured as the account's difference. Returns the cost.
-local function coAfter(ctx, it, spec, category, balance0, log)
+function coAfter(ctx, it, spec, category, balance0, log)
 	if not Co then return nil end
 	local cost = nil
 	local balance1 = balance0 ~= nil and coBalance(ctx) or nil
@@ -760,7 +770,7 @@ end
 -- warnings of the proposal data's errorState. The second argument of makeProposalData must be a Context (a command whose context
 -- was left out made `bad argument #2 to 'makeProposalData'`): a default one with this game's player is made when the command has none.
 -- Returns `critical, messages, warnings` (lists of strings) or nil and the reason it could not be read. Never raises.
-local function engineVerdict(args)
+function engineVerdict(args)
 	local ok, critical, msgs, warns, coll = pcall(function()
 		local ctx = args[2]
 		if ctx == nil or ctx == false then
@@ -971,7 +981,7 @@ local function takeHeldOut(st)
 	return taken
 end
 
-local function buildCategory(body)
+function buildCategory(body)
 	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1] or nil
 	if type(rec) ~= "table" then return "build" end
 	-- the rule of the build module's categoryFor, counted on the record: a build that adds no construction, node or edge
@@ -987,7 +997,7 @@ end
 -- game from the rebuilt proposal made the ledgers differ (a bulldozing that leaves merged road pieces was "build" on one game
 -- and "bulldoze" on the others, and the `companies` part of the checksum differed for good). Only the two build categories
 -- are taken from a record, and only for the build command; anything else is counted the usual way.
-local function actionCategory(body, args)
+function actionCategory(body, args)
 	if type(body) == "table" and body.fn == "makeWorldBuildProposalCmd" and (body.category == "build" or body.category == "bulldoze") then
 		return body.category
 	end
@@ -1036,7 +1046,7 @@ end
 
 -- B2.1, shadow: the record against the text the native module read from the held command, member by member (Portable.compare); one
 -- trace line (build.portable) on whichever half has both. Never raises.
-local function shadowCompare(tracer, who, text, rec)
+function shadowCompare(tracer, who, text, rec)
 	pcall(function()
 		local tree, why = Portable.parse(text)
 		if not tree then
@@ -1716,7 +1726,7 @@ local function buildTraceStep(tick)
 	end
 end
 
-local function update(userParams, state, dt)
+function update(userParams, state, dt)
 	C.poll()
 	pcall(function() buildTraceStep(math.floor(engine.gameTime() / STEP)) end)
 	townTraceGuard(function(t)
@@ -1783,7 +1793,7 @@ local function update(userParams, state, dt)
 end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
-local function handleEvent(userParams, state, src, id, name, param)
+function handleEvent(userParams, state, src, id, name, param)
 	if DEV and id == "apply_command" then
 		pcall(function()
 			local pi = nil
@@ -1936,6 +1946,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 	end)
 	if not ok then logSim("event " .. tostring(name) .. " failed: " .. tostring(err)) end
 end
+end -- section: the simulation half
 
 -- ================================================================== interface half
 
@@ -2109,6 +2120,10 @@ end
 -- strict mode (defined in its section below): a game paused at the stamp releases its own held command; a refusal cancels it
 local natPauseRelease, natHeldRefused, natVeto, vetoChat
 
+-- used outside this section:
+local route, stampAfterFastest, PARK_MAX, pausedNow, graceMs, VETO_STEPS, CONSTRUCTION_VETO_STEPS, CONSTRUCTION_GRACE_MS, noteBuild,
+	pendingBefore, vetoCheck, dryPump, shipNative, shipUiCommand, shipLocal
+do -- section: applying items, the veto, shipping (not indented, see SECTIONS at the top)
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
@@ -2207,7 +2222,7 @@ local function guiApplyNow(it, now)
 	end
 end
 
-local function route(it)
+function route(it)
 	local now = engine.gameTime()
 	if L.applyNow(G.session, now, it) then guiApplyNow(it, now) else toSim("queue", it) end
 end
@@ -2219,7 +2234,7 @@ end
 -- extraSteps: a held strict build is stamped this many steps later, so that a veto (a game that cannot rebuild it says so as soon
 -- as it has the record) is back at the originator and at every other game before the stamp. Not at a pause (the stamp is then
 -- the pause time: the build is applied during the pause, a veto cannot come first).
-local function stampAfterFastest(now, extraSteps)
+function stampAfterFastest(now, extraSteps)
 	local base = now
 	local peers = false
 	for _, pc in pairs(G.peers) do
@@ -2247,9 +2262,9 @@ end
 -- during the grace drops it everywhere; a peer that never answers casts no veto (silence is yes); a peer that never gets the
 -- commit (its originator vanished) drops the parked record after PARK_MAX seconds.
 local GRACE_MIN, GRACE_MAX, GRACE_DRY_MS, GRACE_MARGIN_MS = 250, 1500, 100, 100
-local PARK_MAX = 10.0       -- seconds a peer keeps a parked record without its commit
+PARK_MAX = 10.0       -- seconds a peer keeps a parked record without its commit
 
-local function pausedNow()
+function pausedNow()
 	local s = G.session
 	return s.pauseAt ~= nil and engine.gameTime() >= s.pauseAt
 end
@@ -2257,7 +2272,7 @@ end
 -- The grace in real milliseconds: two round trips' worth (the record out, the veto back) plus a dry run and a margin. The round
 -- trip is read from the host's lead (lead_for: half a round trip plus handling, in steps), which the host derives from its
 -- measurement of the slowest connection.
-local function graceMs()
+function graceMs()
 	local steps = math.floor(L.leadOf(G.session) / STEP + 0.5)
 	local rtt = math.max(0, 2000 * ((steps - 2) / 6 - 0.06))
 	local ms = math.max(GRACE_MIN, math.min(GRACE_MAX, math.floor(2 * rtt + GRACE_DRY_MS + GRACE_MARGIN_MS)))
@@ -2274,15 +2289,15 @@ end
 -- command (nothing is applied on its world) and every game drops the queued replay, so no world runs ahead of a refusal. A
 -- game that is slow, paused or gone casts no veto. The dry run waits for earlier builds that have not landed yet (they create
 -- what this one may refer to); if they do not land before the stamp it is skipped (silence).
-local VETO_STEPS = 1          -- extra steps of lead for a held build (the veto's way back)
+VETO_STEPS = 1          -- extra steps of lead for a held build (the veto's way back)
 -- A build that adds or removes constructions takes the other games much longer to dry-run (every building has to be found, the engine's
 -- factory runs on a big proposal; real session 2026-10-12: a veto 2 s after the build was released after a 626 ms grace): a longer
 -- window, so that a veto reaches the originator before it releases its command.
-local CONSTRUCTION_VETO_STEPS = 12   -- extra steps of lead
-local CONSTRUCTION_GRACE_MS = 4000   -- a paused game waits at least this long
+CONSTRUCTION_VETO_STEPS = 12   -- extra steps of lead
+CONSTRUCTION_GRACE_MS = 4000   -- a paused game waits at least this long
 local VETO_MARGIN = 1         -- a dry run later than this many steps before the stamp is useless and skipped
 
-local function noteBuild(key, at)
+function noteBuild(key, at)
 	G.buildAts[key] = at
 	local n = 0
 	for _ in pairs(G.buildAts) do n = n + 1 end
@@ -2293,7 +2308,7 @@ local function noteBuild(key, at)
 end
 
 -- builds that stamp earlier than `it` and have not landed on this game yet
-local function pendingBefore(it, now)
+function pendingBefore(it, now)
 	local out = nil
 	for k, a in pairs(G.buildAts) do
 		if k ~= it.key and a <= it.at and now < a + STEP then out = math.max(out or 0, a) end
@@ -2357,7 +2372,7 @@ local function sendVeto(it, why)
 	logGui("VETO of " .. it.key .. ": this game cannot build it (" .. tostring(why) .. "); the build is dropped on this game")
 end
 
-local function vetoCheck(it, now)
+function vetoCheck(it, now)
 	local ok, why = dryRun(it)
 	if ok then
 		if why then logGui("dry run of " .. it.key .. ": " .. why) end
@@ -2367,7 +2382,7 @@ local function vetoCheck(it, now)
 end
 
 -- every frame: dry runs that waited for earlier builds
-local function dryPump()
+function dryPump()
 	if next(G.dry) == nil then return end
 	local now = engine.gameTime()
 	for key, it in pairs(G.dry) do
@@ -2384,7 +2399,7 @@ end
 -- The permission category of a captured build record: a record that adds nothing only removes (bulldoze).
 -- (buildCategory and actionCategory are defined above the simulation half)
 
-local function shipNative(o)
+function shipNative(o)
 	local body = C.parse(o.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
 	local category = buildCategory(body)
@@ -2408,7 +2423,7 @@ end
 
 -- A command a window issued, recorded by the UI-state hook (feverlink3_uihook.lua), which applied it natively already:
 -- stamped and shipped; the other games apply it at the stamp.
-local function shipUiCommand(p)
+function shipUiCommand(p)
 	local body = C.parse(p.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
 	local now = engine.gameTime()
@@ -2432,7 +2447,7 @@ local function shipUiCommand(p)
 end
 
 -- A command this player issued (held by the wrapped sendCommand): encode, stamp, ship, queue locally.
-local function shipLocal(tag, cb)
+function shipLocal(tag, cb)
 	local body, err = L.encodeCommand(tag.name, tag.args, { plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end })
 	if not body then return false, err end
 	local now = engine.gameTime()
@@ -2448,6 +2463,7 @@ local function shipLocal(tag, cb)
 	route(it)
 	return true
 end
+end -- section: applying items, the veto, shipping
 
 -- ================================================================== strict mode: the native module holds a tool's build
 --
@@ -2485,14 +2501,18 @@ end
 -- active, on a fault, when the module stops answering, and when the module itself says `holding {on = false}` (it retries
 -- with a back-off). Without native_events.log nothing of this runs and nothing is written.
 
-local NAT_PING = 2.0      -- longest pause between lines written to native_ctl.log while holding
-local NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
+-- used outside this section:
+local NAT_PING, NAT_CAP_TTL, NAT_GRACE, NAT_PREVIEW_TTL, NAT_CONFIRM, NAT_ALIVE, NAT_WATCHDOG, SITES, natNew, natSay, natSend, natTrigger,
+	natStop, natFault, natPing, natOrder, natRelease, natSessionOn, natSite, natDecide
+do -- section: strict mode: the native link and the verdict (not indented, see SECTIONS at the top)
+NAT_PING = 2.0      -- longest pause between lines written to native_ctl.log while holding
+NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
 local NAT_CAP_MAX = 6     -- captures kept
-local NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
-local NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
-local NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
-local NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
-local NAT_WATCHDOG = 8.0  -- no proof of life (a pong or any other event) for this long while holding: the module is gone
+NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
+NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
+NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
+NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
+NAT_WATCHDOG = 8.0  -- no proof of life (a pong or any other event) for this long while holding: the module is gone
 -- Strict mode switched off by the mod (no answer, hold_on not confirmed, the watchdog, the module's own switch-offs) is not off for
 -- good: the mod keeps pinging every X.NAT_REARM_PING s and, when the module answers again, arms strict mode again (hold_on), after a
 -- back-off of X.NAT_REARM_MIN s that doubles with every re-arm up to X.NAT_REARM_MAX s (reset after a minute of holding). Real run
@@ -2511,7 +2531,7 @@ X.NAT_FAULT_COOL = 60.0  -- three faults switch strict mode off for this long, t
 -- UI::LaneModifier::Apply, was paired with a 12 s old preview of the upgrade tool and shipped as that upgrade). `delta`: what that tool
 -- changes is node configurations only, which the world can say after the build ran (Build.nodeConfigDelta). A site that is not listed
 -- is paired as before.
-local SITES = {
+SITES = {
 	[0x4d396f] = { name = "Bulldozer::Apply", tools = { bulldozer = true } },
 	[0x51b56c] = { name = "ConstructionBuilder::MousePressed", tools = { constructionBuilder = true } },
 	[0x5891b4] = { name = "StreetBuilder::UpdateEngine", tools = { streetBuilder = true, trackBuilder = true } },
@@ -2522,7 +2542,7 @@ local SITES = {
 	[0x5387cd] = { name = "LaneModifier::Apply", tools = {}, delta = true },
 }
 
-local function natNew()
+function natNew()
 	return {
 		unaccounted = {},   -- held id -> a command given back with no record of its own, until it is known whether anything shipped it
 		reader = C.newReader(C.path("native_events.log")), writer = nil,
@@ -2543,7 +2563,7 @@ local function natNew()
 end
 
 -- One line each, at most 12 per 10 s (the rest are counted): a stuck state must not fill mod.log.
-local function natSay(text)
+function natSay(text)
 	traceGui("native", text)
 	local N = G.nat
 	if N then
@@ -2561,7 +2581,7 @@ local function natSay(text)
 	logGui("strict: " .. text)
 end
 
-local function natSend(kind, payload)
+function natSend(kind, payload)
 	local N = G.nat
 	if not N then return false end
 	if not N.writer then N.writer = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID) end
@@ -2579,12 +2599,12 @@ end
 
 -- The module hands a held command back (or destroys it) at the next CommandList::Add of ANY command; any command we send
 -- is one. This one does nothing in the simulation half (docs/NATIVE_LINK.md section 4, "Why a trigger").
-local function natTrigger()
+function natTrigger()
 	pcall(toSim, "nop", {})
 end
 
 -- Stops strict mode: hold_off, so that every held command goes back to the engine at the next Add (and one is sent).
-local function natStop(why)
+function natStop(why)
 	local N = G.nat
 	if not N then return end
 	if N.holdSent then
@@ -2608,7 +2628,7 @@ end
 
 -- A fault in strict mode never reaches the bridge: it is logged, and the third one switches strict mode off for X.NAT_FAULT_COOL
 -- seconds (natTick arms it again afterwards, with the count reset).
-local function natFault(where, err)
+function natFault(where, err)
 	local N = G.nat
 	if not N then return end
 	N.faults = N.faults + 1
@@ -2631,7 +2651,7 @@ function X.natGiveUp(why)
 		math.min(X.NAT_REARM_MAX, X.NAT_REARM_MIN * 2 ^ math.min(N.rearms, 4))))
 end
 
-local function natPing()
+function natPing()
 	local N = G.nat
 	N.pingN = N.pingN + 1
 	N.pingAt = os.clock()
@@ -2639,7 +2659,7 @@ local function natPing()
 end
 
 -- release or cancel, and make sure an Add follows: the order is only carried out at the next Add.
-local function natOrder(kind, id)
+function natOrder(kind, id)
 	local N = G.nat
 	local ok = natSend(kind, { id = id })
 	if ok then
@@ -2652,7 +2672,7 @@ end
 -- The stamp of a shipped build has come on this game (the simulation half took the snapshot of its entity lists and booked the
 -- ledger, as every other game does): the held command goes back to the engine, which applies it. The replay mark comes first
 -- in the engine's command list, so the build's event finds it and the simulation half does not capture this build as a new one.
-local function natRelease(key)
+function natRelease(key)
 	local N = G.nat
 	local h = N and N.heldByKey[key]
 	if not h or h.released or h.done or h.cancelled then return false end
@@ -2737,7 +2757,7 @@ function natPauseRelease(it, finish)
 	end
 end
 
-local function natSessionOn(N, now)
+function natSessionOn(N, now)
 	if now - N.sessionAt >= 1 then
 		N.sessionAt = now
 		local text = C.readFile(C.path("identity.txt"))
@@ -2749,7 +2769,7 @@ end
 
 -- ---- the build of one held command
 
-local function natSite(h)
+function natSite(h)
 	return type(h.site) == "number" and string.format("0x%x", h.site) or "?"
 end
 
@@ -3063,14 +3083,18 @@ end
 
 -- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): it
 -- is given back, unless the verdict was already written.
-local function natDecide(h, cap)
+function natDecide(h, cap)
 	local ok, err = pcall(natDecideUnsafe, h, cap)
 	if ok then return end
 	natFault("the verdict on held " .. tostring(h.id), err)
 	local N = G.nat
 	if N and not N.awaiting[h.id] then pcall(natOrder, "release", h.id) end
 end
+end -- section: strict mode: the native link and the verdict
 
+-- used outside this section:
+local natSettle, commitPump, natCapture, natTick
+do -- section: strict mode: commits, the ledger, events (not indented, see SECTIONS at the top)
 -- The grace of a paused game's held build is over (or a resync / the end of the session cuts it short): tell the others to apply it
 -- and release this game's own command. If the game was unpaused meanwhile the normal stamp logic takes over: a new stamp ahead.
 local function natCommit(key, why)
@@ -3094,7 +3118,7 @@ end
 -- Before the game is saved for a resync: no build may stay held across the save. A grace is cut short (committed); a build whose
 -- stamp has not come is taken out of the queue and released now, so the save contains it and no game applies it a second time
 -- after the reload. Returns the number of releases that must be confirmed by the engine before the save.
-local function natSettle(why)
+function natSettle(why)
 	local N = G.nat
 	local waiting = 0
 	if not N then return 0 end
@@ -3150,7 +3174,7 @@ local function heldWatchdog(N, now)
 end
 
 -- every frame: graces that are over, parked records whose commit never came
-local function commitPump()
+function commitPump()
 	local clock = os.clock()
 	for key, g in pairs(G.graces) do
 		local h = G.nat and G.nat.heldByKey[key]
@@ -3284,7 +3308,7 @@ local function natOnHeld(N, p)
 end
 
 -- Called from guiHandleEvent for builder.proposalCreate (the tool's preview): keeps the newest capture for the `held` that follows a click.
-local function natCapture(id, name, param)
+function natCapture(id, name, param)
 	local N = G.nat
 	if not N or N.dead or not N.holdSent or name ~= "builder.proposalCreate" then return end
 	if not (Build and Build.captureToolBuild) then return end
@@ -3520,7 +3544,7 @@ local function natReadEvents(N)
 end
 
 -- Every frame (guarded by the caller). Does nothing until native_events.log has a record.
-local function natTick()
+function natTick()
 	local N = G.nat
 	if not N then return end
 	if N.dead then
@@ -3677,10 +3701,14 @@ local function natTick()
 		end
 	end
 end
+end -- section: strict mode: commits, the ledger, events
 
+-- used outside this section:
+local installWrap, readLink, collectFromSim, serviceWindow, syncLocalCompany
+do -- section: the wrap, link handlers, the service window (not indented, see SECTIONS at the top)
 -- Wraps the command factories (to know a command's name and arguments) and sendCommand (to hold it). Commands
 -- the mod cannot decode go to the engine untouched: losing a player's action is worse than a visible divergence.
-local function installWrap()
+function installWrap()
 	local orig = originals()
 	if not orig.sendCommand then
 		orig.sendCommand = api.cmd.sendCommand
@@ -4000,7 +4028,7 @@ H.chat = function(rec, p)
 	end
 end
 
-local function readLink()
+function readLink()
 	for _, rec in ipairs(C.readerPoll(G.reader)) do
 		if G.loading then
 			-- a resync load is under way: the reloaded game reads these lines again from the cursor
@@ -4019,7 +4047,7 @@ local function readLink()
 end
 
 -- Results, refusals, reports and bindings produced by the simulation half.
-local function collectFromSim(state)
+function collectFromSim(state)
 	local ok, st = pcall(function() return state:get() end)
 	if not ok or type(st) ~= "table" then
 		-- silent before: a state the interface half cannot read stalls every simulation result and checksum round with no trace
@@ -4127,7 +4155,7 @@ end
 
 -- The window's side of the hand-off: chat typed there arrives as records in ui_out.log, the model goes back as a
 -- snapshot file. Throttled: a few frames apart is plenty for a chat box.
-local function serviceWindow()
+function serviceWindow()
 	if G.frames % 3 ~= 0 then return end
 	for _, rec in ipairs(C.readerPoll(G.uiReader)) do
 		if rec.kind == "chat" then
@@ -4183,7 +4211,7 @@ end
 
 -- companies: in separate mode (experimental, docs/COMPANIES.md section 8) this game's windows act as the player's own
 -- company, by making api.engine.util.getPlayer say so; in shared mode, or outside any company, as the game's own player.
-local function syncLocalCompany()
+function syncLocalCompany()
 	if not (Co and G.co and engine.setLocalCompany) then return end
 	local want = nil
 	if G.co.mode == "separate" then
@@ -4229,6 +4257,7 @@ function X.guestSaveOnEnd()
 		G.guestSaved = false
 	end
 end
+end -- section: the wrap, link handlers, the service window
 
 local function guiUpdate(userParams, state, guiState)
 	C.poll()

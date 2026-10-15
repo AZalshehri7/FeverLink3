@@ -29,21 +29,50 @@ class ContentIndexTest(unittest.TestCase):
         for name in ("feverlink3_towntrace.lua", "feverlink3_livevsloaded.lua"):
             self.assertNotIn('format("%d", v)', open(os.path.join(MOD, "content", name), encoding="utf-8").read(), name)
 
-    def test_the_bridge_keeps_room_below_the_games_limit_of_200_locals(self):
-        # The game's Lua refused the bridge with "too many local variables (limit is 200) in main function" when six top-level locals were
-        # added (real run rc1, 2026-10-14; lupa compiled it): 191 declared names loaded, 197 did not (the game counts some more of its own).
-        # New module-level state goes into the X table instead.
-        import re
-        n = 0
-        with open(os.path.join(MOD, "content", "feverlink3_bridge.script.lua"), encoding="utf-8") as f:
-            for line in f.read().splitlines():
-                if re.match(r"^local\s+function\s+\w+", line):
-                    n += 1
-                    continue
-                m = re.match(r"^local\s+([\w\s,]+?)(=|$|--)", line)
-                if m:
-                    n += len([x for x in m.group(1).split(",") if x.strip()])
-        self.assertLessEqual(n, 191, "top-level local names of the bridge")
+    def test_every_mod_file_keeps_room_below_the_games_limit_of_200_locals(self):
+        # Lua allows 200 active locals per function, and a file's main chunk is one function. The game's Lua refused the bridge with "too
+        # many local variables (limit is 200) in main function" when six top-level locals were added (real run rc1, 2026-10-14): 191 names
+        # loaded, 197 did not although lupa compiled them (the game counts a few more of its own), and every entry point of the bridge then
+        # failed. The bridge was cut down to sections in do ... end blocks (SECTIONS in the file); these caps keep real headroom: a file
+        # that reaches its cap needs a section (or a table such as the bridge's X) for its new names, not a higher cap.
+        caps = {"feverlink3_bridge.script.lua": 120, "feverlink3_cmds_build.lua": 145}
+        content = os.path.join(MOD, "content")
+        names = sorted(n for n in os.listdir(content) if n.endswith(".lua"))
+        self.assertIn("feverlink3_bridge.script.lua", names)
+        for name in names:
+            with open(os.path.join(content, name), encoding="utf-8") as f:
+                n = peak_locals(f.read(), name)
+            self.assertLessEqual(n, caps.get(name, 100), "%s: %d active locals at its peak (game limit 200, minus a few)" % (name, n))
+
+
+def peak_locals(text, name):
+    """The most locals active at once at any column-0 statement of the file (its main chunk and its top-level functions), as Lua 5.2's
+    compiler counts them: a probe `do local p0_, ... end` is put before every such line and the largest probe that still compiles is
+    200 - peak. A file that does not compile at all fails here too."""
+    import re
+    import lupa.lua52 as lupa
+    load = lupa.LuaRuntime().eval("function(s) local f, e = load(s, '=probe'); return f ~= nil, e end")
+    ok, err = load(text)
+    if not ok:
+        raise AssertionError("%s does not compile: %s" % (name, err))
+    lines = text.splitlines(True)
+    at = {i for i, l in enumerate(lines) if re.match(r"(local|function|do)\b|end -- section", l)}
+
+    def fits(k):
+        probe = "do local " + ", ".join("p%d_" % j for j in range(k)) + " end\n"
+        ok, err = load("".join(lines[i] if i not in at else probe + lines[i] for i in range(len(lines))))
+        if not ok and "local variables" not in str(err):
+            raise AssertionError("%s: probe did not compile: %s" % (name, err))
+        return ok
+
+    lo, hi = 0, 200
+    while lo < hi:
+        m = (lo + hi + 1) // 2
+        if fits(m):
+            lo = m
+        else:
+            hi = m - 1
+    return 200 - lo
 
 
 if __name__ == "__main__":
