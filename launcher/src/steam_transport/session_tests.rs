@@ -88,7 +88,12 @@ impl FakeGame {
     }
 
     fn saw(&self, kind: &str, needle: &str) -> bool {
-        self.seen.iter().any(|l| l.kind == kind && l.payload.contains(needle))
+        self.index_of(kind, needle).is_some()
+    }
+
+    /// Where the first such line is among the lines this game has read.
+    fn index_of(&self, kind: &str, needle: &str) -> Option<usize> {
+        self.seen.iter().position(|l| l.kind == kind && l.payload.contains(needle))
     }
 }
 
@@ -619,5 +624,152 @@ fn a_bulk_transfer_that_stalls_falls_back_to_chunks_for_that_player() {
     );
     assert!(table.machine.largest_sent() > 349_000, "the chunks went over the reliable stream");
     player.handle.stop();
+    table.handle.stop();
+}
+
+// ------------------------------------------------------------------ the host's loop while a save travels
+
+fn no_bulk() -> BulkSettings {
+    BulkSettings { mode: BulkMode::Off, ..BulkSettings::default() }
+}
+
+/// A table of the host and two players, started, with a save of `chunks` chunks for the next round.
+fn table_of_three(chunks: usize, bulk: BulkSettings) -> (Table, Player, Player, Vec<u8>) {
+    let save: Vec<u8> = (0..(chunks * ResyncLimits::CHUNK_SIZE + 4321)).map(|i| (i % 251) as u8).collect();
+    let mut table = Table::new_with(HostOptions::default(), save.clone(), bulk);
+    let (mut pat, mut bob) = (table.player("Pat"), table.player("Bob"));
+    for p in [&pat, &bob] {
+        assert!(p.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()), "{:?}", p.handle.logs());
+    }
+    table.game.announce();
+    pat.game.announce();
+    bob.game.announce();
+    assert!(table.handle.wait_for(WAIT, |s| s.clocks.len() == 3), "three clocks known");
+    table.handle.command(Command::Start);
+    assert!(table.handle.wait_for(WAIT, |s| s.session.as_ref().is_some_and(|x| x.started)));
+    (table, pat, bob, save)
+}
+
+/// Bob's game makes an action; returns how long it took to reach the host's game.
+fn relay_time(table: &mut Table, bob: &mut Player, body: &str) -> Duration {
+    let started = Instant::now();
+    bob.game.write("action", &format!("{{[\"body\"]=\"{body}\",[\"seq\"]=1,[\"stamp\"]=99000}}"));
+    let needle = format!("\"{body}\"");
+    let seen = wait(WAIT, || {
+        table.game.step();
+        table.game.saw("action", &needle)
+    });
+    assert!(seen, "{:?}", table.handle.logs());
+    started.elapsed()
+}
+
+/// The save is stuck at a receiver that does not read (Steam's send buffer to it is full), and the host goes on: the
+/// action another player makes meanwhile reaches the host's game at once. The receiver gets it after its load line,
+/// where the blocking transfer used to put it, and the save arrives intact.
+#[test]
+fn the_host_keeps_relaying_while_a_receiver_holds_up_the_save() {
+    let (mut table, mut pat, mut bob, save) = table_of_three(24, no_bulk());
+    pat._machine.stall_receive(true);
+    table.handle.command(Command::Resync);
+    assert!(wait(WAIT, || {
+        table.game.step();
+        bob.game.step();
+        table.machine.full_sends() > 0
+    }));
+    let took = relay_time(&mut table, &mut bob, "55");
+    assert!(took < Duration::from_secs(2), "relayed in {took:?} while the save was stuck");
+    assert_eq!(Some("Transferring"), table.handle.status().resync.as_deref(), "and the save is still on its way");
+    // the host's game reloaded early and said hello meanwhile: the host heard it during the transfer
+    assert!(
+        table.handle.wait_for(WAIT, |s| s.players.iter().any(|p| p.id == 0 && p.ready)),
+        "{:?}",
+        table.handle.status().players
+    );
+    assert_eq!(Some("Transferring"), table.handle.status().resync.as_deref());
+
+    pat._machine.stall_receive(false);
+    let done = wait(Duration::from_secs(120), || {
+        table.game.step();
+        pat.game.step();
+        bob.game.step();
+        table.handle.status().resync.as_deref() == Some("Idle")
+    });
+    let logs = table.handle.logs().join("\n");
+    assert!(done, "the round reaches Idle; host log:\n{logs}");
+    for p in [&pat, &bob] {
+        assert!(fs::read(p.saves.join("feverlink3-resync-1.sav")).unwrap() == save, "the save arrived intact");
+    }
+    let load = pat.game.index_of("resync_load", "feverlink3-resync-1").expect("Pat loaded");
+    let action = pat.game.index_of("action", "\"55\"").expect("Pat got Bob's action");
+    assert!(action > load, "after the load line: action {action}, load {load}");
+    assert!(logs.contains("held during the save transfer sent after the load"), "{logs}");
+    assert!(logs.contains("resync 1: save sent ("), "{logs}");
+    assert!(table.handle.status().transfer.is_none());
+    pat.handle.stop();
+    bob.handle.stop();
+    table.handle.stop();
+}
+
+/// A receiver that goes away while the save is stuck at it: the host notices at once (its loop is not inside the
+/// transfer), lets its share of the transfer go, and the other player gets the save and the round ends.
+#[test]
+fn a_receiver_that_disconnects_mid_transfer_is_let_go_and_the_others_get_the_save() {
+    let (mut table, pat, mut bob, save) = table_of_three(24, no_bulk());
+    pat._machine.stall_receive(true);
+    table.handle.command(Command::Resync);
+    assert!(wait(WAIT, || {
+        table.game.step();
+        bob.game.step();
+        table.machine.full_sends() > 0
+    }));
+    let started = Instant::now();
+    pat.handle.crash();
+    assert!(table.handle.wait_for(Duration::from_secs(5), |s| s.players.len() == 2), "{:?}", table.handle.logs());
+    assert!(started.elapsed() < Duration::from_secs(5), "noticed in {:?}", started.elapsed());
+    let done = wait(Duration::from_secs(120), || {
+        table.game.step();
+        bob.game.step();
+        table.handle.status().resync.as_deref() == Some("Idle")
+    });
+    let logs = table.handle.logs().join("\n");
+    assert!(done, "the round reaches Idle without Pat; host log:\n{logs}");
+    assert!(fs::read(bob.saves.join("feverlink3-resync-1.sav")).unwrap() == save);
+    assert!(bob.game.saw("resync_load", "feverlink3-resync-1"));
+    assert!(logs.contains("left during the transfer; the others go on"), "{logs}");
+    bob.handle.stop();
+    table.handle.stop();
+}
+
+/// The way that was to carry the save fails (every datagram is lost, so the send gives up after 10 s of no progress):
+/// meanwhile the host relays as usual, and afterwards the players get the chunks instead.
+#[test]
+fn while_a_bulk_send_fails_the_host_relays_and_then_sends_the_chunks() {
+    let (mut table, mut pat, mut bob, save) =
+        table_of_three(3, BulkSettings { mode: BulkMode::Dgram, ..BulkSettings::default() });
+    table.machine.lose_every_nth_unreliable(1);
+    table.handle.command(Command::Resync);
+    assert!(wait(WAIT, || {
+        table.game.step();
+        table.handle.logs().iter().any(|l| l.contains("as bulk datagrams (the others get chunks)"))
+    }));
+    let took = relay_time(&mut table, &mut bob, "66");
+    assert!(took < Duration::from_secs(2), "relayed in {took:?} during the bulk send");
+    assert!(!table.handle.logs().iter().any(|l| l.contains("failed (no progress")), "the bulk send was still running");
+    let done = wait(Duration::from_secs(120), || {
+        table.game.step();
+        pat.game.step();
+        bob.game.step();
+        table.handle.status().resync.as_deref() == Some("Idle")
+    });
+    let logs = table.handle.logs().join("\n");
+    assert!(done, "the round reaches Idle; host log:\n{logs}");
+    assert!(logs.contains("failed (no progress for 10 s); sending the chunks instead"), "{logs}");
+    for p in [&pat, &bob] {
+        assert!(fs::read(p.saves.join("feverlink3-resync-1.sav")).unwrap() == save, "the save arrived intact");
+    }
+    let load = pat.game.index_of("resync_load", "feverlink3-resync-1").expect("Pat loaded");
+    assert!(pat.game.index_of("action", "\"66\"").expect("Pat got it") > load);
+    pat.handle.stop();
+    bob.handle.stop();
     table.handle.stop();
 }
