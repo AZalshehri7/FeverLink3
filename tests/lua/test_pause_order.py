@@ -76,12 +76,19 @@ class PausedDeferredBuildTest(I.InjectFailClosedTest):
         self.assertEqual(self.A.native.completed, [(1, True, "stamp_apply")])
         self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
         self.assertSameWorld()
-        # and the games go on after the resume
+        # the mod tells its native module that the game time stands still (what it holds does not age during the pause)
+        for g in (self.A, self.B):
+            pings = [p for _, k, p in g.native.ctl_records() if k == "ping"]
+            self.assertTrue(pings and pings[-1].get("paused") is True, "%s: %s" % (g.label, pings[-3:]))
+        # and the games go on after the resume, the next ping saying so at once
         self.relay.pauseAt = None
         self.relay.session()
         self.tick(10)
         self.assertGreater(self.A.time(), self.B.time() - 10 * STEP)
         self.assertSameWorld()
+        for g in (self.A, self.B):
+            pings = [p for _, k, p in g.native.ctl_records() if k == "ping"]
+            self.assertNotIn("paused", pings[-1], "%s: %s" % (g.label, pings[-3:]))
 
 
 class PausedBuildsOvershootTest(PausedDeferredBuildTest):

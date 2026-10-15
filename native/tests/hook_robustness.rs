@@ -378,7 +378,7 @@ fn random_ctl(r: &mut StdRng, max_id: u64) -> CtlMessage {
         2 => CtlMessage::Release { id: id(r), at: if r.gen_bool(0.5) { 0 } else { r.gen_range(0..3000) } },
         3 => CtlMessage::Cancel { id: id(r) },
         4 => CtlMessage::TerrainApply { id: id(r), stamp: r.gen_range(0..1u64 << 53) },
-        _ => CtlMessage::Ping { n: r.gen() },
+        _ => CtlMessage::Ping { n: r.gen(), paused: r.gen() },
     }
 }
 
@@ -470,7 +470,7 @@ fn a_writer_that_never_drains_cannot_make_the_machine_grow() {
     m.handle(&CtlMessage::HoldOn { kinds: vec!["build_proposal".into()] }, 0);
     for round in 0..5000u32 {
         let now = u64::from(round);
-        m.handle(&CtlMessage::Ping { n: i64::from(round) }, now);
+        m.handle(&CtlMessage::Ping { n: i64::from(round), paused: false }, now);
         m.handle(&CtlMessage::Release { id: u64::from(round) + 1_000_000, at: 0 }, now); // unknown id: an error
         if m.hold(52, 0, round, now).is_ok() {
             m.handle(&CtlMessage::Release { id: u64::from(round) + 1, at: 0 }, now);

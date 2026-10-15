@@ -2978,11 +2978,25 @@ function X.natGiveUp(why)
 		math.min(X.NAT_REARM_MAX, X.NAT_REARM_MIN * 2 ^ math.min(N.rearms, 4))))
 end
 
+-- The session's game time stands still: it stands at its pause (pauseAt reached) or runs at speed 0. Every ping tells the native module,
+-- and a change is pinged at once (natTick): what the module holds does not age meanwhile, so a build deferred at a pause that lasts
+-- minutes (the host waits for every game's stop report and a round trip before it stamps the pause's builds) is not failed by the
+-- module's age limit while the mod keeps pinging.
+function X.sessionStill()
+	local ok, still = pcall(function()
+		local s = G.session
+		return s ~= nil and (pausedNow() or (tonumber(s.speed) or 1) <= 0)
+	end)
+	return ok and still == true
+end
+
 function natPing()
 	local N = G.nat
 	N.pingN = N.pingN + 1
 	N.pingAt = os.clock()
-	return natSend("ping", { n = N.pingN })
+	local still = X.sessionStill()
+	N.stillSent = still
+	return natSend("ping", { n = N.pingN, paused = still or nil })
 end
 
 -- release or cancel, and make sure an Add follows: the order is only carried out at the next Add.
@@ -4120,7 +4134,8 @@ function natTick()
 	else
 		-- a ping every NAT_PING s whatever else is written: the module answers only pings with a pong, so a session that writes other
 		-- lines all the time (a build every 2 s: defer, inject_next, release) must still ping, or the watchdog below starves (rail-crash run)
-		if now - N.lastWrite >= NAT_PING or now - N.pingAt >= NAT_PING then natPing() end
+		-- and at once when the session's game time stops or runs again (the module's held commands age only while it runs)
+		if now - N.lastWrite >= NAT_PING or now - N.pingAt >= NAT_PING or X.sessionStill() ~= (N.stillSent == true) then natPing() end
 		if not N.active then
 			if now - N.holdAt > NAT_CONFIRM then
 				X.natGiveUp("hold_on was not confirmed within " .. NAT_CONFIRM .. " s (is the hold hook installed?)")
