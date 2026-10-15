@@ -653,6 +653,10 @@ const REMOVED_NODES: usize = 0x030;
 const REMOVED_SEGMENTS: usize = 0x048;
 const EDGE_OBJECTS_TO_REMOVE: usize = 0x110;
 const TO_REMOVE: usize = 0x240;
+const NODE_CONFIGS_TO_ADD: usize = 0x060;
+const NODE_CONFIGS_TO_REMOVE: usize = 0x078;
+const NODE_CONFIG_STRIDE: usize = 0x80;
+const NODE_CONFIG_ENTITY: usize = 0x78;
 const NODE_STRIDE: usize = 0x40;
 const SEGMENT_STRIDE: usize = 0x350;
 
@@ -662,6 +666,8 @@ const READ_VECTORS: &[(usize, usize)] = &[
     (ADDED_SEGMENTS, SEGMENT_STRIDE),
     (REMOVED_NODES, NODE_STRIDE),
     (REMOVED_SEGMENTS, SEGMENT_STRIDE),
+    (NODE_CONFIGS_TO_ADD, NODE_CONFIG_STRIDE),
+    (NODE_CONFIGS_TO_REMOVE, 4),
     (EDGE_OBJECTS_TO_REMOVE, 4),
     (EDGE_OBJECTS_TO_ADD, EDGE_OBJECT_STRIDE),
     (TO_REMOVE, 4),
@@ -710,11 +716,22 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
 /// (drift and a resync). Since 2026-10-15 every text is matched by place or construction ([`same_build`]), not only those with constructions.
 pub const NOT_OURS: &str = "not the mod's command: ";
 
+/// The prefix of an error that means "whether this command is the mod's cannot be told" (the side file is missing or unreadable, the
+/// text names no place): treated as [`NOT_OURS`]. A command is emptied only once it is positively identified as the order's placeholder:
+/// emptying a town's or a script's own command on one game would itself fork the worlds. The order keeps waiting and expires into a
+/// refusal (`no_command`), which asks for the repair.
+pub const UNKNOWN: &str = "identity unknown: ";
+
+/// The order is put back and the command passes untouched ([`NOT_OURS`], [`UNKNOWN`]).
+pub fn keeps_waiting(why: &str) -> bool {
+    why.starts_with(NOT_OURS) || why.starts_with(UNKNOWN)
+}
+
 /// Whether the command is the one the mod sent for this text, for EVERY build kind (the order names no command: the engine gives a
 /// script command no field the module could match a key against without engine research, so the order goes to the next script
 /// `build_proposal` that passes this test). A text with constructions: the command's constructions are the text's ([`same_constructions`]).
 /// Any other text: the command touches the text's place ([`same_place`]). A command that fails is not the mod's (a town's build); the
-/// order waits for the next one ([`NOT_OURS`]).
+/// order waits for the next one ([`NOT_OURS`]). A text that names no place cannot identify any command ([`UNKNOWN`]).
 pub fn same_build(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
     if construction_count(text) > 0 {
         same_constructions(mem, dest, text)
@@ -732,8 +749,8 @@ pub const PLACE_TOLERANCE_M: f32 = 0.25;
 const PLACE_MAX: usize = 4096;
 
 /// Where a proposal builds: the positions of its added and removed nodes, the two ends of its added and removed segments, and the
-/// existing entities it removes (nodes, segments, edge objects, constructions; the old ids, which the mod checked to be the same
-/// entities on this game before it sent the command).
+/// existing entities it removes or configures (nodes, segments, edge objects, constructions, the nodes of added or removed node
+/// configurations; the old ids, which the mod checked to be the same entities on this game before it sent the command).
 #[derive(Debug, Default, PartialEq)]
 pub struct Place {
     pub points: Vec<[f32; 3]>,
@@ -789,6 +806,8 @@ pub fn text_place(text: &str) -> Place {
         ("proposal.removedSegments", ".entity"),
         ("proposal.edgeObjectsToRemove", ""),
         ("toRemove", ""),
+        ("proposal.nodeConfigsToAdd", ".entity"),
+        ("proposal.nodeConfigsToRemove", ""),
     ] {
         for i in 0..(count(&lines, &format!("{vec}.#")) as usize).min(PLACE_MAX) {
             if let Some(e) = lines.get(format!("{vec}[{i}]{member}").as_str()).and_then(|v| old_entity(v)) {
@@ -825,22 +844,29 @@ pub fn command_place(mem: &dyn Mem, dest: usize) -> Result<Place, String> {
                 .extend(ends.iter().map(|&at| v3(&raw, i * stride + at)).filter(|p| p.iter().all(|f| f.is_finite())));
         }
     }
-    for (off, stride) in
-        [(REMOVED_NODES, NODE_STRIDE), (REMOVED_SEGMENTS, SEGMENT_STRIDE), (EDGE_OBJECTS_TO_REMOVE, 4), (TO_REMOVE, 4)]
-    {
+    for (off, stride, at) in [
+        (REMOVED_NODES, NODE_STRIDE, 0),
+        (REMOVED_SEGMENTS, SEGMENT_STRIDE, 0),
+        (EDGE_OBJECTS_TO_REMOVE, 4, 0),
+        (TO_REMOVE, 4, 0),
+        (NODE_CONFIGS_TO_ADD, NODE_CONFIG_STRIDE, NODE_CONFIG_ENTITY),
+        (NODE_CONFIGS_TO_REMOVE, 4, 0),
+    ] {
         let (raw, n) = elems(off, stride)?;
-        place.removed.extend((0..n).map(|i| u32_at(&raw, i * stride)));
+        place.removed.extend((0..n).map(|i| u32_at(&raw, i * stride + at)));
     }
     Ok(place)
 }
 
 /// A text without constructions: the command builds at the text's place (it shares a node or segment end position, or a removed
 /// entity). Before this (b75 to 2026-10-15) such a command was taken by its kind alone, so a town's road applied while the order waited
-/// could take the originator's build. A text that names no place at all (nothing added or removed by position or id) is not checked.
+/// could take the originator's build. A text that names no place at all identifies nothing ([`UNKNOWN`]): no command takes the order.
 pub fn same_place(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
     let want = text_place(text);
     if want.is_empty() {
-        return Ok(());
+        return Err(format!(
+            "{UNKNOWN}the text names no place (no node, segment end or existing entity) to match a command by"
+        ));
     }
     let have = command_place(mem, dest)?;
     if want.meets(&have) {
@@ -1613,8 +1639,12 @@ toAdd[0].transf	m4:{t}
         assert_eq!(text_place(removal).removed.into_iter().collect::<Vec<_>>(), [54]);
         assert_eq!(same_build(&arena, command_at(&arena, None, &[54]), removal), Ok(()));
         assert!(same_build(&arena, command_at(&arena, None, &[55]), removal).unwrap_err().contains("builds elsewhere"));
-        // a text that names no place at all is not checked (nothing to compare): the limit of this check
-        assert_eq!(same_build(&arena, town, "toAdd.#\tn:0\n"), Ok(()));
+        // a text that names no place at all identifies no command: unknown, never taken for the mod's (and so never emptied)
+        let why = same_build(&arena, town, "toAdd.#\tn:0\n").unwrap_err();
+        assert!(why.starts_with(UNKNOWN) && keeps_waiting(&why), "{why}");
+        // a node configuration is matched by its node
+        let cfg = "toAdd.#\tn:0\nproposal.nodeConfigsToAdd.#\tn:1\nproposal.nodeConfigsToAdd[0].entity\tent:old#101\n";
+        assert_eq!(text_place(cfg).removed.into_iter().collect::<Vec<_>>(), [101]);
         // a text with constructions is still matched by its constructions (file and transform)
         assert!(same_build(&arena, town, "toAdd.#\tn:1\ntoAdd[0].fileName\tres:\"a.con\"\n").is_err());
     }

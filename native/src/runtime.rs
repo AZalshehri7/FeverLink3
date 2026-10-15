@@ -2217,11 +2217,17 @@ mod tests {
         // a tool's command is not the mod's
         let mut tool = Call::new(52, 2);
         unsafe { rt.on_add(tool.args(), at(SITE_A)) };
-        let mut c = Call::new(52, 3);
+        // the mod's placeholder, identified by its place; the test process has no verified engine functions, so the refused order's
+        // command cannot be emptied: it says so (`untouched`) and the mod asks for the repair
+        let text = format!(
+            "proposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\tv3:{:08x},00000000,00000000\n",
+            100f32.to_bits()
+        );
+        std::fs::write(dir.path().join(crate::inject::inject_file_name(5)), text).unwrap();
+        let (mut c, _node) = road_placeholder(100.0);
         let before = c.c.payload.to_vec();
         unsafe { rt.on_add(c.args(), at(0x777)) };
-        assert_eq!(calls().last().map(String::as_str), Some("add kind 52 tag 3"), "the original Add still runs");
-        // refused (no side file); the test process has no verified engine functions, so the command cannot be emptied: it says so
+        assert!(calls().last().is_some_and(|l| l.starts_with("add kind 52")), "the original Add still runs");
         assert_eq!(c.c.payload.to_vec(), before, "not emptied");
         assert!(!rt.inject.pending());
         rt.pump();
@@ -2230,9 +2236,59 @@ mod tests {
             ev.iter().any(|(k, w)| k == "inject_refused"
                 && w.contains("key 5")
                 && w.contains("[\"outcome\"]=\"untouched\"")
-                && w.contains("no side file")),
+                && w.contains("the layout is that of game build")),
             "{ev:?}"
         );
+    }
+
+    #[test]
+    fn a_command_that_cannot_be_identified_is_never_emptied_and_the_order_expires_into_a_refusal() {
+        let dir = TempDir::new("rt-inject-unknown");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        // engine stand-ins are there: the command COULD be emptied; it must not be, because nothing says it is the mod's
+        inject::TEST_FNS.with(|f| {
+            f.set(Some(crate::native_copy::ProposalFns { ctor: p_ctor, dtor: p_dtor, copy: p_copy, assign: p_copy }))
+        });
+        let mut sim = [0u8; 8];
+        // 1. the side file is missing (unreadable): a foreign build_proposal (a town's road) goes by
+        ctl(dir.path(), "1\tinject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
+        let (mut town, _n1) = road_placeholder(400.0);
+        let before = town.c.payload.to_vec();
+        calls();
+        unsafe { rt.on_apply(sim.as_mut_ptr(), town.c.command.as_mut_ptr()) };
+        let seen = calls();
+        assert!(
+            seen.len() == 1 && seen[0].starts_with("apply tag"),
+            "applied as it is, no empty Proposal assigned: {seen:?}"
+        );
+        assert_eq!(town.c.payload.to_vec(), before, "untouched");
+        assert!(rt.inject.pending(), "the order keeps waiting");
+        assert!(lock(&rt.defer_link).is_none());
+        // 2. a side file whose text names no place: no command can be identified by it either
+        std::fs::write(dir.path().join(crate::inject::inject_file_name(6)), "toAdd.#\tn:0\n").unwrap();
+        ctl(dir.path(), "2\tinject_next\t1\t{[\"key\"]=6}\n");
+        rt.pump(); // the module reads it (it replaces key 5, which is refused without a command: no_command)
+        let (mut town2, _n2) = road_placeholder(400.0);
+        let before2 = town2.c.payload.to_vec();
+        unsafe { rt.on_apply(sim.as_mut_ptr(), town2.c.command.as_mut_ptr()) };
+        let seen = calls();
+        assert!(seen.len() == 1 && seen[0].starts_with("apply tag"), "{seen:?}");
+        assert_eq!(town2.c.payload.to_vec(), before2, "untouched");
+        assert!(rt.inject.pending());
+        // the order expires unused: a refusal without a command (the mod asks for the repair)
+        rt.advance(crate::inject::DEFAULT_TTL_MS + 1);
+        rt.pump();
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("[\"key\"]=6")
+                && w.contains("[\"outcome\"]=\"no_command\"")),
+            "{ev:?}"
+        );
+        assert!(!ev.iter().any(|(_, w)| w.contains("[\"outcome\"]=\"nothing\"")), "nothing was emptied: {ev:?}");
+        inject::TEST_FNS.with(|f| f.set(None));
     }
 
     // stand-ins for the engine's Proposal functions: an empty Proposal is zeros, the assignment copies the Proposal's bytes
@@ -2338,14 +2394,9 @@ mod tests {
         let before = script.c.payload.to_vec();
         unsafe { rt.on_apply(sim.as_mut_ptr(), script.c.command.as_mut_ptr()) };
         assert_eq!(calls().last().map(String::as_str), Some("apply tag 7"), "the original apply still runs");
-        assert_eq!(script.c.payload.to_vec(), before, "refused, and no engine functions to empty it with");
-        rt.pump();
-        let ev = events(dir.path());
-        assert!(
-            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("no side file")),
-            "{ev:?}"
-        );
-        // an order that no script command ever uses: the reason says which applies went by
+        assert_eq!(script.c.payload.to_vec(), before, "not identified (no side file): untouched");
+        assert!(rt.inject.pending(), "the order keeps waiting");
+        // an order that no script command ever uses: the reason says which applies went by (it replaces key 5, which is refused)
         rt.inject.arm(9, 0, 0, rt.now_ms());
         let mut other = Call::new(17, 1);
         unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
@@ -2355,6 +2406,10 @@ mod tests {
         let ev = events(dir.path());
         assert!(
             ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 9") && w.contains("1 held, 0 not held")),
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("replaced")),
             "{ev:?}"
         );
     }

@@ -207,7 +207,7 @@ impl Runtime {
         };
         // Fail closed: an order refused on a command that took it (the mod's, as far as the identity checks can tell) empties that command,
         // so this game applies nothing of the build rather than the placeholder (this game's own rebuild of the record, not the build).
-        let refused = !order.link_only && matches!(&run, Err(why) if !why.starts_with(inj::NOT_OURS));
+        let refused = !order.link_only && matches!(&run, Err(why) if !inj::keeps_waiting(why));
         let outcome = refused.then(|| self.inject_neutralise(order.key, dest));
         crate::log::guarded("native inject: result", || self.inject_finish(order, dest, link, (t0, rb0), run, outcome));
     }
@@ -321,7 +321,7 @@ impl Runtime {
                 ));
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
             }
-            Err(why) if why.starts_with(inj::NOT_OURS) => {
+            Err(why) if inj::keeps_waiting(&why) => {
                 self.say(&format!(
                     "native inject: key {}: {why}; the order waits for the next build_proposal",
                     order.key
@@ -447,25 +447,34 @@ impl Runtime {
     }
 
     /// What the injection needs before the engine is called: the side file, the destination's checks (is this the mod's command), then
-    /// the functions and the allocator (their bytes checked). Calls nothing of the engine. The identity comes first, so that a refusal (which
-    /// empties the command) falls on the mod's command and not on a town's; only a side file that cannot be read leaves nothing to compare.
+    /// the functions and the allocator (their bytes checked). Calls nothing of the engine. A refusal empties the command, so it may only
+    /// come after the command was positively identified as the mod's placeholder for this order: every error before that (no side file,
+    /// an unreadable one, a text that names no place) is [`inj::UNKNOWN`] and a mismatch is [`inj::NOT_OURS`]; both leave the command
+    /// untouched and the order waiting (it expires into a refusal that asks for the repair). Emptying someone else's command on one game
+    /// only would itself fork the worlds.
     fn inject_prepare(&self, key: u64, dest: usize) -> Result<Prepared, String> {
-        let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
-        let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
-        let path = dir.join(inj::inject_file_name(key));
-        let len =
-            std::fs::metadata(&path).map_err(|e| format!("no side file {}: {e}", inj::inject_file_name(key)))?.len();
-        if len > inj::MAX_TEXT_BYTES {
-            return Err(format!("the side file has {len} bytes, more than {}", inj::MAX_TEXT_BYTES));
-        }
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
+        let read = || -> Result<(portable::Settings, std::path::PathBuf, String), String> {
+            let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
+            let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
+            let path = dir.join(inj::inject_file_name(key));
+            let len = std::fs::metadata(&path)
+                .map_err(|e| format!("no side file {}: {e}", inj::inject_file_name(key)))?
+                .len();
+            if len > inj::MAX_TEXT_BYTES {
+                return Err(format!("the side file has {len} bytes, more than {}", inj::MAX_TEXT_BYTES));
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
+            Ok((settings, dir, text))
+        };
+        let (settings, dir, text) = read().map_err(|why| format!("{}{why}", inj::UNKNOWN))?;
         let counts = inj::donor_counts(&text);
         let (edge_objects, constructions) = (counts[0], counts[1]);
         // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
         inj::check_destination(&LiveMem, dest, constructions, edge_objects)
             .and_then(|()| inj::same_build(&LiveMem, dest, &text))
-            .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
+            .map_err(|why| if why.starts_with(inj::UNKNOWN) { why } else { format!("{}{why}", inj::NOT_OURS) })?;
+        // from here on the command is the mod's placeholder for this order: a refusal empties it
         if self.build.name != portable::LAYOUT_BUILD {
             return Err(format!(
                 "the layout is that of game build {}, this is {}",
