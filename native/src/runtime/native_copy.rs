@@ -23,34 +23,40 @@ impl Runtime {
     }
 
     /// The three steps of [`crate::native_copy::run`] for the held command at `payload`; every line is written as it is
-    /// known, before the engine function it announces is called.
+    /// known, before the engine function it announces is called. The steps call the engine, so they run outside
+    /// `log::guarded` (the checks before them are guarded): never call this inside a guard.
     pub(super) fn native_copy_check(&self, event: &str, payload: usize, hold_id: Option<u64>) {
         let Some(sink) = self.native_copy.get() else { return };
-        if !sink.has_dir() {
-            return;
-        }
-        let Some(seq) = sink.begin() else { return };
-        let key = hold_id.map_or("none".to_string(), |k| k.to_string());
+        crate::log::calls_engine("native copy (the Proposal functions, operator new)");
         let write = |text: &str| {
             let _ = sink.write(&format!("{text}\n"));
         };
-        write(&format!("=== native copy #{seq} event={event} key={key} payload={payload:#x} ==="));
-        let prepared = nc::ProposalFns::at(self.base).and_then(|f| rebuild::EngineAlloc::at(self.base).map(|a| (f, a)));
-        let (fns, alloc) = match prepared {
-            Ok(x) if self.build.name == portable::LAYOUT_BUILD => x,
-            Ok(_) => {
-                write(&format!(
-                    "REFUSED: the functions are those of game build {}, this is {}",
-                    portable::LAYOUT_BUILD,
-                    self.build.name
-                ));
-                return;
+        let prepared = crate::log::guarded("native copy", || {
+            if !sink.has_dir() {
+                return None;
             }
-            Err(why) => {
-                write(&format!("REFUSED: {why}"));
-                return;
+            let seq = sink.begin()?;
+            let key = hold_id.map_or("none".to_string(), |k| k.to_string());
+            write(&format!("=== native copy #{seq} event={event} key={key} payload={payload:#x} ==="));
+            let prepared =
+                nc::ProposalFns::at(self.base).and_then(|f| rebuild::EngineAlloc::at(self.base).map(|a| (f, a)));
+            match prepared {
+                Ok((fns, alloc)) if self.build.name == portable::LAYOUT_BUILD => Some((seq, fns, alloc)),
+                Ok(_) => {
+                    write(&format!(
+                        "REFUSED: the functions are those of game build {}, this is {}",
+                        portable::LAYOUT_BUILD,
+                        self.build.name
+                    ));
+                    None
+                }
+                Err(why) => {
+                    write(&format!("REFUSED: {why}"));
+                    None
+                }
             }
-        };
+        });
+        let Some((seq, fns, alloc)) = prepared.flatten() else { return };
         // the graph's block sizes come from the containers (see `Mem::heap_size` for why nothing asks the heap)
         let live = crate::dump::LiveMem;
         let ctx = nc::Ctx {

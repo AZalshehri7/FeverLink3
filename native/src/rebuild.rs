@@ -937,6 +937,9 @@ impl Alloc for EngineAlloc {
     /// Gives everything back.
     fn free_all(&self) -> usize {
         let v: Vec<(usize, usize)> = self.taken.borrow_mut().drain(..).collect();
+        if !v.is_empty() {
+            crate::log::calls_engine("operator delete");
+        }
         for &(_, raw) in &v {
             // SAFETY: a block this allocator got from operator new and has not freed.
             unsafe { (self.delete_fn)(raw as *mut u8) };
@@ -950,10 +953,13 @@ impl Alloc for EngineAlloc {
 
     fn alloc(&self, n: usize) -> Option<usize> {
         let n = n.max(1);
+        // The game's operator new throws on failure: never called inside `log::guarded` (see there), so that the exception
+        // reaches the game's own handler.
+        crate::log::calls_engine("operator new");
         // The engine's containers free a block of 0x1000 bytes or more through the pointer stored just below it (the STL's
         // aligned big allocation: request n + 0x27, align to 32, keep the raw pointer at [ptr - 8]); smaller ones directly.
         let (raw, p) = if n >= 0x1000 {
-            // SAFETY: the game's operator new; it throws on failure (the caller is a guarded hook).
+            // SAFETY: the game's operator new (a size it can serve; an exception passes to the game, see above).
             let raw = unsafe { (self.new_fn)(n + 0x27) } as usize;
             if raw == 0 {
                 return None;

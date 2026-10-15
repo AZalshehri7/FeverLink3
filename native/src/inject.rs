@@ -360,6 +360,8 @@ fn entity_diffs(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) ->
 /// copy constructor makes a copy of the donor's Proposal (read only), its `toAdd` is moved into the engine-made source, and the engine's
 /// copy of that is what is returned; the constructions' `frozenNodes` are then set from the text. The proof compares every named
 /// member, the constructions' too: a conversion that differs from the originator's in a named member is refused.
+///
+/// Calls the engine (its Proposal functions, `operator new` through `c.alloc`): never inside `log::guarded`.
 pub fn build_verified(
     c: &Ctx,
     poke: &dyn Poke,
@@ -367,6 +369,7 @@ pub fn build_verified(
     donor: Option<usize>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Built, String> {
+    crate::log::calls_engine("native inject: build_verified (the Proposal functions, operator new)");
     let lines = rebuild::lines_of(text);
     let cons = count(&lines, "toAdd.#");
     let wanted = donor_counts(text);
@@ -553,6 +556,7 @@ fn set_construction_frozen(
 
 /// Destroys a verified Proposal that was not (or no longer needs to be) handed over.
 pub fn release(c: &Ctx, mut b: Built) {
+    crate::log::calls_engine("native inject: release (the Proposal destructor)");
     // SAFETY: `build_verified` returned a constructed Proposal; it is destroyed once, here.
     unsafe { (c.fns.dtor)(b.proposal.ptr()) };
 }
@@ -643,6 +647,7 @@ pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), 
 /// `dest` is the payload of a live command whose first 0x358 bytes are a constructed `Proposal` ([`check_destination`] passed), on the
 /// thread that queues it.
 pub unsafe fn swap_into(c: &Ctx, b: &Built, dest: usize) {
+    crate::log::calls_engine("native inject: swap_into (the Proposal copy assignment)");
     // SAFETY: as the caller guarantees; the source is only read.
     unsafe { (c.fns.assign)(dest as *mut u8, b.proposal.addr() as *const u8) };
 }

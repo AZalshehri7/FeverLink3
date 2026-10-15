@@ -1,7 +1,7 @@
 //! Append-only text log in the session folder. Silent when the module runs as a plain proxy.
 //!
-//! It is also where a panic leaves its message ([`install_panic_hook`]): with `panic = "abort"` the process ends
-//! right after the hook, and this file is all that is left to say why.
+//! It is also where a panic leaves its message ([`install_panic_hook`]): a panic that nothing contains ends the
+//! process soon after the hook, and this file is all that is left to say why.
 
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
@@ -158,16 +158,31 @@ pub fn install_panic_hook() {
     }));
 }
 
+thread_local! {
+    /// How many [`guarded`] calls this thread is inside now.
+    static GUARD_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// How many times [`calls_engine`] found this thread inside [`guarded`] (the tests read it).
+    static ENGINE_IN_GUARD: Cell<u32> = const { Cell::new(0) };
+}
+
 /// Runs `f`, a piece of this module's own bookkeeping inside a hook or an exported function, so that a panic in it
 /// cannot take the game down: `None` (and a log line, the first few times) instead of the result. The panic hook has
-/// already written the message, place and backtrace. Under `panic = "abort"` there is nothing to catch and the
-/// process ends after the hook; under `unwind` this is what makes the hooks fail open.
+/// already written the message, place and backtrace. The build unwinds (root `Cargo.toml`), so this is what makes the
+/// hooks fail open.
 ///
-/// Never wrap a call into the game with it: a C++ exception of the game passing through `catch_unwind` is not a
-/// Rust panic and ends the process. Call the game outside, after the guard returns.
+/// THE RULE: `f` never calls into the game, directly or deep down (an engine function, the game's `operator new`, a
+/// tool's callback). A C++ exception of the game reaching `catch_unwind` is not a Rust panic: Rust's catch pad matches
+/// it as a foreign exception and ends the process ("Rust cannot catch foreign exceptions"), where the game's own
+/// handler would have dealt with it (the tests in `runtime/tests/foreign.rs` show both with a real C++-coded
+/// exception). Code that calls the game is split instead: the decision before it and the
+/// report after it are guarded, the calls run in plain `system-unwind` frames between them and announce themselves
+/// with [`calls_engine`].
 pub fn guarded<R>(site: &'static str, f: impl FnOnce() -> R) -> Option<R> {
     static CONTAINED: AtomicU32 = AtomicU32::new(0);
-    match catch_unwind(AssertUnwindSafe(f)) {
+    let _ = GUARD_DEPTH.try_with(|d| d.set(d.get() + 1));
+    let result = catch_unwind(AssertUnwindSafe(f));
+    let _ = GUARD_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    match result {
         Ok(r) => Some(r),
         Err(_) => {
             let n = CONTAINED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -177,6 +192,28 @@ pub fn guarded<R>(site: &'static str, f: impl FnOnce() -> R) -> Option<R> {
             None
         }
     }
+}
+
+/// Said by every piece of code just before it calls into the game, and at the entry of every function that may (see
+/// [`guarded`]). Inside a guard it is a bug of this module: a log line says where (the first few times), and the tests
+/// fail on [`engine_calls_in_guard`]. Costs one thread-local read otherwise.
+pub fn calls_engine(site: &'static str) {
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if GUARD_DEPTH.try_with(|d| d.get()).unwrap_or(0) == 0 {
+        return;
+    }
+    let _ = ENGINE_IN_GUARD.try_with(|n| n.set(n.get() + 1));
+    if REPORTED.fetch_add(1, Ordering::Relaxed) < 20 {
+        append_unlocked(&format!(
+            "BUG: {site}: a call into the game inside log::guarded; a C++ exception of the game here would end the process"
+        ));
+    }
+}
+
+/// How many calls into the game this thread announced inside [`guarded`] so far (tests).
+#[cfg(test)]
+pub fn engine_calls_in_guard() -> u32 {
+    ENGINE_IN_GUARD.with(|n| n.get())
 }
 
 #[cfg(test)]
@@ -299,5 +336,23 @@ mod tests {
         assert_eq!(none, None);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("test site: a panic was contained"), "{text}");
+    }
+
+    #[test]
+    fn a_call_into_the_game_is_flagged_only_inside_a_guard_and_a_contained_panic_leaves_the_guard() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+        let d = dir();
+        let path = d.path().join("native.log");
+        init(path.clone());
+        let before = engine_calls_in_guard();
+        calls_engine("outside");
+        let _: Option<()> = guarded("panics", || panic!("left the guard by unwinding"));
+        calls_engine("after a contained panic");
+        assert_eq!(engine_calls_in_guard(), before, "no guard is active");
+        guarded("outer", || guarded("inner", || calls_engine("nested")));
+        assert_eq!(engine_calls_in_guard(), before + 1);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("BUG: nested: a call into the game inside log::guarded"), "{text}");
+        assert!(!text.contains("BUG: outside") && !text.contains("BUG: after"), "{text}");
     }
 }

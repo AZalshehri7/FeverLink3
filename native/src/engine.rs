@@ -35,13 +35,18 @@ pub const HANDLE_SIZE: usize = 0x10;
 /// Where the apply function stores the verdict inside a `Command`.
 pub const RESULT_OFFSET: usize = 0x30;
 
+// Every function of the game is declared `system-unwind`: it is C++ and may throw. Through a plain `system` pointer an
+// exception would be undefined behaviour (the call site is compiled as one that cannot unwind: no cleanup of our
+// frame, no lock let go). And none is ever called inside `log::guarded` (see there): each caller announces it with
+// `log::calls_engine`.
+
 /// `Command::Command(Command&&)`: (destination, source) -> destination.
-pub type CommandMove = unsafe extern "system" fn(dst: *mut u8, src: *mut u8) -> *mut u8;
+pub type CommandMove = unsafe extern "system-unwind" fn(dst: *mut u8, src: *mut u8) -> *mut u8;
 /// `Command::~Command()`.
-pub type CommandDestroy = unsafe extern "system" fn(cmd: *mut u8);
+pub type CommandDestroy = unsafe extern "system-unwind" fn(cmd: *mut u8);
 /// The destructor of the handle `Add` writes through `out`.
-pub type HandleDestroy = unsafe extern "system" fn(handle: *mut u8);
-/// `CommandList::Add`. A C++ function, so declared as one that may unwind.
+pub type HandleDestroy = unsafe extern "system-unwind" fn(handle: *mut u8);
+/// `CommandList::Add`.
 pub type AddFn = unsafe extern "system-unwind" fn(
     list: *mut u8,
     out: *mut u8,
@@ -49,8 +54,8 @@ pub type AddFn = unsafe extern "system-unwind" fn(
     done: *mut u8,
     progress: *mut u8,
 ) -> *mut u8;
-type DeleteThis = unsafe extern "system" fn(this: *mut u8, dealloc: bool);
-type MoveThis = unsafe extern "system" fn(this: *mut u8, to: *mut u8) -> *mut u8;
+type DeleteThis = unsafe extern "system-unwind" fn(this: *mut u8, dealloc: bool);
+type MoveThis = unsafe extern "system-unwind" fn(this: *mut u8, to: *mut u8) -> *mut u8;
 
 /// The engine functions the hold path calls, by address.
 #[derive(Clone, Copy)]
@@ -288,13 +293,18 @@ unsafe fn destroy_function(f: *mut u8) {
 /// as an empty handle (so the caller destroys it as it would any handle). `None`, with nothing touched, when an
 /// argument is null or the command has no payload.
 ///
+/// From the moment this returns `Some`, the caller's `Add` arguments are empty: the result must reach the hold ring
+/// (or go back to the engine through [`release`]) without anything that can fail in between. Whatever the hold
+/// needs from the command is read before the capture (`Runtime::plan_add`).
+///
 /// # Safety
 /// `args` are the arguments of a live call to `CommandList::Add` on the calling thread.
-pub unsafe fn capture(fns: &EngineFns, args: &AddArgs) -> Option<Box<Held>> {
+pub unsafe extern "system-unwind" fn capture(fns: &EngineFns, args: &AddArgs) -> Option<Box<Held>> {
     if !args.complete() {
         return None;
     }
     let payload = unsafe { payload_of(args.cmd) }?;
+    crate::log::calls_engine("capture (the command's move constructor)");
     // SAFETY: Held is plain bytes and pointers, for which all-zero is a valid value.
     let mut held: Box<Held> = Box::new(unsafe { core::mem::zeroed() });
     held.list = args.list;
@@ -315,13 +325,14 @@ pub unsafe fn capture(fns: &EngineFns, args: &AddArgs) -> Option<Box<Held>> {
 /// Hands a held command to the engine: `Add` with the held arguments, then the destructors of the handle it
 /// returned and of the moved-from command, exactly what a tool does after its own call.
 ///
-/// `system-unwind`: `Add` is a C++ function and can throw. Under `panic = "abort"` a plain Rust function that calls it
-/// ends the process when the exception comes through (`panic in a function that cannot unwind`); this one lets it pass.
+/// `system-unwind`: `Add` is a C++ function and can throw, and the exception must pass this frame as any other (it is
+/// never called inside `log::guarded`).
 ///
 /// # Safety
 /// `add` is the unhooked `CommandList::Add`; the list the command was taken for must still exist.
 #[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be handed back only once
 pub unsafe extern "system-unwind" fn release(fns: &EngineFns, mut held: Box<Held>, add: AddFn) {
+    crate::log::calls_engine("release (Add)");
     let mut out = Room::<HANDLE_SIZE>([0; HANDLE_SIZE]);
     unsafe {
         add(
@@ -371,6 +382,7 @@ unsafe extern "system-unwind" fn fire_done(fns: &EngineFns, held: &mut Held) -> 
 /// As for [`release`], without `add`.
 #[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be destroyed only once
 pub unsafe extern "system-unwind" fn discard(fns: &EngineFns, mut held: Box<Held>) -> bool {
+    crate::log::calls_engine("discard (callback, destructors)");
     unsafe {
         let fired = fire_done(fns, &mut held);
         (fns.command_destroy)(held.cmd.0.as_mut_ptr());
@@ -436,6 +448,7 @@ pub unsafe fn adopt_result(held: &mut Held, applied: *mut u8) -> Adopted {
 /// As for [`release`], without `add`.
 #[allow(clippy::boxed_local)] // taking the Box is the point: a held command can be destroyed only once
 pub unsafe extern "system-unwind" fn complete(fns: &EngineFns, mut held: Box<Held>) -> bool {
+    crate::log::calls_engine("complete (callback, destructors)");
     unsafe {
         let fired = match done_call_target(held.done.0.as_ptr()) {
             Some(target) => {
@@ -471,7 +484,7 @@ mod tests {
         LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 
-    unsafe extern "system" fn fake_move(dst: *mut u8, src: *mut u8) -> *mut u8 {
+    unsafe extern "system-unwind" fn fake_move(dst: *mut u8, src: *mut u8) -> *mut u8 {
         // the real one copies the fields and empties the source (the result byte is copied, not cleared)
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, COMMAND_SIZE);
@@ -481,13 +494,13 @@ mod tests {
         dst
     }
 
-    unsafe extern "system" fn fake_destroy(cmd: *mut u8) {
+    unsafe extern "system-unwind" fn fake_destroy(cmd: *mut u8) {
         let payload = unsafe { *(cmd as *const usize) };
         log(format!("destroy command payload={}", payload != 0));
         unsafe { core::ptr::write_bytes(cmd, 0, COMMAND_SIZE) };
     }
 
-    unsafe extern "system" fn fake_handle_destroy(h: *mut u8) {
+    unsafe extern "system-unwind" fn fake_handle_destroy(h: *mut u8) {
         log(format!("destroy handle empty={}", unsafe { *(h as *const u64) } == 0));
     }
 
@@ -511,15 +524,15 @@ mod tests {
     }
 
     // a fake MSVC std::function: the callable has a vtable with the five slots of `_Func_base`
-    unsafe extern "system" fn vt_copy(_this: *mut u8, _to: *mut u8) -> *mut u8 {
+    unsafe extern "system-unwind" fn vt_copy(_this: *mut u8, _to: *mut u8) -> *mut u8 {
         core::ptr::null_mut()
     }
-    unsafe extern "system" fn vt_move(this: *mut u8, to: *mut u8) -> *mut u8 {
+    unsafe extern "system-unwind" fn vt_move(this: *mut u8, to: *mut u8) -> *mut u8 {
         log("callable moved");
         unsafe { core::ptr::copy_nonoverlapping(this, to, 0x38) };
         to
     }
-    unsafe extern "system" fn vt_call(this: *mut u8, cmd: *mut u8) -> usize {
+    unsafe extern "system-unwind" fn vt_call(this: *mut u8, cmd: *mut u8) -> usize {
         // the tool's completion callback: logs the command it was given and its result byte
         log(format!("callback called payload={} result={}", unsafe { *(cmd as *const usize) } != 0, unsafe {
             *cmd.add(RESULT_OFFSET)
@@ -527,8 +540,8 @@ mod tests {
         let _ = this;
         0
     }
-    unsafe extern "system" fn vt_type(_this: *mut u8) {}
-    unsafe extern "system" fn vt_delete(this: *mut u8, dealloc: bool) {
+    unsafe extern "system-unwind" fn vt_type(_this: *mut u8) {}
+    unsafe extern "system-unwind" fn vt_delete(this: *mut u8, dealloc: bool) {
         log(format!("callable deleted dealloc={dealloc}"));
         if dealloc {
             // the heap callable made by `heap_function` is a leaked Box<[u8; 16]>

@@ -162,7 +162,14 @@ What unwinding buys besides: every thread root that matters runs through `launch
 step, the host and player session threads, the connection readers, each cycle of the shared Steam poller, the loopback
 check; `DllMain` has its own `catch_unwind`), which now turns a panic into a log line, a stopped session
 (`Controller::recover`, `Status::error`) and a controller that carries on; the hooks' bookkeeping and the service
-thread's pump run through `native::log::guarded` and fail open (the game's call is made all the same). One loose end:
+thread's pump run through `native::log::guarded` and fail open (the game's call is made all the same). A guard never
+wraps a call into the game (2026-10-15): `catch_unwind` ends the process on a C++ exception ("Rust cannot catch foreign
+exceptions"), so every path that calls the engine (the capture's move constructor, the injection's `Proposal` functions,
+the game's `operator new`) is split into a guarded decision, the calls in plain `system-unwind` frames, and a guarded
+report; each call announces itself (`native::log::calls_engine`, a `BUG:` line in `native.log` if one ever runs inside
+a guard). A real C++ throw record is raised through the add hook in a child process by
+`native/src/runtime/tests/foreign.rs`. The price: a panic in our own code between two engine calls is no longer
+contained; it passes to the game's handler like the game's own exceptions. One loose end:
 the window shows a player session's `Status::error`, but not yet that a host session's thread ended.
 
 The roadmap's plan to shrink the DLL to tens of kilobytes with `no_std` has no unwinding at all, which makes the

@@ -255,6 +255,8 @@ impl MaskInfo {
 /// source (a memcpy of a whole element, padding included, puts the same residue into both scratch copies, so it looks carried). It
 /// works for the bytes the copy constructor leaves alone (gaps of the Proposal object, unconstructed padding). Nothing may therefore
 /// rest on it for the unnamed words of a construction entity: that proof rests on named members only (and on b45).
+///
+/// Calls the engine: never inside `log::guarded` (the text of the two copies in between is guarded here).
 pub fn residue_mask(
     fns: &ProposalFns,
     mem: &dyn Mem,
@@ -270,6 +272,7 @@ pub fn residue_mask(
     let mut b = Scratch::new();
     b.bytes_mut().fill(0xFF);
     say("native inject: residue mask: calling the engine copy constructor twice (scratch prefilled 0x00 and 0xFF)");
+    crate::log::calls_engine("residue mask (the Proposal copy constructor and destructor)");
     // SAFETY: `held` is a live payload (only read by a copy constructor); the destinations are scratch buffers.
     unsafe {
         (fns.copy)(a.ptr(), held as *const u8);
@@ -301,8 +304,12 @@ pub fn residue_mask(
         )?;
         Ok(cell.into_inner())
     };
-    let ra = collect(&a);
-    let rb = collect(&b);
+    // reading the copies is ours: contained, so that the copies are destroyed whatever happens to it
+    let regions = crate::log::guarded("residue mask (text)", || (collect(&a), collect(&b)));
+    let (ra, rb) = regions.unwrap_or_else(|| {
+        let e = || Err("a panic was contained while the copies were read".to_string());
+        (e(), e())
+    });
     say("native inject: residue mask: calling the engine destructor on both copies");
     // SAFETY: both were constructed above and are destroyed once, on every path.
     unsafe {
@@ -359,15 +366,21 @@ fn verdict(named_diff: Result<usize, &str>, what: &str) -> String {
     }
 }
 
+/// The text of a scratch Proposal. Reads only, and is contained (`log::guarded`): its callers hold engine objects that must be
+/// destroyed whatever happens to the text.
 pub(crate) fn encode_scratch(c: &Ctx, s: &Scratch, event: &str) -> Result<String, String> {
     let head =
         Header { seq: 0, event, hold_id: None, site_rva: None, tool: None, t_ms: 0, wall_ms: 0, payload: s.addr() };
-    portable::encode(c.mem, Env { image_base: c.base }, c.set, c.build_name, &head).map(|p| p.text)
+    crate::log::guarded("scratch text", || {
+        portable::encode(c.mem, Env { image_base: c.base }, c.set, c.build_name, &head).map(|p| p.text)
+    })
+    .unwrap_or_else(|| Err("a panic was contained while the object was written as text".into()))
 }
 
 /// The three steps for the held command whose payload is at `src`. `say` receives each line as soon as it is known; the
-/// lines before an engine call say what is about to be called.
+/// lines before an engine call say what is about to be called. Calls the engine: never inside `log::guarded`.
 pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
+    crate::log::calls_engine("native copy steps (the Proposal functions)");
     let mut out = String::new();
     let mut put = |out: &mut String, line: &str| {
         out.push_str(line);

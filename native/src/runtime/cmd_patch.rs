@@ -63,8 +63,33 @@ impl Runtime {
 
     /// The command list's `Add` of a command that was not held: if an order is armed and this is a script `build_proposal`, carries it
     /// out (once). Runs before the original `Add`, on the thread that queues commands.
+    ///
+    /// The write allocates with the game's `operator new`, so this runs outside `log::guarded` and guards the decision and the report
+    /// itself: never call it inside a guard.
     pub(super) fn patch_add(&self, args: &AddArgs, caller: Option<usize>) {
-        let Some(kind_offset) = self.build.kind_offset else { return };
+        crate::log::calls_engine("native patch: an order may be carried out (operator new)");
+        let job = crate::log::guarded("native patch: order", || self.patch_take(args, caller)).flatten();
+        let Some((order, payload)) = job else { return };
+        let result = match self.patch_alloc() {
+            Err(why) => Err(why),
+            Ok(alloc) => cp::apply(&crate::dump::LiveMem, &LivePoke, &alloc, payload, &order),
+        };
+        crate::log::guarded("native patch: result", || {
+            match result {
+                Ok(done) => self.patch.report(Event::Patched {
+                    frozen: done.frozen,
+                    adds: u32::try_from(done.nodes).unwrap_or(u32::MAX),
+                    allocated: done.allocated,
+                }),
+                Err(reason) => self.patch.report(Event::PatchRefused { reason }),
+            }
+            self.wake();
+        });
+    }
+
+    /// The decision of [`Runtime::patch_add`]: the order and the command's payload when the order is to be carried out now.
+    fn patch_take(&self, args: &AddArgs, caller: Option<usize>) -> Option<(cp::Order, usize)> {
+        let kind_offset = self.build.kind_offset?;
         // SAFETY: only readable memory is read.
         let kind = unsafe { engine::command_kind(args.cmd, kind_offset as usize) };
         let is_bp = kind.is_some() && self.build.kind_by_name("build_proposal") == kind;
@@ -75,7 +100,7 @@ impl Runtime {
             self.patch.saw_add(rec, is_bp, tool.is_some(), armed);
         }
         if !is_bp {
-            return; // another kind of command: the order keeps waiting
+            return None; // another kind of command: the order keeps waiting
         }
         // a command of a construction tool is never the mod's (the tool's own commands are held or pass untouched)
         if tool.is_some() {
@@ -84,19 +109,19 @@ impl Runtime {
                     self.patch.report(Event::PatchSkipped { reason, kind, site });
                 }
             }
-            return;
+            return None;
         }
         // the mod writes `patch_next` and then sends the command: the order may still be in the file (the service thread has not
         // read it, holding may be off so the hold path did not look, the machine's lock may be taken)
         if !self.patch.pending() {
             self.ingest_patch_order(self.now_ms());
             if !self.patch.pending() {
-                return;
+                return None;
             }
         }
         let now = self.now_ms();
         let converted = self.patch.converted();
-        let Some(order) = self.patch.take(now) else { return };
+        let order = self.patch.take(now)?;
         if converted > 0 {
             // the conversion hook already wrote the order into the proposal(s) this build converted; the command made from one of
             // them is here, so the order is done (nothing is written a second time)
@@ -104,47 +129,50 @@ impl Runtime {
                 "native patch: a build_proposal Add arrived (call site rva {:x?}) after {converted} patched conversion(s): the order is cleared",
                 site
             ));
-            return;
+            return None;
         }
         // SAFETY: only readable memory is read.
         let Some(payload) = (unsafe { engine::payload_of(args.cmd) }) else {
             self.patch.report(Event::PatchRefused { reason: "the command has no payload".into() });
-            return;
+            return None;
         };
-        let result = match self.patch_alloc() {
-            Err(why) => Err(why),
-            Ok(alloc) => cp::apply(&crate::dump::LiveMem, &LivePoke, &alloc, payload, &order),
-        };
-        match result {
-            Ok(done) => self.patch.report(Event::Patched {
-                frozen: done.frozen,
-                adds: u32::try_from(done.nodes).unwrap_or(u32::MAX),
-                allocated: done.allocated,
-            }),
-            Err(reason) => self.patch.report(Event::PatchRefused { reason }),
-        }
-        self.wake();
+        Some((order, payload))
     }
 
     /// Before the construction update inside `Convert` runs: `proposal` is the Proposal being built (it holds the SimpleProposal's
     /// nodes and segments, not yet the construction's entrance). While an order is armed and describes it (the index form's `adds` is
     /// the count of nodes the SimpleProposal brought), `proposal.frozenNodes` is written, so that the update sees the nodes the tool's
     /// own proposal froze. Returns whether anything was armed (the caller then logs what the update left).
+    ///
+    /// The write allocates with the game's `operator new`: this guards its decision and its report itself and must not be called
+    /// inside `log::guarded`.
     pub fn before_convert_update(&self, proposal: usize) -> bool {
-        let now = self.now_ms();
-        if !self.patch.pending() {
-            self.ingest_patch_order(now);
+        crate::log::calls_engine("native patch: convert update (operator new)");
+        let job = crate::log::guarded("native patch: convert update", || {
+            let now = self.now_ms();
             if !self.patch.pending() {
-                return false;
+                self.ingest_patch_order(now);
+                if !self.patch.pending() {
+                    return None;
+                }
             }
-        }
-        let Some(order) = self.patch.peek(now) else { return false };
-        let mem = crate::dump::LiveMem;
-        let nodes = cp::added_nodes(&mem, proposal).map_or("?".to_string(), |n| n.to_string());
-        let outcome = cp::describes_frozen_only(&mem, proposal, &order).and_then(|()| match self.patch_alloc() {
-            Err(why) => Err(cp::Fail::Refuse(why)),
-            Ok(alloc) => cp::apply_proposal_frozen_only(&mem, &LivePoke, &alloc, proposal, &order),
+            let order = self.patch.peek(now)?;
+            let nodes = cp::added_nodes(&crate::dump::LiveMem, proposal).map_or("?".to_string(), |n| n.to_string());
+            let fits = cp::describes_frozen_only(&crate::dump::LiveMem, proposal, &order);
+            Some((now, order, nodes, fits))
         });
+        let Some((now, order, nodes, fits)) = job.flatten() else { return false };
+        let outcome = fits.and_then(|()| match self.patch_alloc() {
+            Err(why) => Err(cp::Fail::Refuse(why)),
+            Ok(alloc) => cp::apply_proposal_frozen_only(&crate::dump::LiveMem, &LivePoke, &alloc, proposal, &order),
+        });
+        crate::log::guarded("native patch: convert update (result)", || {
+            self.convert_update_report(now, &nodes, outcome)
+        });
+        true
+    }
+
+    fn convert_update_report(&self, now: u64, nodes: &str, outcome: Result<cp::Done, cp::Fail>) {
         match outcome {
             Ok(done) => {
                 self.patch.converted_one();
@@ -174,7 +202,6 @@ impl Runtime {
             }
         }
         self.wake();
-        true
     }
 
     /// After the construction update: what the proposal holds now (a dump per distinct shape), to see whether the update honoured the
@@ -206,36 +233,59 @@ impl Runtime {
     /// order describes (same number of added nodes, one construction at least) gets its frozenNodes written, before anything checks
     /// it. The order stays armed (the mod's dry verdict and the build convert separately, and the command's `Add` clears it);
     /// a conversion the order does not describe leaves both alone. Every call while an order is armed is in `native.log`.
+    ///
+    /// The write allocates with the game's `operator new`: this guards its decision and its report itself and must not be called
+    /// inside `log::guarded`.
     pub fn on_convert(&self, out: usize, caller: Option<usize>) {
-        let now = self.now_ms();
-        if !self.patch.pending() {
-            // the mod writes `patch_next` and calls the engine in the same breath: look at the file now
-            self.ingest_patch_order(now);
+        crate::log::calls_engine("native patch: convert (operator new)");
+        let job = crate::log::guarded("native patch: convert", || {
+            let now = self.now_ms();
             if !self.patch.pending() {
-                return;
+                // the mod writes `patch_next` and calls the engine in the same breath: look at the file now
+                self.ingest_patch_order(now);
+                if !self.patch.pending() {
+                    return None;
+                }
             }
-        }
-        let Some(order) = self.patch.peek(now) else { return }; // expired: the service thread reports it
-        let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
-        let at = site.map_or("?".to_string(), |r| format!("{r:x}"));
-        let mem = crate::dump::LiveMem;
-        let flag = crate::dump::Mem::read(&mem, out + cp::PROPOSAL_SIZE, 1).map(|b| b[0]);
-        let nodes = cp::added_nodes(&mem, out).map_or("?".to_string(), |n| n.to_string());
-        // what this conversion produced, once per distinct shape (the engine's own frozenNodes lists show whether it fills them)
-        let (shape, dump) = cp::dump_proposal(&mem, out, flag);
-        if self.patch.new_shape(&shape) {
-            self.say(&format!("native patch: convert: call site rva {at}: {dump}"));
-            self.patch.convert_event(Event::ConvertDump { text: format!("call site rva {at}: {dump}") });
-        }
-        let outcome: Result<cp::Done, cp::Fail> = match flag {
-            None => Err(cp::Fail::NotThis("the result is not readable".into())),
-            Some(0) => Err(cp::Fail::NotThis("Convert produced no proposal (the conversion failed)".into())),
-            // the order must describe this proposal before the allocator matters: another conversion is none of its business
-            Some(_) => cp::describes(&mem, out, &order).and_then(|()| match self.patch_alloc() {
-                Err(why) => Err(cp::Fail::Refuse(why)),
-                Ok(alloc) => cp::apply_proposal(&mem, &LivePoke, &alloc, out, &order),
-            }),
-        };
+            let order = self.patch.peek(now)?; // expired: the service thread reports it
+            let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
+            let at = site.map_or("?".to_string(), |r| format!("{r:x}"));
+            let mem = crate::dump::LiveMem;
+            let flag = crate::dump::Mem::read(&mem, out + cp::PROPOSAL_SIZE, 1).map(|b| b[0]);
+            let nodes = cp::added_nodes(&mem, out).map_or("?".to_string(), |n| n.to_string());
+            // what this conversion produced, once per distinct shape (the engine's own frozenNodes lists show whether it fills them)
+            let (shape, dump) = cp::dump_proposal(&mem, out, flag);
+            if self.patch.new_shape(&shape) {
+                self.say(&format!("native patch: convert: call site rva {at}: {dump}"));
+                self.patch.convert_event(Event::ConvertDump { text: format!("call site rva {at}: {dump}") });
+            }
+            let fits: Result<(), cp::Fail> = match flag {
+                None => Err(cp::Fail::NotThis("the result is not readable".into())),
+                Some(0) => Err(cp::Fail::NotThis("Convert produced no proposal (the conversion failed)".into())),
+                // the order must describe this proposal before the allocator matters: another conversion is none of its business
+                Some(_) => cp::describes(&mem, out, &order),
+            };
+            Some((now, order, site, at, nodes, fits))
+        });
+        let Some((now, order, site, at, nodes, fits)) = job.flatten() else { return };
+        let outcome = fits.and_then(|()| match self.patch_alloc() {
+            Err(why) => Err(cp::Fail::Refuse(why)),
+            Ok(alloc) => cp::apply_proposal(&crate::dump::LiveMem, &LivePoke, &alloc, out, &order),
+        });
+        crate::log::guarded("native patch: convert (result)", || {
+            self.convert_report(now, &order, site, &at, &nodes, outcome)
+        });
+    }
+
+    fn convert_report(
+        &self,
+        now: u64,
+        order: &cp::Order,
+        site: Option<u32>,
+        at: &str,
+        nodes: &str,
+        outcome: Result<cp::Done, cp::Fail>,
+    ) {
         match outcome {
             Ok(done) => {
                 self.patch.converted_one();
