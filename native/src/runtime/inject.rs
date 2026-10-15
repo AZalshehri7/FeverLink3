@@ -20,7 +20,7 @@ impl Runtime {
         // blocks) is neither written nor needed
         let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], typed: true, ..settings });
         self.inject.enable();
-        self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and an inject_next order makes the next script build_proposal take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
+        self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and each inject_next order (queued in the mod's order) makes its own script build_proposal (matched by the text's place or constructions) take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
     }
 
     pub(super) fn inject_dir(&self, dir: &std::path::Path) {
@@ -161,9 +161,11 @@ impl Runtime {
         !held
     }
 
-    /// The orders for a script `build_proposal` the simulation is about to apply (see [`Runtime::note_apply_orders`]). Calls the engine
-    /// when an order is carried out: never call it inside `log::guarded`.
-    pub(super) fn apply_orders(&self, cmd: *mut u8) {
+    /// The orders for a script `build_proposal` the simulation is about to apply (see [`Runtime::note_apply_orders`]): what the command
+    /// list's `Add` already did for it ([`Runtime::take_added`]), else the waiting order it is matched to. The result goes to
+    /// [`Runtime::after_ordered_apply`] once the simulation has applied the command. Calls the engine when an order is carried out:
+    /// never call it inside `log::guarded`.
+    pub(super) fn apply_orders(&self, cmd: *mut u8) -> Option<Used> {
         crate::log::calls_engine("apply orders");
         let args = AddArgs {
             list: core::ptr::null_mut(),
@@ -173,22 +175,97 @@ impl Runtime {
             progress: core::ptr::null_mut(),
         };
         if self.inject.enabled() {
-            self.inject_add(&args, None);
-        } else if self.patch.enabled() {
+            // a command the interface half added took its order at the Add: it never takes a second one here
+            if let Some(used) = crate::log::guarded("native inject: added", || self.take_added(cmd)).flatten() {
+                return Some(used);
+            }
+            return self.inject_add(&args, None);
+        }
+        if self.patch.enabled() {
             self.patch_add(&args, None);
+        }
+        None
+    }
+
+    /// The command list's `Add` of a command that was not held (the interface half's script commands): an order matched to it is
+    /// carried out now, and what it needs after the simulation's apply is kept with the command's identity (see [`Added`]).
+    pub(super) fn inject_on_add(&self, args: &AddArgs, caller: Option<usize>) {
+        crate::log::calls_engine("native inject: an order may be carried out at Add");
+        let Some(used) = self.inject_add(args, caller) else { return };
+        crate::log::guarded("native inject: keep for the apply", || {
+            // SAFETY: only readable memory is read.
+            let Some(payload) = (unsafe { engine::payload_of(args.cmd) }) else { return };
+            let identity = inj::identity(&LiveMem, payload);
+            let now = self.now_ms();
+            let mut added = super::lock(&self.added);
+            self.prune_added(&mut added, now);
+            match identity {
+                Ok(identity) => {
+                    added.insert(used.seq, Added { payload, identity, at_ms: now, used });
+                }
+                Err(why) => {
+                    drop(added);
+                    self.say(&format!(
+                        "native inject: key {}: the command cannot be recognised at its apply ({why}): no timing, and held command {} fails",
+                        used.timing.key,
+                        used.link.unwrap_or(0)
+                    ));
+                    if let Some(held) = used.link {
+                        self.inject.fail_held(held);
+                    }
+                }
+            }
+        });
+    }
+
+    /// The command `cmd` the simulation is about to apply is one the command list's `Add` carried an order out on: the same payload AND
+    /// the same identity as after the order ([`inj::identity`]; a payload address the engine freed and gave to another command is not
+    /// the same command). Takes its record.
+    fn take_added(&self, cmd: *mut u8) -> Option<Used> {
+        let mut added = super::lock(&self.added);
+        if added.is_empty() {
+            return None;
+        }
+        self.prune_added(&mut added, self.now_ms());
+        // SAFETY: only readable memory is read.
+        let payload = unsafe { engine::payload_of(cmd) }?;
+        let seq = {
+            let mut same = added.iter().filter(|(_, a)| a.payload == payload);
+            let first = same.next()?;
+            let identity = inj::identity(&LiveMem, payload).ok()?;
+            std::iter::once(first).chain(same).find(|(_, a)| a.identity == identity).map(|(s, _)| *s)?
+        };
+        added.remove(&seq).map(|a| a.used)
+    }
+
+    /// Drops the records of commands the simulation never applied within [`inj::MAX_TTL_MS`] (the command list was discarded, a load):
+    /// their held command fails (tool callback fired) rather than waiting for the age limit.
+    fn prune_added(&self, added: &mut std::collections::BTreeMap<u64, Added>, now: u64) {
+        let old: Vec<u64> =
+            added.iter().filter(|(_, a)| now.saturating_sub(a.at_ms) > inj::MAX_TTL_MS).map(|(s, _)| *s).collect();
+        for seq in old {
+            let Some(a) = added.remove(&seq) else { continue };
+            self.say(&format!(
+                "native inject: key {}: the command the order was used for at Add was not applied within {} ms: dropped",
+                a.used.timing.key,
+                inj::MAX_TTL_MS
+            ));
+            if let Some(held) = a.used.link {
+                self.inject.fail_held(held);
+            }
         }
     }
 
-    /// The command list's `Add` of a command that was not held: if an order is armed and this is a script `build_proposal`, carries it
-    /// out (once). Runs before the original `Add`, on the thread that queues commands.
+    /// Matches the command to a waiting order and carries it out: if this is a script `build_proposal` and one of the waiting orders
+    /// identifies it, that order is used (once). Runs before the original `Add` or apply, on the thread that queues or applies it.
     ///
     /// Carrying the order out calls the engine (its Proposal functions and `operator new`, [`Runtime::inject_engine`]), so this runs
     /// outside `log::guarded`: the decision before ([`Runtime::inject_take`]) and the report after ([`Runtime::inject_finish`]) are
     /// guarded, the engine part is not. Never call it inside a guard.
-    pub(super) fn inject_add(&self, args: &AddArgs, caller: Option<usize>) {
+    pub(super) fn inject_add(&self, args: &AddArgs, caller: Option<usize>) -> Option<Used> {
         crate::log::calls_engine("native inject: an order may be carried out");
         let job = crate::log::guarded("native inject: order", || self.inject_take(args, caller)).flatten();
-        let Some(InjectJob { order, dest, link, t0, rb0, prepared }) = job else { return };
+        let InjectJob { order, dest, t0, rb0, prepared } = job?;
         let forced = order.forced.clone();
         let run = match prepared {
             // the same parsing and build first as a dry pass inside a guard: a panic of ours on the peer's text is a refusal
@@ -207,9 +284,10 @@ impl Runtime {
         };
         // Fail closed: an order refused on a command that took it (the mod's, as far as the identity checks can tell) empties that command,
         // so this game applies nothing of the build rather than the placeholder (this game's own rebuild of the record, not the build).
-        let refused = !order.link_only && matches!(&run, Err(why) if !inj::keeps_waiting(why));
+        // The order was matched to this command by its identity before (inject_take), so every error here is a refusal.
+        let refused = !order.link_only && run.is_err();
         let outcome = refused.then(|| self.inject_neutralise(order.key, dest));
-        crate::log::guarded("native inject: result", || self.inject_finish(order, dest, link, (t0, rb0), run, outcome));
+        crate::log::guarded("native inject: result", || self.inject_finish(order, (t0, rb0), run, outcome))
     }
 
     /// The engine's Proposal functions; a test sets stand-ins (`TEST_FNS`).
@@ -247,8 +325,13 @@ impl Runtime {
         }
     }
 
-    /// The decision of [`Runtime::inject_add`]: whether an order is used for this command, and everything the injection needs that does
-    /// not call the engine (the side file, the destination's checks). `None` when there is nothing to do.
+    /// The decision of [`Runtime::inject_add`]: which waiting order this command is, and everything the injection needs that does not
+    /// call the engine (the side file, the destination's checks). `None` when it is no waiting order's command.
+    ///
+    /// The waiting orders are tried in the order the mod wrote them, and the first whose identity check the command passes is used: an
+    /// `inject_next` by its text ([`Runtime::inject_prepare`], `inject::same_build`), a `complete_next` by its held command
+    /// ([`Runtime::same_as_held`]). An order the command fails, or whose identity cannot be told, keeps waiting; a command that is no
+    /// order's passes untouched.
     fn inject_take(&self, args: &AddArgs, caller: Option<usize>) -> Option<InjectJob> {
         let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
         if site.and_then(|rva| self.build.ui_site_index(rva)).is_some() {
@@ -258,52 +341,77 @@ impl Runtime {
         // SAFETY: only readable memory is read.
         let kind = unsafe { engine::command_kind(args.cmd, kind_offset as usize) }?;
         if self.build.kind_by_name("build_proposal") != Some(kind) {
-            return None; // another kind of command: the order keeps waiting
+            return None; // another kind of command: the orders keep waiting
         }
         let now = self.now_ms();
+        // the mod writes an order and sends its command in the same breath, possibly several in one step: whatever the file holds now
+        // is armed before the command is matched (even with orders waiting, this command's may be the newest line)
+        self.ingest_patch_order(now);
         if !self.inject.pending() {
-            // the mod writes `inject_next` and sends the command in the same breath: look at the file now
-            self.ingest_patch_order(now);
-            if !self.inject.pending() {
-                return None;
-            }
-        }
-        let Some(order) = self.inject.take(now) else {
-            self.wake();
             return None;
-        };
+        }
         // SAFETY: only readable memory is read.
-        let Some(dest) = (unsafe { engine::payload_of(args.cmd) }) else {
-            self.inject.refuse(
+        let dest = unsafe { engine::payload_of(args.cmd) }?; // no payload: no order can tell it is its command
+        for order in self.inject.waiting(now) {
+            let prepared = if order.link_only {
+                match self.same_as_held(order.held, dest) {
+                    Ok(()) => None,
+                    Err(why) => {
+                        self.say(&format!(
+                            "native inject: complete_next held {}: {why}; the order waits for its own command",
+                            order.held
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                match self.inject_prepare(order.key, dest) {
+                    Err(why) if inj::keeps_waiting(&why) => {
+                        self.say(&format!(
+                            "native inject: key {}: {why}; the order waits for its own command",
+                            order.key
+                        ));
+                        continue;
+                    }
+                    p => Some(p),
+                }
+            };
+            // expired between the two looks: it was refused, the command is not its any more
+            let Some(order) = self.inject.take(order.seq) else { continue };
+            self.say(&format!(
+                "native inject: order {} (key {}, held {}) is this command's ({} order(s) still wait)",
+                order.seq,
                 order.key,
                 order.held,
-                inj::Outcome::NoCommand,
-                format!("key {}: the command has no payload", order.key),
-            );
-            self.inject.fail_held(order.held);
-            self.wake();
-            return None;
-        };
-        // a deferred held command of the same build takes this command's result once the simulation has applied it, when it was injected
-        // (or `complete_next`); a refused order fails the held command instead (inject_finish), as the emptied command carries no build
-        let link = (order.held != 0).then_some((dest, order.held));
-        let t0 = std::time::Instant::now();
-        let rb0 = wall_ms();
-        let prepared = (!order.link_only).then(|| self.inject_prepare(order.key, dest));
-        Some(InjectJob { order, dest, link, t0, rb0, prepared })
+                self.inject.waiting_count()
+            ));
+            return Some(InjectJob { order, dest, t0: std::time::Instant::now(), rb0: wall_ms(), prepared });
+        }
+        None
     }
 
-    /// The report of [`Runtime::inject_add`]: the log lines, the event, the timing record and the deferred link.
+    /// A `complete_next` names no text: the script's command is its build when it builds what this game's own held command `held` of
+    /// the build builds ([`inj::same_command`]). Reads the held command under the machine's lock (it cannot be destroyed meanwhile).
+    fn same_as_held(&self, held: u64, dest: usize) -> Result<(), String> {
+        let machine = super::lock(&self.machine);
+        let Some(h) = machine.handle_of(held) else {
+            return Err(format!("{}held command {held} is not held here", inj::UNKNOWN));
+        };
+        inj::same_command(&LiveMem, h.payload(), dest)
+    }
+
+    /// The report of [`Runtime::inject_add`]: the log lines, the event, and what the apply of the command needs (its timing record,
+    /// the deferred held command that takes its result).
     fn inject_finish(
         &self,
         order: inj::Order,
-        dest: usize,
-        link: Option<(usize, u64)>,
         (t0, rb0): (std::time::Instant, u64),
         run: Result<(u64, u64, u64), String>,
         outcome: Option<inj::Outcome>,
-    ) {
-        let mut link = link;
+    ) -> Used {
+        // a deferred held command of the same build takes this command's result once the simulation has applied it, when it was injected
+        // (or `complete_next`); a refused order fails the held command instead, as the emptied command carries no build
+        let mut link = (order.held != 0).then_some(order.held);
         let mut how = "injected";
         match run {
             Err(why) if order.link_only && why.is_empty() => {
@@ -320,15 +428,6 @@ impl Runtime {
                     t0.elapsed().as_millis()
                 ));
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
-            }
-            Err(why) if inj::keeps_waiting(&why) => {
-                self.say(&format!(
-                    "native inject: key {}: {why}; the order waits for the next build_proposal",
-                    order.key
-                ));
-                self.inject.put_back(order);
-                self.wake();
-                return;
             }
             Err(why) => {
                 // the short reason goes to the log and the event; the full report (every unresolved pointer, every differing line) to a file
@@ -373,40 +472,44 @@ impl Runtime {
                 link = None;
             }
         }
-        *super::lock(&self.stamp_timing) = Some(StampTiming {
-            payload: dest,
-            key: order.key,
-            held: order.held,
-            tm: order.tm.clone(),
-            rebuild: format!(
-                "rebuild={rb0}..{} rebuild_ms={:.1} how={how}",
-                wall_ms(),
-                t0.elapsed().as_secs_f64() * 1000.0
-            ),
-        });
-        if let Some((payload, held)) = link {
+        if let Some(held) = link {
             self.say(&format!(
                 "native inject: key {}: held command {held} completes with this command's result after the apply",
                 order.key
             ));
-            *super::lock(&self.defer_link) = Some((payload, held));
         }
         self.wake();
+        Used {
+            seq: order.seq,
+            timing: StampTiming {
+                key: order.key,
+                held: order.held,
+                tm: order.tm,
+                rebuild: format!(
+                    "rebuild={rb0}..{} rebuild_ms={:.1} how={how}",
+                    wall_ms(),
+                    t0.elapsed().as_secs_f64() * 1000.0
+                ),
+            },
+            link,
+        }
     }
 
-    /// After the simulation applied `cmd`: when it is the command an order was used for, one `timing apply` record with the mod's timing
-    /// text, the rebuild's times and the apply's wall-clock time (the mod writes it into its trace as the build's timing line).
-    pub(super) fn timing_after_apply(&self, cmd: *mut u8) {
+    /// After the simulation applied `cmd`, the command an order was used for ([`Runtime::apply_orders`] handed `used` over within the
+    /// same apply: no lookup by address): its timing record, then its deferred held command takes its result.
+    pub(super) fn after_ordered_apply(&self, cmd: *mut u8, used: Used) {
+        // the timing first: the deferred completion swaps the applied command's payload with the held one's (plain memory, no engine call:
+        // `engine::adopt_result`)
+        crate::log::guarded("apply hook (timing)", || self.timing_after_apply(cmd, &used.timing));
+        if let Some(held) = used.link {
+            crate::log::guarded("apply hook (deferred completion)", || self.complete_deferred(cmd, held));
+        }
+    }
+
+    /// One `timing apply` record with the mod's timing text, the rebuild's times and the apply's wall-clock time (the mod writes it into
+    /// its trace as the build's timing line).
+    fn timing_after_apply(&self, cmd: *mut u8, t: &StampTiming) {
         // SAFETY: only readable memory is read.
-        let Some(payload) = (unsafe { engine::payload_of(cmd) }) else { return };
-        let t = {
-            let mut g = super::lock(&self.stamp_timing);
-            match &*g {
-                Some(t) if t.payload == payload => g.take(),
-                _ => None,
-            }
-        };
-        let Some(t) = t else { return };
         let ok = unsafe { engine::command_result(cmd) }.unwrap_or(false);
         let detail = format!("{} {} apply={} accepted={ok}", t.tm, t.rebuild, wall_ms());
         let id = if t.held != 0 { t.held } else { t.key };
@@ -414,19 +517,9 @@ impl Runtime {
         self.wake();
     }
 
-    /// After the simulation applied `cmd` (simulation thread): when it is the script command a deferred held command waits for, the held
+    /// After the simulation applied `cmd` (simulation thread), the script command deferred held command `held` waits for: the held
     /// command takes its result and is due for completion (its tool callback is fired at the next `Add`, on the interface thread).
-    pub(super) fn complete_deferred(&self, cmd: *mut u8) {
-        // SAFETY: only readable memory is read.
-        let Some(payload) = (unsafe { engine::payload_of(cmd) }) else { return };
-        let link = {
-            let mut g = super::lock(&self.defer_link);
-            match *g {
-                Some((p, _)) if p == payload => g.take(),
-                _ => None,
-            }
-        };
-        let Some((_, held)) = link else { return };
+    fn complete_deferred(&self, cmd: *mut u8, held: u64) {
         let mut adopted = None;
         let done = {
             let mut machine = super::lock(&self.machine);
@@ -575,11 +668,28 @@ impl Runtime {
 struct InjectJob {
     order: inj::Order,
     dest: usize,
-    link: Option<(usize, u64)>,
     t0: std::time::Instant,
     rb0: u64,
     /// What the engine part needs, or why it is refused; `None` for `complete_next` (nothing to inject).
     prepared: Option<Result<Prepared, String>>,
+}
+
+/// What the apply of a command an order was used for needs ([`Runtime::after_ordered_apply`]): the order's number, its timing record
+/// and the deferred held command that takes the command's result (none when the order was refused or names none).
+pub(crate) struct Used {
+    pub seq: u64,
+    pub timing: StampTiming,
+    pub link: Option<u64>,
+}
+
+/// A command the command list's `Add` carried an order out on, until the simulation applies it (`Runtime::added`, keyed by the order's
+/// number). The payload alone does not identify it: the engine may free it and give the address to another command; the identity
+/// after the order (`inject::identity`) must be the same too.
+pub(crate) struct Added {
+    pub payload: usize,
+    pub identity: inj::Identity,
+    pub at_ms: u64,
+    pub used: Used,
 }
 
 /// What [`Runtime::inject_prepare`] found: the engine part runs with it.
