@@ -1,13 +1,13 @@
 # Releasing FeverLink3
 
-A release is a git tag built by GitHub Actions (`.github/workflows/release.yml`). Nothing is built or uploaded from a developer's PC.
+A release is a commit on `main` whose message starts with the version, built by GitHub Actions (`.github/workflows/release.yml`). Nothing is built or uploaded from a developer's PC. Every other commit only runs CI.
 
 ## Cut a release
 
 1. Rename the `Unreleased` heading in `docs/CHANGELOG.md` to the version (its section becomes the release message and the changelog page). Make sure `main` is green in CI and `docs/ROADMAP.md` is current. Re-check the claims made in the listing and in `docs/SECURITY_FOR_USERS.md` against the code you are about to tag (the table is in `docs/nexus/README.md`): what a release says about the network, the files it creates and what is verified must match the tagged code.
 2. Set the version (`[workspace.package] version` in `Cargo.toml`, for example `0.2.0-test1`) and commit. The same version appears in the DLL's `native.log`.
-3. Tag and push: `git tag v0.3.0` then `git push origin v0.3.0`. A tag with a dash (`v0.3.0-rc.1`, `v0.2.0-test1`) becomes a GitHub pre-release, which the updater skips by default.
-4. The job runs `cargo test --workspace`, `cargo build --release`, then `feverlink3_release package`, signs the manifest if the secret `FEVERLINK3_SIGNING_KEY` is set, and creates the release with these assets:
+3. Make the release commit and push it to `main`. Its first line is `V<version>: <title>`, for example `V0.1.0: First beta release`. A version with a dash (`V0.2.0-test1: Friend test`) becomes a GitHub pre-release, which the updater skips by default. The workflow creates the tag `v<version>` itself. Only the head commit of a push is read, so the release commit must be the last one pushed.
+4. The job runs the workspace tests, `cargo build --release`, then `feverlink3_release package`, signs the manifest if the secret `FEVERLINK3_SIGNING_KEY` is set, and creates the release with these assets:
    - `FeverLink3-<version>.zip`: the files to copy into the game's folder (`winhttp.dll`, `mods/release/feverlink3_1/`, no program; `feverlink3_release package --layout portable` makes the developer layout with `feverlink3.exe`), plus `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
    - `FeverLink3-<version>.zip.sha256`
    - `manifest.json`: version, every file with size and SHA-256, and the zip's SHA-256

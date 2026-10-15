@@ -1,34 +1,62 @@
 name: Release
 
-# A release is a tag built here, never on a developer's PC. See docs/RELEASING.md.
+# A release is built here, never on a developer's PC, and only from a commit on main whose message starts with the
+# version, for example `V0.1.0: First beta release` (a dash in the version, `V0.2.0-test1: ...`, makes a pre-release).
+# Every other commit only runs CI. See docs/RELEASING.md.
 on:
   push:
-    tags: ['v*']
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   release:
+    if: ${{ startsWith(github.event.head_commit.message, 'V') }}
     runs-on: windows-latest
     env:
       SIGNING_KEY: ${{ secrets.FEVERLINK3_SIGNING_KEY }}
+      COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - run: cargo test --workspace
-      - run: cargo build --release --workspace
-
-      - name: Package
+      - name: Read the version from the commit message
+        id: parse
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          # `V<major>.<minor>.<patch>[-suffix]: <title>` on the first line; anything else is not a release.
+          $first = ($env:COMMIT_MESSAGE -split "`n")[0].Trim()
+          if ($first -match '^V(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?): \S') {
+            "release=true" >> $env:GITHUB_OUTPUT
+            "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+            Write-Host "release $($Matches[1])"
+          } else {
+            "release=false" >> $env:GITHUB_OUTPUT
+            Write-Host "not a release commit: $first"
+          }
+
+      - if: steps.parse.outputs.release == 'true'
+        uses: actions/checkout@v4
+      - if: steps.parse.outputs.release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: steps.parse.outputs.release == 'true'
+        run: cargo test --workspace --exclude feverlink3_native
+      - if: steps.parse.outputs.release == 'true'
+        run: cargo test -p feverlink3_native -- --test-threads=1
+      - if: steps.parse.outputs.release == 'true'
+        run: cargo build --release --workspace
+
+      - name: Package
+        if: steps.parse.outputs.release == 'true'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          $version = $env:VERSION
           cargo run --release -p feverlink3_release -- package --version $version --out dist
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Sign manifest
-        if: ${{ env.SIGNING_KEY != '' }}
+        if: ${{ steps.parse.outputs.release == 'true' && env.SIGNING_KEY != '' }}
         shell: pwsh
         run: |
           # The key is written to the runner's temp folder, used once and deleted.
@@ -42,11 +70,13 @@ jobs:
           }
 
       - name: Publish GitHub Release
+        if: steps.parse.outputs.release == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.parse.outputs.version }}
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
+          $version = $env:VERSION
           $zip = "FeverLink3-$version.zip"
           $sha = (Get-Content "dist/$zip.sha256").Split(' ')[0]
           $signed = Test-Path dist/manifest.json.sig
@@ -70,5 +100,5 @@ jobs:
           $assets = @("dist/$zip", "dist/$zip.sha256", "dist/manifest.json")
           if ($signed) { $assets += "dist/manifest.json.sig" }
           $extra = @(); if ("$version" -match '-') { $extra += '--prerelease' }
-          gh release create "${{ github.ref_name }}" @assets --title "FeverLink3 $version" --notes-file notes.md @extra
+          gh release create "v$version" @assets --target "${{ github.sha }}" --title "FeverLink3 $version" --notes-file notes.md @extra
           if ($LASTEXITCODE -ne 0) { exit 1 }
