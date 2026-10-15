@@ -2491,9 +2491,11 @@ function X.pauseStamped(it)
 	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then noteBuild(it.key, it.at) end
 	local N = G.nat
 	if N and it.from == C.PLAYER_ID then
-		if it.deferId and N.deferred[it.deferId] then N.deferred[it.deferId].at = it.at end
+		-- the real stamp is known now: the deferred completion (natTick) and the watchdog may count from it
+		local d = it.deferId and N.deferred[it.deferId]
+		if d then d.at, d.waitStamp = it.at, nil end
 		local h = N.heldByKey[it.key]
-		if h then h.at = it.at end
+		if h then h.at, h.waitStamp = it.at, nil end
 	end
 	logGui("pause order #" .. tostring(it.pauseSeq) .. ": " .. tostring(it.key) .. " stamped " .. tostring(it.at) .. " by the host (pause " .. tostring(s.pauseAt or s.lastPauseAt) .. ", this game at t=" .. tostring(engine.gameTime()) .. ")")
 end
@@ -3441,7 +3443,11 @@ local function natDecideUnsafe(h, cap)
 	if flow == "defer" then
 		ship.step = "defer"
 		it.deferId = id
-		N.deferred[id] = { key = it.key, at = at, t = os.clock() }
+		-- made during a pause: `at` is only the pause stamp, a placeholder. The host gives the real stamp, past where every game stands
+		-- (X.pauseStamped); until then nothing may count from it (b3pause2, 2026-10-15: the host stood 6 steps past the pause, natTick took
+		-- the placeholder as passed and wrote `release` at once, the module completed the tool's command at the simulation's apply, before
+		-- the interface's world had the new road, and the street tool's callback stopped the game on an entity it did not know)
+		N.deferred[id] = { key = it.key, at = at, t = os.clock(), waitStamp = it.pause or nil }
 		local okD = natSend("defer", { id = id })
 		ship.verdict = okD and "defer" or nil
 		log(natSay, done(okD))
@@ -3572,6 +3578,11 @@ local function natCommitUnsafe(key, why, g, st)
 	end
 	-- still paused: the commit is numbered in the host's pause order and every game, this one too, applies the build when it comes back
 	it.pause = X.isPauseStamp(it.at) or nil
+	if it.pause then
+		-- the commit's stamp is the host's (X.pauseStamped): the watchdog does not count from the pause stamp meanwhile
+		local h = G.nat and G.nat.heldByKey[key]
+		if h then h.waitStamp = true end
+	end
 	st.sent = true
 	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at, pause = it.pause })
 	pcall(logGui, "commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. tostring(it.at))
@@ -3642,7 +3653,7 @@ local HELD_PAUSED_MAX = 20.0
 local function heldWatchdog(N, now)
 	local gt = engine.gameTime()
 	for key, h in pairs(N.heldByKey) do
-		if not (h.released or h.done or h.cancelled) and not G.graces[key] and h.at then
+		if not (h.released or h.done or h.cancelled) and not G.graces[key] and h.at and not h.waitStamp then
 			if gt >= h.at + HELD_STUCK_STEPS * STEP and now - h.t > 2 then
 				-- Every command in heldByKey was shipped: the other games applied it at its stamp. A release now would apply it here at
 				-- another step (other entity ids from then on, and the simulation half could ship it again): it is failed and the games
@@ -4075,7 +4086,10 @@ function natTick()
 	if next(N.deferred) then
 		local gt = engine.gameTime()
 		for id, d in pairs(N.deferred) do
-			if gt > d.at and not d.ready then
+			-- (a build made during a pause waits for the host's stamp first: its `at` is only the pause stamp until then)
+			if d.waitStamp then
+				-- nothing: no release, no age, no trigger
+			elseif gt > d.at and not d.ready then
 				d.ready = true
 				natSend("release", { id = id })
 			end
