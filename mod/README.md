@@ -53,7 +53,9 @@ seq <TAB> kind <TAB> from <TAB> payload
 - `from_game.log`: mod → launcher. `from` is this player's id. Kinds: `hello`, `clock`, `speed_request`, `action`, `action_refused`, `checksum_report`, `save_done`, `replay_failed`, `chat`.
 - `seq` increases by one per line per file. A reader remembers the last sequence it dispatched and never dispatches a lower one, so a truncated or re-written file cannot replay history. The mod's writer continues the sequence from what the file already holds, so a savegame reload does not restart it.
 - `payload` is one line of Lua literal syntax written by `feverlink3_common.lua`: keys sorted, integers as `%d`, other numbers as `%.17g`, strings escaped. It is parsed in an empty environment. An `action` payload is `{stamp, seq, body, from}` where `body` is itself a serialised command `{fn, args}`, opaque to the launcher.
-- `mod.log` in the same folder is the mod's own log (both script halves append to it).
+- Every link file has one writer and is a generation log: past 4 MiB the writer ends the file with a `rotate` line (`seq` 0, `{["gen"]=<n>}`) and goes on in `<name>.<n>.log`; `<name>.gen` names the newest file, the newest 4 are kept. Readers follow the `rotate` line, so nothing is lost or split, and never see a truncation.
+- `native_ctl.gui.log` / `native_ctl.sim.log`: mod → native module, one file per Lua state (interface half, simulation half), each with its own writer, made once, and its own numbering. `native_events.log`: module → mod, read with the file kept open (no open per frame); a reloaded script reads only its newest generation as history, whose top repeats the module's `ready` and clock lines.
+- `mod.log` in the same folder is the mod's own log (both script halves append to it); it goes on in `mod.2.log` ... every 8 MiB, whoever wrote them, and the newest 4 files are kept.
 
 ## Window and the bridge
 

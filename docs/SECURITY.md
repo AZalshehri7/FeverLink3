@@ -204,7 +204,8 @@ recurse).
 | Relay message | 1 MiB + 16 bytes; read in steps of at most 256 KiB; error text 1024 bytes in, 200 out | `RelayCodec`, `RelayReader` |
 | Native control link | line 8 KiB; 64 KiB read per poll; `hold_on` 16 kinds; `seq` 2^53 | `native::link` |
 | Hold ring | 64 commands, 30 s each, 10 s of silence from the mod; 512 queued events; 6 error events per 10 s | `native::hold` |
-| `native_events.log` | 8 MiB, then the module stops writing it | `native::link::MAX_EVENTS_BYTES` |
+| `native_events.log` | generations of 1 MiB, the newest 4 kept (older ones deleted) | `native::link::EVENTS_ROTATE_BYTES`, `gamelink::GenWriter` |
+| Link logs (`to_game`, `from_game`, `native_ctl.gui` / `.sim`), `mod.log` | generations of 4 MiB (`mod.log` 8 MiB), the newest 4 kept | `gamelink::ROTATE_BYTES`, `C.ROTATE_BYTES`, `C.LOG_BYTES` |
 | Applied-command watch | 64 slots, 64 verdicts queued, entries expire after 60 s | `native::counters` |
 | File-link line; bytes read per poll; `seq` | 4 MiB; 8 MiB; 2^53 | `gamelink` |
 | Lua text | 4 MiB, 250 000 values, 48 levels | `luatext` |

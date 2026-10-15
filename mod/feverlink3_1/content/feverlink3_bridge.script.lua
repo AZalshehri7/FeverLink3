@@ -1062,17 +1062,39 @@ function shadowCompare(tracer, who, text, rec)
 	end)
 end
 
+-- The control file of THIS Lua state (docs/NATIVE_LINK.md section 3): native_ctl.sim.log for the simulation half, native_ctl.gui.log for the
+-- interface half (X.HALF, set by the entry points, see data()). One writer per state, made once and kept, with its own numbering: the
+-- module reads each file with its own last sequence. One shared file with a fresh writer per order (it re-read the file's tail every time)
+-- let one half's line carry a number the other half had already used, and the module dropped it as old (an inject_next / complete_next /
+-- fail lost: a wrong build or a busy tool); two states on two threads could also append to the one file at the same moment.
+function X.ctlWriter()
+	if not X.ctl then X.ctl = C.newWriter(C.path("native_ctl." .. (X.HALF or "gui") .. ".log"), C.PLAYER_ID) end
+	return X.ctl
+end
+
+function X.ctlSend(kind, payload)
+	local w = X.ctlWriter()
+	local ok, why = C.writerSend(w, kind, payload)
+	return ok, why, w
+end
+
+-- "written to native_ctl.sim.log seq 12" / "NOT WRITTEN (why)", for the trace lines of the orders
+function X.ctlWritten(ok, err)
+	local w = X.ctl
+	if not ok then return "NOT WRITTEN (" .. tostring(err) .. ")" end
+	return "written to " .. tostring(w and w.path:match("[^\\/]+$")) .. " seq " .. tostring(w and C.integerText(w.seq))
+end
+
 -- The control order that makes the native module set the converted proposal's frozenNodes at the Add of the command sent next (patch_next:
--- frozen = 0-based indices into the proposal's added nodes, adds = how many nodes it adds). Written from the simulation half, right before the
--- command, with a writer of its own whose sequence continues the file's (the interface half refreshes its own before each write, natSend).
+-- frozen = 0-based indices into the proposal's added nodes, adds = how many nodes it adds). Written right before the command, by this
+-- state's control writer (X.ctlSend).
 local function sendPatchOrder(patch, key)
 	local ok, err = pcall(function()
-		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "patch_next", { frozen = patch.frozen, adds = patch.adds, at = patch.at })
+		local sent, why = X.ctlSend("patch_next", { frozen = patch.frozen, adds = patch.adds, at = patch.at })
 		if not sent then error(why, 0) end
 	end)
 	traceSim("build.patch", string.format("%s patch_next frozen=[%s] adds=%d %s", tostring(key), table.concat(patch.frozen, ","), patch.adds or -1,
-		ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+		X.ctlWritten(ok, err)))
 end
 
 -- A held-command order from the simulation half (`complete_next {held}`: this replay's command is this game's stamp apply of deferred
@@ -1087,11 +1109,10 @@ end
 
 function X.sendHeldOrder(kind, payload, key)
 	local ok, err = pcall(function()
-		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, kind, payload)
+		local sent, why = X.ctlSend(kind, payload)
 		if not sent then error(why, 0) end
 	end)
-	traceSim("build.inject", string.format("%s %s %s %s", tostring(key), kind, C.serialize(payload), ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	traceSim("build.inject", string.format("%s %s %s %s", tostring(key), kind, C.serialize(payload), X.ctlWritten(ok, err)))
 	return ok
 end
 
@@ -1106,12 +1127,11 @@ local function sendInjectOrder(inj, key, held, tm, refuse, counter)
 	local n = counter.injectN
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
-		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held, tm = tm, refuse = refuse })
+		local sent, why = X.ctlSend("inject_next", { key = n, held = held, tm = tm, refuse = refuse })
 		if not sent then error(why, 0) end
 	end)
 	traceSim("build.inject", string.format("%s inject_next key=%d held=%s%s (%d bytes of text) %s", tostring(key), n, tostring(held), refuse and (" refuse=" .. refuse) or "",
-		#inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+		#inj.text, X.ctlWritten(ok, err)))
 	return ok, err
 end
 -- the interface half's apply during a pause writes the same orders (guiApplyNow)
@@ -2763,7 +2783,9 @@ SITES = {
 function natNew()
 	return {
 		unaccounted = {},   -- held id -> a command given back with no record of its own, until it is known whether anything shipped it
-		reader = C.newReader(C.path("native_events.log")), writer = nil,
+		-- read every frame: kept open (no open per frame); a reloaded script reads only the newest generation as history, whose top
+		-- carries the module's `ready` and clock (native link.rs EventWriter), not the whole log again
+		reader = C.newReader(C.path("native_events.log"), { start = "newest", keep = true }),
 		seen = false, read = false,   -- native_events.log has records / its first batch (history) was read
 		ready = nil, hookOk = nil,    -- the latest `ready`; true/false: command_list_add is / is not among its hooks; nil: no `ready` seen
 		pingN = 0, pingAt = -100, pingsTried = 0, pongAt = nil, watchFrom = nil, lastTick = nil, lastWrite = -100,
@@ -2802,15 +2824,12 @@ end
 function natSend(kind, payload)
 	local N = G.nat
 	if not N then return false end
-	if not N.writer then N.writer = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID) end
-	-- the simulation half writes to the same file (patch_next): this writer's sequence continues after whatever is in it now
-	local inFile = C.lastSeqInFile(C.path("native_ctl.log"))
-	if inFile > N.writer.seq then N.writer.seq = inFile end
-	local ok, err = C.writerSend(N.writer, kind, payload)
+	-- this state's own control file and writer (X.ctlWriter): no other writer shares its numbering, nothing is re-read per line
+	local ok, err, w = X.ctlSend(kind, payload)
 	if ok then
 		N.lastWrite = os.clock()
 	else
-		natSay("cannot write native_ctl.log: " .. tostring(err))
+		natSay("cannot write " .. tostring(w and w.path) .. ": " .. tostring(err))
 	end
 	return ok
 end
@@ -4779,11 +4798,14 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	end
 end
 
+-- Each entry point says which Lua state runs it (X.HALF): the simulation state runs update / handleEvent, the interface state
+-- guiUpdate / guiHandleEvent, and module values are per state. The functions both halves share (the stamp apply's orders) write
+-- to their own state's control file with it (X.ctlWriter).
 function data()
 	return {
-		update = update,
-		handleEvent = handleEvent,
-		guiUpdate = guiUpdate,
-		guiHandleEvent = guiHandleEvent,
+		update = function(...) X.HALF = "sim" return update(...) end,
+		handleEvent = function(...) X.HALF = "sim" return handleEvent(...) end,
+		guiUpdate = function(...) X.HALF = "gui" return guiUpdate(...) end,
+		guiHandleEvent = function(...) X.HALF = "gui" return guiHandleEvent(...) end,
 	}
 end
