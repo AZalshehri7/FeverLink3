@@ -326,6 +326,102 @@ fn host_game_action_reaches_every_player() {
     assert_eq!(0, h.host_game_count(MessageKind::Action)); // not echoed to itself
 }
 
+/// The paused actions a game received, in its order: (from, seq, pause_seq).
+fn paused_seen(game: &[(MessageKind, Vec<u8>)]) -> Vec<(u16, i64, u64)> {
+    game.iter()
+        .filter(|g| g.0 == MessageKind::Action)
+        .filter_map(|g| codec::try_decode::<ActionMessage>(&g.1))
+        .filter_map(|m| m.pause_seq.map(|n| (m.from, m.seq, n)))
+        .collect()
+}
+
+#[test]
+fn actions_made_during_a_pause_are_numbered_in_one_order_and_sent_to_every_game_the_sender_included() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    let (ia, ib) = (h.p(a).session.id().unwrap(), h.p(b).session.id().unwrap());
+    // two players and the host act in one pause, interleaved
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(30_000, 1, "{a1}").paused()));
+    h.player_game(b, MessageKind::Action, &json(&ActionMessage::new(30_000, 1, "{b1}").paused()));
+    h.host_game(MessageKind::Action, &json(&ActionMessage::new(30_000, 1, "{h1}").paused()));
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(30_000, 2, "{a2}").paused()));
+    let want = vec![(ia, 1, 1), (ib, 1, 2), (HostSession::HOST_ID, 1, 3), (ia, 2, 4)];
+    assert_eq!(want, paused_seen(&h.p(a).game), "the sender gets its own back, numbered");
+    assert_eq!(want, paused_seen(&h.p(b).game));
+    assert_eq!(want, paused_seen(&h.host_game), "the host's game too");
+    // an action that is not a pause action keeps the old relay: everybody but its sender, no number
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(31_000, 3, "{a3}")));
+    let last: ActionMessage = h.p(b).last(MessageKind::Action);
+    assert_eq!((3, None), (last.seq, last.pause_seq));
+    assert_eq!(4, h.p(a).count(MessageKind::Action));
+}
+
+#[test]
+fn a_players_own_pause_number_is_overwritten_and_a_paused_commit_is_numbered_in_the_same_order() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    let mut forged = ActionMessage::new(30_000, 1, "{x}").paused();
+    forged.pause_seq = Some(99);
+    h.player_game(a, MessageKind::Action, &json(&forged));
+    let mut sneaky = ActionMessage::new(31_000, 2, "{y}");
+    sneaky.pause_seq = Some(7);
+    h.player_game(a, MessageKind::Action, &json(&sneaky));
+    assert_eq!(
+        Some(1),
+        h.p(b)
+            .game
+            .iter()
+            .filter(|g| g.0 == MessageKind::Action)
+            .find_map(|g| codec::try_decode::<ActionMessage>(&g.1))
+            .unwrap()
+            .pause_seq
+    );
+    assert_eq!(None, h.p(b).last::<ActionMessage>(MessageKind::Action).pause_seq, "no pause flag: no number");
+    let commit = BuildCommitMessage { seq: 1, owner: 2, stamp: 30_000, from: 0, pause: true, pause_seq: Some(50) };
+    h.player_game(b, MessageKind::BuildCommit, &json(&commit));
+    let got: BuildCommitMessage = h.p(b).last(MessageKind::BuildCommit);
+    assert_eq!(Some(2), got.pause_seq, "the commit takes the next number, and comes back to its sender");
+    assert_eq!(Some(2), h.p(a).last::<BuildCommitMessage>(MessageKind::BuildCommit).pause_seq);
+    let plain = BuildCommitMessage { seq: 2, owner: 2, stamp: 30_000, from: 0, pause: false, pause_seq: None };
+    h.player_game(b, MessageKind::BuildCommit, &json(&plain));
+    assert_eq!(1, h.p(b).count(MessageKind::BuildCommit), "a commit outside a pause is not echoed");
+}
+
+#[test]
+fn the_resume_reaches_every_game_after_every_paused_action_numbered_before_it() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    let clock = ClockMessage { t: 18_600, speed: 0, ahead: 3, need: None, safe: None, pause: false };
+    h.host_game(MessageKind::Clock, &json(&clock));
+    h.player_game(a, MessageKind::Clock, &json(&clock));
+    h.player_game(b, MessageKind::Clock, &json(&clock));
+    h.host_call(HostSession::start);
+    assert_eq!(Some(18_600), h.host.state().pause_at, "held at the start: a pause");
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(18_600, 1, "{a1}").paused()));
+    h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 1 }));
+    // one that left its game during the pause and reached the host after the resume: still numbered, after the resume line
+    h.player_game(b, MessageKind::Action, &json(&ActionMessage::new(18_600, 1, "{b1}").paused()));
+    for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
+        let order: Vec<String> = game
+            .iter()
+            .filter_map(|g| match g.0 {
+                MessageKind::Action => {
+                    codec::try_decode::<ActionMessage>(&g.1).map(|m| format!("#{}", m.pause_seq.unwrap()))
+                }
+                MessageKind::Session => codec::try_decode::<SessionState>(&g.1)
+                    .filter(|s| s.started && s.pause_at.is_none())
+                    .map(|_| "resume".to_owned()),
+                _ => None,
+            })
+            .collect();
+        let from = order.iter().position(|x| x == "#1").expect("#1 arrives");
+        assert_eq!(vec!["#1", "resume", "#2"], order[from..from + 3].to_vec());
+    }
+}
+
 #[test]
 fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
     let mut h = Harness::new();

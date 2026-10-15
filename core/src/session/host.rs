@@ -238,6 +238,9 @@ pub struct HostSession {
     host_name: String,
     state: SessionState,
     actions_relayed: u64,
+    /// The last number of the pause order (`ActionMessage::pause_seq`): every action or commit made during a pause gets the next one
+    /// and goes to every game, its sender included. Never reset in a session, so a number is never given twice.
+    pause_seq: u64,
     dropped: u64,
     out: Vec<HostOutput>,
 }
@@ -316,6 +319,7 @@ impl HostSession {
                 resync: None,
             },
             actions_relayed: 0,
+            pause_seq: 0,
             dropped: 0,
             out: Vec::new(),
         }
@@ -735,7 +739,9 @@ impl HostSession {
                         let who = self.name(from);
                         self.log(format!("{who} may not {}; action relayed as refused", m.category));
                     }
-                    self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
+                    // made during a pause: numbered in the one pause order and relayed to every game, the sender too (pause_order)
+                    let to = self.pause_order(m.pause, &mut m.pause_seq, from);
+                    self.broadcast(MessageKind::Action, &codec::encode(&m), to);
                     self.actions_relayed += 1;
                 }
             }
@@ -752,7 +758,8 @@ impl HostSession {
             MessageKind::BuildCommit => {
                 if let Some(mut m) = codec::try_decode::<BuildCommitMessage>(payload) {
                     m.from = from;
-                    self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), Some(from));
+                    let to = self.pause_order(m.pause, &mut m.pause_seq, from);
+                    self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), to);
                 }
             }
 
@@ -1287,6 +1294,22 @@ impl HostSession {
     pub(super) fn announce(&mut self, text: &str) {
         let chat = ChatMessage { text: text.to_owned(), from: Self::HOST_ID, name: Some("FeverLink3".to_owned()) };
         self.broadcast(MessageKind::Chat, &codec::encode(&chat), None);
+    }
+
+    /// The pause order. During a pause every game applies the actions made in it at once, in the order they reach it, which is not
+    /// the same on two games: the sender has its own first. So an action (or commit) flagged `pause` gets the next number and is
+    /// relayed to EVERY game, its sender included; no game applies a paused action of its own before it comes back numbered, and
+    /// every game applies them in that order. The host handles messages one at a time and writes each connection in order, so every
+    /// game receives the numbers in increasing order, and the session line that resumes the games comes after every number given
+    /// before it. A player's own number is overwritten. Returns who the message is NOT sent to (`None`: everybody).
+    fn pause_order(&mut self, pause: bool, seq: &mut Option<u64>, from: u16) -> Option<u16> {
+        if !pause {
+            *seq = None;
+            return Some(from);
+        }
+        self.pause_seq += 1;
+        *seq = Some(self.pause_seq);
+        None
     }
 
     fn broadcast(&mut self, kind: MessageKind, payload: &[u8], except: Option<u16>) {
