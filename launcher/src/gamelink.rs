@@ -6,7 +6,7 @@
 //!
 //! - `to_game.log`: written by the launcher, read by the mod. Append-only.
 //! - `from_game.log`: written by the mod, read by the launcher. Append-only.
-//! - `identity.txt`: who this game is (`name=`, `role=`, `id=` lines), written before the game starts.
+//! - `identity.txt`: who this game is and which session it is in (`session=`, `start=`, `id=`, `name=`, `role=` lines).
 //! - `native.log`: the native module's log (written by the module, not here).
 //!
 //! Every line of the two logs is `seq<TAB>kind<TAB>from<TAB>payload\n`, with `seq` strictly increasing within
@@ -106,11 +106,20 @@ pub fn new_session_folder_name(name: &str) -> String {
 // ---------------------------------------------------------------------------------------------------------------
 
 /// The launcher's side of the link with one game: writes `to_game.log`, tails `from_game.log`.
+///
+/// One `Session` is one session's identity on the link. The live folder outlives sessions (quit to the menu, load another
+/// save, host again: the same `to_game.log` and `from_game.log`), so a session never reads or names the lines of an earlier
+/// one: [`Session::open`] starts tailing `from_game.log` after what it holds, and [`Session::write_identity`] tells the mod the
+/// session's id and the last `to_game.log` sequence before it (`start=`), which the mod skips to.
 #[derive(Debug)]
 pub struct Session {
     dir: PathBuf,
     next_seq: u64,
     tail: Tail,
+    /// This session's id (16 hex digits, random), written to `identity.txt`.
+    id: String,
+    /// The highest `seq` of `to_game.log` when the session was opened: every line of this session is above it.
+    start: u64,
 }
 
 impl Session {
@@ -126,13 +135,39 @@ impl Session {
         Self::open(&dir)
     }
 
-    /// Opens the link in an existing folder. `to_game.log` is read back so numbering continues after the
-    /// highest `seq` already written; `from_game.log` is tailed from its start.
+    /// Opens the link in an existing folder for a new session. `to_game.log` is read back so numbering continues after
+    /// the highest `seq` already written (that number is the session's `start`); `from_game.log` is tailed from where it
+    /// ends now: what it holds was written by the game in an earlier session (the mod writes only while `identity.txt`
+    /// names a session, which this one does not yet), and a host that read it would relay an earlier session's actions.
     pub fn open(dir: &Path) -> io::Result<Session> {
         fs::create_dir_all(dir)?;
         let to_game = dir.join(TO_GAME);
         let last = highest_seq(&to_game)?;
-        Ok(Session { dir: dir.to_path_buf(), next_seq: last.saturating_add(1), tail: Tail::new(dir.join(FROM_GAME)) })
+        let mut tail = Tail::new(dir.join(FROM_GAME));
+        loop {
+            let before = tail.offset;
+            tail.poll()?;
+            if tail.offset == before {
+                break;
+            }
+        }
+        Ok(Session {
+            dir: dir.to_path_buf(),
+            next_seq: last.saturating_add(1),
+            tail,
+            id: format!("{:016x}", rand::random::<u64>()),
+            start: last,
+        })
+    }
+
+    /// This session's id, as `identity.txt` names it.
+    pub fn session_id(&self) -> &str {
+        &self.id
+    }
+
+    /// The highest `seq` of `to_game.log` before this session: the mod dispatches only lines above it.
+    pub fn start_seq(&self) -> u64 {
+        self.start
     }
 
     /// The session folder.
@@ -145,9 +180,18 @@ impl Session {
         self.next_seq
     }
 
-    /// Writes `identity.txt`: who this game instance is. The mod reads it when it loads.
+    /// Writes `identity.txt`: who this game instance is and which session it is in. The mod reads it about once a second.
+    /// `session=` and `start=` come first and `role=` last: the mod takes the file only with a complete `role=` line, so a
+    /// read that races this write sees all of it or no role at all.
     pub fn write_identity(&self, player_id: u16, name: &str, role: &str) -> io::Result<()> {
-        let text = format!("id={}\nname={}\nrole={}\n", player_id, clean_field(name), clean_field(role));
+        let text = format!(
+            "session={}\nstart={}\nid={}\nname={}\nrole={}\n",
+            self.id,
+            self.start,
+            player_id,
+            clean_field(name),
+            clean_field(role)
+        );
         fs::write(self.dir.join(IDENTITY), text)
     }
 
@@ -394,7 +438,11 @@ mod tests {
         let mut s = Session::create_under(root.path(), "host").unwrap();
         assert!(s.dir().starts_with(root.path()));
         s.write_identity(0, "Aziz", "host").unwrap();
-        assert_eq!(fs::read_to_string(s.dir().join(IDENTITY)).unwrap(), "id=0\nname=Aziz\nrole=host\n");
+        assert_eq!(s.session_id().len(), 16);
+        assert_eq!(
+            fs::read_to_string(s.dir().join(IDENTITY)).unwrap(),
+            format!("session={}\nstart=0\nid=0\nname=Aziz\nrole=host\n", s.session_id())
+        );
 
         assert_eq!(s.send("session", "host", "{\"started\":false}").unwrap(), 1);
         assert_eq!(s.send("action", "2", "line two").unwrap(), 2);
@@ -594,5 +642,36 @@ mod tests {
         fs::write(s.dir().join(FROM_GAME), format_line(&line(1, "hello"))).unwrap();
         assert_eq!(s.poll().unwrap(), vec![line(1, "hello")]);
         assert_eq!(s.into_tail().last_seq(), 1);
+    }
+
+    #[test]
+    fn a_session_opened_in_a_used_folder_names_itself_and_never_sees_the_earlier_sessions_lines() {
+        // quit to the menu, load another save, host again: the live folder keeps both link files
+        let root = TempDir::new().unwrap();
+        let mut first = Session::open(root.path()).unwrap();
+        first.write_identity(0, "Aziz", "host").unwrap();
+        first.send("session", "0", "{started=true}").unwrap();
+        first.send("action", "1", "{seq=1}").unwrap();
+        fs::write(root.path().join(FROM_GAME), format_line(&line(1, "hello")) + &format_line(&line(2, "old action")))
+            .unwrap();
+        assert_eq!(first.poll().unwrap().len(), 2);
+        let first_id = first.session_id().to_owned();
+        drop(first);
+
+        let mut second = Session::open(root.path()).unwrap();
+        assert_ne!(second.session_id(), first_id, "every session has an id of its own");
+        assert_eq!(second.start_seq(), 2, "the mod skips to the last line of the earlier session");
+        second.write_identity(0, "Aziz", "host").unwrap();
+        let identity = fs::read_to_string(root.path().join(IDENTITY)).unwrap();
+        assert!(identity.starts_with(&format!("session={}\nstart=2\n", second.session_id())), "{identity}");
+        assert!(
+            identity.ends_with("role=host\n"),
+            "the role comes last: a racing read sees a complete file or no role"
+        );
+        assert_eq!(second.poll().unwrap(), vec![], "the earlier session's lines from the game are not read again");
+        let mut f = OpenOptions::new().append(true).open(root.path().join(FROM_GAME)).unwrap();
+        f.write_all(format_line(&line(3, "hello again")).as_bytes()).unwrap();
+        assert_eq!(second.poll().unwrap(), vec![line(3, "hello again")]);
+        assert_eq!(second.send("session", "0", "{}").unwrap(), 3);
     }
 }
