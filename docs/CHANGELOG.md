@@ -7,6 +7,33 @@ title: FeverLink3 changelog
 All notable changes of each release. FeverLink3 is an unfinished test project: read the status in the README before using it.
 Only changes that matter to a player or tester are listed here.
 
+## 0.2.0-pre2
+
+A stability release from a full review of the code. **Not yet played by a person:** tested only in two game windows on one PC with scripted clicks (about 45 scripted builds and actions, 10 real-tool builds of every kind, fast builds, both players building a few seconds apart, and builds during a pause). Not tested over the internet.
+
+### Fixed
+- Several ways the native part of FeverLink3 could crash the game are closed: an error inside the game's own build functions no longer ends the game through our code; a station with several parts that failed to copy no longer frees the same memory twice; a held build is never handed back to the game empty; a damaged build from the other player is refused instead of crashing (two such crashes were found by testing thousands of damaged builds).
+- A build that cannot be copied exactly on a game is no longer replaced by a different build there: that game builds nothing, the repair sync follows, and the builder's tool is freed.
+- No build is applied late any more: every game waits for the other players' input before it passes a step. When the connection lags, the game may pause for a moment instead of drifting apart.
+- A build is never applied at the click on one game and later on the others, even after an internal error.
+- Vehicles, lines, loans and the other actions from the game's windows are applied at the same moment on every game (before, the player who clicked got them a little earlier, which could make the games number their objects differently).
+- Building during a pause works again: every game applies the builds made in the pause in the same order, set by the host.
+- Two builds due at the same moment (two players building at once) no longer overwrite each other.
+- Ending a session returns the game to normal single-player play, and a new session never replays lines of an earlier one.
+- The host keeps the session running while it sends the world to a joining player.
+- The logs rotate instead of growing forever; the native event log no longer stops at 8 MB, which switched the build sync off in long sessions.
+
+### Changed
+- A build appears on both games about 0.4 to 1.3 seconds after the click at 3x speed (median about 0.7 s, on one PC).
+- During a pause, each build made moves the world forward a step or a few (fractions of a second of game time), so that every game applies it at the same step.
+
+### Known gaps
+- Not yet played by a person, and not tested over the internet.
+- The window actions (buying vehicles, lines) were tested through the scripted path, not through clicks in the game's windows.
+- Two players building within the same second has not been tested (a few seconds apart works).
+- The control files between the mod and the native part still use line numbers that two parts of the game's script write; a rare simultaneous write could still lose a build order (a proper fix is planned).
+- The gaps listed for 0.2.0-pre1 below still apply.
+
 ## 0.2.0-pre1
 
 Tested so far with two games on one PC (a scripted test that builds, bulldozes and checks both worlds), not yet with two players over the internet.
