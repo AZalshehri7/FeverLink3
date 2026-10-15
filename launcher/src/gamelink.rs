@@ -15,6 +15,15 @@
 //! last `seq` it dispatched and ignores anything at or below it, so a truncated or rewritten file never replays
 //! history. A writer that restarts has to continue from the highest `seq` already in the file, which is why
 //! [`Session::open`] reads it back.
+//!
+//! Generations (every link log, here and in the native module and the mod: `docs/ARCHITECTURE.md` section 2). A log
+//! never grows without bound and is never truncated: it is a series of generation files, `to_game.log` (generation 1),
+//! `to_game.2.log`, `to_game.3.log`, ..., and `to_game.gen` names the newest. A writer that has put [`ROTATE_BYTES`]
+//! into its generation ends it with a `rotate` line (`seq` 0, so no reader dispatches it) naming the next one, writes
+//! the pointer, deletes the generation [`KEEP_GENERATIONS`] back and goes on in the next file. A reader that reads the
+//! `rotate` line has read the whole generation (its writer adds nothing after it) and goes on at the start of the next:
+//! no line is lost or split by a rotation, and following one costs a reader no file access at all until it happens.
+//! The `seq` numbering goes on across generations.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -79,6 +88,166 @@ pub fn parse_line(text: &str) -> Option<Line> {
     Some(Line { seq, kind, from, payload })
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Generations
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A writer starts a new generation once its current one holds this much. The mod uses the same value
+/// (`C.ROTATE_BYTES`); a reader does not need to know it.
+pub const ROTATE_BYTES: u64 = 4 << 20;
+
+/// Generation files a writer keeps (the newest included); older ones are deleted when a new one starts.
+pub const KEEP_GENERATIONS: u64 = 4;
+
+/// The kind of the line that ends a generation. Its `seq` is 0 and its payload `{["gen"]=<next>}`.
+pub const ROTATE_KIND: &str = "rotate";
+
+/// The file of generation `gen` of the log `base`: `base` itself for generation 1, `<stem>.<gen>.<ext>` after it.
+pub fn generation_path(base: &Path, gen: u64) -> PathBuf {
+    if gen <= 1 {
+        return base.to_path_buf();
+    }
+    let stem = base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    match base.extension() {
+        Some(ext) => base.with_file_name(format!("{stem}.{gen}.{}", ext.to_string_lossy())),
+        None => base.with_file_name(format!("{stem}.{gen}")),
+    }
+}
+
+/// The pointer file of the log `base` (`<stem>.gen`): the number of its newest generation.
+pub fn pointer_path(base: &Path) -> PathBuf {
+    base.with_extension("gen")
+}
+
+/// The newest generation the pointer names; 1 when there is no pointer (or it cannot be read).
+pub fn newest_generation(base: &Path) -> u64 {
+    fs::read_to_string(pointer_path(base))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .filter(|g| *g >= 1)
+        .unwrap_or(1)
+}
+
+/// The text of the line that ends a generation and names the next.
+pub fn rotate_line(from: &str, next: u64) -> String {
+    format_line(&Line { seq: 0, kind: ROTATE_KIND.into(), from: from.into(), payload: format!("{{[\"gen\"]={next}}}") })
+}
+
+/// The generation a `rotate` line names, `None` for every other line.
+pub fn rotate_target(line: &Line) -> Option<u64> {
+    if line.seq != 0 || line.kind != ROTATE_KIND {
+        return None;
+    }
+    let digits: String = line
+        .payload
+        .split('=')
+        .nth(1)?
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok().filter(|g| *g >= 2)
+}
+
+/// The one writer of a generation log (see the module documentation). It keeps no file open: each append opens the
+/// current generation, so other processes may read, and the folder may be cleaned, at any time.
+#[derive(Debug)]
+pub struct GenWriter {
+    base: PathBuf,
+    from: String,
+    gen: u64,
+    /// Bytes in the current generation file.
+    size: u64,
+    rotate_bytes: u64,
+    keep: u64,
+    /// Lines written again at the top of every new generation (they keep their `seq`, so a reader that came
+    /// through the earlier generations drops them; one that starts in the new one reads them as history).
+    header: String,
+}
+
+impl GenWriter {
+    /// Continues the newest generation of `base` (the pointer), at its current size. `from` is the `from` column of
+    /// the `rotate` lines.
+    pub fn open(base: PathBuf, from: &str) -> io::Result<GenWriter> {
+        let gen = newest_generation(&base);
+        let size = match fs::metadata(generation_path(&base, gen)) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        Ok(GenWriter {
+            base,
+            from: from.to_string(),
+            gen,
+            size,
+            rotate_bytes: ROTATE_BYTES,
+            keep: KEEP_GENERATIONS,
+            header: String::new(),
+        })
+    }
+
+    /// The same writer with another generation size and number of generations kept (at least 2).
+    pub fn with_limits(mut self, rotate_bytes: u64, keep: u64) -> GenWriter {
+        self.rotate_bytes = rotate_bytes.max(1);
+        self.keep = keep.max(2);
+        self
+    }
+
+    /// The log's name (generation 1).
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// The file the next line goes to (unless it starts a new generation).
+    pub fn path(&self) -> PathBuf {
+        generation_path(&self.base, self.gen)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.gen
+    }
+
+    /// Lines written again at the top of every later generation.
+    pub fn set_header(&mut self, text: String) {
+        self.header = text;
+    }
+
+    /// Appends complete lines with one `write`. A full generation is ended first.
+    pub fn append(&mut self, text: &str) -> io::Result<()> {
+        if self.size > 0 && self.size >= self.rotate_bytes {
+            self.rotate()?;
+        }
+        OpenOptions::new().create(true).append(true).open(self.path())?.write_all(text.as_bytes())?;
+        self.size += text.len() as u64;
+        Ok(())
+    }
+
+    /// Ends the current generation and starts the next. Only the `rotate` line has to be written: without the pointer a
+    /// reader that follows still finds the next file (a fresh one starts one generation early and follows); an old
+    /// file that cannot be deleted (a reader holds it open) stays until the folder is cleaned.
+    fn rotate(&mut self) -> io::Result<()> {
+        let next = self.gen + 1;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path())?
+            .write_all(rotate_line(&self.from, next).as_bytes())?;
+        let _ = fs::write(pointer_path(&self.base), format!("{next}\n"));
+        if next > self.keep {
+            let _ = fs::remove_file(generation_path(&self.base, next - self.keep));
+        }
+        self.gen = next;
+        self.size = 0;
+        if !self.header.is_empty() {
+            let header = std::mem::take(&mut self.header);
+            let written = OpenOptions::new().create(true).append(true).open(self.path())?.write_all(header.as_bytes());
+            self.size = if written.is_ok() { header.len() as u64 } else { 0 };
+            self.header = header;
+        }
+        Ok(())
+    }
+}
+
 /// Makes a session or player name safe as a folder-name prefix: ASCII letters, digits, `-` and `_` only,
 /// at most 24 characters, never empty.
 pub fn folder_safe(name: &str) -> String {
@@ -110,6 +279,7 @@ pub fn new_session_folder_name(name: &str) -> String {
 pub struct Session {
     dir: PathBuf,
     next_seq: u64,
+    to_game: GenWriter,
     tail: Tail,
 }
 
@@ -127,12 +297,17 @@ impl Session {
     }
 
     /// Opens the link in an existing folder. `to_game.log` is read back so numbering continues after the
-    /// highest `seq` already written; `from_game.log` is tailed from its start.
+    /// highest `seq` already written; `from_game.log` is tailed from its start (its oldest generation).
     pub fn open(dir: &Path) -> io::Result<Session> {
         fs::create_dir_all(dir)?;
         let to_game = dir.join(TO_GAME);
         let last = highest_seq(&to_game)?;
-        Ok(Session { dir: dir.to_path_buf(), next_seq: last.saturating_add(1), tail: Tail::new(dir.join(FROM_GAME)) })
+        Ok(Session {
+            dir: dir.to_path_buf(),
+            next_seq: last.saturating_add(1),
+            to_game: GenWriter::open(to_game, "0")?,
+            tail: Tail::new(dir.join(FROM_GAME)),
+        })
     }
 
     /// The session folder.
@@ -155,11 +330,15 @@ impl Session {
     pub fn send(&mut self, kind: &str, from: &str, payload: &str) -> io::Result<u64> {
         let seq = self.next_seq;
         let line = Line { seq, kind: kind.to_string(), from: from.to_string(), payload: payload.to_string() };
-        let mut file = OpenOptions::new().create(true).append(true).open(self.dir.join(TO_GAME))?;
-        file.write_all(format_line(&line).as_bytes())?;
-        file.flush()?;
+        self.to_game.append(&format_line(&line))?;
         self.next_seq = seq.saturating_add(1);
         Ok(seq)
+    }
+
+    /// The same session with other generation limits for `to_game.log` (tests).
+    pub fn with_rotation(mut self, rotate_bytes: u64, keep: u64) -> Session {
+        self.to_game = self.to_game.with_limits(rotate_bytes, keep);
+        self
     }
 
     /// New, not yet seen lines of `from_game.log`. See [`Tail::poll`].
@@ -173,32 +352,56 @@ impl Session {
     }
 }
 
-/// The highest `seq` in a log file, 0 when the file is missing or holds no valid line. The file is read the way a
-/// [`Tail`] reads it, so invalid text or an enormous line is no problem.
+/// The highest `seq` in a log, 0 when it is missing or holds no valid line: its newest generation is read (the one
+/// before it too when the newest has no line yet), the way a [`Tail`] reads, so invalid text or an enormous line is
+/// no problem.
 pub fn highest_seq(path: &Path) -> io::Result<u64> {
-    let mut tail = Tail::new(path.to_path_buf());
+    let newest = newest_generation(path);
+    let mut tail = Tail::at_generation(path.to_path_buf(), newest.saturating_sub(1).max(1));
     loop {
-        let before = tail.offset;
+        let before = (tail.gen, tail.offset);
         tail.poll()?;
-        if tail.offset == before {
+        if (tail.gen, tail.offset) == before {
             return Ok(tail.last_seq);
         }
     }
+}
+
+/// The newest generation file of a log and its length and modification time: what a heartbeat looks at to see
+/// whether a writer is still writing (`None` when there is no such file).
+pub fn newest_mark(base: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
+    let gen = newest_generation(base);
+    fs::metadata(generation_path(base, gen)).ok().map(|m| (gen, m.len(), m.modified().ok()))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Tail
 // ---------------------------------------------------------------------------------------------------------------
 
+/// Bytes a [`Tail`] remembers of the start of a file and of what it read last, to recognise the same file again.
+const SIGNATURE_BYTES: usize = 64;
+
+/// Generation switches one [`Tail::poll`] follows at most (each reads at most [`MAX_READ_PER_POLL`]).
+const MAX_SWITCHES_PER_POLL: usize = 4;
+
 /// Reads new lines from an append-only log, tolerating a missing file, a partial last line, truncation and a
-/// rewrite. Lines whose `seq` is not above the last dispatched one are dropped, never dispatched twice.
+/// rewrite, and following the log's generations. Lines whose `seq` is not above the last dispatched one are
+/// dropped, never dispatched twice.
+///
+/// A rewrite is recognised by content, not only by size: the tail remembers the first bytes of the file and the
+/// last bytes it read, and a file that no longer holds them at the same places was replaced, even when it is not
+/// shorter than what was read (truncated and grown again between two polls). Reading then restarts at the top, and
+/// the `seq` filter keeps history out, so no new line is lost and none is read from the middle.
 ///
 /// The file is written by the game and may hold anything: a poll reads at most 8 MiB, a line longer than
 /// [`MAX_LINE_BYTES`] is dropped as a whole (up to its newline, however many polls that takes), and invalid UTF-8
 /// is read as the replacement character. Memory stays at most the size of one line plus one poll.
 #[derive(Debug)]
 pub struct Tail {
+    /// The log's name (generation 1).
     path: PathBuf,
+    /// The generation being read.
+    gen: u64,
     /// Bytes of the file already read (an incomplete last line is read, and kept in `pending`).
     offset: u64,
     /// Highest `seq` handed out so far.
@@ -207,12 +410,35 @@ pub struct Tail {
     pending: Vec<u8>,
     /// The line being read is over [`MAX_LINE_BYTES`]: what is left of it is dropped, up to its newline.
     skipping: bool,
+    /// The first bytes of the file as read (up to [`SIGNATURE_BYTES`]).
+    head: Vec<u8>,
+    /// The last bytes read, which end at `offset` (up to [`SIGNATURE_BYTES`]).
+    mark: Vec<u8>,
 }
 
 impl Tail {
-    /// A tail of `path` from its start, with nothing dispatched yet.
+    /// A tail of `path` from its start (its oldest generation still there), with nothing dispatched yet.
     pub fn new(path: PathBuf) -> Tail {
-        Tail { path, offset: 0, last_seq: 0, pending: Vec::new(), skipping: false }
+        let newest = newest_generation(&path);
+        let mut gen = newest;
+        while gen > 1 && generation_path(&path, gen - 1).exists() {
+            gen -= 1;
+        }
+        Tail::at_generation(path, gen)
+    }
+
+    /// A tail from the start of generation `gen`.
+    pub fn at_generation(path: PathBuf, gen: u64) -> Tail {
+        Tail {
+            path,
+            gen: gen.max(1),
+            offset: 0,
+            last_seq: 0,
+            pending: Vec::new(),
+            skipping: false,
+            head: Vec::new(),
+            mark: Vec::new(),
+        }
     }
 
     /// Back to the start of the file, forgetting what was read of an unfinished line.
@@ -220,11 +446,18 @@ impl Tail {
         self.offset = 0;
         self.pending = Vec::new();
         self.skipping = false;
+        self.head.clear();
+        self.mark.clear();
     }
 
-    /// The file being tailed.
+    /// The log being tailed (its generation 1).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The generation being read.
+    pub fn generation(&self) -> u64 {
+        self.gen
     }
 
     /// Highest `seq` returned so far.
@@ -232,36 +465,62 @@ impl Tail {
         self.last_seq
     }
 
-    /// Reads whatever was appended since the last call and returns the complete, new lines in file order.
-    /// A file shorter than what was consumed means it was truncated or rewritten: reading restarts at its
-    /// beginning, and the `seq` filter keeps old lines from coming back.
+    /// Reads whatever was appended since the last call and returns the complete, new lines in file order, through
+    /// the generations the log went on to. A file that is not the one read before (shorter, or other bytes where
+    /// the remembered ones were) was rewritten: reading restarts at its beginning, and the `seq` filter keeps old
+    /// lines from coming back.
     pub fn poll(&mut self) -> io::Result<Vec<Line>> {
-        let mut file = match File::open(&self.path) {
+        let mut out = Vec::new();
+        for _ in 0..=MAX_SWITCHES_PER_POLL {
+            if !self.poll_generation(&mut out)? {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// One read of the current generation. True when the tail went on to another generation (worth reading now).
+    fn poll_generation(&mut self, out: &mut Vec<Line>) -> io::Result<bool> {
+        let mut file = match File::open(generation_path(&self.path, self.gen)) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // the file may be recreated later with fresh content: start over then
+                // deleted under a tail that fell far behind: on with the newest generation (what was in between
+                // is gone); otherwise the file may be recreated later with fresh content: start over then
+                let newest = newest_generation(&self.path);
                 self.rewind();
-                return Ok(Vec::new());
+                if newest > self.gen {
+                    self.gen = newest;
+                    return Ok(true);
+                }
+                return Ok(false);
             }
             Err(e) => return Err(e),
         };
         let len = file.metadata()?.len();
-        if len < self.offset {
+        if len == self.offset {
+            return Ok(false); // nothing new (a file replaced by one of the same length is noticed when it grows)
+        }
+        if len < self.offset || !self.same_file(&mut file)? {
             self.rewind();
         }
         file.seek(SeekFrom::Start(self.offset))?;
         let mut fresh = Vec::new();
         file.take(MAX_READ_PER_POLL).read_to_end(&mut fresh)?;
         if fresh.is_empty() {
-            return Ok(Vec::new());
+            return Ok(false);
         }
         // `offset` counts every byte read from the file; an incomplete last line waits in `pending`
+        if self.offset == 0 {
+            self.head = fresh[..fresh.len().min(SIGNATURE_BYTES)].to_vec();
+        }
+        self.mark.extend_from_slice(&fresh[fresh.len().saturating_sub(SIGNATURE_BYTES)..]);
+        let excess = self.mark.len().saturating_sub(SIGNATURE_BYTES);
+        self.mark.drain(..excess);
         self.offset = self.offset.saturating_add(fresh.len() as u64);
 
         let mut buf = std::mem::take(&mut self.pending);
         buf.extend_from_slice(&fresh);
         drop(fresh);
-        let mut out = Vec::new();
         let mut rest: &[u8] = &buf;
         while let Some((line, after)) =
             rest.iter().position(|&b| b == b'\n').and_then(|newline| rest.split_at_checked(newline + 1))
@@ -272,6 +531,12 @@ impl Tail {
                 continue;
             }
             if let Some(parsed) = parse_line(&String::from_utf8_lossy(line)) {
+                if let Some(next) = rotate_target(&parsed) {
+                    // the writer's last line in this file: everything before it was read, the rest is in `next`
+                    self.rewind();
+                    self.gen = next;
+                    return Ok(true);
+                }
                 if parsed.seq > self.last_seq {
                     self.last_seq = parsed.seq;
                     out.push(parsed);
@@ -283,7 +548,25 @@ impl Tail {
         } else {
             self.pending = rest.to_vec();
         }
-        Ok(out)
+        Ok(false)
+    }
+
+    /// Whether the open file still holds, at the same places, the bytes this tail read from it: its first bytes and
+    /// the last ones before `offset`. Two small reads per poll.
+    fn same_file(&self, file: &mut File) -> io::Result<bool> {
+        if self.offset == 0 {
+            return Ok(true);
+        }
+        let holds = |file: &mut File, at: u64, want: &[u8]| -> io::Result<bool> {
+            let mut probe = vec![0u8; want.len()];
+            file.seek(SeekFrom::Start(at))?;
+            match file.read_exact(&mut probe) {
+                Ok(()) => Ok(probe == want),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+                Err(e) => Err(e),
+            }
+        };
+        Ok(holds(file, 0, &self.head)? && holds(file, self.offset - self.mark.len() as u64, &self.mark)?)
     }
 
     /// Runs the tail on its own thread, calling `on_line` for every new line, polling every `interval`, until
@@ -469,6 +752,112 @@ mod tests {
         fs::write(&path, format_line(&line(8, "eight"))).unwrap();
         assert_eq!(tail.poll().unwrap(), vec![line(8, "eight")]);
         assert_eq!(tail.last_seq(), 8);
+    }
+
+    #[test]
+    fn tail_sees_a_truncate_and_regrow_within_one_poll() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(FROM_GAME);
+        let mut tail = Tail::new(path.clone());
+        let mut text = String::new();
+        for i in 1..=3 {
+            text.push_str(&format_line(&line(i, "before")));
+        }
+        fs::write(&path, &text).unwrap();
+        assert_eq!(tail.poll().unwrap().len(), 3);
+        // between two polls the file is truncated and grows past the old length again with other lines: the old
+        // reader went on at its offset, in the middle of a line, and lost the lines before it
+        let mut regrown = String::new();
+        for i in 4..=9 {
+            regrown.push_str(&format_line(&line(i, "after the truncation")));
+        }
+        assert!(regrown.len() as u64 > text.len() as u64);
+        fs::write(&path, &regrown).unwrap();
+        let got = tail.poll().unwrap();
+        assert_eq!(got.iter().map(|l| l.seq).collect::<Vec<_>>(), [4, 5, 6, 7, 8, 9]);
+        assert!(got.iter().all(|l| l.payload == "after the truncation"), "no line read from its middle");
+        // the same once more with the same first lines (a writer that starts over the same way): the bytes before the
+        // offset differ
+        let mut same_start = String::new();
+        for i in 4..=6 {
+            same_start.push_str(&format_line(&line(i, "after the truncation")));
+        }
+        assert!(same_start.len() > SIGNATURE_BYTES, "the first bytes are the same");
+        for i in 10..=16 {
+            same_start.push_str(&format_line(&line(i, "and again")));
+        }
+        fs::write(&path, &same_start).unwrap();
+        assert_eq!(tail.poll().unwrap().iter().map(|l| l.seq).collect::<Vec<_>>(), (10..=16).collect::<Vec<_>>());
+        // and a plain append is read on from the offset as before
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(format_line(&line(17, "x")).as_bytes()).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line(17, "x")]);
+    }
+
+    #[test]
+    fn to_game_rotates_and_a_tail_reads_every_line_once_across_generations() {
+        let root = TempDir::new().unwrap();
+        let mut s = Session::create_under(root.path(), "host").unwrap().with_rotation(300, 3);
+        let base = s.dir().join(TO_GAME);
+        let mut tail = Tail::new(base.clone());
+        let mut got = Vec::new();
+        for i in 1..=100u64 {
+            assert_eq!(s.send("action", "2", &format!("payload {i}")).unwrap(), i);
+            if i % 9 == 0 {
+                got.extend(tail.poll().unwrap());
+            }
+        }
+        loop {
+            let more = tail.poll().unwrap();
+            if more.is_empty() {
+                break;
+            }
+            got.extend(more);
+        }
+        assert_eq!(got.iter().map(|l| l.seq).collect::<Vec<_>>(), (1..=100).collect::<Vec<_>>());
+        assert!(got.iter().enumerate().all(|(i, l)| l.payload == format!("payload {}", i + 1)), "no line split");
+        let newest = newest_generation(&base);
+        assert!(newest > 3, "it rotated ({newest})");
+        assert!(!base.exists() && generation_path(&base, newest - 2).exists(), "three generations are kept");
+        // a session reopened on the folder continues the numbering of the newest generation
+        let dir = s.dir().to_path_buf();
+        drop(s);
+        assert_eq!(highest_seq(&base).unwrap(), 100);
+        assert_eq!(Session::open(&dir).unwrap().next_seq(), 101);
+        // a tail started now begins at the oldest generation still there, and reads on through the newest
+        let mut late = Tail::new(base.clone());
+        assert_eq!(late.generation(), newest - 2);
+        let mut seqs = Vec::new();
+        loop {
+            let more = late.poll().unwrap();
+            if more.is_empty() {
+                break;
+            }
+            seqs.extend(more.into_iter().map(|l| l.seq));
+        }
+        assert_eq!(seqs.last(), Some(&100));
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+        // the heartbeat's look follows the newest file
+        assert_eq!(newest_mark(&base).map(|m| m.0), Some(newest));
+    }
+
+    #[test]
+    fn rotate_lines_name_the_next_generation() {
+        let l = parse_line(&rotate_line("native", 7)).unwrap();
+        assert_eq!((l.seq, l.kind.as_str(), rotate_target(&l)), (0, ROTATE_KIND, Some(7)));
+        assert_eq!(rotate_target(&line(0, "x")), None);
+        assert_eq!(
+            rotate_target(&Line {
+                seq: 3,
+                kind: ROTATE_KIND.into(),
+                from: "0".into(),
+                payload: "{[\"gen\"]=2}".into()
+            }),
+            None
+        );
+        let base = Path::new("dir").join("native_ctl.sim.log");
+        assert_eq!(generation_path(&base, 1), base);
+        assert_eq!(generation_path(&base, 12), Path::new("dir").join("native_ctl.sim.12.log"));
+        assert_eq!(pointer_path(&base), Path::new("dir").join("native_ctl.sim.gen"));
     }
 
     #[test]
