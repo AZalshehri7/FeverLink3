@@ -160,8 +160,11 @@ in-game window.
   controller clears it at every game start.
 - The window (a button in the game bar, `GameBarInfoDisplayExtension`) appends commands to `ctl_cmd.log`
   (`host`, `join`, `leave`, `start`, `pause`, `speed`, `check`, `resync`) and reads the controller's answer from
-  `ctl_status.txt`. The controller writes `identity.txt` (`role=idle|host|player`); the mod becomes active when the
-  role is `host` or `player`, without reloading the game.
+  `ctl_status.txt`. The controller writes `identity.txt` (`session=<id>`, `start=<seq>`, `role=idle|host|player`); the
+  mod becomes active when the role is `host` or `player`, without reloading the game, and inactive again when it is
+  `idle` (one transition back to single-player: held commands handed back, the session's queue dropped, the speed
+  given back). The link files outlive sessions: each session has its own id, and the mod dispatches only the
+  `to_game.log` lines after its `start`; the controller tails `from_game.log` from where it ended when the session began.
 - A session ends with the world it lives in: the controller watches `from_game.log` (the mod writes to it every half
   second while its script runs) and ends the host or player session when the game that had spoken goes silent for 8
   seconds, except during a resync reload. A host that stops tells its players (`Kicked`, reason `ended`) so they end

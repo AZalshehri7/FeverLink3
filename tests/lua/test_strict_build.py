@@ -610,6 +610,8 @@ class StrictOnTest(StrictTest):
             f.write("id=1\nname=client\nrole=idle\n")   # the session ended while the command is held: strict mode stops
         self.frames(30)
         self.assertIn("goes back to the engine before its stamp (the session ended)", self.B.log())
+        # B's game is single-player now and sends no more clock lines; the host tells A that B left (its promise no longer holds A)
+        self.relay.broadcast("player_left", self.relay.ser({"id": 1}), exclude=self.B)
         self.tick(16)
         self.assertEqual(self.B.native.released, [1])
         self.assertEqual(self.B.shipped_count(), 1)

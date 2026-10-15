@@ -14,7 +14,7 @@ or a test) clears it when the game starts, then owns these files:
 |---|---|---|---|
 | `ctl_cmd.log` | the window (the mod's UI script) | the controller | Commands, one per line, append-only. Format below. |
 | `ctl_status.txt` | the controller | the window | The controller's whole state as one Lua table, rewritten whenever something in it changed. |
-| `identity.txt` | the controller | the mod | `id=`, `name=`, `role=` lines. `role` is `idle` until a session exists, then `host` or `player` with the id the host assigned. The mod becomes active on `host` or `player` without reloading the game. |
+| `identity.txt` | the controller | the mod | `session=`, `start=`, `id=`, `name=`, `role=` lines (role last: the mod takes the file only with a complete `role=` line). `role` is `idle` until a session exists, then `host` or `player` with the id the host assigned. The mod becomes active on `host` or `player` without reloading the game, and single-player again on `idle` (held build commands handed back to the engine, the session's queue dropped, stamped commands not yet applied failed, the speed given back). `session` is the id of the controller's link for this session (16 hex digits, new for every `host` or `join`) and `start` the last `to_game.log` sequence before it: the files outlive sessions, and the mod dispatches only lines above `start`. Another `session` id while active is a new session (the old one ends first). |
 | `to_game.log`, `from_game.log` | the controller / the mod | the mod / the controller | The session's file link with the game (`launcher/README.md`, "File link"). Not part of this page. |
 
 The controller reads new commands and rewrites the status about every 100 ms. The window re-reads the status when its

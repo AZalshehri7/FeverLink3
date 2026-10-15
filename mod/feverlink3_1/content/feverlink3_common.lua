@@ -92,23 +92,56 @@ function C.readFile(path)
 	return s
 end
 
--- Live mode: identity.txt (id, name, role) is written by the native module; the mod becomes active when the role is
--- host or player, without a reload. Cheap to call every frame: the file is read at most once a second.
-function C.poll(force)
-	if not C.LIVE or C.ACTIVE then return C.ACTIVE end
-	local now = os.clock()
-	if not force and C.lastPoll and now - C.lastPoll < 1 then return false end
-	C.lastPoll = now
+-- The session, as identity.txt names it. The session controller writes the file (launcher gamelink::Session::write_identity):
+-- `session=<id>` and `start=<seq>` first, then id, name and `role=` last. The role is `host` or `player` while a session runs and
+-- `idle` when there is none. The link files outlive sessions (quit to the menu, load another save, host again: the same
+-- to_game.log), so a session is known by its id, and its lines are the ones above `start` (the last to_game.log line before it).
+C.SESSION = nil       -- the id of the session this state is in ("" for an identity that names none: an older writer, the tests)
+C.SESSION_START = 0   -- to_game.log lines at or below this sequence belong to earlier sessions
+C.GEN = 0             -- counts the sessions this Lua state has seen begin: a half that started in another one must end first
+C.ROLE = nil
+
+-- identity.txt as a table, or nil when it is missing or incomplete (only a complete `role=` line counts: the writer puts it
+-- last, so a read racing the write sees everything or no role)
+function C.readIdentity()
 	local text = C.readFile(C.path("identity.txt"))
-	if not text then return false end
-	local id = tonumber(text:match("id=(%d+)"))
-	local name = text:match("name=([^" .. CR .. NL .. "]*)")
-	local role = text:match("role=([%a]+)")
-	if id and (role == "host" or role == "player") then
-		C.PLAYER_ID = id
-		C.PLAYER_NAME = (name ~= nil and name ~= "") and name or ("player " .. tostring(id))
-		C.ACTIVE = C.IO ~= nil
-		print("[feverlink3] session found: id=" .. tostring(id) .. " role=" .. role)
+	if not text then return nil end
+	local role = text:match("role=(%a+)[" .. CR .. NL .. "]")
+	if not role then return nil end
+	return {
+		role = role,
+		id = tonumber(text:match("id=(%d+)")),
+		name = text:match("name=([^" .. CR .. NL .. "]*)"),
+		session = text:match("session=([%w%-]+)[" .. CR .. NL .. "]") or "",
+		start = tonumber(text:match("start=(%d+)[" .. CR .. NL .. "]")) or 0,
+	}
+end
+
+-- The session switch, for every half of the mod (both bridge halves, the UI hook, the window). identity.txt is read at most once a
+-- second (cheap to call every frame; `force` reads it now). `host` or `player` makes the mod active; a session id that is not the
+-- one this state is in starts another session (C.GEN grows: a half still in the old one ends it first, see the bridge's
+-- sessionOff); any other complete role (`idle`) makes it inactive: the session is over, the game is single-player again. A
+-- missing or incomplete file changes nothing. Without the file (a game the launcher started with FEVERLINK3_SESSION_DIR and no
+-- identity yet) the environment's answer stands.
+function C.poll(force)
+	if not (C.DIR and C.IO) then return C.ACTIVE end
+	local okT, now = pcall(os.clock)
+	if not okT or type(now) ~= "number" then return C.ACTIVE end
+	if not force and C.lastPoll and now >= C.lastPoll and now - C.lastPoll < 1 then return C.ACTIVE end
+	C.lastPoll = now
+	local idn = C.readIdentity()
+	if not idn then return C.ACTIVE end
+	C.ROLE = idn.role
+	local on = (idn.role == "host" or idn.role == "player") and idn.id ~= nil
+	if on and (not C.ACTIVE or idn.session ~= C.SESSION) then
+		C.PLAYER_ID = idn.id
+		C.PLAYER_NAME = (idn.name ~= nil and idn.name ~= "") and idn.name or ("player " .. tostring(idn.id))
+		C.SESSION, C.SESSION_START = idn.session, idn.start
+		C.ACTIVE, C.GEN = true, C.GEN + 1
+		print("[feverlink3] session found: id=" .. tostring(idn.id) .. " role=" .. idn.role .. " session=" .. tostring(idn.session) .. " start=" .. tostring(idn.start))
+	elseif not on and C.ACTIVE then
+		C.ACTIVE = false
+		print("[feverlink3] session over: role=" .. idn.role .. " (session " .. tostring(C.SESSION) .. ")")
 	end
 	return C.ACTIVE
 end
