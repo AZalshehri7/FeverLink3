@@ -91,13 +91,34 @@ local function short(v)
 	return tostring(v):sub(1, 100)
 end
 
--- is a session on? (the identity file the controller writes; read at most once a second)
+-- The session these commands were held in is over (identity.txt says idle, or names another session). The bridge ends it too
+-- (X.sessionOff) and answers each command: failed when it was not applied, or the engine's own answer when the engine had it already
+-- (applied during a pause). A command whose answer never comes (its record never reached the bridge) fails OVER_SECONDS after the end
+-- instead of the 120 s limit. Nothing is applied here: the command was the window's to retry.
+local OVER_SECONDS = 5
+function M.sessionOver(why)
+	local n, now = 0, os.clock()
+	for _, h in pairs(U.held) do
+		if not h.over then
+			h.over = now
+			n = n + 1
+		end
+	end
+	if n > 0 then log("session over (" .. tostring(why) .. "): " .. n .. " held command(s) wait " .. OVER_SECONDS .. " s for the bridge's last answer, then fail") end
+end
+
+-- is a session on? (the identity file the controller writes; read at most once a second). A session that ended, or was replaced by
+-- another one, since this state last looked fails what it still holds (M.sessionOver).
 local function active()
 	local now = os.clock()
-	if now - U.lastPoll > 1 then
+	if now - U.lastPoll > 1 or now < U.lastPoll then
 		U.lastPoll = now
 		pcall(C.poll)
 	end
+	if U.gen ~= nil and (not C.ACTIVE or U.gen ~= C.GEN) then
+		pcall(M.sessionOver, C.ACTIVE and "another session began" or "the session ended")
+	end
+	U.gen = C.ACTIVE and C.GEN or nil
 	return C.ACTIVE == true
 end
 
@@ -181,6 +202,7 @@ end
 -- stamp. Called by the window's refresh (feverlink3_ui.script.lua) and before every command this hook takes.
 function M.poll()
 	if next(U.held) == nil then return end
+	active()   -- a session that ended fails what is held here (M.sessionOver)
 	local okP, recs = pcall(C.readerPoll, inbox())
 	for _, rec in ipairs(okP and recs or {}) do
 		local p = rec.kind == "result" and C.parse(rec.payload) or nil
@@ -209,6 +231,10 @@ function M.poll()
 			U.held[id] = nil
 			log("command " .. h.name .. " #" .. id .. " had no answer from the bridge in " .. HELD_SECONDS .. " s: its callback is fired with a failure")
 			fire(id, h, {}, false, {})
+		elseif h.over and (now - h.over > OVER_SECONDS or now < h.over) then
+			U.held[id] = nil
+			log("command " .. h.name .. " #" .. id .. ": the session ended and the bridge did not answer within " .. OVER_SECONDS .. " s: its callback is fired with a failure")
+			fire(id, h, {}, false, {})
 		end
 	end
 end
@@ -217,7 +243,7 @@ end
 local function handle(tag, cmd, cb, progress)
 	if tag.name == "makeGameSetSpeedCmd" then
 		U.stats.speed = U.stats.speed + 1
-		send("speed", { n = tag.args[1] })
+		send("speed", { n = tag.args[1], sid = C.SESSION })
 		return true
 	end
 	-- builds are captured where the engine applies them (the bridge's onPreBuildProposal), whoever issued them
@@ -248,7 +274,8 @@ local function handle(tag, cmd, cb, progress)
 	-- is kept with the command but never called: the engine never had this command, so it has no progress of its own to report.
 	inbox()   -- opened before the record leaves, so its answer lies after the place this state starts reading from
 	U.held[id] = { cb = cb, progress = progress, name = tag.name, spec = spec, at = os.clock() }
-	if not send("cmd", { id = id, body = text, category = category }) then
+	-- `sid`: the bridge acts only on records of its own session (the file outlives sessions)
+	if not send("cmd", { id = id, body = text, category = category, sid = C.SESSION }) then
 		-- fail closed: applying it here alone would fork the worlds
 		U.held[id] = nil
 		U.stats.failed = U.stats.failed + 1

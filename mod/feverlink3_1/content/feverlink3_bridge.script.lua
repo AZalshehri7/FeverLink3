@@ -1766,8 +1766,54 @@ local function buildTraceStep(tick)
 	end
 end
 
+-- ---- the end of a session in the simulation half
+--
+-- identity.txt says the session is over (`idle`) or names another one (common.lua C.poll), or the interface half says so (event
+-- `sessionoff`, sent first in its own transition, X.sessionOff): what this half keeps for the ended session goes, so nothing of it is
+-- applied later. The queue of stamped actions is dropped: no peer applies them at their stamps any more, and a stamp of an ended session
+-- means nothing to the next one (it would be due at once). This game's own builds in it are not lost silently: a build whose command
+-- the native module holds goes back to the engine when the interface half switches holding off (the module fails a deferred one), and
+-- the callbacks of commands that were stamped and not applied are failed there. What belongs to the world stays: the bindings
+-- (st.bind) and the company registry. Script builds this half took for stamping are failed (their callbacks run with a failure).
+function X.simSessionOff(state, why)
+	SIM.gen = nil
+	local n = { queue = 0, out = 0, binders = 0, scripts = #SIMO.pending }
+	pcall(function()
+		local st = simState(state)
+		n.queue, n.out, n.binders = #st.queue, #(st.out or {}), #st.binders
+		st.queue, st.out, st.binders, st.watches = {}, nil, {}, {}
+		st.heldOut, st.heldInput, st.heldNative, st.nbinds = nil, nil, nil, nil
+		st.results, st.reports, st.refused, st.notes, st.late = {}, {}, {}, nil, 0
+		st.epoch = nil   -- the next interface run stamps it again
+		state:set(st)
+	end)
+	for _, p in ipairs(SIMO.pending) do
+		if p.cb then pcall(p.cb, nil, false) end
+	end
+	for _, cb in pairs(SIMO.cbs) do pcall(cb, nil, false) end
+	SIMO.pending, SIMO.cbs = {}, {}
+	SIM.deferredBuild, SIM.nativeBinds = nil, nil
+	-- the session's deterministic math.random (L.installRandom) gives way to the game's own; the next session installs a new one
+	if SIM.rng then
+		if SIM.random0 then math.random = SIM.random0 end
+		SIM.rng = nil
+	end
+	logSim(string.format("session over (%s): single-player again; dropped %d queued action(s), %d native build(s) not yet shipped, %d binder(s), %d script build(s) (failed)",
+		tostring(why), n.queue, n.out, n.binders, n.scripts))
+	traceSim("session", string.format("off why=%s queue=%d out=%d binders=%d scripts=%d", tostring(why), n.queue, n.out, n.binders, n.scripts))
+end
+
+-- Every update and every event of the interface half: a session this half started in that is over (or replaced by another) ends here.
+function X.simSessionCheck(state)
+	if SIM.gen ~= nil and (not C.ACTIVE or SIM.gen ~= C.GEN) then
+		X.simSessionOff(state, C.ACTIVE and "another session began" or "the session ended")
+	end
+	if C.ACTIVE and SIM.gen == nil then SIM.gen = C.GEN end
+end
+
 function update(userParams, state, dt)
 	C.poll()
+	X.simSessionCheck(state)
 	pcall(function() buildTraceStep(math.floor(engine.gameTime() / STEP)) end)
 	townTraceGuard(function(t)
 		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
@@ -1779,6 +1825,7 @@ function update(userParams, state, dt)
 		return
 	end
 	if not SIM.rng then
+		SIM.random0 = SIM.random0 or math.random
 		SIM.rng = L.newRandom(engine.gameTime)
 		L.installRandom(SIM.rng)
 		logSim("deterministic math.random installed")
@@ -1857,6 +1904,7 @@ function handleEvent(userParams, state, src, id, name, param)
 	end
 	if id == "apply_command" and name == "onPreBuildProposal" then
 		C.poll()
+		X.simSessionCheck(state)
 		if not C.ACTIVE then return end
 		local ok, err = pcall(simCaptureBuild, state, param)
 		if not ok then logSim("onPreBuildProposal capture failed: " .. tostring(err)) end
@@ -1873,9 +1921,19 @@ function handleEvent(userParams, state, src, id, name, param)
 		end
 		return
 	end
-	C.poll()
-	if not C.ACTIVE or id ~= "feverlink3" then return end
+	if id ~= "feverlink3" then return end
 	if name == "nop" then return end   -- strict mode's trigger: a command that makes the native module run its queue (natTrigger)
+	-- The interface half talks: this half catches up with its view of the session first. Both read identity.txt on their own clock, a
+	-- second apart at most; the interface half's first lines of a session must not be dropped because this half has not looked yet.
+	local sid = type(param) == "table" and name == "session" and param.sid or nil
+	C.poll(not C.ACTIVE or (sid ~= nil and sid ~= C.SESSION))
+	X.simSessionCheck(state)
+	if name == "sessionoff" then
+		-- the interface half ended its session (X.sessionOff): it sends this before it hands held commands back to the engine
+		if SIM.gen ~= nil or not C.ACTIVE then X.simSessionOff(state, "the interface half ended the session") end
+		return
+	end
+	if not C.ACTIVE then return end
 	local ok, err = pcall(function()
 		local st = simState(state)
 		if name == "session" and type(param) == "table" then
@@ -1889,6 +1947,14 @@ function handleEvent(userParams, state, src, id, name, param)
 				st.reports, st.results, st.refused, st.out, st.notes, st.late = {}, {}, {}, nil, nil, 0
 				st.epoch = param.epoch
 				traceSim("session", "epoch " .. tostring(param.epoch) .. ": dropped " .. C.integerText(dropped) .. " outputs of an earlier session")
+				if param.fresh then
+					-- A session begins in this world (not a resync reload, which resumes its session from the saved queue): the queue and the
+					-- pending bindings of the save are another session's. A save made mid-session (the guest's save at the end, a player's own)
+					-- carries them; applied now, every stamp in them would be due at once.
+					local stale = #st.queue + #st.binders
+					st.queue, st.binders, st.watches, st.heldOut, st.heldInput, st.heldNative, st.nbinds = {}, {}, {}, nil, nil, nil, nil
+					if stale > 0 then logSim("a new session: dropped " .. C.integerText(stale) .. " queued action(s) and binder(s) of an earlier session found in this world") end
+				end
 			end
 		elseif name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
@@ -2252,6 +2318,7 @@ local function guiApplyNow(it, now)
 	local bindBefore = {}
 	for _, comp in ipairs(bindComps or {}) do bindBefore[comp] = engine.entitiesWith(comp) end
 	local function finish(data, success, entities)
+		if X.engineHas then X.engineHas[it.key] = nil end
 		if spec.creates and success then
 			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
 			local okd, e = pcall(function() return data[spec.result] end)
@@ -2291,6 +2358,9 @@ local function guiApplyNow(it, now)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
 	local okS, errS
+	-- from here the engine has the command: its own answer (finish) reaches the callback, even after the session ended (X.sessionOff)
+	X.engineHas = X.engineHas or {}
+	X.engineHas[it.key] = true
 	if it.heldId and natPauseRelease then
 		-- the tool's own command is held by the native module: it is released instead of sent (the whole build is that one command)
 		okS, errS = pcall(natPauseRelease, it, finish)
@@ -2314,6 +2384,7 @@ local function guiApplyNow(it, now)
 		end, finish)
 	end
 	if not okS then
+		X.engineHas[it.key] = nil
 		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
 		send("action_refused", { seq = it.seq, from = it.from, detail = tostring(errS) })
 		-- no apply on this game: the deferred held command fails now (tool callback fired); an exact copy that cannot be made asks for the repair
@@ -2797,7 +2868,6 @@ function natNew()
 		caps = {}, parked = {}, awaiting = {}, owed = {}, deferred = {},
 		heldCaps = {},      -- held id -> the capture of that command's own proposal (the native module's preview `held:<id>`, natCapture)
 		heldByKey = {}, byId = {}, finishes = {},   -- shipped builds whose own copy is held: by action key / by held id; pause-path completions
-		sessionOn = true, sessionAt = -100,
 		logWin = -100, logN = 0, logLost = 0, faults = 0, dead = false,
 	}
 end
@@ -3007,14 +3077,9 @@ function natPauseRelease(it, finish)
 	end
 end
 
-function natSessionOn(N, now)
-	if now - N.sessionAt >= 1 then
-		N.sessionAt = now
-		local text = C.readFile(C.path("identity.txt"))
-		local role = text and text:match("role=([%a]+)") or nil
-		if role then N.sessionOn = (role == "host" or role == "player") end
-	end
-	return N.sessionOn
+-- the session switch is common.lua's (C.poll); the end of a session switches strict mode off in X.sessionOff
+function natSessionOn()
+	return C.ACTIVE == true
 end
 
 -- ---- the build of one held command
@@ -4007,7 +4072,7 @@ function natTick()
 	elseif not usable then reason = "the build module has no tool capture"
 	elseif N.hookOk == false then reason = "the native module has no command_list_add hook"
 	elseif G.loading then reason = "a resync load is under way"
-	elseif not natSessionOn(N, now) then reason = "the session ended" end
+	elseif not natSessionOn() then reason = "the session ended" end
 	if reason then
 		if N.holdSent then natStop(reason) end
 	elseif N.gaveUp then
@@ -4167,6 +4232,15 @@ function installWrap()
 		api.cmd.sendCommand = function(cmd, cb, progress)
 			local tag = cmd ~= nil and G.tags[cmd] or nil
 			if tag == nil then return O.sendCommand(cmd, cb, progress) end
+			if not X.live() then
+				-- no session (none began, or it ended: X.sessionOff): every command goes straight to the engine as in single-player, the
+				-- speed buttons included. A mod-level action has no engine command: it fails.
+				if L.COMMANDS[tag.name] and L.COMMANDS[tag.name].virtual then
+					if cb then pcall(cb, {}, false, {}) end
+					return
+				end
+				return O.sendCommand(cmd, cb, progress)
+			end
 			if tag.name == "makeGameSetSpeedCmd" then
 				-- the player's speed buttons become requests to the host; the session speed comes back in `session`
 				send("speed_request", { speed = tag.args[1] })
@@ -4514,7 +4588,7 @@ function collectFromSim(state)
 			G.staleSeen = stale
 			logGui("ignoring " .. C.integerText(stale) .. " stored output(s) (reports, results, refusals, native builds) of an earlier session until the simulation half takes the new session")
 		end
-		if G.frames % 30 == 0 then toSim("session", { epoch = G.epoch }) end
+		if G.frames % 30 == 0 then toSim("session", G.sessionMsg or { epoch = G.epoch }) end
 		return
 	end
 	G.notes = st.notes
@@ -4601,10 +4675,22 @@ end
 
 -- The window's side of the hand-off: chat typed there arrives as records in ui_out.log, the model goes back as a
 -- snapshot file. Throttled: a few frames apart is plenty for a chat box.
+-- A record of ui_out.log belongs to this session when it names it (`sid`, the UI hook's commands and speed requests), or, without a
+-- name (the window's chat), when it was written after this session began here (X.uiFloor). The file outlives sessions; a record of an
+-- earlier one is never acted on (its window was answered, or failed, when that session ended), and never answered here: a new
+-- window state numbers its commands from 1 again, so an answer to an old id could hit one of its own.
+function X.uiRecordOfSession(rec, p)
+	if type(p) == "table" and p.sid ~= nil then return p.sid == G.sid end
+	return rec.seq > (X.uiFloor or 0)
+end
+
 function serviceWindow()
 	if G.frames % 3 ~= 0 then return end
+	local ignored = 0
 	for _, rec in ipairs(C.readerPoll(G.uiReader)) do
-		if rec.kind == "chat" then
+		if not X.uiRecordOfSession(rec, C.parse(rec.payload)) then
+			ignored = ignored + 1
+		elseif rec.kind == "chat" then
 			local p = C.parse(rec.payload)
 			local text = type(p) == "table" and Hud.cleanText(p.text) or nil
 			if text then
@@ -4639,6 +4725,7 @@ function serviceWindow()
 			end)
 		end
 	end
+	if ignored > 0 then logGui("window: " .. ignored .. " record(s) of ui_out.log belong to an earlier session: ignored") end
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
 	coGuard("page", writeCompanies)
 	if G.frames % 30 == 0 then
@@ -4676,11 +4763,7 @@ end
 -- A guest whose session ends while its world is still there (the host stopped, it was removed, the connection was lost, it left) saves its
 -- world first with the game's own save, so nothing it built is lost; the game itself is never closed by FeverLink3.
 function X.guestSaveOnEnd()
-	local now = os.clock()
-	if now < (G.roleAt or 0) then return end
-	G.roleAt = now + 1
-	local text = C.readFile(C.path("identity.txt"))
-	local role = text and text:match("role=([%a]+)") or nil
+	local role = C.ROLE   -- identity.txt as C.poll last read it
 	if not role then return end
 	local was = G.lastRole
 	G.lastRole = role
@@ -4695,44 +4778,180 @@ function X.guestSaveOnEnd()
 		G.guestSaved = false
 	end
 end
+
+-- A session runs on this game: identity.txt names one (C.ACTIVE) and this interface half started in that very one. Everything the
+-- session does to the player's commands (the wrap's stamping and shipping, the speed requests) asks this.
+function X.live()
+	return C.ACTIVE == true and G.started and G.gen == C.GEN
+end
+
+-- THE end of a session on this game, one transition back to single-player: identity.txt says `idle` (the host ended it, the player
+-- left or was removed, the world was closed, the controller gave up reconnecting) or names another session. Until 2026-10-15 nothing
+-- switched the mod off: after the session the wrap still stamped and shipped every command to nobody, the speed stayed forced by the
+-- pacing, a stale peer's promise could freeze the game at the input barrier, and the next session in the same Lua state inherited all of
+-- it. What it does, in this order:
+--   1. tells the simulation half (`sessionoff`, X.simSessionOff; sent before anything below, and events run in order): its queue of
+--      stamped actions goes, so nothing of the ended session is applied there later, nor twice with what follows;
+--   2. hands this game's held native commands back to the engine (natStop: hold_off): a held build is applied NOW. The batch-2 rule (a
+--      shipped build is never applied at another time than the stamp its peers use) protects the peers' worlds; the session is over,
+--      there are no peers any more, so the player's build lands as in single-player. A deferred command (its build was to come from
+--      this game's stamp apply, which no longer happens) is failed by the module at hold_off: its tool callback fires with a failed
+--      result, nothing is applied, the tool lives on. A build parked for a paused game's grace is one of the held ones (released);
+--   3. answers what the simulation half applied or refused at its stamps already (its results in the state), then fails the callbacks of
+--      commands that were stamped and not applied (the wrap's own, and the window commands the UI hook holds: they get a failed answer),
+--      since the engine never had them; one applied from this state during a pause is with the engine already and keeps its callback;
+--   4. drops what the session knew: peers and their promises (the input barrier), the session state, checksum marks, the pause order
+--      (queued and own items), graces, parked and deferred dry runs, vetoes, authority values, the stamp margin, permissions;
+--   5. gives the speed back: the session's speed when it was running, else the speed the game had when the session began; from now
+--      on the wrap passes the player's speed buttons to the engine;
+--   6. remembers where the link stands (G.linkFloor), so a next session in this Lua state never dispatches a line of this one.
+function X.sessionOff(why, state)
+	if not G.started then return end
+	G.started = false
+	local s = G.session
+	local n = { held = 0, deferred = 0, pending = 0, peers = 0, pause = 0, graces = 0, parked = 0 }
+	-- what the simulation half applied (or refused) at its stamps before the end is answered as it happened, not failed below
+	if state then
+		pcall(function()
+			local st = state:get()
+			if type(st) ~= "table" or st.epoch ~= G.epoch then return end
+			for _, r in ipairs(st.results or {}) do
+				if not G.resultsSeen[r.key] then
+					G.resultsSeen[r.key] = true
+					deliverResult(r.key, r.data, r.success, r.entities or {})
+				end
+			end
+			for _, r in ipairs(st.refused or {}) do
+				if not G.refusedSent[r.key] then
+					G.refusedSent[r.key] = true
+					deliverResult(r.key, nil, false, {})
+				end
+			end
+		end)
+	end
+	pcall(toSim, "sessionoff", { sid = G.sid })
+	local N = G.nat
+	if N then
+		for _, h in pairs(N.heldByKey) do
+			if not (h.released or h.done or h.cancelled) then n.held = n.held + 1 end
+		end
+		for _ in pairs(N.deferred) do n.deferred = n.deferred + 1 end
+		local okS, errS = pcall(natStop, why)
+		if not okS then logGui("session over: switching strict mode off failed: " .. tostring(errS)) end
+	end
+	G.nat = nil   -- the next session starts strict mode afresh (natNew)
+	local pending = G.pending
+	G.pending = {}
+	for key, cb in pairs(pending) do
+		if X.engineHas and X.engineHas[key] then
+			G.pending[key] = cb   -- applied from this state during a pause: the engine runs it and its answer reaches the callback
+		else
+			n.pending = n.pending + 1
+			local okC, errC = pcall(cb, nil, false, {})
+			if not okC then logGui("session over: the callback of " .. tostring(key) .. " failed: " .. tostring(errC)) end
+		end
+	end
+	for _ in pairs(G.peers) do n.peers = n.peers + 1 end
+	for _ in pairs(G.pauseOwn or {}) do n.pause = n.pause + 1 end
+	n.pause = n.pause + #(G.pauseQ or {})
+	for _ in pairs(G.graces) do n.graces = n.graces + 1 end
+	for _ in pairs(G.parked) do n.parked = n.parked + 1 end
+	G.peers, G.session, G.marks = {}, L.newSession(), {}
+	G.graces, G.parked, G.dry, G.buildAts, G.vetoed = {}, {}, {}, {}, {}
+	G.pauseQ, G.pauseOwn, G.pauseLast = nil, nil, nil
+	G.promiseFloor, G.promisePause, G.barrier = nil, nil, nil
+	G.authPending, G.accountAt, G.authLast, G.pendingSave = {}, {}, nil, nil
+	G.perms, G.margin = L.newPermissions(), L.newMargin()
+	G.resultsSeen, G.reportsSent, G.refusedSent, G.lateSeen = {}, {}, {}, 0
+	G.outSeen, G.outAcked, G.uiSeq, G.uiFn, G.vetoChatted = {}, nil, {}, nil, nil
+	G.loading = false
+	G.linkFloor = math.max(G.linkFloor or 0, G.reader and G.reader.lastSeq or 0)
+	G.reader, G.writer = nil, nil
+	if G.localCompany ~= nil and engine.setLocalCompany then
+		pcall(engine.setLocalCompany, nil)
+		G.localCompany = nil
+	end
+	local sp = (s.started and (s.speed or 0) > 0) and s.speed or (G.speedBefore or 1)
+	G.lastSpeedSet = nil
+	local okV = pcall(function() O.sendCommand(O.setSpeed(sp)) end)
+	pcall(Hud.setSession, G.hud, { started = false, speed = 0 })
+	pcall(Hud.writeSnapshot, C, G.hud, G.hudWritten)
+	logGui(string.format("session over (%s; identity.txt role %s): single-player again. Strict mode off with %d held command(s) handed back to the engine and %d deferred one(s) failed by the module;"
+		.. " %d stamped command(s) not applied (callbacks failed); dropped %d peer(s), %d pause-order item(s), %d grace(s), %d parked build(s); speed %s%s; the link resumes after line %s",
+		tostring(why), tostring(C.ROLE), n.held, n.deferred, n.pending, n.peers, n.pause, n.graces, n.parked, tostring(sp), okV and "" or " (COULD NOT BE SET)", C.integerText(G.linkFloor)))
+	traceGui("session", string.format("off why=%s sid=%s held=%d deferred=%d pending=%d peers=%d pause=%d graces=%d parked=%d speed=%s floor=%s",
+		tostring(why), tostring(G.sid), n.held, n.deferred, n.pending, n.peers, n.pause, n.graces, n.parked, tostring(sp), C.integerText(G.linkFloor)))
+end
 end -- section: the wrap, link handlers, the service window
 
 local function guiUpdate(userParams, state, guiState)
 	C.poll()
+	if G.started and not X.live() then
+		local okO, errO = pcall(X.sessionOff, C.ACTIVE and "another session began" or "the session ended", state)
+		if not okO then
+			G.started = false
+			logGui("ending the session failed: " .. tostring(errO))
+		end
+	end
+	pcall(X.guestSaveOnEnd)
 	if not C.ACTIVE then
 		if G.nat and G.nat.holdSent then pcall(natStop, "the mod is not active") end
 		return
 	end
 	G.frames = G.frames + 1
 	pcall(X.holdWorldLock)
-	pcall(X.guestSaveOnEnd)
 	if not G.started then
-		G.started = true
+		-- a session begins on this game: the first frame of this Lua state in one, or the next one after X.sessionOff
+		G.started, G.gen, G.sid = true, C.GEN, C.SESSION
+		-- The link: lines at or below the session's start (identity.txt `start=`) are an earlier session's, and so is anything this Lua
+		-- state dispatched before (G.linkFloor). The live folder keeps to_game.log across sessions; reading from its first line fed an
+		-- earlier session's session, action and resync lines into this world.
+		local floor = math.max(tonumber(C.SESSION_START) or 0, G.linkFloor or 0)
 		G.reader = C.newReader(C.path(C.TO_GAME))
+		G.reader.lastSeq = floor
 		G.writer = C.newWriter(C.path(C.FROM_GAME), C.PLAYER_ID)
 		G.hud = Hud.new(C.PLAYER_ID, C.PLAYER_NAME)
 		G.co = Co and Co.new() or nil
 		-- companies: a reload runs this file again in the same Lua state, so an override of the previous run may still be in place
 		if Co and engine.setLocalCompany then engine.setLocalCompany(nil) end
-		G.uiReader = C.newReader(C.path(Hud.OUTBOX))
+		-- the window's records: kept reading where this state stopped; the ones without a session id count from here (X.uiRecordOfSession)
+		G.uiReader = G.uiReader or C.newReader(C.path(Hud.OUTBOX))
+		X.uiFloor = C.lastSeqInFile(C.path(Hud.OUTBOX))
 		-- after a resync load: resume the link after the line that asked for it, and keep the window's roster and chat
 		local cursor, uiCursor = (C.readFile(C.path(C.CURSOR)) or ""):match("^(%d+) (%d+)")
 		cursor, uiCursor = tonumber(cursor), tonumber(uiCursor)
-		if cursor and cursor > 0 then
+		local resumed = false
+		if cursor and cursor > floor then
+			resumed = true
 			G.reader.lastSeq = cursor
 			G.uiReader.lastSeq = uiCursor or 0
+			X.uiFloor = uiCursor or 0
 			C.writeFile(C.path(C.CURSOR), "")
 			local restored = Hud.fromSnapshot(C.parse(C.readFile(C.path(Hud.SNAPSHOT)) or ""))
 			if restored and restored.selfId == C.PLAYER_ID then G.hud = restored end
 			logGui("reloaded after a resync: link resumes after line " .. string.format("%d", cursor))
+		elseif cursor and cursor > 0 then
+			C.writeFile(C.path(C.CURSOR), "")
+			logGui("a resync cursor of an earlier session (line " .. C.integerText(cursor) .. ", this session starts after line " .. C.integerText(floor) .. ") is ignored")
 		end
-		installWrap()
+		if not X.wrapped then
+			X.wrapped = true
+			installWrap()
+		end
 		local okN, nat = pcall(natNew)
 		G.nat = okN and nat or nil
-		pcall(function() guiState:subscribeToAllEvents() end)
+		if not X.subscribed then
+			X.subscribed = true
+			pcall(function() guiState:subscribeToAllEvents() end)
+		end
+		G.speedBefore = engine.speed()
 		setSpeed(0)
 		G.epoch = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock() * 1000)) .. "-" .. tostring(C.PLAYER_ID)
-		toSim("session", { epoch = G.epoch })
+		-- `fresh`: a session begins in this world (no resync reload resumes one): the simulation half drops a saved queue of another session
+		G.sessionMsg = { epoch = G.epoch, sid = C.SESSION, fresh = (not resumed) or nil }
+		toSim("session", G.sessionMsg)
+		logGui("session " .. tostring(C.SESSION) .. " begins here (" .. (resumed and "resumed after a resync load" or "fresh") .. "): to_game.log lines after " .. C.integerText(G.reader.lastSeq))
+		traceGui("session", string.format("on sid=%s gen=%s start=%s floor=%s resumed=%s", tostring(C.SESSION), tostring(C.GEN), tostring(C.SESSION_START), C.integerText(G.reader.lastSeq), tostring(resumed)))
 		send("hello", { time = engine.gameTime(), name = C.PLAYER_NAME })
 		-- the promise goes out with the hello, before anything this game could ship (the input barrier, L.promise)
 		X.reportClock(engine.gameTime())
