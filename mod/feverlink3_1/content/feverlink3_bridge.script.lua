@@ -1072,6 +1072,8 @@ function X.ctlWriter()
 	return X.ctl
 end
 
+-- The simulation half runs in more than one Lua state, each with its own writer of native_ctl.sim.log: C.writerSend takes up the other's
+-- numbering before every line (C.writerLook; real runs b3real, b3real2: repeated numbers were dropped by the module, and the builds with them).
 function X.ctlSend(kind, payload)
 	local w = X.ctlWriter()
 	local ok, why = C.writerSend(w, kind, payload)
@@ -1122,9 +1124,16 @@ end
 -- when the module refuses the order. `refuse`: the test switch's forced refusal (nil: none). Returns true when the order was written; the
 -- caller sends the command only then (an order that did not reach the module would leave the placeholder to be applied as it is).
 local function sendInjectOrder(inj, key, held, tm, refuse, counter)
-	counter = counter or SIM   -- the interface half numbers its own orders apart (guiApplyNow): both halves write native_inject_<n>.txt
-	counter.injectN = (counter.injectN or 0) + 1
-	local n = counter.injectN
+	-- The order's key is the number its line will carry in this half's control file (after C.writerLook), so it never repeats while that
+	-- file goes on, whichever Lua state writes it (a count of each state's own gave two states' orders the same key and text file, real
+	-- runs b3real, b3real2). The interface half's keys start at its base (guiApplyNow): both halves write native_inject_<n>.txt.
+	local n
+	do
+		local w = X.ctlWriter()
+		local f = C.writerLook(w)
+		if f then f:close() end
+		n = ((counter and counter.base) or 0) + w.seq + 1
+	end
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
 		local sent, why = X.ctlSend("inject_next", { key = n, held = held, tm = tm, refuse = refuse })
@@ -2375,7 +2384,7 @@ local function guiApplyNow(it, now)
 			if a.patch then X.sendPatchOrder(a.patch, it.key) end
 			if a.inject then
 				-- this half's inject files are numbered apart from the simulation half's (both write native_inject_<n>.txt)
-				X.guiInject = X.guiInject or { injectN = X.GUI_INJECT_BASE }
+				X.guiInject = X.guiInject or { base = X.GUI_INJECT_BASE }
 				local okO, errO = X.sendInjectOrder(a.inject, it.key, it.deferId, isBuild and X.timingText(it, now) or nil, nil, X.guiInject)
 				if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
 			elseif it.deferId then

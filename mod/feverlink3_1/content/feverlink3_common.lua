@@ -542,8 +542,8 @@ end
 
 -- Writer: appends records with a sequence that continues after whatever the log already holds, so a reload of the
 -- savegame (which restarts the script and its counters) does not restart the sequence seen by the reader. Made ONCE per
--- Lua state and kept: the log's tail is read here and never again. A log has exactly one writer at a time (the native
--- control files are one per half: native_ctl.gui.log, native_ctl.sim.log). `opts.rotate` / `opts.keep` change the
+-- Lua state and kept: the log's tail is read here, and again only when another writer wrote the log meanwhile (C.writerLook:
+-- the game runs the simulation half in more than one Lua state, so native_ctl.sim.log can have two writers). `opts.rotate` / `opts.keep` change the
 -- generation size and how many generations are kept (tests).
 function C.newWriter(path, from, opts)
 	opts = opts or {}
@@ -567,13 +567,48 @@ function C.writerRotate(w)
 	return true
 end
 
+-- The writer takes up its log as it is NOW (the newest generation and its last number), not as it was when the writer was made.
+local function writerSync(w)
+	local g = C.newestGen(w.base)
+	if g ~= w.gen then w.gen, w.path = g, C.genPath(w.base, g) end
+	local last = C.lastSeqInFile(w.path)
+	if last == 0 and w.gen > 1 then last = C.lastSeqInFile(C.genPath(w.base, w.gen - 1)) end
+	if last > w.seq then w.seq = last end
+	w.size = C.fileSize(w.path) or 0
+end
+
+-- Before a line: whether another writer wrote the log since this one's last line (the file is not the size this writer left it), and if
+-- so its numbering and generation are taken up first. The game runs the simulation half in more than one Lua state with the script's
+-- state shared between them (real runs b3real and b3real2, 2026-10-15: two writers of native_ctl.sim.log, each with its own count, wrote
+-- seq 1 2 3 4 3 5 4 5 6 7; the module dropped every repeated number as old, and those builds' orders with them: a build lost or a fork).
+-- The check is the append open the line needs anyway (its size); the tail is read only when someone else wrote. Two writers on one
+-- thread take turns, so nothing comes between this look and the line. Returns the append handle (open) when the writer is up to date
+-- with it, else nil (the caller opens it again).
+function C.writerLook(w)
+	if not C.IO then return nil end
+	local f = C.IO.open(w.path, "ab")
+	if not f then return nil end
+	local size = f:seek("end")
+	if size and size == (w.size or 0) then return f end
+	f:close()
+	writerSync(w)
+	return nil
+end
+
 function C.writerSend(w, kind, payload)
 	local ok, text = pcall(C.serialize, payload or {})
 	if not ok then return false, text end
-	if w.rotate and w.size > 0 and w.size >= w.rotate then C.writerRotate(w) end
+	local f = C.writerLook(w)
+	if w.rotate and w.size > 0 and w.size >= w.rotate then
+		if f then f:close() f = nil end
+		C.writerRotate(w)
+	end
 	w.seq = w.seq + 1
 	local line = C.formatLine(w.seq, kind, w.from, text)
-	if C.appendFile(w.path, line) then
+	f = f or (C.IO and C.IO.open(w.path, "ab"))
+	if f then
+		f:write(line)
+		f:close()
 		w.size = (w.size or 0) + #line
 		return true
 	end
