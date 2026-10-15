@@ -2929,9 +2929,10 @@ local function natDecideUnsafe(h, cap)
 	local category = buildCategory(body)
 	if not L.permitted(G.perms, category) then
 		-- refused before stamping, like the wrapped sendCommand: nothing was built yet, so nothing is sent to the others
+		-- the cancel first: a fault in the lines after it must not reach natDecide's handler with no verdict written (it would release it)
+		natOrder("cancel", id)
 		natSay("held " .. id .. ": not allowed to " .. category .. ", cancelled")
 		send("action_refused", { seq = 0, detail = "permission denied: " .. category })
-		natOrder("cancel", id)
 		return
 	end
 	-- A build that adds constructions (depot, station, ...): the player gets an informational line. With FEVERLINK3_REMOTE_CONSTRUCTIONS=0
@@ -3034,60 +3035,157 @@ local function natDecideUnsafe(h, cap)
 		text = C.serialize(wire)
 	end)
 	if not okT then traceGui("build.timing", "held=" .. tostring(id) .. " the timing text could not be made: " .. tostring(errT)) end
-	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
-	if not okS then return release("the action cannot be sent (" .. tostring(errS) .. ")") end
-	G.seq = seq
+	-- THE SHIP IS THE LAST IRREVERSIBLE STEP. Once the action is written, every other game applies the build at the stamp, so this game may
+	-- only apply it at the stamp too (defer, cancel-and-replay, or hold until the stamp) or, if that cannot be done, fail it (tool freed,
+	-- nothing applied here) and ask for a repair; never release it at the click (natDecide). Everything that can fail is therefore made
+	-- here, before the write: the item, the flow, every log text. A fault in the ship trace (Build.planOf, string.format) used to reach
+	-- natDecide's handler, which released the command: applied at the click here, at the stamp everywhere else, and captured and shipped a
+	-- second time by the simulation half.
+	local site = natSite(h)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq), tRecv = wShip, gRecv = now }
+	local flow = (cancelFlow and deferFlow) and "defer" or (cancelFlow and "cancel" or "held")
+	if flow ~= "held" then wire.held = nil end
+	local function say(fmt, ...)
+		local okF, s = pcall(string.format, fmt, ...)
+		return okF and s or ("held " .. tostring(id) .. " " .. it.key .. " (a log line could not be made: " .. tostring(s) .. ")")
+	end
+	local planOk, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
+	local shipLine = say("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s extra=%s bytes=%d capture_ms=%s balance=%s record=%s", it.key, tostring(id),
+		site, tostring(h.done), tostring(cap.tool), planOk and tostring(plan) or ("? (" .. tostring(plan) .. ")"), tostring(at), tostring(now), tostring(at - now),
+		tostring(wire.xs), #text, string.format("%.1f", tonumber(cap.ms) or 0), tostring(select(2, pcall(engine.account))), text)
+	local done
+	if flow == "defer" then
+		done = function(okV) return say("held %s (site %s) matched the capture of %s (%s bytes): %s stamped %s (now %s), deferred: %s", id, site, tostring(cap.tool),
+			#text, it.key, tostring(at), tostring(now), okV and "kept until this game's own stamp apply, then completed with its result" or "DEFER NOT WRITTEN") end
+	elseif flow == "cancel" then
+		done = function(okV) return say("held %s (site %s) matched the capture of %s (%s bytes): %s stamped %s (now %s), cancel flow: %s", id, site, tostring(cap.tool),
+			#text, it.key, tostring(at), tostring(now), okV and "cancel written, this game replays the record too" or "CANCEL NOT WRITTEN (the build may be applied twice here)") end
+	else
+		local line = say("held %s (site %s) matched the capture of %s (%s bytes, %.0f ms to capture, %.0f ms old): %s stamped %s (now %s), held until the stamp; the tool's verdict %s",
+			id, site, tostring(cap.tool), #text, tonumber(cap.ms) or 0, (os.clock() - (tonumber(cap.t) or os.clock())) * 1000, it.key, tostring(at), tostring(now), tostring(cap.verdict or "n/a"))
+		done = function() return line end
+	end
+	local grace, graceLine = nil, nil
+	if flow == "held" and wire.commit then
+		local ms, rtt = graceMs()
+		local okH, heavy = pcall(function() return Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body) end)
+		if okH and heavy then ms = math.max(ms, CONSTRUCTION_GRACE_MS) end
+		grace = { it = it, ms = ms }
+		graceLine = say("%s: the game is paused, so the build waits %d ms (round trip about %.0f ms) for a veto before it is committed", it.key, ms, rtt)
+	end
+	local ship = { it = it, flow = flow, shipping = true }
+	h.ship = ship   -- natDecide's fault handler reads it: from here on a fault never releases the command
+	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
+	if not okS then
+		h.ship = nil   -- nothing went out: the command may still be given back
+		return release("the action cannot be sent (" .. tostring(errS) .. ")")
+	end
+	ship.shipped = true
+	G.seq = seq
+	-- after the ship: only what makes this game apply the build at the stamp, each step marked (ship.step) for the fault handler; every
+	-- log line is made already and written under pcall, so a log cannot fail the decision
+	local function log(fn, ...) pcall(fn, ...) end
+	ship.step = "book"
 	noteBuild(it.key, at)
-	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s extra=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
-		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), tostring(wire.xs), #text,
-		cap.ms or 0, tostring(engine.account()), text))
-	if cancelFlow and deferFlow then
-		wire.held = nil
-		local okD = natSend("defer", { id = id })
+	log(traceGui, "build.ship", shipLine)
+	if flow == "defer" then
+		ship.step = "defer"
 		it.deferId = id
 		N.deferred[id] = { key = it.key, at = at, t = os.clock() }
-		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), deferred: %s",
-			id, natSite(h), cap.tool, #text, it.key, at, now, okD and "kept until this game's own stamp apply, then completed with its result" or "DEFER NOT WRITTEN"))
-		route(it)
-		return
-	end
-	if cancelFlow then
-		-- cancel flow: the first strict flow. The command is cancelled, every game (this one too) replays the record.
-		wire.held = nil
+		local okD = natSend("defer", { id = id })
+		ship.verdict = okD and "defer" or nil
+		log(natSay, done(okD))
+	elseif flow == "cancel" then
+		ship.step = "cancel"
 		local okC = natOrder("cancel", id)
-		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), cancel flow: %s",
-			id, natSite(h), cap.tool, #text, it.key, at, now, okC and "cancel written, this game replays the record too" or "CANCEL NOT WRITTEN (the build may be applied twice here)"))
-		route(it)
-		return
+		ship.verdict = okC and "cancel" or nil
+		log(natSay, done(okC))
+	else
+		-- The command stays HELD until the stamp (nobody's world runs ahead of the others). It is not cancelled: a cancelled command
+		-- never gives the tool its "applied" callback and the tool stays dead (real run 2026-10-11). At the stamp this game's
+		-- simulation half does everything the other games do except sending (simApplyAction, it.heldId) and this half then releases
+		-- the held command (natRelease); every OTHER game replays the build at the stamp.
+		ship.step = "hold"
+		it.heldId = id
+		local rec = { id = id, key = it.key, at = at, t = os.clock(), fireable = FIRE_DONE and h.done == true }
+		N.heldByKey[it.key], N.byId[id] = rec, rec
+		ship.rec = rec
+		pcall(toSim, "heldout", { key = it.key })
+		log(natSay, done())
+		if grace then
+			grace.due = os.clock() + grace.ms / 1000
+			G.graces[it.key] = grace
+			ship.step, ship.routed = nil, true   -- natCommit routes it when the grace is over
+			log(natSay, graceLine)
+			return
+		end
 	end
-	-- The command stays HELD until the stamp (nobody's world runs ahead of the others). It is not cancelled: a cancelled command
-	-- never gives the tool its "applied" callback and the tool stays dead (real run 2026-10-11). At the stamp this game's
-	-- simulation half does everything the other games do except sending (simApplyAction, it.heldId) and this half then releases
-	-- the held command (natRelease); every OTHER game replays the build at the stamp.
-	it.heldId = id
-	local rec = { id = id, key = it.key, at = at, t = os.clock(), fireable = FIRE_DONE and h.done == true }
-	N.heldByKey[it.key], N.byId[id] = rec, rec
-	pcall(toSim, "heldout", { key = it.key })
-	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp; the tool's verdict %s",
-		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now, tostring(cap.verdict or "n/a")))
-	if wire.commit then
-		local ms, rtt = graceMs()
-		if Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body) then ms = math.max(ms, CONSTRUCTION_GRACE_MS) end
-		G.graces[it.key] = { it = it, due = os.clock() + ms / 1000, ms = ms }
-		natSay(string.format("%s: the game is paused, so the build waits %d ms (round trip about %.0f ms) for a veto before it is committed", it.key, ms, rtt))
-		return
-	end
+	ship.step = "route"
 	route(it)
+	ship.step, ship.routed = nil, true
 end
 
--- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): it
--- is given back, unless the verdict was already written.
+-- A fault AFTER the action was shipped (natDecideUnsafe, h.ship): the other games apply the build at the stamp, so this game must not
+-- apply it at the click. Its command is failed instead: the tool's callback is fired with a failed result (`fail`, the module that can
+-- defer) or the command is cancelled (an older module; the tool's callback is fired only where the module can), nothing is applied here,
+-- this game's replay is dropped from the queue, and the host is asked to repair the games (the others have the build, this one not).
+-- A paused game's build whose commit was never sent is parked on the other games and dropped there: no repair is needed for that one.
+local function natFailShipped(h, err)
+	local N, ship, id = G.nat, h.ship, h.id
+	local it = ship.it
+	local key = it.key
+	if ship.routed and not ship.step then
+		-- everything was in place before the fault (a log line after the last step): the build is applied at the stamp here too
+		natSay(string.format("held %d (%s): a fault after the ship (%s), but its stamp apply here was already arranged (%s): nothing changed", id, key, tostring(err), ship.flow))
+		return
+	end
+	if ship.rec and (ship.rec.released or ship.rec.done) then
+		-- a paused game applies at once (route -> guiApplyNow -> natPauseRelease): the command went back at its stamp (the pause time)
+		natSay(string.format("held %d (%s): a fault after the ship (%s), but it was released at its stamp already: nothing changed", id, key, tostring(err)))
+		return
+	end
+	if ship.rec then ship.rec.cancelled = true end   -- natRelease never gives it back at the stamp now
+	G.graces[key] = nil
+	pcall(toSim, "drop", { key = key, why = "its originator failed it after the ship", own = true })
+	pcall(toSim, "heldgone", { key = key })
+	local how
+	if ship.verdict == "cancel" then
+		how = "cancelled already"
+	elseif N and N.ready and N.ready.defer then
+		-- the module knows `fail` together with `defer` (native runtime: both or neither): a waiting or deferred command fails, callback fired
+		N.deferred[id] = { key = key, at = it.at, t = os.clock(), ready = true, failed = true }
+		local ok = natSend("fail", { id = id })
+		natTrigger()
+		how = ok and "fail written (tool callback fired with a failed result)" or "FAIL NOT WRITTEN"
+	else
+		N.deferred[id] = nil
+		local ok = natOrder("cancel", id)
+		how = (ok and "cancel written" or "CANCEL NOT WRITTEN") .. ((FIRE_DONE and h.done == true) and " (the tool's callback is fired)" or " (this module cannot fire the tool's callback: the tool may stay busy)")
+	end
+	natSay(string.format("held %d (%s) FAILED after the ship at step %s of the %s flow (%s): NOT released, nothing is applied on this game; %s",
+		id, key, tostring(ship.step), ship.flow, tostring(err), how))
+	if it.body and it.body.commit and not ship.routed then
+		natSay("held " .. id .. " (" .. key .. "): its commit was never sent, the other games drop the parked record: no repair needed")
+		return
+	end
+	send("replay_failed", { detail = "build " .. key .. " was shipped but failed on its originator (" .. tostring(err):sub(1, 100) .. "): the other games have it" })
+	pcall(vetoChat, "shipfail:" .. key, "Your build could not be applied on your own game after it was sent; the games will be synchronised.")
+end
+
+-- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): before the ship
+-- it is given back (nothing was sent), unless the verdict was already written. After the ship it is NEVER given back: it is applied at the
+-- stamp here too or failed (natFailShipped).
 function natDecide(h, cap)
+	h.ship = nil
 	local ok, err = pcall(natDecideUnsafe, h, cap)
 	if ok then return end
 	natFault("the verdict on held " .. tostring(h.id), err)
 	local N = G.nat
+	if h.ship then
+		local okF, errF = pcall(natFailShipped, h, err)
+		if not okF then pcall(natSay, "held " .. tostring(h.id) .. ": the failure after the ship itself failed (" .. tostring(errF) .. "); the command is NOT released") end
+		return
+	end
 	if N and not N.awaiting[h.id] then pcall(natOrder, "release", h.id) end
 end
 end -- section: strict mode: the native link and the verdict
