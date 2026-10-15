@@ -468,11 +468,10 @@ pub fn build_verified(
         Err(why)
     };
     if cons > 0 {
+        // on an error the lists already set belong to `d` (its destructor frees them) and the allocator holds nothing: never free_all here
         if let Err(why) = set_construction_frozen(c, poke, d.bytes(), &lines, cons) {
-            c.alloc.free_all();
             return fail(&mut d, why);
         }
-        c.alloc.forget_all(); // the constructions own the lists now
     }
     // the proof: the copy, written as text, equals the input in every named member
     let again = match nc::encode_scratch(c, &d, "inject") {
@@ -506,6 +505,13 @@ pub fn build_verified(
 /// Writes each construction's `frozenNodes` (a vector of u32 indices into `addedNodes`) as the text says: a new block of the game's
 /// allocator, which the engine frees with its own `operator delete` when the Proposal dies; the construction's old block, if any, is
 /// left alone (a few bytes, as in `cmd_patch`).
+///
+/// Ownership: the allocator must hold no block on entry (`build_verified` forgot the builder's blocks). Everything that can be refused
+/// without writing (the text's values, the construction's current list) is checked for every construction first, so a bad text
+/// allocates nothing. Then each block passes to its construction the moment the poke of its triple succeeds and is forgotten there;
+/// on a later failure only the one block not yet poked is freed. Freeing a block that a construction already points at would free it
+/// twice (once here, once in the Proposal's destructor that the caller runs on an error): heap corruption that crashes somewhere else.
+/// On return, success or error, the allocator again holds nothing.
 fn set_construction_frozen(
     c: &Ctx,
     poke: &dyn Poke,
@@ -520,6 +526,8 @@ fn set_construction_frozen(
             if e >= b { (e - b) / CONSTRUCTION_STRIDE } else { 0 }
         ));
     }
+    // 1. every check, nothing written
+    let mut plans = Vec::with_capacity(cons as usize);
     for i in 0..cons {
         let want = frozen_of(lines, i)?;
         let triple = b + i as usize * CONSTRUCTION_STRIDE + CONSTRUCTION_FROZEN;
@@ -530,12 +538,17 @@ fn set_construction_frozen(
         if !ok {
             return Err(format!("toAdd[{i}].frozenNodes is not a vector of 4-byte values"));
         }
+        plans.push((triple, want));
+    }
+    // 2. one block per construction, owned by it from its poke on
+    for (i, (triple, want)) in plans.iter().enumerate() {
         let (nb, ne) = if want.is_empty() {
             (0u64, 0u64)
         } else {
             let at = c.alloc.alloc(4 * want.len()).ok_or("the game's allocator gave no block")?;
             let data: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
             if !c.alloc.write(at, &data) {
+                c.alloc.free_all(); // only this block: it is in no construction
                 return Err("a frozenNodes block could not be written".into());
             }
             (at as u64, (at + 4 * want.len()) as u64)
@@ -544,9 +557,11 @@ fn set_construction_frozen(
         for v in [nb, ne, ne] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        if !poke.poke(triple, &out) {
+        if !poke.poke(*triple, &out) {
+            c.alloc.free_all(); // only this block: the ones before belong to their constructions
             return Err(format!("toAdd[{i}].frozenNodes could not be written"));
         }
+        c.alloc.forget_all(); // construction `i` owns its block now
     }
     Ok(())
 }
@@ -888,6 +903,133 @@ mod tests {
             5,
             "the two mask copies, the donor's copy, the source and the failed copy are all destroyed"
         );
+    }
+
+    thread_local! {
+        /// Every block the counting allocator or the freeing destructor gave back, in order.
+        static FREED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The game's allocator as the ownership rules see it: blocks are held until freed or forgotten, frees are recorded.
+    struct Counting<'a> {
+        arena: &'a Arena,
+        held: std::cell::RefCell<Vec<usize>>,
+        made: std::cell::RefCell<Vec<usize>>,
+    }
+    impl Alloc for Counting<'_> {
+        fn alloc(&self, n: usize) -> Option<usize> {
+            let a = self.arena.alloc(n)?;
+            self.held.borrow_mut().push(a);
+            self.made.borrow_mut().push(a);
+            Some(a)
+        }
+        fn write(&self, addr: usize, data: &[u8]) -> bool {
+            self.arena.write(addr, data)
+        }
+        fn free_all(&self) -> usize {
+            let v: Vec<usize> = self.held.borrow_mut().drain(..).collect();
+            FREED.with(|f| f.borrow_mut().extend(&v));
+            v.len()
+        }
+        fn forget_all(&self) {
+            self.held.borrow_mut().clear();
+        }
+    }
+
+    /// The engine's destructor as far as the constructions' lists go: it frees every non-empty `frozenNodes` block of `toAdd`.
+    unsafe extern "system-unwind" fn freeing_dtor(p: *mut u8) {
+        DTORS.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: the tests only destroy their own scratch Proposals.
+        let bytes = unsafe { core::slice::from_raw_parts(p, PROPOSAL_SIZE) };
+        let (b, e) = (u64_at(bytes, TO_ADD) as usize, u64_at(bytes, TO_ADD + 8) as usize);
+        let world = WORLD.with(|w| w.get());
+        if world.is_null() || b == 0 || e < b {
+            return;
+        }
+        for i in 0..(e - b) / CONSTRUCTION_STRIDE {
+            // SAFETY: set by the test to an arena that outlives the call.
+            let t = unsafe { (*world).read(b + i * CONSTRUCTION_STRIDE + CONSTRUCTION_FROZEN, 8) };
+            let begin = t.map_or(0, |t| u64_at(&t, 0) as usize);
+            if begin != 0 {
+                FREED.with(|f| f.borrow_mut().push(begin));
+            }
+        }
+    }
+
+    /// Refuses the write at one address.
+    struct PokeFailsAt<'a>(&'a Arena, usize);
+    impl Poke for PokeFailsAt<'_> {
+        fn poke(&self, addr: usize, data: &[u8]) -> bool {
+            addr != self.1 && self.0.write(addr, data)
+        }
+    }
+
+    #[test]
+    fn a_failure_at_the_second_construction_frees_every_frozen_nodes_block_exactly_once() {
+        // a depot text and donor with TWO constructions (the second a copy of the first), each with frozenNodes [1] in the text
+        let (arena, at, text) = world_text(true);
+        let begin = u64::from_le_bytes(arena.read(at + 0x258, 8).unwrap().try_into().unwrap()) as usize;
+        let one = arena.read(begin, CONSTRUCTION_STRIDE).unwrap();
+        let two = arena.add(&[one.clone(), one].concat());
+        let mut t = Vec::new();
+        for v in [two, two + 2 * CONSTRUCTION_STRIDE, two + 2 * CONSTRUCTION_STRIDE] {
+            t.extend_from_slice(&(v as u64).to_le_bytes());
+        }
+        arena.write(at + 0x258, &t);
+        let first = rebuild::lines_of(&text)["toAdd[0].frozenNodes[0]"].to_string();
+        let text2 = |second: &str| {
+            format!("{text}toAdd[1].frozenNodes.#\tn:1\ntoAdd[1].frozenNodes[0]\t{second}\n")
+                .replace("toAdd.#\tn:1\n", "toAdd.#\tn:2\n")
+        };
+        let mem = Both(&arena);
+        let alloc = Counting { arena: &arena, held: Default::default(), made: Default::default() };
+        let mut f = fns();
+        f.dtor = freeing_dtor;
+        let ctx = Ctx { fns: f, alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let frozen_triple = |i: usize| two + i * CONSTRUCTION_STRIDE + CONSTRUCTION_FROZEN;
+        WORLD.with(|w| w.set(&arena));
+        FREED.with(|f| f.borrow_mut().clear());
+
+        // construction 0's list is set (its block now belongs to the construction), construction 1's write is refused
+        let r = build_verified(&ctx, &PokeFailsAt(&arena, frozen_triple(1)), &text2(&first), Some(at), &mut |_| {});
+        assert!(matches!(&r, Err(e) if e.contains("toAdd[1].frozenNodes could not be written")), "{:?}", r.err());
+        alloc.free_all(); // what the runtime does after every build_verified
+        let made = alloc.made.borrow().clone();
+        let (b0, b1) = (made[made.len() - 2], made[made.len() - 1]);
+        assert_eq!(
+            u64::from_le_bytes(arena.read(frozen_triple(0), 8).unwrap().try_into().unwrap()) as usize,
+            b0,
+            "construction 0 points at its block"
+        );
+        let freed = FREED.with(|f| f.borrow().clone());
+        let times = |a: usize| freed.iter().filter(|&&x| x == a).count();
+        assert_eq!(
+            (times(b0), times(b1)),
+            (1, 1),
+            "block 0 by the Proposal's destructor, block 1 (never in a construction) by the allocator: {freed:x?}"
+        );
+        assert!(alloc.held.borrow().is_empty());
+
+        // a text whose second list is not an index: refused before anything is allocated or written
+        arena.write(frozen_triple(0), &[0u8; 24]);
+        FREED.with(|f| f.borrow_mut().clear());
+        let made_before = alloc.made.borrow().len();
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &text2("bogus"), Some(at), &mut |_| {});
+        WORLD.with(|w| w.set(core::ptr::null()));
+        assert!(
+            matches!(&r, Err(e) if e.contains("toAdd[1].frozenNodes[0]") && e.contains("not an index")),
+            "{:?}",
+            r.err()
+        );
+        assert_eq!(arena.read(frozen_triple(0), 24).unwrap(), vec![0u8; 24], "construction 0 untouched");
+        let frozen_blocks =
+            alloc.made.borrow()[made_before..].iter().filter(|&&a| arena.heap_size(a) == Some(4)).count();
+        assert_eq!(frozen_blocks, 0, "no frozenNodes block was allocated");
+        let freed = FREED.with(|f| f.borrow().clone());
+        let mut dedup = freed.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), freed.len(), "nothing freed twice: {freed:x?}");
     }
 
     #[test]
