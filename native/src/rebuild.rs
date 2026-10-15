@@ -57,6 +57,9 @@ pub struct Built {
 
 type R<T> = Result<T, String>;
 
+/// The largest byte vector a text may describe (the size of the largest side file, `inject::MAX_TEXT_BYTES`).
+const MAX_BLOB: usize = 64 << 20;
+
 /// The one allocation of a flat hash set of 4-byte ids (see [`Ty::EntSet`]) holding `ids`, and its capacity. The smallest capacity
 /// `2^k - 1` whose load bound (7/8) holds them. The ids fill the first slots and their control bytes say "full" (0x00); the real
 /// hash bytes cannot be made here (they are the receiving game's hash), and need not be: this table is only ever read by the engine's
@@ -149,6 +152,17 @@ impl<'a> Builder<'a> {
         let key = format!("{path}.{suffix}");
         let v = self.val(&key).ok_or_else(|| format!("missing line {key}"))?;
         v.strip_prefix("n:").and_then(|x| x.parse().ok()).ok_or_else(|| format!("{key}: bad count {v}"))
+    }
+
+    /// The element count of a vector whose every element has a line of its own: never more than the text has lines. The count comes
+    /// from the other game; without the bound a damaged one asked for terabytes (an allocation failure ends the process, no guard
+    /// contains it: found by the dry pass's mutation test, 2026-10-15).
+    fn elements(&self, path: &str) -> R<usize> {
+        let n = self.count(path, "#")?;
+        if n > self.lines.len() {
+            return Err(format!("{path}: {n} elements, more than the text has lines"));
+        }
+        Ok(n)
     }
 
     fn block(&mut self, path: &str, data: &[u8]) -> R<(u64, u64, u64)> {
@@ -249,6 +263,10 @@ impl<'a> Builder<'a> {
                     Ty::Ent => buf[..4].copy_from_slice(&Self::ent(v)?.to_le_bytes()),
                     Ty::V3 | Ty::M4 => {
                         let (_, h) = v.split_once(':').ok_or_else(|| format!("{path}: {v}"))?;
+                        // more words than the member holds (a damaged text: the dry pass's mutation test) is refused, not a panic
+                        if h.split(',').count() * 4 > buf.len() {
+                            return Err(format!("{path}: {v} has more words than the member"));
+                        }
                         for (i, w) in h.split(',').enumerate() {
                             buf[i * 4..i * 4 + 4].copy_from_slice(&hex32(w)?.to_le_bytes());
                         }
@@ -274,7 +292,7 @@ impl<'a> Builder<'a> {
                 self.string_into(path, &second, b)
             }
             Ty::EntVec => {
-                let n = self.count(path, "#")?;
+                let n = self.elements(path)?;
                 let mut data = Vec::with_capacity(n * 4);
                 for i in 0..n {
                     let l = format!("{path}[{i}]");
@@ -287,7 +305,10 @@ impl<'a> Builder<'a> {
                 Ok(())
             }
             Ty::Vec(elem) => {
-                let n = self.count(path, "#")?;
+                let n = self.elements(path)?;
+                if n.saturating_mul(elem.stride) > MAX_BLOB {
+                    return Err(format!("{path}: {n} elements of {:#x} bytes", elem.stride));
+                }
                 let mut data = vec![0u8; n * elem.stride];
                 for i in 0..n {
                     let item = &mut data[i * elem.stride..(i + 1) * elem.stride];
@@ -299,6 +320,9 @@ impl<'a> Builder<'a> {
             }
             Ty::BlobVec => {
                 let n = self.count(path, "bytes")?;
+                if n > MAX_BLOB {
+                    return Err(format!("{path}: a vector of {n} bytes"));
+                }
                 let mut data = vec![0u8; n];
                 if let Some(raw) = self.val(&format!("{path}.raw")) {
                     let bytes = self.raw_value(&format!("{path}.raw"), raw)?;

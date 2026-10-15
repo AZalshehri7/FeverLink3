@@ -70,10 +70,14 @@ impl Runtime {
         crate::log::calls_engine("native patch: an order may be carried out (operator new)");
         let job = crate::log::guarded("native patch: order", || self.patch_take(args, caller)).flatten();
         let Some((order, payload)) = job else { return };
-        let result = match self.patch_alloc() {
+        // the same write first as a dry pass inside a guard (`native_copy::dry_pass`): a panic of ours is a refusal
+        let dry = self.patch_dry("native patch: dry pass", |c| {
+            let _ = cp::apply(c.mem, &crate::native_copy::DryPoke, c.alloc, payload, &order);
+        });
+        let result = dry.and_then(|()| match self.patch_alloc() {
             Err(why) => Err(why),
             Ok(alloc) => cp::apply(&crate::dump::LiveMem, &LivePoke, &alloc, payload, &order),
-        };
+        });
         crate::log::guarded("native patch: result", || {
             match result {
                 Ok(done) => self.patch.report(Event::Patched {
@@ -162,9 +166,15 @@ impl Runtime {
             Some((now, order, nodes, fits))
         });
         let Some((now, order, nodes, fits)) = job.flatten() else { return false };
-        let outcome = fits.and_then(|()| match self.patch_alloc() {
-            Err(why) => Err(cp::Fail::Refuse(why)),
-            Ok(alloc) => cp::apply_proposal_frozen_only(&crate::dump::LiveMem, &LivePoke, &alloc, proposal, &order),
+        let outcome = fits.and_then(|()| {
+            self.patch_dry("native patch: convert update: dry pass", |c| {
+                let _ = cp::apply_proposal_frozen_only(c.mem, &crate::native_copy::DryPoke, c.alloc, proposal, &order);
+            })
+            .map_err(cp::Fail::Refuse)?;
+            match self.patch_alloc() {
+                Err(why) => Err(cp::Fail::Refuse(why)),
+                Ok(alloc) => cp::apply_proposal_frozen_only(&crate::dump::LiveMem, &LivePoke, &alloc, proposal, &order),
+            }
         });
         crate::log::guarded("native patch: convert update (result)", || {
             self.convert_update_report(now, &nodes, outcome)
@@ -212,6 +222,12 @@ impl Runtime {
             self.say(&format!("native patch: convert update: after the update: {dump}"));
             self.patch.convert_event(Event::ConvertDump { text: format!("after the construction update: {dump}") });
         }
+    }
+
+    /// The dry pass of a patch write (`native_copy::dry_pass`): `f` with stand-ins for the allocator and the live writes, inside a guard.
+    fn patch_dry(&self, site: &'static str, f: impl FnOnce(&crate::native_copy::Ctx)) -> Result<(), String> {
+        let set = crate::portable::Settings::input_level();
+        crate::native_copy::dry_pass(site, &crate::dump::LiveMem, self.base, set, self.build.name, f)
     }
 
     /// The allocator and layout checks both ways of patching need.
@@ -268,9 +284,15 @@ impl Runtime {
             Some((now, order, site, at, nodes, fits))
         });
         let Some((now, order, site, at, nodes, fits)) = job.flatten() else { return };
-        let outcome = fits.and_then(|()| match self.patch_alloc() {
-            Err(why) => Err(cp::Fail::Refuse(why)),
-            Ok(alloc) => cp::apply_proposal(&crate::dump::LiveMem, &LivePoke, &alloc, out, &order),
+        let outcome = fits.and_then(|()| {
+            self.patch_dry("native patch: convert: dry pass", |c| {
+                let _ = cp::apply_proposal(c.mem, &crate::native_copy::DryPoke, c.alloc, out, &order);
+            })
+            .map_err(cp::Fail::Refuse)?;
+            match self.patch_alloc() {
+                Err(why) => Err(cp::Fail::Refuse(why)),
+                Ok(alloc) => cp::apply_proposal(&crate::dump::LiveMem, &LivePoke, &alloc, out, &order),
+            }
         });
         crate::log::guarded("native patch: convert (result)", || {
             self.convert_report(now, &order, site, &at, &nodes, outcome)

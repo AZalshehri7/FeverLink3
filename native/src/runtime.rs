@@ -273,6 +273,18 @@ impl Runtime {
         });
         let Some((seq, input)) = prepared.flatten() else { return };
         let report = input.and_then(|(alloc, text, original)| {
+            // the same rebuild first as a dry pass inside a guard (`native_copy::dry_pass`): a panic of ours is a refusal
+            let place = |b: &[u8]| Some(b.as_ptr() as usize);
+            crate::native_copy::dry_pass(
+                "rebuild check: dry pass",
+                &dump::LiveMem,
+                self.base,
+                sink.settings,
+                self.build.name,
+                |c| {
+                    let _ = rebuild::roundtrip(&text, &original, self.base, sink.settings, c.alloc, c.mem, &place);
+                },
+            )?;
             let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &dump::LiveMem, &|b| {
                 Some(b.as_ptr() as usize)
             });

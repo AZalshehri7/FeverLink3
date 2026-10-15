@@ -168,8 +168,11 @@ exceptions"), so every path that calls the engine (the capture's move constructo
 the game's `operator new`) is split into a guarded decision, the calls in plain `system-unwind` frames, and a guarded
 report; each call announces itself (`native::log::calls_engine`, a `BUG:` line in `native.log` if one ever runs inside
 a guard). A real C++ throw record is raised through the add hook in a child process by
-`native/src/runtime/tests/foreign.rs`. The price: a panic in our own code between two engine calls is no longer
-contained; it passes to the game's handler like the game's own exceptions. One loose end:
+`native/src/runtime/tests/foreign.rs`. Our own code between two engine calls parses the other game's text, so each such
+piece first runs as a dry pass inside a guard (the same code, stand-ins for the engine, a Rust arena for its heap): a
+panic there is a refusal, and a text that passes it does not panic the parser in the real pass (deterministic code; a
+mutation test of 3 000 damaged texts checks both). An allocation failure is not a panic and no guard contains it, so the
+counts a text gives are bounded before anything is allocated. One loose end:
 the window shows a player session's `Status::error`, but not yet that a host session's thread ended.
 
 The roadmap's plan to shrink the DLL to tens of kilobytes with `no_std` has no unwinding at all, which makes the

@@ -190,10 +190,14 @@ impl Runtime {
         let job = crate::log::guarded("native inject: order", || self.inject_take(args, caller)).flatten();
         let Some(InjectJob { order, dest, link, t0, rb0, prepared }) = job else { return };
         let run = match prepared {
-            Some(Ok(p)) => {
-                crate::log::calls_engine("native inject (the Proposal functions, operator new)");
-                self.inject_engine(order.key, dest, p)
-            }
+            // the same parsing and build first as a dry pass inside a guard: a panic of ours on the peer's text is a refusal
+            Some(Ok(p)) => match inj::dry_build(&LiveMem, self.base, p.settings, self.build.name, &p.text, p.donor) {
+                Err(why) => Err(why),
+                Ok(()) => {
+                    crate::log::calls_engine("native inject (the Proposal functions, operator new)");
+                    self.inject_engine(order.key, dest, p)
+                }
+            },
             Some(Err(why)) => Err(why),
             None => Err(String::new()), // complete_next: the record's own command is this game's stamp apply; nothing to inject
         };

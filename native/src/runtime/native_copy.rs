@@ -59,6 +59,14 @@ impl Runtime {
         let Some((seq, fns, alloc)) = prepared.flatten() else { return };
         // the graph's block sizes come from the containers (see `Mem::heap_size` for why nothing asks the heap)
         let live = crate::dump::LiveMem;
+        // the same steps first as a dry pass inside a guard (`native_copy::dry_pass`): a panic of ours is a refusal
+        let dry = nc::dry_pass("native copy: dry pass", &live, self.base, sink.settings, self.build.name, |c| {
+            let _ = nc::run(c, payload, &mut |_| {});
+        });
+        if let Err(why) = dry {
+            write(&format!("REFUSED: {why}"));
+            return;
+        }
         let ctx = nc::Ctx {
             fns,
             alloc: &alloc,

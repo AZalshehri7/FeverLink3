@@ -129,6 +129,98 @@ pub struct Ctx<'a> {
     pub build_name: &'a str,
 }
 
+// ---- the dry pass
+//
+// The engine part of a build (the injection, the native copy, the rebuild check, the patch writes) runs outside `log::guarded`, so
+// that an exception of the game reaches the game's handler (`log::guarded`). The same code also parses text that came from the other
+// game, where a bug of ours is far likelier than an exception of the engine. So it runs twice: first DRY, inside a guard, with the
+// engine's functions replaced by plain byte copies, a Rust arena for the game's heap and writes into live memory dropped; then for
+// real. The code is deterministic on the same text, so a text that gets through the dry pass does not panic the parser in the real
+// one; a panic in the dry pass is a refusal, as it was when the whole path was guarded.
+
+/// Where the dry pass's arena places its blocks (far from the game's heaps; its blocks are read before live memory anyway).
+pub const DRY_ARENA: usize = 0x7d00_0000_0000;
+
+/// What the dry pass reads: its own arena first, else the memory the real pass would read.
+pub struct DryMem<'a> {
+    pub arena: &'a rebuild::Arena,
+    pub live: &'a dyn Mem,
+}
+
+impl Mem for DryMem<'_> {
+    fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
+        self.arena.read(addr, len).or_else(|| self.live.read(addr, len))
+    }
+    fn heap_size(&self, addr: usize) -> Option<usize> {
+        self.arena.heap_size(addr).or_else(|| self.live.heap_size(addr))
+    }
+}
+
+thread_local! {
+    /// The reader of the dry pass running on this thread (the stand-in copy reads its source through it).
+    static DRY_READER: std::cell::Cell<Option<*const (dyn Mem + 'static)>> = const { std::cell::Cell::new(None) };
+}
+
+unsafe extern "system-unwind" fn dry_ctor(p: *mut u8) -> *mut u8 {
+    p // the scratch buffers are zeroed: an "empty Proposal" of plain bytes
+}
+
+unsafe extern "system-unwind" fn dry_dtor(_p: *mut u8) {}
+
+/// The stand-in for the copy constructor and the copy assignment: the source's bytes, read through the dry pass's reader.
+unsafe extern "system-unwind" fn dry_copy(d: *mut u8, s: *const u8) -> *mut u8 {
+    let reader = DRY_READER.with(|r| r.get());
+    // SAFETY: set by `dry_pass` to a reader that outlives the pass, and cleared when it ends.
+    let bytes = reader.and_then(|m| unsafe { (*m).read(s as usize, PROPOSAL_SIZE) });
+    if let Some(b) = bytes {
+        // SAFETY: `d` is a scratch buffer of the dry pass, larger than a Proposal.
+        unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), d, PROPOSAL_SIZE) };
+    }
+    d
+}
+
+/// Drops every write into live memory (the real pass makes them).
+pub struct DryPoke;
+
+impl crate::cmd_patch::Poke for DryPoke {
+    fn poke(&self, _addr: usize, _data: &[u8]) -> bool {
+        true
+    }
+}
+
+/// Runs `f` as the dry pass of a piece of engine work: inside `log::guarded`, with a [`Ctx`] whose functions, allocator and memory are
+/// the stand-ins above (`live` is what the real pass reads). `Err` (the refusal) when `f` panicked; what `f` itself concluded is not
+/// looked at (the stand-ins are not the engine: only a panic counts).
+pub fn dry_pass(
+    site: &'static str,
+    live: &dyn Mem,
+    base: usize,
+    set: Settings,
+    build_name: &str,
+    f: impl FnOnce(&Ctx),
+) -> Result<(), String> {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            let _ = DRY_READER.try_with(|r| r.set(None));
+        }
+    }
+    let arena = rebuild::Arena::new(DRY_ARENA);
+    let mem = DryMem { arena: &arena, live };
+    let reader: *const (dyn Mem + '_) = &mem;
+    // SAFETY: only the lifetime is erased; `Clear` takes the pointer away before `mem` goes out of scope.
+    let reader: *const (dyn Mem + 'static) = unsafe { core::mem::transmute(reader) };
+    DRY_READER.with(|r| r.set(Some(reader)));
+    let _clear = Clear;
+    let fns = ProposalFns { ctor: dry_ctor, dtor: dry_dtor, copy: dry_copy, assign: dry_copy };
+    let ctx = Ctx { fns, alloc: &arena, mem: &mem, base, set, build_name };
+    crate::log::guarded(site, || f(&ctx)).ok_or_else(|| {
+        format!(
+            "{site}: our own code panicked on this text (a bug of the module, the PANIC line in native.log says where); refused before any call into the game"
+        )
+    })
+}
+
 /// The entry count the text gives for an engine container (`map:size=N` or `hash:size=N,...`), 0 when it has no line.
 pub fn container_entries(lines: &std::collections::BTreeMap<&str, &str>, name: &str) -> u64 {
     lines
@@ -256,7 +348,8 @@ impl MaskInfo {
 /// works for the bytes the copy constructor leaves alone (gaps of the Proposal object, unconstructed padding). Nothing may therefore
 /// rest on it for the unnamed words of a construction entity: that proof rests on named members only (and on b45).
 ///
-/// Calls the engine: never inside `log::guarded` (the text of the two copies in between is guarded here).
+/// Calls the engine through `fns`: never inside `log::guarded` unless they are the dry pass's stand-ins (the text of the two copies in between
+/// is guarded here).
 pub fn residue_mask(
     fns: &ProposalFns,
     mem: &dyn Mem,
@@ -272,7 +365,6 @@ pub fn residue_mask(
     let mut b = Scratch::new();
     b.bytes_mut().fill(0xFF);
     say("native inject: residue mask: calling the engine copy constructor twice (scratch prefilled 0x00 and 0xFF)");
-    crate::log::calls_engine("residue mask (the Proposal copy constructor and destructor)");
     // SAFETY: `held` is a live payload (only read by a copy constructor); the destinations are scratch buffers.
     unsafe {
         (fns.copy)(a.ptr(), held as *const u8);
@@ -378,9 +470,9 @@ pub(crate) fn encode_scratch(c: &Ctx, s: &Scratch, event: &str) -> Result<String
 }
 
 /// The three steps for the held command whose payload is at `src`. `say` receives each line as soon as it is known; the
-/// lines before an engine call say what is about to be called. Calls the engine: never inside `log::guarded`.
+/// lines before an engine call say what is about to be called. Calls the engine through `c`: never inside `log::guarded` unless `c` is
+/// the dry pass's ([`dry_pass`]).
 pub fn run(c: &Ctx, src: usize, say: &mut dyn FnMut(&str)) -> String {
-    crate::log::calls_engine("native copy steps (the Proposal functions)");
     let mut out = String::new();
     let mut put = |out: &mut String, line: &str| {
         out.push_str(line);
