@@ -1100,9 +1100,10 @@ end
 -- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result, or fails
 -- when the module refuses the order. `refuse`: the test switch's forced refusal (nil: none). Returns true when the order was written; the
 -- caller sends the command only then (an order that did not reach the module would leave the placeholder to be applied as it is).
-local function sendInjectOrder(inj, key, held, tm, refuse)
-	SIM.injectN = (SIM.injectN or 0) + 1
-	local n = SIM.injectN
+local function sendInjectOrder(inj, key, held, tm, refuse, counter)
+	counter = counter or SIM   -- the interface half numbers its own orders apart (guiApplyNow): both halves write native_inject_<n>.txt
+	counter.injectN = (counter.injectN or 0) + 1
+	local n = counter.injectN
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
 		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
@@ -1113,6 +1114,8 @@ local function sendInjectOrder(inj, key, held, tm, refuse)
 		#inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
 	return ok, err
 end
+-- the interface half's apply during a pause writes the same orders (guiApplyNow)
+X.sendInjectOrder, X.sendPatchOrder = sendInjectOrder, sendPatchOrder
 
 -- A refusal that means "the exact copy of the build cannot be applied on this game" (the decode's reference check or placeholder, an inject
 -- order that could not be written): nothing was applied here, the build was on the games that could, so the world needs the repair.
@@ -2262,6 +2265,8 @@ local function guiApplyNow(it, now)
 		-- the game is paused, so nothing else moved the account since the command went out
 		coToSim(it, success, success and coAfter(ctx, it, spec, category, balance0, logGui) or nil)
 		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now .. (success and "" or (" REFUSED" .. refusalWhy(data))))
+		-- this game's deferred held command took this apply's result (inject_next / complete_next): its world has the apply now
+		if it.deferId and X.deferApplied then pcall(X.deferApplied, it.deferId) end
 		deliverResult(it.key, data, success, entities)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
@@ -2271,22 +2276,136 @@ local function guiApplyNow(it, now)
 		okS, errS = pcall(natPauseRelease, it, finish)
 	else
 		okS, errS = pcall(L.runChained, args, function(a, cb)
-			if it.body.fn == "makeWorldBuildProposalCmd" then toSim("replay", {}) end
+			local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
+			if isBuild then toSim("replay", {}) end
+			-- the native orders exactly as at a stamp apply in the simulation half (simApplyAction), right before the command: a paused
+			-- build is the originator's exact copy (inject) where the decode chose it, and this game's deferred held command takes its
+			-- result. (The pause path used to send the record's donor command alone: another build than on a running game.)
+			if a.patch then X.sendPatchOrder(a.patch, it.key) end
+			if a.inject then
+				-- this half's inject files are numbered apart from the simulation half's (both write native_inject_<n>.txt)
+				X.guiInject = X.guiInject or { injectN = X.GUI_INJECT_BASE }
+				local okO, errO = X.sendInjectOrder(a.inject, it.key, it.deferId, isBuild and X.timingText(it, now) or nil, nil, X.guiInject)
+				if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
+			elseif it.deferId then
+				X.sendHeldOrder("complete_next", { held = it.deferId }, it.key)
+			end
 			O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
 		end, finish)
 	end
 	if not okS then
 		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
 		send("action_refused", { seq = it.seq, from = it.from, detail = tostring(errS) })
+		-- no apply on this game: the deferred held command fails now (tool callback fired); an exact copy that cannot be made asks for the repair
+		if it.deferId then X.sendHeldOrder("fail", { id = it.deferId }, it.key) end
+		if X.isInjectRefusal(errS) then send("replay_failed", { detail = "action " .. it.key .. " not applied here during the pause: " .. tostring(errS):sub(1, 200) }) end
 		deliverResult(it.key, nil, false, {})
 		coToSim(it)
 		if it.heldId and natHeldRefused then pcall(natHeldRefused, it) end
 	end
 end
 
+-- ---- the pause order (docs/PROTOCOL.md, "The pause order")
+--
+-- During a pause every game applies the actions made in it at once, from this (the interface) state. In the order they reached each game
+-- that was not one order: the originator's own came first (two players acting in one pause gave the engine's free-id FIFO A1,B1 on one game
+-- and B1,A1 on the other). Now an action made while the session stands at its pause is shipped flagged `pause`; the host numbers it and
+-- sends it to EVERY game, its sender included, and every game applies paused actions only in that numbered order (one queue, X.pauseQ).
+-- The originator keeps its own until it comes back (G.pauseOwn): one round trip to the host. Checksums stamped at the pause go through the
+-- same queue, so each sees the same paused actions applied on every game.
+-- The resume: the host's resume line follows every number it gave before it; a paused action that reaches the host after its resume is
+-- numbered after it. No game leaves the pause time while it waits for one of its own (G.pauseOwn) or has one queued (X.pauseCap); the
+-- other games are held there by the originator's pause promise (the input barrier) until its next clock, which comes after the action.
+X.GUI_INJECT_BASE = 1000000000
+
+-- an item stamped at the session's pause: a pause action
+function X.isPauseStamp(at)
+	local p = G.session.pauseAt
+	return p ~= nil and at == p
+end
+
+-- After this game shipped `it`: a pause action waits for the host's pause order; anything else goes the usual way.
+function X.routeOwn(it)
+	if not it.pause then return route(it) end
+	G.pauseOwn = G.pauseOwn or {}
+	G.pauseOwn[it.key] = it
+	logGui("action " .. it.key .. " made during the pause (t=" .. tostring(it.at) .. "): applied when the host's pause order brings it back")
+end
+
+-- An item of the pause order, in the order the host's link brings them (a number that is not the next one is logged: it cannot happen on
+-- one ordered link, it would mean a lost line).
+function X.pauseEnqueue(it)
+	G.pauseQ = G.pauseQ or {}
+	if it.pauseSeq then
+		local want = (G.pauseLast or (it.pauseSeq - 1)) + 1
+		if it.pauseSeq ~= want then logGui("PAUSE ORDER GAP: expected #" .. tostring(want) .. ", got #" .. tostring(it.pauseSeq) .. " (" .. tostring(it.key) .. ")") end
+		G.pauseLast = it.pauseSeq
+	end
+	G.pauseQ[#G.pauseQ + 1] = it
+	X.pausePump()
+end
+
+-- Applies the queued pause items, strictly in order, once this game stands at their time (a slower game lands there first, X.pauseCap).
+function X.pausePump()
+	local q = G.pauseQ
+	while q and q[1] do
+		local it = q[1]
+		local now = engine.gameTime()
+		if now < it.at then return end
+		table.remove(q, 1)
+		if now > it.at then
+			-- cannot happen while X.pauseCap holds the game: applied by the simulation, late (a fork, repaired as every late apply)
+			logGui("PAUSE ORDER LATE: " .. tostring(it.key) .. " for the pause at t=" .. tostring(it.at) .. " reached this game at t=" .. tostring(now))
+			toSim("queue", it)
+		else
+			if it.pauseSeq then logGui("pause order #" .. tostring(it.pauseSeq) .. ": " .. tostring(it.key) .. " applied at t=" .. tostring(now)) end
+			guiApplyNow(it, now)
+		end
+	end
+end
+
+-- The engine speed allowed while pause items wait: none at or past their time (this game's own not yet back, or queued), and a slower
+-- game lands exactly on it.
+function X.pauseCap(now, sp)
+	local first = nil
+	for _, it in pairs(G.pauseOwn or {}) do
+		if type(it.at) == "number" and (first == nil or it.at < first) then first = it.at end
+	end
+	local q = G.pauseQ
+	if q and q[1] and (first == nil or q[1].at < first) then first = q[1].at end
+	if first == nil or sp <= 0 then return sp end
+	if now >= first then return 0 end
+	return math.min(sp, math.floor((first - now) / STEP))
+end
+
+-- A paused action came back numbered from the host (`pauseSeq`): this game's own (it waited in G.pauseOwn) or another player's.
+function X.pauseArrived(it, n)
+	it.pauseSeq = n
+	if it.from == C.PLAYER_ID then
+		local own = G.pauseOwn and G.pauseOwn[it.key]
+		if not own then
+			logGui("pause order #" .. tostring(n) .. ": " .. it.key .. " is this game's own but nothing waits for it here (made before a reload?): applied as received")
+		else
+			G.pauseOwn[it.key] = nil
+			own.pauseSeq = n
+			it = own
+		end
+	elseif it.body and it.body.fn == "makeWorldBuildProposalCmd" then
+		noteBuild(it.key, it.at)
+	end
+	X.pauseEnqueue(it)
+end
+
 function route(it)
 	local now = engine.gameTime()
-	if L.applyNow(G.session, now, it) then guiApplyNow(it, now); return end
+	-- a checksum round at the pause: after exactly the paused actions the host ordered before it, on every game (the pause order); an
+	-- unflagged action that finds this game stopped at its time (the barrier breached) is applied there in arrival order, as before
+	local s = G.session
+	if (it.kind == "checksum" and type(it.at) == "number" and (it.at == s.pauseAt or it.at == s.lastPauseAt) and now <= it.at)
+		or L.applyNow(s, now, it) then
+		X.pauseEnqueue(it)
+		return
+	end
 	if it.kind == "action" and type(it.at) == "number" and it.at <= now and not (it.body and it.body.native and it.from == C.PLAYER_ID) then
 		-- the input barrier should make this impossible: the simulation is at or past the stamp already, so it applies the item late
 		-- (a fork; the simulation half logs LATE and this half asks for the repair)
@@ -2477,13 +2596,15 @@ function shipNative(o)
 	local now = engine.gameTime()
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
-	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
+	-- a script's command made during the pause is applied in the host's pause order (X.routeOwn); a native build is applied here already
+	local pause = (o.script and X.isPauseStamp(at)) or nil
+	send("action", { stamp = at, seq = G.seq, body = o.body, category = category, pause = pause })
 	G.nativeShipped = (G.nativeShipped or 0) + 1
 	if o.script then
 		-- a script's build command (simScriptBuild): not applied anywhere yet, so this game queues it like every other game does
-		local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), scriptOut = o.n }
+		local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), scriptOut = o.n, pause = pause }
 		logGui("native build " .. it.key .. " (a script's command) stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes): applied at the stamp on this game too")
-		route(it)
+		X.routeOwn(it)
 		return true
 	end
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
@@ -2533,13 +2654,13 @@ function shipUiCommand(p)
 	G.uiSeq[p.id] = G.seq
 	local at = stampAfterFastest(now)
 	local category = type(p.category) == "string" and p.category or "other"
-	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
-	send("action", { stamp = at, seq = G.seq, body = text, category = category })
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.isPauseStamp(at) or nil }
+	send("action", { stamp = at, seq = G.seq, body = text, category = category, pause = it.pause })
 	G.uiFn = G.uiFn or {}
 	G.uiFn[it.key] = body.fn
 	G.pending[it.key] = function(data, success, entities) uiReply(p.id, it.key, data, success, entities) end
 	logGui("window command " .. tostring(body.fn) .. " #" .. tostring(p.id) .. " " .. it.key .. " stamped " .. at .. " (now " .. now .. "): held in the window, applied here at the stamp too")
-	route(it)
+	X.routeOwn(it)
 	return true
 end
 
@@ -2552,12 +2673,12 @@ function shipLocal(tag, cb)
 	if #note > 0 then body.diverged = note end
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
-	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.isPauseStamp(at) or nil }
 	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
-	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args) })
+	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args), pause = it.pause })
 	if cb then G.pending[it.key] = cb end
 	logGui("action " .. it.key .. " " .. tag.name .. " stamped " .. at .. " (now " .. now .. ")")
-	route(it)
+	X.routeOwn(it)
 	return true
 end
 end -- section: applying items, the veto, shipping
@@ -2692,6 +2813,17 @@ function natSend(kind, payload)
 		natSay("cannot write native_ctl.log: " .. tostring(err))
 	end
 	return ok
+end
+
+-- A paused game applied the build of deferred held command `id` from this state (X.pausePump -> guiApplyNow): this interface's world
+-- has the apply now, which a running game learns from its game time passing the stamp (natTick). The module completes the command.
+function X.deferApplied(id)
+	local N = G.nat
+	local d = N and N.deferred[id]
+	if d and not d.ready then
+		d.ready = true
+		natSend("release", { id = id })
+	end
 end
 
 -- The module hands a held command back (or destroys it) at the next CommandList::Add of ANY command; any command we send
@@ -3174,7 +3306,10 @@ local function natDecideUnsafe(h, cap)
 	end
 	local ship = { it = it, flow = flow, shipping = true }
 	h.ship = ship   -- natDecide's fault handler reads it: from here on a fault never releases the command
-	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
+	-- made during the pause (defer and cancel flows: applied by every game at once): every game applies it in the host's pause order,
+	-- this one too when it comes back numbered (X.routeOwn). A held build of a paused game is parked by the others and its COMMIT is.
+	it.pause = (flow ~= "held" and X.isPauseStamp(at)) or nil
+	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category, pause = it.pause })
 	if not okS then
 		h.ship = nil   -- nothing went out: the command may still be given back
 		return release("the action cannot be sent (" .. tostring(errS) .. ")")
@@ -3220,7 +3355,7 @@ local function natDecideUnsafe(h, cap)
 		end
 	end
 	ship.step = "route"
-	route(it)
+	X.routeOwn(it)
 	ship.step, ship.routed = nil, true
 end
 
@@ -3319,10 +3454,12 @@ local function natCommitUnsafe(key, why, g, st)
 		if h then h.at = it.at end
 		pcall(logGui, "commit of " .. key .. ": the game is no longer paused, the build gets the stamp " .. tostring(it.at) .. " (now " .. tostring(now) .. ")")
 	end
+	-- still paused: the commit is numbered in the host's pause order and every game, this one too, applies the build when it comes back
+	it.pause = X.isPauseStamp(it.at) or nil
 	st.sent = true
-	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at })
+	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at, pause = it.pause })
 	pcall(logGui, "commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. tostring(it.at))
-	route(it)
+	X.routeOwn(it)
 	st.routed = true
 end
 
@@ -4152,6 +4289,17 @@ H.resync_load = function(rec, p)
 end
 
 H.action = function(rec, p)
+	if type(p) == "table" and p.allowed == false and rec.from == C.PLAYER_ID and p.pauseSeq ~= nil then
+		-- this game's own paused action, refused by the host's permissions: applied nowhere, this one included (it waited for the echo)
+		local key = L.itemKey(rec.from, p.seq)
+		local own = G.pauseOwn and G.pauseOwn[key]
+		if G.pauseOwn then G.pauseOwn[key] = nil end
+		logGui("action " .. key .. " made during the pause came back with allowed=false: applied on no game")
+		if own and own.deferId then X.sendHeldOrder("fail", { id = own.deferId }, key) end
+		if own and own.heldId and natHeldRefused then pcall(natHeldRefused, own) end
+		deliverResult(key, nil, false, {})
+		return
+	end
 	if type(p) == "table" and p.allowed == false then
 		-- the host relayed an action its sender had no permission for: it is not applied here, and since the
 		-- sender's game may have run it, this game asks for a resync
@@ -4164,6 +4312,8 @@ H.action = function(rec, p)
 	it.tRecv, it.gRecv = X.wallNow(), engine.gameTime()
 	if type(p.from) == "number" and p.from ~= rec.from then logGui("action payload claims sender " .. p.from .. ", launcher says " .. tostring(rec.from)) end
 	if G.vetoed[it.key] then logGui("action " .. it.key .. " was vetoed already: dropped"); return end
+	-- made during a pause: applied in the host's pause order, by every game (this one's own came back too)
+	if type(p.pauseSeq) == "number" then return X.pauseArrived(it, p.pauseSeq) end
 	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
 		noteBuild(it.key, it.at)
 		if type(it.body.xs) == "number" and not pausedNow() then
@@ -4256,6 +4406,25 @@ H.build_commit = function(rec, p)
 	local key = L.itemKey(p.owner, p.seq)
 	local by = tonumber(p.from) or tonumber(rec.from)
 	if by ~= p.owner then logGui("build_commit of " .. key .. " from " .. tostring(by) .. " ignored: only its originator commits"); return end
+	if type(p.pauseSeq) == "number" then
+		-- committed during the pause: applied in the host's pause order by every game, the originator too (its build waited in G.pauseOwn)
+		local it
+		if p.owner == C.PLAYER_ID then
+			it = G.pauseOwn and G.pauseOwn[key]
+			if G.pauseOwn then G.pauseOwn[key] = nil end
+		else
+			local pk = G.parked[key]
+			G.parked[key] = nil
+			it = pk and pk.it
+		end
+		if not it or G.vetoed[key] then logGui("commit of " .. key .. " (pause order #" .. p.pauseSeq .. "): nothing to apply here (vetoed, expired or not received)"); return end
+		if type(p.stamp) == "number" then it.at = p.stamp end
+		noteBuild(key, it.at)
+		logGui("build " .. key .. " committed by its originator during the pause: pause order #" .. p.pauseSeq)
+		it.pauseSeq = p.pauseSeq
+		X.pauseEnqueue(it)
+		return
+	end
 	local pk = G.parked[key]
 	if not pk then logGui("commit of " .. key .. ": nothing parked for it (vetoed, expired or not received)"); return end
 	G.parked[key] = nil
@@ -4566,6 +4735,9 @@ local function guiUpdate(userParams, state, guiState)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
 		local sp = L.pace(G.session, G.peers, now, ahead, G.marks)
+		-- the pause order: a slower game lands on the pause items' time, and no game leaves it before they are applied (X.pauseCap)
+		X.pausePump()
+		sp = X.pauseCap(now, sp)
 		setSpeed(sp)
 		X.barrierWatch(now, sp)
 		if now ~= G.lastClock or G.frames % 30 == 0 then
