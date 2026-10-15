@@ -206,6 +206,12 @@ pub struct PeerClockMessage {
     /// The stamp margin this game measured it needs (ClockMessage::need), relayed as the host received it (clamped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need: Option<i32>,
+    /// The input barrier's promise (ClockMessage::safe), relayed as the host received it; `None` when absent or implausible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe: Option<i64>,
+    /// `safe` is the pause the game is stopped at (ClockMessage::pause).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pause: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,11 +313,32 @@ pub struct ClockMessage {
     /// measured yet at this speed; the stamping game then uses its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need: Option<i32>,
+    /// The input barrier's promise (the mod's L.promise): every item this game ships after this message is stamped at or after
+    /// `safe`, so every other game may simulate the steps before it (less a hand-off allowance) without waiting. `None`: an older
+    /// mod, paced as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe: Option<i64>,
+    /// The game is stopped at a pause and `safe` is that pause: the others may reach it exactly and not pass it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pause: bool,
+    /// The game stands still at a pause, at this game time (its speed 0 took effect and its time did not move for a while). The host
+    /// stamps the actions of the pause past the largest of these (the pause order), so every game can still apply them at their stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<i64>,
 }
 
 impl ClockMessage {
     /// The most margin a game may ask for, in steps (the lead's own ceiling): a larger value would only delay every build.
     pub const MAX_NEED: i32 = 24;
+    /// The furthest a promise may lie past its clock, in game time: the longest lead and the largest extra with room to spare.
+    pub const MAX_SAFE_AHEAD: i64 = 64 * 200;
+
+    /// The promise as the host relays it: one further past the clock than [`Self::MAX_SAFE_AHEAD`] is cut down to that (a
+    /// shorter promise only makes the others wait more; a longer one would let them run into steps its sender may still stamp
+    /// something for). A smaller one, even below the clock, is relayed as it is, for the same reason.
+    pub fn bounded_safe(&self) -> Option<i64> {
+        self.safe.map(|s| s.min(self.t.saturating_add(Self::MAX_SAFE_AHEAD)))
+    }
 }
 
 /// 0 asks for a pause.
@@ -379,13 +406,36 @@ pub struct ActionMessage {
     /// Set by the host; a player's own value is overwritten.
     #[serde(default = "ActionMessage::default_allowed")]
     pub allowed: bool,
+    /// Set by the originator: the action was made while its game stood at the session's pause and is applied during the pause.
+    /// The host gives it the next [`pause_seq`](Self::pause_seq) and relays it to EVERY game, the sender included: every game
+    /// applies paused actions in that one order (the arrival order on its own connection would differ between games).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pause: bool,
+    /// Set by the host on a `pause` action (a player's own value is overwritten): its place in the session's pause order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_seq: Option<u64>,
 }
 
 impl ActionMessage {
     pub const CATEGORIES: [&'static str; 4] = ["build", "bulldoze", "spend", "other"];
 
     pub fn new(stamp: i64, seq: i64, body: &str) -> Self {
-        Self { stamp, seq, body: body.to_owned(), from: 0, category: Self::default_category(), allowed: true }
+        Self {
+            stamp,
+            seq,
+            body: body.to_owned(),
+            from: 0,
+            category: Self::default_category(),
+            allowed: true,
+            pause: false,
+            pause_seq: None,
+        }
+    }
+
+    /// The same action made during a pause (see [`pause`](Self::pause)).
+    pub fn paused(mut self) -> Self {
+        self.pause = true;
+        self
     }
 
     pub fn with_category(mut self, category: &str) -> Self {
@@ -489,6 +539,12 @@ pub struct BuildCommitMessage {
     pub stamp: i64,
     #[serde(default)]
     pub from: u16,
+    /// As [`ActionMessage::pause`]: a commit sent while the session is paused is applied in the pause order, by every game.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pause: bool,
+    /// As [`ActionMessage::pause_seq`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_seq: Option<u64>,
 }
 
 /// `from` and `name` are set by the host on relay.

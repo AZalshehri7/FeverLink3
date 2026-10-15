@@ -3323,7 +3323,14 @@ local function decodeBuildUnsafe(body, ctx)
 			log("build inject (" .. plan .. "): the engine's proposal comes from the originator's text (" .. #body.nativeText .. " bytes)")
 			return built
 		end
-		log("build inject not used (" .. tostring(built) .. "); the record path builds it")
+		-- Fail closed: the build is the originator's text or nothing. The record path below is this game's own guess of the build (another
+		-- plan, other flags, other node configurations), so it is never used in place of a text that cannot be injected: the build is
+		-- refused here, nothing is applied, and the bridge asks for the repair (it was applied on the games that could inject it).
+		local why = "inject_refused: the placeholder command cannot be made here (" .. tostring(built):gsub("\nstack traceback:.*", ""):sub(1, 160)
+			.. "); nothing is applied here"
+		log("build inject (" .. plan .. ") REFUSED: " .. why)
+		C.tracer("build")("build.inject", string.format("%s inject_refused placeholder=%s", tostring(ctx.traceKey or "-"), tostring(built)))
+		return nil, why
 	end
 	if PORTABLE_REPLAY and type(body.input) == "string" then
 		local okT, built = pcall(portableReplay, rec, body.input, R, f, ctx and ctx.traceKey)

@@ -154,7 +154,11 @@ local function setup(react, builtin)
 			end)
 		end
 		local refresh = U.refresh
-		local function onRefresh() if refresh() then tick:set(tick:old() + 1) end end
+		local function onRefresh()
+			-- the stamp applies of the window commands the hook holds: their callbacks run as soon as the bridge has answered
+			if Hook and Hook.poll then pcall(Hook.poll) end
+			if refresh() then tick:set(tick:old() + 1) end
+		end
 		react.onStepTimer(onRefresh, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
 		if react.onStep then react.onStep(onRefresh) end
 		local ctl = U.ctl
@@ -371,6 +375,8 @@ local function setup(react, builtin)
 		if tick then
 			pcall(function()
 				react.onStepTimer(function()
+					-- the bar is always there, the window not: held window commands get their stamp applies here too
+					if Hook and Hook.poll then pcall(Hook.poll) end
 					pollCtl()
 					local want = U.ctl and U.ctl.sync ~= nil
 					local text = want and syncText(U.ctl.sync, U.ctl.state == "hosting") or nil

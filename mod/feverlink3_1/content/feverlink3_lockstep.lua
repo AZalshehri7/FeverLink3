@@ -4,11 +4,14 @@
 -- them the engine's clock and the launcher's lines; the tests feed them mocks. Every rule of the lockstep lives
 -- here:
 --   * session state from `session` lines: started, speed, pauseAt, lead;
---   * peer clocks from `peerclock` lines and the barrier: a game holds (speed 0) once it is more than `ahead`
+--   * peer clocks from `peerclock` lines and the pacing: a game holds (speed 0) once it is more than `ahead`
 --     steps past the slowest peer; a pause is a stamp and every game stops at exactly that step;
---   * stamps for local actions: now + lead, rounded up to a step; during a pause, the pause time itself;
+--   * the input barrier: every clock carries a promise (`safe`: nothing its sender ships later is stamped before it),
+--     and a game never runs into a step it may still get a peer's input for (L.promise, L.barrier, L.pace);
+--   * stamps for local actions: now + lead, rounded up to a step and never before this game's own promise; during a
+--     pause, the pause time itself;
 --   * the queue of stamped items, applied when at <= game time in (stamp, sender id, sequence) order, late ones
---     flagged for the LATE log;
+--     flagged: a late apply is a fork, logged and repaired;
 --   * command bodies: engine entity ids never travel; they are replaced by per-session keys;
 --   * a deterministic math.random reseeded from the game time each step;
 --   * checksum parts over an injectable engine accessor.
@@ -35,6 +38,8 @@ function L.applySession(s, p)
 	local pauseAt = tonumber(p.pauseAt)
 	local lead = tonumber(p.lead) or s.lead
 	local changed = started ~= s.started or speed ~= s.speed or pauseAt ~= s.pauseAt or lead ~= s.lead
+	-- the pause that just ended: an item stamped at it may still arrive while this game sits at that time (L.applyNow)
+	if s.pauseAt ~= nil and pauseAt == nil then s.lastPauseAt = s.pauseAt end
 	s.started, s.speed, s.pauseAt, s.lead = started, speed, pauseAt, lead
 	return changed
 end
@@ -52,7 +57,8 @@ function L.applyPeerClock(peers, p, selfId)
 	if type(p) ~= "table" or type(p.t) ~= "number" or p.from == nil or p.from == selfId then return false end
 	local need = tonumber(p.need)
 	if need then need = math.max(0, math.min(L.MARGIN_MAX, math.floor(need))) end
-	peers[p.from] = { t = p.t, ahead = tonumber(p.ahead), need = need }
+	-- the promise is taken as it is, never as the larger of old and new: the sender lowers it at a pause (L.promise)
+	peers[p.from] = { t = p.t, ahead = tonumber(p.ahead), need = need, safe = tonumber(p.safe), pause = p.pause == true }
 	return true
 end
 
@@ -76,7 +82,9 @@ end
 
 -- The speed the engine should be set to right now.
 --   not started          -> 0 (every game holds at the save time)
---   barrier              -> 0 once past slowest peer + ahead steps; never a batch that would cross it
+--   input barrier        -> 0 once the next step would pass L.barrier (a step a peer may still send an input for); never a
+--                           batch that would cross it. Exact, unlike the rest: a game that holds here waits for a clock.
+--   pacing               -> 0 once past slowest peer + ahead steps; never a batch that would cross it
 --   pause                -> 0 at pauseAt exactly; the last batch is shortened to land on it
 --   landing marks        -> `marks` (checksum stamps) never hold the game; the batch is shortened so that one lands
 --                           exactly on the mark. At x3/x4 a batch is several steps, and games whose batches fall at
@@ -85,8 +93,23 @@ end
 function L.pace(s, peers, now, ahead, marks)
 	if not s.started then return 0 end
 	local want = s.speed or 0
-	if want <= 0 then return 0 end
-	local stopAt = s.pauseAt
+	-- standing at a pause, with an action of the pause the host stamped further on (pauseRun: one step past the furthest place a game
+	-- stands, see the bridge's pause order): run on to it, one step a batch, the least the pause's world can move. The simulation applies
+	-- it at its stamp, so overshooting it changes nothing.
+	local run = s.pauseAt ~= nil and now >= s.pauseAt and type(s.pauseRun) == "number" and now < s.pauseRun
+	if run then
+		want = 1
+	elseif want <= 0 then
+		return 0
+	end
+	local bar = L.barrier(s, peers)
+	if bar then
+		-- no shortened last step here (the pause's math.max(room, 1) below): one step too far is the late apply itself
+		local room = math.floor((bar - now) / L.STEP)
+		if room < 1 then return 0 end
+		if room < want then want = room end
+	end
+	local stopAt = run and s.pauseRun or s.pauseAt
 	local slowest = L.slowestPeer(peers)
 	if slowest then
 		local limit = slowest + (ahead or L.aheadFor(want)) * L.STEP
@@ -131,6 +154,75 @@ function L.stampFor(s, now, minLead)
 	local at = L.roundUpStep(now + L.leadOf(s, minLead))
 	if at <= now then at = now + L.STEP end
 	return at
+end
+
+-- ------------------------------------------------------------------ the input barrier
+--
+-- A late apply (an item reaching a game after that game simulated its stamp) forks the entity ids (runs n1-n6, e1-e7: 9 of 10
+-- first late applies did); the measured margin made it rare, never impossible. The barrier makes it impossible by construction:
+--   * every `clock` a game sends carries `safe`, its PROMISE: every item it ships after that line is stamped at or after `safe`
+--     (L.promise; L.clampStamp holds every stamp to it). A game's clocks and its items travel one path, in order (its
+--     from_game.log, the launcher, one reliable connection to the host, the host's relay in the order it handles them, one
+--     connection to each other game, its to_game.log): when a game reads a peer's clock it has every item that peer shipped
+--     before it;
+--   * so a game may simulate every step before the smallest promise of its peers, and no further (L.barrier, L.pace). The
+--     receiver keeps marginTarget(speed) steps of that to itself: the interface sees the game time of its last frame (up to one
+--     batch behind the simulation) and an item reaches the simulation one script event later.
+-- The measured margin and the host's lead then only decide how often a game waits for a clock (latency), not correctness.
+-- A peer that sends no promise (an older mod) is paced as before. A peer that leaves (player_left, away or gone) is removed with its
+-- promise: the barrier is released by the session's own disconnect and timeout path.
+
+-- The steps of its own a promise adds on top of the lead, so that a receiver (which keeps marginTarget of the promise to itself)
+-- can still run up to the sender's clock plus the lead: with less, two games would wait for each other's clocks most of the time.
+function L.barrierExtra(speed)
+	return L.marginTarget(speed)
+end
+
+-- The promise this game reports with its clock at `now`, its new floor (the largest promise it made outside a pause; no stamp it
+-- gives outside a pause may be earlier, see L.clampStamp), and whether the promise is a pause stop. Stopped at a pause, this game
+-- stamps everything with the pause time and every game applies such an item when it is stopped there (L.applyNow), so it promises
+-- the pause time itself, flagged: a peer may reach the pause exactly (it lands there anyway) and not pass it until this game's next
+-- clock, which follows every item this game shipped during the pause, even when the host's resume overtakes such an item.
+-- `minLead`: as in L.stampFor.
+function L.promise(s, now, floor, minLead)
+	if s.pauseAt and now >= s.pauseAt then
+		return s.pauseAt, floor, true
+	end
+	local p = L.roundUpStep(now + L.leadOf(s, minLead)) + L.barrierExtra(s.speed) * L.STEP
+	p = math.max(floor or p, p)
+	return p, p, false
+end
+
+-- The stamp `at` of an item shipped at `now`, held to this game's promise. At a pause (this game stopped at it) the pause time stays.
+function L.clampStamp(s, now, at, floor)
+	if s.pauseAt and now >= s.pauseAt then return at end
+	if type(floor) == "number" and at < floor then return floor end
+	return at
+end
+
+-- The last game time this game may simulate: the smallest promise of its peers, less the steps the receiver keeps (see above); a
+-- pause stop (pc.pause) exactly, as the pause itself. nil: no peer has promised anything (alone, or peers that send no promise).
+function L.barrier(s, peers)
+	local keep = L.marginTarget(s.speed) * L.STEP
+	local b = nil
+	for _, pc in pairs(peers) do
+		if type(pc) == "table" and type(pc.safe) == "number" then
+			-- a pause promise: up to the pause, or to the stamp the host gave an action of the pause past it (pauseRun: every item that
+			-- game ships while paused is such an action, stamped by the host past every game)
+			local lim = pc.pause and math.max(pc.safe, s.pauseRun or pc.safe) or (pc.safe - keep)
+			if b == nil or lim < b then b = lim end
+		end
+	end
+	return b
+end
+
+-- The peer whose promise sets the barrier (for the log), or nil.
+function L.barrierPeer(peers)
+	local who, b = nil, nil
+	for id, pc in pairs(peers) do
+		if type(pc) == "table" and type(pc.safe) == "number" and (b == nil or pc.safe < b) then who, b = id, pc.safe end
+	end
+	return who, b
 end
 
 -- ------------------------------------------------------------------ measured stamp margin
@@ -298,8 +390,13 @@ end
 -- True when the interface half must apply the item itself: the game is stopped at the pause (the simulation
 -- script is not called while the engine is paused) and the item is due. Everything else goes to the simulation
 -- queue and applies at its exact step.
+-- The same for an item stamped at the pause that just ended when this game still sits at that time: its sender shipped it during
+-- the pause and the host's resume overtook it. The input barrier holds this game at the pause until that sender's next clock (see
+-- L.promise), so the item is applied as during the pause, where every other game applied it.
 function L.applyNow(s, now, item)
-	return s.pauseAt ~= nil and now >= s.pauseAt and type(item.at) == "number" and item.at <= now
+	if type(item.at) ~= "number" then return false end
+	if s.pauseAt ~= nil then return now >= s.pauseAt and item.at <= now end
+	return s.lastPauseAt ~= nil and item.at == s.lastPauseAt and now == item.at
 end
 
 -- ------------------------------------------------------------------ commands and entity references

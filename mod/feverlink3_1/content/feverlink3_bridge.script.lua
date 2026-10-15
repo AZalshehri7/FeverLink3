@@ -108,15 +108,23 @@ end)
 -- says `done = true`). With the switch on, a build is cancelled only when its held command says so; otherwise it stays hold-and-release.
 local FIRE_DONE = true
 pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") ~= "0" end)
--- The few module-level values added by the 2026-10-14 work live in one table: the main chunk is at Lua's limit of 200 locals.
+-- SECTIONS. Lua allows 200 locals per function and the main chunk of this file is one function: the game refused the bridge with "too
+-- many local variables (limit is 200) in main function" at 197 top-level names (real run rc1, 2026-10-14; the game counts a few more than
+-- lupa does), and every entry point then failed. So the larger sections below sit in `do ... end` blocks, not indented to keep diffs
+-- small: a name declared in a section is local to that section, and the names other sections use are declared just above its `do`
+-- (`local a, b` there, `function a()` / `a = ...` inside). A new helper goes into the section that uses it (declared above the `do` only
+-- when another section needs it), new module-level state into X. tests/lua/test_mod_files.py measures the peak with the compiler.
+-- The few module-level values added by the 2026-10-14 work live in one table.
 local X = {}
--- Test switch (never set by a player): FEVERLINK3_DEBUG_REFUSE_INJECT=link makes this game's own replay of its deferred build go the record
--- path as if its injection had been refused (the held command takes that apply's result); =fail also tells the module that the held
--- command gets no stamp apply result (its tool callback is fired with a failed result). Proves that no refusal leaves a tool busy.
+-- Test switch (never set by a player): FEVERLINK3_DEBUG_REFUSE_INJECT=1 (or the older values link / fail) makes the native module refuse the
+-- inject order of this game's own replay of its deferred build, after the order's identity checks, like any real refusal: the command is
+-- emptied (nothing of the build is applied here), the held command fails (its tool callback is fired with a failed result) and this game
+-- asks for a resync. Proves in a real run that a refusal applies nothing and leaves no tool busy. Since 2026-10-15 there is no record-path
+-- fallback to force: a build with the originator's text is injected or not applied.
 X.DEBUG_REFUSE_INJECT = nil
 pcall(function()
 	local v = os.getenv("FEVERLINK3_DEBUG_REFUSE_INJECT")
-	if v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
+	if v == "1" or v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
 end)
 -- Test switches (never set by a player): FEVERLINK3_TEST_NO_MARGIN / FEVERLINK3_TEST_NO_LEAD take the measured stamp margin (and the host's
 -- lead) away from deferred builds, to measure what they buy (L.testMargin). Unset: nil, nothing changes.
@@ -164,7 +172,7 @@ X.DEFER_GRACE_S = 3
 -- Every stage time is wall-clock milliseconds since 1970, so the lines of two games compare. The native module gives the wall clock and
 -- the C runtime's clock at one instant (`timing clock`); os.clock() reads that same C runtime clock, so wall = X.WALL0 + os.clock() * 1000.
 -- The format is fixed: "timing key=<k> held=<id> click=<wall>@g<game time> cap=<start>..<end> cap_ms=<ms> bytes=<n> ... ship=<wall>@g<t>
--- recv=<wall>@g<t> stamp=<t> step=<t> ... rebuild=<start>..<end> rebuild_ms=<ms> how=<injected|refused (record path)|record (complete_next)>
+-- recv=<wall>@g<t> stamp=<t> step=<t> ... rebuild=<start>..<end> rebuild_ms=<ms> how=<injected|refused (nothing applied)|refused (NOT emptied)|record (complete_next)>
 -- apply=<wall> accepted=<bool> total_ms=<apply - click> late_steps=<(step - stamp) / STEP>".
 X.WALL0 = nil
 function X.wallNow()
@@ -442,6 +450,10 @@ do
 	end
 end
 
+-- used outside this section:
+local traceSim, traceGui, checksumParts, actionCtx, coBefore, coEffects, coBalance, coAfter, engineVerdict, buildCategory, actionCategory,
+	shadowCompare, update, handleEvent
+do -- section: the simulation half (not indented, see SECTIONS at the top)
 -- The town-buildings lane: what the towns have grown, hashed per town so a log can name the town that differs. Idea from
 -- MPFever (MIT, see THIRD_PARTY_NOTICES.md): a `townBuildings` part. Read-only: only components are read, nothing is
 -- changed. A TOWN_BUILDING component gives its town, level (1-4), depth, timeBuilt and its CONSTRUCTION entity; that
@@ -551,7 +563,7 @@ end
 -- Checksum cost (observation only, never raises, behaviour unchanged): the seconds of every part are measured with os.clock. A
 -- checksum that takes more than CS_SLOW_MS in total logs one line naming the worst parts; every CS_SUMMARY rounds one summary line
 -- (count, average, maximum and the part that was the slowest in the maximum round). Each half (interface, simulation) counts its own.
-local traceSim, traceGui = C.tracer("sim"), C.tracer("gui")   -- trace.log (docs/TRACE.md)
+traceSim, traceGui = C.tracer("sim"), C.tracer("gui")   -- trace.log (docs/TRACE.md)
 local DETAIL = {}   -- the itemised keys of the last full checksum round of this state (dumped when a resync starts)
 local CS_SLOW_MS, CS_SUMMARY = 50, 20
 local CS = { n = 0, sum = 0, max = 0, maxPart = "?", maxWhere = "", nLight = 0, sumLight = 0, maxLight = 0 }
@@ -584,7 +596,7 @@ local function checksumNote(timing, total, where, light)
 end
 
 -- `light` (the round asked for no heavy lanes): constructions, edges, node settings and town buildings are not read.
-local function checksumParts(co, where, light)
+function checksumParts(co, where, light)
 	local function clock() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end
 	local t0 = clock()
 	local timing = {}
@@ -691,7 +703,7 @@ end
 
 -- The context an action is decoded and applied in: the player entity its `player` arguments become (this game's own; in a
 -- company session the acting player's company, see Co.actor), the sender, the stamp, the action key and the registry.
-local function actionCtx(it, co, resolve)
+function actionCtx(it, co, resolve)
 	local ctx = { player = engine.canonicalPlayer and engine.canonicalPlayer() or engine.player(), resolve = resolve, co = co }
 	if it then ctx.from, ctx.at, ctx.key = it.from, it.at, it.key end
 	if Co then pcall(Co.actor, ctx) end
@@ -707,7 +719,7 @@ end
 
 -- companies. Guarded calls into the company module: a fault in that layer is logged and the action goes ahead, since
 -- losing a player's action is worse than a missing ledger line.
-local function coBefore(ctx, it, spec, args, category, log)
+function coBefore(ctx, it, spec, args, category, log)
 	if not Co then return true end
 	local ok, a, b = pcall(Co.beforeApply, ctx, it, spec, args, category)
 	if not ok then
@@ -717,7 +729,7 @@ local function coBefore(ctx, it, spec, args, category, log)
 	return a, b
 end
 
-local function coEffects(ctx, fx, log)
+function coEffects(ctx, fx, log)
 	if not (Co and fx) then return end
 	if fx.note then log("company: " .. fx.note) end
 	if fx.postings then
@@ -731,7 +743,7 @@ local function coEffects(ctx, fx, log)
 end
 
 -- The balance an action's cost lands on (the acting company's account); nil when it cannot be read.
-local function coBalance(ctx)
+function coBalance(ctx)
 	if not Co or not engine.balanceOf then return nil end
 	local ok, v = pcall(engine.balanceOf, ctx.player)
 	if ok and type(v) == "number" and v == v then return v end
@@ -739,7 +751,7 @@ local function coBalance(ctx)
 end
 
 -- After the engine command went out: the ledger, with the cost measured as the account's difference. Returns the cost.
-local function coAfter(ctx, it, spec, category, balance0, log)
+function coAfter(ctx, it, spec, category, balance0, log)
 	if not Co then return nil end
 	local cost = nil
 	local balance1 = balance0 ~= nil and coBalance(ctx) or nil
@@ -760,7 +772,7 @@ end
 -- warnings of the proposal data's errorState. The second argument of makeProposalData must be a Context (a command whose context
 -- was left out made `bad argument #2 to 'makeProposalData'`): a default one with this game's player is made when the command has none.
 -- Returns `critical, messages, warnings` (lists of strings) or nil and the reason it could not be read. Never raises.
-local function engineVerdict(args)
+function engineVerdict(args)
 	local ok, critical, msgs, warns, coll = pcall(function()
 		local ctx = args[2]
 		if ctx == nil or ctx == false then
@@ -971,7 +983,7 @@ local function takeHeldOut(st)
 	return taken
 end
 
-local function buildCategory(body)
+function buildCategory(body)
 	local rec = type(body) == "table" and type(body.args) == "table" and body.args[1] or nil
 	if type(rec) ~= "table" then return "build" end
 	-- the rule of the build module's categoryFor, counted on the record: a build that adds no construction, node or edge
@@ -987,7 +999,7 @@ end
 -- game from the rebuilt proposal made the ledgers differ (a bulldozing that leaves merged road pieces was "build" on one game
 -- and "bulldoze" on the others, and the `companies` part of the checksum differed for good). Only the two build categories
 -- are taken from a record, and only for the build command; anything else is counted the usual way.
-local function actionCategory(body, args)
+function actionCategory(body, args)
 	if type(body) == "table" and body.fn == "makeWorldBuildProposalCmd" and (body.category == "build" or body.category == "bulldoze") then
 		return body.category
 	end
@@ -1036,7 +1048,7 @@ end
 
 -- B2.1, shadow: the record against the text the native module read from the held command, member by member (Portable.compare); one
 -- trace line (build.portable) on whichever half has both. Never raises.
-local function shadowCompare(tracer, who, text, rec)
+function shadowCompare(tracer, who, text, rec)
 	pcall(function()
 		local tree, why = Portable.parse(text)
 		if not tree then
@@ -1050,17 +1062,41 @@ local function shadowCompare(tracer, who, text, rec)
 	end)
 end
 
+-- The control file of THIS Lua state (docs/NATIVE_LINK.md section 3): native_ctl.sim.log for the simulation half, native_ctl.gui.log for the
+-- interface half (X.HALF, set by the entry points, see data()). One writer per state, made once and kept, with its own numbering: the
+-- module reads each file with its own last sequence. One shared file with a fresh writer per order (it re-read the file's tail every time)
+-- let one half's line carry a number the other half had already used, and the module dropped it as old (an inject_next / complete_next /
+-- fail lost: a wrong build or a busy tool); two states on two threads could also append to the one file at the same moment.
+function X.ctlWriter()
+	if not X.ctl then X.ctl = C.newWriter(C.path("native_ctl." .. (X.HALF or "gui") .. ".log"), C.PLAYER_ID) end
+	return X.ctl
+end
+
+-- The simulation half runs in more than one Lua state, each with its own writer of native_ctl.sim.log: C.writerSend takes up the other's
+-- numbering before every line (C.writerLook; real runs b3real, b3real2: repeated numbers were dropped by the module, and the builds with them).
+function X.ctlSend(kind, payload)
+	local w = X.ctlWriter()
+	local ok, why = C.writerSend(w, kind, payload)
+	return ok, why, w
+end
+
+-- "written to native_ctl.sim.log seq 12" / "NOT WRITTEN (why)", for the trace lines of the orders
+function X.ctlWritten(ok, err)
+	local w = X.ctl
+	if not ok then return "NOT WRITTEN (" .. tostring(err) .. ")" end
+	return "written to " .. tostring(w and w.path:match("[^\\/]+$")) .. " seq " .. tostring(w and C.integerText(w.seq))
+end
+
 -- The control order that makes the native module set the converted proposal's frozenNodes at the Add of the command sent next (patch_next:
--- frozen = 0-based indices into the proposal's added nodes, adds = how many nodes it adds). Written from the simulation half, right before the
--- command, with a writer of its own whose sequence continues the file's (the interface half refreshes its own before each write, natSend).
+-- frozen = 0-based indices into the proposal's added nodes, adds = how many nodes it adds). Written right before the command, by this
+-- state's control writer (X.ctlSend).
 local function sendPatchOrder(patch, key)
 	local ok, err = pcall(function()
-		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "patch_next", { frozen = patch.frozen, adds = patch.adds, at = patch.at })
+		local sent, why = X.ctlSend("patch_next", { frozen = patch.frozen, adds = patch.adds, at = patch.at })
 		if not sent then error(why, 0) end
 	end)
 	traceSim("build.patch", string.format("%s patch_next frozen=[%s] adds=%d %s", tostring(key), table.concat(patch.frozen, ","), patch.adds or -1,
-		ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+		X.ctlWritten(ok, err)))
 end
 
 -- A held-command order from the simulation half (`complete_next {held}`: this replay's command is this game's stamp apply of deferred
@@ -1075,27 +1111,45 @@ end
 
 function X.sendHeldOrder(kind, payload, key)
 	local ok, err = pcall(function()
-		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, kind, payload)
+		local sent, why = X.ctlSend(kind, payload)
 		if not sent then error(why, 0) end
 	end)
-	traceSim("build.inject", string.format("%s %s %s %s", tostring(key), kind, C.serialize(payload), ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	traceSim("build.inject", string.format("%s %s %s %s", tostring(key), kind, C.serialize(payload), X.ctlWritten(ok, err)))
 	return ok
 end
 
 -- The inject order: the shipped text goes to native_inject_<n>.txt (closed before the order is written), then `inject_next {key=n}`, then the caller
 -- sends the replay's command at once (nothing in between). The module answers `injected` / `inject_refused` in native_events.log.
--- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result.
-local function sendInjectOrder(inj, key, held, tm)
-	SIM.injectN = (SIM.injectN or 0) + 1
-	local n = SIM.injectN
+-- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result, or fails
+-- when the module refuses the order. `refuse`: the test switch's forced refusal (nil: none). Returns true when the order was written; the
+-- caller sends the command only then (an order that did not reach the module would leave the placeholder to be applied as it is).
+local function sendInjectOrder(inj, key, held, tm, refuse, counter)
+	-- The order's key is the number its line will carry in this half's control file (after C.writerLook), so it never repeats while that
+	-- file goes on, whichever Lua state writes it (a count of each state's own gave two states' orders the same key and text file, real
+	-- runs b3real, b3real2). The interface half's keys start at its base (guiApplyNow): both halves write native_inject_<n>.txt.
+	local n
+	do
+		local w = X.ctlWriter()
+		local f = C.writerLook(w)
+		if f then f:close() end
+		n = ((counter and counter.base) or 0) + w.seq + 1
+	end
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
-		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held, tm = tm })
+		local sent, why = X.ctlSend("inject_next", { key = n, held = held, tm = tm, refuse = refuse })
 		if not sent then error(why, 0) end
 	end)
-	traceSim("build.inject", string.format("%s inject_next key=%d held=%s (%d bytes of text) %s", tostring(key), n, tostring(held), #inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	traceSim("build.inject", string.format("%s inject_next key=%d held=%s%s (%d bytes of text) %s", tostring(key), n, tostring(held), refuse and (" refuse=" .. refuse) or "",
+		#inj.text, X.ctlWritten(ok, err)))
+	return ok, err
+end
+-- the interface half's apply during a pause writes the same orders (guiApplyNow)
+X.sendInjectOrder, X.sendPatchOrder = sendInjectOrder, sendPatchOrder
+
+-- A refusal that means "the exact copy of the build cannot be applied on this game" (the decode's reference check or placeholder, an inject
+-- order that could not be written): nothing was applied here, the build was on the games that could, so the world needs the repair.
+function X.isInjectRefusal(err)
+	return type(err) == "string" and err:find("^inject_refused") ~= nil
 end
 
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
@@ -1325,9 +1379,13 @@ local function simApplyAction(st, it, now)
 		return
 	end
 	if it.lateSteps and it.lateSteps > 0 and not it.waited then
-		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late)")
+		-- the input barrier makes this impossible by construction; if it still happens the entity ids have most likely forked (runs
+		-- n1-n6, e1-e7: 9 of 10 first late applies did). Applied all the same (the other games have it), but never silently: the
+		-- interface half asks the host for the repair (collectFromSim).
+		logSim("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now .. " (" .. it.lateSteps .. " step(s) late): a FORK, the repair is requested")
 		st.late = (st.late or 0) + 1
 		st.lateLast = it.lateSteps
+		st.lateKey = it.key
 	end
 	local ctx = simCtx(st, it)
 	local tDecode = os.clock()
@@ -1358,7 +1416,8 @@ local function simApplyAction(st, it, now)
 		traceSim("build.refused", it.key .. " " .. tostring(err))
 		-- this game's own deferred command gets no stamp apply: it fails now (tool callback fired), not after the grace
 		if it.deferId and it.from == C.PLAYER_ID then X.sendHeldOrder("fail", { id = it.deferId }, it.key) end
-		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err }
+		-- a build whose exact copy cannot be applied here (inject_refused) was applied on the games that could: ask for the repair
+		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err, resync = X.isInjectRefusal(err) or nil }
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
@@ -1417,20 +1476,20 @@ local function simApplyAction(st, it, now)
 					end
 				end
 				if a.patch then sendPatchOrder(a.patch, it.key) end
+				local refuse = nil
 				if a.inject and it.deferId and X.DEBUG_REFUSE_INJECT then
-					logSim("action " .. it.key .. ": FEVERLINK3_DEBUG_REFUSE_INJECT=" .. X.DEBUG_REFUSE_INJECT .. ": this game's own replay is not injected (a forced refusal)")
-					a.inject = nil
+					refuse = "FEVERLINK3_DEBUG_REFUSE_INJECT=" .. X.DEBUG_REFUSE_INJECT
+					logSim("action " .. it.key .. ": " .. refuse .. ": the module is told to refuse this game's own replay (a forced refusal: nothing is applied here)")
 				end
 				local tm = isBuild and X.timingText(it, now) or nil
 				if a.inject then
-					sendInjectOrder(a.inject, it.key, it.deferId, tm)
-				elseif it.deferId and X.DEBUG_REFUSE_INJECT == "fail" then
-					-- the forced refusal of the test switch: the held command gets no result of its own (as if nothing could be linked)
-					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: fail (test switch), its tool callback is fired with a failed result")
-					X.sendHeldOrder("fail", { id = it.deferId }, it.key)
+					local okO, errO = sendInjectOrder(a.inject, it.key, it.deferId, tm, refuse)
+					-- no order, no command: the placeholder alone is this game's guess of the build, never the build (the pcall below refuses it)
+					if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
 				elseif it.deferId then
-					-- not injected (the record path: a chain, a refusal): this replay's command is still this game's stamp apply of the build, so
-					-- the held command takes its result (run rt1 C12: without this the bulldozer stayed busy until the 30 s age limit)
+					-- not injected because the decode took the record path (this simulation half was not told of the module's inject capability;
+					-- a refused injection never gets here any more, it refuses the build): this replay's command is still this game's stamp apply
+					-- of the build, so the held command takes its result (run rt1 C12: without this the bulldozer stayed busy until the 30 s age limit)
 					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: it completes with this replay's result")
 					X.sendHeldOrder("complete_next", { held = it.deferId, tm = tm }, it.key)
 				elseif isBuild then
@@ -1449,7 +1508,7 @@ local function simApplyAction(st, it, now)
 		end
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
 		traceSim("build.error", string.format("%s type=%s value=%s", it.key, type(e), tostring(e)))
-		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e) }
+		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e), resync = X.isInjectRefusal(e) or nil }
 		return
 	end
 	coAfter(ctx, it, spec, category, balance0, logSim)
@@ -1716,8 +1775,54 @@ local function buildTraceStep(tick)
 	end
 end
 
-local function update(userParams, state, dt)
+-- ---- the end of a session in the simulation half
+--
+-- identity.txt says the session is over (`idle`) or names another one (common.lua C.poll), or the interface half says so (event
+-- `sessionoff`, sent first in its own transition, X.sessionOff): what this half keeps for the ended session goes, so nothing of it is
+-- applied later. The queue of stamped actions is dropped: no peer applies them at their stamps any more, and a stamp of an ended session
+-- means nothing to the next one (it would be due at once). This game's own builds in it are not lost silently: a build whose command
+-- the native module holds goes back to the engine when the interface half switches holding off (the module fails a deferred one), and
+-- the callbacks of commands that were stamped and not applied are failed there. What belongs to the world stays: the bindings
+-- (st.bind) and the company registry. Script builds this half took for stamping are failed (their callbacks run with a failure).
+function X.simSessionOff(state, why)
+	SIM.gen = nil
+	local n = { queue = 0, out = 0, binders = 0, scripts = #SIMO.pending }
+	pcall(function()
+		local st = simState(state)
+		n.queue, n.out, n.binders = #st.queue, #(st.out or {}), #st.binders
+		st.queue, st.out, st.binders, st.watches = {}, nil, {}, {}
+		st.heldOut, st.heldInput, st.heldNative, st.nbinds = nil, nil, nil, nil
+		st.results, st.reports, st.refused, st.notes, st.late = {}, {}, {}, nil, 0
+		st.epoch = nil   -- the next interface run stamps it again
+		state:set(st)
+	end)
+	for _, p in ipairs(SIMO.pending) do
+		if p.cb then pcall(p.cb, nil, false) end
+	end
+	for _, cb in pairs(SIMO.cbs) do pcall(cb, nil, false) end
+	SIMO.pending, SIMO.cbs = {}, {}
+	SIM.deferredBuild, SIM.nativeBinds = nil, nil
+	-- the session's deterministic math.random (L.installRandom) gives way to the game's own; the next session installs a new one
+	if SIM.rng then
+		if SIM.random0 then math.random = SIM.random0 end
+		SIM.rng = nil
+	end
+	logSim(string.format("session over (%s): single-player again; dropped %d queued action(s), %d native build(s) not yet shipped, %d binder(s), %d script build(s) (failed)",
+		tostring(why), n.queue, n.out, n.binders, n.scripts))
+	traceSim("session", string.format("off why=%s queue=%d out=%d binders=%d scripts=%d", tostring(why), n.queue, n.out, n.binders, n.scripts))
+end
+
+-- Every update and every event of the interface half: a session this half started in that is over (or replaced by another) ends here.
+function X.simSessionCheck(state)
+	if SIM.gen ~= nil and (not C.ACTIVE or SIM.gen ~= C.GEN) then
+		X.simSessionOff(state, C.ACTIVE and "another session began" or "the session ended")
+	end
+	if C.ACTIVE and SIM.gen == nil then SIM.gen = C.GEN end
+end
+
+function update(userParams, state, dt)
 	C.poll()
+	X.simSessionCheck(state)
 	pcall(function() buildTraceStep(math.floor(engine.gameTime() / STEP)) end)
 	townTraceGuard(function(t)
 		if C.DIR then t.step(math.floor(engine.gameTime() / STEP)) end
@@ -1729,6 +1834,7 @@ local function update(userParams, state, dt)
 		return
 	end
 	if not SIM.rng then
+		SIM.random0 = SIM.random0 or math.random
 		SIM.rng = L.newRandom(engine.gameTime)
 		L.installRandom(SIM.rng)
 		logSim("deterministic math.random installed")
@@ -1783,7 +1889,7 @@ local function update(userParams, state, dt)
 end
 
 -- Messages from the interface half (makeScriptingSendEventCmd with id "feverlink3").
-local function handleEvent(userParams, state, src, id, name, param)
+function handleEvent(userParams, state, src, id, name, param)
 	if DEV and id == "apply_command" then
 		pcall(function()
 			local pi = nil
@@ -1807,6 +1913,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 	end
 	if id == "apply_command" and name == "onPreBuildProposal" then
 		C.poll()
+		X.simSessionCheck(state)
 		if not C.ACTIVE then return end
 		local ok, err = pcall(simCaptureBuild, state, param)
 		if not ok then logSim("onPreBuildProposal capture failed: " .. tostring(err)) end
@@ -1823,9 +1930,19 @@ local function handleEvent(userParams, state, src, id, name, param)
 		end
 		return
 	end
-	C.poll()
-	if not C.ACTIVE or id ~= "feverlink3" then return end
+	if id ~= "feverlink3" then return end
 	if name == "nop" then return end   -- strict mode's trigger: a command that makes the native module run its queue (natTrigger)
+	-- The interface half talks: this half catches up with its view of the session first. Both read identity.txt on their own clock, a
+	-- second apart at most; the interface half's first lines of a session must not be dropped because this half has not looked yet.
+	local sid = type(param) == "table" and name == "session" and param.sid or nil
+	C.poll(not C.ACTIVE or (sid ~= nil and sid ~= C.SESSION))
+	X.simSessionCheck(state)
+	if name == "sessionoff" then
+		-- the interface half ended its session (X.sessionOff): it sends this before it hands held commands back to the engine
+		if SIM.gen ~= nil or not C.ACTIVE then X.simSessionOff(state, "the interface half ended the session") end
+		return
+	end
+	if not C.ACTIVE then return end
 	local ok, err = pcall(function()
 		local st = simState(state)
 		if name == "session" and type(param) == "table" then
@@ -1839,6 +1956,14 @@ local function handleEvent(userParams, state, src, id, name, param)
 				st.reports, st.results, st.refused, st.out, st.notes, st.late = {}, {}, {}, nil, nil, 0
 				st.epoch = param.epoch
 				traceSim("session", "epoch " .. tostring(param.epoch) .. ": dropped " .. C.integerText(dropped) .. " outputs of an earlier session")
+				if param.fresh then
+					-- A session begins in this world (not a resync reload, which resumes its session from the saved queue): the queue and the
+					-- pending bindings of the save are another session's. A save made mid-session (the guest's save at the end, a player's own)
+					-- carries them; applied now, every stamp in them would be due at once.
+					local stale = #st.queue + #st.binders
+					st.queue, st.binders, st.watches, st.heldOut, st.heldInput, st.heldNative, st.nbinds = {}, {}, {}, nil, nil, nil, nil
+					if stale > 0 then logSim("a new session: dropped " .. C.integerText(stale) .. " queued action(s) and binder(s) of an earlier session found in this world") end
+				end
 			end
 		elseif name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
@@ -1936,6 +2061,7 @@ local function handleEvent(userParams, state, src, id, name, param)
 	end)
 	if not ok then logSim("event " .. tostring(name) .. " failed: " .. tostring(err)) end
 end
+end -- section: the simulation half
 
 -- ================================================================== interface half
 
@@ -2016,6 +2142,52 @@ local function setSpeed(sp)
 	end
 end
 
+-- This game's clock line with its promise (L.promise, the input barrier): every item it ships after this line is stamped at or after
+-- `safe`; `pause` = stopped at a pause, `safe` is the pause time and the peers may reach it exactly. Sent every frame the clock moved,
+-- every 30 frames anyway, and before the first item stamped at a pause (X.promisePause).
+function X.reportClock(now)
+	local safe, floor, pause = L.promise(G.session, now, G.promiseFloor)
+	G.promiseFloor, G.promisePause = floor, pause
+	local ahead = L.aheadFor(G.session.speed)
+	send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed), safe = safe, pause = pause or nil,
+		stop = (pause and X.curStop == now) and now or nil })
+end
+
+-- A game stopped at a pause promises the pause time itself, and it must have said so before it ships the first item stamped there:
+-- a peer still holding its earlier promise could otherwise leave the pause (the host's resume) and pass the stamp before the item.
+function X.promisePause(now)
+	if G.session.pauseAt and now >= G.session.pauseAt and not G.promisePause then X.reportClock(now) end
+end
+
+-- The waits of the input barrier, for the logs: a hold is a stretch of frames in which a running game stands still because its next
+-- step would pass the barrier (a peer's clock is late: jitter, a stalled frame, a slow link). Every hold is traced (`barrier`); one
+-- longer than a second also goes to mod.log, and a count every minute.
+function X.barrierWatch(now, sp)
+	local s = G.session
+	local bar = (s.started and (s.speed or 0) > 0) and L.barrier(s, G.peers) or nil
+	local held = bar ~= nil and sp == 0 and now + STEP > bar and not (s.pauseAt and now >= s.pauseAt)
+	local B = G.barrier or { n = 0, wait = 0, logged = os.clock() }
+	G.barrier = B
+	local clock = os.clock()
+	if held and not B.since then
+		B.since, B.at = clock, now
+		B.who, B.safe = L.barrierPeer(G.peers)
+		traceGui("barrier", string.format("hold at t=%s: the next step passes the barrier %s (player %s promised %s) x%s",
+			C.integerText(now), C.integerText(bar), tostring(B.who), tostring(B.safe), tostring(s.speed)))
+	elseif not held and B.since then
+		local d = clock - B.since
+		B.n, B.wait, B.since = B.n + 1, B.wait + d, nil
+		traceGui("barrier", string.format("released at t=%s after %.3f s (player %s)", C.integerText(now), d, tostring(B.who)))
+		if d >= 1 then
+			logGui(string.format("input barrier: held %.2f s at t=%s waiting for player %s's clock (its promise %s)", d, C.integerText(B.at), tostring(B.who), tostring(B.safe)))
+		end
+	end
+	if clock - B.logged >= 60 and B.n > 0 then
+		logGui(string.format("input barrier: %d hold(s), %.2f s in all, in the last %.0f s", B.n, B.wait, clock - B.logged))
+		B.n, B.wait, B.logged = 0, 0, clock
+	end
+end
+
 local function guiCtx(it)
 	local ctx = actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
 	ctx.canPatch = NATIVE_PATCH and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.patch == true
@@ -2090,7 +2262,7 @@ local function coToSim(it, ok, cost, category)
 	toSim("co", { it = { from = it.from, at = it.at, seq = it.seq, key = it.key, body = it.body }, ok = ok == true, cost = cost, category = category })
 end
 
--- An action this game applied natively when its player made it (a build with a native tool, a command from a window): every
+-- An action this game applied natively when its player made it (a build with a native tool that was not held): every
 -- OTHER game runs the company layer when it applies the action at its stamp (the ledger of who built and spent what is part of
 -- the checksum), so this game must run it too, with the same stamp, or its ledger is the only one without the action and the
 -- games "differ in companies" until a resync copies everything (seen in a real game: a reload every two minutes).
@@ -2109,6 +2281,10 @@ end
 -- strict mode (defined in its section below): a game paused at the stamp releases its own held command; a refusal cancels it
 local natPauseRelease, natHeldRefused, natVeto, vetoChat
 
+-- used outside this section:
+local route, stampAfterFastest, PARK_MAX, pausedNow, graceMs, VETO_STEPS, CONSTRUCTION_VETO_STEPS, CONSTRUCTION_GRACE_MS, noteBuild,
+	pendingBefore, vetoCheck, dryPump, shipNative, shipUiCommand, shipLocal, uiReply
+do -- section: applying items, the veto, shipping (not indented, see SECTIONS at the top)
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
 	if it.kind == "checksum" then
@@ -2152,6 +2328,7 @@ local function guiApplyNow(it, now)
 	local bindBefore = {}
 	for _, comp in ipairs(bindComps or {}) do bindBefore[comp] = engine.entitiesWith(comp) end
 	local function finish(data, success, entities)
+		if X.engineHas then X.engineHas[it.key] = nil end
 		if spec.creates and success then
 			-- the engine's result is userdata (VehicleBuyCommandData...) with the field the game's own window reads
 			local okd, e = pcall(function() return data[spec.result] end)
@@ -2185,31 +2362,168 @@ local function guiApplyNow(it, now)
 		-- the game is paused, so nothing else moved the account since the command went out
 		coToSim(it, success, success and coAfter(ctx, it, spec, category, balance0, logGui) or nil)
 		logGui("action " .. it.key .. " " .. it.body.fn .. " applied during the pause at t=" .. now .. (success and "" or (" REFUSED" .. refusalWhy(data))))
+		-- this game's deferred held command took this apply's result (inject_next / complete_next): its world has the apply now
+		if it.deferId and X.deferApplied then pcall(X.deferApplied, it.deferId) end
 		deliverResult(it.key, data, success, entities)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
 	local okS, errS
+	-- from here the engine has the command: its own answer (finish) reaches the callback, even after the session ended (X.sessionOff)
+	X.engineHas = X.engineHas or {}
+	X.engineHas[it.key] = true
 	if it.heldId and natPauseRelease then
 		-- the tool's own command is held by the native module: it is released instead of sent (the whole build is that one command)
 		okS, errS = pcall(natPauseRelease, it, finish)
 	else
 		okS, errS = pcall(L.runChained, args, function(a, cb)
-			if it.body.fn == "makeWorldBuildProposalCmd" then toSim("replay", {}) end
+			local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
+			if isBuild then toSim("replay", {}) end
+			-- the native orders exactly as at a stamp apply in the simulation half (simApplyAction), right before the command: a paused
+			-- build is the originator's exact copy (inject) where the decode chose it, and this game's deferred held command takes its
+			-- result. (The pause path used to send the record's donor command alone: another build than on a running game.)
+			if a.patch then X.sendPatchOrder(a.patch, it.key) end
+			if a.inject then
+				-- this half's inject files are numbered apart from the simulation half's (both write native_inject_<n>.txt)
+				X.guiInject = X.guiInject or { base = X.GUI_INJECT_BASE }
+				local okO, errO = X.sendInjectOrder(a.inject, it.key, it.deferId, isBuild and X.timingText(it, now) or nil, nil, X.guiInject)
+				if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
+			elseif it.deferId then
+				X.sendHeldOrder("complete_next", { held = it.deferId }, it.key)
+			end
 			O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
 		end, finish)
 	end
 	if not okS then
+		X.engineHas[it.key] = nil
 		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
 		send("action_refused", { seq = it.seq, from = it.from, detail = tostring(errS) })
+		-- no apply on this game: the deferred held command fails now (tool callback fired); an exact copy that cannot be made asks for the repair
+		if it.deferId then X.sendHeldOrder("fail", { id = it.deferId }, it.key) end
+		if X.isInjectRefusal(errS) then send("replay_failed", { detail = "action " .. it.key .. " not applied here during the pause: " .. tostring(errS):sub(1, 200) }) end
 		deliverResult(it.key, nil, false, {})
 		coToSim(it)
 		if it.heldId and natHeldRefused then pcall(natHeldRefused, it) end
 	end
 end
 
-local function route(it)
+-- ---- the pause order (docs/PROTOCOL.md, "The pause order")
+--
+-- An action made while the session stands at its pause is shipped flagged `pause` and this game keeps it (G.pauseOwn) until the host
+-- sends it back. Applied at once from this state in arrival order, the actions of a pause were in a different order on each game (the
+-- originator's own first); applied at the pause stamp, they were late on every game, because no game stands AT the pause: speed 0
+-- takes effect a few steps late, by a different amount on each game (real run pause3, 2026-10-15: pauseAt 534400, both games stood at
+-- 535000, "PAUSE ORDER LATE" and a resync for every paused build). So every game says where it really stands still (X.stopAt, the
+-- clock's `stop`), the host stamps the action one step past the furthest of those places and sends it, numbered, to every game, this
+-- one included (X.pauseArrived). Every game applies it at that stamp through the simulation like any action, exactly there whatever its
+-- own overshoot; a game standing still runs on to it (L.pace, pauseRun), a step or a few: the pause's world moves that little for each
+-- build, and the build shows a round trip and that step later. The next stamp waits until every game stands still again at or past it.
+-- At the resume the host gives a held one a normal stamp; one that reaches it after the resume gets one too.
+X.GUI_INJECT_BASE = 1000000000
+
+-- an item stamped at the session's pause: a pause action
+function X.isPauseStamp(at)
+	local p = G.session.pauseAt
+	return p ~= nil and at == p
+end
+
+-- After this game shipped `it`: a pause action waits for the host's pause order; anything else goes the usual way.
+function X.routeOwn(it)
+	if not it.pause then return route(it) end
+	G.pauseOwn = G.pauseOwn or {}
+	G.pauseOwn[it.key] = it
+	logGui("action " .. it.key .. " made during the pause (t=" .. tostring(it.at) .. "): applied when the host's pause order brings it back")
+end
+
+-- Where this game really stands during a pause (ClockMessage.stop: the host stamps the actions of the pause one step past the furthest):
+-- its time once it has not moved for X.STOP_SECONDS of real time and X.STOP_FRAMES frames with speed 0 set (the interface sees the time
+-- of the last frame the simulation finished; a few frames of one time prove nothing at x1). nil while it may still move.
+X.STOP_SECONDS, X.STOP_FRAMES = 0.5, 5
+pcall(function() X.STOP_SECONDS = tonumber(os.getenv("FEVERLINK3_TEST_STOP_SECONDS")) or X.STOP_SECONDS end)   -- test switch
+function X.stopAt(now, sp)
+	local s = G.session
+	local W = G.still or {}
+	G.still = W
+	if not (s.started and s.pauseAt and now >= s.pauseAt and sp == 0) then
+		W.t = nil
+		return nil
+	end
+	if W.t ~= now then
+		W.t, W.n, W.since = now, 0, os.clock()
+		return nil
+	end
+	W.n = W.n + 1
+	if W.n >= X.STOP_FRAMES and os.clock() - W.since >= X.STOP_SECONDS then return now end
+	return nil
+end
+
+-- An action of the pause came back from the host, numbered and STAMPED (one step past the furthest place a game stands still at the
+-- pause, real run pause3: no game stands at the pause stamp itself): this game's own (it waited in G.pauseOwn) or another player's.
+-- Every game applies it at that stamp through the simulation like any action; a game standing still runs on to it (L.pace, pauseRun).
+function X.pauseArrived(it, n)
+	it.pauseSeq = n
+	if it.from == C.PLAYER_ID then
+		local own = G.pauseOwn and G.pauseOwn[it.key]
+		if not own then
+			logGui("pause order #" .. tostring(n) .. ": " .. it.key .. " is this game's own but nothing waits for it here (made before a reload?): applied as received")
+		else
+			G.pauseOwn[it.key] = nil
+			own.pauseSeq, own.at = n, it.at
+			it = own
+		end
+	end
+	X.pauseStamped(it)
+	route(it)
+end
+
+-- The host's stamp of an action of the pause: the native module's bookkeeping of this game's own held build follows it, and the game
+-- runs on to it while paused.
+function X.pauseStamped(it)
+	local s = G.session
+	if it.pauseSeq then
+		-- one ordered link from the host: a number that is not the next one would mean a lost line
+		local want = (G.pauseLast or (it.pauseSeq - 1)) + 1
+		if it.pauseSeq ~= want then logGui("PAUSE ORDER GAP: expected #" .. tostring(want) .. ", got #" .. tostring(it.pauseSeq) .. " (" .. tostring(it.key) .. ")") end
+		G.pauseLast = it.pauseSeq
+	end
+	-- to the stamp and one step on: the simulation finds what the action created (a bought vehicle shows a step after its command) and
+	-- keys it, so the window's callback runs and a later action of the pause can name it
+	s.pauseRun = math.max(s.pauseRun or 0, it.at + STEP)
+	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then noteBuild(it.key, it.at) end
+	local N = G.nat
+	if N and it.from == C.PLAYER_ID then
+		-- the real stamp is known now: the deferred completion (natTick) and the watchdog may count from it
+		local d = it.deferId and N.deferred[it.deferId]
+		if d then d.at, d.waitStamp = it.at, nil end
+		local h = N.heldByKey[it.key]
+		if h then h.at, h.waitStamp = it.at, nil end
+	end
+	logGui("pause order #" .. tostring(it.pauseSeq) .. ": " .. tostring(it.key) .. " stamped " .. tostring(it.at) .. " by the host (pause " .. tostring(s.pauseAt or s.lastPauseAt) .. ", this game at t=" .. tostring(engine.gameTime()) .. ")")
+end
+
+function route(it)
 	local now = engine.gameTime()
-	if L.applyNow(G.session, now, it) then guiApplyNow(it, now) else toSim("queue", it) end
+	-- a checksum round at a pause is stamped where the furthest game stands still: a game behind runs on to it (pauseRun). An item at or
+	-- before the time this game stands at, at a pause, is applied from here in arrival order (a checksum, or the barrier breached)
+	local s = G.session
+	if it.kind == "checksum" and s.pauseAt and type(it.at) == "number" and it.at > now then s.pauseRun = math.max(s.pauseRun or 0, it.at) end
+	if L.applyNow(s, now, it) then
+		if it.kind == "checksum" or it.at == now then
+			guiApplyNow(it, now)
+		else
+			-- an action stamped before the time this game stands at (the barrier breached): applied by the simulation, late (a fork,
+			-- repaired as every late apply)
+			logGui("PAUSE LATE: action " .. tostring(it.key) .. " for t=" .. tostring(it.at) .. " reached this game standing at t=" .. tostring(now))
+			toSim("queue", it)
+		end
+		return
+	end
+	if it.kind == "action" and type(it.at) == "number" and it.at <= now and not (it.body and it.body.native and it.from == C.PLAYER_ID) then
+		-- the input barrier should make this impossible: the simulation is at or past the stamp already, so it applies the item late
+		-- (a fork; the simulation half logs LATE and this half asks for the repair)
+		logGui("INPUT BARRIER BREACHED: action " .. tostring(it.key) .. " stamped " .. C.integerText(it.at) .. " arrived at t=" .. C.integerText(now)
+			.. " (promise of player " .. tostring(it.from) .. ": " .. tostring(G.peers[it.from] and G.peers[it.from].safe) .. ")")
+	end
+	toSim("queue", it)
 end
 
 -- A build the player made with a native tool, captured by the simulation half (simCaptureBuild): stamped and shipped
@@ -2219,7 +2533,7 @@ end
 -- extraSteps: a held strict build is stamped this many steps later, so that a veto (a game that cannot rebuild it says so as soon
 -- as it has the record) is back at the originator and at every other game before the stamp. Not at a pause (the stamp is then
 -- the pause time: the build is applied during the pause, a veto cannot come first).
-local function stampAfterFastest(now, extraSteps)
+function stampAfterFastest(now, extraSteps)
 	local base = now
 	local peers = false
 	for _, pc in pairs(G.peers) do
@@ -2234,7 +2548,9 @@ local function stampAfterFastest(now, extraSteps)
 		-- fixed handling. The host's lead grows with the slowest round trip, so the extra grows with it (half the lead, one step at least).
 		at = at + math.max(extraSteps, math.floor(L.leadOf(G.session) / STEP / 2)) * STEP
 	end
-	return at
+	-- the input barrier: never before what this game promised its peers (L.clampStamp); at a pause, the pause stop is promised first
+	X.promisePause(now)
+	return L.clampStamp(G.session, now, at, G.promiseFloor)
 end
 
 -- ---- a held build in a PAUSED game
@@ -2247,9 +2563,9 @@ end
 -- during the grace drops it everywhere; a peer that never answers casts no veto (silence is yes); a peer that never gets the
 -- commit (its originator vanished) drops the parked record after PARK_MAX seconds.
 local GRACE_MIN, GRACE_MAX, GRACE_DRY_MS, GRACE_MARGIN_MS = 250, 1500, 100, 100
-local PARK_MAX = 10.0       -- seconds a peer keeps a parked record without its commit
+PARK_MAX = 10.0       -- seconds a peer keeps a parked record without its commit
 
-local function pausedNow()
+function pausedNow()
 	local s = G.session
 	return s.pauseAt ~= nil and engine.gameTime() >= s.pauseAt
 end
@@ -2257,7 +2573,7 @@ end
 -- The grace in real milliseconds: two round trips' worth (the record out, the veto back) plus a dry run and a margin. The round
 -- trip is read from the host's lead (lead_for: half a round trip plus handling, in steps), which the host derives from its
 -- measurement of the slowest connection.
-local function graceMs()
+function graceMs()
 	local steps = math.floor(L.leadOf(G.session) / STEP + 0.5)
 	local rtt = math.max(0, 2000 * ((steps - 2) / 6 - 0.06))
 	local ms = math.max(GRACE_MIN, math.min(GRACE_MAX, math.floor(2 * rtt + GRACE_DRY_MS + GRACE_MARGIN_MS)))
@@ -2274,15 +2590,15 @@ end
 -- command (nothing is applied on its world) and every game drops the queued replay, so no world runs ahead of a refusal. A
 -- game that is slow, paused or gone casts no veto. The dry run waits for earlier builds that have not landed yet (they create
 -- what this one may refer to); if they do not land before the stamp it is skipped (silence).
-local VETO_STEPS = 1          -- extra steps of lead for a held build (the veto's way back)
+VETO_STEPS = 1          -- extra steps of lead for a held build (the veto's way back)
 -- A build that adds or removes constructions takes the other games much longer to dry-run (every building has to be found, the engine's
 -- factory runs on a big proposal; real session 2026-10-12: a veto 2 s after the build was released after a 626 ms grace): a longer
 -- window, so that a veto reaches the originator before it releases its command.
-local CONSTRUCTION_VETO_STEPS = 12   -- extra steps of lead
-local CONSTRUCTION_GRACE_MS = 4000   -- a paused game waits at least this long
+CONSTRUCTION_VETO_STEPS = 12   -- extra steps of lead
+CONSTRUCTION_GRACE_MS = 4000   -- a paused game waits at least this long
 local VETO_MARGIN = 1         -- a dry run later than this many steps before the stamp is useless and skipped
 
-local function noteBuild(key, at)
+function noteBuild(key, at)
 	G.buildAts[key] = at
 	local n = 0
 	for _ in pairs(G.buildAts) do n = n + 1 end
@@ -2293,7 +2609,7 @@ local function noteBuild(key, at)
 end
 
 -- builds that stamp earlier than `it` and have not landed on this game yet
-local function pendingBefore(it, now)
+function pendingBefore(it, now)
 	local out = nil
 	for k, a in pairs(G.buildAts) do
 		if k ~= it.key and a <= it.at and now < a + STEP then out = math.max(out or 0, a) end
@@ -2357,7 +2673,7 @@ local function sendVeto(it, why)
 	logGui("VETO of " .. it.key .. ": this game cannot build it (" .. tostring(why) .. "); the build is dropped on this game")
 end
 
-local function vetoCheck(it, now)
+function vetoCheck(it, now)
 	local ok, why = dryRun(it)
 	if ok then
 		if why then logGui("dry run of " .. it.key .. ": " .. why) end
@@ -2367,7 +2683,7 @@ local function vetoCheck(it, now)
 end
 
 -- every frame: dry runs that waited for earlier builds
-local function dryPump()
+function dryPump()
 	if next(G.dry) == nil then return end
 	local now = engine.gameTime()
 	for key, it in pairs(G.dry) do
@@ -2384,20 +2700,22 @@ end
 -- The permission category of a captured build record: a record that adds nothing only removes (bulldoze).
 -- (buildCategory and actionCategory are defined above the simulation half)
 
-local function shipNative(o)
+function shipNative(o)
 	local body = C.parse(o.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
 	local category = buildCategory(body)
 	local now = engine.gameTime()
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
-	send("action", { stamp = at, seq = G.seq, body = o.body, category = category })
+	-- a script's command made during the pause is applied in the host's pause order (X.routeOwn); a native build is applied here already
+	local pause = (o.script and X.isPauseStamp(at)) or nil
+	send("action", { stamp = at, seq = G.seq, body = o.body, category = category, pause = pause })
 	G.nativeShipped = (G.nativeShipped or 0) + 1
 	if o.script then
 		-- a script's build command (simScriptBuild): not applied anywhere yet, so this game queues it like every other game does
-		local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), scriptOut = o.n }
+		local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), scriptOut = o.n, pause = pause }
 		logGui("native build " .. it.key .. " (a script's command) stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes): applied at the stamp on this game too")
-		route(it)
+		X.routeOwn(it)
 		return true
 	end
 	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
@@ -2406,33 +2724,59 @@ local function shipNative(o)
 	return true
 end
 
--- A command a window issued, recorded by the UI-state hook (feverlink3_uihook.lua), which applied it natively already:
--- stamped and shipped; the other games apply it at the stamp.
-local function shipUiCommand(p)
+-- The answer to the UI-state hook about a window command it holds (ui_in.log, read by Hook.poll): applied or refused at the
+-- stamp, the entity it created and its key. The window's callback runs on that answer.
+function uiReply(id, key, data, success, entities, detail)
+	if not G.uiInbox then G.uiInbox = C.newWriter(C.path("ui_in.log"), C.PLAYER_ID) end
+	local e = nil
+	if success and key then e = G.bind[key] end
+	if e == nil and success and data ~= nil then
+		local fn = G.uiFn and G.uiFn[key]
+		local spec = fn and L.COMMANDS[fn]
+		if spec and spec.result then pcall(function() e = data[spec.result] end) end
+		if type(e) ~= "number" then e = nil end
+	end
+	local okE, list = pcall(C.plain, entities)
+	if G.uiFn and key then G.uiFn[key] = nil end
+	local ok, err = C.writerSend(G.uiInbox, "result", { id = id, key = key, success = success == true, e = e,
+		entities = (okE and type(list) == "table" and next(list) ~= nil) and list or nil, detail = detail })
+	logGui("window command #" .. tostring(id) .. " (" .. tostring(key) .. ") " .. (success and "applied" or "REFUSED") .. " at its stamp"
+		.. (e and (", created " .. tostring(e)) or "") .. ": answered to the window" .. (ok and "" or (" - CANNOT WRITE ui_in.log: " .. tostring(err))))
+end
+
+-- A command a window issued, recorded and HELD by the UI-state hook (feverlink3_uihook.lua): stamped, shipped and queued here
+-- like every other action (shipLocal), so this game applies it at the stamp through the same queue as the other games. Applied at
+-- the click instead, it took entity ids from the engine's free-id FIFO at another step than everywhere else, and every later id
+-- could differ (the rule at the deferred completion of builds). The window's callback runs on uiReply, after the stamp apply.
+function shipUiCommand(p)
 	local body = C.parse(p.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
+	body.native = nil   -- nothing of it was applied here
 	local now = engine.gameTime()
 	-- entities a window command made a moment ago travel under the key of the record that made them (L.rewriteUiKeys)
-	local text = p.body
 	local note = L.recentNotes(G.notes, now)
-	if text:find("ui:", 1, true) or #note > 0 then
+	if p.body:find("ui:", 1, true) then
 		local okR, missing = L.rewriteUiKeys(body, function(id) return G.uiSeq[id] end, C.PLAYER_ID)
 		if not okR then return false, "it names the entity window command #" .. tostring(missing) .. " made, which was never shipped" end
-		if #note > 0 then body.diverged = note end
-		text = C.serialize(body)
 	end
+	if #note > 0 then body.diverged = note end
+	local text = C.serialize(body)
 	G.seq = G.seq + 1
 	G.uiSeq[p.id] = G.seq
 	local at = stampAfterFastest(now)
 	local category = type(p.category) == "string" and p.category or "other"
-	send("action", { stamp = at, seq = G.seq, body = text, category = category })
-	logGui("window command " .. tostring(body.fn) .. " " .. L.itemKey(C.PLAYER_ID, G.seq) .. " stamped " .. at .. " (now " .. now .. ")")
-	recordOriginator(body, G.seq, at, category)
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.isPauseStamp(at) or nil }
+	send("action", { stamp = at, seq = G.seq, body = text, category = category, pause = it.pause })
+	G.uiFn = G.uiFn or {}
+	G.uiFn[it.key] = body.fn
+	G.pending[it.key] = function(data, success, entities) uiReply(p.id, it.key, data, success, entities) end
+	logGui("window command " .. tostring(body.fn) .. " #" .. tostring(p.id) .. " " .. it.key .. " stamped " .. at .. " (now " .. now .. "): held in the window, applied here at the stamp too")
+	X.routeOwn(it)
 	return true
 end
 
 -- A command this player issued (held by the wrapped sendCommand): encode, stamp, ship, queue locally.
-local function shipLocal(tag, cb)
+function shipLocal(tag, cb)
 	local body, err = L.encodeCommand(tag.name, tag.args, { plain = C.plain, keyOf = function(e) return L.keyFor(G.rev, e) end })
 	if not body then return false, err end
 	local now = engine.gameTime()
@@ -2440,14 +2784,15 @@ local function shipLocal(tag, cb)
 	if #note > 0 then body.diverged = note end
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
-	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq) }
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.isPauseStamp(at) or nil }
 	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
-	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args) })
+	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args), pause = it.pause })
 	if cb then G.pending[it.key] = cb end
 	logGui("action " .. it.key .. " " .. tag.name .. " stamped " .. at .. " (now " .. now .. ")")
-	route(it)
+	X.routeOwn(it)
 	return true
 end
+end -- section: applying items, the veto, shipping
 
 -- ================================================================== strict mode: the native module holds a tool's build
 --
@@ -2485,14 +2830,18 @@ end
 -- active, on a fault, when the module stops answering, and when the module itself says `holding {on = false}` (it retries
 -- with a back-off). Without native_events.log nothing of this runs and nothing is written.
 
-local NAT_PING = 2.0      -- longest pause between lines written to native_ctl.log while holding
-local NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
+-- used outside this section:
+local NAT_PING, NAT_CAP_TTL, NAT_GRACE, NAT_PREVIEW_TTL, NAT_CONFIRM, NAT_ALIVE, NAT_WATCHDOG, SITES, natNew, natSay, natSend, natTrigger,
+	natStop, natFault, natPing, natOrder, natRelease, natSessionOn, natSite, natDecide
+do -- section: strict mode: the native link and the verdict (not indented, see SECTIONS at the top)
+NAT_PING = 2.0      -- longest pause between lines written to native_ctl.log while holding
+NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
 local NAT_CAP_MAX = 6     -- captures kept
-local NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
-local NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
-local NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
-local NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
-local NAT_WATCHDOG = 8.0  -- no proof of life (a pong or any other event) for this long while holding: the module is gone
+NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
+NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
+NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
+NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
+NAT_WATCHDOG = 8.0  -- no proof of life (a pong or any other event) for this long while holding: the module is gone
 -- Strict mode switched off by the mod (no answer, hold_on not confirmed, the watchdog, the module's own switch-offs) is not off for
 -- good: the mod keeps pinging every X.NAT_REARM_PING s and, when the module answers again, arms strict mode again (hold_on), after a
 -- back-off of X.NAT_REARM_MIN s that doubles with every re-arm up to X.NAT_REARM_MAX s (reset after a minute of holding). Real run
@@ -2511,7 +2860,7 @@ X.NAT_FAULT_COOL = 60.0  -- three faults switch strict mode off for this long, t
 -- UI::LaneModifier::Apply, was paired with a 12 s old preview of the upgrade tool and shipped as that upgrade). `delta`: what that tool
 -- changes is node configurations only, which the world can say after the build ran (Build.nodeConfigDelta). A site that is not listed
 -- is paired as before.
-local SITES = {
+SITES = {
 	[0x4d396f] = { name = "Bulldozer::Apply", tools = { bulldozer = true } },
 	[0x51b56c] = { name = "ConstructionBuilder::MousePressed", tools = { constructionBuilder = true } },
 	[0x5891b4] = { name = "StreetBuilder::UpdateEngine", tools = { streetBuilder = true, trackBuilder = true } },
@@ -2522,10 +2871,12 @@ local SITES = {
 	[0x5387cd] = { name = "LaneModifier::Apply", tools = {}, delta = true },
 }
 
-local function natNew()
+function natNew()
 	return {
 		unaccounted = {},   -- held id -> a command given back with no record of its own, until it is known whether anything shipped it
-		reader = C.newReader(C.path("native_events.log")), writer = nil,
+		-- read every frame: kept open (no open per frame); a reloaded script reads only the newest generation as history, whose top
+		-- carries the module's `ready` and clock (native link.rs EventWriter), not the whole log again
+		reader = C.newReader(C.path("native_events.log"), { start = "newest", keep = true }),
 		seen = false, read = false,   -- native_events.log has records / its first batch (history) was read
 		ready = nil, hookOk = nil,    -- the latest `ready`; true/false: command_list_add is / is not among its hooks; nil: no `ready` seen
 		pingN = 0, pingAt = -100, pingsTried = 0, pongAt = nil, watchFrom = nil, lastTick = nil, lastWrite = -100,
@@ -2537,13 +2888,12 @@ local function natNew()
 		caps = {}, parked = {}, awaiting = {}, owed = {}, deferred = {},
 		heldCaps = {},      -- held id -> the capture of that command's own proposal (the native module's preview `held:<id>`, natCapture)
 		heldByKey = {}, byId = {}, finishes = {},   -- shipped builds whose own copy is held: by action key / by held id; pause-path completions
-		sessionOn = true, sessionAt = -100,
 		logWin = -100, logN = 0, logLost = 0, faults = 0, dead = false,
 	}
 end
 
 -- One line each, at most 12 per 10 s (the rest are counted): a stuck state must not fill mod.log.
-local function natSay(text)
+function natSay(text)
 	traceGui("native", text)
 	local N = G.nat
 	if N then
@@ -2561,30 +2911,38 @@ local function natSay(text)
 	logGui("strict: " .. text)
 end
 
-local function natSend(kind, payload)
+function natSend(kind, payload)
 	local N = G.nat
 	if not N then return false end
-	if not N.writer then N.writer = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID) end
-	-- the simulation half writes to the same file (patch_next): this writer's sequence continues after whatever is in it now
-	local inFile = C.lastSeqInFile(C.path("native_ctl.log"))
-	if inFile > N.writer.seq then N.writer.seq = inFile end
-	local ok, err = C.writerSend(N.writer, kind, payload)
+	-- this state's own control file and writer (X.ctlWriter): no other writer shares its numbering, nothing is re-read per line
+	local ok, err, w = X.ctlSend(kind, payload)
 	if ok then
 		N.lastWrite = os.clock()
 	else
-		natSay("cannot write native_ctl.log: " .. tostring(err))
+		natSay("cannot write " .. tostring(w and w.path) .. ": " .. tostring(err))
 	end
 	return ok
 end
 
+-- A paused game applied the build of deferred held command `id` from this state (route -> guiApplyNow): this interface's world
+-- has the apply now, which a running game learns from its game time passing the stamp (natTick). The module completes the command.
+function X.deferApplied(id)
+	local N = G.nat
+	local d = N and N.deferred[id]
+	if d and not d.ready then
+		d.ready = true
+		natSend("release", { id = id })
+	end
+end
+
 -- The module hands a held command back (or destroys it) at the next CommandList::Add of ANY command; any command we send
 -- is one. This one does nothing in the simulation half (docs/NATIVE_LINK.md section 4, "Why a trigger").
-local function natTrigger()
+function natTrigger()
 	pcall(toSim, "nop", {})
 end
 
 -- Stops strict mode: hold_off, so that every held command goes back to the engine at the next Add (and one is sent).
-local function natStop(why)
+function natStop(why)
 	local N = G.nat
 	if not N then return end
 	if N.holdSent then
@@ -2608,7 +2966,7 @@ end
 
 -- A fault in strict mode never reaches the bridge: it is logged, and the third one switches strict mode off for X.NAT_FAULT_COOL
 -- seconds (natTick arms it again afterwards, with the count reset).
-local function natFault(where, err)
+function natFault(where, err)
 	local N = G.nat
 	if not N then return end
 	N.faults = N.faults + 1
@@ -2631,15 +2989,29 @@ function X.natGiveUp(why)
 		math.min(X.NAT_REARM_MAX, X.NAT_REARM_MIN * 2 ^ math.min(N.rearms, 4))))
 end
 
-local function natPing()
+-- The session's game time stands still: it stands at its pause (pauseAt reached) or runs at speed 0. Every ping tells the native module,
+-- and a change is pinged at once (natTick): what the module holds does not age meanwhile, so a build deferred at a pause that lasts
+-- minutes (the host waits for every game's stop report and a round trip before it stamps the pause's builds) is not failed by the
+-- module's age limit while the mod keeps pinging.
+function X.sessionStill()
+	local ok, still = pcall(function()
+		local s = G.session
+		return s ~= nil and (pausedNow() or (tonumber(s.speed) or 1) <= 0)
+	end)
+	return ok and still == true
+end
+
+function natPing()
 	local N = G.nat
 	N.pingN = N.pingN + 1
 	N.pingAt = os.clock()
-	return natSend("ping", { n = N.pingN })
+	local still = X.sessionStill()
+	N.stillSent = still
+	return natSend("ping", { n = N.pingN, paused = still or nil })
 end
 
 -- release or cancel, and make sure an Add follows: the order is only carried out at the next Add.
-local function natOrder(kind, id)
+function natOrder(kind, id)
 	local N = G.nat
 	local ok = natSend(kind, { id = id })
 	if ok then
@@ -2652,7 +3024,7 @@ end
 -- The stamp of a shipped build has come on this game (the simulation half took the snapshot of its entity lists and booked the
 -- ledger, as every other game does): the held command goes back to the engine, which applies it. The replay mark comes first
 -- in the engine's command list, so the build's event finds it and the simulation half does not capture this build as a new one.
-local function natRelease(key)
+function natRelease(key)
 	local N = G.nat
 	local h = N and N.heldByKey[key]
 	if not h or h.released or h.done or h.cancelled then return false end
@@ -2703,11 +3075,13 @@ function natVeto(key, who, why)
 	end
 	if not natCancelAllowed(h) then
 		-- The module cannot fire this tool's callback, so a cancel would leave the tool dead (real session 2026-10-13: an underground
-		-- station entrance, the owner got stuck and a resync followed). The command goes back to the engine instead: the build exists
-		-- on this game only (false = "too late" for the caller, which tells the players and asks the host to repair the other game).
-		natSay("held " .. h.id .. " (" .. key .. ") NOT cancelled: this tool's callback cannot be fired, a cancel would leave the tool dead; " .. tostring(who) .. " could not build it (" .. tostring(why) .. "), the build is released here and the other game is repaired")
-		natRelease(key)
-		return false
+		-- station entrance, the owner got stuck and a resync followed). It was released instead until 2026-10-15: the build then existed
+		-- on this game only (every other game drops it on the veto) and a resync followed. Now it is FAILED (X.natFailHeld: `fail` fires
+		-- the callback with a failed result, nothing is applied here); no game has the build, so no repair. Only a module without `fail`
+		-- still gets a cancel without the callback (the tool may stay busy), never a release.
+		local how = X.natFailHeld(h.id, key, h.at, false, h, false)
+		natSay("held " .. h.id .. " (" .. key .. ") FAILED on the veto, NOT released: " .. tostring(who) .. " could not build it (" .. tostring(why) .. "); " .. tostring(how))
+		return true
 	end
 	h.cancelled = true
 	pcall(toSim, "heldgone", { key = key })
@@ -2737,19 +3111,14 @@ function natPauseRelease(it, finish)
 	end
 end
 
-local function natSessionOn(N, now)
-	if now - N.sessionAt >= 1 then
-		N.sessionAt = now
-		local text = C.readFile(C.path("identity.txt"))
-		local role = text and text:match("role=([%a]+)") or nil
-		if role then N.sessionOn = (role == "host" or role == "player") end
-	end
-	return N.sessionOn
+-- the session switch is common.lua's (C.poll); the end of a session switches strict mode off in X.sessionOff
+function natSessionOn()
+	return C.ACTIVE == true
 end
 
 -- ---- the build of one held command
 
-local function natSite(h)
+function natSite(h)
 	return type(h.site) == "number" and string.format("0x%x", h.site) or "?"
 end
 
@@ -2909,9 +3278,10 @@ local function natDecideUnsafe(h, cap)
 	local category = buildCategory(body)
 	if not L.permitted(G.perms, category) then
 		-- refused before stamping, like the wrapped sendCommand: nothing was built yet, so nothing is sent to the others
+		-- the cancel first: a fault in the lines after it must not reach natDecide's handler with no verdict written (it would release it)
+		natOrder("cancel", id)
 		natSay("held " .. id .. ": not allowed to " .. category .. ", cancelled")
 		send("action_refused", { seq = 0, detail = "permission denied: " .. category })
-		natOrder("cancel", id)
 		return
 	end
 	-- A build that adds constructions (depot, station, ...): the player gets an informational line. With FEVERLINK3_REMOTE_CONSTRUCTIONS=0
@@ -3014,69 +3384,189 @@ local function natDecideUnsafe(h, cap)
 		text = C.serialize(wire)
 	end)
 	if not okT then traceGui("build.timing", "held=" .. tostring(id) .. " the timing text could not be made: " .. tostring(errT)) end
-	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category })
-	if not okS then return release("the action cannot be sent (" .. tostring(errS) .. ")") end
-	G.seq = seq
+	-- THE SHIP IS THE LAST IRREVERSIBLE STEP. Once the action is written, every other game applies the build at the stamp, so this game may
+	-- only apply it at the stamp too (defer, cancel-and-replay, or hold until the stamp) or, if that cannot be done, fail it (tool freed,
+	-- nothing applied here) and ask for a repair; never release it at the click (natDecide). Everything that can fail is therefore made
+	-- here, before the write: the item, the flow, every log text. A fault in the ship trace (Build.planOf, string.format) used to reach
+	-- natDecide's handler, which released the command: applied at the click here, at the stamp everywhere else, and captured and shipped a
+	-- second time by the simulation half.
+	local site = natSite(h)
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = seq, body = wire, key = L.itemKey(C.PLAYER_ID, seq), tRecv = wShip, gRecv = now }
-	noteBuild(it.key, at)
-	traceGui("build.ship", string.format("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s extra=%s bytes=%d capture_ms=%.1f balance=%s record=%s", it.key, tostring(id), natSite(h),
-		tostring(h.done), tostring(cap.tool), tostring(Build and Build.planOf and Build.planOf(body)), tostring(at), tostring(now), tostring(at - now), tostring(wire.xs), #text,
-		cap.ms or 0, tostring(engine.account()), text))
-	if cancelFlow and deferFlow then
-		wire.held = nil
-		local okD = natSend("defer", { id = id })
-		it.deferId = id
-		N.deferred[id] = { key = it.key, at = at, t = os.clock() }
-		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), deferred: %s",
-			id, natSite(h), cap.tool, #text, it.key, at, now, okD and "kept until this game's own stamp apply, then completed with its result" or "DEFER NOT WRITTEN"))
-		route(it)
-		return
+	local flow = (cancelFlow and deferFlow) and "defer" or (cancelFlow and "cancel" or "held")
+	if flow ~= "held" then wire.held = nil end
+	local function say(fmt, ...)
+		local okF, s = pcall(string.format, fmt, ...)
+		return okF and s or ("held " .. tostring(id) .. " " .. it.key .. " (a log line could not be made: " .. tostring(s) .. ")")
 	end
-	if cancelFlow then
-		-- cancel flow: the first strict flow. The command is cancelled, every game (this one too) replays the record.
-		wire.held = nil
-		local okC = natOrder("cancel", id)
-		natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes): %s stamped %d (now %d), cancel flow: %s",
-			id, natSite(h), cap.tool, #text, it.key, at, now, okC and "cancel written, this game replays the record too" or "CANCEL NOT WRITTEN (the build may be applied twice here)"))
-		route(it)
-		return
+	local planOk, plan = pcall(function() return Build and Build.planOf and Build.planOf(body) end)
+	local shipLine = say("%s held=%s site=%s done=%s tool=%s plan=%s stamp=%s now=%s lead=%s extra=%s bytes=%d capture_ms=%s balance=%s record=%s", it.key, tostring(id),
+		site, tostring(h.done), tostring(cap.tool), planOk and tostring(plan) or ("? (" .. tostring(plan) .. ")"), tostring(at), tostring(now), tostring(at - now),
+		tostring(wire.xs), #text, string.format("%.1f", tonumber(cap.ms) or 0), tostring(select(2, pcall(engine.account))), text)
+	local done
+	if flow == "defer" then
+		done = function(okV) return say("held %s (site %s) matched the capture of %s (%s bytes): %s stamped %s (now %s), deferred: %s", id, site, tostring(cap.tool),
+			#text, it.key, tostring(at), tostring(now), okV and "kept until this game's own stamp apply, then completed with its result" or "DEFER NOT WRITTEN") end
+	elseif flow == "cancel" then
+		done = function(okV) return say("held %s (site %s) matched the capture of %s (%s bytes): %s stamped %s (now %s), cancel flow: %s", id, site, tostring(cap.tool),
+			#text, it.key, tostring(at), tostring(now), okV and "cancel written, this game replays the record too" or "CANCEL NOT WRITTEN (the build may be applied twice here)") end
+	else
+		local line = say("held %s (site %s) matched the capture of %s (%s bytes, %.0f ms to capture, %.0f ms old): %s stamped %s (now %s), held until the stamp; the tool's verdict %s",
+			id, site, tostring(cap.tool), #text, tonumber(cap.ms) or 0, (os.clock() - (tonumber(cap.t) or os.clock())) * 1000, it.key, tostring(at), tostring(now), tostring(cap.verdict or "n/a"))
+		done = function() return line end
 	end
-	-- The command stays HELD until the stamp (nobody's world runs ahead of the others). It is not cancelled: a cancelled command
-	-- never gives the tool its "applied" callback and the tool stays dead (real run 2026-10-11). At the stamp this game's
-	-- simulation half does everything the other games do except sending (simApplyAction, it.heldId) and this half then releases
-	-- the held command (natRelease); every OTHER game replays the build at the stamp.
-	it.heldId = id
-	local rec = { id = id, key = it.key, at = at, t = os.clock(), fireable = FIRE_DONE and h.done == true }
-	N.heldByKey[it.key], N.byId[id] = rec, rec
-	pcall(toSim, "heldout", { key = it.key })
-	natSay(string.format("held %d (site %s) matched the capture of %s (%d bytes, %.0f ms to capture, %.0f ms old): %s stamped %d (now %d), held until the stamp; the tool's verdict %s",
-		id, natSite(h), cap.tool, #text, cap.ms or 0, (os.clock() - cap.t) * 1000, it.key, at, now, tostring(cap.verdict or "n/a")))
-	if wire.commit then
+	local grace, graceLine = nil, nil
+	if flow == "held" and wire.commit then
 		local ms, rtt = graceMs()
-		if Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body) then ms = math.max(ms, CONSTRUCTION_GRACE_MS) end
-		G.graces[it.key] = { it = it, due = os.clock() + ms / 1000, ms = ms }
-		natSay(string.format("%s: the game is paused, so the build waits %d ms (round trip about %.0f ms) for a veto before it is committed", it.key, ms, rtt))
-		return
+		local okH, heavy = pcall(function() return Build and Build.addsOrRemovesConstructions and Build.addsOrRemovesConstructions(body) end)
+		if okH and heavy then ms = math.max(ms, CONSTRUCTION_GRACE_MS) end
+		grace = { it = it, ms = ms }
+		graceLine = say("%s: the game is paused, so the build waits %d ms (round trip about %.0f ms) for a veto before it is committed", it.key, ms, rtt)
 	end
-	route(it)
+	local ship = { it = it, flow = flow, shipping = true }
+	h.ship = ship   -- natDecide's fault handler reads it: from here on a fault never releases the command
+	-- made during the pause (defer and cancel flows: applied by every game at once): every game applies it in the host's pause order,
+	-- this one too when it comes back numbered (X.routeOwn). A held build of a paused game is parked by the others and its COMMIT is.
+	it.pause = (flow ~= "held" and X.isPauseStamp(at)) or nil
+	local okS, errS = C.writerSend(G.writer, "action", { stamp = at, seq = seq, body = text, category = category, pause = it.pause })
+	if not okS then
+		h.ship = nil   -- nothing went out: the command may still be given back
+		return release("the action cannot be sent (" .. tostring(errS) .. ")")
+	end
+	ship.shipped = true
+	G.seq = seq
+	-- after the ship: only what makes this game apply the build at the stamp, each step marked (ship.step) for the fault handler; every
+	-- log line is made already and written under pcall, so a log cannot fail the decision
+	local function log(fn, ...) pcall(fn, ...) end
+	ship.step = "book"
+	noteBuild(it.key, at)
+	log(traceGui, "build.ship", shipLine)
+	if flow == "defer" then
+		ship.step = "defer"
+		it.deferId = id
+		-- made during a pause: `at` is only the pause stamp, a placeholder. The host gives the real stamp, past where every game stands
+		-- (X.pauseStamped); until then nothing may count from it (b3pause2, 2026-10-15: the host stood 6 steps past the pause, natTick took
+		-- the placeholder as passed and wrote `release` at once, the module completed the tool's command at the simulation's apply, before
+		-- the interface's world had the new road, and the street tool's callback stopped the game on an entity it did not know)
+		N.deferred[id] = { key = it.key, at = at, t = os.clock(), waitStamp = it.pause or nil }
+		local okD = natSend("defer", { id = id })
+		ship.verdict = okD and "defer" or nil
+		log(natSay, done(okD))
+	elseif flow == "cancel" then
+		ship.step = "cancel"
+		local okC = natOrder("cancel", id)
+		ship.verdict = okC and "cancel" or nil
+		log(natSay, done(okC))
+	else
+		-- The command stays HELD until the stamp (nobody's world runs ahead of the others). It is not cancelled: a cancelled command
+		-- never gives the tool its "applied" callback and the tool stays dead (real run 2026-10-11). At the stamp this game's
+		-- simulation half does everything the other games do except sending (simApplyAction, it.heldId) and this half then releases
+		-- the held command (natRelease); every OTHER game replays the build at the stamp.
+		ship.step = "hold"
+		it.heldId = id
+		local rec = { id = id, key = it.key, at = at, t = os.clock(), fireable = FIRE_DONE and h.done == true }
+		N.heldByKey[it.key], N.byId[id] = rec, rec
+		ship.rec = rec
+		pcall(toSim, "heldout", { key = it.key })
+		log(natSay, done())
+		if grace then
+			grace.due = os.clock() + grace.ms / 1000
+			G.graces[it.key] = grace
+			ship.step, ship.routed = nil, true   -- natCommit routes it when the grace is over
+			log(natSay, graceLine)
+			return
+		end
+	end
+	ship.step = "route"
+	X.routeOwn(it)
+	ship.step, ship.routed = nil, true
 end
 
--- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): it
--- is given back, unless the verdict was already written.
-local function natDecide(h, cap)
+-- THE rule for a held command whose action was SHIPPED (every other game applies it at the stamp) and that cannot be applied at the stamp
+-- here: it is failed, never released (a release applies it at another time than on the other games: other entity ids from then on, and
+-- the simulation half may ship it a second time). `fail` fires the tool's callback with a failed result (the module that can defer has it:
+-- native runtime, both or neither); an older module gets a cancel (its callback fired only where the module can). This game's replay is
+-- dropped. Returns what was done, for the caller's log line. Used by the verdict (natDecide), the commit of a paused build (natCommit) and
+-- the held watchdog.
+function X.natFailHeld(id, key, at, fireable, rec, cancelledAlready)
+	local N = G.nat
+	if rec then rec.cancelled = true end   -- natRelease never gives it back at the stamp now
+	G.graces[key] = nil
+	pcall(toSim, "drop", { key = key, why = "its originator failed it after the ship", own = true })
+	pcall(toSim, "heldgone", { key = key })
+	if cancelledAlready then return "cancelled already" end
+	if N and N.ready and N.ready.defer then
+		N.deferred[id] = { key = key, at = at, t = os.clock(), ready = true, failed = true }
+		local ok = natSend("fail", { id = id })
+		natTrigger()
+		return ok and "fail written (tool callback fired with a failed result)" or "FAIL NOT WRITTEN"
+	end
+	if N then N.deferred[id] = nil end
+	local ok = natOrder("cancel", id)
+	return (ok and "cancel written" or "CANCEL NOT WRITTEN") .. ((FIRE_DONE and fireable) and " (the tool's callback is fired)" or " (this module cannot fire the tool's callback: the tool may stay busy)")
+end
+
+-- The other games have a build this game failed after shipping it: the host is asked to repair them (and the player told).
+function X.natShippedRepair(key, why)
+	send("replay_failed", { detail = "build " .. key .. " was shipped but failed on its originator (" .. tostring(why):sub(1, 100) .. "): the other games have it" })
+	pcall(vetoChat, "shipfail:" .. key, "Your build could not be applied on your own game after it was sent; the games will be synchronised.")
+end
+
+-- A fault AFTER the action was shipped (natDecideUnsafe, h.ship): the other games apply the build at the stamp, so this game must not
+-- apply it at the click. Its command is failed instead: the tool's callback is fired with a failed result (`fail`, the module that can
+-- defer) or the command is cancelled (an older module; the tool's callback is fired only where the module can), nothing is applied here,
+-- this game's replay is dropped from the queue, and the host is asked to repair the games (the others have the build, this one not).
+-- A paused game's build whose commit was never sent is parked on the other games and dropped there: no repair is needed for that one.
+local function natFailShipped(h, err)
+	local N, ship, id = G.nat, h.ship, h.id
+	local it = ship.it
+	local key = it.key
+	if ship.routed and not ship.step then
+		-- everything was in place before the fault (a log line after the last step): the build is applied at the stamp here too
+		natSay(string.format("held %d (%s): a fault after the ship (%s), but its stamp apply here was already arranged (%s): nothing changed", id, key, tostring(err), ship.flow))
+		return
+	end
+	if ship.rec and (ship.rec.released or ship.rec.done) then
+		-- a paused game applies at once (route -> guiApplyNow -> natPauseRelease): the command went back at its stamp (the pause time)
+		natSay(string.format("held %d (%s): a fault after the ship (%s), but it was released at its stamp already: nothing changed", id, key, tostring(err)))
+		return
+	end
+	local how = X.natFailHeld(id, key, it.at, h.done == true, ship.rec, ship.verdict == "cancel")
+	natSay(string.format("held %d (%s) FAILED after the ship at step %s of the %s flow (%s): NOT released, nothing is applied on this game; %s",
+		id, key, tostring(ship.step), ship.flow, tostring(err), how))
+	if it.body and it.body.commit and not ship.routed then
+		natSay("held " .. id .. " (" .. key .. "): its commit was never sent, the other games drop the parked record: no repair needed")
+		return
+	end
+	X.natShippedRepair(key, err)
+end
+
+-- A fault while deciding must not leave the command held (it would stay in the ring until the module's 30 s age limit): before the ship
+-- it is given back (nothing was sent), unless the verdict was already written. After the ship it is NEVER given back: it is applied at the
+-- stamp here too or failed (natFailShipped).
+function natDecide(h, cap)
+	h.ship = nil
 	local ok, err = pcall(natDecideUnsafe, h, cap)
 	if ok then return end
 	natFault("the verdict on held " .. tostring(h.id), err)
 	local N = G.nat
+	if h.ship then
+		local okF, errF = pcall(natFailShipped, h, err)
+		if not okF then pcall(natSay, "held " .. tostring(h.id) .. ": the failure after the ship itself failed (" .. tostring(errF) .. "); the command is NOT released") end
+		return
+	end
 	if N and not N.awaiting[h.id] then pcall(natOrder, "release", h.id) end
 end
+end -- section: strict mode: the native link and the verdict
 
+-- used outside this section:
+local natSettle, commitPump, natCapture, natTick
+do -- section: strict mode: commits, the ledger, events (not indented, see SECTIONS at the top)
 -- The grace of a paused game's held build is over (or a resync / the end of the session cuts it short): tell the others to apply it
 -- and release this game's own command. If the game was unpaused meanwhile the normal stamp logic takes over: a new stamp ahead.
-local function natCommit(key, why)
-	local g = G.graces[key]
-	if not g then return end
-	G.graces[key] = nil
+-- The commit is an irreversible send like the action itself (natDecide): after it the other games apply the build at the stamp, so this
+-- game routes it to its own stamp apply or fails its command (X.natFailHeld), never leaves it held for the watchdog to release late. A
+-- fault BEFORE the commit fails it too, without a repair: the other games drop the parked record when no commit comes (PARK_MAX).
+local function natCommitUnsafe(key, why, g, st)
 	local it = g.it
 	local now = engine.gameTime()
 	if not pausedNow() then
@@ -3084,17 +3574,51 @@ local function natCommit(key, why)
 		noteBuild(key, it.at)
 		local h = G.nat and G.nat.heldByKey[key]
 		if h then h.at = it.at end
-		logGui("commit of " .. key .. ": the game is no longer paused, the build gets the stamp " .. it.at .. " (now " .. now .. ")")
+		pcall(logGui, "commit of " .. key .. ": the game is no longer paused, the build gets the stamp " .. tostring(it.at) .. " (now " .. tostring(now) .. ")")
 	end
-	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at })
-	logGui("commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. it.at)
-	route(it)
+	-- still paused: the commit is numbered in the host's pause order and every game, this one too, applies the build when it comes back
+	it.pause = X.isPauseStamp(it.at) or nil
+	if it.pause then
+		-- the commit's stamp is the host's (X.pauseStamped): the watchdog does not count from the pause stamp meanwhile
+		local h = G.nat and G.nat.heldByKey[key]
+		if h then h.waitStamp = true end
+	end
+	st.sent = true
+	send("build_commit", { seq = it.seq, owner = C.PLAYER_ID, stamp = it.at, pause = it.pause })
+	pcall(logGui, "commit of " .. key .. " sent (" .. tostring(why) .. "): no veto within " .. tostring(g.ms) .. " ms; every game applies it at " .. tostring(it.at))
+	X.routeOwn(it)
+	st.routed = true
+end
+
+local function natCommit(key, why)
+	local g = G.graces[key]
+	if not g then return end
+	G.graces[key] = nil
+	local st = {}
+	local ok, err = pcall(natCommitUnsafe, key, why, g, st)
+	if ok or st.routed then return end
+	local N = G.nat
+	local rec = N and N.heldByKey[key]
+	if rec and (rec.released or rec.done) then
+		-- a paused game applies at once (route -> guiApplyNow -> natPauseRelease): it went back at its stamp before the fault
+		pcall(natSay, "commit of " .. key .. ": a fault (" .. tostring(err) .. ") after the command was released at its stamp: nothing changed")
+		return
+	end
+	local okF, how = true, "no held command of it here"
+	if rec and not rec.cancelled then okF, how = pcall(X.natFailHeld, rec.id, key, g.it and g.it.at, rec.fireable == true, rec, false) end
+	pcall(natSay, string.format("held %s (%s) FAILED at its commit (%s, %s): NOT released, nothing is applied on this game; %s", tostring(rec and rec.id), key,
+		st.sent and "after the commit was sent" or "before the commit was sent", tostring(err), okF and tostring(how) or ("the failure itself failed: " .. tostring(how))))
+	if st.sent then
+		pcall(X.natShippedRepair, key, err)
+	else
+		pcall(natSay, "commit of " .. key .. " was never sent: the other games drop the parked record, no repair needed")
+	end
 end
 
 -- Before the game is saved for a resync: no build may stay held across the save. A grace is cut short (committed); a build whose
 -- stamp has not come is taken out of the queue and released now, so the save contains it and no game applies it a second time
 -- after the reload. Returns the number of releases that must be confirmed by the engine before the save.
-local function natSettle(why)
+function natSettle(why)
 	local N = G.nat
 	local waiting = 0
 	if not N then return 0 end
@@ -3129,28 +3653,30 @@ local HELD_PAUSED_MAX = 20.0
 local function heldWatchdog(N, now)
 	local gt = engine.gameTime()
 	for key, h in pairs(N.heldByKey) do
-		if not (h.released or h.done or h.cancelled) and not G.graces[key] and h.at then
+		if not (h.released or h.done or h.cancelled) and not G.graces[key] and h.at and not h.waitStamp then
 			if gt >= h.at + HELD_STUCK_STEPS * STEP and now - h.t > 2 then
-				natSay(string.format("WATCHDOG: the stamp %d of held %d (%s) passed %d ms ago (game time %d) and the command is still held; the simulation half's release result %s; releasing it now",
-					h.at, h.id, key, gt - h.at, gt, G.resultsSeen[key .. "#release" .. tostring(h.id)] and "WAS seen" or "was not seen"))
-				natRelease(key)
+				-- Every command in heldByKey was shipped: the other games applied it at its stamp. A release now would apply it here at
+				-- another step (other entity ids from then on, and the simulation half could ship it again): it is failed and the games
+				-- repaired instead (X.natFailHeld, the same rule as a fault after the ship). Was a release until 2026-10-15.
+				local how = X.natFailHeld(h.id, key, h.at, h.fireable == true, h, false)
+				natSay(string.format("WATCHDOG: the stamp %s of held %s (%s) passed %s ms ago (game time %s) and the command is still held; the simulation half's release result %s; FAILED, NOT released: %s",
+					tostring(h.at), tostring(h.id), key, tostring(gt - h.at), tostring(gt), G.resultsSeen[key .. "#release" .. tostring(h.id)] and "WAS seen" or "was not seen", how))
+				X.natShippedRepair(key, "its stamp passed while it was still held")
 			elseif gt < h.at and now - h.t > HELD_PAUSED_MAX then
 				local why = "held for " .. HELD_PAUSED_MAX .. " s and its stamp still lies ahead (the game is paused)"
 				G.vetoed[key] = why
 				pcall(toSim, "drop", { key = key, why = why, own = true })
 				send("build_veto", { seq = tonumber(key:match(":(%d+)$")), owner = C.PLAYER_ID, why = why, name = C.PLAYER_NAME })
-				if natVeto(key, C.PLAYER_NAME, why) == false then
-					vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build exists on their game only (the game stayed paused too long before it could be applied); the games will be synchronised.")
-				else
-					vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
-				end
+				-- cancelled, or FAILED where the callback cannot be fired (natVeto): never released, the other games drop it on the veto
+				natVeto(key, C.PLAYER_NAME, why)
+				vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
 			end
 		end
 	end
 end
 
 -- every frame: graces that are over, parked records whose commit never came
-local function commitPump()
+function commitPump()
 	local clock = os.clock()
 	for key, g in pairs(G.graces) do
 		local h = G.nat and G.nat.heldByKey[key]
@@ -3284,7 +3810,7 @@ local function natOnHeld(N, p)
 end
 
 -- Called from guiHandleEvent for builder.proposalCreate (the tool's preview): keeps the newest capture for the `held` that follows a click.
-local function natCapture(id, name, param)
+function natCapture(id, name, param)
 	local N = G.nat
 	if not N or N.dead or not N.holdSent or name ~= "builder.proposalCreate" then return end
 	if not (Build and Build.captureToolBuild) then return end
@@ -3342,6 +3868,20 @@ local function natCapture(id, name, param)
 end
 
 -- ---- events of the module
+
+-- The module refused an inject order (`inject_refused {key, held, outcome, reason}`). The build is applied exactly as the originator's text
+-- says or not at all: `nothing` = the module emptied the command, nothing of it was applied here; `untouched` = it could not, and the mod's
+-- placeholder (this game's own guess of the build) was applied; `no_command` = no command took the order (expired, replaced). In every case
+-- this world now differs from the games that applied the build, so this game asks for the repair (the host's resync policy decides). The
+-- module fails the held command of the same build itself (`held`): the originator's tool is freed with a failed result.
+function X.onInjectRefused(p)
+	local key, outcome = tonumber(p.key) or 0, tostring(p.outcome or "?")
+	natSay(string.format("the native module refused inject order %d (%s): %s", key, outcome, tostring(p.reason or p.detail)))
+	if key <= 0 then return end
+	logGui(string.format("inject order %d refused (outcome %s, held %s): this world differs from the games that applied the build; asking the host for a resync",
+		key, outcome, tostring(p.held or 0)))
+	send("replay_failed", { detail = string.format("inject order %d refused here (%s): %s", key, outcome, tostring(p.reason or ""):sub(1, 160)) })
+end
 
 local function natEvent(N, rec, p, history)
 	local kind = rec.kind
@@ -3417,7 +3957,7 @@ local function natEvent(N, rec, p, history)
 		natOnHeld(N, p)
 	elseif kind == "injected" or kind == "inject_refused" then
 		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
-		if kind == "inject_refused" then natSay("the native module refused to inject the engine's proposal: " .. tostring(p.reason or p.detail)) end
+		if kind == "inject_refused" then X.onInjectRefused(p) end
 	elseif kind == "timing" then
 		local what, detail = tostring(p.what), tostring(p.detail or "")
 		if what == "capture" or what == "input" then
@@ -3520,7 +4060,7 @@ local function natReadEvents(N)
 end
 
 -- Every frame (guarded by the caller). Does nothing until native_events.log has a record.
-local function natTick()
+function natTick()
 	local N = G.nat
 	if not N then return end
 	if N.dead then
@@ -3546,7 +4086,10 @@ local function natTick()
 	if next(N.deferred) then
 		local gt = engine.gameTime()
 		for id, d in pairs(N.deferred) do
-			if gt > d.at and not d.ready then
+			-- (a build made during a pause waits for the host's stamp first: its `at` is only the pause stamp until then)
+			if d.waitStamp then
+				-- nothing: no release, no age, no trigger
+			elseif gt > d.at and not d.ready then
 				d.ready = true
 				natSend("release", { id = id })
 			end
@@ -3575,7 +4118,7 @@ local function natTick()
 	elseif not usable then reason = "the build module has no tool capture"
 	elseif N.hookOk == false then reason = "the native module has no command_list_add hook"
 	elseif G.loading then reason = "a resync load is under way"
-	elseif not natSessionOn(N, now) then reason = "the session ended" end
+	elseif not natSessionOn() then reason = "the session ended" end
 	if reason then
 		if N.holdSent then natStop(reason) end
 	elseif N.gaveUp then
@@ -3614,7 +4157,8 @@ local function natTick()
 	else
 		-- a ping every NAT_PING s whatever else is written: the module answers only pings with a pong, so a session that writes other
 		-- lines all the time (a build every 2 s: defer, inject_next, release) must still ping, or the watchdog below starves (rail-crash run)
-		if now - N.lastWrite >= NAT_PING or now - N.pingAt >= NAT_PING then natPing() end
+		-- and at once when the session's game time stops or runs again (the module's held commands age only while it runs)
+		if now - N.lastWrite >= NAT_PING or now - N.pingAt >= NAT_PING or X.sessionStill() ~= (N.stillSent == true) then natPing() end
 		if not N.active then
 			if now - N.holdAt > NAT_CONFIRM then
 				X.natGiveUp("hold_on was not confirmed within " .. NAT_CONFIRM .. " s (is the hold hook installed?)")
@@ -3677,10 +4221,14 @@ local function natTick()
 		end
 	end
 end
+end -- section: strict mode: commits, the ledger, events
 
+-- used outside this section:
+local installWrap, readLink, collectFromSim, serviceWindow, syncLocalCompany
+do -- section: the wrap, link handlers, the service window (not indented, see SECTIONS at the top)
 -- Wraps the command factories (to know a command's name and arguments) and sendCommand (to hold it). Commands
 -- the mod cannot decode go to the engine untouched: losing a player's action is worse than a visible divergence.
-local function installWrap()
+function installWrap()
 	local orig = originals()
 	if not orig.sendCommand then
 		orig.sendCommand = api.cmd.sendCommand
@@ -3731,6 +4279,15 @@ local function installWrap()
 		api.cmd.sendCommand = function(cmd, cb, progress)
 			local tag = cmd ~= nil and G.tags[cmd] or nil
 			if tag == nil then return O.sendCommand(cmd, cb, progress) end
+			if not X.live() then
+				-- no session (none began, or it ended: X.sessionOff): every command goes straight to the engine as in single-player, the
+				-- speed buttons included. A mod-level action has no engine command: it fails.
+				if L.COMMANDS[tag.name] and L.COMMANDS[tag.name].virtual then
+					if cb then pcall(cb, {}, false, {}) end
+					return
+				end
+				return O.sendCommand(cmd, cb, progress)
+			end
 			if tag.name == "makeGameSetSpeedCmd" then
 				-- the player's speed buttons become requests to the host; the session speed comes back in `session`
 				send("speed_request", { speed = tag.args[1] })
@@ -3872,6 +4429,17 @@ H.resync_load = function(rec, p)
 end
 
 H.action = function(rec, p)
+	if type(p) == "table" and p.allowed == false and rec.from == C.PLAYER_ID and p.pauseSeq ~= nil then
+		-- this game's own paused action, refused by the host's permissions: applied nowhere, this one included (it waited for the echo)
+		local key = L.itemKey(rec.from, p.seq)
+		local own = G.pauseOwn and G.pauseOwn[key]
+		if G.pauseOwn then G.pauseOwn[key] = nil end
+		logGui("action " .. key .. " made during the pause came back with allowed=false: applied on no game")
+		if own and own.deferId then X.sendHeldOrder("fail", { id = own.deferId }, key) end
+		if own and own.heldId and natHeldRefused then pcall(natHeldRefused, own) end
+		deliverResult(key, nil, false, {})
+		return
+	end
 	if type(p) == "table" and p.allowed == false then
 		-- the host relayed an action its sender had no permission for: it is not applied here, and since the
 		-- sender's game may have run it, this game asks for a resync
@@ -3884,6 +4452,8 @@ H.action = function(rec, p)
 	it.tRecv, it.gRecv = X.wallNow(), engine.gameTime()
 	if type(p.from) == "number" and p.from ~= rec.from then logGui("action payload claims sender " .. p.from .. ", launcher says " .. tostring(rec.from)) end
 	if G.vetoed[it.key] then logGui("action " .. it.key .. " was vetoed already: dropped"); return end
+	-- made during a pause: applied in the host's pause order, by every game (this one's own came back too)
+	if type(p.pauseSeq) == "number" then return X.pauseArrived(it, p.pauseSeq) end
 	if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
 		noteBuild(it.key, it.at)
 		if type(it.body.xs) == "number" and not pausedNow() then
@@ -3976,6 +4546,25 @@ H.build_commit = function(rec, p)
 	local key = L.itemKey(p.owner, p.seq)
 	local by = tonumber(p.from) or tonumber(rec.from)
 	if by ~= p.owner then logGui("build_commit of " .. key .. " from " .. tostring(by) .. " ignored: only its originator commits"); return end
+	if type(p.pauseSeq) == "number" then
+		-- committed during the pause: applied in the host's pause order by every game, the originator too (its build waited in G.pauseOwn)
+		local it
+		if p.owner == C.PLAYER_ID then
+			it = G.pauseOwn and G.pauseOwn[key]
+			if G.pauseOwn then G.pauseOwn[key] = nil end
+		else
+			local pk = G.parked[key]
+			G.parked[key] = nil
+			it = pk and pk.it
+		end
+		if not it or G.vetoed[key] then logGui("commit of " .. key .. " (pause order #" .. p.pauseSeq .. "): nothing to apply here (vetoed, expired or not received)"); return end
+		if type(p.stamp) == "number" then it.at = p.stamp end
+		logGui("build " .. key .. " committed by its originator during the pause: pause order #" .. p.pauseSeq)
+		it.pauseSeq = p.pauseSeq
+		X.pauseStamped(it)
+		route(it)
+		return
+	end
 	local pk = G.parked[key]
 	if not pk then logGui("commit of " .. key .. ": nothing parked for it (vetoed, expired or not received)"); return end
 	G.parked[key] = nil
@@ -4000,7 +4589,7 @@ H.chat = function(rec, p)
 	end
 end
 
-local function readLink()
+function readLink()
 	for _, rec in ipairs(C.readerPoll(G.reader)) do
 		if G.loading then
 			-- a resync load is under way: the reloaded game reads these lines again from the cursor
@@ -4019,7 +4608,7 @@ local function readLink()
 end
 
 -- Results, refusals, reports and bindings produced by the simulation half.
-local function collectFromSim(state)
+function collectFromSim(state)
 	local ok, st = pcall(function() return state:get() end)
 	if not ok or type(st) ~= "table" then
 		-- silent before: a state the interface half cannot read stalls every simulation result and checksum round with no trace
@@ -4046,7 +4635,7 @@ local function collectFromSim(state)
 			G.staleSeen = stale
 			logGui("ignoring " .. C.integerText(stale) .. " stored output(s) (reports, results, refusals, native builds) of an earlier session until the simulation half takes the new session")
 		end
-		if G.frames % 30 == 0 then toSim("session", { epoch = G.epoch }) end
+		if G.frames % 30 == 0 then toSim("session", G.sessionMsg or { epoch = G.epoch }) end
 		return
 	end
 	G.notes = st.notes
@@ -4077,6 +4666,11 @@ local function collectFromSim(state)
 			G.refusedSent[r.key] = true
 			if G.nat then pcall(natHeldRefused, { key = r.key }) end
 			send("action_refused", { seq = r.seq, from = r.from, detail = r.detail })
+			if r.resync then
+				-- the host ignores action_refused; this world now differs from the games that applied the build: ask for the repair
+				logGui("action " .. tostring(r.key) .. ": its exact copy cannot be applied here and nothing of it was; asking the host for a resync")
+				send("replay_failed", { detail = "build " .. tostring(r.key) .. " not applied here: " .. tostring(r.detail):sub(1, 160) })
+			end
 			deliverResult(r.key, nil, false, {})
 		end
 	end
@@ -4088,7 +4682,8 @@ local function collectFromSim(state)
 	end
 	if (st.late or 0) > G.lateSeen then
 		G.lateSeen = st.late
-		logGui("the simulation applied an action late (" .. st.late .. " so far)")
+		logGui("the simulation applied an action late (" .. st.late .. " so far): the worlds may have forked, asking the host for a repair")
+		send("replay_failed", { detail = "late apply of " .. tostring(st.lateKey) .. " (" .. tostring(st.lateLast) .. " step(s) after its stamp): the input barrier was breached, the entity ids may have forked" })
 		-- the measured stamp margin grows at once (see L.marginSample): a late apply must not happen twice
 		local need = L.marginLate(G.margin, G.session.speed, st.lateLast)
 		traceGui("build.margin", string.format("late apply (%s steps late): need now %d steps at x%s", tostring(st.lateLast), need, tostring(G.session.speed)))
@@ -4127,10 +4722,22 @@ end
 
 -- The window's side of the hand-off: chat typed there arrives as records in ui_out.log, the model goes back as a
 -- snapshot file. Throttled: a few frames apart is plenty for a chat box.
-local function serviceWindow()
+-- A record of ui_out.log belongs to this session when it names it (`sid`, the UI hook's commands and speed requests), or, without a
+-- name (the window's chat), when it was written after this session began here (X.uiFloor). The file outlives sessions; a record of an
+-- earlier one is never acted on (its window was answered, or failed, when that session ended), and never answered here: a new
+-- window state numbers its commands from 1 again, so an answer to an old id could hit one of its own.
+function X.uiRecordOfSession(rec, p)
+	if type(p) == "table" and p.sid ~= nil then return p.sid == G.sid end
+	return rec.seq > (X.uiFloor or 0)
+end
+
+function serviceWindow()
 	if G.frames % 3 ~= 0 then return end
+	local ignored = 0
 	for _, rec in ipairs(C.readerPoll(G.uiReader)) do
-		if rec.kind == "chat" then
+		if not X.uiRecordOfSession(rec, C.parse(rec.payload)) then
+			ignored = ignored + 1
+		elseif rec.kind == "chat" then
 			local p = C.parse(rec.payload)
 			local text = type(p) == "table" and Hud.cleanText(p.text) or nil
 			if text then
@@ -4143,16 +4750,8 @@ local function serviceWindow()
 				local okN, okShip, whyShip = pcall(shipUiCommand, p)
 				if not okN then logGui("shipping a window command failed: " .. tostring(okShip))
 				elseif not okShip then logGui("a window command was not shipped: " .. tostring(whyShip)) end
-			end
-		elseif rec.kind == "bind" then
-			-- the entity a window command created here, named by the key the other games give theirs
-			local p = C.parse(rec.payload)
-			local seq = type(p) == "table" and G.uiSeq[p.id] or nil
-			if seq and type(p.e) == "number" then
-				local key = L.itemKey(C.PLAYER_ID, seq)
-				G.bind[key] = p.e
-				G.rev[p.e] = key
-				toSim("bind", { key = key, e = p.e })
+				-- the window holds it: it learns that it was applied nowhere (its callback runs with a failure)
+				if not (okN and okShip) then pcall(uiReply, p.id, nil, nil, false, {}, tostring(okN and whyShip or okShip)) end
 			end
 		elseif rec.kind == "speed" then
 			-- a speed button of the window: the session speed is the host's to decide, so it is a request, like the
@@ -4173,6 +4772,7 @@ local function serviceWindow()
 			end)
 		end
 	end
+	if ignored > 0 then logGui("window: " .. ignored .. " record(s) of ui_out.log belong to an earlier session: ignored") end
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
 	coGuard("page", writeCompanies)
 	if G.frames % 30 == 0 then
@@ -4183,7 +4783,7 @@ end
 
 -- companies: in separate mode (experimental, docs/COMPANIES.md section 8) this game's windows act as the player's own
 -- company, by making api.engine.util.getPlayer say so; in shared mode, or outside any company, as the game's own player.
-local function syncLocalCompany()
+function syncLocalCompany()
 	if not (Co and G.co and engine.setLocalCompany) then return end
 	local want = nil
 	if G.co.mode == "separate" then
@@ -4210,11 +4810,7 @@ end
 -- A guest whose session ends while its world is still there (the host stopped, it was removed, the connection was lost, it left) saves its
 -- world first with the game's own save, so nothing it built is lost; the game itself is never closed by FeverLink3.
 function X.guestSaveOnEnd()
-	local now = os.clock()
-	if now < (G.roleAt or 0) then return end
-	G.roleAt = now + 1
-	local text = C.readFile(C.path("identity.txt"))
-	local role = text and text:match("role=([%a]+)") or nil
+	local role = C.ROLE   -- identity.txt as C.poll last read it
 	if not role then return end
 	local was = G.lastRole
 	G.lastRole = role
@@ -4230,43 +4826,184 @@ function X.guestSaveOnEnd()
 	end
 end
 
+-- A session runs on this game: identity.txt names one (C.ACTIVE) and this interface half started in that very one. Everything the
+-- session does to the player's commands (the wrap's stamping and shipping, the speed requests) asks this.
+function X.live()
+	return C.ACTIVE == true and G.started and G.gen == C.GEN
+end
+
+-- THE end of a session on this game, one transition back to single-player: identity.txt says `idle` (the host ended it, the player
+-- left or was removed, the world was closed, the controller gave up reconnecting) or names another session. Until 2026-10-15 nothing
+-- switched the mod off: after the session the wrap still stamped and shipped every command to nobody, the speed stayed forced by the
+-- pacing, a stale peer's promise could freeze the game at the input barrier, and the next session in the same Lua state inherited all of
+-- it. What it does, in this order:
+--   1. tells the simulation half (`sessionoff`, X.simSessionOff; sent before anything below, and events run in order): its queue of
+--      stamped actions goes, so nothing of the ended session is applied there later, nor twice with what follows;
+--   2. hands this game's held native commands back to the engine (natStop: hold_off): a held build is applied NOW. The batch-2 rule (a
+--      shipped build is never applied at another time than the stamp its peers use) protects the peers' worlds; the session is over,
+--      there are no peers any more, so the player's build lands as in single-player. A deferred command (its build was to come from
+--      this game's stamp apply, which no longer happens) is failed by the module at hold_off: its tool callback fires with a failed
+--      result, nothing is applied, the tool lives on. A build parked for a paused game's grace is one of the held ones (released);
+--   3. answers what the simulation half applied or refused at its stamps already (its results in the state), then fails the callbacks of
+--      commands that were stamped and not applied (the wrap's own, and the window commands the UI hook holds: they get a failed answer),
+--      since the engine never had them; one applied from this state during a pause is with the engine already and keeps its callback;
+--   4. drops what the session knew: peers and their promises (the input barrier), the session state, checksum marks, the pause order
+--      (queued and own items), graces, parked and deferred dry runs, vetoes, authority values, the stamp margin, permissions;
+--   5. gives the speed back: the session's speed when it was running, else the speed the game had when the session began; from now
+--      on the wrap passes the player's speed buttons to the engine;
+--   6. remembers where the link stands (G.linkFloor), so a next session in this Lua state never dispatches a line of this one.
+function X.sessionOff(why, state)
+	if not G.started then return end
+	G.started = false
+	local s = G.session
+	local n = { held = 0, deferred = 0, pending = 0, peers = 0, pause = 0, graces = 0, parked = 0 }
+	-- what the simulation half applied (or refused) at its stamps before the end is answered as it happened, not failed below
+	if state then
+		pcall(function()
+			local st = state:get()
+			if type(st) ~= "table" or st.epoch ~= G.epoch then return end
+			for _, r in ipairs(st.results or {}) do
+				if not G.resultsSeen[r.key] then
+					G.resultsSeen[r.key] = true
+					deliverResult(r.key, r.data, r.success, r.entities or {})
+				end
+			end
+			for _, r in ipairs(st.refused or {}) do
+				if not G.refusedSent[r.key] then
+					G.refusedSent[r.key] = true
+					deliverResult(r.key, nil, false, {})
+				end
+			end
+		end)
+	end
+	pcall(toSim, "sessionoff", { sid = G.sid })
+	local N = G.nat
+	if N then
+		for _, h in pairs(N.heldByKey) do
+			if not (h.released or h.done or h.cancelled) then n.held = n.held + 1 end
+		end
+		for _ in pairs(N.deferred) do n.deferred = n.deferred + 1 end
+		local okS, errS = pcall(natStop, why)
+		if not okS then logGui("session over: switching strict mode off failed: " .. tostring(errS)) end
+	end
+	G.nat = nil   -- the next session starts strict mode afresh (natNew)
+	local pending = G.pending
+	G.pending = {}
+	for key, cb in pairs(pending) do
+		if X.engineHas and X.engineHas[key] then
+			G.pending[key] = cb   -- applied from this state during a pause: the engine runs it and its answer reaches the callback
+		else
+			n.pending = n.pending + 1
+			local okC, errC = pcall(cb, nil, false, {})
+			if not okC then logGui("session over: the callback of " .. tostring(key) .. " failed: " .. tostring(errC)) end
+		end
+	end
+	for _ in pairs(G.peers) do n.peers = n.peers + 1 end
+	for _ in pairs(G.pauseOwn or {}) do n.pause = n.pause + 1 end
+	n.pause = n.pause + #(G.pauseQ or {})
+	for _ in pairs(G.graces) do n.graces = n.graces + 1 end
+	for _ in pairs(G.parked) do n.parked = n.parked + 1 end
+	G.peers, G.session, G.marks = {}, L.newSession(), {}
+	G.graces, G.parked, G.dry, G.buildAts, G.vetoed = {}, {}, {}, {}, {}
+	G.pauseQ, G.pauseOwn, G.pauseLast = nil, nil, nil
+	-- where this game stood still at the pause (the clock's `stop`); the run on to a host's pause stamp (pauseRun) goes with G.session
+	G.still, X.curStop, G.lastStop = nil, nil, nil
+	G.promiseFloor, G.promisePause, G.barrier = nil, nil, nil
+	G.authPending, G.accountAt, G.authLast, G.pendingSave = {}, {}, nil, nil
+	G.perms, G.margin = L.newPermissions(), L.newMargin()
+	G.resultsSeen, G.reportsSent, G.refusedSent, G.lateSeen = {}, {}, {}, 0
+	G.outSeen, G.outAcked, G.uiSeq, G.uiFn, G.vetoChatted = {}, nil, {}, nil, nil
+	G.loading = false
+	G.linkFloor = math.max(G.linkFloor or 0, G.reader and G.reader.lastSeq or 0)
+	G.reader, G.writer = nil, nil
+	if G.localCompany ~= nil and engine.setLocalCompany then
+		pcall(engine.setLocalCompany, nil)
+		G.localCompany = nil
+	end
+	local sp = (s.started and (s.speed or 0) > 0) and s.speed or (G.speedBefore or 1)
+	G.lastSpeedSet = nil
+	local okV = pcall(function() O.sendCommand(O.setSpeed(sp)) end)
+	pcall(Hud.setSession, G.hud, { started = false, speed = 0 })
+	pcall(Hud.writeSnapshot, C, G.hud, G.hudWritten)
+	logGui(string.format("session over (%s; identity.txt role %s): single-player again. Strict mode off with %d held command(s) handed back to the engine and %d deferred one(s) failed by the module;"
+		.. " %d stamped command(s) not applied (callbacks failed); dropped %d peer(s), %d pause-order item(s), %d grace(s), %d parked build(s); speed %s%s; the link resumes after line %s",
+		tostring(why), tostring(C.ROLE), n.held, n.deferred, n.pending, n.peers, n.pause, n.graces, n.parked, tostring(sp), okV and "" or " (COULD NOT BE SET)", C.integerText(G.linkFloor)))
+	traceGui("session", string.format("off why=%s sid=%s held=%d deferred=%d pending=%d peers=%d pause=%d graces=%d parked=%d speed=%s floor=%s",
+		tostring(why), tostring(G.sid), n.held, n.deferred, n.pending, n.peers, n.pause, n.graces, n.parked, tostring(sp), C.integerText(G.linkFloor)))
+end
+end -- section: the wrap, link handlers, the service window
+
 local function guiUpdate(userParams, state, guiState)
 	C.poll()
+	if G.started and not X.live() then
+		local okO, errO = pcall(X.sessionOff, C.ACTIVE and "another session began" or "the session ended", state)
+		if not okO then
+			G.started = false
+			logGui("ending the session failed: " .. tostring(errO))
+		end
+	end
+	pcall(X.guestSaveOnEnd)
 	if not C.ACTIVE then
 		if G.nat and G.nat.holdSent then pcall(natStop, "the mod is not active") end
 		return
 	end
 	G.frames = G.frames + 1
 	pcall(X.holdWorldLock)
-	pcall(X.guestSaveOnEnd)
 	if not G.started then
-		G.started = true
+		-- a session begins on this game: the first frame of this Lua state in one, or the next one after X.sessionOff
+		G.started, G.gen, G.sid = true, C.GEN, C.SESSION
+		-- The link: lines at or below the session's start (identity.txt `start=`) are an earlier session's, and so is anything this Lua
+		-- state dispatched before (G.linkFloor). The live folder keeps to_game.log across sessions; reading from its first line fed an
+		-- earlier session's session, action and resync lines into this world.
+		local floor = math.max(tonumber(C.SESSION_START) or 0, G.linkFloor or 0)
 		G.reader = C.newReader(C.path(C.TO_GAME))
+		G.reader.lastSeq = floor
 		G.writer = C.newWriter(C.path(C.FROM_GAME), C.PLAYER_ID)
 		G.hud = Hud.new(C.PLAYER_ID, C.PLAYER_NAME)
 		G.co = Co and Co.new() or nil
 		-- companies: a reload runs this file again in the same Lua state, so an override of the previous run may still be in place
 		if Co and engine.setLocalCompany then engine.setLocalCompany(nil) end
-		G.uiReader = C.newReader(C.path(Hud.OUTBOX))
+		-- the window's records: kept reading where this state stopped; the ones without a session id count from here (X.uiRecordOfSession)
+		G.uiReader = G.uiReader or C.newReader(C.path(Hud.OUTBOX))
+		X.uiFloor = C.lastSeqInFile(C.path(Hud.OUTBOX))
 		-- after a resync load: resume the link after the line that asked for it, and keep the window's roster and chat
 		local cursor, uiCursor = (C.readFile(C.path(C.CURSOR)) or ""):match("^(%d+) (%d+)")
 		cursor, uiCursor = tonumber(cursor), tonumber(uiCursor)
-		if cursor and cursor > 0 then
+		local resumed = false
+		if cursor and cursor > floor then
+			resumed = true
 			G.reader.lastSeq = cursor
 			G.uiReader.lastSeq = uiCursor or 0
+			X.uiFloor = uiCursor or 0
 			C.writeFile(C.path(C.CURSOR), "")
 			local restored = Hud.fromSnapshot(C.parse(C.readFile(C.path(Hud.SNAPSHOT)) or ""))
 			if restored and restored.selfId == C.PLAYER_ID then G.hud = restored end
 			logGui("reloaded after a resync: link resumes after line " .. string.format("%d", cursor))
+		elseif cursor and cursor > 0 then
+			C.writeFile(C.path(C.CURSOR), "")
+			logGui("a resync cursor of an earlier session (line " .. C.integerText(cursor) .. ", this session starts after line " .. C.integerText(floor) .. ") is ignored")
 		end
-		installWrap()
+		if not X.wrapped then
+			X.wrapped = true
+			installWrap()
+		end
 		local okN, nat = pcall(natNew)
 		G.nat = okN and nat or nil
-		pcall(function() guiState:subscribeToAllEvents() end)
+		if not X.subscribed then
+			X.subscribed = true
+			pcall(function() guiState:subscribeToAllEvents() end)
+		end
+		G.speedBefore = engine.speed()
 		setSpeed(0)
 		G.epoch = tostring(os.time()) .. "-" .. tostring(math.floor(os.clock() * 1000)) .. "-" .. tostring(C.PLAYER_ID)
-		toSim("session", { epoch = G.epoch })
+		-- `fresh`: a session begins in this world (no resync reload resumes one): the simulation half drops a saved queue of another session
+		G.sessionMsg = { epoch = G.epoch, sid = C.SESSION, fresh = (not resumed) or nil }
+		toSim("session", G.sessionMsg)
+		logGui("session " .. tostring(C.SESSION) .. " begins here (" .. (resumed and "resumed after a resync load" or "fresh") .. "): to_game.log lines after " .. C.integerText(G.reader.lastSeq))
+		traceGui("session", string.format("on sid=%s gen=%s start=%s floor=%s resumed=%s", tostring(C.SESSION), tostring(C.GEN), tostring(C.SESSION_START), C.integerText(G.reader.lastSeq), tostring(resumed)))
 		send("hello", { time = engine.gameTime(), name = C.PLAYER_NAME })
+		-- the promise goes out with the hello, before anything this game could ship (the input barrier, L.promise)
+		X.reportClock(engine.gameTime())
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
@@ -4284,10 +5021,15 @@ local function guiUpdate(userParams, state, guiState)
 		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
 		local ahead = L.aheadFor(G.session.speed)
-		setSpeed(L.pace(G.session, G.peers, now, ahead, G.marks))
-		if now ~= G.lastClock or G.frames % 30 == 0 then
+		local sp = L.pace(G.session, G.peers, now, ahead, G.marks)
+		setSpeed(sp)
+		X.barrierWatch(now, sp)
+		-- where this game really stands at a pause, for the host's stamps of the pause's actions (said at once when it changes)
+		X.curStop = X.stopAt(now, sp)
+		if now ~= G.lastClock or G.frames % 30 == 0 or X.curStop ~= G.lastStop then
+			G.lastStop = X.curStop
 			G.lastClock = now
-			send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed) })
+			X.reportClock(now)
 		end
 	end)
 	if not ok then logGui("frame failed: " .. tostring(err)) end
@@ -4324,11 +5066,14 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	end
 end
 
+-- Each entry point says which Lua state runs it (X.HALF): the simulation state runs update / handleEvent, the interface state
+-- guiUpdate / guiHandleEvent, and module values are per state. The functions both halves share (the stamp apply's orders) write
+-- to their own state's control file with it (X.ctlWriter).
 function data()
 	return {
-		update = update,
-		handleEvent = handleEvent,
-		guiUpdate = guiUpdate,
-		guiHandleEvent = guiHandleEvent,
+		update = function(...) X.HALF = "sim" return update(...) end,
+		handleEvent = function(...) X.HALF = "sim" return handleEvent(...) end,
+		guiUpdate = function(...) X.HALF = "gui" return guiUpdate(...) end,
+		guiHandleEvent = function(...) X.HALF = "gui" return guiHandleEvent(...) end,
 	}
 end

@@ -151,8 +151,9 @@ struct CommandResult {
 /// looks at whether it changed, which is all a heartbeat needs.
 struct Pulse {
     path: PathBuf,
-    /// Length and modification time of the file at the last look. Any change is taken as a new line.
-    mark: Option<(u64, Option<SystemTime>)>,
+    /// Generation, length and modification time of the log's newest file at the last look. Any change is taken as a
+    /// new line (a new generation too: the log goes on in another file, `gamelink` generations).
+    mark: Option<(u64, u64, Option<SystemTime>)>,
     /// A line has come since the session started. Until then the world may still be loading and nothing is judged.
     seen: bool,
     /// When the file last changed, or when the game was last excused for a reload.
@@ -169,8 +170,8 @@ impl Pulse {
         Pulse { path, mark, seen: false, last: now, excused_since: None }
     }
 
-    fn look(path: &Path) -> Option<(u64, Option<SystemTime>)> {
-        fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+    fn look(path: &Path) -> Option<(u64, u64, Option<SystemTime>)> {
+        gamelink::newest_mark(path)
     }
 
     /// Looks at the file at `now`. True when the game has spoken in this session and then been silent for `limit`, with

@@ -23,6 +23,8 @@
 //!   (a pause menu longer than the age limit right after a build click must not drop or release the build that waits
 //!   for its stamp). A held kind sent by a tool while the mod is silent proves the game is not paused but the mod is
 //!   gone: everything is then given back as before.
+//! - A session pause is not a silence (the mod keeps pinging) but its game time stands still too: while the mod's pings say
+//!   `paused`, nothing held ages (a build deferred at a pause waits minutes for the host's pause stamp). Every other way out stays.
 //! - A deferred command never leaves without its tool callback: completed with the result of this game's stamp apply,
 //!   or, on every other way out (`fail`, `cancel`, holding off, the age limit, the control file gone), failed: the callback
 //!   is fired with the command's own "not applied" result, so a tool is never left busy.
@@ -144,7 +146,8 @@ struct Entry<H> {
     id: HoldId,
     kind: u8,
     held_ms: u64,
-    /// The machine's silent time when this entry was held: the age of an entry leaves out the time the mod was silent.
+    /// The machine's still time ([`HoldMachine::still_total`]) when this entry was held: the age of an entry leaves out the time the
+    /// mod was silent and the time the session's game time stood still.
     silent_at_hold: u64,
     phase: Phase,
     /// The interface's world has this game's stamp apply (the mod's `release` of a deferred entry, or no mod left to say it): a
@@ -199,7 +202,9 @@ pub struct HoldMachine<H> {
     suspended: Option<Vec<u8>>,
     /// Since when the mod is silent (its last line), while a silence lasts.
     silent_since: Option<u64>,
-    /// The silent time of all earlier silences, in milliseconds.
+    /// Since when the session's game time stands still (the mod's ping says `paused`), while the session pause lasts.
+    paused_since: Option<u64>,
+    /// The still time of all earlier silences and session pauses, in milliseconds.
     silent_total: u64,
     events: Vec<Event>,
     lost_events: u64,
@@ -218,6 +223,7 @@ impl<H> HoldMachine<H> {
             last_ctl_ms: 0,
             suspended: None,
             silent_since: None,
+            paused_since: None,
             silent_total: 0,
             events: Vec::new(),
             lost_events: 0,
@@ -323,6 +329,7 @@ impl<H> HoldMachine<H> {
                 }
             }
             CtlMessage::HoldOff => {
+                self.session_paused(false, now); // the session is over: what is held leaves now, failed if deferred
                 let was = self.enabled;
                 self.enabled = false;
                 self.release_all(ReleaseReason::HoldOff);
@@ -367,7 +374,10 @@ impl<H> HoldMachine<H> {
             CtlMessage::TerrainApply { id, .. } => {
                 self.error("terrain_apply", format!("edit {id}: terrain edits are not copied by this build"), now)
             }
-            CtlMessage::Ping { n } => self.push_event(Event::Pong { n: *n }),
+            CtlMessage::Ping { n, paused } => {
+                self.session_paused(*paused, now);
+                self.push_event(Event::Pong { n: *n });
+            }
             CtlMessage::PatchNext { .. } | CtlMessage::InjectNext { .. } | CtlMessage::CompleteNext { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject)
         }
     }
@@ -402,6 +412,7 @@ impl<H> HoldMachine<H> {
     /// The control file is gone: nobody can ask for a release any more.
     pub fn ctl_gone(&mut self, now: u64) {
         self.suspended = None;
+        self.session_paused(false, now);
         if let Some(since) = self.silent_since.take() {
             self.silent_total = self.silent_total.saturating_add(now.saturating_sub(since));
         }
@@ -410,11 +421,32 @@ impl<H> HoldMachine<H> {
         }
     }
 
-    /// How long an entry has been held, without the time the mod was silent (the pause menu stops the mod's script and the game).
+    /// The session's game time stands still (`paused`, from the mod's ping) or runs again. While it stands, nothing held ages: a
+    /// session pause can last minutes (the host waits for every game's stop report and a round trip before it stamps the builds of
+    /// the pause), and a build deferred at the pause waits for that stamp; the mod still pings meanwhile, so this is not a silence.
+    /// Every other way out stays: `hold_off` (the session ends), the control file gone, `fail`, `cancel`.
+    fn session_paused(&mut self, paused: bool, now: u64) {
+        match (paused, self.paused_since) {
+            (true, None) => self.paused_since = Some(now),
+            (false, Some(since)) => {
+                self.paused_since = None;
+                self.silent_total = self.silent_total.saturating_add(now.saturating_sub(since));
+            }
+            _ => {}
+        }
+    }
+
+    /// The machine's still time so far: every silence of the mod and every session pause, the open ones up to `now`.
+    fn still_total(&self, now: u64) -> u64 {
+        let open = |since: Option<u64>| since.map_or(0, |s| now.saturating_sub(s));
+        self.silent_total.saturating_add(open(self.silent_since)).saturating_add(open(self.paused_since))
+    }
+
+    /// How long an entry has been held, without the time the mod was silent (the pause menu stops the mod's script and the game) and
+    /// without the time the session's game time stood still (a session pause).
     fn age(&self, e: &Entry<H>, now: u64) -> u64 {
-        let current = self.silent_since.map_or(0, |since| now.saturating_sub(since.max(e.held_ms)));
-        let silent = self.silent_total.saturating_sub(e.silent_at_hold).saturating_add(current);
-        now.saturating_sub(e.held_ms).saturating_sub(silent)
+        let still = self.still_total(now).saturating_sub(e.silent_at_hold);
+        now.saturating_sub(e.held_ms).saturating_sub(still)
     }
 
     /// Time passes: silence suspends holding (what is held waits, its age stands still), an old entry is released.
@@ -424,6 +456,8 @@ impl<H> HoldMachine<H> {
             // What is held waits for the mod's next line (a pause menu longer than the age limit right after a build click dropped
             // the deferred build before, 2026-10-14); new commands pass meanwhile (see `tool_while_silent`).
             self.suspended = Some(self.kinds.clone());
+            // a session pause open at the mod's last line ends there: from then on the silence counts (never both at once)
+            self.session_paused(false, self.last_ctl_ms);
             self.silent_since = Some(self.last_ctl_ms);
             self.enabled = false;
             let waiting = self.entries.len();
@@ -518,7 +552,7 @@ impl<H> HoldMachine<H> {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let silent_at_hold = self.silent_total;
+        let silent_at_hold = self.still_total(now);
         self.entries.push_back(Entry {
             id,
             kind,
@@ -599,6 +633,19 @@ impl<H> HoldMachine<H> {
             }
             None => false,
         }
+    }
+
+    /// Held command `id`, whatever its phase (an order of its build identifies the script's command by it: `inject::same_command`).
+    pub fn handle_of(&self, id: HoldId) -> Option<&H> {
+        self.entries.iter().find(|e| e.id == id).map(|e| &e.handle)
+    }
+
+    /// Held command `id` is still held and not leaving (waiting, scheduled or deferred; not failed, cancelled, completed or gone): a
+    /// stamp apply of its build may still be due for it.
+    pub fn is_kept(&self, id: HoldId) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.id == id && matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. } | Phase::Deferred))
     }
 
     /// For the tests and diagnostics: the held entries as `(id, kind)`.
@@ -833,7 +880,7 @@ mod tests {
         hold_on(&mut m, &["build_proposal"], 10);
         let c = hold(&mut m, BUILD, 10);
         m.handle(&CtlMessage::Defer { id: c }, 11);
-        m.handle(&CtlMessage::Ping { n: 1 }, 30_000);
+        m.handle(&CtlMessage::Ping { n: 1, paused: false }, 30_000);
         m.tick(30_010);
         assert_eq!(m.take_due(None, 30_010), [Action::Fail { id: c, handle: c, reason: "timeout" }]);
     }
@@ -861,10 +908,10 @@ mod tests {
         let c = hold(&mut m, BUILD, 10);
         m.handle(&CtlMessage::Defer { id: c }, 11);
         assert!(m.complete(c, false, |_| {}));
-        m.handle(&CtlMessage::Ping { n: 1 }, 30_000);
+        m.handle(&CtlMessage::Ping { n: 1, paused: false }, 30_000);
         m.tick(30_000);
         assert!(m.take_due(None, 30_000).is_empty());
-        m.handle(&CtlMessage::Ping { n: 2 }, 30_010);
+        m.handle(&CtlMessage::Ping { n: 2, paused: false }, 30_010);
         m.tick(30_010);
         assert_eq!(m.take_due(None, 30_010), [Action::Complete { id: c, handle: c, ok: false }]);
     }
@@ -902,7 +949,7 @@ mod tests {
         assert!(!m.enabled());
         m.tick(56_000);
         assert!(m.take_due(None, 56_000).is_empty(), "nothing leaves during the pause");
-        m.handle(&CtlMessage::Ping { n: 1 }, 56_100); // the menu is closed
+        m.handle(&CtlMessage::Ping { n: 1, paused: false }, 56_100); // the menu is closed
         assert!(m.enabled(), "resumed");
         m.tick(56_200);
         assert!(m.take_due(None, 56_200).is_empty(), "about 0.1 s of age counted before the pause, not 55 s");
@@ -912,12 +959,61 @@ mod tests {
         // and the age limit still holds for time the mod spoke: 30 s after the resume
         let b = hold(&mut m, BUILD, 57_000);
         m.handle(&CtlMessage::Defer { id: b }, 57_000);
-        m.handle(&CtlMessage::Ping { n: 2 }, 86_000);
+        m.handle(&CtlMessage::Ping { n: 2, paused: false }, 86_000);
         m.tick(86_999);
         assert!(m.take_due(None, 86_999).is_empty());
-        m.handle(&CtlMessage::Ping { n: 3 }, 87_000);
+        m.handle(&CtlMessage::Ping { n: 3, paused: false }, 87_000);
         m.tick(87_000);
         assert_eq!(m.take_due(None, 87_000), [Action::Fail { id: b, handle: b, reason: "timeout" }]);
+    }
+
+    #[test]
+    fn a_deferred_command_waits_through_five_minutes_of_a_session_pause_with_pings_and_still_times_out_while_running() {
+        // a build deferred at a session pause: the host waits for every game's stop report and a round trip before it stamps it; the mod
+        // keeps pinging (no silence), with `paused`
+        let mut m = machine();
+        hold_on(&mut m, &["build_proposal"], 0);
+        let a = hold(&mut m, BUILD, 1_000);
+        m.handle(&CtlMessage::Defer { id: a }, 1_100);
+        m.handle(&CtlMessage::Ping { n: 1, paused: true }, 2_000);
+        let mut n = 1;
+        for t in (4_000..=302_000).step_by(2_000) {
+            n += 1;
+            m.handle(&CtlMessage::Ping { n, paused: true }, t);
+            m.tick(t);
+            assert!(m.enabled(), "pings: no silence");
+            assert!(m.take_due(None, t).is_empty(), "nothing leaves during the session pause (t = {t})");
+        }
+        // the pause ends; the stamp comes a moment later: 1 s of age before the pause, 0.5 s after
+        m.handle(&CtlMessage::Ping { n: n + 1, paused: false }, 303_000);
+        m.tick(303_500);
+        assert!(m.take_due(None, 303_500).is_empty());
+        assert!(m.complete(a, true, |_| {}), "still deferred: it takes its stamp apply's result");
+        m.handle(&CtlMessage::Release { id: a, at: 0 }, 303_600);
+        assert_eq!(m.take_due(None, 303_600), [Action::Complete { id: a, handle: a, ok: true }]);
+        // held 31 s while the session runs (pings without `paused`): failed by the age limit as before
+        let b = hold(&mut m, BUILD, 310_000);
+        m.handle(&CtlMessage::Defer { id: b }, 310_000);
+        for t in (312_000..=338_000).step_by(2_000) {
+            m.handle(&CtlMessage::Ping { n: 0, paused: false }, t);
+        }
+        m.tick(339_000);
+        assert!(m.take_due(None, 339_000).is_empty(), "29 s: not yet");
+        m.handle(&CtlMessage::Ping { n: 0, paused: false }, 341_000);
+        m.tick(341_000);
+        assert_eq!(m.take_due(None, 341_000), [Action::Fail { id: b, handle: b, reason: "timeout" }]);
+        // a session that ends during a pause (hold_off) still fails what is deferred, whatever its age
+        let c = hold_on_and_defer(&mut m, 350_000);
+        m.handle(&CtlMessage::Ping { n: 0, paused: true }, 350_100);
+        m.handle(&CtlMessage::HoldOff, 600_000);
+        assert_eq!(m.take_due(None, 600_000), [Action::Fail { id: c, handle: c, reason: "hold_off" }]);
+    }
+
+    fn hold_on_and_defer(m: &mut HoldMachine<u64>, now: u64) -> HoldId {
+        hold_on(m, &["build_proposal"], now);
+        let id = hold(m, BUILD, now);
+        m.handle(&CtlMessage::Defer { id }, now);
+        id
     }
 
     #[test]
@@ -955,7 +1051,7 @@ mod tests {
         let mut m = machine();
         hold_on(&mut m, &["build_proposal"], 0);
         m.drain_events();
-        m.handle(&CtlMessage::Ping { n: 5 }, 9_000);
+        m.handle(&CtlMessage::Ping { n: 5, paused: false }, 9_000);
         assert_eq!(m.drain_events(), [Event::Pong { n: 5 }]);
         m.tick(18_000); // 9 s after the ping: not silent yet
         assert!(m.enabled());
@@ -989,7 +1085,7 @@ mod tests {
         m.tick(10_000);
         assert!(!m.enabled());
         m.drain_events();
-        m.handle(&CtlMessage::Ping { n: 7 }, 60_000);
+        m.handle(&CtlMessage::Ping { n: 7, paused: false }, 60_000);
         assert!(m.enabled(), "resumed");
         let ev = m.drain_events();
         assert!(matches!(&ev[0], Event::Holding { on: true, reason: "resume", .. }), "{ev:?}");
@@ -999,13 +1095,13 @@ mod tests {
         // a hold_off is final: no resume after it
         m.handle(&CtlMessage::HoldOff, 60_002);
         m.drain_events();
-        m.handle(&CtlMessage::Ping { n: 8 }, 60_003);
+        m.handle(&CtlMessage::Ping { n: 8, paused: false }, 60_003);
         assert!(!m.enabled());
         // nor after the control file went away
         hold_on(&mut m, &["build_proposal"], 70_000);
         m.tick(80_000);
         m.ctl_gone(80_001);
-        m.handle(&CtlMessage::Ping { n: 9 }, 80_002);
+        m.handle(&CtlMessage::Ping { n: 9, paused: false }, 80_002);
         assert!(!m.enabled());
     }
 
@@ -1021,7 +1117,7 @@ mod tests {
         let mut m = machine();
         hold_on(&mut m, &["build_proposal"], 0);
         let a = hold(&mut m, BUILD, 1_000);
-        m.handle(&CtlMessage::Ping { n: 1 }, 29_000);
+        m.handle(&CtlMessage::Ping { n: 1, paused: false }, 29_000);
         let b = hold(&mut m, BUILD, 29_500);
         m.drain_events();
         m.tick(30_999);
@@ -1086,7 +1182,7 @@ mod tests {
     fn the_event_queue_is_bounded() {
         let mut m = machine();
         for n in 0..(MAX_QUEUED_EVENTS as i64 + 10) {
-            m.handle(&CtlMessage::Ping { n }, 0);
+            m.handle(&CtlMessage::Ping { n, paused: false }, 0);
         }
         let ev = m.drain_events();
         assert_eq!(ev.len(), MAX_QUEUED_EVENTS + 1);
@@ -1141,7 +1237,7 @@ mod tests {
                         now,
                     ),
                     5 => m.handle(&CtlMessage::Cancel { id: 1 + rng.next(held_ids.len() as u64 + 2) }, now),
-                    6 => m.handle(&CtlMessage::Ping { n: 1 }, now),
+                    6 => m.handle(&CtlMessage::Ping { n: 1, paused: false }, now),
                     7 => m.tick(now),
                     _ => {
                         let clock = if rng.next(2) == 0 { None } else { Some(rng.next(1_000)) };

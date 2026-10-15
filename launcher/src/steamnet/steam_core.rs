@@ -651,8 +651,8 @@ impl Shared {
         let _ = THREAD_SINK.try_with(|s| *s.borrow_mut() = Some(Arc::clone(&self.sink)));
         while !self.stopped() {
             // One bad cycle (an owner that panics on a message, say) must not end Steam networking for everybody
-            // in the process. The release build aborts on a panic (see `crate::guard`); a build that unwinds
-            // lands here, says so in the status, and goes on with the next cycle.
+            // in the process. Every profile unwinds (root Cargo.toml, see `crate::guard`), so a panic lands here,
+            // says so in the status, and the poller goes on with the next cycle.
             let cycle = crate::guard::guarded(|| {
                 for notice in self.cycle() {
                     notice.dispatch();

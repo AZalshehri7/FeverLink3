@@ -1707,7 +1707,7 @@ class BuildTest(unittest.TestCase):
         self.assertIn("1:1#c1/d1", str(self.A.lua("BOUND_KEYS()")).split())
         self.assertIn("1:1#c1/d1", str(self.B.lua("BOUND_KEYS()")).split())
 
-    def test_a_refused_second_command_stops_the_chain_and_tells_the_window(self):
+    def test_a_refused_second_command_of_a_build_made_in_a_pause_stops_the_chain_on_both_games(self):
         self.start(speed=2)
         self.tick(10)
         self.relay.pump()
@@ -1718,11 +1718,14 @@ class BuildTest(unittest.TestCase):
             g.run("BUILD_REFUSE = function(parts) if #parts.consAdd > 0 then return 'Collision' end end")
         self.B.issue("NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }",
                      cb="function(d, s, e) PAUSED_OK = s end")
-        self.tick(10)
-        self.assertTrue(self.B.lua("PAUSED_OK == false"), "the window learns the build failed")
-        self.assertEqual(self.A.lua("#BUILD_LOG"), 1, "only the street part ran")
-        self.assertEqual(self.A.lua("BUILD_REFUSALS[1]"), "Collision")
-        self.assertIn("REFUSED", self.B.log())
+        self.tick(16)
+        # Applied at the host's stamp by the simulation half, as every build: the engine gives no callback there, so the window does
+        # not learn of a refusal the engine reports only through a callback (it did when a paused game applied from the interface state,
+        # in arrival order, at another step on each game). What the engine built is the same on both games.
+        for g in (self.A, self.B):
+            self.assertEqual(g.lua("#BUILD_LOG"), 1, "only the street part ran")
+            self.assertEqual(g.lua("BUILD_REFUSALS[1]"), "Collision")
+        self.assertSameWorld()
 
     # ---- signals and stops
 
@@ -3034,6 +3037,29 @@ class InjectReferenceCheckTest(PureBuildTest):
         self.assertEqual(str(f(inject_text())), "built street inject")
         got = str(f(inject_text(node0=110)))
         self.assertTrue(got.startswith("refused: inject_refused: proposal.addedSegments[0].node0 names node 110"), got)
+
+    def test_a_placeholder_that_cannot_be_made_refuses_the_build_and_never_falls_back_to_the_record_path(self):
+        # fail closed (2026-10-15): the record path is this game's own guess of the build, never a stand-in for the originator's text. Before,
+        # "build inject not used (...); the record path builds it" applied that guess on this game while the others injected the text.
+        code = """(function(txt, rejectFirst)
+            local M = PURE()
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 100, y = 0, z = 0 }, b = { x = 200, y = 80, z = 0 } })
+            body.nativeText = txt
+            local calls = 0
+            -- the factory refuses the first command it is given (the placeholder) and would take every later one (the record path's forms)
+            FACTORY_REJECT = function() calls = calls + 1; if rejectFirst and calls == 1 then return 'Unknown exception' end end
+            local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '1:1',
+                resolve = function(key) local n = tostring(key):match('^s:(%d+)$'); return n and tonumber(n) or nil end })
+            FACTORY_REJECT = nil
+            if not args then return 'refused: ' .. tostring(why), calls end
+            return 'built ' .. tostring(args.plan) .. (args.inject and ' inject' or ''), calls
+        end)"""
+        f = self.L.eval(code)
+        self.assertEqual(str(f(inject_text(), False)[0]), "built street inject")
+        got, calls = f(inject_text(), True)
+        self.assertTrue(str(got).startswith("refused: inject_refused: the placeholder command cannot be made here (") and "Unknown exception" in str(got)
+                        and str(got).endswith("nothing is applied here"), got)
+        self.assertEqual(int(calls), 1, "no form of the record path is tried after the placeholder failed")
 
 
 if __name__ == "__main__":

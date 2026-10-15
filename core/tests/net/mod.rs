@@ -225,12 +225,19 @@ impl Net {
 
     pub fn hello(&mut self, c: ConnectionId, t: i64, speed: i32) {
         self.send(c, MessageKind::Hello, &json(&HelloMessage::new(t)));
-        self.send(c, MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3, need: None }));
+        self.send(
+            c,
+            MessageKind::Clock,
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        );
     }
 
     pub fn host_hello(&mut self, t: i64, speed: i32) {
         self.host_send(MessageKind::Hello, &json(&HelloMessage::new(t)));
-        self.host_send(MessageKind::Clock, &json(&ClockMessage { t, speed, ahead: 3, need: None }));
+        self.host_send(
+            MessageKind::Clock,
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        );
     }
 
     /// Every game says hello and reports a clock at `t`.
@@ -246,11 +253,18 @@ impl Net {
 
     /// Every connected game reports a stopped clock at `t`.
     pub fn stop_all_at(&mut self, t: i64) {
-        self.host_send(MessageKind::Clock, &json(&ClockMessage { t, speed: 0, ahead: 3, need: None }));
+        self.host_send(
+            MessageKind::Clock,
+            &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        );
         let live: Vec<ConnectionId> = self.reachable.iter().copied().filter(|c| self.peers.contains_key(c)).collect();
         for c in live {
             if self.peers[&c].session.state() == PlayerState::Joined {
-                self.send(c, MessageKind::Clock, &json(&ClockMessage { t, speed: 0, ahead: 3, need: None }));
+                self.send(
+                    c,
+                    MessageKind::Clock,
+                    &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+                );
             }
         }
     }

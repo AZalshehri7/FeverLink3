@@ -48,7 +48,14 @@ pub(super) struct ResyncRound {
     /// The host's game was sent the load while the players are still receiving the save (it is paused, so it can
     /// reload in that time instead of after it).
     host_loading: bool,
+    /// What the games of the participants were sent while their save was on its way, held back until the load
+    /// (`HostSession::holds_for_load`): (receiver, kind, payload), the host's own game as [`HostSession::HOST_ID`].
+    held: Vec<(u16, MessageKind, Vec<u8>)>,
 }
+
+/// At most this many messages are held for the games of a round while the save travels; more are dropped (counted
+/// and logged). A paused round sees a few actions and clocks, not thousands.
+const MAX_HELD: usize = 20_000;
 
 impl HostSession {
     pub fn resync_state(&self) -> ResyncState {
@@ -139,6 +146,62 @@ impl HostSession {
             if let Some(participants) = r.participants.as_mut() {
                 participants.remove(&id);
             }
+            r.held.retain(|(to, ..)| *to != id);
+        }
+    }
+
+    /// Whether a message of `kind` for the game of `to` must wait for that game's load. While the save of a round
+    /// travels, the participants' games are paused at the save's point and will replace their world by the save; a
+    /// message sent to them now (an action, a commit, a clock, a session line) would reach the world that is about to be
+    /// thrown away. So it is held and sent right after the `ResyncLoad`, and the reloaded game reads it after its load
+    /// line. Before the launcher sent the save on its own thread the host's loop was stuck in the transfer and every such
+    /// message went out after the load by accident; this keeps that order on purpose. Not held: what the session layer
+    /// handles itself (pings, the transfer, the load, a kick), and anything for the host's own game once it was sent
+    /// its load early or when it does not reload.
+    pub(super) fn holds_for_load(&self, to: u16, kind: MessageKind) -> bool {
+        use MessageKind::*;
+        if matches!(kind, Challenge | Join | Reject | Welcome | ResyncChunk | ResyncLoad | Ping | Kicked) {
+            return false;
+        }
+        let Some(r) = self.resync.as_ref().filter(|r| r.state == ResyncState::Transferring) else {
+            return false;
+        };
+        if !r.participants.as_ref().is_some_and(|p| p.contains(&to)) {
+            return false;
+        }
+        to != Self::HOST_ID || (self.options.host_reloads && !r.host_loading)
+    }
+
+    /// Keeps a message for the game of `to` until its load ([`HostSession::holds_for_load`]).
+    pub(super) fn hold_for_load(&mut self, to: u16, kind: MessageKind, payload: &[u8]) {
+        let full = self.resync.as_ref().is_none_or(|r| r.held.len() >= MAX_HELD);
+        if full {
+            self.dropped += 1;
+            if self.first_time("held/full".to_owned()) {
+                self.log(format!(
+                    "more than {MAX_HELD} messages held for the games during a save transfer; {kind:?} dropped"
+                ));
+            }
+            return;
+        }
+        if let Some(r) = self.resync.as_mut() {
+            r.held.push((to, kind, payload.to_vec()));
+        }
+    }
+
+    /// Sends what was held for the games while the save travelled, in the order it was made. Called once the round left
+    /// `Transferring` (after the loads went out, or because the round ended without them).
+    fn release_held(&mut self, held: Vec<(u16, MessageKind, Vec<u8>)>) {
+        if held.is_empty() {
+            return;
+        }
+        self.log(format!("{} message(s) held during the save transfer sent after the load", held.len()));
+        for (to, kind, payload) in held {
+            if to == Self::HOST_ID {
+                self.out.push(HostOutput::DeliverToLocalGame { kind, payload });
+            } else if let Some(connection) = self.connection_of(to) {
+                self.send(connection, kind, &payload);
+            }
         }
     }
 
@@ -196,6 +259,7 @@ impl HostSession {
             verify_n: None,
             verify_skews: 0,
             host_loading: false,
+            held: Vec::new(),
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -465,6 +529,8 @@ impl HostSession {
             to_load.remove(&Self::HOST_ID);
         }
         self.send_to_players(MessageKind::ResyncLoad, &codec::encode(&load), &to_load);
+        let held = self.resync.as_mut().map(|r| std::mem::take(&mut r.held)).unwrap_or_default();
+        self.release_held(held);
     }
 
     fn enter_verifying(&mut self) {
@@ -574,7 +640,10 @@ impl HostSession {
 
     /// Ends the round without resuming: the session stays paused.
     fn fail(&mut self, reason: String) {
-        let Some(r) = self.resync.take() else { return };
+        let Some(mut r) = self.resync.take() else { return };
+        // no load follows: what was held for the games goes out now, they keep the world they have
+        let held = std::mem::take(&mut r.held);
+        self.release_held(held);
         self.set_resync_phase(None);
         self.log(format!("resync {} ({}) failed: {reason}", r.id, r.reason));
         self.policy.resync_finished(self.now());

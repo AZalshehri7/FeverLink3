@@ -738,7 +738,7 @@ class VehicleTest(OpsBase):
         self.assertIn("bus_blue", snap)
         self.assertEqual(self.A.balance(), 1000000 - 2 * 10000 + 5000, "a sale returns half")
 
-    def test_a_purchase_during_a_pause_binds_the_vehicle_although_the_engine_answers_with_userdata(self):
+    def test_a_purchase_during_a_pause_binds_the_vehicle_and_a_later_command_of_the_pause_names_it(self):
         self.start(speed=2)
         for g in (self.A, self.B):
             g.userdata_results()
@@ -752,8 +752,10 @@ class VehicleTest(OpsBase):
         self.tick(8)
         self.agree()
         self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
-        self.assertIn("applied during the pause", self.B.log())
-        v = int(self.B.L.eval("BUY[2]"))   # the window read its vehicle from the userdata result
+        self.assertIn("stamped", self.B.log())
+        self.assertIn("by the host (pause", self.B.log())
+        self.assertEqual((self.A.speed(), self.B.speed()), (0, 0), "still paused")
+        v = int(self.B.L.eval("BUY[2]"))
         # a later command names the vehicle by the key the purchase bound, not by an id the host does not have
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetStoppedByUserCmd(%d, true))" % v)
         self.tick(8)

@@ -48,6 +48,10 @@ pub struct PlayerClock {
     pub speed: i32,
     /// Host time (seconds) at which the report arrived.
     pub at: f64,
+    /// The input barrier's promise that came with it (ClockMessage::safe, bounded), if any.
+    pub safe: Option<i64>,
+    /// The game stands still at a pause at this time (ClockMessage::stop), if it said so.
+    pub stop: Option<i64>,
 }
 
 impl PlayerClock {

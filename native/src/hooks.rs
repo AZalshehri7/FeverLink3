@@ -73,8 +73,8 @@ unsafe extern "system-unwind" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
 
 /// The function `scripting::Convert(out optional<Proposal>*, state*, SimpleProposal*, ..)` is made to jump to: calls the original with
 /// every slot as given (four registers, four stack slots), then lets the runtime write the armed `patch_next` order's frozenNodes
-/// into the proposal it produced. Returns what the original returned. The runtime's part is contained (`log::guarded`); the call
-/// into the game is outside it and may unwind.
+/// into the proposal it produced. Returns what the original returned. The runtime's bookkeeping is contained (`log::guarded`, inside
+/// `on_convert`); the calls into the game (the original, the allocator of the write) are outside it and may unwind.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system-unwind" fn convert_hook(
     rcx: u64,
@@ -97,7 +97,8 @@ unsafe extern "system-unwind" fn convert_hook(
     let original: Original = unsafe { core::mem::transmute(original) };
     let ret = unsafe { original(rcx, rdx, r8, r9, a5, a6, a7, a8) };
     if let Some(rt) = RUNTIME.get() {
-        crate::log::guarded("convert hook", || rt.on_convert(rcx as usize, caller));
+        // guards its own bookkeeping: the write calls the game's allocator, which must not run inside a guard
+        rt.on_convert(rcx as usize, caller);
     }
     ret
 }
@@ -110,9 +111,8 @@ unsafe extern "system-unwind" fn convert_update_hook(rcx: u64, rdx: u64, r8: u64
     if original == 0 {
         return 0; // unreachable once installed
     }
-    let armed = RUNTIME.get().is_some_and(|rt| {
-        crate::log::guarded("convert update hook", || rt.before_convert_update(a6 as usize)).unwrap_or(false)
-    });
+    // guards its own bookkeeping: the write calls the game's allocator, which must not run inside a guard
+    let armed = RUNTIME.get().is_some_and(|rt| rt.before_convert_update(a6 as usize));
     type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64) -> u64;
     // SAFETY: the trampoline for the update, which takes these six slots.
     let original: Original = unsafe { core::mem::transmute(original) };

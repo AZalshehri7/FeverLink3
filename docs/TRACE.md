@@ -2,7 +2,8 @@
 
 `FEVERLINK3_TRACE` is on by default in test builds (`FEVERLINK3_TRACE=0` turns it off). Each game writes `trace.log` into its session
 folder (`%LOCALAPPDATA%\FeverLink3\live1` for the host, `live2` for a second window), next to `mod.log`. The file rolls over to
-`trace.2.log`, `trace.3.log`, ... every 8 MB (nothing is deleted; after 12 segments it says `TRACE FULL`). Lines are written per build and
+`trace.2.log`, `trace.3.log`, ... every 8 MB of the file, whichever half wrote it (`trace.gen` names the current one; nothing is deleted; after
+12 segments it says `TRACE FULL`; the limit holds across reloads). Lines are written per build and
 per checksum round, never per tick; the heavy dump is only for builds.
 
 Line format: `<HH:MM:SS> +<cpu seconds> <state> <tag> <text>`; `state` is `gui` (interface half) or `sim` (simulation half) or `build`

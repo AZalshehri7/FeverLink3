@@ -184,6 +184,13 @@ impl fmt::Debug for Identity {
     }
 }
 
+/// An action or a held build's commit made during a pause, waiting for its stamp (HostSession::flush_pause).
+#[derive(Debug)]
+enum PauseItem {
+    Action(ActionMessage),
+    Commit(BuildCommitMessage),
+}
+
 /// The host side of a session, as a state machine with no I/O: connections are integers the caller owns, frames
 /// go in through [`HostSession::frame_received`] and every call returns the [`HostOutput`]s to act on. The host's
 /// own game is player 0, reached through [`HostSession::local_game_message`] and
@@ -238,6 +245,15 @@ pub struct HostSession {
     host_name: String,
     state: SessionState,
     actions_relayed: u64,
+    /// The last number of the pause order (`ActionMessage::pause_seq`): every action or commit made during a pause gets the next one
+    /// and goes to every game, its sender included. Never reset in a session, so a number is never given twice.
+    pause_seq: u64,
+    /// Actions and commits of the pause waiting for every game to say where it stands (flush_pause), in arrival order.
+    pause_held: Vec<PauseItem>,
+    /// The last stamp the host gave an action of the current pause.
+    pause_last: Option<i64>,
+    /// A checksum round asked for at a pause before every game said where it stands: stamped at the furthest once they have.
+    pending_paused_checksum: bool,
     dropped: u64,
     out: Vec<HostOutput>,
 }
@@ -316,6 +332,10 @@ impl HostSession {
                 resync: None,
             },
             actions_relayed: 0,
+            pause_seq: 0,
+            pause_held: Vec::new(),
+            pause_last: None,
+            pending_paused_checksum: false,
             dropped: 0,
             out: Vec::new(),
         }
@@ -696,11 +716,25 @@ impl HostSession {
                             self.log(format!("clock of {} dropped (t {}, speed {})", self.name(from), m.t, m.speed));
                         }
                     } else {
-                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now() });
+                        // relayed in the order it came, after every action its game shipped before it: the input barrier
+                        // (the mod's L.barrier) counts on that
+                        let safe = m.bounded_safe();
+                        // a stop is the time the clock shows, nothing else; a game that makes no pause promise (an older mod)
+                        // counts as standing still where its clock shows speed 0
+                        let stop = if m.pause { m.stop.filter(|&s| s == m.t) } else { (m.speed == 0).then_some(m.t) };
+                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now(), safe, stop });
                         self.resync_step();
+                        self.flush_pause();
                         // a player cannot push every other game's stamps into the far future with an absurd margin
                         let need = m.need.map(|n| n.clamp(0, ClockMessage::MAX_NEED));
-                        let peer = PeerClockMessage { from, t: m.t, ahead: m.ahead, need };
+                        let peer = PeerClockMessage {
+                            from,
+                            t: m.t,
+                            ahead: m.ahead,
+                            need,
+                            safe,
+                            pause: m.pause && safe.is_some(),
+                        };
                         self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
                     }
                 }
@@ -725,8 +759,15 @@ impl HostSession {
                         let who = self.name(from);
                         self.log(format!("{who} may not {}; action relayed as refused", m.category));
                     }
-                    self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
-                    self.actions_relayed += 1;
+                    m.pause_seq = None;
+                    if m.pause {
+                        // made during a pause: stamped by the host and relayed to every game, the sender too (flush_pause)
+                        self.pause_held.push(PauseItem::Action(m));
+                        self.flush_pause();
+                    } else {
+                        self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
+                        self.actions_relayed += 1;
+                    }
                 }
             }
 
@@ -742,7 +783,13 @@ impl HostSession {
             MessageKind::BuildCommit => {
                 if let Some(mut m) = codec::try_decode::<BuildCommitMessage>(payload) {
                     m.from = from;
-                    self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), Some(from));
+                    m.pause_seq = None;
+                    if m.pause {
+                        self.pause_held.push(PauseItem::Commit(m));
+                        self.flush_pause();
+                    } else {
+                        self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), Some(from));
+                    }
                 }
             }
 
@@ -966,6 +1013,8 @@ impl HostSession {
         self.lead_lower_since = None;
         self.state = SessionState { speed, pause_at: None, lead, ..self.state.clone() };
         self.broadcast_session();
+        // actions of the pause still held (a game had not said where it stands): a normal stamp now, after the resume line
+        self.flush_pause();
     }
 
     fn pause_inner(&mut self) {
@@ -973,13 +1022,24 @@ impl HostSession {
             return;
         }
         self.state.pause_at = Some(self.future_stamp());
+        self.pause_last = None;
         self.broadcast_session();
     }
 
     fn request_checksum_inner(&mut self) {
+        let paused = matches!(self.state.pause_at, Some(p) if self.max_clock() >= p);
+        // a round at a pause is stamped where the furthest game stands still (the others run on to it): known once every game said
+        // where it stands (the pause order, flush_pause)
+        let stopped = match self.state.pause_at {
+            Some(p) if paused => self.pause_stops(p),
+            _ => None,
+        };
+        if paused && stopped.is_none() {
+            self.pending_paused_checksum = true;
+            return;
+        }
         self.checksum_n += 1;
         let n = self.checksum_n;
-        let paused = matches!(self.state.pause_at, Some(p) if self.max_clock() >= p);
         // Every Nth round (the first one too) and every paused round is a full check; the rounds between leave out the heavy lanes.
         let every = i64::from(self.options.full_checksum_every.max(1));
         let full = paused || (i64::from(n) - 1) % every == 0;
@@ -988,9 +1048,9 @@ impl HostSession {
         } else {
             self.checksums.open_light(n);
         }
-        let at = match self.state.pause_at {
-            Some(p) if paused => p.max(self.clocks.values().map(|c| c.t).max().unwrap_or(0)),
-            _ => self.future_stamp(),
+        let at = match stopped {
+            Some(furthest) => furthest,
+            None => self.future_stamp(),
         };
         let request = ChecksumRequestMessage { n, at, paused, full };
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
@@ -1006,9 +1066,15 @@ impl HostSession {
         self.clocks.values().map(|c| c.estimate(now)).fold(f64::NEG_INFINITY, f64::max) as i64
     }
 
-    /// A stamp every game reaches after receiving a message sent now.
+    /// A stamp every game reaches after receiving a message sent now. Never before a promise a game has made (ClockMessage::safe):
+    /// a game may run up to the smallest promise of the others, so no game has passed the largest one, and a pause or a checksum
+    /// stamped there is never late on any game, whatever lead each of them used.
     pub fn future_stamp(&self) -> i64 {
-        Lockstep::round_up_to_step(self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64)
+        let by_lead = Lockstep::round_up_to_step(
+            self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64,
+        );
+        let promised = self.clocks.values().filter_map(|c| c.safe).max().unwrap_or(by_lead);
+        by_lead.max(Lockstep::round_up_to_step(promised as f64))
     }
 
     fn broadcast_session(&mut self) {
@@ -1097,6 +1163,8 @@ impl HostSession {
         let Some(info) = self.players.remove(&id) else { return };
         let now = self.now();
         self.clocks.remove(&id);
+        // the actions of a pause may have waited for this game to say where it stands
+        self.flush_pause();
         self.rtt_ms.remove(&id);
         self.pings.remove(&id);
         let hold = hold && self.options.reconnect_window_seconds > 0.0;
@@ -1273,6 +1341,66 @@ impl HostSession {
         self.broadcast(MessageKind::Chat, &codec::encode(&chat), None);
     }
 
+    /// The pause order. An action (or a held build's commit) made while its game stood at the pause is flagged `pause`. Applied at
+    /// once from each game's interface state, in arrival order, it was not one order (the sender had its own first); applied at the
+    /// pause stamp, it was late, because no game stands AT the pause: speed 0 takes effect a few steps late, by a different amount on
+    /// each game (real run pause3, 2026-10-15: pauseAt 534400, both games stood at 535000, every paused build forked). So the host
+    /// STAMPS it: one step past the furthest place any game stands (each says where, ClockMessage::stop, once it stands still), then
+    /// relays it to EVERY game, its sender included, numbered (`pause_seq`). Every game applies it at that stamp like any action: a
+    /// game runs on to it (one step or a few, the pause's world moves that little) and the simulation applies it there, exactly,
+    /// whatever the overshoot. No game can be past the stamp: none moves while paused, except to a stamp the host gave, and the next
+    /// stamp waits until every game stands still again at or past the last one. Held while a game has not said where it stands (it
+    /// may still be coasting). After the resume (or with the session running) a held one gets a normal stamp, past every promise.
+    fn flush_pause(&mut self) {
+        if self.pause_held.is_empty() && !self.pending_paused_checksum {
+            return;
+        }
+        let stamp = match self.state.pause_at {
+            None => self.future_stamp(),
+            Some(p) => match self.pause_stops(p) {
+                Some(furthest) => Lockstep::round_up_to_step(furthest as f64) + Lockstep::STEP,
+                None => return,
+            },
+        };
+        let paused = self.state.pause_at.is_some();
+        for item in std::mem::take(&mut self.pause_held) {
+            self.pause_seq += 1;
+            match item {
+                PauseItem::Action(mut m) => {
+                    m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
+                    m.pause_seq = Some(self.pause_seq);
+                    self.broadcast(MessageKind::Action, &codec::encode(&m), None);
+                    self.actions_relayed += 1;
+                }
+                PauseItem::Commit(mut m) => {
+                    m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
+                    m.pause_seq = Some(self.pause_seq);
+                    self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), None);
+                }
+            }
+            if paused {
+                self.pause_last = Some(stamp);
+            }
+        }
+        if paused && std::mem::take(&mut self.pending_paused_checksum) {
+            self.request_checksum_inner();
+        }
+    }
+
+    /// The furthest place a game stands at the pause `p`, once every ready game said where it stands still (at or past the pause and
+    /// the last stamp the host gave in it); `None` while one has not.
+    fn pause_stops(&self, p: i64) -> Option<i64> {
+        let floor = self.pause_last.unwrap_or(p).max(p);
+        let mut furthest = p;
+        for player in self.players.values().filter(|x| x.ready) {
+            match self.clocks.get(&player.id).and_then(|c| c.stop) {
+                Some(s) if s >= floor => furthest = furthest.max(s),
+                _ => return None,
+            }
+        }
+        Some(furthest)
+    }
+
     fn broadcast(&mut self, kind: MessageKind, payload: &[u8], except: Option<u16>) {
         let targets: Vec<ConnectionId> = self
             .connections
@@ -1284,11 +1412,22 @@ impl HostSession {
             self.send(connection, kind, payload);
         }
         if except != Some(Self::HOST_ID) {
-            self.out.push(HostOutput::DeliverToLocalGame { kind, payload: payload.to_vec() });
+            if self.holds_for_load(Self::HOST_ID, kind) {
+                self.hold_for_load(Self::HOST_ID, kind, payload);
+            } else {
+                self.out.push(HostOutput::DeliverToLocalGame { kind, payload: payload.to_vec() });
+            }
         }
     }
 
     fn send(&mut self, connection: ConnectionId, kind: MessageKind, payload: &[u8]) {
+        // sealed only when it is sent: a frame sealed now and sent later would arrive behind newer counters (replay window)
+        if let Some(to) = self.connections.get(&connection).and_then(|c| c.player) {
+            if self.holds_for_load(to, kind) {
+                self.hold_for_load(to, kind, payload);
+                return;
+            }
+        }
         match self.sealer.try_seal(kind.into(), payload) {
             Ok(frame) => self.out.push(HostOutput::SendToConnection { connection, frame }),
             // a relayed message that grew past the frame limit when the host added its fields, say
