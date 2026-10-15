@@ -149,6 +149,7 @@ class FakeNative:
                 continue
             seq, kind, payload = int(parts[0]), parts[1], parts[3]
             if seq <= pos[1]:
+                self.discarded = getattr(self, "discarded", 0) + 1   # as the module: a number not above the file's last is old
                 continue
             pos[1] = seq
             p = to_py(self.C.parse(payload))

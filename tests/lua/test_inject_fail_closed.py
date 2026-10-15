@@ -330,6 +330,35 @@ class InjectFailClosedTest(S.StrictTest):
         for g in (self.A, self.B):
             self.assertEqual(g.native.most_waiting, 2, "%s: both orders waited together" % g.label)
 
+    def test_two_simulation_states_that_take_turns_never_lose_an_order(self):
+        """Real run b3real (2026-10-15): the game ran the simulation half in two Lua states that took turns, sharing the script's
+        state; each kept its own control writer, so every other order carried a number the other state had already used and the
+        module dropped it as old ("1 control line(s) discarded"): the originator's command went by without its order, its held
+        command was failed 9 s after the stamp, the other game injected the build (a fork). Here B's simulation half alternates
+        between two states every step; one player builds four roads one after the other."""
+        self.start()
+        self.strict_on(self.A, self.B)
+        self.B.run("SIM_OTHER = LOAD_HALF('sim')")
+        texts = []
+        for i in range(4):
+            x0 = 300.0 + 200.0 * i
+            text = road_text(x0, x0 + 100.0)
+            texts.append(text)
+            for g in (self.A, self.B):
+                g.native.native_text = g.native.input_text = text
+            self.B.tool(self.road(int(x0), 0, int(x0) + 100, 0), make="NATIVE_ROAD")
+            for _ in range(13):
+                self.tick(1)
+                self.B.run("SIM, SIM_OTHER = SIM_OTHER, SIM")   # the next step runs in the other state
+        held = [p for _, k, p in self.B.native.ctl_records() if k == "inject_next"]
+        self.assertEqual(len(held), 4, held)
+        self.assertEqual(self.B.native.completed, [(i, True, "stamp_apply") for i in range(1, 5)], self.log())
+        self.assertEqual(getattr(self.B.native, "discarded", 0), 0, "no control line was dropped as old")
+        self.assertEqual(len(self.B.native.injected), 4)
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (4, 4))
+        self.assertSameWorld()
+        self.assertEqual(self.relay.replay_failed, [])
+
     def two_players_in_one_step(self, late):
         self.start()
         self.strict_on(self.A, self.B)

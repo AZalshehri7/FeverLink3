@@ -90,6 +90,30 @@ class CommonLinkTest(unittest.TestCase):
         self.assertEqual(self.opens("native_ctl.sim.log", "ab"), 20)
         self.assertEqual([s for s, _ in records(base)], list(range(1, 23)))
 
+    def test_two_writers_of_one_log_never_repeat_a_number(self):
+        # real runs b3real / b3real2 (2026-10-15): the game ran the simulation half in two Lua states, each with its own writer of
+        # native_ctl.sim.log; they wrote seq 1 2 3 4 3 5 4 5 6 7 and the module dropped every repeated number with its order
+        base = self.path("native_ctl.sim.log")
+        a = self.C.newWriter(base, 1)
+        self.send(a, "inject_next", 1)
+        b = self.C.newWriter(base, 1)
+        r = self.C.newReader(base)
+        got = []
+        for n, w in enumerate([b, a, a, b, a, b, b, a], start=2):
+            self.send(w, "inject_next", n)
+            got += self.poll(r)
+        self.assertEqual([s for s, _ in records(base)], list(range(1, 10)), "each line takes up the other writer's numbering")
+        self.assertEqual(len(got), 9)
+        self.assertEqual(int(r.dropped), 0, "no line is old to a reader")
+        # the tail is read only after the other writer wrote, once; a writer alone never reads it (the look is the append's own open)
+        self.send(b, "inject_next", 10)
+        self.L.execute("OPENS_RESET()")
+        for n in range(11, 16):
+            self.send(a, "inject_next", n)
+        self.assertEqual(self.opens("native_ctl.sim.log", "rb"), 2, "one take-up: the last number and the size")
+        self.assertEqual(self.opens("native_ctl.sim.log", "ab"), 6, "one append open per line, one more for the take-up")
+        self.assertEqual([s for s, _ in records(base)], list(range(1, 16)))
+
     def test_a_reader_follows_the_writers_generations_without_losing_or_splitting_a_line(self):
         base = self.path("from_game.log")
         w = self.C.newWriter(base, 1, self.L.eval("{ rotate = 200, keep = 3 }"))
