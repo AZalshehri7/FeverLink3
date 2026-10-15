@@ -9,9 +9,14 @@
 //!    makes the Proposal that will be given away (a self-contained deep copy that owns its blocks), and that copy is written as
 //!    text again and compared with the input: every named member must be equal (the A1 `MATCH` rule). Anything else is refused and
 //!    nothing was handed to the game. Refused too: a text with heap pointers the rebuild cannot resolve.
-//! 2. [`check_destination`]: the command the mod's script sent (a placeholder: kind `build_proposal`, no construction in it).
+//! 2. [`check_destination`] and [`same_build`]: the command the mod's script sent (a placeholder of kind `build_proposal`, with the
+//!    receiver's own conversion of the constructions and edge objects, built at the text's place).
 //! 3. [`swap_into`]: the engine's copy assignment (`0x4ced30`) from the verified Proposal into the command's own Proposal (the engine
 //!    destroys what the placeholder held and allocates the new containers itself), then the verified Proposal is destroyed.
+//!
+//! Fail closed: when the order is refused after a command took it, [`neutralise`] empties that command's Proposal, so this game applies
+//! nothing of the build (never the placeholder, which is this game's own guess of it); the refusal goes to the mod (`inject_refused`),
+//! which asks for the repair, and a deferred held command of the same build is failed (its tool callback fired), never completed.
 //!
 //! Only the `Proposal` (the first 0x358 bytes of the payload) is replaced; the Context the mod gave the command stays (the mod ships and
 //! sets the originator's Context flags itself). The move variants of the engine's functions are never used on a held command.
@@ -68,6 +73,32 @@ pub struct Order {
     pub link_only: bool,
     /// The mod's timing text of the build (`tm`), written back with the rebuild and apply times at the stamp apply.
     pub tm: String,
+    /// Test switch (`refuse` of the order, `FEVERLINK3_DEBUG_REFUSE_INJECT` in the mod): the order is refused with this reason once the
+    /// command it is used for passed the identity checks, exactly as any other refusal (empty: a normal order).
+    pub forced: String,
+}
+
+/// What became of the command an order was meant for, when the order was refused (the `inject_refused` event's `outcome`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The command took the order and its Proposal was replaced by an empty one: this game applies nothing of the build.
+    Nothing,
+    /// The command took the order and could NOT be emptied (no verified engine functions, not a sane Proposal): it applies what it
+    /// carries (the mod's placeholder). The world differs; only the repair (a resync) helps.
+    Untouched,
+    /// No command took the order (expired, replaced, the switch off, no payload): a placeholder that went by unrecognised may have
+    /// been applied as it is.
+    NoCommand,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Nothing => "nothing",
+            Outcome::Untouched => "untouched",
+            Outcome::NoCommand => "no_command",
+        }
+    }
 }
 
 /// The switch, the armed order, the events for the mod.
@@ -105,12 +136,16 @@ impl State {
         lock(&self.events).push(e);
     }
 
-    pub fn refuse(&self, reason: impl Into<String>) {
-        self.report(Event::InjectRefused { reason: reason.into() });
+    /// An order is refused: the event names the order (`key`, 0 when it has none), the deferred held command of the same build (`held`,
+    /// failed by the caller) and what became of the command (`outcome`). The mod asks for a resync on every keyed refusal: the build
+    /// was applied on the other games and not here, or (`untouched`, `no_command`) something else was applied here.
+    pub fn refuse(&self, key: u64, held: u64, outcome: Outcome, reason: impl Into<String>) {
+        self.report(Event::InjectRefused { key, held, outcome: outcome.as_str(), reason: reason.into() });
     }
 
-    /// An order of deferred command `held` (0: none) will never be used: the command is to be failed.
-    fn fail_held(&self, held: u64) {
+    /// An order of deferred command `held` (0: none) will never be used, or was refused: the command is to be failed (its tool callback
+    /// fired with a failed result), never completed with the result of a command that did not carry the build.
+    pub fn fail_held(&self, held: u64) {
         if held != 0 {
             lock(&self.failed).push(held);
         }
@@ -124,29 +159,44 @@ impl State {
 
     /// The mod's `inject_next`. A second order replaces the first (reported as refused).
     pub fn arm(&self, key: u64, ttl: u64, held: u64, now: u64) {
-        self.arm_order(key, ttl, held, false, String::new(), now)
+        self.arm_order(Order {
+            key,
+            armed_ms: now,
+            ttl_ms: ttl,
+            held,
+            link_only: false,
+            tm: String::new(),
+            forced: String::new(),
+        })
     }
 
-    /// As [`State::arm`], with the mod's timing text of the build.
-    pub fn arm_timed(&self, key: u64, ttl: u64, held: u64, tm: String, now: u64) {
-        self.arm_order(key, ttl, held, false, tm, now)
+    /// As [`State::arm`], with the mod's timing text of the build and the test switch's forced refusal (`forced`, empty: none).
+    pub fn arm_timed(&self, key: u64, ttl: u64, held: u64, tm: String, forced: String, now: u64) {
+        self.arm_order(Order { key, armed_ms: now, ttl_ms: ttl, held, link_only: false, tm, forced })
     }
 
     /// The mod's `complete_next`: the next script `build_proposal` gives its result to deferred command `held`, nothing is injected.
     pub fn arm_link(&self, held: u64, ttl: u64, tm: String, now: u64) {
-        self.arm_order(0, ttl, held, true, tm, now)
+        self.arm_order(Order { key: 0, armed_ms: now, ttl_ms: ttl, held, link_only: true, tm, forced: String::new() })
     }
 
-    fn arm_order(&self, key: u64, ttl: u64, held: u64, link_only: bool, tm: String, now: u64) {
+    /// `o.ttl_ms` is the order's `ttl` as the mod wrote it (0: the default).
+    fn arm_order(&self, mut o: Order) {
         if !self.enabled() {
-            self.refuse(format!("{INJECT_VAR} is off"));
-            self.fail_held(held);
+            self.refuse(o.key, o.held, Outcome::NoCommand, format!("key {}: {INJECT_VAR} is off", o.key));
+            self.fail_held(o.held);
             return;
         }
-        let ttl_ms = if ttl == 0 { DEFAULT_TTL_MS } else { ttl.min(MAX_TTL_MS) };
+        o.ttl_ms = if o.ttl_ms == 0 { DEFAULT_TTL_MS } else { o.ttl_ms.min(MAX_TTL_MS) };
+        let held = o.held;
         *lock(&self.applies) = Default::default();
-        if let Some(old) = lock(&self.order).replace(Order { key, armed_ms: now, ttl_ms, held, link_only, tm }) {
-            self.refuse(format!("order for key {} replaced by a newer inject_next before a command used it", old.key));
+        if let Some(old) = lock(&self.order).replace(o) {
+            self.refuse(
+                old.key,
+                old.held,
+                Outcome::NoCommand,
+                format!("order for key {} replaced by a newer inject_next before a command used it", old.key),
+            );
             if old.held != held {
                 self.fail_held(old.held);
             }
@@ -175,7 +225,7 @@ impl State {
         self.pending.store(false, Ordering::Release);
         let order = order?;
         if now.saturating_sub(order.armed_ms) > order.ttl_ms {
-            self.refuse(self.expired(order.key, order.ttl_ms));
+            self.refuse(order.key, order.held, Outcome::NoCommand, self.expired(order.key, order.ttl_ms));
             self.fail_held(order.held);
             return None;
         }
@@ -199,7 +249,7 @@ impl State {
                 let o = g.take().expect("checked");
                 self.pending.store(false, Ordering::Release);
                 drop(g);
-                self.refuse(self.expired(o.key, o.ttl_ms));
+                self.refuse(o.key, o.held, Outcome::NoCommand, self.expired(o.key, o.ttl_ms));
                 self.fail_held(o.held);
             }
         }
@@ -597,22 +647,48 @@ fn sane(t: (u64, u64, u64), stride: usize) -> bool {
     (b == 0 && e == 0 && c == 0) || (pointer_like(b) && b <= e && e <= c && ((e - b) as usize).is_multiple_of(stride))
 }
 
-/// The command the script sent must be a `build_proposal` with sane vectors, and carry exactly `constructions` constructions: none for a
-/// text without (a placeholder), the receiver's own conversion of them for a text with.
-pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_objects: u64) -> Result<(), String> {
+const ADDED_NODES: usize = 0x000;
+const ADDED_SEGMENTS: usize = 0x018;
+const REMOVED_NODES: usize = 0x030;
+const REMOVED_SEGMENTS: usize = 0x048;
+const EDGE_OBJECTS_TO_REMOVE: usize = 0x110;
+const TO_REMOVE: usize = 0x240;
+const NODE_STRIDE: usize = 0x40;
+const SEGMENT_STRIDE: usize = 0x350;
+
+/// The vectors [`same_build`] and [`check_destination`] read, with their element strides.
+const READ_VECTORS: &[(usize, usize)] = &[
+    (ADDED_NODES, NODE_STRIDE),
+    (ADDED_SEGMENTS, SEGMENT_STRIDE),
+    (REMOVED_NODES, NODE_STRIDE),
+    (REMOVED_SEGMENTS, SEGMENT_STRIDE),
+    (EDGE_OBJECTS_TO_REMOVE, 4),
+    (EDGE_OBJECTS_TO_ADD, EDGE_OBJECT_STRIDE),
+    (TO_REMOVE, 4),
+    (TO_ADD, CONSTRUCTION_STRIDE),
+];
+
+/// The payload at `dest` is a `build_proposal` whose vectors are vectors: its bytes. Reads only.
+pub fn is_proposal(mem: &dyn Mem, dest: usize) -> Result<Vec<u8>, String> {
     let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
     if bytes[0x9b8] != portable::KIND_BUILD_PROPOSAL {
         return Err(format!("the command is kind {}, not build_proposal", bytes[0x9b8]));
     }
+    for &(off, stride) in READ_VECTORS {
+        if !sane((u64_at(&bytes, off), u64_at(&bytes, off + 8), u64_at(&bytes, off + 16)), stride) {
+            return Err("the command's proposal has a vector that is not one".into());
+        }
+    }
+    Ok(bytes)
+}
+
+/// The command the script sent must be a `build_proposal` with sane vectors, and carry exactly `constructions` constructions: none for a
+/// text without (a placeholder), the receiver's own conversion of them for a text with.
+pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_objects: u64) -> Result<(), String> {
+    let bytes = is_proposal(mem, dest)?;
     let tri = |off: usize| (u64_at(&bytes, off), u64_at(&bytes, off + 8), u64_at(&bytes, off + 16));
     let to_add = tri(TO_ADD);
-    if !sane(tri(0x000), 0x40) || !sane(tri(0x018), 0x350) || !sane(to_add, CONSTRUCTION_STRIDE) {
-        return Err("the command's proposal has a vector that is not one".into());
-    }
     let objects = tri(EDGE_OBJECTS_TO_ADD);
-    if !sane(objects, EDGE_OBJECT_STRIDE) {
-        return Err("the command's proposal has a vector that is not one".into());
-    }
     // the edge objects are the receiver's own conversion as well (see DONOR_MEMBERS): the command carries the text's number of them
     let have_objects = (objects.1 - objects.0) / EDGE_OBJECT_STRIDE as u64;
     if have_objects != edge_objects {
@@ -628,10 +704,156 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
 }
 
 /// The prefix of an error that means "this command is not the one the mod sent": the order is put back and waits for the next
-/// `build_proposal` (until its time to live ends) instead of being refused. b75: a town's own `build_proposal` (applied by the
-/// simulation like the script's, so the apply hook cannot tell them apart by caller) took the order first; its construction was not
-/// the text's, the proof refused it, and the mod's command then went without its order (drift and a resync).
+/// `build_proposal` (until its time to live ends) instead of being refused, and the command passes untouched (it is someone else's).
+/// b75: a town's own `build_proposal` (applied by the simulation like the script's, so the apply hook cannot tell them apart by caller)
+/// took the order first; its construction was not the text's, the proof refused it, and the mod's command then went without its order
+/// (drift and a resync). Since 2026-10-15 every text is matched by place or construction ([`same_build`]), not only those with constructions.
 pub const NOT_OURS: &str = "not the mod's command: ";
+
+/// Whether the command is the one the mod sent for this text, for EVERY build kind (the order names no command: the engine gives a
+/// script command no field the module could match a key against without engine research, so the order goes to the next script
+/// `build_proposal` that passes this test). A text with constructions: the command's constructions are the text's ([`same_constructions`]).
+/// Any other text: the command touches the text's place ([`same_place`]). A command that fails is not the mod's (a town's build); the
+/// order waits for the next one ([`NOT_OURS`]).
+pub fn same_build(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
+    if construction_count(text) > 0 {
+        same_constructions(mem, dest, text)
+    } else {
+        same_place(mem, dest, text)
+    }
+}
+
+/// How far (metres) a point of the command may lie from the text's to count as the same place. The mod's placeholder is rebuilt from
+/// the originator's record, whose node positions are the held command's own, so the same place is the same float; a town's build at
+/// another place is metres away.
+pub const PLACE_TOLERANCE_M: f32 = 0.25;
+
+/// The most elements of one vector [`same_place`] looks at (a large station has a few hundred segments).
+const PLACE_MAX: usize = 4096;
+
+/// Where a proposal builds: the positions of its added and removed nodes, the two ends of its added and removed segments, and the
+/// existing entities it removes (nodes, segments, edge objects, constructions; the old ids, which the mod checked to be the same
+/// entities on this game before it sent the command).
+#[derive(Debug, Default, PartialEq)]
+pub struct Place {
+    pub points: Vec<[f32; 3]>,
+    pub removed: std::collections::BTreeSet<u32>,
+}
+
+impl Place {
+    fn is_empty(&self) -> bool {
+        self.points.is_empty() && self.removed.is_empty()
+    }
+
+    /// The two share a point (within [`PLACE_TOLERANCE_M`]) or a removed entity.
+    fn meets(&self, other: &Place) -> bool {
+        let tol2 = PLACE_TOLERANCE_M * PLACE_TOLERANCE_M;
+        self.removed.iter().any(|e| other.removed.contains(e))
+            || self.points.iter().any(|p| {
+                other.points.iter().any(|q| (0..3).map(|j| (p[j] - q[j]) * (p[j] - q[j])).sum::<f32>() <= tol2)
+            })
+    }
+}
+
+fn v3_of(v: &str) -> Option<[f32; 3]> {
+    let mut it = v.strip_prefix("v3:")?.split(',').map(|w| u32::from_str_radix(w, 16).ok().map(f32::from_bits));
+    let p = [it.next()??, it.next()??, it.next()??];
+    (it.next().is_none() && p.iter().all(|f| f.is_finite())).then_some(p)
+}
+
+/// An existing entity as the text writes it (`ent:old#N`, perhaps with `@position`); new entities are not world entities.
+fn old_entity(v: &str) -> Option<u32> {
+    v.strip_prefix("ent:old#")?.split('@').next()?.parse().ok()
+}
+
+/// [`Place`] of the text.
+pub fn text_place(text: &str) -> Place {
+    let lines = rebuild::lines_of(text);
+    let mut place = Place::default();
+    for (vec, members) in [
+        ("proposal.addedNodes", &["position"][..]),
+        ("proposal.removedNodes", &["position"][..]),
+        ("proposal.addedSegments", &["position0", "position1"][..]),
+        ("proposal.removedSegments", &["position0", "position1"][..]),
+    ] {
+        for i in 0..(count(&lines, &format!("{vec}.#")) as usize).min(PLACE_MAX) {
+            for m in members {
+                if let Some(p) = lines.get(format!("{vec}[{i}].{m}").as_str()).and_then(|v| v3_of(v)) {
+                    place.points.push(p);
+                }
+            }
+        }
+    }
+    for (vec, member) in [
+        ("proposal.removedNodes", ".entity"),
+        ("proposal.removedSegments", ".entity"),
+        ("proposal.edgeObjectsToRemove", ""),
+        ("toRemove", ""),
+    ] {
+        for i in 0..(count(&lines, &format!("{vec}.#")) as usize).min(PLACE_MAX) {
+            if let Some(e) = lines.get(format!("{vec}[{i}]{member}").as_str()).and_then(|v| old_entity(v)) {
+                place.removed.insert(e);
+            }
+        }
+    }
+    place
+}
+
+/// [`Place`] of the command at `dest` (its vectors checked by [`is_proposal`] first).
+pub fn command_place(mem: &dyn Mem, dest: usize) -> Result<Place, String> {
+    let bytes = is_proposal(mem, dest)?;
+    let elems = |off: usize, stride: usize| -> Result<(Vec<u8>, usize), String> {
+        let (b, e) = (u64_at(&bytes, off) as usize, u64_at(&bytes, off + 8) as usize);
+        let n = ((e - b) / stride).min(PLACE_MAX);
+        if n == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        Ok((mem.read(b, n * stride).ok_or("a vector of the command is not readable")?, n))
+    };
+    let v3 = |raw: &[u8], at: usize| [0, 4, 8].map(|d| f32::from_bits(u32_at(raw, at + d)));
+    let mut place = Place::default();
+    for (off, stride, ends) in [
+        (ADDED_NODES, NODE_STRIDE, &[4usize][..]),
+        (REMOVED_NODES, NODE_STRIDE, &[4][..]),
+        (ADDED_SEGMENTS, SEGMENT_STRIDE, &[0x10, 0x1c][..]),
+        (REMOVED_SEGMENTS, SEGMENT_STRIDE, &[0x10, 0x1c][..]),
+    ] {
+        let (raw, n) = elems(off, stride)?;
+        for i in 0..n {
+            place
+                .points
+                .extend(ends.iter().map(|&at| v3(&raw, i * stride + at)).filter(|p| p.iter().all(|f| f.is_finite())));
+        }
+    }
+    for (off, stride) in
+        [(REMOVED_NODES, NODE_STRIDE), (REMOVED_SEGMENTS, SEGMENT_STRIDE), (EDGE_OBJECTS_TO_REMOVE, 4), (TO_REMOVE, 4)]
+    {
+        let (raw, n) = elems(off, stride)?;
+        place.removed.extend((0..n).map(|i| u32_at(&raw, i * stride)));
+    }
+    Ok(place)
+}
+
+/// A text without constructions: the command builds at the text's place (it shares a node or segment end position, or a removed
+/// entity). Before this (b75 to 2026-10-15) such a command was taken by its kind alone, so a town's road applied while the order waited
+/// could take the originator's build. A text that names no place at all (nothing added or removed by position or id) is not checked.
+pub fn same_place(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
+    let want = text_place(text);
+    if want.is_empty() {
+        return Ok(());
+    }
+    let have = command_place(mem, dest)?;
+    if want.meets(&have) {
+        return Ok(());
+    }
+    Err(format!(
+        "the command builds elsewhere: none of its {} point(s) and {} removed entit(ies) is one of the text's {} point(s) and {} removed entit(ies)",
+        have.points.len(),
+        have.removed.len(),
+        want.points.len(),
+        want.removed.len()
+    ))
+}
 
 /// The command's constructions are the text's: the same file and the same transform, in order. The script builds them from the
 /// originator's record, so the receiver's conversion keeps both; any other command that adds constructions (a town's) differs.
@@ -681,6 +903,26 @@ pub unsafe fn swap_into(c: &Ctx, b: &Built, dest: usize) {
     crate::log::calls_engine("native inject: swap_into (the Proposal copy assignment)");
     // SAFETY: as the caller guarantees; the source is only read.
     unsafe { (c.fns.assign)(dest as *mut u8, b.proposal.addr() as *const u8) };
+}
+
+/// Empties the command's Proposal: an engine-constructed empty `Proposal` is copy-assigned into it and destroyed. The command then
+/// adds and removes nothing when the simulation applies it, whatever placeholder the mod built. This is what a refused order does to
+/// the command it was used for: the build is applied exactly as the originator's text says or not at all, never as this game's own
+/// rebuild of the record (which is not the same build). The same three engine functions as an injection (constructor, copy assignment,
+/// destructor), on the same command at the same moment; only the source is empty. The Context and the flags after the Proposal stay.
+///
+/// # Safety
+/// `dest` is the payload of a live command that [`is_proposal`] accepted, on the thread that applies or queues it; `fns` are the
+/// engine's verified functions (or test stand-ins).
+pub unsafe fn neutralise(fns: &nc::ProposalFns, dest: usize) {
+    crate::log::calls_engine("native inject: neutralise (an empty Proposal assigned into the command)");
+    let mut empty = Scratch::new();
+    // SAFETY: as the caller guarantees; the scratch is a zeroed buffer of a payload's size, constructed once and destroyed once.
+    unsafe {
+        (fns.ctor)(empty.ptr());
+        (fns.assign)(dest as *mut u8, empty.addr() as *const u8);
+        (fns.dtor)(empty.ptr());
+    }
 }
 
 /// True for the members `build_verified` would not rebuild; kept next to the rule it mirrors.
@@ -1146,31 +1388,41 @@ mod tests {
         let s = State::default();
         s.arm(7, 0, 0, 0);
         assert!(!s.pending(), "off: refused");
-        assert!(matches!(s.drain_events(0).as_slice(), [Event::InjectRefused { reason }] if reason.contains("is off")));
+        assert!(
+            matches!(s.drain_events(0).as_slice(), [Event::InjectRefused { key: 7, outcome: "no_command", reason, .. }] if reason.contains("is off"))
+        );
         s.enable();
         s.arm(7, 0, 0, 100);
         assert!(s.pending());
         assert_eq!(
             s.take(150),
-            Some(Order { key: 7, armed_ms: 100, ttl_ms: DEFAULT_TTL_MS, held: 0, link_only: false, tm: String::new() })
+            Some(Order {
+                key: 7,
+                armed_ms: 100,
+                ttl_ms: DEFAULT_TTL_MS,
+                held: 0,
+                link_only: false,
+                tm: String::new(),
+                forced: String::new()
+            })
         );
         assert_eq!((s.take(150), s.pending()), (None, false));
         s.arm(8, 50, 0, 0);
         s.arm(9, 50, 0, 10);
         let ev = s.drain_events(10);
         assert!(
-            matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("key 8") && reason.contains("replaced")),
+            matches!(ev.as_slice(), [Event::InjectRefused { key: 8, reason, .. }] if reason.contains("key 8") && reason.contains("replaced")),
             "{ev:?}"
         );
         assert!(s.take(100).is_none());
         let ev = s.drain_events(100);
         assert!(
-            matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("key 9") && reason.contains("expired")),
+            matches!(ev.as_slice(), [Event::InjectRefused { key: 9, reason, .. }] if reason.contains("key 9") && reason.contains("expired")),
             "{ev:?}"
         );
         s.arm(1, 0, 0, 0);
         let ev = s.drain_events(DEFAULT_TTL_MS + 1);
-        assert!(matches!(ev.as_slice(), [Event::InjectRefused { reason }] if reason.contains("expired")), "{ev:?}");
+        assert!(matches!(ev.as_slice(), [Event::InjectRefused { reason, .. }] if reason.contains("expired")), "{ev:?}");
     }
 
     #[test]
@@ -1267,6 +1519,104 @@ toAdd[0].transf	m4:{t}
 "
         )
         .is_ok());
+    }
+
+    // ---- fail closed: a refused order empties the command; every build kind is matched by more than its kind
+
+    #[test]
+    fn a_refused_order_empties_the_command_with_the_engines_own_functions_and_keeps_its_kind_and_context() {
+        let mut dest = placeholder(true); // the mod's placeholder: one added node of this game's own rebuild of the record
+        dest.bytes_mut()[0x358] = 1; // context.gatherBuildings
+        dest.bytes_mut()[0x3d2] = 1; // playerInitiated
+        assert!(is_proposal(&crate::dump::LiveMem, dest.addr()).is_ok());
+        assert_eq!(portable::proposal_is_empty(&crate::dump::LiveMem, dest.addr()), Some(false), "it would build");
+        let counts = || [&CTORS, &ASSIGNS, &DTORS, &COPIES].map(|c| c.load(Ordering::SeqCst));
+        let before = counts();
+        // SAFETY: the stand-ins construct, copy and destroy plain buffers of this test.
+        unsafe { neutralise(&fns(), dest.addr()) };
+        let after = counts();
+        assert_eq!(
+            [after[0] - before[0], after[1] - before[1], after[2] - before[2], after[3] - before[3]],
+            [1, 1, 1, 0],
+            "an empty Proposal constructed, assigned into the command and destroyed; no copy constructor"
+        );
+        assert!(dest.bytes()[..PROPOSAL_SIZE].iter().all(|&b| b == 0), "the Proposal is the empty one");
+        assert_eq!(portable::proposal_is_empty(&crate::dump::LiveMem, dest.addr()), Some(true), "it applies nothing");
+        assert_eq!(
+            (dest.bytes()[0x9b8], dest.bytes()[0x358], dest.bytes()[0x3d2]),
+            (portable::KIND_BUILD_PROPOSAL, 1, 1),
+            "the kind, the Context and the flags stay"
+        );
+        // a payload that is not a sane build_proposal is never handed to the engine
+        let mut other = Scratch::new();
+        other.bytes_mut()[0x9b8] = 17;
+        assert!(is_proposal(&crate::dump::LiveMem, other.addr()).unwrap_err().contains("kind 17"));
+        let mut broken = placeholder(false);
+        broken.bytes_mut()[0x240..0x248].copy_from_slice(&0x2000_0000_0000u64.to_le_bytes()); // toRemove: begin without end
+        assert!(is_proposal(&crate::dump::LiveMem, broken.addr()).unwrap_err().contains("not one"));
+        let _ = (dest.ptr(), other.ptr(), broken.ptr());
+    }
+
+    fn v3(p: [f32; 3]) -> String {
+        format!("v3:{:08x},{:08x},{:08x}", p[0].to_bits(), p[1].to_bits(), p[2].to_bits())
+    }
+
+    /// A payload in the arena with one added node at `node` (when given) and the removals `to_remove` (construction ids).
+    fn command_at(arena: &Arena, node: Option<[f32; 3]>, to_remove: &[u32]) -> usize {
+        let mut payload = vec![0u8; PAYLOAD_SIZE];
+        payload[0x9b8] = portable::KIND_BUILD_PROPOSAL;
+        let mut put = |off: usize, block: Vec<u8>, stride: usize| {
+            let n = block.len() / stride;
+            let at = arena.add(&block) as u64;
+            for (k, v) in [at, at + (n * stride) as u64, at + (n * stride) as u64].iter().enumerate() {
+                payload[off + k * 8..off + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        if let Some(p) = node {
+            let mut n = vec![0u8; NODE_STRIDE];
+            for (j, f) in p.iter().enumerate() {
+                n[4 + j * 4..8 + j * 4].copy_from_slice(&f.to_bits().to_le_bytes());
+            }
+            put(ADDED_NODES, n, NODE_STRIDE);
+        }
+        if !to_remove.is_empty() {
+            put(TO_REMOVE, to_remove.iter().flat_map(|e| e.to_le_bytes()).collect(), 4);
+        }
+        arena.add(&payload)
+    }
+
+    #[test]
+    fn a_text_without_constructions_takes_only_a_command_at_its_place_not_the_next_build_proposal_by_kind() {
+        let arena = Arena::new(0x3000_0000_0000);
+        let (a, b) = ([100.0f32, 20.0, 5.0], [180.0f32, 20.0, 5.0]);
+        let road = format!(
+            "toAdd.#\tn:0\nproposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\t{}\nproposal.addedSegments.#\tn:1\n\
+             proposal.addedSegments[0].position0\t{}\nproposal.addedSegments[0].position1\t{}\n",
+            v3(b),
+            v3(a),
+            v3(b)
+        );
+        assert_eq!(text_place(&road).points.len(), 3);
+        // the mod's placeholder: this game's rebuild of the record, the same node (a float a little off still counts)
+        let ours = command_at(&arena, Some([180.05, 20.0, 5.0]), &[]);
+        assert_eq!(same_build(&arena, ours, &road), Ok(()));
+        // a town's road elsewhere: 0 constructions like the text, so the old check (constructions only) took it for the mod's
+        let town = command_at(&arena, Some([400.0, 20.0, 5.0]), &[]);
+        assert!(check_destination(&arena, town, 0, 0).is_ok(), "the counts alone cannot tell them apart");
+        let why = same_build(&arena, town, &road).unwrap_err();
+        assert!(why.contains("builds elsewhere") && why.contains("1 point(s)"), "{why}");
+        // a command that adds nothing at all (a script's no-op) is not the mod's road either
+        let empty = command_at(&arena, None, &[]);
+        assert!(same_build(&arena, empty, &road).unwrap_err().contains("builds elsewhere"));
+        // a removal (the bulldozer over a building) is matched by the entity it removes
+        let removal = "toAdd.#\tn:0\ntoRemove.#\tn:1\ntoRemove[0]\tent:old#54\n";
+        assert_eq!(text_place(removal).removed.into_iter().collect::<Vec<_>>(), [54]);
+        assert_eq!(same_build(&arena, command_at(&arena, None, &[54]), removal), Ok(()));
+        assert!(same_build(&arena, command_at(&arena, None, &[55]), removal).unwrap_err().contains("builds elsewhere"));
+        // a text that names no place at all is not checked (nothing to compare): the limit of this check
+        assert_eq!(same_build(&arena, town, "toAdd.#\tn:0\n"), Ok(()));
+        // a text with constructions is still matched by its constructions (file and transform)
+        assert!(same_build(&arena, town, "toAdd.#\tn:1\ntoAdd[0].fileName\tres:\"a.con\"\n").is_err());
     }
 
     // ---- the dry pass: the peer's text through our own code, inside a guard, before the engine is called

@@ -77,7 +77,9 @@ pub enum CtlMessage {
     /// the module builds natively from the portable text in `native_inject_<key>.txt` (`inject.rs`). Expires after `ttl` ms (0: default).
     /// `held` (0: none) is this game's deferred held command of the same build (`defer`): it completes with this command's result.
     /// `tm` (optional) is the mod's timing text of the build; the module adds the rebuild and apply times and writes it back (`timing`).
-    InjectNext { key: u64, ttl: u64, held: u64, tm: String },
+    /// `refuse` (optional, a test switch: `FEVERLINK3_DEBUG_REFUSE_INJECT`): the module refuses the order with this reason once a command
+    /// passed the identity checks, exactly like any other refusal (the command is emptied, `held` is failed).
+    InjectNext { key: u64, ttl: u64, held: u64, tm: String, refuse: String },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -136,6 +138,20 @@ fn timing_text(p: &Value) -> Result<String, CtlError> {
             let t = v.as_str().ok_or(CtlError::BadPayload("tm must be a string"))?;
             if t.len() > 1024 || t.chars().any(|c| c.is_control()) {
                 return Err(CtlError::BadPayload("tm must be printable text of at most 1024 bytes"));
+            }
+            Ok(t.to_string())
+        }
+    }
+}
+
+/// An optional short text member (plain printable text, at most 200 bytes; absent: empty).
+fn short_text(p: &Value, key: &str) -> Result<String, CtlError> {
+    match p.get(key) {
+        None => Ok(String::new()),
+        Some(v) => {
+            let t = v.as_str().ok_or(CtlError::BadPayload("a text member must be a string"))?;
+            if t.len() > 200 || t.chars().any(|c| c.is_control()) {
+                return Err(CtlError::BadPayload("a text member must be printable text of at most 200 bytes"));
             }
             Ok(t.to_string())
         }
@@ -234,6 +250,7 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
             held: optional(&p, "held", "held must be a held command id")?,
             tm: timing_text(&p)?,
+            refuse: short_text(&p, "refuse")?,
         }),
         "ping" => {
             let n = match p.get("n") {
@@ -622,8 +639,13 @@ pub enum Event {
         segments: u64,
         constructions: u64,
     },
-    /// `inject_next` was not carried out; the command was left untouched.
+    /// `inject_next` was not carried out. `key`: the order (0: none); `held`: the deferred held command of the same build (0: none), which
+    /// the module fails; `outcome`: what became of the command (`nothing`: emptied, nothing of the build applied here; `untouched`: it
+    /// could not be emptied; `no_command`: no command took the order). See `inject::Outcome`.
     InjectRefused {
+        key: u64,
+        held: u64,
+        outcome: &'static str,
         reason: String,
     },
     /// Cumulative counts of the commands the simulation applied, by kind byte.
@@ -705,7 +727,9 @@ impl Event {
             Event::Injected { key, nodes, segments, constructions } => format!(
                 "event injected: key {key}: {nodes} nodes, {segments} segments, {constructions} construction(s)"
             ),
-            Event::InjectRefused { reason } => format!("event inject_refused: {reason}"),
+            Event::InjectRefused { key, held, outcome, reason } => {
+                format!("event inject_refused: key {key} held {held} outcome {outcome}: {reason}")
+            }
             Event::PatchSkipped { reason, kind, site } => {
                 format!("event patch_skipped: {reason} (kind {kind:?}, call site rva {site:x?})")
             }
@@ -802,7 +826,12 @@ impl Event {
                 ("nodes", Lua::uint(*nodes)),
                 ("segments", Lua::uint(*segments)),
             ]),
-            Event::InjectRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
+            Event::InjectRefused { key, held, outcome, reason } => Lua::map([
+                ("held", Lua::uint(*held)),
+                ("key", Lua::uint(*key)),
+                ("outcome", Lua::str(*outcome)),
+                ("reason", Lua::str(reason)),
+            ]),
             Event::PatchSkipped { reason, kind, site } => Lua::map([
                 ("kind", Lua::Int(kind.map_or(-1, i64::from))),
                 ("reason", Lua::str(reason)),
@@ -920,15 +949,23 @@ mod tests {
         }
         assert_eq!(
             parse("inject_next", r#"{["key"]=12,["ttl"]=500}"#),
-            Ok(CtlMessage::InjectNext { key: 12, ttl: 500, held: 0, tm: String::new() })
+            Ok(CtlMessage::InjectNext { key: 12, ttl: 500, held: 0, tm: String::new(), refuse: String::new() })
         );
         assert_eq!(
             parse("inject_next", r#"{["key"]=3}"#),
-            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 0, tm: String::new() })
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 0, tm: String::new(), refuse: String::new() })
         );
         assert_eq!(
             parse("inject_next", r#"{["key"]=3,["held"]=9}"#),
-            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9, tm: String::new() })
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9, tm: String::new(), refuse: String::new() })
+        );
+        assert_eq!(
+            parse("inject_next", r#"{["held"]=9,["key"]=3,["refuse"]="debug switch"}"#),
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9, tm: String::new(), refuse: "debug switch".into() })
+        );
+        assert!(
+            matches!(parse("inject_next", r#"{["key"]=3,["refuse"]=1}"#), Err(CtlError::BadPayload(_))),
+            "refuse is text"
         );
         assert_eq!(parse("defer", r#"{["id"]=4}"#), Ok(CtlMessage::Defer { id: 4 }));
         assert_eq!(parse("fail", r#"{["id"]=4}"#), Ok(CtlMessage::Fail { id: 4 }));
@@ -939,8 +976,11 @@ mod tests {
         assert!(matches!(parse("complete_next", "{}"), Err(CtlError::BadPayload(_))), "held is required");
         assert!(matches!(parse("inject_next", r#"{["key"]=3,["tm"]=5}"#), Err(CtlError::BadPayload(_))), "tm is text");
         assert!(matches!(parse("inject_next", "{}"), Err(CtlError::BadPayload(_))));
-        let i = Event::InjectRefused { reason: "r".into() };
-        assert_eq!((i.kind(), i.payload().as_str()), ("inject_refused", r#"{["reason"]="r"}"#));
+        let i = Event::InjectRefused { key: 4, held: 2, outcome: "nothing", reason: "r".into() };
+        assert_eq!(
+            (i.kind(), i.payload().as_str()),
+            ("inject_refused", r#"{["held"]=2,["key"]=4,["outcome"]="nothing",["reason"]="r"}"#)
+        );
         assert_eq!(Event::Injected { key: 1, nodes: 2, segments: 3, constructions: 0 }.kind(), "injected");
         let d = Event::ConvertDump { text: "t".into() };
         assert_eq!((d.kind(), d.payload().as_str()), ("convert_dump", r#"{["text"]="t"}"#));

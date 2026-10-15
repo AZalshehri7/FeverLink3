@@ -117,8 +117,6 @@ pub struct Runtime {
     /// The script command an order was used for and its timing so far (the mod's `tm`, the rebuild's wall-clock start and end and how it
     /// went): after the simulation applied that command, one `timing apply` line is written (`timing_after_apply`).
     stamp_timing: Mutex<Option<StampTiming>>,
-    /// The key of the order whose injection succeeded just now (for the timing record's `how`).
-    inject_last_ok: Mutex<Option<u64>>,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
@@ -184,7 +182,6 @@ impl Runtime {
             inject_dir_path: Mutex::new(None),
             defer_link: Mutex::new(None),
             stamp_timing: Mutex::new(None),
-            inject_last_ok: Mutex::new(None),
             preview_fn: AtomicUsize::new(0),
             preview_args: Mutex::new(None),
             preview_holding: AtomicBool::new(false),
@@ -663,8 +660,8 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm }) => {
-                    self.inject.arm_timed(key, ttl, held, tm, now)
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm, refuse }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, refuse, now)
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 _ => rest.push(line),
@@ -679,8 +676,8 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm }) => {
-                    self.inject.arm_timed(key, ttl, held, tm, now)
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm, refuse }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, refuse, now)
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(msg) => machine.handle(&msg, now),
@@ -2208,7 +2205,7 @@ mod tests {
 ";
 
     #[test]
-    fn an_inject_next_is_read_by_the_commands_own_add_and_a_refusal_leaves_the_command_alone() {
+    fn an_inject_next_is_read_by_the_commands_own_add_and_a_command_that_cannot_be_emptied_is_reported_untouched() {
         let dir = TempDir::new("rt-inject");
         let rt = runtime(Some(dir.path()));
         rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
@@ -2224,16 +2221,99 @@ mod tests {
         let before = c.c.payload.to_vec();
         unsafe { rt.on_add(c.args(), at(0x777)) };
         assert_eq!(calls().last().map(String::as_str), Some("add kind 52 tag 3"), "the original Add still runs");
-        assert_eq!(c.c.payload.to_vec(), before, "untouched");
+        // refused (no side file); the test process has no verified engine functions, so the command cannot be emptied: it says so
+        assert_eq!(c.c.payload.to_vec(), before, "not emptied");
         assert!(!rt.inject.pending());
         rt.pump();
         let ev = events(dir.path());
         assert!(
             ev.iter().any(|(k, w)| k == "inject_refused"
                 && w.contains("key 5")
+                && w.contains("[\"outcome\"]=\"untouched\"")
+                && w.contains("no side file")),
+            "{ev:?}"
+        );
+    }
+
+    // stand-ins for the engine's Proposal functions: an empty Proposal is zeros, the assignment copies the Proposal's bytes
+    unsafe extern "system-unwind" fn p_ctor(p: *mut u8) -> *mut u8 {
+        unsafe { core::ptr::write_bytes(p, 0, crate::native_copy::PROPOSAL_SIZE) };
+        note("proposal ctor");
+        p
+    }
+    unsafe extern "system-unwind" fn p_dtor(_p: *mut u8) {
+        note("proposal dtor");
+    }
+    unsafe extern "system-unwind" fn p_copy(d: *mut u8, s: *const u8) -> *mut u8 {
+        unsafe { core::ptr::copy_nonoverlapping(s, d, crate::native_copy::PROPOSAL_SIZE) };
+        note("proposal assign");
+        d
+    }
+
+    /// The mod's placeholder of a road: one added node at `x` (this game's rebuild of the record).
+    fn road_placeholder(x: f32) -> (Call, Box<[u8; 0x40]>) {
+        let mut c = Call::new(52, 0);
+        let mut node = Box::new([0u8; 0x40]);
+        node[4..8].copy_from_slice(&x.to_bits().to_le_bytes());
+        let b = node.as_ptr() as u64;
+        for (k, v) in [b, b + 0x40, b + 0x40].iter().enumerate() {
+            c.c.payload[k * 8..k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        (c, node)
+    }
+
+    #[test]
+    fn a_refused_order_empties_the_mods_command_fails_its_held_command_and_reports_the_outcome() {
+        let dir = TempDir::new("rt-inject-closed");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        inject::TEST_FNS.with(|f| {
+            f.set(Some(crate::native_copy::ProposalFns { ctor: p_ctor, dtor: p_dtor, copy: p_copy, assign: p_copy }))
+        });
+        // the originator's text of a road with a node at x = 100; the order names this game's deferred held command 3
+        let text = format!(
+            "proposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\tv3:{:08x},00000000,00000000\n",
+            100f32.to_bits()
+        );
+        std::fs::write(dir.path().join(crate::inject::inject_file_name(5)), text).unwrap();
+        ctl(dir.path(), "1\tinject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
+        let mut sim = [0u8; 8];
+        // a town's road elsewhere goes by first: not the mod's command, untouched, the order keeps waiting
+        let (mut town, _n1) = road_placeholder(400.0);
+        let town_before = town.c.payload.to_vec();
+        unsafe { rt.on_apply(sim.as_mut_ptr(), town.c.command.as_mut_ptr()) };
+        assert_eq!(town.c.payload.to_vec(), town_before, "someone else's command is never touched");
+        assert!(rt.inject.pending(), "put back");
+        calls();
+        // the mod's placeholder at the text's place: the identity holds, the order is refused (this test's layout is not the game's) and
+        // the command is emptied before the simulation applies it
+        let (mut ours, _n2) = road_placeholder(100.0);
+        ours.c.payload[0x358] = 1;
+        unsafe { rt.on_apply(sim.as_mut_ptr(), ours.c.command.as_mut_ptr()) };
+        assert_eq!(
+            calls(),
+            ["proposal ctor", "proposal assign", "proposal dtor", "apply tag 0"],
+            "emptied, then applied"
+        );
+        assert!(
+            ours.c.payload[..crate::native_copy::PROPOSAL_SIZE].iter().all(|&b| b == 0),
+            "nothing of the placeholder is applied"
+        );
+        assert_eq!((ours.c.payload[0x9b8], ours.c.payload[0x358]), (52, 1), "the kind and the Context stay");
+        assert!(lock(&rt.defer_link).is_none(), "the held command never takes the result of the emptied command");
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("[\"held\"]=3")
+                && w.contains("[\"key\"]=5")
+                && w.contains("[\"outcome\"]=\"nothing\"")
                 && w.contains("the layout is that of game build")),
             "{ev:?}"
         );
+        // the held command is failed at once (here it is not in the ring, so the machine says it does not know it)
+        assert!(ev.iter().any(|(k, w)| k == "error" && w.contains("no held command 3")), "{ev:?}");
+        inject::TEST_FNS.with(|f| f.set(None));
     }
 
     #[test]
@@ -2258,10 +2338,13 @@ mod tests {
         let before = script.c.payload.to_vec();
         unsafe { rt.on_apply(sim.as_mut_ptr(), script.c.command.as_mut_ptr()) };
         assert_eq!(calls().last().map(String::as_str), Some("apply tag 7"), "the original apply still runs");
-        assert_eq!(script.c.payload.to_vec(), before, "refused: untouched");
+        assert_eq!(script.c.payload.to_vec(), before, "refused, and no engine functions to empty it with");
         rt.pump();
         let ev = events(dir.path());
-        assert!(ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("layout")), "{ev:?}");
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("no side file")),
+            "{ev:?}"
+        );
         // an order that no script command ever uses: the reason says which applies went by
         rt.inject.arm(9, 0, 0, rt.now_ms());
         let mut other = Call::new(17, 1);
