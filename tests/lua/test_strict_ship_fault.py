@@ -245,10 +245,24 @@ class ShippedHeldWatchdogTest(ShipFaultBase):
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(1)
         self.frames(500)   # the game is stopped (frames go on, the clock does not) for longer than the limit
-        self.assertIn("FAILED by the watchdog, NOT released", self.B.log())
+        self.assertIn("FAILED on the veto, NOT released", self.B.log())
         self.assertFailedOnB()
         self.assertEqual(self.A.builds_applied(), 0, "the other game dropped it on the veto")
         self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats))
+
+    def test_a_vetoed_build_whose_callback_cannot_be_fired_is_failed_not_released(self):
+        # was a release: the build existed on this game only (the vetoing game dropped it) and a resync followed
+        self.start()
+        self.A.run("WORLD[110] = nil")   # the host cannot build this split
+        self.B.tool(S.SPLIT, make="NATIVE_SPLIT")
+        self.tick(20)
+        self.assertEqual(len(self.relay.vetoes), 1)
+        self.assertIn("FAILED on the veto, NOT released", self.B.log())
+        self.assertIn("fail written", self.B.log())
+        self.assertFailedOnB()
+        self.assertEqual(self.A.builds_applied(), 0, "no game has the build")
+        self.assertEqual(self.relay.replay_failed, [], "so no repair")
+        self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats), self.relay.chats)
 
     def test_a_fault_after_the_commit_of_a_paused_build_fails_it_and_asks_for_a_repair(self):
         self.pause()

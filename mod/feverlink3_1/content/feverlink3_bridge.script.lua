@@ -2723,11 +2723,13 @@ function natVeto(key, who, why)
 	end
 	if not natCancelAllowed(h) then
 		-- The module cannot fire this tool's callback, so a cancel would leave the tool dead (real session 2026-10-13: an underground
-		-- station entrance, the owner got stuck and a resync followed). The command goes back to the engine instead: the build exists
-		-- on this game only (false = "too late" for the caller, which tells the players and asks the host to repair the other game).
-		natSay("held " .. h.id .. " (" .. key .. ") NOT cancelled: this tool's callback cannot be fired, a cancel would leave the tool dead; " .. tostring(who) .. " could not build it (" .. tostring(why) .. "), the build is released here and the other game is repaired")
-		natRelease(key)
-		return false
+		-- station entrance, the owner got stuck and a resync followed). It was released instead until 2026-10-15: the build then existed
+		-- on this game only (every other game drops it on the veto) and a resync followed. Now it is FAILED (X.natFailHeld: `fail` fires
+		-- the callback with a failed result, nothing is applied here); no game has the build, so no repair. Only a module without `fail`
+		-- still gets a cancel without the callback (the tool may stay busy), never a release.
+		local how = X.natFailHeld(h.id, key, h.at, false, h, false)
+		natSay("held " .. h.id .. " (" .. key .. ") FAILED on the veto, NOT released: " .. tostring(who) .. " could not build it (" .. tostring(why) .. "); " .. tostring(how))
+		return true
 	end
 	h.cancelled = true
 	pcall(toSim, "heldgone", { key = key })
@@ -3304,14 +3306,8 @@ local function heldWatchdog(N, now)
 				G.vetoed[key] = why
 				pcall(toSim, "drop", { key = key, why = why, own = true })
 				send("build_veto", { seq = tonumber(key:match(":(%d+)$")), owner = C.PLAYER_ID, why = why, name = C.PLAYER_NAME })
-				if h.fireable == true then
-					natVeto(key, C.PLAYER_NAME, why)
-				else
-					-- natVeto would RELEASE a command whose callback cannot be fired (the build on this game only): failed instead, as the
-					-- other games drop it on the veto (no repair needed)
-					local how = X.natFailHeld(h.id, key, h.at, false, h, false)
-					natSay("held " .. h.id .. " (" .. key .. ") FAILED by the watchdog, NOT released (" .. why .. "): " .. how)
-				end
+				-- cancelled, or FAILED where the callback cannot be fired (natVeto): never released, the other games drop it on the veto
+				natVeto(key, C.PLAYER_NAME, why)
 				vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
 			end
 		end

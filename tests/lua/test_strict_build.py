@@ -1154,21 +1154,24 @@ class VetoTest(StrictTest):
 
 
 class NoCancelWithoutCallbackTest(StrictTest):
-    """One rule for every tool kind: a held command is cancelled only when the module can fire the tool's callback. A veto (a game that
-    cannot rebuild the build) then releases the command instead (real session 2026-10-13: a cancelled underground station entrance left the
-    tool dead); the vetoing game dropped it, so the games differ and the host is asked to repair."""
+    """A held command is cancelled only when the module can fire the tool's callback. A veto (a game that cannot rebuild the build) of
+    one whose callback cannot be fired was a release until 2026-10-15 (the build then existed on this game only, every other game dropped
+    it, a resync followed); now it is failed (`fail`, test_strict_ship_fault.py), and a module without `fail` (this fake one) gets a
+    cancel: nothing is applied on any game, never a release."""
 
     fires = False
 
-    def test_a_veto_releases_the_build_instead_of_killing_the_tool(self):
+    def test_a_veto_never_releases_the_build_on_this_game_only(self):
         self.start()
         self.A.run("WORLD[110] = nil")
         self.B.tool(SPLIT, make="NATIVE_SPLIT")
         self.tick(20)
         self.assertEqual(len(self.relay.vetoes), 1)
-        self.assertEqual(self.B.native.dropped, [], "nothing was cancelled: the tool keeps its callback")
-        self.assertEqual(self.B.native.released, [1], "the command went back to the engine")
-        self.assertIn("NOT cancelled", self.B.log())
+        self.assertEqual(self.B.native.released, [], "never given back to the engine")
+        self.assertEqual(self.B.native.dropped, [1], "a module without `fail`: cancelled")
+        self.assertIn("FAILED on the veto, NOT released", self.B.log())
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "no game has the build")
+        self.assertEqual(self.relay.replay_failed, [], "so no repair")
 
 
 class StrictCancelFallbackTest(StrictTest):
