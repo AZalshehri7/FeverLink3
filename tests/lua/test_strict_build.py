@@ -860,7 +860,7 @@ class StrictOnTest(StrictTest):
 
     # ---- pause, a late capture, a game without the module
 
-    def test_a_build_made_while_the_session_is_paused_is_applied_by_both_games_at_the_pause_time(self):
+    def test_a_build_made_while_the_session_is_paused_is_applied_by_both_games_at_the_hosts_stamp(self):
         self.start(speed=2)
         self.tick(10)
         self.relay.pump()
@@ -871,9 +871,10 @@ class StrictOnTest(StrictTest):
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(14)   # the grace for vetoes (real time), then the commit
         self.assertEqual(self.B.native.released, [1])
-        expected = ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt]
-        self.assertEqual(self.A.builds(), expected)
-        self.assertEqual(self.B.builds(), expected, "the originator applied it during the pause too, and only once")
+        # the host stamps it one step past where the games stand still; they run on to it during the pause
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % (self.relay.pauseAt + STEP)])
+        self.assertEqual(self.B.builds_applied(), 1, "the originator applied it during the pause too, and only once")
+        self.assertEqual((self.A.speed(), self.B.speed()), (0, 0), "still paused")
         self.assertSameWorld()
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1))
 
@@ -1803,10 +1804,12 @@ class PausedGraceTest(StrictTest):
         self.assertIn("parked until its originator commits it", self.A.log())
         self.assertIn("for a veto before it is committed", self.B.log())
         self.tick(14)
-        self.assertEqual(self.relay.commits, [(1, 1, 1, self.relay.pauseAt)], "one commit, at the pause time")
+        stamp = self.relay.pauseAt + STEP
+        self.assertEqual(self.relay.commits, [(1, 1, 1, stamp)], "one commit, stamped by the host one step past where the games stand")
         self.assertEqual(self.B.native.released, [1])
-        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt])
-        self.assertEqual(self.B.builds(), ["makeWorldBuildProposalCmd@%d" % self.relay.pauseAt])
+        self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stamp])
+        # hold-and-release: the originator's own command is released at the stamp and the engine applies it at its next tick
+        self.assertEqual(self.B.builds_applied(), 1)
         self.assertSameWorld()
         self.assertEqual(self.relay.vetoes, [])
         self.assertEqual(self.B.shipped_count(), 1)

@@ -27,6 +27,10 @@ impl Player {
         codec::try_decode(payload).unwrap_or_else(|| panic!("{kind:?} decodes"))
     }
 
+    fn all<T: DeserializeOwned>(&self, kind: MessageKind) -> Vec<T> {
+        self.game.iter().filter(|g| g.0 == kind).filter_map(|g| codec::try_decode(&g.1)).collect()
+    }
+
     fn count(&self, kind: MessageKind) -> usize {
         self.game.iter().filter(|g| g.0 == kind).count()
     }
@@ -394,7 +398,7 @@ fn the_resume_reaches_every_game_after_every_paused_action_numbered_before_it() 
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    let clock = ClockMessage { t: 18_600, speed: 0, ahead: 3, need: None, safe: None, pause: false };
+    let clock = ClockMessage { t: 18_600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None };
     h.host_game(MessageKind::Clock, &json(&clock));
     h.player_game(a, MessageKind::Clock, &json(&clock));
     h.player_game(b, MessageKind::Clock, &json(&clock));
@@ -422,6 +426,118 @@ fn the_resume_reaches_every_game_after_every_paused_action_numbered_before_it() 
     }
 }
 
+/// A clock of a game standing still at a pause (its promise is the pause, `stop` where it really stands).
+fn stopped(t: i64, pause_at: i64) -> Vec<u8> {
+    json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: Some(pause_at), pause: true, stop: Some(t) })
+}
+
+/// Three ready games (the host's and two players'), running at x3, then paused; returns the players and the pause stamp.
+fn three_paused() -> (Harness, ConnectionId, ConnectionId, i64) {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    let b = h.connect("B");
+    for c in [a, b] {
+        h.player_game(c, MessageKind::Hello, &json(&HelloMessage::new(30_000)));
+    }
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(30_000)));
+    let running =
+        |t: i64| json(&ClockMessage { t, speed: 3, ahead: 3, need: None, safe: None, pause: false, stop: None });
+    h.host_game(MessageKind::Clock, &running(30_000));
+    h.player_game(a, MessageKind::Clock, &running(30_000));
+    h.player_game(b, MessageKind::Clock, &running(30_000));
+    h.host_call(HostSession::start);
+    h.host_call(|host| host.set_speed(3));
+    h.host_call(HostSession::pause);
+    let p = h.host.state().pause_at.unwrap();
+    (h, a, b, p)
+}
+
+fn paused_actions(game: &[(MessageKind, Vec<u8>)]) -> Vec<(i64, i64, u64)> {
+    game.iter()
+        .filter(|g| g.0 == MessageKind::Action)
+        .filter_map(|g| codec::try_decode::<ActionMessage>(&g.1))
+        .filter_map(|m| m.pause_seq.map(|n| (m.seq, m.stamp, n)))
+        .collect()
+}
+
+#[test]
+fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stands() {
+    let (mut h, a, b, p) = three_paused();
+    // speed 0 takes effect late, by a different amount on each game (real run pause3: 3 steps at x3)
+    h.host_game(MessageKind::Clock, &stopped(p, p));
+    h.player_game(a, MessageKind::Clock, &stopped(p + 2 * Lockstep::STEP, p));
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(p, 1, "{a1}").paused()));
+    assert_eq!(
+        Vec::<(i64, i64, u64)>::new(),
+        paused_actions(&h.p(b).game),
+        "held: B has not said where it stands (it may still move)"
+    );
+    // a stop that is not the clock's own time counts for nothing
+    let mut odd =
+        ClockMessage { t: p + 600, speed: 0, ahead: 3, need: None, safe: Some(p), pause: true, stop: Some(p) };
+    h.player_game(b, MessageKind::Clock, &json(&odd));
+    assert!(paused_actions(&h.p(b).game).is_empty());
+    odd.stop = Some(p + 600);
+    h.player_game(b, MessageKind::Clock, &json(&odd));
+    let first = p + 600 + Lockstep::STEP;
+    for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
+        assert_eq!(
+            vec![(1, first, 1)],
+            paused_actions(game),
+            "one step past the furthest stop, to every game, the sender too"
+        );
+    }
+    // the next one waits until every game stands still at or past that stamp again (they run on to apply it)
+    h.player_game(b, MessageKind::Action, &json(&ActionMessage::new(p, 1, "{b1}").paused()));
+    assert_eq!(1, paused_actions(&h.p(a).game).len());
+    h.host_game(MessageKind::Clock, &stopped(first, p));
+    h.player_game(a, MessageKind::Clock, &stopped(first + 3 * Lockstep::STEP, p));
+    h.player_game(b, MessageKind::Clock, &stopped(first + Lockstep::STEP, p));
+    let second = first + 4 * Lockstep::STEP;
+    for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
+        assert_eq!(vec![(1, first, 1), (1, second, 2)], paused_actions(game));
+    }
+}
+
+#[test]
+fn a_checksum_round_at_a_pause_is_stamped_where_the_furthest_game_stands() {
+    let (mut h, a, b, p) = three_paused();
+    h.host_game(MessageKind::Clock, &stopped(p, p));
+    h.player_game(a, MessageKind::Clock, &stopped(p + 400, p));
+    h.host_call(HostSession::request_checksum);
+    let paused_rounds = |h: &Harness| {
+        h.p(b).all::<ChecksumRequestMessage>(MessageKind::ChecksumRequest).into_iter().filter(|r| r.paused).count()
+    };
+    assert_eq!(0, paused_rounds(&h), "waits until every game said where it stands");
+    h.player_game(b, MessageKind::Clock, &stopped(p + 200, p));
+    let round = h
+        .p(b)
+        .all::<ChecksumRequestMessage>(MessageKind::ChecksumRequest)
+        .into_iter()
+        .find(|r| r.paused)
+        .expect("the round");
+    assert_eq!(p + 400, round.at);
+}
+
+#[test]
+fn an_action_of_the_pause_still_held_at_the_resume_gets_a_normal_stamp_after_the_resume_line() {
+    let (mut h, a, b, p) = three_paused();
+    h.host_game(MessageKind::Clock, &stopped(p, p));
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(p, 1, "{a1}").paused()));
+    h.host_call(|host| host.set_speed(3));
+    let got = paused_actions(&h.p(b).game);
+    assert_eq!(1, got.len());
+    assert!(
+        got[0].1 >= h.host.future_stamp() - Lockstep::STEP && got[0].1 > p,
+        "a stamp past every clock and promise: {got:?}"
+    );
+    let kinds: Vec<MessageKind> =
+        h.p(a).game.iter().map(|g| g.0).filter(|k| matches!(k, MessageKind::Action | MessageKind::Session)).collect();
+    let resume = kinds.iter().rposition(|k| *k == MessageKind::Session).unwrap();
+    let action = kinds.iter().rposition(|k| *k == MessageKind::Action).unwrap();
+    assert!(action > resume, "after the resume line");
+}
+
 #[test]
 fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
     let mut h = Harness::new();
@@ -430,7 +546,7 @@ fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
     );
     let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
     assert_eq!(h.p(a).session.id().unwrap(), pc.from);
@@ -450,25 +566,33 @@ fn a_measured_stamp_margin_is_relayed_with_the_clock_and_clamped() {
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 49800, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+        &json(&ClockMessage { t: 49800, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
     );
     assert_eq!(None, h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need, "nothing measured: none relayed");
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: Some(2), safe: None, pause: false }),
+        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: Some(2), safe: None, pause: false, stop: None }),
     );
     assert_eq!(Some(2), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50200, speed: 1, ahead: 3, need: Some(1_000_000), safe: None, pause: false }),
+        &json(&ClockMessage {
+            t: 50200,
+            speed: 1,
+            ahead: 3,
+            need: Some(1_000_000),
+            safe: None,
+            pause: false,
+            stop: None,
+        }),
     );
     assert_eq!(Some(ClockMessage::MAX_NEED), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50400, speed: 1, ahead: 3, need: Some(-5), safe: None, pause: false }),
+        &json(&ClockMessage { t: 50400, speed: 1, ahead: 3, need: Some(-5), safe: None, pause: false, stop: None }),
     );
     assert_eq!(Some(0), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
 }
@@ -478,8 +602,15 @@ fn the_input_barriers_promise_is_relayed_after_the_actions_shipped_before_it_and
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    let clock =
-        |t: i64, safe: Option<i64>, pause: bool| ClockMessage { t, speed: 1, ahead: 3, need: None, safe, pause };
+    let clock = |t: i64, safe: Option<i64>, pause: bool| ClockMessage {
+        t,
+        speed: 1,
+        ahead: 3,
+        need: None,
+        safe,
+        pause,
+        stop: None,
+    };
     // an action, then the clock whose promise covers it: the other game gets them in that order (the barrier counts on it)
     h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(51_400, 1, "{x}")));
     h.player_game(a, MessageKind::Clock, &json(&clock(50_000, Some(51_400), false)));
@@ -510,7 +641,8 @@ fn the_input_barriers_promise_is_relayed_after_the_actions_shipped_before_it_and
 fn a_pause_or_checksum_stamp_is_never_before_a_promise_a_game_made() {
     let mut h = Harness::new();
     let a = h.connect("A");
-    let clock = |t: i64, safe: Option<i64>| ClockMessage { t, speed: 1, ahead: 3, need: None, safe, pause: false };
+    let clock =
+        |t: i64, safe: Option<i64>| ClockMessage { t, speed: 1, ahead: 3, need: None, safe, pause: false, stop: None };
     h.host_game(MessageKind::Clock, &json(&clock(50_000, Some(50_000 + 2 * Lockstep::STEP))));
     h.player_game(a, MessageKind::Clock, &json(&clock(50_000, None)));
     let by_lead = Lockstep::round_up_to_step((50_000 + Lockstep::lead_units(1)) as f64);
@@ -531,13 +663,13 @@ fn start_speed_and_pause_are_broadcast_and_speed_requests_obeyed() {
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(18600)));
     h.host_game(
         MessageKind::Clock,
-        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false }),
+        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
     );
     h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(18600)));
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false }),
+        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
     );
 
     h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 2 }));
@@ -655,7 +787,7 @@ fn disconnect_removes_the_player_and_tells_the_others() {
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+        &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
     );
     h.disconnect(a);
     assert_eq!(2, h.host.players().len());

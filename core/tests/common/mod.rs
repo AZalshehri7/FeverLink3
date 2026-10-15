@@ -172,7 +172,7 @@ impl Harness {
         self.host_game(MessageKind::Hello, &json(&HelloMessage::new(t)));
         self.host_game(
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false }),
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
         );
         let ids: Vec<ConnectionId> = self.players.keys().copied().collect();
         for c in ids {
@@ -185,7 +185,7 @@ impl Harness {
         self.player_game(
             c,
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false }),
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
         );
     }
 
@@ -193,14 +193,14 @@ impl Harness {
     pub fn stop_all_at(&mut self, t: i64) {
         self.host_game(
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false }),
+            &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
         );
         let ids: Vec<ConnectionId> = self.players.keys().copied().collect();
         for c in ids {
             self.player_game(
                 c,
                 MessageKind::Clock,
-                &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false }),
+                &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
             );
         }
     }

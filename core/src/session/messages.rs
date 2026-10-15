@@ -321,6 +321,10 @@ pub struct ClockMessage {
     /// The game is stopped at a pause and `safe` is that pause: the others may reach it exactly and not pass it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pause: bool,
+    /// The game stands still at a pause, at this game time (its speed 0 took effect and its time did not move for a while). The host
+    /// stamps the actions of the pause past the largest of these (the pause order), so every game can still apply them at their stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<i64>,
 }
 
 impl ClockMessage {

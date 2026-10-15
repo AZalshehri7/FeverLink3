@@ -1300,14 +1300,16 @@ class CompanyGameTest(unittest.TestCase):
         self.relay.session()
         self.tick(40, lag_b=True)
         self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
-        # both are applied by the interface halves, at once
+        # both are applied during the pause, at the stamps the host gives them
         self.A.send_gui('api.cmd.sendCommand(api.cmd.feverlink3Company({ op = "limit", player = 1, amount = 50000 }), function(d, s) PAUSED_OP = s end)')
         self.tick(8)
         self.assertTrue(self.A.ev("PAUSED_OP"))
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s) PAUSED_BUY = s end)")
         self.tick(8)
         self.assertTrue(self.B.ev("PAUSED_BUY"))
-        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt), "still paused")
+        # applied at the host's stamps, a step or two past the pause: the games ran on to them and stand still again
+        self.assertEqual((self.A.speed(), self.B.speed()), (0, 0), "still paused")
+        self.assertEqual(self.A.time(), self.B.time())
         self.assertEqual(self.A.applied(), self.B.applied())
         self.assertSameRegistry()
         reg = self.A.registry()
@@ -1317,15 +1319,21 @@ class CompanyGameTest(unittest.TestCase):
         # the company page, written by the interface half from its mirror, shows the same
         self.assertEqual(row(self.B.status(), 1)["total"], 30000)
         self.assertEqual(row(self.A.status(), 1)["limit"]["amount"], 50000)
-        # forged actions of player 1 delivered to the host's game during the pause: the first is still under the limit, the
-        # second is not; it is refused on the interface half and replayed as a refusal into the state the savegame keeps
+        # forged actions of player 1 made during the pause (the host stamps them, every game applies them): the first is still under
+        # the limit, the second is not; it is refused, and the refusal is in the state the savegame keeps
         body = self.relay.C.serialize(self.relay.C.parse(
             '{["fn"]="makeVehicleBuyCmd",["args"]={["n"]=3,[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={}}}'))
-        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.relay.pauseAt, "seq": 9, "body": body, "from": 1}))
+
+        def forge(seq):
+            p = self.relay.lua({"stamp": self.relay.pauseAt, "seq": seq, "body": body, "from": 1, "pause": True})
+            self.relay.pause_held.append(("action", self.B, p))
+            self.relay.flush_pause()
+
+        forge(9)
         self.tick(8)
         self.assertEqual(self.A.registry()["ledger"][1]["refused"], 0, "30 000 of 50 000 is still under the limit")
         self.assertEqual(self.A.applied()[-1].split("@")[0], "makeVehicleBuyCmd")
-        self.relay.send(self.A, "action", 1, self.relay.ser({"stamp": self.relay.pauseAt, "seq": 10, "body": body, "from": 1}))
+        forge(10)
         self.tick(8)
         self.assertEqual(self.A.registry()["ledger"][1]["refused"], 1, "60 000 of 50 000: refused, and the refusal is in the state the savegame keeps")
         self.assertEqual(row(self.A.status(), 1)["refused"], 1)

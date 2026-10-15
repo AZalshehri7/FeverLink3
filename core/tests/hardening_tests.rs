@@ -109,7 +109,7 @@ fn clocks_that_are_not_game_times_are_dropped() {
         h.player_game(
             liar,
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false }),
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
         );
     }
     assert_eq!(h.host.dropped(), dropped + 7);
@@ -120,7 +120,15 @@ fn clocks_that_are_not_game_times_are_dropped() {
     h.player_game(
         liar,
         MessageKind::Clock,
-        &json(&ClockMessage { t: PlayerClock::MAX_TIME, speed: 16, ahead: 3, need: None, safe: None, pause: false }),
+        &json(&ClockMessage {
+            t: PlayerClock::MAX_TIME,
+            speed: 16,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+        }),
     );
     assert_eq!(h.host.dropped(), dropped + 7);
     // and the host's own arithmetic holds at the edge
