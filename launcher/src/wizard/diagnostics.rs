@@ -130,7 +130,12 @@ fn read_log_tail(path: &Path) -> LogTail {
 /// The ends of the two logs the diagnostics hold, given `%LOCALAPPDATA%\FeverLink3` (`None`: not known).
 pub(super) fn read_logs(local_dir: Option<&Path>) -> (LogTail, LogTail) {
     match local_dir {
-        Some(dir) => (read_log_tail(&dir.join(NATIVE_LOG)), read_log_tail(&dir.join(LIVE_SUBDIR).join(MOD_LOG))),
+        Some(dir) => {
+            // mod.log goes on in mod.2.log, mod.3.log ... (the mod's C.logger, `mod.gen` names the newest)
+            let mod_log = dir.join(LIVE_SUBDIR).join(MOD_LOG);
+            let newest = crate::gamelink::generation_path(&mod_log, crate::gamelink::newest_generation(&mod_log));
+            (read_log_tail(&dir.join(NATIVE_LOG)), read_log_tail(&newest))
+        }
         None => (LogTail::Missing, LogTail::Missing),
     }
 }

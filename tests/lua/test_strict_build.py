@@ -3,7 +3,8 @@ with a stamp, cancels the held command and EVERY game, the originator's included
 
 Two mocked games run the real mod (the harness of test_native_capture.py / test_cmds_build.py, imported, not edited). What is new
 here is a FAKE NATIVE MODULE (`FakeNative`) that does what native/ does through the two files of docs/NATIVE_LINK.md section 3:
-it reads `native_ctl.log` (hold_on, hold_off, release, cancel, ping), writes `native_events.log` (ready with hooks, holding,
+it reads the control files `native_ctl.gui.log` and `native_ctl.sim.log` (one per Lua state, each numbered on its own: hold_on, hold_off,
+release, cancel, ping, the orders), writes `native_events.log` (ready with hooks, holding,
 held, released, dropped, pong, error), holds a build command added by a tool at CommandList::Add, hands held commands back or
 destroys them at the NEXT Add (any command), and switches holding off after 10 s without a valid line from the mod. A mock
 native TOOL fires the engine's tool event (builder.proposalApply, into the interface half's guiHandleEvent) and then adds its
@@ -67,13 +68,14 @@ class FakeNative:
 
     def __init__(self, game, clock, hooks=("apply_command", "command_list_add"), link=True):
         self.game, self.clock, self.hooks = game, clock, list(hooks)
-        self.ctl = os.path.join(game.dir, "native_ctl.log")
+        self.ctl = os.path.join(game.dir, "native_ctl.gui.log")       # the interface half's control file
+        self.ctl_sim = os.path.join(game.dir, "native_ctl.sim.log")   # the simulation half's
         self.events = os.path.join(game.dir, "native_events.log")
         self.R = lupa.LuaRuntime(unpack_returned_tuples=True)
         self.C = self.R.execute(T.COMMON_SRC)
         self.ev_seq = 0
         self.outbox = []
-        self.ctl_off, self.ctl_seq, self.partial = 0, 0, ""
+        self.ctl_pos = {}   # control file -> [offset, last seq, partial line]: each writer is read on its own
         self.holding, self.hold_kinds = False, []
         self.ring, self.next_id = [], 1
         self.last_valid = None
@@ -113,35 +115,42 @@ class FakeNative:
             f.write(text)
 
     def open_link(self):
-        """The link opens: what native_ctl.log holds is history; `ready` is the first event."""
+        """The link opens: what the control files hold is history; `ready` is the first event."""
         self.is_open = True
-        if os.path.exists(self.ctl):
-            data = open(self.ctl, "rb").read()
-            self.ctl_off = len(data)
-            for line in data.decode("utf-8").splitlines():
-                if line.split(TAB)[0].isdigit():
-                    self.ctl_seq = max(self.ctl_seq, int(line.split(TAB)[0]))
+        for path in (self.ctl, self.ctl_sim):
+            pos = self.ctl_pos.setdefault(path, [0, 0, ""])
+            if os.path.exists(path):
+                data = open(path, "rb").read()
+                pos[0], pos[2] = len(data), ""
+                for line in data.decode("utf-8").splitlines():
+                    if line.split(TAB)[0].isdigit():
+                        pos[1] = max(pos[1], int(line.split(TAB)[0]))
         self.emit("ready", {"build": "40420", "version": "0.1.0", "hooks": self.hooks, "poolpatch": False, "clock": False,
                             "kinds": {"build_proposal": 52}, "sites": 12, "patch": self.patch_cap})
         self.flush_events()
 
     def read_ctl(self):
-        if not os.path.exists(self.ctl):
+        for path in (self.ctl, self.ctl_sim):
+            self.read_ctl_file(path)
+
+    def read_ctl_file(self, path):
+        if not os.path.exists(path):
             return
-        with open(self.ctl, "rb") as f:
-            f.seek(self.ctl_off)
+        pos = self.ctl_pos.setdefault(path, [0, 0, ""])
+        with open(path, "rb") as f:
+            f.seek(pos[0])
             chunk = f.read()
-        self.ctl_off += len(chunk)
-        text = self.partial + chunk.decode("utf-8")
-        *lines, self.partial = text.split("\n")
+        pos[0] += len(chunk)
+        text = pos[2] + chunk.decode("utf-8")
+        *lines, pos[2] = text.split("\n")
         for line in lines:
             parts = line.split(TAB, 3)
             if len(parts) < 4 or not parts[0].isdigit():
                 continue
             seq, kind, payload = int(parts[0]), parts[1], parts[3]
-            if seq <= self.ctl_seq:
+            if seq <= pos[1]:
                 continue
-            self.ctl_seq = seq
+            pos[1] = seq
             p = to_py(self.C.parse(payload))
             self.handle(seq, kind, p if isinstance(p, dict) else {})
 
@@ -235,12 +244,14 @@ class FakeNative:
 
     # ---- what a test reads
     def ctl_records(self):
+        """Every control line written so far: the interface half's file, then the simulation half's."""
         out = []
-        if os.path.exists(self.ctl):
-            for line in T.read_text(self.ctl).splitlines():
-                parts = line.split(TAB, 3)
-                p = to_py(self.C.parse(parts[3]))
-                out.append((int(parts[0]), parts[1], p))
+        for path in (self.ctl, self.ctl_sim):
+            if os.path.exists(path):
+                for line in T.read_text(path).splitlines():
+                    parts = line.split(TAB, 3)
+                    p = to_py(self.C.parse(parts[3]))
+                    out.append((int(parts[0]), parts[1], p))
         return out
 
     def ctl_kinds(self):
@@ -953,7 +964,8 @@ class StrictOffTest(StrictTest):
         self.B.tool(self.road(300, 0, 400, 0))   # the tool event reaches the mod, the command goes to the engine
         self.tick(16)
         for g in (self.A, self.B):
-            self.assertFalse(os.path.exists(os.path.join(g.dir, "native_ctl.log")), "no control file without a module")
+            for name in ("native_ctl.gui.log", "native_ctl.sim.log"):
+                self.assertFalse(os.path.exists(os.path.join(g.dir, name)), "no control file without a module")
             self.assertNotIn("strict:", g.log())
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
@@ -1423,8 +1435,8 @@ class TraceLogTest(StrictTest):
         self.assertEqual(self.B.builds_applied(), 1)
 
     def external_ctl_line(self, g, kind, payload_text):
-        """A control line written by someone else than the interface half (the simulation half writes patch_next), in the file's own shape."""
-        path = g.native.ctl
+        """A control line written by the simulation half (patch_next), in its own file and numbering."""
+        path = g.native.ctl_sim
         last = 0
         if os.path.exists(path):
             for line in open(path, encoding="utf-8").read().splitlines():
@@ -1435,7 +1447,7 @@ class TraceLogTest(StrictTest):
             f.write(TAB.join([str(last + 1), kind, str(g.player_id if hasattr(g, "player_id") else 1), payload_text]) + chr(10))
 
     def test_a_control_line_written_by_the_simulation_half_does_not_make_the_interface_halfs_next_order_stale(self):
-        # patch_next is written from the simulation half with a writer of its own; the interface half's writer continues after it
+        # patch_next is written from the simulation half to its own file: the interface half's orders keep their own numbering
         self.start()
         self.strict_on(self.A, self.B)
         self.external_ctl_line(self.B, "patch_next", '{["adds"]=3,["frozen"]={[1]=1}}')

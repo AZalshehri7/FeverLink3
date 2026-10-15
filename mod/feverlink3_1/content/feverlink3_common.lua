@@ -9,6 +9,8 @@
 -- remembers the last sequence it dispatched and never dispatches a lower one, so a truncation (or a re-write of
 -- history) cannot replay old lines. `from` is the sender id the launcher attached (0 = host); the mod trusts the
 -- column, not anything inside the payload. The payload is one line produced by C.serialize.
+-- Every link file has exactly one writer, and is a generation log (C.newWriter, the launcher's gamelink "Generations"):
+-- it never grows without bound and is never truncated; readers follow its `rotate` lines.
 
 local C = {}
 
@@ -92,6 +94,72 @@ function C.readFile(path)
 	return s
 end
 
+-- The size of a file, nil when it cannot be opened.
+function C.fileSize(path)
+	if not C.IO then return nil end
+	local f = C.IO.open(path, "rb")
+	if not f then return nil end
+	local size = f:seek("end")
+	f:close()
+	return size
+end
+
+-- ------------------------------------------------------------------ generations
+-- A log is a series of generation files: <stem>.<ext> (generation 1), <stem>.2.<ext>, <stem>.3.<ext>, ..., and <stem>.gen
+-- holds the newest number. The same rule as the launcher's gamelink.rs ("Generations") and the native module's link.rs.
+C.ROTATE_BYTES = 4 * 1024 * 1024   -- a writer starts a new generation once its current one holds this much
+C.KEEP_GENERATIONS = 4             -- generation files a writer keeps, the newest included
+C.ROTATE_KIND = "rotate"           -- the last line of a generation: seq 0, payload {["gen"]=<next>}
+
+function C.genPath(base, gen)
+	if gen == nil or gen <= 1 then return base end
+	local stem, ext = base:match("^(.*)%.([^%.\\/]*)$")
+	if not stem then return base .. "." .. C.integerText(gen) end
+	return stem .. "." .. C.integerText(gen) .. "." .. ext
+end
+
+function C.genPointer(base)
+	local stem = base:match("^(.*)%.[^%.\\/]*$")
+	return (stem or base) .. ".gen"
+end
+
+-- The newest generation the pointer names; 1 without one.
+function C.newestGen(base)
+	local text = C.readFile(C.genPointer(base))
+	local g = text and tonumber(text:match("%d+"))
+	if g and g >= 1 then return g end
+	return 1
+end
+
+-- Appends to a log that more than one Lua state writes (mod.log, trace.log: people read them, no program follows them): a
+-- new generation starts when the current FILE holds `cap` bytes, whoever wrote them, so the limit holds across both halves
+-- and across reloads. The generation before `keep` back is deleted (nil: none); after `maxGen` generations nothing more is
+-- written (nil: no end). Returns true when written, false when not, "full" when the log reached `maxGen`.
+local capGen = {}   -- per Lua state: log -> the generation it last wrote to
+function C.appendCapped(base, text, cap, keep, maxGen)
+	if not C.IO then return false end
+	local g = capGen[base] or C.newestGen(base)
+	local f = C.IO.open(C.genPath(base, g), "ab")
+	if not f then return false end
+	if (f:seek("end") or 0) >= cap then
+		f:close()
+		local newest = C.newestGen(base)
+		local nextG = math.max(g + 1, newest)   -- the other half may have gone on already
+		if maxGen and nextG > maxGen then return "full" end
+		if newest < nextG then
+			C.writeFile(C.genPointer(base), C.integerText(nextG) .. NL)
+			if keep and nextG > keep then pcall(os.remove, C.genPath(base, nextG - keep)) end
+		end
+		g = nextG
+		f = C.IO.open(C.genPath(base, g), "ab")
+		if not f then return false end
+	end
+	capGen[base] = g
+	f:write(text)
+	f:close()
+	return true
+end
+
 -- Live mode: identity.txt (id, name, role) is written by the native module; the mod becomes active when the role is
 -- host or player, without a reload. Cheap to call every frame: the file is read at most once a second.
 function C.poll(force)
@@ -115,13 +183,16 @@ end
 C.poll(true)
 print("[feverlink3] common loaded: active=" .. tostring(C.ACTIVE) .. " live=" .. tostring(C.LIVE) .. " io=" .. tostring(C.IO ~= nil) .. " id=" .. tostring(C.PLAYER_ID))
 
--- a logger writing "<clock> [<tag>] <message>" lines to mod.log in the session folder (and to the game's own log)
+-- a logger writing "<clock> [<tag>] <message>" lines to mod.log in the session folder (and to the game's own log). Both halves
+-- write it: it goes on in mod.2.log, mod.3.log ... every C.LOG_BYTES (whoever wrote them), and only the newest C.LOG_KEEP files
+-- are kept (mod.gen names the newest).
+C.LOG_BYTES, C.LOG_KEEP = 8 * 1024 * 1024, 4
 function C.logger(tag)
 	return function(msg)
 		local line = "[FeverLink3 " .. tag .. "] " .. tostring(msg)
 		pcall(function() if debugPrint then debugPrint(line) end end)
 		if C.DIR and C.IO then
-			pcall(C.appendFile, C.path(C.LOG), os.date("%H:%M:%S") .. " " .. line .. NL)
+			pcall(C.appendCapped, C.path(C.LOG), os.date("%H:%M:%S") .. " " .. line .. NL, C.LOG_BYTES, C.LOG_KEEP)
 		end
 	end
 end
@@ -129,28 +200,23 @@ end
 -- Trace log (FEVERLINK3_TRACE, DEFAULT ON in test builds, FEVERLINK3_TRACE=0 switches it off): everything a real run needs to be explained
 -- from the logs alone, in trace.log of the session folder (docs/TRACE.md). One line per event: "<HH:MM:SS> +<cpu s> <state> <tag> <text>".
 -- Built for per-build and per-round events, never per tick. The file rolls over to trace.2.log, trace.3.log ... every 8 MB (nothing is
--- deleted); after TRACE_MAX_SEGMENTS segments it stops and says so once.
+-- deleted); after TRACE_MAX_SEGMENTS segments it stops and says so once. The size is the file's, so the limit holds for both halves
+-- together and across reloads (it was counted per Lua state and started again at a reload).
 C.TRACE = true
 pcall(function() C.TRACE = os.getenv("FEVERLINK3_TRACE") ~= "0" end)
 local TRACE_SEGMENT, TRACE_MAX_SEGMENTS = 8 * 1024 * 1024, 12
-local traceState = { seg = 1, bytes = 0, stopped = false }
+local traceState = { stopped = false }
 function C.tracer(state)
 	return function(tag, text)
 		if not C.TRACE or traceState.stopped or not (C.DIR and C.IO) then return end
 		pcall(function()
 			local line = string.format("%s +%.3f %s %s %s", os.date("%H:%M:%S"), os.clock(), state, tag, tostring(text))
 			if #line > 200000 then line = line:sub(1, 200000) .. " ...(cut)" end
-			if traceState.bytes > TRACE_SEGMENT then
-				traceState.seg, traceState.bytes = traceState.seg + 1, 0
-				if traceState.seg > TRACE_MAX_SEGMENTS then
-					traceState.stopped = true
-					C.appendFile(C.path("trace." .. TRACE_MAX_SEGMENTS .. ".log"), os.date("%H:%M:%S") .. " TRACE FULL: no more lines" .. NL)
-					return
-				end
+			local base = C.path("trace.log")
+			if C.appendCapped(base, line .. NL, TRACE_SEGMENT, nil, TRACE_MAX_SEGMENTS) == "full" then
+				traceState.stopped = true
+				C.appendFile(C.genPath(base, TRACE_MAX_SEGMENTS), os.date("%H:%M:%S") .. " TRACE FULL: no more lines" .. NL)
 			end
-			local name = traceState.seg == 1 and "trace.log" or ("trace." .. traceState.seg .. ".log")
-			C.appendFile(C.path(name), line .. NL)
-			traceState.bytes = traceState.bytes + #line + 1
 		end)
 	end
 end
@@ -277,14 +343,72 @@ function C.parseLine(line)
 	return { seq = tonumber(seq), kind = kind, from = tonumber(from) or from, payload = payload }
 end
 
--- Reader: tracks the byte offset consumed and the last sequence dispatched.
-function C.newReader(path)
-	return { path = path, offset = 0, lastSeq = 0, partial = "", dropped = 0 }
+-- The generation a `rotate` line names (seq 0, kind rotate), nil for every other record.
+function C.rotateTarget(rec)
+	if rec.seq ~= 0 or rec.kind ~= C.ROTATE_KIND then return nil end
+	local g = tonumber(tostring(rec.payload):match("=%s*(%d+)"))
+	if g and g >= 2 then return g end
+	return nil
+end
+
+-- The highest sequence in the last 4 KB of a file, and the generation its last record names when that is a `rotate` line.
+-- One open and one bounded read: a writer or reader calls it once, when it is made.
+function C.lastSeqInFile(path)
+	if not C.IO then return 0 end
+	local f = C.IO.open(path, "rb")
+	if not f then return 0 end
+	local size = f:seek("end") or 0
+	f:seek("set", math.max(0, size - 4096))
+	local tail = f:read("*a") or ""
+	f:close()
+	if size > 4096 then tail = tail:gsub("^[^" .. NL .. "]*" .. NL, "", 1) end   -- the first piece may start mid-line
+	local last, rotate = 0, nil
+	for line in tail:gmatch("[^" .. NL .. "]+") do
+		local rec = C.parseLine((line:gsub(CR .. "$", "")))
+		if rec then
+			if rec.seq > last then last = rec.seq end
+			rotate = C.rotateTarget(rec)
+		end
+	end
+	return last, rotate
+end
+
+-- Reader: tracks the generation and byte offset consumed and the last sequence dispatched. `opts`:
+--   start = "oldest" (default: the oldest generation still there, from its first byte), "newest" (the newest generation from
+--           its first byte: what a reloaded script reads as history), or "end" (whatever the log holds now is skipped);
+--   keep  = true: the file stays open between polls (a file read every frame: no open per frame). A kept file cannot be
+--           deleted while the reader holds it (Windows); readers close it when they go on to the next generation, so a
+--           writer's deletion of old generations is not in the way, and the session folder is cleaned at game start.
+function C.newReader(path, opts)
+	opts = opts or {}
+	local g = C.newestGen(path)
+	if (opts.start or "oldest") == "oldest" and C.IO then
+		while g > 1 and C.fileSize(C.genPath(path, g - 1)) do g = g - 1 end
+	end
+	local r = { base = path, gen = g, path = C.genPath(path, g), offset = 0, lastSeq = 0, partial = "", dropped = 0, keep = opts.keep == true }
+	if opts.start == "end" then
+		local size = C.fileSize(r.path)
+		if size then
+			local last, rotate = C.lastSeqInFile(r.path)
+			r.offset, r.lastSeq = size, last
+			if rotate then C.readerNext(r, rotate) end
+		elseif g > 1 then
+			r.lastSeq = C.lastSeqInFile(C.genPath(path, g - 1))
+		end
+	end
+	return r
+end
+
+-- On to the start of generation `gen` (the one a `rotate` line named, or the newest after a deletion).
+function C.readerNext(r, gen)
+	if r.f then pcall(function() r.f:close() end) r.f = nil end
+	r.gen, r.path, r.offset, r.partial, r.head, r.nextGen = gen, C.genPath(r.base or r.path, gen), 0, "", nil, nil
 end
 
 -- Pure part of the reader: feeds a chunk of text, returns the complete records with a new sequence number.
 -- A trailing line without newline waits for the rest. Records whose seq is not above lastSeq are dropped and
--- counted (history re-written after a truncation, duplicates).
+-- counted (history re-written after a truncation, duplicates). A `rotate` line ends the feed: the writer wrote nothing
+-- after it in this file, and r.nextGen says where the log goes on.
 function C.readerFeed(r, text)
 	local out = {}
 	local buf = r.partial .. text
@@ -298,6 +422,11 @@ function C.readerFeed(r, text)
 		if #line > 0 then
 			local rec = C.parseLine(line)
 			if rec then
+				local nextGen = C.rotateTarget(rec)
+				if nextGen then
+					r.nextGen, r.partial = nextGen, ""
+					return out
+				end
 				if rec.seq > r.lastSeq then
 					r.lastSeq = rec.seq
 					out[#out + 1] = rec
@@ -311,51 +440,110 @@ function C.readerFeed(r, text)
 	return out
 end
 
--- Reads what the file gained since the last poll. A file shorter than the offset was truncated: reading restarts
--- from the beginning and the sequence filter in readerFeed keeps history from being dispatched again.
-function C.readerPoll(r)
-	if not C.IO then return {} end
-	local f = C.IO.open(r.path, "rb")
-	if not f then return {} end
-	local size = f:seek("end") or 0
-	if size < r.offset then
-		r.offset = 0
-		r.partial = ""
+-- One read of the reader's generation file. Returns the records and whether the reader went on to another generation.
+local HEAD = 64
+local function readGeneration(r)
+	local f = r.f
+	if not f then
+		f = C.IO.open(r.path, "rb")
+		if not f then
+			-- a file that was there and is gone: deleted under a reader that fell behind every kept generation (on with the newest),
+			-- or the folder was cleaned (a new file starts from its first byte)
+			if r.seen then
+				r.seen = false
+				local newest = C.newestGen(r.base or r.path)
+				if newest > (r.gen or 1) then
+					C.readerNext(r, newest)
+					return {}, true
+				end
+			end
+			return {}, false
+		end
+		if r.keep then r.f = f end
 	end
-	local out = {}
+	r.seen = true
+	local size = f:seek("end")
+	if not size then
+		pcall(function() f:close() end)
+		r.f = nil
+		return {}, false
+	end
+	if size < r.offset then
+		r.offset, r.partial, r.head = 0, "", nil
+	elseif size > r.offset and r.offset > 0 and r.head then
+		-- grown, but is it still the same file? A file truncated and written again past the old length starts with other bytes
+		f:seek("set", 0)
+		if f:read(#r.head) ~= r.head then r.offset, r.partial, r.head = 0, "", nil end
+	end
+	local out, switched = {}, false
 	if size > r.offset then
 		f:seek("set", r.offset)
 		local chunk = f:read(size - r.offset) or ""
+		if r.offset == 0 then r.head = chunk:sub(1, HEAD) end
 		r.offset = r.offset + #chunk
 		out = C.readerFeed(r, chunk)
+		if r.nextGen then
+			if not r.keep then f:close() end
+			f = nil
+			C.readerNext(r, r.nextGen)
+			switched = true
+		end
 	end
-	f:close()
+	if f and not r.keep then f:close() end
+	return out, switched
+end
+
+-- Reads what the log gained since the last poll, through the generations it went on to. A file that is not the one read
+-- before (shorter, or other first bytes) was rewritten: reading restarts from its beginning and the sequence filter in
+-- readerFeed keeps history from being dispatched again.
+function C.readerPoll(r)
+	if not C.IO then return {} end
+	local out = {}
+	for _ = 1, 5 do
+		local recs, switched = readGeneration(r)
+		for _, rec in ipairs(recs) do out[#out + 1] = rec end
+		if not switched then break end
+	end
 	return out
 end
 
--- Writer: appends records with a sequence that continues after whatever the file already holds, so a reload of
--- the savegame (which restarts the script and its counters) does not restart the sequence seen by the launcher.
-function C.lastSeqInFile(path)
-	local s = C.readFile(path)
-	if not s or #s == 0 then return 0 end
-	local tail = s:sub(-4096)
-	local last = 0
-	for line in tail:gmatch("[^" .. NL .. "]+") do
-		local seq = line:match("^(%d+)" .. TAB)
-		if seq then last = tonumber(seq) end
-	end
-	return last
+-- Writer: appends records with a sequence that continues after whatever the log already holds, so a reload of the
+-- savegame (which restarts the script and its counters) does not restart the sequence seen by the reader. Made ONCE per
+-- Lua state and kept: the log's tail is read here and never again. A log has exactly one writer at a time (the native
+-- control files are one per half: native_ctl.gui.log, native_ctl.sim.log). `opts.rotate` / `opts.keep` change the
+-- generation size and how many generations are kept (tests).
+function C.newWriter(path, from, opts)
+	opts = opts or {}
+	local g = C.newestGen(path)
+	local w = { base = path, gen = g, path = C.genPath(path, g), from = from, seq = 0, size = 0, failed = 0,
+		rotate = opts.rotate or C.ROTATE_BYTES, keep = opts.keep or C.KEEP_GENERATIONS }
+	w.size = C.fileSize(w.path) or 0
+	w.seq = C.lastSeqInFile(w.path)
+	if w.seq == 0 and g > 1 then w.seq = C.lastSeqInFile(C.genPath(path, g - 1)) end
+	return w
 end
 
-function C.newWriter(path, from)
-	return { path = path, from = from, seq = C.lastSeqInFile(path), failed = 0 }
+-- Ends the writer's generation with a `rotate` line and goes on in the next (the pointer is written, the generation `keep`
+-- back is deleted). False when the `rotate` line could not be written: the writer stays where it is.
+function C.writerRotate(w)
+	local nextG = w.gen + 1
+	if not C.appendFile(w.path, C.formatLine(0, C.ROTATE_KIND, w.from, C.serialize({ gen = nextG }))) then return false end
+	C.writeFile(C.genPointer(w.base), C.integerText(nextG) .. NL)
+	if nextG > w.keep then pcall(os.remove, C.genPath(w.base, nextG - w.keep)) end
+	w.gen, w.path, w.size = nextG, C.genPath(w.base, nextG), 0
+	return true
 end
 
 function C.writerSend(w, kind, payload)
 	local ok, text = pcall(C.serialize, payload or {})
 	if not ok then return false, text end
+	if w.rotate and w.size > 0 and w.size >= w.rotate then C.writerRotate(w) end
 	w.seq = w.seq + 1
-	if C.appendFile(w.path, C.formatLine(w.seq, kind, w.from, text)) then return true end
+	local line = C.formatLine(w.seq, kind, w.from, text)
+	if C.appendFile(w.path, line) then
+		w.size = (w.size or 0) + #line
+		return true
+	end
 	w.failed = w.failed + 1
 	return false, "cannot append to " .. w.path
 end

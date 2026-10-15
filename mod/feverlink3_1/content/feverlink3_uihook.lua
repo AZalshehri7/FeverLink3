@@ -164,15 +164,8 @@ end
 local function inbox()
 	if U.inbox then return U.inbox end
 	local path = C.path("ui_in.log")
-	local r = C.newReader(path)
-	pcall(function()
-		local f = C.IO and C.IO.open(path, "rb")
-		if f then
-			r.offset = f:seek("end") or 0
-			f:close()
-		end
-		r.lastSeq = C.lastSeqInFile(path)
-	end)
+	local ok, r = pcall(C.newReader, path, { start = "end" })
+	if not ok then r = C.newReader(path) end
 	U.inbox = r
 	return r
 end

@@ -17,8 +17,8 @@ use feverlink3_native::build_table::{self, BuildAddrs, Rva};
 use feverlink3_native::counters::{AddSource, AppliedWatch, Audit, Counters, MAX_SITES, WATCH_EXPIRY_MS, WATCH_SLOTS};
 use feverlink3_native::hold::{Action, Admit, HoldConfig, HoldMachine};
 use feverlink3_native::link::{
-    parse_ctl_line, valid_kind_name, AddCounts, CtlMessage, CtlReader, Event, EventWriter, CTL_FILE, MAX_EVENTS_BYTES,
-    MAX_HOLD_KINDS, MAX_LINE, MAX_READ,
+    parse_ctl_line, valid_kind_name, AddCounts, CtlMessage, CtlReader, Event, EventWriter, CTL_FILE,
+    EVENTS_ROTATE_BYTES, MAX_HOLD_KINDS, MAX_LINE, MAX_READ,
 };
 use feverlink3_native::plan::{plan, Feature, HookConfig, Image, Step};
 use rand::rngs::StdRng;
@@ -338,7 +338,7 @@ fn events_of_any_content_make_lines_the_mods_reader_accepts() {
 }
 
 #[test]
-fn the_event_file_stops_growing_and_numbering_survives_a_reopen() {
+fn the_event_log_stays_bounded_and_numbering_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = EventWriter::open(dir.path()).unwrap();
     assert_eq!(w.next_seq(), 1);
@@ -347,18 +347,15 @@ fn the_event_file_stops_growing_and_numbering_survives_a_reopen() {
         w.append(std::slice::from_ref(&small)).unwrap();
     }
     assert_eq!(EventWriter::open(dir.path()).unwrap().next_seq(), 501, "numbering continues after a reopen");
+    // a mod that never reads the log must not fill the disk: the writer goes on in new generations, never refuses
     let big = Event::Error { place: "p".into(), detail: "y".repeat(100_000) };
-    let mut refused = None;
     for _ in 0..200 {
-        if let Err(e) = w.append(std::slice::from_ref(&big)) {
-            refused = Some(e);
-            break;
-        }
+        w.append(std::slice::from_ref(&big)).unwrap();
     }
-    let refused = refused.expect("a mod that never reads the file must hit the limit");
-    assert_eq!(refused.kind(), std::io::ErrorKind::StorageFull);
-    let len = fs::metadata(w.path()).unwrap().len();
-    assert!(len <= MAX_EVENTS_BYTES && len + 100_100 > MAX_EVENTS_BYTES, "{len}");
+    let total: u64 = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
+    let bound = (gamelink::KEEP_GENERATIONS + 1) * (EVENTS_ROTATE_BYTES + 200_000);
+    assert!(total <= bound, "{total} bytes on disk, bound {bound}");
+    assert_eq!(EventWriter::open(dir.path()).unwrap().next_seq(), 701, "numbering continues across generations");
     assert!(w.append(&[]).is_ok(), "an empty batch is not an error");
 }
 
