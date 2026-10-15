@@ -4868,6 +4868,8 @@ function X.sessionOff(why, state)
 	G.peers, G.session, G.marks = {}, L.newSession(), {}
 	G.graces, G.parked, G.dry, G.buildAts, G.vetoed = {}, {}, {}, {}, {}
 	G.pauseQ, G.pauseOwn, G.pauseLast = nil, nil, nil
+	-- where this game stood still at the pause (the clock's `stop`); the run on to a host's pause stamp (pauseRun) goes with G.session
+	G.still, X.curStop, G.lastStop = nil, nil, nil
 	G.promiseFloor, G.promisePause, G.barrier = nil, nil, nil
 	G.authPending, G.accountAt, G.authLast, G.pendingSave = {}, {}, nil, nil
 	G.perms, G.margin = L.newPermissions(), L.newMargin()

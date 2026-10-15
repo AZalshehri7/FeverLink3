@@ -189,22 +189,23 @@ class SessionEndTest(S.StrictTest):
         self.assertGreater(self.B.time(), self.relay.pauseAt)
         self.assertEqual(self.B.vehicles(), 0, "the paused action of the ended session is applied nowhere here")
 
-    def test_a_command_the_engine_has_already_keeps_its_callback(self):
-        # the pause order applied the window's command from the interface state: the engine has it queued when the session ends, and
-        # its own answer (applied) reaches the window, not a failure
+    def test_a_paused_command_the_host_stamped_but_the_game_has_not_reached_fails_and_is_applied_nowhere_here(self):
+        # the pause order (pause-align): the host stamps a paused action one step past where the games stand still, and every game's
+        # simulation applies it there. The session ends after the stamp came back and before this game ran on to it.
         self.start(speed=2)
         self.relay.pauseAt = self.relay.future_stamp()
         self.relay.session()
         self.tick(20)
         self.B.window(BUY % "WIN_CB")
-        self.frames(4)
-        self.assertIn("pause order #1: 1:1 applied at t=", self.B.log())
-        self.assertTrue(self.B.lua("WIN_CB == nil"), "the engine has not run it yet")
+        self.frames(30)   # frames only: the stamp comes back, the simulation does not step
+        self.assertIn("pause order #1: 1:1 stamped", self.B.log())
+        self.assertTrue(self.B.lua("WIN_CB == nil"), "it waits for its stamp")
         self.end_session(self.B)
-        self.assertIn("0 stamped command(s) not applied", self.B.log())
-        self.tick(2)
-        self.assertEqual(self.B.vehicles(), 1)
-        self.assertTrue(self.B.lua("WIN_CB ~= nil and WIN_CB[1] == true"), "the window hears the engine's own answer")
+        self.assertIn("1 stamped command(s) not applied (callbacks failed)", self.B.log())
+        self.assertTrue(self.B.lua("WIN_CB ~= nil and WIN_CB[1] == false"))
+        self.tick(10)
+        self.assertEqual(self.B.vehicles(), 0, "the simulation's queue of the ended session is gone: nothing applied late")
+        self.assertGreater(self.B.time(), self.relay.pauseAt, "no run-to-stamp or pause holds this game any more")
 
     # ---- #16: the next session
 
