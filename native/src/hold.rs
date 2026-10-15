@@ -601,6 +601,11 @@ impl<H> HoldMachine<H> {
         }
     }
 
+    /// Held command `id`, whatever its phase (an order of its build identifies the script's command by it: `inject::same_command`).
+    pub fn handle_of(&self, id: HoldId) -> Option<&H> {
+        self.entries.iter().find(|e| e.id == id).map(|e| &e.handle)
+    }
+
     /// For the tests and diagnostics: the held entries as `(id, kind)`.
     pub fn held(&self) -> Vec<(HoldId, u8)> {
         self.entries.iter().map(|e| (e.id, e.kind)).collect()

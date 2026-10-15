@@ -61,9 +61,16 @@ pub fn inject_file_name(key: u64) -> String {
 /// The largest side file read.
 pub const MAX_TEXT_BYTES: u64 = 64 << 20;
 
+/// The most orders that wait at once. Every build due in one step writes one (two players building at once, a chain); more than
+/// this many unused orders means the mod's commands are not reaching the module at all: the oldest is refused.
+pub const MAX_ORDERS: usize = 64;
+
 /// One armed order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Order {
+    /// The module's own number of the order (from 1, in the order the mod wrote them, never reused): the key of the queue and of
+    /// the runtime's record of the command the order was used for.
+    pub seq: u64,
     pub key: u64,
     pub armed_ms: u64,
     pub ttl_ms: u64,
@@ -76,6 +83,8 @@ pub struct Order {
     /// Test switch (`refuse` of the order, `FEVERLINK3_DEBUG_REFUSE_INJECT` in the mod): the order is refused with this reason once the
     /// command it is used for passed the identity checks, exactly as any other refusal (empty: a normal order).
     pub forced: String,
+    /// The `build_proposal` applies seen while this order waited (the reason of an expiry says which went by).
+    pub applies: crate::cmd_patch::ApplyTrail,
 }
 
 /// What became of the command an order was meant for, when the order was refused (the `inject_refused` event's `outcome`).
@@ -86,8 +95,8 @@ pub enum Outcome {
     /// The command took the order and could NOT be emptied (no verified engine functions, not a sane Proposal): it applies what it
     /// carries (the mod's placeholder). The world differs; only the repair (a resync) helps.
     Untouched,
-    /// No command took the order (expired, replaced, the switch off, no payload): a placeholder that went by unrecognised may have
-    /// been applied as it is.
+    /// No command took the order (expired, the queue full, the switch off): a placeholder that went by unrecognised may have been
+    /// applied as it is.
     NoCommand,
 }
 
@@ -101,16 +110,26 @@ impl Outcome {
     }
 }
 
-/// The switch, the armed order, the events for the mod.
+/// The switch, the waiting orders, the events for the mod.
+///
+/// The orders wait in a queue, in the order the mod wrote them (2026-10-15, open bug 7): before, one slot held one order and a second
+/// order replaced the first, so two builds due in the same step (two players building at once, a chain, the interface half's pause
+/// applies, which reach the command list before the simulation applies any of them) lost the first one's order: its command went by
+/// uninjected (the placeholder applied, or a refusal), and its deferred held command was failed or kept the tool busy. Now every
+/// command is matched to its own order by its identity (`same_build`: the place or the constructions of the order's text; a
+/// `complete_next` by its held command's place, see `same_command`), never by "the next build_proposal"; the first waiting order in
+/// the mod's order that the command passes is used, so that two orders of the same place are used in the order they were written.
+/// A command that is no order's passes untouched, and each order expires on its own.
 #[derive(Default)]
 pub struct State {
     on: AtomicBool,
     pending: AtomicBool,
-    order: Mutex<Option<Order>>,
-    applies: Mutex<crate::cmd_patch::ApplyTrail>,
+    next_seq: std::sync::atomic::AtomicU64,
+    orders: Mutex<std::collections::VecDeque<Order>>,
     events: Mutex<Vec<Event>>,
-    /// Deferred held commands whose order was refused before any command used it (expired, replaced, the switch off): they get no stamp
-    /// apply result, so the runtime fails them at once (their tool callback fired), instead of leaving the tool busy until the age limit.
+    /// Deferred held commands whose order was refused before any command used it (expired, the queue full, the switch off): they get no
+    /// stamp apply result, so the runtime fails them at once (their tool callback fired), instead of leaving the tool busy until the age
+    /// limit.
     failed: Mutex<Vec<u64>>,
 }
 
@@ -151,33 +170,46 @@ impl State {
         }
     }
 
-    /// The deferred held commands to fail now (see [`State::fail_held`]); expires an unused order first.
+    /// The deferred held commands to fail now (see [`State::fail_held`]); expires the unused orders first.
     pub fn take_failed(&self, now: u64) -> Vec<u64> {
         self.expire(now);
         std::mem::take(&mut *lock(&self.failed))
     }
 
-    /// The mod's `inject_next`. A second order replaces the first (reported as refused).
+    /// The mod's `inject_next`: queued behind the orders already waiting.
     pub fn arm(&self, key: u64, ttl: u64, held: u64, now: u64) {
+        self.arm_timed(key, ttl, held, String::new(), String::new(), now)
+    }
+
+    /// As [`State::arm`], with the mod's timing text of the build and the test switch's forced refusal (`forced`, empty: none).
+    pub fn arm_timed(&self, key: u64, ttl: u64, held: u64, tm: String, forced: String, now: u64) {
         self.arm_order(Order {
+            seq: 0,
             key,
             armed_ms: now,
             ttl_ms: ttl,
             held,
             link_only: false,
-            tm: String::new(),
-            forced: String::new(),
+            tm,
+            forced,
+            applies: Default::default(),
         })
     }
 
-    /// As [`State::arm`], with the mod's timing text of the build and the test switch's forced refusal (`forced`, empty: none).
-    pub fn arm_timed(&self, key: u64, ttl: u64, held: u64, tm: String, forced: String, now: u64) {
-        self.arm_order(Order { key, armed_ms: now, ttl_ms: ttl, held, link_only: false, tm, forced })
-    }
-
-    /// The mod's `complete_next`: the next script `build_proposal` gives its result to deferred command `held`, nothing is injected.
+    /// The mod's `complete_next`: the script `build_proposal` of deferred command `held`'s build (matched by that held command's place)
+    /// gives its result to `held`; nothing is injected.
     pub fn arm_link(&self, held: u64, ttl: u64, tm: String, now: u64) {
-        self.arm_order(Order { key: 0, armed_ms: now, ttl_ms: ttl, held, link_only: true, tm, forced: String::new() })
+        self.arm_order(Order {
+            seq: 0,
+            key: 0,
+            armed_ms: now,
+            ttl_ms: ttl,
+            held,
+            link_only: true,
+            tm,
+            forced: String::new(),
+            applies: Default::default(),
+        })
     }
 
     /// `o.ttl_ms` is the order's `ttl` as the mod wrote it (0: the default).
@@ -188,74 +220,83 @@ impl State {
             return;
         }
         o.ttl_ms = if o.ttl_ms == 0 { DEFAULT_TTL_MS } else { o.ttl_ms.min(MAX_TTL_MS) };
-        let held = o.held;
-        *lock(&self.applies) = Default::default();
-        if let Some(old) = lock(&self.order).replace(o) {
+        o.seq = self.next_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let full = {
+            let mut q = lock(&self.orders);
+            let full = (q.len() >= MAX_ORDERS).then(|| q.pop_front()).flatten();
+            q.push_back(o);
+            full
+        };
+        self.pending.store(true, Ordering::Release);
+        if let Some(old) = full {
             self.refuse(
                 old.key,
                 old.held,
                 Outcome::NoCommand,
-                format!("order for key {} replaced by a newer inject_next before a command used it", old.key),
+                format!("key {}: {MAX_ORDERS} orders wait and no command used this one, the oldest", old.key),
             );
-            if old.held != held {
-                self.fail_held(old.held);
+            self.fail_held(old.held);
+        }
+    }
+
+    /// A `build_proposal` was applied by the simulation while orders wait.
+    pub fn note_apply(&self, held: bool, now: u64) {
+        if self.pending() {
+            for o in lock(&self.orders).iter_mut() {
+                o.applies.note(held, now as i64 - o.armed_ms as i64);
             }
         }
-        self.pending.store(true, Ordering::Release);
     }
 
-    /// A `build_proposal` was applied by the simulation while an order is armed.
-    pub fn note_apply(&self, held: bool, now: u64) {
-        let armed = lock(&self.order).as_ref().map(|o| o.armed_ms);
-        if let Some(armed) = armed {
-            lock(&self.applies).note(held, now as i64 - armed as i64);
-        }
-    }
-
-    fn expired(&self, key: u64, ttl_ms: u64) -> String {
+    fn expired(o: &Order) -> String {
         format!(
-            "key {key}: expired, no script build_proposal arrived within {ttl_ms} ms; {}",
-            lock(&self.applies).text()
+            "key {}: expired, no script build_proposal of this order arrived within {} ms; {}",
+            o.key,
+            o.ttl_ms,
+            o.applies.text()
         )
     }
 
-    /// The armed order, once; an expired one is reported and dropped.
-    pub fn take(&self, now: u64) -> Option<Order> {
-        let order = lock(&self.order).take();
-        self.pending.store(false, Ordering::Release);
-        let order = order?;
-        if now.saturating_sub(order.armed_ms) > order.ttl_ms {
-            self.refuse(order.key, order.held, Outcome::NoCommand, self.expired(order.key, order.ttl_ms));
-            self.fail_held(order.held);
-            return None;
-        }
-        Some(order)
+    /// The waiting orders, in the order the mod wrote them (copies: [`State::take`] takes the one a command is matched to); the expired
+    /// ones are reported and dropped first.
+    pub fn waiting(&self, now: u64) -> Vec<Order> {
+        self.expire(now);
+        lock(&self.orders).iter().cloned().collect()
     }
 
-    /// Puts back an order taken for a command that turned out not to be the mod's (see [`NOT_OURS`]); a newer order wins.
-    pub fn put_back(&self, o: Order) {
-        let mut g = lock(&self.order);
-        if g.is_none() {
-            *g = Some(o);
-            self.pending.store(true, Ordering::Release);
-        }
+    /// How many orders wait (for the log).
+    pub fn waiting_count(&self) -> usize {
+        lock(&self.orders).len()
     }
 
-    /// Expires an order nobody used.
+    /// Takes order `seq` out of the queue: a command was matched to it. `None` when it is gone (expired meanwhile).
+    pub fn take(&self, seq: u64) -> Option<Order> {
+        let mut q = lock(&self.orders);
+        let o = q.iter().position(|o| o.seq == seq).and_then(|i| q.remove(i));
+        self.pending.store(!q.is_empty(), Ordering::Release);
+        o
+    }
+
+    /// Expires every order nobody used within its own time to live.
     fn expire(&self, now: u64) {
-        if self.pending() {
-            let mut g = lock(&self.order);
-            if g.as_ref().is_some_and(|o| now.saturating_sub(o.armed_ms) > o.ttl_ms) {
-                let o = g.take().expect("checked");
-                self.pending.store(false, Ordering::Release);
-                drop(g);
-                self.refuse(o.key, o.held, Outcome::NoCommand, self.expired(o.key, o.ttl_ms));
-                self.fail_held(o.held);
-            }
+        if !self.pending() {
+            return;
+        }
+        let gone: Vec<Order> = {
+            let mut q = lock(&self.orders);
+            let (gone, keep): (Vec<Order>, Vec<Order>) =
+                std::mem::take(&mut *q).into_iter().partition(|o| now.saturating_sub(o.armed_ms) > o.ttl_ms);
+            *q = keep.into();
+            self.pending.store(!q.is_empty(), Ordering::Release);
+            gone
+        };
+        for o in gone {
+            self.refuse(o.key, o.held, Outcome::NoCommand, Self::expired(&o));
+            self.fail_held(o.held);
         }
     }
 
-    /// Expires an order nobody used (the service thread calls this) and hands out the events.
+    /// Expires the orders nobody used (the service thread calls this) and hands out the events.
     pub fn drain_events(&self, now: u64) -> Vec<Event> {
         self.expire(now);
         std::mem::take(&mut *lock(&self.events))
@@ -709,8 +750,9 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
     }
 }
 
-/// The prefix of an error that means "this command is not the one the mod sent": the order is put back and waits for the next
-/// `build_proposal` (until its time to live ends) instead of being refused, and the command passes untouched (it is someone else's).
+/// The prefix of an error that means "this command is not the one the mod sent for this order": the order keeps waiting for its own
+/// command (until its time to live ends) instead of being refused, and a command that is no waiting order's passes untouched (it is
+/// someone else's).
 /// b75: a town's own `build_proposal` (applied by the simulation like the script's, so the apply hook cannot tell them apart by caller)
 /// took the order first; its construction was not the text's, the proof refused it, and the mod's command then went without its order
 /// (drift and a resync). Since 2026-10-15 every text is matched by place or construction ([`same_build`]), not only those with constructions.
@@ -722,14 +764,14 @@ pub const NOT_OURS: &str = "not the mod's command: ";
 /// refusal (`no_command`), which asks for the repair.
 pub const UNKNOWN: &str = "identity unknown: ";
 
-/// The order is put back and the command passes untouched ([`NOT_OURS`], [`UNKNOWN`]).
+/// The order keeps waiting and is not used for this command ([`NOT_OURS`], [`UNKNOWN`]).
 pub fn keeps_waiting(why: &str) -> bool {
     why.starts_with(NOT_OURS) || why.starts_with(UNKNOWN)
 }
 
 /// Whether the command is the one the mod sent for this text, for EVERY build kind (the order names no command: the engine gives a
-/// script command no field the module could match a key against without engine research, so the order goes to the next script
-/// `build_proposal` that passes this test). A text with constructions: the command's constructions are the text's ([`same_constructions`]).
+/// script command no field the module could match a key against without engine research, so a script `build_proposal` takes the
+/// first waiting order, in the mod's order, whose test it passes). A text with constructions: the command's constructions are the text's ([`same_constructions`]).
 /// Any other text: the command touches the text's place ([`same_place`]). A command that fails is not the mod's (a town's build); the
 /// order waits for the next one ([`NOT_OURS`]). A text that names no place cannot identify any command ([`UNKNOWN`]).
 pub fn same_build(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
@@ -881,16 +923,15 @@ pub fn same_place(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> 
     ))
 }
 
-/// The command's constructions are the text's: the same file and the same transform, in order. The script builds them from the
-/// originator's record, so the receiver's conversion keeps both; any other command that adds constructions (a town's) differs.
-pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
-    let lines = rebuild::lines_of(text);
-    let n = count(&lines, "toAdd.#") as usize;
-    if n == 0 {
-        return Ok(());
-    }
+/// One construction a command adds, as [`same_constructions`] compares it: its file and its transform (16 words, as the text writes
+/// them).
+type Construction = (Vec<u8>, String);
+
+/// The first `n` constructions of the command at `dest` (the caller knows it has that many).
+fn constructions(mem: &dyn Mem, dest: usize, n: usize) -> Result<Vec<Construction>, String> {
     let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
     let b = u64_at(&bytes, TO_ADD) as usize;
+    let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let e = mem.read(b + i * CONSTRUCTION_STRIDE, CONSTRUCTION_STRIDE).ok_or("a construction is not readable")?;
         // ResName: the text is the second std::string (+0x20): inline up to 15 bytes, else behind the pointer
@@ -902,6 +943,28 @@ pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), 
         } else {
             return Err(format!("construction {i}: not a file name"));
         };
+        let transf: Vec<String> = (0..16).map(|k| format!("{:08x}", u32_at(&e, 0xc98 + k * 4))).collect();
+        out.push((file, transf.join(",")));
+    }
+    Ok(out)
+}
+
+/// Every construction of the command at `dest` (its vectors checked by [`is_proposal`] first).
+fn command_constructions(mem: &dyn Mem, dest: usize) -> Result<Vec<Construction>, String> {
+    let bytes = is_proposal(mem, dest)?;
+    let n = ((u64_at(&bytes, TO_ADD + 8) - u64_at(&bytes, TO_ADD)) as usize / CONSTRUCTION_STRIDE).min(PLACE_MAX);
+    constructions(mem, dest, n)
+}
+
+/// The command's constructions are the text's: the same file and the same transform, in order. The script builds them from the
+/// originator's record, so the receiver's conversion keeps both; any other command that adds constructions (a town's) differs.
+pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
+    let lines = rebuild::lines_of(text);
+    let n = count(&lines, "toAdd.#") as usize;
+    if n == 0 {
+        return Ok(());
+    }
+    for (i, (file, transf)) in constructions(mem, dest, n)?.into_iter().enumerate() {
         let want = lines.get(format!("toAdd[{i}].fileName").as_str()).and_then(|v| v.strip_prefix("res:"));
         let want = want.map(rebuild::unescape).transpose()?.unwrap_or_default();
         if file != want {
@@ -911,13 +974,55 @@ pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), 
                 String::from_utf8_lossy(&want)
             ));
         }
-        let transf: Vec<String> = (0..16).map(|k| format!("{:08x}", u32_at(&e, 0xc98 + k * 4))).collect();
         let want = lines.get(format!("toAdd[{i}].transf").as_str()).and_then(|v| v.strip_prefix("m4:")).unwrap_or("");
-        if transf.join(",") != want {
+        if transf != want {
             return Err(format!("construction {i} stands elsewhere than the text's"));
         }
     }
     Ok(())
+}
+
+/// What a command builds, as far as telling one command from another needs: its [`Place`] and its constructions. Two commands with
+/// the same identity build the same thing at the same place.
+#[derive(Debug, Default, PartialEq)]
+pub struct Identity {
+    pub place: Place,
+    constructions: Vec<Construction>,
+}
+
+/// [`Identity`] of the command at `dest`.
+pub fn identity(mem: &dyn Mem, dest: usize) -> Result<Identity, String> {
+    Ok(Identity { place: command_place(mem, dest)?, constructions: command_constructions(mem, dest)? })
+}
+
+/// Whether the command at `dest` is the build of the command at `like`, for an order that has no text (`complete_next`): `like` is
+/// this game's own held command of the same build, and the script's command is the rebuild of its record, so it adds the same
+/// constructions (file and transform, in order) or, without constructions, touches the same place (as [`same_place`]). A held
+/// command that cannot be read or names no place identifies nothing ([`UNKNOWN`]); any other mismatch is [`NOT_OURS`].
+pub fn same_command(mem: &dyn Mem, like: usize, dest: usize) -> Result<(), String> {
+    let want = identity(mem, like).map_err(|e| format!("{UNKNOWN}the held command: {e}"))?;
+    let have = identity(mem, dest).map_err(|e| format!("{NOT_OURS}{e}"))?;
+    if !want.constructions.is_empty() || !have.constructions.is_empty() {
+        if want.constructions == have.constructions {
+            return Ok(());
+        }
+        return Err(format!(
+            "{NOT_OURS}the command's {} construction(s) are not the held command's {}",
+            have.constructions.len(),
+            want.constructions.len()
+        ));
+    }
+    if want.place.is_empty() {
+        return Err(format!("{UNKNOWN}the held command names no place (no node, segment end or existing entity)"));
+    }
+    if want.place.meets(&have.place) {
+        return Ok(());
+    }
+    Err(format!(
+        "{NOT_OURS}the command builds elsewhere: none of its {} point(s) and {} removed entit(ies) is one of the held command's",
+        have.place.points.len(),
+        have.place.removed.len()
+    ))
 }
 
 /// Puts the verified Proposal into the command's own: the engine's copy assignment.
@@ -1399,18 +1504,20 @@ mod tests {
         assert_eq!(s.take_failed(0), [4], "the switch is off: the deferred command can never get its result");
         s.enable();
         s.arm(2, 0, 5, 10);
-        s.arm(3, 0, 6, 20); // replaces the first before a command used it
-        assert_eq!(s.take_failed(20), [5]);
-        assert!(s.take_failed(20 + DEFAULT_TTL_MS).is_empty(), "not expired yet");
-        assert_eq!(s.take_failed(21 + DEFAULT_TTL_MS), [6], "expired unused");
+        s.arm(3, 0, 6, 20); // a second order waits behind the first: nothing is replaced, nothing failed
+        assert!(s.take_failed(20).is_empty());
+        assert!(s.take_failed(10 + DEFAULT_TTL_MS).is_empty(), "not expired yet");
+        assert_eq!(s.take_failed(11 + DEFAULT_TTL_MS), [5], "each order expires on its own");
+        assert_eq!(s.take_failed(21 + DEFAULT_TTL_MS), [6]);
         s.arm_link(8, 0, "key=1:1".into(), 100);
-        let o = s.take(110).expect("armed");
+        let w = s.waiting(110);
+        let o = s.take(w[0].seq).expect("armed");
         assert!(o.link_only && o.held == 8 && o.tm == "key=1:1");
         assert!(s.take_failed(110).is_empty(), "used: it completes with that command's result");
     }
 
     #[test]
-    fn an_order_is_taken_once_expires_and_is_replaced() {
+    fn orders_wait_in_the_mods_order_are_taken_by_number_once_and_expire_each_on_its_own() {
         let s = State::default();
         s.arm(7, 0, 0, 0);
         assert!(!s.pending(), "off: refused");
@@ -1418,37 +1525,49 @@ mod tests {
             matches!(s.drain_events(0).as_slice(), [Event::InjectRefused { key: 7, outcome: "no_command", reason, .. }] if reason.contains("is off"))
         );
         s.enable();
-        s.arm(7, 0, 0, 100);
+        // three orders in one step: all wait, in the order they were written, each with its own number
+        s.arm(7, 0, 1, 100);
+        s.arm(8, 50, 2, 100);
+        s.arm_link(3, 0, String::new(), 100);
         assert!(s.pending());
+        assert!(s.drain_events(100).is_empty(), "no order replaces another");
+        let w = s.waiting(100);
         assert_eq!(
-            s.take(150),
-            Some(Order {
-                key: 7,
-                armed_ms: 100,
-                ttl_ms: DEFAULT_TTL_MS,
-                held: 0,
-                link_only: false,
-                tm: String::new(),
-                forced: String::new()
-            })
+            w.iter().map(|o| (o.key, o.held, o.link_only)).collect::<Vec<_>>(),
+            [(7, 1, false), (8, 2, false), (0, 3, true)]
         );
-        assert_eq!((s.take(150), s.pending()), (None, false));
-        s.arm(8, 50, 0, 0);
-        s.arm(9, 50, 0, 10);
-        let ev = s.drain_events(10);
+        assert!(w[0].seq < w[1].seq && w[1].seq < w[2].seq);
+        assert_eq!((w[0].ttl_ms, w[1].ttl_ms), (DEFAULT_TTL_MS, 50));
+        // the second is used first (its command came first): the others keep waiting; a number is taken once
+        assert_eq!(s.take(w[1].seq).map(|o| o.key), Some(8));
+        assert!(s.take(w[1].seq).is_none());
+        assert_eq!(s.waiting(100).iter().map(|o| o.key).collect::<Vec<_>>(), [7, 0]);
+        // the applies seen while an order waits are its own
+        s.note_apply(false, 120);
+        assert!(s.waiting(120)[0].applies.text().contains("0 held, 1 not held"));
+        // only the first expires at its own time; the link order (same time to live) with it
+        s.arm(9, 50, 4, 200);
+        let ev = s.drain_events(260);
         assert!(
-            matches!(ev.as_slice(), [Event::InjectRefused { key: 8, reason, .. }] if reason.contains("key 8") && reason.contains("replaced")),
+            matches!(ev.as_slice(), [Event::InjectRefused { key: 9, reason, .. }] if reason.contains("key 9") && reason.contains("expired") && !reason.contains("1 not held")),
             "{ev:?}"
         );
-        assert!(s.take(100).is_none());
-        let ev = s.drain_events(100);
+        assert_eq!(s.take_failed(260), [4]);
+        assert_eq!(s.waiting_count(), 2);
+        let ev = s.drain_events(101 + DEFAULT_TTL_MS);
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        assert_eq!(s.take_failed(101 + DEFAULT_TTL_MS), [1, 3]);
+        assert!(!s.pending());
+        // the queue is bounded: the oldest unused order is refused when it is full
+        for k in 0..=MAX_ORDERS as u64 {
+            s.arm(1000 + k, 0, 0, 300);
+        }
+        assert_eq!(s.waiting_count(), MAX_ORDERS);
+        let ev = s.drain_events(300);
         assert!(
-            matches!(ev.as_slice(), [Event::InjectRefused { key: 9, reason, .. }] if reason.contains("key 9") && reason.contains("expired")),
+            matches!(ev.as_slice(), [Event::InjectRefused { key: 1000, reason, .. }] if reason.contains("the oldest")),
             "{ev:?}"
         );
-        s.arm(1, 0, 0, 0);
-        let ev = s.drain_events(DEFAULT_TTL_MS + 1);
-        assert!(matches!(ev.as_slice(), [Event::InjectRefused { reason, .. }] if reason.contains("expired")), "{ev:?}");
     }
 
     #[test]
@@ -1499,20 +1618,7 @@ proposal.new2oldNodes.graph	raw:P w:0000000000000002",
     }
 
     #[test]
-    fn an_order_taken_for_a_command_that_is_not_the_mods_is_put_back_and_a_town_construction_is_not_the_mods() {
-        let s = State::default();
-        s.enable();
-        s.arm(3, 0, 0, 100);
-        let o = s.take(150).expect("armed");
-        s.put_back(o);
-        assert!(s.pending());
-        assert_eq!(s.take(160).expect("put back").key, 3);
-        // a newer order wins over the one put back
-        s.arm(4, 0, 0, 200);
-        let o = s.take(210).expect("armed");
-        s.arm(5, 0, 0, 220);
-        s.put_back(o);
-        assert_eq!(s.take(230).expect("the newer").key, 5);
+    fn a_town_construction_is_not_the_mods_and_a_held_commands_build_is_told_by_its_constructions() {
         // the command's construction against the text's: file and transform
         let arena = Arena::new(0x3000_0000_0000);
         let mut e = vec![0u8; CONSTRUCTION_STRIDE];
@@ -1545,6 +1651,34 @@ toAdd[0].transf	m4:{t}
 "
         )
         .is_ok());
+        // a complete_next has no text: the script's command is its held command's build when it adds the same constructions
+        let with = |transf: f32| {
+            let mut e = e.clone();
+            e[0xc98..0xc9c].copy_from_slice(&transf.to_bits().to_le_bytes());
+            let ent = arena.add(&e);
+            let mut payload = payload.clone();
+            payload[0x9b8] = portable::KIND_BUILD_PROPOSAL;
+            for (k, v) in [ent, ent + CONSTRUCTION_STRIDE, ent + CONSTRUCTION_STRIDE].iter().enumerate() {
+                payload[TO_ADD + k * 8..TO_ADD + k * 8 + 8].copy_from_slice(&(*v as u64).to_le_bytes());
+            }
+            arena.add(&payload)
+        };
+        let (held, rebuild, town) = (with(1.0), with(1.0), with(2.0));
+        assert_eq!(same_command(&arena, held, rebuild), Ok(()));
+        let why = same_command(&arena, held, town).unwrap_err();
+        assert!(why.starts_with(NOT_OURS) && why.contains("construction"), "{why}");
+        // ... or, without constructions, touches the same place
+        let road = command_at(&arena, Some([10.0, 0.0, 0.0]), &[]);
+        assert_eq!(same_command(&arena, road, command_at(&arena, Some([10.1, 0.0, 0.0]), &[])), Ok(()));
+        let why = same_command(&arena, road, command_at(&arena, Some([90.0, 0.0, 0.0]), &[])).unwrap_err();
+        assert!(why.starts_with(NOT_OURS) && why.contains("elsewhere"), "{why}");
+        assert!(same_command(&arena, road, held).unwrap_err().starts_with(NOT_OURS), "a road is not a construction");
+        // a held command that names no place identifies nothing
+        let nothing = command_at(&arena, None, &[]);
+        assert!(same_command(&arena, nothing, road).unwrap_err().starts_with(UNKNOWN));
+        // the identity two commands are compared by after an order (a reused address must carry the same build)
+        assert_eq!(identity(&arena, held), identity(&arena, rebuild));
+        assert_ne!(identity(&arena, held), identity(&arena, town));
     }
 
     // ---- fail closed: a refused order empties the command; every build kind is matched by more than its kind

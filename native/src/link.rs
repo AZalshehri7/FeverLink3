@@ -60,8 +60,8 @@ pub enum CtlMessage {
     /// Held command `id` gets no stamp apply of its own on this game (its replay was refused or failed): fire its tool callback with
     /// the command's own "not applied" result and destroy it now.
     Fail { id: u64 },
-    /// The NEXT script `build_proposal` the simulation applies is this game's stamp apply of deferred command `held`, built from the
-    /// record (not injected): the held command takes that command's result, as with `inject_next {held}`.
+    /// The script `build_proposal` that builds what deferred command `held` builds (its place or constructions) is this game's stamp
+    /// apply of it, built from the record (not injected): the held command takes that command's result, as with `inject_next {held}`.
     CompleteNext { held: u64, ttl: u64, tm: String },
     /// Apply the staged terrain edit `id` at `stamp` (stage 0.4: parsed, not acted on).
     TerrainApply { id: u64, stamp: u64 },
@@ -73,8 +73,9 @@ pub enum CtlMessage {
     /// `at` (optional, 1 to 64 `{x, y, z}` positions) names the nodes by position instead: each must match exactly one node of the
     /// converted proposal within 0.05 m, and then `frozen` and `adds` are not needed (and not used).
     PatchNext { frozen: Vec<u32>, adds: u32, at: Vec<[f64; 3]>, ttl: u64 },
-    /// `FEVERLINK3_NATIVE_INJECT`: the NEXT script `build_proposal` command (a placeholder without construction) gets the engine `Proposal`
-    /// the module builds natively from the portable text in `native_inject_<key>.txt` (`inject.rs`). Expires after `ttl` ms (0: default).
+    /// `FEVERLINK3_NATIVE_INJECT`: the script `build_proposal` command of this build (the mod's placeholder, identified by the text's place
+    /// or constructions) gets the engine `Proposal` the module builds natively from the portable text in `native_inject_<key>.txt`
+    /// (`inject.rs`). Orders wait in a queue in the order they were written. Expires after `ttl` ms (0: default).
     /// `held` (0: none) is this game's deferred held command of the same build (`defer`): it completes with this command's result.
     /// `tm` (optional) is the mod's timing text of the build; the module adds the rebuild and apply times and writes it back (`timing`).
     /// `refuse` (optional, a test switch: `FEVERLINK3_DEBUG_REFUSE_INJECT`): the module refuses the order with this reason once a command

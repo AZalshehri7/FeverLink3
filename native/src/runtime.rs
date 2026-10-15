@@ -111,12 +111,12 @@ pub struct Runtime {
     inject: crate::inject::State,
     inject_settings: OnceLock<portable::Settings>,
     inject_dir_path: Mutex<Option<std::path::PathBuf>>,
-    /// The script command an `inject_next` with `held` was used for (its payload) and that deferred held command: when the simulation
-    /// has applied the script command, the held command takes its result (`engine::adopt_result`).
-    defer_link: Mutex<Option<(usize, u64)>>,
-    /// The script command an order was used for and its timing so far (the mod's `tm`, the rebuild's wall-clock start and end and how it
-    /// went): after the simulation applied that command, one `timing apply` line is written (`timing_after_apply`).
-    stamp_timing: Mutex<Option<StampTiming>>,
+    /// The commands the command list's `Add` carried an order out on (the interface half's script commands), by the order's number,
+    /// until the simulation applies them: their timing and the deferred held command that takes their result (`inject::Added`).
+    /// A command the simulation's apply hook matched to its order needs no record: the apply hands it over within the same call.
+    /// Before 2026-10-15 these were single slots keyed by the payload address: a second build in the same step overwrote the first's
+    /// link (its held command never completed) and a reused address could match another command.
+    added: Mutex<std::collections::BTreeMap<u64, inject::Added>>,
     /// The engine-copy experiment (`FEVERLINK3_NATIVE_COPY`, track A); unset in a normal run.
     native_copy: OnceLock<portable::Sink>,
     /// `FEVERLINK3_NATIVE_PATCH` (track A, A2c): the armed `patch_next` order and its events.
@@ -180,8 +180,7 @@ impl Runtime {
             inject: Default::default(),
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
-            defer_link: Mutex::new(None),
-            stamp_timing: Mutex::new(None),
+            added: Mutex::new(Default::default()),
             preview_fn: AtomicUsize::new(0),
             preview_args: Mutex::new(None),
             preview_holding: AtomicBool::new(false),
@@ -876,7 +875,7 @@ impl Runtime {
         }
         // both call the engine when an order is carried out: they guard their own bookkeeping
         if self.inject.enabled() {
-            self.inject_add(&args, caller);
+            self.inject_on_add(&args, caller);
         }
         if self.patch.enabled() {
             self.patch_add(&args, caller);
@@ -1038,6 +1037,7 @@ impl Runtime {
         })
         .flatten();
         // the orders of `inject_next` / `patch_next`: the script's command passes here, not the command list's `Add` (see apply_orders)
+        let mut used = None;
         if self.inject.enabled() || self.patch.enabled() {
             let mine = crate::log::guarded("apply hook (orders)", || {
                 let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
@@ -1047,7 +1047,7 @@ impl Runtime {
             });
             if mine == Some(true) {
                 // calls the engine when an order is carried out: guards its own bookkeeping
-                self.apply_orders(cmd);
+                used = self.apply_orders(cmd);
             }
         }
         // dev-only dump of a build command before the simulation applies it, and of its result part afterwards
@@ -1097,11 +1097,8 @@ impl Runtime {
             }
         }
         let result = unsafe { original(sim, cmd) };
-        if self.inject.enabled() {
-            // the timing first: the deferred completion swaps the applied command's payload with the held one's (plain memory, no
-            // engine call: `engine::adopt_result`)
-            crate::log::guarded("apply hook (timing)", || self.timing_after_apply(cmd));
-            crate::log::guarded("apply hook (deferred completion)", || self.complete_deferred(cmd));
+        if let Some(used) = used {
+            self.after_ordered_apply(cmd, used);
         }
         if let Some((payload, seq)) = dumped {
             crate::log::guarded("apply hook (dump after)", || {
@@ -1118,9 +1115,8 @@ impl Runtime {
     }
 }
 
-/// The timing of an ordered script command until its stamp apply (see `Runtime::stamp_timing`).
+/// The timing of an ordered script command until its stamp apply (see `inject::Used`).
 pub(crate) struct StampTiming {
-    pub payload: usize,
     pub key: u64,
     pub held: u64,
     pub tm: String,
@@ -1191,6 +1187,7 @@ mod tests {
     use std::cell::RefCell;
 
     mod foreign;
+    mod queue;
 
     // ---- a fake engine that records what the hooks do to it, per test thread
 
@@ -2264,11 +2261,11 @@ mod tests {
         );
         assert_eq!(town.c.payload.to_vec(), before, "untouched");
         assert!(rt.inject.pending(), "the order keeps waiting");
-        assert!(lock(&rt.defer_link).is_none());
+        assert!(lock(&rt.added).is_empty());
         // 2. a side file whose text names no place: no command can be identified by it either
         std::fs::write(dir.path().join(crate::inject::inject_file_name(6)), "toAdd.#\tn:0\n").unwrap();
         ctl(dir.path(), "2\tinject_next\t1\t{[\"key\"]=6}\n");
-        rt.pump(); // the module reads it (it replaces key 5, which is refused without a command: no_command)
+        rt.pump(); // the module reads it: it waits behind key 5
         let (mut town2, _n2) = road_placeholder(400.0);
         let before2 = town2.c.payload.to_vec();
         unsafe { rt.on_apply(sim.as_mut_ptr(), town2.c.command.as_mut_ptr()) };
@@ -2356,7 +2353,6 @@ mod tests {
             "nothing of the placeholder is applied"
         );
         assert_eq!((ours.c.payload[0x9b8], ours.c.payload[0x358]), (52, 1), "the kind and the Context stay");
-        assert!(lock(&rt.defer_link).is_none(), "the held command never takes the result of the emptied command");
         rt.pump();
         let ev = events(dir.path());
         assert!(
@@ -2396,7 +2392,7 @@ mod tests {
         assert_eq!(calls().last().map(String::as_str), Some("apply tag 7"), "the original apply still runs");
         assert_eq!(script.c.payload.to_vec(), before, "not identified (no side file): untouched");
         assert!(rt.inject.pending(), "the order keeps waiting");
-        // an order that no script command ever uses: the reason says which applies went by (it replaces key 5, which is refused)
+        // an order that no script command ever uses: the reason says which applies went by (it waits behind key 5)
         rt.inject.arm(9, 0, 0, rt.now_ms());
         let mut other = Call::new(17, 1);
         unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
@@ -2409,8 +2405,11 @@ mod tests {
             "{ev:?}"
         );
         assert!(
-            ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 5") && w.contains("replaced")),
-            "{ev:?}"
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("key 5")
+                && w.contains("expired")
+                && w.contains("1 held, 0 not held")),
+            "each order expires on its own, with the applies it saw: {ev:?}"
         );
     }
 
