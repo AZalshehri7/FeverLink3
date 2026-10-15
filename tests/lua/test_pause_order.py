@@ -126,5 +126,134 @@ class PausedBuildsOvershootTest(PausedDeferredBuildTest):
         self.assertEqual(self.relay.replay_failed, [])
 
 
+GUI_TIME = "GUI_ENV.api.engine.getComponent(1, GUI_ENV.api.type.ComponentType.GAME_TIME).gameTime"
+
+# The interface's world lags the simulation (the engine copies the simulation's changes to it a little later): with GUI_LAG set, the
+# interface half sees the game time of the frame before (one frame behind after every step; a game standing still catches up).
+# Installed on the interface half's api after every load.
+GUI_LAG_LUA = r'''
+local api = GUI_ENV.api
+local base = api.engine.getComponent
+api.engine.getComponent = function(e, t)
+  local c = base(e, t)
+  if t == api.type.ComponentType.GAME_TIME and GUI_LAG and GUI_SEEN then return { gameTime = GUI_SEEN } end
+  return c
+end
+if not FRAME_LAGGED then
+  FRAME_LAGGED = true
+  local baseFrame = FRAME
+  FRAME = function()
+    GUI_SEEN, PREV_T = PREV_T or GAME.time, GAME.time
+    return baseFrame()
+  end
+end
+'''
+
+
+class ReleaseNative(I.InjectNative):
+    """The module's real rule for a deferred held command (docs/NATIVE_LINK.md, commit 712c55b): its completion with this game's stamp
+    apply waits for the mod's `release` of the id, which says the INTERFACE's world has that apply; the tool's callback fires then and
+    reads the new entities there. The fake notes the interface's game time at the release."""
+
+    def __init__(self, game, clock):
+        self.waiting, self.release_gui_time = {}, {}
+        super().__init__(game, clock)
+
+    def handle(self, seq, kind, p):
+        hid = int(p.get("id", -1)) if kind == "release" else None
+        if hid is not None and (hid in self.deferred or hid in self.waiting):
+            self.last_valid = self.clock.t
+            self.heard.append((self.clock.t, seq, kind, p))
+            self.release_gui_time[hid] = int(self.game.L.eval(GUI_TIME))
+            if self.waiting.pop(hid, None):
+                I.InjectNative.finish_held(self, hid, True, "stamp_apply")
+            return
+        super().handle(seq, kind, p)
+
+    def finish_held(self, hid, ok, reason):
+        if ok and reason == "stamp_apply" and hid not in self.release_gui_time:
+            if hid in self.deferred:
+                self.waiting[hid] = True   # the simulation applied it: the completion waits for the release
+                return True
+            return False
+        return I.InjectNative.finish_held(self, hid, ok, reason)
+
+
+class ReleaseGame(I.InjectGame):
+    def __init__(self, label, player_id, tmp, first_entity, clock):
+        I.S.N.NativeGame.__init__(self, label, player_id, tmp, first_entity)
+        clock.games.append(self)
+        self.native = ReleaseNative(self, clock)
+        g = self.L.globals()
+        g.FAKE_T = clock.t
+        g.NATIVE_HOOK = self.native.on_add
+        g.INJECT_HOOK = self.native.inject_hook
+        self.L.execute(I.S.STRICT_LUA)
+        self.L.execute(I.INJECT_LUA)
+        self.reload()
+
+    def reload(self):
+        super().reload()
+        self.L.execute(GUI_LAG_LUA)
+
+
+class PausedCallbackWaitsForTheInterfaceWorldTest(PausedDeferredBuildTest):
+    """b3pause2 (2026-10-15): the host's own road made in a pause crashed the host. The host stood 6 steps past the pause (speed 0 takes
+    effect late), the mod took the pause stamp, a placeholder until the host stamps the build, for passed and wrote `release` at once;
+    the module completed the street tool's command at the simulation's apply of the host's stamp, before the interface's world had the
+    road, and the tool's callback stopped the game on an edge it did not know. The release must wait for the host's stamp and for the
+    interface's world to have it, while paused too."""
+
+    test_a_deferred_build_made_in_a_pause_is_injected_on_both_games_in_the_pause_order_and_completes_the_tool = None
+    test_two_players_building_in_one_pause_get_the_same_world = None
+
+    def setUp(self):
+        super().setUp()
+        self.A = ReleaseGame("host", 0, self.tmp + "x", 50000, self.clock)
+        self.B = ReleaseGame("client", 1, self.tmp + "x", 51000, self.clock)
+        self.clock.games[:] = [self.A, self.B]
+        self.relay = I.T.Relay([self.A, self.B])
+
+    def test_the_originators_paused_build_completes_only_once_the_interface_world_is_past_the_hosts_stamp(self):
+        self.start(speed=2)
+        self.strict_on(self.A, self.B)
+        self.A.run("OVERSHOOT = 3")      # the host stands 3 steps past the pause, as in the real run
+        for g in (self.A, self.B):
+            g.run("GUI_LAG = true")       # and every interface world is a frame behind its simulation
+        self.tick(4)
+        self.relay.pump()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(18)
+        paused_at = self.relay.pauseAt
+        self.assertGreater(self.A.time(), paused_at, "the host overshot the pause")
+        for g in (self.A, self.B):
+            g.native.native_text = I.road_text()
+            g.native.input_text = I.road_text()
+        stood = self.A.time()
+        self.A.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+        self.tick(16)
+        stamp = int(self.A.builds()[0].split("@")[1])
+        self.assertEqual(self.A.builds(), self.B.builds())
+        self.assertGreater(stamp, stood, "stamped by the host past where the games stood")
+        self.assertIn(1, self.A.native.release_gui_time, "released: " + self.log())
+        self.assertGreater(self.A.native.release_gui_time[1], stamp, "released only once the interface's world is past the stamp")
+        self.assertEqual(self.A.native.completed, [(1, True, "stamp_apply")], "the tool's callback took the stamp apply")
+        self.assertEqual((self.A.speed(), self.B.speed()), (0, 0), "while paused")
+        self.assertSameWorld()
+        self.assertEqual(self.relay.replay_failed, [])
+
+
+# only its own test: the inherited ones run with their own module elsewhere
+for _name in dir(PausedCallbackWaitsForTheInterfaceWorldTest):
+    if _name.startswith("test_") and _name != "test_the_originators_paused_build_completes_only_once_the_interface_world_is_past_the_hosts_stamp":
+        setattr(PausedCallbackWaitsForTheInterfaceWorldTest, _name, None)
+# likewise for the pause tests' base: the inject tests run in test_inject_fail_closed.py
+for _cls in (PausedDeferredBuildTest, PausedBuildsOvershootTest):
+    for _name in dir(I.InjectFailClosedTest):
+        if _name.startswith("test_") and _name not in vars(_cls):
+            setattr(_cls, _name, None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
