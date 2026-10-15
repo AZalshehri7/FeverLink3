@@ -20,7 +20,7 @@ impl Runtime {
         // blocks) is neither written nor needed
         let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], typed: true, ..settings });
         self.inject.enable();
-        self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and an inject_next order makes the next script build_proposal take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal leaves the command untouched)");
+        self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and an inject_next order makes the next script build_proposal take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
     }
 
     pub(super) fn inject_dir(&self, dir: &std::path::Path) {
@@ -145,8 +145,8 @@ impl Runtime {
     /// simulation state does not pass the command list's `Add` hook (b31 to b41: the engine executed the command, our `Add` hook never
     /// saw a non-tool kind 52), so the orders are also carried out here, on a `build_proposal` the module did not hold, BEFORE the original
     /// applies it. Dev-only switches, and like the dev dumps that already run here they read a file and call the engine on this thread;
-    /// everything is checked first and a refusal leaves the command untouched. A construction tool's command that was not held can be
-    /// mistaken for the script's here; the order's own checks (the number of constructions or nodes) guard against that.
+    /// everything is checked first and a refusal empties the command. A construction tool's command that was not held can be mistaken for
+    /// the script's here; the order's own checks (`inject::same_build`: the constructions, or the place) guard against that.
     ///
     /// This part only notes the apply (guarded by the caller): true when the command is a `build_proposal` the module did not hold, for
     /// which the caller then runs [`Runtime::apply_orders`] outside the guard.
@@ -189,8 +189,12 @@ impl Runtime {
         crate::log::calls_engine("native inject: an order may be carried out");
         let job = crate::log::guarded("native inject: order", || self.inject_take(args, caller)).flatten();
         let Some(InjectJob { order, dest, link, t0, rb0, prepared }) = job else { return };
+        let forced = order.forced.clone();
         let run = match prepared {
             // the same parsing and build first as a dry pass inside a guard: a panic of ours on the peer's text is a refusal
+            Some(Ok(_)) if !forced.is_empty() => {
+                Err(format!("forced refusal ({forced}): the test switch FEVERLINK3_DEBUG_REFUSE_INJECT"))
+            }
             Some(Ok(p)) => match inj::dry_build(&LiveMem, self.base, p.settings, self.build.name, &p.text, p.donor) {
                 Err(why) => Err(why),
                 Ok(()) => {
@@ -201,7 +205,46 @@ impl Runtime {
             Some(Err(why)) => Err(why),
             None => Err(String::new()), // complete_next: the record's own command is this game's stamp apply; nothing to inject
         };
-        crate::log::guarded("native inject: result", || self.inject_finish(order, dest, link, t0, rb0, run));
+        // Fail closed: an order refused on a command that took it (the mod's, as far as the identity checks can tell) empties that command,
+        // so this game applies nothing of the build rather than the placeholder (this game's own rebuild of the record, not the build).
+        let refused = !order.link_only && matches!(&run, Err(why) if !inj::keeps_waiting(why));
+        let outcome = refused.then(|| self.inject_neutralise(order.key, dest));
+        crate::log::guarded("native inject: result", || self.inject_finish(order, dest, link, (t0, rb0), run, outcome));
+    }
+
+    /// The engine's Proposal functions; a test sets stand-ins (`TEST_FNS`).
+    fn proposal_fns(&self) -> Result<nc::ProposalFns, String> {
+        #[cfg(test)]
+        if let Some(f) = TEST_FNS.with(|t| t.get()) {
+            return Ok(f);
+        }
+        nc::ProposalFns::at(self.base)
+    }
+
+    /// Empties the command a refused order was used for (`inject::neutralise`): what became of it. Calls the engine: never inside a guard
+    /// (the checks before are guarded).
+    fn inject_neutralise(&self, key: u64, dest: usize) -> inj::Outcome {
+        crate::log::calls_engine("native inject: the refused order's command is emptied");
+        let ready = crate::log::guarded("native inject: neutralise check", || {
+            let fns = self.proposal_fns()?;
+            inj::is_proposal(&LiveMem, dest)?;
+            Ok::<_, String>(fns)
+        });
+        match ready {
+            Some(Ok(fns)) => {
+                // SAFETY: `is_proposal` accepted this payload just now, on the thread that applies (or queues) the command; the functions
+                // are the verified ones.
+                unsafe { inj::neutralise(&fns, dest) };
+                inj::Outcome::Nothing
+            }
+            Some(Err(why)) => {
+                crate::log::guarded("native inject: neutralise report", || {
+                    self.say(&format!("native inject: key {key}: the command could NOT be emptied: {why}"))
+                });
+                inj::Outcome::Untouched
+            }
+            None => inj::Outcome::Untouched,
+        }
     }
 
     /// The decision of [`Runtime::inject_add`]: whether an order is used for this command, and everything the injection needs that does
@@ -231,12 +274,18 @@ impl Runtime {
         };
         // SAFETY: only readable memory is read.
         let Some(dest) = (unsafe { engine::payload_of(args.cmd) }) else {
-            self.inject.refuse(format!("key {}: the command has no payload", order.key));
+            self.inject.refuse(
+                order.key,
+                order.held,
+                inj::Outcome::NoCommand,
+                format!("key {}: the command has no payload", order.key),
+            );
+            self.inject.fail_held(order.held);
             self.wake();
             return None;
         };
-        // a deferred held command of the same build takes this command's result once the simulation has applied it, injected or not
-        // (a refusal leaves the command to the record path, which is still this game's stamp apply of the build)
+        // a deferred held command of the same build takes this command's result once the simulation has applied it, when it was injected
+        // (or `complete_next`); a refused order fails the held command instead (inject_finish), as the emptied command carries no build
         let link = (order.held != 0).then_some((dest, order.held));
         let t0 = std::time::Instant::now();
         let rb0 = wall_ms();
@@ -250,16 +299,19 @@ impl Runtime {
         order: inj::Order,
         dest: usize,
         link: Option<(usize, u64)>,
-        t0: std::time::Instant,
-        rb0: u64,
+        (t0, rb0): (std::time::Instant, u64),
         run: Result<(u64, u64, u64), String>,
+        outcome: Option<inj::Outcome>,
     ) {
+        let mut link = link;
+        let mut how = "injected";
         match run {
             Err(why) if order.link_only && why.is_empty() => {
                 self.say(&format!(
                     "native inject: complete_next held {}: this script build_proposal is this game's stamp apply (record path)",
                     order.held
                 ));
+                how = "record (complete_next)";
             }
             Ok((nodes, segments, constructions)) => {
                 self.say(&format!(
@@ -268,9 +320,8 @@ impl Runtime {
                     t0.elapsed().as_millis()
                 ));
                 self.inject.report(Event::Injected { key: order.key, nodes, segments, constructions });
-                *super::lock(&self.inject_last_ok) = Some(order.key);
             }
-            Err(why) if why.starts_with(inj::NOT_OURS) => {
+            Err(why) if inj::keeps_waiting(&why) => {
                 self.say(&format!(
                     "native inject: key {}: {why}; the order waits for the next build_proposal",
                     order.key
@@ -295,17 +346,33 @@ impl Runtime {
                         self.say(&format!("native inject: report: {l}"));
                     }
                 }
-                self.say(&format!("native inject: key {}: REFUSED, the command is untouched: {why}", order.key));
-                self.inject.refuse(format!("key {}: {why}", order.key));
+                let outcome = outcome.unwrap_or(inj::Outcome::Untouched);
+                if outcome == inj::Outcome::Nothing {
+                    self.say(&format!(
+                        "native inject: key {}: REFUSED, the command was emptied: nothing of the build is applied on this game: {why}",
+                        order.key
+                    ));
+                    how = "refused (nothing applied)";
+                } else {
+                    self.say(&format!(
+                        "native inject: key {}: REFUSED and the command could NOT be emptied: it applies the mod's placeholder (the mod asks for the repair): {why}",
+                        order.key
+                    ));
+                    how = "refused (NOT emptied)";
+                }
+                self.inject.refuse(order.key, order.held, outcome, format!("key {}: {why}", order.key));
+                // the held command of the same build never takes the result of a command that did not carry the build: it fails now (its
+                // tool callback fired with a failed result at the next Add), so the tool is not left busy and nothing is applied twice
+                if order.held != 0 {
+                    self.say(&format!(
+                        "native inject: key {}: held command {} fails (its tool callback is fired with a failed result)",
+                        order.key, order.held
+                    ));
+                    self.inject.fail_held(order.held);
+                }
+                link = None;
             }
         }
-        let how = if order.link_only {
-            "record (complete_next)"
-        } else if super::lock(&self.inject_last_ok).take() == Some(order.key) {
-            "injected"
-        } else {
-            "refused (record path)"
-        };
         *super::lock(&self.stamp_timing) = Some(StampTiming {
             payload: dest,
             key: order.key,
@@ -379,9 +446,35 @@ impl Runtime {
         self.wake();
     }
 
-    /// What the injection needs before the engine is called: the functions and the allocator (their bytes checked), the side file, the
-    /// destination's checks. Calls nothing of the engine; every refusal leaves the command untouched.
+    /// What the injection needs before the engine is called: the side file, the destination's checks (is this the mod's command), then
+    /// the functions and the allocator (their bytes checked). Calls nothing of the engine. A refusal empties the command, so it may only
+    /// come after the command was positively identified as the mod's placeholder for this order: every error before that (no side file,
+    /// an unreadable one, a text that names no place) is [`inj::UNKNOWN`] and a mismatch is [`inj::NOT_OURS`]; both leave the command
+    /// untouched and the order waiting (it expires into a refusal that asks for the repair). Emptying someone else's command on one game
+    /// only would itself fork the worlds.
     fn inject_prepare(&self, key: u64, dest: usize) -> Result<Prepared, String> {
+        let read = || -> Result<(portable::Settings, std::path::PathBuf, String), String> {
+            let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
+            let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
+            let path = dir.join(inj::inject_file_name(key));
+            let len = std::fs::metadata(&path)
+                .map_err(|e| format!("no side file {}: {e}", inj::inject_file_name(key)))?
+                .len();
+            if len > inj::MAX_TEXT_BYTES {
+                return Err(format!("the side file has {len} bytes, more than {}", inj::MAX_TEXT_BYTES));
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
+            Ok((settings, dir, text))
+        };
+        let (settings, dir, text) = read().map_err(|why| format!("{}{why}", inj::UNKNOWN))?;
+        let counts = inj::donor_counts(&text);
+        let (edge_objects, constructions) = (counts[0], counts[1]);
+        // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
+        inj::check_destination(&LiveMem, dest, constructions, edge_objects)
+            .and_then(|()| inj::same_build(&LiveMem, dest, &text))
+            .map_err(|why| if why.starts_with(inj::UNKNOWN) { why } else { format!("{}{why}", inj::NOT_OURS) })?;
+        // from here on the command is the mod's placeholder for this order: a refusal empties it
         if self.build.name != portable::LAYOUT_BUILD {
             return Err(format!(
                 "the layout is that of game build {}, this is {}",
@@ -389,26 +482,9 @@ impl Runtime {
                 self.build.name
             ));
         }
-        let fns = nc::ProposalFns::at(self.base)?;
+        let fns = self.proposal_fns()?;
         let alloc =
             EngineAlloc::at(self.base).map_err(|why| format!("the game's allocator was not verified: {why}"))?;
-        let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
-        let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
-        // the cheap refusals first
-        let path = dir.join(inj::inject_file_name(key));
-        let len =
-            std::fs::metadata(&path).map_err(|e| format!("no side file {}: {e}", inj::inject_file_name(key)))?.len();
-        if len > inj::MAX_TEXT_BYTES {
-            return Err(format!("the side file has {len} bytes, more than {}", inj::MAX_TEXT_BYTES));
-        }
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
-        let counts = inj::donor_counts(&text);
-        let (edge_objects, constructions) = (counts[0], counts[1]);
-        // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
-        inj::check_destination(&LiveMem, dest, constructions, edge_objects)
-            .and_then(|()| inj::same_constructions(&LiveMem, dest, &text))
-            .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
         let donor = counts.iter().any(|&n| n > 0).then_some(dest);
         Ok(Prepared { fns, alloc, settings, dir, text, donor })
     }
@@ -515,4 +591,10 @@ struct Prepared {
     text: String,
     /// The script command's payload when the text adds constructions or edge objects (the receiver's own conversion of them).
     donor: Option<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stand-ins for the engine's Proposal functions in a test (the test process has no game image).
+    pub(super) static TEST_FNS: std::cell::Cell<Option<nc::ProposalFns>> = const { std::cell::Cell::new(None) };
 }

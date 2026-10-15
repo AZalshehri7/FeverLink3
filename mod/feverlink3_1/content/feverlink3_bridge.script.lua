@@ -116,13 +116,15 @@ pcall(function() FIRE_DONE = os.getenv("FEVERLINK3_STRICT_FIRE_DONE") ~= "0" end
 -- when another section needs it), new module-level state into X. tests/lua/test_mod_files.py measures the peak with the compiler.
 -- The few module-level values added by the 2026-10-14 work live in one table.
 local X = {}
--- Test switch (never set by a player): FEVERLINK3_DEBUG_REFUSE_INJECT=link makes this game's own replay of its deferred build go the record
--- path as if its injection had been refused (the held command takes that apply's result); =fail also tells the module that the held
--- command gets no stamp apply result (its tool callback is fired with a failed result). Proves that no refusal leaves a tool busy.
+-- Test switch (never set by a player): FEVERLINK3_DEBUG_REFUSE_INJECT=1 (or the older values link / fail) makes the native module refuse the
+-- inject order of this game's own replay of its deferred build, after the order's identity checks, like any real refusal: the command is
+-- emptied (nothing of the build is applied here), the held command fails (its tool callback is fired with a failed result) and this game
+-- asks for a resync. Proves in a real run that a refusal applies nothing and leaves no tool busy. Since 2026-10-15 there is no record-path
+-- fallback to force: a build with the originator's text is injected or not applied.
 X.DEBUG_REFUSE_INJECT = nil
 pcall(function()
 	local v = os.getenv("FEVERLINK3_DEBUG_REFUSE_INJECT")
-	if v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
+	if v == "1" or v == "link" or v == "fail" then X.DEBUG_REFUSE_INJECT = v end
 end)
 -- Test switches (never set by a player): FEVERLINK3_TEST_NO_MARGIN / FEVERLINK3_TEST_NO_LEAD take the measured stamp margin (and the host's
 -- lead) away from deferred builds, to measure what they buy (L.testMargin). Unset: nil, nothing changes.
@@ -170,7 +172,7 @@ X.DEFER_GRACE_S = 3
 -- Every stage time is wall-clock milliseconds since 1970, so the lines of two games compare. The native module gives the wall clock and
 -- the C runtime's clock at one instant (`timing clock`); os.clock() reads that same C runtime clock, so wall = X.WALL0 + os.clock() * 1000.
 -- The format is fixed: "timing key=<k> held=<id> click=<wall>@g<game time> cap=<start>..<end> cap_ms=<ms> bytes=<n> ... ship=<wall>@g<t>
--- recv=<wall>@g<t> stamp=<t> step=<t> ... rebuild=<start>..<end> rebuild_ms=<ms> how=<injected|refused (record path)|record (complete_next)>
+-- recv=<wall>@g<t> stamp=<t> step=<t> ... rebuild=<start>..<end> rebuild_ms=<ms> how=<injected|refused (nothing applied)|refused (NOT emptied)|record (complete_next)>
 -- apply=<wall> accepted=<bool> total_ms=<apply - click> late_steps=<(step - stamp) / STEP>".
 X.WALL0 = nil
 function X.wallNow()
@@ -1095,17 +1097,27 @@ end
 
 -- The inject order: the shipped text goes to native_inject_<n>.txt (closed before the order is written), then `inject_next {key=n}`, then the caller
 -- sends the replay's command at once (nothing in between). The module answers `injected` / `inject_refused` in native_events.log.
--- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result.
-local function sendInjectOrder(inj, key, held, tm)
+-- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result, or fails
+-- when the module refuses the order. `refuse`: the test switch's forced refusal (nil: none). Returns true when the order was written; the
+-- caller sends the command only then (an order that did not reach the module would leave the placeholder to be applied as it is).
+local function sendInjectOrder(inj, key, held, tm, refuse)
 	SIM.injectN = (SIM.injectN or 0) + 1
 	local n = SIM.injectN
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. n .. ".txt"), inj.text) then error("cannot write the text file", 0) end
 		local w = C.newWriter(C.path("native_ctl.log"), C.PLAYER_ID)
-		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held, tm = tm })
+		local sent, why = C.writerSend(w, "inject_next", { key = n, held = held, tm = tm, refuse = refuse })
 		if not sent then error(why, 0) end
 	end)
-	traceSim("build.inject", string.format("%s inject_next key=%d held=%s (%d bytes of text) %s", tostring(key), n, tostring(held), #inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	traceSim("build.inject", string.format("%s inject_next key=%d held=%s%s (%d bytes of text) %s", tostring(key), n, tostring(held), refuse and (" refuse=" .. refuse) or "",
+		#inj.text, ok and "written to native_ctl.log" or ("NOT WRITTEN (" .. tostring(err) .. ")")))
+	return ok, err
+end
+
+-- A refusal that means "the exact copy of the build cannot be applied on this game" (the decode's reference check or placeholder, an inject
+-- order that could not be written): nothing was applied here, the build was on the games that could, so the world needs the repair.
+function X.isInjectRefusal(err)
+	return type(err) == "string" and err:find("^inject_refused") ~= nil
 end
 
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
@@ -1372,7 +1384,8 @@ local function simApplyAction(st, it, now)
 		traceSim("build.refused", it.key .. " " .. tostring(err))
 		-- this game's own deferred command gets no stamp apply: it fails now (tool callback fired), not after the grace
 		if it.deferId and it.from == C.PLAYER_ID then X.sendHeldOrder("fail", { id = it.deferId }, it.key) end
-		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err }
+		-- a build whose exact copy cannot be applied here (inject_refused) was applied on the games that could: ask for the repair
+		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err, resync = X.isInjectRefusal(err) or nil }
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
@@ -1431,20 +1444,20 @@ local function simApplyAction(st, it, now)
 					end
 				end
 				if a.patch then sendPatchOrder(a.patch, it.key) end
+				local refuse = nil
 				if a.inject and it.deferId and X.DEBUG_REFUSE_INJECT then
-					logSim("action " .. it.key .. ": FEVERLINK3_DEBUG_REFUSE_INJECT=" .. X.DEBUG_REFUSE_INJECT .. ": this game's own replay is not injected (a forced refusal)")
-					a.inject = nil
+					refuse = "FEVERLINK3_DEBUG_REFUSE_INJECT=" .. X.DEBUG_REFUSE_INJECT
+					logSim("action " .. it.key .. ": " .. refuse .. ": the module is told to refuse this game's own replay (a forced refusal: nothing is applied here)")
 				end
 				local tm = isBuild and X.timingText(it, now) or nil
 				if a.inject then
-					sendInjectOrder(a.inject, it.key, it.deferId, tm)
-				elseif it.deferId and X.DEBUG_REFUSE_INJECT == "fail" then
-					-- the forced refusal of the test switch: the held command gets no result of its own (as if nothing could be linked)
-					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: fail (test switch), its tool callback is fired with a failed result")
-					X.sendHeldOrder("fail", { id = it.deferId }, it.key)
+					local okO, errO = sendInjectOrder(a.inject, it.key, it.deferId, tm, refuse)
+					-- no order, no command: the placeholder alone is this game's guess of the build, never the build (the pcall below refuses it)
+					if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
 				elseif it.deferId then
-					-- not injected (the record path: a chain, a refusal): this replay's command is still this game's stamp apply of the build, so
-					-- the held command takes its result (run rt1 C12: without this the bulldozer stayed busy until the 30 s age limit)
+					-- not injected because the decode took the record path (this simulation half was not told of the module's inject capability;
+					-- a refused injection never gets here any more, it refuses the build): this replay's command is still this game's stamp apply
+					-- of the build, so the held command takes its result (run rt1 C12: without this the bulldozer stayed busy until the 30 s age limit)
 					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: it completes with this replay's result")
 					X.sendHeldOrder("complete_next", { held = it.deferId, tm = tm }, it.key)
 				elseif isBuild then
@@ -1463,7 +1476,7 @@ local function simApplyAction(st, it, now)
 		end
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
 		traceSim("build.error", string.format("%s type=%s value=%s", it.key, type(e), tostring(e)))
-		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e) }
+		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e), resync = X.isInjectRefusal(e) or nil }
 		return
 	end
 	coAfter(ctx, it, spec, category, balance0, logSim)
@@ -3566,6 +3579,20 @@ end
 
 -- ---- events of the module
 
+-- The module refused an inject order (`inject_refused {key, held, outcome, reason}`). The build is applied exactly as the originator's text
+-- says or not at all: `nothing` = the module emptied the command, nothing of it was applied here; `untouched` = it could not, and the mod's
+-- placeholder (this game's own guess of the build) was applied; `no_command` = no command took the order (expired, replaced). In every case
+-- this world now differs from the games that applied the build, so this game asks for the repair (the host's resync policy decides). The
+-- module fails the held command of the same build itself (`held`): the originator's tool is freed with a failed result.
+function X.onInjectRefused(p)
+	local key, outcome = tonumber(p.key) or 0, tostring(p.outcome or "?")
+	natSay(string.format("the native module refused inject order %d (%s): %s", key, outcome, tostring(p.reason or p.detail)))
+	if key <= 0 then return end
+	logGui(string.format("inject order %d refused (outcome %s, held %s): this world differs from the games that applied the build; asking the host for a resync",
+		key, outcome, tostring(p.held or 0)))
+	send("replay_failed", { detail = string.format("inject order %d refused here (%s): %s", key, outcome, tostring(p.reason or ""):sub(1, 160)) })
+end
+
 local function natEvent(N, rec, p, history)
 	local kind = rec.kind
 	local now = os.clock()
@@ -3640,7 +3667,7 @@ local function natEvent(N, rec, p, history)
 		natOnHeld(N, p)
 	elseif kind == "injected" or kind == "inject_refused" then
 		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
-		if kind == "inject_refused" then natSay("the native module refused to inject the engine's proposal: " .. tostring(p.reason or p.detail)) end
+		if kind == "inject_refused" then X.onInjectRefused(p) end
 	elseif kind == "timing" then
 		local what, detail = tostring(p.what), tostring(p.detail or "")
 		if what == "capture" or what == "input" then
@@ -4304,6 +4331,11 @@ function collectFromSim(state)
 			G.refusedSent[r.key] = true
 			if G.nat then pcall(natHeldRefused, { key = r.key }) end
 			send("action_refused", { seq = r.seq, from = r.from, detail = r.detail })
+			if r.resync then
+				-- the host ignores action_refused; this world now differs from the games that applied the build: ask for the repair
+				logGui("action " .. tostring(r.key) .. ": its exact copy cannot be applied here and nothing of it was; asking the host for a resync")
+				send("replay_failed", { detail = "build " .. tostring(r.key) .. " not applied here: " .. tostring(r.detail):sub(1, 160) })
+			end
 			deliverResult(r.key, nil, false, {})
 		end
 	end

@@ -3035,6 +3035,29 @@ class InjectReferenceCheckTest(PureBuildTest):
         got = str(f(inject_text(node0=110)))
         self.assertTrue(got.startswith("refused: inject_refused: proposal.addedSegments[0].node0 names node 110"), got)
 
+    def test_a_placeholder_that_cannot_be_made_refuses_the_build_and_never_falls_back_to_the_record_path(self):
+        # fail closed (2026-10-15): the record path is this game's own guess of the build, never a stand-in for the originator's text. Before,
+        # "build inject not used (...); the record path builds it" applied that guess on this game while the others injected the text.
+        code = """(function(txt, rejectFirst)
+            local M = PURE()
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 100, y = 0, z = 0 }, b = { x = 200, y = 80, z = 0 } })
+            body.nativeText = txt
+            local calls = 0
+            -- the factory refuses the first command it is given (the placeholder) and would take every later one (the record path's forms)
+            FACTORY_REJECT = function() calls = calls + 1; if rejectFirst and calls == 1 then return 'Unknown exception' end end
+            local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '1:1',
+                resolve = function(key) local n = tostring(key):match('^s:(%d+)$'); return n and tonumber(n) or nil end })
+            FACTORY_REJECT = nil
+            if not args then return 'refused: ' .. tostring(why), calls end
+            return 'built ' .. tostring(args.plan) .. (args.inject and ' inject' or ''), calls
+        end)"""
+        f = self.L.eval(code)
+        self.assertEqual(str(f(inject_text(), False)[0]), "built street inject")
+        got, calls = f(inject_text(), True)
+        self.assertTrue(str(got).startswith("refused: inject_refused: the placeholder command cannot be made here (") and "Unknown exception" in str(got)
+                        and str(got).endswith("nothing is applied here"), got)
+        self.assertEqual(int(calls), 1, "no form of the record path is tried after the placeholder failed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
