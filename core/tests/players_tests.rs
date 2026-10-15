@@ -110,7 +110,15 @@ fn a_clock_goes_to_every_other_game_and_the_host_keeps_all_eight() {
             n.send(
                 c,
                 MessageKind::Clock,
-                &json(&ClockMessage { t: t * 200, speed: 1, ahead: 3, need: None, safe: None, pause: false }),
+                &json(&ClockMessage {
+                    t: t * 200,
+                    speed: 1,
+                    ahead: 3,
+                    need: None,
+                    safe: None,
+                    pause: false,
+                    stop: None,
+                }),
             );
         }
     }
