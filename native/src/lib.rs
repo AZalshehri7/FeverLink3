@@ -98,8 +98,9 @@ mod entry {
     /// which no later moment can promise. What waits (the control link) is done by a thread started from here.
     #[no_mangle]
     pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
-        // Nothing may unwind into the loader. With `panic = "unwind"` a panic is stopped here; with `abort` (the
-        // release profile, see docs/SECURITY.md) the panic hook installed by `attach` has written it to the log.
+        // Nothing may unwind into the loader: a panic is stopped here (every profile unwinds, root Cargo.toml), after
+        // the panic hook installed by `attach` has written it to the log. `attach` never calls into the game, which
+        // is what makes `catch_unwind` safe here (see `log::guarded`).
         let _ = std::panic::catch_unwind(|| attach(reason));
         TRUE
     }

@@ -256,8 +256,8 @@ fn wait_for_key() {
     let _ = Command::new(windows_program(&["System32", "cmd.exe"])).args(["/C", "pause"]).status();
 }
 
-/// The release profile aborts on a panic, which would close a double-clicked window without a word; this prints
-/// what happened first and waits. Nothing in the wizard is meant to panic.
+/// A panic on the wizard's thread ends the program, which would close a double-clicked window without a word; this
+/// prints what happened first and waits. Nothing in the wizard is meant to panic.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let _ = writeln!(

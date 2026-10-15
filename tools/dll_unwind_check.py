@@ -6,7 +6,7 @@ abort "panic in a function that cannot unwind", and maps an RVA to the nearest P
     python tools/dll_unwind_check.py DLL PDB --rva 0xb7bf5       # which function is this address in?
     python tools/dll_unwind_check.py DLL PDB --check             # exit 1 unless the build unwinds
 
-Why: the DLL is built with panic = "abort". In such a build a plain Rust function (or closure) that calls a game
+Why: the DLL must unwind (root Cargo.toml; --check fails otherwise). In a panic = "abort" build a plain Rust function (or closure) that calls a game
 function which may throw has a terminate pad, and the game's own exceptions (script errors in command handlers, say)
 then end the process when they pass through it. The code between a hook and the game function it calls must be
 `extern "system-unwind"`; this tool shows what is left. Every call to `panic_cannot_unwind` listed outside `std` and

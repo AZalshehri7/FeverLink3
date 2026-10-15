@@ -360,6 +360,9 @@ fn entity_diffs(c: &Ctx, text: &str, donor: usize, say: &mut dyn FnMut(&str)) ->
 /// copy constructor makes a copy of the donor's Proposal (read only), its `toAdd` is moved into the engine-made source, and the engine's
 /// copy of that is what is returned; the constructions' `frozenNodes` are then set from the text. The proof compares every named
 /// member, the constructions' too: a conversion that differs from the originator's in a named member is refused.
+///
+/// Calls the engine through `c` (its Proposal functions, `operator new` through `c.alloc`): never inside `log::guarded`, except as the dry pass
+/// ([`dry_build`]), whose `c` holds stand-ins.
 pub fn build_verified(
     c: &Ctx,
     poke: &dyn Poke,
@@ -502,6 +505,22 @@ pub fn build_verified(
     })
 }
 
+/// The dry pass of [`build_verified`] on `text` (`native_copy::dry_pass`): the same code with stand-ins for the engine, inside a guard.
+/// `Err` only when our code panicked on the text: the injection is then refused before the engine is called. `live` is the memory the
+/// real pass reads (the donor's conversion).
+pub fn dry_build(
+    live: &dyn Mem,
+    base: usize,
+    set: portable::Settings,
+    build_name: &str,
+    text: &str,
+    donor: Option<usize>,
+) -> Result<(), String> {
+    nc::dry_pass("native inject: dry pass", live, base, set, build_name, |c| {
+        let _ = build_verified(c, &nc::DryPoke, text, donor, &mut |_| {});
+    })
+}
+
 /// Writes each construction's `frozenNodes` (a vector of u32 indices into `addedNodes`) as the text says: a new block of the game's
 /// allocator, which the engine frees with its own `operator delete` when the Proposal dies; the construction's old block, if any, is
 /// left alone (a few bytes, as in `cmd_patch`).
@@ -568,6 +587,7 @@ fn set_construction_frozen(
 
 /// Destroys a verified Proposal that was not (or no longer needs to be) handed over.
 pub fn release(c: &Ctx, mut b: Built) {
+    crate::log::calls_engine("native inject: release (the Proposal destructor)");
     // SAFETY: `build_verified` returned a constructed Proposal; it is destroyed once, here.
     unsafe { (c.fns.dtor)(b.proposal.ptr()) };
 }
@@ -658,6 +678,7 @@ pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), 
 /// `dest` is the payload of a live command whose first 0x358 bytes are a constructed `Proposal` ([`check_destination`] passed), on the
 /// thread that queues it.
 pub unsafe fn swap_into(c: &Ctx, b: &Built, dest: usize) {
+    crate::log::calls_engine("native inject: swap_into (the Proposal copy assignment)");
     // SAFETY: as the caller guarantees; the source is only read.
     unsafe { (c.fns.assign)(dest as *mut u8, b.proposal.addr() as *const u8) };
 }
@@ -1246,5 +1267,145 @@ toAdd[0].transf	m4:{t}
 "
         )
         .is_ok());
+    }
+
+    // ---- the dry pass: the peer's text through our own code, inside a guard, before the engine is called
+
+    /// Random line mutations of a real text: removed, doubled, swapped, cut short, a value replaced by another line's or by junk.
+    fn mutate(text: &str, rng: &mut impl rand::Rng) -> String {
+        use rand::seq::SliceRandom;
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        const JUNK: &[&str] = &[
+            "",
+            "n:",
+            "n:-1",
+            "n:18446744073709551615",
+            "n:4294967296",
+            "raw:",
+            "raw:P",
+            "raw:b:",
+            "@B",
+            "@B999999",
+            "f:nan",
+            "m4:",
+            "res:",
+            "ent:old#",
+            "map:size=99999999",
+            "hash:size=3,",
+            "x",
+            "\t\t",
+            "w:zz",
+            "s:\u{1}",
+        ];
+        for _ in 0..rng.gen_range(1..=4) {
+            if lines.is_empty() {
+                break;
+            }
+            let i = rng.gen_range(0..lines.len());
+            match rng.gen_range(0..6) {
+                0 => {
+                    lines.remove(i);
+                }
+                1 => {
+                    let l = lines[i].clone();
+                    lines.insert(i, l);
+                }
+                2 => {
+                    let j = rng.gen_range(0..lines.len());
+                    lines.swap(i, j);
+                }
+                3 => {
+                    let cut = rng.gen_range(0..=lines[i].len());
+                    let cut = (0..=cut).rev().find(|&k| lines[i].is_char_boundary(k)).unwrap_or(0);
+                    lines[i].truncate(cut);
+                }
+                4 => {
+                    let other = lines.choose(rng).cloned().unwrap_or_default();
+                    let value = other.split_once('\t').map_or(other.clone(), |(_, v)| v.to_string());
+                    if let Some((k, _)) = lines[i].clone().split_once('\t') {
+                        lines[i] = format!("{k}\t{value}");
+                    }
+                }
+                _ => {
+                    let junk = JUNK.choose(rng).copied().unwrap_or("");
+                    if let Some((k, _)) = lines[i].clone().split_once('\t') {
+                        lines[i] = format!("{k}\t{junk}");
+                    }
+                }
+            }
+        }
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn mutated_texts_never_panic_past_the_dry_pass_and_one_that_gets_through_does_not_panic_the_real_pass() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0f1_3d27);
+        let (mut refused, mut through) = (0, 0);
+        for n in 0..3000 {
+            let construction = n % 2 == 0;
+            let (arena, at, text) = world_text(construction);
+            let text = mutate(&text, &mut rng);
+            let donor = construction.then_some(at);
+            let live = Both(&arena);
+            // the dry pass itself never lets a panic out (it is guarded); its verdict is all that is asked
+            let dry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dry_build(&live, BASE, settings(), "40420", &text, donor)
+            }))
+            .expect("the dry pass let a panic out");
+            if dry.is_err() {
+                refused += 1;
+                continue;
+            }
+            through += 1;
+            // the real pass (the engine stand-ins of these tests) on a text the dry pass got through: no panic in our code
+            WORLD.with(|w| w.set(&arena));
+            let ctx = Ctx { fns: fns(), alloc: &arena, mem: &live, base: BASE, set: settings(), build_name: "40420" };
+            let real = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_verified(&ctx, &ArenaPoke(&arena), &text, donor, &mut |_| {}).map(|b| release(&ctx, b))
+            }));
+            WORLD.with(|w| w.set(core::ptr::null()));
+            assert!(real.is_ok(), "iteration {n}: the dry pass passed, the real pass panicked on:\n{text}");
+        }
+        eprintln!("dry pass: {through} texts through, {refused} refused for a panic of ours");
+        assert!(through > 0);
+    }
+
+    #[test]
+    fn a_panic_of_ours_in_the_dry_pass_is_a_refusal_and_no_engine_stand_in_is_called() {
+        /// Our reading of the donor's world panics: a stand-in for a parser bug on a damaged text (the ones the mutation test found
+        /// are fixed: an element count that asked for terabytes, a vector value with too many words).
+        struct Panics;
+        impl Mem for Panics {
+            fn read(&self, _: usize, _: usize) -> Option<Vec<u8>> {
+                panic!("a bug in our own code on this text")
+            }
+        }
+        let (_arena, at, text) = world_text(true);
+        let counts = || [&CTORS, &DTORS, &COPIES, &ASSIGNS].map(|c| c.load(Ordering::SeqCst));
+        let before = counts();
+        let why = dry_build(&Panics, BASE, settings(), "40420", &text, Some(at)).unwrap_err();
+        assert!(
+            why.contains("native inject: dry pass") && why.contains("refused before any call into the game"),
+            "{why}"
+        );
+        assert_eq!(counts(), before, "no engine stand-in was called");
+        // the damaged value the mutation test found: one word too many in a vector, now refused by the parser without a panic
+        let mut done = false;
+        let bad: String = text
+            .lines()
+            .map(|l| {
+                if !done && l.contains("\tv3:") {
+                    done = true;
+                    format!("{l},00000000\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        assert!(done, "the text has a vector value");
+        let (arena, at, _) = world_text(true);
+        let live = Both(&arena);
+        assert_eq!(dry_build(&live, BASE, settings(), "40420", &bad, Some(at)), Ok(()));
     }
 }

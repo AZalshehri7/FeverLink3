@@ -240,45 +240,71 @@ impl Runtime {
         }
     }
 
-    /// The rebuild self-check of the payload at `payload`: report into the rebuild file.
+    /// The rebuild self-check of the payload at `payload`: report into the rebuild file. The rebuild allocates with the
+    /// game's `operator new`, so it runs outside `log::guarded`; the text before it and the report after it are guarded.
+    /// Never call this inside a guard.
     fn rebuild_check(&self, event: &str, payload: usize, hold_id: Option<u64>) {
         let Some(sink) = self.rebuild.get() else { return };
-        if !sink.has_dir() {
-            return;
-        }
-        let Some(seq) = sink.begin() else { return };
-        let report = (|| -> Result<String, String> {
-            let alloc = rebuild::EngineAlloc::at(self.base)?;
-            let head = portable::Header {
-                seq,
-                event,
-                hold_id,
-                site_rva: None,
-                tool: None,
-                t_ms: self.now_ms(),
-                wall_ms: 0,
-                payload,
-            };
-            let env = Env { image_base: self.base };
-            let live = dump::LiveMem;
-            let text = portable::encode(&live, env, sink.settings, self.build.name, &head)?.text;
-            let original = dump::Mem::read(&live, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
-            let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &live, &|b| {
+        crate::log::calls_engine("rebuild check (operator new and delete)");
+        let prepared = crate::log::guarded("rebuild check", || {
+            if !sink.has_dir() {
+                return None;
+            }
+            let seq = sink.begin()?;
+            let input = (|| -> Result<(rebuild::EngineAlloc, String, Vec<u8>), String> {
+                let alloc = rebuild::EngineAlloc::at(self.base)?;
+                let head = portable::Header {
+                    seq,
+                    event,
+                    hold_id,
+                    site_rva: None,
+                    tool: None,
+                    t_ms: self.now_ms(),
+                    wall_ms: 0,
+                    payload,
+                };
+                let env = Env { image_base: self.base };
+                let text = portable::encode(&dump::LiveMem, env, sink.settings, self.build.name, &head)?.text;
+                let original =
+                    dump::Mem::read(&dump::LiveMem, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
+                Ok((alloc, text, original))
+            })();
+            Some((seq, input))
+        });
+        let Some((seq, input)) = prepared.flatten() else { return };
+        let report = input.and_then(|(alloc, text, original)| {
+            // the same rebuild first as a dry pass inside a guard (`native_copy::dry_pass`): a panic of ours is a refusal
+            let place = |b: &[u8]| Some(b.as_ptr() as usize);
+            crate::native_copy::dry_pass(
+                "rebuild check: dry pass",
+                &dump::LiveMem,
+                self.base,
+                sink.settings,
+                self.build.name,
+                |c| {
+                    let _ = rebuild::roundtrip(&text, &original, self.base, sink.settings, c.alloc, c.mem, &place);
+                },
+            )?;
+            let r = rebuild::roundtrip(&text, &original, self.base, sink.settings, &alloc, &dump::LiveMem, &|b| {
                 Some(b.as_ptr() as usize)
             });
             let freed = rebuild::Alloc::free_all(&alloc);
             r.map(|r| format!("{}FREED {freed} blocks\n", r.text))
-        })();
-        let key = hold_id.map_or("none".to_string(), |k| k.to_string());
-        let text = match report {
-            Ok(t) => {
-                format!("=== rebuild check #{seq} event={event} key={key} ===\n{t}=== end rebuild check #{seq} ===\n")
+        });
+        crate::log::guarded("rebuild check (report)", || {
+            let key = hold_id.map_or("none".to_string(), |k| k.to_string());
+            let text = match report {
+                Ok(t) => {
+                    format!(
+                        "=== rebuild check #{seq} event={event} key={key} ===\n{t}=== end rebuild check #{seq} ===\n"
+                    )
+                }
+                Err(why) => format!("=== rebuild check #{seq} event={event} key={key} REFUSED: {why} ===\n"),
+            };
+            if let Err(e) = sink.write(&text) {
+                self.say(&format!("rebuild: cannot write {}: {e}", rebuild::REBUILD_FILE));
             }
-            Err(why) => format!("=== rebuild check #{seq} event={event} key={key} REFUSED: {why} ===\n"),
-        };
-        if let Err(e) = sink.write(&text) {
-            self.say(&format!("rebuild: cannot write {}: {e}", rebuild::REBUILD_FILE));
-        }
+        });
     }
 
     /// The portable text of the payload at `payload` (or why it is refused) into the portable file.
@@ -496,6 +522,7 @@ impl Runtime {
         // SAFETY: the emitter of this build (prologue checked when it was hooked), with the objects of the newest tool preview of this
         // session, the held command's Proposal and its ProposalData slot; the call into the scripts is synchronous.
         let emit: Emit = unsafe { core::mem::transmute::<usize, Emit>(emit) };
+        crate::log::calls_engine("preview of a held command (the emitter, the game scripts)");
         unsafe {
             emit(
                 a[0],
@@ -761,27 +788,35 @@ impl Runtime {
     /// # Safety
     /// `args` are the arguments of a live call to `CommandList::Add` on the calling thread.
     ///
-    /// Two rules shape this function, both learned from a crash of the real game (`docs/NATIVE_LINK.md`, section 10):
+    /// Three rules shape this function: the first learned from a crash of the real game (`docs/NATIVE_LINK.md`, section
+    /// 10), the other two from a review of the code (2026-10-15; the second is shown by `runtime/tests/foreign.rs`):
     ///
     /// - The build must unwind (`panic = "unwind"`, root `Cargo.toml`) and every function between this one and the
-    ///   engine's `Add` ([`engine::release`]) is `system-unwind`, with `Add` called from its body, not from a closure.
-    ///   A C++ exception of the game then passes through our frames as through any others. Under `panic = "abort"`
-    ///   every Rust frame, `system-unwind` or not, is a terminate pad: the exception ends the process with
-    ///   `panic in a function that cannot unwind`.
-    /// - Our own bookkeeping runs inside [`crate::log::guarded`] and never around a call into the game. A bug in it
-    ///   (under `unwind`) costs the step, not the game: the call goes on to the original.
+    ///   engine is `system-unwind` or plain Rust, with the engine called from its body, not from a closure. A C++
+    ///   exception of the game then passes through our frames as through any others, to the game's own handler.
+    /// - Our own bookkeeping runs inside [`crate::log::guarded`], and no call into the game ever does (not the
+    ///   capture's move constructor, not the injection's Proposal functions, not the game's `operator new`): Rust's
+    ///   `catch_unwind` ends the process on a C++ exception. Each such piece is split into a guarded decision, the calls
+    ///   in plain frames, and a guarded report. A bug in the bookkeeping costs the step, not the game.
+    /// - A command taken out of the engine's hands is held, or handed back, with nothing that can fail in between:
+    ///   everything the hold needs is read from the command before the capture ([`Runtime::plan_add`]).
     #[allow(improper_ctypes_definitions)] // only ever called from Rust, with Rust types; "system-unwind" is for the exception
     pub unsafe extern "system-unwind" fn on_add(&self, args: AddArgs, caller: Option<usize>) -> *mut u8 {
         let add = self.add_fn();
         // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
         // was taken out of the engine's hands must be given back, whatever happens)
         let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None, preview: None };
-        crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan));
+        let hold = crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan)).flatten();
+        if let Some(hold) = hold {
+            // SAFETY: the arguments of the live call, as the caller guarantees.
+            unsafe { self.capture_and_hold(&args, hold, &mut plan) };
+        }
         if self.patch.enabled() {
             crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
         }
         if let Some(job) = plan.dump.take() {
-            crate::log::guarded("add hook (inject text)", || self.inject_publish_text(job.payload, job.id));
+            // calls the engine (the residue mask's copies): guards its own bookkeeping
+            self.inject_publish_text(job.payload, job.id);
             // dev-only and read-only: the held command's payload, decoded (the command is already out of the engine's hands)
             crate::log::guarded("add hook (dump)", || {
                 self.dump_payload("held", job.payload, Some(job.id), Some(job.site), Scope::Whole, Budget::Held, None)
@@ -789,12 +824,9 @@ impl Runtime {
             crate::log::guarded("add hook (portable)", || {
                 self.portable_payload("held", job.payload, Some(job.id), Some(job.site));
             });
-            crate::log::guarded("add hook (rebuild)", || {
-                self.rebuild_check("held", job.payload, Some(job.id));
-            });
-            crate::log::guarded("add hook (native copy)", || {
-                self.native_copy_check("held", job.payload, Some(job.id));
-            });
+            // dev-only, and both call the engine: they guard their own bookkeeping
+            self.rebuild_check("held", job.payload, Some(job.id));
+            self.native_copy_check("held", job.payload, Some(job.id));
         }
         if let Some((id, payload)) = plan.preview.take() {
             // SAFETY: the payload of the command held just now; it stays held while the scripts read it.
@@ -845,20 +877,28 @@ impl Runtime {
         if plan.held_here {
             return args.out;
         }
+        // both call the engine when an order is carried out: they guard their own bookkeeping
         if self.inject.enabled() {
-            crate::log::guarded("add hook (inject)", || self.inject_add(&args, caller));
+            self.inject_add(&args, caller);
         }
         if self.patch.enabled() {
-            crate::log::guarded("add hook (patch)", || self.patch_add(&args, caller));
+            self.patch_add(&args, caller);
         }
         // SAFETY: the arguments of the live call that is being hooked.
         unsafe { add(args.list, args.out, args.cmd, args.done, args.progress) }
     }
 
     /// The part of [`Runtime::on_add`] that decides: counts the call and, when holding is on, asks the machine what
-    /// is due and whether this command is held (taking it out of the engine's hands if so). Touches the engine only
-    /// through its move constructor. The result is written into `plan` step by step.
-    fn plan_add(&self, args: &AddArgs, caller: Option<usize>, have_add: bool, plan: &mut AddPlan) {
+    /// is due and whether this command is to be held. Never calls the engine (it runs inside `log::guarded`). The result
+    /// is written into `plan` step by step; a command to hold comes back as a [`HoldStep`], with the machine still
+    /// locked and everything the hold needs already read from the command, for [`Runtime::capture_and_hold`].
+    fn plan_add<'a>(
+        &'a self,
+        args: &AddArgs,
+        caller: Option<usize>,
+        have_add: bool,
+        plan: &mut AddPlan,
+    ) -> Option<HoldStep<'a>> {
         let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
         let tool = site.and_then(|rva| self.build.ui_site_index(rva));
         self.counters.added(match (caller, tool) {
@@ -866,13 +906,13 @@ impl Runtime {
             (Some(_), Some(i)) => AddSource::Tool(i),
             (Some(_), None) => AddSource::Other,
         });
-        let Some(engine) = self.engine else { return };
+        let engine = self.engine?;
         if !have_add || !self.live.load(Relaxed) {
-            return;
+            return None;
         }
         let now = self.now_ms();
         plan.now = now;
-        let Some(mut machine) = try_lock_briefly(&self.machine) else { return };
+        let mut machine = try_lock_briefly(&self.machine)?;
         // the mod writes `release` and then sends a command to get here: look at the file now, do not wait for the pump
         self.ingest(&mut machine, now);
         plan.due = machine.take_due(self.game_time(), now);
@@ -885,57 +925,83 @@ impl Runtime {
                     machine.tool_while_silent(kind, now); // a tool at work while the mod is silent: not a pause menu
                     plan.due.extend(machine.take_due(self.game_time(), now)); // given back before this command passes
                 }
-                if admit == Admit::Hold {
-                    // SAFETY: the arguments of the live call, as the caller guarantees.
-                    if let Some(held) = unsafe { engine::capture(&engine, args) } {
-                        let done = held.done_ok();
-                        let payload = held.payload();
-                        // how the tool built the command (Context members, ignoreErrors, playerInitiated): a preview carries none of it
-                        let flags = if self.build.kind_by_name("build_proposal") == Some(kind) {
-                            // SAFETY: only readable memory is read.
-                            unsafe { engine::build_flags(payload) }
-                        } else {
-                            None
-                        };
-                        // the input-level text of the same command (what a SimpleProposal is made of), for the mod
-                        let t_input = std::time::Instant::now();
-                        let input = flags.is_some().then(|| self.input_text(payload)).flatten();
-                        let input_ms = t_input.elapsed().as_secs_f64() * 1000.0;
-                        match machine.hold_with(kind, rva, done, flags, held, now) {
-                            Ok(id) => {
-                                if input.is_some() {
-                                    self.inject.report(Event::Timing {
-                                        what: "input",
-                                        id,
-                                        detail: format!("held={id} wall={} input_ms={input_ms:.1}", wall_ms()),
-                                    });
-                                }
-                                if let Some(text) = &input {
-                                    if let Err(e) = self.input.write(id, text) {
-                                        self.say(&format!("input: cannot write {}: {e}", crate::input::file_name(id)));
-                                    }
-                                }
-                                plan.held_here = true;
-                                if self.build.kind_by_name("build_proposal") == Some(kind) {
-                                    plan.preview = Some((id, payload));
-                                }
-                                if (self.inject.enabled()
-                                    || self.dump.get().is_some()
-                                    || self.portable.get().is_some()
-                                    || self.rebuild.get().is_some()
-                                    || self.native_copy.get().is_some())
-                                    && self.build.kind_by_name("build_proposal") == Some(kind)
-                                {
-                                    plan.dump = Some(DumpJob { id, site: rva, payload });
-                                }
-                            }
-                            Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
-                        }
-                    }
+                // SAFETY: only readable memory is read; the capture takes the same payload pointer along.
+                if let (Admit::Hold, Some(payload)) = (admit, unsafe { engine::payload_of(args.cmd) }) {
+                    // Everything that can fail is done here, before the capture empties the caller's arguments: a panic in it
+                    // costs the hold, and the command goes on to the engine untouched.
+                    let build_proposal = self.build.kind_by_name("build_proposal") == Some(kind);
+                    // how the tool built the command (Context members, ignoreErrors, playerInitiated): a preview carries none of it
+                    // SAFETY: only readable memory is read.
+                    let flags = if build_proposal { unsafe { engine::build_flags(payload) } } else { None };
+                    // the input-level text of the same command (what a SimpleProposal is made of), for the mod
+                    let t_input = std::time::Instant::now();
+                    let input = flags.is_some().then(|| self.input_text(payload)).flatten();
+                    let input_ms = t_input.elapsed().as_secs_f64() * 1000.0;
+                    return Some(HoldStep { machine, engine, kind, rva, flags, input, input_ms, build_proposal });
                 }
             }
         }
         self.sync_flags(&machine);
+        drop(machine);
+        if !plan.due.is_empty() {
+            self.wake();
+        }
+        None
+    }
+
+    /// Takes the command out of the engine's hands ([`engine::capture`], the engine's move constructor) and into the
+    /// machine, which is still locked from [`Runtime::plan_add`]. Not inside `log::guarded`: the move is a call into
+    /// the game, and an exception from it must reach the game's handler. Between the capture and `hold_with` nothing
+    /// can fail (two field reads), so the command is held, or refused and put into `plan.spill` to go on to the
+    /// engine; the bookkeeping after that is guarded again. An exception in the capture leaves the machine's lock by
+    /// unwinding (a foreign exception does not even poison it, and every lock of it ignores poisoning).
+    ///
+    /// # Safety
+    /// `args` are the arguments of a live call to `CommandList::Add` on the calling thread.
+    unsafe fn capture_and_hold(&self, args: &AddArgs, step: HoldStep<'_>, plan: &mut AddPlan) {
+        let HoldStep { mut machine, engine, kind, rva, flags, input, input_ms, build_proposal } = step;
+        // SAFETY: as the caller guarantees.
+        let held = unsafe { engine::capture(&engine, args) };
+        let mut held_id = None;
+        if let Some(held) = held {
+            let (done, payload) = (held.done_ok(), held.payload());
+            match machine.hold_with(kind, rva, done, flags, held, plan.now) {
+                Ok(id) => {
+                    plan.held_here = true;
+                    held_id = Some((id, payload));
+                }
+                Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
+            }
+        }
+        crate::log::guarded("add hook (held)", || {
+            if let Some((id, payload)) = held_id {
+                if input.is_some() {
+                    self.inject.report(Event::Timing {
+                        what: "input",
+                        id,
+                        detail: format!("held={id} wall={} input_ms={input_ms:.1}", wall_ms()),
+                    });
+                }
+                if let Some(text) = &input {
+                    if let Err(e) = self.input.write(id, text) {
+                        self.say(&format!("input: cannot write {}: {e}", crate::input::file_name(id)));
+                    }
+                }
+                if build_proposal {
+                    plan.preview = Some((id, payload));
+                }
+                if build_proposal
+                    && (self.inject.enabled()
+                        || self.dump.get().is_some()
+                        || self.portable.get().is_some()
+                        || self.rebuild.get().is_some()
+                        || self.native_copy.get().is_some())
+                {
+                    plan.dump = Some(DumpJob { id, site: rva, payload });
+                }
+            }
+            self.sync_flags(&machine);
+        });
         drop(machine);
         if plan.held_here || !plan.due.is_empty() {
             self.wake();
@@ -976,12 +1042,16 @@ impl Runtime {
         .flatten();
         // the orders of `inject_next` / `patch_next`: the script's command passes here, not the command list's `Add` (see apply_orders)
         if self.inject.enabled() || self.patch.enabled() {
-            crate::log::guarded("apply hook (orders)", || {
+            let mine = crate::log::guarded("apply hook (orders)", || {
                 let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
                 // SAFETY: only readable memory is read.
                 let kind = unsafe { engine::command_kind(cmd, kind_offset) };
-                self.apply_orders(cmd, kind, claimed.is_some());
+                self.note_apply_orders(kind, claimed.is_some())
             });
+            if mine == Some(true) {
+                // calls the engine when an order is carried out: guards its own bookkeeping
+                self.apply_orders(cmd);
+            }
         }
         // dev-only dump of a build command before the simulation applies it, and of its result part afterwards
         let dumped = self.dump.get().and_then(|_| {
@@ -1015,21 +1085,24 @@ impl Runtime {
         }
         if let Some(sink) = self.rebuild.get() {
             // script commands the module did not hold, with the level-3 switch
-            crate::log::guarded("apply hook (rebuild)", || {
+            let payload = crate::log::guarded("apply hook (rebuild)", || {
                 // SAFETY: only readable memory is read.
                 let payload = unsafe { engine::payload_of(cmd) }?;
                 let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
                 let kind = unsafe { engine::command_kind(cmd, kind_offset) }?;
                 (self.build.kind_by_name("build_proposal") == Some(kind)).then_some(())?;
                 (claimed.is_none() && sink.settings.scripts).then_some(())?;
-                (portable::proposal_is_empty(&LiveMem, payload) == Some(false)).then_some(())?;
-                self.rebuild_check("apply", payload, None);
-                Some(())
+                (portable::proposal_is_empty(&LiveMem, payload) == Some(false)).then_some(payload)
             });
+            if let Some(payload) = payload.flatten() {
+                // calls the game's allocator: guards its own bookkeeping
+                self.rebuild_check("apply", payload, None);
+            }
         }
         let result = unsafe { original(sim, cmd) };
         if self.inject.enabled() {
-            // the timing first: the deferred completion swaps the applied command's payload with the held one's
+            // the timing first: the deferred completion swaps the applied command's payload with the held one's (plain memory, no
+            // engine call: `engine::adopt_result`)
             crate::log::guarded("apply hook (timing)", || self.timing_after_apply(cmd));
             crate::log::guarded("apply hook (deferred completion)", || self.complete_deferred(cmd));
         }
@@ -1087,6 +1160,19 @@ struct AddPlan {
     preview: Option<(crate::hold::HoldId, usize)>,
 }
 
+/// A tool's command [`Runtime::plan_add`] decided to hold: the machine, still locked, and what the hold records about the
+/// command, read before the capture.
+struct HoldStep<'a> {
+    machine: MutexGuard<'a, HoldMachine<Box<Held>>>,
+    engine: EngineFns,
+    kind: u8,
+    rva: u32,
+    flags: Option<engine::BuildFlags>,
+    input: Option<String>,
+    input_ms: f64,
+    build_proposal: bool,
+}
+
 /// What the dump needs to know about a command that was just held.
 struct DumpJob {
     id: u64,
@@ -1106,6 +1192,8 @@ mod tests {
     use crate::engine::{AddArgs, EngineFns, COMMAND_SIZE, HANDLE_SIZE, PROGRESS_SIZE};
     use crate::testutil::TempDir;
     use std::cell::RefCell;
+
+    mod foreign;
 
     // ---- a fake engine that records what the hooks do to it, per test thread
 
@@ -1133,18 +1221,19 @@ mod tests {
         CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
-    unsafe extern "system" fn e_move(dst: *mut u8, src: *mut u8) -> *mut u8 {
+    unsafe extern "system-unwind" fn e_move(dst: *mut u8, src: *mut u8) -> *mut u8 {
+        foreign::raise_if_armed();
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, COMMAND_SIZE);
             core::ptr::write_bytes(src, 0, engine::RESULT_OFFSET);
         }
         dst
     }
-    unsafe extern "system" fn e_destroy(cmd: *mut u8) {
+    unsafe extern "system-unwind" fn e_destroy(cmd: *mut u8) {
         note(format!("destroy command {}", unsafe { *(cmd as *const usize) } != 0));
         unsafe { core::ptr::write_bytes(cmd, 0, COMMAND_SIZE) };
     }
-    unsafe extern "system" fn e_handle(_h: *mut u8) {}
+    unsafe extern "system-unwind" fn e_handle(_h: *mut u8) {}
     unsafe extern "system-unwind" fn e_add(
         _list: *mut u8,
         out: *mut u8,
@@ -1847,6 +1936,37 @@ mod tests {
         assert_eq!(calls(), ["add kind 27 tag 2"]);
     }
 
+    fn panicking_log(_: &str) {
+        panic!("a bug in the bookkeeping while a command is read")
+    }
+
+    #[test]
+    fn a_panic_while_a_command_to_hold_is_read_leaves_it_whole_for_the_original_add() {
+        let dir = TempDir::new("rt-bug-hold");
+        let mut rt = runtime(Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        // the fake build's layout table refuses this command's input text and says so in the log: here, a panic. It used to come
+        // after the capture had emptied the caller's command, and the original Add then got an empty command (a lost build, a
+        // tool whose callback never came).
+        rt.log = panicking_log;
+        let mut c = Call::new(52, 1);
+        let out = unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        assert_eq!(out, c.args().out);
+        assert_eq!(calls(), ["add kind 52 tag 1"], "the engine got the command whole, as if the module were not there");
+        assert_eq!(c.done[..], [0; engine::FUNCTION_SIZE][..]);
+        assert_eq!(*c.progress, [5; PROGRESS_SIZE], "progress untouched");
+        rt.log = quiet;
+        rt.pump();
+        assert!(!kinds(dir.path()).contains(&"held".to_string()), "nothing was held");
+        // the next tool command is held as usual (the lock the planning died holding is poisoned, not stuck)
+        let mut next = Call::new(52, 2);
+        unsafe { rt.on_add(next.args(), at(SITE_A)) };
+        assert!(calls().is_empty(), "held, not passed on");
+        rt.pump();
+        assert!(kinds(dir.path()).contains(&"held".to_string()));
+    }
+
     #[test]
     fn a_runtime_without_the_engine_helpers_only_counts() {
         let rt = Runtime::new(Init {
@@ -2146,7 +2266,7 @@ mod tests {
         rt.inject.arm(9, 0, 0, rt.now_ms());
         let mut other = Call::new(17, 1);
         unsafe { rt.on_apply(sim.as_mut_ptr(), other.c.command.as_mut_ptr()) };
-        rt.apply_orders(script.c.command.as_mut_ptr(), Some(52), true); // a held one (the tool's)
+        assert!(!rt.note_apply_orders(Some(52), true), "a held one (the tool's) is noted, not carried out");
         rt.advance(crate::inject::DEFAULT_TTL_MS + 1);
         rt.pump();
         let ev = events(dir.path());
@@ -2154,5 +2274,44 @@ mod tests {
             ev.iter().any(|(k, w)| k == "inject_refused" && w.contains("key 9") && w.contains("1 held, 0 not held")),
             "{ev:?}"
         );
+    }
+
+    #[test]
+    fn no_call_into_the_game_is_announced_inside_a_guard_on_any_hook_path() {
+        let before = crate::log::engine_calls_in_guard();
+        let dir = TempDir::new("rt-no-engine-in-guard");
+        let rt = runtime(Some(dir.path()));
+        let set = portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap();
+        rt.enable_native_inject(set);
+        rt.enable_native_patch();
+        rt.enable_rebuild(set, Some(dir.path()));
+        rt.enable_native_copy(set, Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        // two tool commands held (the capture), then one released (Add) and one cancelled (destructors)
+        let (mut a, mut b) = (Call::new(52, 10), Call::new(52, 11));
+        unsafe { rt.on_add(a.args(), at(SITE_A)) };
+        unsafe { rt.on_add(b.args(), at(SITE_B)) };
+        ctl(dir.path(), "2\trelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n3\tcancel\t1\t{[\"id\"]=2}\n");
+        let mut nop = Call::new(27, 50);
+        unsafe { rt.on_add(nop.args(), at(0x999)) };
+        assert!(calls().iter().any(|c| c == "add kind 52 tag 10"), "the release reached Add");
+        // the orders on the command list's path and on the simulation's, and the two conversion hooks
+        ctl(dir.path(), INJECT_NEXT);
+        let mut script = Call::new(52, 3);
+        unsafe { rt.on_add(script.args(), at(0x777)) };
+        rt.inject.arm(6, 0, 0, rt.now_ms());
+        let mut sim = [0u8; 8];
+        unsafe { rt.on_apply(sim.as_mut_ptr(), script.c.command.as_mut_ptr()) };
+        rt.arm_patch(vec![1], 2, vec![], 0, rt.now_ms());
+        let o = out(2, 1, true);
+        rt.before_convert_update(o.buf.as_ptr() as usize);
+        rt.on_convert(o.buf.as_ptr() as usize, at(0xe2b1a1));
+        calls();
+        rt.pump();
+        assert_eq!(crate::log::engine_calls_in_guard(), before, "an engine call inside log::guarded");
+        // the check itself sees one
+        crate::log::guarded("test", || crate::log::calls_engine("test"));
+        assert_eq!(crate::log::engine_calls_in_guard(), before + 1);
     }
 }

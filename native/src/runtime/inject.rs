@@ -36,7 +36,9 @@ impl Runtime {
             && EngineAlloc::at(self.base).is_ok()
     }
 
-    /// The originator's side: the held command's full portable text, for the mod to ship (`native_text_<id>.txt`).
+    /// The originator's side: the held command's full portable text, for the mod to ship (`native_text_<id>.txt`). The
+    /// residue mask calls the engine's copy constructor, so this runs outside `log::guarded` and guards the rest itself:
+    /// never call it inside a guard.
     pub(super) fn inject_publish_text(&self, payload: usize, id: u64) {
         if !self.inject.enabled() {
             return;
@@ -44,6 +46,24 @@ impl Runtime {
         let Some(settings) = self.inject_settings.get().copied() else { return };
         let t0 = std::time::Instant::now();
         let wall0 = wall_ms();
+        // R2: which unnamed bytes of the held command are values and which residue, by a differential engine copy (both copies destroyed)
+        crate::log::calls_engine("native inject: residue mask (the engine's copy constructor)");
+        let mask = nc::ProposalFns::at(self.base).and_then(|fns| {
+            nc::residue_mask(&fns, &LiveMem, self.base, settings, self.build.name, payload, &mut |l| self.say(l))
+        });
+        crate::log::guarded("native inject: text", || self.inject_write_text(payload, id, settings, t0, wall0, mask));
+    }
+
+    /// The rest of [`Runtime::inject_publish_text`]: the text with the mask, the file, the log lines and the timing record.
+    fn inject_write_text(
+        &self,
+        payload: usize,
+        id: u64,
+        settings: portable::Settings,
+        t0: std::time::Instant,
+        wall0: u64,
+        mask: Result<nc::MaskInfo, String>,
+    ) {
         let live = LiveMem;
         let head = portable::Header {
             seq: 0,
@@ -55,11 +75,7 @@ impl Runtime {
             wall_ms: 0,
             payload,
         };
-        // R2: which unnamed bytes of the held command are values and which residue, by a differential engine copy (both copies destroyed)
-        let mask = nc::ProposalFns::at(self.base)
-            .and_then(|fns| {
-                nc::residue_mask(&fns, &live, self.base, settings, self.build.name, payload, &mut |l| self.say(l))
-            })
+        let mask = mask
             .map_err(|e| {
                 self.say(&format!("native inject: hold {id}: no residue mask, unnamed words are not carried: {e}"))
             })
@@ -131,17 +147,24 @@ impl Runtime {
     /// applies it. Dev-only switches, and like the dev dumps that already run here they read a file and call the engine on this thread;
     /// everything is checked first and a refusal leaves the command untouched. A construction tool's command that was not held can be
     /// mistaken for the script's here; the order's own checks (the number of constructions or nodes) guard against that.
-    pub(super) fn apply_orders(&self, cmd: *mut u8, kind: Option<u8>, held: bool) {
+    ///
+    /// This part only notes the apply (guarded by the caller): true when the command is a `build_proposal` the module did not hold, for
+    /// which the caller then runs [`Runtime::apply_orders`] outside the guard.
+    pub(super) fn note_apply_orders(&self, kind: Option<u8>, held: bool) -> bool {
         let bp = kind.is_some() && self.build.kind_by_name("build_proposal") == kind;
         if !bp {
-            return;
+            return false;
         }
         let now = self.now_ms();
         self.inject.note_apply(held, now);
         self.patch.note_apply(held, now);
-        if held {
-            return;
-        }
+        !held
+    }
+
+    /// The orders for a script `build_proposal` the simulation is about to apply (see [`Runtime::note_apply_orders`]). Calls the engine
+    /// when an order is carried out: never call it inside `log::guarded`.
+    pub(super) fn apply_orders(&self, cmd: *mut u8) {
+        crate::log::calls_engine("apply orders");
         let args = AddArgs {
             list: core::ptr::null_mut(),
             out: core::ptr::null_mut(),
@@ -158,45 +181,79 @@ impl Runtime {
 
     /// The command list's `Add` of a command that was not held: if an order is armed and this is a script `build_proposal`, carries it
     /// out (once). Runs before the original `Add`, on the thread that queues commands.
+    ///
+    /// Carrying the order out calls the engine (its Proposal functions and `operator new`, [`Runtime::inject_engine`]), so this runs
+    /// outside `log::guarded`: the decision before ([`Runtime::inject_take`]) and the report after ([`Runtime::inject_finish`]) are
+    /// guarded, the engine part is not. Never call it inside a guard.
     pub(super) fn inject_add(&self, args: &AddArgs, caller: Option<usize>) {
+        crate::log::calls_engine("native inject: an order may be carried out");
+        let job = crate::log::guarded("native inject: order", || self.inject_take(args, caller)).flatten();
+        let Some(InjectJob { order, dest, link, t0, rb0, prepared }) = job else { return };
+        let run = match prepared {
+            // the same parsing and build first as a dry pass inside a guard: a panic of ours on the peer's text is a refusal
+            Some(Ok(p)) => match inj::dry_build(&LiveMem, self.base, p.settings, self.build.name, &p.text, p.donor) {
+                Err(why) => Err(why),
+                Ok(()) => {
+                    crate::log::calls_engine("native inject (the Proposal functions, operator new)");
+                    self.inject_engine(order.key, dest, p)
+                }
+            },
+            Some(Err(why)) => Err(why),
+            None => Err(String::new()), // complete_next: the record's own command is this game's stamp apply; nothing to inject
+        };
+        crate::log::guarded("native inject: result", || self.inject_finish(order, dest, link, t0, rb0, run));
+    }
+
+    /// The decision of [`Runtime::inject_add`]: whether an order is used for this command, and everything the injection needs that does
+    /// not call the engine (the side file, the destination's checks). `None` when there is nothing to do.
+    fn inject_take(&self, args: &AddArgs, caller: Option<usize>) -> Option<InjectJob> {
         let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
         if site.and_then(|rva| self.build.ui_site_index(rva)).is_some() {
-            return; // a construction tool's command is never the mod's
+            return None; // a construction tool's command is never the mod's
         }
-        let Some(kind_offset) = self.build.kind_offset else { return };
+        let kind_offset = self.build.kind_offset?;
         // SAFETY: only readable memory is read.
-        let Some(kind) = (unsafe { engine::command_kind(args.cmd, kind_offset as usize) }) else { return };
+        let kind = unsafe { engine::command_kind(args.cmd, kind_offset as usize) }?;
         if self.build.kind_by_name("build_proposal") != Some(kind) {
-            return; // another kind of command: the order keeps waiting
+            return None; // another kind of command: the order keeps waiting
         }
         let now = self.now_ms();
         if !self.inject.pending() {
             // the mod writes `inject_next` and sends the command in the same breath: look at the file now
             self.ingest_patch_order(now);
             if !self.inject.pending() {
-                return;
+                return None;
             }
         }
         let Some(order) = self.inject.take(now) else {
             self.wake();
-            return;
+            return None;
         };
         // SAFETY: only readable memory is read.
         let Some(dest) = (unsafe { engine::payload_of(args.cmd) }) else {
             self.inject.refuse(format!("key {}: the command has no payload", order.key));
             self.wake();
-            return;
+            return None;
         };
         // a deferred held command of the same build takes this command's result once the simulation has applied it, injected or not
         // (a refusal leaves the command to the record path, which is still this game's stamp apply of the build)
         let link = (order.held != 0).then_some((dest, order.held));
         let t0 = std::time::Instant::now();
         let rb0 = wall_ms();
-        let run = if order.link_only {
-            Err(String::new()) // complete_next: the record's own command is this game's stamp apply; nothing to inject
-        } else {
-            self.inject_run(order.key, dest)
-        };
+        let prepared = (!order.link_only).then(|| self.inject_prepare(order.key, dest));
+        Some(InjectJob { order, dest, link, t0, rb0, prepared })
+    }
+
+    /// The report of [`Runtime::inject_add`]: the log lines, the event, the timing record and the deferred link.
+    fn inject_finish(
+        &self,
+        order: inj::Order,
+        dest: usize,
+        link: Option<(usize, u64)>,
+        t0: std::time::Instant,
+        rb0: u64,
+        run: Result<(u64, u64, u64), String>,
+    ) {
         match run {
             Err(why) if order.link_only && why.is_empty() => {
                 self.say(&format!(
@@ -322,8 +379,9 @@ impl Runtime {
         self.wake();
     }
 
-    /// Everything between the order and the swap; every early return leaves the command untouched.
-    fn inject_run(&self, key: u64, dest: usize) -> Result<(u64, u64, u64), String> {
+    /// What the injection needs before the engine is called: the functions and the allocator (their bytes checked), the side file, the
+    /// destination's checks. Calls nothing of the engine; every refusal leaves the command untouched.
+    fn inject_prepare(&self, key: u64, dest: usize) -> Result<Prepared, String> {
         if self.build.name != portable::LAYOUT_BUILD {
             return Err(format!(
                 "the layout is that of game build {}, this is {}",
@@ -351,25 +409,35 @@ impl Runtime {
         inj::check_destination(&LiveMem, dest, constructions, edge_objects)
             .and_then(|()| inj::same_constructions(&LiveMem, dest, &text))
             .map_err(|why| format!("{}{why}", inj::NOT_OURS))?;
+        let donor = counts.iter().any(|&n| n > 0).then_some(dest);
+        Ok(Prepared { fns, alloc, settings, dir, text, donor })
+    }
+
+    /// The engine part of the injection: the verified Proposal is built (engine constructor, copies, `operator new`), swapped into the
+    /// command (copy assignment) and destroyed. Not inside `log::guarded`, so that an exception of the engine reaches the game's own
+    /// handler; the reports in between, which call nothing of the engine, are guarded.
+    fn inject_engine(&self, key: u64, dest: usize, p: Prepared) -> Result<(u64, u64, u64), String> {
+        let Prepared { fns, alloc, settings, dir, text, donor } = p;
         let live = LiveMem;
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
         let mut say = |l: &str| self.say(l);
-        let donor = counts.iter().any(|&n| n > 0).then_some(dest);
         let built = inj::build_verified(&ctx, &super::cmd_patch::LivePoke, &text, donor, &mut say);
         alloc.free_all();
         let built = built?;
         let stats = (built.nodes, built.segments, built.constructions);
-        if !built.r4_report.is_empty() {
-            let name = inj::report_file_name(key);
-            match std::fs::write(dir.join(&name), &built.r4_report) {
-                Ok(()) => self.say(&format!("native inject: key {key}: informational R4 report in {name}")),
-                Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
+        crate::log::guarded("native inject: reports", || {
+            if !built.r4_report.is_empty() {
+                let name = inj::report_file_name(key);
+                match std::fs::write(dir.join(&name), &built.r4_report) {
+                    Ok(()) => self.say(&format!("native inject: key {key}: informational R4 report in {name}")),
+                    Err(e) => self.say(&format!("native inject: key {key}: cannot write {name}: {e}")),
+                }
             }
-        }
-        if donor.is_some() {
-            self.inject_donor_report(key, dest, &text, &built, &dir);
-        }
+            if donor.is_some() {
+                self.inject_donor_report(key, dest, &text, &built, &dir);
+            }
+        });
         self.say("native inject: calling the engine copy assignment into the script command's Proposal");
         // SAFETY: `check_destination` passed on this payload moments ago, on the thread that queues the command.
         unsafe { inj::swap_into(&ctx, &built, dest) };
@@ -425,4 +493,26 @@ impl Runtime {
             write(format!("native_inject_final_{key}.txt"), &fin);
         }
     }
+}
+
+/// An order [`Runtime::inject_take`] decided to carry out, for the engine part and the report.
+struct InjectJob {
+    order: inj::Order,
+    dest: usize,
+    link: Option<(usize, u64)>,
+    t0: std::time::Instant,
+    rb0: u64,
+    /// What the engine part needs, or why it is refused; `None` for `complete_next` (nothing to inject).
+    prepared: Option<Result<Prepared, String>>,
+}
+
+/// What [`Runtime::inject_prepare`] found: the engine part runs with it.
+struct Prepared {
+    fns: nc::ProposalFns,
+    alloc: EngineAlloc,
+    settings: portable::Settings,
+    dir: std::path::PathBuf,
+    text: String,
+    /// The script command's payload when the text adds constructions or edge objects (the receiver's own conversion of them).
+    donor: Option<usize>,
 }
