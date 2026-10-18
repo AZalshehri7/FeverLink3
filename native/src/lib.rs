@@ -28,6 +28,7 @@ pub mod inject;
 pub mod input;
 pub mod link;
 pub mod native_copy;
+pub mod pace;
 pub mod patch;
 pub mod pe;
 pub mod plan;
@@ -46,6 +47,8 @@ pub mod log;
 pub mod mem;
 #[cfg(windows)]
 pub mod proxy;
+#[cfg(windows)]
+pub mod refund;
 #[cfg(windows)]
 pub mod runtime;
 #[cfg(all(windows, target_arch = "x86_64"))]

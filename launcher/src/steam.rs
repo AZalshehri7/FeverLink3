@@ -421,11 +421,11 @@ mod tests {
         let steam = PathBuf::from(r"C:\Steam");
         let dirs = user_local_dirs_with(
             &steam,
-            ["192289926".to_string(), "ac".to_string(), "7".to_string(), String::new()],
-            |p| p.ends_with(r"192289926\3493540\local"),
+            ["123456789".to_string(), "ac".to_string(), "7".to_string(), String::new()],
+            |p| p.ends_with(r"123456789\3493540\local"),
         );
-        assert_eq!(dirs, vec![PathBuf::from(r"C:\Steam\userdata\192289926\3493540\local")]);
-        assert_eq!(mods_dir(&dirs[0]), PathBuf::from(r"C:\Steam\userdata\192289926\3493540\local\mods"));
+        assert_eq!(dirs, vec![PathBuf::from(r"C:\Steam\userdata\123456789\3493540\local")]);
+        assert_eq!(mods_dir(&dirs[0]), PathBuf::from(r"C:\Steam\userdata\123456789\3493540\local\mods"));
     }
 
     #[test]

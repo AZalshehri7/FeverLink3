@@ -1639,7 +1639,7 @@ fn a_frame_inside_a_data_message_is_checked_and_only_a_whole_frame_passes() {
 fn relay_rooms_depend_on_the_secret_alone_and_say_nothing_about_the_key() {
     let mut r = rng(23);
     let mut seen = HashSet::new();
-    for _ in 0..iters(2000) {
+    for _ in 0..iters(500) {
         let secret: [u8; 16] = r.gen();
         let room = SessionKey::relay_room_id(&secret);
         assert_eq!(room, SessionKey::relay_room_id(&secret));

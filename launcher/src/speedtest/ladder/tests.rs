@@ -375,6 +375,7 @@ fn tester_on_fake(old: bool, cancel_after: Option<Duration>) -> FakeRun {
 }
 
 #[test]
+#[ignore = "full set: the whole speed-test ladder on the fake Steam, about 9 s (cargo test -- --include-ignored)"]
 fn the_whole_ladder_runs_on_the_fake_steam_and_leaves_the_default_rate() {
     let (report, config, default) = tester_on_fake(false, None);
     assert!(report.finished && report.error.is_none(), "{report:?}");
@@ -389,6 +390,7 @@ fn the_whole_ladder_runs_on_the_fake_steam_and_leaves_the_default_rate() {
 }
 
 #[test]
+#[ignore = "full set: the whole speed-test ladder on the fake Steam, about 9 s (cargo test -- --include-ignored)"]
 fn an_old_peer_does_not_break_the_ladder_on_the_fake_steam() {
     let (report, _, _) = tester_on_fake(true, None);
     assert!(report.finished && report.error.is_none(), "{report:?}");

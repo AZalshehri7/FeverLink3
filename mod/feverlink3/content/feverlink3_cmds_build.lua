@@ -67,10 +67,29 @@ local function walk(root, dotted)
 	return cur
 end
 
-local function get(o, k)
-	local ok, v = pcall(function() return o[k] end)
-	if ok then return v end
-	return nil
+-- A read that raised on an engine object: counted (M.counters.engineFailed) and logged, the first 5 of each member and then every
+-- 100th. MPFever issue #21: each failed read makes the game write a crash dump (~0.1 s, inside pcall too; bug #10, the clone
+-- freeze), so a lab run must show any that remain. The object's type is what its tostring starts with.
+M.counters = { engineFailed = 0 }
+local get
+do
+	local readFailures = {}
+	local function failedRead(o, k, err)
+		M.counters.engineFailed = M.counters.engineFailed + 1
+		local okT, t = pcall(tostring, o)
+		local what = (okT and tostring(t):match("^[^:%s]+") or "?") .. "." .. tostring(k)
+		local n = (readFailures[what] or 0) + 1
+		readFailures[what] = n
+		if n <= 5 or n % 100 == 0 then log(string.format("engine read failed: %s (%d so far): %s", what, n, tostring(err):match("^[^\n]*"))) end
+	end
+	local function index(o, k) return o[k] end
+	get = function(o, k)
+		if o == nil then return nil end
+		local ok, v = pcall(index, o, k)
+		if ok then return v end
+		failedRead(o, k, v)
+		return nil
+	end
 end
 A.get = get
 
@@ -172,11 +191,23 @@ function A.items(l)
 	return out
 end
 
+-- The list members whose `<name>_native` view the game's typed definitions give (api/tealdef/api/type.d.tl, engine.d.tl:
+-- `addedSegments_native : Vector<SegmentAndEntity>` and so on). Only these are asked for: a `_native` read of a member that has
+-- none is a failed read on an engine object, and MPFever issue #21 found each one makes the game write a crash dump (~0.1 s,
+-- inside pcall too; bug #10). Until 2026-10-18 every list read tried `<name>_native` first (objects, depots, stations,
+-- laneConnections, crosswalks, ...).
+A.NATIVE_VIEW = {
+	addedNodes = true, addedSegments = true, laneConfigs = true, toAddData = true, subconstructionDatas = true, toAdd = true,
+	toRemove = true, constructionTemplates = true, models = true, fatInstances = true, thinInstances = true, rangeGroups = true,
+	subconstructions = true,
+}
+
 -- The elements of a list member as a Lua array. Properties return copies, so big lists are read through the
--- `<name>_native` view (size(), at(i), 1-based) when the engine has one (used that way by the game's own scripts).
+-- `<name>_native` view (size(), at(i), 1-based) when the typed definitions give one (A.NATIVE_VIEW; used that way by the game's own
+-- scripts).
 function A.list(o, k)
 	if o == nil then return {} end
-	local nat = get(o, k .. "_native")
+	local nat = A.NATIVE_VIEW[k] and get(o, k .. "_native") or nil
 	if nat ~= nil then
 		local ok, n = pcall(function() return nat:size() end)
 		if ok and type(n) == "number" then
@@ -1638,6 +1669,12 @@ local function newContext(c, R)
 		for _, x in ipairs(refundIdsOf(f, R)) do
 			if A.exists(x.e) then entries[#entries + 1] = x end
 		end
+		-- the same entries go to the native module with an inject order (the decode's inject path, refund.rs): it inserts them into the
+		-- injected command's own Context container with the engine's insert. MPFever measured that a list written from a script Context
+		-- gives no refund; the typed-map write below stays, harmless (the engine keeps one entry per key, the module inserts only what the
+		-- command lacks and logs how many were already there: whether the script's conversion carries it at all is the open question),
+		-- and it is the only list of the record path, where no module takes part
+		R.refundNative = entries
 		if #entries > 0 then
 			-- the binding behaves alike on every game (same game build), so a form it refuses is refused everywhere: no refund anywhere
 			local form, why = A.setRefundable(obj, entries)
@@ -3674,7 +3711,18 @@ local function decodeBuildUnsafe(body, ctx)
 		if okI and built then
 			built.plan, built.form, built.ctxSource = plan, 1, ctxSource
 			built.inject = { text = body.nativeText }
-			log("build inject (" .. plan .. "): the engine's proposal comes from the originator's text (" .. #body.nativeText .. " bytes)")
+			-- the refundable entities newContext resolved to this game's own (refundIdsOf: the same references on every game, one the command
+			-- removes that cannot be found refused the decode alike everywhere): the order carries them to the module, which puts them into
+			-- the command's own Context (refund.rs); { e, k, r = { a, b, c }, n } per entry
+			if type(R.refundNative) == "table" and #R.refundNative > 0 then
+				local list = {}
+				for i, x in ipairs(R.refundNative) do
+					list[i] = { e = x.e, k = x.k, r = { x.num[1], x.num[2], x.num[3] }, n = x.n }
+				end
+				built.inject.refund = list
+			end
+			log("build inject (" .. plan .. "): the engine's proposal comes from the originator's text (" .. #body.nativeText .. " bytes)"
+				.. (built.inject.refund and (", " .. #built.inject.refund .. " refund entries for the module") or ""))
 			return built
 		end
 		-- Fail closed: the build is the originator's text or nothing. The record path below is this game's own guess of the build (another

@@ -244,7 +244,7 @@ pub(crate) fn selected(f: &F, lines: &std::collections::BTreeMap<&str, &str>) ->
         return true;
     }
     match f.ty {
-        Ty::Map | Ty::Hash(_) => {
+        Ty::Map(_) | Ty::Hash(_) => {
             container_entries(lines, f.name) > 0 && lines.contains_key(format!("{}.graph", f.name).as_str())
         }
         Ty::Skip(_) => false,

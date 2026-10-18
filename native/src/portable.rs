@@ -66,8 +66,9 @@ pub enum Ty {
     EntVec,
     /// A vector of elements of an unknown type: kept structurally.
     BlobVec,
-    /// `std::map` (0x10 bytes: head pointer, size).
-    Map,
+    /// `std::map` (0x10 bytes: head pointer, size) whose tree nodes (and the tree's sentinel, the same type) are described by the
+    /// [`MapNode`]: left, parent, right, colour, isnil, the key at +0x20 and the value after it.
+    Map(&'static MapNode),
     /// `std::unordered_map/set` (0x40 bytes) whose list nodes (and the list's sentinel, the same type) are described by the
     /// [`HashNode`]: next, prev, the value. The node size is the container's element type, so every block of its graph has a size known
     /// from the layout (no heap query). [b45, c10c, inj3: sentinels of 24 bytes for the four Proposal sets and `old2new`, 40 for
@@ -95,34 +96,76 @@ impl Ty {
             Ty::Str => 0x20,
             Ty::Res | Ty::Hash(_) => 0x40,
             Ty::Vec(_) | Ty::EntVec | Ty::BlobVec => 0x18,
-            Ty::Map => 0x10,
+            Ty::Map(_) => 0x10,
             Ty::EntSet => 0x20,
             Ty::Raw(n) | Ty::Skip(n) | Ty::Pad(n) => n,
         }
     }
 }
 
-/// The node of an engine hash container's list: `size` bytes (next at +0, prev at +8, the value from +0x10), and the byte ranges of
-/// the value that are its padding (never constructed: residue of earlier users of the memory, not part of the value; written as zero).
-/// A container whose value type is not known has no padding listed: its value words are literals, and a word that is an address in
-/// this game stays a `P` (the rebuild refuses it).
+/// The node of an engine hash container's list: `size` bytes (next at +0, prev at +8, the value from +0x10), the byte ranges of
+/// the value that are its padding (never constructed: residue of earlier users of the memory, not part of the value; written as zero),
+/// and whether the value is known to hold no pointer (`literal`: its words are data, written as they are). A container whose value
+/// type is not known is not `literal`: a value word that is an address in this game stays a `P` (the rebuild refuses it).
 #[derive(Debug, PartialEq, Eq)]
 pub struct HashNode {
     pub size: usize,
     pub pad: &'static [(usize, usize)],
+    pub literal: bool,
 }
 
-/// A node whose value is not typed (24 bytes: an 8-byte value of an unknown layout).
-pub static HASH_NODE_18: HashNode = HashNode { size: 0x18, pad: &[] };
-/// `refundableEntities`: 40-byte nodes, a 24-byte value of an unknown layout.
-pub static HASH_NODE_28: HashNode = HashNode { size: 0x28, pad: &[] };
+/// `refundableEntities`: 40-byte nodes, a 24-byte value. Not typed: the engine's copy of an entry is a plain 24-byte copy (`0x4be210`:
+/// `vmovups` of 16 bytes and `vmovsd` of 8), which does not tell data from a pointer; only the key's two 4-byte words at +0x10/+0x14 are
+/// compared as such. The container is past the Proposal and never taken from the text (`inject::outside_proposal_container`).
+pub static HASH_NODE_28: HashNode = HashNode { size: 0x28, pad: &[], literal: false };
 /// A set of 4-byte values (`std::unordered_set<uint32>`): the value at +0x10, four bytes of padding at +0x14.
 /// [owner airport run 2026-10-15 key 20 and friend test 2026-10-16 keys 20, 28, 29 and the friend's hold 4: every unresolved pointer of
 /// those refusals was +0x10 of a `terrainAlignSkipEdges` node; the low halves of the 22 values of key 20 are 0..21, each once (two of
 /// them only in the "pointers": 0x171_00000007 and 0x170_00000012), and the high halves are 0, 1, 0x12f, 0x170, 0x171, 0x2c8: the high
 /// words of the heap addresses that memory held before. The halves above 0x10000 made the word look like a readable address on one game
-/// and not on the other.]
-pub static HASH_NODE_SET32: HashNode = HashNode { size: 0x18, pad: &[(0x14, 0x18)] };
+/// and not on the other. Engine: the Proposal copy constructor (`0x4c6640`) copies the set with `0x4bda90`, whose node copy is
+/// `mov ecx,[src+0x10]; mov [node+0x10],ecx` into an `operator new(0x18)` node: 4 bytes of value.]
+pub static HASH_NODE_SET32: HashNode = HashNode { size: 0x18, pad: &[(0x14, 0x18)], literal: true };
+/// A map of a 4-byte key to a 4-byte value (`std::unordered_map<uint32, uint32>`): key at +0x10, value at +0x14, no padding, no
+/// pointer. [Engine: `hash90` and `hashd0` (StreetProposal copy constructor `0x4c78c0`) and `old2new` (Proposal copy constructor
+/// `0x4c6640`) are all copied by the same function `0x4c31a0`, whose node insert `0x4bec80` hashes the 4 bytes at +0x10 (FNV-1a, byte
+/// by byte), compares them as one dword and copies the 8-byte pair as a qword (`mov rcx,[src+0x10]; mov [node+0x10],rcx`) into an
+/// `operator new(0x18)` node: 8 bytes of value whose first 4 are the key; an 8-byte pointer cannot fit beside it.]
+pub static HASH_NODE_PAIR32: HashNode = HashNode { size: 0x18, pad: &[], literal: true };
+
+/// The node of an engine `std::map` (MSVC: left +0, parent +8, right +0x10, colour +0x18, isnil +0x19, the value from +0x20, whose first
+/// member is the key) and what its value is.
+pub struct MapNode {
+    pub size: usize,
+    pub value: MapValue,
+}
+
+pub enum MapValue {
+    /// `std::map<uint32, std::set<uint32>>`: the key at +0x20, the set (sentinel pointer +0x28, size +0x30).
+    IdSet,
+    /// A value of a known layout from +0x20 (key included): an [`Elem`] of `size - 0x20` bytes, written member by member as named
+    /// lines `<map>[i].<member>` (in key order) and carried in the node's block by value (scalars as literals, vectors as `V` tokens
+    /// whose elements are typed the same way): no word of it is ever a pointer of the originator.
+    Record(&'static Elem),
+}
+
+// a node is one entry of the layout table: the same node is the same type
+impl PartialEq for MapNode {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+impl Eq for MapNode {}
+impl std::fmt::Debug for MapNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MapNode({:#x})", self.size)
+    }
+}
+
+/// The six id maps of the Proposal (nodes, segments, edge objects; new to old and old to new), see [`Enc::register_map_nodes`].
+pub static MAP_ID_SETS: MapNode = MapNode { size: 0x38, value: MapValue::IdSet };
+/// `parcelsMap`: `std::map<Entity, Parcel>`, the parcels the build makes (keys `new#N`), nodes of 0x50 bytes. See [`PARCEL`].
+pub static MAP_PARCELS: MapNode = MapNode { size: 0x50, value: MapValue::Record(&PARCEL) };
 
 /// The byte offset of the slots of an [`Ty::EntSet`] table of `cap` slots from its control bytes: `cap` control bytes, the sentinel,
 /// 15 cloned bytes for a 16-byte group read, padded to the 4-byte slot alignment. [b45: 20 for capacities 1 and 3]
@@ -293,6 +336,46 @@ pub static CONSTRUCTION: Elem = Elem {
     anchors: &[],
 };
 
+/// A `Vec3f` as the element of a vector (12 bytes, no padding).
+pub static VEC3F: Elem = Elem { name: "Vec3f", stride: 12, fields: &[f(0, "v", Ty::V3)], anchors: &[] };
+
+/// `Parcel::Face` (0x20 bytes): `points` (`std::vector<Vec3f>`), `collision` (the api's `{CollisionType : boolean}`, a 4-byte set of
+/// flags), four bytes of padding. [Engine: the parcel copy `0x4c1df0` copies each face with `0xdf480` for the points (its element
+/// count is `(end - begin) / 12`: `imul 0x2aaaaaaaaaaaaaab`, `sar 1`; the bytes by `memmove`) and `mov eax,[src+0x18]; mov
+/// [dst+0x18],eax`, stride 0x20 (`add rdi,0x20`). Owner run 2026-10-18 (pre4, host hold 1): in each of the 13 nodes
+/// (of 42) whose pointers native.log details, the face vector is 0x80 bytes (four faces) and the first face's points 0x30 (four points).]
+pub static PARCEL_FACE: Elem = Elem {
+    name: "ParcelFace",
+    stride: 0x20,
+    fields: &[f(0, "points", Ty::Vec(&VEC3F)), f(0x18, "collision", Ty::U32), f(0x1c, "padding", Ty::Pad(4))],
+    anchors: &[],
+};
+
+/// The value of a `parcelsMap` node from +0x20 (0x30 bytes): the key (the parcel's entity) and the api's `Parcel` component in its
+/// order (`streetSegment`, `left`, `curveParam`, `offset`, `faces`). [Engine: the Proposal copy constructor (`0x4c6640`) copies the
+/// map at +0x2c8 from a 0x50-byte sentinel with `0x4bc770` -> `0x4bd1f0` (an `operator new(0x50)` node per entry, the value from +0x20
+/// copied by `0x4c1df0`): `mov eax,[src]` (key), `[src+8]` (4 bytes), `movzx [src+0xc]` (1 byte), `[src+0x10]`, `[src+0x14]` (4 bytes
+/// each), then the vector at +0x18 of 0x20-byte elements (`sar rbx,5`). The bytes +4..+8 and +0xd..+0x10 are never copied: padding.
+/// Owner run 2026-10-18 (pre4, host hold 1, a street built by the street tool over town land): 42 entries, keys new#42..new#1; every
+/// unresolved pointer of its refusal was one of +0x38/+0x40/+0x48 of a node, the faces vector (begin, end, capacity, end = capacity).
+/// The run of 2026-10-14 (h3, a station over town land, the untyped graph): +0x28 0xffffffff/0xfffffffe (the new segments new#1/#2),
+/// +0x2c 0 or 1 under residue bytes (0x435f4e00), +0x30 0.0855..0.83 (a curve parameter), +0x34 8.0.]
+pub static PARCEL: Elem = Elem {
+    name: "Parcel",
+    stride: 0x30,
+    fields: &[
+        f(0, "key", Ty::Ent),
+        f(4, "padding0", Ty::Pad(4)),
+        f(8, "streetSegment", Ty::Ent),
+        f(0xc, "left", Ty::U8),
+        f(0xd, "padding1", Ty::Pad(3)),
+        f(0x10, "curveParam", Ty::F32),
+        f(0x14, "offset", Ty::F32),
+        f(0x18, "faces", Ty::Vec(&PARCEL_FACE)),
+    ],
+    anchors: &[],
+};
+
 /// The payload of a `build_proposal` command (`WorldBuildProposalCommandData` and the kind byte).
 pub static PAYLOAD: &[F] = &[
     f(0x000, "proposal.addedNodes", Ty::Vec(&NODE)),
@@ -301,16 +384,16 @@ pub static PAYLOAD: &[F] = &[
     f(0x048, "proposal.removedSegments", Ty::Vec(&SEGMENT)),
     f(0x060, "proposal.nodeConfigsToAdd", Ty::Vec(&NODE_CONFIG)),
     f(0x078, "proposal.nodeConfigsToRemove", Ty::EntVec),
-    f(0x090, "proposal.hash90", Ty::Hash(&HASH_NODE_18)),
-    f(0x0d0, "proposal.hashd0", Ty::Hash(&HASH_NODE_18)),
+    f(0x090, "proposal.hash90", Ty::Hash(&HASH_NODE_PAIR32)),
+    f(0x0d0, "proposal.hashd0", Ty::Hash(&HASH_NODE_PAIR32)),
     f(0x110, "proposal.edgeObjectsToRemove", Ty::EntVec),
     f(0x128, "proposal.edgeObjectsToAdd", Ty::Vec(&EDGE_OBJECT)),
-    f(0x140, "proposal.new2oldNodes", Ty::Map),
-    f(0x150, "proposal.old2newNodes", Ty::Map),
-    f(0x160, "proposal.new2oldSegments", Ty::Map),
-    f(0x170, "proposal.old2newSegments", Ty::Map),
-    f(0x180, "proposal.new2oldEdgeObjects", Ty::Map),
-    f(0x190, "proposal.old2newEdgeObjects", Ty::Map),
+    f(0x140, "proposal.new2oldNodes", Ty::Map(&MAP_ID_SETS)),
+    f(0x150, "proposal.old2newNodes", Ty::Map(&MAP_ID_SETS)),
+    f(0x160, "proposal.new2oldSegments", Ty::Map(&MAP_ID_SETS)),
+    f(0x170, "proposal.old2newSegments", Ty::Map(&MAP_ID_SETS)),
+    f(0x180, "proposal.new2oldEdgeObjects", Ty::Map(&MAP_ID_SETS)),
+    f(0x190, "proposal.old2newEdgeObjects", Ty::Map(&MAP_ID_SETS)),
     // the tail of the StreetProposal that the Lua binding does not register. The first 0x20 bytes are carried by the engine's own
     // copy constructor (0x4c78c0): an image pointer (constant) or a begin/end range of 20 bytes and two small integers (2, 3) in the
     // stop pair; the word at +0x20 (small integers, a pair of floats, 0x3f800060) is NOT carried (the copy has zeros, seen in the real
@@ -326,10 +409,10 @@ pub static PAYLOAD: &[F] = &[
     f(0x228, "segmentTags", Ty::Vec(&SEGMENT_TAG)),
     f(0x240, "toRemove", Ty::EntVec),
     f(0x258, "toAdd", Ty::Vec(&CONSTRUCTION)),
-    f(0x270, "old2new", Ty::Hash(&HASH_NODE_18)),
-    // a vector of u32 (copied with sar 2 in the engine's copy constructor) and a std::map whose sentinel is 0x50 bytes
+    f(0x270, "old2new", Ty::Hash(&HASH_NODE_PAIR32)),
+    // a vector of u32 (copied with sar 2 in the engine's copy constructor) and the parcels the build makes (see PARCEL)
     f(0x2b0, "parcelsToRemove", Ty::EntVec),
-    f(0x2c8, "parcelsMap", Ty::Map),
+    f(0x2c8, "parcelsMap", Ty::Map(&MAP_PARCELS)),
     f(0x2d8, "terrain", Ty::Raw(0x80)),
     f(0x358, "context.gatherBuildings", Ty::U8),
     f(0x359, "context.gatherFields", Ty::U8),
@@ -346,16 +429,6 @@ pub static PAYLOAD: &[F] = &[
     f(0x3d8, "result", Ty::Skip(0x9b0 - 0x3d8)),
     f(0x9b0, "doDust", Ty::U8),
     f(0x9b8, "kind", Ty::U8),
-];
-
-/// The Proposal's maps of ids, each a `std::map<u32, std::set<u32>>` (see [`Enc::register_map_nodes`]).
-pub const ID_MAPS: &[&str] = &[
-    "proposal.new2oldNodes",
-    "proposal.old2newNodes",
-    "proposal.new2oldSegments",
-    "proposal.old2newSegments",
-    "proposal.new2oldEdgeObjects",
-    "proposal.old2newEdgeObjects",
 ];
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -596,14 +669,17 @@ enum Kind {
     Sentinel,
     /// A node of a `std::set<u32>`: left, parent, right, colour, isnil, key at +0x1c.
     SetNode,
-    /// A node of the segment maps: left, parent, right, colour, isnil, key at +0x20, the set (head pointer +0x28, size +0x30).
+    /// A node of the id maps: left, parent, right, colour, isnil, key at +0x20, the set (head pointer +0x28, size +0x30).
     MapNode,
+    /// A node of a map whose value is a [`MapValue::Record`]: left, parent, right, colour, isnil, then the value carried by value
+    /// ([`Enc::record_tokens`]).
+    RecordNode(&'static MapNode),
     /// The sentinel of a hash container's list: next, prev; its value is never constructed (residue: b45 hashd0's pointed at a
     /// foreign block), so it is written as zero.
     ListSentinel,
-    /// A node of a hash container's list: next, prev, the value (literal words; a word that is an address in this game is a `P`), with
-    /// the value's padding (the [`HashNode`]'s byte ranges) zeroed.
-    ListNode(&'static [(usize, usize)]),
+    /// A node of a hash container's list: next, prev, the value, with the value's padding (the [`HashNode`]'s byte ranges) zeroed. Its
+    /// words are literals; unless the node is `literal`, a word that is an address in this game is a `P`.
+    ListNode(&'static HashNode),
     /// The bucket vector of a hash container: every word points at a node of its list (or the sentinel).
     Buckets,
 }
@@ -830,13 +906,23 @@ impl Enc<'_> {
                 }
                 Ok(())
             }
-            Ty::Map => {
+            Ty::Map(node) => {
                 // std::map: head pointer and size; the nodes are heap blocks of the graph
                 self.line(path, &format!("map:size={}", u64_at(b, 8)))?;
-                if let Some(keys) = self.register_map_nodes(path, u64_at(b, 0) as usize, u64_at(b, 8) as usize) {
-                    // the entries' keys (and, for the segment maps, the set each key maps to), sorted: a named line, so that a rebuilt
+                if let Some((keys, values)) =
+                    self.register_map_nodes(u64_at(b, 0) as usize, u64_at(b, 8) as usize, node)
+                {
+                    // the entries' keys (and, for the id maps, the set each key maps to), sorted: a named line, so that a rebuilt
                     // map's entries are part of the comparison (the nodes themselves are unnamed graph blocks)
                     self.line(&format!("{path}.keys"), &format!("keys:{keys}"))?;
+                    // a typed value: every entry's members as named lines, in key order, so that the values are compared too. Not in the
+                    // input level (the mod's text, bounded to 1 MB): the engine makes the parcels, a SimpleProposal has none, and their
+                    // points (16 per parcel, 42 parcels for one street in the owner's pre4 run) would only fill it
+                    if let (MapValue::Record(elem), false) = (&node.value, self.set.input_level) {
+                        for (i, v) in values.iter().enumerate() {
+                            self.record(&format!("{path}[{i}]"), v, elem.fields, elem.stride, depth + 1)?;
+                        }
+                    }
                 }
                 self.container_graph(path, b, depth, u64_at(b, 8))
             }
@@ -844,7 +930,7 @@ impl Enc<'_> {
                 // std::unordered_map/set: load factor (the other four bytes of its word are padding), then the list head, size,
                 // bucket vector, mask and maximum index; the nodes are heap blocks of the graph
                 self.line(path, &format!("hash:size={},load={:08x}", u64_at(b, 0x10), u32_at(b, 0)))?;
-                self.register_hash_list(u64_at(b, 8) as usize, u64_at(b, 0x10) as usize, node.size, node.pad);
+                self.register_hash_list(u64_at(b, 8) as usize, u64_at(b, 0x10) as usize, node);
                 self.register_hash_buckets(
                     u64_at(b, 0x18) as usize,
                     u64_at(b, 0x20) as usize,
@@ -884,22 +970,32 @@ impl Enc<'_> {
     /// the key at +0x1c. The Proposal's copy constructor (0x4c78c0) copies all six with the same function (0x4bc8d0) from a 0x38-byte
     /// sentinel each. Only the segment maps used to be typed: the node maps of a station configure (inj3, 2026-10-14) were walked as
     /// generic maps of 0x50-byte nodes with their values left to the graph, and the walk followed the sets and the words beside them
-    /// into the world (32768 blocks, a 7.6 MB text). Other maps with entries are walked as nodes of 0x50 bytes with the key at +0x20 and
-    /// the value left to the graph. The line returned is the sorted keys (with each set's keys for the id maps).
-    fn register_map_nodes(&mut self, path: &str, head: usize, size: usize) -> Option<String> {
+    /// into the world (32768 blocks, a 7.6 MB text). A map whose value is a [`MapValue::Record`] (`parcelsMap`) has its nodes typed as
+    /// [`Kind::RecordNode`]: the value is carried by value, never as a pointer of the originator (owner run 2026-10-18, pre4: a street
+    /// over town land had 42 parcels whose untyped nodes left 126 pointers of their face vectors unresolved, and the originator refused
+    /// its own text). Returns the sorted keys line (with each set's keys for the id maps) and the entries' value bytes (from +0x20) in
+    /// key order.
+    fn register_map_nodes(
+        &mut self,
+        head: usize,
+        size: usize,
+        map: &'static MapNode,
+    ) -> Option<(String, Vec<Vec<u8>>)> {
         if size == 0 {
             return None; // an empty engine map is the engine's own; nothing to describe
         }
-        let sets = ID_MAPS.contains(&path);
-        let node = if sets { 0x38 } else { 0x50 };
+        let sets = matches!(map.value, MapValue::IdSet);
+        let node = map.size;
         let nodes = self.walk_tree(head, size, node)?;
         let mut register: Vec<(usize, usize)> = vec![(head, node)];
         let mut kinds: Vec<(usize, Kind)> = vec![(head, Kind::Sentinel)];
         let mut entries: Vec<(u32, String)> = Vec::new();
+        let mut values: Vec<(u32, Vec<u8>)> = Vec::new();
         for (a, n) in &nodes {
             register.push((*a, node));
-            kinds.push((*a, if sets { Kind::MapNode } else { Kind::Sentinel }));
+            kinds.push((*a, if sets { Kind::MapNode } else { Kind::RecordNode(map) }));
             let key = u32_at(n, 0x20);
+            values.push((key, n[0x20..].to_vec()));
             let mut inner = String::new();
             if sets {
                 let (h2, c2) = (u64_at(n, 0x28) as usize, u64_at(n, 0x30) as usize);
@@ -917,13 +1013,15 @@ impl Enc<'_> {
         for (a, n) in register {
             self.known_sizes.insert(a, n);
         }
-        if sets {
-            // the id maps are typed: their nodes are written word by word by kind. Other maps keep the generic walk
-            self.kinds.extend(kinds);
-        }
+        // every map of the table is typed: its nodes are written word by word by kind
+        self.kinds.extend(kinds);
         self.sentinels.insert(head);
         entries.sort();
-        Some(entries.iter().map(|(k, v)| format!("{k:08x}{v}")).collect::<Vec<_>>().join(","))
+        values.sort_by_key(|(k, _)| *k);
+        Some((
+            entries.iter().map(|(k, v)| format!("{k:08x}{v}")).collect::<Vec<_>>().join(","),
+            values.into_iter().map(|(_, v)| v).collect(),
+        ))
     }
 
     /// The bucket vector of an engine hash container (MSVC: begin, end, capacity at +0x18 of the member; two list pointers per bucket)
@@ -949,7 +1047,8 @@ impl Enc<'_> {
     /// readable nodes whose `prev` links agree; else nothing is registered and the pointers stay `P` (the rebuild refuses). The sizes
     /// come from the container's type, so the graph needs no heap index (the whole-heap walk it replaces took 220-320 ms per text and
     /// stopped at 3,145,728 blocks, missing blocks past it: b45 `refundableEntities` sentinel, inj7 its list head, inj3/inj8 buckets).
-    fn register_hash_list(&mut self, head: usize, size: usize, node: usize, pad: &'static [(usize, usize)]) {
+    fn register_hash_list(&mut self, head: usize, size: usize, list: &'static HashNode) {
+        let node = list.size;
         if size > self.set.max_elems || !pointer_like(head as u64) || node < 0x10 {
             return;
         }
@@ -974,7 +1073,7 @@ impl Enc<'_> {
         self.kinds.insert(head, Kind::ListSentinel);
         for a in found {
             self.known_sizes.insert(a, node);
-            self.kinds.insert(a, Kind::ListNode(pad));
+            self.kinds.insert(a, Kind::ListNode(list));
         }
     }
 
@@ -1146,15 +1245,20 @@ impl Enc<'_> {
 
     /// The tokens of a block of a typed engine container: pointers only at the words the kind names (blocks of the graph, or the game's
     /// image), every other word a literal, padding zeroed. Never a guess.
-    fn typed_tokens(&mut self, bytes: &[u8], kind: Kind) -> String {
-        let mut b = bytes.to_vec();
+    fn typed_tokens(&mut self, bytes: &[u8], kind: Kind) -> R<String> {
+        // a record node: the tree's links here, the value (from +0x20) by value below
+        let (mut b, value) = match kind {
+            Kind::RecordNode(_) if bytes.len() >= 0x20 => (bytes[..0x20].to_vec(), Some(&bytes[0x20..])),
+            _ => (bytes.to_vec(), None),
+        };
         let all: Vec<usize> = (0..b.len() / 8).map(|i| i * 8).collect();
         let (pad, ptrs): (&[(usize, usize)], &[usize]) = match kind {
             Kind::Sentinel => (&[(0x1a, usize::MAX)], &[0, 8, 0x10]),
             Kind::SetNode => (&[(0x1a, 0x1c)], &[0, 8, 0x10]),
             Kind::MapNode => (&[(0x1a, 0x20), (0x24, 0x28)], &[0, 8, 0x10, 0x28]),
+            Kind::RecordNode(_) => (&[(0x1a, 0x20)], &[0, 8, 0x10]),
             Kind::ListSentinel => (&[(0x10, usize::MAX)], &[0, 8]),
-            Kind::ListNode(pad) => (pad, &[0, 8]),
+            Kind::ListNode(node) => (node.pad, &[0, 8]),
             Kind::Buckets => (&[], &all),
         };
         for &(from, to) in pad {
@@ -1189,7 +1293,7 @@ impl Enc<'_> {
                     }
                     toks.push("P".into());
                 }
-            } else if matches!(kind, Kind::ListNode(_))
+            } else if matches!(kind, Kind::ListNode(node) if !node.literal)
                 && pointer_like(w)
                 && !((w as usize) >= self.env.image_base && (w as usize) - self.env.image_base < IMAGE_BOUND)
                 && self.mem.read(w as usize, 1).is_some()
@@ -1209,7 +1313,97 @@ impl Enc<'_> {
         if !b.len().is_multiple_of(8) {
             toks.push(format!("b:{}", hex(&b[b.len() - b.len() % 8..])));
         }
-        toks.join(" ")
+        if let (Kind::RecordNode(map), Some(value)) = (kind, value) {
+            let MapValue::Record(elem) = map.value else { unreachable!("a record node is a record map's") };
+            if value.len() != elem.stride {
+                return Err(format!(
+                    "{}: a node of {:#x} bytes for a value of {:#x}",
+                    self.label,
+                    bytes.len(),
+                    elem.stride
+                ));
+            }
+            let label = self.label.clone();
+            toks.push(self.record_tokens(&label, value, elem, 1)?);
+        }
+        Ok(toks.join(" "))
+    }
+
+    /// The tokens of one record of `elem` carried by value inside a block of the graph: its scalar members as literal words, its padding
+    /// (every byte no member names) zeroed, each vector member as a `V<bytes>[...]` token (the rebuild makes the vector's block from
+    /// it) whose elements are typed the same way, an empty vector as three zero words (the engine's empty vector; its copy constructor
+    /// copies nothing from it). No word is ever a pointer of the game that wrote the text. A member type that cannot be carried by
+    /// value (a string, a container) or a vector that does not fit its element type refuses the text with the reason, never a guess.
+    fn record_tokens(&mut self, path: &str, bytes: &[u8], elem: &'static Elem, depth: usize) -> R<String> {
+        if depth > self.set.max_depth {
+            return Err(format!("{path}: nesting is over the bound"));
+        }
+        let mut b = vec![0u8; elem.stride];
+        let mut vecs: Vec<(usize, String)> = Vec::new();
+        for fl in elem.fields {
+            let end = fl.off + fl.ty.size();
+            match fl.ty {
+                Ty::U8 | Ty::U32 | Ty::I32 | Ty::F32 | Ty::Ent | Ty::V3 | Ty::M4 => {
+                    b[fl.off..end].copy_from_slice(&bytes[fl.off..end])
+                }
+                Ty::Pad(_) => {}
+                Ty::Vec(inner) => {
+                    let p = format!("{path}.{}", fl.name);
+                    let block = self.vec_block(&bytes[fl.off..end], inner.stride, &p)?;
+                    if !fl.off.is_multiple_of(8) {
+                        return Err(format!("layout table: {p} is not at a word of its record"));
+                    }
+                    let n = block.len() / inner.stride;
+                    if n > self.set.max_elems {
+                        return Err(format!("{p}: {n} elements are over the bound"));
+                    }
+                    let tok = if n == 0 {
+                        "z3".to_string()
+                    } else if inner.stride.is_multiple_of(8) {
+                        let mut parts = Vec::with_capacity(n);
+                        for (i, item) in block.chunks(inner.stride).enumerate() {
+                            parts.push(self.record_tokens(&format!("{p}[{i}]"), item, inner, depth + 1)?);
+                        }
+                        format!("V{}[{}]", block.len(), parts.join(" "))
+                    } else {
+                        // elements that are not whole words (Vec3f): their bytes, members only, as one hex run
+                        let mut all = Vec::with_capacity(block.len());
+                        for (i, item) in block.chunks(inner.stride).enumerate() {
+                            let t = self.record_tokens(&format!("{p}[{i}]"), item, inner, depth + 1)?;
+                            let h = t
+                                .strip_prefix("b:")
+                                .ok_or_else(|| format!("layout table: {p} holds elements that are not plain bytes"))?;
+                            all.push(h.to_string());
+                        }
+                        format!("V{}[b:{}]", block.len(), all.concat())
+                    };
+                    vecs.push((fl.off, tok));
+                }
+                _ => return Err(format!("layout table: {path}.{} cannot be carried by value", fl.name)),
+            }
+        }
+        if vecs.is_empty() && !elem.stride.is_multiple_of(8) {
+            return Ok(format!("b:{}", hex(&b)));
+        }
+        if !elem.stride.is_multiple_of(8) {
+            return Err(format!(
+                "layout table: {path} ({}) holds a vector but is not a whole number of words",
+                elem.name
+            ));
+        }
+        let mut toks: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if let Some((_, t)) = vecs.iter().find(|(o, _)| *o == i) {
+                toks.push(t.clone());
+                i += 0x18;
+                continue;
+            }
+            let w = u64_at(&b, i);
+            toks.push(if w == 0 { "z1".to_string() } else { format!("w:{w:016x}") });
+            i += 8;
+        }
+        Ok(toks.join(" "))
     }
 
     /// `len` bytes of heap were read for the structural dump: refused past the text's heap bound ([`heap_budget`]).
@@ -1440,7 +1634,7 @@ pub fn encode_with(
         e.origin = e.blocks[done].origin.clone();
         e.label = format!("@B{}", done + 1);
         let tokens = match e.blocks[done].kind {
-            Some(kind) => e.typed_tokens(&bytes, kind),
+            Some(kind) => e.typed_tokens(&bytes, kind)?,
             None => e.raw_tokens(&bytes, 1)?,
         };
         e.container_mode = false;

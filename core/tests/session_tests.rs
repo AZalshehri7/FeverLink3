@@ -1189,4 +1189,51 @@ fn skewed_rounds_are_counted_and_logged_every_twenty_rounds() {
     let lines: Vec<&String> = h.host_log.iter().filter(|l| l.contains("skipped as skewed")).collect();
     assert_eq!(1, lines.len(), "{:?}", h.host_log);
     assert!(lines[0].contains("5 of 20"), "{}", lines[0]);
+    assert!(!h.host_log.iter().any(|l| l.contains("WARNING")), "never 3 in a row: {:?}", h.host_log);
+}
+
+/// Owner's live test 2026-10-18: 44 of 60 rounds were skewed (no desync could be seen) and the only trace was the line every 20
+/// rounds. A run of skewed rounds is a WARNING, its end is said, and a minute with a skewed round has its own count.
+#[test]
+fn skewed_rounds_in_a_row_give_a_warning_a_minute_line_and_a_line_when_compared_again() {
+    let mut h = Harness::new();
+    let a = h.connect("A");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.host_call(HostSession::start);
+    let p = parts(&[("money", "1")]);
+    let round = |h: &mut Harness, skew: i64| {
+        h.host_call(HostSession::request_checksum);
+        let req: ChecksumRequestMessage = h.p(a).last(MessageKind::ChecksumRequest);
+        h.host_game(MessageKind::ChecksumReport, &json(&ChecksumReportMessage::new(req.n, req.at, p.clone())));
+        h.player_game(
+            a,
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at + skew, p.clone())),
+        );
+        h.advance(8.0);
+    };
+    let warnings = |h: &Harness| h.host_log.iter().filter(|l| l.starts_with("WARNING:")).cloned().collect::<Vec<_>>();
+    round(&mut h, 200);
+    round(&mut h, 200);
+    assert!(warnings(&h).is_empty());
+    round(&mut h, 200);
+    assert_eq!(
+        vec!["WARNING: 3 checksum rounds in a row not compared (the games hashed at different sim times): no desync can be detected until one is"],
+        warnings(&h)
+    );
+    for _ in 0..10 {
+        round(&mut h, 400);
+    }
+    assert_eq!(2, warnings(&h).len(), "again after 10 more: {:?}", warnings(&h));
+    assert!(warnings(&h)[1].starts_with("WARNING: 13 checksum rounds in a row"), "{:?}", warnings(&h));
+    let minute: Vec<&String> = h.host_log.iter().filter(|l| l.starts_with("checksum minute:")).collect();
+    assert!(!minute.is_empty(), "{:?}", h.host_log);
+    assert!(minute[0].contains("round(s) not compared"), "{}", minute[0]);
+    round(&mut h, 0);
+    assert!(
+        h.host_log.iter().any(|l| l == "checksum rounds compared again after 13 skewed round(s) in a row"),
+        "{:?}",
+        h.host_log
+    );
 }

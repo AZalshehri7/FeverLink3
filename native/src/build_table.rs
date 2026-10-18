@@ -52,6 +52,51 @@ pub const fn lua_seed_patch<const N: usize>(seed: u32) -> [u8; N] {
 
 static LUA_SEED_PATCH_40420: [u8; 26] = lua_seed_patch(LUA_SEED);
 
+/// Displacement of `GameTime.tickCount` in the component (`mov eax,[rax+3Ch]` in its getter).
+pub const TICK_COUNT_OFFSET: u8 = 0x3c;
+/// Displacement of `GameTime.updateCount`, the simulation step count (`mov eax,[rax+40h]` in its getter).
+pub const UPDATE_COUNT_OFFSET: u8 = 0x40;
+/// Index of the load's displacement byte inside the getter.
+pub const TICK_GETTER_DISP_AT: usize = 21;
+
+/// A tickCount getter turned into an updateCount getter: the same bytes, the load's displacement replaced.
+pub const fn step_getter_patch<const N: usize>(tick_getter: [u8; N]) -> [u8; N] {
+    let mut out = tick_getter;
+    out[TICK_GETTER_DISP_AT] = UPDATE_COUNT_OFFSET;
+    out
+}
+
+static TICK_GETTER_40420: [u8; 27] = [
+    0x48,
+    0x83,
+    0xEC,
+    0x28,
+    0x48,
+    0x8B,
+    0x41,
+    0x10,
+    0x48,
+    0x8B,
+    0x49,
+    0x08,
+    0x8B,
+    0x10,
+    0xE8,
+    0xAD,
+    0xAF,
+    0xE9,
+    0xFF,
+    0x8B,
+    0x40,
+    TICK_COUNT_OFFSET,
+    0x48,
+    0x83,
+    0xC4,
+    0x28,
+    0xC3,
+];
+static STEP_GETTER_40420: [u8; 27] = step_getter_patch(TICK_GETTER_40420);
+
 /// Shortest prologue a [`CallSite`] may record.
 pub const CALL_PROLOGUE_MIN: usize = 8;
 
@@ -124,9 +169,25 @@ pub struct BuildAddrs {
     /// The call `RandomInt(rng, 0, n)` that picks the country edge in `0x95d100` (`0x95d627`): the id vector at
     /// `[rbp-0x40, rbp-0x38)` is read just before it.
     pub town_pick_call: Option<CallPatchSite>,
+    /// The call of `CGame::Sync` in `CGame::Step` (main thread, every frame): smooth pacing redirects it and, after a `Sync` that handed
+    /// the simulation a batch, stretches the batch interval by the mod's factor (`pace.rs`). Static analysis of build 40420 (`Step` at
+    /// `0x11f3f0`); the place is TPF3-MP's (MIT) "batch interval" by way of MPFever 0.3.15 (MIT), found again here in the executable.
+    pub batch_pace: Option<CallPatchSite>,
     /// `GameTime` getter: `fn(system*) -> u32` (the dword at `+0x40` of the `GameTime` component). Called, never
     /// hooked; the prologue is compared first.
     pub game_time_getter: Option<CallSite>,
+    /// The engine's `GameTime.tickCount` getter, `fn(system*) -> u32` (the dword at `+0x3c`). The official API reference
+    /// (`api/tealdef/api/engine.d.tl`, record `GameTime`) says tickCount "ticks also when the game is paused (once per frame)",
+    /// updateCount (`+0x40`) counts simulation updates only; the engine increments both in one function (`0xbad6b0`:
+    /// `inc [x+0x3c]`, then `inc [x+0x40]` only when the frame ran an update). The simulation seeds random draws from this
+    /// getter: the land vehicles' reservation shuffle (`LandVehicleMoveSystem::Update2`, minstd seed), `AccountSystem`,
+    /// `TownDeveloper::Develop` (directly and through the street developer) and `MakeStreetProposal`, so two games that
+    /// stood still for a different number of frames (the input barrier sets speed 0) draw differently. The patch turns the
+    /// getter's one load `mov eax,[rax+0x3c]` into `mov eax,[rax+0x40]`: every caller of the getter reads the step count,
+    /// the same on every game; the field itself (what Lua reads) stays as it is. Static analysis of build 40420 (getter
+    /// callers by a rel32 scan of `.text`, their functions by unwind data, vtables and assert strings); the finding comes
+    /// from TPF3-MP (Juliansgith, MIT) as ported by MPFever, the getter-level patch is ours (THIRD_PARTY_NOTICES.md).
+    pub tick_count_getter: Option<PatchSite>,
     /// Lua 5.2's `makeseed`, the seed of the string hash, called once by `lua_newstate`. The replacement is
     /// `mov eax, LUA_SEED ; ret` padded with `int3` (see [`lua_seed_patch`]), so every process hashes strings the
     /// same way and `pairs` order over string keys no longer differs between processes. `expected` is the
@@ -260,10 +321,31 @@ pub const BUILDS: &[BuildAddrs] = &[
                 ],
             },
         }),
+        // `call 0x11f690` (CGame::Sync) at `0x11f446` in CGame::Step (`0x11f3f0`), after `movsxd rdi,[rdx+218h] ; mov rcx,rbx ;
+        // add rdi,[rdx+1A8h] ; mov rdx,rsi` and before `test al,al ; je`; callee: `mov [rsp+10h],rbx ; push rbp,rsi,rdi,r12,r13,r14,r15`
+        batch_pace: Some(CallPatchSite {
+            rva: 0x0011_f446,
+            expected: &[0xE8, 0x45, 0x02, 0x00, 0x00],
+            callee: CallSite {
+                rva: 0x0011_f690,
+                prologue: &[
+                    0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+                ],
+            },
+        }),
         // `sub rsp,28h ; mov rax,[rcx+10h] ; mov rcx,[rcx+8] ; mov edx,[rax]` (then a call to the component lookup)
         game_time_getter: Some(CallSite {
             rva: 0x002a_96c0,
             prologue: &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x8B, 0x49, 0x08, 0x8B, 0x10],
+        }),
+        // the tickCount getter, the whole function: `sub rsp,28h ; mov rax,[rcx+10h] ; mov rcx,[rcx+8] ; mov edx,[rax] ;
+        // call 0x1445c0 (component lookup) ; mov eax,[rax+3Ch] ; add rsp,28h ; ret`; only the load's displacement changes.
+        // Its direct callers (rel32 scan of .text): 0x577e0b, 0x5a51f1 (interface tools), 0x900170, 0x90edc0, 0x96ad13,
+        // 0xa38dda, 0xa7db6d, 0xac2dd3, 0x2698385.
+        tick_count_getter: Some(PatchSite {
+            rva: 0x002a_9600,
+            expected: &TICK_GETTER_40420,
+            replacement: &STEP_GETTER_40420,
         }),
         script_pool: Some(PatchSite {
             rva: 0x00ab_00fc,
@@ -359,7 +441,9 @@ mod tests {
         town_edges: None,
         town_sort_call: None,
         town_pick_call: None,
+        batch_pace: None,
         game_time_getter: None,
+        tick_count_getter: None,
         script_pool: None,
         lua_makeseed: None,
         command_move: None,
@@ -410,7 +494,7 @@ mod tests {
     #[test]
     fn patch_sites_replace_exactly_as_many_bytes_as_they_expect() {
         for b in BUILDS.iter().chain(FAKE) {
-            for p in [&b.script_pool, &b.lua_makeseed].into_iter().flatten() {
+            for p in [&b.script_pool, &b.lua_makeseed, &b.tick_count_getter].into_iter().flatten() {
                 assert_eq!(p.expected.len(), p.replacement.len(), "{}: patch length mismatch", b.name);
                 assert_ne!(p.expected, p.replacement, "{}: patch changes nothing", b.name);
             }
@@ -428,6 +512,25 @@ mod tests {
         assert!(p.replacement[6..].iter().all(|&b| b == 0xCC));
         assert_eq!(p.replacement.len(), p.expected.len());
         assert_eq!(lua_seed_patch::<8>(1), [0xB8, 1, 0, 0, 0, 0xC3, 0xCC, 0xCC]);
+    }
+
+    #[test]
+    fn the_step_seed_patch_changes_only_the_tick_count_load() {
+        let b = select(0x6ac5_0427).unwrap();
+        let p = b.tick_count_getter.as_ref().unwrap();
+        assert_eq!(p.rva, 0x002a_9600);
+        // the same getter shape as the updateCount getter the growth log calls (first 14 bytes, up to the call)
+        assert_eq!(&p.expected[..14], b.game_time_getter.as_ref().unwrap().prologue);
+        // `call rel32` to the component lookup 0x1445c0, then `mov eax,[rax+3Ch] ; add rsp,28h ; ret`
+        let rel = i32::from_le_bytes(p.expected[15..19].try_into().unwrap());
+        assert_eq!(p.expected[14], 0xE8);
+        assert_eq!((p.rva + 19).wrapping_add(rel as u32), 0x0014_45c0);
+        assert_eq!(&p.expected[19..22], &[0x8B, 0x40, TICK_COUNT_OFFSET]);
+        assert_eq!(&p.replacement[19..22], &[0x8B, 0x40, UPDATE_COUNT_OFFSET]);
+        assert_eq!(&p.expected[22..], &[0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        let changed: Vec<usize> = (0..p.expected.len()).filter(|&i| p.expected[i] != p.replacement[i]).collect();
+        assert_eq!(changed, [TICK_GETTER_DISP_AT], "one byte: the displacement of the load");
+        assert_eq!(step_getter_patch([0u8; 27])[TICK_GETTER_DISP_AT], 0x40);
     }
 
     #[test]
@@ -487,7 +590,8 @@ mod tests {
         assert_eq!(b.town_update_size.as_ref().unwrap().rva, 0x9e12b0);
         assert_eq!(b.town_candidates.as_ref().unwrap().rva, 0x9677c0);
         assert_eq!(b.town_edges.as_ref().unwrap().rva, 0x95d100);
-        for (site, call) in [(&b.town_sort_call, 0x967c16u32), (&b.town_pick_call, 0x95d627)] {
+        for (site, call) in [(&b.town_sort_call, 0x967c16u32), (&b.town_pick_call, 0x95d627), (&b.batch_pace, 0x11f446)]
+        {
             let s = site.as_ref().unwrap();
             assert_eq!(s.rva, call);
             // the displacement leads to the recorded callee

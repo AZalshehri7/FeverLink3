@@ -1068,6 +1068,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: a tight wall-clock bound that a busy runner can miss (cargo test -- --include-ignored)"]
     fn a_peer_that_sends_faster_than_the_limit_is_slowed_not_dropped() {
         let limits = NetLimits { frames_per_second: 50, bytes_per_second: 0, ..NetLimits::default() };
         let (htx, hrx) = mpsc::channel();

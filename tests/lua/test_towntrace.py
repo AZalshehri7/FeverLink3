@@ -495,6 +495,7 @@ class InBridgeTest(unittest.TestCase):
         self.assertIn("~ house_b.con@30.0,40.0,2.0 L=2>3 D=1 P=2 T=200", lines)
         self.assertNotIn("town=91", text, "the other town is not traced")
 
+    @T.full
     def test_commands_seen_by_the_sim_script_are_listed(self):
         os.environ["FEVERLINK3_TOWN_TRACE"] = "90"
         g = self.game()
@@ -508,6 +509,7 @@ class InBridgeTest(unittest.TestCase):
         self.assertIn("cmd townUpdateSize town=90 pi=0", text)
 
 
+@T.own_tests_only
 class InBridgeCmdsTest(InBridgeTest):
     """FEVERLINK3_TOWN_TRACE_CMDS in the real bridge: the game script's factory calls reach the file, unchanged."""
 
@@ -522,6 +524,7 @@ class InBridgeCmdsTest(InBridgeTest):
             os.environ["FEVERLINK3_TOWN_TRACE_CMDS"] = self.old_cmds
         super().tearDown()
 
+    @T.full
     def test_factories_are_wrapped_only_when_the_switch_is_on(self):
         import time
 
@@ -535,6 +538,7 @@ class InBridgeCmdsTest(InBridgeTest):
         g.step()
         self.assertNotIn(" mk ", T.read_text(os.path.join(g.dir, "town_trace.txt")))
 
+    @T.full
     def test_the_game_scripts_call_is_logged_and_returned_unchanged(self):
         import time
 

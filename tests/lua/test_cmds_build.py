@@ -1249,6 +1249,7 @@ class BuildGame(T.Game):
         self.from_game = os.path.join(self.dir, "from_game.log")
         self.use_env()
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        T.fastio.install(self.L)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = T.COMMON_SRC, T.LOCKSTEP_SRC, T.BRIDGE_SRC, T.HUD_SRC
         g.PORTABLE_SRC = T.PORTABLE_SRC
@@ -2268,6 +2269,7 @@ end
 '''
 
 
+@T.own_tests_only
 class TrackEdgeTest(BuildTest):
     """The segment of a track build carries its track type and catenary (SegmentAndEntity.trackEdge): a replay without it is a street edge."""
 
@@ -2282,6 +2284,7 @@ class TrackEdgeTest(BuildTest):
         self.assertEqual(self.A.lua("tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.trackType) .. ' ' .. tostring(GAME.applied[2].args[1].streetProposal.edgesToAdd[1].trackEdge.catenary)"), "0 false", "a road stays default")
 
 
+@T.own_tests_only
 class RealTrackTemplateTest(BuildTest):
     """A user's track has the template ::/infrastructure/track/simple/simple.street_template, whose name contains the text of a
     construction's own piece. It must still travel with its geometry and track type (real session 2026-10-13: it was captured
@@ -2326,11 +2329,13 @@ class ReplayIgnoreErrorsBase:
         self.tick(14)
         return str(self.A.lua("BUILD_CTX[1]"))
 
+@T.own_tests_only
 class ReplayIgnoreErrorsOffTest(ReplayIgnoreErrorsBase, BuildTest):
     def test_off_by_default(self):
         self.assertIn("ie=false", self.replayed_ctx())
 
 
+@T.own_tests_only
 class ReplayIgnoreErrorsOnTest(ReplayIgnoreErrorsBase, BuildTest):
     switch = "1"
 
@@ -2898,6 +2903,21 @@ class PureBuildTest(unittest.TestCase):
                       "return v.x .. v.y .. v.z .. '|' .. #mm .. '|' .. mm[13] .. '|' .. #l .. '|' .. tostring(A.isObject(V(1, 2, 3))) .. tostring(A.isObject({})) end)()")
         self.assertEqual(got, "123|16|5|2|truefalse")
 
+    def test_a_list_asks_for_a_native_view_only_where_the_typed_definitions_give_one(self):
+        # bug #10: a read of a member an engine object lacks costs the real game a crash dump (MPFever issue #21); `objects_native`
+        # is in no typed definition, `addedSegments_native` is (type.d.tl StreetProposal)
+        got = self.ev("(function() local M = PURE(); local A = M.adapter; local asked = {}; "
+                      "local function obj(fields) return setmetatable({}, { __index = function(_, k) asked[#asked + 1] = k; "
+                      "if fields[k] == nil then error('no member ' .. k) end; return fields[k] end }) end; "
+                      "local nat = obj({ size = function() return 2 end, at = function(_, i) return 10 * i end }); "
+                      "local o = obj({ objects = { 1, 2, 3 }, addedSegments = { 7 }, addedSegments_native = nat }); "
+                      "local before = M.counters.engineFailed; "
+                      "local a, b = A.list(o, 'objects'), A.list(o, 'addedSegments'); "
+                      "local miss = A.get(o, 'nothing'); "
+                      "return #a .. '|' .. table.concat(b, ',') .. '|' .. table.concat(asked, ',') .. '|' .. (M.counters.engineFailed - before) end)()")
+        self.assertEqual(got, "3|10,20|objects,addedSegments_native,size,at,at,nothing|1",
+                         "objects read as it is, the documented view used, and the one failed read counted")
+
     def test_a_lanes_transport_modes_are_the_documented_map_by_name(self):
         # {TransportMode : boolean} keyed by api.type.enum.TransportMode: read as the names of the modes that are on, rebuilt by
         # setting each named key (wiki audit 2026-10-18 A5; the shift guess C.writeEngineArray is gone)
@@ -3081,11 +3101,13 @@ class PortableReplayBase:
         return str(self.L.eval(code)(text))
 
 
+@T.own_tests_only
 class PortableReplayOffTest(PortableReplayBase, PureBuildTest):
     def test_off_by_default_the_record_path_builds_it(self):
         self.assertEqual(self.decoded(portable_road_text()), "street|2|1")
 
 
+@T.own_tests_only
 class PortableReplayOnTest(PortableReplayBase, PureBuildTest):
     switch = "1"
 
@@ -3217,6 +3239,7 @@ def inject_text(node0=101, pos=(100.0, 0.0, 0.0), extra=()):
     return "\n".join(lines) + "\n=== end portable #0 ===\n"
 
 
+@T.own_tests_only
 class InjectReferenceCheckTest(PureBuildTest):
     """Before the native module injects the engine's Proposal from the originator's text, every existing entity the text names must be one
     of the kind the member needs in THIS game (real run 2026-10-14, rail-crash: node 50395 of the guest's track was an edge on the forked

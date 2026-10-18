@@ -232,11 +232,11 @@ pub struct RefundEntry {
 const FLAG_OFFSETS: [usize; 7] = [0x358, 0x359, 0x360, 0x362, 0x3b2, 0x3d1, 0x3d2];
 
 /// The Context's `refundableEntities` in a build command's payload (`portable.rs`: `Ty::Hash(0x28)` at 0x370).
-const REFUNDABLE_OFFSET: usize = 0x370;
+pub(crate) const REFUNDABLE_OFFSET: usize = 0x370;
 /// The list nodes of `refundableEntities` are 0x28 bytes: next, prev, then the 24-byte entry ([`RefundEntry`]; real texts, e.g. friend
 /// test 2026-10-16 `native_inject_4.txt`: 25 nodes, consecutive ids of two recent builds).
-const REFUNDABLE_NODE: usize = 0x28;
-const REFUNDABLE_VALUE: usize = 0x10;
+pub(crate) const REFUNDABLE_NODE: usize = 0x28;
+pub(crate) const REFUNDABLE_VALUE: usize = 0x10;
 /// More entries than this are not a tool's list (real runs: up to 25): the container is taken as unreadable.
 pub const REFUNDABLE_MAX: usize = 4096;
 

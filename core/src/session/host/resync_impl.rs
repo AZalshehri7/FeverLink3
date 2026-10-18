@@ -29,6 +29,11 @@ const MAX_VERIFY_SKEWS: u8 = 3;
 const MAX_VERIFY_NOT_READY: u8 = 3;
 /// A line in the session log with the count of skewed rounds after this many finished rounds.
 const SKEW_LOG_EVERY: u32 = 20;
+/// A WARNING line once this many rounds in a row were skewed (and every `SKEW_WARN_AGAIN` more): no desync is detected meanwhile.
+const SKEW_WARN_STREAK: u32 = 3;
+const SKEW_WARN_AGAIN: u32 = 10;
+/// The minute's line (host seconds): rounds finished and skipped as skewed, written for a minute that had a skewed round.
+const SKEW_MINUTE_S: f64 = 60.0;
 
 #[derive(Debug)]
 pub(super) struct ResyncRound {
@@ -618,6 +623,9 @@ impl HostSession {
 
     /// Counts a finished round and, every `SKEW_LOG_EVERY` rounds, logs how many were skipped as skewed (the games hashed
     /// at different sim times), so a real game can measure how well the games hash at the same time.
+    /// A skewed round is a round in which no desync can be seen. Owner's live test 2026-10-18: 44 of 60 rounds were skewed and
+    /// the only trace was this line every 20 rounds (the launcher even logged a skewed round as "identical"). So a run of them is a
+    /// WARNING (`SKEW_WARN_STREAK` in a row), the end of a run is said, and a minute with a skewed round gets its own count.
     fn count_round(&mut self, skewed: bool) {
         self.rounds_done += 1;
         if skewed {
@@ -628,6 +636,41 @@ impl HostSession {
             self.log(format!(
                 "checksum rounds: {skewed} of {done} skipped as skewed (games hashed at different sim times)"
             ));
+        }
+        if skewed {
+            self.skew_streak += 1;
+            let streak = self.skew_streak;
+            if streak == SKEW_WARN_STREAK
+                || (streak > SKEW_WARN_STREAK && (streak - SKEW_WARN_STREAK).is_multiple_of(SKEW_WARN_AGAIN))
+            {
+                self.log(format!(
+                    "WARNING: {streak} checksum rounds in a row not compared (the games hashed at different sim times): no desync can be detected until one is"
+                ));
+            }
+        } else {
+            if self.skew_streak >= SKEW_WARN_STREAK {
+                let streak = self.skew_streak;
+                self.log(format!("checksum rounds compared again after {streak} skewed round(s) in a row"));
+            }
+            self.skew_streak = 0;
+        }
+        let now = self.now();
+        let (since, rounds, skews) = &mut self.skew_minute;
+        if !since.is_finite() {
+            *since = now;
+        }
+        *rounds += 1;
+        if skewed {
+            *skews += 1;
+        }
+        if now - *since >= SKEW_MINUTE_S {
+            let (rounds, skews) = (*rounds, *skews);
+            self.skew_minute = (now, 0, 0);
+            if skews > 0 {
+                self.log(format!(
+                    "checksum minute: {skews} of {rounds} round(s) not compared (games hashed at different sim times)"
+                ));
+            }
         }
     }
 

@@ -31,9 +31,13 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
   (`action_refused`, reason in `mod.log`); it is never applied to whatever shares the id.
 - **Result binding.** `makeVehicleBuyCmd` and `makeLineCreateCmd` create an entity (`makeVehicleReplaceCmd` changes the vehicle in
   place: its command data has no result entity in the game's typed definition). The key of
-  the action that made it names it on every game; several creations in one step are served in the order the actions
-  applied (`L.claimEntity`), so the n-th purchase is the n-th new vehicle everywhere, and a purchase the account could
-  not pay finishes with `success = false` for its own window only.
+  the action that made it names it on every game. The simulation state runs a command as it is sent, so each action takes
+  what appeared during its own send (`L.claimOwn`): several purchases in one step each get their own vehicle whatever ids
+  the engine hands out (it reuses freed ids, so the n-th purchase is not the n-th smallest new id: lab run F 2026-10-18, two
+  buses of one window order, the second purchase reported nothing created). A creation that shows only later is served in
+  the order the actions applied (`L.claimEntity`), a key bound before the action ran does not hold a reused id, and the
+  watch counts game steps, not calls. A purchase the account could not pay finishes with `success = false` for its own
+  window only.
 - **Engine objects** (vehicle configuration, line, colour, date, journal entry) are read through their member lists,
   rebuilt with `api.type.<Name>.new()` and filled member by member (findings from MPFever, MIT). The sender rebuilds
   every object before shipping it and compares it with what it read; a difference refuses the command on the sending game
@@ -41,11 +45,13 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
   reads why in the session chat, and `mod.log` names the member and, when the engine refused to set it, quotes the engine
   (`REFUSED: it cannot be replicated, ...: argument 3: does not rebuild equal at TransportVehicleConfig.vehicles.1.x (the engine refused: ...)`).
   Members the engine refuses as "read only" are left to it and noted once; any other refusal is tolerated when the
-  member comes out equal anyway (noted) and is the reason the command is refused when it does not. A member that takes an
-  object of its own type (`Line.vehicleInfo`) is filled through the copy the engine hands out and written back. A
-  transport-mode map (`Line.vehicleInfo.transportModes`, `{TransportMode : boolean}` keyed by `api.type.enum.TransportMode`)
-  travels keyed by the enum's names and is keyed by the receiving game's enum values again (`C.modeNames` / `C.modeMap` in
-  `feverlink3_common.lua`); a key the enum does not name refuses the command. The receiving game
+  member comes out equal anyway (noted) and is the reason the command is refused when it does not. Members the engine
+  derives itself (`DERIVED` in `feverlink3_cmds_ops.lua`, each with its evidence) are neither read, shipped, written nor
+  compared: the object goes out with the engine's own default, as the game's windows send it. Today that is
+  `Line.vehicleInfo` (the line's transport modes: no base game script writes it, the line manager sends a fresh
+  `api.type.Line.new()`; shipping it refused every line edit in the live test of 0.2.0-pre5 with "does not rebuild equal at
+  Line.vehicleInfo.transportModes.9"). The receiving game
+  does the same check on what it rebuilds, so a body that does not fit the engine's object is refused, not applied half built.
   does the same check on what it rebuilds, so a body that does not fit the engine's object is refused, not applied half built.
 - **Model resources** travel by name beside the id (`modelRep.getName` / `find`, both used by the game's achievement
   script); the receiver uses its own id and notes it when the two differ.
@@ -186,8 +192,9 @@ loan, and it was a placeholder:
   field may send one command per edit. Each is an action: a line on the file link, a log line, a queue entry. If it
   costs, coalesce in the module (keep the last one per target and stamp).
 - **N10. One purchase per step.** MPFever applies at most one vehicle purchase per game and step; this module applies
-  them all and tells them apart by creation order (V7). If the engine turns out to create vehicles in an order that
-  differs from the order of the commands, that is where it shows.
+  them all in the order of their stamp and sequence, once per stamp (a call at a time that did not move applies nothing
+  again), and tells them apart by what each command's own send created (V7). Seen in the lab only (run F), not yet with
+  the fix.
 
 ## Needs game verification
 

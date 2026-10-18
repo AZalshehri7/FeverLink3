@@ -378,7 +378,10 @@ impl<H> HoldMachine<H> {
                 self.session_paused(*paused, now);
                 self.push_event(Event::Pong { n: *n });
             }
-            CtlMessage::PatchNext { .. } | CtlMessage::InjectNext { .. } | CtlMessage::CompleteNext { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject)
+            CtlMessage::PatchNext { .. }
+            | CtlMessage::InjectNext { .. }
+            | CtlMessage::CompleteNext { .. }
+            | CtlMessage::Pace { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, pace.rs)
         }
     }
 

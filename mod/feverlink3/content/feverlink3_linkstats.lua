@@ -10,7 +10,8 @@
 --
 -- Once a minute (S.minute) the lines, in the `name=min/median/max` form (ms, with `name_n=count`) the launcher and the host use too:
 --   link.minute secs=<s> stood_s=<stand-still in the minute> holds=<n> longest_s=<s> frame_ms ... rtt_ms clock_gap_ms g2l_ms
---     l2h_ms h2w_ms w2r_ms e2e_ms act_e2e_ms build_ms build_p90_ms
+--     l2h_ms h2w_ms w2r_ms e2e_ms act_e2e_ms build_ms build_p90_ms pace_mean=<factor> pace_max=<factor> paced_s=<s slowed>
+--   (pace: the smooth pacing factor of this game, feverlink3_lockstep.lua "smooth pacing", averaged over the minute's real time)
 --   link.peer peer=<id> clock_gap_ms gap_g_ms gap_l_ms gap_h_ms gap_w_ms g2l_ms l2h_ms h2w_ms w2r_ms e2e_ms rtt_ms actions act_e2e_ms
 -- gap_X_ms is the gap between consecutive clock lines of that peer measured at stamp X: the first stamp at which a gap appears is
 -- where it comes from (the sender's game at g, its file link at l, the network to the host at h, the host's relay or the network
@@ -137,6 +138,19 @@ function S.holdEnd(st, clock, d)
 	if d > st.longest then st.longest = d end
 end
 
+-- The smooth pacing factor this frame (S.minute: its mean over real time, its largest value, the seconds it was above 1).
+function S.pace(st, factor, clock)
+	if type(factor) ~= "number" then return end
+	if st.paceAt then
+		local dt = math.max(0, clock - st.paceAt)
+		st.paceT = (st.paceT or 0) + dt
+		st.paceSum = (st.paceSum or 0) + dt * (st.paceLast or 1)
+		if (st.paceLast or 1) > 1.005 then st.paceSlowS = (st.paceSlowS or 0) + dt end
+	end
+	st.paceAt, st.paceLast = clock, factor
+	if factor > (st.paceMax or 1) then st.paceMax = factor end
+end
+
 -- A build's click-to-apply time on this game (ms).
 function S.build(st, ms)
 	push(st.builds, ms)
@@ -175,6 +189,9 @@ function S.minute(st, clock)
 		.. S.describe("frame_ms", st.frames) .. S.describe("rtt_ms", all.rtt) .. S.describe("clock_gap_ms", all.gaps)
 	for _, k in ipairs({ "g2l", "l2h", "h2w", "w2r", "e2e", "act_e2e" }) do head = head .. S.describe(k .. "_ms", all[k]) end
 	head = head .. S.describe("build_ms", st.builds) .. " build_p90_ms=" .. (p90 and string.format("%.0f", p90) or "?")
+	head = head .. string.format(" pace_mean=%.2f pace_max=%.2f paced_s=%.1f", (st.paceT or 0) > 0 and st.paceSum / st.paceT or 1,
+		math.max(st.paceMax or 1, st.paceLast or 1), st.paceSlowS or 0)
+	st.paceT, st.paceSum, st.paceSlowS, st.paceMax = 0, 0, 0, st.paceLast or 1
 	table.insert(lines, 1, head)
 	st.started, st.frames, st.builds, st.holdN, st.holdS, st.longest = clock, {}, {}, 0, 0, 0
 	if st.holdSince then st.holdCarry = clock - st.holdSince end

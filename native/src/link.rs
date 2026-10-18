@@ -99,7 +99,12 @@ pub enum CtlMessage {
     /// `tm` (optional) is the mod's timing text of the build; the module adds the rebuild and apply times and writes it back (`timing`).
     /// `refuse` (optional, a test switch: `FEVERLINK3_DEBUG_REFUSE_INJECT`): the module refuses the order with this reason once a command
     /// passed the identity checks, exactly like any other refusal (the command is emptied, `held` is failed).
-    InjectNext { key: u64, ttl: u64, held: u64, tm: String, refuse: String },
+    /// `refund` (optional, 0: none) is how many refund entries the mod wrote in `native_refund_<key>.txt` (this game's own entities):
+    /// the module puts them into the command's Context `refundableEntities` with the engine's insert (`refund.rs`).
+    InjectNext { key: u64, ttl: u64, held: u64, tm: String, refuse: String, refund: u64 },
+    /// Smooth pacing (`pace.rs`): stretch the engine's batch interval by `permille` / 1000 (1000 to 2000, held to that range). The mod
+    /// sends it when the factor changes and every second while it is not 1; one not refreshed for `pace::STALE_MS` goes back to 1.
+    Pace { permille: u32 },
 }
 
 /// Why a control line could not be turned into a [`CtlMessage`].
@@ -271,6 +276,7 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             held: optional(&p, "held", "held must be a held command id")?,
             tm: timing_text(&p)?,
             refuse: short_text(&p, "refuse")?,
+            refund: optional(&p, "refund", "refund must be a number of entries")?,
         }),
         "ping" => {
             let n = match p.get("n") {
@@ -285,6 +291,12 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
                 Some(v) => v.as_bool().ok_or(CtlError::BadPayload("paused must be true or false"))?,
             };
             Ok(CtlMessage::Ping { n, paused })
+        }
+        "pace" => {
+            let p = required(&p, "permille", "pace needs a factor in thousandths")?;
+            let permille = crate::pace::accept_permille(p)
+                .ok_or(CtlError::BadPayload("permille must be a factor from 1000 to 2000"))?;
+            Ok(CtlMessage::Pace { permille })
         }
         other => Err(CtlError::UnknownKind(other.chars().take(40).collect())),
     }
@@ -1232,23 +1244,46 @@ mod tests {
         }
         assert_eq!(
             parse("inject_next", r#"{["key"]=12,["ttl"]=500}"#),
-            Ok(CtlMessage::InjectNext { key: 12, ttl: 500, held: 0, tm: String::new(), refuse: String::new() })
+            Ok(CtlMessage::InjectNext {
+                key: 12,
+                ttl: 500,
+                held: 0,
+                tm: String::new(),
+                refuse: String::new(),
+                refund: 0
+            })
         );
         assert_eq!(
             parse("inject_next", r#"{["key"]=3}"#),
-            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 0, tm: String::new(), refuse: String::new() })
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 0, tm: String::new(), refuse: String::new(), refund: 0 })
         );
         assert_eq!(
             parse("inject_next", r#"{["key"]=3,["held"]=9}"#),
-            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9, tm: String::new(), refuse: String::new() })
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9, tm: String::new(), refuse: String::new(), refund: 0 })
         );
         assert_eq!(
             parse("inject_next", r#"{["held"]=9,["key"]=3,["refuse"]="debug switch"}"#),
-            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 9, tm: String::new(), refuse: "debug switch".into() })
+            Ok(CtlMessage::InjectNext {
+                key: 3,
+                ttl: 0,
+                held: 9,
+                tm: String::new(),
+                refuse: "debug switch".into(),
+                refund: 0
+            })
         );
         assert!(
             matches!(parse("inject_next", r#"{["key"]=3,["refuse"]=1}"#), Err(CtlError::BadPayload(_))),
             "refuse is text"
+        );
+        // a bulldozing's order names how many refund entries its side file holds
+        assert_eq!(
+            parse("inject_next", r#"{["key"]=3,["refund"]=2}"#),
+            Ok(CtlMessage::InjectNext { key: 3, ttl: 0, held: 0, tm: String::new(), refuse: String::new(), refund: 2 })
+        );
+        assert!(
+            matches!(parse("inject_next", r#"{["key"]=3,["refund"]=-1}"#), Err(CtlError::BadPayload(_))),
+            "refund is a count"
         );
         assert_eq!(parse("defer", r#"{["id"]=4}"#), Ok(CtlMessage::Defer { id: 4 }));
         assert_eq!(parse("fail", r#"{["id"]=4}"#), Ok(CtlMessage::Fail { id: 4 }));
@@ -1289,6 +1324,16 @@ mod tests {
         assert_eq!(parse("ping", r#"{["n"]=-4}"#), Ok(CtlMessage::Ping { n: -4, paused: false }));
         assert_eq!(parse("ping", r#"{["n"]=5,["paused"]=true}"#), Ok(CtlMessage::Ping { n: 5, paused: true }));
         assert!(matches!(parse("ping", r#"{["n"]=5,["paused"]=1}"#), Err(CtlError::BadPayload(_))));
+        assert_eq!(parse("pace", r#"{["permille"]=1500}"#), Ok(CtlMessage::Pace { permille: 1500 }));
+        assert_eq!(parse("pace", r#"{["permille"]=1000}"#), Ok(CtlMessage::Pace { permille: 1000 }));
+        assert_eq!(
+            parse("pace", r#"{["permille"]=2400}"#),
+            Ok(CtlMessage::Pace { permille: 2000 }),
+            "capped at half speed"
+        );
+        assert!(matches!(parse("pace", r#"{["permille"]=0}"#), Err(CtlError::BadPayload(_))));
+        assert!(matches!(parse("pace", r#"{["permille"]=1.5}"#), Err(CtlError::BadPayload(_))));
+        assert!(matches!(parse("pace", "{}"), Err(CtlError::BadPayload(_))));
     }
 
     #[test]

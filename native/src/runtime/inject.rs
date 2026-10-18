@@ -39,6 +39,10 @@ impl Runtime {
         // blocks) is neither written nor needed
         let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], typed: true, ..settings });
         self.inject.enable();
+        match crate::refund::RefundFns::at(self.base) {
+            Ok(_) => self.say(&format!("native inject: refund (native): the engine's insert of the Context's refundableEntities at {:#x} is verified: an order with refund entries puts them into its command's Context", crate::refund::INSERT_RANGE_RVA)),
+            Err(e) => self.say(&format!("native inject: refund (native): {e}: an order with refund entries is refused")),
+        }
         self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and each inject_next order (queued in the mod's order) makes its own script build_proposal (matched by the text's place or constructions) take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
     }
 
@@ -493,7 +497,7 @@ impl Runtime {
                     }
                 }
             } else {
-                match self.inject_prepare(order.key, dest) {
+                match self.inject_prepare(order.key, order.refund, dest) {
                     Err(why) if inj::keeps_waiting(&why) => {
                         self.say(&format!(
                             "native inject: key {}: {why}; the order waits for its own command",
@@ -673,7 +677,10 @@ impl Runtime {
     /// an unreadable one, a text that names no place) is [`inj::UNKNOWN`] and a mismatch is [`inj::NOT_OURS`]; both leave the command
     /// untouched and the order waiting (it expires into a refusal that asks for the repair). Emptying someone else's command on one game
     /// only would itself fork the worlds.
-    fn inject_prepare(&self, key: u64, dest: usize) -> Result<Prepared, String> {
+    ///
+    /// `refund`: how many refund entries the order's side file holds (`native_refund_<key>.txt`); read and checked here, with the
+    /// command's Context container and the engine's insert function, so that the engine part only calls the insert ([`refund_job`]).
+    fn inject_prepare(&self, key: u64, refund: u64, dest: usize) -> Result<Prepared, String> {
         let read = || -> Result<(portable::Settings, std::path::PathBuf, String), String> {
             let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
             let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
@@ -707,14 +714,67 @@ impl Runtime {
         let alloc =
             EngineAlloc::at(self.base).map_err(|why| format!("the game's allocator was not verified: {why}"))?;
         let donor = counts.iter().any(|&n| n > 0).then_some(dest);
-        Ok(Prepared { fns, alloc, settings, dir, text, donor })
+        let refund = if refund > 0 { Some(self.refund_job(key, refund, &dir, dest)?) } else { None };
+        Ok(Prepared { fns, alloc, settings, dir, text, donor, refund })
+    }
+
+    /// The refund part of an order (owner decision 2026-10-18: the bulldoze refund natively, `refund.rs`): the side file's entries,
+    /// the engine's insert function (its bytes checked) and the plan for the command's own Context container (an engine-made one; which
+    /// entries it lacks). Calls nothing of the engine. Every error is a refusal of the order: the command is the mod's (identified
+    /// before), and a build is applied as the originator's text and Context say or not at all.
+    pub(super) fn refund_job(&self, key: u64, n: u64, dir: &std::path::Path, dest: usize) -> Result<RefundJob, String> {
+        let name = crate::refund::file_name(key);
+        let text = std::fs::read_to_string(dir.join(&name)).map_err(|e| format!("refund: cannot read {name}: {e}"))?;
+        let entries = crate::refund::parse_file(&text, n).map_err(|e| format!("refund: {name}: {e}"))?;
+        let fns = self.refund_fns().map_err(|e| format!("refund: {e}"))?;
+        let plan = crate::refund::plan(&LiveMem, dest, &entries).map_err(|e| format!("refund: {e}"))?;
+        Ok(RefundJob { fns, entries, plan })
+    }
+
+    /// The engine's insert function of the refund container; a test sets a stand-in (`TEST_REFUND_FNS`).
+    fn refund_fns(&self) -> Result<crate::refund::RefundFns, String> {
+        #[cfg(test)]
+        if let Some(f) = TEST_REFUND_FNS.with(|t| t.get()) {
+            return Ok(f);
+        }
+        crate::refund::RefundFns::at(self.base)
+    }
+
+    /// The engine part of the refund: the engine's insert into the command's Context container, then the read-back (guarded). The
+    /// money it brings back is measured by the mod (`refund (native): ... account before ..., after ...` in mod.log).
+    pub(super) fn refund_engine(&self, key: u64, dest: usize, job: RefundJob) -> Result<(), String> {
+        let RefundJob { fns, entries, plan } = job;
+        crate::log::calls_engine("native inject: refund (the Context's refundableEntities insert)");
+        self.say(&format!(
+            "native inject: key {key}: refund (native): calling the engine's insert of {} of {} entries into the command's Context refundableEntities ({} there before)",
+            plan.missing,
+            entries.len(),
+            plan.before
+        ));
+        // SAFETY: `refund::plan` accepted this payload's container in `inject_prepare`, on this thread, moments ago; nothing since has
+        // touched the Context (the Proposal swap writes only the first 0x358 bytes); the function is the verified one.
+        unsafe { crate::refund::insert(&fns, dest, &plan) };
+        let checked = crate::log::guarded("native inject: refund check", || {
+            let done = crate::refund::check(&LiveMem, dest, &entries, &plan)?;
+            self.say(&format!(
+                "native inject: key {key}: refund (native): {} entries set in the command's Context ({} were there from the script's conversion, {} of ours there with other values; {} in the container now) [{}]",
+                done.set,
+                done.before,
+                done.differ,
+                done.after,
+                crate::refund::text(&entries)
+            ));
+            Ok::<(), String>(())
+        });
+        drop(plan); // the source range: Rust memory, never linked into the container
+        checked.unwrap_or_else(|| Err("refund: our own check panicked (the PANIC line in native.log)".into()))
     }
 
     /// The engine part of the injection: the verified Proposal is built (engine constructor, copies, `operator new`), swapped into the
     /// command (copy assignment) and destroyed. Not inside `log::guarded`, so that an exception of the engine reaches the game's own
     /// handler; the reports in between, which call nothing of the engine, are guarded.
     fn inject_engine(&self, key: u64, dest: usize, p: Prepared) -> Result<(u64, u64, u64), String> {
-        let Prepared { fns, alloc, settings, dir, text, donor } = p;
+        let Prepared { fns, alloc, settings, dir, text, donor, refund } = p;
         let live = LiveMem;
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
@@ -739,6 +799,11 @@ impl Runtime {
         // SAFETY: `check_destination` passed on this payload moments ago, on the thread that queues the command.
         unsafe { inj::swap_into(&ctx, &built, dest) };
         inj::release(&ctx, built);
+        // the refund list goes into the command's own Context after the Proposal (a refused proof writes nothing into it); a failure
+        // here refuses the order and the command is emptied (`inject_add`), on every game alike (the same side file, the same checks)
+        if let Some(job) = refund {
+            self.refund_engine(key, dest, job)?;
+        }
         Ok(stats)
     }
 
@@ -843,10 +908,21 @@ struct Prepared {
     text: String,
     /// The script command's payload when the text adds constructions or edge objects (the receiver's own conversion of them).
     donor: Option<usize>,
+    /// The order's refund entries and the plan for the command's Context container (`None`: the order names none).
+    refund: Option<RefundJob>,
+}
+
+/// The refund part of an order, checked before the engine is called ([`Runtime::refund_job`]).
+pub(super) struct RefundJob {
+    fns: crate::refund::RefundFns,
+    entries: Vec<crate::engine::RefundEntry>,
+    plan: crate::refund::Plan,
 }
 
 #[cfg(test)]
 thread_local! {
     /// Stand-ins for the engine's Proposal functions in a test (the test process has no game image).
     pub(super) static TEST_FNS: std::cell::Cell<Option<nc::ProposalFns>> = const { std::cell::Cell::new(None) };
+    /// A stand-in for the engine's insert of the refund container in a test.
+    pub(super) static TEST_REFUND_FNS: std::cell::Cell<Option<crate::refund::RefundFns>> = const { std::cell::Cell::new(None) };
 }

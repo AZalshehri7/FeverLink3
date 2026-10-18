@@ -203,7 +203,7 @@ pub(super) fn build_diagnostics(
 // Redaction
 // ---------------------------------------------------------------------------------------------------------------
 
-/// A name to take out of a text: the name itself, or its 8.3 short form (`ABDULA~1`), which Windows shows for
+/// A name to take out of a text: the name itself, or its 8.3 short form (`EXAMPL~1`), which Windows shows for
 /// long user folder names in `%TEMP%` and other environment variables.
 struct UserPattern {
     name: Vec<char>,
@@ -526,16 +526,16 @@ mod tests {
 
     #[test]
     fn several_names_and_the_short_form_are_replaced() {
-        let n = names(&["ExampleUser", "Abdul", "  ", "", "abdulazizalshehri"]);
+        let n = names(&["ExamplePlayerName", "Example", "  ", "", "exampleplayername"]);
         assert_eq!(
-            redact_user(r"C:\Users\ABDULA~1\AppData\Local\Temp and ExampleUser and Abdul", &n),
+            redact_user(r"C:\Users\EXAMPL~1\AppData\Local\Temp and ExamplePlayerName and Example", &n),
             r"C:\Users\<user>\AppData\Local\Temp and <user> and <user>"
         );
-        assert_eq!(redact_user("ABDULA~12 end", &n), "<user> end");
+        assert_eq!(redact_user("EXAMPL~12 end", &n), "<user> end");
         assert_eq!(redact_user("ABDULA~ end", &n), "ABDULA~ end", "a short form needs its digit");
         assert_eq!(redact_user("ABDULA end", &n), "ABDULA end");
         // the longest name wins where one contains the other
-        assert_eq!(redact_user("ExampleUser", &names(&["Abdul", "ExampleUser"])), "<user>");
+        assert_eq!(redact_user("ExamplePlayerName", &names(&["Example", "ExamplePlayerName"])), "<user>");
         // spaces in the name; no short form for a name with fewer than six letters
         assert_eq!(redact_user("John Smith and JOHN SMITH", &names(&["John Smith"])), "<user> and <user>");
         assert_eq!(redact_user("JOHNSM~1 and JOHNSM", &names(&["John Smith"])), "<user> and JOHNSM");

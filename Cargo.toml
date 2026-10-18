@@ -19,6 +19,37 @@ repository = "https://github.com/AZalshehri7/FeverLink3"
 # exception passes through our frames; the price is about 550 KB of DLL (MSVC, rustc 1.99: 1 132 544 -> 1 662 464
 # bytes), docs/SECURITY.md section 5. It also lets launcher::guard and native::log::guarded contain a panic in our own
 # bookkeeping. CI fails if the shipped DLL has a terminate pad on the hook path (tools/dll_unwind_check.py).
+# Debug builds (the tests): the hash and cipher crates optimized. The sealed channel stretches a password with 600 000 rounds of
+# PBKDF2-HMAC-SHA256, seconds per key unoptimized; tests derive many keys. Our own crates stay unoptimized (debug asserts, overflow
+# checks). Release builds are not affected.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.polyval]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+# the JSON parser: the hostile-input tests feed it megabytes (a million nested arrays must be refused, not overflow the stack)
+[profile.dev.package.serde_json]
+opt-level = 3
+
 [profile.release]
 opt-level = "z"
 lto = "fat"

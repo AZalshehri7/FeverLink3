@@ -71,6 +71,8 @@ local U = {
 	lastPoll = -10, bindsText = nil, rev = {},
 	pending = {},   -- entity -> { key = <its key>, at = clock }: created by a command of this window, not yet in binds.txt
 	held = {},      -- record id -> { cb, progress, name, spec, at }: a command waiting for its stamp apply (the bridge's answer)
+	speedWait = {}, -- { cb, n, at, from }: the callbacks of the speed buttons' requests, run once the session answered (speedAnswers)
+	sess = nil, sessText = nil, sessAt = nil,   -- the session as hud_state.txt last said (M.sessionSpeed)
 	inbox = nil,    -- reader of ui_in.log (the bridge's answers)
 	stats = { shipped = 0, speed = 0, untouched = 0, failed = 0, answered = 0 },
 	-- The group of the commands a window issues in one go (M.poll starts the next one) and, for the timing lines, when the window's refresh
@@ -84,6 +86,11 @@ local HELD_SECONDS = 120
 
 -- A speed request repeated within this many seconds of the last one is not sent again (handle).
 local SPEED_REPEAT_S = 1
+-- A speed request's callback runs when the session shows the asked speed, when the session changed otherwise, or after this many
+-- seconds (the host ignored it: no permission, a resync; the speed control then shows the session's speed again).
+M.SPEED_ANSWER_S = 3
+-- hud_state.txt (the session as the bridge sees it) is read at most this often (M.sessionSpeed)
+M.SESSION_READ_S = 0.25
 
 -- The one writer of ui_out.log in this Lua state (the window's chat uses it too). The bridge reads the file by position, so a new writer
 -- after a reload simply goes on at its end.
@@ -304,6 +311,48 @@ local function answers()
 	end
 end
 
+-- The speed the session shows, as the game's speed control knows speeds (0 = pause, else the speedup), from hud_state.txt, the
+-- session the bridge applies (its `session` lines): 0 while it waits for the host's start or is paused (speed 0, or a pause time set:
+-- the HUD's "Paused" says the same, Hud.statusText). nil: no session, or the bridge has written nothing yet.
+function M.sessionSpeed()
+	if not active() then return nil end
+	local now = C.clock()
+	if U.sessAt == nil or now - U.sessAt >= M.SESSION_READ_S or now < U.sessAt then
+		U.sessAt = now
+		-- by its text, not its version: a new session's model counts its versions from the start again
+		local text = C.readFile(C.path(Hud.SNAPSHOT))
+		if text ~= U.sessText then
+			U.sessText = text
+			local okR, m = pcall(function() return Hud.fromSnapshot(C.parse(text or "")) end)
+			U.sess = okR and m and m.session or nil
+		end
+	end
+	local s = U.sess
+	if type(s) ~= "table" then return nil end
+	if not s.started or (tonumber(s.speed) or 0) <= 0 or s.pauseAt ~= nil then return 0 end
+	return tonumber(s.speed)
+end
+
+-- The callbacks of the speed buttons' requests (handle): each runs once the session shows the asked speed (success), once the session
+-- changed otherwise since the request (the host decided something else), after M.SPEED_ANSWER_S, or when the session is over. Only then
+-- does the game's speed control look at the speed again, so its icon does not jump back to the old speed while the request travels.
+local function speedAnswers()
+	if #U.speedWait == 0 then return end
+	local shown, now = M.sessionSpeed(), C.clock()
+	local keep = {}
+	for _, w in ipairs(U.speedWait) do
+		local done = shown == nil or shown == w.n or shown ~= w.from or now - w.at >= M.SPEED_ANSWER_S or now < w.at
+		if done then
+			-- GameSetSpeedCommandData { speedup } (tf3-docs api/cmd), as the engine's callback gets it
+			fire(0, { cb = w.cb, name = "makeGameSetSpeedCmd" }, { speedup = w.n }, shown ~= nil and shown == w.n, {})
+		else
+			keep[#keep + 1] = w
+		end
+	end
+	U.speedWait = keep
+end
+M.speedAnswers = speedAnswers
+
 local words = L.commandWords
 
 -- A command this game cannot replicate is refused here too, never applied on this game alone: the engine applying it on the
@@ -329,6 +378,7 @@ function M.poll()
 	U.grp = U.grp + 1
 	U.tickAt = C.clock()
 	U.fireCtx = "the window's refresh"
+	pcall(speedAnswers)
 	return answers()
 end
 
@@ -344,6 +394,11 @@ local function handle(tag, cmd, cb, progress, t0)
 		-- hook, 1210 "speed request ... ignored (resync in progress)" lines on the host while the worlds loaded). The host answers with the
 		-- session speed, so one request a second loses nothing.
 		local n, now = tag.args[1], C.clock()
+		-- The window's callback is kept and run once the session answered (speedAnswers), the asked one too. It was dropped until
+		-- 2026-10-18: the game's speed control (gui/main/game.tl, GameSpeedHelper) counts its commands in flight and reads the
+		-- engine's speed only while none is (cmdCounter), so after the first click it never looked again and its icon kept the
+		-- player's own last speed (friend test 2026-10-18 22:47: the other player paused, this game paused, its icon still ran).
+		if cb then U.speedWait[#U.speedWait + 1] = { cb = cb, n = n, at = now, from = M.sessionSpeed() } end
 		local last = U.lastSpeed
 		if last and last.n == n and now >= last.at and now - last.at < SPEED_REPEAT_S then
 			last.quiet = last.quiet + 1

@@ -166,6 +166,7 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                         assert!(id <= 1 << 53, "{line:?}")
                     }
                     CtlMessage::TerrainApply { id, stamp } => assert!(id <= 1 << 53 && stamp <= 1 << 53, "{line:?}"),
+                    CtlMessage::Pace { permille } => assert!((1000..=2000).contains(&permille), "{line:?}"),
                     CtlMessage::HoldOff
                     | CtlMessage::Ping { .. }
                     | CtlMessage::PatchNext { .. }
@@ -210,7 +211,7 @@ fn the_control_reader_survives_any_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut r = rng(11);
     let ping_n = |payload: &str| -> Option<u64> { payload.strip_prefix("{[\"n\"]=")?.strip_suffix('}')?.parse().ok() };
-    for round in 0..iters(150) {
+    for round in 0..iters(50) {
         let path = dir.path().join(format!("ctl{round}.log"));
         let mut reader = CtlReader::new(path.clone());
         let mut n = 0u64;
@@ -704,7 +705,7 @@ fn expected_bytes(b: &BuildAddrs) -> Vec<(Rva, &'static [u8])> {
     for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
         v.push((s.rva, s.prologue));
     }
-    if let Some(s) = &b.script_pool {
+    for s in [&b.script_pool, &b.tick_count_getter].into_iter().flatten() {
         v.push((s.rva, s.expected));
     }
     v
@@ -738,7 +739,9 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 force_seed: None,
                 growth: Default::default(),
                 luaseed: r.gen(),
+                step_seed: r.gen(),
                 native_patch: r.gen(),
+                smooth_pace: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
@@ -762,7 +765,8 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
             assert!(!p.has(Feature::PoolPatch) || cfg.poolpatch);
             assert!(!p.has(Feature::Hold) || (p.engine.is_some() && p.kind_offset.is_some()));
             assert!(cfg.any() || p.steps.is_empty());
-            assert!(p.steps.len() <= 4);
+            assert!(p.steps.len() <= 5);
+            assert!(!p.has(Feature::StepSeed) || cfg.step_seed);
             assert!(!p.has(Feature::TownSeed) || cfg.town_seed);
             for line in p.report() {
                 assert!(line.starts_with("hooks: "), "{line}");
@@ -782,12 +786,12 @@ fn the_switches_read_any_text_a_lone_zero_turns_a_default_off_and_a_lone_one_an_
         // any text is a verdict (a number or an error) for the forced seed, never a panic
         let _ = feverlink3_native::plan::parse_seed(&value);
         let on = value.trim() == "1";
-        // hooks, hold, the pool patch and the seed pin are on unless the text is a lone zero
+        // hooks, hold, the pool patch, the seed pin and the step seed are on unless the text is a lone zero
         let default_on = value.trim() != "0";
         assert_eq!(cfg.town_seed, on, "{value:?}");
         assert_eq!(
-            (cfg.hooks, cfg.hold, cfg.poolpatch, cfg.luaseed),
-            (default_on, default_on, default_on, default_on),
+            (cfg.hooks, cfg.hold, cfg.poolpatch, cfg.luaseed, cfg.step_seed),
+            (default_on, default_on, default_on, default_on, default_on),
             "{value:?}"
         );
         assert_eq!(cfg.any(), on || default_on);

@@ -2115,6 +2115,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: a tight wall-clock bound that a busy runner can miss (cargo test -- --include-ignored)"]
     fn the_poller_idles_with_nothing_to_serve_and_runs_every_few_ms_with_a_connection() {
         let (a, b) = (FakeMachine::new(), FakeMachine::new());
         let (core_a, core_b) = (a.core_with(Config::default()), b.core_with(Config::default()));
@@ -2142,6 +2143,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: a tight wall-clock bound that a busy runner can miss (cargo test -- --include-ignored)"]
     fn the_pace_follows_what_there_is_to_serve() {
         let c = Config::default();
         assert_eq!(c.rest(0, 0), Duration::from_millis(100));

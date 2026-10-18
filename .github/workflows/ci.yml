@@ -15,6 +15,7 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # the essential set: ignored tests (the full set, docs/RELEASING.md) run on a developer's PC on demand
       - run: cargo test --workspace --exclude feverlink3_native
       # the native tests share process-wide state (hook counters, logs): one thread at a time
       - run: cargo test -p feverlink3_native -- --test-threads=1
@@ -72,4 +73,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install lupa
+      # the essential set; FEVERLINK3_FULL_TESTS=1 (the full set) runs on a developer's PC on demand
       - run: python -I -m unittest discover -s tests/lua -p "test_*.py"

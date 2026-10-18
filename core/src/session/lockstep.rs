@@ -28,8 +28,9 @@ impl Lockstep {
 
     /// How far past the fastest clock a stamp must lie so that every game has the action before it reaches the stamp, in
     /// game-time units: the one-way network time (half the slowest round trip) and the handling, counted in steps at this
-    /// speed, plus the hand-off step and one step of margin. On a good connection that is 3 steps (about half a second at
-    /// normal speed); a slow link or a higher speed lengthens it. It was a fixed 6 steps (1.2 s) at the first real test.
+    /// speed, plus the hand-off step and one engine batch (`speed` steps: one at normal speed). On a good connection that is 3
+    /// steps at normal speed (about half a second), 7 at x4; a slow link or a higher speed lengthens it. It was a fixed 6 steps
+    /// (1.2 s) at the first real test.
     pub fn lead_for(speed: i32, rtt_ms: f64) -> i64 {
         Self::lead_for_measured(speed, rtt_ms, 0.0)
     }
@@ -39,18 +40,29 @@ impl Lockstep {
     /// plus the receivers' hand-off allowance), so a game whose frames stall for seconds is not hidden behind a lead of seconds.
     pub const GAP_EXCESS_MAX_MS: f64 = 500.0;
 
-    /// [`Self::lead_for`] with the measured cadence of the clocks: `gap_ms` is a high quantile of the time between two clock
-    /// lines of a running game as the host receives them ([`LeadMeter::gap_ms`]). A running game's clock moves one step at a time,
-    /// so a gap of one step's real time is what the two fixed steps already cover (a peer's barrier sits at its clock plus the
-    /// lead and moves a step with each clock line); only the excess over it, up to [`Self::GAP_EXCESS_MAX_MS`], is added to the
-    /// one-way time. In steps: `ceil((rtt/2 + handling + excess) * steps_per_second * speed) + 2`, bounded to 3..=24.
+    /// The real time of one engine batch at any speed, in seconds: the engine runs `speed` steps at once, a batch about every sixth
+    /// of a second (measured in the friend test of 2026-10-18: 190-218 ms between batches at x2 and x4, the clock moving 4 steps a
+    /// line at x4).
+    pub const BATCH_SECONDS: f64 = 1.0 / Self::STEPS_PER_SECOND;
+
+    /// [`Self::lead_for`] with the measured cadence of the clocks: `gap_ms` is a high quantile of the time between two moves of a
+    /// running game's clock as the host receives them ([`LeadMeter::gap_ms`]). The lead is also the room every game has before its
+    /// input barrier (a peer's barrier sits at its clock plus the lead), and a running game's clock moves a whole engine batch at a
+    /// time: `speed` steps every [`Self::BATCH_SECONDS`]. So the lead holds one batch of steps on top of the hand-off step, and only
+    /// the excess of the gap over a batch's real time, up to [`Self::GAP_EXCESS_MAX_MS`], is added to the one-way time. In steps:
+    /// `ceil((rtt/2 + handling + excess) * steps_per_second * speed) + 1 + speed`, bounded to 3..=24.
+    ///
+    /// Friend test of 2026-10-18 (x4, 30 ms round trip): the lead was counted as if the clock moved one step per line (+ 2 steps), 4
+    /// steps at x4, which is exactly one batch: every game had at most one batch of room, both games stood at their barriers about
+    /// 20 times a minute and the smooth pacing slowed both to 0.6x nearly all the time (pace_mean 1.58, paced_s 60).
     pub fn lead_for_measured(speed: i32, rtt_ms: f64, gap_ms: f64) -> i64 {
         let rtt = if rtt_ms.is_finite() { rtt_ms.max(0.0) } else { 0.0 };
         let per_second = Self::STEPS_PER_SECOND * f64::from(speed.max(1));
         let gap = if gap_ms.is_finite() { gap_ms.max(0.0) } else { 0.0 };
-        let excess = (gap - 1000.0 / per_second).clamp(0.0, Self::GAP_EXCESS_MAX_MS);
+        let excess = (gap - Self::BATCH_SECONDS * 1000.0).clamp(0.0, Self::GAP_EXCESS_MAX_MS);
         let seconds = rtt / 2000.0 + Self::HANDLING_SECONDS + excess / 1000.0;
-        let steps = (seconds * per_second).ceil() as i64 + 2;
+        let batch = i64::from(speed.clamp(1, 4));
+        let steps = (seconds * per_second).ceil() as i64 + 1 + batch;
         Self::STEP * steps.clamp(Self::MIN_LEAD_STEPS, Self::MAX_LEAD_STEPS)
     }
 
@@ -70,9 +82,12 @@ pub struct LeadMeter {
     clocks: BTreeMap<u16, ClockCadence>,
 }
 
-/// The clock lines of one game: the last one's time and game time, and the gaps (host time, ms) between two lines of a running
-/// game. A line whose game time did not move (the game stands at the barrier, the pacing or a pause and sends its keepalive), and
-/// the first line after one, say nothing about the cadence of a running game and are left out.
+/// The clock lines of one game: the host time and game time of its clock's last move, whether its engine has run since then, and
+/// the gaps (host time, ms) between two moves of a running game. Between two moves a game also sends lines whose time did not move:
+/// a keepalive of a running engine between two batches (the 30-frame and real-time cadences, X.clockDue) says nothing and is
+/// skipped; a line of a game whose engine stands (speed 0: at the barrier, the pacing, a pause) ends the run, and the move after it
+/// starts a new one. It took the line before a move to have moved too, which a keepalive between two batches never had: in the
+/// friend test of 2026-10-18 nearly every gap was left out (link.lead gap_ms=0), and the lead fell to its floor.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ClockCadence {
     last: Option<(f64, i64, bool)>,
@@ -104,19 +119,25 @@ impl LeadMeter {
         }
     }
 
-    /// A clock line of `player` showing game time `t` reached the host at host time `at` (seconds).
-    pub fn clock(&mut self, player: u16, t: i64, at: f64) {
+    /// A clock line of `player` showing game time `t` and engine speed `speed` reached the host at host time `at` (seconds).
+    pub fn clock(&mut self, player: u16, t: i64, speed: i32, at: f64) {
         let c = self.clocks.entry(player).or_default();
-        let moved = c.last.is_some_and(|(_, lt, _)| t > lt);
-        if let Some((last_at, _, last_moved)) = c.last {
-            if moved && last_moved && at >= last_at {
-                c.gaps.push_back((at, (at - last_at) * 1000.0));
-                while c.gaps.len() > Self::GAP_KEEP {
-                    c.gaps.pop_front();
+        let running = speed > 0;
+        c.last = match c.last {
+            Some((last_at, lt, ran)) if t > lt => {
+                if ran && at >= last_at {
+                    c.gaps.push_back((at, (at - last_at) * 1000.0));
+                    while c.gaps.len() > Self::GAP_KEEP {
+                        c.gaps.pop_front();
+                    }
                 }
+                Some((at, t, running))
             }
-        }
-        c.last = Some((at, t, moved));
+            // the same time: a keepalive between two batches keeps the run, a standing engine ends it
+            Some((last_at, lt, ran)) if t == lt => Some((last_at, lt, ran && running)),
+            // the first line, or a clock that went back (a reload): no gap until the next move
+            _ => Some((at, t, false)),
+        };
     }
 
     /// A player left: its measurements go (a gap across its absence says nothing about the link).

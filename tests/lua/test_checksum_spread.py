@@ -45,14 +45,15 @@ end
 FAKE_CLOCK = """
 FAKE = 0
 os.clock = function() return FAKE end
-for _, env in ipairs({ SIM_ENV, GUI_ENV }) do
+for _, env in ipairs({ SIM_ENV, GUI_ENV, SIM2_ENV }) do   -- (SIM2_ENV: a second simulation state, when the test made one)
   local gc = env.api.engine.getComponent
   env.api.engine.getComponent = function(e, t) FAKE = FAKE + 0.00005; return gc(e, t) end
 end
 """
 
 
-class SpreadChecksumTest(unittest.TestCase):
+class TwoGames(unittest.TestCase):
+    """Two mocked games with a populated world (the harness of the tests below)."""
     N = 600
 
     def setUp(self):
@@ -85,6 +86,9 @@ class SpreadChecksumTest(unittest.TestCase):
         self.assertIsNotNone(m, g.log())
         keys = ("entities", "chunks", "chunk", "every", "first", "last", "start", "step_max", "budget", "over")
         return {k: float(v) for k, v in zip(keys, m.groups())}
+
+
+class SpreadChecksumTest(TwoGames):
 
     def test_both_games_reach_the_same_parts_reading_one_chunk_a_step(self):
         self.start()
@@ -238,6 +242,95 @@ class SpreadChecksumTest(unittest.TestCase):
         self.assertNotIn("checksum round 2 spread", self.A.log())
 
 
+class TwoSimulationStatesTest(SpreadChecksumTest):
+    """The real game shares the steps of one game between two simulation Lua states (owner's live test of 0.2.0-pre5, 2026-10-18,
+    22:08:51: round 20 read its chunks at t=13300200, 13300800, 13301000, 13301600, ... two steps in four, 37 of 38 late by 144400 ms in
+    all; an action was applied at its stamp at a step between them, by the other state). Before the fix the round lived in the module
+    table of the state that began it. Each game here splits its steps the way the live log shows (two steps in one state, two in the
+    other), the guest one step out of phase with the host: a round kept in one state was late by a different amount on each game."""
+
+    # step k = t / 200: the host's state 1 runs k = 0, 1 mod 4, the guest's k = 1, 2 mod 4 (live log: 13300200 / 200 = 66501 = 1 mod 4)
+    HOST_SPLIT = "function(t) local k = math.floor(t / 200) %% 4; return (k == 0 or k == 1) and 1 or 2 end"
+    GUEST_SPLIT = "function(t) local k = math.floor(t / 200) %% 4; return (k == 1 or k == 2) and 1 or 2 end"
+
+    def setUp(self):
+        super().setUp()
+        self.A.split_sim(self.HOST_SPLIT.replace("%%", "%"))
+        self.B.split_sim(self.GUEST_SPLIT.replace("%%", "%"))
+
+    def test_every_chunk_is_read_at_its_step_whichever_state_runs_it(self):
+        self.start()
+        self.tick(5)
+        for n in (1, 2, 3):
+            at, (ta, pa), (tb, pb) = self.round(n, spread=1)
+            self.assertEqual((ta, tb), (at, at), "both report the round's stamp: every chunk on time")
+            self.assertEqual(pa, pb)
+            self.assertTrue(HEAVY <= set(pa), pa)
+            for g in (self.A, self.B):
+                s = self.spread_line(g, n)
+                self.assertEqual((s["first"], s["last"]), (at, at + s["chunks"] * STEP))
+                self.assertLessEqual(s["step_max"], BUDGET_MS)
+        log = self.A.log() + self.B.log()
+        self.assertNotIn("read after their step", log)
+        self.assertNotIn("WARNING", log)
+        self.assertNotIn("failed and is dropped", log)
+        for g in (self.A, self.B):
+            runs = g.sim_runs()
+            self.assertGreater(runs[1], 20, runs)
+            self.assertGreater(runs[2], 20, "the second state ran steps too: %s" % runs)
+        # a split world is the same as one Lua state's: the parts equal those of a round hashed whole
+        _at, (_t, whole), (_tb, whole_b) = self.round(4, spread=None)
+        self.assertEqual({k: v for k, v in pa.items() if k != "time"}, {k: v for k, v in whole.items() if k != "time"})
+        self.assertEqual(whole, whole_b)
+
+    def test_a_difference_in_the_middle_of_the_round_is_still_seen(self):
+        self.start()
+        self.tick(5)
+        self.relay.pump()
+        at = self.relay.future_stamp()
+        self.B.L.execute("STEP_HOOK = function(t) if t == %d then WORLD[1001 + 2 * 12].TOWN_BUILDING.depth = 3 end end" % (at + 2 * STEP))
+        self.relay.checksum_request(1, at, False, spread=1)
+        self.tick(40)
+        (ta, pa), (tb, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
+        self.assertEqual((ta, tb), (at, at), "compared")
+        self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"townBuildings", "townBuildings:90"})
+
+    def test_at_x2_with_lag_every_chunk_is_on_time(self):
+        self.start(speed=2)
+        self.tick(6, lag_b=True)
+        for n in (1, 2):
+            at, (ta, pa), (tb, pb) = self.round(n, spread=2, ticks=60, lag_b=True)
+            self.assertEqual((ta, tb), (at, at))
+            self.assertEqual(pa, pb)
+        self.assertNotIn("read after their step", self.A.log() + self.B.log())
+
+
+class LateRoundsAreLoudTest(TwoGames):
+    """Rounds read late again and again are desync detection lost (the host skips a round whose games report different times): the
+    simulation half says so in a WARNING line and a line every game minute, never only in a clause of the round's own line."""
+
+    def test_rounds_late_in_a_row_give_a_warning_and_a_minute_line_and_on_time_again_is_said(self):
+        # the host's game runs no script at one step in four (a step the script misses: the only way left to make a chunk late)
+        self.A.split_sim("function(t) return math.floor(t / 200) % 4 == 3 and 0 or 1 end")
+        self.start()
+        self.tick(5)
+        for n in (1, 2, 3):
+            self.round(n, spread=1)
+        log = self.A.log()
+        self.assertIn("read after their step", log)
+        self.assertRegex(log, r"WARNING: 3 checksum rounds in a row read chunks after their steps \(round 3: \d+ chunk\(s\), \+[\d,]+ ms\)")
+        self.assertNotIn("WARNING", self.B.log(), "the guest read every chunk on time")
+        # a game minute later: the minute's line
+        self.tick(300)
+        self.round(4, spread=1)
+        self.assertRegex(self.A.log(), r"checksum minute: \d+ of \d+ spread round\(s\) since t=[\d,]+ read chunks after their steps")
+        # every step runs a script again: the next round is on time, and that is said
+        self.A.L.execute("SIM_SPLIT = nil")
+        _at, (ta, pa), (tb, pb) = self.round(5, spread=1)
+        self.assertEqual((ta, pa), (tb, pb))
+        self.assertRegex(self.A.log(), r"checksum rounds read on time again after \d+ late round\(s\) in a row \(round 5\)")
+
+
 class SpreadRoundPureTest(unittest.TestCase):
     """L.newChecksumRound / L.checksumRoundStep over a plain engine: no game, no bridge."""
 
@@ -314,6 +407,28 @@ class SpreadRoundPureTest(unittest.TestCase):
         self.assertEqual(r.parts["edges"], "error")
         self.assertNotEqual(r.parts["townBuildings"], "error")
         self.assertIn("boom", r.errors["edges"])
+
+    def test_a_round_saved_and_restored_after_every_chunk_gives_the_same_parts(self):
+        # the shared form (the game-script state): every chunk read by a fresh copy restored from the saved record, as when each step
+        # runs in another Lua state; the state's copy goes through a deep copy as the mock's game-script state does
+        e, _reads = self.mk(250)
+        opts = self.L.table_from({"chunk": 64, "maxChunks": 1000, "keyHash": self.C.fnv1a})
+        r = self.K.newChecksumRound(e, self.C.hashValue, False, opts)
+        rec = self.K.checksumRoundSave(r, None)
+        ids = rec.lanes[1].ids
+        self.assertEqual(self.L.eval("type")(ids), "string", "an entity list travels as one text")
+        copy = self.L.eval("""function(v) local function dc(x) if type(x) ~= 'table' then return x end local o = {} for k, y in pairs(x) do o[dc(k)] = dc(y) end return o end return dc(v) end""")
+        steps = 0
+        while not rec.done:
+            r2 = self.K.checksumRoundRestore(e, self.C.hashValue, copy(rec), opts)
+            self.K.checksumRoundStep(r2)
+            rec = self.K.checksumRoundSave(r2, copy(rec))
+            steps += 1
+        whole, _t = self.K.checksumParts(e, self.C.hashValue, None, False, None, self.C.fnv1a)
+        self.assertEqual({k: v for k, v in rec.parts.items()}, {k: v for k, v in whole.items()})
+        self.assertEqual(steps, -(-1000 // 64))
+        self.assertEqual(list(self.K.unpackIds("5,6,70").values()), [5, 6, 70])
+        self.assertEqual(self.K.packIds(self.L.table_from([3, 4])), "3,4")
 
     def test_the_marks_of_a_spread_round_are_its_chunk_steps(self):
         it = self.K.checksumItem(self.L.table_from({"n": 3, "at": 4000, "paused": False, "spread": 2}))

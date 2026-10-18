@@ -7,6 +7,54 @@ title: FeverLink3 changelog
 All notable changes of each release. FeverLink3 is an unfinished test project: read the status in the README before using it.
 Only changes that matter to a player or tester are listed here.
 
+## 0.2.0-pre6
+
+Fixes from the internet test of 0.2.0-pre5 with a friend. **Not yet played by a person:** tested in the automatic tests and one short lab run on one PC (two windows, scripted and real-tool builds, a build during a pause, a forced repair sync). Not tested over the internet.
+
+### Fixed
+- Builds are captured again before the game applies them (0.2.0-pre3 to pre5 never received the build tools' events: every build was applied at the click on one game, the games' objects drifted apart and repair syncs followed).
+- Changing what a line loads or unloads (cargo filters, load mode, stops) works while the game runs, not only in a pause.
+- The two games' checksums are really compared again (since 0.2.0-pre3 every check was skipped), and a run of skipped checks now shows a warning.
+- No more slowing down and standing still on a fast connection: the waiting room between the games was one engine step batch too short.
+- No more half-second stutter every few seconds on the host after a line was deleted (the company page read the deleted line).
+- The speed buttons show the session's speed after a click again.
+
+### Known gaps
+- Not yet played by a person, and not tested over the internet.
+- Unproven in the game: the clone freeze fix, refund money, lines with waypoints, roads over town parcels, the builder's engine check on big stations.
+- The speed icon may still flicker briefly while the game waits for the other player.
+- The gaps listed for the earlier versions below still apply where not fixed above.
+
+## 0.2.0-pre5
+
+Fixes from the owner's own test of 0.2.0-pre4. **Not tested in a game before release:** only the automatic tests ran on these fixes (the owner asked for the build without a lab check).
+
+### Fixed
+- Builds are captured again before the game applies them (0.2.0-pre3 and 0.2.0-pre4 could not listen to the build tools' events, so every build was applied at the click on one game and copied afterwards: roads of the guest did not appear on the host, a bulldoze on the host stayed on the guest, and a repair sync followed).
+- Roads over a town's land parcels are no longer refused before they are sent ("heap pointers in the text cannot be resolved"): the copy now carries the parcels.
+
+### Known gaps
+- Not tested in a game before release, not yet played by a person, not tested over the internet.
+- Everything listed as unproven for 0.2.0-pre4 still is (clone freeze fix, refund money, line edits with vehicles, waypoints, smoother waiting over the internet).
+
+## 0.2.0-pre4
+
+Fixes after 0.2.0-pre3. **Not yet played by a person:** tested only in two game windows on one PC (about 38 scripted builds, 10 real-tool builds, fast and interleaved builds from both windows, builds during a pause, two forced repair syncs followed by buying, a line edit and building, an airport with Configure and a runway). Not tested over the internet.
+
+### Fixed
+- After a repair sync the game starts by itself again (0.2.0-pre3 stopped at the loading screen until a player clicked "Start Game").
+- Cloning vehicles should no longer freeze the game: FeverLink3 no longer tries to read things an engine object does not have; every such failed read made the game write a crash report, about 0.1 s each (thousands in the last internet test, most of them during the clone freezes). Not yet confirmed with a real clone.
+- The game's own random choices (town and street development, vehicle track reservations) no longer depend on how long a game stood still waiting for the other player, a likely cause of the worlds drifting apart.
+- Smoother play when waiting for the other player: the game slows down a little before it would have to stop, instead of running and then standing still.
+- Bulldozing now hands the game its own refund list inside the game's command on every game. Whether the money comes back is not yet confirmed.
+- Buying several vehicles in one go assigns each purchase to the right vehicle; putting a vehicle on a line during a pause waits until its purchase is done.
+- Waypoints on a track that runs the other way on the other game land in the right place.
+
+### Known gaps
+- Not yet played by a person, and not tested over the internet.
+- Unproven in the game: the clone freeze fix, refund money, editing a line that has vehicles, lines with waypoints, the smoother waiting over the internet.
+- The gaps listed for the earlier versions below still apply where not fixed above.
+
 ## 0.2.0-pre3
 
 Fixes from the first internet test with a friend and an airport test on one PC (0.2.0-pre2), plus work on stalls and the checksum. **Not yet played by a person:** tested only in two game windows on one PC (scripted builds, real-tool builds, fast and interleaved builds, builds during a pause, forced repair syncs followed by buying and building). The newest changes (line waypoints, the builder's own check before shipping, unusual tools during a pause) ran only in the automatic tests. Not tested over the internet.

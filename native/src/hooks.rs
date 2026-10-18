@@ -781,6 +781,71 @@ unsafe extern "system-unwind" fn pick_hook(rng: u64, lo: u64, n: u64, frame: u64
     ret
 }
 
+/// Where the redirected call of `CGame::Sync` (`0x11f690`) leads after [`pace_hook`]; 0 until published (before the call is patched).
+static PACE_CALLEE: AtomicUsize = AtomicUsize::new(0);
+
+/// The call `CGame::Sync(cgame, arg)` at `0x11f446` in `CGame::Step` (main thread, every frame), reached through a thunk the module
+/// placed at the call (smooth pacing, `pace.rs`). Calls the real `Sync` with every register argument as given (the caller sets two;
+/// `r8`/`r9` are passed through unchanged, and `Step` reserves no stack argument), and after a `Sync` that handed the simulation a
+/// batch (`al` = 1) stretches the batch interval by the mod's factor. The real `Sync` runs in this plain frame, outside any guard
+/// (log.rs THE RULE); only the module's own reads and the one write after it are guarded.
+unsafe extern "system-unwind" fn pace_hook(cgame: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let callee = PACE_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return 0;
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the real function at the call's original target; it takes at most these four register slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    let ret = unsafe { original(cgame, arg2, arg3, arg4) };
+    if ret & 0xFF != 0 {
+        let now = crate::pace::clock_ms();
+        // SAFETY: every address is checked with the OS before it is read or written (pace_after_sync).
+        crate::log::guarded("batch pace", || unsafe { pace_after_sync(&crate::pace::PACER, cgame as usize, now) });
+    }
+    ret
+}
+
+/// After a `Sync` that handed out a batch: the engine's interval at `[[cgame+0x1f0]+0x218]` (i32 us) is replaced by what the pacer
+/// says (`pace.rs`). The layout is checked every time: a pointer or a field that is not there switches the piece off for good (logged
+/// by the service thread's minute line), an implausible value is left alone this once. Calls nothing of the game.
+///
+/// # Safety
+/// Any `cgame` is allowed: nothing is read or written before the OS said the range is committed and readable (and writable).
+unsafe fn pace_after_sync(pacer: &crate::pace::Pacer, cgame: usize, now: u64) {
+    use crate::pace::{ACC_OFFSET, DATA_OFFSET, INTERVAL_OFFSET, LAST_OFFSET};
+    if pacer.idle(now) {
+        return;
+    }
+    let Some(data_at) = cgame.checked_add(DATA_OFFSET).filter(|_| cgame != 0) else {
+        return pacer.disable("Sync was called without a game object");
+    };
+    // SAFETY: the OS is asked first.
+    if !unsafe { mem::readable(data_at as *const u8, 8) } {
+        return pacer.disable("the game object's timing pointer is not readable");
+    }
+    let data = unsafe { core::ptr::read_unaligned(data_at as *const usize) };
+    let fields_ok = data != 0
+        && data & 7 == 0
+        && data.checked_add(INTERVAL_OFFSET + 4).is_some()
+        && unsafe { mem::readable((data + ACC_OFFSET) as *const u8, 16) }
+        && unsafe { mem::writable((data + INTERVAL_OFFSET) as *const u8, 4) };
+    if !fields_ok {
+        return pacer.disable("the timing data is not at [game+0x1f0] as on build 40420");
+    }
+    // SAFETY: checked readable (and the interval writable) just above; the main thread is the one that runs Step and Sync.
+    let acc = unsafe { core::ptr::read_unaligned((data + ACC_OFFSET) as *const i64) };
+    let last = unsafe { core::ptr::read_unaligned((data + LAST_OFFSET) as *const i64) };
+    let interval_at = (data + INTERVAL_OFFSET) as *mut i32;
+    let engine = unsafe { core::ptr::read_volatile(interval_at) };
+    if acc < last {
+        return pacer.implausible(); // Step calls Sync only once the accumulated time passed the last batch: not the fields expected
+    }
+    if let Some(write) = pacer.decide(engine, now) {
+        unsafe { core::ptr::write_volatile(interval_at, write) };
+    }
+}
+
 /// The `TownUpdateSize` command handler `(this, payload) -> bool`: reads the game time the way the handler itself
 /// does a few instructions later (`[[this+8]+0x28]` is the `GameTime` system, `0x2a96c0` the getter), keeps it for
 /// `Develop` to see, and calls the original with the arguments as given. Changes nothing.
@@ -950,6 +1015,8 @@ pub struct Targets {
     pub convert: usize,
     pub convert_update: usize,
     pub preview: usize,
+    /// The call-site hook of smooth pacing ([`pace_hook`]).
+    pub pace: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -974,6 +1041,8 @@ pub struct Installed {
     call_patches: Vec<(&'static str, AppliedPatch)>,
     /// The pinned Lua string-hash seed.
     seed_patch: Option<AppliedPatch>,
+    /// The tickCount getter that returns the step count.
+    step_seed_patch: Option<AppliedPatch>,
 }
 
 impl Installed {
@@ -989,8 +1058,16 @@ impl Installed {
         self.seed_patch.as_ref().is_some_and(AppliedPatch::is_applied)
     }
 
+    pub fn step_seed(&self) -> bool {
+        self.step_seed_patch.as_ref().is_some_and(AppliedPatch::is_applied)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.detours.is_empty() && self.patch.is_none() && self.call_patches.is_empty() && self.seed_patch.is_none()
+        self.detours.is_empty()
+            && self.patch.is_none()
+            && self.call_patches.is_empty()
+            && self.seed_patch.is_none()
+            && self.step_seed_patch.is_none()
     }
 
     /// Takes everything out again, newest first: the jumps, then the patch.
@@ -1012,6 +1089,12 @@ impl Installed {
             match unsafe { d.uninstall() } {
                 Ok(()) => lines.push(format!("hooks: {name}: jump removed, original bytes restored")),
                 Err(e) => lines.push(format!("hooks: {name}: jump NOT removed: {e}")),
+            }
+        }
+        if let Some(mut p) = self.step_seed_patch.take() {
+            match unsafe { p.restore() } {
+                Ok(()) => lines.push("hooks: tick_count_getter: original bytes restored".to_string()),
+                Err(e) => lines.push(format!("hooks: tick_count_getter: original bytes NOT restored: {e}")),
             }
         }
         if let Some(mut p) = self.seed_patch.take() {
@@ -1066,6 +1149,14 @@ pub unsafe fn execute(
                     ));
                     inst.seed_patch = Some(p);
                 }
+                Ok(p) if *feature == Feature::StepSeed => {
+                    lines.push(format!(
+                        "simulation seeds read the step count: tickCount getter returns updateCount (tick_count_getter: {} bytes at rva {rva:#x}, page protection {})",
+                        expected.len(),
+                        if p.protection_restored() { "restored" } else { "NOT restored" }
+                    ));
+                    inst.step_seed_patch = Some(p);
+                }
                 Ok(p) => {
                     lines.push(format!(
                         "hooks: {name}: applied, {} bytes at rva {rva:#x}, page protection {}",
@@ -1076,6 +1167,9 @@ pub unsafe fn execute(
                 }
                 Err(e) if *feature == Feature::LuaSeed => {
                     lines.push(format!("lua seed NOT pinned, the game keeps its own seed: {e}"))
+                }
+                Err(e) if *feature == Feature::StepSeed => {
+                    lines.push(format!("simulation seeds NOT moved to the step count, tickCount as shipped: {e}"))
                 }
                 Err(e) => lines.push(format!("hooks: {name}: NOT applied: {e}")),
             }
@@ -1144,17 +1238,20 @@ pub unsafe fn execute(
         lines.extend(unsafe { undo.uninstall_all() });
     } else {
         inst.detours = written;
-        // 5. the call-site redirects of the deep log: read-only, each independent (a failure costs only that one)
+        // 5. the call-site redirects (the deep log, read-only; smooth pacing): each independent, a failure costs only that one
         for step in &plan.steps {
             let Step::CallPatch { feature, name, rva, expected, callee } = step else { continue };
             let (hook, prefix): (usize, &[u8]) = match feature {
                 Feature::GrowthSort => (targets.sort, &[]),
+                Feature::BatchPace => (targets.pace, &[]),
                 // `mov r9, rbp`: the caller's frame pointer as a fourth argument the callee ignores
                 _ => (targets.pick, &[0x4C, 0x8B, 0xCD]),
             };
             let callee_addr = base + *callee as usize;
             if *feature == Feature::GrowthSort {
                 SORT_CALLEE.store(callee_addr, Ordering::Release);
+            } else if *feature == Feature::BatchPace {
+                PACE_CALLEE.store(callee_addr, Ordering::Release);
             } else {
                 PICK_CALLEE.store(callee_addr, Ordering::Release);
             }
@@ -1378,6 +1475,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         convert: convert_hook as *const () as usize,
         convert_update: convert_update_hook as *const () as usize,
         preview: preview_hook as *const () as usize,
+        pace: pace_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1557,6 +1655,10 @@ mod tests {
     const SEED_BEFORE: &[u8] = &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 1, 2, 3, 4, 0x48];
     static SEED_AFTER: [u8; 14] = crate::build_table::lua_seed_patch(crate::build_table::LUA_SEED);
     const POOL_BEFORE: &[u8] = &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00];
+    const TICK_RVA: u32 = 0x3c0;
+    /// A fake tickCount getter over a fake component in rcx: `mov eax,[rcx+3Ch] ; ret` (the real one looks the component up first).
+    const TICK_BEFORE: &[u8] = &[0x8B, 0x41, 0x3C, 0xC3];
+    const TICK_AFTER: &[u8] = &[0x8B, 0x41, 0x40, 0xC3];
     const POOL_AFTER: &[u8] = &[0x83, 0xF8, 0x08, 0x66, 0x0F, 0x1F, 0x44, 0x00];
 
     fn fake_build() -> &'static BuildAddrs {
@@ -1570,6 +1672,8 @@ mod tests {
             Box::leak(Box::new(PatchSite { rva: POOL_RVA, expected: POOL_BEFORE, replacement: POOL_AFTER }));
         let seed: &'static PatchSite =
             Box::leak(Box::new(PatchSite { rva: LUASEED_RVA, expected: SEED_BEFORE, replacement: &SEED_AFTER }));
+        let tick: &'static PatchSite =
+            Box::leak(Box::new(PatchSite { rva: TICK_RVA, expected: TICK_BEFORE, replacement: TICK_AFTER }));
         Box::leak(Box::new(BuildAddrs {
             timestamp: 9,
             name: "fake",
@@ -1594,9 +1698,11 @@ mod tests {
             }),
             town_sort_call: Some(call_site(SORT_CALL_RVA, SORT_CALLEE_RVA, sort_callee_probe as *const () as usize)),
             town_pick_call: Some(call_site(PICK_CALL_RVA, PICK_CALLEE_RVA, pick_callee_probe as *const () as usize)),
+            batch_pace: None,
             game_time_getter: Some(CallSite { rva: GETTER_RVA, prologue: &GETTER_FN }),
             script_pool: Some(pool.clone()),
             lua_makeseed: Some(seed.clone()),
+            tick_count_getter: Some(tick.clone()),
             command_move: Some(helper.clone()),
             command_destroy: Some(helper.clone()),
             handle_destroy: Some(helper.clone()),
@@ -1632,6 +1738,7 @@ mod tests {
         g.fill(EDGES_RVA as usize, &stub(edges_probe as *const () as usize));
         g.fill(GETTER_RVA as usize, &GETTER_FN);
         g.fill(LUASEED_RVA as usize, SEED_BEFORE);
+        g.fill(TICK_RVA as usize, TICK_BEFORE);
         g.fill(MOVE_RVA as usize, &[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
         g
     }
@@ -1689,6 +1796,7 @@ mod tests {
             convert: convert_hook as *const () as usize,
             convert_update: convert_update_hook as *const () as usize,
             preview: preview_hook as *const () as usize,
+            pace: pace_hook as *const () as usize,
         }
     }
 
@@ -1702,6 +1810,104 @@ mod tests {
 
     // the tests of one process share the statics above: run them one at a time
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    // ---- smooth pacing: the write after a batch, on a fake game object
+
+    /// A fake `CGame` whose `[+0x1f0]` leads to fake timing data: accumulated time, last batch time, interval (us).
+    struct FakeTiming {
+        game: Box<[u64; 0x40]>,
+        data: Box<[u64; 0x48]>,
+    }
+
+    impl FakeTiming {
+        fn new(acc: i64, last: i64, interval: i32) -> FakeTiming {
+            let mut t = FakeTiming { game: Box::new([0; 0x40]), data: Box::new([0; 0x48]) };
+            t.game[crate::pace::DATA_OFFSET / 8] = t.data.as_ptr() as u64;
+            t.data[crate::pace::ACC_OFFSET / 8] = acc as u64;
+            t.data[crate::pace::LAST_OFFSET / 8] = last as u64;
+            t.set_interval(interval);
+            t
+        }
+        fn interval(&self) -> i32 {
+            self.data[crate::pace::INTERVAL_OFFSET / 8] as u32 as i32
+        }
+        fn set_interval(&mut self, v: i32) {
+            let w = &mut self.data[crate::pace::INTERVAL_OFFSET / 8];
+            *w = (*w & !0xFFFF_FFFF) | u64::from(v as u32);
+        }
+        fn game(&self) -> usize {
+            self.game.as_ptr() as usize
+        }
+    }
+
+    #[test]
+    fn after_a_batch_the_interval_is_stretched_by_the_fresh_factor_and_given_back() {
+        let p = crate::pace::Pacer::new();
+        let mut t = FakeTiming::new(5_000_000, 4_750_000, 250_000);
+        unsafe { pace_after_sync(&p, t.game(), 10) };
+        assert_eq!(t.interval(), 250_000, "factor 1: nothing written");
+        p.set(1600, 100);
+        unsafe { pace_after_sync(&p, t.game(), 200) };
+        assert_eq!(t.interval(), 400_000);
+        // Sync left it: not compounded
+        unsafe { pace_after_sync(&p, t.game(), 300) };
+        assert_eq!(t.interval(), 400_000);
+        // Sync set its own estimate
+        t.set_interval(300_000);
+        unsafe { pace_after_sync(&p, t.game(), 400) };
+        assert_eq!(t.interval(), 480_000);
+        // the mod stopped refreshing: the engine's interval back
+        unsafe { pace_after_sync(&p, t.game(), 100 + crate::pace::STALE_MS + 1) };
+        assert_eq!(t.interval(), 300_000);
+        assert!(!p.is_off());
+    }
+
+    #[test]
+    fn a_layout_that_is_not_the_expected_one_switches_smooth_pacing_off_without_touching_anything() {
+        let p = crate::pace::Pacer::new();
+        p.set(2000, 0);
+        unsafe { pace_after_sync(&p, 0, 1) };
+        assert!(p.is_off(), "no game object");
+        let p = crate::pace::Pacer::new();
+        p.set(2000, 0);
+        let mut t = FakeTiming::new(1, 2, 250_000);
+        unsafe { pace_after_sync(&p, t.game(), 1) };
+        assert_eq!(t.interval(), 250_000, "accumulated time before the last batch: left alone");
+        assert!(!p.is_off());
+        t.set_interval(7);
+        t.data[crate::pace::ACC_OFFSET / 8] = 10;
+        unsafe { pace_after_sync(&p, t.game(), 2) };
+        assert_eq!(t.interval(), 7, "not an interval: left alone");
+        // a pointer into unmapped memory
+        t.game[crate::pace::DATA_OFFSET / 8] = 0x10;
+        unsafe { pace_after_sync(&p, t.game(), 3) };
+        assert!(p.is_off(), "unreadable timing data: off for good");
+    }
+
+    static FAKE_SYNC_ARGS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    static FAKE_SYNC_RESULT: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system-unwind" fn fake_sync(a: u64, b: u64, c: u64, d: u64) -> u64 {
+        FAKE_SYNC_ARGS.lock().unwrap_or_else(|p| p.into_inner()).extend([a, b, c, d]);
+        FAKE_SYNC_RESULT.load(SeqCst)
+    }
+
+    #[test]
+    fn the_pace_hook_calls_sync_with_its_arguments_and_returns_its_result() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let before = PACE_CALLEE.swap(fake_sync as *const () as usize, SeqCst);
+        crate::pace::PACER.set(1000, crate::pace::clock_ms());
+        let t = FakeTiming::new(5_000_000, 4_750_000, 250_000);
+        // a Sync that handed out no batch (al = 0, the upper bits whatever they are): nothing is touched
+        FAKE_SYNC_RESULT.store(0x1234_5600, SeqCst);
+        assert_eq!(unsafe { pace_hook(t.game() as u64, 2, 3, 4) }, 0x1234_5600);
+        FAKE_SYNC_RESULT.store(1, SeqCst);
+        assert_eq!(unsafe { pace_hook(t.game() as u64, 5, 6, 7) }, 1);
+        assert_eq!(*FAKE_SYNC_ARGS.lock().unwrap(), [t.game() as u64, 2, 3, 4, t.game() as u64, 5, 6, 7]);
+        assert_eq!(t.interval(), 250_000, "factor 1: the engine's interval");
+        PACE_CALLEE.store(before, SeqCst);
+        FAKE_SYNC_ARGS.lock().unwrap().clear();
+    }
 
     #[test]
     fn a_full_installation_hooks_both_functions_and_patches_the_pool_and_comes_out_again() {
@@ -1925,6 +2131,57 @@ mod tests {
     }
 
     #[test]
+    fn the_step_seed_makes_the_tick_getter_read_the_update_count_and_comes_out_again() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        // a fake GameTime component: tickCount at +0x3c counted 900 frames, 500 of them standing still; updateCount 400
+        let mut component = [0u8; 0x48];
+        component[0x3c..0x40].copy_from_slice(&900u32.to_le_bytes());
+        component[0x40..0x44].copy_from_slice(&400u32.to_le_bytes());
+        let getter = || {
+            let f: extern "system" fn(*const u8) -> u32 = unsafe { core::mem::transmute(game.at(TICK_RVA as usize)) };
+            f(component.as_ptr())
+        };
+        assert_eq!(getter(), 900, "as shipped: the frame count");
+
+        let cfg = HookConfig { step_seed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.report());
+        let (mut inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(inst.step_seed() && !inst.lua_seed() && !inst.poolpatch() && inst.hook_names().is_empty(), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("simulation seeds read the step count")), "{lines:?}");
+        assert_eq!(game.bytes(TICK_RVA as usize, TICK_AFTER.len()), TICK_AFTER);
+        assert_eq!(getter(), 400, "patched: the step count, the same on every game");
+        assert_eq!(game.protection(0), PAGE_EXECUTE_READ);
+        assert_eq!(component[0x3c..0x40], 900u32.to_le_bytes(), "the field itself is not written");
+
+        assert!(unsafe { inst.uninstall_all() }
+            .iter()
+            .any(|l| l.contains("tick_count_getter: original bytes restored")));
+        assert!(inst.is_empty());
+        assert_eq!(game.bytes(TICK_RVA as usize, TICK_BEFORE.len()), TICK_BEFORE);
+        assert_eq!(getter(), 900);
+    }
+
+    #[test]
+    fn a_tick_getter_that_does_not_match_is_left_alone_and_logged() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (build, game) = (fake_build(), fake_game());
+        let base = game.base as usize;
+        let rt = runtime(build, base);
+        let cfg = HookConfig { step_seed: true, ..Default::default() };
+        let plan = plan::plan(build, cfg, &ProcessImage { base });
+        // the memory changed after planning: the executor refuses it again and writes nothing
+        game.fill(TICK_RVA as usize + 2, &[0x38]);
+        let (inst, lines) = unsafe { execute(&plan, base, &rt, &targets(), &mut |_| {}) };
+        assert!(!inst.step_seed() && inst.is_empty());
+        assert!(lines.iter().any(|l| l.starts_with("simulation seeds NOT moved to the step count")), "{lines:?}");
+        assert_eq!(game.bytes(TICK_RVA as usize + 2, 1), [0x38], "nothing written");
+    }
+
+    #[test]
     fn a_seed_site_that_does_not_match_is_left_alone_and_logged() {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let (build, game) = (fake_build(), fake_game());
@@ -2145,7 +2402,7 @@ mod tests {
         assert_in_order(
             &logged,
             &[
-                "hooks: switches hooks=on hold=off poolpatch=on luaseed=off town_seed=off fire_done=off",
+                "hooks: switches hooks=on hold=off poolpatch=on luaseed=off step_seed=off town_seed=off fire_done=off",
                 "hooks: self-test: detour, trampoline and stack argument work in this binary",
                 "hooks: self-test: the hook identifies the call site of a detoured function",
                 "hooks: apply_command: 16 bytes at rva 0x100 match the build table",
@@ -2825,6 +3082,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: the deep town trace past its 2000-command sampling threshold, 4 s; the plain trace test covers every-call and sampling (cargo test -- --include-ignored)"]
     fn traced_towns_are_logged_on_every_call_in_the_deep_log() {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let dir = temp_dir("deep-trace");

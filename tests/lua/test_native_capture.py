@@ -244,6 +244,22 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.shipped_count(), 0, "no replay's event was taken for a new build of this game")
         self.assertEqual(self.A.builds_applied(), 3)
 
+    def test_a_mark_the_interface_half_sent_names_its_build_when_no_event_spent_it(self):
+        # friend test 2026-10-18 (0.2.0-pre5): the guest applied the host's builds 0:9 and 0:13 during a pause from its interface half,
+        # whose "replay" mark carried no key, and the report read "the engine did not run the replayed build nil@14282800,
+        # nil@14285000" (no apply event reached the simulation half then: its subscription by names, fixed in de15edb)
+        self.start()
+        self.A.run('SIM_EVENT("", "feverlink3", "replay", { key = "0:9" })')
+        self.tick(14)
+        self.A.run('SIM_EVENT("", "feverlink3", "replay", { key = "0:13" })')
+        line = [x for x in self.A.log().splitlines() if "did not run the replayed build" in x]
+        self.assertEqual(len(line), 1, self.A.log())
+        named = line[0].split("did not run the replayed build", 1)[1]
+        self.assertIn(" 0:9@", named, "the build is named by its key")
+        self.assertNotIn("nil", named)
+        # the interface half's sends carry the key: the pause path, a released held command, hold_off
+        self.assertEqual(T.BRIDGE_SRC.count('toSim("replay", {})') + T.BRIDGE_SRC.count('toSim, "replay", {})'), 0)
+
     def test_both_games_building_at_once_end_up_with_both_roads(self):
         self.start()
         self.A.native(self.road(0, 300, 0, 400))

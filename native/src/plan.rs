@@ -30,10 +30,17 @@
 //! 6. Lua string-hash seed pin: pin the seed of Lua's string hash to a constant (`build_table::LUA_SEED`), so the
 //!    iteration order of `pairs` over string keys is the same in every process. A patch, independent of the others.
 //!
-//! Switches 4 and 5 are off unless the value is exactly `1` (after trimming blanks). Four pieces are ON by default because a
+//! 7. `FEVERLINK3_STEP_SEED` (on by default, `=0` off, and then on every game of the session): the engine's
+//!    `GameTime.tickCount` getter returns the step count (`updateCount`) instead. tickCount also counts the frames a game
+//!    stands still (paused, or at the input barrier), a different number on every game, and the simulation seeds random
+//!    draws from that getter (vehicle reservations, town and street development). Which pseudo-random sequence is drawn
+//!    changes, no rule does. A one-byte patch, independent of the others (`build_table::BuildAddrs::tick_count_getter`).
+//!
+//! Switches 4 and 5 are off unless the value is exactly `1` (after trimming blanks). Five pieces are ON by default because a
 //! session of several games needs them to stay in step: the counters and the hold hook (1, 2: the hold hook holds nothing
-//! until the mod writes `hold_on`, which the mod does for the strict build flow), the single-worker script pool (3) and the
-//! Lua seed pin (6); `FEVERLINK3_HOOKS=0`, `FEVERLINK3_HOLD=0`, `FEVERLINK3_POOLPATCH=0` and `FEVERLINK3_LUA_SEED=0` turn them off. Both stay fail-open: an unknown build or other
+//! until the mod writes `hold_on`, which the mod does for the strict build flow), the single-worker script pool (3), the
+//! Lua seed pin (6) and the step-count seeds (7); `FEVERLINK3_HOOKS=0`, `FEVERLINK3_HOLD=0`, `FEVERLINK3_POOLPATCH=0`,
+//! `FEVERLINK3_LUA_SEED=0` and `FEVERLINK3_STEP_SEED=0` turn them off. Both stay fail-open: an unknown build or other
 //! bytes at the site install nothing and the reason is logged.
 
 use crate::build_table::{BuildAddrs, PatchSite, Rva};
@@ -71,6 +78,8 @@ pub fn forced_seed(get: impl Fn(&str) -> Option<String>) -> Result<Option<u32>, 
 pub const LUA_SEED_VAR: &str = "FEVERLINK3_LUA_SEED";
 /// `1` asks the mod's Lua probe (and the module's log) to record the string-hash seed's effect. Observation only.
 pub const LUA_SEED_LOG_VAR: &str = "FEVERLINK3_LUA_SEED_LOG";
+/// `0` keeps the engine's tickCount getter as shipped (switch 7). Must be the same on every game of a session.
+pub const STEP_SEED_VAR: &str = "FEVERLINK3_STEP_SEED";
 
 /// The switches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -87,8 +96,13 @@ pub struct HookConfig {
     /// The town-growth log and seed experiment (`growth.rs`).
     pub growth: Settings,
     pub luaseed: bool,
+    /// The engine's tickCount getter returns the step count (switch 7).
+    pub step_seed: bool,
     /// `FEVERLINK3_NATIVE_PATCH=1`: also hook `scripting::Convert`, to write `frozenNodes` into a script's converted proposal.
     pub native_patch: bool,
+    /// Smooth pacing (`pace.rs`): the call of `CGame::Sync` in `CGame::Step` is redirected so that the batch interval can be stretched by
+    /// the mod's factor. On by default with the hooks; `FEVERLINK3_SMOOTH_PACE=0` off.
+    pub smooth_pace: bool,
 }
 
 impl HookConfig {
@@ -106,25 +120,35 @@ impl HookConfig {
             force_seed,
             growth: Some(Settings::from_lookup(&get).0).filter(Settings::active).unwrap_or_default(),
             luaseed: !off(LUA_SEED_VAR),
+            step_seed: !off(STEP_SEED_VAR),
             native_patch: on(crate::cmd_patch::PATCH_VAR),
+            smooth_pace: !off(crate::pace::SMOOTH_PACE_VAR),
         }
     }
 
     /// True when the module may touch the game's code at all.
     pub fn any(&self) -> bool {
-        self.hooks || self.poolpatch || self.native_patch || self.town_seed || self.growth.active() || self.luaseed
+        self.hooks
+            || self.poolpatch
+            || self.native_patch
+            || self.town_seed
+            || self.growth.active()
+            || self.luaseed
+            || self.step_seed
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
         format!(
-            "hooks={} hold={} poolpatch={} luaseed={} town_seed={} fire_done={}{}{}",
+            "hooks={} hold={} poolpatch={} luaseed={} step_seed={} town_seed={} fire_done={} smooth_pace={}{}{}",
             f(self.hooks),
             f(self.hold),
             f(self.poolpatch),
             f(self.luaseed),
+            f(self.step_seed),
             f(self.town_seed),
             f(self.fire_done),
+            f(self.hooks && self.smooth_pace),
             self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default(),
             self.growth.describe()
         )
@@ -187,12 +211,16 @@ pub enum Feature {
     GrowthPick,
     /// The pinned Lua string-hash seed.
     LuaSeed,
+    /// The tickCount getter that returns the step count.
+    StepSeed,
     /// The hook on `scripting::Convert` (the native frozenNodes patch).
     Convert,
     /// The hook on the construction update `Convert` runs (frozenNodes before the entrance is generated).
     ConvertUpdate,
     /// The hook on the interface's `builder.proposalCreate` emitter (a held build command given to the scripts as a preview).
     PreviewEvent,
+    /// The call-site redirect of `CGame::Sync` in `CGame::Step`: the batch interval stretched by the mod's factor (`pace.rs`).
+    BatchPace,
 }
 
 impl Feature {
@@ -209,9 +237,11 @@ impl Feature {
             Feature::GrowthSort => "town_sort",
             Feature::GrowthPick => "town_pick",
             Feature::LuaSeed => "luaseed",
+            Feature::StepSeed => "step_seed",
             Feature::Convert => "script_convert",
             Feature::ConvertUpdate => "script_convert_update",
             Feature::PreviewEvent => "preview_event",
+            Feature::BatchPace => crate::pace::HOOK_NAME,
         }
     }
 }
@@ -347,6 +377,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
         if cfg.hold {
             plan_hold(build, image, &mut p);
         }
+        if cfg.smooth_pace {
+            plan_batch_pace(build, image, &mut p);
+        }
     }
     if cfg.town_seed {
         plan_town_seed(build, image, &mut p);
@@ -366,6 +399,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
     }
     if cfg.luaseed {
         plan_patch(Feature::LuaSeed, "lua_makeseed", &build.lua_makeseed, image, &mut p);
+    }
+    if cfg.step_seed {
+        plan_patch(Feature::StepSeed, "tick_count_getter", &build.tick_count_getter, image, &mut p);
     }
     p
 }
@@ -541,6 +577,25 @@ fn plan_growth_calls(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
+/// Smooth pacing: the call of `CGame::Sync` in `CGame::Step` and the callee's prologue must both match. A build without the site
+/// paces as before (the barrier's hard stop alone).
+fn plan_batch_pace(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let (feature, name) = (Feature::BatchPace, crate::pace::HOOK_NAME);
+    let Some(site) = &build.batch_pace else { return };
+    let checked = verify(image, site.rva, site.expected)
+        .and_then(|()| verify(image, site.callee.rva, site.callee.prologue).map_err(|e| format!("callee: {e}")));
+    match checked {
+        Ok(()) => p.steps.push(Step::CallPatch {
+            feature,
+            name,
+            rva: site.rva,
+            expected: site.expected,
+            callee: site.callee.rva,
+        }),
+        Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+    }
+}
+
 fn plan_hold(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     let skip = |p: &mut Plan, reason: String| {
         p.skipped.push(Skip { feature: Feature::Hold, name: "command_list_add", reason });
@@ -625,7 +680,7 @@ mod tests {
         }
         let g = b.game_time_getter.as_ref().unwrap();
         img.write(g.rva, g.prologue);
-        for c in [&b.town_sort_call, &b.town_pick_call].into_iter().flatten() {
+        for c in [&b.town_sort_call, &b.town_pick_call, &b.batch_pace].into_iter().flatten() {
             img.write(c.rva, c.expected);
             img.write(c.callee.rva, c.callee.prologue);
         }
@@ -636,6 +691,8 @@ mod tests {
         img.write(p.rva, p.expected);
         let q = b.lua_makeseed.as_ref().unwrap();
         img.write(q.rva, q.expected);
+        let t = b.tick_count_getter.as_ref().unwrap();
+        img.write(t.rva, t.expected);
         img
     }
 
@@ -655,25 +712,32 @@ mod tests {
             hold: true,
             poolpatch: true,
             luaseed: true,
+            step_seed: true,
             fire_done: true,
+            smooth_pace: true,
             ..Default::default()
         };
         assert_eq!(
             HookConfig::from_lookup(env(&[])),
             defaults,
-            "hooks, hold, the pool patch, the seed pin and the firing of the tool callback are on by default"
+            "hooks, hold, the pool patch, the seed pin, the firing of the tool callback and smooth pacing are on by default"
         );
         let none = HookConfig::from_lookup(env(&[
             (HOOKS_VAR, "0"),
             (HOLD_VAR, "0"),
             (POOLPATCH_VAR, "0"),
             (LUA_SEED_VAR, "0"),
+            (STEP_SEED_VAR, "0"),
             (FIRE_DONE_VAR, "0"),
+            (crate::pace::SMOOTH_PACE_VAR, "0"),
         ]));
         assert_eq!(none, HookConfig::default(), "=0 turns each of them off");
         assert!(!HookConfig::default().any());
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
-        assert_eq!(all, HookConfig { luaseed: true, fire_done: true, ..cfg(true, true, true) });
+        assert_eq!(
+            all,
+            HookConfig { luaseed: true, step_seed: true, fire_done: true, smooth_pace: true, ..cfg(true, true, true) }
+        );
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
             let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
             let on_by_default = off.trim() != "0";
@@ -684,7 +748,9 @@ mod tests {
                     hold: on_by_default,
                     poolpatch: on_by_default,
                     luaseed: on_by_default,
+                    step_seed: on_by_default,
                     fire_done: on_by_default,
+                    smooth_pace: on_by_default,
                     ..Default::default()
                 },
                 "{off:?} must not switch anything else on"
@@ -693,14 +759,20 @@ mod tests {
         assert!(HookConfig::from_lookup(|k| (k == HOOKS_VAR).then(|| " 1 ".to_string())).hooks, "blanks are trimmed");
         let only_pool = HookConfig::from_lookup(env(&[(HOOKS_VAR, "0"), (POOLPATCH_VAR, "1")]));
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
-        assert_eq!(all.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=off fire_done=on");
+        assert_eq!(
+            all.describe(),
+            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=off fire_done=on smooth_pace=on"
+        );
         assert_eq!(
             HookConfig::default().describe(),
-            "hooks=off hold=off poolpatch=off luaseed=off town_seed=off fire_done=off"
+            "hooks=off hold=off poolpatch=off luaseed=off step_seed=off town_seed=off fire_done=off smooth_pace=off"
         );
         let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
         assert!(seed.any() && seed.town_seed, "its own switch");
-        assert_eq!(seed.describe(), "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=on");
+        assert_eq!(
+            seed.describe(),
+            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=on fire_done=on smooth_pace=on"
+        );
         assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).town_seed, "only the exact value 1");
     }
 
@@ -720,7 +792,7 @@ mod tests {
         assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
         assert_eq!(
             c.describe(),
-            "hooks=on hold=on poolpatch=on luaseed=on town_seed=on fire_done=on force_seed=0x00000010"
+            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=on fire_done=on smooth_pace=on force_seed=0x00000010"
         );
         let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
         assert_eq!(bad, HookConfig::from_lookup(env(&[])), "an invalid value switches nothing on");
@@ -901,7 +973,7 @@ mod tests {
         let b = select(0x6ac5_0427).unwrap();
         let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
         assert!(deep.any() && deep.growth.deep);
-        let deep = HookConfig { hooks: false, hold: false, poolpatch: false, luaseed: false, ..deep }; // on by default; not what this test is about
+        let deep = HookConfig { hooks: false, hold: false, poolpatch: false, luaseed: false, step_seed: false, ..deep }; // on by default; not what this test is about
         let p = plan(b, deep, &image_of_40420());
         assert_eq!(
             names(&p),
@@ -925,7 +997,7 @@ mod tests {
         assert!(p.skipped.iter().any(|s| s.name == "town_pick" && s.reason.starts_with("callee: ")), "{:?}", p.skipped);
         // without the deep switch neither is planned
         let log = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH", "1")]));
-        let log = HookConfig { hooks: false, hold: false, poolpatch: false, luaseed: false, ..log };
+        let log = HookConfig { hooks: false, hold: false, poolpatch: false, luaseed: false, step_seed: false, ..log };
         assert_eq!(names(&plan(b, log, &image_of_40420())), ["town_develop", "town_update_size"]);
     }
 
@@ -1000,9 +1072,11 @@ mod tests {
         town_edges: None,
         town_sort_call: None,
         town_pick_call: None,
+        batch_pace: None,
         game_time_getter: None,
         script_pool: None,
         lua_makeseed: None,
+        tick_count_getter: None,
         command_move: None,
         command_destroy: None,
         handle_destroy: None,
@@ -1110,6 +1184,46 @@ mod tests {
         let leaked: &'static BuildAddrs = Box::leak(Box::new(bare));
         let p = plan(leaked, on, &img);
         assert!(p.steps.is_empty() && p.skipped[0].reason.contains("no lua_makeseed site"));
+    }
+
+    #[test]
+    fn the_step_seed_is_on_unless_zero() {
+        let env = |v: Option<&'static str>| {
+            HookConfig::from_lookup(move |n| if n == STEP_SEED_VAR { v.map(String::from) } else { None })
+        };
+        for on in [None, Some(""), Some("1"), Some("on")] {
+            assert!(env(on).step_seed, "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0 ")] {
+            assert!(!env(off).step_seed, "{off:?}");
+        }
+        let alone = HookConfig { step_seed: true, ..Default::default() };
+        assert!(alone.any(), "the step seed alone makes the module touch the game's code");
+    }
+
+    #[test]
+    fn the_step_seed_is_planned_only_when_asked_and_verified() {
+        let img = image_of_40420();
+        let b = select(0x6ac5_0427).unwrap();
+        let on = HookConfig { step_seed: true, ..Default::default() };
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["tick_count_getter"]);
+        let Step::Patch { rva, replacement, expected, feature, .. } = &p.steps[0] else { panic!("not a patch") };
+        assert_eq!((*feature, *rva), (Feature::StepSeed, 0x2a9600));
+        assert_eq!((expected[21], replacement[21]), (0x3c, 0x40), "the load reads updateCount instead of tickCount");
+        assert!(plan(b, HookConfig::default(), &img).steps.is_empty(), "nothing without the switch");
+
+        // a getter that reads something else already (another build, or another module's patch): left alone
+        let mut other = img.clone();
+        other.write(0x2a9600 + 21, &[0x40]);
+        let p = plan(b, on, &other);
+        assert!(p.steps.is_empty());
+        assert_eq!((p.skipped[0].name, p.skipped[0].feature), ("tick_count_getter", Feature::StepSeed));
+        assert!(p.skipped[0].reason.contains("the table expects"), "{}", p.skipped[0].reason);
+
+        let leaked: &'static BuildAddrs = Box::leak(Box::new(BARE.clone()));
+        let p = plan(leaked, on, &img);
+        assert!(p.steps.is_empty() && p.skipped[0].reason.contains("no tick_count_getter site"));
     }
 
     #[test]

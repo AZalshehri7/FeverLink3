@@ -663,6 +663,42 @@ class InjectFailClosedTest(S.StrictTest):
         self.assertSameWorld()
         self.assertEqual(self.relay.replay_failed, [])
 
+    def test_a_bulldozings_inject_order_carries_each_games_own_resolved_refund_entries(self):
+        # The bulldoze refund made natively (owner decision 2026-10-18, native/src/refund.rs): MPFever measured that a refundableEntities
+        # list written into a script Context gives no refund. So every game's inject order of a bulldozing carries the refund entries that
+        # game resolved to its OWN entities (the session's ids differ between the games here), in native_refund_<key>.txt with the count
+        # in the order, and the module inserts them into the injected command's own Context with the engine's insert. The account is read
+        # before the send and again at the next step, on every game.
+        self.start()
+        self.strict_on(self.A, self.B)
+        for g in (self.A, self.B):
+            g.native.native_text = road_text()
+            g.native.input_text = road_text()
+        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+        self.tick(30)
+        eb, ea = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)")), int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.assertNotEqual(ea, eb)
+        before = {g.label: len([1 for _, k, _ in g.native.ctl_records() if k == "inject_next"]) for g in (self.A, self.B)}
+        # the tool's Context names the segment (and an entity no record can reference: left out on every game before the record travels)
+        self.B.native.held_flags = {"align": False, "cleanup": True, "buildings": True, "fields": True, "redo": False, "ie": False, "pi": True,
+                                    "refund": [{"e": eb, "k": -1, "r": [1, 11, 0], "n": 339}, {"e": 99999, "k": -1, "r": [1, 11, 0], "n": 339}]}
+        self.B.tool("{ edges = { %d } }" % eb, make="NATIVE_BULLDOZE")
+        self.tick(30)
+        for g, e in ((self.A, ea), (self.B, eb)):
+            orders = [p for _, k, p in g.native.ctl_records() if k == "inject_next"]
+            self.assertEqual(len(orders), before[g.label] + 1, "%s: one order for the bulldozing\n%s" % (g.label, self.log()))
+            o = orders[-1]
+            self.assertEqual(int(o["refund"]), 1, "%s: the order says how many refund entries its side file holds" % g.label)
+            with open(os.path.join(g.dir, "native_refund_%d.txt" % int(o["key"])), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "%d\t-1\t1\t11\t0\t339\n" % e, "%s: this game's own entity, the recorded revision, key and value integers" % g.label)
+            self.assertIn("1 refund entries for the module", g.log(), g.label)
+            self.assertRegex(g.log(), r"refund \(native\): action \S+: 1 refund entries ordered into the command's Context .*account before \d+, after \d+",
+                             g.label)
+        # the road's order (no refundable entity) names none and writes no side file
+        first = [p for _, k, p in self.A.native.ctl_records() if k == "inject_next"][0]
+        self.assertNotIn("refund", first)
+        self.assertFalse(os.path.exists(os.path.join(self.A.dir, "native_refund_%d.txt" % int(first["key"]))))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -335,7 +335,7 @@ impl<'a> Builder<'a> {
                 Self::put_triple(buf, t);
                 Ok(())
             }
-            Ty::Map => {
+            Ty::Map(_) => {
                 let v = v.ok_or_else(|| format!("missing line {path}"))?;
                 let size: u64 = v
                     .split("size=")
@@ -1026,11 +1026,16 @@ pub(crate) mod testgraph {
     /// An engine hash container at `payload + off` whose list holds one 24-byte node per value (next, prev, the 8-byte value word), with
     /// a bucket array of 8 buckets (first, last) pointing at the nodes. Returns the nodes' addresses.
     pub(crate) fn add_hash(arena: &Arena, payload: usize, off: usize, values: &[u64]) -> Vec<usize> {
-        let h = arena.add(&[0u8; 0x18]);
-        let nodes: Vec<usize> = values.iter().map(|_| arena.add(&[0u8; 0x18])).collect();
+        add_hash_of(arena, payload, off, 0x18, values)
+    }
+
+    /// [`add_hash`] with list nodes of `node` bytes (the value word at +0x10, the rest of the value zero).
+    pub(crate) fn add_hash_of(arena: &Arena, payload: usize, off: usize, node: usize, values: &[u64]) -> Vec<usize> {
+        let h = arena.add(&vec![0u8; node]);
+        let nodes: Vec<usize> = values.iter().map(|_| arena.add(&vec![0u8; node])).collect();
         let ring: Vec<usize> = std::iter::once(h).chain(nodes.iter().copied()).collect();
         for (i, &a) in ring.iter().enumerate() {
-            let mut b = vec![0u8; 0x18];
+            let mut b = vec![0u8; node];
             w(&mut b, 0, ring[(i + 1) % ring.len()] as u64);
             w(&mut b, 8, ring[(i + ring.len() - 1) % ring.len()] as u64);
             if i > 0 {
@@ -1370,8 +1375,8 @@ mod tests {
         let r = roundtrip(&e.text, &payload, BASE, typed, &arena, &NoHeap(&arena), &|b| Some(arena.add(b)))
             .expect("rebuilds");
         assert!(!r.text.contains("DIFF  terrainAlignSkipEdges"), "{}", r.text);
-        // the same words in a container whose value type the table does not know stay pointers, and the originator refuses the text
-        // (every receiver would): never shipped to be refused at the stamp
+        // the same words in `old2new`, a map of 4-byte keys to 4-byte values (the engine copies the 8-byte pair as data, 0x4bec80), are
+        // literals too: the text ships
         let (fake, at) = synthetic();
         let arena = world(fake.0);
         for _ in 0..3 {
@@ -1379,9 +1384,20 @@ mod tests {
         }
         super::testgraph::add_hash(&arena, at, 0x270, &values[1..]);
         let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        assert_eq!(e.stats.heap_ptrs, 0, "{}", e.text);
+        assert!(e.text.contains(&format!(" w:{:016x}", values[1])), "the whole pair is the value: {}", e.text);
+        assert_eq!(crate::inject::text_refusal(&e.text, BASE), None, "the originator ships it");
+        // the same words in a container whose value type the table does not know (`refundableEntities`, 40-byte nodes) stay pointers
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        for _ in 0..3 {
+            arena.add(&[0x5au8; 0x40]);
+        }
+        super::testgraph::add_hash_of(&arena, at, 0x370, 0x28, &values[1..]);
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
         assert!(e.stats.heap_ptrs >= 2, "{}", e.text);
-        let why = crate::inject::text_refusal(&e.text, BASE).expect("refused before shipping");
-        assert!(why.starts_with("2 heap pointers in the text cannot be resolved"), "{why}");
+        // a container past the Proposal is never taken from the text, so its pointers refuse nothing
+        assert_eq!(crate::inject::text_refusal(&e.text, BASE), None);
     }
 
     #[test]
@@ -1434,15 +1450,11 @@ mod tests {
         let bad = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes").text;
         let line = bad.lines().find(|l| l.starts_with("old2new.graph")).expect("a graph line");
         assert!(line.starts_with("old2new.graph\traw:P "), "{line}");
-        // a value word that is an address in this game is a P, never a literal
+        // a value word that looks like an address in this game is data in a node whose value is two 4-byte values: a literal
         assert!(arena.write(n1 + 8, &(h as u64).to_le_bytes()));
         assert!(arena.write(n1 + 0x10, &(h as u64).to_le_bytes()));
         let addr = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
-        assert!(
-            addr.stats.heap_ptrs > 0 && addr.text.lines().any(|l| l.starts_with("@B") && l.contains(" P")),
-            "{}",
-            addr.text
-        );
+        assert!(addr.stats.heap_ptrs == 0 && addr.text.contains(&format!(" w:{:016x}", h as u64)), "{}", addr.text);
     }
 
     #[test]
@@ -1624,6 +1636,217 @@ mod tests {
             .unwrap_or_else(|| panic!("the region is written: {}", e.text));
         let hex: String = (readable as u64).to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert!(!line.contains(&hex) && line.contains("b3fa3f3f"), "{line}");
+    }
+
+    /// A parcel of [`add_parcels`]: key, the value bytes as the engine's copy carries them, each face's points and collision flags.
+    type Parcel = (u32, Vec<u8>, Vec<(Vec<u8>, u32)>);
+    /// A parcel of a rebuilt map ([`parcels_of`]): the value bytes, each face's points, collision flags and padding.
+    type RebuiltParcel = (Vec<u8>, Vec<(Vec<u8>, u32, Vec<u8>)>);
+
+    /// A `parcelsMap` (`std::map<Entity, Parcel>`, build 40420) in the arena laid out as the engine's: a 0x50-byte sentinel and one
+    /// 0x50-byte node per parcel in a balanced tree, each value at +0x20 (key, streetSegment +0x28, left +0x2c, curveParam +0x30, offset
+    /// +0x34, the face vector +0x38) with residue in its padding, four faces of 0x20 bytes each (points vector, collision flags +0x18,
+    /// residue at +0x1c) and four points per face. The shape is the owner's pre4 hold 1: 42 parcels, keys new#42..new#1, faces 0x80
+    /// bytes, points 0x30 bytes; the scalars are those of the h3 donor's parcels (streetSegment new#1, curve parameters 0.0855..0.83,
+    /// offset 8.0). The point coordinates are made up (the logs hold no point bytes). Returns, per key, the value bytes as the engine's
+    /// copy carries them (padding zero) and the faces' points.
+    fn add_parcels(arena: &Arena, at: usize, n: usize) -> Vec<Parcel> {
+        let w = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        let readable = arena.add(&[0x77u8; 0x40]) as u64; // residue that is an address of this "game"
+        let head = arena.add(&[0u8; 0x50]);
+        let mut entries = Vec::new();
+        let mut nodes = Vec::new();
+        for i in 0..n {
+            let key = (-(n as i32) + i as i32) as u32; // new#n .. new#1, in key order
+            let mut faces = Vec::new();
+            let mut face_block = vec![0u8; 4 * 0x20];
+            for k in 0..4usize {
+                let mut pts = Vec::new();
+                for p in 0..4usize {
+                    for v in [(i * 10 + k) as f32 * 1.5, (p as f32) * 0.25 - 3.0, 12.5 + k as f32] {
+                        pts.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                }
+                let pb = arena.add(&pts) as u64;
+                let f = &mut face_block[k * 0x20..(k + 1) * 0x20];
+                w(f, 0, pb);
+                w(f, 8, pb + 0x30);
+                w(f, 0x10, pb + 0x30);
+                let collision = 1 + (k as u32 % 2);
+                f[0x18..0x1c].copy_from_slice(&collision.to_le_bytes());
+                f[0x1c..0x20].copy_from_slice(&(readable as u32).to_le_bytes()); // residue
+                faces.push((pts, collision));
+            }
+            let fb = arena.add(&face_block) as u64;
+            let mut v = vec![0u8; 0x30];
+            v[0..4].copy_from_slice(&key.to_le_bytes());
+            v[8..0xc].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            v[0xc] = (i % 2) as u8;
+            v[0x10..0x14].copy_from_slice(&(0x3daf_1e1bu32 + i as u32 * 0x0010_0000).to_le_bytes());
+            v[0x14..0x18].copy_from_slice(&0x4100_0000u32.to_le_bytes());
+            w(&mut v, 0x18, fb);
+            w(&mut v, 0x20, fb + 0x80);
+            w(&mut v, 0x28, fb + 0x80);
+            let mut with_residue = v.clone();
+            with_residue[4..8].copy_from_slice(&((readable >> 32) as u32).to_le_bytes()); // h3: 0x167, the high half of an old address
+            with_residue[0xd..0x10].copy_from_slice(&[0x4e, 0x5f, 0x43]); // h3: 0x435f4e00 around a left of 0
+            nodes.push((arena.add(&[0u8; 0x50]), with_residue));
+            entries.push((key, v, faces));
+        }
+        // a balanced tree over the nodes in key order; a missing child is the sentinel
+        fn link(
+            nodes: &[(usize, Vec<u8>)],
+            lo: usize,
+            hi: usize,
+            parent: usize,
+            head: usize,
+            out: &mut Vec<(usize, Vec<u8>)>,
+        ) -> usize {
+            if lo >= hi {
+                return head;
+            }
+            let mid = (lo + hi) / 2;
+            let (a, value) = (nodes[mid].0, &nodes[mid].1);
+            let left = link(nodes, lo, mid, a, head, out);
+            let right = link(nodes, mid + 1, hi, a, head, out);
+            let mut b = vec![0u8; 0x50];
+            b[0..8].copy_from_slice(&(left as u64).to_le_bytes());
+            b[8..0x10].copy_from_slice(&(parent as u64).to_le_bytes());
+            b[0x10..0x18].copy_from_slice(&(right as u64).to_le_bytes());
+            b[0x18] = 1; // black
+            b[0x1a..0x20].copy_from_slice(b"/town_"); // residue beside colour and isnil
+            b[0x20..].copy_from_slice(value);
+            out.push((a, b));
+            a
+        }
+        let mut blocks = Vec::new();
+        let root = link(&nodes, 0, n, head, head, &mut blocks);
+        for (a, b) in blocks {
+            assert!(arena.write(a, &b));
+        }
+        let mut h = vec![0u8; 0x50];
+        w(&mut h, 0, nodes[0].0 as u64);
+        w(&mut h, 8, root as u64);
+        w(&mut h, 0x10, nodes[n - 1].0 as u64);
+        h[0x18] = 1;
+        h[0x19] = 1;
+        w(&mut h, 0x38, readable); // the sentinel's value is never constructed: residue
+        assert!(arena.write(head, &h));
+        let mut map = vec![0u8; 0x10];
+        w(&mut map, 0, head as u64);
+        w(&mut map, 8, n as u64);
+        assert!(arena.write(at + 0x2c8, &map));
+        entries
+    }
+
+    /// The parcels of the rebuilt map at `payload + 0x2c8`, walked through `mem` in key order: (value bytes, each face's points and
+    /// collision flags, each face's padding bytes).
+    fn parcels_of(mem: &dyn Mem, payload: &[u8]) -> Vec<RebuiltParcel> {
+        let head = u64_at(payload, 0x2c8) as usize;
+        let h = mem.read(head, 0x50).unwrap();
+        let mut out = Vec::new();
+        fn walk(mem: &dyn Mem, a: usize, head: usize, out: &mut Vec<RebuiltParcel>) {
+            if a == head {
+                return;
+            }
+            let n = mem.read(a, 0x50).unwrap();
+            assert_eq!(n[0x19], 0, "a node, not the sentinel");
+            walk(mem, u64_at(&n, 0) as usize, head, out);
+            let v = n[0x20..].to_vec();
+            let (b, e) = (u64_at(&v, 0x18) as usize, u64_at(&v, 0x20) as usize);
+            let fb = mem.read(b, e - b).unwrap();
+            let faces = fb
+                .chunks(0x20)
+                .map(|f| {
+                    let (pb, pe) = (u64_at(f, 0) as usize, u64_at(f, 8) as usize);
+                    (
+                        mem.read(pb, pe - pb).unwrap(),
+                        u32::from_le_bytes(f[0x18..0x1c].try_into().unwrap()),
+                        f[0x1c..0x20].to_vec(),
+                    )
+                })
+                .collect();
+            out.push((v, faces));
+            walk(mem, u64_at(&n, 0x10) as usize, head, out);
+        }
+        walk(mem, u64_at(&h, 8) as usize, head, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_parcel_map_is_carried_by_value_without_a_single_unresolved_pointer_and_rebuilt_exactly() {
+        // owner pre4 run 2026-10-18, host hold 1: a plain street over town land was "REFUSED BEFORE SHIPPING ... 126 heap pointers in the
+        // text cannot be resolved: @B7+0x38, @B7+0x40, @B7+0x48 ...": the three words of the face vector of each of the 42 parcels
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        let entries = add_parcels(&arena, at, 42);
+        let typed = Settings { typed: true, graph_skip: &["toAdd"], ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        assert_eq!(e.stats.heap_ptrs, 0, "{:?}\n{}", e.unresolved, e.text);
+        assert!(!e.text.lines().any(|l| l.split(' ').any(|t| t == "P" || t.ends_with(":P"))), "{}", e.text);
+        assert!(e.text.contains("parcelsMap\tmap:size=42"), "{}", e.text);
+        // the values are named lines, in key order: new#42 first
+        assert!(e.text.contains("parcelsMap[0].key\tent:new#42"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[41].key\tent:new#1"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[0].streetSegment\tent:new#1"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[1].left\tu8:01"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[0].curveParam\tf32:3daf1e1b"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[0].offset\tf32:41000000"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[3].faces.#\tn:4"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[3].faces[2].points.#\tn:4"), "{}", e.text);
+        assert!(e.text.contains("parcelsMap[3].faces[1].collision\tu32:00000002"), "{}", e.text);
+        let p = f32::from_bits(u32::from_le_bytes(entries[3].2[2].0[12..16].try_into().unwrap()));
+        assert!(e.text.contains(&format!("parcelsMap[3].faces[2].points[1].v\tv3:{:08x},", p.to_bits())), "{}", e.text);
+        // the node blocks carry the faces by value: a V token of 0x80 bytes holding four V tokens of 0x30 bytes
+        let node_lines: Vec<&str> = e.text.lines().filter(|l| l.starts_with("@B") && l.contains("size=80")).collect();
+        assert_eq!(node_lines.len(), 43, "the sentinel and 42 nodes");
+        assert!(node_lines.iter().filter(|l| l.contains(" V128[V48[b:")).count() == 42, "{node_lines:?}");
+        // residue is not carried: not the sentinel's, not beside the colour, not in the value's or a face's padding
+        assert!(!e.text.contains("5f6e776f742f") && !e.text.contains("435f4e"), "{}", e.text);
+        // the originator ships it
+        assert_eq!(crate::inject::text_refusal(&e.text, BASE), None);
+        // the receiver rebuilds it, and the rebuild written as text again is the same text
+        let payload = arena.read(at, PAYLOAD_SIZE).unwrap();
+        let r = roundtrip(&e.text, &payload, BASE, typed, &arena, &NoHeap(&arena), &|b| Some(arena.add(b)))
+            .expect("rebuilds");
+        assert!(r.text.contains("MATCH parcelsMap (") && !r.text.contains("DIFF  parcelsMap"), "{}", r.text);
+        assert!(!r.text.contains("DIFF  (heap graph)"), "{}", r.text);
+        // byte for byte: every parcel's value (padding zero), every face's points and flags, in its own new blocks
+        let built = build(&e.text, BASE, &arena).unwrap();
+        assert!(built.blocked.is_empty(), "{:?}", built.blocked);
+        assert_ne!(u64_at(&built.payload, 0x2c8), u64_at(&payload, 0x2c8));
+        let got = parcels_of(&arena, &built.payload);
+        assert_eq!(got.len(), 42);
+        for ((key, want, faces), (v, gf)) in entries.iter().zip(&got) {
+            assert_eq!(u32::from_le_bytes(v[0..4].try_into().unwrap()), *key);
+            assert_eq!(v[..0x18], want[..0x18], "key {key:08x}: the scalars, padding zero");
+            assert_ne!(v[0x18..0x30], want[0x18..0x30], "key {key:08x}: a face vector of its own");
+            assert_eq!(gf.len(), 4);
+            for ((pts, col), (gp, gc, gpad)) in faces.iter().zip(gf) {
+                assert_eq!(gp, pts);
+                assert_eq!(gc, col);
+                assert_eq!(gpad, &vec![0u8; 4]);
+            }
+        }
+        // the input-level text (the mod's) keeps only the keys, as before
+        let i = encode(&NoHeap(&arena), Env { image_base: BASE }, Settings::input_level(), "40420", &head(at)).unwrap();
+        assert!(i.text.contains("parcelsMap.keys\tkeys:ffffffd6,ffffffd7,"), "{}", i.text);
+        assert!(!i.text.contains("parcelsMap[") && !i.text.contains("parcelsMap.graph"), "{}", i.text);
+    }
+
+    #[test]
+    fn a_parcel_whose_face_vector_is_not_a_vector_refuses_the_text_with_the_member() {
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        add_parcels(&arena, at, 3);
+        // the second parcel's face vector: end before begin
+        let sentinel = u64::from_le_bytes(arena.read(at + 0x2c8, 8).unwrap().try_into().unwrap()) as usize;
+        let root = u64::from_le_bytes(arena.read(sentinel + 8, 8).unwrap().try_into().unwrap()) as usize;
+        let b = u64::from_le_bytes(arena.read(root + 0x38, 8).unwrap().try_into().unwrap());
+        assert!(arena.write(root + 0x40, &(b - 0x20).to_le_bytes()));
+        let typed = Settings { typed: true, graph_skip: &["toAdd"], ..settings() };
+        let err = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect_err("refused");
+        assert!(err.contains("parcelsMap[1].faces") && err.contains("not a vector triple"), "{err}");
     }
 
     #[test]

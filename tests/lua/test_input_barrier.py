@@ -179,19 +179,28 @@ class BarrierTest(unittest.TestCase):
 
     # ---- the barrier under a network that misbehaves
 
+    # The pauses under jitter run on the test's own clock in test_barrier_cadence.py (the seeds that breached the barrier before), so
+    # the real-clock runs below are one seed by default and the rest in the full set.
     def test_two_games_with_jitter_never_apply_late(self):
-        for seed in (1, 2, 3):
+        self.random_run(2, 1, 260, lead_choices=[1, 2, 3, 6], speeds=[1, 2, 3, 4])
+
+    @T.full
+    def test_two_games_with_jitter_never_apply_late_at_more_seeds(self):
+        for seed in (2, 3):
             with self.subTest(seed=seed):
                 self.random_run(2, seed, 260, lead_choices=[1, 2, 3, 6], speeds=[1, 2, 3, 4])
 
+    @T.full
     def test_three_games_with_jitter_never_apply_late(self):
         self.random_run(3, 11, 260, lead_choices=[1, 3, 5], speeds=[1, 3, 4])
 
+    @T.full
     def test_pauses_and_resumes_with_jitter_never_apply_late(self):
         for seed in (21, 22):
             with self.subTest(seed=seed):
                 self.random_run(2, seed, 280, lead_choices=[1, 3], speeds=[1, 2, 4], pauses=True)
 
+    @T.full
     def test_without_the_promises_the_same_network_applies_late(self):
         # The control: stamps by the rule before the barrier (the sender's clock plus the lead) and no promises, so only the pacing
         # holds the client (at most `ahead` steps past the slowest clock it knows). The same kind of network then makes the client

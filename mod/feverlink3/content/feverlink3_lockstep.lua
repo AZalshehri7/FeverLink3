@@ -93,9 +93,14 @@ function L.slowestPeer(peers)
 end
 
 -- How many steps this game may run ahead of the slowest peer (the `ahead` it reports in its clock). More speed
--- means more steps per engine batch, so a little more room; always below lead (2 + 2 * speed steps).
-function L.aheadFor(speed)
-	return 2 + math.max(1, math.min(4, speed or 1))
+-- means more steps per engine batch, so a little more room. With the session's `lead` (game-time units) never less than the lead
+-- in steps: a peer's input barrier sits at its clock plus the lead, and a pacing limit nearer than that would take the room the lead
+-- gives (the host's lead holds one engine batch on top of the one-way time since 2026-10-18; at x4 it is 7 steps or more, this
+-- limit was 6).
+function L.aheadFor(speed, lead)
+	local a = 2 + math.max(1, math.min(4, speed or 1))
+	if type(lead) == "number" and lead > 0 then a = math.max(a, math.ceil(lead / L.STEP)) end
+	return a
 end
 
 -- The speed the engine should be set to right now.
@@ -247,6 +252,158 @@ function L.barrierPeer(peers)
 	return who, b
 end
 
+-- ------------------------------------------------------------------ smooth pacing
+--
+-- Bug 4: over the internet a game ran at full speed into its stop (the input barrier, or the pacing limit `ahead` steps past the
+-- slowest peer) and then stood there until a peer's next clock moved the stop on: in the friend tests of 2026-10-16/17 a median 14 s of
+-- standstill a minute, single holds up to 16.6 s. Instead, when the batches this game has left before the stop would run out before the
+-- stop is expected to move again, it asks the native module to stretch the engine's batch interval (the real time between two simulation
+-- batches; native pace.rs) by a factor from 1 to L.PACE_MAX, so that those batches last until then: it runs a little slower and keeps
+-- moving. Only real time changes: every game runs the same steps at the same game times and applies the same items at the same stamps
+-- (the full-game rule: no mechanic is touched), and the hard stop of L.pace stays as the safety net. The idea of scaling the batch
+-- interval is TPF3-MP's (Juliansgith, MIT) by way of MPFever 0.3.15 (MIT); the measure is our own, from what this game observes:
+--   * the stop (L.paceStop): the nearer of the two stops a peer's clock moves, the barrier and the pacing limit. A pause, a slot hold or
+--     a checksum mark are stops of the session itself and never slow anyone;
+--   * when the stop moves next (L.paceObserve, L.paceNext): the real-time gaps between its last L.PACE_GAPS moves are measured (the
+--     clock cadence of whichever peer sets it, as this game sees it after the whole path: the peer's frames, its link, the host's relay,
+--     so the round trip's jitter is in it); the next move is expected L.PACE_GAP_PCT percent of those gaps after the last one. A stop
+--     already later than that is expected within its jitter (the 90th less the 50th percentile) or as late again as it is;
+--   * this game's batch time (L.paceBatch): the real time between its own batches at factor 1, measured (the median of the last ones,
+--     with the factor it ran at taken out); L.STEP ms until it is;
+--   * the factor (L.paceTarget): the batch that would leave less than a step of room (the game stands still at once then) is timed to
+--     come when the stop moves on: the batches up to it are stretched by the factor that makes them last until then, at most
+--     L.PACE_MAX. A room that lasts longer than the stop's next move: 1;
+--   * L.paceSmooth: the factor follows its target over L.PACE_UP_S / L.PACE_DOWN_S of real time, so the speed changes gradually.
+-- No stretch is asked for when the room outlasts the stop's next move, so a game with ample room (the one behind, a fast link) runs at 1,
+-- and the factor follows the stop as it is now (it does not average a slower past into the future), so it does not feed itself.
+L.PACE_MAX = 2
+L.PACE_GAPS = 32          -- the stop's last moves kept
+L.PACE_GAP_PCT = 50       -- the stop is expected to move after this percentile of its gaps
+L.PACE_BIAS = 0.9         -- the batches are stretched a little less than to the stop's expected move (see L.paceTarget)
+L.PACE_WAIT_MAX_MS = 3000 -- a longer gap is an outage, not a pace: the hard stop handles it
+L.PACE_BATCHES = 16       -- this game's last batch times kept
+L.PACE_UP_S = 0.03     -- the factor of the next batch is needed right after this one: follows at once
+L.PACE_DOWN_S = 0.3
+
+function L.paceNew()
+	return { trim = 1, target = 1, gaps = {}, batches = {}, stop = nil, movedAt = nil, at = nil }
+end
+
+-- The nearer of the stops a peer's clock moves (game time), or nil when there is none (alone, no promises, not running).
+function L.paceStop(s, peers, ahead)
+	if not s.started or (s.speed or 0) <= 0 then return nil end
+	local stop = L.barrier(s, peers)
+	local slowest = L.slowestPeer(peers)
+	if slowest then
+		local limit = slowest + (ahead or L.aheadFor(s.speed)) * L.STEP
+		if stop == nil or limit < stop then stop = limit end
+	end
+	return stop
+end
+
+local function keepLast(list, v, n)
+	list[#list + 1] = v
+	if #list > n then table.remove(list, 1) end
+end
+
+-- percentile p (0..100) of a list, nil when empty
+local function pctOf(list, p)
+	local n = #list
+	if n == 0 then return nil end
+	local v = {}
+	for i = 1, n do v[i] = list[i] end
+	table.sort(v)
+	return v[math.max(1, math.min(n, math.floor(p / 100 * (n - 1) + 0.5) + 1))]
+end
+
+-- The stop at real time `clock` (seconds): a move forward ends a gap, which is kept (a stop that went back, a peer that left or lowered
+-- its promise at a pause, starts the count again without a gap). Frames that read the same real time are one moment.
+function L.paceObserve(P, stop, clock)
+	if stop == nil then
+		P.stop, P.movedAt = nil, nil
+		return
+	end
+	if P.stop == nil or stop < P.stop then
+		P.stop, P.movedAt = stop, clock
+		return
+	end
+	if stop > P.stop then
+		if P.movedAt and clock > P.movedAt then keepLast(P.gaps, math.min((clock - P.movedAt) * 1000, L.PACE_WAIT_MAX_MS), L.PACE_GAPS) end
+		P.stop, P.movedAt = stop, clock
+	end
+end
+
+-- The value at percentile p of the stop's recent gaps (ms), nil before any.
+function L.paceGap(P, p)
+	return pctOf(P.gaps, p)
+end
+
+-- The stop's jitter (ms): the 90th less the 50th percentile of its gaps; 0 before four gaps were measured.
+function L.paceJitter(P)
+	if #P.gaps < 4 then return 0 end
+	return math.max(0, L.paceGap(P, 90) - L.paceGap(P, 50))
+end
+
+-- Real time (ms) until the stop is expected to move again, at `clock`; nil before four gaps were measured.
+function L.paceNext(P, clock)
+	if #P.gaps < 4 or not P.movedAt then return nil end
+	local due = (L.paceGap(P, L.PACE_GAP_PCT) or 0) - (clock - P.movedAt) * 1000
+	if due > 0 then return due end
+	-- later than usual already: expected within its jitter, or as late again as it is now (a stop that is late tends to stay late a
+	-- while: a spike on the link, a peer's stalled frame), so the game slows down into the hold instead of stopping dead
+	return math.min(L.PACE_WAIT_MAX_MS, math.max(L.paceJitter(P), -due))
+end
+
+-- This game's own clock at real time `clock`: the real time between two of its batches, with `applied` (the factor the module was
+-- asked for meanwhile) taken out, is kept when the engine ran all along (`ran`: not held at speed 0 since the last batch).
+function L.paceOwn(P, now, clock, ran, applied)
+	if P.ownNow == nil or now < P.ownNow then
+		P.ownNow, P.ownAt, P.ownRan = now, clock, true
+		return
+	end
+	P.ownRan = P.ownRan and ran
+	if now > P.ownNow then
+		if P.ownRan and clock > P.ownAt then keepLast(P.batches, (clock - P.ownAt) * 1000 / math.max(1, applied or 1), L.PACE_BATCHES) end
+		P.ownNow, P.ownAt, P.ownRan = now, clock, true
+	end
+end
+
+-- This game's batch time at factor 1 (ms): the median of its last batches, L.STEP before four were measured.
+function L.paceBatch(P)
+	if #P.batches < 4 then return L.STEP end
+	return pctOf(P.batches, 50)
+end
+
+-- The factor wanted: `room` game ms before the stop (nil: no stop) at session speed `speed`, the stop expected to move in `waitMs` (nil:
+-- not known yet), a batch every `batchMs` at factor 1, this game's last batch `sinceMs` ago. The game stands still as soon as its room
+-- is below a step (L.pace sets speed 0 at once, mid-batch), so the batch to time is the one that would leave it so: n = room / batch - 1
+-- batches can still be taken safely, and the (n + 1)-th one empties the room. Stretched by f, it comes (n + 1) * batchMs * f after the
+-- last one; it should come when the stop moves on (sinceMs + waitMs from the last one), a little before (L.PACE_BIAS) so that the
+-- session never settles slower than its stops allow. Returns the factor (1 .. L.PACE_MAX) and the real time (ms) until the batch that
+-- empties the room at factor 1.
+function L.paceTarget(room, speed, waitMs, batchMs, sinceMs)
+	if room == nil or waitMs == nil then return 1, nil end
+	local per = math.max(1, math.min(4, speed or 1))
+	local b = math.max(1, batchMs or L.STEP)
+	if room < L.STEP then return L.PACE_MAX, 0 end   -- standing still already (L.pace): the batches after the release come stretched
+	local n = math.max(0, room / (per * L.STEP) - 1)
+	local since = math.max(0, math.min(sinceMs or 0, b))
+	local left = (n + 1) * b - since
+	local f = (since + waitMs * L.PACE_BIAS) / ((n + 1) * b)
+	if f <= 1 then return 1, left end
+	return math.min(L.PACE_MAX, f), left
+end
+-- Moves the factor towards `target` over the real time since the last call (`clock`, seconds).
+function L.paceSmooth(P, target, clock)
+	local dt = P.at and math.max(0, clock - P.at) or 0
+	P.at, P.target = clock, target
+	local tau = target > P.trim and L.PACE_UP_S or L.PACE_DOWN_S
+	local a = 1 - math.exp(-dt / tau)
+	local trim = P.trim + (target - P.trim) * a
+	if target <= 1 and trim < 1.01 then trim = 1 end
+	P.trim = math.max(1, math.min(L.PACE_MAX, trim))
+	return P.trim
+end
 -- ------------------------------------------------------------------ measured stamp margin
 --
 -- A build every game applies at its stamp (the native copy's deferred flow) must reach every game before that game's simulation passes
@@ -756,15 +913,73 @@ end
 
 -- The same when several creations may appear together (a player buying five vehicles in one go): the oldest new id
 -- that no other watch has claimed. Watches are served in the order their commands were applied, which is the same on
--- every game, and the engine numbers entities in creation order, so the n-th command gets the n-th entity everywhere.
+-- every game. This is only the fallback for an entity that appears after its command's step: the engine does NOT number
+-- new entities in creation order (freed ids are handed out again first), so "the n-th command gets the n-th smallest id"
+-- is wrong whenever an id is reused; what a command made at its own send is taken from its own snapshot (L.claimOwn).
+-- `claimed` is a set of entities or a function(e) -> true for an entity that is not this watch's to take.
 function L.claimEntity(before, after, claimed)
 	local seen = {}
 	for _, e in ipairs(before) do seen[e] = true end
+	local taken = claimed
+	if type(claimed) == "table" then taken = function(e) return claimed[e] end end
 	local found = nil
 	for _, e in ipairs(after) do
-		if not seen[e] and not (claimed and claimed[e]) and (found == nil or e < found) then found = e end
+		if not seen[e] and not (taken and taken(e)) and (found == nil or e < found) then found = e end
 	end
 	return found
+end
+
+-- The entity a command created during its own send (`sent`: what appeared among the component's entities between the
+-- snapshot before the send and the one right after it; the simulation state runs a command as it is sent) that still
+-- exists (`after`) and is not taken: the smallest such, or nil. Exact whatever ids the engine hands out (run F 2026-10-18:
+-- two buses bought in one window order, one stamp; the first watch took the smaller new id, which was the second bus's, and
+-- the second watch then found nothing: "action 1:9: nothing created after 10 steps" on both games, three vehicles in the
+-- depot afterwards for two purchases bound).
+function L.claimOwn(sent, after, claimed)
+	if type(sent) ~= "table" or #sent == 0 then return nil end
+	local now = {}
+	for _, e in ipairs(after) do now[e] = true end
+	local found = nil
+	for _, e in ipairs(sent) do
+		if now[e] and not (claimed and claimed(e)) and (found == nil or e < found) then found = e end
+	end
+	return found
+end
+
+-- Which pending record (watches and binders: { key, sent }) made each entity at its own send: entity -> key. A watch or a
+-- binder never takes an entity another command made at its send.
+function L.sentOwners(watches, binders)
+	local by = {}
+	for _, w in ipairs(watches or {}) do
+		for _, e in ipairs(type(w.sent) == "table" and w.sent or {}) do by[e] = by[e] or w.key end
+	end
+	for _, b in ipairs(binders or {}) do
+		for _, list in pairs(type(b.sent) == "table" and b.sent or {}) do
+			for _, e in ipairs(type(list) == "table" and list or {}) do by[e] = by[e] or b.key end
+		end
+	end
+	return by
+end
+
+-- The latest binding of each entity: entity -> { key, at } (`at`: the game time it was bound, st.bindAt; nil for a binding
+-- older than that record). A binding made before a watch's command ran names an entity that was gone by then (it is not in
+-- the watch's snapshot) whose id the engine handed out again: it does not make the new entity taken (L.isTakenAt).
+function L.bindOwners(bind, bindAt)
+	local by = {}
+	for k, e in pairs(bind or {}) do
+		local at = type(bindAt) == "table" and bindAt[k] or nil
+		local cur = by[e]
+		if cur == nil or (at or -math.huge) > (cur.at or -math.huge) then by[e] = { key = k, at = at } end
+	end
+	return by
+end
+
+-- Whether owner record `o` (L.bindOwners) holds its entity for a record applied at `since` (nil: an older record, which
+-- counts every binding as it did before bindAt existed).
+function L.isTakenAt(o, since)
+	if o == nil then return false end
+	if since == nil then return true end
+	return o.at ~= nil and o.at >= since
 end
 
 -- ------------------------------------------------------------------ permissions
@@ -1114,14 +1329,18 @@ end
 -- keyHash (key -> 32-bit number; default: the hex of hashFn), chunk (entities a step reads), maxChunks.
 -- What it does now: the time, the light lanes, the ids lane and the entity lists of the heavy lanes. L.checksumRoundStep reads the rest.
 L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true, ids = true }
-function L.newChecksumRound(engine, hashFn, light, opts)
-	opts = opts or {}
-	local clock = opts.clock or function() return 0 end
-	local r = {
+-- a round's own state, without the work: the engine, the hash functions, the clock (opts as L.newChecksumRound)
+local function roundShell(engine, hashFn, light, opts)
+	return {
 		engine = engine, hash = hashFn, light = light == true, parts = {}, timing = {}, detail = opts.detail, errors = {}, lanes = {},
-		li = 1, pos = 1, total = 0, ctx = {}, clock = clock, steps = 0, frameMax = 0, frameLanes = {},
+		li = 1, pos = 1, total = 0, ctx = {}, clock = opts.clock or function() return 0 end, steps = 0, frameMax = 0, frameLanes = {},
 		keyHash = opts.keyHash or function(k) return tonumber(hashFn(k), 16) or 0 end,
 	}
+end
+function L.newChecksumRound(engine, hashFn, light, opts)
+	opts = opts or {}
+	local r = roundShell(engine, hashFn, light, opts)
+	local clock = r.clock
 	local parts, timing, detail = r.parts, r.timing, r.detail
 	local t0 = clock()
 	local function part(name, fn)
@@ -1236,6 +1455,96 @@ end
 -- The step at which chunk k (1-based) of round r is read: `spread` steps apart after the step the round started at.
 function L.checksumChunkAt(r, k)
 	return r.start + k * r.spread * L.STEP
+end
+
+-- ---- a spread round shared by the simulation Lua states
+--
+-- Real game 2026-10-18 (owner's live test of 0.2.0-pre5, and every lab run of that day since the rounds are spread): every spread round
+-- logged "37 chunk(s) read after their step (+144400 ms game time)". The game runs the game scripts in more than one simulation Lua
+-- state, and the steps of one game are shared between them: two states installed the session's math.random at the same t=12998600, and
+-- round 24 (begun at t=13366600, one chunk a step) read its chunks only at t=13367200, 13367400, 13368000, 13368200, ..., two steps in
+-- four, while action 0:2 was applied at its stamp t=13367800 in between, by the other state. A round kept in one Lua state's own module
+-- table is read only on that state's steps. So its progress lives in the game-script state, which every simulation state reads and
+-- writes (the stamped queue lives there for the same reason): L.checksumRoundSave writes it after a chunk, L.checksumRoundSync reads it
+-- into a state's own copy before the next, and L.checksumRoundRestore makes that copy in a state that has none. The entity lists taken
+-- at the stamp travel once, packed as text (L.packIds); each state unpacks them once a round.
+local ROUND_FIELDS = { "time", "light", "li", "pos", "total", "chunk", "chunks", "steps", "done", "frameMax", "startCost" }
+
+local function flatCopy(t)
+	local out = {}
+	for k, v in pairs(t or {}) do out[k] = v end
+	return out
+end
+
+-- An entity list as text ("12,13,40"): one string in the game-script state instead of thousands of entries. The records of a list
+-- accessor (the test engines) are kept as a list.
+function L.packIds(list)
+	local s = {}
+	for i = 1, #list do
+		local v = list[i]
+		if type(v) ~= "number" or v ~= math.floor(v) or math.abs(v) >= 1e15 then return flatCopy(list) end
+		s[i] = tostring(v)
+	end
+	return table.concat(s, ",")
+end
+
+function L.unpackIds(p)
+	if type(p) == "table" then return p end
+	local out = {}
+	if type(p) == "string" then
+		for w in p:gmatch("[^,]+") do out[#out + 1] = tonumber(w) end
+	end
+	return out
+end
+
+-- The progress of round r as plain data (into `rec`, or a new table): the counters, the parts so far, each lane's sums and towns.
+-- Town sums go as a list ({ town, n, sum }), never as a table keyed by entity id.
+function L.checksumRoundSave(r, rec)
+	rec = rec or {}
+	for _, k in ipairs(ROUND_FIELDS) do rec[k] = r[k] end
+	rec.parts, rec.errors, rec.timing, rec.frameLanes = flatCopy(r.parts), flatCopy(r.errors), flatCopy(r.timing), flatCopy(r.frameLanes)
+	rec.lanes = type(rec.lanes) == "table" and rec.lanes or {}
+	for i, ln in ipairs(r.lanes) do
+		local s = rec.lanes[i] or {}
+		if s.ids == nil then s.ids = L.packIds(ln.ids) end
+		s.name, s.n, s.sum, s.failed = ln.spec.name, ln.n, ln.sum, ln.failed
+		local towns = {}
+		for town, t in pairs(ln.towns) do towns[#towns + 1] = { town = town, n = t.n, sum = t.sum } end
+		table.sort(towns, function(a, b) return tostring(a.town) < tostring(b.town) end)
+		s.towns = towns
+		rec.lanes[i] = s
+	end
+	return rec
+end
+
+-- Round r takes the progress `rec` holds (another Lua state may have read chunks since this one last did). The per-round cache of the
+-- entity readers (r.ctx: node positions) starts empty at every step, so a value is never one this state read at an earlier step.
+function L.checksumRoundSync(r, rec)
+	for _, k in ipairs(ROUND_FIELDS) do r[k] = rec[k] end
+	r.parts, r.errors, r.timing, r.frameLanes = flatCopy(rec.parts), flatCopy(rec.errors), flatCopy(rec.timing), flatCopy(rec.frameLanes)
+	r.ctx = {}
+	for i, s in ipairs(rec.lanes or {}) do
+		local ln = r.lanes[i]
+		if ln then
+			ln.n, ln.sum, ln.failed = s.n or 0, s.sum or 0, s.failed
+			ln.towns = {}
+			for _, t in ipairs(s.towns or {}) do ln.towns[t.town] = { n = t.n, sum = t.sum } end
+		end
+	end
+	return r
+end
+
+-- A Lua state's own copy of a round it did not begin (opts as L.newChecksumRound: detail, clock, keyHash).
+function L.checksumRoundRestore(engine, hashFn, rec, opts)
+	opts = opts or {}
+	local r = roundShell(engine, hashFn, rec.light, opts)
+	local spec = {}
+	for _, s in ipairs(L.SPREAD_LANES) do spec[s.name] = s end
+	for i, s in ipairs(rec.lanes or {}) do
+		if not spec[s.name] then error("checksum round restore: unknown lane " .. tostring(s.name)) end
+		r.lanes[i] = { spec = spec[s.name], ids = L.unpackIds(s.ids), n = 0, sum = 0, towns = {}, keys = opts.detail and {} or nil }
+	end
+	return L.checksumRoundSync(r, rec)
 end
 
 -- An `action` record from the link as a queue item; `from` is the sender id the launcher attached.

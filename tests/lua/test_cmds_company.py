@@ -593,11 +593,13 @@ class CompanyUnit(unittest.TestCase):
         L.execute("""
             REAL = function() return 7 end
             api = {
-              engine = { util = { getPlayer = REAL, finance = {
+              engine = { entityExists = function(e) return e == 5 or e == 6 end,
+                         getComponent = function(e, t) if t == 7 and e == 5 then return { stops = {} } end end,
+                         util = { getPlayer = REAL, finance = {
                 getPlayersBalance = function(e) if e == 99 then return nil end return e * 1000 end,
                 calculateBalance = function(list, from, to, flag) return list[1] + from + to end } } },
               util = { getDefaultYearDuration = function() return 96000 end, getDefaultMonthDuration = function() return 8000 end },
-              type = { JournalEntry = { new = function() return { category = {} } end, Type = { OTHER = 5 } } },
+              type = { ComponentType = { LINE = 7 }, JournalEntry = { new = function() return { category = {} } end, Type = { OTHER = 5 } } },
               cmd = { makeJournalBookAssetCmd = function(e, entry) return { to = e, amount = entry.amount, time = entry.time, kind = entry.category.type } end,
                       sendCommand = function(c) NATIVE_SENT = c end },
             }
@@ -611,6 +613,9 @@ class CompanyUnit(unittest.TestCase):
         self.assertEqual(engine.balanceOf(7), 7000)
         self.assertIsNone(engine.balanceOf(99), "nil is infinite money")
         self.assertEqual(engine.lineResult(5, 10, 20), 35)
+        # a deleted line (its entity gone, or its id reused by something that is no line) is not read: nil, no balance call
+        self.assertIsNone(engine.lineResult(4, 10, 20))
+        self.assertIsNone(engine.lineResult(6, 10, 20))
         self.assertEqual((engine.yearLength(), engine.monthLength()), (96000, 8000))
         engine.bookJournalFor(52001, -2500)
         self.assertEqual((sent[1].to, sent[1].amount, sent[1].time, sent[1].kind), (52001, -2500, -1, 5))
@@ -786,6 +791,7 @@ class CoGame(tl.Game):
         self.from_game = os.path.join(self.dir, "from_game.log")
         self.use_env()
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        tl.fastio.install(self.L)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = tl.COMMON_SRC, tl.LOCKSTEP_SRC, tl.BRIDGE_SRC, tl.HUD_SRC
         g.LINK_SRC, g.LOG_SRC = tl.LINK_SRC, tl.LOG_SRC
@@ -863,6 +869,7 @@ class CompanyGameTest(unittest.TestCase):
 
     # ---- shared company: the ledger
 
+    @tl.full
     def test_ledger_records_who_bought_and_built_what_identically_on_both_games(self):
         self.start()
         self.tick(10)
@@ -904,6 +911,7 @@ class CompanyGameTest(unittest.TestCase):
         pa, pb = self.relay.reports[3][0][1], self.relay.reports[3][1][1]
         self.assertEqual({k for k in pa if pa[k] != pb[k]}, {"companies"})
 
+    @tl.full
     def test_a_cost_the_engine_cannot_tell_still_counts_the_action(self):
         self.start()
         self.tick(10)
@@ -914,6 +922,7 @@ class CompanyGameTest(unittest.TestCase):
         led = self.A.registry()["ledger"][1]
         self.assertEqual((led["n"], led["gross"]), ({"spend": 1}, {}))
 
+    @tl.full
     def test_the_cost_is_booked_when_the_engine_runs_the_command_after_the_update(self):
         # the real game: a command sent in the simulation update runs after the update returns, so the account read right after the send
         # has not moved (friend test 2026-10-16: 82 builds and 15 vehicles bought, every ledger said "spent 0")
@@ -934,6 +943,7 @@ class CompanyGameTest(unittest.TestCase):
 
     # ---- limits
 
+    @tl.full
     def test_the_host_sets_a_limit_and_further_spending_is_stopped(self):
         self.start()
         self.tick(10)
@@ -1010,6 +1020,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertFalse(self.log_has("company layer failed"))
         self.assertFalse(self.log_has("LATE"))
 
+    @tl.full
     def test_events_are_counted_loans_follow_the_limit_but_repaying_does_not_and_local_ones_stay_local(self):
         self.start()
         self.tick(10)
@@ -1066,6 +1077,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(led["refused"], 1, "each game refused it once, and the registry (identical on both) counts it once")
         self.assertIn("spending limit reached", led["last"])
 
+    @tl.full
     def test_a_category_the_host_forbade_stops_the_player_at_the_originator_and_on_every_game(self):
         self.start()
         self.tick(10)
@@ -1092,6 +1104,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.buy(self.B))
         self.assertSameRegistry()
 
+    @tl.full
     def test_only_the_host_can_set_limits_and_found_companies(self):
         self.start()
         self.tick(10)
@@ -1107,6 +1120,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.B.registry()["members"], {1: "c1"})
         self.assertSameRegistry()
 
+    @tl.full
     def test_a_limit_per_period_starts_again_with_the_next_period(self):
         self.start()
         self.tick(10)
@@ -1136,6 +1150,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.op(self.A, op="assign", player=1, company="c2"))
         self.assertTrue(self.op(self.A, op="mode", mode="separate", experimental=True))
 
+    @tl.full
     def test_adding_a_player_binds_a_company_to_the_new_entity_on_every_game(self):
         self.start()
         self.tick(10)
@@ -1156,6 +1171,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.both("#GAME.applied"), (1, 1))
         self.assertEqual(len(self.A.registry()["companies"]), 1)
 
+    @tl.full
     def test_player_arguments_become_the_senders_company_entity_on_each_game(self):
         self.start()
         self.tick(10)
@@ -1187,6 +1203,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.A.applied(), self.B.applied())
         self.assertSameRegistry()
 
+    @tl.full
     def test_the_operations_modules_commands_follow_the_senders_company(self):
         self.start()
         self.tick(10)
@@ -1209,6 +1226,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual((led["gross"], led["made"]), ({"spend": 4000}, {"makeEntitySetNameCmd": 1, "makeJournalBookAssetCmd": 1}))
         self.assertSameRegistry()
 
+    @tl.full
     def test_a_player_outside_every_company_acts_as_the_games_own_player(self):
         self.start()
         self.tick(10)
@@ -1234,6 +1252,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(len(self.A.applied()), before + 1, "the host's game, which knows the entity, did: the games now differ (a checksum shows it)")
         self.assertIn("not known on this game", self.B.log())
 
+    @tl.full
     def test_a_payment_between_companies_is_a_journal_entry_on_each_account(self):
         self.start()
         self.tick(10)
@@ -1253,6 +1272,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.op(self.A, op="pay", to=0, amount=500, **{"from": 1}))
         self.assertEqual(self.B.ev("ACCOUNTS[%d].balance" % pb), 2000000 - 12500)
 
+    @tl.full
     def test_in_shared_mode_a_payment_is_only_a_ledger_entry(self):
         self.start()
         self.tick(10)
@@ -1262,6 +1282,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.A.registry()["ledger"][1]["paid"], 12000)
         self.assertSameRegistry()
 
+    @tl.full
     def test_the_games_windows_follow_the_registry_in_separate_mode_and_are_restored(self):
         self.start()
         self.tick(10)
@@ -1285,6 +1306,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.B.ev("GUI_API.engine.util.getPlayer()"), 7)
         self.assertIn("the game's own player", self.B.log())
 
+    @tl.full
     def test_the_hosts_money_authority_still_corrects_the_savegames_player_in_separate_mode(self):
         self.start()
         self.tick(10)
@@ -1357,6 +1379,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.A.registry()["ledger"][1]["refused"], 1, "60 000 of 50 000: refused, and the refusal is in the state the savegame keeps")
         self.assertEqual(row(self.A.status(), 1)["refused"], 1)
 
+    @tl.full
     def test_a_mod_level_action_during_a_pause_is_replayed_into_the_state(self):
         self.start(speed=2)
         self.tick(10, lag_b=True)
@@ -1381,6 +1404,7 @@ class CompanyGameTest(unittest.TestCase):
 
     # ---- persistence, the window, faults
 
+    @tl.full
     def test_a_reload_keeps_the_registry_and_the_page(self):
         self.start()
         self.tick(10)
@@ -1492,6 +1516,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual({k for k in a if a[k] != b.get(k)}, {"companies"}, "the registry differs and is reported as a difference")
         self.assertEqual(self.relay.not_ready[10], {0: [], 1: []}, "nothing is hidden as not ready")
 
+    @tl.full
     def test_the_company_page_is_written_for_the_window(self):
         self.start()
         self.tick(10)
@@ -1512,6 +1537,7 @@ class CompanyGameTest(unittest.TestCase):
             self.assertEqual(row(st, 1)["earned"], 1700)
             self.assertEqual(row(st, 1)["net"], 1700 - 5000)
 
+    @tl.full
     def test_a_window_record_becomes_a_company_action(self):
         self.start()
         self.tick(10)
@@ -1533,6 +1559,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.both("#GAME.applied"), (1, 1))
         self.assertSameRegistry()
 
+    @tl.full
     def test_window_records_are_dropped_when_commands_cannot_be_held(self):
         # an api whose command table refuses assignment: nothing is wrapped, so an operation or a new player would apply
         # on this game alone; the record is dropped and the log says why
@@ -1556,6 +1583,7 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual(self.A.applied(), self.B.applied(), "the purchase went through on both")
         self.assertIn("company layer failed", self.B.log())
 
+    @tl.full
     def test_a_fault_while_writing_the_page_neither_stops_the_game_nor_fills_the_log(self):
         self.start()
         self.tick(10)

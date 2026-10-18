@@ -275,6 +275,7 @@ class InBridgeTest(unittest.TestCase):
             g.step()
         self.assertFalse(os.path.exists(os.path.join(g.dir, "live_vs_loaded.txt")))
 
+    @T.full
     def test_on_writes_the_start_and_l4_and_never_breaks_the_game(self):
         import time
 

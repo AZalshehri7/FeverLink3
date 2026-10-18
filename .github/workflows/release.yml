@@ -38,6 +38,7 @@ jobs:
       - if: steps.parse.outputs.release == 'true'
         uses: dtolnay/rust-toolchain@stable
 
+      # the essential set, as in CI (the full set is run on a developer's PC on demand: docs/RELEASING.md)
       - if: steps.parse.outputs.release == 'true'
         run: cargo test --workspace --exclude feverlink3_native
       - if: steps.parse.outputs.release == 'true'

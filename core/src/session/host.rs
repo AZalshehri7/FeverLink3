@@ -262,6 +262,9 @@ pub struct HostSession {
     /// Checksum rounds completed, and how many of them were skipped because the games hashed at different sim times.
     rounds_done: u32,
     rounds_skewed: u32,
+    /// Skewed rounds in a row (reset by a compared one), and the minute's counts: (start host time, rounds, skewed).
+    skew_streak: u32,
+    skew_minute: (f64, u32, u32),
     permissions: Permissions,
     policy: ChecksumPolicy,
     resync: Option<ResyncRound>,
@@ -358,6 +361,8 @@ impl HostSession {
             verdicts: VerdictBook::new(),
             rounds_done: 0,
             rounds_skewed: 0,
+            skew_streak: 0,
+            skew_minute: (f64::NEG_INFINITY, 0, 0),
             permissions: Permissions::default(),
             policy: ChecksumPolicy::new(ChecksumPolicyConfig::default()),
             resync: None,
@@ -779,7 +784,7 @@ impl HostSession {
                         let now = self.now();
                         self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: now, safe, stop });
                         self.link_stats.clock(from, now);
-                        self.lead_meter.clock(from, m.t, now);
+                        self.lead_meter.clock(from, m.t, m.speed, now);
                         self.resync_step();
                         self.flush_pause();
                         // a player cannot push every other game's stamps into the far future with an absurd margin

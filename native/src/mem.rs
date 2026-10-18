@@ -93,6 +93,20 @@ pub unsafe fn readable(addr: *const u8, len: usize) -> bool {
     }
 }
 
+/// `PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY`: the protections that allow an ordinary write.
+const WRITABLE: u32 = 0x04 | 0x08 | 0x40 | 0x80;
+
+/// True when every byte of the range is committed and an ordinary write to it cannot fault (data, not code: nothing is lifted).
+///
+/// # Safety
+/// Only asks the OS about addresses; any arguments are allowed.
+pub unsafe fn writable(addr: *const u8, len: usize) -> bool {
+    match unsafe { regions(addr as usize, len) } {
+        Ok(rs) => rs.iter().all(|&(_, _, p)| p & WRITABLE != 0 && p & PAGE_GUARD == 0),
+        Err(_) => false,
+    }
+}
+
 /// Copies out a range after checking it is readable.
 ///
 /// # Safety

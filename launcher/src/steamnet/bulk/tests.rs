@@ -342,6 +342,7 @@ fn describe(label: &str, o: &Outcome) {
 // ---- complete and correct
 
 #[test]
+#[ignore = "full set: a bulk-transfer rate simulation, 4 to 8 s (cargo test -- --include-ignored)"]
 fn transfers_complete_and_correct_at_every_loss_level() {
     for size in [MB, 8 * MB, 32 * MB] {
         for loss in [0.0, 0.01, 0.05] {
@@ -357,6 +358,7 @@ fn transfers_complete_and_correct_at_every_loss_level() {
 }
 
 #[test]
+#[ignore = "full set: a bulk-transfer rate simulation, 4 to 8 s (cargo test -- --include-ignored)"]
 fn goodput_reaches_most_of_a_5_mb_s_bottleneck_at_214_ms() {
     for loss in [0.0, 0.01] {
         let mut net = Net::new(5_000_000.0);
@@ -382,6 +384,7 @@ fn queueing_delay_stays_near_the_target() {
 }
 
 #[test]
+#[ignore = "full set: a bulk-transfer rate simulation, 4 to 8 s (cargo test -- --include-ignored)"]
 fn a_fast_line_is_filled_too() {
     // 300 Mbit/s is 37 MB/s; the controller's maximum is 40
     let mut net = Net::new(37_500_000.0);

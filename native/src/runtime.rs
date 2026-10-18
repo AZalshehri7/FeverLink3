@@ -663,8 +663,8 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm, refuse }) => {
-                    self.inject.arm_timed(key, ttl, held, tm, refuse, now)
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm, refuse, refund }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, refuse, refund, now)
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 _ => rest.push(line),
@@ -679,10 +679,15 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::PatchNext { frozen, adds, at, ttl }) => {
                     self.arm_patch(frozen, adds, at, ttl, now)
                 }
-                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm, refuse }) => {
-                    self.inject.arm_timed(key, ttl, held, tm, refuse, now)
+                Ok(crate::link::CtlMessage::InjectNext { key, ttl, held, tm, refuse, refund }) => {
+                    self.inject.arm_timed(key, ttl, held, tm, refuse, refund, now)
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
+                Ok(crate::link::CtlMessage::Pace { permille }) => {
+                    crate::pace::PACER.set(permille, crate::pace::clock_ms());
+                    // the mod speaks: what is held keeps its liveness as with any other line
+                    machine.handle(&crate::link::CtlMessage::Pace { permille }, now);
+                }
                 Ok(msg) => machine.handle(&msg, now),
                 Err(e) => machine.error("ctl", format!("line {}: {e}", line.kind), now),
             }
@@ -750,6 +755,11 @@ impl Runtime {
                 place: "applied".into(),
                 detail: format!("command {id} was released but never seen being applied"),
             });
+        }
+        // smooth pacing (pace.rs): its first stretched batch and a line a minute, from this thread (never from the hook on the main thread)
+        let pace_now = crate::pace::clock_ms();
+        for line in [crate::pace::PACER.first_line(), crate::pace::PACER.minute_line(pace_now)].into_iter().flatten() {
+            self.say(&line);
         }
         if let Some(audit) = lock(&self.audit).poll(now, &self.counters) {
             self.say(&audit_log_line(&audit, |k| self.build.kind_name(k)));
@@ -1286,9 +1296,11 @@ mod tests {
             town_edges: None,
             town_sort_call: None,
             town_pick_call: None,
+            batch_pace: None,
             game_time_getter: None,
             script_pool: None,
             lua_makeseed: None,
+            tick_count_getter: None,
             command_move: None,
             command_destroy: None,
             handle_destroy: None,
@@ -2408,6 +2420,55 @@ mod tests {
         assert!(why.contains("not the build its text describes"), "{why}");
         assert_eq!(crate::log::engine_calls_in_guard(), 0, "no engine call announced inside a guard");
         inject::TEST_FNS.with(|f| f.set(None));
+    }
+
+    thread_local! {
+        static SAID: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    fn keep(l: &str) {
+        SAID.with(|s| s.borrow_mut().push(l.to_string()));
+    }
+
+    #[test]
+    fn an_orders_refund_entries_go_into_the_commands_context_through_the_engines_insert() {
+        use crate::refund::tests::{calls as inserts, entry, fake_fns, Synthetic};
+        let dir = TempDir::new("rt-refund");
+        let mut rt = runtime(Some(dir.path()));
+        rt.log = keep;
+        // the mod's side file: this game's own entities, resolved from the originator's references
+        std::fs::write(
+            dir.path().join(crate::refund::file_name(5)),
+            "50215\t-1\t3\t11\t0\t3143\n46947\t-1\t11\t11\t0\t2899\n",
+        )
+        .unwrap();
+        let mut s = Synthetic::new(&[]); // the script command's Context container, as the engine made it (empty)
+        let fns = fake_fns(&mut s);
+        inject::TEST_REFUND_FNS.with(|f| f.set(Some(fns)));
+        let n0 = inserts();
+        // the checks refuse a count that is not the file's and a missing file, before any call
+        let why = rt.refund_job(5, 3, dir.path(), s.addr()).err().unwrap();
+        assert!(why.contains("the order says 3"), "{why}");
+        let why = rt.refund_job(6, 1, dir.path(), s.addr()).err().unwrap();
+        assert!(why.contains("cannot read native_refund_6.txt"), "{why}");
+        let job = rt.refund_job(5, 2, dir.path(), s.addr()).expect("checked");
+        assert_eq!(inserts(), n0, "the checks call nothing of the engine");
+        rt.refund_engine(5, s.addr(), job).expect("set");
+        assert_eq!(inserts() - n0, 1, "one call of the engine's insert");
+        let (have, _) = crate::refund::read_container(&crate::dump::LiveMem, s.addr()).unwrap();
+        assert_eq!(have, vec![entry(50215, 3, 3143), entry(46947, 11, 2899)]);
+        let said = SAID.with(|l| l.borrow().clone());
+        assert!(
+            said.iter()
+                .any(|l| l.contains("key 5: refund (native): 2 entries set in the command's Context (0 were there")
+                    && l.contains("[50215{-1}rev3,11,0/3143 46947{-1}rev11,11,0/2899]")),
+            "{said:?}"
+        );
+        assert_eq!(crate::log::engine_calls_in_guard(), 0, "the insert is not called inside a guard");
+        // a container that is not an engine-made one: refused by the checks
+        let zero = Box::new([0u8; 0x9c0]);
+        let why = rt.refund_job(5, 2, dir.path(), zero.as_ptr() as usize).err().unwrap();
+        assert!(why.contains("refund: the Context's refundableEntities has no load factor"), "{why}");
+        inject::TEST_REFUND_FNS.with(|f| f.set(None));
     }
 
     #[test]

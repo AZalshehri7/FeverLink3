@@ -1325,6 +1325,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: a speed-test run over the fake Steam, 4 to 6 s (cargo test -- --include-ignored)"]
     fn an_auto_run_sends_and_receives_over_parallel_connections_and_reports_them() {
         let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
         // every connection carries 5 MB/s, the line does not limit; 30 MB each way is three connections by the rule
@@ -1371,6 +1372,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: a speed-test run over the fake Steam, 4 to 6 s (cargo test -- --include-ignored)"]
     fn a_datagram_offer_while_the_friend_is_busy_is_refused() {
         let (a, b, _ca, _cb, mut probe_a, mut probe_b) = two_probes();
         // two uploads at once: the second offer meets a busy receiver and is aborted with a reason, not hung

@@ -3,8 +3,9 @@ session, replicated between two mocked Transport Fever 3 games through the real 
 the harness this builds on, imported and not edited).
 
 What the mock adds to the lockstep harness (OPS_PRELUDE, run between the base mock and the mod's harness):
-  * engine objects as the game shows them (finding from MPFever, MIT): a vehicle configuration, a line, a stop, a
-    colour are objects that list their members under __members, refuse members they do not have and raise
+  * engine objects as the game shows them: a vehicle configuration, a line, a stop, a colour are objects with the
+    members of their type in the game's typed definitions (api/tealdef), refuse members they do not have (a read raises
+    and is counted in FAILED_READS: MPFever issue #21, every failed read costs the real game a crash dump) and raise
     "read only" for the ones the engine derives;
   * model resources whose ids differ between the two games (the client's are 100 higher) but whose names do not;
   * station groups, depots, a vehicle, a line, a town and an industry in the "savegame", with ids both games share;
@@ -69,6 +70,26 @@ local function arrayWrite(v)
   end
   return arrayRead(out)
 end
+-- Reads of what an engine object does not have (a member its type lacks, `__members`, `#` on an object that is no list) raise, as
+-- the real engine's do, and are counted in FAILED_READS["<Type>.<member>"] (MPFever issue #21: each such failed read makes the real
+-- game write a crash dump, ~0.1 s, inside pcall too). MEMBERS_OF is the mock's own member list of each object, for SNAPSHOT.
+FAILED_READS = {}
+MEMBERS_OF = setmetatable({}, { __mode = "k" })
+function FAILED_READ_COUNT()
+  local n = 0
+  for _, c in pairs(FAILED_READS) do n = n + c end
+  return n
+end
+function FAILED_READ_NAMES()
+  local out = {}
+  for k, c in pairs(FAILED_READS) do out[#out + 1] = k .. "=" .. c end
+  table.sort(out)
+  return table.concat(out, ",")
+end
+local function failedRead(what)
+  FAILED_READS[what] = (FAILED_READS[what] or 0) + 1
+  error("no member '" .. what .. "'", 2)
+end
 function NEW(typeName)
   local def = TYPES[typeName]
   local data = def.init()
@@ -77,7 +98,7 @@ function NEW(typeName)
   local obj
   obj = setmetatable({}, {
     __index = function(_, k)
-      if k == "__members" then return def.members end
+      if not member[k] or OPS.refuseRead == typeName .. "." .. tostring(k) then failedRead(typeName .. "." .. tostring(k)) end
       if OPS.engineArrays and typeName == "LineVehicleInfo" and k == "transportModes" then return arrayRead(data.transportModes) end
       -- (the savegame's line was made before the switch: its member is a plain table, handed out as it is)
       if OPS.engineArrays and OPS.copies ~= false and typeName == "Line" and k == "vehicleInfo" and DATA[data.vehicleInfo] then
@@ -93,15 +114,14 @@ function NEW(typeName)
         data.transportModes = arrayWrite(v)
         return
       end
-      -- the real engine (seen in every real game): Line.vehicleInfo is typed; a plain table is refused with this message
+      -- the real engine (seen in every real game): Line.vehicleInfo is typed; a plain table is refused with this message. An object
+      -- of its type is taken without a word and changes nothing: the engine derives the member itself (no base game script writes it,
+      -- the line manager sends a fresh api.type.Line.new() with only stops, customFilters and reservationPriority set; the owner's
+      -- live test of 0.2.0-pre5, 2026-10-18 22:11: every line edit "does not rebuild equal at Line.vehicleInfo.transportModes.9",
+      -- with no refusal of the write, which is what a write the engine drops reads back as)
       if OPS.realVehicleInfo and typeName == "Line" and k == "vehicleInfo" then
         if not OBJECTS[v] then error("bad argument #2 to '?' (const LineVehicleInfo expected, got no value)") end
-        if OPS.engineArrays and OPS.copies ~= false then
-          local c = NEW("LineVehicleInfo")
-          DATA[c].transportModes = arrayRead(DATA[v].transportModes)
-          v = c
-        end
-        data[k] = v
+        WRITES_VEHICLE_INFO = (WRITES_VEHICLE_INFO or 0) + 1
         return
       end
       if def.readonly and def.readonly[k] then error("member '" .. k .. "' is read only") end
@@ -109,20 +129,23 @@ function NEW(typeName)
       if OPS.refuse == k then error("cannot set " .. k) end   -- one that refuses it, not as "read only"
       data[k] = v
     end,
+    __len = function() failedRead(typeName .. ".#") end,
     __tostring = function() return "<" .. typeName .. ">" end,
   })
   OBJECTS[obj] = true
   DATA[obj] = data
+  MEMBERS_OF[obj] = def.members
   return obj
 end
 TYPES = {
   TransportVehicleConfig = { members = { "vehicles", "vehicleGroups", "muFileNames" },
     init = function() return { vehicles = {}, vehicleGroups = {}, muFileNames = {} } end },
-  TransportVehiclePart = { members = { "part", "purchaseTime", "maintenanceState", "autoLoadConfig" },
-    init = function() return { part = NEW("VehiclePart"), purchaseTime = 0, maintenanceState = 1, autoLoadConfig = {} } end },
+  -- the members of api/tealdef/api/type.d.tl (and what the friend test 2026-10-16 shipped from the real engine)
+  TransportVehiclePart = { members = { "part", "purchaseTime", "maintenanceChange", "maintenanceState", "autoLoadConfig" },
+    init = function() return { part = NEW("VehiclePart"), purchaseTime = 0, maintenanceChange = 0, maintenanceState = 1, autoLoadConfig = {} } end },
   VehiclePart = { members = { "modelId", "reversed", "compartment2loadConfig", "color" },
     init = function() return { modelId = 0, reversed = false, compartment2loadConfig = {} } end },
-  LoadConfig = { members = { "loadConfigIndex" }, init = function() return { loadConfigIndex = 0 } end },
+  LoadConfig = { members = { "loadConfigIndex", "cargoTypeId" }, init = function() return { loadConfigIndex = 0, cargoTypeId = -1 } end },
   Line = { members = { "stops", "customFilters", "reservationPriority", "vehicleInfo" }, readonly = { vehicleInfo = true },
     init = function() return { stops = {}, customFilters = false, reservationPriority = 1.0,
       vehicleInfo = OPS.realVehicleInfo and NEW("LineVehicleInfo") or { transportModes = { true } } } end },
@@ -136,8 +159,9 @@ TYPES = {
   StationTerminal = { members = { "station", "terminal" }, init = function() return { station = 0, terminal = 0 } end },
   Vec3f = { members = { "x", "y", "z" }, init = function() return { x = 0, y = 0, z = 0 } end },
   Date = { members = { "year", "month", "day" }, init = function() return { year = 1900, month = 1, day = 1 } end },
-  Modifiers = { members = { "noiseModifier", "pollutionModifier", "maxSpeedModifier" },
-    init = function() return { noiseModifier = 0, pollutionModifier = 0, maxSpeedModifier = 0 } end },
+  -- Engine.Component.TransportVehicle.Modifiers (api/tealdef/api/engine.d.tl), what makeVehicleSetModifiersCmd takes
+  Modifiers = { members = { "topSpeedScale", "noiseScale", "pollutionScale", "comfortScale" },
+    init = function() return { topSpeedScale = 1, noiseScale = 1, pollutionScale = 1, comfortScale = 1 } end },
   -- a line stop's waypoints as the game's typed definition has them (api/tealdef/api/type.d.tl Waypoint, EdgePos, EdgeId): a waypoint
   -- on a street or track is an EdgePos (edge `index` of the TransportNetwork entity `entity`, `param` along it), one of a ship a pos
   Waypoint = { members = { "edgePos", "pos", "tag" }, init = function() return { edgePos = NEW("EdgePos"), pos = NEW("Vec3f"), tag = 0 } end },
@@ -279,6 +303,13 @@ function MAKE_API()
     return base_get(e, t)
   end
   api.engine.util.getPlayer = function() return OPS.player end   -- the games' own player entities need not be the same
+  -- api.engine.util.transport.calcPositionAndDirection(eg, t) -> { position, direction } (api/tealdef/api/engine/util.d.tl); the mock's
+  -- edge geometry is a straight line { a, b } (ROADS); NO_EDGE_PLACE (a test's) leaves it out, as on a game whose geometry cannot be read
+  api.engine.util.transport = { calcPositionAndDirection = function(g, t)
+    if NO_EDGE_PLACE then error("no geometry here") end
+    local a, b = g.a, g.b
+    return { { x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t, z = 0 }, { x = b.x - a.x, y = b.y - a.y, z = 0 } }
+  end }
   for _, n in ipairs({ "makeVehicleSellCmd", "makeVehicleReplaceCmd", "makeVehicleSendToDepotCmd", "makeVehicleReverseCmd",
       "makeVehicleSetStoppedByUserCmd", "makeVehicleTryToDepartCmd", "makeLineUpdateCmd", "makeLineDestroyCmd",
       "makeEntitySetNameCmd", "makeEntitySetColorCmd", "makeGameSetCalendarSpeedCmd", "makeGameSetDateCmd",
@@ -427,7 +458,7 @@ OPS_EXEC.makeVehicleSetModifiersCmd = function(a)
   if not isVehicle(a[1]) then return false, "no vehicle " .. tostring(a[1]) end
   local m = a[2]
   if not OBJECTS[m] then return false, "Modifiers expected, got " .. tostring(m) end
-  WORLD[a[1]].TRANSPORT_VEHICLE.state = string.format("MODIFIED_%g_%g_%g", m.noiseModifier, m.pollutionModifier, m.maxSpeedModifier)
+  WORLD[a[1]].TRANSPORT_VEHICLE.state = string.format("MODIFIED_%g_%g_%g_%g", m.topSpeedScale, m.noiseScale, m.pollutionScale, m.comfortScale)
   return true
 end
 OPS_EXEC.makeVehicleReverseCmd = function(a)
@@ -453,7 +484,9 @@ OPS_EXEC.makeLineCreateCmd = function(a)
     if not (WORLD[g] and WORLD[g].STATION_GROUP) then return false, "no station group " .. tostring(g) end
   end
   local created = newId()
-  WORLD[created] = { LINE = { stops = comp.stops, customFilters = comp.customFilters, reservationPriority = comp.reservationPriority, vehicleInfo = comp.vehicleInfo },
+  -- (a new line's vehicleInfo is the engine's own: it derives it, whatever the command's object holds)
+  WORLD[created] = { LINE = { stops = comp.stops, customFilters = comp.customFilters, reservationPriority = comp.reservationPriority,
+      vehicleInfo = OPS.realVehicleInfo and NEW("LineVehicleInfo") or comp.vehicleInfo },
     NAME = { name = a[1] }, COLOR = { color = a[2] } }
   return true, created, { resultEntity = created }
 end
@@ -465,8 +498,8 @@ OPS_EXEC.makeLineUpdateCmd = function(a)
     if not (WORLD[g] and WORLD[g].STATION_GROUP) then return false, "no station group " .. tostring(g) end
   end
   local l = WORLD[a[1]].LINE
+  -- (the line keeps its vehicleInfo: the engine derives it, an edit does not set it)
   l.stops, l.customFilters, l.reservationPriority = comp.stops, comp.customFilters, comp.reservationPriority
-  if OPS.realVehicleInfo then l.vehicleInfo = comp.vehicleInfo end   -- the edit's transport modes become the line's
   return true
 end
 OPS_EXEC.makeLineDestroyCmd = function(a)
@@ -592,7 +625,7 @@ local function sig(v, depth)
   if type(v) ~= "table" then return tostring(v) end
   if depth > 8 then return "..." end
   local keys, parts = {}, {}
-  local m = v.__members
+  local m = MEMBERS_OF[v]
   if m then for _, k in ipairs(m) do keys[#keys + 1] = k end else for k in pairs(v) do keys[#keys + 1] = k end end
   table.sort(keys, function(x, y) return tostring(x) < tostring(y) end)
   for _, k in ipairs(keys) do
@@ -660,16 +693,29 @@ end
 
 -- A street and a railway at entity ids from `base` up: built after the savegame, each game numbered them its own way. Nodes base+1 (0,0),
 -- base+2 (100,0), base+3 (200,0) and base+4 (0,50), base+5 (150,50); street segments base+11 (base+1 - base+2) and base+12 (base+2 -
--- base+3), a track segment base+13 (base+4 - base+5). Each is a TransportNetwork entity with its own edges (lanes).
-function ROADS(base)
+-- base+3), a track segment base+13 (base+4 - base+5). Each is a TransportNetwork entity with its own edges (lanes): a street's four
+-- lanes 6 and 2 m right of its node0 -> node1 line running that way, then 2 and 6 m left running back; the track's two edges on its line,
+-- one each way. `flip` (names): segments this game built from the other end (node0 and node1 swapped, and so are their edges).
+function ROADS(base, flip)
+  flip = flip or {}
   local function node(e, x, y, name)
     WORLD[e] = { BASE_NODE = { position = { x = x, y = y, z = 0 } }, TRANSPORT_NETWORK = { edges = { {}, {}, {}, {} } }, NAME = { name = name } }
   end
   local function seg(e, n0, n1, track, lanes, name)
+    if flip[name] then n0, n1 = n1, n0 end
     local p0, p1 = WORLD[n0].BASE_NODE.position, WORLD[n1].BASE_NODE.position
     local t = { x = p1.x - p0.x, y = p1.y - p0.y, z = 0 }
+    local l = math.sqrt(t.x * t.x + t.y * t.y)
+    local nx, ny = -t.y / l, t.x / l   -- left of node0 -> node1
+    local layout = track and { { 0, true }, { 0, false } } or { { -6, true }, { -2, true }, { 2, false }, { 6, false } }
     local edges = {}
-    for i = 1, lanes do edges[i] = {} end
+    for i = 1, lanes do
+      local o, fwd = layout[i][1], layout[i][2]
+      local a = { x = p0.x + nx * o, y = p0.y + ny * o, z = 0 }
+      local b = { x = p1.x + nx * o, y = p1.y + ny * o, z = 0 }
+      if not fwd then a, b = b, a end
+      edges[i] = { geometry = { a = a, b = b } }
+    end
     WORLD[e] = { BASE_EDGE = { node0 = n0, node1 = n1, tangent0 = t, tangent1 = t, track = track }, TRANSPORT_NETWORK = { edges = edges },
       NAME = { name = name } }
   end
@@ -737,7 +783,10 @@ class OpsBase(unittest.TestCase):
     def tearDown(self):
         if os.environ.get("FEVERLINK3_TEST_VERBOSE"):
             print("\n--- host mod.log ---\n" + self.A.log() + "\n--- client mod.log ---\n" + self.B.log())
+        # every test: the codecs read only what the engine objects have (a failed read costs the real game a crash dump)
+        failed = {g.label: str(g.L.eval("FAILED_READ_NAMES()")) for g in (self.A, self.B)}
         shutil.rmtree(self.tmp, ignore_errors=True)
+        self.assertEqual(failed, {self.A.label: "", self.B.label: ""}, "reads of members the engine objects do not have")
 
     def tick(self, n=1):
         for _ in range(n):
@@ -951,12 +1000,13 @@ class VehicleTest(OpsBase):
     def test_vehicle_modifiers_travel_as_an_engine_object(self):
         # makeVehicleSetModifiersCmd(vehicle, Engine.Component.TransportVehicle.Modifiers): read and rebuilt through the schema
         self.start()
+        # (its members as the typed definition has them: topSpeedScale, noiseScale, pollutionScale, comfortScale; api/tealdef/api/engine.d.tl)
         self.B.send_gui("local m = api.type.TransportVehicle.Modifiers.new()\n"
-                        "m.noiseModifier = 0.5; m.pollutionModifier = -0.25; m.maxSpeedModifier = 2\n"
+                        "m.topSpeedScale = 2; m.noiseScale = 0.5; m.pollutionScale = 0.75; m.comfortScale = 1.5\n"
                         "api.cmd.sendCommand(api.cmd.makeVehicleSetModifiersCmd(70, m))")
         self.settle()
         self.agree()
-        self.assertIn("state=MODIFIED_0.5_-0.25_2", self.A.snapshot(), "the receiver got a Modifiers object with the values")
+        self.assertIn("state=MODIFIED_2_0.5_0.75_1.5", self.A.snapshot(), "the receiver got a Modifiers object with the values")
         # fail closed: something that is no readable engine object
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetModifiersCmd(70, function() end))")
         self.settle()
@@ -1043,6 +1093,91 @@ class VehicleTest(OpsBase):
         self.assertIn("REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): argument 2: "
                       "cannot refer to entity 70 as a line", self.B.log())
         self.assertEqual(len(self.B.actions_shipped()), 1, "only the first command was shipped")
+
+
+class EngineReadTest(OpsBase):
+    """Bug #10 (the clone freeze): the window commands read engine objects only by the members their documented type has. MPFever
+    issue #21: every failed read on an engine object (a member the type lacks, e.g. `.w` or `__members` on a Vec3f colour) makes
+    the real game write a crash dump, ~0.1 s, inside pcall too; this PC's game wrote 66 dumps in each minute of the two clone
+    freezes of the friend test 2026-10-17. The mock's objects raise on such reads and count them (FAILED_READS)."""
+
+    def failed(self, g):
+        return int(g.L.eval("FAILED_READ_COUNT()")), str(g.L.eval("FAILED_READ_NAMES()"))
+
+    def test_a_clone_of_a_three_part_train_reads_no_member_its_type_lacks(self):
+        self.start()
+        # the window copies a vehicle: a configuration of three parts, each with its colour and load configurations
+        self.B.window(buy("CLONED", "%s, %s, %s" % (BUS_RED, BUS_BLUE, '{ model = "vehicle/truck.mdl", color = { 0, 0, 1 }, compartments = 3 }')))
+        self.settle()
+        self.agree("the copy is on both games")
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
+        self.assertIn("window command makeVehicleBuyCmd", self.B.log())
+        for g in (self.A, self.B):
+            self.assertEqual(self.failed(g), (0, ""), g.label)
+            self.assertNotIn("engine read failed", g.log())
+        body, _ = self.wire(self.B.actions_shipped()[0])
+        for member in ("maintenanceChange", "cargoTypeId", "autoLoadConfig", "muFileNames", "vehicleGroups"):
+            self.assertIn(member, body, "every documented member travels")
+        self.assertNotIn('"w"', body)
+
+    def test_a_line_create_and_update_with_waypoints_read_no_member_their_types_lack(self):
+        for g in (self.A, self.B):
+            g.L.execute("OPS.realVehicleInfo = true; OPS.engineArrays = true")
+        self.start()
+        self.B.window(LINE_2.replace("customFilters = true,", "customFilters = true, modes = { 0, 3 },").replace(
+            "{ group = 61, station = 0, terminal = 0 }", "{ group = 61, wps = { { pos = { 1, 2, 3 }, tag = 7 } } }"))
+        self.settle()
+        self.B.window(LINE_EDIT % "{ 0, 11 }")
+        self.settle()
+        self.agree()
+        self.assertEqual(self.A.count("LINE"), 2)
+        self.assertNotIn("modes=0,11", self.A.snapshot(), "the engine derives a line's modes: the window's never travel")
+        for g in (self.A, self.B):
+            self.assertEqual(self.failed(g), (0, ""), g.label)
+            self.assertNotIn("engine write failed", g.log())
+            self.assertEqual(g.L.eval("WRITES_VEHICLE_INFO or 0"), 0, "Line.vehicleInfo is never written")
+
+    def test_the_other_window_commands_read_no_member_their_types_lack(self):
+        self.start()
+        self.B.window(buy("BUY", BUS_RED))
+        self.settle()
+        v = int(self.B.L.eval("BUY[2]"))
+        self.B.window('api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(%d, "Bus 9"))\n'
+                      'api.cmd.sendCommand(api.cmd.makeEntitySetColorCmd(%d, api.type.Vec3f.new(0.1, 0.2, 0.3)))\n'
+                      'api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, 71, 1))\n'
+                      'api.cmd.sendCommand(api.cmd.makeVehicleReverseCmd(%d))\n'
+                      'api.cmd.sendCommand(api.cmd.makeVehicleSetStoppedByUserCmd(%d, true))\n'
+                      'local m = api.type.TransportVehicle.Modifiers.new(); m.topSpeedScale = 1.5\n'
+                      'api.cmd.sendCommand(api.cmd.makeVehicleSetModifiersCmd(%d, m))\n'
+                      'api.cmd.sendCommand(api.cmd.makeVehicleSendToDepotCmd(70, false, 55))\n'
+                      'api.cmd.sendCommand(api.cmd.makeGameSetDateCmd(api.type.Date.new(1930, 2, 3)))\n'
+                      'api.cmd.sendCommand(api.cmd.makeGameSetCalendarSpeedCmd(2000))\n'
+                      'api.cmd.sendCommand(api.cmd.makeTownSetDevelopmentActiveCmd(80, false))\n'
+                      'api.cmd.sendCommand(api.cmd.makeStockListDiscardCargoCmd(81, { 0, 1 }, 1.0))' % (v, v, v, v, v, v))
+        self.settle()
+        self.B.window("api.cmd.sendCommand(api.cmd.makeVehicleSellCmd({ %d }))" % v)
+        self.settle()
+        self.agree()
+        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 1)
+        self.assertNotIn("REFUSED", self.A.log() + self.B.log())
+        for g in (self.A, self.B):
+            self.assertEqual(self.failed(g), (0, ""), g.label)
+            self.assertNotIn("engine read failed", g.log())
+
+    def test_a_read_the_engine_refuses_is_counted_logged_and_keeps_the_command_unreplicated(self):
+        self.start()
+        # an engine whose colour refuses `z` (the typed definitions and the game would disagree): the purchase stays unreplicated, says
+        # which member, and the counter shows it
+        self.B.L.execute("OPS.refuseRead = 'Vec3f.z'")
+        self.B.window(buy("BAD", BUS_RED))
+        self.B.L.execute("OPS.refuseRead = nil")
+        self.settle()
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertIn("engine read failed: Vec3f.z (makeVehicleBuyCmd, 1 so far)", self.B.log())
+        self.assertIn("encode of makeVehicleBuyCmd: 1 engine access(es) failed", self.B.log())
+        self.assertEqual(self.failed(self.B)[1], "Vec3f.z=1")
+        self.B.L.execute("FAILED_READS = {}")   # (the tearDown check is for reads nobody asked for)
+        self.agree()
 
 
 LINE_2 = """local line = BUILD_LINE(api, { priority = 2.0, customFilters = true, stops = {
@@ -1150,30 +1285,34 @@ class LineTest(OpsBase):
         self.assertEqual(len(self.B.actions_shipped()), 1, "only the first line was shipped")
         self.assertIn("does not rebuild equal at Line.stops.1.loadMode (the engine refused: Line.stops[1].loadMode:", self.B.log())
 
-    def test_a_line_member_that_wants_an_engine_object_is_filled_in_place(self):
-        # the real engine takes Line.vehicleInfo only as a LineVehicleInfo; every real game logged the refusal and the
-        # transport modes the window had chosen never reached the other game unless they were the defaults
+    def test_a_line_made_with_transport_modes_gets_the_engines_own_on_both_games(self):
+        # Line.vehicleInfo is derived data (the engine's, DERIVED in the codec): the modes the window's object holds are neither
+        # shipped nor written, and each game's engine keeps its own, the same on both
         for g in (self.A, self.B):
             g.L.execute("OPS.realVehicleInfo = true")
         self.start()
         self.B.send_gui(LINE_2.replace("customFilters = true,", "customFilters = true, modes = { true, false, true },"))
         self.settle()
-        self.agree("the line carries the transport modes in both games")
+        self.agree("the line is the same in both games")
         self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2), "the line was created on both")
-        self.assertIn("modes=true,false,true", self.A.snapshot())
+        self.assertNotIn("modes=true,false,true", self.A.snapshot())
         self.assertNotIn("vehicleInfo", self.A.log() + self.B.log(), "no refused member to report")
+        body, _ = self.wire(self.B.actions_shipped()[0])
+        self.assertNotIn("vehicleInfo", body)
+        for g in (self.A, self.B):
+            self.assertEqual(g.L.eval("WRITES_VEHICLE_INFO or 0"), 0, g.label)
 
-    def test_read_only_members_are_left_to_the_engine_and_noted_once(self):
+    def test_a_derived_member_is_never_read_nor_shipped(self):
+        # (the plain mock calls Line.vehicleInfo read-only: the codec does not come near it, so there is nothing to note either)
         self.start()
         self.B.send_gui(LINE_2)
         self.settle()
         self.agree()
-        self.assertIn("read-only member 'vehicleInfo' of Line is left to the engine", self.B.log())
-        # once per Lua state (the window's dry run, the simulation's replay), not once per use
-        self.assertLessEqual(self.B.log().count("read-only member 'vehicleInfo'"), 2)
-        # the member is read and shipped like any other; the receiver skips what its engine will not let it set
+        self.assertNotIn("vehicleInfo", self.B.log())
         body, _ = self.wire(self.B.actions_shipped()[0])
-        self.assertIn("vehicleInfo", body)
+        self.assertNotIn("vehicleInfo", body)
+        self.assertIn("reservationPriority", body)
+        self.assertIn("customFilters", body)
 
 
 LINE_EDIT = ('api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, BUILD_LINE(api, { priority = 2.0, customFilters = true, stops = {\n'
@@ -1184,10 +1323,10 @@ LINE_EDIT = ('api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, BUILD_LINE(api, 
 
 class LineEditTest(OpsBase):
     """A line edit made in the line window (the UI hook's path), with the engine's real ways: Line.vehicleInfo is a typed
-    LineVehicleInfo the engine hands out as a copy, and its transportModes is a map keyed by api.type.enum.TransportMode (PERSON 0,
-    BUS 3, AIRCRAFT 9, SMALL_AIRCRAFT 11, ...). Friend test 2026-10-16: every line edit with a mode on came back "does not
-    rebuild equal at Line.vehicleInfo.transportModes.<that mode>", was applied on the editing game alone, and the resync that
-    followed erased it."""
+    LineVehicleInfo the engine hands out as a copy and derives itself (a write of one changes nothing), and its transportModes is a
+    map keyed by api.type.enum.TransportMode (PERSON 0, BUS 3, AIRCRAFT 9, SMALL_AIRCRAFT 11, ...). Friend test 2026-10-16 and the
+    owner's live test of 0.2.0-pre5 (2026-10-18): every line edit with a mode on came back "does not rebuild equal at
+    Line.vehicleInfo.transportModes.<that mode>". The member is derived data now: it neither travels nor is compared."""
 
     def setUp(self):
         super().setUp()
@@ -1205,13 +1344,15 @@ class LineEditTest(OpsBase):
 
     def test_a_line_edit_with_transport_modes_rebuilds_equal_and_reaches_both_games(self):
         self.start()
-        for modes, want in (("{ 0, 3 }", "0,3"), ("{ 0, 11 }", "0,11"), ("{ 0, 9, 15 }", "0,9,15"), ("{ 3 }", "3")):
+        line_modes = re.findall(r"line Line 1 .* (modes=\S*)", self.A.snapshot())
+        self.assertEqual(len(line_modes), 1)
+        for modes in ("{ 0, 3 }", "{ 0, 11 }", "{ 0, 9, 15 }", "{ 3 }"):
             self.B.window(LINE_EDIT % modes)
             self.settle()
             self.assertTrue(self.B.L.eval("EDITED == true"), modes)
             self.agree("the edit is on both games: " + modes)
-            self.assertIn("modes=" + want, self.A.snapshot(), modes)
-            self.assertIn("modes=" + want, self.B.snapshot(), modes)
+            # the window's copy of the modes is not what the line gets: its engine's own stays, the same on both games
+            self.assertEqual(re.findall(r"line Line 1 .* (modes=\S*)", self.A.snapshot()), line_modes, modes)
         self.assertNotIn("does not rebuild equal", self.B.log())
         self.assertNotIn("REFUSED", self.A.log() + self.B.log())
         self.assertEqual(self.B.log().count("window command makeLineUpdateCmd"), 4, "every edit was shipped")
@@ -1219,29 +1360,64 @@ class LineEditTest(OpsBase):
         self.assertEqual(self.A.snapshot().count("line=Line 1"), 3)
         self.assertIn("terminal=2", self.A.snapshot())
 
-    def test_the_transport_modes_travel_by_the_enums_names(self):
-        # the documented map ({TransportMode : boolean}) is shipped keyed by name, not by a number or a position
+    def test_edits_of_a_line_whose_engine_derived_modes_are_on_reach_both_games_with_identical_stops(self):
+        # The owner's live test of 0.2.0-pre5 (2026-10-18 22:11): the line window copies the line's component, whose vehicleInfo
+        # the engine derived (AIRCRAFT 9 on), and every edit was REFUSED with "does not rebuild equal at
+        # Line.vehicleInfo.transportModes.9": the rebuilt Line.new() kept the engine's own vehicleInfo. The member is derived data
+        # now: it neither travels nor is compared, and the stops, filters and priority still are, exactly.
+        self.start()
+        for g in (self.A, self.B):
+            # (the savegame was built before the switch to the engine's ways: the line gets its engine object here, AIRCRAFT on)
+            g.L.execute("local vi = NEW('LineVehicleInfo'); DATA[vi].transportModes[9] = true; DATA[WORLD[71].LINE].vehicleInfo = vi")
+        edit = ('api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, BUILD_LINE(api, { priority = 1.0, customFilters = %s, stops = {\n'
+                '    %s } , modes = { 9 } })), function(d, s) EDITED = s end)')
+        steps = (
+            ("false", "{ group = 58, mode = 2 }, { group = 61 }", ("loadMode=2",)),                         # a stop's load mode
+            ("true", "{ group = 58, mode = 2, load = { true, false }, maxLoad = { 1, 0 } }, { group = 61 }",  # a cargo filter
+             ("filters=true", "load={1=true,2=false}", "loadMode=2")),
+            ("true", "{ group = 58, mode = 2, load = { true, false }, maxLoad = { 1, 0 } }, { group = 61 }, "  # a stop added
+                     "{ group = 58, terminal = 2, min = 15 }", ("terminal=2", "minWaitingTime=15")),
+        )
+        for filters, stops, needles in steps:
+            self.B.L.execute("EDITED = nil")
+            self.B.window(edit % (filters, stops))
+            self.settle()
+            self.assertTrue(self.B.L.eval("EDITED == true"), stops)
+            self.agree("the edit is on both games: " + stops)
+            for needle in needles:
+                self.assertIn(needle, self.A.snapshot(), needle)
+                self.assertIn(needle, self.B.snapshot(), needle)
+            self.assertEqual(self.A.snapshot().count("modes=9"), 1, "the line keeps the modes its engine derived")
+        self.assertNotIn("does not rebuild equal", self.A.log() + self.B.log())
+        self.assertNotIn("REFUSED", self.A.log() + self.B.log())
+        self.assertEqual(len(self.B.actions_shipped()), 3, "every edit was shipped")
+        for shipped in self.B.actions_shipped():
+            body, _ = self.wire(shipped)
+            self.assertNotIn("vehicleInfo", body, "derived data never travels")
+            self.assertNotIn("transportModes", body)
+        # the decoded line's vehicleInfo is never written: the engine's own default stays (what the base game sends)
+        for g in (self.A, self.B):
+            self.assertEqual(g.L.eval("WRITES_VEHICLE_INFO or 0"), 0, g.label)
+
+    def test_the_transport_modes_never_travel(self):
+        # derived data: no mode map on the wire, by name or by number
         self.start()
         self.B.window(LINE_EDIT % "{ 0, 3 }")
         self.settle()
         self.agree()
         body, _ = self.wire(self.B.actions_shipped()[0])
-        self.assertIn("PERSON", body)
-        self.assertIn("BUS", body)
-        self.assertIn("modes=0,3", self.A.snapshot())
+        for word in ("PERSON", "BUS", "transportModes", "vehicleInfo"):
+            self.assertNotIn(word, body)
 
-    def test_a_mode_the_enum_does_not_name_refuses_the_edit(self):
-        # fail closed: a key that is no api.type.enum.TransportMode value here cannot be named for the other games
+    def test_a_mode_the_enum_does_not_name_in_the_windows_copy_does_not_matter(self):
+        # (it refused the edit while the modes travelled; the codec does not read them now)
         self.start()
-        before = self.B.snapshot()
-        # (the enum of the window's state and of the bridge's, each with an api of its own)
         self.B.window("api.type.enum.TransportMode.SMALL_AIRCRAFT = nil; if GUI_API then GUI_API.type.enum.TransportMode.SMALL_AIRCRAFT = nil end")
         self.B.window(LINE_EDIT % "{ 0, 11 }")
         self.settle()
-        self.assertTrue(self.B.L.eval("EDITED == false"))
-        self.assertEqual(self.B.snapshot(), before)
-        self.assertIn("transport mode key 11 is not a value of api.type.enum.TransportMode", self.B.log())
-        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertTrue(self.B.L.eval("EDITED == true"))
+        self.assertEqual(len(self.B.actions_shipped()), 1)
+        self.assertNotIn("transport mode key", self.B.log())
         self.agree()
 
     def test_a_line_created_in_the_bridges_state_with_modes_is_the_same_on_both_games(self):
@@ -1250,7 +1426,7 @@ class LineEditTest(OpsBase):
         self.settle()
         self.agree()
         self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
-        self.assertIn("modes=0,3", self.A.snapshot())
+        self.assertNotIn("modes=0,3", self.A.snapshot(), "a new line's modes are its engine's own")
 
     def test_a_line_edit_that_cannot_be_replicated_is_refused_on_the_editing_game_too_and_the_player_is_told(self):
         self.start()
@@ -1281,7 +1457,14 @@ class LineEditTest(OpsBase):
 
 
 class LineEditNoCopyTest(LineEditTest):
-    """The same with an engine that hands out Line.vehicleInfo itself rather than a copy."""
+    """The same with an engine that hands out Line.vehicleInfo itself rather than a copy. Only the edit itself reads vehicleInfo: the
+    refusals and the wire form take the same path with either engine shape and run once, in LineEditTest (the encoder reads the
+    edit's argument, not the engine's line)."""
+
+    test_the_transport_modes_travel_by_the_enums_names = None
+    test_a_mode_the_enum_does_not_name_refuses_the_edit = None
+    test_a_line_edit_that_cannot_be_replicated_is_refused_on_the_editing_game_too_and_the_player_is_told = None
+    test_an_encoder_that_raises_is_refused_not_passed_to_the_engine = None
 
     def setUp(self):
         super().setUp()
@@ -1376,6 +1559,50 @@ class WaypointTest(OpsBase):
         self.B.send_gui(WP_LINE % {"base": 400})
         self.settle()
         self.assertIn("stop 1 waypoint 1: network entity 311 has 2 edges here and 4 on the sending game", self.A.log())
+        self.assertEqual(self.A.count("LINE"), 1)
+
+    def test_a_waypoint_on_a_segment_built_the_other_way_round_takes_the_same_place_and_lane_there(self):
+        # The host built the street and the railway from the other end: node0 and node1 swapped, and so its lanes. The sender adds where
+        # the waypoint is (calcPositionAndDirection); the host takes the lane and param at that place, in that direction.
+        self.A.L.execute("ROADS(300, { ['Main Street West'] = true, ['Railway'] = true })")
+        self.start()
+        self.B.send_gui(WP_LINE % {"base": 400})
+        self.settle()
+        self.assertTrue(self.B.L.eval("MADE[1] == true"))
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
+        host, client = self.A.snapshot(), self.B.snapshot()
+        self.assertIn("entity=Main Street West,index=1},param=0.25", client)
+        self.assertIn("entity=Railway,index=0},param=0.75", client)
+        # the client's lane 1 (2 m right, west to east, a quarter from the west end) is the host's lane 2; the track's west-to-east
+        # edge is the host's edge 1, three quarters from the west end as on the client
+        self.assertIn("entity=Main Street West,index=2},param=0.25", host)
+        self.assertIn("entity=Railway,index=1},param=0.75", host)
+        self.assertIn("entity=Crossing,index=2},param=0", host, "a node waypoint is as it was")
+        self.assertNotIn("REFUSED", self.A.log() + self.B.log())
+
+    def test_a_waypoint_on_a_one_edge_track_built_the_other_way_round_takes_the_opposite_param_without_its_place(self):
+        # No position to go by (the sender could not read the geometry): a segment of one edge takes the opposite place, 1 - param
+        self.A.L.execute("ROADS(300, { ['Railway'] = true }); WORLD[313].TRANSPORT_NETWORK.edges = { WORLD[313].TRANSPORT_NETWORK.edges[1] }")
+        self.B.L.execute("WORLD[413].TRANSPORT_NETWORK.edges = { WORLD[413].TRANSPORT_NETWORK.edges[1] }")
+        for g in (self.A, self.B):
+            g.L.execute("NO_EDGE_PLACE = true")
+        self.start()
+        self.B.send_gui(WP_LINE % {"base": 400})
+        self.settle()
+        self.assertEqual(self.A.count("LINE"), 2)
+        self.assertIn("entity=Railway,index=0},param=0.25", self.A.snapshot())
+        self.assertIn("entity=Railway,index=0},param=0.75", self.B.snapshot())
+
+    def test_a_waypoint_on_a_street_built_the_other_way_round_is_refused_when_its_lane_cannot_be_told(self):
+        # several lanes and no position: guessing would put it on another lane, so the game refuses the command
+        self.A.L.execute("ROADS(300, { ['Main Street West'] = true })")
+        for g in (self.A, self.B):
+            g.L.execute("NO_EDGE_PLACE = true")
+        self.start()
+        self.B.send_gui(WP_LINE % {"base": 400})
+        self.settle()
+        self.assertIn("stop 1 waypoint 1: segment 311 runs the other way here and its 4 edges cannot be told apart without the waypoint's place",
+                      self.A.log())
         self.assertEqual(self.A.count("LINE"), 1)
 
     def test_a_waypoint_on_an_edge_its_network_does_not_have_is_refused_everywhere(self):
@@ -1633,10 +1860,32 @@ class WorldSettingsTest(OpsBase):
 CTX = "{ keyOf = function(e) return 's:' .. e end, plain = function(v) return v end }"
 
 
+class Engine:
+    """An engine object as the real game hands it out, seen from Lua as userdata: the members its type has, given here; a read of any
+    other name (`w`, `__members`, ...) or `#` raises and is recorded in Engine.failed ("<Type>.<member>")."""
+    failed = []
+
+    def __init__(self, type_name, **members):
+        object.__setattr__(self, "_type", type_name)
+        for k, v in members.items():
+            object.__setattr__(self, k, v)
+
+    def __getattr__(self, k):
+        if k.startswith("__") and k.endswith("__") and k != "__members":
+            raise AttributeError(k)   # (lupa's own protocol lookups, e.g. __getitem__, not the mod's)
+        Engine.failed.append("%s.%s" % (object.__getattribute__(self, "_type"), k))
+        raise AttributeError(k)
+
+    def __len__(self):
+        Engine.failed.append("%s.#" % object.__getattribute__(self, "_type"))
+        raise TypeError("no length")
+
+
 class ModuleTest(unittest.TestCase):
     """The module and the lockstep additions on their own, inside one mocked game (no session running)."""
 
     def setUp(self):
+        Engine.failed = []
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-ops-")
         self.G = OpsGame("solo", 0, self.tmp, 50000, 0, 7)
         self.L = self.G.L
@@ -1655,20 +1904,42 @@ class ModuleTest(unittest.TestCase):
         t = marshal(self.L.eval("{ a = 1, b = { 2, 3 }, c = 'x', d = true }"))
         self.assertEqual((t["a"], t["b"][1], t["b"][2], t["c"], t["d"]), (1, 2, 3, "x", True))
         cfg = self.L.eval("BUILD_CONFIG(GUI_API, { purchaseTime = 7, parts = { { model = 'vehicle/truck.mdl', color = { 1, 0, 0 } } } })")
-        t = marshal(cfg)
+        t = marshal(cfg, "TransportVehicleConfig")
         self.assertEqual(t["vehicles"][1]["purchaseTime"], 7)
         self.assertEqual(t["vehicles"][1]["part"]["color"]["x"], 1)
         self.assertEqual(t["vehicles"][1]["part"]["modelId"], 103)
 
-        class Vector:   # what the game hands out for a vector is userdata: x, y, z, no member list
-            x, y, z = 1.5, 2.5, 3.5
+        # what the game hands out for a vector is userdata: x, y, z (type.d.tl Vec3f), and nothing else may be asked of it
+        t = marshal(Engine("Vec3f", x=1.5, y=2.5, z=3.5), "Vec3f")
+        self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
+        self.assertEqual(Engine.failed, [], "no w, no __members, no #")
+        # an engine object where a plain value belongs is refused, not probed
+        self.assertIn("without its documented type", marshal(Engine("Vec3f", x=1, y=2, z=3))[1])
+        self.assertEqual(Engine.failed, [])
 
-        t = marshal(Vector())
-        self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
-        listed = Vector()   # a member list that is empty (or that cannot be counted) does not hide the coordinates
-        setattr(listed, "__members", [])
-        t = marshal(listed)
-        self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
+    def test_a_clone_of_engine_userdata_reads_only_documented_members(self):
+        # the window's copy of a three-part train as the real engine hands it out: userdata with the members of type.d.tl, which raise
+        # (and are counted) for anything else; lists are Lua tables ({T} in the typed definitions)
+        tbl = self.L.table_from
+
+        def part(model, color, compartments):
+            vp = Engine("VehiclePart", modelId=model, reversed=False, color=Engine("Vec3f", x=color[0], y=color[1], z=color[2]),
+                        compartment2loadConfig=tbl([Engine("LoadConfig", loadConfigIndex=i, cargoTypeId=-1) for i in range(compartments)]))
+            return Engine("TransportVehiclePart", part=vp, purchaseTime=18000, maintenanceChange=0, maintenanceState=1,
+                          autoLoadConfig=tbl([True] * compartments))
+
+        cfg = Engine("TransportVehicleConfig", vehicles=tbl([part(101, (0.9, 0.1, 0.1), 2), part(102, (-1, -1, -1), 1), part(103, (0, 0, 1), 3)]),
+                     vehicleGroups=tbl([1, 1, 1]), muFileNames=tbl([]))
+        spec = self.ops.commands.makeVehicleBuyCmd
+        body = spec.encode("makeVehicleBuyCmd", self.L.eval("function(c) return { n = 3, 7, 55, c } end")(cfg), self.L.eval(CTX))
+        self.assertEqual(Engine.failed, [], "no read of a member the engine objects do not have")
+        self.assertEqual(int(self.L.eval("FAILED_READ_COUNT()")), 0, "nor in the dry run's rebuilt objects")
+        self.assertEqual(self.ops.counters.engineFailed, 0)
+        vs = body.args[3].vehicles
+        self.assertEqual([vs[i].part.modelName for i in (1, 2, 3)], ["vehicle/bus_red.mdl", "vehicle/bus_blue.mdl", "vehicle/truck.mdl"])
+        self.assertEqual((vs[3].part.color.x, vs[3].part.color.z, vs[3].part.color.w), (0, 1, None))
+        self.assertEqual((vs[1].maintenanceChange, vs[3].part.compartment2loadConfig[3].cargoTypeId, vs[3].autoLoadConfig[3]), (0, -1, True))
+        self.assertEqual(sorted(str(k) for k in vs[2].keys()), ["autoLoadConfig", "maintenanceChange", "maintenanceState", "part", "purchaseTime"])
 
     def test_model_find_takes_id_0_and_refuses_only_minus_1(self):
         # ResTypeRep.find: "the id of the resource, -1 if the resource doesn't exist" (tf3-docs api/res): 0 is a real model id
@@ -1689,19 +1960,29 @@ class ModuleTest(unittest.TestCase):
 
         self.assertEqual(marshal(Opaque())[0], None)
         self.assertIn("cannot read", marshal(Opaque())[1])
+        # an object that refuses a documented member: refused with the member's name (counted and logged as an engine read failure)
+        self.assertIn("x: the engine refused the read", marshal(Engine("Vec3f"), "Vec3f")[1])
+        self.assertEqual(Engine.failed, ["Vec3f.x"])
         self.assertEqual(marshal(self.L.eval("{ f = print }")), (None, "f: a function cannot be replicated"))
         self.assertIn("keyed by a boolean", marshal(self.L.eval("{ [true] = 1 }"))[1])
         self.assertIn("too deep", marshal(self.L.eval("(function() local t = {} t.t = t return t end)()"))[1])
 
     def test_rebuild_makes_an_equal_object_skips_read_only_members_and_names_a_failing_one(self):
         I = self.ops.internals
-        tree = I.marshal(self.L.eval("BUILD_LINE(GUI_API, { priority = 2.5, stops = { { group = 58, min = 9, alt = { { 1, 2 } } } } })"))
+        tree = I.marshal(self.L.eval("BUILD_LINE(GUI_API, { priority = 2.5, stops = { { group = 58, min = 9, alt = { { 1, 2 } } } } })"), "Line")
         skipped = self.L.table()
         obj = I.rebuild("Line", tree, "Line", skipped)
         self.assertEqual(str(self.L.eval("tostring")(obj)), "<Line>", "an engine object, not the plain table")
-        again = I.marshal(obj)
+        again = I.marshal(obj, "Line")
         self.assertIs(I.contained(tree, again, "Line", skipped), True)
-        self.assertTrue(skipped["vehicleInfo"], "the derived member was skipped, not set")
+        self.assertIsNone(tree["vehicleInfo"], "the derived member is not read")
+        # a body that still carries it (an older sender): skipped, never written, never compared, not a failure
+        old = self.L.eval("{ stops = {}, reservationPriority = 1, vehicleInfo = { transportModes = { [9] = true } } }")
+        skipped, failed = self.L.table(), self.L.table()
+        obj = I.rebuild("Line", old, "Line", skipped, failed)
+        self.assertTrue(skipped["vehicleInfo"])
+        self.assertIsNone(failed["vehicleInfo"])
+        self.assertIs(I.contained(old, I.marshal(obj, "Line"), "Line", skipped), True)
         # a member the object does not have is an error that names the path
         bad = self.L.eval("{ stops = { { stationGroup = 58, nonsense = 1 } } }")
         failed = self.L.table()
@@ -1870,11 +2151,17 @@ class ModuleTest(unittest.TestCase):
                                       "{ __ref = 'entity', key = 's:81', f = 'industry/coal.con', p = { x = {} } } } } }"), dctx)
         self.assertEqual(out[0], None)
         self.assertIn("failed", out[1])
-        # and an encode that raises answers "native" instead of throwing into the window
+        # and an object that is none answers "native" with the reason instead of throwing into the window (it is read by its documented
+        # members only, so its __pairs is never called)
         weird = self.L.eval("{ n = 3, 7, 55, setmetatable({}, { __pairs = function() error('boom') end }) }")
         out = buy.encode("makeVehicleBuyCmd", weird, self.L.eval(CTX))
         self.assertEqual(out[0], None)
-        self.assertIn("encode failed", out[1])
+        self.assertIn("argument 3: not a TransportVehicleConfig (none of its members is there", out[1])
+        # one whose read raises: the same, never thrown
+        raising = self.L.eval("{ n = 3, 7, 55, setmetatable({}, { __index = function() error('boom') end }) }")
+        out = buy.encode("makeVehicleBuyCmd", raising, self.L.eval(CTX))
+        self.assertEqual(out[0], None)
+        self.assertIn("argument 3: muFileNames: the engine refused the read", out[1])
 
     def test_a_date_is_read_by_its_fields(self):
         class Date:   # userdata with no member list: the game's calendar widget reads year, month and day

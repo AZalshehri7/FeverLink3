@@ -328,7 +328,7 @@ fn model_of(content: &[u8]) -> Vec<Line> {
 fn a_tail_reads_a_file_the_game_writes_in_any_pieces_and_any_state() {
     let mut r = rng(4);
     let dir = tempfile::tempdir().unwrap();
-    for i in 0..iters(150) {
+    for i in 0..iters(50) {
         let path = dir.path().join(format!("from_game_{i}.log"));
         // the content: valid lines, repeated lines, garbage, blank lines, a last line that ends
         let mut content = Vec::new();

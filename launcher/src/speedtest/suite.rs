@@ -513,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "full set: waits out the peer start window, 5 s (cargo test -- --include-ignored)"]
     fn the_peer_may_start_late_within_the_waiting_time() {
         let (a, b) = (FakeMachine::new(), FakeMachine::new());
         let (core_a, core_b) = (a.core(), b.core());

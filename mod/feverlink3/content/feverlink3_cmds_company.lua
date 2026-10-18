@@ -912,8 +912,16 @@ function Co.extendEngine(engine, deps)
 		if engine.account then engine.account = canonical(engine.account) end
 		if engine.bookJournal then engine.bookJournal = canonical(engine.bookJournal) end
 	end
+	-- Only a line that still exists is read (nil otherwise): a registry entry outlives its line, and its key stays bound to the
+	-- line's old entity id, which is gone or reused by something else. calculateBalance on such an id cost the interface frame
+	-- 450-610 ms by itself, once for every line deleted, every pass (friend test 2026-10-18: the first slow companies= frame came
+	-- in the same second as the first makeLineDestroyCmd, a second one per pass from the second deletion on; the lines alive, old
+	-- and new, cost nothing measurable). entityExists and the LINE component are cheap reads.
 	if engine.lineResult == nil then
-		engine.lineResult = function(entity, from, to) return api.engine.util.finance.calculateBalance({ entity }, from, to, true) end
+		engine.lineResult = function(entity, from, to)
+			if not (api.engine.entityExists(entity) and api.engine.getComponent(entity, api.type.ComponentType.LINE)) then return nil end
+			return api.engine.util.finance.calculateBalance({ entity }, from, to, true)
+		end
 	end
 	if engine.monthLength == nil then
 		engine.monthLength = function() return api.util.getDefaultMonthDuration() end

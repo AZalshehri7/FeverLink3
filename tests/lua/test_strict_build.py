@@ -108,8 +108,7 @@ class FakeNative:
         for kind, payload in self.outbox:
             text += self.C.formatLine(kind, "native", self.C.serialize(self.lua(payload)))
         self.outbox = []
-        with open(self.events, "a", encoding="utf-8", newline="") as f:
-            f.write(text)
+        T.fastio.CACHE.append(self.events, text.encode("utf-8"))
 
     def ctl_slots(self):
         """The control files there now as (writer, path), as the module finds them (docs/NATIVE_LINK.md section 3): every writer
@@ -154,14 +153,13 @@ class FakeNative:
 
     def read_ctl_file(self, path):
         """One writer's file, by position: complete lines only, nothing dropped for what it says."""
-        if not os.path.exists(path):
+        data = T.fastio.CACHE.read(path)
+        if data is None:
             return
         pos = self.ctl_pos.setdefault(path, [0, ""])
-        if os.path.getsize(path) < pos[0]:
+        if len(data) < pos[0]:
             pos[0], pos[1] = 0, ""   # shorter: another file, read from its first byte
-        with open(path, "rb") as f:
-            f.seek(pos[0])
-            chunk = f.read()
+        chunk = data[pos[0]:]
         pos[0] += len(chunk)
         text = pos[1] + chunk.decode("utf-8")
         *lines, pos[1] = text.split("\n")
@@ -334,6 +332,11 @@ function TOOL_MAKE(spec, make)
   return #TOOLS
 end
 function TOOL_EVENT(i)
+  -- like the game: an interface state that subscribed to nothing gets no tool event (owner test 2026-10-18: the failed subscription by
+  -- name left the interface half without builder events, and every build went the release-at-the-click path)
+  -- the script's one subscription is made in the simulation state (SUBS): once it subscribed by name, an event outside the names is not
+  -- delivered to guiHandleEvent either (0.2.0-pre3 to pre5 subscribed the simulation half to its own names: 0 builds captured in real play)
+  if (SUBS.all or SUBS.any) and not (SUBS.all or SUBS.names["builder.proposalCreate"]) then return end
   GUI.guiHandleEvent(nil, STATE, GSTATE, 0, "streetBuilder", "builder.proposalCreate", { TOOLS[i].p, {}, nil })
 end
 function TOOL_ADD(i, site)
@@ -1264,23 +1267,6 @@ class StrictCancelFallbackTest(StrictTest):
         self.assertEqual(self.relay.vetoes, [], "the originator replays it itself: nothing to cancel, the refusal at the stamp is the old one")
 
 
-class DefaultHoldAndReleaseTest(StrictTest):
-    """FEVERLINK3_STRICT_CANCEL unset: every build, host's or guest's, is held and released (the tool gets its callback and keeps its
-    ghost); nothing is cancelled."""
-
-    strict_cancel = None
-
-    def test_a_road_build_of_either_game_is_held_and_released_by_default(self):
-        self.start()
-        self.A.tool(SPLIT, make="NATIVE_SPLIT")
-        self.tick(24)
-        self.assertEqual((self.A.native.released, self.A.native.dropped), ([1], []))
-        self.B.tool(self.road(300, 0, 400, 0))
-        self.tick(24)
-        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
-        self.assertNotIn("cancel flow", self.log())
-
-
 class DefaultDemolitionTest(StrictTest):
     """Nothing set: the defaults since 2026-10-13 (FEVERLINK3_STRICT_CANCEL=removals, FEVERLINK3_STRICT_FIRE_DONE on). A demolition is cancelled
     and replayed at the stamp by every game (real two-window run: 11 of 11 left the checksums identical and the bulldozer usable); roads are
@@ -1372,18 +1358,6 @@ class CancelFlowHostOnlyTest(StrictTest):
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(24)
         self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
-        self.assertSameWorld()
-
-
-class HoldAndReleaseSwitchTest(StrictTest):
-    """FEVERLINK3_STRICT_CANCEL=0: the developer switch back to hold-and-release for every kind."""
-
-    def test_the_originator_releases_its_own_command(self):
-        self.start()
-        self.B.tool(SPLIT, make="NATIVE_SPLIT")
-        self.tick(16)
-        self.assertEqual(self.B.native.released, [1])
-        self.assertEqual(self.B.native.dropped, [])
         self.assertSameWorld()
 
 

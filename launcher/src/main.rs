@@ -138,7 +138,13 @@ fn print_status(s: &Status) {
         println!(
             "last sync: round {}, {}",
             sync.n,
-            if sync.identical() { "identical".into() } else { sync.differing.join(", ") }
+            if !sync.compared {
+                "not compared (different sim times)".into()
+            } else if sync.identical() {
+                "identical".into()
+            } else {
+                sync.differing.join(", ")
+            }
         );
     }
     println!("actions relayed {}, refused {}", s.actions_relayed, s.dropped);

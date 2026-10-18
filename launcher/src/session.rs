@@ -169,11 +169,15 @@ pub struct SyncResult {
     pub reporters: Vec<u16>,
     /// Parts whose hashes differed between games; empty when the world is identical everywhere.
     pub differing: Vec<String>,
+    /// False when the games hashed at different sim times: nothing was compared (`differing` is empty, the world is unknown).
+    pub compared: bool,
 }
 
 impl SyncResult {
+    /// Compared and no part differed. A round that was not compared is never identical (owner's live test 2026-10-18: skewed rounds
+    /// were logged as "identical" while no desync could be seen).
     pub fn identical(&self) -> bool {
-        self.differing.is_empty()
+        self.compared && self.differing.is_empty()
     }
 
     fn from_outcome(o: &ChecksumOutcome) -> SyncResult {
@@ -182,6 +186,23 @@ impl SyncResult {
             time: o.time,
             reporters: o.reporters.clone(),
             differing: o.differing_parts().map(str::to_owned).collect(),
+            compared: o.comparable(),
+        }
+    }
+
+    /// The session log's line for a completed round (`unknown`: the parts not measured, already worded).
+    fn log_line(&self, o: &ChecksumOutcome, unknown: &str) -> String {
+        if let Some(skew) = o.time_skew.as_ref().filter(|_| !self.compared) {
+            let times: Vec<String> = skew.iter().map(|(id, t)| format!("{id} at t={t}")).collect();
+            format!("checksum {} NOT COMPARED: the games hashed at different sim times ({})", self.n, times.join(", "))
+        } else if self.identical() {
+            format!("checksum {} identical across {} game(s){unknown}", self.n, self.reporters.len())
+        } else {
+            format!(
+                "checksum {} differs in {}{unknown}",
+                self.n,
+                ChecksumPolicy::describe_parts(self.differing.iter().map(String::as_str))
+            )
         }
     }
 }
@@ -721,15 +742,7 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
                 } else {
                     format!("; not ready (not compared): {}", outcome.describe_not_ready())
                 };
-                shared.log(if result.identical() {
-                    format!("checksum {} identical across {} game(s){unknown}", result.n, result.reporters.len())
-                } else {
-                    format!(
-                        "checksum {} differs in {}{unknown}",
-                        result.n,
-                        ChecksumPolicy::describe_parts(result.differing.iter().map(String::as_str))
-                    )
-                });
+                shared.log(result.log_line(&outcome, &unknown));
                 shared.update(|s| s.last_sync = Some(result));
             }
             HostOutput::Log(text) => shared.log(text),
@@ -1255,6 +1268,29 @@ impl Retry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner's live test 2026-10-18: a round the games hashed at different sim times was logged "identical".
+    #[test]
+    fn a_round_hashed_at_different_times_is_logged_as_not_compared_never_identical() {
+        use feverlink3_core::session::messages::ChecksumReportMessage;
+        use std::collections::BTreeMap;
+        let parts: BTreeMap<String, String> = [("money".to_owned(), "1".to_owned())].into_iter().collect();
+        let report = |t: i64| ChecksumReportMessage::new(20, t, parts.clone());
+        let skewed: BTreeMap<u16, ChecksumReportMessage> =
+            [(0, report(13427600)), (1, report(13427800))].into_iter().collect();
+        let o = feverlink3_core::session::ChecksumRounds::compare(20, &skewed);
+        let r = SyncResult::from_outcome(&o);
+        assert!(!r.compared && !r.identical());
+        assert_eq!(
+            "checksum 20 NOT COMPARED: the games hashed at different sim times (0 at t=13427600, 1 at t=13427800)",
+            r.log_line(&o, "")
+        );
+        let same: BTreeMap<u16, ChecksumReportMessage> = [(0, report(5)), (1, report(5))].into_iter().collect();
+        let o = feverlink3_core::session::ChecksumRounds::compare(20, &same);
+        let r = SyncResult::from_outcome(&o);
+        assert!(r.identical());
+        assert_eq!("checksum 20 identical across 2 game(s)", r.log_line(&o, ""));
+    }
 
     #[test]
     fn the_table_is_consistent() {

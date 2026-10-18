@@ -59,9 +59,9 @@ os.clock = function() return FAKE_CLOCK end
 def lead_for_measured(speed, rtt_ms, gap_ms):
     """core/src/session/lockstep.rs Lockstep::lead_for_measured, in Python (the relay plays the host)."""
     per_second = 6.0 * max(speed, 1)
-    excess = min(max(gap_ms - 1000.0 / per_second, 0.0), 500.0)
+    excess = min(max(gap_ms - 1000.0 / 6.0, 0.0), 500.0)   # over one engine batch's real time (BATCH_SECONDS)
     seconds = rtt_ms / 2000.0 + 0.06 + excess / 1000.0
-    steps = math.ceil(seconds * per_second) + 2
+    steps = math.ceil(seconds * per_second) + 1 + min(max(speed, 1), 4)   # the hand-off step and one batch of `speed` steps
     return STEP * min(max(steps, 3), 24)
 
 
@@ -136,6 +136,7 @@ def link(rtt_ms):
 class CadenceTest(B.BarrierTest):
     # the harness of the barrier tests, not their tests (they run in test_input_barrier.py, on the real clock)
     test_two_games_with_jitter_never_apply_late = None
+    test_two_games_with_jitter_never_apply_late_at_more_seeds = None
     test_three_games_with_jitter_never_apply_late = None
     test_pauses_and_resumes_with_jitter_never_apply_late = None
     test_without_the_promises_the_same_network_applies_late = None
@@ -174,6 +175,7 @@ class CadenceTest(B.BarrierTest):
             local key = "0:" .. (9000 + i)
             G.co.made[key] = { kind = "LINE", by = 0 }
             G.bind[key] = 70000 + i
+            WORLD[70000 + i] = { LINE = { stops = {} } }
           end
           READS, FRAME_READS = 0, 0
           GUI_API.engine.util.finance = { calculateBalance = function(list, a, b)
@@ -207,6 +209,59 @@ class CadenceTest(B.BarrierTest):
         for _ in range(9):
             host.frame()
         self.assertGreater(int(host.L.eval("READS")), before, "a pass every few seconds")
+
+    def test_the_company_page_never_stalls_a_frame_on_a_deleted_or_slow_line(self):
+        # The pre5 friend test (2026-10-18): companies= 450-610 ms in one frame, once per pass for every deleted line. A late-game
+        # registry here: 40 live lines (0.2 ms a read), 6 deleted ones whose keys stay bound to their old entity (2 of those ids reused by
+        # a vehicle), every engine read of an entity that is no line costs 550 ms like in the log, and one live line whose read is slow
+        # by itself (500 ms). Over many passes no frame spends more than a few ms on the page, apart from the one read of the slow line.
+        self.make(2, 3, lambda rng, dest: 1)
+        self.start(speed=1)
+        host = self.games[0]
+        host.L.execute(r'''
+          local G = FIND_UP("G")
+          LIVE_SUM = 0
+          for i = 1, 40 do
+            local key = "0:" .. (8000 + i)
+            G.co.made[key] = { kind = "LINE", by = 0 }
+            G.bind[key] = 60000 + i
+            WORLD[60000 + i] = { LINE = { stops = {} } }
+            if i ~= 7 then LIVE_SUM = LIVE_SUM + i end
+          end
+          for i = 1, 6 do
+            local key = "1:" .. (8100 + i)
+            G.co.made[key] = { kind = "LINE", by = 0 }
+            G.bind[key] = 61000 + i
+            if i <= 2 then WORLD[61000 + i] = { TRANSPORT_VEHICLE = {} } end
+          end
+          SLOW_LINE, PAGE_COST, BAD_READS, SLOW_READS = 60007, 0, 0, 0
+          GUI_API.engine.util.finance = { calculateBalance = function(list, a, b)
+            local e = list[1]
+            local cost = 0.0002
+            if not (WORLD[e] and WORLD[e].LINE) then cost, BAD_READS = 0.55, BAD_READS + 1
+            elseif e == SLOW_LINE then cost, SLOW_READS = 0.5, SLOW_READS + 1 end
+            FAKE_CLOCK = FAKE_CLOCK + cost
+            PAGE_COST = PAGE_COST + cost
+            return e - 60000
+          end }
+        ''')
+        costs = []
+        for _ in range(4000):
+            host.L.execute("PAGE_COST = 0")
+            host.frame()
+            costs.append(float(host.L.eval("PAGE_COST")))
+            host.L.execute("FAKE_CLOCK = FAKE_CLOCK + 0.016")
+            if int(host.L.eval("FIND_UP('X').coPage and FIND_UP('X').coPage.pass or 0")) >= 6:
+                break
+        self.assertGreaterEqual(int(host.L.eval("FIND_UP('X').coPage.pass")), 6, "six passes ran")
+        self.assertEqual(int(host.L.eval("BAD_READS")), 0, "the entity of a deleted line is never read")
+        self.assertEqual(int(host.L.eval("SLOW_READS")), 1, "a line whose one read is slow is read once, not every pass")
+        over = [c for c in costs if c > 0.003]
+        self.assertEqual(len(over), 1, "one frame paid the slow line's read, no other frame more than 3 ms: %s" % over)
+        self.assertLessEqual(max(c for c in costs if c != over[0]), 0.003)
+        self.assertIn("(entity 60007) took 500 ms in one engine call", host.log())
+        text = T.read_text(os.path.join(host.dir, "companies.txt")).replace(" ", "")
+        self.assertIn('["earned"]=%d' % (int(host.L.eval("LIVE_SUM")) + 7), text, "every live line counted (the slow one with the result it had)")
 
     # ---- the clock line of a game that stands still: a real-time cadence
 
@@ -267,8 +322,15 @@ class CadenceTest(B.BarrierTest):
         # The barrier runs of test_input_barrier.py with the interface's real-time clock moving with the game: these seeds breached the
         # barrier before (an action of the pause stamped after the resume behind the step every game had run on to; a later one behind
         # the run-on of an earlier one stamped after the resume; seed 29: two actions of one flush read in different frames, the first
-        # one's run-on passing the second's stamp, until the flush carried its batch marker, pauseUpto), and a sweep of further seeds.
-        for seed in (22, 29, 31, 33, 35) + tuple(range(36, 48)):
+        # one's run-on passing the second's stamp, until the flush carried its batch marker, pauseUpto). Seeds 22 and 29 by default (the
+        # first breach and the pauseUpto one); 31, 33, 35 and a sweep of further seeds in the full set (the next test).
+        for seed in (22, 29):
+            with self.subTest(seed=seed):
+                self.random_run(2, seed, 280, lead_choices=[1, 3], speeds=[1, 2, 4], pauses=True)
+
+    @T.full
+    def test_actions_of_a_pause_stamped_after_the_resume_never_land_behind_a_game_over_a_sweep_of_seeds(self):
+        for seed in (31, 33, 35) + tuple(range(36, 48)):
             with self.subTest(seed=seed):
                 self.random_run(2, seed, 280, lead_choices=[1, 3], speeds=[1, 2, 4], pauses=True)
 
@@ -292,8 +354,15 @@ class CadenceTest(B.BarrierTest):
         self.assert_no_late_and_same(issued)
         return self.relay.leads
 
-    def test_the_adaptive_lead_converges_and_never_applies_late_over_30_150_and_300_ms(self):
-        for rtt, seed in ((30, 31), (150, 32), (300, 33)):
+    def test_the_adaptive_lead_converges_and_never_applies_late_over_150_ms(self):
+        self.check_adaptive(((150, 32),))
+
+    @T.full
+    def test_the_adaptive_lead_converges_and_never_applies_late_over_30_and_300_ms(self):
+        self.check_adaptive(((30, 31), (300, 33)))
+
+    def check_adaptive(self, links):
+        for rtt, seed in links:
             with self.subTest(rtt=rtt):
                 leads = self.adaptive_run(rtt, seed, speeds=[1, 2, 4])
                 for lead in leads:

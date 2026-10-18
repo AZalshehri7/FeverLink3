@@ -603,8 +603,9 @@ end
 -- the heavy lanes, the companies digest and the account are taken now. `it` is the queue item ({ n, full, paused, spread }); a spread
 -- round (it.spread > 0, full, not paused) reads its heavy lanes a chunk at a time with X.csStep, every other round at once (checksumParts).
 -- `light` (the round asked for no heavy lanes): constructions, edges, node settings and town buildings are not read.
+function X.csClock() local ok, v = pcall(C.clock); return ok and tonumber(v) or 0 end
 function X.csBegin(co, where, it)
-	local function clock() local ok, v = pcall(C.clock); return ok and tonumber(v) or 0 end
+	local clock = X.csClock
 	local w0 = clock()
 	local light = it.full == false
 	-- each key is hashed as it is read (C.fnv1a of the key itself): a lane is the sum of its keys' hashes, so no step sorts or rehashes it
@@ -630,8 +631,9 @@ function X.csBegin(co, where, it)
 end
 
 -- The next chunk of a spread round, when its step has come: chunk k is read at exactly start + k * spread steps on every game (each is
--- a landing mark the interface half set, L.checksumMarks). A chunk read later than its step (a batch that did not land on its mark) is
--- counted: the round then reports another time than the games that read it on time, and the host does not compare it (time_skew).
+-- a landing mark the interface half set, L.checksumMarks). A chunk read later than its step (a batch that did not land on its mark, a
+-- step the script did not run at) is counted: the round then reports another time than the games that read it on time, and the host
+-- does not compare it (time_skew; X.csLateNote makes a run of them loud). Catching up reads one chunk a step, never more (the budget).
 -- True once the round is complete.
 function X.csStep(r, now)
 	if r.done then return true end
@@ -639,6 +641,7 @@ function X.csStep(r, now)
 	if now < at then return false end
 	if now > at then r.slip, r.late = r.slip + (now - at), r.late + 1 end
 	L.checksumRoundStep(r)
+	r.mine = (r.mine or 0) + 1   -- the chunks this Lua state read (its itemised keys: DETAIL)
 	local s, read = 0, {}
 	for name, v in pairs(r.frame) do s = s + v; read[#read + 1] = string.format("%s %.1f", name, v * 1000) end
 	table.sort(read)
@@ -649,32 +652,105 @@ function X.csStep(r, now)
 	return r.done
 end
 
--- The simulation half's spread rounds (`holder.csRounds`, the SIM table), each step before the step's items are applied: every round whose
--- chunk is due reads it; a complete one is stored as a report. A round of a session that ended is dropped. Never raises: the step's
--- actions are applied whatever happens here. Returns the number of the last round stored, or nil.
+-- What the bridge adds to a round's progress (L.checksumRoundSave keeps the rest): its number, session, half, start, spread, how late
+-- its chunks were, its cost so far and the account taken at its stamp.
+X.CS_FIELDS = { "n", "epoch", "where", "wall0", "slip", "late", "over", "spread", "start", "work", "account" }
+
+-- Round r's progress into its record in the game-script state (`rec`, or a new one): every simulation Lua state reads it from there
+-- (L.checksumRoundSave says why).
+function X.csSave(r, rec)
+	rec = L.checksumRoundSave(r, rec)
+	for _, k in ipairs(X.CS_FIELDS) do rec[k] = r[k] end
+	return rec
+end
+
+-- This Lua state's own copy of the round `rec` holds: the one it keeps (`live`, by round), brought up to the record's progress, or one
+-- made from the record (the state did not begin it). A made one keeps only the itemised keys of the chunks this state reads.
+function X.csLive(live, rec)
+	local key = tostring(rec.epoch) .. "/" .. tostring(rec.n) .. "/" .. tostring(rec.start)
+	local r = live[key]
+	if r then
+		L.checksumRoundSync(r, rec)
+	else
+		r = L.checksumRoundRestore(engine, C.hashValue, rec, { detail = (not rec.light) and {} or nil, clock = X.csClock, keyHash = C.fnv1a })
+		r.mine = 0
+		live[key] = r
+	end
+	for _, k in ipairs(X.CS_FIELDS) do r[k] = rec[k] end
+	return r, key
+end
+
+-- The simulation half's spread rounds (`st.csRounds`, the game-script state, so that whichever simulation Lua state runs a step reads
+-- the chunk due at it), each step before the step's items are applied: every round whose chunk is due reads it; a complete one is
+-- stored as a report. `holder.csLive` (the SIM table) keeps this Lua state's own copies. A round of a session that ended is dropped.
+-- Never raises: the step's actions are applied whatever happens here. Returns the number of the last round stored, or nil.
 function X.csAdvance(holder, st, now)
 	local stored = nil
-	local keep = {}
-	for _, r in ipairs(holder.csRounds or {}) do
+	local keep, kept = {}, {}
+	local live = holder.csLive or {}
+	for _, rec in ipairs(st.csRounds or {}) do
+		local key = nil
 		local ok, done = pcall(function()
-			if r.epoch ~= st.epoch then
-				C.logger("sim")("checksum round " .. tostring(r.n) .. " dropped: its session ended before it was read")
+			if rec.epoch ~= st.epoch then
+				C.logger("sim")("checksum round " .. tostring(rec.n) .. " dropped: its session ended before it was read")
 				return nil
 			end
-			if not X.csStep(r, now) then return false end
+			local r
+			r, key = X.csLive(live, rec)
+			local steps = r.steps
+			if not X.csStep(r, now) then
+				if r.steps ~= steps then X.csSave(r, rec) end
+				return false
+			end
 			local parts, t = X.csFinish(r)
 			st.reports[#st.reports + 1] = { n = r.n, time = t, parts = parts, account = r.account }
 			stored = r.n
+			pcall(X.csLateNote, st, r, now)
 			return true
 		end)
 		if not ok then
-			C.logger("sim")("checksum round " .. tostring(r.n) .. " failed and is dropped: " .. tostring(done))
+			C.logger("sim")("checksum round " .. tostring(rec.n) .. " failed and is dropped: " .. tostring(done))
 		elseif done == false then
-			keep[#keep + 1] = r
+			keep[#keep + 1] = rec
+			if key then kept[key] = true end
 		end
 	end
-	holder.csRounds = keep
+	-- the copies of rounds that are complete (here or in another Lua state) or dropped go
+	for key in pairs(live) do if not kept[key] then live[key] = nil end end
+	holder.csLive = live
+	st.csRounds = #keep > 0 and keep or nil
 	return stored
+end
+
+-- A spread round with a chunk read after its step reports its start plus that lateness (X.csFinish): the host compares it only with the
+-- games that were late by exactly as much, and skips it as skewed otherwise. Since 2026-10-18 every regular round is spread, so rounds
+-- that are late again and again are desync detection lost (the real-game bug above went unseen for a day: its only trace was a clause at
+-- the end of a long line). Counted in the game-script state (every simulation Lua state finishes rounds): a WARNING line once
+-- CS_LATE_WARN rounds in a row were late (and every 10 more), a line when they are read on time again, and every game minute with a
+-- late round a line with the minute's counts.
+X.CS_LATE_WARN = 3
+function X.csLateNote(st, r, now)
+	local log = C.logger("sim")
+	local s = type(st.csLate) == "table" and st.csLate or { streak = 0, at = now, rounds = 0, late = 0 }
+	s.rounds = s.rounds + 1
+	if (r.late or 0) > 0 then
+		s.late, s.streak = s.late + 1, s.streak + 1
+		if s.streak == X.CS_LATE_WARN or (s.streak > X.CS_LATE_WARN and (s.streak - X.CS_LATE_WARN) % 10 == 0) then
+			log(string.format("WARNING: %d checksum rounds in a row read chunks after their steps (round %s: %d chunk(s), +%s ms): each reports a moved time, so the host compares it only with games late by exactly as much; desync detection may be lost",
+				s.streak, tostring(r.n), r.late, C.integerText(r.slip or 0)))
+		end
+	else
+		if s.streak >= X.CS_LATE_WARN then log(string.format("checksum rounds read on time again after %d late round(s) in a row (round %s)", s.streak, tostring(r.n))) end
+		s.streak = 0
+	end
+	if now - s.at >= 60000 then
+		if s.late > 0 then
+			log(string.format("checksum minute: %d of %d spread round(s) since t=%s read chunks after their steps (not comparable unless every game was late alike); %d in a row now",
+				s.late, s.rounds, C.integerText(s.at), s.streak))
+		end
+		s.at, s.rounds, s.late = now, 0, 0
+	end
+	st.csLate = s
 end
 
 -- A finished round: its cost logged, its part-level breakdown traced, its itemised keys kept. Returns the parts and the time to report:
@@ -694,7 +770,7 @@ function X.csFinish(r)
 			table.sort(names, function(a, b) if r.timing[a] ~= r.timing[b] then return r.timing[a] > r.timing[b] end return a < b end)
 			local lanes = {}
 			for i = 1, math.min(6, #names) do lanes[i] = string.format("%s %.0f", names[i], r.timing[names[i]] * 1000) end
-			local late = r.late > 0 and string.format("; %d chunk(s) read after their step (+%s ms game time): this round is not compared", r.late, C.integerText(r.slip)) or ""
+			local late = r.late > 0 and string.format("; %d chunk(s) read after their step (+%s ms game time): this round reports t=%s, compared only with games late by as much", r.late, C.integerText(r.slip), C.integerText(t)) or ""
 			C.logger(r.where)(string.format("checksum round %s spread: %d entities in %d chunk(s) of %d, every %d step(s) from t=%s to t=%s; start %.1f ms, step max %.1f ms (budget %d ms, %d chunk(s) over), work %.0f ms, wall %.2f s%s; lanes: %s",
 				tostring(r.n), r.total, r.steps, r.chunk, r.spread, C.integerText(r.start), C.integerText(L.checksumChunkAt(r, r.steps)), r.startCost * 1000,
 				r.frameMax * 1000, L.CHECKSUM_FRAME_BUDGET_MS, r.over, (r.startCost + (r.work or 0)) * 1000, clock() - r.wall0, late, table.concat(lanes, ", ")))
@@ -709,7 +785,9 @@ function X.csFinish(r)
 		table.sort(counts)
 		local tr = (r.where == "sim") and traceSim or traceGui
 		tr("checksum", string.format("t=%s light=%s lanes=%s items{%s} parts=%s spread=%s", tostring(t), tostring(r.light), tostring(next(parts) ~= nil), table.concat(counts, " "), C.serialize(parts), tostring(r.spread)))
-		if detail then DETAIL.last = { time = t, lanes = detail } end
+		-- a spread round's keys are those of the chunks this Lua state read (the others' were read by another simulation state)
+		local partial = (r.spread or 0) > 0 and (r.mine or 0) < r.steps and string.format("%d of %d chunks", r.mine or 0, r.steps) or nil
+		if detail then DETAIL.last = { time = t, lanes = detail, partial = partial } end
 	end)
 	return parts, t
 end
@@ -908,6 +986,39 @@ function X.simBookCosts(st, now)
 	end
 end
 
+-- The bulldoze refund made natively (owner decision 2026-10-18): a build whose inject order carries refund entries (the module puts them
+-- into the command's own Context, refund.rs) has its account read before the send and again at this half's next step, after the engine
+-- applied it, so that every game's mod.log shows what the removal cost there with the list in the command ("refund (native): ...").
+-- MPFever measured no refund from a script Context's list; whether the native list refunds is what these lines prove (unproven so far).
+-- The account: the acting company's (coBalance), else this game's (engine.account). Not booked anywhere, a measurement only.
+function X.refundMoney(ctx)
+	local v = ctx and coBalance(ctx) or nil
+	if v == nil then pcall(function() v = engine.account() end) end
+	return type(v) == "number" and v or nil
+end
+
+function X.watchRefund(st, key, n, money0, ctx, now)
+	st.refundWatch = st.refundWatch or {}
+	st.refundWatch[#st.refundWatch + 1] = { key = key, n = n, b0 = money0, step = now, ctx = ctx and { player = ctx.player } or nil }
+end
+
+function X.simRefundMoney(st, now)
+	local list = st.refundWatch
+	if type(list) ~= "table" or #list == 0 then return end
+	local keep = {}
+	for _, w in ipairs(list) do
+		if (tonumber(w.step) or now) >= now then
+			keep[#keep + 1] = w
+		else
+			local b1 = X.refundMoney(w.ctx)
+			local spent = (type(w.b0) == "number" and type(b1) == "number") and string.format("%.0f", w.b0 - b1) or "?"
+			logSim(string.format("refund (native): action %s: %d refund entries ordered into the command's Context (the module's line in native.log says how many it set); account before %s, after %s (spent %s, measured at t=%s; anything else of that step is in the figure too)",
+				tostring(w.key), w.n, tostring(w.b0), tostring(b1), spent, tostring(now)))
+		end
+	end
+	st.refundWatch = #keep > 0 and keep or nil
+end
+
 -- Applies one due action in the simulation state. No callback here (finding from MPFever (MIT): the engine
 -- rejects callbacks from inside the simulation update; postUpdate, where this runs now, is taken to be the same: unproven), so an entity the command creates is found afterwards by
 -- comparing the entity lists (a watch), and the result reaches the originator through the state.
@@ -1068,7 +1179,7 @@ local function markReplay(st, now, state, key, noPlayer)
 		-- 2026-10-15: 2:18 got no apply event on either game, 2:19's event spent 2:18's mark, 2:20's event 2:19's, and "2:20 not run" was
 		-- logged on both games although 2:20 was applied on both).
 		local names = {}
-		for _, m in ipairs(type(r.marks) == "table" and r.marks or {}) do names[#names + 1] = tostring(m.k) .. "@" .. tostring(m.at) end
+		for _, m in ipairs(type(r.marks) == "table" and r.marks or {}) do names[#names + 1] = tostring(m.k or "?") .. "@" .. tostring(m.at) end
 		local which = #names > 0 and table.concat(names, ", ") or tostring(r.key or "?")
 		logSim("the engine did not run the replayed build " .. which .. " (last sent at t=" .. tostring(r.at) .. "): no apply event within " .. REPLAY_STEPS .. " steps (refused by the engine?)")
 		st.unrun = (st.unrun or 0) + 1
@@ -1330,13 +1441,24 @@ local function sendInjectOrder(inj, key, held, tm, refuse)
 		traceSim("build.inject", string.format("%s inject_next NOT WRITTEN (no control file: %s)", tostring(key), tostring(X.ctlWhy)))
 		return false, "no control file (" .. tostring(X.ctlWhy) .. ")"
 	end
+	-- the refundable entities this game resolved (the decode's inject path): native_refund_<n>.txt, one entry per line (entity, key integer,
+	-- three revision integers, value integer), and the order says how many; the module inserts them into the command's own Context
+	-- refundableEntities with the engine's insert (refund.rs) and refuses the order when it cannot (the build is applied nowhere here)
+	local refund = type(inj.refund) == "table" and #inj.refund > 0 and inj.refund or nil
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. C.integerText(n) .. ".txt"), inj.text) then error("cannot write the text file", 0) end
-		local sent, why = X.ctlSend("inject_next", { key = n, held = held, tm = tm, refuse = refuse })
+		if refund then
+			local rows = {}
+			for i, x in ipairs(refund) do
+				rows[i] = table.concat({ C.integerText(x.e), C.integerText(x.k), C.integerText(x.r[1]), C.integerText(x.r[2]), C.integerText(x.r[3]), C.integerText(x.n) }, "\t")
+			end
+			if not C.writeFile(C.path("native_refund_" .. C.integerText(n) .. ".txt"), table.concat(rows, "\n") .. "\n") then error("cannot write the refund file", 0) end
+		end
+		local sent, why = X.ctlSend("inject_next", { key = n, held = held, tm = tm, refuse = refuse, refund = refund and #refund or nil })
 		if not sent then error(why, 0) end
 	end)
-	traceSim("build.inject", string.format("%s inject_next key=%s held=%s%s (%d bytes of text) %s", tostring(key), C.integerText(n), tostring(held), refuse and (" refuse=" .. refuse) or "",
-		#inj.text, X.ctlWritten(ok, err)))
+	traceSim("build.inject", string.format("%s inject_next key=%s held=%s%s%s (%d bytes of text) %s", tostring(key), C.integerText(n), tostring(held), refuse and (" refuse=" .. refuse) or "",
+		refund and (" refund=" .. #refund) or "", #inj.text, X.ctlWritten(ok, err)))
 	return ok, err, n   -- n: the module answers the order under it (injected / inject_refused), which decides this game's verdict
 end-- the interface half's apply during a pause writes the same orders (guiApplyNow)
 X.sendInjectOrder, X.sendPatchOrder = sendInjectOrder, sendPatchOrder
@@ -1634,7 +1756,12 @@ local function simApplyAction(st, it, now)
 		local waitsFor = (it.waited or 0) < WATCH_STEPS + 2 and L.pendingRef(it.body, function(k) return L.keyIsPending(k, st.watches, st.binders) end) or nil
 		if waitsFor then
 			if not it.waited then logSim("action " .. it.key .. " waits for the entity " .. waitsFor .. " names") end
-			it.waited = (it.waited or 0) + 1
+			-- counted in game steps, not calls: a call at a time that has not moved (a game standing still) is no step of waiting, or a
+			-- game that stood still would give up where a running one applied it (MPFever issue #35, its watch)
+			if it.waitAt ~= now then
+				it.waited = (it.waited or 0) + 1
+				it.waitAt = now
+			end
 			L.enqueue(st.queue, it)
 			return
 		end
@@ -1727,7 +1854,11 @@ local function simApplyAction(st, it, now)
 					-- no order: the record's rebuild is applied by the engine without the module's help; the line ends at the send
 					traceSim("build.timing", string.format("timing %s rebuild=- how=record (no order) apply=%.0f accepted=? total_ms=? late_steps=%s", tm, X.wallNow(), tostring((now - it.at) / STEP)))
 				end
+				-- a build whose order carries refund entries: the account before, measured again at the next step (X.simRefundMoney)
+				local refundN = a.inject and type(a.inject.refund) == "table" and #a.inject.refund or 0
+				local money0 = refundN > 0 and X.refundMoney(ctx) or nil
 				simSendCommand(it.body.fn, a)
+				if refundN > 0 then X.watchRefund(st, it.key, refundN, money0, ctx, now) end
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
 		end)
@@ -1743,6 +1874,18 @@ local function simApplyAction(st, it, now)
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
 		return
 	end
+	-- What appeared during this action's own send: the simulation state runs a command as it is sent (a build's entities are keyed at
+	-- the step of its apply, "steps=1"), so this is exactly what this command made, whatever ids the engine handed out; several
+	-- commands of one step never take each other's entities (L.claimOwn, L.sentOwners). Empty for an engine that shows them later
+	-- (the watch then falls back to the order of the commands) and for this game's own held build (released by the interface half).
+	local sentW, sentB = nil, nil
+	if not held then
+		if spec.creates and before then sentW = L.newEntities(before, engine.entitiesWith(spec.creates)) end
+		if bindComps then
+			sentB = {}
+			for _, comp in ipairs(bindComps) do sentB[comp] = L.newEntities(bindBefore[comp] or {}, engine.entitiesWith(comp)) end
+		end
+	end
 	X.simVerdict(st, it, now, injects)
 	X.simQueueCost(st, ctx, it, category, balance0, coAfter(ctx, it, spec, category, balance0, logSim), now)
 	logSim("action " .. it.key .. " " .. it.body.fn .. (held and (" due at t=" .. now .. ": the native module holds this game's own copy (held " .. tostring(it.heldId) .. "), the interface half releases it") or (" applied at t=" .. now)))
@@ -1751,10 +1894,11 @@ local function simApplyAction(st, it, now)
 		pcall(function() logSim(string.format("timing window command %s apply=%.0f late_steps=%s", X.timingText(it, now), X.wallNow(), tostring((now - it.at) / STEP))) end)
 	end
 	if bindComps then
-		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0, pre = preInfo, money0 = balance0 }
+		st.binders[#st.binders + 1] = { key = it.key, fn = it.body.fn, body = it.body, comps = bindComps, before = bindBefore, steps = 0, pre = preInfo, money0 = balance0,
+			sent = sentB, at = now }
 	end
 	if spec.creates then
-		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now }
+		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now, sent = sentW }
 	else
 		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
 	end
@@ -1792,18 +1936,42 @@ local function simReplayCompany(st, param)
 	end
 end
 
+-- A key bound to an entity on this game: st.bindAt keeps the game time of the binding, so that a later watch can tell a binding
+-- of its own time (that entity is taken) from an old one whose entity is gone and whose id the engine handed out again.
+function X.simBind(st, key, e, now)
+	st.bind[key] = e
+	st.bindAt = st.bindAt or {}
+	st.bindAt[key] = now
+end
+
+-- One step of a watch or binder: counted only when the game time moved since its last count (a call while the game stands still
+-- is no step: MPFever issue #35, "the watch counts its steps only when the game time has moved").
+function X.watchStep(w, now)
+	if w.seenAt ~= now then
+		w.steps = w.steps + 1
+		w.seenAt = now
+	end
+end
+
 local function simAdvanceWatches(st, now)
 	if #st.watches == 0 then return end
-	-- an entity bound to one key is not there for the next watch: five vehicles bought in one step appear together
-	local claimed = {}
-	for _, e in pairs(st.bind) do claimed[e] = true end
+	-- An entity another command made at its own send, or one bound to a key since this watch's command ran, is not this watch's:
+	-- five vehicles bought in one step appear together. A binding older than the command names an entity that was gone when the
+	-- command ran (it is not in the snapshot), so the id was handed out again and the binding does not hold the new entity.
+	local sentBy = L.sentOwners(st.watches, st.binders)
+	local owners = L.bindOwners(st.bind, st.bindAt)
 	local keep = {}
 	for _, w in ipairs(st.watches) do
-		w.steps = w.steps + 1
-		local created = L.claimEntity(w.before, engine.entitiesWith(w.comp), claimed)
+		X.watchStep(w, now)
+		local function taken(e)
+			if sentBy[e] ~= nil and sentBy[e] ~= w.key then return true end
+			return L.isTakenAt(owners[e], w.at)
+		end
+		local after = engine.entitiesWith(w.comp)
+		local created = L.claimOwn(w.sent, after, taken) or L.claimEntity(w.before, after, taken)
 		if created then
-			claimed[created] = true
-			st.bind[w.key] = created
+			owners[created] = { key = w.key, at = now }
+			X.simBind(st, w.key, created, now)
 			st.results[#st.results + 1] = { key = w.key, at = w.at, success = true, data = { [w.result] = created }, entities = { { created } } }   -- (the revision is added where the callback runs: C.resultEntities)
 			logSim("action " .. w.key .. " created entity " .. created .. " (" .. w.comp .. ")")
 		elseif w.steps >= WATCH_STEPS then
@@ -1823,17 +1991,21 @@ end
 -- not take each other's entities (the engine runs the commands in the order they were applied, on every game).
 local function simAdvanceBinders(st, now)
 	if #st.binders == 0 then return end
-	local owner = {}
-	for k, e in pairs(st.bind) do owner[e] = k end
+	-- (as the watches: what another pending command made at its own send is not this one's, and a binding older than this command
+	-- does not hold a new entity)
+	local sentBy = L.sentOwners(st.watches, st.binders)
+	local owners = L.bindOwners(st.bind, st.bindAt)
 	local keep = {}
 	for _, b in ipairs(st.binders) do
-		b.steps = b.steps + 1
+		X.watchStep(b, now)
 		local mine = b.key .. "#"
 		local made, seen = {}, {}
 		for _, comp in ipairs(b.comps) do
 			for _, e in ipairs(L.newEntities(b.before[comp] or {}, engine.entitiesWith(comp))) do
-				local other = owner[e]
-				if not seen[e] and (other == nil or other:sub(1, #mine) == mine) then
+				local o = owners[e]
+				local other = L.isTakenAt(o, b.at) and o.key or nil
+				local byOther = sentBy[e] ~= nil and sentBy[e] ~= b.key
+				if not seen[e] and not byOther and (other == nil or other:sub(1, #mine) == mine) then
 					seen[e] = true
 					made[#made + 1] = e
 				end
@@ -1842,8 +2014,8 @@ local function simAdvanceBinders(st, now)
 		table.sort(made)
 		local map, complete = L.bindMap(L.COMMANDS[b.fn], b.body, b.key, made)
 		for key, e in pairs(map) do
-			st.bind[key] = e
-			owner[e] = key
+			X.simBind(st, key, e, now)
+			owners[e] = { key = key, at = now }
 		end
 		if complete then
 			logSim("action " .. b.key .. " created " .. #made .. " " .. table.concat(b.comps, "/") .. " entities, keyed")
@@ -2032,6 +2204,7 @@ function X.simSessionOff(state, why)
 		st.heldOut, st.heldInput, st.heldNative, st.nbinds = nil, nil, nil, nil
 		st.results, st.reports, st.refused, st.notes, st.late = {}, {}, {}, nil, 0
 		st.costs = nil
+		st.csRounds, st.csLate = nil, nil   -- the spread checksum rounds of the session (X.csAdvance)
 		st.epoch = nil   -- the next interface run stamps it again
 		state:set(st)
 	end)
@@ -2040,7 +2213,7 @@ function X.simSessionOff(state, why)
 	end
 	for _, cb in pairs(SIMO.cbs) do pcall(cb, nil, false) end
 	SIMO.pending, SIMO.cbs = {}, {}
-	SIM.deferredBuild, SIM.nativeBinds = nil, nil
+	SIM.deferredBuild, SIM.nativeBinds, SIM.csLive = nil, nil, nil
 	-- the session's deterministic math.random (L.installRandom) gives way to the game's own; the next session installs a new one
 	if SIM.rng then
 		if SIM.random0 then math.random = SIM.random0 end
@@ -2151,8 +2324,8 @@ function X.simStep(state, now)
 		-- Which Lua state and which load of this file installs it, and what the game-script state already holds (friend test 2026-10-16: the
 		-- friend's game logged this line mid-session with no reload, at 01:18:33, 01:54:43 and 02:10:47, the last two shortly before the ids
 		-- forks of resyncs 10 and 11; that run had no load lines). A load that finds a session in the game-script state (an epoch, queued
-		-- actions, binders) started mid-session: this load's module values (SIM: native build keys, spread checksum rounds, script build
-		-- callbacks) are new and empty, those of the load before are gone with it.
+		-- actions, binders) started mid-session: this load's module values (SIM: native build keys, script build callbacks) are new and
+		-- empty, those of the load before are gone with it. (The spread checksum rounds live in the game-script state: X.csAdvance.)
 		pcall(function()
 			local st = state:get()
 			st = type(st) == "table" and st or {}
@@ -2176,6 +2349,8 @@ function X.simStep(state, now)
 		-- the cost of the actions the engine ran after the last step (X.simQueueCost), before this step's actions move the account
 		local okK, errK = pcall(X.simBookCosts, st, now)
 		if not okK then logSim("company cost booking failed: " .. tostring(errK)) end
+		local okR, errR = pcall(X.simRefundMoney, st, now)
+		if not okR then logSim("refund (native): the money measurement failed: " .. tostring(errR)) end
 		-- spread checksum rounds: a chunk due at this step is read before the step's items, as a round's own start is (L.itemBefore)
 		stored = X.csAdvance(SIM, st, now)
 		local due = L.takeDue(st.queue, now)
@@ -2186,8 +2361,14 @@ function X.simStep(state, now)
 				local okB, r = pcall(X.csBegin, st.co, "sim", it)
 				if okB then
 					r.epoch = st.epoch
-					SIM.csRounds = SIM.csRounds or {}
-					SIM.csRounds[#SIM.csRounds + 1] = r
+					-- the round's progress goes to the game-script state, so that whichever simulation Lua state runs a chunk's step reads it
+					-- (X.csAdvance); this state keeps its own copy with the entity lists already unpacked
+					r.mine = 0
+					st.csRounds = st.csRounds or {}
+					local rec = X.csSave(r, nil)
+					st.csRounds[#st.csRounds + 1] = rec
+					SIM.csLive = SIM.csLive or {}
+					SIM.csLive[tostring(rec.epoch) .. "/" .. tostring(rec.n) .. "/" .. tostring(rec.start)] = r
 					traceSim("checksum.spread", string.format("round %s begun at t=%s: %d entities, %d chunk(s) of %d every %d step(s); start %.1f ms",
 						tostring(it.n), C.integerText(now), r.total, r.chunks, r.chunk, r.spread, r.startCost * 1000))
 				else
@@ -2237,47 +2418,35 @@ end
 --     test_strict_build), bind (test_lockstep line/vehicle keys), replay, heldout, heldgone, heldinput, heldnative, nativebind,
 --     nativecaps (test_strict_build, test_native_capture), outack (test_lockstep), dumpdetail (resync save), co (companies,
 --     test_cmds_company). test_lockstep EventSubscriptionTest checks that every name toSim sends is here.
--- "nop" is not subscribed: it is the strict mode's trigger, a command whose only purpose is that the engine runs it (the native module
--- runs its queue at the command, natTrigger); handleEvent ignores it. The town trace and FEVERLINK3_DEV log every apply_command event by
--- its command name, a set of names the docs do not list: with either of them on (diagnostics), and with FEVERLINK3_EVENTS=all (the
--- earlier behaviour, a lab switch should a game build deliver a needed event under another name), the script subscribes to all events.
--- An event the mock receives without a subscription is dropped (tests/lua/test_lockstep.py STATE), so a missing name fails the tests.
+-- "nop" is not in the list: it is the strict mode's trigger, a command whose only purpose is that the engine runs it (the native module
+-- runs its queue at the command, natTrigger); handleEvent ignores it. Since 2026-10-18 the script subscribes to ALL events again (see
+-- X.subscribeEvents below: a subscription by these names cut the interface half off the build tools' events).
 X.SIM_EVENTS = { "onPreBuildProposal", "onPostBuildProposal", "session", "sessionoff", "queue", "drop", "bind", "replay", "heldout",
 	"heldgone", "heldinput", "heldnative", "nativebind", "nativecaps", "outack", "dumpdetail", "co" }
 -- The interface half's guiHandleEvent acts on the tool events builder.proposalCreate / builder.proposalApply only (the strict capture and
 -- the construction schema's log, test_strict_build); the log of other tool-like events (seenOtherEvents) needs every event: DEV only.
 X.GUI_EVENTS = { "builder.proposalCreate", "builder.proposalApply" }
 
--- Subscribes `st` once per load of this file: to the names, or to all events for the diagnostics above. Logged once with the reason.
+-- Subscribes once per load of this file and half. The simulation half subscribes to ALL events; the interface half makes no call.
+-- Evidence (real sessions, 2026-10-18): the game's interface state has neither subscribeToEvent nor subscribeToAllEvents ("attempt to
+-- call method ... (a nil value)" for both); guiHandleEvent receives the events of the script's one subscription, made in the simulation
+-- state. 0.2.0-pre3 to pre5 subscribed the simulation half to the names above only, so the build tools' builder.* events no longer reached
+-- guiHandleEvent: owner and friend tests had 0 builds captured (pre2 sessions: 56, 39, 13), every build went the release-at-the-click
+-- path, ids drifted and repair syncs followed. The lab did not see it: FEVERLINK3_DEV subscribed to all events. The names list above is
+-- kept as the record of what handleEvent acts on (its test), not as a subscription.
 function X.subscribeEvents(st, names, half, where, log)
 	X.subscribedHalves = X.subscribedHalves or {}
 	if X.subscribedHalves[half] then return end
 	X.subscribedHalves[half] = true
-	local all, why = false, nil
-	pcall(function()
-		local ev = C.env("FEVERLINK3_EVENTS")
-		if ev == "all" then all, why = true, "FEVERLINK3_EVENTS=all" end
-	end)
-	if not all and DEV then all, why = true, "FEVERLINK3_DEV=1" end
-	if not all and half == "sim" then
-		pcall(function()
-			local spec = C.env("FEVERLINK3_TOWN_TRACE")
-			if type(spec) == "string" and spec ~= "" then all, why = true, "the town trace is on" end
-		end)
+	if half == "gui" then
+		log(string.format("events (gui, at %s): no subscription here (the interface state has none): guiHandleEvent receives the events the simulation half subscribed to (all)", where))
+	else
+		local ok, err = pcall(function() st:subscribeToAllEvents() end)
+		log(string.format("events (sim, at %s): all%s", where, ok and "" or (" - SUBSCRIBING FAILED: " .. tostring(err))))
 	end
-	local ok, err = pcall(function()
-		if all then
-			st:subscribeToAllEvents()
-		else
-			for _, n in ipairs(names) do st:subscribeToEvent(n) end
-		end
-	end)
-	log(string.format("events (%s, at %s): %s%s", half, where, all and ("all (" .. why .. ")") or table.concat(names, " "),
-		ok and "" or (" - SUBSCRIBING FAILED: " .. tostring(err))))
 	-- once per load of this file and half (lab): what this state's `app` and `main` hold (the start gate's functions, X.appFn)
 	pcall(function() log("app keys (" .. half .. "): " .. C.appKeys()) end)
 end
-
 function X.subscribeSim(state, where)
 	X.subscribeEvents(state, X.SIM_EVENTS, "sim", where, logSim)
 end
@@ -2375,7 +2544,8 @@ function handleEvent(userParams, state, src, id, name, param)
 				end
 				-- sorted, so the two games' files diff line by line (a spread round keeps its keys in the order it read them)
 				table.sort(lines)
-				table.insert(lines, 1, "# itemised keys of the last full checksum round of this game: time=" .. tostring(d.time) .. " why=" .. tostring(param.why))
+				table.insert(lines, 1, "# itemised keys of the last full checksum round of this game: time=" .. tostring(d.time) .. " why=" .. tostring(param.why)
+					.. (d.partial and (" partial: the keys of the " .. d.partial .. " this simulation Lua state read") or ""))
 				local fname = "detail_" .. tostring(d.time) .. "_" .. tostring(C.PLAYER_ID) .. ".txt"
 				C.dumpReplace(fname, table.concat(lines, "\n") .. "\n")
 				traceSim("detail", string.format("%s: %d lines written to %s (diff the two games' files to see which entities differ)", tostring(param.why), #lines - 1, fname))
@@ -2404,7 +2574,9 @@ function handleEvent(userParams, state, src, id, name, param)
 				logSim("action " .. param.key .. ": this game's own native build is keyed here like a replay (" .. table.concat(nb.comps, "/") .. ")")
 			end
 		elseif name == "replay" then
-			markReplay(st, engine.gameTime())
+			-- the interface half's own sends of a build (the pause path, a held command released): the key names the build in the report
+			-- of a mark no engine event spent (friend test 2026-10-18 printed "nil@14282800, nil@14285000": these events carried no key)
+			markReplay(st, engine.gameTime(), nil, type(param) == "table" and type(param.key) == "string" and param.key or nil)
 		elseif name == "nativecaps" and type(param) == "table" then
 			SIM.nativePatch = param.patch == true
 			SIM.nativeInject = param.inject == true
@@ -2455,7 +2627,8 @@ function handleEvent(userParams, state, src, id, name, param)
 			end
 			st.out = keep
 		elseif name == "bind" and type(param) == "table" and param.key then
-			st.bind[param.key] = param.e
+			local okT, t = pcall(engine.gameTime)
+			X.simBind(st, param.key, param.e, okT and t or nil)
 		elseif name == "co" and Co and type(param) == "table" and type(param.it) == "table" then
 			simReplayCompany(st, param)
 		end
@@ -2555,7 +2728,7 @@ function X.reportClock(now)
 	X.clockSentAt = C.clock()
 	local safe, floor, pause = L.promise(G.session, now, G.promiseFloor)
 	G.promiseFloor, G.promisePause = floor, pause
-	local ahead = L.aheadFor(G.session.speed)
+	local ahead = L.aheadFor(G.session.speed, G.session.lead)
 	send("clock", { t = now, speed = engine.speed(), ahead = ahead, need = L.marginNeed(G.margin, G.session.speed), safe = safe, pause = pause or nil,
 		stop = (pause and X.curStop == now) and now or nil })
 end
@@ -2607,6 +2780,64 @@ function X.barrierWatch(now, sp)
 	X.linkMinute(clock)
 end
 
+-- ---- smooth pacing (bug 4; feverlink3_lockstep.lua "smooth pacing", native pace.rs). Every frame: the room before the nearer of the
+-- stops a peer's clock moves, when that stop is expected to move next, this game's batch time, the factor wanted and its smoothed value; the factor goes to
+-- the native module (`pace {permille}`) when it moved by X.PACE_STEP, when it came back to 1, and every X.PACE_REFRESH_S while it is not 1
+-- (the module drops a factor not refreshed for 3 s). Nothing is sent unless the module said it can (`batch_pace` among its hooks).
+-- FEVERLINK3_SMOOTH_PACE=0 keeps the factor at 1 (the native module has the same switch). Wall-clock pacing only: no step, stamp or
+-- mechanic changes.
+X.PACE_STEP = 0.03
+X.PACE_REFRESH_S = 1.0
+X.PACE_ON = true
+pcall(function() X.PACE_ON = C.env("FEVERLINK3_SMOOTH_PACE") ~= "0" end)
+function X.paceTick(now)
+	local P = G.pace or L.paceNew()
+	G.pace = P
+	local s, clock = G.session, C.clock()
+	local stop = L.paceStop(s, G.peers, L.aheadFor(s.speed, s.lead))
+	L.paceObserve(P, stop, clock)
+	L.paceOwn(P, now, clock, (P.ranSp or 0) > 0, P.sent or 1)
+	P.ranSp = G.lastSpeedSet
+	local target, left = 1, nil
+	if X.PACE_ON and stop and s.pauseAt == nil and s.holdAt == nil then
+		target, left = L.paceTarget(stop - now, s.speed, L.paceNext(P, clock), L.paceBatch(P), P.ownAt and (clock - P.ownAt) * 1000 or 0)
+	end
+	P.room, P.left = stop and (stop - now) or nil, left
+	local trim = L.paceSmooth(P, target, clock)
+	if X.LS and G.ls then X.LS.pace(G.ls, trim, clock) end
+	X.paceSend(P, clock, now)
+end
+
+-- The factor to the native module (see above); a stretch of slowing down starts and ends with a trace line.
+function X.paceSend(P, clock, now)
+	local N = G.nat
+	if not (N and N.ready and N.ready.pace) then return end
+	local sent = P.sent or 1
+	local due = math.abs(P.trim - sent) >= X.PACE_STEP or (P.trim == 1 and sent ~= 1) or (P.trim ~= 1 and clock - (P.sentAt or -100) >= X.PACE_REFRESH_S)
+	if not due then return end
+	local permille = math.floor(P.trim * 1000 + 0.5)
+	-- (X.ctlSend, not natSend: that local of the strict-mode section is declared further down the chunk)
+	if X.ctlSend("pace", { permille = permille }) then
+		N.lastWrite = C.clock()
+		if (sent == 1) ~= (P.trim == 1) then
+			traceGui("pace", string.format("%s at t=%s: factor %.2f (target %.2f, room_steps=%s, room_lasts_ms=%s, stop_moves_in_ms=%s, batch_ms=%.0f, jitter_ms=%.0f, x%s)",
+				P.trim == 1 and "back to 1" or "slowing", C.integerText(now), P.trim, P.target or 1, P.room and string.format("%.1f", P.room / STEP) or "-",
+				P.left and string.format("%.0f", P.left) or "-", (function() local w = L.paceNext(P, clock); return w and string.format("%.0f", w) or "-" end)(), L.paceBatch(P), L.paceJitter(P), tostring(G.session.speed)))
+		end
+		P.sent, P.sentAt = P.trim, clock
+	end
+end
+
+-- The session ends (or this game leaves it): the factor goes back to 1 at once.
+function X.paceEnd(why)
+	local P = G.pace
+	G.pace = nil
+	if P and (P.sent or 1) ~= 1 and G.nat and G.nat.ready and G.nat.ready.pace then
+		X.ctlSend("pace", { permille = 1000 })
+		traceGui("pace", "back to 1: " .. tostring(why))
+	end
+end
+
 -- ---- the latency logs (see X.LS at the top). The state of this session's link statistics, made at its first use.
 function X.ls()
 	if not X.LS then return nil end
@@ -2624,9 +2855,11 @@ function X.holdDetail(now, bar, who, clock)
 		if X.LS and G.ls and who ~= nil then age, rtt = X.LS.peerNow(G.ls, who, clock) end
 		local function f(v) return type(v) == "number" and string.format("%.0f", v) or "?" end
 		local okE, es = pcall(engine.speed)
-		return string.format(" peer_t=%s behind_steps=%s room_steps=%s clock_age_ms=%s rtt_ms=%s frame_ms=%s engine_speed=%s",
+		local P = G.pace
+		return string.format(" peer_t=%s behind_steps=%s room_steps=%s clock_age_ms=%s rtt_ms=%s frame_ms=%s engine_speed=%s pace=%s pace_target=%s pace_batch_ms=%s pace_jitter_ms=%s",
 			pc and C.integerText(pc.t) or "?", pc and string.format("%.1f", (now - pc.t) / STEP) or "?", bar and string.format("%.1f", (bar - now) / STEP) or "-",
-			f(age), f(rtt), f(G.ls and G.ls.lastFrame), okE and tostring(es) or "?")
+			f(age), f(rtt), f(G.ls and G.ls.lastFrame), okE and tostring(es) or "?",
+			P and string.format("%.2f", P.trim) or "-", P and string.format("%.2f", P.target or 1) or "-", P and f(L.paceBatch(P)) or "-", P and f(L.paceJitter(P)) or "-")
 	end)
 	return okD and text or (" detail=? (" .. tostring(text) .. ")")
 end
@@ -2887,6 +3120,9 @@ local route, stampAfterFastest, PARK_MAX, pausedNow, graceMs, VETO_STEPS, CONSTR
 do -- section: applying items, the veto, shipping (not indented, see SECTIONS at the top)
 local function guiApplyNow(it, now)
 	if it.kind == "action" and it.body and it.body.native and it.from == C.PLAYER_ID then return end
+	-- an action that names what an earlier action applied from here made, before the engine answered that one, waits for the answer
+	-- (with everything after it, a checksum round too, in arrival order): X.guiParks
+	if X.guiParks(it, now) then return end
 	if it.kind == "checksum" then
 		X.guiChecksum(it)   -- waits (bounded) until the registry mirror holds what the save loaded
 		return
@@ -2971,19 +3207,26 @@ local function guiApplyNow(it, now)
 		-- this game's deferred held command took this apply's result (inject_next / complete_next): its world has the apply now
 		if it.deferId and X.deferApplied then pcall(X.deferApplied, it.deferId) end
 		deliverResult(it.key, data, success, entities)
+		-- its keys are bound here and on their way to the simulation half (toSim "bind" above): what waited for them goes on
+		X.guiMade(it.key)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
 	local okS, errS
 	-- from here the engine has the command: its own answer (finish) reaches the callback, even after the session ended (X.sessionOff)
 	X.engineHas = X.engineHas or {}
 	X.engineHas[it.key] = true
+	-- an action that creates entities (a purchase, a line, a build): its keys exist only once the engine answers, a frame or more later
+	if spec.creates or bindComps then
+		X.guiMaking = X.guiMaking or {}
+		X.guiMaking[it.key] = C.clock()
+	end
 	if it.heldId and natPauseRelease then
 		-- the tool's own command is held by the native module: it is released instead of sent (the whole build is that one command)
 		okS, errS = pcall(natPauseRelease, it, finish)
 	else
 		okS, errS = pcall(L.runChained, args, function(a, cb)
 			local isBuild = it.body.fn == "makeWorldBuildProposalCmd"
-			if isBuild then toSim("replay", {}) end
+			if isBuild then toSim("replay", { key = it.key }) end
 			-- the native orders exactly as at a stamp apply in the simulation half (simApplyAction), right before the command: a paused
 			-- build is the originator's exact copy (inject) where the decode chose it, and this game's deferred held command takes its
 			-- result. (The pause path used to send the record's donor command alone: another build than on a running game.)
@@ -3009,7 +3252,84 @@ local function guiApplyNow(it, now)
 		deliverResult(it.key, nil, false, {})
 		coToSim(it)
 		if it.heldId and natHeldRefused then pcall(natHeldRefused, it) end
+		X.guiMade(it.key)
 	end
+end
+
+-- ---- what an action applied from here makes, before the engine answered (MPFever issue #36, re-designed)
+--
+-- Applied from this interface (a pause, a slot's record), a command's entities are known only from the engine's answer, a frame or
+-- more later (finish above: G.bind, then toSim "bind" for the simulation half). Two things must not overtake that answer:
+--   * an action applied from here that names one of its keys (a purchase and the line assignment its callback made, read in one
+--     frame on a game that stalled): it waits, and so does everything after it, in arrival order, until the answer came
+--     (X.guiParks / X.guiUnpark), at most X.GUI_MAKE_MAX real seconds, after which it is decoded as it is (refused if still unknown);
+--   * the simulation: a later action of the pause is applied there at its stamp when the game runs on, and its reference resolves
+--     from the simulation half's keys, which the "bind" message brings. So the game does not run on while an answer is outstanding
+--     (X.guiHolds, speed 0 in the frame), and the message goes out before the speed command that lets the game step. Every game
+--     applies the same actions at the same stamps; only this one waits a frame longer at the pause.
+X.GUI_MAKE_MAX = 5.0
+
+-- whether `key` (or a sub-key "<key>#...") belongs to an action applied from here whose engine answer is outstanding
+function X.guiIsMaking(key)
+	if type(key) ~= "string" then return false end
+	for k in pairs(X.guiMaking or {}) do
+		if key == k or key:sub(1, #k + 1) == k .. "#" then return true end
+	end
+	return false
+end
+
+-- True (and the item kept) when `it` must wait: something waits already (the order is kept), or it names an outstanding key.
+function X.guiParks(it, now)
+	X.guiParked = X.guiParked or {}
+	local key = nil
+	if #X.guiParked == 0 then
+		if it.kind ~= "action" or next(X.guiMaking or {}) == nil then return false end
+		key = L.pendingRef(it.body, X.guiIsMaking)
+		if key == nil then return false end
+	end
+	X.guiParked[#X.guiParked + 1] = { it = it, now = now, wall = C.clock() }
+	logGui("action " .. tostring(it.key) .. " waits for the engine's answer to " .. (key and ("the action that makes " .. key) or "an earlier action")
+		.. " (applied from here at t=" .. tostring(now) .. "; " .. #X.guiParked .. " waiting)")
+	return true
+end
+
+-- The engine answered the action `key` applied from here (or it failed): its keys are bound; what waited goes on.
+function X.guiMade(key)
+	if X.guiMaking then X.guiMaking[key] = nil end
+	local ok, err = pcall(X.guiUnpark)
+	if not ok then logGui("the actions waiting for an engine answer failed: " .. tostring(err)) end
+end
+
+-- Applies the waiting actions in order up to the first that still names an outstanding key (within the time limit).
+function X.guiUnpark()
+	local P = X.guiParked
+	if not P or #P == 0 then return end
+	X.guiParked = {}
+	for i, p in ipairs(P) do
+		local key = p.it.kind == "action" and L.pendingRef(p.it.body, X.guiIsMaking) or nil
+		if key ~= nil and C.clock() - p.wall < X.GUI_MAKE_MAX then
+			for j = i, #P do X.guiParked[#X.guiParked + 1] = P[j] end
+			return
+		end
+		if key ~= nil then logGui("action " .. tostring(p.it.key) .. ": no engine answer for " .. key .. " within " .. X.GUI_MAKE_MAX .. " s: applied as it is") end
+		guiApplyNow(p.it, p.now)
+	end
+end
+
+-- Every frame: true while an action applied from here waits for its engine answer (the game then stays at speed 0); an answer
+-- outstanding for longer than X.GUI_MAKE_MAX is given up (logged) so that the game cannot stand still for good.
+function X.guiHolds()
+	local M = X.guiMaking
+	if not M or next(M) == nil then return false end
+	local clock = C.clock()
+	for k, t in pairs(M) do
+		if clock - t >= X.GUI_MAKE_MAX then
+			M[k] = nil
+			logGui("action " .. tostring(k) .. ": no engine answer within " .. X.GUI_MAKE_MAX .. " s; the game goes on without it")
+		end
+	end
+	pcall(X.guiUnpark)
+	return next(M) ~= nil
 end
 
 -- ---- the pause order (docs/PROTOCOL.md, "The pause order")
@@ -3771,7 +4091,7 @@ function natStop(why)
 		for _, h in pairs(N.heldByKey) do
 			if not (h.released or h.done or h.cancelled) then
 				h.released, h.early = C.clock(), true
-				pcall(toSim, "replay", {})
+				pcall(toSim, "replay", { key = h.key })
 				pcall(toSim, "heldgone", { key = h.key })
 				natSay("held " .. h.id .. " (" .. h.key .. ") goes back to the engine before its stamp (" .. tostring(why) .. ")")
 			end
@@ -3849,7 +4169,7 @@ function natRelease(key)
 	if not h or h.released or h.done or h.cancelled then return false end
 	h.released = C.clock()
 	h.releasedAt = engine.gameTime()
-	pcall(toSim, "replay", {})
+	pcall(toSim, "replay", { key = key })
 	local ok = natOrder("release", h.id)
 	pcall(toSim, "heldgone", { key = key })
 	natSay(string.format("held %d (%s) released at game time %d (stamp %d); the engine applies it here, the other games replay it at the stamp",
@@ -4908,6 +5228,7 @@ local function natEvent(N, rec, p, history)
 			if h == "patch_next" then N.ready.patch = true end
 			if h == "inject_next" then N.ready.inject = true end
 			if h == "defer" then N.ready.defer = true end
+			if h == "batch_pace" then N.ready.pace = true end   -- native pace.rs: `pace` lines stretch the batch interval
 		end
 		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, wall0 = X.WALL0 })
 		N.hookOk = false
@@ -5790,10 +6111,14 @@ end
 -- every line in one frame before (one engine.lineResult, a balance since the game's start, per line, every 5 s): a frame that stalls
 -- sends no clock line, and every peer waits at its input barrier for it (bug 4: friend test 2026-10-16, holds of 0.3 s and more on a
 -- 4.7-4.8 s median cadence; frame.slow's companies= shows what it cost).
-X.CO_PAGE_EVERY_S, X.CO_PAGE_BUDGET_S = 5, 0.002
+-- The budget is checked between reads, so one read that is slow by itself is not sliced: it was (pre5 friend test 2026-10-18,
+-- companies= 450-610 ms in one frame twice every 5 s: calculateBalance on the entity of a deleted line, engine.lineResult now reads
+-- only live lines). Whatever else makes one read slow, a line whose single read took more than X.CO_READ_SLOW_S is not read again
+-- while its key stays bound to that entity (it keeps the result it had; logged once): at most one such frame per line and binding.
+X.CO_PAGE_EVERY_S, X.CO_PAGE_BUDGET_S, X.CO_READ_SLOW_S = 5, 0.002, 0.05
 local function writeCompanies()
 	if not (Co and G.co) then return end
-	local P = X.coPage or { cache = {}, pass = 0 }
+	local P = X.coPage or { cache = {}, pass = 0, slow = {} }
 	X.coPage = P
 	local clock = C.clock()
 	local seen = tostring(G.co.rev) .. ":" .. tostring(G.hud.version)
@@ -5811,9 +6136,17 @@ local function writeCompanies()
 		repeat
 			local key = P.keys[P.i]
 			local e = G.bind[key]
-			if e ~= nil then
+			if e ~= nil and P.slow[key] == e then
+				P.fresh[key] = P.cache[key]
+			elseif e ~= nil then
+				local t0 = C.clock()
 				local ok, v = pcall(engine.lineResult, e, 0, P.at)
 				if ok and type(v) == "number" then P.fresh[key] = v end
+				local took = C.clock() - t0
+				if took > X.CO_READ_SLOW_S then
+					P.slow[key], P.fresh[key] = e, P.fresh[key] or P.cache[key]
+					logGui(string.format("company page: reading the result of line %s (entity %s) took %d ms in one engine call: not read again while that key names that entity", tostring(key), tostring(e), math.floor(took * 1000 + 0.5)))
+				end
 			end
 			P.i = P.i + 1
 		until P.i > #P.keys or C.clock() - clock >= X.CO_PAGE_BUDGET_S
@@ -6057,9 +6390,11 @@ function X.sessionOff(why, state)
 	-- where this game stood still at the pause (the clock's `stop`); the run on to a host's pause stamp (pauseRun) goes with G.session
 	G.still, X.curStop, G.lastStop = nil, nil, nil
 	G.promiseFloor, G.promisePause, G.barrier = nil, nil, nil
+	pcall(X.paceEnd, "the session ended")   -- the engine's own batch interval again (smooth pacing)
 	G.ls, X.lagWait, X.actHop, X.frameAt = nil, nil, nil, nil   -- the latency logs start afresh with the next session
 	X.coPage, X.clockSentAt = nil, nil   -- the company page's line results (keys of this session) and the clock keepalive
 	X.pauseRunWant = nil                 -- a run-on of the pause order waiting for the rest of its flush
+	X.guiParked, X.guiMaking = nil, nil  -- actions waiting for an engine answer (their callbacks failed with the pending ones above)
 	G.authPending, G.accountAt, G.authLast, G.pendingSave = {}, {}, nil, nil
 	G.perms, G.margin = L.newPermissions(), L.newMargin()
 	G.resultsSeen, G.reportsSent, G.refusedSent, G.lateSeen = {}, {}, {}, 0
@@ -6110,8 +6445,11 @@ function X.appFn(name)
 end
 
 function X.readyLoad()
-	if C.env("FEVERLINK3_READY_WAIT") == "0" then
-		logGui("ready: FEVERLINK3_READY_WAIT=0: the loaded game starts by itself and is held by speed 0 (the old path)")
+	-- Off unless FEVERLINK3_READY_WAIT=1 (lab 2026-10-18, run H-new: after setWaitForStartReadyGame the loaded game showed its own
+	-- loading screen with a "Start Game" button and this script's guiUpdate never ran, so nothing released it: the resync waited
+	-- until a player clicked. Only the window state ran there. Back on once the release comes from a state that runs.)
+	if C.env("FEVERLINK3_READY_WAIT") ~= "1" then
+		logGui("ready: the start gate is off (FEVERLINK3_READY_WAIT is not 1): the loaded game starts by itself and is held by speed 0 (the old path)")
 		return
 	end
 	if not (X.appFn("setWaitForStartReadyGame") and X.appFn("startReadyGame")) then
@@ -6287,11 +6625,21 @@ local function guiUpdate(userParams, state, guiState)
 		pcall(X.frameMark, "nat")
 		coGuard("local company", syncLocalCompany)
 		local now = engine.gameTime()
-		local ahead = L.aheadFor(G.session.speed)
+		local ahead = L.aheadFor(G.session.speed, G.session.lead)
 		local sp = L.pace(G.session, G.peers, now, ahead, G.marks)
+		-- an action applied from here waits for its engine answer: no step before its keys reached the simulation half (X.guiHolds)
+		if sp > 0 then
+			local okH, holds = pcall(X.guiHolds)
+			if okH and holds then sp = 0 end
+		end
 		pcall(X.readyGate, sp)
 		setSpeed(sp)
 		X.barrierWatch(now, sp)
+		local okPc, errPc = pcall(X.paceTick, now)
+		if not okPc and not X.paceFault then
+			X.paceFault = true
+			logGui("smooth pacing failed (the factor stays where it is; the native module goes back to 1 after 3 s): " .. tostring(errPc))
+		end
 		-- where this game really stands at a pause, for the host's stamps of the pause's actions (said at once when it changes)
 		X.curStop = X.stopAt(now, sp)
 		if now ~= G.lastClock or G.frames % 30 == 0 or X.clockDue() or X.curStop ~= G.lastStop then
