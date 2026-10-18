@@ -4,7 +4,7 @@ Every command maker of Transport Fever 3's `api.cmd` that is not about construct
 what is still open. Construction (`makeWorldBuildProposalCmd`, terrain) belongs to `feverlink3_cmds_build.lua`,
 companies (`makeEntitySetPlayerCmd`, `makeGameAddPlayerCmd`, company levels and permits) to
 `feverlink3_cmds_company.lua`; speed and pause belong to the session. The code is
-`mod/feverlink3_1/content/feverlink3_cmds_ops.lua`, the tests `tests/lua/test_cmds_ops.py`.
+`mod/feverlink3/content/feverlink3_cmds_ops.lua`, the tests `tests/lua/test_cmds_ops.py`.
 
 ## Where the list comes from
 
@@ -29,17 +29,23 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
 - **Every reference is checked where it is applied**: it must exist and be of the expected kind (a vehicle where a
   vehicle belongs, a line where a line belongs), a model resource must be installed. A failure refuses the action
   (`action_refused`, reason in `mod.log`); it is never applied to whatever shares the id.
-- **Result binding.** `makeVehicleBuyCmd`, `makeVehicleReplaceCmd` and `makeLineCreateCmd` create an entity. The key of
+- **Result binding.** `makeVehicleBuyCmd` and `makeLineCreateCmd` create an entity (`makeVehicleReplaceCmd` changes the vehicle in
+  place: its command data has no result entity in the game's typed definition). The key of
   the action that made it names it on every game; several creations in one step are served in the order the actions
   applied (`L.claimEntity`), so the n-th purchase is the n-th new vehicle everywhere, and a purchase the account could
   not pay finishes with `success = false` for its own window only.
 - **Engine objects** (vehicle configuration, line, colour, date, journal entry) are read through their member lists,
   rebuilt with `api.type.<Name>.new()` and filled member by member (findings from MPFever, MIT). The sender rebuilds
-  every object before shipping it and compares it with what it read; a difference keeps the command native and
-  `mod.log` names the member and, when the engine refused to set it, quotes the engine
-  (`sent natively: argument 3: does not rebuild equal at TransportVehicleConfig.vehicles.1.x (the engine refused: ...)`).
+  every object before shipping it and compares it with what it read; a difference refuses the command on the sending game
+  too (never applied there alone: that forked the worlds, friend test 2026-10-16), the window's callback fails, the player
+  reads why in the session chat, and `mod.log` names the member and, when the engine refused to set it, quotes the engine
+  (`REFUSED: it cannot be replicated, ...: argument 3: does not rebuild equal at TransportVehicleConfig.vehicles.1.x (the engine refused: ...)`).
   Members the engine refuses as "read only" are left to it and noted once; any other refusal is tolerated when the
-  member comes out equal anyway (noted) and is the reason the command stays native when it does not. The receiving game
+  member comes out equal anyway (noted) and is the reason the command is refused when it does not. A member that takes an
+  object of its own type (`Line.vehicleInfo`) is filled through the copy the engine hands out and written back. A
+  transport-mode map (`Line.vehicleInfo.transportModes`, `{TransportMode : boolean}` keyed by `api.type.enum.TransportMode`)
+  travels keyed by the enum's names and is keyed by the receiving game's enum values again (`C.modeNames` / `C.modeMap` in
+  `feverlink3_common.lua`); a key the enum does not name refuses the command. The receiving game
   does the same check on what it rebuilds, so a body that does not fit the engine's object is refused, not applied half built.
 - **Model resources** travel by name beside the id (`modelRep.getName` / `find`, both used by the game's achievement
   script); the receiver uses its own id and notes it when the two differ.
@@ -51,15 +57,16 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
 | Command | Arguments (call sites) | Category | Mode / status |
 |---|---|---|---|
 | `makeVehicleBuyCmd` | player, depot, `TransportVehicleConfig`; result `resultVehicleEntity` (`vehicle_react_util.tl`) | spend | **Replicated**, creates a vehicle |
-| `makeVehicleReplaceCmd` | vehicle, config (`vehicle_react_util.tl`, mission `replace_vehicles.tl`) | spend | **Replicated**; treated as creating a vehicle (MPFever did), see verification V6 |
+| `makeVehicleReplaceCmd` | vehicle, config (`vehicle_react_util.tl`, mission `replace_vehicles.tl`) | spend | **Replicated**; the vehicle is changed in place and keeps its key (VehicleReplaceCommandData has no result entity, tf3-docs api/cmd; until 2026-10-18 treated as creating one, as MPFever did), see verification V6 |
 | `makeVehicleSellCmd` | **list** of vehicles (`vehicle.tl`, `manager_window.tl`) | bulldoze | **Replicated** |
 | `makeVehicleSetLineCmd` | vehicle, line, stop index (`manager_window.tl`, `vehicle_react_util.tl`) | other | **Replicated** (was generic) |
-| `makeVehicleSendToDepotCmd` | vehicle, flag (`vehicle.tl`, `manager_window.tl`) | other | **Replicated** |
+| `makeVehicleSendToDepotCmd` | vehicle, flag (`vehicle.tl`, `manager_window.tl`), optional depot to jump to (script-doc) | other | **Replicated**; the depot travels as a reference |
 | `makeVehicleReverseCmd` | vehicle | other | **Replicated** |
 | `makeVehicleSetStoppedByUserCmd` | vehicle, flag | other | **Replicated** |
-| `makeVehicleTryToDepartCmd`, `makeVehicleSetManualDepartureCmd`, `makeVehicleSetModifiersCmd` | no call site in the base scripts; vehicle first (MPFever) | other | Registered with the vehicle checked and the rest as plain values; unverified |
+| `makeVehicleTryToDepartCmd`, `makeVehicleSetManualDepartureCmd` | no call site in the base scripts; vehicle first (MPFever) | other | Registered with the vehicle checked and the rest as plain values; unverified |
+| `makeVehicleSetModifiersCmd` | vehicle, `api.type.TransportVehicle.Modifiers` (noise, pollution, max speed; script-doc) | other | Registered; the modifiers are rebuilt as an engine object and compared; unverified |
 | `makeLineCreateCmd` | name, colour `Vec3f`, player, `Line`; result `resultEntities[1][1]` (`manager_window.tl`) | build | **Replicated**, creates a line |
-| `makeLineUpdateCmd` | line, `Line` ("update cannot change entity id"): stops, waiting times, load modes, cargo filters, priority (`manager_window.tl`, `cargofilter_window.tl`, `line.tl`) | build | **Replicated**; not with waypoints (N3) |
+| `makeLineUpdateCmd` | line, `Line` ("update cannot change entity id"): stops, waiting times, load modes, cargo filters, priority (`manager_window.tl`, `cargofilter_window.tl`, `line.tl`) | build | **Replicated**, waypoints included (N3) |
 | `makeLineDestroyCmd` | line (the window sells the line's vehicles first, in the same frame) | bulldoze | **Replicated** |
 | `makeEntitySetNameCmd` | any entity: line, vehicle, station group, depot, town, the company (the player entity) | other | **Replicated**; the player travels as "own company" |
 | `makeEntitySetColorCmd` | entity, `Vec3f` (lines, vehicles) | other | **Replicated** |
@@ -153,11 +160,18 @@ loan, and it was a placeholder:
   game script made. Constructions are the exception: found by file and position.
 - **N2. Entity ids in other arguments.** Only the arguments listed are translated. A command whose arguments hold
   entities somewhere this module does not look would carry raw ids; none of the registered ones does.
-- **N3. Waypoints on a line** name network edges (`edgePos.edgeId.entity`), whose ids no two games share. A line with any
-  waypoint stays native (`sent natively: ... has waypoints`), which is a visible divergence repaired by the next resync.
-  Needs the build module's edge references.
+- **N3. Waypoints on a line** (`Line.Stop.waypoints : {Waypoint}`; a Waypoint is `edgePos` = edge `index` of the
+  TransportNetwork entity `edgeId.entity` plus `param` along it, or `pos` for ships and aircraft, plus `tag`;
+  `api/tealdef/api/type.d.tl`) name a network entity whose id no two games share. The entity (a segment, a node or a
+  construction) travels as the build module's reference (`M.refOf`: segment by key, ends and tangents; node by key and
+  position; construction by key, file and position) with the number of edges of its network; index, param, pos and tag
+  travel as they are. Each game resolves the reference to its own entity and refuses the command when it does not
+  resolve, is ambiguous, or has another number of edges (`stop i waypoint j: unresolved segment ...`). An entity that is
+  no network entity, or an edge index its network does not have, refuses it on every game, the sender's included, and
+  the player is told. Lab only (mocked games); a real line edit with waypoints has not run yet.
 - **N4. The `Local` time-of-day mode** follows each machine's wall clock (`os.date` in `game_time.script.tl`): no two
-  games agree. The event stays native and the mod logs why; do not use it in a session.
+  games agree. It is the player's own setting (the handler's `localFor`, category `local`): it runs on the game that
+  asked and is never sent.
 - **N5. Anything a game script sends from the simulation state** is run by every game itself. If such a script is not
   deterministic (wall clock, a random call that is not the mod's), it diverges and only the checksum round notices.
 - **N6. Callback success.** For commands that create nothing, the originator's callback gets `success = true` once the
@@ -182,14 +196,14 @@ None of this has run in the game. Each item says what to do and what to compare;
 
 **One game is enough for most of it.** A host with no other player still captures, encodes (including the dry run that
 rebuilds every engine object), stamps and applies its own commands at their stamp, so the codec guesses (V1, V2, V4's
-hint, V5, V6, V8, V9, V12, V13) show up as a `sent natively` line or as an `applied` / `created entity` line in its own
+hint, V5, V6, V8, V9, V12, V13) show up as a `REFUSED: it cannot be replicated` line or as an `applied` / `created entity` line in its own
 `mod.log`. Items that need a second game say so (V3, V10, and the "same on both" comparisons).
 
 1. **V1. Engine objects.** In a session (host alone is enough), buy one bus in a depot of the savegame. Log: an
    `action <id>:<n> makeVehicleBuyCmd stamped ...` line, then `applied at t=<T>` and `created entity <id>
-   (TRANSPORT_VEHICLE)` a step or two later, and **no** `sent natively: argument 3: ...` line. With a second game: the
+   (TRANSPORT_VEHICLE)` a step or two later, and **no** `REFUSED: it cannot be replicated: argument 3: ...` line. With a second game: the
    other game's log shows the same `<T>`, both vehicle lists show the bus, the money in the top bar is the same. If a
-   game says `sent natively`, the text after it names the member (`does not rebuild equal at ...`, or the engine's own
+   game says `REFUSED: it cannot be replicated`, the text after it names the member (`does not rebuild equal at ...`, or the engine's own
    message): that is what to fix in the schema or the read-only rule.
 2. **V2. Read-only members.** `[FeverLink3 ops] read-only member 'x' of Line is left to the engine` lines list what the
    engine derives. Expected for a few members, not for `stops`, `vehicles` or `purchaseTime`.
@@ -200,16 +214,17 @@ hint, V5, V6, V8, V9, V12, V13) show up as a `sent natively` line or as an `appl
    and the stop's station group should carry `at` with the building's key (`0:<seq>`), not only `s:<id>`. Both games
    then show the bus on the line. If the stops are road-side stops, see N1.
 5. **V5. Lines.** Create a line, change a waiting time and a cargo filter, rename and recolour it, from each side. Compare
-   the line manager on both games; `sent natively` must not appear. Delete a line with a vehicle on it: refused in
+   the line manager on both games; `REFUSED: it cannot be replicated` must not appear. Delete a line with a vehicle on it: refused in
    both; sell the vehicle first: works in both.
-6. **V6. Replacing a vehicle.** Upgrade one vehicle to another model. Host log, one of `action <k> created entity <id>
-   (TRANSPORT_VEHICLE)` (a new entity: replacement works as modelled, later commands on it find it) or `action <k>:
-   nothing created after 10 steps` (the engine changed the vehicle in place: set `creates = nil` for
-   `makeVehicleReplaceCmd`, one line in the module).
+6. **V6. Replacing a vehicle.** Upgrade one vehicle to another model, from each side. Both games show the new model on the
+   same vehicle, the window answers at once (`command makeVehicleReplaceCmd #<n> applied at its stamp`), and a later command on that
+   vehicle (stop it, send it to a depot) works on both. The mod follows the typed definition (no result entity: changed in place);
+   should the engine make a new vehicle after all, the old id disappears from the vehicle list and later commands on the new one are
+   refused with `does not exist here`: then the spec needs `creates = "TRANSPORT_VEHICLE"` back.
 7. **V7. Several purchases in one step.** Clone a vehicle five times (the window sends five purchases). Five new vehicles on
    both; sell the third one: the same one disappears on both (compare names or positions in the list).
 8. **V8. Loans.** Take a loan, with the game running and again paused (host alone is enough for the first half). Log:
-   `action <id>:<n> makeScriptingSendEventCmd stamped ...` and `applied`, no `sent natively`; the finance window shows
+   `action <id>:<n> makeScriptingSendEventCmd stamped ...` and `applied`, no `REFUSED: it cannot be replicated`; the finance window shows
    the obtained loan. With a second game both show the same balance and loan in the next report (parts `balance` and
    `loan` equal in the two `checksum_report` lines of `from_game.log`). This also verifies the assumption behind
    `adjustLoan`: in the host's `checksum_report` lines the `authority` field holds the real `balance` and `loan`;
@@ -226,7 +241,7 @@ hint, V5, V6, V8, V9, V12, V13) show up as a `sent natively` line or as an `appl
     after a minute. Switch time of day to Local on the client: the log says it is not replicated.
 12. **V12. Towns and industries.** Greenify an industry, set a town rating sensitivity, accept a subsidy, toggle
     historic preservation on a building; the other game shows the same industry/town state. If the historic
-    preservation click ends in `sent natively: argument 1: cannot refer to entity <n> as a construction`, a town
+    preservation click ends in `REFUSED: it cannot be replicated: argument 1: cannot refer to entity <n> as a construction`, a town
     building is not a construction entity in this build and its reference needs the building's own component.
 13. **V13. Sale and rename.** Sell a bus from the client, rename a station group and the company from the host: same
     result on both; the company name is the same although the two games' player entities differ.

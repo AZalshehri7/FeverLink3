@@ -41,8 +41,14 @@ pub mod update;
 /// Steam app id of Transport Fever 3.
 pub const APP_ID: &str = "3493540";
 
-/// Folder name of the game-script mod under the user mods folder (`mods/feverlink3_1/`).
-pub const MOD_ID: &str = "feverlink3_1";
+/// Folder name and `modId` of the game-script mod under the user mods folder (`mods/feverlink3/`). The TF3 wiki
+/// (modding:general:moddefinition): "there is no major version like _3 at the end of the modId", and the folder
+/// should be kept in sync with the modId.
+pub const MOD_ID: &str = "feverlink3";
+
+/// Earlier folder names (and mod ids) of the same mod. Install and uninstall remove them, so the game never loads
+/// an old copy next to the current one. `feverlink3_1` was the name until 2026-10-18.
+pub const LEGACY_MOD_IDS: &[&str] = &["feverlink3_1"];
 
 /// Byte string the native module carries, by which the launcher tells its `winhttp.dll` from anyone else's.
 /// The native crate is named `feverlink3_native`, and the PE export directory of the DLL keeps that internal

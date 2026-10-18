@@ -78,7 +78,7 @@ fn three_orders_of_one_step_are_each_used_by_their_own_command_in_any_order_and_
     }
     ctl(
         dir.path(),
-        "1\tinject_next\t1\t{[\"held\"]=11,[\"key\"]=5}\n2\tinject_next\t1\t{[\"held\"]=12,[\"key\"]=6}\n3\tinject_next\t1\t{[\"held\"]=13,[\"key\"]=7}\n",
+        "inject_next\t1\t{[\"held\"]=11,[\"key\"]=5}\ninject_next\t1\t{[\"held\"]=12,[\"key\"]=6}\ninject_next\t1\t{[\"held\"]=13,[\"key\"]=7}\n",
     );
     rt.pump();
     assert_eq!(rt.inject.waiting_count(), 3, "no order replaced another");
@@ -123,7 +123,7 @@ fn two_orders_of_the_same_place_are_used_in_the_order_the_mod_wrote_them() {
     for key in [8u64, 9] {
         std::fs::write(dir.path().join(crate::inject::inject_file_name(key)), road_text(500.0)).unwrap();
     }
-    ctl(dir.path(), "1\tinject_next\t1\t{[\"held\"]=21,[\"key\"]=8}\n2\tinject_next\t1\t{[\"held\"]=22,[\"key\"]=9}\n");
+    ctl(dir.path(), "inject_next\t1\t{[\"held\"]=21,[\"key\"]=8}\ninject_next\t1\t{[\"held\"]=22,[\"key\"]=9}\n");
     let (mut first, _n1) = road(500.0);
     let (mut second, _n2) = road(500.0);
     // the command's own apply reads the file: both orders are armed before the first command is matched
@@ -146,18 +146,15 @@ fn two_deferred(rt: &Runtime, dir: &Path) -> Vec<(Call, Box<[u8; 0x40]>)> {
     }
     ctl(
         dir,
-        "2\tdefer\t1\t{[\"id\"]=1}\n3\tdefer\t1\t{[\"id\"]=2}\n4\tcomplete_next\t1\t{[\"held\"]=2}\n5\tcomplete_next\t1\t{[\"held\"]=1}\n",
+        "defer\t1\t{[\"id\"]=1}\ndefer\t1\t{[\"id\"]=2}\ncomplete_next\t1\t{[\"held\"]=2}\ncomplete_next\t1\t{[\"held\"]=1}\n",
     );
     rt.pump();
     held
 }
 
 /// The mod's release of both deferred commands (the interface world has the apply), then any Add: the callbacks fire.
-fn release_both(rt: &Runtime, dir: &Path, seq: u64) {
-    ctl(
-        dir,
-        &format!("{seq}\trelease\t1\t{{[\"at\"]=0,[\"id\"]=1}}\n{}\trelease\t1\t{{[\"at\"]=0,[\"id\"]=2}}\n", seq + 1),
-    );
+fn release_both(rt: &Runtime, dir: &Path) {
+    ctl(dir, "release\t1\t{[\"at\"]=0,[\"id\"]=1}\nrelease\t1\t{[\"at\"]=0,[\"id\"]=2}\n");
     rt.pump();
     let mut nop = Call::new(27, 50);
     unsafe { rt.on_add(nop.args(), at(0x999)) };
@@ -187,7 +184,7 @@ fn each_held_command_takes_the_result_of_its_own_builds_apply_when_two_are_due_i
     // waited for the age limit.
     assert_eq!(payload_now(&r1), held[0].0.payload(), "build 1's apply went to held command 1");
     assert_eq!(payload_now(&r2), held[1].0.payload(), "build 2's apply went to held command 2");
-    release_both(&rt, dir.path(), 6);
+    release_both(&rt, dir.path());
     let done: Vec<_> = completions(dir.path()).into_iter().map(|(id, _, why)| (id, why)).collect();
     assert_eq!(done, [(1, "stamp_apply".to_string()), (2, "stamp_apply".to_string())], "{:?}", events(dir.path()));
     assert!(refusals(dir.path()).is_empty());
@@ -219,12 +216,12 @@ fn commands_the_interface_adds_keep_their_order_until_their_apply_and_a_reused_a
     assert_eq!(lock(&rt.added).len(), 1, "the record stays: nothing completes held 1 with the other build's result");
     assert_eq!(payload_now(&r1), r1_payload, "the other build's result went to nobody");
     // the mod fails held 1 (its build got no apply here): the record goes with it at the next look, nothing else fails
-    ctl(dir.path(), "6\tfail\t1\t{[\"id\"]=1}\n");
+    ctl(dir.path(), "fail\t1\t{[\"id\"]=1}\n");
     rt.pump();
     let (mut later, _l) = road(700.0);
     apply(&rt, &mut later);
     assert!(lock(&rt.added).is_empty());
-    release_both(&rt, dir.path(), 7);
+    release_both(&rt, dir.path());
     let done = completions(dir.path());
     assert!(done.iter().any(|(id, _, why)| *id == 2 && why == "stamp_apply"), "{done:?}");
     assert!(done.contains(&(1, false, "fail".to_string())), "a failed result: {done:?}");
@@ -253,12 +250,12 @@ fn a_deferred_link_waiting_five_minutes_of_wall_time_in_a_pause_is_still_complet
     assert_eq!(lock(&rt.added).len(), 1, "no wall-clock expiry: the record waits as long as its held command is kept");
     assert!(completions(dir.path()).is_empty(), "nothing was failed during the pause: {:?}", events(dir.path()));
     // the session resumes: the mod speaks again and the simulation applies the build
-    ctl(dir.path(), "6\tping\t1\t{[\"n\"]=1}\n");
+    ctl(dir.path(), "ping\t1\t{[\"n\"]=1}\n");
     rt.pump();
     apply(&rt, &mut r2);
     assert!(lock(&rt.added).is_empty());
     assert_eq!(payload_now(&r2), held[1].0.payload(), "build 2's apply went to held command 2");
-    release_both(&rt, dir.path(), 7);
+    release_both(&rt, dir.path());
     let done = completions(dir.path());
     assert!(done.iter().any(|(id, _, why)| *id == 2 && why == "stamp_apply"), "{done:?}");
 }

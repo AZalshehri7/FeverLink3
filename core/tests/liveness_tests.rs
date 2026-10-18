@@ -102,7 +102,7 @@ fn a_pong_that_answers_no_ping_changes_nothing() {
     let mut n = Net::new();
     let a = n.connect("A");
     let id = n.id(a);
-    n.send(a, MessageKind::Pong, &json(&PongMessage { n: 4242 }));
+    n.send(a, MessageKind::Pong, &json(&PongMessage { n: 4242, w: None }));
     assert_eq!(None, n.host.rtt_ms(id));
     n.tick();
     let first = n.host.rtt_ms(id);
@@ -110,7 +110,7 @@ fn a_pong_that_answers_no_ping_changes_nothing() {
     // the same number again, much later: that ping is long answered
     n.set_latency(a, 5.0);
     n.advance(60.0);
-    n.send(a, MessageKind::Pong, &json(&PongMessage { n: 1 }));
+    n.send(a, MessageKind::Pong, &json(&PongMessage { n: 1, w: None }));
     assert_eq!(first, n.host.rtt_ms(id));
 }
 
@@ -119,7 +119,7 @@ fn pongs_from_the_hosts_own_game_are_ignored() {
     let mut n = Net::new();
     let _a = n.connect("A");
     n.tick();
-    n.host_send(MessageKind::Pong, &json(&PongMessage { n: 1 }));
+    n.host_send(MessageKind::Pong, &json(&PongMessage { n: 1, w: None }));
     n.host_send(MessageKind::Leave, b"{}");
     assert!(n.host.players().contains_key(&0));
 }
@@ -175,7 +175,8 @@ fn a_stalled_host_times_nobody_out() {
 
 #[test]
 fn any_frame_counts_as_a_sign_of_life() {
-    let clock = json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None });
+    let clock =
+        json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None });
     // pings 100 s apart: between them, only what the game itself sends can show the connection is alive
     let options = HostOptions { ping_seconds: 100.0, ..HostOptions::default() };
     let mut n = Net::with(options.clone());

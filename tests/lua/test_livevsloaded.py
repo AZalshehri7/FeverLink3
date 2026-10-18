@@ -14,7 +14,7 @@ sys.path.insert(0, HERE)
 import test_lockstep as T  # noqa: E402  (only for the lupa import and the Game harness)
 
 lupa = T.lupa
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 
 
 def read(name):
@@ -211,12 +211,15 @@ class LvlTest(unittest.TestCase):
     def test_the_api_accessors(self):
         self.run_lua(r'''
           ids = { TOWN = { 4, 2 }, LINE = { 9 }, TRANSPORT_NETWORK = { 6 } }
-          API = { type = { ComponentType = { GAME_SCRIPT = 'GS' } }, engine = {
+          LUS = {}
+          API = { type = { ComponentType = { GAME_SCRIPT = 'GS' },
+                           enum = { LandUseType = { RESIDENTIAL = 'res', COMMERCIAL = 'com', INDUSTRIAL = 'ind' } } }, engine = {
             getComponent = function(e, c) return { state = { townState = { [2] = { experience = 12, level = 3 } } } } end,
+            entityExists = function(e) return e == 1 end,
             util = { town = { getTownLineUsage = function() return 0.5 end } },
             system = {
               gameScriptSystem = { getEntityForGameScript = function() return 1 end },
-              townBuildingSystem = { getCargoSupplyAndLimit = function(e, lu) return { [2] = { 1, 4 }, [1] = { 2, 5 } } end },
+              townBuildingSystem = { getCargoSupplyAndLimit = function(e, lu) LUS[#LUS + 1] = lu return { [2] = { 1, 4 }, [1] = { 2, 5 } } end },
               simPersonSystem = { getCount = function() return 5 end, getDestination2SpMap = function() return { [8] = {}, [3] = {} } end,
                 getSimPersonsForDestination = function() return { 1, 2 } end, getSimPersonsAtTerminalForTransportNetwork = function() return { 3 } end,
                 getSimPersonsForLine = function() return { 4, 5, 6 } end } } } }
@@ -226,6 +229,15 @@ class LvlTest(unittest.TestCase):
         ''')
         self.assertEqual((12, 3), (self.lua.eval("XP"), self.lua.eval("LV")))
         self.assertEqual((3, 9), (self.lua.eval("SD[1][1]"), self.lua.eval("SD[1][2]")))
+        # the land uses are the enum's values (getCargoSupplyAndLimit's typed LandUseType), in the documented order
+        self.assertEqual("res,com,ind", self.lua.eval("table.concat(LUS, ',')"))
+        # a game without the town game script: no entity, no component read of it
+        self.lua.execute("API.engine.system.gameScriptSystem.getEntityForGameScript = function() return -1 end; "
+                         "API.engine.getComponent = function() error('read of a missing entity') end")
+        self.assertIsNone(self.lua.eval("A.xp(2)"))
+        # no LandUseType enum: the accessor raises (the caller guards), it does not guess integers
+        self.lua.execute("API.type.enum = nil")
+        self.assertFalse(self.lua.eval("(pcall(A.supplyDemand, 2))"))
         self.assertEqual(5, self.lua.eval("A.count()"))
         self.assertEqual(2, self.lua.eval("#A.destinations()"))
         self.assertEqual(3, self.lua.eval("#A.forLine(1)"))

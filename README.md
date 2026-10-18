@@ -35,7 +35,7 @@ There is no public release yet; a test package is handed out to the people takin
 2. Start Transport Fever 3 from Steam and activate the mod *FeverLink3 Multiplayer* when starting a game.
 3. Click **FeverLink3** in the bar at the bottom of the screen. The host clicks **Host a game**, presses **Copy code** and sends the code; a friend pastes it and presses **Join**, and the host presses **Start the session**.
 
-To remove everything: delete `winhttp.dll` and `mods\release\feverlink3_1` from the game's folder. What the `winhttp.dll` file is and why antivirus programs may look at it: [docs/SECURITY_FOR_USERS.md](docs/SECURITY_FOR_USERS.md).
+To remove everything: delete `winhttp.dll` and `mods\release\feverlink3` from the game's folder. What the `winhttp.dll` file is and why antivirus programs may look at it: [docs/SECURITY_FOR_USERS.md](docs/SECURITY_FOR_USERS.md).
 
 ## More
 
@@ -59,11 +59,13 @@ cargo build --release -p feverlink3_launcher    # target/release/feverlink3.exe
 pip install lupa && python -I -m unittest discover -s tests/lua -p "test_*.py"
 ```
 
-The folders: `core/` (protocol and session logic), `launcher/` (the in-game session controller and the `feverlink3` command), `native/` (the `winhttp.dll` proxy the game loads), `mod/feverlink3_1/` (the game-script mod), `tests/lua/` (two mocked games running the real mod) and `docs/`.
+The folders: `core/` (protocol and session logic), `launcher/` (the in-game session controller and the `feverlink3` command), `native/` (the `winhttp.dll` proxy the game loads), `mod/feverlink3/` (the game-script mod), `tests/lua/` (two mocked games running the real mod) and `docs/`.
 
 ## Credits
 
 FeverLink3 is a fresh implementation, not a fork, but it stands on two projects that proved the model and documented their findings: [TpF2 Multiplayer](https://github.com/silver2127/tpf2-multiplayer) by silver2127 and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight. Both are MIT-licensed, and their licences are reproduced in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The mod's use of the game's scripting API follows the Transport Fever 3 modding documentation: the official [Transport Fever 3 modding wiki](https://wiki.transportfever3.com/doku.php?id=modding) by Urban Games and the [TF3 docs](https://tf3-docs.transportfever.net/en/guides/index.html) (guides and an API reference generated from the game's own files).
 
 FeverLink3 is not affiliated with, endorsed by or supported by Urban Games or Paradox Interactive. Transport Fever is a trademark of its owners; the name is used here only to say which game the mod is for.
 

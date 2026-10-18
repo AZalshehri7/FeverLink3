@@ -15,8 +15,13 @@
 --     Every entity the simulation creates takes its id from one FIFO of free ids, so a command applied at the click here and
 --     at the stamp elsewhere shifts every later id (see the bridge's deferred completion of builds). The bridge answers with a
 --     `result` record in ui_in.log once the stamp apply is known (applied, or refused there, which every game decides alike),
---     and the callback the window passed runs then, with the entity the command created (M.poll).
---   * anything else, and everything while no session is on: untouched.
+--     and the callback the window passed runs then, with the entity the command created (M.poll). Nothing here ever waits for that
+--     answer: sendCommand returns at once and the window goes on. The commands one handler of the window issues in one go (a clone
+--     of N vehicles is N purchases, then N line assignments from their callbacks) carry one group number, and the bridge ships each
+--     group as one order: one stamp, applied in one step on every game, refused as a whole when any of it cannot be shipped.
+--     One that cannot be encoded (it does not rebuild equal, it names what cannot travel, the hook itself fails) is REFUSED on
+--     this game too: its callback fails and the player is told in the session chat. It is never applied here alone (refuse).
+--   * anything else (no schema, or an event no game replicates), and everything while no session is on: untouched.
 -- Entity ids never travel; the keys of entities created in the session come from binds.txt, which the bridge writes.
 --
 -- Credit: wrapping the engine's command functions in the interface state, keeping the command objects in a weak table, and
@@ -28,27 +33,36 @@
 -- the real shape of what the game's windows issue is learned without guessing.
 
 local okC, C = pcall(ug_require, "feverlink3_common.lua")
-if not okC then C = ug_require("feverlink3_1::/feverlink3_common.lua") end
+if not okC then C = ug_require("feverlink3::/feverlink3_common.lua") end
 local okL, L = pcall(ug_require, "feverlink3_lockstep.lua")
-if not okL then L = ug_require("feverlink3_1::/feverlink3_lockstep.lua") end
+if not okL then L = ug_require("feverlink3::/feverlink3_lockstep.lua") end
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
-if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
+if not okH then Hud = ug_require("feverlink3::/feverlink3_hud.lua") end
 
 local log = C.logger("uihook")
 local M = { installed = false }
 
--- the schemas of the other areas, loaded as the bridge loads them (each optional)
+-- the schemas of the other areas, loaded as the bridge loads them (each optional); `counters`: the world searches a schema made
+-- (the timing line shows how many a command cost)
+local COUNTERS = {}
 for _, name in ipairs({ "feverlink3_cmds_build", "feverlink3_cmds_ops", "feverlink3_cmds_company" }) do
 	local okM, mod = pcall(ug_require, name .. ".lua")
-	if not okM then okM, mod = pcall(ug_require, "feverlink3_1::/" .. name .. ".lua") end
+	if not okM then okM, mod = pcall(ug_require, "feverlink3::/" .. name .. ".lua") end
 	if okM and type(mod) == "table" then
 		L.registerCommands(mod.commands)
 		if mod.events then L.registerEvents(mod.events) end
+		if type(mod.counters) == "table" then COUNTERS[#COUNTERS + 1] = mod.counters end
 	end
 end
 
+local function scans()
+	local n, t = 0, 0
+	for _, c in ipairs(COUNTERS) do n, t = n + (tonumber(c.scans) or 0), t + (tonumber(c.scanMs) or 0) end
+	return n, t
+end
+
 local DEV = false
-pcall(function() DEV = os.getenv("FEVERLINK3_DEV") == "1" end)
+pcall(function() DEV = C.env("FEVERLINK3_DEV") == "1" end)
 
 local U = {
 	tags = setmetatable({}, { __mode = "k" }),   -- command object -> { name, args }
@@ -59,14 +73,20 @@ local U = {
 	held = {},      -- record id -> { cb, progress, name, spec, at }: a command waiting for its stamp apply (the bridge's answer)
 	inbox = nil,    -- reader of ui_in.log (the bridge's answers)
 	stats = { shipped = 0, speed = 0, untouched = 0, failed = 0, answered = 0 },
+	-- The group of the commands a window issues in one go (M.poll starts the next one) and, for the timing lines, when the window's refresh
+	-- last ran (tickAt) and when this hook last handed control back to the window inside the current group (exitAt, exitGrp).
+	grp = 1, tickAt = nil, exitAt = nil, exitGrp = nil,
 }
 
 -- How long a held command waits for the bridge's answer before its callback is fired with a failure (the bridge is gone, the
 -- session ended): far above any stamp lead, so it only fires when nothing will answer.
 local HELD_SECONDS = 120
 
--- The one writer of ui_out.log (the window's chat uses it too: the file has a single writer so its sequence numbers
--- keep increasing).
+-- A speed request repeated within this many seconds of the last one is not sent again (handle).
+local SPEED_REPEAT_S = 1
+
+-- The one writer of ui_out.log in this Lua state (the window's chat uses it too). The bridge reads the file by position, so a new writer
+-- after a reload simply goes on at its end.
 function M.outbox()
 	if not U.outbox then U.outbox = Hud.newOutbox(C) end
 	return U.outbox
@@ -80,7 +100,7 @@ end
 M.send = send
 
 local function trace(text)
-	if DEV then C.appendFile(C.path("dev_trace.txt"), string.format("%.2f ui ", os.clock()) .. text .. "\n") end
+	if DEV then C.dump("dev_trace.txt", string.format("%.2f ui ", C.clock()) .. text .. "\n") end
 end
 
 local function short(v)
@@ -97,7 +117,7 @@ end
 -- instead of the 120 s limit. Nothing is applied here: the command was the window's to retry.
 local OVER_SECONDS = 5
 function M.sessionOver(why)
-	local n, now = 0, os.clock()
+	local n, now = 0, C.clock()
 	for _, h in pairs(U.held) do
 		if not h.over then
 			h.over = now
@@ -110,7 +130,7 @@ end
 -- is a session on? (the identity file the controller writes; read at most once a second). A session that ended, or was replaced by
 -- another one, since this state last looked fails what it still holds (M.sessionOver).
 local function active()
-	local now = os.clock()
+	local now = C.clock()
 	if now - U.lastPoll > 1 or now < U.lastPoll then
 		U.lastPoll = now
 		pcall(C.poll)
@@ -153,7 +173,7 @@ local function keyOf(rev, e)
 	end
 	local p = U.pending[e]
 	if p then
-		if os.clock() - p.at <= PENDING_SECONDS then return p.key end
+		if C.clock() - p.at <= PENDING_SECONDS then return p.key end
 		U.pending[e] = nil
 	end
 	return "s:" .. tostring(e)
@@ -191,16 +211,55 @@ local function inbox()
 	return r
 end
 
+-- Where the held callbacks run (U.fireCtx): the window's refresh (a react step timer) or a window's own sendCommand (a handler). A callback
+-- the engine itself would have run after the command applied may call an API that the game refuses at the place it runs now: friend test
+-- 2026-10-16, 31 x "API is currently restricted" from makeVehicleSetLineCmd's callback (manager_window.tl:4724 playRandomSoundEffect),
+-- every one fired from the step timer; the rest of such a callback does not run. The line says where it ran, the full text the first
+-- times only.
 local function fire(id, h, res, success, entities)
 	if not h.cb then return end
 	local ok, err = pcall(h.cb, res, success, entities)
-	if not ok then log("the callback of command " .. h.name .. " #" .. id .. " failed: " .. tostring(err)) end
+	if ok then return end
+	local text = tostring(err)
+	if text:find("currently restricted", 1, true) then
+		U.restricted = (U.restricted or 0) + 1
+		if U.restricted > 3 then text = text:match("^[^\n]*") end
+		log(string.format("the callback of command %s #%s hit an API the game restricts where it ran (fired from %s; %d so far): %s",
+			h.name, tostring(id), tostring(U.fireCtx or "?"), U.restricted, text))
+		return
+	end
+	log("the callback of command " .. h.name .. " #" .. id .. " failed (fired from " .. tostring(U.fireCtx or "?") .. "): " .. text)
+end
+
+local function ms(a, b)
+	if type(a) ~= "number" or type(b) ~= "number" then return "-" end
+	return string.format("%.0f", (b - a) * 1000)
+end
+
+-- One line per window command once its answer is in: every step from the click to the callback, in ms after the click (the
+-- sendCommand call), on this game's one clock (C.clock: the window state and the bridge's interface half run in one process).
+-- since_tick: from the window's last refresh to the click (a stall in the window's own code before its first command shows here);
+-- gap: from this hook's previous command of the group to this one (the window's and the engine's code between two commands);
+-- maker/poll/encode/write: inside the hook (encode broken down: binds.txt read, each argument's codec with its dry run, each engine
+-- object's read/wire/dry phases, and the world searches the codecs made); read/shipped: the bridge took the record and stamped it; applied/answered: the stamp
+-- apply's answer written by the bridge and read here. Friend test 2026-10-16: a clone of two vehicles stood the game still for 16 s
+-- with no line telling where.
+local function timingLine(id, h, p)
+	local t, b = h.tm or {}, type(p.tm) == "table" and p.tm or {}
+	local c = t.c
+	local detail = t.detail and (" {" .. t.detail .. "}") or ""
+	local order = (type(b.i) == "number" and type(b.n) == "number") and string.format(" (%d of %d)", b.i, b.n) or ""
+	return string.format("timing window #%d %s grp=%s%s stamp=%s now=%s: since_tick=%s gap=%s maker=%.1f poll=%.1f encode=%.1f%s write=%.1f"
+		.. " | read=+%s shipped=+%s applied=+%s answered=+%s ms after the click", id, h.name, tostring(t.grp), order, tostring(b.at), tostring(b.now),
+		ms(t.tick, c), t.exit and ms(t.exit, c) or "-", (t.mk or 0) * 1000, ((t.p or c or 0) - (c or 0)) * 1000, ((t.e or 0) - (t.p or 0)) * 1000, detail,
+		((t.s or 0) - (t.e or 0)) * 1000, ms(c, b.r), ms(c, b.s), ms(c, b.a), ms(c, C.clock()))
 end
 
 -- The stamp apply of held commands, as the bridge reports it: the callback the window passed runs now, with what the command
 -- created (the field the window reads, spec.result, and the entity list), or with a failure when every game refused it at the
--- stamp. Called by the window's refresh (feverlink3_ui.script.lua) and before every command this hook takes.
-function M.poll()
+-- stamp. Run by the window's refresh (M.poll) and before every command this hook takes. Never waits: what is not answered yet
+-- stays held, and the window goes on.
+local function answers()
 	if next(U.held) == nil then return end
 	active()   -- a session that ended fails what is held here (M.sessionOver)
 	local okP, recs = pcall(C.readerPoll, inbox())
@@ -216,16 +275,22 @@ function M.poll()
 			local res = {}
 			if success and e and h.spec.creates then
 				-- usable at once by the next command of the window, before the bridge's table (binds.txt) has it
-				U.pending[e] = { key = type(p.key) == "string" and p.key or ("ui:" .. tostring(id)), at = os.clock() }
+				U.pending[e] = { key = type(p.key) == "string" and p.key or ("ui:" .. tostring(id)), at = C.clock() }
 				if h.spec.result then res[h.spec.result] = e end
 			end
-			local entities = type(p.entities) == "table" and p.entities or (e and { { e, 0 } } or {})
+			-- {{Engine.Entity, Engine.Revision}} as sendCommand's callback gets it (tf3-docs api/cmd): the answer names entities only, so
+			-- each gets this game's revision of it (C.resultEntities; until 2026-10-18 the revision was a bare 0)
+			local entities = type(p.entities) == "table" and p.entities or (e and { { e } } or {})
+			local okR, list = pcall(C.resultEntities, entities)
+			if okR then entities = list end
 			log("command " .. h.name .. " #" .. id .. " " .. (success and "applied" or "REFUSED") .. " at its stamp" .. (p.key and (" (" .. tostring(p.key) .. ")") or "")
 				.. (e and (", created " .. tostring(e)) or "") .. (p.detail and (": " .. tostring(p.detail)) or "") .. "; its callback runs now")
+			local okT, line = pcall(timingLine, id, h, p)
+			if okT then log(line) end
 			fire(id, h, res, success, entities)
 		end
 	end
-	local now = os.clock()
+	local now = C.clock()
 	for id, h in pairs(U.held) do
 		if now - h.at > HELD_SECONDS then
 			U.held[id] = nil
@@ -239,11 +304,56 @@ function M.poll()
 	end
 end
 
--- the command a window sends: encoded, recorded for the bridge and HELD until the bridge reports its stamp apply (M.poll)
-local function handle(tag, cmd, cb, progress)
+local words = L.commandWords
+
+-- A command this game cannot replicate is refused here too, never applied on this game alone: the engine applying it on the
+-- originator only made the worlds differ and the next resync erased the player's edit (friend test 2026-10-16: line edits that
+-- "do not rebuild equal" were applied on the editing game only, 9 of the 14 resyncs of that test followed from it). The window's
+-- callback fails, the log says why, and the player reads it in the session chat (a `notice` record: the bridge adds it to this
+-- game's chat only).
+local function refuse(tag, cb, why)
+	U.stats.failed = U.stats.failed + 1
+	log("command " .. tag.name .. " is REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): " .. tostring(why))
+	send("notice", { text = "Your " .. words(tag.name) .. " was not applied: it cannot be shared with the other players (" .. tostring(why):sub(1, 90) .. ").",
+		sid = C.SESSION })
+	fire(0, { cb = cb, name = tag.name }, {}, false, {})
+	return true
+end
+M.refuse = refuse
+
+-- The window's refresh (feverlink3_ui.script.lua, its step timer): it runs between the window's handlers, never inside one, so it
+-- closes the group of commands the window issued since the last refresh. What one handler issues in one go (a clone of N vehicles:
+-- N purchases in one loop of vehicle_react_util.HandleVehicleChanges) and what the callbacks of one refresh issue (their N line
+-- assignments) carry one group number; the bridge ships each group as one order with one stamp (shipUiCommand).
+function M.poll()
+	U.grp = U.grp + 1
+	U.tickAt = C.clock()
+	U.fireCtx = "the window's refresh"
+	return answers()
+end
+
+-- the command a window sends: encoded, recorded for the bridge and HELD until the bridge reports its stamp apply (M.poll).
+-- `t0`: when the window called sendCommand (the timing line's click).
+local function handle(tag, cmd, cb, progress, t0)
+	local tm = { c = t0, p = C.clock(), grp = U.grp, tick = U.tickAt, mk = tag.mk }
+	if U.exitGrp == U.grp then tm.exit = U.exitAt end
 	if tag.name == "makeGameSetSpeedCmd" then
 		U.stats.speed = U.stats.speed + 1
-		send("speed", { n = tag.args[1], sid = C.SESSION })
+		-- The same speed asked again within SPEED_REPEAT_S of the last request is not sent again: the game's own speed control asks
+		-- every frame while the engine's speed is not the one it shows (friend test 2026-10-16, resync 4: 2760 "speed 4" records from this
+		-- hook, 1210 "speed request ... ignored (resync in progress)" lines on the host while the worlds loaded). The host answers with the
+		-- session speed, so one request a second loses nothing.
+		local n, now = tag.args[1], C.clock()
+		local last = U.lastSpeed
+		if last and last.n == n and now >= last.at and now - last.at < SPEED_REPEAT_S then
+			last.quiet = last.quiet + 1
+			return true
+		end
+		if last and last.quiet > 0 then
+			log(string.format("speed %s was asked %d more time(s) within %.0f s of a request: not sent again", tostring(last.n), last.quiet, SPEED_REPEAT_S))
+		end
+		U.lastSpeed = { n = n, at = now, quiet = 0 }
+		send("speed", { n = n, sid = C.SESSION })
 		return true
 	end
 	-- builds are captured where the engine applies them (the bridge's onPreBuildProposal), whoever issued them
@@ -251,31 +361,37 @@ local function handle(tag, cmd, cb, progress)
 	local spec = L.COMMANDS[tag.name]
 	if not spec or spec.virtual then return false end
 	local category = L.categoryOf(tag.name, tag.args)
+	-- what no game replicates (an event nobody registered: notifications, tutorial steps) is this game's own business
 	if category == "local" then return false end
 	local rev = reverse()
-	local ctx = { plain = C.plain, keyOf = function(e) return keyOf(rev, e) end }
+	tm.r = C.clock()
+	-- argMs / objMs: the schema's own timing of each argument and of each engine object's dry run (feverlink3_cmds_ops.lua)
+	local ctx = { plain = C.plain, keyOf = function(e) return keyOf(rev, e) end, argMs = {}, objMs = {} }
+	local n0, ms0 = scans()
 	local ok, body, why = pcall(L.encodeCommand, tag.name, tag.args, ctx)
 	if not ok then body, why = nil, tostring(body) end
-	if not body then
-		U.stats.failed = U.stats.failed + 1
-		log("command " .. tag.name .. " is not replicated: " .. tostring(why))
-		return false
-	end
+	local n1, ms1 = scans()
+	local parts = {}
+	for i = 1, (tag.args and tag.args.n) or 0 do parts[i] = ctx.argMs[i] and string.format("%.1f", ctx.argMs[i]) or "-" end
+	tm.detail = string.format("binds=%.1f args=[%s] objects=[%s] world_searches=%d (%.0f ms)", (tm.r - tm.p) * 1000, table.concat(parts, " "),
+		table.concat(ctx.objMs, "; "), n1 - n0, ms1 - ms0)
+	if not body then return refuse(tag, cb, why) end
 	local okS, text = pcall(C.serialize, body)
-	if not okS then
-		U.stats.failed = U.stats.failed + 1
-		log("command " .. tag.name .. " is not replicated: " .. tostring(text))
-		return false
-	end
+	if not okS then return refuse(tag, cb, text) end
 	U.seq = U.seq + 1
 	local id = U.seq
+	tm.e = C.clock()
 	-- Nothing goes to the engine here: the refusal the engine would give (not enough money, a depot that is gone) is the stamp
 	-- apply's, decided alike on every game from the same world, and reaches the callback through the bridge's answer. `progress`
 	-- is kept with the command but never called: the engine never had this command, so it has no progress of its own to report.
 	inbox()   -- opened before the record leaves, so its answer lies after the place this state starts reading from
-	U.held[id] = { cb = cb, progress = progress, name = tag.name, spec = spec, at = os.clock() }
-	-- `sid`: the bridge acts only on records of its own session (the file outlives sessions)
-	if not send("cmd", { id = id, body = text, category = category, sid = C.SESSION }) then
+	U.held[id] = { cb = cb, progress = progress, name = tag.name, spec = spec, at = C.clock(), tm = tm }
+	-- `sid`: the bridge acts only on records of its own session (the file outlives sessions). `grp`: the records of one group are
+	-- one order (M.poll); `t`: the click and the end of the encode, for the bridge's part of the timing line.
+	local sent = send("cmd", { id = id, body = text, category = category, sid = C.SESSION, grp = tm.grp, t = { c = tm.c, e = tm.e } })
+	tm.s = C.clock()
+	U.exitAt, U.exitGrp = tm.s, tm.grp
+	if not sent then
 		-- fail closed: applying it here alone would fork the worlds
 		U.held[id] = nil
 		U.stats.failed = U.stats.failed + 1
@@ -284,10 +400,14 @@ local function handle(tag, cmd, cb, progress)
 		return true
 	end
 	U.stats.shipped = U.stats.shipped + 1
-	log("command " .. tag.name .. " #" .. id .. " recorded (" .. #text .. " bytes, " .. category .. "): held until its stamp")
+	log("command " .. tag.name .. " #" .. id .. " recorded (" .. #text .. " bytes, " .. category .. "): held until its stamp; group " .. tm.grp
+		.. string.format(", %.1f ms in the hook (encode %.1f: %s)", (tm.s - (tm.c or tm.p)) * 1000, (tm.e - tm.p) * 1000, tm.detail or "") .. (tm.exit and (", " .. ms(tm.exit, tm.c) .. " ms in the window since its previous command") or ""))
+	U.exitAt = C.clock()
 	return true
 end
 
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the window state's command factories and sendCommand are
+-- replaced: a window command must be held and stamped before any game applies it, and the API has no command hook.
 function M.install()
 	if M.installed then return true end
 	if not (C.DIR and C.IO and api and api.cmd) then return false end
@@ -317,8 +437,10 @@ function M.install()
 	for name, fn in pairs(orig.factory) do
 		local okw = pcall(function()
 			api.cmd[name] = function(...)
+				local t = C.clock()
 				local cmd = fn(...)
-				if cmd ~= nil then U.tags[cmd] = { name = name, args = { n = select("#", ...), ... } } end
+				-- mk: the seconds the engine's own command maker took (the timing line)
+				if cmd ~= nil then U.tags[cmd] = { name = name, args = { n = select("#", ...), ... }, mk = C.clock() - t } end
 				return cmd
 			end
 		end)
@@ -326,6 +448,7 @@ function M.install()
 	end
 	local oks = pcall(function()
 		api.cmd.sendCommand = function(cmd, cb, progress)
+			local t0 = C.clock()
 			local tag = cmd ~= nil and U.tags[cmd] or nil
 			if tag ~= nil then
 				if DEV then
@@ -334,10 +457,15 @@ function M.install()
 					trace("sendCommand " .. tag.name .. "(" .. table.concat(parts, " | ") .. ")" .. (active() and "" or " [no session]"))
 				end
 				if active() then
-					pcall(M.poll)
-					local okH2, handled = pcall(handle, tag, cmd, cb, progress)
+					U.fireCtx = "a window's sendCommand (" .. tag.name .. ")"
+					pcall(answers)   -- not M.poll: a command issued inside a window's handler stays in that handler's group
+					local okH2, handled = pcall(handle, tag, cmd, cb, progress, t0)
 					if okH2 and handled then return end
-					if not okH2 then log("command " .. tag.name .. " failed in the hook: " .. tostring(handled)) end
+					-- a fault in the hook is refused like a command that cannot be replicated: passing it on would apply it here alone
+					if not okH2 then
+						pcall(refuse, tag, cb, "the hook failed: " .. tostring(handled))
+						return
+					end
 				end
 			elseif DEV then
 				trace("sendCommand (untagged) " .. tostring(cmd))
@@ -380,7 +508,7 @@ function M.devPoll()
 			out = head .. "ERROR: " .. tostring(res)
 		end
 	end
-	C.appendFile(C.path("dev_ui_out.txt"), "---- t=" .. tostring(os.clock()) .. "\n" .. out .. "\n")
+	C.dump("dev_ui_out.txt", "---- t=" .. tostring(C.clock()) .. "\n" .. out .. "\n")
 end
 
 -- DEV only: the same as devPoll, but for the file dev_click.lua and called from a button's click handler. The engine lets
@@ -391,7 +519,7 @@ function M.devClick()
 	local path = C.path("dev_click.lua")
 	local text = C.readFile(path)
 	if type(text) ~= "string" or text == "" then
-		C.appendFile(C.path("dev_click_out.txt"), "---- t=" .. tostring(os.clock()) .. "\nNOTHING TO RUN\n")
+		C.dump("dev_click_out.txt", "---- t=" .. tostring(C.clock()) .. "\nNOTHING TO RUN\n")
 		return
 	end
 	C.writeFile(path, "")
@@ -418,7 +546,7 @@ function M.devClick()
 			out = head .. "ERROR: " .. tostring(res)
 		end
 	end
-	C.appendFile(C.path("dev_click_out.txt"), "---- t=" .. tostring(os.clock()) .. "\n" .. out .. "\n")
+	C.dump("dev_click_out.txt", "---- t=" .. tostring(C.clock()) .. "\n" .. out .. "\n")
 end
 
 M.dev = DEV

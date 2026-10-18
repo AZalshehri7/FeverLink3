@@ -224,6 +224,26 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.shipped_count(), 1, "the host's own build was captured")
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (5, 5))
 
+    def test_a_replay_the_engine_refused_is_named_and_does_not_take_the_next_ones_event(self):
+        # owner one-PC test 2026-10-15: 2:18 got no apply event (refused) on either game; the next two replays' events spent the marks one
+        # behind, and the log said "the engine did not run the replayed build 2:20" on both games although 2:20 was applied on both
+        self.start()
+        self.A.run("DROP_NEXT_BUILD = true; local BASE = EXECUTE; function EXECUTE(cmd, cb) "
+                   "if DROP_NEXT_BUILD and cmd.__cmd == 'makeWorldBuildProposalCmd' then DROP_NEXT_BUILD = false; return end; return BASE(cmd, cb) end")
+        for i in range(3):
+            self.B.native(self.road(300 + 150 * i, 0, 400 + 150 * i, 0))
+            self.tick(3)
+        self.tick(20)
+        self.B.native(self.road(0, 700, 0, 800))
+        self.tick(20)
+        line = [x for x in self.A.log().splitlines() if "did not run the replayed build" in x]
+        self.assertEqual(len(line), 1, self.A.log())
+        named = line[0].split("did not run the replayed build", 1)[1]   # not the wall-clock prefix: "11:01:39" holds "1:3"
+        self.assertIn(" 1:1@", named, "the refused replay is the one named")
+        self.assertNotIn("1:3@", named, "the last replay sent was applied")
+        self.assertEqual(self.A.shipped_count(), 0, "no replay's event was taken for a new build of this game")
+        self.assertEqual(self.A.builds_applied(), 3)
+
     def test_both_games_building_at_once_end_up_with_both_roads(self):
         self.start()
         self.A.native(self.road(0, 300, 0, 400))

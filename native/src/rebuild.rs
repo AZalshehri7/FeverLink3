@@ -1023,6 +1023,40 @@ pub(crate) mod testgraph {
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 
+    /// An engine hash container at `payload + off` whose list holds one 24-byte node per value (next, prev, the 8-byte value word), with
+    /// a bucket array of 8 buckets (first, last) pointing at the nodes. Returns the nodes' addresses.
+    pub(crate) fn add_hash(arena: &Arena, payload: usize, off: usize, values: &[u64]) -> Vec<usize> {
+        let h = arena.add(&[0u8; 0x18]);
+        let nodes: Vec<usize> = values.iter().map(|_| arena.add(&[0u8; 0x18])).collect();
+        let ring: Vec<usize> = std::iter::once(h).chain(nodes.iter().copied()).collect();
+        for (i, &a) in ring.iter().enumerate() {
+            let mut b = vec![0u8; 0x18];
+            w(&mut b, 0, ring[(i + 1) % ring.len()] as u64);
+            w(&mut b, 8, ring[(i + ring.len() - 1) % ring.len()] as u64);
+            if i > 0 {
+                w(&mut b, 0x10, values[i - 1]);
+            }
+            assert!(arena.write(a, &b));
+        }
+        let mut slots = vec![0u8; 0x80];
+        for (i, node) in nodes.iter().enumerate().take(8) {
+            w(&mut slots, i * 16, *node as u64);
+            w(&mut slots, i * 16 + 8, *node as u64);
+        }
+        let buckets = arena.add(&slots);
+        let mut hash = vec![0u8; 0x40];
+        hash[..4].copy_from_slice(&1.0f32.to_le_bytes());
+        w(&mut hash, 8, h as u64);
+        w(&mut hash, 0x10, values.len() as u64);
+        w(&mut hash, 0x18, buckets as u64);
+        w(&mut hash, 0x20, (buckets + 0x80) as u64);
+        w(&mut hash, 0x28, (buckets + 0x80) as u64);
+        w(&mut hash, 0x30, 7);
+        w(&mut hash, 0x38, 8);
+        assert!(arena.write(payload + off, &hash));
+        nodes
+    }
+
     pub(crate) fn add_containers(arena: &Arena, payload: usize) {
         // list of the hash: head H, nodes N1 and N2 (next, prev, key, value), all of the node type (24 bytes, as `old2new`'s in the game)
         let (h, n1, n2) = (arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x18]), arena.add(&[0u8; 0x18]));
@@ -1304,6 +1338,50 @@ mod tests {
             image[3] ^= 1;
             assert!(EngineAlloc::at(base).is_err(), "a changed byte refuses it");
         }
+    }
+
+    #[test]
+    fn a_set_of_4_byte_values_carries_its_values_and_not_the_residue_beside_them() {
+        // owner airport run 2026-10-15 key 20, friend test 2026-10-16 keys 20/28/29: every refusal "N heap pointers cannot be resolved"
+        // was +0x10 of a terrainAlignSkipEdges node, a 4-byte value under the high half of an old heap address (0x171_00000007)
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        // the residue: the high halves of real blocks of this "game", so that the whole word is a readable address here
+        let targets: Vec<usize> = (0..3).map(|_| arena.add(&[0x5au8; 0x40])).collect();
+        let values: Vec<u64> = targets.iter().enumerate().map(|(i, t)| (*t as u64 & !0xffff_ffff) | i as u64).collect();
+        assert!(
+            values.iter().all(|v| arena.read(*v as usize, 1).is_some()),
+            "each value word looks like a readable address"
+        );
+        super::testgraph::add_hash(&arena, at, 0x1e8, &values);
+        let typed = Settings { typed: true, graph_skip: &["toAdd"], ..settings() };
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        assert!(e.text.contains("terrainAlignSkipEdges\thash:size=3,"), "{}", e.text);
+        assert!(!e.text.lines().any(|l| l.starts_with("@B") && l.contains(" P")), "no pointer left: {}", e.text);
+        for i in 0..3 {
+            assert!(
+                e.text.contains(&format!(" w:{i:016x}")) || (i == 0 && e.text.contains(" z1")),
+                "the value {i}: {}",
+                e.text
+            );
+        }
+        assert_eq!(crate::inject::text_refusal(&e.text, BASE), None, "the originator ships it");
+        let payload = arena.read(at, PAYLOAD_SIZE).unwrap();
+        let r = roundtrip(&e.text, &payload, BASE, typed, &arena, &NoHeap(&arena), &|b| Some(arena.add(b)))
+            .expect("rebuilds");
+        assert!(!r.text.contains("DIFF  terrainAlignSkipEdges"), "{}", r.text);
+        // the same words in a container whose value type the table does not know stay pointers, and the originator refuses the text
+        // (every receiver would): never shipped to be refused at the stamp
+        let (fake, at) = synthetic();
+        let arena = world(fake.0);
+        for _ in 0..3 {
+            arena.add(&[0x5au8; 0x40]);
+        }
+        super::testgraph::add_hash(&arena, at, 0x270, &values[1..]);
+        let e = encode(&NoHeap(&arena), Env { image_base: BASE }, typed, "40420", &head(at)).expect("encodes");
+        assert!(e.stats.heap_ptrs >= 2, "{}", e.text);
+        let why = crate::inject::text_refusal(&e.text, BASE).expect("refused before shipping");
+        assert!(why.starts_with("2 heap pointers in the text cannot be resolved"), "{why}");
     }
 
     #[test]

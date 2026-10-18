@@ -30,7 +30,7 @@ use std::sync::Mutex;
 
 /// Switch: `1` = the normal dump, `2` = deeper and larger.
 pub const DUMP_VAR: &str = "FEVERLINK3_DUMP_COMMANDS";
-/// Where it goes, next to `native_ctl.log`.
+/// Where it goes, next to the control files.
 pub const DUMP_FILE: &str = "native_dump.log";
 /// One summary line per dump, to find the right one in the big file.
 pub const INDEX_FILE: &str = "native_dump_index.log";

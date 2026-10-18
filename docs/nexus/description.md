@@ -50,7 +50,7 @@ The zip holds a testing installer, the native module (`winhttp.dll`) and the mod
 3. It prints one line per item (the mod, `steam_appid.txt`, `winhttp.dll`, `feverlink3_path.txt`), each marked DONE, SKIP or FAILED with the reason. If a line says the Steam user folder does not exist, start the game once, close it and run the command again.
 4. Start Transport Fever 3 from Steam. When you start a game, open the mod list on the settings page, find *FeverLink3 Multiplayer* and activate it. The **FeverLink3** button appears in the bar at the bottom of the screen.
 
-Without the installer: copy `winhttp.dll` into the Transport Fever 3 game folder and the folder `mod\feverlink3_1` into `<Steam>\userdata\<your id>\3493540\local\mods\`. That is what the installer does for the in-game window (the other two files it writes are not used by the in-game window). This route has not been tested separately; if the button does not appear, use the installer and tell us.
+Without the installer: copy `winhttp.dll` into the Transport Fever 3 game folder and the folder `mod\feverlink3` into `<Steam>\userdata\<your id>\3493540\local\mods\`. That is what the installer does for the in-game window (the other two files it writes are not used by the in-game window). This route has not been tested separately; if the button does not appear, use the installer and tell us.
 
 ## Running the connection test
 

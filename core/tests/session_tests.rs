@@ -272,7 +272,7 @@ fn host_only_kinds_from_a_player_are_dropped_and_never_relayed() {
     h.player_game(a, MessageKind::Session, &json(&state));
     let load = ResyncLoadMessage { id: 1, name: "evil".into(), sha256: "00".into() };
     h.player_game(a, MessageKind::ResyncLoad, &json(&load));
-    let request = ChecksumRequestMessage { n: 9, at: 0, paused: false, full: true };
+    let request = ChecksumRequestMessage { n: 9, at: 0, paused: false, full: true, spread: 0 };
     h.player_game(a, MessageKind::ChecksumRequest, &json(&request));
     assert_eq!(3, h.host.dropped());
     assert_eq!(before, h.p(b).game.len());
@@ -383,12 +383,28 @@ fn a_players_own_pause_number_is_overwritten_and_a_paused_commit_is_numbered_in_
             .pause_seq
     );
     assert_eq!(None, h.p(b).last::<ActionMessage>(MessageKind::Action).pause_seq, "no pause flag: no number");
-    let commit = BuildCommitMessage { seq: 1, owner: 2, stamp: 30_000, from: 0, pause: true, pause_seq: Some(50) };
+    let commit = BuildCommitMessage {
+        seq: 1,
+        owner: 2,
+        stamp: 30_000,
+        from: 0,
+        pause: true,
+        pause_seq: Some(50),
+        pause_upto: None,
+    };
     h.player_game(b, MessageKind::BuildCommit, &json(&commit));
     let got: BuildCommitMessage = h.p(b).last(MessageKind::BuildCommit);
     assert_eq!(Some(2), got.pause_seq, "the commit takes the next number, and comes back to its sender");
     assert_eq!(Some(2), h.p(a).last::<BuildCommitMessage>(MessageKind::BuildCommit).pause_seq);
-    let plain = BuildCommitMessage { seq: 2, owner: 2, stamp: 30_000, from: 0, pause: false, pause_seq: None };
+    let plain = BuildCommitMessage {
+        seq: 2,
+        owner: 2,
+        stamp: 30_000,
+        from: 0,
+        pause: false,
+        pause_seq: None,
+        pause_upto: None,
+    };
     h.player_game(b, MessageKind::BuildCommit, &json(&plain));
     assert_eq!(1, h.p(b).count(MessageKind::BuildCommit), "a commit outside a pause is not echoed");
 }
@@ -398,7 +414,8 @@ fn the_resume_reaches_every_game_after_every_paused_action_numbered_before_it() 
     let mut h = Harness::new();
     let a = h.connect("A");
     let b = h.connect("B");
-    let clock = ClockMessage { t: 18_600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None };
+    let clock =
+        ClockMessage { t: 18_600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None };
     h.host_game(MessageKind::Clock, &json(&clock));
     h.player_game(a, MessageKind::Clock, &json(&clock));
     h.player_game(b, MessageKind::Clock, &json(&clock));
@@ -428,7 +445,16 @@ fn the_resume_reaches_every_game_after_every_paused_action_numbered_before_it() 
 
 /// A clock of a game standing still at a pause (its promise is the pause, `stop` where it really stands).
 fn stopped(t: i64, pause_at: i64) -> Vec<u8> {
-    json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: Some(pause_at), pause: true, stop: Some(t) })
+    json(&ClockMessage {
+        t,
+        speed: 0,
+        ahead: 3,
+        need: None,
+        safe: Some(pause_at),
+        pause: true,
+        stop: Some(t),
+        hop: None,
+    })
 }
 
 /// Three ready games (the host's and two players'), running at x3, then paused; returns the players and the pause stamp.
@@ -440,8 +466,9 @@ fn three_paused() -> (Harness, ConnectionId, ConnectionId, i64) {
         h.player_game(c, MessageKind::Hello, &json(&HelloMessage::new(30_000)));
     }
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(30_000)));
-    let running =
-        |t: i64| json(&ClockMessage { t, speed: 3, ahead: 3, need: None, safe: None, pause: false, stop: None });
+    let running = |t: i64| {
+        json(&ClockMessage { t, speed: 3, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None })
+    };
     h.host_game(MessageKind::Clock, &running(30_000));
     h.player_game(a, MessageKind::Clock, &running(30_000));
     h.player_game(b, MessageKind::Clock, &running(30_000));
@@ -473,8 +500,16 @@ fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stand
         "held: B has not said where it stands (it may still move)"
     );
     // a stop that is not the clock's own time counts for nothing
-    let mut odd =
-        ClockMessage { t: p + 600, speed: 0, ahead: 3, need: None, safe: Some(p), pause: true, stop: Some(p) };
+    let mut odd = ClockMessage {
+        t: p + 600,
+        speed: 0,
+        ahead: 3,
+        need: None,
+        safe: Some(p),
+        pause: true,
+        stop: Some(p),
+        hop: None,
+    };
     h.player_game(b, MessageKind::Clock, &json(&odd));
     assert!(paused_actions(&h.p(b).game).is_empty());
     odd.stop = Some(p + 600);
@@ -497,6 +532,29 @@ fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stand
     for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
         assert_eq!(vec![(1, first, 1), (1, second, 2)], paused_actions(game));
     }
+}
+
+#[test]
+fn every_item_of_one_flush_of_the_pause_order_names_the_last_one_of_it() {
+    let (mut h, a, b, p) = three_paused();
+    h.host_game(MessageKind::Clock, &stopped(p, p));
+    h.player_game(a, MessageKind::Clock, &stopped(p, p));
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(p, 1, "{a1}").paused()));
+    h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(p, 2, "{a2}").paused()));
+    h.player_game(b, MessageKind::Clock, &stopped(p, p)); // the flush: both at once
+    h.player_game(b, MessageKind::Action, &json(&ActionMessage::new(p, 1, "{b1}").paused()));
+    h.host_game(MessageKind::Clock, &stopped(p + 2 * Lockstep::STEP, p));
+    h.player_game(a, MessageKind::Clock, &stopped(p + 2 * Lockstep::STEP, p));
+    h.player_game(b, MessageKind::Clock, &stopped(p + 2 * Lockstep::STEP, p)); // a flush of one
+    let marks: Vec<(Option<u64>, Option<u64>)> = h
+        .p(b)
+        .game
+        .iter()
+        .filter(|g| g.0 == MessageKind::Action)
+        .filter_map(|g| codec::try_decode::<ActionMessage>(&g.1))
+        .map(|m| (m.pause_seq, m.pause_upto))
+        .collect();
+    assert_eq!(vec![(Some(1), Some(2)), (Some(2), Some(2)), (Some(3), Some(3))], marks);
 }
 
 #[test]
@@ -546,7 +604,16 @@ fn clock_becomes_a_peer_clock_for_the_others_and_feeds_the_stamp() {
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 50000,
+            speed: 1,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     let pc: PeerClockMessage = h.p(b).last(MessageKind::PeerClock);
     assert_eq!(h.p(a).session.id().unwrap(), pc.from);
@@ -566,13 +633,31 @@ fn a_measured_stamp_margin_is_relayed_with_the_clock_and_clamped() {
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 49800, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 49800,
+            speed: 1,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     assert_eq!(None, h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need, "nothing measured: none relayed");
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50000, speed: 1, ahead: 3, need: Some(2), safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 50000,
+            speed: 1,
+            ahead: 3,
+            need: Some(2),
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     assert_eq!(Some(2), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
     h.player_game(
@@ -586,13 +671,23 @@ fn a_measured_stamp_margin_is_relayed_with_the_clock_and_clamped() {
             safe: None,
             pause: false,
             stop: None,
+            hop: None,
         }),
     );
     assert_eq!(Some(ClockMessage::MAX_NEED), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 50400, speed: 1, ahead: 3, need: Some(-5), safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 50400,
+            speed: 1,
+            ahead: 3,
+            need: Some(-5),
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     assert_eq!(Some(0), h.p(b).last::<PeerClockMessage>(MessageKind::PeerClock).need);
 }
@@ -610,6 +705,7 @@ fn the_input_barriers_promise_is_relayed_after_the_actions_shipped_before_it_and
         safe,
         pause,
         stop: None,
+        hop: None,
     };
     // an action, then the clock whose promise covers it: the other game gets them in that order (the barrier counts on it)
     h.player_game(a, MessageKind::Action, &json(&ActionMessage::new(51_400, 1, "{x}")));
@@ -641,8 +737,16 @@ fn the_input_barriers_promise_is_relayed_after_the_actions_shipped_before_it_and
 fn a_pause_or_checksum_stamp_is_never_before_a_promise_a_game_made() {
     let mut h = Harness::new();
     let a = h.connect("A");
-    let clock =
-        |t: i64, safe: Option<i64>| ClockMessage { t, speed: 1, ahead: 3, need: None, safe, pause: false, stop: None };
+    let clock = |t: i64, safe: Option<i64>| ClockMessage {
+        t,
+        speed: 1,
+        ahead: 3,
+        need: None,
+        safe,
+        pause: false,
+        stop: None,
+        hop: None,
+    };
     h.host_game(MessageKind::Clock, &json(&clock(50_000, Some(50_000 + 2 * Lockstep::STEP))));
     h.player_game(a, MessageKind::Clock, &json(&clock(50_000, None)));
     let by_lead = Lockstep::round_up_to_step((50_000 + Lockstep::lead_units(1)) as f64);
@@ -663,13 +767,31 @@ fn start_speed_and_pause_are_broadcast_and_speed_requests_obeyed() {
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(18600)));
     h.host_game(
         MessageKind::Clock,
-        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 18600,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(18600)));
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 18600, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 18600,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
 
     h.player_game(a, MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 2 }));
@@ -753,6 +875,36 @@ fn reports_taken_at_different_sim_times_are_not_compared() {
 }
 
 #[test]
+fn a_part_a_game_reports_not_ready_is_not_compared_and_a_missing_part_still_differs() {
+    let mut late = ChecksumReportMessage::new(1, 5, parts(&[("a", "1"), ("b", "other")]));
+    late.not_ready = vec!["companies".to_owned()];
+    let reports: BTreeMap<u16, ChecksumReportMessage> = [
+        (0, ChecksumReportMessage::new(1, 5, parts(&[("a", "1"), ("b", "2"), ("companies", "c"), ("towns:7", "t")]))),
+        (1, late),
+    ]
+    .into_iter()
+    .collect();
+    let o = ChecksumRounds::compare(1, &reports);
+    assert!(o.comparable() && !o.ready() && !o.identical());
+    assert_eq!(vec![1], o.not_ready["companies"]);
+    // what both games hashed is compared as always, and a part one game simply does not have is a difference (a town only one
+    // world has): only a part the game itself names not ready is unknown
+    assert_eq!(vec!["b", "towns:7"], o.differing_parts().collect::<Vec<_>>());
+    assert_eq!("companies on 1", o.describe_not_ready());
+}
+
+#[test]
+fn a_light_round_drops_heavy_parts_from_the_not_ready_list_too() {
+    let mut rounds = ChecksumRounds::new();
+    rounds.open_light(3);
+    let mut r = ChecksumReportMessage::new(3, 5, parts(&[("a", "1")]));
+    r.not_ready = vec!["edges".to_owned()];
+    assert!(rounds.report(1, r, &[0, 1]).is_none());
+    let o = rounds.report(0, ChecksumReportMessage::new(3, 5, parts(&[("a", "1")])), &[0, 1]).expect("complete");
+    assert!(o.identical(), "{o:?}");
+}
+
+#[test]
 fn tick_rebroadcasts_the_session_and_requests_checksums_while_running() {
     let options = HostOptions { session_broadcast_seconds: 3.0, checksum_seconds: 10.0, ..HostOptions::default() };
     let mut h = Harness::with("Hote", options);
@@ -780,6 +932,171 @@ fn tick_rebroadcasts_the_session_and_requests_checksums_while_running() {
 }
 
 #[test]
+fn a_running_full_round_is_spread_one_batch_apart_and_light_and_paused_rounds_are_not() {
+    let options = HostOptions { checksum_seconds: 10.0, full_checksum_every: 2, ..HostOptions::default() };
+    let mut h = Harness::with("Hote", options);
+    let a = h.connect("A");
+    h.host_call(HostSession::start);
+    h.host_call(|host| host.set_speed(3));
+    for _ in 0..4 {
+        h.advance(10.5);
+        h.host_call(HostSession::tick);
+    }
+    let running: Vec<(bool, bool, u32)> = h
+        .p(a)
+        .all::<ChecksumRequestMessage>(MessageKind::ChecksumRequest)
+        .into_iter()
+        .filter(|r| !r.paused)
+        .map(|r| (r.paused, r.full, r.spread))
+        .collect();
+    assert!(running.contains(&(false, true, 3)), "a full round at x3 is read one chunk every 3 steps: {running:?}");
+    assert!(running.contains(&(false, false, 0)), "a light round is hashed whole: {running:?}");
+    assert!(running.iter().all(|r| r.1 == (r.2 > 0)), "{running:?}");
+    let paused = h.p(a).all::<ChecksumRequestMessage>(MessageKind::ChecksumRequest).into_iter().filter(|r| r.paused);
+    assert!(paused.into_iter().all(|r| r.spread == 0), "a paused round is hashed whole by the interface half");
+}
+
+/// A running session of the host's game and player A, both ready, at x3; returns A's connection.
+fn running_pair(options: HostOptions) -> (Harness, ConnectionId) {
+    let mut h = Harness::with("Hote", options);
+    let a = h.connect("A");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.player_game(a, MessageKind::Hello, &json(&HelloMessage::new(0)));
+    h.host_call(HostSession::start);
+    h.host_call(|host| host.set_speed(3));
+    // the round asked at the start is reported by both, then forgotten by the test: what follows is the timer's rounds alone
+    for r in running_requests(&h, a) {
+        report(&mut h, None, &r);
+        report(&mut h, Some(a), &r);
+    }
+    h.players.get_mut(&a).unwrap().game.clear();
+    h.outcomes.clear();
+    h.host_log.clear();
+    (h, a)
+}
+
+fn running_requests(h: &Harness, a: ConnectionId) -> Vec<ChecksumRequestMessage> {
+    h.p(a).all::<ChecksumRequestMessage>(MessageKind::ChecksumRequest).into_iter().filter(|r| !r.paused).collect()
+}
+
+fn report(h: &mut Harness, who: Option<ConnectionId>, r: &ChecksumRequestMessage) {
+    let m = json(&ChecksumReportMessage::new(r.n, r.at, parts(&[("roads", "r"), ("edges", "e")])));
+    match who {
+        None => h.host_game(MessageKind::ChecksumReport, &m),
+        Some(c) => h.player_game(c, MessageKind::ChecksumReport, &m),
+    }
+}
+
+#[test]
+fn every_regular_round_is_full_and_spread_by_default() {
+    let (mut h, a) = running_pair(HostOptions::default());
+    for _ in 0..4 {
+        h.advance(10.5);
+        h.host_call(HostSession::tick);
+        let r = running_requests(&h, a).pop().expect("a round");
+        report(&mut h, None, &r);
+        report(&mut h, Some(a), &r);
+    }
+    let rounds = running_requests(&h, a);
+    assert_eq!(4, rounds.len(), "{rounds:?}");
+    assert!(
+        rounds.iter().all(|r| r.full && r.spread == 3),
+        "every round full, one chunk every 3 steps at x3: {rounds:?}"
+    );
+    assert!(h.outcomes.iter().all(|o| o.full && o.identical()), "{:?}", h.outcomes);
+}
+
+#[test]
+fn a_regular_round_waits_for_a_slow_game_and_starts_right_after_it_reported() {
+    let (mut h, a) = running_pair(HostOptions::default());
+    h.advance(10.5);
+    h.host_call(HostSession::tick);
+    let first = running_requests(&h, a).pop().expect("round one");
+    report(&mut h, None, &first);
+    // A is slow: its spread round is still being read when the 10 s timer fires twice; no second round is asked meanwhile
+    for _ in 0..2 {
+        h.advance(10.0);
+        h.host_call(HostSession::tick);
+        assert_eq!(1, running_requests(&h, a).len(), "no overlap while A has not reported");
+    }
+    report(&mut h, Some(a), &first);
+    assert_eq!(1, h.outcomes.len());
+    // the timer is overdue: the next round starts at the next tick, not 10 s after the late report
+    h.advance(0.3);
+    h.host_call(HostSession::tick);
+    let rounds = running_requests(&h, a);
+    assert_eq!(2, rounds.len());
+    assert!(rounds[1].n > first.n && rounds[1].full);
+    // the wait is logged once a minute: how many rounds waited and the longest wait
+    report(&mut h, None, &rounds[1]);
+    report(&mut h, Some(a), &rounds[1]);
+    for _ in 0..8 {
+        h.advance(10.0);
+        h.host_call(HostSession::tick);
+        let r = running_requests(&h, a).pop().unwrap();
+        report(&mut h, None, &r);
+        report(&mut h, Some(a), &r);
+    }
+    let waits: Vec<&String> = h.host_log.iter().filter(|l| l.contains("waited for the previous one")).collect();
+    assert_eq!(1, waits.len(), "{:?}", h.host_log);
+    assert!(waits[0].contains("checksum: 1 round(s)") && waits[0].contains("longest wait 10.3 s"), "{}", waits[0]);
+}
+
+#[test]
+fn a_round_that_never_completes_is_dropped_after_the_bound_and_the_next_one_starts() {
+    let options = HostOptions { checksum_round_timeout_seconds: 30.0, ..HostOptions::default() };
+    let (mut h, a) = running_pair(options);
+    h.advance(10.5);
+    h.host_call(HostSession::tick);
+    let first = running_requests(&h, a).pop().expect("round one");
+    report(&mut h, None, &first);
+    // A never reports (it reloads, say): the round holds the next one back only up to the bound
+    for _ in 0..2 {
+        h.advance(10.0);
+        h.host_call(HostSession::tick);
+    }
+    assert_eq!(1, running_requests(&h, a).len());
+    h.advance(10.5);
+    h.host_call(HostSession::tick);
+    assert!(
+        h.host_log.iter().any(|l| l.contains(&format!("checksum round {} dropped: not reported by A", first.n))),
+        "{:?}",
+        h.host_log
+    );
+    assert_eq!(2, running_requests(&h, a).len(), "the next round starts once the stuck one is dropped");
+    // a late report of the dropped round is ignored
+    report(&mut h, Some(a), &first);
+    assert!(h.outcomes.is_empty());
+}
+
+#[test]
+fn with_the_switch_a_light_round_is_still_hashed_whole_and_waits_like_any_round() {
+    let options = HostOptions { full_checksum_every: 6, ..HostOptions::default() };
+    let (mut h, a) = running_pair(options);
+    for _ in 0..3 {
+        h.advance(10.5);
+        h.host_call(HostSession::tick);
+        let r = running_requests(&h, a).pop().unwrap();
+        report(&mut h, None, &r);
+        report(&mut h, Some(a), &r);
+    }
+    let kinds: Vec<(bool, u32)> = running_requests(&h, a).iter().map(|r| (r.full, r.spread)).collect();
+    assert_eq!(3, kinds.len());
+    assert!(kinds.contains(&(false, 0)), "the old split: light rounds between the full ones: {kinds:?}");
+    assert!(h.outcomes.iter().any(|o| !o.full));
+}
+
+#[test]
+fn a_request_without_spread_reads_as_a_whole_round() {
+    let r: ChecksumRequestMessage = serde_json::from_str(r#"{"n":1,"at":5,"paused":false}"#).unwrap();
+    assert_eq!((true, 0), (r.full, r.spread));
+    assert!(
+        !String::from_utf8(json(&r)).unwrap().contains("spread"),
+        "0 is left out, so an older game reads the same request"
+    );
+}
+
+#[test]
 fn disconnect_removes_the_player_and_tells_the_others() {
     let mut h = Harness::new();
     let a = h.connect("A");
@@ -787,7 +1104,7 @@ fn disconnect_removes_the_player_and_tells_the_others() {
     h.player_game(
         a,
         MessageKind::Clock,
-        &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage { t: 5, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None }),
     );
     h.disconnect(a);
     assert_eq!(2, h.host.players().len());

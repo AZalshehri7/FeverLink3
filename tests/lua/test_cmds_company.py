@@ -93,7 +93,7 @@ class CompanyUnit(unittest.TestCase):
     def setUp(self):
         os.environ.pop("FEVERLINK3_SESSION_DIR", None)
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.L.execute(tl.COMMON_SRC)
+        self.C = tl.load_common(self.L)
         self.K = self.L.execute(tl.LOCKSTEP_SRC)
         self.M = self.L.execute(COMPANY_SRC)
         self.Co = self.M.company
@@ -788,6 +788,7 @@ class CoGame(tl.Game):
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = tl.COMMON_SRC, tl.LOCKSTEP_SRC, tl.BRIDGE_SRC, tl.HUD_SRC
+        g.LINK_SRC, g.LOG_SRC = tl.LINK_SRC, tl.LOG_SRC
         cmds = self.L.table()
         for stem, src in tl.CMDS_SRC.items():
             cmds[stem] = src
@@ -913,6 +914,24 @@ class CompanyGameTest(unittest.TestCase):
         led = self.A.registry()["ledger"][1]
         self.assertEqual((led["n"], led["gross"]), ({"spend": 1}, {}))
 
+    def test_the_cost_is_booked_when_the_engine_runs_the_command_after_the_update(self):
+        # the real game: a command sent in the simulation update runs after the update returns, so the account read right after the send
+        # has not moved (friend test 2026-10-16: 82 builds and 15 vehicles bought, every ledger said "spent 0")
+        later = ("SEND_LATER = {}; local BASE = EXECUTE; "
+                 "function EXECUTE(cmd, cb) if GAME.inUpdate and cmd.__cmd ~= 'makeScriptingSendEventCmd' then SEND_LATER[#SEND_LATER + 1] = { cmd, cb }; return end; return BASE(cmd, cb) end; "
+                 "local U0 = SIM.update; SIM.update = function(...) U0(...); local l = SEND_LATER; SEND_LATER = {}; for _, x in ipairs(l) do BASE(x[1], x[2]) end end")
+        self.A.L.execute(later)
+        self.B.L.execute(later)
+        self.start()
+        self.tick(10)
+        self.assertTrue(self.buy(self.B))
+        self.assertTrue(self.line(self.A))
+        self.assertSameRegistry()
+        reg = self.A.registry()
+        self.assertEqual((reg["ledger"][1]["n"], reg["ledger"][1]["gross"]), ({"spend": 1}, {"spend": 30000}))
+        self.assertEqual((reg["ledger"][0]["n"], reg["ledger"][0]["gross"]), ({"build": 1}, {"build": 5000}))
+        self.assertFalse(self.log_has("company cost booking failed"))
+
     # ---- limits
 
     def test_the_host_sets_a_limit_and_further_spending_is_stopped(self):
@@ -924,9 +943,9 @@ class CompanyGameTest(unittest.TestCase):
         self.assertTrue(self.buy(self.B))          # 0 of 50 000 used
         self.assertTrue(self.buy(self.B))          # 30 000 used: one more is allowed, it may overshoot
         self.assertEqual(len(self.A.applied()), 2)
-        shipped = len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"])
+        shipped = len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"])
         self.assertFalse(self.buy(self.B), "60 000 of 50 000: the window hears about it at once")
-        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]), shipped, "nothing was stamped or shipped")
+        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"]), shipped, "nothing was stamped or shipped")
         self.assertEqual(len(self.A.applied()), 2)
         self.assertTrue(any("spending limit reached (60,000 of 50,000)" in why for (_, _, why) in self.relay.refused), self.relay.refused)
         self.assertTrue(self.line(self.A), "the host has no limit")
@@ -1052,9 +1071,9 @@ class CompanyGameTest(unittest.TestCase):
         self.tick(10)
         self.assertTrue(self.op(self.A, op="perm", player=1, category="spend", allowed=False))
         self.assertSameRegistry()
-        shipped = len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"])
+        shipped = len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"])
         self.assertFalse(self.buy(self.B), "buying is forbidden: the window hears about it at once")
-        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]), shipped)
+        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"]), shipped)
         self.assertTrue(any("not allowed to spend" in why for (_, _, why) in self.relay.refused), self.relay.refused)
         self.assertTrue(self.line(self.B), "building is not")
         # a client that sends it anyway is refused by every game
@@ -1389,6 +1408,90 @@ class CompanyGameTest(unittest.TestCase):
         self.assertEqual((len(self.A.applied()), len(self.B.applied())), (applied + 1, applied + 1), "the limit (50 000, 60 000 spent) stops the next one")
         self.assertSameRegistry()
 
+    # ---- the verify round after a resync reload (bug list 2026-10-17 #2; friend test 2026-10-16: five repairs that worked were
+    # reported as failed with "still differ after the reload: companies", because the reloaded game hashed its still empty mirror)
+
+    def paused_with_a_company(self):
+        """Both games hold a registry with a company and stand still at a pause; returns the pause time."""
+        self.start()
+        self.tick(10)
+        self.assertTrue(self.op(self.A, op="found", name="Ironworks", open=True))
+        self.assertTrue(self.op(self.B, op="join", company="c1"))
+        self.assertSameRegistry()
+        self.relay.pauseAt = self.relay.future_stamp()
+        self.relay.session()
+        self.tick(40)
+        self.assertEqual((self.A.time(), self.B.time()), (self.relay.pauseAt, self.relay.pauseAt))
+        return self.relay.pauseAt
+
+    def reload_b_and_verify(self, n, at):
+        """B reloads as the resync asks; the host's session line and the paused verify round are waiting in its link when it starts."""
+        self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 1, "name": "hostsave", "sha256": "00"}))
+        self.B.frame()
+        self.B.reload()
+        self.relay.session()
+        self.relay.checksum_request(n, at, True)
+
+    def frames(self, n=1):
+        """Interface frames only: the simulation half of neither game runs."""
+        for _ in range(n):
+            for g in (self.A, self.B):
+                g.frame()
+            self.relay.pump()
+
+    def test_a_game_that_verifies_right_after_its_reload_hashes_the_registry_the_save_loaded(self):
+        at = self.paused_with_a_company()
+        self.reload_b_and_verify(7, at)
+        self.frames(1)                    # the round is read in the reloaded game's very first frame, before its mirror is filled
+        self.tick(3)
+        a, b = self.relay.reports[7][0], self.relay.reports[7][1]
+        self.assertIn("companies", b[1], "the reloaded game hashed its registry, not the empty mirror")
+        self.assertEqual(a, b, "the repair worked: the same world on both games")
+        self.assertEqual(self.relay.not_ready[7], {0: [], 1: []})
+
+    def test_a_round_waits_while_the_interface_cannot_read_the_loaded_state_then_matches(self):
+        at = self.paused_with_a_company()
+        self.reload_b_and_verify(8, at)
+        # the simulation half has not started: the interface half of B cannot read the game-script state yet
+        self.B.L.execute("REAL_GET = STATE.get; STATE.get = function() return nil end")
+        self.frames(6)
+        self.assertIn(0, self.relay.reports[8])
+        self.assertNotIn(1, self.relay.reports.get(8, {}), "B waits instead of reporting the empty registry")
+        self.assertIn("the company registry is not read from the loaded state yet; the round waits for it", self.B.log())
+        self.B.L.execute("STATE.get = REAL_GET")
+        self.tick(3)
+        a, b = self.relay.reports[8][0], self.relay.reports[8][1]
+        self.assertEqual(a, b)
+        self.assertEqual(self.relay.not_ready[8][1], [])
+        self.assertIn("the company registry was read from the loaded state after", self.B.log())
+
+    def test_a_registry_that_stays_unreadable_is_reported_not_ready_never_as_a_different_hash(self):
+        at = self.paused_with_a_company()
+        self.reload_b_and_verify(9, at)
+        self.B.L.execute("REAL_GET = STATE.get; STATE.get = function() return nil end")
+        self.frames(2)
+        self.assertNotIn(1, self.relay.reports.get(9, {}))
+        self.B.L.execute("REAL_CLOCK = os.clock; os.clock = function() return REAL_CLOCK() + 60 end")   # the bound (10 s) is over
+        self.frames(2)
+        self.B.L.execute("os.clock = REAL_CLOCK; STATE.get = REAL_GET")
+        b = self.relay.reports[9][1][1]
+        self.assertNotIn("companies", b, "no hash of the empty mirror")
+        self.assertEqual(self.relay.not_ready[9][1], ["companies"])
+        self.assertEqual({k: v for k, v in b.items()}, {k: v for k, v in self.relay.reports[9][0][1].items() if k != "companies"},
+                         "every other part is measured and compared as always")
+        self.assertIn("companies are reported not ready", self.B.log())
+
+    def test_a_registry_that_really_differs_after_the_reload_is_still_a_difference(self):
+        at = self.paused_with_a_company()
+        # the world B loads holds another registry than the host's (a real difference the repair did not remove)
+        self.B.L.execute("local st = STATE:get(); st.co.companies.c1.name = 'Elsewhere'; st.co.rev = st.co.rev + 1; STATE:set(st)")
+        self.reload_b_and_verify(10, at)
+        self.frames(1)
+        self.tick(3)
+        a, b = self.relay.reports[10][0][1], self.relay.reports[10][1][1]
+        self.assertEqual({k for k in a if a[k] != b.get(k)}, {"companies"}, "the registry differs and is reported as a difference")
+        self.assertEqual(self.relay.not_ready[10], {0: [], 1: []}, "nothing is hidden as not ready")
+
     def test_the_company_page_is_written_for_the_window(self):
         self.start()
         self.tick(10)
@@ -1442,7 +1545,7 @@ class CompanyGameTest(unittest.TestCase):
         self.tick(10)
         self.assertIn("company action not sent", self.B.log())
         self.assertEqual(self.B.ev("#GAME.applied"), 0, "no player was added on this game alone")
-        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]), 0)
+        self.assertEqual(len([l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"]), 0)
 
     def test_a_fault_in_the_company_layer_never_loses_the_players_action(self):
         self.start()

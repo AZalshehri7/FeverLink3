@@ -1,4 +1,4 @@
-"""Tests for the operations schemas (mod/feverlink3_1/content/feverlink3_cmds_ops.lua): the everyday actions of a
+"""Tests for the operations schemas (mod/feverlink3/content/feverlink3_cmds_ops.lua): the everyday actions of a
 session, replicated between two mocked Transport Fever 3 games through the real mod files (see test_lockstep.py for
 the harness this builds on, imported and not edited).
 
@@ -34,7 +34,7 @@ lupa = T.lupa
 
 OPS_PRELUDE = r'''
 OBJECTS = setmetatable({}, { __mode = "k" })   -- every engine object NEW made
-OPS = { realVehicleInfo = false, priceBuy = 10000, loanSign = 1, drop = nil, refuse = nil, replaceKeepsEntity = false, player = 7, strictCmd = false,
+OPS = { realVehicleInfo = false, priceBuy = 10000, loanSign = 1, drop = nil, refuse = nil, replaceMakesNew = false, player = 7, strictCmd = false,
   userdataResults = false }
 JOURNAL_LOAN = 2
 MODEL_OFFSET = 0
@@ -48,6 +48,27 @@ local function modelName(id) return MODELS[id - 100 - MODEL_OFFSET] end
 
 -- ---- engine objects
 local TYPES
+-- OPS.engineArrays (with OPS.realVehicleInfo): the engine's way with a transport-mode map ({TransportMode : boolean}, script-doc
+-- api/type.html): a read hands out a fresh Lua table with every mode, keyed by the api.type.enum.TransportMode values (the shipped
+-- bodies of the friend test 2026-10-16 show [0]=false ... [15]=false), and a write takes a map keyed the same way back (the game's
+-- own scripts read and write it by enum key). A key that is not an enum value is refused.
+-- Line.vehicleInfo hands out a copy (the engine's struct properties do; finding from MPFever (MIT)): filling the copy changes
+-- nothing until it is written back.
+DATA = setmetatable({}, { __mode = "k" })
+local function arrayRead(a)
+  local out = {}
+  for j = 0, 15 do out[j] = a[j] == true end
+  return out
+end
+local function arrayWrite(v)
+  if type(v) ~= "table" then error("bad argument #2 to '?' (table expected)") end
+  local out = {}
+  for k, x in pairs(v) do
+    if type(k) ~= "number" or k < 0 or k > 15 or k ~= math.floor(k) then error("bad argument #2 to '?' (TransportMode expected as key, got " .. tostring(k) .. ")") end
+    out[k] = x == true
+  end
+  return arrayRead(out)
+end
 function NEW(typeName)
   local def = TYPES[typeName]
   local data = def.init()
@@ -57,13 +78,29 @@ function NEW(typeName)
   obj = setmetatable({}, {
     __index = function(_, k)
       if k == "__members" then return def.members end
+      if OPS.engineArrays and typeName == "LineVehicleInfo" and k == "transportModes" then return arrayRead(data.transportModes) end
+      -- (the savegame's line was made before the switch: its member is a plain table, handed out as it is)
+      if OPS.engineArrays and OPS.copies ~= false and typeName == "Line" and k == "vehicleInfo" and DATA[data.vehicleInfo] then
+        local c = NEW("LineVehicleInfo")
+        DATA[c].transportModes = arrayRead(DATA[data.vehicleInfo].transportModes)
+        return c
+      end
       return data[k]
     end,
     __newindex = function(_, k, v)
       if not member[k] then error("no member '" .. tostring(k) .. "' in " .. typeName) end
+      if OPS.engineArrays and typeName == "LineVehicleInfo" and k == "transportModes" then
+        data.transportModes = arrayWrite(v)
+        return
+      end
       -- the real engine (seen in every real game): Line.vehicleInfo is typed; a plain table is refused with this message
       if OPS.realVehicleInfo and typeName == "Line" and k == "vehicleInfo" then
         if not OBJECTS[v] then error("bad argument #2 to '?' (const LineVehicleInfo expected, got no value)") end
+        if OPS.engineArrays and OPS.copies ~= false then
+          local c = NEW("LineVehicleInfo")
+          DATA[c].transportModes = arrayRead(DATA[v].transportModes)
+          v = c
+        end
         data[k] = v
         return
       end
@@ -75,6 +112,7 @@ function NEW(typeName)
     __tostring = function() return "<" .. typeName .. ">" end,
   })
   OBJECTS[obj] = true
+  DATA[obj] = data
   return obj
 end
 TYPES = {
@@ -98,6 +136,13 @@ TYPES = {
   StationTerminal = { members = { "station", "terminal" }, init = function() return { station = 0, terminal = 0 } end },
   Vec3f = { members = { "x", "y", "z" }, init = function() return { x = 0, y = 0, z = 0 } end },
   Date = { members = { "year", "month", "day" }, init = function() return { year = 1900, month = 1, day = 1 } end },
+  Modifiers = { members = { "noiseModifier", "pollutionModifier", "maxSpeedModifier" },
+    init = function() return { noiseModifier = 0, pollutionModifier = 0, maxSpeedModifier = 0 } end },
+  -- a line stop's waypoints as the game's typed definition has them (api/tealdef/api/type.d.tl Waypoint, EdgePos, EdgeId): a waypoint
+  -- on a street or track is an EdgePos (edge `index` of the TransportNetwork entity `entity`, `param` along it), one of a ship a pos
+  Waypoint = { members = { "edgePos", "pos", "tag" }, init = function() return { edgePos = NEW("EdgePos"), pos = NEW("Vec3f"), tag = 0 } end },
+  EdgePos = { members = { "edgeId", "param" }, init = function() return { edgeId = NEW("EdgeId"), param = 0 } end },
+  EdgeId = { members = { "entity", "index" }, init = function() return { entity = -1, index = -1 } end },
 }
 
 local function vec(x, y, z) local o = NEW("Vec3f"); o.x, o.y, o.z = x, y, z; return o end
@@ -149,12 +194,39 @@ function BUILD_LINE(api, spec)
     for j, a in ipairs(s.alt or {}) do alt[j] = api.type.StationTerminal.new(a[1], a[2]) end
     stop.alternativeTerminals = alt
     if s.waypoints then stop.waypoints = s.waypoints end
+    -- s.wps = { { edge =, index =, param =, tag = } | { pos = { x, y, z }, tag = } }: built as the line manager does (api.type.Waypoint.new()
+    -- and its edgePos or pos set, gui/line_vehicle_mgmt/manager_window.tl)
+    if s.wps then
+      local wps = {}
+      for j, w in ipairs(s.wps) do
+        local wp = api.type.Waypoint.new()
+        if w.edge then
+          local ep = api.type.EdgePos.new()
+          ep.edgeId = api.type.EdgeId.new(w.edge, w.index or 0)
+          ep.param = w.param or 0
+          wp.edgePos = ep
+        else
+          wp.pos = api.type.Vec3f.new(w.pos[1], w.pos[2], w.pos[3])
+        end
+        wp.tag = w.tag or j
+        wps[j] = wp
+      end
+      stop.waypoints = wps
+    end
     stops[i] = stop
   end
   line.stops = stops
   line.customFilters = spec.customFilters or false
   line.reservationPriority = spec.priority or 1.0
-  if spec.modes then line.vehicleInfo.transportModes = spec.modes end
+  if spec.modes and OPS.engineArrays then
+    -- the line the window made holds exactly these modes (spec.modes lists the enum values that are on), whatever this engine
+    -- does with a write
+    local tm = DATA[DATA[line].vehicleInfo].transportModes
+    for j = 0, 15 do tm[j] = false end
+    for _, m in ipairs(spec.modes) do tm[m] = true end
+  elseif spec.modes then
+    line.vehicleInfo.transportModes = spec.modes
+  end
   return line
 end
 
@@ -190,7 +262,9 @@ function BUILD_SAVEGAME()
 end
 
 -- ---- the api the games see, on top of the base mock's
-local EXTRA_CT = { STATION_GROUP = 9, STATION = 10, TOWN = 11, NAME = 12, COLOR = 13, INDUSTRY = 14 }
+-- (numbers above the base mock's CT: STATION_GROUP was 9 there, TOWN_BUILDING's number, so a TOWN_BUILDING read answered the station group)
+local EXTRA_CT = { STATION_GROUP = 21, STATION = 22, TOWN = 23, NAME = 24, COLOR = 25, INDUSTRY = 26, BASE_EDGE = 27, BASE_NODE = 28,
+  TRANSPORT_NETWORK = 29 }
 local EXTRA_NAME = {}
 for k, v in pairs(EXTRA_CT) do EXTRA_NAME[v] = k end
 local function mk(name) return function(...) return { __cmd = name, args = { n = select("#", ...), ... } } end end
@@ -209,7 +283,7 @@ function MAKE_API()
       "makeVehicleSetStoppedByUserCmd", "makeVehicleTryToDepartCmd", "makeLineUpdateCmd", "makeLineDestroyCmd",
       "makeEntitySetNameCmd", "makeEntitySetColorCmd", "makeGameSetCalendarSpeedCmd", "makeGameSetDateCmd",
       "makeGameSetTimeOfDayCmd", "makeGameSetCloudCoverageCmd", "makeStockListDiscardCargoCmd",
-      "makeTownBuildingSetBlockedDevelopmentCmd", "makeTownSetDevelopmentActiveCmd" }) do
+      "makeTownBuildingSetBlockedDevelopmentCmd", "makeTownSetDevelopmentActiveCmd", "makeVehicleSetModifiersCmd" }) do
     api.cmd[n] = mk(n)
   end
   -- a build whose command table refuses the lookup of a factory it does not have, instead of answering nil
@@ -226,6 +300,10 @@ function MAKE_API()
   t.StationTerminal = { new = function(s, tm) local o = NEW("StationTerminal"); o.station = s or 0; o.terminal = tm or 0; return o end }
   t.Vec3f = { new = function(x, y, z) return vec(x or 0, y or 0, z or 0) end }
   t.Date = { new = function(y, m, d) local o = NEW("Date"); o.year, o.month, o.day = y, m, d; return o end }
+  t.TransportVehicle = { Modifiers = { new = function() return NEW("Modifiers") end } }
+  t.Waypoint = { new = function() return NEW("Waypoint") end }
+  t.EdgePos = { new = function() return NEW("EdgePos") end }
+  t.EdgeId = { new = function(e, i) local o = NEW("EdgeId"); if e ~= nil then o.entity, o.index = e, i end; return o end }
   t.JournalEntry = {
     new = function() return { category = {} } end,
     Type = { OTHER = 1, LOAN = JOURNAL_LOAN, INTEREST = 3, CONSTRUCTION = 4, ACQUISITION = 5, MAINTENANCE = 6, INCOME = 7, SUBSIDY = 8 },
@@ -254,6 +332,25 @@ function MAKE_API()
     getConstructionEntityForSubconstruction = ownerOf,
     getConstructionEntityForDepot = ownerOf,
     getConstructionEntityForStation = ownerOf,
+  }
+  -- the street graph (no octree in this mock: the build module's references find nodes by the street system's own map)
+  local function segmentsAt(n, track)
+    local out = {}
+    for e, w in pairs(WORLD) do
+      local b = w.BASE_EDGE
+      if b and (b.node0 == n or b.node1 == n) and (b.track == true) == track then out[#out + 1] = e end
+    end
+    table.sort(out)
+    return out
+  end
+  api.engine.system.streetSystem = {
+    getNode2SegmentMap = function()
+      local map = {}
+      for e, w in pairs(WORLD) do if w.BASE_NODE then map[e] = segmentsAt(e, false) end end
+      return map
+    end,
+    getNodeStreetSegments = function(n) return segmentsAt(n, false) end,
+    getNodeTrackSegments = function(n) return segmentsAt(n, true) end,
   }
   api.engine.system.stationGroupSystem = { getStationGroup = function(st)
     for g, w in pairs(WORLD) do
@@ -295,7 +392,9 @@ OPS_EXEC.makeVehicleReplaceCmd = function(a)
   if not isVehicle(a[1]) then return false, "no vehicle " .. tostring(a[1]) end
   if not charge(a[2]) then return false, "not enough money" end
   local old = WORLD[a[1]].TRANSPORT_VEHICLE
-  if OPS.replaceKeepsEntity then old.config = a[2]; return true end
+  -- VehicleReplaceCommandData is { vehicleEntity, config, applyPurchaseCost } (tf3-docs api/cmd): no result entity, the vehicle is
+  -- changed in place. OPS.replaceMakesNew models an engine that made a new one after all.
+  if not OPS.replaceMakesNew then old.config = a[2]; return true end
   local created = createVehicle({ config = a[2], line = old.line, stopIndex = old.stopIndex, userStopped = old.userStopped, state = old.state })
   WORLD[a[1]] = nil
   return true, created, { resultVehicleEntity = created }
@@ -315,7 +414,20 @@ OPS_EXEC.makeVehicleSetLineCmd = function(a)
 end
 OPS_EXEC.makeVehicleSendToDepotCmd = function(a)
   if not isVehicle(a[1]) then return false, "no vehicle " .. tostring(a[1]) end
+  -- (vehicleEntity, sellOnArrival, jumpToDepoEntity?): with the third the vehicle is "teleported" to that depot
+  if a[3] ~= nil then
+    if not (WORLD[a[3]] and WORLD[a[3]].VEHICLE_DEPOT) then return false, "no depot " .. tostring(a[3]) end
+    WORLD[a[1]].TRANSPORT_VEHICLE.state = "IN_DEPOT_" .. tostring(a[3])
+    return true
+  end
   WORLD[a[1]].TRANSPORT_VEHICLE.state = "GOING_TO_DEPOT"
+  return true
+end
+OPS_EXEC.makeVehicleSetModifiersCmd = function(a)
+  if not isVehicle(a[1]) then return false, "no vehicle " .. tostring(a[1]) end
+  local m = a[2]
+  if not OBJECTS[m] then return false, "Modifiers expected, got " .. tostring(m) end
+  WORLD[a[1]].TRANSPORT_VEHICLE.state = string.format("MODIFIED_%g_%g_%g", m.noiseModifier, m.pollutionModifier, m.maxSpeedModifier)
   return true
 end
 OPS_EXEC.makeVehicleReverseCmd = function(a)
@@ -354,6 +466,7 @@ OPS_EXEC.makeLineUpdateCmd = function(a)
   end
   local l = WORLD[a[1]].LINE
   l.stops, l.customFilters, l.reservationPriority = comp.stops, comp.customFilters, comp.reservationPriority
+  if OPS.realVehicleInfo then l.vehicleInfo = comp.vehicleInfo end   -- the edit's transport modes become the line's
   return true
 end
 OPS_EXEC.makeLineDestroyCmd = function(a)
@@ -393,7 +506,7 @@ OPS_EXEC.makeStockListDiscardCargoCmd = function(a)
   return true
 end
 OPS_EXEC.makeTownBuildingSetBlockedDevelopmentCmd = function(a)
-  if not (WORLD[a[1]] and WORLD[a[1]].CONSTRUCTION) then return false, "no building" end
+  if not (WORLD[a[1]] and (WORLD[a[1]].CONSTRUCTION or WORLD[a[1]].TOWN_BUILDING)) then return false, "no building" end
   WORLD[a[1]].blocked = a[2]
   return true
 end
@@ -486,6 +599,8 @@ local function sig(v, depth)
     local x = v[k]
     if k == "modelId" then x = modelName(x) or ("?" .. tostring(x)) end
     if k == "stationGroup" then x = WORLD[x] and WORLD[x].NAME and WORLD[x].NAME.name or ("?" .. tostring(x)) end
+    -- a waypoint's network entity (EdgeId.entity) by its name: the ids differ between the games
+    if k == "entity" and type(x) == "number" and x >= 0 then x = WORLD[x] and WORLD[x].NAME and WORLD[x].NAME.name or ("?" .. tostring(x)) end
     parts[#parts + 1] = tostring(k) .. "=" .. sig(x, depth + 1)
   end
   return "{" .. table.concat(parts, ",") .. "}"
@@ -507,7 +622,11 @@ function SNAPSHOT()
       local tm = OPS.realVehicleInfo and w.LINE.vehicleInfo and w.LINE.vehicleInfo.transportModes
       if tm then
         local bits = {}
-        for i = 1, #tm do bits[i] = tostring(tm[i]) end
+        if OPS.engineArrays then
+          for j = 0, 15 do if tm[j] then bits[#bits + 1] = tostring(j) end end
+        else
+          for i = 1, #tm do bits[i] = tostring(tm[i]) end
+        end
         rows[#rows] = rows[#rows] .. " modes=" .. table.concat(bits, ",")
       end
     end
@@ -537,6 +656,28 @@ function COUNT(kind)
   local n = 0
   for _, w in pairs(WORLD) do if w[kind] then n = n + 1 end end
   return n
+end
+
+-- A street and a railway at entity ids from `base` up: built after the savegame, each game numbered them its own way. Nodes base+1 (0,0),
+-- base+2 (100,0), base+3 (200,0) and base+4 (0,50), base+5 (150,50); street segments base+11 (base+1 - base+2) and base+12 (base+2 -
+-- base+3), a track segment base+13 (base+4 - base+5). Each is a TransportNetwork entity with its own edges (lanes).
+function ROADS(base)
+  local function node(e, x, y, name)
+    WORLD[e] = { BASE_NODE = { position = { x = x, y = y, z = 0 } }, TRANSPORT_NETWORK = { edges = { {}, {}, {}, {} } }, NAME = { name = name } }
+  end
+  local function seg(e, n0, n1, track, lanes, name)
+    local p0, p1 = WORLD[n0].BASE_NODE.position, WORLD[n1].BASE_NODE.position
+    local t = { x = p1.x - p0.x, y = p1.y - p0.y, z = 0 }
+    local edges = {}
+    for i = 1, lanes do edges[i] = {} end
+    WORLD[e] = { BASE_EDGE = { node0 = n0, node1 = n1, tangent0 = t, tangent1 = t, track = track }, TRANSPORT_NETWORK = { edges = edges },
+      NAME = { name = name } }
+  end
+  node(base + 1, 0, 0, "Corner West"); node(base + 2, 100, 0, "Crossing"); node(base + 3, 200, 0, "Corner East")
+  node(base + 4, 0, 50, "Rail West"); node(base + 5, 150, 50, "Rail East")
+  seg(base + 11, base + 1, base + 2, false, 4, "Main Street West")
+  seg(base + 12, base + 2, base + 3, false, 4, "Main Street East")
+  seg(base + 13, base + 4, base + 5, true, 2, "Railway")
 end
 '''
 
@@ -580,7 +721,7 @@ class OpsGame(T.Game):
         return int(self.L.eval("ACCOUNT.loan"))
 
     def actions_shipped(self):
-        return [l for l in self.lines(self.from_game) if l.split(T.TAB)[1] == "action"]
+        return [l for l in self.lines(self.from_game) if l.split(T.TAB)[0] == "action"]
 
 
 class OpsBase(unittest.TestCase):
@@ -621,7 +762,7 @@ class OpsBase(unittest.TestCase):
 
     def wire(self, line):
         """An `action` line of from_game.log as (the serialised command body, the payload table)."""
-        p = self.relay.C.parse(line.split(T.TAB)[3])
+        p = self.relay.C.parse(line.split(T.TAB)[2])
         if isinstance(p, tuple):
             p = p[0]
         return str(p.body), p
@@ -789,41 +930,67 @@ class VehicleTest(OpsBase):
         self.assertEqual(self.A.applied(), self.B.applied(), "the same commands at the same steps")
         self.assertEqual(len(self.A.applied()), 4)
 
-    def test_replacing_a_vehicle_binds_the_new_one_and_later_commands_find_it(self):
+    def test_the_depot_a_vehicle_jumps_to_travels_as_a_reference(self):
+        # makeVehicleSendToDepotCmd(vehicle, sellOnArrival, jumpToDepoEntity): the third is an entity (wiki audit 2026-10-18 A4)
+        self.start()
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSendToDepotCmd(70, false, 55))")
+        self.settle()
+        self.agree()
+        self.assertIn("state=IN_DEPOT_55", self.A.snapshot())
+        body, _ = self.wire(self.B.actions_shipped()[0])
+        self.assertIn("__ref", body.split("false", 1)[-1], "the depot after sellOnArrival is a reference, not a raw id")
+        # fail closed: an id that is no depot cannot be referred to, and the command is applied nowhere
+        before = self.B.snapshot()
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSendToDepotCmd(70, false, 9999))")
+        self.settle()
+        self.assertEqual(self.B.snapshot(), before)
+        self.assertEqual(len(self.B.actions_shipped()), 1, "the second order was not shipped")
+        self.assertIn("argument 3: cannot refer to entity 9999 as a depot", self.B.log())
+        self.agree()
+
+    def test_vehicle_modifiers_travel_as_an_engine_object(self):
+        # makeVehicleSetModifiersCmd(vehicle, Engine.Component.TransportVehicle.Modifiers): read and rebuilt through the schema
+        self.start()
+        self.B.send_gui("local m = api.type.TransportVehicle.Modifiers.new()\n"
+                        "m.noiseModifier = 0.5; m.pollutionModifier = -0.25; m.maxSpeedModifier = 2\n"
+                        "api.cmd.sendCommand(api.cmd.makeVehicleSetModifiersCmd(70, m))")
+        self.settle()
+        self.agree()
+        self.assertIn("state=MODIFIED_0.5_-0.25_2", self.A.snapshot(), "the receiver got a Modifiers object with the values")
+        # fail closed: something that is no readable engine object
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetModifiersCmd(70, function() end))")
+        self.settle()
+        self.assertEqual(len(self.B.actions_shipped()), 1)
+        self.assertIn("argument 2: a function cannot be replicated", self.B.log())
+        self.agree()
+
+    def test_replacing_a_vehicle_changes_it_in_place_and_answers_at_the_apply(self):
+        # makeVehicleReplaceCmd's data has no result entity (VehicleReplaceCommandData: vehicleEntity, config, applyPurchaseCost; tf3-docs
+        # api/cmd): the spec names none and watches for no new vehicle, so the window's callback is answered when the command applies
         self.start()
         self.B.send_gui(buy("BUY", BUS_RED))
         self.settle()
         old = int(self.B.L.eval("BUY[2]"))
         self.B.send_gui('local cfg = BUILD_CONFIG(api, { purchaseTime = 19000, parts = { { model = "vehicle/truck.mdl" } } })\n'
-                        'api.cmd.sendCommand(api.cmd.makeVehicleReplaceCmd(%d, cfg))' % old)
+                        'api.cmd.sendCommand(api.cmd.makeVehicleReplaceCmd(%d, cfg), function(d, s) REPL = { s } end)' % old)
         self.settle()
-        self.agree("the old vehicle is gone, a truck took its place")
+        self.agree("the vehicle is a truck now on both games")
         self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
         self.assertNotIn("bus_red", self.A.snapshot())
-        # the window never saw the new vehicle's id; it finds the vehicle in the world, as the game's windows do
-        new = int(self.B.L.eval("(function() for e, w in pairs(WORLD) do if w.TRANSPORT_VEHICLE and e ~= 70 then return e end end end)()"))
-        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetStoppedByUserCmd(%d, true))" % new)
-        self.settle()
-        self.agree("the command found the replacement on the other game")
-        self.assertEqual(self.A.snapshot().count("stopped=true"), 1)
-
-    def test_a_replacement_that_keeps_the_entity_is_noted_and_changes_nothing_else(self):
-        self.start()
+        self.assertIs(self.B.L.eval("REPL and REPL[1]"), True, "the replacement is answered as applied")
         for g in (self.A, self.B):
-            g.L.execute("OPS.replaceKeepsEntity = true")
-        self.B.send_gui(buy("BUY", BUS_RED))
-        self.settle()
-        old = int(self.B.L.eval("BUY[2]"))
-        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleReplaceCmd(%d, BUILD_CONFIG(api, { parts = { { model = "vehicle/truck.mdl" } } })))' % old)
-        self.settle(60)
-        self.agree()
-        self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 2)
-        self.assertIn("action 1:2: nothing created after 10 steps", self.A.log(), "the watch gave up and said so")
-        # the vehicle is still reachable through the key of the purchase
+            self.assertNotIn("nothing created", g.log(), "no watch for a vehicle the command does not make")
+        # the vehicle keeps its entity and the key of its purchase
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetStoppedByUserCmd(%d, true))" % old)
         self.settle()
         self.agree()
         self.assertEqual(self.A.snapshot().count("stopped=true"), 1)
+
+    def test_the_replace_spec_names_no_result(self):
+        spec = self.B.L.eval("GUI_ENV.ug_require('feverlink3_cmds_ops.lua').commands.makeVehicleReplaceCmd")
+        self.assertIsNone(spec["creates"])
+        self.assertIsNone(spec["result"])
+        self.assertEqual(spec["category"], "spend")
 
     def test_selling_a_list_of_vehicles_and_a_stale_reference(self):
         self.start()
@@ -848,7 +1015,7 @@ class VehicleTest(OpsBase):
         self.settle()
         self.assertEqual(self.A.count("TRANSPORT_VEHICLE"), 1, "the host does not buy a vehicle it cannot build")
         self.assertIn("model vehicle/mod_bus.mdl is not installed here", self.A.log())
-        self.assertTrue(any(l.split(T.TAB)[1] == "action_refused" for l in self.A.lines(self.A.from_game)))
+        self.assertTrue(any(l.split(T.TAB)[0] == "action_refused" for l in self.A.lines(self.A.from_game)))
 
     def test_a_configuration_the_engine_does_not_take_back_equal_stays_native(self):
         self.start()
@@ -869,11 +1036,12 @@ class VehicleTest(OpsBase):
         self.settle()
         self.assertEqual(self.A.applied(), [])
         self.assertIn("vehicle s:9999 does not exist here", self.A.log())
-        self.assertTrue(any(l.split(T.TAB)[1] == "action_refused" for l in self.A.lines(self.A.from_game)))
+        self.assertTrue(any(l.split(T.TAB)[0] == "action_refused" for l in self.A.lines(self.A.from_game)))
         # a vehicle given where a line belongs never leaves the sender: the dry run catches it
         self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(70, 70, 0))")
         self.settle()
-        self.assertIn("sent natively: argument 2: cannot refer to entity 70 as a line", self.B.log())
+        self.assertIn("REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): argument 2: "
+                      "cannot refer to entity 70 as a line", self.B.log())
         self.assertEqual(len(self.B.actions_shipped()), 1, "only the first command was shipped")
 
 
@@ -941,12 +1109,17 @@ class LineTest(OpsBase):
         self.assertEqual(str(self.B.L.eval("WORLD[17].NAME.name")), "Rails Inc")
         self.assertIn("named Central Station", self.A.snapshot())
 
-    def test_a_line_with_waypoints_is_not_replicated_and_says_why(self):
+    def test_a_line_with_a_waypoint_that_names_no_network_entity_is_refused_everywhere_and_says_why(self):
         self.start()
-        self.B.send_gui(LINE_2.replace("{ group = 61, station = 0, terminal = 0 }", "{ group = 61, waypoints = { { tag = 1 } } }"))
+        # the town (80) has no TransportNetwork: such a waypoint cannot be named for the other games
+        self.B.send_gui(LINE_2.replace("{ group = 61, station = 0, terminal = 0 }",
+                                       "{ group = 61, wps = { { edge = 80, index = 0, param = 0.5 } } }"))
         self.settle()
-        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (1, 2), "native on the sender only: a visible divergence")
-        self.assertIn("sent natively: argument 4: stop 2 has waypoints (not replicated yet)", self.B.log())
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (1, 1), "refused on the sender too: never applied there alone")
+        self.assertIn("REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): argument 4: "
+                      "stop 2 waypoint 1: network entity 80 is neither a segment, a node nor a construction", self.B.log())
+        self.assertTrue(self.B.L.eval("MADE ~= nil and MADE[1] == false"), "the window is told it failed")
+        self.agree()
         self.assertEqual(self.B.actions_shipped(), [])
 
     def test_an_object_the_engine_does_not_take_back_equal_is_not_replicated(self):
@@ -1001,6 +1174,218 @@ class LineTest(OpsBase):
         # the member is read and shipped like any other; the receiver skips what its engine will not let it set
         body, _ = self.wire(self.B.actions_shipped()[0])
         self.assertIn("vehicleInfo", body)
+
+
+LINE_EDIT = ('api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, BUILD_LINE(api, { priority = 2.0, customFilters = true, stops = {\n'
+             '    { group = 58, min = 30, max = 90, mode = 1, load = { true, false, true }, maxLoad = { 1, 0.5, 1 }, alt = { { 0, 1 } } },\n'
+             '    { group = 61, terminal = 1 }, { group = 58, terminal = 2, extra = 10 } }, modes = %s })),\n'
+             '  function(d, s) EDITED = s end)')
+
+
+class LineEditTest(OpsBase):
+    """A line edit made in the line window (the UI hook's path), with the engine's real ways: Line.vehicleInfo is a typed
+    LineVehicleInfo the engine hands out as a copy, and its transportModes is a map keyed by api.type.enum.TransportMode (PERSON 0,
+    BUS 3, AIRCRAFT 9, SMALL_AIRCRAFT 11, ...). Friend test 2026-10-16: every line edit with a mode on came back "does not
+    rebuild equal at Line.vehicleInfo.transportModes.<that mode>", was applied on the editing game alone, and the resync that
+    followed erased it."""
+
+    def setUp(self):
+        super().setUp()
+        for g in (self.A, self.B):
+            g.L.execute("OPS.realVehicleInfo = true; OPS.engineArrays = true")
+            # three buses on the line in the savegame both games load
+            for i, e in enumerate((72, 73, 74)):
+                g.L.execute("WORLD[%d] = { TRANSPORT_VEHICLE = { userStopped = false, line = 71, stopIndex = %d, state = 'EN_ROUTE', "
+                            "config = BUILD_CONFIG(MAKE_API(), { parts = { { model = 'vehicle/bus_red.mdl' } } }) }, NAME = { name = 'Bus %d' } }"
+                            % (e, i % 2, i + 1))
+
+    def hud_text(self, g):
+        path = os.path.join(g.dir, "hud_state.txt")
+        return open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+
+    def test_a_line_edit_with_transport_modes_rebuilds_equal_and_reaches_both_games(self):
+        self.start()
+        for modes, want in (("{ 0, 3 }", "0,3"), ("{ 0, 11 }", "0,11"), ("{ 0, 9, 15 }", "0,9,15"), ("{ 3 }", "3")):
+            self.B.window(LINE_EDIT % modes)
+            self.settle()
+            self.assertTrue(self.B.L.eval("EDITED == true"), modes)
+            self.agree("the edit is on both games: " + modes)
+            self.assertIn("modes=" + want, self.A.snapshot(), modes)
+            self.assertIn("modes=" + want, self.B.snapshot(), modes)
+        self.assertNotIn("does not rebuild equal", self.B.log())
+        self.assertNotIn("REFUSED", self.A.log() + self.B.log())
+        self.assertEqual(self.B.log().count("window command makeLineUpdateCmd"), 4, "every edit was shipped")
+        # the line still has its vehicles, on both games, and three stops
+        self.assertEqual(self.A.snapshot().count("line=Line 1"), 3)
+        self.assertIn("terminal=2", self.A.snapshot())
+
+    def test_the_transport_modes_travel_by_the_enums_names(self):
+        # the documented map ({TransportMode : boolean}) is shipped keyed by name, not by a number or a position
+        self.start()
+        self.B.window(LINE_EDIT % "{ 0, 3 }")
+        self.settle()
+        self.agree()
+        body, _ = self.wire(self.B.actions_shipped()[0])
+        self.assertIn("PERSON", body)
+        self.assertIn("BUS", body)
+        self.assertIn("modes=0,3", self.A.snapshot())
+
+    def test_a_mode_the_enum_does_not_name_refuses_the_edit(self):
+        # fail closed: a key that is no api.type.enum.TransportMode value here cannot be named for the other games
+        self.start()
+        before = self.B.snapshot()
+        # (the enum of the window's state and of the bridge's, each with an api of its own)
+        self.B.window("api.type.enum.TransportMode.SMALL_AIRCRAFT = nil; if GUI_API then GUI_API.type.enum.TransportMode.SMALL_AIRCRAFT = nil end")
+        self.B.window(LINE_EDIT % "{ 0, 11 }")
+        self.settle()
+        self.assertTrue(self.B.L.eval("EDITED == false"))
+        self.assertEqual(self.B.snapshot(), before)
+        self.assertIn("transport mode key 11 is not a value of api.type.enum.TransportMode", self.B.log())
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.agree()
+
+    def test_a_line_created_in_the_bridges_state_with_modes_is_the_same_on_both_games(self):
+        self.start()
+        self.B.send_gui(LINE_2.replace("customFilters = true,", "customFilters = true, modes = { 0, 3 },"))
+        self.settle()
+        self.agree()
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
+        self.assertIn("modes=0,3", self.A.snapshot())
+
+    def test_a_line_edit_that_cannot_be_replicated_is_refused_on_the_editing_game_too_and_the_player_is_told(self):
+        self.start()
+        before = self.B.snapshot()
+        # a waypoint on an entity that is no network entity (the town) cannot be named for the other games
+        self.B.window(LINE_EDIT.replace("{ group = 61, terminal = 1 }", "{ group = 61, terminal = 1, wps = { { edge = 80 } } }") % "{ 0, 3 }")
+        self.settle()
+        self.assertTrue(self.B.L.eval("EDITED == false"), "the window's callback fails")
+        self.assertEqual(self.B.snapshot(), before, "nothing was applied on the editing game")
+        self.agree("the worlds stay equal: no resync needed")
+        self.assertIn("command makeLineUpdateCmd is REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): "
+                      "argument 2: stop 2 waypoint 1: network entity 80 is neither a segment, a node nor a construction", self.B.log())
+        self.assertIn("[FeverLink3] Your line update was not applied: it cannot be shared with the other players", self.hud_text(self.B))
+        self.assertNotIn("Your line update", self.hud_text(self.A), "a line for this player alone")
+        self.assertEqual(self.B.actions_shipped(), [])
+
+    def test_an_encoder_that_raises_is_refused_not_passed_to_the_engine(self):
+        self.start()
+        before = self.B.snapshot()
+        # the encoder raises (an object that throws when it is read)
+        self.B.window("api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, setmetatable({}, { __index = function() error('boom') end, "
+                      "__pairs = function() error('boom') end })), function(d, s) EDITED = s end)")
+        self.settle()
+        self.assertTrue(self.B.L.eval("EDITED == false"))
+        self.assertEqual(self.B.snapshot(), before)
+        self.assertIn("command makeLineUpdateCmd is REFUSED", self.B.log())
+        self.agree()
+
+
+class LineEditNoCopyTest(LineEditTest):
+    """The same with an engine that hands out Line.vehicleInfo itself rather than a copy."""
+
+    def setUp(self):
+        super().setUp()
+        for g in (self.A, self.B):
+            g.L.execute("OPS.copies = false")
+
+
+WP_LINE = """local line = BUILD_LINE(api, { stops = {
+    { group = 58, wps = { { edge = %(base)d + 11, index = 1, param = 0.25, tag = 1 }, { edge = %(base)d + 13, index = 0, param = 0.75, tag = 2 } } },
+    { group = 61, wps = { { edge = %(base)d + 2, index = 2, param = 0, tag = 3 } } } } })
+api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Waypoint Line", api.type.Vec3f.new(0.2, 0.8, 0.1), api.engine.util.getPlayer(), line),
+    function(d, s, e) MADE = { s, e and e[1] and e[1][1] } end)"""
+
+WP_EDIT = ('api.cmd.sendCommand(api.cmd.makeLineUpdateCmd(71, BUILD_LINE(api, { stops = {\n'
+           '    { group = 58, wps = { { edge = %(base)d + 12, index = 3, param = %(param)s, tag = 4 } } },\n'
+           '    { group = 61, wps = { { edge = %(base)d + 13, index = 1, param = 0.5, tag = 5 }, { edge = %(base)d + 11, index = 0, param = 0.1, tag = 6 } } } } })),\n'
+           '  function(d, s) EDITED = s end)')
+
+
+class WaypointTest(OpsBase):
+    """Lines with waypoints on streets and tracks (Line.Stop.waypoints : {Waypoint}, a Waypoint's edgePos names an edge of a
+    TransportNetwork entity: api/tealdef/api/type.d.tl). The street and the railway were built after the savegame, so the two games
+    number them differently (host 301.., client 401..), and the host has an unrelated segment at 411, the id of the client's
+    "Main Street West": a waypoint must reach the host on the host's own segment, never on whatever shares the client's id."""
+
+    def setUp(self):
+        super().setUp()
+        self.A.L.execute("ROADS(300)")
+        self.B.L.execute("ROADS(400)")
+        # the decoy: on the host, id 411 is a segment far away
+        self.A.L.execute("WORLD[421] = { BASE_NODE = { position = { x = 5000, y = 5000, z = 0 } }, NAME = { name = 'Far A' } }; "
+                         "WORLD[422] = { BASE_NODE = { position = { x = 5100, y = 5000, z = 0 } }, NAME = { name = 'Far B' } }; "
+                         "WORLD[411] = { BASE_EDGE = { node0 = 421, node1 = 422, tangent0 = { x = 100, y = 0, z = 0 }, tangent1 = { x = 100, y = 0, z = 0 } }, "
+                         "TRANSPORT_NETWORK = { edges = { {}, {}, {}, {} } }, NAME = { name = 'Decoy' } }")
+
+    def test_a_line_created_with_waypoints_on_a_street_a_track_and_a_node_is_the_same_on_both_games(self):
+        self.start()
+        self.B.send_gui(WP_LINE % {"base": 400})
+        self.settle()
+        self.agree("the line has the same waypoints, on the same streets and tracks, in both games")
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (2, 2))
+        self.assertTrue(self.B.L.eval("MADE[1] == true"))
+        snap = self.A.snapshot()
+        for needle in ("entity=Main Street West,index=1},param=0.25", "entity=Railway,index=0},param=0.75", "entity=Crossing,index=2},param=0",
+                       "tag=1", "tag=2", "tag=3"):
+            self.assertIn(needle, snap)
+        self.assertNotIn("Decoy", snap, "the client's id 411 names another segment on the host")
+        self.assertNotIn("entity=?", snap)
+        self.assertNotIn("does not rebuild equal", self.A.log() + self.B.log())
+        self.assertNotIn("REFUSED", self.A.log() + self.B.log())
+        # on the wire: the segment by its ends, never a bare entity id of the client's game
+        body, _ = self.wire(self.B.actions_shipped()[0])
+        self.assertIn('"network"', body)
+        self.assertIn('"edge"', body)
+        self.assertNotIn("entity=411", body)
+
+    def test_a_line_edit_with_waypoints_in_the_line_window_reaches_both_games_and_a_moved_waypoint_too(self):
+        self.start()
+        self.B.window(WP_EDIT % {"base": 400, "param": "0.6"})
+        self.settle()
+        self.assertTrue(self.B.L.eval("EDITED == true"), "the window's callback succeeds")
+        self.agree("the edit with its waypoints is on both games")
+        snap = self.A.snapshot()
+        for needle in ("entity=Main Street East,index=3},param=0.6", "entity=Railway,index=1},param=0.5", "entity=Main Street West,index=0},param=0.1"):
+            self.assertIn(needle, snap)
+        self.assertNotIn("Decoy", snap)
+        # the host moves the first waypoint along its street (its own ids)
+        self.A.window(WP_EDIT % {"base": 300, "param": "0.9"})
+        self.settle()
+        self.assertTrue(self.A.L.eval("EDITED == true"))
+        self.agree("the moved waypoint is on both games")
+        self.assertIn("entity=Main Street East,index=3},param=0.9", self.B.snapshot())
+        self.assertNotIn("REFUSED", self.A.log() + self.B.log())
+        self.assertEqual(self.B.log().count("window command makeLineUpdateCmd"), 1)
+
+    def test_a_waypoint_on_a_segment_another_game_does_not_have_is_refused_there(self):
+        self.start()
+        # a street only the client has (a native build that never reached the host)
+        self.B.L.execute("WORLD[451] = { BASE_NODE = { position = { x = 0, y = 900, z = 0 } } }; WORLD[452] = { BASE_NODE = { position = { x = 80, y = 900, z = 0 } } }; "
+                         "WORLD[453] = { BASE_EDGE = { node0 = 451, node1 = 452, tangent0 = { x = 80, y = 0, z = 0 }, tangent1 = { x = 80, y = 0, z = 0 } }, "
+                         "TRANSPORT_NETWORK = { edges = { {}, {} } }, NAME = { name = 'Lonely Lane' } }")
+        self.B.send_gui("local line = BUILD_LINE(api, { stops = { { group = 58, wps = { { edge = 453, index = 0, param = 0.5 } } }, { group = 61 } } })\n"
+                        'api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Lonely", api.type.Vec3f.new(0, 0, 0), api.engine.util.getPlayer(), line))')
+        self.settle()
+        self.assertEqual(len(self.B.actions_shipped()), 1, "the sender can name it: it is shipped")
+        self.assertIn("argument 4: stop 1 waypoint 1: unresolved segment 0.000,900.000,0.000 - 80.000,900.000,0.000", self.A.log())
+        self.assertNotIn("line Lonely", self.A.snapshot(), "never applied to another segment on the host")
+
+    def test_a_segment_with_other_lanes_on_another_game_refuses_the_waypoint_there(self):
+        self.A.L.execute("WORLD[311].TRANSPORT_NETWORK.edges = { {}, {} }")
+        self.start()
+        self.B.send_gui(WP_LINE % {"base": 400})
+        self.settle()
+        self.assertIn("stop 1 waypoint 1: network entity 311 has 2 edges here and 4 on the sending game", self.A.log())
+        self.assertEqual(self.A.count("LINE"), 1)
+
+    def test_a_waypoint_on_an_edge_its_network_does_not_have_is_refused_everywhere(self):
+        self.start()
+        self.B.send_gui(WP_LINE.replace("index = 0, param = 0.75", "index = 7, param = 0.75") % {"base": 400})
+        self.settle()
+        self.assertIn("stop 1 waypoint 2: edge 7 of network entity 413 which has 2", self.B.log())
+        self.assertEqual(self.B.actions_shipped(), [])
+        self.assertEqual((self.A.count("LINE"), self.B.count("LINE")), (1, 1))
+        self.agree()
 
 
 class FinanceTest(OpsBase):
@@ -1058,13 +1443,15 @@ class FinanceTest(OpsBase):
         self.settle()
         self.agree()
         self.assertEqual(self.B.balance(), 1005000)
-        # a booking nobody could rebuild stays native: a category this module does not know
+        # a booking nobody could rebuild is refused, on the sender too: a category this module does not know
         self.A.send_gui('local entry = api.type.JournalEntry.new()\n'
                         'entry.amount = 1; entry.time = -1; entry.category.type = 99\n'
                         'api.cmd.sendCommand(api.cmd.makeJournalBookAssetCmd(api.engine.util.getPlayer(), entry))')
         self.settle()
-        self.assertIn("sent natively: argument 2: a journal category this module does not know", self.A.log())
-        self.assertEqual(self.B.balance(), 1005000)
+        self.assertIn("REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): argument 2: "
+                      "a journal category this module does not know", self.A.log())
+        self.assertEqual((self.A.balance(), self.B.balance()), (1005000, 1005000))
+        self.agree()
 
     def drift_round(self, n):
         self.relay.checksum_request(n, self.relay.future_stamp(), False)
@@ -1197,6 +1584,25 @@ class TownTest(OpsBase):
         self.settle()
         self.assertEqual(self.A.L.eval("WORLD[90100].blocked"), True)
 
+    def test_a_town_building_entity_of_its_own_travels_through_its_construction(self):
+        # the command takes "the entity Id of the town building" (tf3-docs api/cmd); TownBuilding.construction names its building and
+        # Construction.townBuildings lists it: the reference is the building's file and place plus the town building's place in it
+        self.start()
+        self.A.L.execute("WORLD[90100] = { CONSTRUCTION = { fileName = 'house/h2.con', transf = { [13] = 30, [14] = 40, [15] = 0 }, townBuildings = { 90101 } } }; "
+                         "WORLD[90101] = { TOWN_BUILDING = { construction = 90100 } }")
+        self.B.L.execute("WORLD[90200] = { CONSTRUCTION = { fileName = 'house/h2.con', transf = { [13] = 30, [14] = 40, [15] = 0 }, townBuildings = { 90201 } } }; "
+                         "WORLD[90201] = { TOWN_BUILDING = { construction = 90200 } }")
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeTownBuildingSetBlockedDevelopmentCmd(90201, true))")
+        self.settle()
+        self.assertEqual(self.A.L.eval("WORLD[90101].blocked"), True, "the host blocked its own town building of that house")
+        self.assertEqual(self.B.L.eval("WORLD[90201].blocked"), True)
+        # neither a town building nor a construction: refused on the sender, applied nowhere
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeTownBuildingSetBlockedDevelopmentCmd(70, true))")
+        self.settle()
+        self.assertIsNone(self.A.L.eval("WORLD[70].blocked"))
+        self.assertIsNone(self.B.L.eval("WORLD[70].blocked"))
+        self.assertIn("neither a town building nor a construction", self.B.log())
+
 
 class WorldSettingsTest(OpsBase):
     def test_calendar_weather_and_time_of_day_are_set_on_every_game(self):
@@ -1219,7 +1625,7 @@ class WorldSettingsTest(OpsBase):
         self.B.send_gui('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "GameTime", "SetMode", { mode = "Local" }))')
         self.settle()
         self.assertEqual(self.B.actions_shipped(), [])
-        self.assertIn("the Local time-of-day mode follows each machine's clock", self.B.log())
+        self.assertNotIn("REFUSED", self.B.log(), "the player's own setting: not a command that failed to replicate")
         self.assertEqual(str(self.B.L.eval("GAME.timeMode")), "Local", "it still runs, on the game that asked")
         self.assertEqual(self.A.L.eval("GAME.timeMode"), None)
 
@@ -1263,6 +1669,17 @@ class ModuleTest(unittest.TestCase):
         setattr(listed, "__members", [])
         t = marshal(listed)
         self.assertEqual((t["x"], t["y"], t["z"]), (1.5, 2.5, 3.5))
+
+    def test_model_find_takes_id_0_and_refuses_only_minus_1(self):
+        # ResTypeRep.find: "the id of the resource, -1 if the resource doesn't exist" (tf3-docs api/res): 0 is a real model id
+        A = self.ops.internals.A
+        self.L.execute("SAVED_FIND = GUI_API.res.modelRep.find; "
+                       "GUI_API.res.modelRep.find = function(name) if name == 'vehicle/first.mdl' then return 0 end return -1 end")
+        try:
+            self.assertEqual(A.modelFind("vehicle/first.mdl"), 0)
+            self.assertIsNone(A.modelFind("vehicle/missing.mdl"))
+        finally:
+            self.L.execute("GUI_API.res.modelRep.find = SAVED_FIND")
 
     def test_marshal_refuses_what_cannot_travel_and_says_what(self):
         marshal = self.ops.internals.marshal

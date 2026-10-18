@@ -10,11 +10,29 @@ fn outcome(parts: &[&str]) -> ChecksumOutcome {
             values: BTreeMap::from([(0, Some("a".to_owned())), (1, Some("b".to_owned()))]),
         })
         .collect();
-    ChecksumOutcome { n: 1, time: 0, reporters: vec![0, 1], differences, time_skew: None, full: true }
+    ChecksumOutcome {
+        n: 1,
+        time: 0,
+        reporters: vec![0, 1],
+        differences,
+        time_skew: None,
+        full: true,
+        not_ready: BTreeMap::new(),
+    }
 }
 
 fn policy() -> ChecksumPolicy {
     ChecksumPolicy::new(ChecksumPolicyConfig::default())
+}
+
+#[test]
+fn a_full_round_is_spread_one_engine_batch_apart() {
+    assert_eq!(1, ChecksumPolicy::spread_steps(true, false, 1));
+    assert_eq!(4, ChecksumPolicy::spread_steps(true, false, 4));
+    assert_eq!(1, ChecksumPolicy::spread_steps(true, false, 0), "not running: one step apart");
+    assert_eq!(ChecksumPolicy::SPREAD_MAX_STEPS, ChecksumPolicy::spread_steps(true, false, 99));
+    assert_eq!(0, ChecksumPolicy::spread_steps(false, false, 4), "a light round is hashed whole");
+    assert_eq!(0, ChecksumPolicy::spread_steps(true, true, 4), "a paused round is hashed whole");
 }
 
 #[test]
@@ -243,4 +261,30 @@ fn a_heavy_drift_part_keeps_counting_through_light_rounds() {
         }
     }
     assert!(p.on_outcome(300.0, &outcome(&["nodeConfigs"])).is_some(), "drift for 300 s reloads");
+}
+
+fn not_ready(parts: &[&str], missing: &[&str]) -> ChecksumOutcome {
+    let not_ready = missing.iter().map(|p| ((*p).to_owned(), vec![1])).collect();
+    ChecksumOutcome { not_ready, ..outcome(parts) }
+}
+
+#[test]
+fn a_part_not_ready_on_a_game_keeps_its_streak_and_a_measured_one_still_counts() {
+    // companies differ, then a round in which one game could not hash them yet: neither a match nor a new difference
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &outcome(&["companies"])));
+    assert_eq!(None, p.on_outcome(10.0, &not_ready(&[], &["companies"])), "an unmeasured part is not a match");
+    assert!(
+        p.on_outcome(20.0, &outcome(&["companies"])).is_some(),
+        "the streak went on through the round that could not measure it"
+    );
+    // a part that was measured and differs counts as before, whatever else was not ready
+    let mut p = policy();
+    assert_eq!(None, p.on_outcome(0.0, &not_ready(&["roads"], &["companies"])));
+    assert!(p.on_outcome(10.0, &not_ready(&["roads"], &["companies"])).is_some());
+    // a not-ready round never starts a streak by itself
+    let mut p = policy();
+    for t in 0..20 {
+        assert_eq!(None, p.on_outcome(f64::from(t) * 10.0, &not_ready(&[], &["companies"])));
+    }
 }

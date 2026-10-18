@@ -81,7 +81,7 @@ It is a separate program that you start yourself (a double-click shows a numbere
 | `<game folder>\winhttp.dll` | the DLL | install | yes, only when it is ours (it carries the marker `feverlink3_native`) |
 | `<game folder>\steam_appid.txt` | one line, `3493540` (the game's Steam app id), so that the game program can also be started outside Steam | install, only if the file is absent | yes, only when it holds exactly `3493540` |
 | `<game folder>\feverlink3_path.txt` | the path of `feverlink3.exe`; read only by `feverlink3 doctor` and the installer's menu (to find out which version installed), never by the DLL | install | yes |
-| `<Steam>\userdata\<id>\3493540\local\mods\feverlink3_1\` | the mod (Lua game scripts and the window) | install, one copy for each Steam account on the PC | yes |
+| `<Steam>\userdata\<id>\3493540\local\mods\feverlink3\` | the mod (Lua game scripts and the window) | install, one copy for each Steam account on the PC | yes |
 | `%LOCALAPPDATA%\FeverLink3\native.log` | the DLL's text log | the DLL | no, delete the folder by hand |
 | `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`; emptied at every game start | the DLL and the mod | no, delete the folder by hand |
 | `<Steam>\userdata\<id>\3493540\local\save\feverlink3-resync-<number>.sav` | the host's world while it is synced to the players. These are ordinary game saves and can be large | the game and the DLL | no, delete them when you do not need them |
@@ -198,7 +198,7 @@ Tips that every vendor asks for: name the product and the detection, send the ex
 
 1. Close the game. Run `feverlink3 uninstall` (add `--dry-run` first to see the plan). It removes the mod, our `winhttp.dll`, `feverlink3_path.txt` and, if it holds our app id, `steam_appid.txt`. It never touches a `winhttp.dll` that is not ours.
 2. Optional: delete `%LOCALAPPDATA%\FeverLink3\` (logs and session files), `%TEMP%\feverlink3\`, and the files named `feverlink3-resync-*.sav` in your save folder.
-3. By hand, if you no longer have `feverlink3.exe`: delete `winhttp.dll` from the game folder (check that it is ours first, with the hash above) and the folder `userdata\<id>\3493540\local\mods\feverlink3_1`.
+3. By hand, if you no longer have `feverlink3.exe`: delete `winhttp.dll` from the game folder (check that it is ours first, with the hash above) and the folder `userdata\<id>\3493540\local\mods\feverlink3`.
 
 The game keeps no other trace of FeverLink3. The mod declares that removing it has no effect on a save (`severityRemove: None` in its `mod.json`); the game may still list it as missing when you load a save that was made with it.
 

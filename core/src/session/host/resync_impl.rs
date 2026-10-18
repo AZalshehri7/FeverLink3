@@ -6,12 +6,13 @@ use std::collections::BTreeSet;
 use super::{clip, HostOutput, HostSession};
 use crate::session::checksum::ChecksumOutcome;
 use crate::session::kind::MessageKind;
-use crate::session::lockstep::Lockstep;
+use crate::session::lockstep::{Lockstep, PlayerClock};
 use crate::session::messages::{
-    codec, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage, ResyncSaveMessage, SaveDoneMessage,
-    SessionState,
+    codec, ActionRefusedMessage, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage, ResyncSaveMessage,
+    SaveDoneMessage, SessionState,
 };
 use crate::session::resync::{normalize_sha256, ResyncLimits, ResyncState};
+use crate::session::verdict::{Verdict, VerdictOutcome};
 
 /// The saved file as the launcher announced it.
 #[derive(Debug)]
@@ -24,6 +25,8 @@ pub(super) struct FileInfo {
 
 /// How often a paused verify round that cannot be compared (different sim times) is asked again.
 const MAX_VERIFY_SKEWS: u8 = 3;
+/// How often a paused verify round in which a game reported a part not ready (and nothing differs) is asked again.
+const MAX_VERIFY_NOT_READY: u8 = 3;
 /// A line in the session log with the count of skewed rounds after this many finished rounds.
 const SKEW_LOG_EVERY: u32 = 20;
 
@@ -35,7 +38,10 @@ pub(super) struct ResyncRound {
     /// Host time the current state was entered.
     entered: f64,
     resume_speed: i32,
+    /// The pause the round stops the games at; after the load, the time the loaded world stands at (`on_load_hello`).
     pause_at: i64,
+    /// The time the participants' games said hello at after the load (the save's time), once one has.
+    loaded_at: Option<i64>,
     file: Option<FileInfo>,
     /// Players present when the transfer started: they get the chunks and the load, and must say Hello again.
     participants: Option<BTreeSet<u16>>,
@@ -45,6 +51,8 @@ pub(super) struct ResyncRound {
     verify_n: Option<i32>,
     /// Paused verify rounds that came back not comparable (the games reported different sim times): asked again.
     verify_skews: u8,
+    /// Paused verify rounds in which a game reported a part not ready: asked again.
+    verify_not_ready: u8,
     /// The host's game was sent the load while the players are still receiving the save (it is paused, so it can
     /// reload in that time instead of after it).
     host_loading: bool,
@@ -217,6 +225,8 @@ impl HostSession {
             return;
         }
         self.resync_counter += 1;
+        // every game gets the host's world: what the verdicts of the old worlds said no longer matters
+        self.verdicts.clear();
         let id = self.resync_counter;
         // Tell everyone before the games pause: a repair copies the host's world to everybody, so a build that never reached the host
         // (a kind that is not replicated yet) is lost on the other game.
@@ -253,11 +263,13 @@ impl HostSession {
             entered: self.now(),
             resume_speed,
             pause_at,
+            loaded_at: None,
             file: None,
             participants: None,
             bulk: BTreeSet::new(),
             verify_n: None,
             verify_skews: 0,
+            verify_not_ready: 0,
             host_loading: false,
             held: Vec::new(),
         });
@@ -278,6 +290,59 @@ impl HostSession {
                 self.log(format!("{reason} waits for the next resync round"));
             }
             Some(_) => {}
+        }
+    }
+
+    /// From the save to the load: the games' worlds are about to be replaced by the save, so what they report (where they stand still)
+    /// says nothing about the world they will run.
+    pub(super) fn resync_replaces_world(&self) -> bool {
+        self.resync
+            .as_ref()
+            .is_some_and(|r| matches!(r.state, ResyncState::Saving | ResyncState::Transferring | ResyncState::Loading))
+    }
+
+    /// A participant's game said hello after the round's load, its world standing at `time`: the save's time, the same on every game
+    /// (they all loaded one file). Every step before it belongs to the world the games left, so the session's pause moves there, and
+    /// so do the round's verify stamp and the floor of the pause order (no stamp of the pause before it). Real friend test 2026-10-16:
+    /// the pause stayed at 10341800 after both games had loaded the save at 10342400; a build made then was stamped at the stale pause
+    /// and reached the other game 3 steps after its stamp (LATE, a fork, another resync). The game's clock from before the load goes
+    /// too: it describes the world it left (the clock that follows the hello is the loaded world's).
+    pub(super) fn on_load_hello(&mut self, from: u16, time: i64) {
+        let Some(r) = self.resync.as_mut() else { return };
+        let loading = matches!(r.state, ResyncState::Transferring | ResyncState::Loading);
+        if !loading || !r.participants.as_ref().is_some_and(|p| p.contains(&from)) {
+            return;
+        }
+        if !PlayerClock::plausible(time, 0) {
+            self.dropped += 1;
+            let who = self.name(from);
+            self.log(format!("hello of {who} after the load does not move the pause (time {time})"));
+            return;
+        }
+        let id = r.id;
+        let earlier = r.loaded_at;
+        let loaded = earlier.map_or(time, |t| t.max(time));
+        let round = r.pause_at;
+        r.loaded_at = Some(loaded);
+        r.pause_at = r.pause_at.max(loaded);
+        let pause = r.pause_at;
+        self.clocks.remove(&from);
+        if let Some(t) = earlier.filter(|&t| t != time) {
+            // one save, one time: a game that says otherwise did not load what the others did (the verify round will tell)
+            let who = self.name(from);
+            self.log(format!(
+                "resync {id}: {who} loaded at {time}, another game at {t}; the pause is the furthest, {pause}"
+            ));
+        }
+        // the pause order's floor is a stamp of the world before the load
+        self.pause_last = None;
+        if self.state.pause_at != Some(pause) {
+            let was = self.state.pause_at.map_or_else(|| "none".to_owned(), |p| p.to_string());
+            self.log(format!(
+                "resync {id}: the games loaded the save at {loaded}; the pause moves from {was} (round {round}) to {pause}"
+            ));
+            self.state.pause_at = Some(pause);
+            self.broadcast_session();
         }
     }
 
@@ -535,6 +600,8 @@ impl HostSession {
 
     fn enter_verifying(&mut self) {
         let Some(at) = self.resync.as_ref().map(|r| r.pause_at) else { return };
+        // a regular round asked before the resync is of the world the games just replaced: never waited for after it
+        self.forget_running_round();
         self.checksum_n += 1;
         let n = self.checksum_n;
         self.checksums.open(n);
@@ -542,7 +609,7 @@ impl HostSession {
             r.verify_n = Some(n);
         }
         self.enter(ResyncState::Verifying, "comparing the paused checksums".to_owned());
-        let request = ChecksumRequestMessage { n, at, paused: true, full: true };
+        let request = ChecksumRequestMessage { n, at, paused: true, full: true, spread: 0 };
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
         self.last_checksum = self.now();
     }
@@ -572,6 +639,25 @@ impl HostSession {
             if verify == Some(outcome.n) {
                 if outcome.identical() {
                     self.finish();
+                } else if outcome.comparable() && outcome.differences.is_empty() && !outcome.ready() {
+                    // a game could not hash a part yet (right after its load): unknown, not a difference. Asked again a few
+                    // times; a part two games did hash and that differs fails the repair at once (the branch below).
+                    let tries = self.resync.as_mut().map_or(0, |r| {
+                        r.verify_not_ready += 1;
+                        r.verify_not_ready
+                    });
+                    let what = outcome.describe_not_ready();
+                    if tries <= MAX_VERIFY_NOT_READY {
+                        self.log(format!(
+                            "verify round {}: not ready yet ({what}); asked again ({tries} of {MAX_VERIFY_NOT_READY})",
+                            outcome.n
+                        ));
+                        self.enter_verifying();
+                    } else {
+                        self.fail(format!(
+                            "the games could not be verified after the reload: not ready after {MAX_VERIFY_NOT_READY} retries ({what})"
+                        ));
+                    }
                 } else if !outcome.comparable() {
                     // the games sampled at different sim times: ask again (a few times) before giving up, so a skewed round
                     // does not leave the host paused with a failed resync
@@ -589,7 +675,12 @@ impl HostSession {
                     }
                 } else {
                     let parts: Vec<&str> = outcome.differing_parts().collect();
-                    self.fail(format!("games still differ after the reload: {}", parts.join(", ")));
+                    let unknown = if outcome.ready() {
+                        String::new()
+                    } else {
+                        format!(" (not measured: {})", outcome.describe_not_ready())
+                    };
+                    self.fail(format!("games still differ after the reload: {}{unknown}", parts.join(", ")));
                 }
             }
             return;
@@ -612,6 +703,45 @@ impl HostSession {
         let now = self.now();
         if let Some(reason) = self.policy.on_replay_failed(now) {
             self.request_resync(reason);
+        }
+    }
+
+    /// A game's verdict of an action at its stamp. A refusal decided at the stamp from the game's own world is deterministic: identical
+    /// worlds refuse alike, so a refusal alone asks for nothing (lab run 2026-10-18: a town replaced a building during a build's lead,
+    /// both games refused the build at its stamp, and each asked for a resync of two identical worlds). Only verdicts that DIFFER
+    /// between games (one applied it, another refused it) are a fork, and that asks for the repair at once.
+    pub(super) fn on_action_verdict(&mut self, from: u16, m: ActionRefusedMessage) {
+        let who = self.name(from);
+        let key = format!("{}:{}", m.from, m.seq);
+        if !m.applied {
+            let class = m.class.as_deref().map(|c| format!(" ({})", clip(c, 40))).unwrap_or_default();
+            self.log(format!("action {key} refused on {who} at its stamp{class}: {}", clip(&m.detail, 200)));
+        }
+        if self.resync.is_some() || !self.state.started || !self.players.get(&from).is_some_and(|p| p.ready) {
+            return;
+        }
+        let expected = self.expected_reporters();
+        let verdict = Verdict { applied: m.applied, detail: m.detail };
+        match self.verdicts.record((m.from, m.seq), from, verdict, &expected) {
+            VerdictOutcome::Waiting | VerdictOutcome::Agreed { applied: true } => {}
+            VerdictOutcome::Agreed { applied: false } => {
+                self.log(format!(
+                    "action {key} was refused alike on every game (the same world refuses alike): no repair needed"
+                ));
+            }
+            VerdictOutcome::Differ { applied, refused } => {
+                let names = |ids: Vec<u16>| ids.into_iter().map(|g| self.name(g)).collect::<Vec<_>>().join(", ");
+                let first = refused.first().map(|(_, d)| clip(d, 160)).unwrap_or_default();
+                let applied = names(applied);
+                let refused = names(refused.into_iter().map(|(g, _)| g).collect());
+                self.log(format!(
+                    "action {key}: applied on {applied}, refused on {refused} ({first}): the worlds forked at this action"
+                ));
+                let now = self.now();
+                if let Some(reason) = self.policy.on_verdicts_differ(now, &key) {
+                    self.request_resync(reason);
+                }
+            }
         }
     }
 

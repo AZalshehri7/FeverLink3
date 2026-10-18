@@ -192,7 +192,7 @@ end
 
 -- ------------------------------------------------------------------ outbox hand-off (window -> bridge)
 
--- The window's writer for ui_out.log. Records are `chat` with {text}; the sequence is the writer's own.
+-- The window's writer for ui_out.log. Records are `chat` with {text}; the bridge reads them by position.
 function H.newOutbox(C)
 	return C.newWriter(C.path(H.OUTBOX), 0)
 end
@@ -207,7 +207,7 @@ end
 -- A throttled ticker for the window's refresh. The step timer (react.onStepTimer) is not guaranteed to fire while the
 -- game is paused, which left a guest's window saying "Connected" after the host had ended the session; the window now
 -- also calls the ticker from react.onStep (every interface frame, which runs while paused). The ticker runs fn at most
--- once per `interval` seconds of the real clock (os.clock), however many drivers call it, and returns fn's result
+-- once per `interval` seconds of the real clock (C.clock, feverlink3_link.lua), however many drivers call it, and returns fn's result
 -- (nil when it skipped this call).
 function H.newTicker(interval, clock, fn)
 	local last

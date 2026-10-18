@@ -25,7 +25,7 @@ impl Inputs {
         Inputs {
             exe: root.join("target/release/feverlink3.exe"),
             native_dll: root.join("target/release/feverlink3_native.dll"),
-            mod_dir: root.join("mod/feverlink3_1"),
+            mod_dir: root.join("mod/feverlink3"),
             readme: root.join("README.md"),
             guide: root.join("docs/PLAYING.md"),
             license: root.join("LICENSE"),
@@ -66,7 +66,7 @@ pub fn valid_version(v: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// A player copies `winhttp.dll` and the `mods` folder into the game's own folder; no program is shipped.
-    /// The mod sits in `mods/release/feverlink3_1`, where the game keeps its built-in mods (it loads from there:
+    /// The mod sits in `mods/release/feverlink3`, where the game keeps its built-in mods (it loads from there:
     /// checked in the game, build 40420).
     Overlay,
     /// The launcher program, the DLL and the mod folder side by side; `feverlink3.exe install` puts them in place.
@@ -85,10 +85,10 @@ pub fn package_with(inputs: &Inputs, version: &str, out: &Path, layout: Layout) 
         ("THIRD_PARTY_NOTICES.md".into(), read(&inputs.notices)?),
     ];
     match layout {
-        Layout::Overlay => collect_dir(&inputs.mod_dir, "mods/release/feverlink3_1", &mut files)?,
+        Layout::Overlay => collect_dir(&inputs.mod_dir, "mods/release/feverlink3", &mut files)?,
         Layout::Portable => {
             files.push(("feverlink3.exe".into(), read(&inputs.exe)?));
-            collect_dir(&inputs.mod_dir, "mod/feverlink3_1", &mut files)?;
+            collect_dir(&inputs.mod_dir, "mod/feverlink3", &mut files)?;
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -146,9 +146,9 @@ mod tests {
         w("docs/PLAYING.md", "guide");
         w("LICENSE", "mit");
         w("THIRD_PARTY_NOTICES.md", "notices");
-        w("mod/feverlink3_1/mod.json", "{}");
-        w("mod/feverlink3_1/content/b.lua", "b");
-        w("mod/feverlink3_1/content/a.lua", "a");
+        w("mod/feverlink3/mod.json", "{}");
+        w("mod/feverlink3/content/b.lua", "b");
+        w("mod/feverlink3/content/a.lua", "a");
         Inputs::from_root(root)
     }
 
@@ -168,8 +168,8 @@ mod tests {
             "FeverLink3-1.2.3/winhttp.dll",
             "FeverLink3-1.2.3/HOW-TO-PLAY.txt",
             "FeverLink3-1.2.3/LICENSE",
-            "FeverLink3-1.2.3/mods/release/feverlink3_1/mod.json",
-            "FeverLink3-1.2.3/mods/release/feverlink3_1/content/a.lua",
+            "FeverLink3-1.2.3/mods/release/feverlink3/mod.json",
+            "FeverLink3-1.2.3/mods/release/feverlink3/content/a.lua",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}");
         }
@@ -201,8 +201,8 @@ mod tests {
             "FeverLink3-1.2.3/HOW-TO-PLAY.txt",
             "FeverLink3-1.2.3/LICENSE",
             "FeverLink3-1.2.3/THIRD_PARTY_NOTICES.md",
-            "FeverLink3-1.2.3/mod/feverlink3_1/mod.json",
-            "FeverLink3-1.2.3/mod/feverlink3_1/content/a.lua",
+            "FeverLink3-1.2.3/mod/feverlink3/mod.json",
+            "FeverLink3-1.2.3/mod/feverlink3/content/a.lua",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}");
         }

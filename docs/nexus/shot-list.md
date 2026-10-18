@@ -111,7 +111,7 @@ For the person who drives the game. Each entry says what to capture, the exact s
 ## S11 - Files after the install
 
 - **Purpose:** shows the footprint. Name: `nexus-11-files.png`.
-- **Steps:** open the game folder (Steam, right-click the game, Manage, Browse local files). Show `winhttp.dll`, `steam_appid.txt` and `feverlink3_path.txt` next to `TransportFever3.exe`. In a second Explorer window open `userdata\<id>\3493540\local\mods` and show the folder `feverlink3_1`. Combine the two windows in one image.
+- **Steps:** open the game folder (Steam, right-click the game, Manage, Browse local files). Show `winhttp.dll`, `steam_appid.txt` and `feverlink3_path.txt` next to `TransportFever3.exe`. In a second Explorer window open `userdata\<id>\3493540\local\mods` and show the folder `feverlink3`. Combine the two windows in one image.
 - **Hide:** the Steam user id folder name (crop the address bar or blur the digits) and any user name.
 - **Caption:** "Everything FeverLink3 puts on your PC: three small files next to the game program and one mod folder."
 

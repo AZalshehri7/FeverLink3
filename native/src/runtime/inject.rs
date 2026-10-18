@@ -12,6 +12,25 @@ use crate::rebuild::{Alloc, EngineAlloc};
 
 use super::{wall_ms, StampTiming};
 
+/// What an unresolved pointer of a text points at, for the log: the word's two 32-bit halves (a small low half under a high half that
+/// is a heap prefix is a 4-byte value beside residue, not a pointer), the first 32 bytes there, and what its first word is (an offset
+/// into the game's image is likely a vtable: an engine object of a polymorphic class).
+fn describe_target(addr: usize, base: usize) -> String {
+    let (lo, hi) = (addr as u64 & 0xffff_ffff, addr as u64 >> 32);
+    let Some(b) = LiveMem.read(addr, 32) else {
+        return format!("{addr:#x} (low32 {lo:#x}, high32 {hi:#x}) unreadable");
+    };
+    let w0 = crate::dump::u64_at(&b, 0) as usize;
+    let first = if w0 >= base && w0 - base < crate::dump::IMAGE_BOUND {
+        format!("first word I+{:x} (an image pointer: a vtable?)", w0 - base)
+    } else if crate::dump::pointer_like(w0 as u64) && LiveMem.read(w0, 1).is_some() {
+        "first word a readable address".to_string()
+    } else {
+        "first word a literal".to_string()
+    };
+    format!("{addr:#x} (low32 {lo:#x}, high32 {hi:#x}) bytes {}; {first}", crate::plan::hex(&b))
+}
+
 impl Runtime {
     /// Switches the native injection on (`FEVERLINK3_NATIVE_INJECT=1`). `settings` are the portable text settings the originator's
     /// copy of the text is written with and the receiver's proof is made with.
@@ -51,19 +70,64 @@ impl Runtime {
         let mask = nc::ProposalFns::at(self.base).and_then(|fns| {
             nc::residue_mask(&fns, &LiveMem, self.base, settings, self.build.name, payload, &mut |l| self.say(l))
         });
-        crate::log::guarded("native inject: text", || self.inject_write_text(payload, id, settings, t0, wall0, mask));
+        let Some(mut job) =
+            crate::log::guarded("native inject: text", || self.inject_encode_text(payload, id, settings, t0, mask))
+        else {
+            return;
+        };
+        // Owner decision 2026-10-18 (#6): a text that passes the text-only checks is also proved by the engine on this game, before
+        // anything leaves it: the same rebuild every receiver makes at the stamp, destroyed again (the engine calls are not guarded)
+        if let (Ok(p), None) = (&job.encoded, &job.refusal) {
+            let t_proof = std::time::Instant::now();
+            let proof = self.inject_own_proof(payload, &p.text, settings);
+            job.proof_ms = t_proof.elapsed().as_secs_f64() * 1000.0;
+            match proof {
+                Ok(stats) => job.proved = Some(stats),
+                Err(why) => job.refusal = Some(why),
+            }
+        }
+        crate::log::guarded("native inject: text (ship)", || self.inject_write_text(id, t0, wall0, job));
     }
 
-    /// The rest of [`Runtime::inject_publish_text`]: the text with the mask, the file, the log lines and the timing record.
-    fn inject_write_text(
+    /// The originator's own engine proof of its text (`inject::own_proof`) on the held command at `payload`: the checks and the dry
+    /// pass guarded, the engine part not. `Err` (the refusal) whenever the proof cannot be made: an unverified function or allocator is
+    /// a refusal too (fail closed: the receivers could not inject it either). Never call it inside a guard.
+    pub(super) fn inject_own_proof(
+        &self,
+        payload: usize,
+        text: &str,
+        settings: portable::Settings,
+    ) -> Result<(u64, u64, u64), String> {
+        crate::log::calls_engine("native inject: the originator's own proof");
+        let ready = crate::log::guarded("native inject: own proof (checks)", || -> Result<_, String> {
+            let donor = inj::own_checks(&LiveMem, payload, text)?;
+            let fns = self.proposal_fns().map_err(|why| format!("{}{why}", inj::OWN_PROOF))?;
+            let alloc = EngineAlloc::at(self.base)
+                .map_err(|why| format!("{}the game's allocator was not verified: {why}", inj::OWN_PROOF))?;
+            Ok((donor, fns, alloc))
+        });
+        let (donor, fns, alloc) = match ready {
+            Some(r) => r?,
+            None => return Err(format!("{}our own check panicked (the PANIC line in native.log)", inj::OWN_PROOF)),
+        };
+        inj::dry_own_proof(&LiveMem, self.base, settings, self.build.name, text, donor)
+            .map_err(|why| format!("{}{why}", inj::OWN_PROOF))?;
+        let live = LiveMem;
+        let ctx =
+            nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
+        let mut say = |l: &str| self.say(l);
+        inj::own_proof(&ctx, &super::cmd_patch::LivePoke, text, donor, &mut say)
+    }
+
+    /// The text of [`Runtime::inject_publish_text`] with the mask and its text-only checks (no engine call).
+    fn inject_encode_text(
         &self,
         payload: usize,
         id: u64,
         settings: portable::Settings,
         t0: std::time::Instant,
-        wall0: u64,
         mask: Result<nc::MaskInfo, String>,
-    ) {
+    ) -> TextJob {
         let live = LiveMem;
         let head = portable::Header {
             seq: 0,
@@ -96,28 +160,76 @@ impl Runtime {
         let encoded =
             portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts);
         let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(p) = &encoded {
+            // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what the
+            // memory there looks like, so that one run shows everything that stays to be understood
+            for (member, addr) in p.unresolved.iter().take(40) {
+                self.say(&format!(
+                    "native inject: hold {id}: unresolved pointer in {member} -> {}",
+                    describe_target(*addr, self.base)
+                ));
+            }
+            self.say(&format!(
+                "native inject: hold {id}: structural dump read {} heap bytes of its bound {} (scaled from the proposal's own size)",
+                p.stats.heap_read, p.stats.heap_budget
+            ));
+        }
+        // The originator decides (open bug 7): the part of every receiver's proof that rests on the text alone is run here, on the same
+        // text with the same rules. A text that every game would refuse at the stamp is not shipped: the reason goes to
+        // native_refused_<id>.txt instead of native_text_<id>.txt, and the mod fails the held command (nothing is built on any game).
+        let refusal: Option<String> = match &encoded {
+            Ok(p) => inj::text_refusal(&p.text, self.base),
+            Err(why) => Some(format!("the layout table refuses this command: {why}")),
+        };
+        TextJob { encoded, refusal, mask_ms, encode_ms, proof_ms: 0.0, proved: None }
+    }
+
+    /// The rest of [`Runtime::inject_publish_text`] once the text is checked and proved: the file (or the refusal), the log lines and the
+    /// timing record.
+    fn inject_write_text(&self, id: u64, t0: std::time::Instant, wall0: u64, job: TextJob) {
+        let TextJob { encoded, refusal, mask_ms, encode_ms, proof_ms, proved } = job;
+        if let Some((nodes, segments, constructions)) = proved {
+            self.say(&format!(
+                "native inject: hold {id}: own proof PASSED in {proof_ms:.1} ms: the engine Proposal rebuilt from this text the way every receiver rebuilds it ({nodes} nodes, {segments} segments, {constructions} construction(s)) equals the text in every named member; destroyed, nothing of it applied"
+            ));
+        }
         let t_write = std::time::Instant::now();
-        let written: Option<std::io::Result<()>> = encoded.as_ref().ok().map(|p| self.text.write(id, &p.text));
+        let written: Option<std::io::Result<()>> = match (&encoded, &refusal) {
+            (Ok(p), None) => Some(self.text.write(id, &p.text)),
+            (_, Some(why)) => {
+                let (short, report) = why.split_once(inj::REPORT_MARK).unwrap_or((why.as_str(), ""));
+                let _ = self.refused_text.write(id, &format!("{short}\n{report}"));
+                let whose = if short.starts_with(inj::OWN_PROOF) {
+                    format!("the engine's own rebuild of this text on this game was refused ({proof_ms:.1} ms), as every receiver's would be")
+                } else {
+                    "every game would refuse this text".to_string()
+                };
+                self.say(&format!(
+                    "native inject: hold {id}: REFUSED BEFORE SHIPPING, {whose}: {short}; native_refused_{id}.txt written, no native_text_{id}.txt: the mod fails the held command and ships nothing"
+                ));
+                None
+            }
+            (Err(_), None) => None,
+        };
         let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
         let bytes = encoded.as_ref().map_or(0, |p| p.text.len());
         self.inject.report(Event::Timing {
             what: "capture",
             id,
             detail: format!(
-                "held={id} start={wall0} end={} ms={:.1} bytes={bytes} mask_ms={mask_ms:.1} encode_ms={encode_ms:.1} write_ms={write_ms:.1}",
+                "held={id} start={wall0} end={} ms={:.1} bytes={bytes} mask_ms={mask_ms:.1} encode_ms={encode_ms:.1} proof_ms={proof_ms:.1} proof={} write_ms={write_ms:.1}",
                 wall_ms(),
-                t0.elapsed().as_secs_f64() * 1000.0
+                t0.elapsed().as_secs_f64() * 1000.0,
+                match (&proved, &refusal) {
+                    (Some(_), _) => "passed",
+                    (None, Some(r)) if r.starts_with(inj::OWN_PROOF) => "refused",
+                    _ => "not_run",
+                }
             ),
         });
         match encoded.map(|p| (written, p)) {
             Ok((Some(w), p)) => match w {
                 Ok(()) if !p.unresolved.is_empty() => {
-                    // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what
-                    // the memory there looks like, so that one run shows everything that stays to be understood
-                    for (member, addr) in p.unresolved.iter().take(40) {
-                        let bytes = LiveMem.read(*addr, 32).map_or("unreadable".to_string(), |b| crate::plan::hex(&b));
-                        self.say(&format!("native inject: hold {id}: unresolved pointer in {member} -> {addr:#x} bytes {bytes}"));
-                    }
                     self.say(&format!(
                         "native inject: hold {id}: portable text written in {} ms, {} bytes, {} lines (native_text_{id}.txt), {} pointer(s) not followed; {}",
                         t0.elapsed().as_millis(),
@@ -708,6 +820,18 @@ pub(crate) struct Added {
     pub payload: usize,
     pub identity: inj::Identity,
     pub used: Used,
+}
+
+/// A held command's text between its encoding and its file ([`Runtime::inject_publish_text`]): the refusal (text-only checks, then
+/// the originator's own engine proof) and the times.
+struct TextJob {
+    encoded: Result<portable::Portable, String>,
+    refusal: Option<String>,
+    mask_ms: f64,
+    encode_ms: f64,
+    proof_ms: f64,
+    /// `(nodes, segments, constructions)` of the Proposal the own proof built and destroyed, when it passed.
+    proved: Option<(u64, u64, u64)>,
 }
 
 /// What [`Runtime::inject_prepare`] found: the engine part runs with it.

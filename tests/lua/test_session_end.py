@@ -8,8 +8,9 @@ module, commands stamped and not applied fail their callbacks, the queue goes, t
 speed buttons reach the engine directly.
 
 #16: the live folder keeps to_game.log across sessions, and a new interface state read it from its first line: an earlier session's
-`session`, `action` and resync lines were fed into the next world. Now identity.txt names the session (`session=`) and the last line
-before it (`start=`, launcher gamelink::Session::open), and a state that saw a session never dispatches a line of it again.
+`session`, `action` and resync lines were fed into the next world. Now identity.txt names the session (`session=`) and where
+to_game.log ended before it (`start=<gen>:<offset>`, launcher gamelink::Session::open), and a state that saw a session never dispatches a line
+of it again.
 
 Two mocked games run the real mod with the fake native module of test_strict_build.py / test_inject_fail_closed.py (imported, not edited);
 the one used here also does what the Rust module does at hold_off with a deferred command (hold.rs release_all: failed, never applied).
@@ -34,9 +35,15 @@ BUY = 'api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), 
 
 
 def identity(g, session, start, role):
-    """What the session controller writes (launcher gamelink::Session::write_identity): session and start first, role last."""
+    """What the session controller writes (launcher gamelink::Session::write_identity): session and start first, role last. `start`:
+    where to_game.log ends (bytes of its first generation)."""
     with open(os.path.join(g.dir, "identity.txt"), "w", encoding="utf-8", newline="") as f:
-        f.write("session=%s\nstart=%d\nid=%d\nname=%s\nrole=%s\n" % (session, start, g.id, g.label, role))
+        f.write("session=%s\nstart=1:%d\nid=%d\nname=%s\nrole=%s\n" % (session, start, g.id, g.label, role))
+
+
+def log_end(g):
+    """Where the game's to_game.log ends now (the controller's Session::open)."""
+    return os.path.getsize(g.to_game) if os.path.exists(g.to_game) else 0
 
 
 class EndNative(I.InjectNative):
@@ -69,7 +76,7 @@ class EndGame(S.StrictGame):
         return len([a for a in self.applied() if a.startswith("makeVehicleBuyCmd@")])
 
     def records(self, kind):
-        return [line for line in self.lines(self.from_game) if line.split(T.TAB)[1:2] == [kind]]
+        return [line for line in self.lines(self.from_game) if line.split(T.TAB)[0:1] == [kind]]
 
 
 class SessionEndTest(S.StrictTest):
@@ -222,9 +229,9 @@ class SessionEndTest(S.StrictTest):
         if reload:
             for g in (self.A, self.B):
                 g.reload()
-        # the controller opens session 2 on the same folder: a new id, and the last line of session 1 as its start
+        # the controller opens session 2 on the same folder: a new id, and the end of session 1's lines as its start
         self.relay.started, self.relay.speed, self.relay.pauseAt, self.relay.safes = False, 0, None, {}
-        self.starts = dict(self.relay.seq)
+        self.starts = {g.id: log_end(g) for g in (self.A, self.B)}
         for g in (self.A, self.B):
             identity(g, "s2", self.starts[g.id], "host" if g.id == 0 else "player")
         self.look()
@@ -251,7 +258,7 @@ class SessionEndTest(S.StrictTest):
 
     def test_a_second_session_in_a_fresh_lua_state_skips_to_its_start_line(self):
         self.second_session(reload=True)
-        self.assertIn("session s2 begins here (fresh): to_game.log lines after %d" % self.starts[self.B.id], self.B.log())
+        self.assertIn("session s2 begins here (fresh): to_game.log from 1:%d" % self.starts[self.B.id], self.B.log())
         self.check_nothing_replayed()
 
     def test_a_save_made_mid_session_brings_no_queued_action_into_the_next_session(self):
@@ -271,7 +278,7 @@ class SessionEndTest(S.StrictTest):
             g.reload()
         self.relay.started, self.relay.speed, self.relay.pauseAt, self.relay.safes = False, 0, None, {}
         for g in (self.A, self.B):
-            identity(g, "s2", self.relay.seq[g.id], "host" if g.id == 0 else "player")
+            identity(g, "s2", log_end(g), "host" if g.id == 0 else "player")
         self.look()
         self.tick(2)
         self.assertIn("a new session: dropped 1 queued action(s) and binder(s) of an earlier session", self.B.log())
@@ -292,7 +299,7 @@ class IdentityTest(unittest.TestCase):
         os.environ["FEVERLINK3_LIVE_DIR"] = self.tmp
         import lupa.lua52 as lupa
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.L.execute(T.COMMON_SRC)
+        self.C = T.load_common(self.L)
 
     def tearDown(self):
         for k, v in self._env.items():
@@ -311,22 +318,22 @@ class IdentityTest(unittest.TestCase):
 
     def test_on_off_another_session_and_incomplete_files(self):
         self.assertFalse(self.poll(), "no identity: idle")
-        self.write("session=aa\nstart=7\nid=2\nname=Pat\nrole=player\n")
+        self.write("session=aa\nstart=1:7\nid=2\nname=Pat\nrole=player\n")
         self.assertTrue(self.poll())
-        self.assertEqual((self.C.SESSION, self.C.SESSION_START, self.C.PLAYER_ID, self.C.GEN), ("aa", 7, 2, 1))
-        self.write("session=aa\nstart=7\nid=2\nname=Pat\nrole=pla")   # a read racing the write: no complete role line
+        self.assertEqual((self.C.SESSION, self.C.posText(self.C.SESSION_START), self.C.PLAYER_ID, self.C.GEN), ("aa", "1:7", 2, 1))
+        self.write("session=aa\nstart=1:7\nid=2\nname=Pat\nrole=pla")   # a read racing the write: no complete role line
         self.assertTrue(self.poll(), "an incomplete file changes nothing")
         self.write("")
         self.assertTrue(self.poll())
-        self.write("session=bb\nstart=40\nid=0\nname=Pat\nrole=host\n")
+        self.write("session=bb\nstart=2:40\nid=0\nname=Pat\nrole=host\n")
         self.assertTrue(self.poll())
-        self.assertEqual((self.C.SESSION, self.C.SESSION_START, self.C.PLAYER_ID, self.C.GEN), ("bb", 40, 0, 2), "another session began")
-        self.write("session=cc\nstart=41\nid=0\nname=Pat\nrole=idle\n")
+        self.assertEqual((self.C.SESSION, self.C.posText(self.C.SESSION_START), self.C.PLAYER_ID, self.C.GEN), ("bb", "2:40", 0, 2), "another session began")
+        self.write("session=cc\nstart=2:41\nid=0\nname=Pat\nrole=idle\n")
         self.assertFalse(self.poll(), "idle: the session is over")
         self.assertEqual(self.C.ROLE, "idle")
         self.write("id=1\nname=Old\nrole=player\n")
         self.assertTrue(self.poll(), "an identity without a session line (an older writer) still starts one")
-        self.assertEqual((self.C.SESSION, self.C.SESSION_START, self.C.GEN), ("", 0, 3))
+        self.assertEqual((self.C.SESSION, self.C.SESSION_START, self.C.GEN), ("", None, 3))
 
 
 if __name__ == "__main__":

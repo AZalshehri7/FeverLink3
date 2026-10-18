@@ -1,40 +1,45 @@
 //! The control link between the Lua mod and the native module (`docs/NATIVE_LINK.md` section 3).
 //!
-//! Two append-only text files in the session folder, in exactly the shape of the launcher link
-//! (`docs/ARCHITECTURE.md` section 2): one record per line, `seq<TAB>kind<TAB>from<TAB>payload`, the payload one
-//! line of Lua literal syntax, `seq` growing by one per line, a reader keeping the last `seq` it dispatched. The
-//! mod therefore reads and writes them with the helpers it already has (`C.newWriter`, `C.newReader`, `C.parse`).
+//! Append-only text files in the session folder, in exactly the shape of the launcher link (`docs/ARCHITECTURE.md`
+//! section 2): one record per line, `kind<TAB>from<TAB>payload`, the payload one line of Lua literal syntax. A line
+//! carries no number: the order of the lines in a file is the order, and a reader reads by position (the generation
+//! and the byte offset it consumed), taking complete lines only. The mod reads and writes them with the helpers it
+//! already has (`C.newWriter`, `C.newReader`, `C.parse`).
 //!
-//! - `native_ctl.gui.log` and `native_ctl.sim.log`: the mod writes, the module reads ([`CtlReader`], [`CtlMessage`]).
-//!   One file per writer: the mod's interface half and its simulation half are two Lua states (the game's scripts
-//!   run on a thread pool, `docs/ARCHITECTURE.md` section 7), each with its own writer and its own numbering. The
-//!   reader keeps a position and a last `seq` per file, so a line of one half is never dropped for a number the
-//!   other half used, and two halves never append to the same file at the same time.
-//! - `native_events.log`: the module writes, the mod reads ([`EventWriter`], [`Event`]).
+//! - The control files (the mod writes, the module reads: [`CtlReader`], [`CtlMessage`]) are ONE FILE PER WRITER. The
+//!   mod's interface half and its simulation half are Lua states of their own, and the game runs the simulation half
+//!   in more than one Lua state (real runs b3real, b3real2, 2026-10-15: two writers of one file). Two Lua states on
+//!   two threads cannot share a file: the C runtime's append is a seek to the end and a write, two steps, so two
+//!   appends at the same moment overwrite or split each other's lines (two lupa states appending 200-byte lines lost
+//!   7 % of them; 5000-byte lines were torn as well). So every writer names a file of its own,
+//!   `<family>.w<id>.log`, with an id that is unique without coordination (the address of the writer's Lua table, the
+//!   clocks, a count: the game's Lua has no rename and no exclusive open, real run 2026-10-18 02:33). The families are
+//!   `native_ctl.gui` and `native_ctl.sim` ([`CTL_FAMILIES`]). The reader finds the files by listing the folder (when
+//!   on every poll, and in `has_news`), reads each by its own position, and hands out, per
+//!   poll, the interface writers' new lines and then the simulation writers'. Each writer's lines keep their order;
+//!   lines of two writers have no order between them beyond that (each order is complete in itself).
+//! - `native_events.log`: the module writes, the mod reads ([`EventWriter`], [`Event`]). One writer.
 //!
 //! Every file is a generation log (`feverlink3_launcher::gamelink`, "Generations"): it never grows without bound and
 //! is never truncated; the readers follow its `rotate` lines.
 //!
 //! Everything here is pure or plain file access. The reader is bounded (a line longer than [`MAX_LINE`] is thrown
-//! away, at most [`MAX_READ`] bytes are taken per poll) because the content comes from outside the process.
+//! away, at most [`MAX_READ`] bytes are taken per poll and file) because the content comes from outside the process.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use feverlink3_launcher::gamelink::{self, Line};
+use feverlink3_launcher::gamelink::{self, Line, Pos};
 use feverlink3_launcher::luatext;
 use serde_json::Value;
 
 use crate::engine::BuildFlags;
 
-/// The mod's interface half writes, the module reads (holding, verdicts, pings).
-pub const CTL_FILE: &str = "native_ctl.gui.log";
-/// The mod's simulation half writes, the module reads (the orders of its stamp applies).
-pub const CTL_SIM_FILE: &str = "native_ctl.sim.log";
-/// Every control file, one per writer, with the writer's name.
-pub const CTL_FILES: [(&str, &str); 2] = [("gui", CTL_FILE), ("sim", CTL_SIM_FILE)];
+/// The control-file families, one per half of the mod: (writer name, file stem). A writer of family `stem` writes
+/// `<stem>.w<id>.log`, its id hex digits.
+pub const CTL_FAMILIES: [(&str, &str); 2] = [("gui", "native_ctl.gui"), ("sim", "native_ctl.sim")];
 /// The module writes, the mod reads.
 pub const EVENTS_FILE: &str = "native_events.log";
 /// The events file starts a new generation at this size: small, because a reloaded mod reads the newest generation
@@ -44,7 +49,7 @@ pub const EVENTS_ROTATE_BYTES: u64 = 1 << 20;
 pub const EVENTS_FROM: &str = "native";
 /// A control line longer than this is thrown away.
 pub const MAX_LINE: usize = 8 * 1024;
-/// Most bytes read from the control file in one poll.
+/// Most bytes read from one control file in one poll.
 pub const MAX_READ: usize = 64 * 1024;
 /// Most kind names one `hold_on` may carry.
 pub const MAX_HOLD_KINDS: usize = 16;
@@ -53,7 +58,7 @@ pub const MAX_HOLD_KINDS: usize = 16;
 // Mod to module
 // ---------------------------------------------------------------------------------------------------------------
 
-/// One message of `native_ctl.log`.
+/// One message of a control file (`native_ctl.<half>.w<id>.log`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CtlMessage {
     /// Start holding commands of these kinds (names of the build's kind table).
@@ -184,7 +189,7 @@ fn optional(p: &Value, key: &str, why: &'static str) -> Result<u64, CtlError> {
     }
 }
 
-/// Turns one record of `native_ctl.log` into a message.
+/// Turns one record of a control file into a message.
 pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
     let p = parse_payload(&line.payload)?;
     match line.kind.as_str() {
@@ -286,86 +291,178 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Reading the control file
+// Reading the control files
 // ---------------------------------------------------------------------------------------------------------------
 
 /// What one poll of the control files found.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Poll {
-    /// New, complete, valid records: each file's in its order, one file after the other.
+    /// New, complete, valid records: each writer's in its order, the writers one after the other (interface ones first).
     pub lines: Vec<Line>,
     /// A control file existed before and is gone now (the session folder was cleaned). Reported once.
     pub gone: bool,
-    /// Records thrown away: longer than [`MAX_LINE`], not a link record, or a `seq` not above its writer's last one.
+    /// Records thrown away: longer than [`MAX_LINE`], or not a link record.
     pub discarded: usize,
     /// A read error (the file is retried on the next poll), or a generation that was deleted before it was read.
     pub error: Option<String>,
+    /// Writers that appeared since the link opened, at their first line: `sim.w<id> (from <its from column>)`, for the log.
+    pub new_writers: Vec<String>,
 }
 
 /// Generation switches one poll of one file follows at most.
 const MAX_SWITCHES: usize = 4;
 
-/// Reads new records from the control files: one source per writer, each with its own position and its own last
-/// `seq`. Tolerates a missing file, a partial last line, truncation and a rewrite, and follows each file's
-/// generations; a `seq` that is not above its writer's last dispatched one is dropped, so history never plays twice,
-/// and a line is never dropped for a number another writer used.
+/// Reads new records from the control files by position: one source per writer, each with its own position.
+/// Tolerates a missing file, a partial last line (it waits for its newline), truncation and a rewrite (read again
+/// from the first byte), and follows each file's generations. Nothing is dropped for what a line says.
 #[derive(Debug)]
 pub struct CtlReader {
+    families: Vec<Family>,
+    /// The folder the writers' files are found in by listing it (`None` for a reader of one fixed file).
+    scan: Option<Scan>,
+}
+
+#[derive(Debug)]
+struct Scan {
+    dir: PathBuf,
+}
+
+/// One family of writer files (or one plain file).
+#[derive(Debug)]
+struct Family {
+    /// `gui`, `sim` (a reader of one file: the file's name).
+    name: String,
+    /// The file stem of the family (`native_ctl.sim`); `None` for a reader of one fixed file.
+    stem: Option<String>,
     sources: Vec<Source>,
 }
 
+/// The writer id in a file name of family `stem`: `<stem>.w<id>.log`, `<stem>.w<id>.<gen>.log` or `<stem>.w<id>.gen`, the id
+/// hex digits only.
+pub fn writer_id(file_name: &str, stem: &str) -> Option<String> {
+    let rest = file_name.strip_prefix(stem)?.strip_prefix(".w")?;
+    let (id, tail) = rest.split_once('.')?;
+    let tail_ok = tail == "log"
+        || tail == "gen"
+        || tail.strip_suffix(".log").is_some_and(|g| !g.is_empty() && g.bytes().all(|b| b.is_ascii_digit()));
+    (tail_ok && !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
+/// The control file (its generation 1) of writer `id` of a family.
+pub fn writer_log_path(dir: &Path, stem: &str, id: &str) -> PathBuf {
+    dir.join(format!("{stem}.w{id}.log"))
+}
+
 impl CtlReader {
-    /// A reader of one file from its first byte (tests, tools).
+    /// A reader of one file from its first byte (tests, tools, the events file).
     pub fn new(path: PathBuf) -> CtlReader {
-        CtlReader { sources: vec![Source::new(&file_label(&path), path)] }
+        let name = file_label(&path);
+        CtlReader {
+            families: vec![Family { name: name.clone(), stem: None, sources: vec![Source::new(&name, path)] }],
+            scan: None,
+        }
     }
 
-    /// A reader of one file that treats whatever it holds now as history: it starts at the end and remembers the
-    /// highest `seq` in it.
+    /// A reader of one file that treats whatever it holds now as history: it starts at its end.
     pub fn starting_at_end(path: PathBuf) -> io::Result<CtlReader> {
-        Ok(CtlReader { sources: vec![Source::at_end(&file_label(&path), path)?] })
+        let name = file_label(&path);
+        let source = Source::at_end(&name, path)?;
+        Ok(CtlReader { families: vec![Family { name, stem: None, sources: vec![source] }], scan: None })
     }
 
-    /// The reader of the link: every control file of the session folder ([`CTL_FILES`]), each starting at its end.
-    /// Used when the link opens, so lines of an earlier run are never acted on.
+    /// The reader of the link: every writer's control file of the session folder ([`CTL_FAMILIES`]), found by listing the
+    /// folder. The files there now are read from their ends, so lines of an earlier run are never acted on; a file that
+    /// appears later is read from its start.
     pub fn writers_at_end(dir: &Path) -> io::Result<CtlReader> {
-        let sources =
-            CTL_FILES.iter().map(|(name, file)| Source::at_end(name, dir.join(file))).collect::<Result<_, _>>()?;
-        Ok(CtlReader { sources })
+        let families = CTL_FAMILIES
+            .iter()
+            .map(|(name, stem)| Family { name: name.to_string(), stem: Some(stem.to_string()), sources: Vec::new() })
+            .collect();
+        let mut r = CtlReader { families, scan: Some(Scan { dir: dir.to_path_buf() }) };
+        r.discover(true)?;
+        Ok(r)
     }
 
-    /// The first file read (generation 1).
-    pub fn path(&self) -> &Path {
-        &self.sources[0].base
+    /// Lists the folder and takes on every writer file not known yet (`history`: read from its end).
+    fn discover(&mut self, history: bool) -> io::Result<()> {
+        let Some(scan) = self.scan.as_ref() else { return Ok(()) };
+        let mut names: Vec<String> = match fs::read_dir(&scan.dir) {
+            Ok(entries) => entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        names.sort();
+        for f in &mut self.families {
+            let Some(stem) = f.stem.clone() else { continue };
+            for n in &names {
+                let Some(id) = writer_id(n, &stem) else { continue };
+                let name = format!("{}.w{id}", f.name);
+                if f.sources.iter().any(|s| s.name == name) {
+                    continue;
+                }
+                let path = writer_log_path(&scan.dir, &stem, &id);
+                let mut s = if history { Source::at_end(&name, path)? } else { Source::new(&name, path) };
+                s.announce = !history;
+                f.sources.push(s);
+            }
+        }
+        Ok(())
     }
 
-    /// The highest `seq` dispatched (or skipped as history) of any writer.
-    pub fn last_seq(&self) -> u64 {
-        self.sources.iter().map(|s| s.last_seq).max().unwrap_or(0)
+    /// Whether the folder holds a writer file not known yet: one listing of the folder. (Its modification time is no
+    /// guide: on NTFS it did not change when a file was created right after the link opened.)
+    fn folder_news(&self) -> bool {
+        let Some(scan) = self.scan.as_ref() else { return false };
+        let Ok(entries) = fs::read_dir(&scan.dir) else { return false };
+        entries.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            self.families.iter().any(|f| {
+                f.stem.as_deref().and_then(|stem| writer_id(&n, stem)).is_some_and(|id| {
+                    let name = format!("{}.w{id}", f.name);
+                    !f.sources.iter().any(|s| s.name == name)
+                })
+            })
+        })
     }
-
-    /// Where each writer's file is read, for the log: `gui seq 12 (generation 1), sim seq 3 (generation 1)`.
+    /// Where each writer's file is read, for the log: `gui.w1a2b at 1:345, sim.w3c4d at 1:0` (`no control writer
+    /// yet` when there is none).
     pub fn describe(&self) -> String {
         let parts: Vec<String> =
-            self.sources.iter().map(|s| format!("{} seq {} (generation {})", s.name, s.last_seq, s.gen)).collect();
-        parts.join(", ")
+            self.families.iter().flat_map(|f| &f.sources).map(|s| format!("{} at {}", s.name, s.position())).collect();
+        if parts.is_empty() {
+            "no control writer yet".to_string()
+        } else {
+            parts.join(", ")
+        }
     }
 
-    /// True when a file is longer than what was consumed (or gone): the cheap check (a metadata call per writer, no
-    /// open) that lets a caller on a hot path decide whether a [`poll`](Self::poll) is worth it.
+    /// The writers known (files, or the one file).
+    pub fn writers(&self) -> usize {
+        self.families.iter().map(|f| f.sources.len()).sum()
+    }
+
+    /// True when a file is longer than what was consumed (or gone), or the folder may hold a new writer's file: the cheap
+    /// check (a metadata call per writer and one for the folder, no open) that lets a caller on a hot path decide whether
+    /// a [`poll`](Self::poll) is worth it.
     pub fn has_news(&self) -> bool {
-        self.sources.iter().any(Source::has_news)
+        self.folder_news() || self.families.iter().any(|f| f.sources.iter().any(Source::has_news))
     }
 
     pub fn poll(&mut self) -> Poll {
         let mut out = Poll::default();
-        for s in &mut self.sources {
-            s.poll(&mut out);
+        if self.folder_news() {
+            if let Err(e) = self.discover(false) {
+                out.error = Some(format!("listing the control files: {e}"));
+            }
+        }
+        for f in &mut self.families {
+            for s in &mut f.sources {
+                s.poll(&mut out);
+            }
         }
         out
     }
 }
-
 fn file_label(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
@@ -373,19 +470,21 @@ fn file_label(path: &Path) -> String {
 /// One writer's file.
 #[derive(Debug)]
 struct Source {
-    /// The writer (`gui`, `sim`; the file's name for a reader of one file).
+    /// The writer (`gui.s1`, `sim.s2`; the file's name for a reader of one file).
     name: String,
     /// The log's name (its generation 1).
     base: PathBuf,
     gen: u64,
-    /// Bytes of the generation file consumed; an incomplete last line waits in `pending`.
+    /// Bytes of the generation file read; an incomplete last line waits in `pending`.
     offset: u64,
-    last_seq: u64,
     pending: Vec<u8>,
-    /// In the middle of a line longer than [`MAX_LINE`]: everything up to its newline is dropped.
+    /// In the middle of a line that is not taken (longer than [`MAX_LINE`], or history when the reader opened):
+    /// everything up to its newline is dropped.
     skipping: bool,
     /// The current generation file was seen.
     existed: bool,
+    /// A writer that appeared after the link opened: its first line is announced in `Poll::new_writers`.
+    announce: bool,
 }
 
 impl Source {
@@ -395,35 +494,36 @@ impl Source {
             base,
             gen: 1,
             offset: 0,
-            last_seq: 0,
             pending: Vec::new(),
             skipping: false,
             existed: false,
+            announce: false,
         }
     }
 
-    /// Whatever the newest generation holds now is history: reading starts at its end, with its highest `seq`. A
-    /// generation that already ends with its `rotate` line is history as a whole: reading starts at the next one.
+    /// Whatever the newest generation holds now is history: reading starts at its end, and an unfinished last line
+    /// is history too (dropped up to its newline). A generation that already ends with its `rotate` line is history
+    /// as a whole: reading starts in the next one.
     fn at_end(name: &str, base: PathBuf) -> io::Result<Source> {
         let mut s = Source::new(name, base);
         s.gen = gamelink::newest_generation(&s.base);
         let path = s.path();
-        match fs::metadata(&path) {
-            Ok(m) => {
-                s.offset = m.len();
+        match File::open(&path) {
+            Ok(mut f) => {
+                let len = f.metadata()?.len();
+                s.offset = len;
                 s.existed = true;
-                let (seq, next) = tail_scan(&path)?;
-                s.last_seq = seq;
-                if let Some(next) = next {
+                let from = len.saturating_sub(MAX_READ as u64);
+                f.seek(SeekFrom::Start(from))?;
+                let mut tail = Vec::new();
+                f.take(MAX_READ as u64).read_to_end(&mut tail)?;
+                if tail.last().is_some_and(|b| *b != b'\n') {
+                    s.skipping = true;
+                } else if let Some(next) = last_rotate(&tail, from > 0) {
                     s.next_generation(next);
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // the pointer is ahead of its file (the writer is between the two): the numbering is in the one before
-                if s.gen > 1 {
-                    s.last_seq = tail_scan(&gamelink::generation_path(&s.base, s.gen - 1))?.0;
-                }
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
         Ok(s)
@@ -433,9 +533,14 @@ impl Source {
         gamelink::generation_path(&self.base, self.gen)
     }
 
-    fn next_generation(&mut self, gen: u64) {
-        self.gen = gen;
-        self.offset = 0;
+    /// Where the lines read end.
+    fn position(&self) -> Pos {
+        Pos { gen: self.gen, offset: self.offset.saturating_sub(self.pending.len() as u64) }
+    }
+
+    fn next_generation(&mut self, next: gamelink::Rotate) {
+        self.gen = next.gen;
+        self.offset = next.skip;
         self.pending.clear();
         self.skipping = false;
         self.existed = false;
@@ -464,18 +569,18 @@ impl Source {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let newest = gamelink::newest_generation(&self.base);
                 if newest > self.gen {
-                    // deleted under a reader that fell behind by every kept generation: on with the newest, keeping
-                    // the numbering (cannot happen to a reader polled every 20 ms; said, never silent)
+                    // deleted under a reader that fell behind by every kept generation: on with the newest (cannot
+                    // happen to a reader polled every 20 ms; said, never silent)
                     out.error = Some(format!(
                         "{}: control file {} was deleted before it was read to its end; going on with generation {newest}",
                         self.name,
                         path.display()
                     ));
-                    self.next_generation(newest);
+                    self.next_generation(gamelink::Rotate { gen: newest, skip: 0 });
                     return true;
                 }
                 if self.existed {
-                    // gone for good as far as this session goes: a fresh file starts a fresh numbering
+                    // gone for good as far as this session goes: a fresh file is read from its first byte
                     *self = Source::new(&self.name, self.base.clone());
                     out.gone = true;
                 }
@@ -488,7 +593,7 @@ impl Source {
         };
         self.existed = true;
         if len < self.offset {
-            // truncated or rewritten: read from the top again, the seq filter keeps old lines out
+            // shorter than what was read: another file now (only a cleaned folder replaces one); read it from the top
             self.offset = 0;
             self.pending.clear();
             self.skipping = false;
@@ -515,21 +620,27 @@ impl Source {
         }
     }
 
-    /// The records of `bytes`; stops at a `rotate` line and returns the generation it names (the writer wrote nothing
-    /// after it in this file).
-    fn feed(&mut self, bytes: &[u8], out: &mut Poll) -> Option<u64> {
+    /// The records of `bytes`; stops at a `rotate` line and returns where it leads (the writer wrote nothing after it
+    /// in this file).
+    fn feed(&mut self, bytes: &[u8], out: &mut Poll) -> Option<gamelink::Rotate> {
         for &b in bytes {
             if b == b'\n' {
                 if std::mem::take(&mut self.skipping) {
                     self.pending.clear();
                 } else {
                     let raw = std::mem::take(&mut self.pending);
-                    if let Some(next) = self.accept(&raw, out) {
-                        return Some(next);
+                    let before = out.lines.len();
+                    let next = accept(&raw, out);
+                    if self.announce && out.lines.len() > before {
+                        self.announce = false;
+                        out.new_writers.push(format!("{} (from {})", self.name, out.lines[before].from));
+                    }
+                    if next.is_some() {
+                        return next;
                     }
                 }
             } else if self.skipping {
-                // the rest of an oversize line
+                // the rest of a line that is not taken
             } else if self.pending.len() >= MAX_LINE {
                 self.pending.clear();
                 self.skipping = true;
@@ -540,51 +651,41 @@ impl Source {
         }
         None
     }
-
-    fn accept(&mut self, raw: &[u8], out: &mut Poll) -> Option<u64> {
-        let text = String::from_utf8_lossy(raw);
-        if text.trim().is_empty() {
-            return None;
-        }
-        match gamelink::parse_line(&text) {
-            Some(line) => {
-                if let Some(next) = gamelink::rotate_target(&line) {
-                    return Some(next);
-                }
-                if line.seq > self.last_seq {
-                    self.last_seq = line.seq;
-                    out.lines.push(line);
-                } else {
-                    out.discarded += 1;
-                }
-            }
-            None => out.discarded += 1,
-        }
-        None
-    }
 }
 
-/// The highest `seq` among the complete records in the last [`MAX_READ`] bytes of a file (0 when there is none), and
-/// the generation its last record names when that record is a `rotate` line.
-fn tail_scan(path: &Path) -> io::Result<(u64, Option<u64>)> {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, None)),
-        Err(e) => return Err(e),
-    };
-    let len = f.metadata()?.len();
-    let from = len.saturating_sub(MAX_READ as u64);
-    f.seek(SeekFrom::Start(from))?;
-    let mut tail = Vec::new();
-    f.take(MAX_READ as u64).read_to_end(&mut tail)?;
-    let text = String::from_utf8_lossy(&tail);
-    let mut pieces = text.split('\n');
-    if from > 0 {
-        pieces.next(); // the first piece may start mid-line
+/// One complete line: a record goes out, a `rotate` line says where the file goes on, anything else is counted.
+fn accept(raw: &[u8], out: &mut Poll) -> Option<gamelink::Rotate> {
+    let text = String::from_utf8_lossy(raw);
+    if text.trim().is_empty() {
+        return None;
     }
-    let records: Vec<Line> = pieces.filter_map(gamelink::parse_line).collect();
-    let highest = records.iter().map(|l| l.seq).max().unwrap_or(0);
-    Ok((highest, records.last().and_then(gamelink::rotate_target)))
+    match gamelink::parse_line(&text) {
+        Some(line) => {
+            if let Some(next) = gamelink::rotate_target(&line) {
+                return Some(next);
+            }
+            out.lines.push(line);
+        }
+        None => out.discarded += 1,
+    }
+    None
+}
+
+/// Where the last complete line of `tail` leads when it is a `rotate` line (`cut`: the first piece may start
+/// mid-line).
+fn last_rotate(tail: &[u8], cut: bool) -> Option<gamelink::Rotate> {
+    let text = String::from_utf8_lossy(tail);
+    let mut pieces: Vec<&str> = text.split('\n').collect();
+    pieces.pop(); // after the last newline: nothing
+    if cut && pieces.len() <= 1 {
+        return None;
+    }
+    pieces
+        .iter()
+        .rev()
+        .find(|p| !p.trim().is_empty())
+        .and_then(|p| gamelink::parse_line(p))
+        .and_then(|l| gamelink::rotate_target(&l))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -853,8 +954,13 @@ impl Event {
                 if *poolpatch { "applied" } else { "off" },
                 if *clock { "yes" } else { "no" }
             ),
-            Event::Held { id, kind, site, .. } => {
-                format!("event held: command {id}, kind {kind}, from tool site {site:#x}")
+            Event::Held { id, kind, site, flags, .. } => {
+                let refund = match flags.as_ref().map(|f| f.refundable.as_ref()) {
+                    Some(Some(ids)) => format!(", {} refundable entities", ids.len()),
+                    Some(None) => ", refundable entities unreadable".to_string(),
+                    None => String::new(),
+                };
+                format!("event held: command {id}, kind {kind}, from tool site {site:#x}{refund}")
             }
             Event::Released { id, reason, .. } => format!("event released: command {id} ({reason})"),
             Event::Dropped { id, reason } => format!("event dropped: command {id} ({reason})"),
@@ -910,21 +1016,30 @@ impl Event {
                     fields.insert(0, ("done", Lua::Bool(true)));
                 }
                 if let Some(f) = flags {
-                    fields.insert(
-                        0,
-                        (
-                            "ctx",
+                    let mut ctx = vec![
+                        ("align", Lua::Bool(f.check_terrain_alignment)),
+                        ("buildings", Lua::Bool(f.gather_buildings)),
+                        ("cleanup", Lua::Bool(f.cleanup_street_graph)),
+                        ("fields", Lua::Bool(f.gather_fields)),
+                        ("ie", Lua::Bool(f.ignore_errors)),
+                        ("pi", Lua::Bool(f.player_initiated)),
+                        ("redo", Lua::Bool(f.extend_proposal_redo_pillars)),
+                    ];
+                    // the Context's refundableEntities, each { e = local entity id, k = key integer, r = revision {3 integers},
+                    // n = value integer } (the mod names the entity by reference before it travels); absent when the container could
+                    // not be read
+                    if let Some(entries) = &f.refundable {
+                        let entry = |r: &crate::engine::RefundEntry| {
                             Lua::map([
-                                ("align", Lua::Bool(f.check_terrain_alignment)),
-                                ("buildings", Lua::Bool(f.gather_buildings)),
-                                ("cleanup", Lua::Bool(f.cleanup_street_graph)),
-                                ("fields", Lua::Bool(f.gather_fields)),
-                                ("ie", Lua::Bool(f.ignore_errors)),
-                                ("pi", Lua::Bool(f.player_initiated)),
-                                ("redo", Lua::Bool(f.extend_proposal_redo_pillars)),
-                            ]),
-                        ),
-                    );
+                                ("e", Lua::uint(u64::from(r.entity))),
+                                ("k", Lua::Int(i64::from(r.key))),
+                                ("n", Lua::Int(i64::from(r.value))),
+                                ("r", Lua::List(r.revision.iter().map(|&x| Lua::Int(i64::from(x))).collect())),
+                            ])
+                        };
+                        ctx.push(("refund", Lua::List(entries.iter().map(entry).collect())));
+                    }
+                    fields.insert(0, ("ctx", Lua::Map(ctx.into_iter().map(|(k, v)| (k.to_string(), v)).collect())));
                 }
                 Lua::Map(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
             }
@@ -993,15 +1108,14 @@ impl Event {
     }
 }
 
-/// Appends events to `native_events.log` (a generation log), continuing the numbering of whatever it already holds.
+/// Appends events to `native_events.log` (a generation log, one writer: this module).
 ///
-/// Every new generation starts with the latest `ready` and the `timing clock` line after it, with their own `seq`: a
-/// mod that reads on from the generation before drops them as numbers it has seen, and a reloaded mod, which reads only
-/// the newest generation as history, finds the module's state there instead of reading the whole log again.
+/// Every new generation starts with the latest `ready` and the `timing clock` line after it: a reloaded mod, which
+/// reads only the newest generation as history, finds the module's state there instead of reading the whole log
+/// again, and a mod that reads on from the generation before starts after them (the `rotate` line's `skip`).
 #[derive(Debug)]
 pub struct EventWriter {
     out: gamelink::GenWriter,
-    next_seq: u64,
     /// The latest `ready` line and the `timing clock` line written after it.
     header: String,
 }
@@ -1010,10 +1124,9 @@ impl EventWriter {
     /// Opens the writer in a session folder. Nothing is created until the first [`append`](Self::append).
     pub fn open(dir: &Path) -> io::Result<EventWriter> {
         let base = dir.join(EVENTS_FILE);
-        let next_seq = gamelink::highest_seq(&base)? + 1;
         let out =
             gamelink::GenWriter::open(base, EVENTS_FROM)?.with_limits(EVENTS_ROTATE_BYTES, gamelink::KEEP_GENERATIONS);
-        Ok(EventWriter { out, next_seq, header: String::new() })
+        Ok(EventWriter { out, header: String::new() })
     }
 
     /// The same writer with another generation size (tests).
@@ -1027,15 +1140,14 @@ impl EventWriter {
         self.out.path()
     }
 
-    /// The `seq` the next event gets.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
+    /// Where the log ends: the next event starts here.
+    pub fn end(&self) -> Pos {
+        self.out.end()
     }
 
     /// The text of one event line, including the newline.
-    pub fn line(seq: u64, event: &Event) -> String {
+    pub fn line(event: &Event) -> String {
         gamelink::format_line(&Line {
-            seq,
             kind: event.kind().to_string(),
             from: EVENTS_FROM.to_string(),
             payload: event.payload(),
@@ -1043,7 +1155,6 @@ impl EventWriter {
     }
 
     /// Writes the events with one `write`, so a reader never sees half a batch's lines interleaved with another's.
-    /// The numbers are used up even when the write fails: a gap is harmless, a repeated `seq` would be dropped.
     pub fn append(&mut self, events: &[Event]) -> io::Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -1051,7 +1162,7 @@ impl EventWriter {
         let mut text = String::new();
         let mut header = None::<String>;
         for e in events {
-            let line = EventWriter::line(self.next_seq, e);
+            let line = EventWriter::line(e);
             match e {
                 Event::Ready { .. } => header = Some(line.clone()),
                 Event::Timing { what: "clock", .. } => {
@@ -1063,7 +1174,6 @@ impl EventWriter {
                 _ => {}
             }
             text.push_str(&line);
-            self.next_seq += 1;
         }
         let written = self.out.append(&text);
         if let Some(h) = header {
@@ -1081,12 +1191,12 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    fn line(seq: u64, kind: &str, payload: &str) -> Line {
-        Line { seq, kind: kind.into(), from: "1".into(), payload: payload.into() }
+    fn line(kind: &str, payload: &str) -> Line {
+        Line { kind: kind.into(), from: "1".into(), payload: payload.into() }
     }
 
     fn parse(kind: &str, payload: &str) -> Result<CtlMessage, CtlError> {
-        parse_ctl_line(&line(1, kind, payload))
+        parse_ctl_line(&line(kind, payload))
     }
 
     // ---- control messages
@@ -1185,11 +1295,11 @@ mod tests {
     fn lines_written_by_the_mods_own_writer_parse() {
         // The bytes feverlink3_common.lua produces: C.newWriter(path, 1), then C.writerSend for each kind with
         // {kinds={"build_proposal"}}, {n=3}, {id=3, at=12400}, {id=7}, {} and {id=2, stamp=400}.
-        let file = "1\thold_on\t1\t{[\"kinds\"]={[1]=\"build_proposal\"}}\n2\tping\t1\t{[\"n\"]=3}\n\
-                    3\trelease\t1\t{[\"at\"]=12400,[\"id\"]=3}\n4\tcancel\t1\t{[\"id\"]=7}\n5\thold_off\t1\t{}\n\
-                    6\tterrain_apply\t1\t{[\"id\"]=2,[\"stamp\"]=400}\n";
+        let file = "hold_on\t1\t{[\"kinds\"]={[1]=\"build_proposal\"}}\nping\t1\t{[\"n\"]=3}\n\
+                    release\t1\t{[\"at\"]=12400,[\"id\"]=3}\ncancel\t1\t{[\"id\"]=7}\nhold_off\t1\t{}\n\
+                    terrain_apply\t1\t{[\"id\"]=2,[\"stamp\"]=400}\n";
         let dir = TempDir::new("mod-writer");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("native_ctl.gui.s1.log");
         fs::write(&path, file).unwrap();
         let messages: Vec<_> = CtlReader::new(path).poll().lines.iter().map(|l| parse_ctl_line(l).unwrap()).collect();
         assert_eq!(
@@ -1271,37 +1381,49 @@ mod tests {
         OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
     }
 
-    fn rec(seq: u64, kind: &str, payload: &str) -> String {
-        format!("{seq}\t{kind}\t1\t{payload}\n")
+    fn rec(kind: &str, payload: &str) -> String {
+        format!("{kind}\t1\t{payload}\n")
     }
+
+    fn pings(p: &Poll) -> Vec<String> {
+        p.lines.iter().map(|l| l.payload.clone()).collect()
+    }
+
+    /// The file a writer of a family names for itself (`<stem>.w<id>.log`); it appears with the first line.
+    fn writer(dir: &Path, stem: &str, id: &str) -> PathBuf {
+        writer_log_path(dir, stem, id)
+    }
+
+    const GUI: &str = "native_ctl.gui";
+    const SIM: &str = "native_ctl.sim";
 
     #[test]
     fn reader_returns_new_complete_lines_once() {
         let dir = TempDir::new("reader-basic");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
         assert_eq!(r.poll(), Poll::default(), "a missing file is not an event");
         assert!(!r.has_news());
-        append(&path, &rec(1, "ping", "{}"));
+        append(&path, &rec("ping", "{}"));
         assert!(r.has_news());
         let p = r.poll();
         assert_eq!(p.lines.len(), 1);
         assert_eq!(p.lines[0].kind, "ping");
         assert!(!r.has_news());
         assert_eq!(r.poll(), Poll::default(), "nothing is dispatched twice");
-        append(&path, &(rec(2, "hold_off", "{}") + &rec(3, "ping", r#"{["n"]=1}"#)));
+        append(&path, &(rec("hold_off", "{}") + &rec("ping", r#"{["n"]=1}"#)));
         let kinds: Vec<_> = r.poll().lines.into_iter().map(|l| l.kind).collect();
         assert_eq!(kinds, ["hold_off", "ping"]);
-        assert_eq!(r.last_seq(), 3);
     }
 
     #[test]
     fn a_partial_last_line_waits_for_its_newline() {
         let dir = TempDir::new("reader-partial");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(&path, "1\tping\t1\t{[\"n\"]");
+        append(&path, "ping\t1\t{[\"n\"]");
         assert!(r.poll().lines.is_empty());
+        assert_eq!(r.describe(), "ctl.log at 1:0", "the unfinished line is not consumed");
         append(&path, "=5}\n");
         let p = r.poll();
         assert_eq!(p.lines.len(), 1);
@@ -1311,9 +1433,9 @@ mod tests {
     #[test]
     fn crlf_lines_and_blank_lines_are_fine() {
         let dir = TempDir::new("reader-crlf");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(&path, "1\tping\t1\t{}\r\n\r\n2\tping\t1\t{}\r\n");
+        append(&path, "ping\t1\t{}\r\n\r\nping\t1\t{}\r\n");
         let p = r.poll();
         assert_eq!(p.lines.len(), 2);
         assert_eq!(p.discarded, 0);
@@ -1321,118 +1443,90 @@ mod tests {
     }
 
     #[test]
-    fn a_patch_next_from_a_second_writer_with_the_next_sequence_is_accepted() {
-        // the interface half writes seq 1..3 (hold_on, release, ping), the simulation half continues at 4 right before its command
-        let dir = TempDir::new("link-two-writers");
-        let path = dir.path().join(CTL_FILE);
+    fn the_same_line_twice_is_two_orders() {
+        // nothing is dropped for what a line says (it used to be dropped for its number)
+        let dir = TempDir::new("reader-repeat");
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(
-            &path,
-            &(rec(1, "hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#) + &rec(2, "release", r#"{["id"]=1}"#)),
-        );
-        assert_eq!(r.poll().lines.len(), 2);
-        append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
+        let order = rec("patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#);
+        append(&path, &(order.clone() + &order));
         let p = r.poll();
-        assert_eq!(p.lines.len(), 1, "{p:?}");
-        assert_eq!(
-            parse_ctl_line(&p.lines[0]),
-            Ok(CtlMessage::PatchNext { frozen: vec![1], adds: 3, at: vec![], ttl: 0 })
-        );
-        // a line whose sequence number is not above the last one is dropped, whoever wrote it
-        append(&path, &rec(3, "patch_next", r#"{["adds"]=3,["frozen"]={[1]=1}}"#));
-        let p = r.poll();
-        assert_eq!((p.lines.len(), p.discarded), (0, 1));
+        assert_eq!((p.lines.len(), p.discarded), (2, 0));
     }
 
     #[test]
-    fn old_and_repeated_sequence_numbers_are_dropped() {
-        let dir = TempDir::new("reader-seq");
-        let path = dir.path().join(CTL_FILE);
-        let mut r = CtlReader::new(path.clone());
-        append(&path, &(rec(5, "ping", "{}") + &rec(5, "ping", "{}") + &rec(4, "ping", "{}") + &rec(6, "ping", "{}")));
-        let p = r.poll();
-        assert_eq!(p.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [5, 6]);
-        assert_eq!(p.discarded, 2);
-    }
-
-    #[test]
-    fn truncation_restarts_the_read_without_replaying_history() {
+    fn truncation_resets_the_reader_to_the_first_byte() {
         let dir = TempDir::new("reader-truncate");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(&path, &(rec(1, "ping", "{}") + &rec(2, "ping", "{}") + &rec(3, "ping", "{}")));
+        append(&path, &(rec("ping", "{[\"n\"]=1}") + &rec("ping", "{[\"n\"]=2}") + &rec("ping", "{[\"n\"]=3}")));
         assert_eq!(r.poll().lines.len(), 3);
-        fs::write(&path, rec(1, "ping", "{}") + &rec(2, "ping", "{}")).unwrap(); // shorter: rewritten history
-        let p = r.poll();
-        assert!(p.lines.is_empty());
-        assert_eq!(p.discarded, 2);
-        append(&path, &rec(4, "hold_off", "{}"));
-        assert_eq!(r.poll().lines.len(), 1, "new numbers after a rewrite are dispatched");
+        // shorter: another file now, read from its start
+        fs::write(&path, rec("ping", "{[\"n\"]=10}")).unwrap();
+        assert_eq!(pings(&r.poll()), [r#"{["n"]=10}"#]);
+        append(&path, &rec("hold_off", "{}"));
+        assert_eq!(r.poll().lines.len(), 1, "and read on from there");
     }
 
     #[test]
     fn a_deleted_file_is_reported_once_and_a_new_one_starts_afresh() {
         let dir = TempDir::new("reader-gone");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(&path, &rec(7, "ping", "{}"));
+        append(&path, &rec("ping", "{}"));
         assert_eq!(r.poll().lines.len(), 1);
         fs::remove_file(&path).unwrap();
         assert!(r.has_news(), "the disappearance is news");
         let p = r.poll();
         assert!(p.gone);
         assert!(!r.poll().gone, "reported once");
-        append(&path, &rec(1, "ping", "{}"));
-        assert_eq!(r.poll().lines.len(), 1, "a re-created file may restart its numbering");
+        append(&path, &rec("ping", "{}"));
+        assert_eq!(r.poll().lines.len(), 1, "a re-created file is read from its first byte");
     }
 
     #[test]
     fn a_file_that_never_existed_is_not_gone() {
         let dir = TempDir::new("reader-never");
-        let mut r = CtlReader::new(dir.path().join(CTL_FILE));
+        let mut r = CtlReader::new(dir.path().join("ctl.log"));
         assert!(!r.poll().gone);
     }
 
     #[test]
     fn oversize_lines_are_thrown_away_without_losing_the_next_ones() {
         let dir = TempDir::new("reader-oversize");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
         let huge = "x".repeat(MAX_LINE * 3);
-        append(&path, &(rec(1, "ping", "{}") + &format!("2\tping\t1\t{huge}\n") + &rec(3, "ping", "{}")));
+        append(&path, &(rec("ping", "{1}") + &format!("ping\t1\t{huge}\n") + &rec("ping", "{3}")));
         let p = r.poll();
-        assert_eq!(p.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(pings(&p), ["{1}", "{3}"]);
         assert_eq!(p.discarded, 1);
-        assert!(r.sources[0].pending.len() < MAX_LINE, "the buffer stays bounded");
+        assert!(r.families[0].sources[0].pending.len() < MAX_LINE, "the buffer stays bounded");
     }
 
     #[test]
     fn an_oversize_line_split_across_polls_is_still_one_discard() {
         let dir = TempDir::new("reader-oversize-split");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(&path, &format!("1\tping\t1\t{}", "y".repeat(MAX_LINE + 10)));
+        append(&path, &format!("ping\t1\t{}", "y".repeat(MAX_LINE + 10)));
         assert_eq!(r.poll().discarded, 1);
         append(&path, &format!("{}\n", "z".repeat(1000)));
         let p = r.poll();
         assert_eq!(p.discarded, 0, "the tail of the same line is not counted again");
         assert!(p.lines.is_empty());
-        append(&path, &rec(2, "ping", "{}"));
+        append(&path, &rec("ping", "{}"));
         assert_eq!(r.poll().lines.len(), 1);
     }
 
     #[test]
     fn a_read_is_bounded_and_resumes() {
         let dir = TempDir::new("reader-bounded");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        let one = rec(1, "ping", "{}");
+        let one = rec("ping", "{}");
         let n = MAX_READ / one.len() * 2 + 10;
-        let mut text = String::new();
-        for i in 1..=n as u64 {
-            text.push_str(&rec(i, "ping", "{}"));
-        }
-        fs::write(&path, &text).unwrap();
+        fs::write(&path, one.repeat(n)).unwrap();
         let first = r.poll().lines.len();
         assert!(first > 0 && first < n, "one poll takes at most MAX_READ bytes ({first} of {n})");
         let mut total = first;
@@ -1445,9 +1539,9 @@ mod tests {
     #[test]
     fn garbage_lines_are_counted_not_dispatched() {
         let dir = TempDir::new("reader-garbage");
-        let path = dir.path().join(CTL_FILE);
+        let path = dir.path().join("ctl.log");
         let mut r = CtlReader::new(path.clone());
-        append(&path, "not a record\n\u{1}\u{2}\n1\tping\t1\t{}\nnoseq\tping\t1\t{}\n");
+        append(&path, "not a record\n\u{1}\u{2}\nping\t1\t{}\nnofrom\n");
         let p = r.poll();
         assert_eq!(p.lines.len(), 1);
         assert_eq!(p.discarded, 3);
@@ -1456,17 +1550,161 @@ mod tests {
     }
 
     #[test]
-    fn starting_at_the_end_ignores_history_but_keeps_its_numbering() {
+    fn starting_at_the_end_ignores_history_and_an_unfinished_history_line() {
         let dir = TempDir::new("reader-history");
-        let path = dir.path().join(CTL_FILE);
-        append(&path, &(rec(1, "hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#) + &rec(2, "ping", "{}")));
+        let path = dir.path().join("ctl.log");
+        append(
+            &path,
+            &(rec("hold_on", r#"{["kinds"]={[1]="build_proposal"}}"#) + &rec("ping", "{}") + "ping\t1\t{[\"n\"]"),
+        );
         let mut r = CtlReader::starting_at_end(path.clone()).unwrap();
-        assert_eq!(r.last_seq(), 2);
         assert!(r.poll().lines.is_empty(), "an earlier run's lines are not acted on");
-        append(&path, &rec(3, "hold_off", "{}"));
-        assert_eq!(r.poll().lines.len(), 1);
-        let none = CtlReader::starting_at_end(dir.path().join("missing.log")).unwrap();
-        assert_eq!(none.last_seq(), 0);
+        append(&path, "=4}\n");
+        assert!(r.poll().lines.is_empty(), "the end of a line the earlier run was writing is history too");
+        append(&path, &rec("hold_off", "{}"));
+        assert_eq!(r.poll().lines.iter().map(|l| l.kind.as_str()).collect::<Vec<_>>(), ["hold_off"]);
+        let mut none = CtlReader::starting_at_end(dir.path().join("missing.log")).unwrap();
+        append(&dir.path().join("missing.log"), &rec("ping", "{}"));
+        assert_eq!(none.poll().lines.len(), 1, "a file made after the start is news from its first byte");
+    }
+
+    // ---- one file per writer
+
+    #[test]
+    fn two_writers_interleaving_lose_no_line() {
+        // two simulation states and the interface half, each with its own file, write in turns: every line arrives once,
+        // each writer's in its order (with one shared file, two states appending at the same moment overwrite each other)
+        let dir = TempDir::new("two-writers");
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        assert!(!r.has_news());
+        assert_eq!(r.describe(), "no control writer yet");
+        let gui = writer(dir.path(), GUI, "a1");
+        let sim_a = writer(dir.path(), SIM, "b2");
+        let sim_b = writer(dir.path(), SIM, "c3");
+        let mut got = Vec::new();
+        for i in 0..30 {
+            append(&sim_a, &rec("inject_next", &format!("a{i}")));
+            append(&sim_b, &rec("inject_next", &format!("b{i}")));
+            if i % 3 == 0 {
+                append(&gui, &rec("ping", &format!("g{i}")));
+            }
+            if i % 4 == 0 {
+                let p = r.poll();
+                assert_eq!(p.discarded, 0);
+                got.extend(p.lines);
+            }
+        }
+        got.extend(r.poll().lines);
+        assert!(!r.has_news());
+        for (who, want) in [("a", 30), ("b", 30), ("g", 10)] {
+            let mine: Vec<&str> = got.iter().map(|l| l.payload.as_str()).filter(|p| p.starts_with(who)).collect();
+            let expected: Vec<String> =
+                (0..30).filter(|i| who != "g" || i % 3 == 0).map(|i| format!("{who}{i}")).collect();
+            assert_eq!(mine.len(), want, "{who}");
+            assert_eq!(mine, expected, "{who}: every line once, in its writer's order");
+        }
+        assert!(r.describe().starts_with("gui.wa1 at 1:"), "{}", r.describe());
+        assert_eq!(r.writers(), 3);
+    }
+
+    #[test]
+    fn a_writer_that_appears_after_the_link_opened_is_read_from_its_first_byte_and_named() {
+        let dir = TempDir::new("late-writer");
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        let sim = writer(dir.path(), SIM, "d4");
+        append(&sim, &rec("inject_next", "{first}"));
+        assert!(r.has_news(), "a new file in the folder is news");
+        let p = r.poll();
+        assert_eq!(pings(&p), ["{first}"]);
+        assert_eq!(p.new_writers, ["sim.wd4 (from 1)"]);
+        assert!(r.poll().new_writers.is_empty(), "named once");
+        // an empty file: known, nothing to read; named at its first line
+        fs::write(writer(dir.path(), SIM, "e5"), "").unwrap();
+        let p = r.poll();
+        assert!(p.lines.is_empty() && p.new_writers.is_empty());
+        append(&writer(dir.path(), SIM, "e5"), &rec("fail", "{}"));
+        assert_eq!(r.poll().new_writers, ["sim.we5 (from 1)"]);
+        // files of no family, and names that are not a writer's, are not read
+        append(&dir.path().join("native_ctl.sim.wxyz.log"), &rec("ping", "{}"));
+        append(&dir.path().join("native_ctl.other.w12.log"), &rec("ping", "{}"));
+        append(&dir.path().join("native_inject_5.txt"), "text");
+        assert!(r.poll().lines.is_empty());
+        assert_eq!(r.writers(), 2);
+    }
+
+    #[test]
+    fn writer_file_names() {
+        assert_eq!(writer_id("native_ctl.sim.w0a1b.log", SIM), Some("0a1b".into()));
+        assert_eq!(writer_id("native_ctl.sim.w0a1b.3.log", SIM), Some("0a1b".into()), "a later generation");
+        assert_eq!(writer_id("native_ctl.sim.w0a1b.gen", SIM), Some("0a1b".into()), "the pointer");
+        for bad in [
+            "native_ctl.sim.w.log",
+            "native_ctl.sim.wzz.log",
+            "native_ctl.sim.log",
+            "native_ctl.sim.w1.x.log",
+            "native_ctl.gui.w1.log",
+        ] {
+            assert_eq!(writer_id(bad, SIM), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn opening_the_link_treats_each_writers_lines_as_history() {
+        let dir = TempDir::new("two-writers-history");
+        append(&writer(dir.path(), GUI, "1"), &rec("ping", "{}"));
+        let sim = writer(dir.path(), SIM, "2");
+        append(&sim, &rec("fail", "{}"));
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        assert!(r.poll().lines.is_empty());
+        append(&sim, &rec("inject_next", "{}"));
+        let p = r.poll();
+        assert_eq!(p.lines.iter().map(|l| l.kind.as_str()).collect::<Vec<_>>(), ["inject_next"]);
+        assert!(p.new_writers.is_empty(), "the writers there at the start are not new");
+    }
+
+    #[test]
+    fn a_reader_follows_rotations_without_losing_or_splitting_a_line() {
+        let dir = TempDir::new("rotate-follow");
+        let base = writer(dir.path(), SIM, "3");
+        let mut w = gamelink::GenWriter::open(base.clone(), "1").unwrap().with_limits(150, 3);
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        let mut got = Vec::new();
+        let mut discarded = 0;
+        for i in 1..=120u64 {
+            w.append(&rec("ping", &format!("{{[\"n\"]={i}}}"))).unwrap();
+            if i % 5 == 0 || i % 11 == 0 {
+                let p = r.poll();
+                discarded += p.discarded;
+                assert!(p.error.is_none(), "{p:?}");
+                got.extend(pings(&p));
+            }
+        }
+        while r.has_news() {
+            let p = r.poll();
+            discarded += p.discarded;
+            got.extend(pings(&p));
+        }
+        assert_eq!(got, (1..=120).map(|i| format!("{{[\"n\"]={i}}}")).collect::<Vec<_>>());
+        assert_eq!(discarded, 0, "a rotate line is no discarded record");
+        assert!(w.generation() > 3, "it rotated ({})", w.generation());
+        assert!(!gamelink::generation_path(&base, w.generation() - 3).exists(), "older generations are deleted");
+        // a reader opened now starts at the end of the newest generation, also when that one has just been ended
+        let mut late = CtlReader::writers_at_end(dir.path()).unwrap();
+        assert!(late.poll().lines.is_empty());
+        w.append(&rec("ping", "{121}")).unwrap();
+        assert_eq!(pings(&late.poll()), ["{121}"]);
+    }
+
+    #[test]
+    fn a_link_opened_right_after_a_rotate_line_reads_the_next_generation_from_its_start() {
+        let dir = TempDir::new("rotate-open");
+        let base = writer(dir.path(), GUI, "4");
+        append(&base, &(rec("ping", "{}") + &gamelink::rotate_line("1", 2, 0)));
+        fs::write(gamelink::pointer_path(&base), "2\n").unwrap();
+        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
+        assert!(r.poll().lines.is_empty());
+        append(&gamelink::generation_path(&base, 2), &rec("hold_off", "{}"));
+        assert_eq!(r.poll().lines.iter().map(|l| l.kind.as_str()).collect::<Vec<_>>(), ["hold_off"]);
     }
 
     // ---- events
@@ -1474,7 +1712,7 @@ mod tests {
     #[test]
     fn lua_literals_match_the_mods_serialiser() {
         let v = Lua::map([
-            ("s", Lua::str("a\tb\nc\"d\\e\u{1}f é")),
+            ("s", Lua::str("a\tb\nc\"d\\e\u{1}f Ã©")),
             ("n", Lua::Int(-3)),
             ("b", Lua::Bool(false)),
             ("l", Lua::List(vec![Lua::Int(1), Lua::str("x")])),
@@ -1484,7 +1722,7 @@ mod tests {
         assert_eq!(
             v.text(),
             "{[\"b\"]=false,[\"e\"]={},[\"i\"]={[3]=1,[52]=9},[\"l\"]={[1]=1,[2]=\"x\"},[\"n\"]=-3,\
-             [\"s\"]=\"a\\tb\\nc\\\"d\\\\e\\001f é\"}"
+             [\"s\"]=\"a\\tb\\nc\\\"d\\\\e\\001f Ã©\"}"
         );
         assert!(!v.text().contains(['\n', '\t', '\r']), "an event payload stays on one line");
     }
@@ -1520,13 +1758,36 @@ mod tests {
             extend_proposal_redo_pillars: true,
             ignore_errors: false,
             player_initiated: true,
+            refundable: None,
         };
-        let ev = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: true, flags: Some(flags) };
+        let ev = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: true, flags: Some(flags.clone()) };
         let json: Value = serde_json::from_slice(&luatext::lua_to_json(&ev.payload()).unwrap()).unwrap();
         assert_eq!(
             json["ctx"],
             serde_json::json!({"align": false, "buildings": true, "cleanup": true, "fields": true, "ie": false, "pi": true, "redo": true})
         );
+        assert!(ev.log_line().unwrap().ends_with("refundable entities unreadable"), "{:?}", ev.log_line());
+        let refund = Event::Held {
+            id: 4,
+            kind: 52,
+            site: 1,
+            ms: 2,
+            done: true,
+            flags: Some(BuildFlags {
+                refundable: Some(vec![
+                    crate::engine::RefundEntry { entity: 98719, key: -1, revision: [1, 11, 0], value: 0x153 },
+                    crate::engine::RefundEntry { entity: 7, key: -1, revision: [1, 9, 0], value: 0x156 },
+                ]),
+                ..flags
+            }),
+        };
+        let json: Value = serde_json::from_slice(&luatext::lua_to_json(&refund.payload()).unwrap()).unwrap();
+        assert_eq!(
+            json["ctx"]["refund"],
+            serde_json::json!([{"e": 98719, "k": -1, "r": [1, 11, 0], "n": 0x153}, {"e": 7, "k": -1, "r": [1, 9, 0], "n": 0x156}]),
+            "every entry goes to the mod: local id, key integer, revision, value integer"
+        );
+        assert!(refund.log_line().unwrap().ends_with(", 2 refundable entities"), "{:?}", refund.log_line());
         let none = Event::Held { id: 4, kind: 52, site: 1, ms: 2, done: false, flags: None };
         let json: Value = serde_json::from_slice(&luatext::lua_to_json(&none.payload()).unwrap()).unwrap();
         assert!(json.get("ctx").is_none(), "a command without readable flags says nothing about them");
@@ -1554,9 +1815,9 @@ mod tests {
             let payload = ev.payload();
             assert!(luatext::lua_to_json(&payload).is_some(), "{} payload {payload}", ev.kind());
             assert!(!payload.contains('\n'));
-            let text = EventWriter::line(4, &ev);
+            let text = EventWriter::line(&ev);
             let back = gamelink::parse_line(&text).expect("a link record");
-            assert_eq!((back.seq, back.kind.as_str(), back.from.as_str()), (4, ev.kind(), "native"));
+            assert_eq!((back.kind.as_str(), back.from.as_str()), (ev.kind(), "native"));
             assert_eq!(back.payload, payload);
         }
         let audit: Value = serde_json::from_slice(
@@ -1626,14 +1887,14 @@ mod tests {
     #[test]
     fn golden_event_lines() {
         assert_eq!(
-            EventWriter::line(1, &Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120, done: false, flags: None }),
-            "1\theld\tnative\t{[\"id\"]=3,[\"kind\"]=52,[\"ms\"]=120,[\"site\"]=5060975}\n"
+            EventWriter::line(&Event::Held { id: 3, kind: 52, site: 5_060_975, ms: 120, done: false, flags: None }),
+            "held\tnative\t{[\"id\"]=3,[\"kind\"]=52,[\"ms\"]=120,[\"site\"]=5060975}\n"
         );
         assert_eq!(
-            EventWriter::line(2, &Event::Released { id: 3, reason: "silence", ms: 99 }),
-            "2\treleased\tnative\t{[\"id\"]=3,[\"ms\"]=99,[\"reason\"]=\"silence\"}\n"
+            EventWriter::line(&Event::Released { id: 3, reason: "silence", ms: 99 }),
+            "released\tnative\t{[\"id\"]=3,[\"ms\"]=99,[\"reason\"]=\"silence\"}\n"
         );
-        assert_eq!(EventWriter::line(9, &Event::Pong { n: 4 }), "9\tpong\tnative\t{[\"n\"]=4}\n");
+        assert_eq!(EventWriter::line(&Event::Pong { n: 4 }), "pong\tnative\t{[\"n\"]=4}\n");
     }
 
     /// The lines the module writes, as the Lua test `tests/lua/test_native_link.py` also holds them: each side
@@ -1650,14 +1911,14 @@ mod tests {
             sites: 12,
         };
         assert_eq!(
-            EventWriter::line(1, &ready),
-            "1\tready\tnative\t{[\"build\"]=\"40420\",[\"clock\"]=false,[\"hooks\"]={[1]=\"apply_command\",[2]=\"command_list_add\"},\
+            EventWriter::line(&ready),
+            "ready\tnative\t{[\"build\"]=\"40420\",[\"clock\"]=false,[\"hooks\"]={[1]=\"apply_command\",[2]=\"command_list_add\"},\
              [\"kinds\"]={[\"build_proposal\"]=52},[\"poolpatch\"]=true,[\"sites\"]=12,[\"version\"]=\"0.1.0\"}\n"
         );
         let holding = Event::Holding { on: true, kinds: vec!["build_proposal".into()], reason: "hold_on" };
         assert_eq!(
-            EventWriter::line(2, &holding),
-            "2\tholding\tnative\t{[\"kinds\"]={[1]=\"build_proposal\"},[\"on\"]=true,[\"reason\"]=\"hold_on\"}\n"
+            EventWriter::line(&holding),
+            "holding\tnative\t{[\"kinds\"]={[1]=\"build_proposal\"},[\"on\"]=true,[\"reason\"]=\"hold_on\"}\n"
         );
         let audit = Event::Audit {
             counts: vec![(17, 4), (52, 2)],
@@ -1667,32 +1928,32 @@ mod tests {
             sites: vec![(0, 2)],
         };
         assert_eq!(
-            EventWriter::line(3, &audit),
-            "3\taudit\tnative\t{[\"adds\"]={[\"other\"]=5,[\"tool\"]=2,[\"unknown\"]=0},[\"counts\"]={[17]=4,[52]=2},\
+            EventWriter::line(&audit),
+            "audit\tnative\t{[\"adds\"]={[\"other\"]=5,[\"tool\"]=2,[\"unknown\"]=0},[\"counts\"]={[17]=4,[52]=2},\
              [\"sites\"]={[0]=2},[\"total\"]=6,[\"unreadable\"]=0}\n"
         );
         let error = Event::Error { place: "release".into(), detail: "no held command 9".into() };
         assert_eq!(
-            EventWriter::line(4, &error),
-            "4\terror\tnative\t{[\"detail\"]=\"no held command 9\",[\"where\"]=\"release\"}\n"
+            EventWriter::line(&error),
+            "error\tnative\t{[\"detail\"]=\"no held command 9\",[\"where\"]=\"release\"}\n"
         );
     }
 
     #[test]
-    fn writer_numbers_events_and_continues_after_a_restart() {
+    fn writer_appends_events_and_continues_the_file_after_a_restart() {
         let dir = TempDir::new("writer");
         let mut w = EventWriter::open(dir.path()).unwrap();
-        assert_eq!(w.next_seq(), 1);
+        assert_eq!(w.end(), Pos::START);
         assert!(!w.path().exists(), "nothing is created before the first event");
         w.append(&[]).unwrap();
         assert!(!w.path().exists());
         w.append(&[Event::Pong { n: 1 }, Event::Pong { n: 2 }]).unwrap();
         w.append(&[Event::Pong { n: 3 }]).unwrap();
         let text = fs::read_to_string(w.path()).unwrap();
-        let seqs: Vec<u64> = text.lines().filter_map(gamelink::parse_line).map(|l| l.seq).collect();
-        assert_eq!(seqs, [1, 2, 3]);
+        let ns: Vec<String> = text.lines().filter_map(gamelink::parse_line).map(|l| l.payload).collect();
+        assert_eq!(ns, [r#"{["n"]=1}"#, r#"{["n"]=2}"#, r#"{["n"]=3}"#]);
         let again = EventWriter::open(dir.path()).unwrap();
-        assert_eq!(again.next_seq(), 4, "a new writer continues the numbering");
+        assert_eq!(again.end(), Pos { gen: 1, offset: text.len() as u64 }, "a new writer goes on at the end");
     }
 
     #[test]
@@ -1705,7 +1966,7 @@ mod tests {
         assert_eq!(r.poll().lines.len(), 1);
         w.append(&[Event::Pong { n: 2 }]).unwrap();
         let p = r.poll();
-        assert_eq!((p.lines.len(), p.lines[0].seq), (1, 2));
+        assert_eq!(pings(&p), [r#"{["n"]=2}"#]);
     }
 
     #[test]
@@ -1733,17 +1994,18 @@ mod tests {
             }
         }
         got.extend(follower.poll().lines);
-        let pongs: Vec<u64> = got.iter().filter(|l| l.kind == "pong").map(|l| l.seq).collect();
+        let pongs: Vec<String> = got.iter().filter(|l| l.kind == "pong").map(|l| l.payload.clone()).collect();
         assert_eq!(
             pongs,
-            (3..=202).collect::<Vec<u64>>(),
+            (1..=200).map(|n| format!("{{[\"n\"]={n}}}")).collect::<Vec<_>>(),
             "every event exactly once, in order, across the generations"
         );
         assert_eq!(
             got.iter().filter(|l| l.kind == "ready").count(),
             1,
-            "the copies at the top of later files are not news"
+            "a reader that comes through a rotation starts after the copy at the top of the next file"
         );
+        assert_eq!(got.iter().filter(|l| l.kind == "timing").count(), 1);
         let newest = gamelink::newest_generation(&dir.path().join(EVENTS_FILE));
         assert!(newest > gamelink::KEEP_GENERATIONS, "it rotated ({newest})");
         let files = fs::read_dir(dir.path())
@@ -1754,103 +2016,8 @@ mod tests {
         // a reloaded mod reads the newest generation only, and finds the module's state at its top
         let mut fresh = CtlReader::new(gamelink::generation_path(&dir.path().join(EVENTS_FILE), newest));
         let lines = fresh.poll().lines;
-        assert_eq!((lines[0].seq, lines[0].kind.as_str()), (1, "ready"));
-        assert_eq!((lines[1].seq, lines[1].kind.as_str()), (2, "timing"));
-        assert!(lines[2..].iter().all(|l| l.kind == "pong" && l.seq > 2));
-        // and a reopened writer continues the numbering of the newest generation
-        assert_eq!(EventWriter::open(dir.path()).unwrap().next_seq(), 203);
-    }
-
-    // ---- one file per writer, generations
-
-    fn ctl_line(seq: u64, kind: &str) -> String {
-        format!("{seq}\t{kind}\t1\t{{}}\n")
-    }
-
-    #[test]
-    fn two_writers_interleaving_lose_no_line() {
-        // the interface half and the simulation half each number their own lines from 1: with one shared file and one
-        // last `seq`, the simulation half's `inject_next` (its seq 1, after the interface's 3) was dropped
-        let dir = TempDir::new("two-writers");
-        let gui = dir.path().join(CTL_FILE);
-        let sim = dir.path().join(CTL_SIM_FILE);
-        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
-        assert!(!r.has_news());
-        append(&gui, &(ctl_line(1, "hold_on") + &ctl_line(2, "ping") + &ctl_line(3, "release")));
-        append(&sim, &ctl_line(1, "inject_next"));
-        assert!(r.has_news());
-        let first = r.poll();
-        append(&gui, &ctl_line(4, "defer"));
-        append(&sim, &ctl_line(2, "complete_next"));
-        append(&gui, &ctl_line(5, "ping"));
-        append(&sim, &ctl_line(3, "fail"));
-        assert!(r.has_news());
-        let second = r.poll();
-        assert!(!r.has_news());
-        let mut kinds: Vec<String> = first.lines.iter().chain(&second.lines).map(|l| l.kind.clone()).collect();
-        kinds.sort();
-        assert_eq!(kinds, ["complete_next", "defer", "fail", "hold_on", "inject_next", "ping", "ping", "release"]);
-        assert_eq!(first.discarded + second.discarded, 0);
-        assert_eq!(r.describe(), "gui seq 5 (generation 1), sim seq 3 (generation 1)");
-        // a writer's own repeated number is still dropped (history after a rewrite)
-        append(&sim, &ctl_line(3, "fail"));
-        assert_eq!(r.poll().discarded, 1);
-    }
-
-    #[test]
-    fn opening_the_link_treats_each_writers_lines_as_history() {
-        let dir = TempDir::new("two-writers-history");
-        append(&dir.path().join(CTL_FILE), &ctl_line(9, "ping"));
-        append(&dir.path().join(CTL_SIM_FILE), &ctl_line(2, "fail"));
-        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
-        assert!(r.poll().lines.is_empty());
-        append(&dir.path().join(CTL_SIM_FILE), &ctl_line(3, "inject_next"));
-        let p = r.poll();
-        assert_eq!(p.lines.iter().map(|l| (l.seq, l.kind.as_str())).collect::<Vec<_>>(), [(3, "inject_next")]);
-    }
-
-    #[test]
-    fn a_reader_follows_rotations_without_losing_or_splitting_a_line() {
-        let dir = TempDir::new("rotate-follow");
-        let base = dir.path().join(CTL_SIM_FILE);
-        let mut w = gamelink::GenWriter::open(base.clone(), "1").unwrap().with_limits(150, 3);
-        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
-        let mut seqs = Vec::new();
-        let mut discarded = 0;
-        for seq in 1..=120u64 {
-            w.append(&format!("{seq}\tping\t1\t{{[\"n\"]={seq}}}\n")).unwrap();
-            if seq % 5 == 0 || seq % 11 == 0 {
-                let p = r.poll();
-                discarded += p.discarded;
-                assert!(p.error.is_none(), "{p:?}");
-                seqs.extend(p.lines.iter().map(|l| l.seq));
-            }
-        }
-        while r.has_news() {
-            let p = r.poll();
-            discarded += p.discarded;
-            seqs.extend(p.lines.iter().map(|l| l.seq));
-        }
-        assert_eq!(seqs, (1..=120).collect::<Vec<u64>>());
-        assert_eq!(discarded, 0, "a rotate line is no discarded record");
-        assert!(w.generation() > 3, "it rotated ({})", w.generation());
-        assert!(!gamelink::generation_path(&base, w.generation() - 3).exists(), "older generations are deleted");
-        // a reader opened now starts at the end of the newest generation, also when that one has just been ended
-        let mut late = CtlReader::writers_at_end(dir.path()).unwrap();
-        assert!(late.poll().lines.is_empty());
-        w.append("121\tping\t1\t{}\n").unwrap();
-        assert_eq!(late.poll().lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [121]);
-    }
-
-    #[test]
-    fn a_link_opened_right_after_a_rotate_line_reads_the_next_generation_from_its_start() {
-        let dir = TempDir::new("rotate-open");
-        let base = dir.path().join(CTL_FILE);
-        append(&base, &(ctl_line(1, "ping") + &gamelink::rotate_line("1", 2)));
-        fs::write(gamelink::pointer_path(&base), "2\n").unwrap();
-        let mut r = CtlReader::writers_at_end(dir.path()).unwrap();
-        assert!(r.poll().lines.is_empty());
-        append(&gamelink::generation_path(&base, 2), &ctl_line(2, "hold_off"));
-        assert_eq!(r.poll().lines.iter().map(|l| l.kind.as_str()).collect::<Vec<_>>(), ["hold_off"]);
+        assert_eq!(lines[0].kind, "ready");
+        assert_eq!(lines[1].kind, "timing");
+        assert!(lines[2..].iter().all(|l| l.kind == "pong"));
     }
 }

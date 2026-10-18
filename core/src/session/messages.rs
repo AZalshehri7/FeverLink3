@@ -197,6 +197,63 @@ pub struct PlayerLeftMessage {
     pub away: bool,
 }
 
+/// Wall-clock stamps (milliseconds since 1970, each on the clock of the machine that took it) of one clock or action line on
+/// its way from the game that made it to a game that reads it, for the latency logs (owner list 2026-10-17, items 4 and 6).
+/// Measurement only: nothing decides anything from it, and an older peer simply leaves it out. The sending game's mod starts
+/// it (`g`), its launcher adds `l`, the host `h` with the sender's clock offset and round trip, the receiving launcher `w`
+/// with its own; the receiving mod reads the line (its own stamp, not carried further). Offsets are the machine's wall clock
+/// minus the host's (`HostSession::wall_offset_ms`), so a stamp `x` taken on that machine is `x - offset` on the host's clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hops {
+    /// The sending game's mod wrote the line to `from_game.log` (sender's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub g: Option<i64>,
+    /// The sender's launcher read it from `from_game.log` (sender's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l: Option<i64>,
+    /// The host handled it (host's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<i64>,
+    /// The sender's wall clock minus the host's, ms (0 for the host's own game; absent before it was measured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub so: Option<i64>,
+    /// The sender's round trip to the host, whole ms (0 for the host's own game).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sr: Option<i64>,
+    /// The receiving launcher wrote it to `to_game.log` (receiver's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<i64>,
+    /// The receiver's wall clock minus the host's, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ro: Option<i64>,
+    /// The receiver's round trip to the host, whole ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rr: Option<i64>,
+}
+
+impl Hops {
+    /// A value a game could not have meant as a wall clock (ms since 1970 between 2001 and 2286) is left out: these stamps
+    /// are only ever logged, and a player's own numbers must not make another game's log lie.
+    pub fn plausible_ms(v: i64) -> bool {
+        (1_000_000_000_000..10_000_000_000_000).contains(&v)
+    }
+
+    /// The stamps as the host passes them on: what the sender said (implausible ones dropped), the host's own stamp and what
+    /// the host knows of the sender. Fields the host or a receiver fills are never taken from a player.
+    pub fn relayed(&self, host_ms: Option<i64>, sender_offset: Option<i64>, sender_rtt: Option<f64>) -> Hops {
+        Hops {
+            g: self.g.filter(|v| Self::plausible_ms(*v)),
+            l: self.l.filter(|v| Self::plausible_ms(*v)),
+            h: host_ms,
+            so: sender_offset,
+            sr: sender_rtt.filter(|r| r.is_finite()).map(|r| r.round() as i64),
+            w: None,
+            ro: None,
+            rr: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerClockMessage {
@@ -212,6 +269,9 @@ pub struct PeerClockMessage {
     /// `safe` is the pause the game is stopped at (ClockMessage::pause).
     #[serde(default, skip_serializing_if = "is_false")]
     pub pause: bool,
+    /// The clock line's stamps so far ([`Hops`]), when its game sent any. Logs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hop: Option<Hops>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +285,15 @@ pub struct ChecksumRequestMessage {
     /// older host's requests and an older game that ignores the flag both stay correct.
     #[serde(default = "full_by_default", skip_serializing_if = "is_true")]
     pub full: bool,
+    /// A full round spread over the simulation: every game reads the heavy lanes a fixed number of entities at a time, one chunk
+    /// every `spread` steps after `at` (`ChecksumPolicy::spread_steps`), so no single step stalls the game. 0 (absent) = the whole
+    /// round at `at`, as before: light and paused rounds, and an older host.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spread: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 fn full_by_default() -> bool {
@@ -276,6 +345,10 @@ pub struct PingMessage {
     pub n: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rtt: BTreeMap<u16, f64>,
+    /// Each player's wall clock minus the host's, in milliseconds, as the host measured it from the pongs (`PongMessage::w`), so a
+    /// player can put the stamps of a line ([`Hops`]) on one clock. Logs only; absent from an older host.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub off: BTreeMap<u16, i64>,
 }
 
 // ---- player -> host
@@ -285,6 +358,10 @@ pub struct PingMessage {
 #[serde(rename_all = "camelCase")]
 pub struct PongMessage {
     pub n: u32,
+    /// The player's wall clock when it answered (ms since 1970): with the ping's send and the pong's arrival the host estimates
+    /// the player's clock offset (NTP's rule, the arrival in the middle of the round trip). Absent from an older player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<i64>,
 }
 
 /// The game has loaded a savegame and runs the mod. `time` is its game time.
@@ -325,6 +402,9 @@ pub struct ClockMessage {
     /// stamps the actions of the pause past the largest of these (the pause order), so every game can still apply them at their stamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<i64>,
+    /// Wall-clock stamps of this line ([`Hops`]): the mod's write and its launcher's read. Logs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hop: Option<Hops>,
 }
 
 impl ClockMessage {
@@ -356,11 +436,15 @@ pub struct ChecksumReportMessage {
     pub parts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<BTreeMap<String, f64>>,
+    /// Parts this game could not hash for this round (its registry not read from the loaded state yet, a lane that failed):
+    /// unknown, not different. They are not in `parts`; the host does not compare them in this round.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ready: Vec<String>,
 }
 
 impl ChecksumReportMessage {
     pub fn new(n: i32, time: i64, parts: BTreeMap<String, String>) -> Self {
-        Self { n, time, parts, authority: None }
+        Self { n, time, parts, authority: None, not_ready: Vec::new() }
     }
 }
 
@@ -384,6 +468,28 @@ pub struct ReplayFailedMessage {
 pub struct ActionRefusedMessage {
     pub seq: i64,
     pub detail: String,
+    /// The action's originator (the action is `from:seq`). Not the sender: the host knows who sent it.
+    #[serde(default)]
+    pub from: u16,
+    /// The sending game's verdict of the action at its stamp: `true` applied (the line kind `action_applied`), `false` refused
+    /// (`action_refused`, and every message of an older mod). The host compares the verdicts of every game (`VerdictBook`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub applied: bool,
+    /// The refusal's class (`inject_refused`, `decode`, `engine`, `company`, `module`), for the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+}
+
+impl ActionRefusedMessage {
+    /// A refusal of action `from:seq` on the sending game.
+    pub fn refused(from: u16, seq: i64, detail: impl Into<String>) -> Self {
+        Self { seq, detail: detail.into(), from, applied: false, class: None }
+    }
+
+    /// The action `from:seq` applied at its stamp on the sending game.
+    pub fn applied(from: u16, seq: i64) -> Self {
+        Self { seq, detail: String::new(), from, applied: true, class: None }
+    }
 }
 
 // ---- relayed
@@ -414,6 +520,15 @@ pub struct ActionMessage {
     /// Set by the host on a `pause` action (a player's own value is overwritten): its place in the session's pause order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_seq: Option<u64>,
+    /// Set by the host with `pause_seq`: the `pause_seq` of the last item of the same flush of the pause order (every item of one
+    /// flush has one stamp). A game runs on to a stamp of the pause only once it has read the whole flush, so the run-on of an
+    /// earlier item never passes the stamp of a later one still on its way. `None` (an older host): the run-on as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_upto: Option<u64>,
+    /// Wall-clock stamps of this action on its way ([`Hops`]): the host replaces what the sender claims about the host's part.
+    /// Logs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hop: Option<Hops>,
 }
 
 impl ActionMessage {
@@ -429,6 +544,8 @@ impl ActionMessage {
             allowed: true,
             pause: false,
             pause_seq: None,
+            pause_upto: None,
+            hop: None,
         }
     }
 
@@ -545,6 +662,9 @@ pub struct BuildCommitMessage {
     /// As [`ActionMessage::pause_seq`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_seq: Option<u64>,
+    /// As [`ActionMessage::pause_upto`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_upto: Option<u64>,
 }
 
 /// `from` and `name` are set by the host on relay.

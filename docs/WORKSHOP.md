@@ -17,7 +17,7 @@ Decision of 2026-10-10: the end state is **the mod offered in the game's own Mod
 
 | Part | Where it lives | Channel |
 |---|---|---|
-| `mod/feverlink3_1` (Lua game scripts and the in-game window) | the user mods folder | the Mod Hub, if accepted; Nexus Mods and GitHub in any case |
+| `mod/feverlink3` (Lua game scripts and the in-game window) | the user mods folder | the Mod Hub, if accepted; Nexus Mods and GitHub in any case |
 | `winhttp.dll` (native module and the in-game controller) | the game folder | Nexus Mods and GitHub only, as a separate file |
 | `feverlink3.exe` (testing installer, `doctor`, development commands) | anywhere | the test zip only; not part of the end state |
 
@@ -71,7 +71,7 @@ Moving the session controller out of the DLL into the external program (the orig
 
 This work is documentation only, so none of these is made; each is small.
 
-- **`mod/feverlink3_1/_metadata/modinfo.json` is wrong today.** The description says the mod "does nothing unless the game was started by FeverLink3.exe" and the summary says "start the game through FeverLink3.exe". Both have been untrue since live mode, and the game shows these texts in its mod list. They should say what the mod does now (a multiplayer window and the lockstep scripts, needs the separate native module, Windows PC only) and `url` should point to the project; the wiki recommends it so that players can find the source.
+- **`mod/feverlink3/_metadata/modinfo.json` is wrong today.** The description says the mod "does nothing unless the game was started by FeverLink3.exe" and the summary says "start the game through FeverLink3.exe". Both have been untrue since live mode, and the game shows these texts in its mod list. They should say what the mod does now (a multiplayer window and the lockstep scripts, needs the separate native module, Windows PC only) and `url` should point to the project; the wiki recommends it so that players can find the source.
 - Put the "Required Notice" line and the PolyForm licence address into the mod's description, so that the licence travels with a Hub download (see the licence section).
 - When the native module is missing, the window's message should name the download page instead of `feverlink3 install`, in the build meant for the Hub.
 - Keep the use of files in one small place with a clear comment, so that it can be replaced if the game offers an official data exchange.

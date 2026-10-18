@@ -8,7 +8,7 @@ A release is a commit on `main` whose message starts with the version, built by 
 2. Set the version (`[workspace.package] version` in `Cargo.toml`, for example `0.2.0-test1`) and commit. The same version appears in the DLL's `native.log`.
 3. Make the release commit and push it to `main`. Its first line is `V<version>: <title>`, for example `V0.1.0: First beta release`. A version with a dash (`V0.2.0-test1: Friend test`) becomes a GitHub pre-release, which the updater skips by default. The workflow creates the tag `v<version>` itself. Only the head commit of a push is read, so the release commit must be the last one pushed.
 4. The job runs the workspace tests, `cargo build --release`, then `feverlink3_release package`, signs the manifest if the secret `FEVERLINK3_SIGNING_KEY` is set, and creates the release with these assets:
-   - `FeverLink3-<version>.zip`: the files to copy into the game's folder (`winhttp.dll`, `mods/release/feverlink3_1/`, no program; `feverlink3_release package --layout portable` makes the developer layout with `feverlink3.exe`), plus `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
+   - `FeverLink3-<version>.zip`: the files to copy into the game's folder (`winhttp.dll`, `mods/release/feverlink3/`, no program; `feverlink3_release package --layout portable` makes the developer layout with `feverlink3.exe`), plus `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
    - `FeverLink3-<version>.zip.sha256`
    - `manifest.json`: version, every file with size and SHA-256, and the zip's SHA-256
    - `manifest.json.sig`: Ed25519 signature over the exact bytes of `manifest.json` (hex)

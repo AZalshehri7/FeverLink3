@@ -3,7 +3,7 @@ with a stamp, cancels the held command and EVERY game, the originator's included
 
 Two mocked games run the real mod (the harness of test_native_capture.py / test_cmds_build.py, imported, not edited). What is new
 here is a FAKE NATIVE MODULE (`FakeNative`) that does what native/ does through the two files of docs/NATIVE_LINK.md section 3:
-it reads the control files `native_ctl.gui.log` and `native_ctl.sim.log` (one per Lua state, each numbered on its own: hold_on, hold_off,
+it reads the control files `native_ctl.gui.w<id>.log` and `native_ctl.sim.w<id>.log` (one per writer, read by position: hold_on, hold_off,
 release, cancel, ping, the orders), writes `native_events.log` (ready with hooks, holding,
 held, released, dropped, pong, error), holds a build command added by a tool at CommandList::Add, hands held commands back or
 destroys them at the NEXT Add (any command), and switches holding off after 10 s without a valid line from the mod. A mock
@@ -16,6 +16,7 @@ Time: the mod reads os.clock(); the games get a fake one (`Clock`) that moves 50
 Run:  python -I -m unittest discover -s tests/lua -p "test_strict_build.py"
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -68,18 +69,15 @@ class FakeNative:
 
     def __init__(self, game, clock, hooks=("apply_command", "command_list_add"), link=True):
         self.game, self.clock, self.hooks = game, clock, list(hooks)
-        self.ctl = os.path.join(game.dir, "native_ctl.gui.log")       # the interface half's control file
-        self.ctl_sim = os.path.join(game.dir, "native_ctl.sim.log")   # the simulation half's
         self.events = os.path.join(game.dir, "native_events.log")
         self.R = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.R.execute(T.COMMON_SRC)
-        self.ev_seq = 0
+        self.C = T.load_common(self.R)
         self.outbox = []
-        self.ctl_pos = {}   # control file -> [offset, last seq, partial line]: each writer is read on its own
+        self.ctl_pos = {}   # control file -> [offset, partial line]: each writer is read on its own, by position
         self.holding, self.hold_kinds = False, []
         self.ring, self.next_id = [], 1
         self.last_valid = None
-        self.heard = []          # (time, seq, kind, payload) of every control line it accepted
+        self.heard = []          # (time, n, kind, payload) of every control line it read (n counts them)
         self.dropped, self.released, self.held = [], [], []
         self.site = TOOL_SITE   # the call site the module reports for the next held command
         self.input_text = None   # the input-level text the module writes for every held command (native_input_<id>.txt); None = an old module
@@ -108,53 +106,74 @@ class FakeNative:
             return
         text = ""
         for kind, payload in self.outbox:
-            self.ev_seq += 1
-            text += self.C.formatLine(self.ev_seq, kind, "native", self.C.serialize(self.lua(payload)))
+            text += self.C.formatLine(kind, "native", self.C.serialize(self.lua(payload)))
         self.outbox = []
         with open(self.events, "a", encoding="utf-8", newline="") as f:
             f.write(text)
 
+    def ctl_slots(self):
+        """The control files there now as (writer, path), as the module finds them (docs/NATIVE_LINK.md section 3): every writer
+        names its own file native_ctl.<half>.w<id>.log; the interface half's first, each half's in the order they were found."""
+        found = getattr(self, "_writers", None)
+        if found is None:
+            found = self._writers = []
+        names = sorted(os.listdir(self.game.dir)) if os.path.isdir(self.game.dir) else []
+        for n in names:
+            m = re.match(r"^native_ctl\.(gui|sim)\.w([0-9a-f]+)\.log$", n)
+            if m and n not in [x[2] for x in found]:
+                found.append((m.group(1), "%s.w%s" % (m.group(1), m.group(2)), n))
+        return [(w, os.path.join(self.game.dir, n)) for half in ("gui", "sim") for h, w, n in found if h == half]
+    def newest_slot(self, half):
+        slots = [p for w, p in self.ctl_slots() if w.startswith(half + ".")]
+        return slots[-1] if slots else os.path.join(self.game.dir, "native_ctl.%s.w0.log" % half)
+
+    @property
+    def ctl(self):
+        """The interface half's newest control file."""
+        return self.newest_slot("gui")
+
+    @property
+    def ctl_sim(self):
+        """The simulation half's newest control file."""
+        return self.newest_slot("sim")
+
     def open_link(self):
         """The link opens: what the control files hold is history; `ready` is the first event."""
         self.is_open = True
-        for path in (self.ctl, self.ctl_sim):
-            pos = self.ctl_pos.setdefault(path, [0, 0, ""])
+        for _, path in self.ctl_slots():
+            pos = self.ctl_pos.setdefault(path, [0, ""])
             if os.path.exists(path):
-                data = open(path, "rb").read()
-                pos[0], pos[2] = len(data), ""
-                for line in data.decode("utf-8").splitlines():
-                    if line.split(TAB)[0].isdigit():
-                        pos[1] = max(pos[1], int(line.split(TAB)[0]))
+                pos[0], pos[1] = os.path.getsize(path), ""
         self.emit("ready", {"build": "40420", "version": "0.1.0", "hooks": self.hooks, "poolpatch": False, "clock": False,
                             "kinds": {"build_proposal": 52}, "sites": 12, "patch": self.patch_cap})
         self.flush_events()
 
     def read_ctl(self):
-        for path in (self.ctl, self.ctl_sim):
+        for _, path in self.ctl_slots():
             self.read_ctl_file(path)
 
     def read_ctl_file(self, path):
+        """One writer's file, by position: complete lines only, nothing dropped for what it says."""
         if not os.path.exists(path):
             return
-        pos = self.ctl_pos.setdefault(path, [0, 0, ""])
+        pos = self.ctl_pos.setdefault(path, [0, ""])
+        if os.path.getsize(path) < pos[0]:
+            pos[0], pos[1] = 0, ""   # shorter: another file, read from its first byte
         with open(path, "rb") as f:
             f.seek(pos[0])
             chunk = f.read()
         pos[0] += len(chunk)
-        text = pos[2] + chunk.decode("utf-8")
-        *lines, pos[2] = text.split("\n")
+        text = pos[1] + chunk.decode("utf-8")
+        *lines, pos[1] = text.split("\n")
         for line in lines:
-            parts = line.split(TAB, 3)
-            if len(parts) < 4 or not parts[0].isdigit():
+            parts = line.split(TAB, 2)
+            if len(parts) < 3:
+                self.discarded = getattr(self, "discarded", 0) + 1
                 continue
-            seq, kind, payload = int(parts[0]), parts[1], parts[3]
-            if seq <= pos[1]:
-                self.discarded = getattr(self, "discarded", 0) + 1   # as the module: a number not above the file's last is old
-                continue
-            pos[1] = seq
+            kind, payload = parts[0], parts[2]
+            self.lines_read = getattr(self, "lines_read", 0) + 1
             p = to_py(self.C.parse(payload))
-            self.handle(seq, kind, p if isinstance(p, dict) else {})
-
+            self.handle(self.lines_read, kind, p if isinstance(p, dict) else {})
     # ---- what the module does with a control line
     def handle(self, seq, kind, p):
         now = self.clock.t
@@ -245,21 +264,21 @@ class FakeNative:
 
     # ---- what a test reads
     def ctl_records(self):
-        """Every control line written so far: the interface half's file, then the simulation half's."""
+        """Every control line written so far as (writer, kind, payload): the interface half's slots, then the simulation half's."""
         out = []
-        for path in (self.ctl, self.ctl_sim):
+        for writer, path in self.ctl_slots():
             if os.path.exists(path):
                 for line in T.read_text(path).splitlines():
-                    parts = line.split(TAB, 3)
-                    p = to_py(self.C.parse(parts[3]))
-                    out.append((int(parts[0]), parts[1], p))
+                    parts = line.split(TAB, 2)
+                    p = to_py(self.C.parse(parts[2]))
+                    out.append((writer, parts[0], p))
         return out
 
     def ctl_kinds(self):
         return [k for _, k, _ in self.ctl_records()]
 
     def event_kinds(self):
-        return [line.split(TAB)[1] for line in T.read_text(self.events).splitlines()] if os.path.exists(self.events) else []
+        return [line.split(TAB)[0] for line in T.read_text(self.events).splitlines()] if os.path.exists(self.events) else []
 
 
 STRICT_LUA = r'''
@@ -355,14 +374,14 @@ class StrictGame(N.NativeGame):
     def action_records(self):
         out = []
         for line in self.lines(self.from_game):
-            parts = line.split(TAB, 3)
-            if len(parts) == 4 and parts[1] == "action":
-                out.append(to_py(self.native_C().parse(parts[3])))
+            parts = line.split(TAB, 2)
+            if len(parts) == 3 and parts[0] == "action":
+                out.append(to_py(self.native_C().parse(parts[2])))
         return out
 
     def native_C(self):
         if not hasattr(self, "_C"):
-            self._C = lupa.LuaRuntime(unpack_returned_tuples=True).execute(T.COMMON_SRC)
+            self._C = T.load_common(lupa.LuaRuntime(unpack_returned_tuples=True))
         return self._C
 
 
@@ -630,18 +649,19 @@ class StrictOnTest(StrictTest):
         self.assertNotIn("native build captured", self.B.log())
         self.assertSameWorld()
 
-    def test_a_build_the_originator_refuses_at_the_stamp_is_released_not_cancelled_when_the_callback_cannot_be_fired(self):
-        # the rule that refuses it on every other game refuses it here too; a cancel would leave the tool dead (the module cannot fire
-        # the callback here), so the command goes back to the engine and the games are repaired
+    def test_a_build_the_originator_refuses_at_the_stamp_is_failed_never_released_when_the_callback_cannot_be_fired(self):
+        # bug 8 (fail closed): the rule that refuses it at the stamp refused it here; released, the build was applied on this game alone.
+        # Failed now as on a veto (this old module has no `fail`: a cancel), never given back to the engine.
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))
         self.frames(2)
         self.assertEqual(self.B.native.held, [1])
         self.B.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _ in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
         self.tick(14)
-        self.assertEqual(self.B.native.dropped, [])
-        self.assertEqual(self.B.native.released, [1])
-        self.assertIn("was refused at its stamp but is NOT cancelled", self.B.log())
+        self.assertEqual(self.B.native.released, [], "never given back to the engine")
+        self.assertEqual(self.B.native.dropped, [1])
+        self.assertIn("was refused at its stamp: FAILED, NOT released", self.B.log())
+        self.assertEqual(self.B.builds_applied(), 0, "the refused build is not applied on its originator")
         self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
 
     # ---- (g) both players building at once
@@ -679,7 +699,24 @@ class StrictOnTest(StrictTest):
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1), "the simulation half shipped it, once")
         self.assertIn("native build captured", self.B.log())
 
-    def test_a_capture_the_module_could_not_make_releases_the_held_command(self):
+    def assertRefusedEverywhere(self, chat=None):
+        """Bug 8 (fail closed): B's held build failed a check on B. It is never given back to the engine: nothing is shipped, nothing is
+        built on either game, the player is told, nothing stays held."""
+        self.assertEqual(self.B.native.released, [], "never given back to the engine (fail closed)")
+        self.assertEqual(self.B.native.dropped, [1], "failed (this old module has no `fail`: a cancel)")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "no game has the build")
+        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 0), "nothing was shipped")
+        self.assertNotIn("native build captured", self.B.log(), "the simulation half never saw the build either")
+        self.assertIn("REFUSED: ", self.B.log())
+        self.assertIn("NOT released, nothing is shipped or applied on any game", self.B.log())
+        self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
+        self.assertSameWorld()
+        self.assertEqual(len(self.relay.chats), 1, "the player is told once")
+        self.assertIn("build was cancelled: ", self.relay.chats[0][1])
+        if chat:
+            self.assertIn(chat, self.relay.chats[0][1])
+
+    def test_a_capture_the_module_could_not_make_refuses_the_held_command(self):
         self.start()
         self.B.run("FACTORY_REJECT = nil")
         i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))
@@ -687,40 +724,36 @@ class StrictOnTest(StrictTest):
         self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
         self.B.L.execute("TOOL_ADD(%d, true)" % i)
         self.tick(14)
-        self.assertEqual(self.B.native.released, [1])
-        self.assertIn("the capture of streetBuilder failed", self.B.log())
-        self.assertSameWorld()
-        self.assertEqual(self.B.shipped_count(), 1, "the old path shipped it")
+        self.assertIn("REFUSED: the capture of streetBuilder failed", self.B.log())
+        self.assertRefusedEverywhere("cannot be recorded yet")
 
-    def test_a_record_this_game_cannot_rebuild_is_released_never_cancelled(self):
+    def test_a_record_this_game_cannot_rebuild_is_refused_never_released(self):
+        # friend test 2026-10-16, host street 0:2: "it cannot be rebuilt here (...); release written, the native build goes through"
         self.start()
         i = int(self.B.L.eval("TOOL_MAKE(%s)" % self.road(300, 0, 400, 0)))   # the command exists; now the factory turns strict
         self.B.run("FACTORY_REJECT = function(parts, kind) if kind == 'SimpleProposal' then for _ in ipairs(parts.edgesAdd) do return 'no segment please' end end end")
         self.B.tool_event(i)
         self.B.L.execute("TOOL_ADD(%d, true)" % i)
         self.tick(14)
-        self.assertEqual(self.B.native.dropped, [], "a build that cannot be rebuilt is never cancelled")
-        self.assertEqual(self.B.native.released, [1])
-        self.assertIn("it cannot be rebuilt here", self.B.log())
-        self.assertEqual(self.B.builds_applied(), 1, "the tool's own build went through")
-        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.B.sig())
-        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig(), "and the old path took it to the other game")
+        self.assertIn("REFUSED: it cannot be rebuilt here", self.B.log())
+        self.assertNotIn("release written", self.B.log())
+        self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.B.sig())
+        self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertRefusedEverywhere("cannot be rebuilt the same way on every game")
 
-    def test_a_fault_while_deciding_gives_the_command_back_and_does_not_break_the_bridge(self):
+    def test_a_fault_while_deciding_refuses_the_command_and_does_not_break_the_bridge(self):
         self.start()
         self.B.tool(self.road(300, 0, 400, 0))     # held; the verdict is made in the next frame
         self.B.run("FAIL_NEXT_PLAYER = true")
         self.tick(14)
-        self.assertEqual(self.B.native.released, [1], "the held command was given back, not left in the ring")
-        self.assertEqual(self.B.native.dropped, [])
         self.assertIn("fault in the verdict on held 1", self.B.log())
-        self.assertSameWorld()
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
-        self.assertEqual(self.B.shipped_count(), 1, "the old path shipped it")
+        self.assertIn("REFUSED: a fault in the verdict", self.B.log())
+        self.assertRefusedEverywhere()
         # and the next build is strict again
         self.B.tool(self.road(500, 0, 600, 0))
         self.tick(16)
-        self.assertEqual(self.B.native.released, [1, 2])
+        self.assertEqual(self.B.native.released, [2])
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertSameWorld()
 
     # ---- (d) a capture without a held command
@@ -759,8 +792,7 @@ class StrictOnTest(StrictTest):
         self.assertGreaterEqual(len(times), 15)
         ns = [p["n"] for _, _, kind, p in self.B.native.heard if kind == "ping"]
         self.assertEqual(ns, sorted(set(ns)), "ping numbers grow")
-        seqs = [s for s, _, _ in self.B.native.ctl_records()]
-        self.assertEqual(seqs, list(range(1, len(seqs) + 1)), "the control file's sequence numbers grow by one")
+        self.assertEqual(len(self.B.native.heard), len(self.B.native.ctl_records()), "every control line written was read, none dropped")
         self.assertEqual(self.B.native.event_kinds().count("holding"), 1, "the module never switched holding off")
         self.assertNotIn("switched holding off", self.B.log())
 
@@ -806,8 +838,11 @@ class StrictOnTest(StrictTest):
         kinds = self.B.native.ctl_kinds()
         self.assertEqual(kinds.count("hold_on"), 2)
         self.assertLess(kinds.index("hold_off"), len(kinds) - 1 - kinds[::-1].index("hold_on"), "hold_off came before the second hold_on")
-        seqs = [s for s, _, _ in self.B.native.ctl_records()]
-        self.assertEqual(seqs, list(range(1, len(seqs) + 1)), "the reloaded mod continued the numbering")
+        recs = self.B.native.ctl_records()
+        before = {w for w, k, _ in recs if k == "hold_off"}
+        after = {w for w, k, _ in recs if k == "hold_on"} - before
+        self.assertTrue(before and after and all(w.startswith("gui.") for w in before | after),
+                        "the reloaded script writes a control file of its own: %r %r" % (before, after))
         # and a build after the reload is strict again
         self.B.tool(self.road(300, 0, 400, 0))
         self.tick(20)
@@ -880,19 +915,19 @@ class StrictOnTest(StrictTest):
         self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1))
 
     def test_a_newer_preview_that_cannot_be_captured_is_never_replaced_by_an_older_good_one(self):
-        # the newest preview is the proposal on screen: if it could not be encoded, the held command must go back, not be
-        # paired with the record of an earlier preview
+        # the newest preview is the proposal on screen: if it could not be encoded, the held command is refused (bug 8: fail closed),
+        # never paired with the record of an earlier preview
         self.start()
         self.B.tool(self.road(300, 0, 400, 0), add=False)          # a good preview
         self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
         self.B.tool(self.road(500, 0, 600, 0), event=False)        # the click: its command is held, its preview is the bad one
         self.tick(14)
-        self.assertEqual(self.B.native.released, [1])
-        self.assertEqual(self.B.native.dropped, [])
+        self.assertEqual(self.B.native.released, [])
+        self.assertEqual(self.B.native.dropped, [1])
         self.assertSameWorld()
-        self.assertIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig(), "the clicked road, not the earlier preview's")
-        self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertNotIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig())
+        self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig(), "never the earlier preview's road")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
 
     # ---- (e) a command is paired with the preview of its own tool only; nothing given back is unaccounted for
 
@@ -968,8 +1003,7 @@ class StrictOffTest(StrictTest):
         self.B.tool(self.road(300, 0, 400, 0))   # the tool event reaches the mod, the command goes to the engine
         self.tick(16)
         for g in (self.A, self.B):
-            for name in ("native_ctl.gui.log", "native_ctl.sim.log"):
-                self.assertFalse(os.path.exists(os.path.join(g.dir, name)), "no control file without a module")
+            self.assertFalse([n for n in os.listdir(g.dir) if n.startswith("native_ctl.")], "no control file without a module")
             self.assertNotIn("strict:", g.log())
         self.assertSameWorld()
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
@@ -1268,6 +1302,37 @@ class DefaultDemolitionTest(StrictTest):
         self.assertSameWorld()
 
 
+class DemolitionRefundTest(StrictTest):
+    """The held command's Context names what the engine refunds (refundableEntities, read by the native module and given in the held
+    event's ctx.refund: this game's entity id, key integer, revision and value integer per entry). Friend test 2026-10-16: a bulldozing was cancelled and replayed with a Context that had none,
+    and no game gave money back. The cancelled demolition's replay on every game, the originator's too, carries that game's own ids.
+    The defaults, as DefaultDemolitionTest."""
+
+    strict_cancel = None
+    extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": None}
+    fires = True
+
+    def test_a_cancelled_demolition_is_replayed_with_each_games_own_refundable_entities(self):
+        self.start()
+        self.B.tool(self.road(300, 0, 400, 0))
+        self.tick(24)
+        eb, ea = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)")), int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.assertNotEqual(ea, eb)
+        self.B.native.held_flags = {"align": False, "cleanup": True, "buildings": True, "fields": True, "redo": False, "ie": False, "pi": True,
+                                    "refund": [{"e": eb, "k": -1, "r": [1, 11, 0], "n": 339}, {"e": 99999, "k": -1, "r": [1, 11, 0], "n": 339}]}
+        self.B.tool("{ edges = { %d } }" % eb, make="NATIVE_BULLDOZE")
+        self.tick(24)
+        self.assertEqual(self.B.native.dropped, [2], "the demolition was cancelled and replayed")
+        self.assertSameWorld()
+        self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        for g, e in ((self.A, ea), (self.B, eb)):
+            self.assertEqual(g.lua("REFUND_TEXT(GAME.applied[#GAME.applied].args[2])"), "%d{-1}rev1,11,0/339" % e, g.label)
+        self.assertIn("left out on every game", self.B.log(), "99999 names nothing: left out before the record travels")
+        with open(os.path.join(self.B.dir, "trace.log"), encoding="utf-8") as f:
+            trace = f.read()
+        self.assertIn("side=originator source=held command ctx{align=false cleanup=true buildings=true fields=true redo=false refund=1}", trace)
+
+
 class OptOutTest(DefaultDemolitionTest):
     """FEVERLINK3_STRICT_FIRE_DONE=0 or FEVERLINK3_STRICT_CANCEL=0: back to hold-and-release for everything."""
 
@@ -1439,17 +1504,12 @@ class TraceLogTest(StrictTest):
         self.assertEqual(self.B.builds_applied(), 1)
 
     def external_ctl_line(self, g, kind, payload_text):
-        """A control line written by the simulation half (patch_next), in its own file and numbering."""
-        path = g.native.ctl_sim
-        last = 0
-        if os.path.exists(path):
-            for line in open(path, encoding="utf-8").read().splitlines():
-                head = line.split(TAB)[0]
-                if head.isdigit():
-                    last = max(last, int(head))
-        with open(path, "a", encoding="utf-8", newline="") as f:
-            f.write(TAB.join([str(last + 1), kind, str(g.player_id if hasattr(g, "player_id") else 1), payload_text]) + chr(10))
-
+        """A control line written by another simulation-half writer (patch_next), in a file of its own."""
+        n = 1
+        while os.path.exists(os.path.join(g.dir, "native_ctl.sim.wfeed%d.log" % n)):
+            n += 1
+        with open(os.path.join(g.dir, "native_ctl.sim.wfeed%d.log" % n), "a", encoding="utf-8", newline="") as f:
+            f.write(TAB.join([kind, str(g.player_id if hasattr(g, "player_id") else 1), payload_text]) + chr(10))
     def test_a_control_line_written_by_the_simulation_half_does_not_make_the_interface_halfs_next_order_stale(self):
         # patch_next is written from the simulation half to its own file: the interface half's orders keep their own numbering
         self.start()
@@ -1538,8 +1598,8 @@ class ConstructionBlockTest(StrictTest):
 
 
 class UncapturableBuildTest(StrictTest):
-    """A build whose capture fails cannot be shipped: with the tool's callback fireable it is cancelled with a chat line, otherwise it is
-    released as before (fail open)."""
+    """A build whose capture fails cannot be shipped: it is refused with a chat line (bug 8: fail closed, also where the module cannot fire
+    the tool's callback; it was released then, applied on this game alone)."""
 
     extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "1"}
     fires = True
@@ -1557,7 +1617,8 @@ class UncapturableBuildTest(StrictTest):
         self.assertEqual((self.B.native.dropped, self.B.native.released), ([1], []))
         self.assertEqual(self.B.shipped_count(), 0)
         self.assertEqual(len(self.relay.chats), 1)
-        self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
+        self.assertIn("cannot be recorded yet in this test build", self.relay.chats[0][1])
+        self.assertIn("(the tool's callback is fired)", self.B.log())
         self.assertSameWorld()
 
     def test_a_capture_that_only_lacks_the_model_of_an_edge_object_is_released_and_read_after_the_build(self):
@@ -1569,7 +1630,7 @@ class UncapturableBuildTest(StrictTest):
         self.assertIn("waits for the build", self.B.log())
         self.assertEqual(self.relay.chats, [])
 
-    def test_without_a_fireable_callback_it_is_released_as_before(self):
+    def test_without_a_fireable_callback_it_is_still_refused_never_released(self):
         self.fires_off = True
         self.start()
         self.B.native.fires = False
@@ -1578,18 +1639,23 @@ class UncapturableBuildTest(StrictTest):
         self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'streetBuilder', 'builder.proposalCreate', { 'junk' })")
         self.B.L.execute("TOOL_ADD(%d, true)" % i)
         self.tick(14)
-        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []))
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]))
+        self.assertIn("this module cannot fire the tool's callback", self.B.log(), "said, not hidden")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
 
 
 class ConstructionBlockWithoutFireTest(StrictTest):
     extra_env = {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}
     fires = False
 
-    def test_without_a_fireable_callback_the_build_is_not_cancelled(self):
+    def test_without_a_fireable_callback_the_build_is_still_refused_never_released(self):
+        # the record of a build with constructions cannot be rebuilt in this test mode: a failed self-check, refused (bug 8: fail closed);
+        # it was released before, the build then existed on this game alone
         self.start()
         self.B.tool(ConstructionDefaultTest.DEPOT, make="NATIVE_DEPOT_ON_ROAD")
         self.tick(20)
-        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []), "a cancel would leave the tool dead")
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
 
 
 class FireDoneChoiceTest(StrictTest):

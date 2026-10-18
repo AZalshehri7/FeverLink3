@@ -9,8 +9,10 @@ import unittest
 
 import lupa.lua52 as lupa
 
+import test_lockstep as T
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 VAR = "FEVERLINK3_LUA_SEED_LOG"
 
 
@@ -25,7 +27,7 @@ class SeedProbe(unittest.TestCase):
         os.environ.pop("FEVERLINK3_SESSION_DIR", None)
         os.environ.pop(VAR, None)
         self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.lua.execute(read("feverlink3_common.lua"))
+        self.C = T.load_common(self.lua)
         self.lines = []
         self.log = lambda msg: self.lines.append(msg)
 

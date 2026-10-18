@@ -228,7 +228,7 @@ impl Net {
         self.send(
             c,
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None }),
         );
     }
 
@@ -236,7 +236,7 @@ impl Net {
         self.host_send(MessageKind::Hello, &json(&HelloMessage::new(t)));
         self.host_send(
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None }),
         );
     }
 
@@ -255,7 +255,7 @@ impl Net {
     pub fn stop_all_at(&mut self, t: i64) {
         self.host_send(
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+            &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None }),
         );
         let live: Vec<ConnectionId> = self.reachable.iter().copied().filter(|c| self.peers.contains_key(c)).collect();
         for c in live {
@@ -263,7 +263,16 @@ impl Net {
                 self.send(
                     c,
                     MessageKind::Clock,
-                    &json(&ClockMessage { t, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+                    &json(&ClockMessage {
+                        t,
+                        speed: 0,
+                        ahead: 3,
+                        need: None,
+                        safe: None,
+                        pause: false,
+                        stop: None,
+                        hop: None,
+                    }),
                 );
             }
         }

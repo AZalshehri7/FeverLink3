@@ -14,7 +14,7 @@ or a test) clears it when the game starts, then owns these files:
 |---|---|---|---|
 | `ctl_cmd.log` | the window (the mod's UI script) | the controller | Commands, one per line, append-only. Format below. |
 | `ctl_status.txt` | the controller | the window | The controller's whole state as one Lua table, rewritten whenever something in it changed. |
-| `identity.txt` | the controller | the mod | `session=`, `start=`, `id=`, `name=`, `role=` lines (role last: the mod takes the file only with a complete `role=` line). `role` is `idle` until a session exists, then `host` or `player` with the id the host assigned. The mod becomes active on `host` or `player` without reloading the game, and single-player again on `idle` (held build commands handed back to the engine, the session's queue dropped, stamped commands not yet applied failed, the speed given back). `session` is the id of the controller's link for this session (16 hex digits, new for every `host` or `join`) and `start` the last `to_game.log` sequence before it: the files outlive sessions, and the mod dispatches only lines above `start`. Another `session` id while active is a new session (the old one ends first). |
+| `identity.txt` | the controller | the mod | `session=`, `start=`, `id=`, `name=`, `role=` lines (role last: the mod takes the file only with a complete `role=` line). `role` is `idle` until a session exists, then `host` or `player` with the id the host assigned. The mod becomes active on `host` or `player` without reloading the game, and single-player again on `idle` (held build commands handed back to the engine, the session's queue dropped, stamped commands not yet applied failed, the speed given back). `session` is the id of the controller's link for this session (16 hex digits, new for every `host` or `join`) and `start` where `to_game.log` ended before it (`<gen>:<offset>`, a place in the file): the files outlive sessions, and the mod reads only the lines after `start`. Another `session` id while active is a new session (the old one ends first). |
 | `to_game.log`, `from_game.log` | the controller / the mod | the mod / the controller | The session's file link with the game (`launcher/README.md`, "File link"). Not part of this page. |
 
 The controller reads new commands and rewrites the status about every 100 ms. The window re-reads the status when its
@@ -25,12 +25,12 @@ The controller reads new commands and rewrites the status about every 100 ms. Th
 One command per line, in the file link's line format:
 
 ```
-seq<TAB>kind<TAB>from<TAB>payload<LF>
+kind<TAB>from<TAB>payload<LF>
 ```
 
-- `seq` is a number that only grows within the file. The controller remembers the highest it has seen and ignores
-  anything at or below it, so a rewritten or truncated file never repeats a command. The mod's writer (`C.newWriter`)
-  does this.
+- A line carries no number: the controller reads the file by position (the bytes it consumed), complete lines only, so
+  every command is read once, in the order written. The controller clears the folder at every game start, so it reads
+  the file from its first byte.
 - `kind` is the command name below. A kind the controller does not know is ignored.
 - `from` is ignored.
 - `payload` is one line of **Lua literal syntax**: a table of strings, numbers, booleans and tables, as the mod's
@@ -128,7 +128,7 @@ changed.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `seq` | number | The `seq` of the command line this answers, so a window knows whether the answer is to its latest command. |
+| `n` | number | Which command line this answers, counted from 1 in the order the controller read `ctl_cmd.log`, so a window that counts its lines knows whether the answer is to its latest command. |
 | `kind` | string | `kick` or `permissions`. |
 | `ok` | boolean | The command was accepted. For `kick` that means the request was passed on; the player disappears from `players` when the host has done it. |
 | `message` | string | In words for the host: `Pat was removed`, `the slot of Pat was released`, `permissions sent to everyone`, or why not (`there is no player #9`, `the host cannot be removed`, `only the host can remove a player`, `build: "nobody" is not everyone, hostOnly or {only = ids}`, ...). |
@@ -172,7 +172,7 @@ those entries, they are not at the table.
 
 A session lives in the world of each game. When a player closes the save to the main menu, the mod's script is gone and
 nothing tells the controller, so the controller watches `from_game.log`: the mod appends a `clock` line to it at least
-every 30 frames (about half a second) while its script runs, even when the game is paused. A game that **has spoken in
+every 30 frames and every quarter of a second of real time (whichever comes first) while its script runs, even when the game is paused. A game that **has spoken in
 this session** (at least one new line since the session started) and then falls **silent for 120 seconds** has no world
 any more, and the controller ends the session by itself. The limit is long because the game's **pause menu** (Escape)
 stops every game script while the world is still loaded: with the earlier 8 seconds a player who opened the pause menu
@@ -214,7 +214,7 @@ A host with one player who is away, after the host restricted building:
                   ["spend"]={["only"]={[1]=1}}},
  ["players"]={[1]={["id"]=0,["name"]="Pat",["ready"]=true,["role"]="host",["rtt"]=0,["state"]="connected"},
               [2]={["id"]=1,["name"]="Bob",["ready"]=false,["role"]="player",["state"]="away"}},
- ["result"]={["kind"]="permissions",["message"]="permissions sent to everyone",["ok"]=true,["seq"]=14},
+ ["result"]={["kind"]="permissions",["message"]="permissions sent to everyone",["n"]=14,["ok"]=true},
  ["speed"]=0,["started"]=false,["state"]="hosting",["steam"]={["state"]="not available"},["version"]=21}
 ```
 
@@ -235,4 +235,4 @@ Removing Bob from the window is one line appended to `ctl_cmd.log`:
    plain JSON value (`nil` is dropped), and add the row to the table of the state that has it. Fields that change often
    must be rounded or throttled like `rtt`, or the file is rewritten and the window redrawn at every change.
 3. Keep names lower-case words as the existing ones are. Never remove or rename a field the window reads without
-   changing `mod/feverlink3_1/content/feverlink3_ui.script.lua` in the same change.
+   changing `mod/feverlink3/content/feverlink3_ui.script.lua` in the same change.

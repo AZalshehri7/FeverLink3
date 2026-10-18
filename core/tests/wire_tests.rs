@@ -110,13 +110,17 @@ fn player_left_says_when_the_slot_is_held() {
 
 #[test]
 fn ping_and_pong_are_tiny() {
-    let ping = PingMessage { n: 7, rtt: [(1, 23.4), (3, 150.0)].into_iter().collect() };
+    let ping = PingMessage { n: 7, rtt: [(1, 23.4), (3, 150.0)].into_iter().collect(), off: Default::default() };
     assert_eq!(json!({"n": 7, "rtt": {"1": 23.4, "3": 150.0}}), value(&ping));
     assert_eq!(Some(ping), codec::try_decode(br#"{"n":7,"rtt":{"1":23.4,"3":150.0}}"#));
-    assert_eq!(json!({"n": 7}), value(&PingMessage { n: 7, rtt: Default::default() }), "no table, no key");
-    assert_eq!(json!({"n": 7}), value(&PongMessage { n: 7 }));
+    assert_eq!(
+        json!({"n": 7}),
+        value(&PingMessage { n: 7, rtt: Default::default(), off: Default::default() }),
+        "no table, no key"
+    );
+    assert_eq!(json!({"n": 7}), value(&PongMessage { n: 7, w: None }));
     assert_eq!(None, codec::try_decode::<PongMessage>(b"{}"));
-    assert!(codec::encode(&PongMessage { n: u32::MAX }).len() < 20);
+    assert!(codec::encode(&PongMessage { n: u32::MAX, w: None }).len() < 20);
 }
 
 #[test]

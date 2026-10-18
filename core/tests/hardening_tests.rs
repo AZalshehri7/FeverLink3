@@ -109,7 +109,7 @@ fn clocks_that_are_not_game_times_are_dropped() {
         h.player_game(
             liar,
             MessageKind::Clock,
-            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+            &json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None }),
         );
     }
     assert_eq!(h.host.dropped(), dropped + 7);
@@ -128,6 +128,7 @@ fn clocks_that_are_not_game_times_are_dropped() {
             safe: None,
             pause: false,
             stop: None,
+            hop: None,
         }),
     );
     assert_eq!(h.host.dropped(), dropped + 7);

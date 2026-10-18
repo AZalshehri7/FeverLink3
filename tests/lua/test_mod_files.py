@@ -5,7 +5,7 @@ import os
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MOD = os.path.join(HERE, "..", "..", "mod", "feverlink3_1")
+MOD = os.path.join(HERE, "..", "..", "mod", "feverlink3")
 
 
 class ContentIndexTest(unittest.TestCase):
@@ -43,6 +43,36 @@ class ContentIndexTest(unittest.TestCase):
             with open(os.path.join(content, name), encoding="utf-8") as f:
                 n = peak_locals(f.read(), name)
             self.assertLessEqual(n, caps.get(name, 100), "%s: %d active locals at its peak (game limit 200, minus a few)" % (name, n))
+
+
+class ModDefinitionTest(unittest.TestCase):
+    """mod.json and _metadata as the docs describe them (wiki modding:general:moddefinition; tf3-docs guides/mod-structure.html)."""
+
+    def test_mod_json_has_the_documented_fields_and_no_empty_hooks(self):
+        with open(os.path.join(MOD, "mod.json"), encoding="utf-8") as f:
+            m = json.load(f)
+        self.assertEqual("feverlink3", m["modId"])
+        self.assertIsInstance(m["revision"], int)
+        self.assertIn(m["severityAdd"], ("None", "Warning", "Critical"))
+        # the game script stores its state in the save: removing the mod is not harmless ("None may be used when adding or removing may
+        # not harm the savegame in any way")
+        self.assertEqual("Warning", m["severityRemove"])
+        # the mod runs no mod script (pre/run/postRunScript): the empty hooks and "options" (undocumented) are left out
+        for k in ("preRunScript", "runScript", "postRunScript", "options"):
+            self.assertNotIn(k, m)
+        allowed = {"modId", "revision", "severityAdd", "severityRemove", "dependencies", "incompatibilities", "params", "visible",
+                   "cosmetic", "autoActivate", "url"}
+        self.assertEqual(set(), set(m) - allowed, "fields the docs do not describe")
+
+    def test_the_cover_is_a_1920_by_1080_png_below_8_mb(self):
+        import struct
+        path = os.path.join(MOD, "_metadata", "0.png")
+        with open(path, "rb") as f:
+            head = f.read(24)
+        self.assertEqual(b"\x89PNG\r\n\x1a\n", head[:8])
+        self.assertEqual(b"IHDR", head[12:16])
+        self.assertEqual((1920, 1080), struct.unpack(">II", head[16:24]))
+        self.assertLess(os.path.getsize(path), 8 * 1024 * 1024)
 
 
 def peak_locals(text, name):

@@ -50,7 +50,6 @@ fn ensure(report: &mut Report, ok: bool, what: &str) -> Result<(), String> {
 struct FakeGame {
     dir: PathBuf,
     id: String,
-    next_seq: u64,
     tail: Tail,
     seen: Vec<Line>,
 }
@@ -60,7 +59,6 @@ impl FakeGame {
         FakeGame {
             dir: dir.to_path_buf(),
             id: id.to_owned(),
-            next_seq: 1,
             tail: Tail::new(dir.join(gamelink::TO_GAME)),
             seen: Vec::new(),
         }
@@ -68,8 +66,7 @@ impl FakeGame {
 
     /// Appends one line in the format the mod writes.
     fn write(&mut self, kind: &str, payload: &str) -> io::Result<()> {
-        let line = Line { seq: self.next_seq, kind: kind.into(), from: self.id.clone(), payload: payload.into() };
-        self.next_seq += 1;
+        let line = Line { kind: kind.into(), from: self.id.clone(), payload: payload.into() };
         let mut f = fs::OpenOptions::new().create(true).append(true).open(self.dir.join(gamelink::FROM_GAME))?;
         f.write_all(gamelink::format_line(&line).as_bytes())
     }

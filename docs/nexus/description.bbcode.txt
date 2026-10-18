@@ -68,7 +68,7 @@ Windows SmartScreen may say "Windows protected your PC" the first time, because 
 [*]Start Transport Fever 3 from Steam. When you start a game, open the mod list on the settings page, find FeverLink3 Multiplayer and activate it. The [b]FeverLink3[/b] button appears in the bar at the bottom of the screen.
 [/list]
 
-Without the installer: copy winhttp.dll into the Transport Fever 3 game folder and the folder mod\feverlink3_1 into (your Steam folder)\userdata\(your Steam user id)\3493540\local\mods\ . That is what the installer does for the in-game window (the other two files it writes are not used by the in-game window). This route has not been tested separately; if the button does not appear, use the installer and tell us.
+Without the installer: copy winhttp.dll into the Transport Fever 3 game folder and the folder mod\feverlink3 into (your Steam folder)\userdata\(your Steam user id)\3493540\local\mods\ . That is what the installer does for the in-game window (the other two files it writes are not used by the in-game window). This route has not been tested separately; if the button does not appear, use the installer and tell us.
 
 [size=4][b]Running the connection test[/b][/size]
 

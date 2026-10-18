@@ -200,7 +200,7 @@ pub unsafe fn payload_of(cmd: *const u8) -> Option<usize> {
 /// The flags a build command carries: the members of its Context and the two flags after it, as the engine's own Lua binding
 /// names them (`docs/research/SPIKE_NATIVE_COMMAND.md` 3.1; the offsets are the layout table's in `portable.rs`). They tell the mod
 /// how the tool built the command, so every game rebuilds it with the same flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildFlags {
     pub gather_buildings: bool,
     pub gather_fields: bool,
@@ -209,10 +209,36 @@ pub struct BuildFlags {
     pub extend_proposal_redo_pillars: bool,
     pub ignore_errors: bool,
     pub player_initiated: bool,
+    /// The entries of the Context's `refundableEntities` (the tool's list of what the player built recently: the engine refunds a
+    /// removal of one of them; friend test 2026-10-16, a bulldozing replayed without them gave no money back). `None` when the
+    /// container could not be read whole; the mod then replays without a refund and says so.
+    pub refundable: Option<Vec<RefundEntry>>,
+}
+
+/// One entry of `Context.refundableEntities`, typed in the game's API reference (script-doc `api/type.html`, 19-08-2026) as
+/// `{{Engine.Entity, integer}, {Engine.Revision, integer}}`: a key of an entity and an integer, a value of the entity's revision
+/// (`Engine.Revision.num: {integer, integer, integer}`) and an integer. The 24 bytes of a list node's value match that layout exactly
+/// (friend test 2026-10-16 `native_inject_4.txt`: `w:ffffffff0001819f w:0000000b00000001 w:0000015300000000` = entity 0x1819f, key
+/// integer -1, revision {1, 11, 0}, value integer 0x153). What the two integers mean is not documented (unproven).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefundEntry {
+    pub entity: u32,
+    pub key: i32,
+    pub revision: [i32; 3],
+    pub value: i32,
 }
 
 /// Offsets inside a build command's payload.
 const FLAG_OFFSETS: [usize; 7] = [0x358, 0x359, 0x360, 0x362, 0x3b2, 0x3d1, 0x3d2];
+
+/// The Context's `refundableEntities` in a build command's payload (`portable.rs`: `Ty::Hash(0x28)` at 0x370).
+const REFUNDABLE_OFFSET: usize = 0x370;
+/// The list nodes of `refundableEntities` are 0x28 bytes: next, prev, then the 24-byte entry ([`RefundEntry`]; real texts, e.g. friend
+/// test 2026-10-16 `native_inject_4.txt`: 25 nodes, consecutive ids of two recent builds).
+const REFUNDABLE_NODE: usize = 0x28;
+const REFUNDABLE_VALUE: usize = 0x10;
+/// More entries than this are not a tool's list (real runs: up to 25): the container is taken as unreadable.
+pub const REFUNDABLE_MAX: usize = 4096;
 
 /// Reads the flags out of a build command's payload; `None` when any of it is not readable memory.
 ///
@@ -233,7 +259,48 @@ pub unsafe fn build_flags(payload: usize) -> Option<BuildFlags> {
         extend_proposal_redo_pillars: v[4],
         ignore_errors: v[5],
         player_initiated: v[6],
+        // SAFETY: only readable memory is read.
+        refundable: unsafe { refundable_entities(payload) },
     })
+}
+
+/// The entries of the Context's `refundableEntities` of a build command's payload, in the container's list order. MSVC's
+/// `std::unordered_map`: the list head pointer at +8 and the size at +0x10 (the load factor at +0, the buckets after); the list is
+/// circular through its sentinel. `None` unless exactly `size` readable nodes lead back to the sentinel.
+///
+/// # Safety
+/// `payload` may be any value; only readable memory is read.
+pub unsafe fn refundable_entities(payload: usize) -> Option<Vec<RefundEntry>> {
+    let word = |at: usize| -> Option<usize> {
+        // SAFETY: readable was checked for the pointer-sized word.
+        unsafe { mem::readable(at as *const u8, 8).then(|| *(at as *const usize)) }
+    };
+    let c = payload.checked_add(REFUNDABLE_OFFSET)?;
+    let head = word(c.checked_add(8)?)?;
+    let size = word(c.checked_add(0x10)?)?;
+    if size > REFUNDABLE_MAX || head == 0 {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(size);
+    let mut node = word(head)?;
+    for _ in 0..size {
+        if node == head || node == 0 {
+            return None;
+        }
+        let value = node.checked_add(REFUNDABLE_VALUE)?;
+        // SAFETY: readable was checked for the node's whole block; the entry is six 4-byte words at +0x10.
+        let w = unsafe {
+            mem::readable(node as *const u8, REFUNDABLE_NODE).then(|| (value as *const [u32; 6]).read_unaligned())
+        }?;
+        ids.push(RefundEntry {
+            entity: w[0],
+            key: w[1] as i32,
+            revision: [w[2] as i32, w[3] as i32, w[4] as i32],
+            value: w[5] as i32,
+        });
+        node = word(node)?;
+    }
+    (node == head).then_some(ids)
 }
 
 /// The verdict byte the apply function wrote into the command at `cmd`: true when it ran. `None` when unreadable.
@@ -637,9 +704,86 @@ mod tests {
                 extend_proposal_redo_pillars: false,
                 ignore_errors: false,
                 player_initiated: true,
+                refundable: None,
             }
         );
         assert!(unsafe { build_flags(0) }.is_none(), "unreadable memory gives nothing");
+    }
+
+    /// Writes an MSVC hash container's list into `payload` at the `refundableEntities` offset: a sentinel and one node per id.
+    /// The nodes are returned and must outlive the reads (the vector is not changed after their addresses are taken).
+    fn refund_list(payload: &mut [u8], ids: &[u32]) -> Vec<[u8; REFUNDABLE_NODE]> {
+        let mut nodes = Vec::with_capacity(ids.len() + 1);
+        nodes.push([0u8; REFUNDABLE_NODE]); // the sentinel
+        for &id in ids {
+            // the words of a real entry (friend test 2026-10-16): entity, -1, revision {1, 11, 0}, 0x153
+            let mut n = [0u8; REFUNDABLE_NODE];
+            for (i, w) in [id, u32::MAX, 1, 11, 0, 0x153].iter().enumerate() {
+                let at = REFUNDABLE_VALUE + 4 * i;
+                n[at..at + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            nodes.push(n);
+        }
+        let addr: Vec<usize> = nodes.iter().map(|n| n.as_ptr() as usize).collect();
+        for (i, n) in nodes.iter_mut().enumerate() {
+            let next = addr[(i + 1) % addr.len()];
+            let prev = addr[(i + addr.len() - 1) % addr.len()];
+            n[0..8].copy_from_slice(&next.to_le_bytes());
+            n[8..16].copy_from_slice(&prev.to_le_bytes());
+        }
+        let c = REFUNDABLE_OFFSET;
+        payload[c..c + 4].copy_from_slice(&1.0f32.to_le_bytes());
+        payload[c + 8..c + 16].copy_from_slice(&addr[0].to_le_bytes());
+        payload[c + 0x10..c + 0x18].copy_from_slice(&(ids.len() as u64).to_le_bytes());
+        nodes
+    }
+
+    #[test]
+    fn the_refundable_entities_of_a_build_command_are_read_from_its_context() {
+        let mut c = command(52);
+        let _nodes = refund_list(&mut c.payload[..], &[0x1819f, 0x181cd, 7]);
+        let f = unsafe { build_flags(c.payload.as_ptr() as usize) }.expect("readable");
+        let entry = |entity| RefundEntry { entity, key: -1, revision: [1, 11, 0], value: 0x153 };
+        assert_eq!(
+            f.refundable,
+            Some(vec![entry(0x1819f), entry(0x181cd), entry(7)]),
+            "every entry with its key integer, revision and value integer, in the list's order"
+        );
+
+        let mut empty = command(52);
+        let _none = refund_list(&mut empty.payload[..], &[]);
+        assert_eq!(
+            unsafe { refundable_entities(empty.payload.as_ptr() as usize) },
+            Some(vec![]),
+            "an empty list is read as empty"
+        );
+    }
+
+    #[test]
+    fn a_refundable_list_that_does_not_close_on_its_sentinel_is_not_read() {
+        let mut c = command(52);
+        let _nodes = refund_list(&mut c.payload[..], &[1, 2, 3]);
+        // the size says 4: the walk meets the sentinel early
+        let at = REFUNDABLE_OFFSET + 0x10;
+        c.payload[at..at + 8].copy_from_slice(&4u64.to_le_bytes());
+        assert_eq!(unsafe { refundable_entities(c.payload.as_ptr() as usize) }, None);
+        // the size says 2: the walk does not end at the sentinel
+        c.payload[at..at + 8].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(unsafe { refundable_entities(c.payload.as_ptr() as usize) }, None);
+        // an absurd size, and a null head
+        c.payload[at..at + 8].copy_from_slice(&((REFUNDABLE_MAX + 1) as u64).to_le_bytes());
+        assert_eq!(unsafe { refundable_entities(c.payload.as_ptr() as usize) }, None);
+        let zero = command(52);
+        assert_eq!(
+            unsafe { refundable_entities(zero.payload.as_ptr() as usize) },
+            None,
+            "a container that was never made"
+        );
+        assert_eq!(
+            unsafe { build_flags(zero.payload.as_ptr() as usize) }.map(|f| f.refundable),
+            Some(None),
+            "the flags are still read"
+        );
     }
 
     struct Call {

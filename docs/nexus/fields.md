@@ -48,7 +48,7 @@ FeverLink3 0.2.0-test1: testing installer (feverlink3.exe), winhttp.dll and the 
 
 (185 characters.)
 
-**Owner decision, 2026-10-10:** the end state is the mod offered in the game's Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now, and the installer kept for testing. When the packaging changes, upload two files instead of this one: the mod (the `mod/feverlink3_1` folder, as a zip) as the main file, and the native module (`winhttp.dll` with a short text on where it goes and the hash) as a second file, and rewrite the Installation section of the description to match. Do not announce the Mod Hub listing before the Hub has accepted the mod (`docs/WORKSHOP.md`).
+**Owner decision, 2026-10-10:** the end state is the mod offered in the game's Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now, and the installer kept for testing. When the packaging changes, upload two files instead of this one: the mod (the `mod/feverlink3` folder, as a zip) as the main file, and the native module (`winhttp.dll` with a short text on where it goes and the hash) as a second file, and rewrite the Installation section of the description to match. Do not announce the Mod Hub listing before the Hub has accepted the mod (`docs/WORKSHOP.md`).
 
 ## Requirements tab
 

@@ -118,6 +118,7 @@ fn a_clock_goes_to_every_other_game_and_the_host_keeps_all_eight() {
                     safe: None,
                     pause: false,
                     stop: None,
+                    hop: None,
                 }),
             );
         }
@@ -283,7 +284,7 @@ fn players_cannot_send_what_only_the_host_may_say() {
     let b = n.connect("Bob");
     let before = n.host.dropped();
     n.send(a, MessageKind::Kicked, &json(&RejectMessage::new("kicked", Some("by Alice"))));
-    n.send(a, MessageKind::Ping, &json(&PingMessage { n: 1, rtt: Default::default() }));
+    n.send(a, MessageKind::Ping, &json(&PingMessage { n: 1, rtt: Default::default(), off: Default::default() }));
     assert_eq!(before + 2, n.host.dropped());
     assert!(n.peer(b).rejected.is_none());
     assert_eq!(PlayerState::Joined, n.peer(b).session.state());

@@ -7,7 +7,9 @@
 --   u8:xx u32:xxxxxxxx i32:xxxxxxxx f32:xxxxxxxx   hex bit patterns -> numbers (i32 signed, f32 decoded from its bits)
 --   v3:a,b,c  m4:16 words                           f32 bit patterns -> {x,y,z} / an array of 16 numbers
 --   ent:new#N                                       -> { new = N }       an entity the proposal creates (placeholder -N)
---   ent:old#ID[@bx,by,bz]                           -> { old = ID, pos = {x,y,z} }   an existing entity (pos when the proposal locates it)
+--   ent:old#ID[@bx,by,bz]                           -> { old = ID, pos = {x,y,z} }   an existing entity (pos: the position of the element
+--                                                      that names it, e.g. a segment's end; the proposal's geometry, which need not be
+--                                                      where the entity is: a segment may end away from its node)
 --   str:"..." res:"..."                             -> a string (\" \\ \xNN escapes undone)
 --   n:K                                             -> K
 --   hash:... map:... raw:...                        -> not data of the input: skipped
@@ -173,7 +175,7 @@ function M.countsText(c)
 end
 
 -- ---- the existing entities a text names (the receiver checks them before the injection)
--- The text names an existing entity by its id (`ent:old#ID`, with the node's position where the proposal locates it). The engine takes
+-- The text names an existing entity by its id (`ent:old#ID`, with the position of the element that names it). The engine takes
 -- the id as it is: on a game whose ids differ (a fork) the id is another entity, and the engine asserts on a component it lacks (real
 -- run 2026-10-14, rail-crash: a track's start node 50395 was an edge on the forked host, `it != components.end()`, BaseNode, the game
 -- stopped). What kind each member names (by its path, element indices left out); a member not listed is not checked (frozenNodes hold

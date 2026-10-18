@@ -49,7 +49,7 @@ pub(super) fn base_facts() -> Facts {
         build: BuildCheck::Known { name: "40420" },
         game_running: false,
         exe_path: PathBuf::from(r"C:\FeverLink3-0.1.0\feverlink3.exe"),
-        payload_mod: Some(PathBuf::from(r"C:\FeverLink3-0.1.0\mod\feverlink3_1")),
+        payload_mod: Some(PathBuf::from(r"C:\FeverLink3-0.1.0\mod\feverlink3")),
         payload_dll: Some(PathBuf::from(r"C:\FeverLink3-0.1.0\winhttp.dll")),
         plan: None,
         installed_version: None,

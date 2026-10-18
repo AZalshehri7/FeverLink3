@@ -592,7 +592,7 @@ mod tests {
     }
 
     const FILES: &[(&str, &[u8])] =
-        &[("feverlink3.exe", b"new exe"), ("mod/feverlink3_1/mod.json", b"{}"), ("winhttp.dll", b"dll")];
+        &[("feverlink3.exe", b"new exe"), ("mod/feverlink3/mod.json", b"{}"), ("winhttp.dll", b"dll")];
 
     fn good_zip() -> (Vec<u8>, Manifest) {
         let entries: Vec<(String, &[u8])> = FILES.iter().map(|(p, d)| (format!("FeverLink3-1.2.0/{p}"), *d)).collect();
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn path_rules_including_zip_slip() {
-        for ok in ["feverlink3.exe", "mod/feverlink3_1/mod.json"] {
+        for ok in ["feverlink3.exe", "mod/feverlink3/mod.json"] {
             assert!(safe_rel_path(ok).is_ok(), "{ok}");
         }
         for bad in [
@@ -739,7 +739,7 @@ mod tests {
         let (zip, m) = good_zip();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("install");
-        fs::create_dir_all(dir.join("mod/feverlink3_1")).unwrap();
+        fs::create_dir_all(dir.join("mod/feverlink3")).unwrap();
         fs::write(dir.join("feverlink3.exe"), b"old exe").unwrap();
         fs::write(dir.join("settings.json"), b"keep me").unwrap();
         fs::write(tmp.path().join("outside.txt"), b"untouched").unwrap();
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(fs::read(dir.join("feverlink3.exe")).unwrap(), b"new exe");
         assert_eq!(fs::read(dir.join("feverlink3.exe.old")).unwrap(), b"old exe");
         assert_eq!(fs::read(dir.join("winhttp.dll")).unwrap(), b"dll");
-        assert_eq!(fs::read(dir.join("mod/feverlink3_1/mod.json")).unwrap(), b"{}");
+        assert_eq!(fs::read(dir.join("mod/feverlink3/mod.json")).unwrap(), b"{}");
         assert_eq!(fs::read(dir.join("settings.json")).unwrap(), b"keep me");
         assert_eq!(fs::read(tmp.path().join("outside.txt")).unwrap(), b"untouched");
         assert!(!dir.join(STAGING_DIR).exists());

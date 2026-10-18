@@ -13,7 +13,7 @@ sys.path.insert(0, HERE)
 import test_lockstep as T  # noqa: E402  (only for the lupa import)
 
 lupa = T.lupa
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 
 
 def read(name):

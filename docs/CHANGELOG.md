@@ -7,6 +7,34 @@ title: FeverLink3 changelog
 All notable changes of each release. FeverLink3 is an unfinished test project: read the status in the README before using it.
 Only changes that matter to a player or tester are listed here.
 
+## 0.2.0-pre3
+
+Fixes from the first internet test with a friend and an airport test on one PC (0.2.0-pre2), plus work on stalls and the checksum. **Not yet played by a person:** tested only in two game windows on one PC (scripted builds, real-tool builds, fast and interleaved builds, builds during a pause, forced repair syncs followed by buying and building). The newest changes (line waypoints, the builder's own check before shipping, unusual tools during a pause) ran only in the automatic tests. Not tested over the internet.
+
+### Fixed
+- Line edits no longer start a repair sync: an edit that cannot be shared is refused on every game with a chat message, never applied on one game only. Lines with waypoints are shared too.
+- A repair sync is no longer reported as failed while it worked, and buying vehicles and editing lines keep working after a repair sync (before, every window action timed out until a restart).
+- Builds made right after a repair sync are no longer applied late on the other game.
+- A build that the builder's own check finds unsafe is refused on every game instead of being built on one game only. The builder now also rebuilds its own build through the game's engine before sending it.
+- A build whose ground the town changed before its turn (for example a town building replaced) is refused on every game alike, without a repair sync.
+- Airports with Configure items, runways and stations over town buildings: the copy no longer refuses them on one game only.
+- Bulldozing a station built beside a road works again.
+- The game no longer stalls every few seconds for the checksum: it is now spread over many short steps (each a few milliseconds on one PC) instead of one long pause about once a minute.
+- Fewer and shorter stand-stills while waiting for the other player: the company page and other periodic work no longer block a frame, and the waiting time adapts to the measured connection.
+- Cloning several vehicles is sent as one action. Whether this removes the freeze of 0.2.0-pre2 is not proven yet.
+- Bulldozing a fresh build carries the game's refund list to every game. Whether both games get the money back is not proven yet.
+- Building with an unusual tool during a pause is applied in the pause on every game.
+
+### Changed
+- The mod's folder is now `mods\release\feverlink3` (was `feverlink3_1`). **Delete the old `feverlink3_1` folder** when you update, or the game loads two copies.
+- The mod follows the official Transport Fever 3 modding documentation for every game API call it makes.
+- A build appears on both games about 0.4 to 1.6 seconds after the click at 3x speed (median about 0.7 s, on one PC).
+
+### Known gaps
+- Not yet played by a person, and not tested over the internet.
+- Unproven in the game: the clone freeze, refund amounts, editing a line that has vehicles, lines with waypoints, the builder's engine check on big stations (it may add up to about a second to the click), unusual tools during a pause.
+- The gaps listed for the earlier versions below still apply where not fixed above.
+
 ## 0.2.0-pre2
 
 A stability release from a full review of the code. **Not yet played by a person:** tested only in two game windows on one PC with scripted clicks (about 45 scripted builds and actions, 10 real-tool builds of every kind, fast builds, both players building a few seconds apart, and builds during a pause). Not tested over the internet.

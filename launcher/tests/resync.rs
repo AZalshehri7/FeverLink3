@@ -19,7 +19,6 @@ struct FakeGame {
     dir: PathBuf,
     save_dir: PathBuf,
     is_host: bool,
-    next_seq: u64,
     tail: Tail,
     seen: Vec<Line>,
     handled: usize,
@@ -34,7 +33,6 @@ impl FakeGame {
             dir: dir.to_path_buf(),
             save_dir: save_dir.to_path_buf(),
             is_host,
-            next_seq: 1,
             tail: Tail::new(dir.join(gamelink::TO_GAME)),
             seen: Vec::new(),
             handled: 0,
@@ -44,8 +42,7 @@ impl FakeGame {
     }
 
     fn write(&mut self, kind: &str, payload: &str) {
-        let line = Line { seq: self.next_seq, kind: kind.into(), from: "0".into(), payload: payload.into() };
-        self.next_seq += 1;
+        let line = Line { kind: kind.into(), from: "0".into(), payload: payload.into() };
         let mut f = OpenOptions::new().create(true).append(true).open(self.dir.join(gamelink::FROM_GAME)).unwrap();
         f.write_all(gamelink::format_line(&line).as_bytes()).unwrap();
     }

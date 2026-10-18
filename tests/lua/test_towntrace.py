@@ -13,7 +13,7 @@ sys.path.insert(0, HERE)
 import test_lockstep as T  # noqa: E402  (only for the lupa import)
 
 lupa = T.lupa
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 
 
 def read(name):
@@ -219,7 +219,7 @@ class TraceTest(unittest.TestCase):
           }
           API = { type = { ComponentType = CT },
                   engine = { getComponent = function(e, t) return comps[e] and comps[e][t] end,
-                             util = { getTownEmissionDB = function(e) return 55 end } } }
+                             util = { town = { getTownEmissionDB = function(e) return 55 end } } } }
           A = TT.apiAccessors(API, function(name) if name == 'TOWN_BUILDING' then return { 10 } end return {} end)
           t = TT.new({ spec = '7', acc = A, hash = hash, clock = function() return NOW end, write = function(x) WRITES[#WRITES + 1] = x return true end })
           t.step(1); t.flush(true)
@@ -229,7 +229,7 @@ class TraceTest(unittest.TestCase):
         self.assertIn("+ res/x.mdl@1.2,2.5,3.0 L=3 D=2 P=3 T=42", out)
         info = [l for l in out if " info " in l][0]
         self.assertIn("dev=1", info)
-        self.assertIn("emis=55", info)
+        self.assertIn("emis=55", info, "read through api.engine.util.town.getTownEmissionDB, where the API has it")
         self.assertNotIn("10", "".join(l for l in out if l.startswith("+ ")), "no entity id in a building line")
 
 
@@ -423,14 +423,20 @@ class CmdTraceTest(unittest.TestCase):
     def test_the_api_accessors_for_the_inputs(self):
         self.lua.execute(r"""
           CT = { TOWN_BUILDING = 1, CONSTRUCTION = 2, TOWN = 3, GAME_TIME = 4 }
-          API = { type = { ComponentType = CT },
+          LUS = {}
+          API = { type = { ComponentType = CT, enum = { LandUseType = { RESIDENTIAL = 5, COMMERCIAL = 6, INDUSTRIAL = 7 } } },
                   engine = { getComponent = function(e, t) if t == CT.GAME_TIME then return { updateCount = 77 } end end,
                              util = { getWorld = function() return 1 end, town = { getTownLineUsage = function(e) return 0.5 end } },
                              forEachEntityWithComponent = function(fn, t) for _, e in ipairs({ 9, 3, 5 }) do fn(e) end end,
-                             system = { townBuildingSystem = { getCargoSupplyAndLimit = function(e, lu) return { [12] = { 1, 2 }, [3] = { 0.5, 1 } } end } } },
+                             system = { townBuildingSystem = { getCargoSupplyAndLimit = function(e, lu) LUS[#LUS + 1] = lu return { [12] = { 1, 2 }, [3] = { 0.5, 1 } } end } } },
                   res = { cargoTypeRep = { getAll = function() return { [4] = 'x' } end } } }
           A = TT.apiAccessors(API, function() return {} end)
         """)
+        self.assertEqual(3, self.lua.eval("#A.supplyDemand(1)"))
+        self.assertEqual("5,6,7", self.lua.eval("table.concat(LUS, ',')"), "the land uses are the enum's values, in its order")
+        self.lua.execute("API.type.enum.LandUseType.COMMERCIAL = nil")
+        self.assertFalse(self.lua.eval("(pcall(A.supplyDemand, 1))"), "a missing land use raises, it is not guessed")
+        self.lua.execute("API.type.enum.LandUseType.COMMERCIAL = 6")
         self.assertEqual(77, self.lua.eval("A.updateCount()"))
         self.assertEqual(0.5, self.lua.eval("A.lineUsage(1)"))
         self.assertEqual("1.5/3", self.lua.eval("(function() local s = A.supplyDemand(1)[2] return s[1] .. '/' .. s[2] end)()"))

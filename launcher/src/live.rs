@@ -135,10 +135,11 @@ struct LoopCheck {
     checks: Vec<steam_transport::Check>,
 }
 
-/// How the last command that can fail ended; the window shows `message` and tells its own command by `seq`.
+/// How the last command that can fail ended; the window shows `message`. `n` is the command line it answers, counted
+/// from 1 in the order the controller read `ctl_cmd.log` (the lines carry no number of their own).
 #[derive(Debug, Clone)]
 struct CommandResult {
-    seq: u64,
+    n: u64,
     kind: String,
     ok: bool,
     message: String,
@@ -272,6 +273,8 @@ pub struct Controller {
     save_dirs: Vec<PathBuf>,
     host_options: HostOptions,
     commands: Tail,
+    /// Command lines read from `ctl_cmd.log` so far (the `n` of a [`CommandResult`]).
+    commands_read: u64,
     state: State,
     steam: Option<steamnet::Probe>,
     /// The Steam core to use instead of the process's (the tests give it a fake Steam).
@@ -347,18 +350,20 @@ impl Controller {
             host_options: HostOptions {
                 host_reloads: !std::env::var("FEVERLINK3_HOST_RELOAD").is_ok_and(|v| v.trim() == "0"),
                 host_loads_early: !std::env::var("FEVERLINK3_HOST_LOAD_EARLY").is_ok_and(|v| v.trim() == "0"),
-                // FEVERLINK3_FULL_CHECKSUM_EVERY=<n> (default 6, 1 = every round is a full check)
+                // FEVERLINK3_FULL_CHECKSUM_EVERY=<n> (default 1: every round is a full check, spread over the steps; n > 1 gives
+                // the lab the old split back, a full round every nth time and light ones between)
                 full_checksum_every: std::env::var("FEVERLINK3_FULL_CHECKSUM_EVERY")
                     .ok()
                     .and_then(|v| v.trim().parse::<u32>().ok())
                     .filter(|v| *v >= 1)
-                    .unwrap_or(6),
+                    .unwrap_or(HostOptions::default().full_checksum_every),
                 // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
                 // resync is requested", but none is started by itself; only the window's Sync button starts one.
                 auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),
                 ..HostOptions::default()
             },
             commands,
+            commands_read: 0,
             state: State::Idle,
             steam: core.clone().map(steamnet::Probe::on).or_else(steamnet::Probe::load),
             core,
@@ -420,7 +425,8 @@ impl Controller {
             let params = luatext::lua_to_json(&line.payload)
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                 .unwrap_or(Value::Null);
-            self.command(line.seq, &line.kind, &params);
+            self.commands_read += 1;
+            self.command(self.commands_read, &line.kind, &params);
         }
         self.advance();
         self.watch_game();
@@ -508,18 +514,18 @@ impl Controller {
         self.state = State::Failed(format!("internal error: {why}"));
     }
 
-    fn command(&mut self, seq: u64, kind: &str, params: &Value) {
+    fn command(&mut self, n: u64, kind: &str, params: &Value) {
         match kind {
             "host" => self.host(params),
             "join" => self.join(params),
             "leave" => self.leave(),
             "kick" => {
                 let outcome = self.kick(params);
-                self.note(seq, kind, outcome);
+                self.note(n, kind, outcome);
             }
             "permissions" => {
                 let outcome = self.set_permissions(params);
-                self.note(seq, kind, outcome);
+                self.note(n, kind, outcome);
             }
             "copy" => {
                 // the game's text fields cannot copy, so the host's join code goes to the clipboard from here
@@ -533,7 +539,7 @@ impl Controller {
                     }
                     _ => Err("there is no join code to copy".to_owned()),
                 };
-                self.note(seq, kind, outcome);
+                self.note(n, kind, outcome);
             }
             "steamtest" => {
                 let text = params.get("id").and_then(Value::as_str).unwrap_or("").trim();
@@ -605,12 +611,12 @@ impl Controller {
     }
 
     /// Records how a command that can be refused ended, for the status.
-    fn note(&mut self, seq: u64, kind: &str, outcome: Result<String, String>) {
+    fn note(&mut self, n: u64, kind: &str, outcome: Result<String, String>) {
         let (ok, message) = match outcome {
             Ok(message) => (true, message),
             Err(message) => (false, message),
         };
-        self.result = Some(CommandResult { seq, kind: kind.to_owned(), ok, message });
+        self.result = Some(CommandResult { n, kind: kind.to_owned(), ok, message });
     }
 
     /// `kick {id}`: removes a player, or releases the slot held for one that dropped.
@@ -967,7 +973,7 @@ impl Controller {
             }
         }
         if let Some(r) = &self.result {
-            v["result"] = json!({ "seq": r.seq, "kind": r.kind, "ok": r.ok, "message": r.message });
+            v["result"] = json!({ "n": r.n, "kind": r.kind, "ok": r.ok, "message": r.message });
         }
         if let Some(notice) = &self.notice {
             v["notice"] = json!(notice);
@@ -1282,7 +1288,7 @@ mod tests {
             Window { dir: dir.to_path_buf(), seq: 1 }
         }
         fn send(&mut self, kind: &str, payload: &str) {
-            let line = Line { seq: self.seq, kind: kind.into(), from: "0".into(), payload: payload.into() };
+            let line = Line { kind: kind.into(), from: "0".into(), payload: payload.into() };
             self.seq += 1;
             let mut f = OpenOptions::new().create(true).append(true).open(self.dir.join(CMD_FILE)).unwrap();
             f.write_all(gamelink::format_line(&line).as_bytes()).unwrap();
@@ -1310,7 +1316,7 @@ mod tests {
     #[test]
     fn a_new_controller_is_idle_and_clears_the_folder() {
         let t = tempfile::tempdir().unwrap();
-        fs::write(t.path().join("to_game.log"), "1\tsession\t0\t{}\n").unwrap();
+        fs::write(t.path().join("to_game.log"), "session\t0\t{}\n").unwrap();
         let c = Controller::new(t.path().to_path_buf(), "Pat".into(), Vec::new()).unwrap();
         assert_eq!(c.state_name(), "idle");
         assert!(!t.path().join("to_game.log").exists());
@@ -1522,7 +1528,7 @@ mod tests {
         // nothing to copy before hosting
         w.send("copy", "{}");
         let seq = w.seq - 1;
-        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["n"] == seq));
         assert_eq!(w.status()["result"]["ok"], false);
         assert!(copied.lock().unwrap().is_empty());
 
@@ -1531,7 +1537,7 @@ mod tests {
         let code = w.status()["code"].as_str().unwrap().to_owned();
         w.send("copy", "{}");
         let seq = w.seq - 1;
-        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["n"] == seq));
         let r = w.status()["result"].clone();
         assert_eq!((r["ok"].clone(), r["kind"].clone()), (json!(true), json!("copy")));
         assert_eq!(*copied.lock().unwrap(), vec![code]);
@@ -1547,7 +1553,7 @@ mod tests {
         assert!(until(&mut [&mut c], Duration::from_secs(10), || w.status()["state"] == "hosting"));
         w.send("copy", "{}");
         let seq = w.seq - 1;
-        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+        assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["n"] == seq));
         let r = w.status()["result"].clone();
         assert_eq!(r["ok"], false);
         assert!(r["message"].as_str().unwrap().contains("clipboard"), "{r}");
@@ -1698,9 +1704,7 @@ mod tests {
         {
             hw.send("kick", payload);
             let seq = hw.seq - 1;
-            assert!(
-                until(&mut [&mut host, &mut player], Duration::from_secs(5), || hw.status()["result"]["seq"] == seq)
-            );
+            assert!(until(&mut [&mut host, &mut player], Duration::from_secs(5), || hw.status()["result"]["n"] == seq));
             let r = hw.status()["result"].clone();
             assert_eq!((r["ok"].clone(), r["kind"].clone()), (json!(false), json!("kick")));
             assert!(r["message"].as_str().unwrap().contains(wanted), "{r}");
@@ -1714,7 +1718,7 @@ mod tests {
             hw.status()["players"].as_array().is_some_and(|p| p.len() == 1) && pw.status()["state"] == "failed"
         }));
         let r = hw.status()["result"].clone();
-        assert_eq!((r["ok"].clone(), r["seq"].clone()), (json!(true), json!(seq)));
+        assert_eq!((r["ok"].clone(), r["n"].clone()), (json!(true), json!(seq)));
         assert!(r["message"].as_str().unwrap().contains("Pat was removed"), "{r}");
         assert!(pw.status()["message"].as_str().unwrap().contains("removed you"), "{:?}", pw.status());
         assert_eq!(pw.status()["notice"], "The host removed you from the session");
@@ -1734,7 +1738,7 @@ mod tests {
         for (kind, payload) in [("kick", "{[\"id\"]=1}"), ("permissions", "{[\"build\"]=\"hostOnly\"}")] {
             w.send(kind, payload);
             let seq = w.seq - 1;
-            assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["seq"] == seq));
+            assert!(until(&mut [&mut c], Duration::from_secs(5), || w.status()["result"]["n"] == seq));
             let r = w.status()["result"].clone();
             assert_eq!((r["ok"].clone(), r["kind"].clone()), (json!(false), json!(kind)));
             assert!(r["message"].as_str().unwrap().contains("only the host"), "{r}");
@@ -1775,7 +1779,7 @@ mod tests {
             &pw.status()["permissions"]["other"]
         )));
         let told = fs::read_to_string(root.path().join("player").join("to_game.log")).unwrap();
-        let last = told.lines().rev().find(|l| l.contains("\tpermissions\t")).expect("a permissions line");
+        let last = told.lines().rev().find(|l| l.starts_with("permissions\t")).expect("a permissions line");
         for (key, allowed) in [("build", false), ("bulldoze", false), ("spend", true), ("other", false)] {
             assert!(last.contains(&format!("[\"{key}\"]={allowed}")), "{key}: {last}");
         }
@@ -1788,9 +1792,7 @@ mod tests {
         ] {
             hw.send("permissions", payload);
             let seq = hw.seq - 1;
-            assert!(
-                until(&mut [&mut host, &mut player], Duration::from_secs(5), || hw.status()["result"]["seq"] == seq)
-            );
+            assert!(until(&mut [&mut host, &mut player], Duration::from_secs(5), || hw.status()["result"]["n"] == seq));
             let r = hw.status()["result"].clone();
             assert_eq!(r["ok"], false);
             assert!(r["message"].as_str().unwrap().contains(wanted), "{r}");
@@ -1855,7 +1857,6 @@ mod tests {
         save_dir: PathBuf,
         is_host: bool,
         open: bool,
-        seq: u64,
         to_game: Tail,
         /// The host's game takes a save request and never answers it: the round stays in `Saving`.
         hold_saves: bool,
@@ -1876,7 +1877,6 @@ mod tests {
                 save_dir: dir.join("save"),
                 is_host,
                 open: true,
-                seq: 1,
                 to_game: Tail::new(dir.join(gamelink::TO_GAME)),
                 hold_saves: false,
                 held_save: None,
@@ -1889,8 +1889,7 @@ mod tests {
         }
 
         fn say(&mut self, kind: &str, payload: &str) {
-            let line = Line { seq: self.seq, kind: kind.into(), from: "0".into(), payload: payload.into() };
-            self.seq += 1;
+            let line = Line { kind: kind.into(), from: "0".into(), payload: payload.into() };
             let mut f = OpenOptions::new().create(true).append(true).open(self.dir.join(gamelink::FROM_GAME)).unwrap();
             f.write_all(gamelink::format_line(&line).as_bytes()).unwrap();
         }
@@ -2233,19 +2232,19 @@ mod tests {
             f.write_all(text.as_bytes()).unwrap();
         };
         // lines of an earlier session are the baseline, not a sign of life
-        append("1\tclock\t0\t{}\n");
+        append("clock\t0\t{}\n");
         let t0 = Instant::now();
         let mut pulse = Pulse::start(log.clone(), t0);
         assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(3600)), "no verdict before the first line");
 
-        append("2\tclock\t0\t{}\n");
+        append("clock\t0\t{}\n");
         assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(100)), "a line just came");
         assert!(!pulse.silent(limit, false, t0 + Duration::from_secs(107)));
         assert!(pulse.silent(limit, false, t0 + Duration::from_secs(108)), "eight seconds without a line");
 
         // a reload (a round) excuses the silence, however long it is within the grace, and the count starts again after
         let mut pulse = Pulse::start(log.clone(), t0);
-        append("3\tclock\t0\t{}\n");
+        append("clock\t0\t{}\n");
         assert!(!pulse.silent(limit, false, t0));
         assert!(!pulse.silent(limit, true, t0 + Duration::from_secs(60)));
         assert!(!pulse.silent(limit, true, t0 + Duration::from_secs(200)));
@@ -2254,7 +2253,7 @@ mod tests {
 
         // a round that never ends does not keep a closed world alive for ever
         let mut pulse = Pulse::start(log.clone(), t0);
-        append("4\tclock\t0\t{}\n");
+        append("clock\t0\t{}\n");
         assert!(!pulse.silent(limit, true, t0));
         assert!(!pulse.silent(limit, true, t0 + RELOAD_GRACE - Duration::from_secs(1)));
         assert!(pulse.silent(limit, true, t0 + RELOAD_GRACE + limit));

@@ -1,6 +1,6 @@
 # Companies: several players, one economy or several
 
-Status: research, design and the parts that need no unknown engine behaviour. The findings in section 1 come from reading the game's own scripts and MPFever's code; nothing here has been run in the real game. The shared-company layer (registry, attribution, ledger, limits, payments, the window's data) is implemented in `mod/feverlink3_1/content/feverlink3_cmds_company.lua` and tested against a mocked engine in `tests/lua/test_cmds_company.py`. Everything that depends on an engine call nobody has made yet sits behind an adapter (section 4) and is listed in section 8 with the experiment that settles it. Section 6 is the contract for the in-game window; section 9 lists what the owner has to decide.
+Status: research, design and the parts that need no unknown engine behaviour. The findings in section 1 come from reading the game's own scripts and MPFever's code; nothing here has been run in the real game. The shared-company layer (registry, attribution, ledger, limits, payments, the window's data) is implemented in `mod/feverlink3/content/feverlink3_cmds_company.lua` and tested against a mocked engine in `tests/lua/test_cmds_company.py`. Everything that depends on an engine call nobody has made yet sits behind an adapter (section 4) and is listed in section 8 with the experiment that settles it. Section 6 is the contract for the in-game window; section 9 lists what the owner has to decide.
 
 ## 1. Findings: what Transport Fever 3 offers
 
@@ -202,9 +202,9 @@ The engine calls the company code makes, all in `Co.extendEngine`, all added to 
 
 | File | Role |
 |---|---|
-| `mod/feverlink3_1/content/feverlink3_cmds_company.lua` | The module: `commands` (registered in `L.COMMANDS`), `events` (`Companies` / `applyLevel`) and `company` (`Co`, the functions the bridge calls). Pure Lua except `Co.extendEngine`. |
-| `mod/feverlink3_1/content/feverlink3_lockstep.lua` | `spec.virtual` and `spec.apply` documented; `decodeCommand` honours `ctx.refuse`. |
-| `mod/feverlink3_1/content/feverlink3_bridge.script.lua` | Hunks marked `companies`: the context of an action, the guarded calls around the engine command, the registry in the state and its mirror, the replay of pause-time actions, the pre-check, the factory of mod-level actions, `companies.txt`, the window records, the local-company switch. |
+| `mod/feverlink3/content/feverlink3_cmds_company.lua` | The module: `commands` (registered in `L.COMMANDS`), `events` (`Companies` / `applyLevel`) and `company` (`Co`, the functions the bridge calls). Pure Lua except `Co.extendEngine`. |
+| `mod/feverlink3/content/feverlink3_lockstep.lua` | `spec.virtual` and `spec.apply` documented; `decodeCommand` honours `ctx.refuse`. |
+| `mod/feverlink3/content/feverlink3_bridge.script.lua` | Hunks marked `companies`: the context of an action, the guarded calls around the engine command, the registry in the state and its mirror, the replay of pause-time actions, the pre-check, the factory of mod-level actions, `companies.txt`, the window records, the local-company switch. |
 | `tests/lua/test_cmds_company.py` | 25 unit tests of the module and 29 tests of two mocked games (more than one player entity, per-player accounts, ownership, pauses, reloads, forged actions, events, the operations module's commands, faults in the company layer). They also pass on Lua 5.3, 5.4 and LuaJIT 2.1 (run by hand with lupa's other runtimes; CI runs the harness' 5.2). |
 
 ## 6. The window

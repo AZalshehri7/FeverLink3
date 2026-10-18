@@ -57,8 +57,8 @@ impl Problem {
                 .to_owned(),
             Problem::PackageIncomplete { mod_missing, dll_missing } => {
                 let missing = match (mod_missing, dll_missing) {
-                    (true, true) => "the mod folder (mod\\feverlink3_1) and winhttp.dll are",
-                    (true, false) => "the mod folder (mod\\feverlink3_1) is",
+                    (true, true) => "the mod folder (mod\\feverlink3) and winhttp.dll are",
+                    (true, false) => "the mod folder (mod\\feverlink3) is",
                     _ => "winhttp.dll is",
                 };
                 format!(
@@ -278,7 +278,7 @@ mod tests {
             ),
             (
                 Problem::PackageIncomplete { mod_missing: true, dll_missing: false },
-                &["mod folder (mod\\feverlink3_1) is missing"],
+                &["mod folder (mod\\feverlink3) is missing"],
             ),
             (Problem::PackageIncomplete { mod_missing: false, dll_missing: true }, &["winhttp.dll is missing"]),
             (Problem::PackageDamaged, &["not FeverLink3's native module", "Download the zip file again"]),
@@ -417,7 +417,7 @@ mod tests {
         let r = report(vec![
             step_at(
                 Item::Mod,
-                r"C:\Steam\mods\feverlink3_1",
+                r"C:\Steam\mods\feverlink3",
                 Outcome::Failed,
                 "installed: Access is denied. (os error 5)",
             ),

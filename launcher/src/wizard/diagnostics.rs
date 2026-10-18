@@ -336,7 +336,7 @@ mod tests {
             "winhttp.dll:     absent",
             "steam_appid.txt: absent",
             "launcher path:   not recorded (feverlink3_path.txt absent)",
-            r"payload mod:     C:\FeverLink3-0.1.0\mod\feverlink3_1",
+            r"payload mod:     C:\FeverLink3-0.1.0\mod\feverlink3",
             r"payload dll:     C:\FeverLink3-0.1.0\winhttp.dll",
             "game running:    no",
         ]
@@ -482,7 +482,7 @@ mod tests {
     fn the_user_name_never_reaches_the_diagnostics() {
         let mut f = installed_facts();
         f.exe_path = PathBuf::from(r"C:\Users\Zara Quill\Downloads\FeverLink3-0.1.0\feverlink3.exe");
-        f.payload_mod = Some(PathBuf::from(r"c:\users\zara quill\downloads\feverlink3-0.1.0\mod\feverlink3_1"));
+        f.payload_mod = Some(PathBuf::from(r"c:\users\zara quill\downloads\feverlink3-0.1.0\mod\feverlink3"));
         f.libraries = vec![PathBuf::from(r"C:\Users\ZARAQU~1\steam")];
         let log = LogTail::Lines(vec![r"opened C:\Users\Zara Quill\AppData\Local\FeverLink3 as Zara Quill".into()]);
         let names = vec!["Zara Quill".to_owned()];

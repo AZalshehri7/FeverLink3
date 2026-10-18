@@ -83,7 +83,7 @@ fn pausing_waits_for_every_ready_game_to_stop_and_ignores_unready_ones() {
     h.host_call(|host| host.start_resync("t"));
     let pause_at = h.host.state().pause_at.unwrap();
     let c = |t: i64, speed: i32| {
-        json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None })
+        json(&ClockMessage { t, speed, ahead: 3, need: None, safe: None, pause: false, stop: None, hop: None })
     };
     h.host_game(MessageKind::Clock, &c(pause_at, 0));
     h.player_game(ids[0], MessageKind::Clock, &c(pause_at, 0));
@@ -340,6 +340,89 @@ fn a_verification_that_stays_at_different_sim_times_fails_after_four_skewed_roun
     assert_eq!(Some(pause_at), h.host.state().pause_at);
 }
 
+/// A verify round in which the player's game could not hash `companies` yet (it verified right after its load, before its
+/// registry was read back): the friend test of 2026-10-16 failed five repairs this way with "still differ: companies".
+fn not_ready_report(n: i32, at: i64, extra: &[(&str, &str)]) -> ChecksumReportMessage {
+    let mut p = parts(&[("roads", "a")]);
+    for (k, v) in extra {
+        p.insert((*k).to_owned(), (*v).to_owned());
+    }
+    ChecksumReportMessage { not_ready: vec!["companies".to_owned()], ..ChecksumReportMessage::new(n, at, p) }
+}
+
+fn reach_verifying(h: &mut Harness) -> i64 {
+    h.host_call(|host| host.start_resync("t"));
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(5000));
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.hello_all(pause_at, 0);
+    pause_at
+}
+
+#[test]
+fn a_part_not_ready_after_the_load_is_asked_again_never_counted_as_a_difference() {
+    let (mut h, ids) = Harness::running(1, 2, quiet());
+    reach_verifying(&mut h);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    h.host_game(
+        MessageKind::ChecksumReport,
+        &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a"), ("companies", "c")]))),
+    );
+    h.player_game(ids[0], MessageKind::ChecksumReport, &json(&not_ready_report(req.n, req.at, &[])));
+    assert_eq!(ResyncState::Verifying, h.host.resync_state(), "not ready: asked again, not failed");
+    assert!(h.failures().is_empty());
+    assert!(h.host_log.iter().any(|l| l.contains("not ready yet (companies on 1)")), "{:?}", h.host_log);
+    // the next round, with the registry read, matches: the repair worked
+    let again: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert_ne!(req.n, again.n);
+    report_all(
+        &mut h,
+        &ids,
+        again.n,
+        again.at,
+        &[("roads", "a"), ("companies", "c")],
+        &[("roads", "a"), ("companies", "c")],
+    );
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+    assert_eq!(2, h.host.state().speed, "resumed at the speed before the repair");
+}
+
+#[test]
+fn a_real_difference_next_to_a_part_not_ready_still_fails_the_repair() {
+    let (mut h, ids) = Harness::running(1, 2, quiet());
+    let pause_at = reach_verifying(&mut h);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    h.host_game(
+        MessageKind::ChecksumReport,
+        &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a"), ("edges", "x"), ("companies", "c")]))),
+    );
+    h.player_game(ids[0], MessageKind::ChecksumReport, &json(&not_ready_report(req.n, req.at, &[("edges", "y")])));
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    let failure = &h.failures()[0];
+    assert!(failure.contains("still differ after the reload: edges"), "{failure}");
+    assert!(failure.contains("not measured: companies on 1"), "{failure}");
+    assert_eq!(Some(pause_at), h.host.state().pause_at, "a failed repair stays paused");
+}
+
+#[test]
+fn a_part_that_stays_not_ready_fails_as_not_verified_after_the_retries() {
+    let (mut h, ids) = Harness::running(1, 2, quiet());
+    reach_verifying(&mut h);
+    for _ in 0..4 {
+        let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+        h.host_game(
+            MessageKind::ChecksumReport,
+            &json(&ChecksumReportMessage::new(req.n, req.at, parts(&[("roads", "a"), ("companies", "c")]))),
+        );
+        h.player_game(ids[0], MessageKind::ChecksumReport, &json(&not_ready_report(req.n, req.at, &[])));
+    }
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    let failure = &h.failures()[0];
+    assert!(failure.contains("could not be verified") && failure.contains("companies on 1"), "{failure}");
+    assert!(!failure.contains("differ"), "an unknown part is not reported as a difference: {failure}");
+}
+
 #[test]
 fn verification_that_never_completes_fails_after_120_seconds() {
     let (mut h, _) = Harness::running(1, 2, quiet());
@@ -364,6 +447,14 @@ fn speed_changes_are_ignored_while_a_round_runs() {
     h.host_call(HostSession::pause);
     assert!(h.host.state().pause_at.is_some());
     assert_eq!(2, h.host.state().speed);
+    // a game that asks every frame while its world loads gets one line per round, not one per request (friend test 2026-10-16: 1210)
+    for _ in 0..50 {
+        h.player_game(ids[0], MessageKind::SpeedRequest, &json(&SpeedRequestMessage { speed: 4 }));
+    }
+    assert_eq!(
+        1,
+        h.host_log.iter().filter(|l| l.contains("speed request") && l.contains("ignored (resync in progress")).count()
+    );
 }
 
 #[test]
@@ -499,6 +590,46 @@ fn a_replay_failure_requests_a_resync_at_once_and_the_cooldown_holds_the_next() 
     h.advance(120.0);
     h.host_game(MessageKind::ReplayFailed, &json(&ReplayFailedMessage { detail: "host".to_owned() }));
     assert_eq!(2, h.requests().len());
+}
+
+/// Lab run 2026-10-18 (A-stress): a town replaced a building during a build's lead; every game refused the build at its stamp.
+#[test]
+fn a_build_refused_alike_on_every_game_at_its_stamp_asks_for_nothing() {
+    let (mut h, ids) = Harness::running(2, 1, quiet());
+    let why = "inject_refused: toRemove[0] names construction 39513, which does not exist here";
+    h.host_game(MessageKind::ActionRefused, &json(&ActionRefusedMessage::refused(1, 12, why)));
+    for &c in &ids {
+        h.player_game(c, MessageKind::ActionRefused, &json(&ActionRefusedMessage::refused(1, 12, why)));
+    }
+    assert!(h.requests().is_empty(), "identical worlds refuse alike: nothing to repair");
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    // the applied builds after it agree too
+    h.host_game(MessageKind::ActionRefused, &json(&ActionRefusedMessage::applied(1, 13)));
+    for &c in &ids {
+        h.player_game(c, MessageKind::ActionRefused, &json(&ActionRefusedMessage::applied(1, 13)));
+    }
+    assert!(h.requests().is_empty());
+}
+
+#[test]
+fn one_game_refusing_a_build_another_applied_requests_a_resync_at_once() {
+    let (mut h, ids) = Harness::running(2, 1, quiet());
+    h.player_game(ids[0], MessageKind::ActionRefused, &json(&ActionRefusedMessage::applied(1, 4)));
+    assert!(h.requests().is_empty(), "one verdict alone says nothing");
+    h.host_game(MessageKind::ActionRefused, &json(&ActionRefusedMessage::refused(1, 4, "inject_refused: gone")));
+    assert_eq!(vec!["verdicts of 1:4 differ".to_owned()], h.requests(), "without waiting for the third game");
+    assert_eq!(ResyncState::Pausing, h.host.resync_state());
+    // the third game's verdict changes nothing more
+    h.player_game(ids[1], MessageKind::ActionRefused, &json(&ActionRefusedMessage::applied(1, 4)));
+    assert_eq!(1, h.requests().len());
+}
+
+#[test]
+fn an_older_refusal_message_without_a_verdict_counts_as_a_refusal() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    h.host_game(MessageKind::ActionRefused, br#"{"seq":7,"from":1,"detail":"old mod"}"#);
+    h.player_game(ids[0], MessageKind::ActionRefused, &json(&ActionRefusedMessage::applied(1, 7)));
+    assert_eq!(1, h.requests().len());
 }
 
 #[test]
@@ -680,7 +811,16 @@ fn started_at_different_times() -> (Harness, ConnectionId) {
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
     h.host_game(
         MessageKind::Clock,
-        &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 87_000,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     h.hello_player(p, 183_600, 0);
     h.host_call(HostSession::start);
@@ -705,12 +845,30 @@ fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_a
     assert_eq!(ResyncState::Pausing, h.host.resync_state(), "the host's game is still behind the stamp");
     h.host_game(
         MessageKind::Clock,
-        &json(&ClockMessage { t: pause_at, speed: 1, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: pause_at,
+            speed: 1,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     assert_eq!(ResyncState::Pausing, h.host.resync_state(), "still running");
     h.host_game(
         MessageKind::Clock,
-        &json(&ClockMessage { t: pause_at, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: pause_at,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     assert_eq!(ResyncState::Saving, h.host.resync_state());
 
@@ -735,7 +893,16 @@ fn starting_with_one_game_does_not_start_a_round() {
     h.host_game(MessageKind::Hello, &json(&HelloMessage::new(87_000)));
     h.host_game(
         MessageKind::Clock,
-        &json(&ClockMessage { t: 87_000, speed: 0, ahead: 3, need: None, safe: None, pause: false, stop: None }),
+        &json(&ClockMessage {
+            t: 87_000,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
     );
     h.host_call(HostSession::start);
     assert_eq!(ResyncState::Idle, h.host.resync_state());
@@ -1031,9 +1198,34 @@ fn round_is_full(h: &mut Harness, ids: &[ConnectionId], part: Option<&str>) -> b
     h.host_game_last::<ChecksumRequestMessage>(MessageKind::ChecksumRequest).full
 }
 
+/// The old light/full split (FEVERLINK3_FULL_CHECKSUM_EVERY=6), kept as a lab switch.
+fn split() -> HostOptions {
+    HostOptions { full_checksum_every: 6, ..quiet() }
+}
+
 #[test]
-fn only_every_sixth_checksum_round_is_full_and_the_verification_round_always_is() {
+fn every_regular_round_is_full_by_default() {
     let (mut h, ids) = Harness::running(2, 3, quiet());
+    let kinds: Vec<bool> = (0..8).map(|_| round_is_full(&mut h, &ids, None)).collect();
+    assert!(kinds.iter().all(|&f| f), "{kinds:?}");
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert!(req.spread > 0 && !req.paused, "a running full round is spread: {req:?}");
+}
+
+#[test]
+fn every_round_full_still_reloads_on_a_heavy_or_ids_difference_twice_in_a_row() {
+    for part in ["edges", "ids"] {
+        let (mut h, ids) = Harness::running(2, 3, quiet());
+        assert!(round_is_full(&mut h, &ids, Some(part)));
+        assert_eq!(ResyncState::Idle, h.host.resync_state(), "{part}: one round is not enough");
+        assert!(round_is_full(&mut h, &ids, Some(part)));
+        assert_ne!(ResyncState::Idle, h.host.resync_state(), "{part}: two full rounds in a row reload");
+    }
+}
+
+#[test]
+fn with_the_switch_only_every_sixth_checksum_round_is_full_and_the_verification_round_always_is() {
+    let (mut h, ids) = Harness::running(2, 3, split());
     let kinds: Vec<bool> = (0..13).map(|_| round_is_full(&mut h, &ids, None)).collect();
     let first = kinds.iter().position(|&f| f).expect("a full round");
     assert!(first < 6);
@@ -1051,7 +1243,7 @@ fn only_every_sixth_checksum_round_is_full_and_the_verification_round_always_is(
 
 #[test]
 fn a_difference_in_a_heavy_lane_is_judged_over_full_rounds_only() {
-    let (mut h, ids) = Harness::running(2, 3, quiet());
+    let (mut h, ids) = Harness::running(2, 3, split());
     while !round_is_full(&mut h, &ids, Some("edges")) {} // rounds before the first full one: the heavy lane is not compared
     assert_eq!(ResyncState::Idle, h.host.resync_state(), "one full round is not enough");
     for _ in 0..5 {
@@ -1069,7 +1261,7 @@ fn a_difference_in_a_heavy_lane_is_judged_over_full_rounds_only() {
 
 #[test]
 fn a_light_round_with_a_light_difference_still_counts_and_an_old_game_that_sends_heavy_lanes_is_not_a_difference() {
-    let (mut h, ids) = Harness::running(2, 3, quiet());
+    let (mut h, ids) = Harness::running(2, 3, split());
     checksum_round(&mut h, &ids, None); // round 1, full
                                         // round 2 is light: the host game sends no heavy lane, a game that does not know the flag sends one: still identical
     h.host_call(HostSession::request_checksum);
@@ -1153,8 +1345,16 @@ fn what_is_relayed_while_the_save_travels_reaches_the_participants_after_their_l
 
     // mid-transfer: one player builds, the other's game reports its clock
     h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(12_000, 1, "mid")));
-    let clock =
-        ClockMessage { t: 11_000, speed: 0, ahead: 3, need: None, safe: Some(11_000), pause: false, stop: None };
+    let clock = ClockMessage {
+        t: 11_000,
+        speed: 0,
+        ahead: 3,
+        need: None,
+        safe: Some(11_000),
+        pause: false,
+        stop: None,
+        hop: None,
+    };
     let peer_clocks = h.p(ids[0]).count(MessageKind::PeerClock);
     h.player_game(ids[1], MessageKind::Clock, &json(&clock));
     assert_eq!(None, action_position(&h.p(ids[1]).game, "mid"), "held for the participant");
@@ -1227,4 +1427,136 @@ fn a_participant_that_leaves_mid_transfer_is_dropped_from_the_round_and_the_othe
     assert_eq!(1, h.p(ids[1]).saves.len());
     assert!(action_position(&h.p(ids[1]).game, "x").is_some());
     assert_eq!(None, action_position(&h.p(ids[0]).game, "x"), "nothing for the one that left");
+}
+
+// ------------------------------------------------------------------ the load moves the pause (bug 9)
+
+/// A clock of a game standing still at a pause: its promise is the pause, `stop` where it really stands.
+fn still(t: i64, pause_at: i64) -> Vec<u8> {
+    json(&ClockMessage {
+        t,
+        speed: 0,
+        ahead: 3,
+        need: None,
+        safe: Some(pause_at),
+        pause: true,
+        stop: Some(t),
+        hop: None,
+    })
+}
+
+/// The actions of the pause order a game was sent: (seq, stamp).
+fn pause_order(game: &[(MessageKind, Vec<u8>)]) -> Vec<(i64, i64)> {
+    game.iter()
+        .filter(|g| g.0 == MessageKind::Action)
+        .filter_map(|g| codec::try_decode::<ActionMessage>(&g.1))
+        .filter_map(|m| m.pause_seq.map(|_| (m.seq, m.stamp)))
+        .collect()
+}
+
+/// Real friend test 2026-10-16: the round paused at 10341800, the host's game stood still 3 steps on and saved there (10342400),
+/// and both games loaded that save. The session still said pauseAt 10341800, so the next build was stamped at the stale pause and
+/// was applied 3 steps late on the other game. After the load the pause is where the loaded world stands, on every game.
+#[test]
+fn after_the_load_the_pause_is_the_time_the_games_loaded_at() {
+    let (mut h, ids) = Harness::running(1, 3, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let p = h.host.state().pause_at.unwrap();
+    let saved = p + 3 * Lockstep::STEP;
+    // speed 0 takes effect late: the host's game stands 3 steps past the pause, the player's at it
+    h.host_game(MessageKind::Clock, &still(saved, p));
+    h.player_game(ids[0], MessageKind::Clock, &still(p, p));
+    assert_eq!(ResyncState::Saving, h.host.resync_state());
+    let id = h.host.resync_id().unwrap();
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    h.send_file(id, &blob(600 * 1024));
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+
+    // the host's game loaded early; then the player's
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(saved)));
+    assert_eq!(Some(saved), h.host.state().pause_at, "the host's hello moves the pause to the save's time");
+    h.host_game(MessageKind::Clock, &still(saved, saved));
+    h.player_game(ids[0], MessageKind::Hello, &json(&HelloMessage::new(saved)));
+    h.player_game(ids[0], MessageKind::Clock, &still(saved, saved));
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    assert_eq!(Some(saved), h.p(ids[0]).session.session().unwrap().pause_at, "the player's game is told so too");
+    let session: SessionState = h.host_game_last(MessageKind::Session);
+    assert_eq!(Some(saved), session.pause_at, "and the host's own game");
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    assert!(req.paused);
+    assert_eq!(saved, req.at, "the verify round hashes the loaded world where it stands");
+    assert!(h.host_log.iter().any(|l| l.contains(&format!("the pause moves from {p}"))), "{:?}", h.host_log);
+
+    // an action of the pause made now is stamped past the loaded world's time on every game
+    h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(saved, 1, "{a}").paused()));
+    let first = saved + Lockstep::STEP;
+    assert_eq!(vec![(1, first)], pause_order(&h.p(ids[0]).game));
+    assert_eq!(vec![(1, first)], pause_order(&h.host_game));
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(h.failures().is_empty());
+}
+
+/// An action of the pause made before the save is not stamped from the stops of the world that is being replaced: the host's game,
+/// loading early, no longer counts, so the furthest stop would be the player's, behind the host's save, and the stamp would lie before
+/// the time every game reloads at (late on every game). It waits for the stops of the loaded world.
+#[test]
+fn an_action_of_the_pause_made_before_the_load_is_stamped_after_the_loaded_time() {
+    let (mut h, ids) = Harness::running(1, 3, quiet());
+    h.host_call(|host| host.start_resync("test"));
+    let p = h.host.state().pause_at.unwrap();
+    let saved = p + 3 * Lockstep::STEP;
+    // the player's action is held: the host's game has not said where it stands
+    h.player_game(ids[0], MessageKind::Clock, &still(p, p));
+    h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(p, 7, "{early}").paused()));
+    h.host_game(
+        MessageKind::Clock,
+        &json(&ClockMessage {
+            t: saved,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
+    );
+    let id = h.host.resync_id().unwrap();
+    assert_eq!(ResyncState::Saving, h.host.resync_state());
+    // (the action may be stamped from these stops already: then the stamp is past the furthest, the host's save)
+    let before: Vec<(i64, i64)> = pause_order(&h.p(ids[0]).game);
+    assert!(before.iter().all(|&(_, at)| at > saved), "{before:?}");
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    let sha = sha256_hex(&blob(600 * 1024));
+    h.host_call(|host| host.resync_file_ready(id, &sha, 600 * 1024));
+    // the host's game loads early: its clock is gone, the player's old stop alone is left
+    h.player_game(ids[0], MessageKind::Clock, &still(p, p));
+    h.player_game(ids[0], MessageKind::Action, &json(&ActionMessage::new(p, 8, "{late}").paused()));
+    for (i, chunk) in blob(600 * 1024).chunks(ResyncLimits::CHUNK_SIZE).enumerate() {
+        h.host_call(|host| host.resync_chunk(id, i as u32, chunk));
+    }
+    assert!(
+        pause_order(&h.p(ids[0]).game).iter().all(|&(seq, _)| seq != 8),
+        "not stamped from the stops of the world being replaced"
+    );
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(saved)));
+    h.host_game(MessageKind::Clock, &still(saved, saved));
+    h.player_game(ids[0], MessageKind::Hello, &json(&HelloMessage::new(saved)));
+    assert!(pause_order(&h.p(ids[0]).game).iter().all(|&(seq, _)| seq != 8), "the player's loaded clock is not in yet");
+    h.player_game(ids[0], MessageKind::Clock, &still(saved, saved));
+    let order = pause_order(&h.p(ids[0]).game);
+    assert!(order.contains(&(8, saved + Lockstep::STEP)), "{order:?}");
+    assert!(order.iter().all(|&(_, at)| at > saved), "no stamp at or before the loaded time: {order:?}");
+    assert_eq!(order, pause_order(&h.host_game), "the same order on the host's game");
+}
+
+/// A hello outside a round's load (a game that starts, a player that joins) does not touch the pause.
+#[test]
+fn a_hello_outside_a_load_leaves_the_pause_alone() {
+    let (mut h, ids) = Harness::running(1, 3, quiet());
+    h.host_call(HostSession::pause);
+    let p = h.host.state().pause_at.unwrap();
+    h.player_game(ids[0], MessageKind::Hello, &json(&HelloMessage::new(p + 10 * Lockstep::STEP)));
+    assert_eq!(Some(p), h.host.state().pause_at);
 }

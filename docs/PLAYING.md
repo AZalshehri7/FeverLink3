@@ -1,4 +1,4 @@
-# Playing FeverLink3 (test version 0.2.0-pre2)
+# Playing FeverLink3 (test version 0.2.0-pre3)
 
 FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. Players connect to each other through Steam's own peer-to-peer networking: by design that means no port forwarding, no router settings, no VPN and nothing to open in the firewall. A first test between two Steam accounts reached through Steam's relay servers; the full host-and-join test is what this build is for. This is an early test build: expect rough edges, and tell the maintainer (Discord `azalshehri`) what happens.
 
@@ -17,12 +17,12 @@ There is no installer. You copy the files into the folder of the game:
 2. Close Transport Fever 3 if it is running.
 3. Open the game's folder: in Steam, right-click **Transport Fever 3**, choose **Manage**, then **Browse local files**. A folder opens that contains `TransportFever3.exe` and a folder called `mods`.
 4. In the unzipped folder select **`winhttp.dll`** and the **`mods`** folder, copy them (`Ctrl+C`), go to the game's folder and paste (`Ctrl+V`).
-   - Windows asks about the `mods` folder that already exists: choose **Yes / Merge**. Nothing of the game is replaced; the mod is added as `mods\release\feverlink3_1`.
+   - Windows asks about the `mods` folder that already exists: choose **Yes / Merge**. Nothing of the game is replaced; the mod is added as `mods\release\feverlink3`.
    - If Windows asks for administrator permission to paste, click **Continue**.
    - If Windows says `winhttp.dll` already exists, **stop**: another mod uses the same file name. Do not replace it; tell the maintainer.
-5. Check: the game's folder now contains `winhttp.dll` next to `TransportFever3.exe`, and `mods\release\feverlink3_1` exists.
+5. Check: the game's folder now contains `winhttp.dll` next to `TransportFever3.exe`, and `mods\release\feverlink3` exists.
 
-**To update:** close the game and copy the new files over the old ones in the same way. **To remove FeverLink3:** delete `winhttp.dll` and the folder `mods\release\feverlink3_1` from the game's folder. Steam's "Verify integrity of game files" leaves both in place.
+**To update:** close the game and copy the new files over the old ones in the same way. If the game's folder still has `mods\release\feverlink3_1` (the mod's folder name in versions up to 0.2.0-pre2), delete that folder, or the game loads two copies of the mod. **To remove FeverLink3:** delete `winhttp.dll` and the folder `mods\release\feverlink3` from the game's folder. Steam's "Verify integrity of game files" leaves both in place.
 
 ## 2. Start the game
 

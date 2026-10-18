@@ -9,22 +9,36 @@
 //! - `identity.txt`: who this game is and which session it is in (`session=`, `start=`, `id=`, `name=`, `role=` lines).
 //! - `native.log`: the native module's log (written by the module, not here).
 //!
-//! Every line of the two logs is `seq<TAB>kind<TAB>from<TAB>payload\n`, with `seq` strictly increasing within
-//! one file and the payload on one line, verbatim (the mod writes Lua literal syntax that is already one line, and
-//! its reader does not unescape; see [`format_line`]). A reader keeps the
-//! last `seq` it dispatched and ignores anything at or below it, so a truncated or rewritten file never replays
-//! history. A writer that restarts has to continue from the highest `seq` already in the file, which is why
-//! [`Session::open`] reads it back.
+//! Every line of the two logs is `kind<TAB>from<TAB>payload\n`, the payload on one line, verbatim (the mod writes Lua
+//! literal syntax that is already one line, and its reader does not unescape; see [`format_line`]). A line carries no
+//! number: the order of the lines in the file IS the order, and every reader reads by position, the generation and
+//! the byte offset it has consumed ([`Pos`]). A reader takes complete lines only (up to the last newline), so a line
+//! still being written waits for its end. A file shorter than what was consumed, or one that no longer holds the bytes
+//! read at the same places, was replaced: reading starts again at its first byte (the files are append-only; only a
+//! cleaned folder replaces them). Where a session begins and where a reloaded mod resumes are positions too
+//! (`start=<gen>:<offset>` in `identity.txt`, the mod's resync cursor).
+//!
+//! (The lines used to carry a sequence number that a reader filtered on; a writer that restarted its numbering, the
+//! mod's after a reload in the friend test of 2026-10-16, then had every later line dropped as old. Positions cannot
+//! go wrong that way.)
+//!
+//! One writer per file. A writer here appends each batch of lines with one `write` on a file opened for appending,
+//! which Windows carries out as one append, so a line lands whole. The mod's writers do not have that guarantee (the C
+//! runtime's append is a seek to the end and a write, two steps): a file the mod can write from two Lua states at
+//! once has one file per writer instead (the native control files, `docs/NATIVE_LINK.md` section 3).
 //!
 //! Generations (every link log, here and in the native module and the mod: `docs/ARCHITECTURE.md` section 2). A log
 //! never grows without bound and is never truncated: it is a series of generation files, `to_game.log` (generation 1),
 //! `to_game.2.log`, `to_game.3.log`, ..., and `to_game.gen` names the newest. A writer that has put [`ROTATE_BYTES`]
-//! into its generation ends it with a `rotate` line (`seq` 0, so no reader dispatches it) naming the next one, writes
-//! the pointer, deletes the generation [`KEEP_GENERATIONS`] back and goes on in the next file. A reader that reads the
-//! `rotate` line has read the whole generation (its writer adds nothing after it) and goes on at the start of the next:
-//! no line is lost or split by a rotation, and following one costs a reader no file access at all until it happens.
-//! The `seq` numbering goes on across generations.
+//! into its generation ends it with a `rotate` line naming the next one, writes the pointer, deletes the generation
+//! [`KEEP_GENERATIONS`] back and goes on in the next file. A reader that reads the `rotate` line has read the whole
+//! generation (its writer adds nothing after it) and goes on in the next: no line is lost or split by a rotation, and
+//! following one costs a reader no file access at all until it happens. A writer with a header (lines a reader that
+//! starts in a generation needs, the native module's `ready`) writes it at the top of the next generation BEFORE the
+//! `rotate` line, and the `rotate` line says how many bytes it holds (`skip`): a reader that came through the earlier
+//! generation starts after it (it read those lines already), one that starts in the new generation reads them.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -48,17 +62,38 @@ pub const MAX_LINE_BYTES: usize = 4 << 20;
 /// Most bytes one [`Tail::poll`] reads. A file that grew by more is read over several polls.
 const MAX_READ_PER_POLL: u64 = 8 << 20;
 
-/// Largest `seq` a line may carry. The mod writes the number as a Lua double, which holds integers exactly up to
-/// 2^53; a line beyond that is garbage, and accepting it would end the numbering for every line after it.
-pub const MAX_SEQ: u64 = 1 << 53;
-
 /// One line of either log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
-    pub seq: u64,
     pub kind: String,
     pub from: String,
     pub payload: String,
+}
+
+/// A place in a generation log: generation `gen`, `offset` bytes into its file. Positions are ordered by generation,
+/// then offset. Written as `<gen>:<offset>` (`identity.txt`, the mod's resync cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pos {
+    pub gen: u64,
+    pub offset: u64,
+}
+
+impl Pos {
+    /// The first byte of a log.
+    pub const START: Pos = Pos { gen: 1, offset: 0 };
+
+    /// Reads `<gen>:<offset>`; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Pos> {
+        let (gen, offset) = text.trim().split_once(':')?;
+        let gen = gen.parse::<u64>().ok().filter(|g| *g >= 1)?;
+        Some(Pos { gen, offset: offset.parse().ok()? })
+    }
+}
+
+impl fmt::Display for Pos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.gen, self.offset)
+    }
 }
 
 /// Formats a line, including the trailing newline. The payload travels verbatim: the mod's reader does not
@@ -68,24 +103,23 @@ pub struct Line {
 /// (a guard against a caller bug, they cannot occur in serialiser output) rather than corrupting the file.
 pub fn format_line(line: &Line) -> String {
     let payload: String = line.payload.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-    format!("{}\t{}\t{}\t{}\n", line.seq, clean_field(&line.kind), clean_field(&line.from), payload)
+    format!("{}\t{}\t{}\n", clean_field(&line.kind), clean_field(&line.from), payload)
 }
 
 fn clean_field(s: &str) -> String {
     s.chars().map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c }).collect()
 }
 
-/// Parses one line (without or with its trailing newline). `None` for anything malformed: a line with fewer
-/// than four fields, or a `seq` that is not a number up to [`MAX_SEQ`].
+/// Parses one line (without or with its trailing newline). `None` for a line with fewer than three fields; the
+/// payload is everything after the second tab.
 pub fn parse_line(text: &str) -> Option<Line> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     let text = text.strip_suffix('\r').unwrap_or(text);
-    let mut parts = text.splitn(4, '\t');
-    let seq = parts.next()?.trim().parse().ok().filter(|seq| *seq <= MAX_SEQ)?;
+    let mut parts = text.splitn(3, '\t');
     let kind = parts.next()?.to_string();
     let from = parts.next()?.to_string();
     let payload = parts.next()?.to_string();
-    Some(Line { seq, kind, from, payload })
+    Some(Line { kind, from, payload })
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -99,7 +133,7 @@ pub const ROTATE_BYTES: u64 = 4 << 20;
 /// Generation files a writer keeps (the newest included); older ones are deleted when a new one starts.
 pub const KEEP_GENERATIONS: u64 = 4;
 
-/// The kind of the line that ends a generation. Its `seq` is 0 and its payload `{["gen"]=<next>}`.
+/// The kind of the line that ends a generation. Its payload is `{["gen"]=<next>,["skip"]=<bytes>}`.
 pub const ROTATE_KIND: &str = "rotate";
 
 /// The file of generation `gen` of the log `base`: `base` itself for generation 1, `<stem>.<gen>.<ext>` after it.
@@ -128,25 +162,50 @@ pub fn newest_generation(base: &Path) -> u64 {
         .unwrap_or(1)
 }
 
-/// The text of the line that ends a generation and names the next.
-pub fn rotate_line(from: &str, next: u64) -> String {
-    format_line(&Line { seq: 0, kind: ROTATE_KIND.into(), from: from.into(), payload: format!("{{[\"gen\"]={next}}}") })
+/// Where a log ends now: its newest generation and that file's length (0 when it does not exist yet).
+pub fn end_of(base: &Path) -> io::Result<Pos> {
+    let gen = newest_generation(base);
+    match fs::metadata(generation_path(base, gen)) {
+        Ok(m) => Ok(Pos { gen, offset: m.len() }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Pos { gen, offset: 0 }),
+        Err(e) => Err(e),
+    }
 }
 
-/// The generation a `rotate` line names, `None` for every other line.
-pub fn rotate_target(line: &Line) -> Option<u64> {
-    if line.seq != 0 || line.kind != ROTATE_KIND {
+/// The text of the line that ends a generation: the next one is `next`, and its first `skip` bytes are the
+/// writer's header (a reader that comes through this line starts after them).
+pub fn rotate_line(from: &str, next: u64, skip: u64) -> String {
+    format_line(&Line {
+        kind: ROTATE_KIND.into(),
+        from: from.into(),
+        payload: format!("{{[\"gen\"]={next},[\"skip\"]={skip}}}"),
+    })
+}
+
+/// Where a `rotate` line sends a reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rotate {
+    /// The next generation (at least 2).
+    pub gen: u64,
+    /// Bytes at the top of it a reader that comes through the rotation has read already (the header).
+    pub skip: u64,
+}
+
+/// The whole number after `["<name>"]=` in a Lua table text.
+fn lua_whole(payload: &str, name: &str) -> Option<u64> {
+    let at = payload.find(&format!("[\"{name}\"]="))? + name.len() + 5;
+    let digits: String =
+        payload[at..].chars().skip_while(|c| c.is_whitespace()).take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Where a `rotate` line leads, `None` for every other line.
+pub fn rotate_target(line: &Line) -> Option<Rotate> {
+    if line.kind != ROTATE_KIND {
         return None;
     }
-    let digits: String = line
-        .payload
-        .split('=')
-        .nth(1)?
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok().filter(|g| *g >= 2)
+    let gen = lua_whole(&line.payload, "gen").filter(|g| *g >= 2)?;
+    Some(Rotate { gen, skip: lua_whole(&line.payload, "skip").unwrap_or(0) })
 }
 
 /// The one writer of a generation log (see the module documentation). It keeps no file open: each append opens the
@@ -160,8 +219,8 @@ pub struct GenWriter {
     size: u64,
     rotate_bytes: u64,
     keep: u64,
-    /// Lines written again at the top of every new generation (they keep their `seq`, so a reader that came
-    /// through the earlier generations drops them; one that starts in the new one reads them as history).
+    /// Lines written again at the top of every new generation (for a reader that starts there; one that comes
+    /// through the rotation skips them, see the module documentation).
     header: String,
 }
 
@@ -169,17 +228,12 @@ impl GenWriter {
     /// Continues the newest generation of `base` (the pointer), at its current size. `from` is the `from` column of
     /// the `rotate` lines.
     pub fn open(base: PathBuf, from: &str) -> io::Result<GenWriter> {
-        let gen = newest_generation(&base);
-        let size = match fs::metadata(generation_path(&base, gen)) {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e),
-        };
+        let end = end_of(&base)?;
         Ok(GenWriter {
             base,
             from: from.to_string(),
-            gen,
-            size,
+            gen: end.gen,
+            size: end.offset,
             rotate_bytes: ROTATE_BYTES,
             keep: KEEP_GENERATIONS,
             header: String::new(),
@@ -207,6 +261,11 @@ impl GenWriter {
         self.gen
     }
 
+    /// Where the log ends after what this writer wrote.
+    pub fn end(&self) -> Pos {
+        Pos { gen: self.gen, offset: self.size }
+    }
+
     /// Lines written again at the top of every later generation.
     pub fn set_header(&mut self, text: String) {
         self.header = text;
@@ -222,28 +281,33 @@ impl GenWriter {
         Ok(())
     }
 
-    /// Ends the current generation and starts the next. Only the `rotate` line has to be written: without the pointer a
-    /// reader that follows still finds the next file (a fresh one starts one generation early and follows); an old
-    /// file that cannot be deleted (a reader holds it open) stays until the folder is cleaned.
+    /// Ends the current generation and starts the next. The header goes into the next file first, so a reader that
+    /// follows the `rotate` line finds it there and starts after it. Only the `rotate` line has to be written: without
+    /// the pointer a reader that follows still finds the next file (a fresh one starts one generation early and
+    /// follows); an old file that cannot be deleted (a reader holds it open) stays until the folder is cleaned.
     fn rotate(&mut self) -> io::Result<()> {
         let next = self.gen + 1;
+        let next_path = generation_path(&self.base, next);
+        let mut skip = 0;
+        if !self.header.is_empty() {
+            // a rotation that failed after the header was written finds it there and does not write it twice
+            let have = fs::metadata(&next_path).map(|m| m.len()).unwrap_or(0);
+            if have == 0 {
+                OpenOptions::new().create(true).append(true).open(&next_path)?.write_all(self.header.as_bytes())?;
+            }
+            skip = fs::metadata(&next_path).map(|m| m.len()).unwrap_or(0);
+        }
         OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.path())?
-            .write_all(rotate_line(&self.from, next).as_bytes())?;
+            .write_all(rotate_line(&self.from, next, skip).as_bytes())?;
         let _ = fs::write(pointer_path(&self.base), format!("{next}\n"));
         if next > self.keep {
             let _ = fs::remove_file(generation_path(&self.base, next - self.keep));
         }
         self.gen = next;
-        self.size = 0;
-        if !self.header.is_empty() {
-            let header = std::mem::take(&mut self.header);
-            let written = OpenOptions::new().create(true).append(true).open(self.path())?.write_all(header.as_bytes());
-            self.size = if written.is_ok() { header.len() as u64 } else { 0 };
-            self.header = header;
-        }
+        self.size = skip;
         Ok(())
     }
 }
@@ -279,17 +343,16 @@ pub fn new_session_folder_name(name: &str) -> String {
 /// One `Session` is one session's identity on the link. The live folder outlives sessions (quit to the menu, load another
 /// save, host again: the same `to_game.log` and `from_game.log`), so a session never reads or names the lines of an earlier
 /// one: [`Session::open`] starts tailing `from_game.log` after what it holds, and [`Session::write_identity`] tells the mod the
-/// session's id and the last `to_game.log` sequence before it (`start=`), which the mod skips to.
+/// session's id and where `to_game.log` ended before it (`start=<gen>:<offset>`), which the mod starts reading at.
 #[derive(Debug)]
 pub struct Session {
     dir: PathBuf,
-    next_seq: u64,
     to_game: GenWriter,
     tail: Tail,
     /// This session's id (16 hex digits, random), written to `identity.txt`.
     id: String,
-    /// The highest `seq` of `to_game.log` when the session was opened: every line of this session is above it.
-    start: u64,
+    /// Where `to_game.log` ended when the session was opened: every line of this session lies after it.
+    start: Pos,
 }
 
 impl Session {
@@ -305,30 +368,24 @@ impl Session {
         Self::open(&dir)
     }
 
-    /// Opens the link in an existing folder for a new session. `to_game.log` is read back so numbering continues after
-    /// the highest `seq` already written (that number is the session's `start`); `from_game.log` is tailed from where it
-    /// ends now (its newest generation): what it holds was written by the game in an earlier session (the mod writes only while `identity.txt`
-    /// names a session, which this one does not yet), and a host that read it would relay an earlier session's actions.
+    /// Opens the link in an existing folder for a new session. `to_game.log` is appended to where it ends (that place is
+    /// the session's `start`); `from_game.log` is tailed from where it ends now: what it holds was written by the game in
+    /// an earlier session (the mod writes only while `identity.txt` names a session, which this one does not yet), and a
+    /// host that read it would relay an earlier session's actions.
     pub fn open(dir: &Path) -> io::Result<Session> {
         fs::create_dir_all(dir)?;
-        let to_game = dir.join(TO_GAME);
-        let last = highest_seq(&to_game)?;
+        let to_game = GenWriter::open(dir.join(TO_GAME), "0")?;
+        let start = to_game.end();
         let mut tail = Tail::new(dir.join(FROM_GAME));
+        // read through (and drop) what the file holds; an unfinished last line stays pending and is read when it ends
         loop {
-            let before = tail.offset;
+            let before = tail.position();
             tail.poll()?;
-            if tail.offset == before {
+            if tail.position() == before {
                 break;
             }
         }
-        Ok(Session {
-            dir: dir.to_path_buf(),
-            next_seq: last.saturating_add(1),
-            to_game: GenWriter::open(to_game, "0")?,
-            tail,
-            id: format!("{:016x}", rand::random::<u64>()),
-            start: last,
-        })
+        Ok(Session { dir: dir.to_path_buf(), to_game, tail, id: format!("{:016x}", rand::random::<u64>()), start })
     }
 
     /// This session's id, as `identity.txt` names it.
@@ -336,8 +393,8 @@ impl Session {
         &self.id
     }
 
-    /// The highest `seq` of `to_game.log` before this session: the mod dispatches only lines above it.
-    pub fn start_seq(&self) -> u64 {
+    /// Where `to_game.log` ended before this session: the mod reads the lines after it.
+    pub fn start(&self) -> Pos {
         self.start
     }
 
@@ -346,9 +403,9 @@ impl Session {
         &self.dir
     }
 
-    /// The `seq` the next [`send`](Self::send) will use.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
+    /// Where `to_game.log` ends now.
+    pub fn end(&self) -> Pos {
+        self.to_game.end()
     }
 
     /// Writes `identity.txt`: who this game instance is and which session it is in. The mod reads it about once a second.
@@ -366,13 +423,10 @@ impl Session {
         fs::write(self.dir.join(IDENTITY), text)
     }
 
-    /// Appends one line to `to_game.log` and returns its `seq`.
-    pub fn send(&mut self, kind: &str, from: &str, payload: &str) -> io::Result<u64> {
-        let seq = self.next_seq;
-        let line = Line { seq, kind: kind.to_string(), from: from.to_string(), payload: payload.to_string() };
-        self.to_game.append(&format_line(&line))?;
-        self.next_seq = seq.saturating_add(1);
-        Ok(seq)
+    /// Appends one line to `to_game.log`.
+    pub fn send(&mut self, kind: &str, from: &str, payload: &str) -> io::Result<()> {
+        let line = Line { kind: kind.to_string(), from: from.to_string(), payload: payload.to_string() };
+        self.to_game.append(&format_line(&line))
     }
 
     /// The same session with other generation limits for `to_game.log` (tests).
@@ -389,21 +443,6 @@ impl Session {
     /// The tail of `from_game.log`, for the blocking variant ([`Tail::spawn`]).
     pub fn into_tail(self) -> Tail {
         self.tail
-    }
-}
-
-/// The highest `seq` in a log, 0 when it is missing or holds no valid line: its newest generation is read (the one
-/// before it too when the newest has no line yet), the way a [`Tail`] reads, so invalid text or an enormous line is
-/// no problem.
-pub fn highest_seq(path: &Path) -> io::Result<u64> {
-    let newest = newest_generation(path);
-    let mut tail = Tail::at_generation(path.to_path_buf(), newest.saturating_sub(1).max(1));
-    loop {
-        let before = (tail.gen, tail.offset);
-        tail.poll()?;
-        if (tail.gen, tail.offset) == before {
-            return Ok(tail.last_seq);
-        }
     }
 }
 
@@ -424,14 +463,14 @@ const SIGNATURE_BYTES: usize = 64;
 /// Generation switches one [`Tail::poll`] follows at most (each reads at most [`MAX_READ_PER_POLL`]).
 const MAX_SWITCHES_PER_POLL: usize = 4;
 
-/// Reads new lines from an append-only log, tolerating a missing file, a partial last line, truncation and a
-/// rewrite, and following the log's generations. Lines whose `seq` is not above the last dispatched one are
-/// dropped, never dispatched twice.
+/// Reads new lines from an append-only log by position, tolerating a missing file, a partial last line, truncation
+/// and a rewrite, and following the log's generations. Every complete line after the position is handed out once, in
+/// file order; nothing is dropped for what it says.
 ///
 /// A rewrite is recognised by content, not only by size: the tail remembers the first bytes of the file and the
 /// last bytes it read, and a file that no longer holds them at the same places was replaced, even when it is not
-/// shorter than what was read (truncated and grown again between two polls). Reading then restarts at the top, and
-/// the `seq` filter keeps history out, so no new line is lost and none is read from the middle.
+/// shorter than what was read (truncated and grown again between two polls). Reading then starts again at its first
+/// byte: the new file's lines are new lines (nobody rewrites a link log; only a cleaned folder replaces one).
 ///
 /// The file is written by the game and may hold anything: a poll reads at most 8 MiB, a line longer than
 /// [`MAX_LINE_BYTES`] is dropped as a whole (up to its newline, however many polls that takes), and invalid UTF-8
@@ -444,36 +483,38 @@ pub struct Tail {
     gen: u64,
     /// Bytes of the file already read (an incomplete last line is read, and kept in `pending`).
     offset: u64,
-    /// Highest `seq` handed out so far.
-    last_seq: u64,
-    /// Bytes read past `offset` that do not yet end with a newline.
+    /// Bytes read past the last complete line that do not yet end with a newline.
     pending: Vec<u8>,
     /// The line being read is over [`MAX_LINE_BYTES`]: what is left of it is dropped, up to its newline.
     skipping: bool,
-    /// The first bytes of the file as read (up to [`SIGNATURE_BYTES`]).
+    /// The first bytes of the file as read (up to [`SIGNATURE_BYTES`]); empty when reading did not start at byte 0.
     head: Vec<u8>,
     /// The last bytes read, which end at `offset` (up to [`SIGNATURE_BYTES`]).
     mark: Vec<u8>,
 }
 
 impl Tail {
-    /// A tail of `path` from its start (its oldest generation still there), with nothing dispatched yet.
+    /// A tail of `path` from its start (its oldest generation still there).
     pub fn new(path: PathBuf) -> Tail {
         let newest = newest_generation(&path);
         let mut gen = newest;
         while gen > 1 && generation_path(&path, gen - 1).exists() {
             gen -= 1;
         }
-        Tail::at_generation(path, gen)
+        Tail::at(path, Pos { gen, offset: 0 })
     }
 
     /// A tail from the start of generation `gen`.
     pub fn at_generation(path: PathBuf, gen: u64) -> Tail {
+        Tail::at(path, Pos { gen, offset: 0 })
+    }
+
+    /// A tail that reads the lines after `pos` (a place a line ends, as [`position`](Self::position) gives it).
+    pub fn at(path: PathBuf, pos: Pos) -> Tail {
         Tail {
             path,
-            gen: gen.max(1),
-            offset: 0,
-            last_seq: 0,
+            gen: pos.gen.max(1),
+            offset: pos.offset,
             pending: Vec::new(),
             skipping: false,
             head: Vec::new(),
@@ -500,15 +541,14 @@ impl Tail {
         self.gen
     }
 
-    /// Highest `seq` returned so far.
-    pub fn last_seq(&self) -> u64 {
-        self.last_seq
+    /// Where the lines handed out so far end: the next line starts here.
+    pub fn position(&self) -> Pos {
+        Pos { gen: self.gen, offset: self.offset.saturating_sub(self.pending.len() as u64) }
     }
 
-    /// Reads whatever was appended since the last call and returns the complete, new lines in file order, through
-    /// the generations the log went on to. A file that is not the one read before (shorter, or other bytes where
-    /// the remembered ones were) was rewritten: reading restarts at its beginning, and the `seq` filter keeps old
-    /// lines from coming back.
+    /// Reads whatever was appended since the last call and returns the complete lines in file order, through the
+    /// generations the log went on to. A file that is not the one read before (shorter, or other bytes where the
+    /// remembered ones were) was replaced: reading starts again at its beginning.
     pub fn poll(&mut self) -> io::Result<Vec<Line>> {
         let mut out = Vec::new();
         for _ in 0..=MAX_SWITCHES_PER_POLL {
@@ -572,15 +612,14 @@ impl Tail {
             }
             if let Some(parsed) = parse_line(&String::from_utf8_lossy(line)) {
                 if let Some(next) = rotate_target(&parsed) {
-                    // the writer's last line in this file: everything before it was read, the rest is in `next`
+                    // the writer's last line in this file: everything before it was read, the rest is in `next`,
+                    // after the header this tail has read already
                     self.rewind();
-                    self.gen = next;
+                    self.gen = next.gen;
+                    self.offset = next.skip;
                     return Ok(true);
                 }
-                if parsed.seq > self.last_seq {
-                    self.last_seq = parsed.seq;
-                    out.push(parsed);
-                }
+                out.push(parsed);
             }
         }
         if self.skipping || rest.len() > MAX_LINE_BYTES {
@@ -606,7 +645,8 @@ impl Tail {
                 Err(e) => Err(e),
             }
         };
-        Ok(holds(file, 0, &self.head)? && holds(file, self.offset - self.mark.len() as u64, &self.mark)?)
+        let mark_at = self.offset.saturating_sub(self.mark.len() as u64);
+        Ok(holds(file, 0, &self.head)? && holds(file, mark_at, &self.mark)?)
     }
 
     /// Runs the tail on its own thread, calling `on_line` for every new line, polling every `interval`, until
@@ -642,8 +682,8 @@ pub struct TailHandle {
 }
 
 impl TailHandle {
-    /// Stops the thread and returns the tail, whose `last_seq` tells what was dispatched. `None` if the thread
-    /// ended in a panic of its own (a callback's, say).
+    /// Stops the thread and returns the tail, whose `position` tells what was read. `None` if the thread ended in a
+    /// panic of its own (a callback's, say).
     pub fn stop(mut self) -> Option<Tail> {
         self.stop.store(true, Ordering::Relaxed);
         self.thread.take().and_then(|t| t.join().ok())
@@ -665,37 +705,53 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    fn line(seq: u64, payload: &str) -> Line {
-        Line { seq, kind: "action".into(), from: "1".into(), payload: payload.into() }
+    fn line(payload: &str) -> Line {
+        Line { kind: "action".into(), from: "1".into(), payload: payload.into() }
+    }
+
+    fn payloads(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| l.payload.clone()).collect()
     }
 
     #[test]
     fn line_round_trip_keeps_the_payload_verbatim() {
-        let l = Line { seq: 7, kind: "chat".into(), from: "3".into(), payload: r#"{["t"]="a\"b\\n\009"}"#.into() };
+        let l = Line { kind: "chat".into(), from: "3".into(), payload: r#"{["t"]="a\"b\\n\009"}"#.into() };
         let text = format_line(&l);
         assert_eq!(text.matches('\n').count(), 1, "payload stays on one line");
         assert!(text.contains(r#"{["t"]="a\"b\\n\009"}"#), "no escaping layer");
         assert_eq!(parse_line(&text), Some(l));
-        let raw = Line { seq: 8, kind: "x".into(), from: "0".into(), payload: "a\nb\rc".into() };
+        let raw = Line { kind: "x".into(), from: "0".into(), payload: "a\nb\rc".into() };
         assert_eq!(parse_line(&format_line(&raw)).unwrap().payload, "a b c", "stray line breaks cannot split a line");
         assert_eq!(
-            parse_line("12\thello\thost\t\n"),
-            Some(Line { seq: 12, kind: "hello".into(), from: "host".into(), payload: String::new() })
+            parse_line("hello\thost\t\n"),
+            Some(Line { kind: "hello".into(), from: "host".into(), payload: String::new() })
         );
-        assert_eq!(parse_line("3\tclock\t0\tpayload\twith\ttabs\r\n").unwrap().payload, "payload\twith\ttabs");
+        assert_eq!(parse_line("clock\t0\tpayload\twith\ttabs\r\n").unwrap().payload, "payload\twith\ttabs");
     }
 
     #[test]
     fn malformed_lines_are_rejected() {
         assert_eq!(parse_line(""), None);
-        assert_eq!(parse_line("x\tkind\tfrom\tpayload"), None);
-        assert_eq!(parse_line("1\tkind\tfrom"), None);
+        assert_eq!(parse_line("kind\tfrom"), None);
+        assert_eq!(parse_line("garbage line"), None);
     }
 
     #[test]
     fn fields_with_tabs_are_cleaned_not_corrupting() {
-        let l = Line { seq: 1, kind: "a\tb".into(), from: "c\nd".into(), payload: "p".into() };
+        let l = Line { kind: "a\tb".into(), from: "c\nd".into(), payload: "p".into() };
         assert_eq!(parse_line(&format_line(&l)).unwrap().kind, "a b");
+    }
+
+    #[test]
+    fn positions_read_and_write_and_order() {
+        assert_eq!(Pos::parse("3:120"), Some(Pos { gen: 3, offset: 120 }));
+        assert_eq!(Pos { gen: 3, offset: 120 }.to_string(), "3:120");
+        assert_eq!(Pos::parse(" 1:0\n"), Some(Pos::START));
+        for bad in ["", "7", "0:5", "a:1", "1:-1", "1:2:3"] {
+            assert_eq!(Pos::parse(bad), None, "{bad}");
+        }
+        assert!(Pos { gen: 1, offset: 900 } < Pos { gen: 2, offset: 0 });
+        assert!(Pos { gen: 2, offset: 10 } < Pos { gen: 2, offset: 11 });
     }
 
     #[test]
@@ -712,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn session_writes_identity_and_numbered_lines_and_continues_after_reopen() {
+    fn session_writes_identity_and_lines_and_continues_after_reopen() {
         let root = TempDir::new().unwrap();
         let mut s = Session::create_under(root.path(), "host").unwrap();
         assert!(s.dir().starts_with(root.path()));
@@ -720,21 +776,26 @@ mod tests {
         assert_eq!(s.session_id().len(), 16);
         assert_eq!(
             fs::read_to_string(s.dir().join(IDENTITY)).unwrap(),
-            format!("session={}\nstart=0\nid=0\nname=Aziz\nrole=host\n", s.session_id())
+            format!("session={}\nstart=1:0\nid=0\nname=Aziz\nrole=host\n", s.session_id())
         );
 
-        assert_eq!(s.send("session", "host", "{\"started\":false}").unwrap(), 1);
-        assert_eq!(s.send("action", "2", "line two").unwrap(), 2);
+        s.send("session", "host", "{\"started\":false}").unwrap();
+        s.send("action", "2", "line two").unwrap();
         let text = fs::read_to_string(s.dir().join(TO_GAME)).unwrap();
-        assert_eq!(text, "1\tsession\thost\t{\"started\":false}\n2\taction\t2\tline two\n");
+        assert_eq!(text, "session\thost\t{\"started\":false}\naction\t2\tline two\n");
+        assert_eq!(s.end(), Pos { gen: 1, offset: text.len() as u64 });
 
         let dir = s.dir().to_path_buf();
         drop(s);
         let mut again = Session::open(&dir).unwrap();
-        assert_eq!(again.next_seq(), 3);
-        assert_eq!(again.send("x", "host", "").unwrap(), 3);
-        assert_eq!(highest_seq(&dir.join(TO_GAME)).unwrap(), 3);
-        assert_eq!(highest_seq(&dir.join("missing.log")).unwrap(), 0);
+        assert_eq!(
+            again.start(),
+            Pos { gen: 1, offset: text.len() as u64 },
+            "the next session starts where the log ends"
+        );
+        again.send("x", "host", "").unwrap();
+        assert!(fs::read_to_string(dir.join(TO_GAME)).unwrap().ends_with("line two\nx\thost\t\n"));
+        assert_eq!(end_of(&dir.join("missing.log")).unwrap(), Pos::START);
     }
 
     #[test]
@@ -745,57 +806,75 @@ mod tests {
         assert_eq!(tail.poll().unwrap(), vec![], "missing file is not an error");
 
         let mut f = File::create(&path).unwrap();
-        f.write_all(format_line(&line(1, "one")).as_bytes()).unwrap();
-        f.write_all(b"2\taction\t1\tpart").unwrap();
+        f.write_all(format_line(&line("one")).as_bytes()).unwrap();
+        f.write_all(b"action\t1\tpart").unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(1, "one")]);
+        assert_eq!(tail.poll().unwrap(), vec![line("one")]);
+        assert_eq!(
+            tail.position(),
+            Pos { gen: 1, offset: format_line(&line("one")).len() as u64 },
+            "the partial line is not consumed"
+        );
         assert_eq!(tail.poll().unwrap(), vec![], "nothing new, partial line held back");
 
         f.write_all(b"ial\n").unwrap();
-        f.write_all(format_line(&line(3, "three")).as_bytes()).unwrap();
+        f.write_all(format_line(&line("three")).as_bytes()).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(2, "partial"), line(3, "three")]);
-        assert_eq!(tail.last_seq(), 3);
+        assert_eq!(tail.poll().unwrap(), vec![line("partial"), line("three")]);
+        assert_eq!(tail.position().offset, fs::metadata(&path).unwrap().len());
         assert_eq!(tail.poll().unwrap(), vec![]);
     }
 
     #[test]
-    fn tail_never_redispatches_after_truncation_or_rewrite() {
+    fn the_same_line_twice_is_two_lines() {
+        // nothing is dropped for what a line says: two equal lines are two lines
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(FROM_GAME);
+        let text = format_line(&line("same")) + &format_line(&line("same"));
+        fs::write(&path, text).unwrap();
+        assert_eq!(Tail::new(path).poll().unwrap(), vec![line("same"), line("same")]);
+    }
+
+    #[test]
+    fn a_tail_at_a_position_reads_what_follows_and_a_shorter_file_resets_it() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join(TO_GAME);
+        let first = format_line(&line("before"));
+        fs::write(&path, first.clone() + &format_line(&line("after"))).unwrap();
+        let mut tail = Tail::at(path.clone(), Pos { gen: 1, offset: first.len() as u64 });
+        assert_eq!(tail.poll().unwrap(), vec![line("after")]);
+        // a position beyond the file (the folder was cleaned): the file is another one, read from its first byte
+        let mut beyond = Tail::at(path.clone(), Pos { gen: 1, offset: 10_000 });
+        assert_eq!(payloads(&beyond.poll().unwrap()), ["before", "after"]);
+    }
+
+    #[test]
+    fn truncation_resets_the_tail_to_the_first_byte() {
         let root = TempDir::new().unwrap();
         let path = root.path().join(FROM_GAME);
         let mut tail = Tail::new(path.clone());
         let mut text = String::new();
         for i in 1..=5 {
-            text.push_str(&format_line(&line(i, "x")));
+            text.push_str(&format_line(&line(&format!("old {i}"))));
         }
         fs::write(&path, &text).unwrap();
         assert_eq!(tail.poll().unwrap().len(), 5);
 
-        // truncated to nothing, then the writer continues with new numbers
+        // truncated to nothing, then a writer starts over: every line of the new file is read
         fs::write(&path, "").unwrap();
         assert_eq!(tail.poll().unwrap(), vec![]);
-        fs::write(&path, format_line(&line(6, "six"))).unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(6, "six")]);
+        fs::write(&path, format_line(&line("six"))).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line("six")]);
 
-        // rewritten with old history first: only the new line comes out
-        let mut rewritten = String::new();
-        for i in 1..=6 {
-            rewritten.push_str(&format_line(&line(i, "x")));
-        }
-        rewritten.push_str(&format_line(&line(7, "seven")));
-        fs::write(&path, &rewritten).unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(7, "seven")]);
-
-        // rewritten shorter with only old numbers: nothing at all
-        fs::write(&path, format_line(&line(2, "old"))).unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![]);
+        // rewritten shorter: the new content is read from its start
+        fs::write(&path, format_line(&line("x"))).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line("x")]);
 
         // file deleted and recreated
         fs::remove_file(&path).unwrap();
         assert_eq!(tail.poll().unwrap(), vec![]);
-        fs::write(&path, format_line(&line(8, "eight"))).unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(8, "eight")]);
-        assert_eq!(tail.last_seq(), 8);
+        fs::write(&path, format_line(&line("eight"))).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line("eight")]);
     }
 
     #[test]
@@ -805,36 +884,24 @@ mod tests {
         let mut tail = Tail::new(path.clone());
         let mut text = String::new();
         for i in 1..=3 {
-            text.push_str(&format_line(&line(i, "before")));
+            text.push_str(&format_line(&line(&format!("before {i}"))));
         }
         fs::write(&path, &text).unwrap();
         assert_eq!(tail.poll().unwrap().len(), 3);
-        // between two polls the file is truncated and grows past the old length again with other lines: the old
-        // reader went on at its offset, in the middle of a line, and lost the lines before it
+        // between two polls the file is truncated and grows past the old length again with other lines: a reader that
+        // went on at its offset would start in the middle of a line and lose the lines before it
         let mut regrown = String::new();
         for i in 4..=9 {
-            regrown.push_str(&format_line(&line(i, "after the truncation")));
+            regrown.push_str(&format_line(&line(&format!("after the truncation {i}"))));
         }
         assert!(regrown.len() as u64 > text.len() as u64);
         fs::write(&path, &regrown).unwrap();
         let got = tail.poll().unwrap();
-        assert_eq!(got.iter().map(|l| l.seq).collect::<Vec<_>>(), [4, 5, 6, 7, 8, 9]);
-        assert!(got.iter().all(|l| l.payload == "after the truncation"), "no line read from its middle");
-        // the same once more with the same first lines (a writer that starts over the same way): the bytes before the
-        // offset differ
-        let mut same_start = String::new();
-        for i in 4..=6 {
-            same_start.push_str(&format_line(&line(i, "after the truncation")));
-        }
-        assert!(same_start.len() > SIGNATURE_BYTES, "the first bytes are the same");
-        for i in 10..=16 {
-            same_start.push_str(&format_line(&line(i, "and again")));
-        }
-        fs::write(&path, &same_start).unwrap();
-        assert_eq!(tail.poll().unwrap().iter().map(|l| l.seq).collect::<Vec<_>>(), (10..=16).collect::<Vec<_>>());
+        assert_eq!(got.len(), 6);
+        assert!(got.iter().all(|l| l.payload.starts_with("after the truncation")), "no line read from its middle");
         // and a plain append is read on from the offset as before
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(format_line(&line(17, "x")).as_bytes()).unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(17, "x")]);
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(format_line(&line("x")).as_bytes()).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec![line("x")]);
     }
 
     #[test]
@@ -845,7 +912,7 @@ mod tests {
         let mut tail = Tail::new(base.clone());
         let mut got = Vec::new();
         for i in 1..=100u64 {
-            assert_eq!(s.send("action", "2", &format!("payload {i}")).unwrap(), i);
+            s.send("action", "2", &format!("payload {i}")).unwrap();
             if i % 9 == 0 {
                 got.extend(tail.poll().unwrap());
             }
@@ -857,45 +924,71 @@ mod tests {
             }
             got.extend(more);
         }
-        assert_eq!(got.iter().map(|l| l.seq).collect::<Vec<_>>(), (1..=100).collect::<Vec<_>>());
-        assert!(got.iter().enumerate().all(|(i, l)| l.payload == format!("payload {}", i + 1)), "no line split");
+        assert_eq!(
+            payloads(&got),
+            (1..=100).map(|i| format!("payload {i}")).collect::<Vec<_>>(),
+            "every line once, in order"
+        );
         let newest = newest_generation(&base);
         assert!(newest > 3, "it rotated ({newest})");
         assert!(!base.exists() && generation_path(&base, newest - 2).exists(), "three generations are kept");
-        // a session reopened on the folder continues the numbering of the newest generation
+        // a session reopened on the folder starts where the newest generation ends
         let dir = s.dir().to_path_buf();
         drop(s);
-        assert_eq!(highest_seq(&base).unwrap(), 100);
-        assert_eq!(Session::open(&dir).unwrap().next_seq(), 101);
+        let end = end_of(&base).unwrap();
+        assert_eq!(end.gen, newest);
+        assert_eq!(Session::open(&dir).unwrap().start(), end);
         // a tail started now begins at the oldest generation still there, and reads on through the newest
         let mut late = Tail::new(base.clone());
         assert_eq!(late.generation(), newest - 2);
-        let mut seqs = Vec::new();
+        let mut seen = Vec::new();
         loop {
             let more = late.poll().unwrap();
             if more.is_empty() {
                 break;
             }
-            seqs.extend(more.into_iter().map(|l| l.seq));
+            seen.extend(more);
         }
-        assert_eq!(seqs.last(), Some(&100));
-        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+        assert_eq!(seen.last().map(|l| l.payload.as_str()), Some("payload 100"));
+        assert_eq!(late.position(), end);
         // the heartbeat's look follows the newest file
         assert_eq!(newest_mark(&base).map(|m| m.0), Some(newest));
     }
 
     #[test]
+    fn a_header_is_read_once_by_a_tail_that_follows_and_by_one_that_starts_after_the_rotation() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("events.log");
+        let mut w = GenWriter::open(base.clone(), "native").unwrap().with_limits(100, 4);
+        let header = format_line(&Line { kind: "ready".into(), from: "native".into(), payload: "{}".into() });
+        w.append(&header).unwrap();
+        w.set_header(header.clone());
+        let mut follower = Tail::new(base.clone());
+        let mut got = follower.poll().unwrap();
+        for i in 1..=12 {
+            w.append(&format_line(&line(&format!("event {i}")))).unwrap();
+            got.extend(follower.poll().unwrap());
+        }
+        assert!(w.generation() > 2, "it rotated");
+        let kinds = got.iter().filter(|l| l.kind == "ready").count();
+        assert_eq!(kinds, 1, "the follower read the header once: {got:?}");
+        assert_eq!(got.iter().filter(|l| l.kind == "action").count(), 12, "and every event once");
+        // a reader that starts in the newest generation finds the header at its top
+        let fresh = Tail::at_generation(base.clone(), w.generation()).poll().unwrap();
+        assert_eq!(fresh.first().map(|l| l.kind.as_str()), Some("ready"));
+    }
+
+    #[test]
     fn rotate_lines_name_the_next_generation() {
-        let l = parse_line(&rotate_line("native", 7)).unwrap();
-        assert_eq!((l.seq, l.kind.as_str(), rotate_target(&l)), (0, ROTATE_KIND, Some(7)));
-        assert_eq!(rotate_target(&line(0, "x")), None);
+        let l = parse_line(&rotate_line("native", 7, 33)).unwrap();
+        assert_eq!((l.kind.as_str(), rotate_target(&l)), (ROTATE_KIND, Some(Rotate { gen: 7, skip: 33 })));
+        assert_eq!(rotate_target(&line("x")), None);
         assert_eq!(
-            rotate_target(&Line {
-                seq: 3,
-                kind: ROTATE_KIND.into(),
-                from: "0".into(),
-                payload: "{[\"gen\"]=2}".into()
-            }),
+            rotate_target(&Line { kind: ROTATE_KIND.into(), from: "0".into(), payload: "{[\"gen\"]=2}".into() }),
+            Some(Rotate { gen: 2, skip: 0 })
+        );
+        assert_eq!(
+            rotate_target(&Line { kind: ROTATE_KIND.into(), from: "0".into(), payload: "{[\"gen\"]=1}".into() }),
             None
         );
         let base = Path::new("dir").join("native_ctl.sim.log");
@@ -905,40 +998,39 @@ mod tests {
     }
 
     #[test]
-    fn tail_skips_garbage_and_out_of_order_lines() {
+    fn tail_skips_garbage_and_keeps_the_order_of_the_file() {
         let root = TempDir::new().unwrap();
         let path = root.path().join(FROM_GAME);
         let mut tail = Tail::new(path.clone());
         let mut text = String::new();
         text.push_str("garbage line\n");
-        text.push_str(&format_line(&line(2, "two")));
-        text.push_str(&format_line(&line(1, "one, late")));
-        text.push_str(&format_line(&line(2, "two again")));
-        text.push_str(&format_line(&line(3, "three")));
+        text.push_str(&format_line(&line("two")));
+        text.push_str(&format_line(&line("one, written after two")));
+        text.push_str(&format_line(&line("three")));
         fs::write(&path, &text).unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(2, "two"), line(3, "three")]);
+        assert_eq!(payloads(&tail.poll().unwrap()), ["two", "one, written after two", "three"]);
     }
 
     #[test]
     fn tail_thread_delivers_lines_and_stops() {
         let root = TempDir::new().unwrap();
         let path = root.path().join(FROM_GAME);
-        fs::write(&path, format_line(&line(1, "first"))).unwrap();
+        fs::write(&path, format_line(&line("first"))).unwrap();
         let got = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&got);
         let handle = Tail::new(path.clone())
             .spawn(Duration::from_millis(10), move |l| sink.lock().unwrap().push(l), |e| panic!("tail error: {e}"))
             .unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(format_line(&line(2, "second")).as_bytes()).unwrap();
+        f.write_all(format_line(&line("second")).as_bytes()).unwrap();
         drop(f);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while got.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         let tail = handle.stop().expect("the thread ended cleanly");
-        assert_eq!(*got.lock().unwrap(), vec![line(1, "first"), line(2, "second")]);
-        assert_eq!(tail.last_seq(), 2);
+        assert_eq!(*got.lock().unwrap(), vec![line("first"), line("second")]);
+        assert_eq!(tail.position().offset, fs::metadata(&path).unwrap().len());
     }
 
     #[test]
@@ -947,12 +1039,12 @@ mod tests {
         let path = root.path().join(FROM_GAME);
         let mut tail = Tail::new(path.clone());
         let mut f = File::create(&path).unwrap();
-        f.write_all(format_line(&line(1, "before")).as_bytes()).unwrap();
+        f.write_all(format_line(&line("before")).as_bytes()).unwrap();
         // the start of a line that never ends, in pieces bigger than the limit
-        f.write_all(b"2\taction\t1\t").unwrap();
+        f.write_all(b"action\t1\t").unwrap();
         f.write_all(&vec![b'x'; MAX_LINE_BYTES + 10]).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(1, "before")]);
+        assert_eq!(tail.poll().unwrap(), vec![line("before")]);
         assert!(tail.pending.is_empty(), "the reader does not keep what it is skipping");
         f.write_all(&vec![b'y'; MAX_LINE_BYTES]).unwrap();
         f.flush().unwrap();
@@ -960,18 +1052,18 @@ mod tests {
         assert!(tail.pending.is_empty());
         // its newline ends the skipping; the next line is read normally
         f.write_all(b"tail of the long line\n").unwrap();
-        f.write_all(format_line(&line(3, "after")).as_bytes()).unwrap();
+        f.write_all(format_line(&line("after")).as_bytes()).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(3, "after")]);
+        assert_eq!(tail.poll().unwrap(), vec![line("after")]);
 
         // a whole line over the limit that arrives in one poll is dropped too
-        let mut huge = b"4\taction\t1\t".to_vec();
+        let mut huge = b"action\t1\t".to_vec();
         huge.extend(vec![b'z'; MAX_LINE_BYTES]);
         huge.push(b'\n');
         f.write_all(&huge).unwrap();
-        f.write_all(format_line(&line(5, "five")).as_bytes()).unwrap();
+        f.write_all(format_line(&line("five")).as_bytes()).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line(5, "five")]);
+        assert_eq!(tail.poll().unwrap(), vec![line("five")]);
     }
 
     #[test]
@@ -979,15 +1071,15 @@ mod tests {
         let root = TempDir::new().unwrap();
         let path = root.path().join(FROM_GAME);
         let mut text = String::new();
-        let mut seq = 0;
+        let mut n = 0u64;
         while text.len() < (MAX_READ_PER_POLL as usize) * 2 + 1000 {
-            seq += 1;
-            text.push_str(&format_line(&line(seq, &"p".repeat(1000))));
+            n += 1;
+            text.push_str(&format_line(&line(&"p".repeat(1000))));
         }
         fs::write(&path, &text).unwrap();
         let mut tail = Tail::new(path);
         let first = tail.poll().unwrap();
-        assert!(!first.is_empty() && (first.len() as u64) < seq, "the first poll stopped at its budget");
+        assert!(!first.is_empty() && (first.len() as u64) < n, "the first poll stopped at its budget");
         let mut total = first.len() as u64;
         loop {
             let more = tail.poll().unwrap();
@@ -996,27 +1088,18 @@ mod tests {
             }
             total += more.len() as u64;
         }
-        assert_eq!((total, tail.last_seq()), (seq, seq), "and every line arrived exactly once");
+        assert_eq!(total, n, "and every line arrived exactly once");
     }
 
     #[test]
-    fn garbage_and_huge_numbers_do_not_end_the_numbering() {
+    fn garbage_does_not_stop_the_reading() {
         let root = TempDir::new().unwrap();
         let path = root.path().join(FROM_GAME);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\xff\xfe not text \x00\x01\n");
-        bytes.extend_from_slice(format!("{}\tx\t0\tbeyond what a Lua number holds\n", u64::MAX).as_bytes());
-        bytes.extend_from_slice(format!("{}\tx\t0\tjust over\n", MAX_SEQ + 1).as_bytes());
-        bytes.extend_from_slice(format_line(&line(7, "seven")).as_bytes());
+        bytes.extend_from_slice(format_line(&line("seven")).as_bytes());
         fs::write(&path, &bytes).unwrap();
-        assert_eq!(Tail::new(path.clone()).poll().unwrap(), vec![line(7, "seven")]);
-        assert_eq!(highest_seq(&path).unwrap(), 7, "also for a file whose text is not UTF-8");
-        assert_eq!(parse_line(&format!("{MAX_SEQ}\tk\t0\tp")).map(|l| l.seq), Some(MAX_SEQ));
-        // a log that already holds the largest number goes on after it
-        fs::write(root.path().join(TO_GAME), format_line(&line(MAX_SEQ, "last"))).unwrap();
-        let mut s = Session::open(root.path()).unwrap();
-        assert_eq!(s.next_seq(), MAX_SEQ + 1);
-        assert_eq!(s.send("x", "0", "p").unwrap(), MAX_SEQ + 1);
+        assert_eq!(Tail::new(path.clone()).poll().unwrap(), vec![line("seven")]);
     }
 
     #[test]
@@ -1024,9 +1107,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let mut s = Session::create_under(root.path(), "player").unwrap();
         assert_eq!(s.poll().unwrap(), vec![]);
-        fs::write(s.dir().join(FROM_GAME), format_line(&line(1, "hello"))).unwrap();
-        assert_eq!(s.poll().unwrap(), vec![line(1, "hello")]);
-        assert_eq!(s.into_tail().last_seq(), 1);
+        fs::write(s.dir().join(FROM_GAME), format_line(&line("hello"))).unwrap();
+        assert_eq!(s.poll().unwrap(), vec![line("hello")]);
+        assert_eq!(s.into_tail().position().offset, format_line(&line("hello")).len() as u64);
     }
 
     #[test]
@@ -1037,7 +1120,8 @@ mod tests {
         first.write_identity(0, "Aziz", "host").unwrap();
         first.send("session", "0", "{started=true}").unwrap();
         first.send("action", "1", "{seq=1}").unwrap();
-        fs::write(root.path().join(FROM_GAME), format_line(&line(1, "hello")) + &format_line(&line(2, "old action")))
+        let end = first.end();
+        fs::write(root.path().join(FROM_GAME), format_line(&line("hello")) + &format_line(&line("old action")))
             .unwrap();
         assert_eq!(first.poll().unwrap().len(), 2);
         let first_id = first.session_id().to_owned();
@@ -1045,18 +1129,17 @@ mod tests {
 
         let mut second = Session::open(root.path()).unwrap();
         assert_ne!(second.session_id(), first_id, "every session has an id of its own");
-        assert_eq!(second.start_seq(), 2, "the mod skips to the last line of the earlier session");
+        assert_eq!(second.start(), end, "the mod starts reading where the earlier session's lines end");
         second.write_identity(0, "Aziz", "host").unwrap();
         let identity = fs::read_to_string(root.path().join(IDENTITY)).unwrap();
-        assert!(identity.starts_with(&format!("session={}\nstart=2\n", second.session_id())), "{identity}");
+        assert!(identity.starts_with(&format!("session={}\nstart={end}\n", second.session_id())), "{identity}");
         assert!(
             identity.ends_with("role=host\n"),
             "the role comes last: a racing read sees a complete file or no role"
         );
         assert_eq!(second.poll().unwrap(), vec![], "the earlier session's lines from the game are not read again");
         let mut f = OpenOptions::new().append(true).open(root.path().join(FROM_GAME)).unwrap();
-        f.write_all(format_line(&line(3, "hello again")).as_bytes()).unwrap();
-        assert_eq!(second.poll().unwrap(), vec![line(3, "hello again")]);
-        assert_eq!(second.send("session", "0", "{}").unwrap(), 3);
+        f.write_all(format_line(&line("hello again")).as_bytes()).unwrap();
+        assert_eq!(second.poll().unwrap(), vec![line("hello again")]);
     }
 }

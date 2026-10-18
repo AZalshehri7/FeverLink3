@@ -12,13 +12,13 @@ the end state is the mod coming from the in-game Mod Hub or Nexus Mods with the 
 (`docs/WORKSHOP.md`). The same library also runs **inside the game process**: the native module (`winhttp.dll`,
 crate `feverlink3_native`) links it and calls [`live::spawn`](src/live.rs), which starts the session controller that
 the in-game window drives, without any terminal (see "Live mode" below). The in-game window itself is the Lua mod's
-(`mod/feverlink3_1`); this crate has no window of its own.
+(`mod/feverlink3`); this crate has no window of its own.
 
 | Module | What it does | Pure part (tested without Steam or the game) |
 |---|---|---|
 | `steam.rs` | Finds Steam (`HKCU\Software\Valve\Steam\SteamPath`, fallback `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath`), reads `steamapps/libraryfolders.vdf`, finds `steamapps/common/Transport Fever 3/TransportFever3.exe`, lists `userdata/<id>/3493540/local/` | tolerant VDF parser, library and path arithmetic |
 | `install.rs` | Installs and uninstalls the game-side footprint idempotently and returns a report | everything, run against temporary folders |
-| `gamelink.rs` | The file link with one game: session folder, `to_game.log`, `from_game.log` tail, `identity.txt` | line format, sequence tracking, truncation handling |
+| `gamelink.rs` | The file link with one game: session folder, `to_game.log`, `from_game.log` tail, `identity.txt` | line format, reading by position, truncation handling |
 | `process.rs` | Starts `TransportFever3.exe` with the session environment, reports the pid, says whether a game runs | the `Command` is built and checked without being run |
 | `net.rs` | TCP transport on `std::net` and threads: `HostNet` (listen, accept, one reader thread per connection), `ClientNet` (connect to the endpoints of a join code), `NetEvent`, the LAN addresses for a join code | loopback sockets in the tests |
 | `session.rs` | The session thread: `run_host`, `run_player`, `SessionHandle` (`stop()`, `status()`), the line-kind table | kind table, payload translation; end to end in `selftest.rs` |
@@ -85,7 +85,7 @@ so it is not in `winhttp.dll`.
 | Game build | the PE link timestamp of `TransportFever3.exe`, looked up in a copy of the builds of `native/src/build_table.rs` (`KNOWN_BUILDS`; the native crate links the launcher, so the launcher cannot link it. A test reads `build_table.rs` and fails when the two lists differ). An unknown build means the mod runs in reduced mode, and the line says so |
 | Game running | `process::any_game_running` |
 | FeverLink3 | `winhttp.dll` ours (marker), the mod in every Steam user folder, and which version put them there (below) |
-| This folder | `mod/feverlink3_1` and `winhttp.dll` beside the exe, and not running from inside a zip file (`Temp1_*.zip`, WinRAR, 7-Zip) or `%TEMP%`, where `feverlink3_path.txt` would record a path Windows deletes |
+| This folder | `mod/feverlink3` and `winhttp.dll` beside the exe, and not running from inside a zip file (`Temp1_*.zip`, WinRAR, 7-Zip) or `%TEMP%`, where `feverlink3_path.txt` would record a path Windows deletes |
 
 Under the checks, **Next step** says the first thing to do in a sentence. The banner, the diagnostics text and the
 file properties of the exe name the license (`CARGO_PKG_LICENSE`, read from `Cargo.toml`, never typed again).
@@ -183,7 +183,7 @@ One thread owns each session's state machine; everything else only feeds it even
 
 ## Kind mapping
 
-The file link carries one line per message: `seq<TAB>kind<TAB>from<TAB>payload`. `kind` is the snake_case of the
+The file link carries one line per message: `kind<TAB>from<TAB>payload` (no line number: the place in the file is the order). `kind` is the snake_case of the
 protocol kind in `docs/PROTOCOL.md`, with one exception the mod already depends on (`peerclock`). The payload is
 the wire payload (JSON, camelCase) rewritten as Lua literal syntax by `luatext.rs`, which is what `mod/` writes
 and reads; the mapping of the format is described under *File link* below. Direction is from the launcher's side.
@@ -207,6 +207,7 @@ and reads; the mapping of the format is described under *File link* below. Direc
 | `save_done` | SaveDone (34) | from game | ignored |
 | `replay_failed` | ReplayFailed (35) | from game | ignored |
 | `action_refused` | ActionRefused (36) | from game | ignored |
+| `action_applied` | ActionRefused (36), `applied: true` | from game | ignored |
 | `action` | Action (50) | both | to game: the origin player's id, as the host filled it into the payload; from game: ignored |
 | `chat` | Chat (51) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
 | `build_veto` | BuildVeto (52) | both | to game: `0` (the payload carries `from` and `name`); from game: ignored |
@@ -224,7 +225,7 @@ Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
   syntax is logged and dropped.
 - An `action` goes to the game only if its `body` is itself a Lua literal (`luatext::is_literal`): the mod `load`s the
   body, and a `load` runs calls and loops even in an empty environment. Anything else is logged and dropped.
-- A line is at most 4 MiB, a poll reads at most 8 MiB, a `seq` is at most 2^53, and the Lua text reader stops at
+- A line is at most 4 MiB, a poll reads at most 8 MiB, and the Lua text reader stops at
   4 MiB, 250 000 values and 48 levels; a longer line is dropped whole.
 - The `from` column of a line from the game is not used. The state machine knows who the game is: the host's own
   game is player 0 and trusted like the host; a player's frames are sealed with the id the host assigned, and the
@@ -257,9 +258,11 @@ that one *Uninstall* button removes exactly those. The three pieces:
    (`feverlink3_native`, which the module's PE export directory keeps even after the file is renamed). A
    `winhttp.dll` from another mod is never overwritten and never removed; the report says so and the install
    counts as failed.
-2. **The mod**, mirrored into `userdata/<id>/3493540/local/mods/feverlink3_1/` for every Steam user of the PC.
-   Mirror means the folder is replaced, so files removed from the mod disappear too; nothing else in `mods/` is
-   touched.
+2. **The mod**, mirrored into `userdata/<id>/3493540/local/mods/feverlink3/` for every Steam user of the PC.
+   Mirror means the folder is replaced, so files removed from the mod disappear too. The only other folder in
+   `mods/` that is touched is an old copy under an earlier name (`feverlink3_1`, the name until 2026-10-18,
+   `LEGACY_MOD_IDS` in `lib.rs`): install and uninstall remove it and report it, so the game never loads two
+   copies.
 3. **`feverlink3_path.txt`** next to `TransportFever3.exe`, holding the launcher's own path (UTF-8, one line),
    so that a game started by Steam can find the launcher. Today only `feverlink3 doctor` reads it: the in-game
    controller (live mode) does not need the launcher executable, and nothing in the native module reads this file.
@@ -331,15 +334,16 @@ folder above. The files:
 | `ctl_cmd.log`, `ctl_status.txt` | window / controller (live mode only) | controller / window |
 | `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt` | Lua mod | people / the mod itself |
 
-Each log line is `seq<TAB>kind<TAB>from<TAB>payload\n`. `seq` is strictly increasing within a file; the payload
+Each log line is `kind<TAB>from<TAB>payload\n`, with no number: the order of the lines in the file is the order; the payload
 is one line of Lua literal syntax, written verbatim (the mod's serialiser already escapes control characters in
 strings, and its reader does not unescape, so the launcher adds no escaping layer; an earlier version of
 `gamelink.rs` did and would have corrupted every string containing `"` or `\`). `luatext.rs` converts between
 that and the wire's JSON: objects become `{["key"]=value}` with sorted keys, arrays `{[1]=a,[2]=b}`, `null`
 fields are left out; going back, a table whose keys are exactly 1..n is an array, any other table an object, and
-only literal syntax is accepted (no calls, no names, no `(0/0)`). The reader remembers
-the highest `seq` it dispatched and ignores anything at or below it, so a truncated or rewritten file never
-replays history; a file that shrinks is re-read from its start. A partial last line waits for its newline.
+only literal syntax is accepted (no calls, no names, no `(0/0)`). The reader reads by position (`Pos`: the generation
+and the bytes it consumed) and drops nothing for what a line says; a file that shrinks, or no longer holds the bytes it
+read at the same places, was replaced and is re-read from its start. A partial last line waits for its newline. Where a
+session begins in `to_game.log` is a position too (`identity.txt` `start=<gen>:<offset>`).
 `Tail::poll()` returns the new lines; `Tail::spawn()` runs the same on a thread with a callback.
 
 ## Game start
@@ -443,7 +447,7 @@ As of 2026-10-10, with what has and has not been run in the real game kept apart
 
 - **Done and tested without the game:** host / join over the development TCP transport with the player allow-list
   and sender-id rewrite, `selftest` over loopback, the player-side reconnect, game launch with the session
-  environment, the file link with sequence numbers, install and uninstall of the game-side footprint (run against
+  environment, the file link read by position, install and uninstall of the game-side footprint (run against
   temporary folders), the resync round and savegame transfer (`tests/resync.rs`, a multi-chunk save over loopback),
   permissions, the live-mode controller (driven through files), update verification (`update.rs`), and the release
   zip and manifest (`tools/release`).
@@ -458,8 +462,8 @@ As of 2026-10-10, with what has and has not been run in the real game kept apart
   `docs/RELEASING.md`); the guided installer; the Steam connection as the session transport (hosting and joining
   over Steam).
 
-The release zip holds `feverlink3.exe`, `winhttp.dll` and `mod/feverlink3_1/` side by side; in a source tree
-`main.rs` finds them by walking up from the executable's folder (`mod/feverlink3_1/`, and `winhttp.dll` or
+The release zip holds `feverlink3.exe`, `winhttp.dll` and `mod/feverlink3/` side by side; in a source tree
+`main.rs` finds them by walking up from the executable's folder (`mod/feverlink3/`, and `winhttp.dll` or
 `target/release/feverlink3_native.dll` in each folder on the way).
 
 ## Resync and permissions (launcher side)

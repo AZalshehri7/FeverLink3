@@ -332,8 +332,8 @@ fn footprint(dry_run: bool, remove: bool) -> ExitCode {
 }
 
 /// The mod folder and native module shipped with this executable. In a release zip both sit next to the exe
-/// (`mod/feverlink3_1/`, `winhttp.dll`); in a source tree they are found by walking up to the repository root
-/// (`mod/feverlink3_1/`, `target/release/feverlink3_native.dll`).
+/// (`mod/feverlink3/`, `winhttp.dll`); in a source tree they are found by walking up to the repository root
+/// (`mod/feverlink3/`, `target/release/feverlink3_native.dll`).
 fn locate_payload() -> (Option<PathBuf>, Option<PathBuf>) {
     let start = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let mut mod_src = None;

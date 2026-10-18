@@ -68,10 +68,11 @@ pub enum Ty {
     BlobVec,
     /// `std::map` (0x10 bytes: head pointer, size).
     Map,
-    /// `std::unordered_map/set` (0x40 bytes) whose list nodes (and the list's sentinel, the same type) are `n` bytes: next, prev, value.
-    /// The node size is the container's element type, so every block of its graph has a size known from the layout (no heap query).
-    /// [b45, c10c, inj3: sentinels of 24 bytes for the four Proposal sets and `old2new`, 40 for `refundableEntities`]
-    Hash(usize),
+    /// `std::unordered_map/set` (0x40 bytes) whose list nodes (and the list's sentinel, the same type) are described by the
+    /// [`HashNode`]: next, prev, the value. The node size is the container's element type, so every block of its graph has a size known
+    /// from the layout (no heap query). [b45, c10c, inj3: sentinels of 24 bytes for the four Proposal sets and `old2new`, 40 for
+    /// `refundableEntities`]
+    Hash(&'static HashNode),
     /// A flat hash set of 4-byte entity ids (0x20 bytes: control-byte pointer, slot pointer, size, capacity; one allocation of
     /// `capacity + 16` control bytes, padded to 4, then `capacity` slots). Its value is the set of ids; the control bytes are a hash of
     /// them made by the game that owns the table (b54: other bytes in the receiver's copy), so they are not part of the value.
@@ -100,6 +101,28 @@ impl Ty {
         }
     }
 }
+
+/// The node of an engine hash container's list: `size` bytes (next at +0, prev at +8, the value from +0x10), and the byte ranges of
+/// the value that are its padding (never constructed: residue of earlier users of the memory, not part of the value; written as zero).
+/// A container whose value type is not known has no padding listed: its value words are literals, and a word that is an address in
+/// this game stays a `P` (the rebuild refuses it).
+#[derive(Debug, PartialEq, Eq)]
+pub struct HashNode {
+    pub size: usize,
+    pub pad: &'static [(usize, usize)],
+}
+
+/// A node whose value is not typed (24 bytes: an 8-byte value of an unknown layout).
+pub static HASH_NODE_18: HashNode = HashNode { size: 0x18, pad: &[] };
+/// `refundableEntities`: 40-byte nodes, a 24-byte value of an unknown layout.
+pub static HASH_NODE_28: HashNode = HashNode { size: 0x28, pad: &[] };
+/// A set of 4-byte values (`std::unordered_set<uint32>`): the value at +0x10, four bytes of padding at +0x14.
+/// [owner airport run 2026-10-15 key 20 and friend test 2026-10-16 keys 20, 28, 29 and the friend's hold 4: every unresolved pointer of
+/// those refusals was +0x10 of a `terrainAlignSkipEdges` node; the low halves of the 22 values of key 20 are 0..21, each once (two of
+/// them only in the "pointers": 0x171_00000007 and 0x170_00000012), and the high halves are 0, 1, 0x12f, 0x170, 0x171, 0x2c8: the high
+/// words of the heap addresses that memory held before. The halves above 0x10000 made the word look like a readable address on one game
+/// and not on the other.]
+pub static HASH_NODE_SET32: HashNode = HashNode { size: 0x18, pad: &[(0x14, 0x18)] };
 
 /// The byte offset of the slots of an [`Ty::EntSet`] table of `cap` slots from its control bytes: `cap` control bytes, the sentinel,
 /// 15 cloned bytes for a 16-byte group read, padded to the 4-byte slot alignment. [b45: 20 for capacities 1 and 3]
@@ -278,8 +301,8 @@ pub static PAYLOAD: &[F] = &[
     f(0x048, "proposal.removedSegments", Ty::Vec(&SEGMENT)),
     f(0x060, "proposal.nodeConfigsToAdd", Ty::Vec(&NODE_CONFIG)),
     f(0x078, "proposal.nodeConfigsToRemove", Ty::EntVec),
-    f(0x090, "proposal.hash90", Ty::Hash(0x18)),
-    f(0x0d0, "proposal.hashd0", Ty::Hash(0x18)),
+    f(0x090, "proposal.hash90", Ty::Hash(&HASH_NODE_18)),
+    f(0x0d0, "proposal.hashd0", Ty::Hash(&HASH_NODE_18)),
     f(0x110, "proposal.edgeObjectsToRemove", Ty::EntVec),
     f(0x128, "proposal.edgeObjectsToAdd", Ty::Vec(&EDGE_OBJECT)),
     f(0x140, "proposal.new2oldNodes", Ty::Map),
@@ -299,11 +322,11 @@ pub static PAYLOAD: &[F] = &[
     f(0x1c0, "proposal.gap1c0", Ty::Pad(0x10)),
     // indices into addedNodes, see the construction's `frozenNodes`
     f(0x1d0, "proposal.frozenNodes", Ty::EntVec),
-    f(0x1e8, "terrainAlignSkipEdges", Ty::Hash(0x18)),
+    f(0x1e8, "terrainAlignSkipEdges", Ty::Hash(&HASH_NODE_SET32)),
     f(0x228, "segmentTags", Ty::Vec(&SEGMENT_TAG)),
     f(0x240, "toRemove", Ty::EntVec),
     f(0x258, "toAdd", Ty::Vec(&CONSTRUCTION)),
-    f(0x270, "old2new", Ty::Hash(0x18)),
+    f(0x270, "old2new", Ty::Hash(&HASH_NODE_18)),
     // a vector of u32 (copied with sar 2 in the engine's copy constructor) and a std::map whose sentinel is 0x50 bytes
     f(0x2b0, "parcelsToRemove", Ty::EntVec),
     f(0x2c8, "parcelsMap", Ty::Map),
@@ -314,7 +337,7 @@ pub static PAYLOAD: &[F] = &[
     f(0x362, "context.cleanupStreetGraph", Ty::U8),
     f(0x36c, "context.player", Ty::Ent),
     // an unordered container (load factor 1.0 at +0, bucket vector, mask 7, maxidx 8 seen at +0x30, +0x38 of it)
-    f(0x370, "context.refundableEntities", Ty::Hash(0x28)),
+    f(0x370, "context.refundableEntities", Ty::Hash(&HASH_NODE_28)),
     f(0x3b2, "context.extendProposalRedoPillars", Ty::U8),
     f(0x3d0, "withCostRep", Ty::U8),
     f(0x3d1, "ignoreErrors", Ty::U8),
@@ -366,6 +389,37 @@ pub struct Settings {
     /// Typed copy (`inject.rs`): pointers are followed only through typed members; in the bytes the table does not name every pointer
     /// to something other than the game's image is zeroed (it is a foreign address, owned or not), and an empty engine container writes no graph.
     pub typed: bool,
+    /// The hard ceiling of the heap the structural dump may read behind unnamed bytes (vectors and ranges it recognises). The bound of
+    /// one text is scaled from the proposal's own size ([`heap_budget`]) and never goes above this.
+    pub max_heap_bytes: usize,
+}
+
+/// Bytes of heap the structural dump may read per byte of the proposal's own data (the payload and the blocks of its vectors).
+pub const HEAP_PER_OWN_BYTE: usize = 64;
+/// The least heap bound of a text: the fixed bound every text had before it was scaled (8 MB), so that no text is refused that was not
+/// refused before.
+pub const HEAP_FLOOR: usize = 8 << 20;
+
+/// The heap the structural dump of a proposal of `own` bytes may read: [`HEAP_PER_OWN_BYTE`] per byte, at least [`HEAP_FLOOR`], at most
+/// `ceiling`. The friend test (2026-10-16, key 108, a modular station's module over a town building) refused the host's own copy at the
+/// fixed 8 MB while the friend's game injected the same text: the bound is a property of the proposal, the same on every game, and only
+/// the bytes really read count against it (see [`Enc::raw_tokens`]).
+pub fn heap_budget(own: usize, ceiling: usize) -> usize {
+    own.saturating_mul(HEAP_PER_OWN_BYTE).max(HEAP_FLOOR).min(ceiling)
+}
+
+/// The proposal's own data: the payload and the element blocks of its vectors (the table's `Vec`, `EntVec` and `BlobVec` members, by
+/// their begin and end; a triple that is not a vector counts nothing).
+pub fn own_bytes(payload: &[u8], max_block_bytes: usize) -> usize {
+    PAYLOAD.iter().filter(|f| matches!(f.ty, Ty::Vec(_) | Ty::EntVec | Ty::BlobVec)).fold(payload.len(), |n, f| {
+        let (b, e) = (u64_at(payload, f.off), u64_at(payload, f.off + 8));
+        let len = e.wrapping_sub(b) as usize;
+        if b != 0 && b <= e && len <= max_block_bytes {
+            n.saturating_add(len)
+        } else {
+            n
+        }
+    })
 }
 
 impl Settings {
@@ -386,6 +440,7 @@ impl Settings {
             input_level: true,
             graph_skip: &[],
             typed: false,
+            max_heap_bytes: 8 << 20,
         }
     }
 
@@ -417,6 +472,7 @@ impl Settings {
             input_level: false,
             graph_skip: &[],
             typed: false,
+            max_heap_bytes: 64 << 20,
         })
     }
 }
@@ -438,6 +494,9 @@ pub struct Stats {
     pub block_bytes: usize,
     /// Pointers left as `P` because a bound of the graph was reached.
     pub graph_truncated: usize,
+    /// Heap bytes the structural dump read behind unnamed bytes, and the text's bound of them ([`heap_budget`]).
+    pub heap_read: usize,
+    pub heap_budget: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,8 +560,11 @@ struct Enc<'a> {
     stats: Stats,
     /// entity id -> position (f32 bits), from the elements that locate their entities
     pos: HashMap<u32, [u32; 3]>,
-    /// bytes of heap memory read for the structural dump so far
+    /// bytes of heap memory read for the structural dump so far (only reads that succeeded)
     raw_spent: usize,
+    /// what `raw_spent` may reach: [`heap_budget`] of the proposal's [`own_bytes`]
+    heap_budget: usize,
+    own_bytes: usize,
     /// the heap graph: blocks reached by pointers, in the order they were found (block `n` is `blocks[n - 1]`)
     blocks: Vec<Blk>,
     by_addr: BTreeMap<usize, usize>,
@@ -539,8 +601,9 @@ enum Kind {
     /// The sentinel of a hash container's list: next, prev; its value is never constructed (residue: b45 hashd0's pointed at a
     /// foreign block), so it is written as zero.
     ListSentinel,
-    /// A node of a hash container's list: next, prev, the value (literal words; a word that is an address in this game is a `P`).
-    ListNode,
+    /// A node of a hash container's list: next, prev, the value (literal words; a word that is an address in this game is a `P`), with
+    /// the value's padding (the [`HashNode`]'s byte ranges) zeroed.
+    ListNode(&'static [(usize, usize)]),
     /// The bucket vector of a hash container: every word points at a node of its list (or the sentinel).
     Buckets,
 }
@@ -781,7 +844,7 @@ impl Enc<'_> {
                 // std::unordered_map/set: load factor (the other four bytes of its word are padding), then the list head, size,
                 // bucket vector, mask and maximum index; the nodes are heap blocks of the graph
                 self.line(path, &format!("hash:size={},load={:08x}", u64_at(b, 0x10), u32_at(b, 0)))?;
-                self.register_hash_list(u64_at(b, 8) as usize, u64_at(b, 0x10) as usize, node);
+                self.register_hash_list(u64_at(b, 8) as usize, u64_at(b, 0x10) as usize, node.size, node.pad);
                 self.register_hash_buckets(
                     u64_at(b, 0x18) as usize,
                     u64_at(b, 0x20) as usize,
@@ -886,7 +949,7 @@ impl Enc<'_> {
     /// readable nodes whose `prev` links agree; else nothing is registered and the pointers stay `P` (the rebuild refuses). The sizes
     /// come from the container's type, so the graph needs no heap index (the whole-heap walk it replaces took 220-320 ms per text and
     /// stopped at 3,145,728 blocks, missing blocks past it: b45 `refundableEntities` sentinel, inj7 its list head, inj3/inj8 buckets).
-    fn register_hash_list(&mut self, head: usize, size: usize, node: usize) {
+    fn register_hash_list(&mut self, head: usize, size: usize, node: usize, pad: &'static [(usize, usize)]) {
         if size > self.set.max_elems || !pointer_like(head as u64) || node < 0x10 {
             return;
         }
@@ -911,7 +974,7 @@ impl Enc<'_> {
         self.kinds.insert(head, Kind::ListSentinel);
         for a in found {
             self.known_sizes.insert(a, node);
-            self.kinds.insert(a, Kind::ListNode);
+            self.kinds.insert(a, Kind::ListNode(pad));
         }
     }
 
@@ -1091,7 +1154,7 @@ impl Enc<'_> {
             Kind::SetNode => (&[(0x1a, 0x1c)], &[0, 8, 0x10]),
             Kind::MapNode => (&[(0x1a, 0x20), (0x24, 0x28)], &[0, 8, 0x10, 0x28]),
             Kind::ListSentinel => (&[(0x10, usize::MAX)], &[0, 8]),
-            Kind::ListNode => (&[], &[0, 8]),
+            Kind::ListNode(pad) => (pad, &[0, 8]),
             Kind::Buckets => (&[], &all),
         };
         for &(from, to) in pad {
@@ -1126,7 +1189,7 @@ impl Enc<'_> {
                     }
                     toks.push("P".into());
                 }
-            } else if kind == Kind::ListNode
+            } else if matches!(kind, Kind::ListNode(_))
                 && pointer_like(w)
                 && !((w as usize) >= self.env.image_base && (w as usize) - self.env.image_base < IMAGE_BOUND)
                 && self.mem.read(w as usize, 1).is_some()
@@ -1147,6 +1210,18 @@ impl Enc<'_> {
             toks.push(format!("b:{}", hex(&b[b.len() - b.len() % 8..])));
         }
         toks.join(" ")
+    }
+
+    /// `len` bytes of heap were read for the structural dump: refused past the text's heap bound ([`heap_budget`]).
+    fn spend(&mut self, len: usize) -> R<()> {
+        self.raw_spent = self.raw_spent.saturating_add(len);
+        if self.raw_spent > self.heap_budget {
+            return Err(format!(
+                "structural dump reads more heap than the bound ({} bytes read; the bound is {} bytes: {HEAP_PER_OWN_BYTE} x the proposal's own {} bytes, at least {HEAP_FLOOR}, at most {})",
+                self.raw_spent, self.heap_budget, self.own_bytes, self.set.max_heap_bytes
+            ));
+        }
+        Ok(())
     }
 
     /// Tokens for `bytes` (a multiple of 8 long, or the tail as `b:`).
@@ -1202,10 +1277,6 @@ impl Enc<'_> {
                     && (e - b) as usize <= self.set.max_block_bytes
                 {
                     let len = (e - b) as usize;
-                    self.raw_spent += len;
-                    if self.raw_spent > self.set.max_text_bytes {
-                        return Err("structural dump reads more heap than the bound".into());
-                    }
                     if len == 0 {
                         if self.mem.read(b as usize, 1).is_some() {
                             self.stats.vectors += 1;
@@ -1214,6 +1285,10 @@ impl Enc<'_> {
                             continue;
                         }
                     } else if let Some(block) = self.mem.read(b as usize, len) {
+                        // only the bytes that were read count against the bound: three words that only look like a vector (residue,
+                        // packed 32-bit values; unreadable in this game) used to count their whole span, so the verdict depended on the
+                        // residue of the game that wrote the text (friend test 2026-10-16, key 108: refused on the host only)
+                        self.spend(len)?;
                         self.stats.vectors += 1;
                         let inner = if len.is_multiple_of(8) {
                             self.raw_tokens(&block, depth + 1)?
@@ -1247,7 +1322,7 @@ impl Enc<'_> {
                         let block =
                             if len == 0 { self.mem.read(p, 1).map(|_| Vec::new()) } else { self.mem.read(p, len) };
                         if let Some(block) = block {
-                            self.raw_spent += len;
+                            self.spend(len)?;
                             let inner = if len == 0 {
                                 String::new()
                             } else if len.is_multiple_of(8) {
@@ -1315,6 +1390,7 @@ pub fn encode_with(
     if payload[0x9b8] != KIND_BUILD_PROPOSAL {
         return Err(format!("kind byte {} is not {KIND_BUILD_PROPOSAL}", payload[0x9b8]));
     }
+    let own = own_bytes(&payload, set.max_block_bytes);
     let mut e = Enc {
         mem,
         opts,
@@ -1325,6 +1401,8 @@ pub fn encode_with(
         stats: Stats::default(),
         pos: HashMap::new(),
         raw_spent: 0,
+        heap_budget: heap_budget(own, set.max_heap_bytes),
+        own_bytes: own,
         blocks: Vec::new(),
         by_addr: BTreeMap::new(),
         graph_bytes: 0,
@@ -1375,6 +1453,8 @@ pub fn encode_with(
     e.stats.blocks = e.blocks.len();
     e.stats.block_bytes = e.graph_bytes;
     e.stats.lines += e.blocks.len();
+    e.stats.heap_read = e.raw_spent;
+    e.stats.heap_budget = e.heap_budget;
     e.out.push_str(&block_lines);
     let mut text = String::new();
     let _ = writeln!(
@@ -1882,6 +1962,68 @@ mod tests {
         assert!(encode(&mem, Env { image_base: BASE }, tiny, "40420", &head(at)).unwrap_err().contains("size bound"));
         let few = Settings { max_elems: 1, ..settings() };
         assert!(encode(&mem, Env { image_base: BASE }, few, "40420", &head(at)).is_err());
+    }
+
+    /// The synthetic depot with `count` constructions (copies of its one), the first with two vectors of `len` readable zero bytes in
+    /// its unnamed words and, beside them, three words that only look like vectors of almost 8 MB each (unreadable here: residue).
+    fn heavy(count: usize, len: usize) -> (Fake, usize) {
+        let (Fake(mut regions), at) = synthetic();
+        let cons = regions.iter().find(|(a, _)| *a == HEAP + 0x9000).unwrap().1.clone();
+        let (v1, v2, many) = (HEAP + 0x100_0000, HEAP + 0x200_0000, HEAP + 0x400_0000);
+        let mut all = Vec::with_capacity(count * 0xe48);
+        for i in 0..count {
+            let mut c = cons.clone();
+            if i == 0 {
+                for (k, v) in [v1, v2].iter().enumerate() {
+                    put(&mut c, 0x200 + k * 0x18, *v as u64);
+                    put(&mut c, 0x208 + k * 0x18, (*v + len) as u64);
+                    put(&mut c, 0x210 + k * 0x18, (*v + len) as u64);
+                }
+                for k in 0..3u64 {
+                    let b = (k + 1) << 32; // packed 32-bit values: (0, k + 1), (0x7f0000, k + 1) ...
+                    put(&mut c, 0x300 + k as usize * 0x18, b);
+                    put(&mut c, 0x308 + k as usize * 0x18, b + 0x7f_0000);
+                    put(&mut c, 0x310 + k as usize * 0x18, b + 0x7f_0000);
+                }
+            }
+            all.extend_from_slice(&c);
+        }
+        let pay = regions.iter_mut().find(|(a, _)| *a == at).unwrap();
+        put(&mut pay.1, 0x258, many as u64);
+        put(&mut pay.1, 0x260, (many + count * 0xe48) as u64);
+        put(&mut pay.1, 0x268, (many + count * 0xe48) as u64);
+        regions.push((many, all));
+        regions.push((v1, vec![0u8; len]));
+        regions.push((v2, vec![0u8; len]));
+        (Fake(regions), at)
+    }
+
+    #[test]
+    fn the_heap_bound_counts_only_what_is_read_and_scales_with_the_proposal() {
+        let plain = Settings { graph: false, ..settings() };
+        // friend test 2026-10-16 key 108: the host refused its own copy, the friend injected it. Three words that only look like vectors
+        // (unreadable) counted their whole span: 3 x 8 MB "read" without a byte read. They count nothing now.
+        let (mem, at) = heavy(1, 0x1000);
+        let p =
+            encode(&mem, Env { image_base: BASE }, plain, "40420", &head(at)).expect("unreadable spans count nothing");
+        assert_eq!(p.stats.heap_read, 0x2000, "only the two real vectors were read");
+        assert_eq!(p.stats.heap_budget, HEAP_FLOOR, "a small proposal has the old bound");
+        // a small proposal that really reads 10 MB behind its unnamed words is refused at the floor, and says why
+        let (mem, at) = heavy(1, 5 << 20);
+        let e = encode(&mem, Env { image_base: BASE }, plain, "40420", &head(at)).unwrap_err();
+        assert!(e.starts_with("structural dump reads more heap than the bound"), "{e}");
+        assert!(e.contains(&format!("the bound is {HEAP_FLOOR} bytes")), "{e}");
+        // the same reads in a large proposal (200 constructions): its own bound is 64 x its size
+        let (mem, at) = heavy(200, 5 << 20);
+        let p = encode(&mem, Env { image_base: BASE }, plain, "40420", &head(at)).expect("a large proposal reads more");
+        assert_eq!(p.stats.heap_read, 10 << 20);
+        let own = PAYLOAD_SIZE + 200 * 0xe48 + 0x80 + 0x40 + 0x350 + 8;
+        assert_eq!(p.stats.heap_budget, own * HEAP_PER_OWN_BYTE, "scaled from the proposal's own bytes");
+        // and never past the hard ceiling
+        let capped = Settings { max_heap_bytes: 9 << 20, ..plain };
+        let e = encode(&mem, Env { image_base: BASE }, capped, "40420", &head(at)).unwrap_err();
+        assert!(e.contains("at most 9437184"), "{e}");
+        assert_eq!(heap_budget(usize::MAX, 64 << 20), 64 << 20);
     }
 
     #[test]

@@ -5,7 +5,7 @@ function data()
 	return {
 		type = "react-plugin ::GameBarInfoDisplayExtension",
 		data = {
-			filePath = "feverlink3_1::/feverlink3_ui.script@FeverLink3Bar",
+			filePath = "feverlink3::/feverlink3_ui.script@FeverLink3Bar",
 			priority = -2, -- negative: left of the default entries
 		},
 	}

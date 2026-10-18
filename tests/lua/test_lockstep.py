@@ -14,6 +14,7 @@ Run:  python -I tests/lua/test_lockstep.py        (or: python -m unittest discov
 Set FEVERLINK3_TEST_VERBOSE=1 to print both games' mod.log on failure.
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -26,7 +27,7 @@ import lupa.lua52 as lupa
 os.environ.pop("FEVERLINK3_REMOTE_CONSTRUCTIONS", None)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 TAB = "\t"
 STEP = 200
 T0 = 18600
@@ -55,12 +56,35 @@ HOOK_SRC = read_src("feverlink3_uihook.lua")
 TRACE_SRC = read_src("feverlink3_towntrace.lua")
 PORTABLE_SRC = read_src("feverlink3_portable.lua")
 LVL_SRC = read_src("feverlink3_livevsloaded.lua")
+LINKSTATS_SRC = read_src("feverlink3_linkstats.lua")
+# every io/os use of the mod (feverlink3_link.lua) and its logging (feverlink3_log.lua): the common module loads both
+LINK_SRC = read_src("feverlink3_link.lua")
+LOG_SRC = read_src("feverlink3_log.lua")
 # the command-schema modules of the other areas (feverlink3_cmds_*.lua), by module name
 CMDS_SRC = {
     os.path.splitext(f)[0]: read_src(f)
     for f in sorted(os.listdir(CONTENT))
     if f.startswith("feverlink3_cmds_") and f.endswith(".lua")
 }
+
+# feverlink3_common.lua in a bare Lua state (no harness): ug_require finds the two modules it loads, the link and the log module
+STANDALONE_REQUIRE = r'''
+function ug_require(p)
+  if p:find("feverlink3_link.lua", 1, true) then return assert(load(LINK_SRC, "=link", "t"))() end
+  if p:find("feverlink3_log.lua", 1, true) then return assert(load(LOG_SRC, "=log", "t"))() end
+  error("no module " .. tostring(p))
+end
+'''
+
+
+def load_common(rt):
+    """Runs feverlink3_common.lua in the runtime `rt` and returns the module (a ug_require of its own unless rt has one)."""
+    g = rt.globals()
+    g.LINK_SRC, g.LOG_SRC = LINK_SRC, LOG_SRC
+    if g.ug_require is None:
+        rt.execute(STANDALONE_REQUIRE)
+    return rt.execute(COMMON_SRC)
+
 
 # ---------------------------------------------------------------- mocked engine (one per game)
 
@@ -95,6 +119,11 @@ app = {
   end,
   findAllSavegames = function(ns) assert(ns == 1); return SAVES end,
   loadGame = function(id, flag) assert(id.saveGameNamespace == 1 and id.path); LOADED = id.saveGameName; RELOAD_PENDING = true end,
+  -- the start gate (script-doc app.html): a game loaded after setWaitForStartReadyGame does not start by itself. Modelled (not seen in
+  -- the game): while it waits the interface frames run, the engine applies no command and runs no step, until startReadyGame.
+  setWaitForStartReadyGame = function() GAME.waitNext = true end,
+  isWaitForStartReadyGame = function() return GAME.waitReady == true or GAME.waitNext == true end,
+  startReadyGame = function() READY_STARTS = (READY_STARTS or 0) + 1; GAME.held = false end,
 }
 local CT = { GAME_TIME = 1, GAME_SPEED = 2, ACCOUNT = 3, CONSTRUCTION = 4, VEHICLE_DEPOT = 5, TRANSPORT_VEHICLE = 6, LINE = 7, PLAYER = 8, TOWN_BUILDING = 9 }
 local NAMEOF = {}
@@ -130,7 +159,7 @@ function EXECUTE(cmd, cb)
     return
   end
   if name == "makeScriptingSendEventCmd" then
-    EVENTS_SEEN[#EVENTS_SEEN + 1] = { a[2], a[3] }
+    EVENTS_SEEN[#EVENTS_SEEN + 1] = { a[2], a[3], a[1] }
     SIM_EVENT(a[1], a[2], a[3], a[4])
     if cb then cb({}, true, {}) end
     return
@@ -172,6 +201,7 @@ end
 function MAKE_API()
   local cmd = {
     sendCommand = function(c, cb, progress)
+      if GAME.phase == "update" then UPDATE_WRITES[#UPDATE_WRITES + 1] = "sendCommand " .. tostring(c and c.__cmd) end
       if GAME.inUpdate then
         -- finding from MPFever (MIT): callbacks are refused inside the simulation update
         if cb then error("Callbacks are currently disallowed") end
@@ -190,6 +220,12 @@ function MAKE_API()
       ComponentType = CT,
       JournalEntry = { new = function() return { category = {} } end, Type = { OTHER = 1 } },
       SavegameId = { new = function() return {} end },
+      -- the TransportMode enum (api.type.enum.TransportMode); its values here as the game's maps are keyed (PERSON 0 ... 15)
+      enum = { TransportMode = { PERSON = 0, CARGO = 1, CAR = 2, BUS = 3, TRUCK = 4, TRAM = 5, ELECTRIC_TRAM = 6, TRAIN = 7,
+        ELECTRIC_TRAIN = 8, AIRCRAFT = 9, SHIP = 10, SMALL_AIRCRAFT = 11, SMALL_SHIP = 12, HELICOPTER = 13, TRAM_TRACK = 14,
+        ELECTRIC_TRAM_TRACK = 15 },
+        -- land uses (getCargoSupplyAndLimit's LandUseType) and street vs track (BaseEdge.roadType), as tf3-docs api/type lists them
+        LandUseType = { RESIDENTIAL = 0, COMMERCIAL = 1, INDUSTRIAL = 2 }, RoadType = { STREET = 0, TRACK = 1 } },
     },
     engine = {
       getComponent = function(e, t)
@@ -200,6 +236,8 @@ function MAKE_API()
         return w and w[NAMEOF[t]] or nil
       end,
       entityExists = function(e) return WORLD[e] ~= nil end,
+      -- Engine.Revision of an entity ({ num = { a, b, c } }, tf3-docs api/engine getRevision); an entity that is gone raises
+      getRevision = function(e) if WORLD[e] == nil then error("no entity " .. tostring(e)) end return { num = { 1000 + e, 0, 0 } } end,
       util = { getWorld = function() return 1 end, getPlayer = function() return 7 end },
       forEachEntityWithComponent = function(fn, t) for _, e in ipairs(idsWith(NAMEOF[t])) do fn(e) end end,
       system = { lineSystem = { getLines = function() return idsWith("LINE") end } },
@@ -237,14 +275,37 @@ local function deepcopy(v)
   return out
 end
 
--- the game-script state: written by the simulation half, readable from both (copies: no shared references)
+-- the game-script state: written by the simulation half, readable from both (copies: no shared references). The wiki's update
+-- "may not write the state itself": what a script writes or sends during the update phase is recorded (UPDATE_WRITES).
 local STORED = nil
+UPDATE_WRITES = {}
 STATE = {
   get = function(self) return deepcopy(STORED) end,
-  set = function(self, v) STORED = deepcopy(v) end,
-  subscribeToAllEvents = function() end,
+  set = function(self, v)
+    if GAME.phase == "update" then UPDATE_WRITES[#UPDATE_WRITES + 1] = "state:set" end
+    STORED = deepcopy(v)
+  end,
+  -- subscriptions (script-doc gamescript.html): handleEvent receives the events of the names subscribed, or all. Until the script's first
+  -- subscription the mock delivers everything (the docs do not say what an unsubscribed script receives; the base scripts subscribe on the
+  -- game's init events, which therefore arrive without one); after it, an event of another name is dropped (SUBS.dropped).
+  subscribeToAllEvents = function()
+    if GAME.phase == "update" then UPDATE_WRITES[#UPDATE_WRITES + 1] = "state:subscribeToAllEvents" end
+    SUBS.all = true
+  end,
+  subscribeToEvent = function(self, name)
+    if GAME.phase == "update" then UPDATE_WRITES[#UPDATE_WRITES + 1] = "state:subscribeToEvent" end
+    assert(type(name) == "string", "subscribeToEvent(name : string)")
+    SUBS.names[name] = true
+    SUBS.any = true
+  end,
+  hasEventSubscriptions = function() return SUBS.all or SUBS.any end,
 }
-GSTATE = { subscribeToAllEvents = function() end }
+SUBS = { all = false, any = false, names = {}, dropped = {} }
+GSUBS = { all = false, names = {} }
+GSTATE = {
+  subscribeToAllEvents = function() GSUBS.all = true end,
+  subscribeToEvent = function(self, name) assert(type(name) == "string"); GSUBS.names[name] = true end,
+}
 
 function LOAD_HALF(label)
   local env = setmetatable({}, { __index = _G })
@@ -252,12 +313,15 @@ function LOAD_HALF(label)
   env.package = { loaded = {} }
   env.FEVERLINK3_ENGINE = { adjustLoan = function(d) ACCOUNT.loan = ACCOUNT.loan + d end }   -- the injected loan accessor
   env.ug_require = function(p)
+    if p:find("feverlink3_link.lua", 1, true) then return assert(load(LINK_SRC, "=link", "t", env))() end
+    if p:find("feverlink3_log.lua", 1, true) then return assert(load(LOG_SRC, "=log", "t", env))() end
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
     if p:find("feverlink3_towntrace") then return assert(load(TRACE_SRC, "=towntrace", "t", env))() end
     if p:find("feverlink3_livevsloaded") then return assert(load(LVL_SRC, "=livevsloaded", "t", env))() end
+    if p:find("feverlink3_linkstats") then return assert(load(LINKSTATS_SRC, "=linkstats", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
     if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
     error("no module " .. tostring(p))
@@ -274,6 +338,9 @@ GUI_API = GUI_ENV.api
 function RELOAD()
   RELOAD_PENDING = false
   GAME.guiQueue = {}
+  -- the loaded game waits for app.startReadyGame when the wait was asked for before (or at) the load
+  GAME.waitReady, GAME.waitNext = GAME.waitNext == true, nil
+  GAME.held = GAME.waitReady
   SIM, SIM_ENV = LOAD_HALF("sim")
   GUI, GUI_ENV = LOAD_HALF("gui")
   GUI_API = GUI_ENV.api
@@ -284,6 +351,8 @@ function UI_HOOK_NEW()
   env.api = MAKE_API()
   env.package = { loaded = {} }
   env.ug_require = function(p)
+    if p:find("feverlink3_link.lua", 1, true) then return assert(load(LINK_SRC, "=link", "t", env))() end
+    if p:find("feverlink3_log.lua", 1, true) then return assert(load(LOG_SRC, "=log", "t", env))() end
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
@@ -304,6 +373,8 @@ function UI_ENV_NEW()
   local env = setmetatable({}, { __index = _G })
   env.package = { loaded = {} }
   env.ug_require = function(p)
+    if p:find("feverlink3_link.lua", 1, true) then return assert(load(LINK_SRC, "=link", "t", env))() end
+    if p:find("feverlink3_log.lua", 1, true) then return assert(load(LOG_SRC, "=log", "t", env))() end
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
@@ -329,13 +400,20 @@ function UI_VIEW()
   return e.Hud.statusText(m) .. "|" .. e.Hud.rosterText(m) .. "|" .. table.concat(e.Hud.chatLines(m, 15), ";")
 end
 
-function SIM_EVENT(src, id, name, param) SIM.handleEvent(nil, STATE, src, id, name, param) end
+function SIM_EVENT(src, id, name, param)
+  if SUBS.any and not SUBS.all and not SUBS.names[name] then
+    SUBS.dropped[#SUBS.dropped + 1] = tostring(id) .. "/" .. tostring(name)
+    return
+  end
+  SIM.handleEvent(nil, STATE, src, id, name, param)
+end
 -- a frame: the bridge's interface half, then the window state's refresh (the UI hook's held commands get their stamp applies)
 function FRAME()
   GUI.guiUpdate(nil, STATE, GSTATE)
   if UI_HOOK and UI_HOOK.HookModule.poll then UI_HOOK.HookModule.poll() end
 end
 function SIMSTEP()
+  if GAME.held then HELD_TICKS = (HELD_TICKS or 0) + 1; return end   -- a loaded game waiting for app.startReadyGame
   local cbs = SAVE_CBS
   SAVE_CBS = {}
   for _, cb in ipairs(cbs) do cb() end
@@ -348,8 +426,23 @@ function SIMSTEP()
     for _, e in ipairs(GAME.deferred) do WORLD[e] = { TRANSPORT_VEHICLE = {} } end
     GAME.deferred = {}
     GAME.time = GAME.time + 200
+    if STEP_HOOK then STEP_HOOK(GAME.time) end   -- a test's own world change at a step (as the engine's town growth), before the script
+    -- one simulation step as the wiki describes it (modding:scripting:gamescripts): every game script's update, which "may not write
+    -- the state itself" and whose result "is forwarded to the next script", then postUpdate, "executed after all the update scripts are
+    -- done", at the same game time. Commands sent in either run at once (the simulation state) and may not carry a callback.
     GAME.inUpdate = true
-    SIM.update(nil, STATE, 0.2)
+    GAME.phase = "update"
+    local applied0 = #GAME.applied
+    local res = SIM.update(nil, STATE, 0.2)
+    if #GAME.applied ~= applied0 then UPDATE_WRITES[#UPDATE_WRITES + 1] = "engine command applied in update" end
+    if OTHER_UPDATE then OTHER_UPDATE(GAME.time) end   -- another game script's update in the same step (a test's own)
+    -- POST_MODE (a test's): "never" calls no postUpdate, "alternate" every other step (the bridge's fallback applies the step in update)
+    GAME.stepN = (GAME.stepN or 0) + 1
+    if not (POST_MODE == "never" or (POST_MODE == "alternate" and GAME.stepN % 2 == 0)) then
+      GAME.phase = "postUpdate"
+      SIM.postUpdate(nil, STATE, 0.2, res)
+    end
+    GAME.phase = nil
     GAME.inUpdate = false
   end
 end
@@ -376,6 +469,8 @@ class Game:
         g.TRACE_SRC = TRACE_SRC
         g.PORTABLE_SRC = PORTABLE_SRC
         g.LVL_SRC = LVL_SRC
+        g.LINKSTATS_SRC = LINKSTATS_SRC
+        g.LINK_SRC, g.LOG_SRC = LINK_SRC, LOG_SRC
         cmds = self.L.table()
         for stem, src in CMDS_SRC.items():
             cmds[stem] = src
@@ -452,13 +547,16 @@ class Relay:
     def __init__(self, games):
         self.games = games
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.L.execute(COMMON_SRC)
+        self.C = load_common(self.L)
         self.readers = {g.id: self.C.newReader(g.from_game) for g in games}
         self.seq = {g.id: 0 for g in games}
         self.history = {g.id: [] for g in games}
         self.clocks, self.aheads, self.hello, self.reports, self.speed_requests = {}, {}, {}, {}, []
         self.hellos, self.authority, self.saves_done, self.replay_failed, self.refused, self.chats = [], {}, [], [], [], []
         self.vetoes = []
+        # every game's verdict of an action at its stamp, as the host keeps them (core VerdictBook): (owner, seq) -> {game: (applied, detail)}
+        self.verdicts, self.verdict_resyncs = {}, []
+        self.not_ready = {}
         self.commits = []
         self.pause_seq = 0   # the host's pause order
         self.stops, self.pause_held, self.pause_last, self.pause_of = {}, [], None, None
@@ -468,7 +566,7 @@ class Relay:
     # launcher -> mod
     def send(self, g, kind, frm, payload):
         self.seq[g.id] += 1
-        line = self.C.formatLine(self.seq[g.id], kind, frm, payload)
+        line = self.C.formatLine(kind, frm, payload)
         self.history[g.id].append(line)
         with open(g.to_game, "a", encoding="utf-8", newline="") as f:
             f.write(line)
@@ -497,7 +595,11 @@ class Relay:
         if self.pauseAt is not None:
             d["pauseAt"] = self.pauseAt
         if self.pauseAt != self.pause_of:
-            self.pause_of, self.pause_last = self.pauseAt, None   # a new pause (or the resume)
+            # a new pause starts its own order; the resume keeps the last stamp of the pause (host.rs: the actions still held then are
+            # stamped past it)
+            if self.pauseAt is not None:
+                self.pause_last = None
+            self.pause_of = self.pauseAt
         self.broadcast("session", self.ser(d))
         self.flush_pause()
 
@@ -509,6 +611,8 @@ class Relay:
             return
         if self.pauseAt is None:
             stamp = self.future_stamp()
+            if self.pause_last is not None:
+                stamp = max(stamp, self.pause_last + 2 * STEP)   # host.rs: every game may stand at the pause's last stamp plus a step
         else:
             floor = max(self.pauseAt, self.pause_last or self.pauseAt)
             stops = [self.stops.get(g.id) for g in self.games]
@@ -516,8 +620,10 @@ class Relay:
                 return
             stamp = -(-max(stops) // STEP) * STEP + STEP
         held, self.pause_held = self.pause_held, []
+        upto = self.pause_seq + len(held)   # host.rs: every item of a flush names the number of its last one (pause_upto)
         for kind, g, p in held:
             self.pause_seq += 1
+            p["pauseUpto"] = upto
             p["stamp"] = stamp if self.pauseAt is not None else max(stamp, int(p.stamp))
             p["pauseSeq"] = self.pause_seq
             if kind == "build_commit":
@@ -533,10 +639,12 @@ class Relay:
         # as host.rs: never before a promise a game has made, so no game has passed the stamp (the input barrier)
         return max([-(-(t + self.lead) // STEP) * STEP] + list(self.safes.values()))
 
-    def checksum_request(self, n, at, paused, full=None):
+    def checksum_request(self, n, at, paused, full=None, spread=None):
         body = {"n": n, "at": at, "paused": paused}
         if full is not None:
             body["full"] = full   # absent means a full round
+        if spread is not None:
+            body["spread"] = spread   # absent: the round is hashed whole at its stamp
         self.broadcast("checksum_request", self.ser(body))
 
     def send_authority(self, n):
@@ -551,6 +659,19 @@ class Relay:
         launcher compacting the file): the file gets shorter, the remaining lines keep their sequence numbers."""
         with open(g.to_game, "w", encoding="utf-8", newline="") as f:
             f.write("".join(self.history[g.id][drop:]))
+
+    def verdict(self, g, p, applied):
+        """core VerdictBook / host on_action_verdict: verdicts of one action that differ between games ask for a resync at once;
+        verdicts that agree (all refused alike, all applied) ask for nothing."""
+        key = (int(p["from"]) if p["from"] is not None else 0, int(p.seq))
+        by = self.verdicts.setdefault(key, {})
+        by[g.id] = (applied, str(p.detail or ""))
+        n_applied = sum(1 for a, _ in by.values() if a)
+        if 0 < n_applied < len(by):
+            self.verdict_resyncs.append("verdicts of %d:%d differ" % key)
+            del self.verdicts[key]
+        elif len(by) == len(self.games):
+            del self.verdicts[key]
 
     # mod -> launcher
     def pump(self):
@@ -595,6 +716,9 @@ class Relay:
                     self.replay_failed.append((g.id, str(p.detail)))
                 elif rec.kind == "action_refused":
                     self.refused.append((g.id, int(p.seq), str(p.detail)))
+                    self.verdict(g, p, False)
+                elif rec.kind == "action_applied":
+                    self.verdict(g, p, True)
                 elif rec.kind == "chat":
                     self.chats.append((g.id, str(p.text)))
                     # the host fills in the sender and relays to everyone but the origin, as a line from 0
@@ -622,6 +746,8 @@ class Relay:
                                 self.send(o, "build_commit", 0, out)
                 elif rec.kind == "checksum_report":
                     self.reports.setdefault(int(p.n), {})[g.id] = (int(p.time), {k: v for k, v in p.parts.items()})
+                    # the parts the game could not hash this round (core ChecksumReportMessage.not_ready)
+                    self.not_ready.setdefault(int(p.n), {})[g.id] = sorted(p.notReady.values()) if p.notReady is not None else []
                     if g.id == 0 and p.authority is not None:
                         self.authority[int(p.n)] = {k: v for k, v in p.authority.items()}
                 elif rec.kind == "speed_request":
@@ -697,7 +823,7 @@ class LockstepTest(unittest.TestCase):
         va, vb = self.A.L.eval("GAME.applied[1].entity"), self.B.L.eval("GAME.applied[1].entity")
         self.assertNotEqual(va, vb, "the vehicle has different ids in the two games")
         self.assertTrue(self.B.L.eval("BUY_CB ~= nil and BUY_CB[1] == true and BUY_CB[2] == %d" % vb), "the client's callback got its local vehicle id")
-        shipped = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "action"]
+        shipped = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"]
         self.assertEqual(len(shipped), 1)
         self.assertIn('s:55', shipped[0], "the depot travels as a savegame key")
         self.assertNotIn(str(vb), shipped[0])
@@ -718,6 +844,82 @@ class LockstepTest(unittest.TestCase):
         self.assertTrue(self.B.L.eval("SET_CB == true"))
         self.assertFalse(self.log_has("LATE"), "no late action")
 
+    def update_writes(self, g):
+        return list(g.L.eval("table.concat(UPDATE_WRITES, ';')").split(";")) if int(g.L.eval("#UPDATE_WRITES")) else []
+
+    def test_update_itself_writes_no_state_and_postupdate_applies_at_the_stamp(self):
+        # The wiki (modding:scripting:gamescripts): update "may not write the state itself"; postUpdate "is executed after all the update
+        # scripts are done". The mock records every state write, subscription and engine command made in the update phase.
+        self.start()
+        self.tick(10, lag_b=True)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s, e) BUY_CB = s end)')
+        self.tick(40, lag_b=True)
+        a, b = self.A.applied(), self.B.applied()
+        self.assertEqual(len(a), 1, a)
+        self.assertEqual(a, b, "same action at the same step on both games")
+        shipped = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "action"]
+        self.assertEqual(len(shipped), 1)
+        p = self.relay.C.parse(shipped[0].split(TAB)[-1])
+        if isinstance(p, tuple):
+            p = p[0]
+        self.assertEqual(int(a[0].split("@")[1]), int(p.stamp), "applied in postUpdate at exactly its stamp")
+        self.assertTrue(self.B.L.eval("BUY_CB == true"))
+        for g in (self.A, self.B):
+            self.assertEqual(self.update_writes(g), [], "%s: nothing written or sent in update()" % g.label)
+            for bad in ("postUpdate was not called", "postUpdate missing", "update fallback failed", "postUpdate received no result", "postUpdate runs at t=", "postUpdate failed"):
+                self.assertNotIn(bad, g.log())
+        # the detector itself: the step's work run inside the update phase (the fallback when no postUpdate comes) is caught
+        self.B.L.execute('POST_MODE = "never"')
+        self.B.step()
+        self.B.step()
+        self.assertIn("state:set", self.update_writes(self.B))
+
+    def buy_and_line(self):
+        """A vehicle bought, a line made and the vehicle set on it, from the client's window; returns what each game applied."""
+        self.start()
+        self.tick(10)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s, e) BUY_CB = { s, d and d.resultVehicleEntity } end)')
+        self.tick(40)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("Line 1", { x = 1, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) LINE_CB = { s, e and e[1] and e[1][1] } end)')
+        self.tick(40)
+        vb, lb = self.B.L.eval("BUY_CB and BUY_CB[2]"), self.B.L.eval("LINE_CB and LINE_CB[2]")
+        self.assertTrue(vb and lb, "the client's callbacks got their entities")
+        self.B.send_gui("api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(%d, %d, 0), function(d, s) SET_CB = s end)" % (vb, lb))
+        self.tick(40)
+        stamps = []
+        for l in self.B.lines(self.B.from_game):
+            if l.split(TAB)[0] == "action":
+                p = self.relay.C.parse(l.split(TAB)[-1])
+                stamps.append(int((p[0] if isinstance(p, tuple) else p).stamp))
+        return self.A.applied(), self.B.applied(), stamps
+
+    def test_a_game_whose_engine_never_calls_postupdate_still_applies_every_action_at_its_stamp(self):
+        for g in (self.A, self.B):
+            g.L.execute('POST_MODE = "never"')
+        a, b, stamps = self.buy_and_line()
+        self.assertEqual(len(a), 3, a)
+        self.assertEqual(a, b, "same actions, same steps, same order on both games")
+        self.assertEqual([int(x.split("@")[1]) for x in a], stamps, "each applied at exactly its stamp")
+        self.assertTrue(self.B.L.eval("SET_CB == true"))
+        for g in (self.A, self.B):
+            self.assertIn("postUpdate was not called after the update at t=", g.log())
+            self.assertIn("step(s) of this session applied in update instead", g.log())
+            self.assertNotIn("update fallback failed", g.log())
+
+    def test_a_postupdate_on_every_other_step_never_applies_a_step_twice(self):
+        for g in (self.A, self.B):
+            g.L.execute('POST_MODE = "alternate"')
+        a, b, stamps = self.buy_and_line()
+        self.assertEqual(len(a), 3, "each action applied once: %s" % a)
+        self.assertEqual(a, b, "same actions, same steps, same order on both games")
+        self.assertEqual([x.split("@")[0] for x in a], ["makeVehicleBuyCmd", "makeLineCreateCmd", "makeVehicleSetLineCmd"])
+        for got, stamp in zip([int(x.split("@")[1]) for x in a], stamps):
+            # a step caught up in the next update lands one engine step late in world time; never earlier, never twice
+            self.assertIn(got - stamp, (0, STEP))
+        self.assertTrue(self.B.L.eval("SET_CB == true"))
+        for g in (self.A, self.B):
+            self.assertNotIn("update fallback failed", g.log())
+
     def test_unresolvable_reference_is_refused_not_applied(self):
         self.start()
         self.tick(10)
@@ -727,7 +929,7 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(len(self.A.applied()), 0, "the host did not buy in a depot it does not have")
         self.assertEqual(len(self.B.applied()), 1)
         self.assertIn("refused", self.A.log())
-        self.assertTrue(any(l.split(TAB)[1] == "action_refused" for l in self.A.lines(self.A.from_game)))
+        self.assertTrue(any(l.split(TAB)[0] == "action_refused" for l in self.A.lines(self.A.from_game)))
 
     def test_pause_stamp_stops_both_exactly_and_action_during_pause(self):
         self.start(speed=2)
@@ -903,7 +1105,7 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(len(self.A.applied()), 1)
         before = self.A.applied()
         self.relay.rewrite_history(self.A)
-        self.assertTrue(any(l.split(TAB)[1] == "action" for l in self.A.lines(self.A.to_game)), "the old action line is still in the file")
+        self.assertTrue(any(l.split(TAB)[0] == "action" for l in self.A.lines(self.A.to_game)), "the old action line is still in the file")
         self.tick(20)
         self.assertEqual(self.A.applied(), before, "re-written history was not dispatched again")
         # new lines after the truncation still arrive
@@ -1076,12 +1278,13 @@ class LockstepTest(unittest.TestCase):
         before = self.B.applied()
         self.assertEqual(len(before), 1, "the client applied the host's action once")
         self.assertEqual(self.relay.hellos.count(1), 1)
-        lines_before = len(self.B.lines(self.B.to_game))
         self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 3, "name": "hostsave", "sha256": "00"}))
+        after_load_line = os.path.getsize(self.B.to_game)
         self.B.frame()
         self.assertEqual(self.B.L.eval("LOADED"), "hostsave")
         self.assertTrue(self.B.reload_pending())
-        self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "%d 0" % (lines_before + 1))
+        # the places right after the load line in to_game.log and where the window's records were read to (none yet)
+        self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "1:%d 1:0" % after_load_line)
         # a line queued behind the load in the same file is not dispatched by the old scripts
         self.relay.send(self.B, "session", 0, self.relay.ser({"started": True, "speed": 3, "lead": 2000}))
         self.B.frame()
@@ -1099,9 +1302,95 @@ class LockstepTest(unittest.TestCase):
         self.relay.session()
         self.tick(5)
         self.assertEqual(self.B.speed(), 2)
-        # the writer continued its sequence: the launcher saw no restart
-        seqs = [int(l.split(TAB)[0]) for l in self.B.lines(self.B.from_game)]
-        self.assertEqual(seqs, sorted(set(seqs)))
+        # the reloaded writer went on at the end of from_game.log: the launcher reads both hellos, every line whole
+        kinds = [l.split(TAB)[0] for l in self.B.lines(self.B.from_game)]
+        self.assertEqual(kinds.count("hello"), 2)
+        self.assertTrue(all(len(l.split(TAB)) == 3 for l in self.B.lines(self.B.from_game)))
+
+    def resync_reload_b(self):
+        """B loads the host's save on the relay's word and comes back as a fresh script (the old one's next frame starts the load)."""
+        self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 3, "name": "hostsave", "sha256": "00"}))
+        self.B.frame()
+        self.assertTrue(self.B.reload_pending())
+        self.B.reload()
+
+    def test_a_resync_load_waits_for_the_start_until_the_session_runs(self):
+        self.start()
+        self.tick(10)
+        self.resync_reload_b()
+        self.assertIn("ready: app.setWaitForStartReadyGame() before the load called", self.B.log())
+        held_at = self.B.time()
+        self.tick(8)
+        self.assertEqual(self.B.time(), held_at, "the loaded game ran no step while it waited")
+        self.assertTrue(self.B.L.eval("GAME.held == true and READY_STARTS == nil"))
+        self.assertIn("ready: this loaded game waits", self.B.log())
+        self.assertEqual(self.relay.hellos.count(1), 2, "the waiting game's interface half said hello")
+        # the host's session line after the load releases it: started once, then it runs with the session
+        self.relay.session()
+        self.tick(6)
+        self.assertEqual(int(self.B.L.eval("READY_STARTS")), 1, "app.startReadyGame was called once")
+        self.assertIn("ready: app.startReadyGame() after", self.B.log())
+        self.assertIn("(the session runs, speed", self.B.log())
+        self.assertGreater(self.B.time(), held_at)
+        self.tick(6)
+        self.assertEqual(int(self.B.L.eval("READY_STARTS")), 1, "and never again")
+        self.assertIsNone(self.A.L.eval("READY_STARTS"), "a game that did not load is not touched")
+        self.assertFalse(self.log_has("LATE"))
+
+    def test_a_resync_load_without_the_start_functions_keeps_the_speed_zero_hold(self):
+        self.B.L.execute("app.setWaitForStartReadyGame, app.isWaitForStartReadyGame, app.startReadyGame = nil, nil, nil")
+        self.start()
+        self.tick(10)
+        self.resync_reload_b()
+        self.assertIn("ready: app.setWaitForStartReadyGame / app.startReadyGame missing", self.B.log())
+        self.tick(4)
+        self.assertFalse(self.B.L.eval("GAME.held == true"))
+        self.assertEqual(self.B.speed(), 0, "the first frame's speed 0 holds the game until the session runs")
+        self.relay.session()
+        self.tick(6)
+        self.assertEqual(self.B.speed(), 1)
+
+    def test_a_game_the_session_never_releases_is_started_after_the_time_limit(self):
+        self.start()
+        self.tick(10)
+        self.resync_reload_b()
+        os.environ["FEVERLINK3_READY_WAIT_SECONDS"] = "0"
+        try:
+            self.tick(3)
+        finally:
+            os.environ.pop("FEVERLINK3_READY_WAIT_SECONDS", None)
+        self.assertEqual(int(self.B.L.eval("READY_STARTS")), 1)
+        self.assertIn("not released within 0 s", self.B.log())
+        self.assertEqual(self.B.speed(), 0, "started and held by speed 0, the old path")
+
+    def test_the_start_functions_as_the_game_binds_them_callable_tables_are_used(self):
+        # the lab run of 2026-10-18 logged the interface state's app functions as tables ("saveUserdata=table"): bound engine functions
+        self.B.L.execute("for _, n in ipairs({ 'setWaitForStartReadyGame', 'isWaitForStartReadyGame', 'startReadyGame' }) do"
+                         " local f = app[n]; app[n] = setmetatable({}, { __call = function(_, ...) return f(...) end }) end")
+        self.start()
+        self.tick(10)
+        self.resync_reload_b()
+        self.assertIn("ready: app.setWaitForStartReadyGame() before the load called", self.B.log())
+        self.tick(4)
+        self.assertTrue(self.B.L.eval("GAME.held == true"))
+        self.relay.session()
+        self.tick(4)
+        self.assertEqual(int(self.B.L.eval("READY_STARTS")), 1)
+        self.assertIn("app keys (gui): app ", self.B.log())
+        self.assertIn("by name: setWaitForStartReadyGame=table isWaitForStartReadyGame=table startReadyGame=table", self.B.log())
+        self.assertIn("app keys (sim): app ", self.B.log())
+
+    def test_the_start_wait_can_be_switched_off(self):
+        os.environ["FEVERLINK3_READY_WAIT"] = "0"
+        try:
+            self.start()
+            self.tick(10)
+            self.resync_reload_b()
+            self.tick(3)
+        finally:
+            os.environ.pop("FEVERLINK3_READY_WAIT", None)
+        self.assertIn("ready: FEVERLINK3_READY_WAIT=0", self.B.log())
+        self.assertFalse(self.B.L.eval("GAME.held == true"))
 
     def test_resync_load_of_an_unknown_save_fails_without_reloading(self):
         self.start()
@@ -1126,7 +1415,7 @@ class LockstepTest(unittest.TestCase):
         self.assertTrue(self.B.L.eval("LINE_OK == false"), "the window got a failed result")
         self.assertEqual(self.A.applied(), [])
         self.assertEqual(self.B.applied(), [], "not even applied locally")
-        self.assertFalse(any(l.split(TAB)[1] == "action" for l in self.B.lines(self.B.from_game)), "nothing stamped or shipped")
+        self.assertFalse(any(l.split(TAB)[0] == "action" for l in self.B.lines(self.B.from_game)), "nothing stamped or shipped")
         self.assertEqual(self.relay.refused, [(1, 0, "permission denied: build")])
         # spending is still allowed
         self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
@@ -1202,8 +1491,8 @@ class LockstepTest(unittest.TestCase):
         self.assertTrue(self.A.ui_speed(0))
         self.assertTrue(self.B.ui_speed(9), "the record is written; the bridge refuses a speed it does not know")
         self.tick(4)
-        b = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[1] == "speed_request"]
-        a = [l for l in self.A.lines(self.A.from_game) if l.split(TAB)[1] == "speed_request"]
+        b = [l for l in self.B.lines(self.B.from_game) if l.split(TAB)[0] == "speed_request"]
+        a = [l for l in self.A.lines(self.A.from_game) if l.split(TAB)[0] == "speed_request"]
         self.assertEqual(len(b), 1, b)
         self.assertIn('["speed"]=3', b[0])
         self.assertEqual(len(a), 1, a)
@@ -1266,6 +1555,37 @@ class StampedEverywhereTest(unittest.TestCase):
         self.assertTrue(self.A.L.eval("SET == true"))
         self.assertFalse(any("LATE" in g.log() for g in (self.A, self.B)))
 
+    def test_the_interface_half_talks_to_the_simulation_half_with_an_empty_event_source(self):
+        # makeScriptingSendEventCmd(src, id, name, param): src is "the filename of the game_script that should be the pretended origin"
+        # (tf3-docs api/cmd); the bridge's messages have none and send "" as the base game does; handleEvent tells them by id
+        self.start()
+        self.tick(5)
+        srcs = self.A.L.eval("(function() local out = {} for _, e in ipairs(EVENTS_SEEN) do if e[1] == 'feverlink3' then out[#out + 1] = e[3] end end return table.concat(out, ',') end)()")
+        self.assertTrue(self.A.L.eval("(function() for _, e in ipairs(EVENTS_SEEN) do if e[1] == 'feverlink3' then return true end end return false end)()"),
+                        "the session message went to the simulation half")
+        self.assertEqual(set(srcs.split(",")), {""}, srcs)
+
+    def test_a_callback_gets_entity_and_revision_pairs_as_send_command_documents(self):
+        # sendCommand's callback: (data, success, resultEntities : {{Engine.Entity, Engine.Revision}}) (tf3-docs api/cmd). The result of
+        # a stamp apply names the entity only; the callback gets this game's revision of it, from the bridge and from a window alike
+        self.start()
+        self.tick(10, lag_b=True)
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), '
+                        'function(d, s, e) BUY_E = { e[1][1], e[1][2] and e[1][2].num and e[1][2].num[1] } end)')
+        self.A.window('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), '
+                      'function(d, s, e) LINE_E = { e[1][1], e[1][2] and e[1][2].num and e[1][2].num[1] } end)')
+        self.tick(40, lag_b=True)
+        vb = int(self.B.L.eval("BUY_E[1]"))
+        self.assertEqual(int(self.B.L.eval("BUY_E[2]")), 1000 + vb, "the bridge's answer carries the vehicle's revision")
+        la = int(self.A.L.eval("LINE_E[1]"))
+        self.assertEqual(int(self.A.L.eval("LINE_E[2]")), 1000 + la, "the window's answer carries the line's revision")
+        # pairs that came with a revision keep it; an entity that is gone keeps the pair as it came
+        C = self.A.L.eval("GUI_ENV.ug_require('feverlink3_common.lua')")
+        out = C.resultEntities(self.A.L.eval("{ { %d, { num = { 5, 0, 0 } } }, { 424242 }, 'x' }" % la))
+        self.assertEqual(out[1][2]["num"][1], 5)
+        self.assertEqual((out[2][1], out[2][2]), (424242, None))
+        self.assertIsNone(out[3])
+
     def test_a_purchase_refused_at_its_stamp_is_refused_on_every_game_and_the_window_hears_it(self):
         self.start()
         self.tick(5)
@@ -1278,6 +1598,77 @@ class StampedEverywhereTest(unittest.TestCase):
         for g in (self.A, self.B):
             self.assertIn("refused by the engine: ", g.log())
         self.assertIn("REFUSED at its stamp", self.A.log())
+
+    def make_line(self):
+        self.A.window('api.cmd.sendCommand(api.cmd.makeLineCreateCmd("L", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) LINE = e[1][1] end)')
+        self.tick(40)
+        return int(self.A.L.eval("LINE"))
+
+    def actions_shipped(self, g, fn):
+        """The stamps of g's own actions of command `fn`, as shipped to the host (from_game.log)."""
+        parse = g.L.eval("function(s) return UI_ENV_NEW().C.parse(s) end")
+        out = []
+        for line in g.lines(g.from_game):
+            parts = line.split(TAB, 2)
+            if len(parts) == 3 and parts[0] == "action":
+                p = parse(parts[2])
+                if ('"%s"' % fn) in str(p.body):
+                    out.append(int(p.stamp))
+        return out
+
+    def test_a_clone_of_n_vehicles_is_one_order_stamped_once_with_no_wait_and_the_same_on_both_games(self):
+        # Friend test 2026-10-16: cloning vehicles froze the game. The game's clone (vehicle_react_util.HandleVehicleChanges) buys
+        # every copy in one loop and puts each on the line from the purchase's callback. Here: the window's sendCommand returns at
+        # once (nothing waits for the network), the purchases are one order with one stamp, the line assignments another, and
+        # both games apply the same commands at the same steps with the same entity ids.
+        self.start()
+        self.tick(5)
+        line = self.make_line()
+        n = 3
+        self.A.window(('CLONED = {}; for i = 1, %d do api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }),'
+                       ' function(d, s) if s then api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(d.resultVehicleEntity, %d, 0),'
+                       ' function(_, s2) CLONED[#CLONED + 1] = s2 end) end end) end') % (n, line))
+        self.assertEqual(len(self.A.applied()), 1, "nothing of the clone applied at the click")
+        self.assertEqual(int(self.A.L.eval("#CLONED")), 0, "sendCommand returned without waiting for any answer")
+        parse = self.A.L.eval("function(s) return UI_ENV_NEW().C.parse(s) end")
+        recs = [parse(l.split(TAB, 2)[2]) for l in self.A.lines(os.path.join(self.A.dir, "ui_out.log")) if l.split(TAB)[0] == "cmd"]
+        buys = [r for r in recs if "makeVehicleBuyCmd" in str(r.body)]
+        self.assertEqual(len(buys), n)
+        self.assertEqual(len({int(r.grp) for r in buys}), 1, "the purchases of one handler are one group")
+        self.tick(60)
+        self.assertSameApplies(1 + 2 * n)
+        self.assertEqual([str(v) for v in self.A.L.eval("CLONED").values()], ["True"] * n)
+        applied = self.A.applied()
+        self.assertEqual(len({a for a in applied if a.startswith("makeVehicleBuyCmd@")}), 1, "every purchase in one step")
+        self.assertEqual(len({a for a in applied if a.startswith("makeVehicleSetLineCmd@")}), 1, "every line assignment in one step")
+        self.assertEqual(len(set(self.actions_shipped(self.A, "makeVehicleBuyCmd"))), 1, "one stamp for the order")
+        log = self.A.log()
+        self.assertEqual(log.count("3 command(s) stamped once"), 2, "the purchases one order, the line assignments one order")
+        self.assertEqual(log.count("timing window #"), 1 + 2 * n, "one timing line per window command on the originator's window")
+        for g in (self.A, self.B):
+            self.assertEqual(g.log().count("timing window command "), 1 + 2 * n, "one apply timing line per command on every game")
+        self.assertFalse(any("LATE" in g.log() for g in (self.A, self.B)))
+
+    def test_a_window_order_that_cannot_be_shipped_whole_is_shipped_nowhere_and_every_command_of_it_fails(self):
+        self.start()
+        self.tick(5)
+        # two records of one group, the second naming the entity of a window command that was never shipped
+        self.A.window("local _ = 0")
+        self.A.L.execute(r'''
+          local C = UI_HOOK.ug_require("feverlink3_common.lua")
+          local send = UI_HOOK.HookModule.send
+          send("cmd", { id = 901, grp = 4242, category = "spend", sid = C.SESSION,
+            body = '{["fn"]="makeVehicleBuyCmd",["args"]={["n"]=3,[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={}}}' })
+          send("cmd", { id = 902, grp = 4242, category = "other", sid = C.SESSION,
+            body = '{["fn"]="makeVehicleSetLineCmd",["args"]={["n"]=3,[1]={["__ref"]="entity",["key"]="ui:999"},[2]={["__ref"]="entity",["key"]="s:55"},[3]=0}}' })
+        ''')
+        self.tick(40)
+        self.assertEqual((self.A.applied(), self.B.applied()), ([], []), "nothing of the order is applied anywhere")
+        self.assertEqual(self.actions_shipped(self.A, "makeVehicleBuyCmd"), [], "the valid purchase did not leave either")
+        self.assertIn("a window order of 2 command(s) was not shipped, none of it", self.A.log())
+        answers = [l for l in self.A.lines(os.path.join(self.A.dir, "ui_in.log")) if l.split(TAB)[0] == "result"]
+        self.assertEqual(len(answers), 2, answers)
+        self.assertTrue(all('["success"]=false' in a for a in answers))
 
     def pause_both(self):
         self.start(speed=2)
@@ -1323,7 +1714,7 @@ class StampedEverywhereTest(unittest.TestCase):
         self.tick(20)
         for g in (self.A, self.B):
             lines = self.relay.history[g.id]
-            kinds = [ln.split(TAB)[1] for ln in lines]
+            kinds = [ln.split(TAB)[0] for ln in lines]
             last_pause = max(i for i, ln in enumerate(lines) if "pauseAt" in ln)
             resume = kinds.index("session", last_pause + 1)
             first_action = kinds.index("action", last_pause + 1)
@@ -1424,13 +1815,59 @@ class ThreeGamesPauseOrderTest(unittest.TestCase):
         self.assertTrue(all(g.time() > first for g in self.games))
 
 
+class EventSubscriptionTest(unittest.TestCase):
+    """The scripts subscribe to the event names they handle (subscribeToEvent), not to all events; the mock drops the others."""
+
+    setUp, tearDown, tick, start = LockstepTest.setUp, LockstepTest.tearDown, LockstepTest.tick, LockstepTest.start
+
+    def sim_names(self, g):
+        return sorted(g.L.eval("(function() local t = {}; for k in pairs(SUBS.names) do t[#t + 1] = k end; return table.concat(t, ' ') end)()").split())
+
+    def test_every_message_the_interface_half_sends_is_subscribed(self):
+        with open(os.path.join(CONTENT, "feverlink3_bridge.script.lua"), encoding="utf-8") as f:
+            src = f.read()
+        sent = set(re.findall(r'toSim\(\s*"(\w+)"', src)) | set(re.findall(r'toSim,\s*"(\w+)"', src))
+        listed = set(re.search(r"X\.SIM_EVENTS = \{(.*?)\}", src, re.S).group(1).replace('"', " ").replace(",", " ").split())
+        self.assertGreater(len(sent), 10)
+        self.assertEqual(sorted(sent - listed), ["nop"], "only the strict mode's trigger is not subscribed")
+        for n in ("onPreBuildProposal", "onPostBuildProposal"):
+            self.assertIn(n, listed)
+
+    def test_the_session_runs_with_the_named_subscriptions_and_an_unknown_name_is_not_received(self):
+        self.start()
+        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+        self.tick(40)
+        self.assertEqual(len(self.A.applied()), 1)
+        self.assertEqual(self.A.applied(), self.B.applied(), "the stamped action reached both simulation halves")
+        for g in (self.A, self.B):
+            self.assertFalse(g.L.eval("SUBS.all"), "not every event")
+            self.assertIn("queue", self.sim_names(g))
+            self.assertIn("session", self.sim_names(g))
+            self.assertNotIn("nop", self.sim_names(g))
+            self.assertTrue(g.L.eval("GSUBS.all == false and GSUBS.names['builder.proposalCreate'] and GSUBS.names['builder.proposalApply']"))
+            self.assertEqual(g.L.eval("#SUBS.dropped"), 0, "no event the mod sends was dropped")
+            self.assertIn("events (sim, at", g.log())
+        self.A.L.execute("SIM_EVENT('', 'feverlink3', 'somethingElse', {})")
+        self.assertEqual(self.A.L.eval("SUBS.dropped[1]"), "feverlink3/somethingElse")
+
+    def test_the_lab_switch_subscribes_to_all_events(self):
+        os.environ["FEVERLINK3_EVENTS"] = "all"
+        try:
+            self.A.reload()
+            self.tick(3)
+        finally:
+            os.environ.pop("FEVERLINK3_EVENTS", None)
+        self.assertTrue(self.A.L.eval("SUBS.all and GSUBS.all"))
+        self.assertIn("all (FEVERLINK3_EVENTS=all)", self.A.log())
+
+
 class PureTest(unittest.TestCase):
     """The common module and the core, without any game."""
 
     def setUp(self):
         os.environ.pop("FEVERLINK3_SESSION_DIR", None)
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.L.execute(COMMON_SRC)
+        self.C = load_common(self.L)
         self.K = self.L.execute(LOCKSTEP_SRC)
         self.H = self.L.execute(HUD_SRC)
 
@@ -1530,6 +1967,46 @@ class PureTest(unittest.TestCase):
         self.assertNotEqual(h(n), h(dict(n, towns=["T1", "T3"])))
         self.assertNotEqual(h(n), h(dict(n, players=["Q"])))
 
+    def test_names_lane_is_itemised_per_entity_for_the_detail_dump(self):
+        # a names difference must say which entity (friend test 2026-10-16 could only say "names")
+        L = self.L
+        e = L.eval(self.WIDE_ENGINE)(L.table_from({"names": {"stations": ["Beta", "Alpha"], "lines": ["L1"], "towns": ["T1"], "players": ["P"]}},
+                                                  recursive=True))
+        detail = L.table()
+        self.K.checksumParts(e, self.C.hashValue, None, False, detail)
+        items = [detail["names"][i] for i in range(1, len(detail["names"]) + 1)]
+        self.assertEqual(items, ["lines|L1", "players|P", "stations|Alpha", "stations|Beta", "towns|T1"])
+
+    def test_a_transport_mode_map_travels_by_the_enums_names(self):
+        # {TransportMode : boolean} (script-doc api/type.html): keyed by api.type.enum.TransportMode values; it travels by name and
+        # is keyed by this game's own enum values again, whatever numbers they are (wiki audit 2026-10-18 A5)
+        L = self.L
+        both = L.eval("function(f, x) local a, b = f(x); return { a, b } end")
+
+        def call(f, code):
+            return both(f, L.eval(code))
+        L.execute("FL3_SAVED_API = api; api = { type = { enum = { TransportMode = { PERSON = 0, CARGO = 1, BUS = 3, SHIP = 10 } } } }")
+        try:
+            r = call(self.C.modeNames, "{ [0] = true, [1] = false, [3] = true }")
+            self.assertIsNone(r[2])
+            self.assertEqual(dict(r[1].items()), {"PERSON": True, "CARGO": False, "BUS": True})
+            # a game whose enum gives the names other numbers keys the map by its own
+            L.execute("api.type.enum.TransportMode = { PERSON = 20, CARGO = 21, BUS = 23 }")
+            back = both(self.C.modeMap, r[1])
+            self.assertIsNone(back[2])
+            self.assertEqual(dict(back[1].items()), {20: True, 21: False, 23: True})
+            # fail closed: a key the enum does not name, a name this game lacks, a value that is not a boolean, no enum at all
+            r = call(self.C.modeNames, "{ [99] = true }")
+            self.assertIsNone(r[1])
+            self.assertIn("99 is not a value of api.type.enum.TransportMode", r[2])
+            self.assertIn("SHIP is not in api.type.enum.TransportMode here", call(self.C.modeMap, "{ SHIP = true }")[2])
+            self.assertIn("not a boolean", call(self.C.modeNames, "{ [20] = 1 }")[2])
+            L.execute("api = {}")
+            self.assertIn("no api.type.enum.TransportMode", call(self.C.modeMap, "{ BUS = true }")[2])
+            self.assertIsNone(self.C["writeEngineArray"], "the shift guess is gone")
+        finally:
+            L.execute("api = FL3_SAVED_API; FL3_SAVED_API = nil")
+
     def test_a_failing_accessor_yields_an_error_part_not_a_crash(self):
         L = self.L
         e = L.eval(self.WIDE_ENGINE)(L.table_from({"stations": [{"stations": 1}]}, recursive=True))
@@ -1615,20 +2092,23 @@ class PureTest(unittest.TestCase):
         self.assertEqual(int(self.C.fnv1a("foobar")), 0xBF9CF968)
         self.assertEqual(self.C.hashValue(self.L.table_from({"x": 1})), self.C.hashValue(self.L.table_from({"x": 1})))
 
-    def test_reader_tracks_sequence_and_partial_lines(self):
+    def test_reader_reads_by_position_and_waits_for_partial_lines(self):
         r = self.C.newReader("unused")
-        recs = self.C.readerFeed(r, "1\tsession\t0\t{}\n2\taction\t5\t{[\"stamp\"]=1}\n3\tclo")
+        recs = self.C.readerFeed(r, "session\t0\t{}\naction\t5\t{[\"stamp\"]=1}\nclo")
         self.assertEqual([x.kind for x in recs.values()], ["session", "action"])
         self.assertEqual(recs[2]["from"], 5)
-        self.assertEqual(int(r.lastSeq), 2)
+        self.assertEqual((int(recs[1].start), int(recs[1].after), int(recs[2].start)), (0, 13, 13), "each record knows its place")
+        self.assertEqual(self.C.posText(self.C.readerPos(r)), "1:%d" % len("session\t0\t{}\naction\t5\t{[\"stamp\"]=1}\n"), "the partial line is not consumed")
         recs = self.C.readerFeed(r, "ck\t0\t{}\r\n")
         self.assertEqual([x.kind for x in recs.values()], ["clock"])
-        # history re-written after a truncation: nothing below lastSeq is dispatched
-        recs = self.C.readerFeed(r, "1\tsession\t0\t{}\n2\taction\t5\t{}\n3\tclock\t0\t{}\n4\tsession\t0\t{}\n")
-        self.assertEqual([int(x.seq) for x in recs.values()], [4])
-        self.assertEqual(int(r.dropped), 3)
+        # the same lines again are new lines: nothing is dropped for what it says
+        recs = self.C.readerFeed(r, "session\t0\t{}\nsession\t0\t{}\n")
+        self.assertEqual([x.kind for x in recs.values()], ["session", "session"])
+        self.assertEqual(int(r.dropped), 0)
+        recs = self.C.readerFeed(r, "garbage without tabs\n")
+        self.assertEqual((len(recs), int(r.dropped)), (0, 1))
 
-    def test_writer_continues_sequence_from_file(self):
+    def test_a_writer_made_again_goes_on_at_the_end_of_the_file(self):
         tmp = tempfile.mkdtemp(prefix="feverlink3-")
         try:
             p = os.path.join(tmp, "from_game.log")
@@ -1638,11 +2118,10 @@ class PureTest(unittest.TestCase):
             w2 = self.C.newWriter(p, 3)
             self.C.writerSend(w2, "clock", self.L.table_from({"t": 2}))
             lines = read_text(p).splitlines()
-            self.assertEqual([l.split(TAB)[0] for l in lines], ["1", "2", "3"])
-            self.assertEqual(lines[2], '3\tclock\t3\t{["t"]=2}')
+            self.assertEqual([l.split(TAB)[0] for l in lines], ["hello", "clock", "clock"])
+            self.assertEqual(lines[2], 'clock\t3\t{["t"]=2}')
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-
     def test_pace_and_stamps(self):
         K, L = self.K, self.L
         s = K.newSession()

@@ -1,6 +1,7 @@
 """The control link between the Lua mod and the native module (docs/NATIVE_LINK.md section 3), from the mod's side.
 
-The module reads `native_ctl.log` and writes `native_events.log`, in the shape of the launcher link. The mod reads
+The module reads the control files (`native_ctl.<half>.w<id>.log`, one per writer) and writes `native_events.log`, in the shape of the
+launcher link: `kind<TAB>from<TAB>payload`, no line number, read by position. The mod reads
 and writes them with the helpers it already has (`C.newWriter` / `C.writerSend` and `C.newReader` / `C.readerFeed`
 / `C.parse`), so these tests only pin the text on both sides to the same golden lines as the Rust tests
 (`native/src/link.rs`: `lines_written_by_the_mods_own_writer_parse`, `golden_lines_shared_with_the_lua_test`). If
@@ -15,8 +16,10 @@ import unittest
 
 import lupa.lua52 as lupa
 
+import test_lockstep as T
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 TAB = "\t"
 
 
@@ -29,25 +32,25 @@ COMMON_SRC = read_src("feverlink3_common.lua")
 
 # What C.writerSend writes for the control messages, one writer, player id 1 (the Rust test parses these bytes).
 CTL_FILE = (
-    '1\thold_on\t1\t{["kinds"]={[1]="build_proposal"}}\n'
-    '2\tping\t1\t{["n"]=3}\n'
-    '3\trelease\t1\t{["at"]=12400,["id"]=3}\n'
-    '4\tcancel\t1\t{["id"]=7}\n'
-    '5\thold_off\t1\t{}\n'
-    '6\tterrain_apply\t1\t{["id"]=2,["stamp"]=400}\n'
+    'hold_on\t1\t{["kinds"]={[1]="build_proposal"}}\n'
+    'ping\t1\t{["n"]=3}\n'
+    'release\t1\t{["at"]=12400,["id"]=3}\n'
+    'cancel\t1\t{["id"]=7}\n'
+    'hold_off\t1\t{}\n'
+    'terrain_apply\t1\t{["id"]=2,["stamp"]=400}\n'
 )
 
 # What the module writes (EventWriter::line in Rust). The payload texts are the Rust golden strings.
 EVENTS_FILE = (
-    '1\tready\tnative\t{["build"]="40420",["clock"]=false,["hooks"]={[1]="apply_command",[2]="command_list_add"},'
+    'ready\tnative\t{["build"]="40420",["clock"]=false,["hooks"]={[1]="apply_command",[2]="command_list_add"},'
     '["kinds"]={["build_proposal"]=52},["poolpatch"]=true,["sites"]=12,["version"]="0.1.0"}\n'
-    '2\tholding\tnative\t{["kinds"]={[1]="build_proposal"},["on"]=true,["reason"]="hold_on"}\n'
-    '3\taudit\tnative\t{["adds"]={["other"]=5,["tool"]=2,["unknown"]=0},["counts"]={[17]=4,[52]=2},'
+    'holding\tnative\t{["kinds"]={[1]="build_proposal"},["on"]=true,["reason"]="hold_on"}\n'
+    'audit\tnative\t{["adds"]={["other"]=5,["tool"]=2,["unknown"]=0},["counts"]={[17]=4,[52]=2},'
     '["sites"]={[0]=2},["total"]=6,["unreadable"]=0}\n'
-    '4\terror\tnative\t{["detail"]="no held command 9",["where"]="release"}\n'
-    '5\theld\tnative\t{["id"]=3,["kind"]=52,["ms"]=120,["site"]=5060975}\n'
-    '6\treleased\tnative\t{["id"]=3,["ms"]=99,["reason"]="silence"}\n'
-    '7\tpong\tnative\t{["n"]=4}\n'
+    'error\tnative\t{["detail"]="no held command 9",["where"]="release"}\n'
+    'held\tnative\t{["id"]=3,["kind"]=52,["ms"]=120,["site"]=5060975}\n'
+    'released\tnative\t{["id"]=3,["ms"]=99,["reason"]="silence"}\n'
+    'pong\tnative\t{["n"]=4}\n'
 )
 
 
@@ -55,7 +58,7 @@ class NativeLinkTest(unittest.TestCase):
     def setUp(self):
         os.environ.pop("FEVERLINK3_SESSION_DIR", None)
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.C = self.L.execute(COMMON_SRC)
+        self.C = T.load_common(self.L)
         self.tmp = tempfile.mkdtemp(prefix="feverlink3-native-link-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
@@ -75,16 +78,15 @@ class NativeLinkTest(unittest.TestCase):
         with open(path, encoding="utf-8", newline="") as f:
             self.assertEqual(f.read(), CTL_FILE)
 
-    def test_a_restarted_writer_continues_the_numbering_the_module_reads(self):
-        # a savegame reload restarts the script; the module's reader drops any seq it has seen, so the numbers
-        # must continue from the file
+    def test_a_restarted_writer_goes_on_at_the_end_of_the_file(self):
+        # a savegame reload restarts the script: its new writer appends after what the file holds, and the module reads by position
         path = os.path.join(self.tmp, "native_ctl.log")
         w = self.C.newWriter(path, 1)
         self.C.writerSend(w, "ping", self.table("{ n = 1 }"))
         w2 = self.C.newWriter(path, 1)
         self.C.writerSend(w2, "ping", self.table("{ n = 2 }"))
         with open(path, encoding="utf-8") as f:
-            self.assertEqual([line.split(TAB)[0] for line in f.read().splitlines()], ["1", "2"])
+            self.assertEqual(f.read(), 'ping\t1\t{["n"]=1}\nping\t1\t{["n"]=2}\n')
 
     def test_the_mod_reads_every_event_the_module_writes(self):
         r = self.C.newReader("unused")
@@ -127,13 +129,13 @@ class NativeLinkTest(unittest.TestCase):
         with open(path, "a", encoding="utf-8", newline="") as f:
             f.write("".join(lines[2:4]))
         self.assertEqual([x.kind for x in self.C.readerPoll(r).values()], ["audit", "error"])
-        # rewritten from the top (shorter than what was read): nothing is dispatched twice
+        # rewritten from the top (shorter than what was read: another file, the folder was cleaned): read from its first byte
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(lines[0])
-        self.assertEqual(len(list(self.C.readerPoll(r).values())), 0)
+        self.assertEqual([x.kind for x in self.C.readerPoll(r).values()], ["ready"])
         with open(path, "a", encoding="utf-8", newline="") as f:
             f.write("".join(lines[1:]))
-        self.assertEqual([x.kind for x in self.C.readerPoll(r).values()], ["held", "released", "pong"])
+        self.assertEqual([x.kind for x in self.C.readerPoll(r).values()], ["holding", "audit", "error", "held", "released", "pong"])
 
 
 if __name__ == "__main__":

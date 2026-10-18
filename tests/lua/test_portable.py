@@ -7,7 +7,7 @@ import unittest
 import lupa.lua52 as lupa
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content", "feverlink3_portable.lua")
+SRC = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content", "feverlink3_portable.lua")
 REAL = os.path.join(HERE, "..", "..", "docs", "research", "spike-dumps-20261013", "s0s1", "guest", "native_portable.log")
 
 

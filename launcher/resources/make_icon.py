@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """make_icon.py: draws feverlink3.ico, the icon of feverlink3.exe. Pure Python, no packages.
 
-The picture is the "two people" glyph of the mod's in-game button (mod/feverlink3_1/content/feverlink3_icon.tga),
+The picture is the "two people" glyph of the mod's in-game button (mod/feverlink3/content/feverlink3_icon.tga),
 white on a blue rounded square, drawn from shapes instead of scaled from the 64 pixel bitmap, so that every size is
 sharp. Re-run it after changing the drawing and commit the new .ico; the build (launcher/build.rs) only reads the
 .ico, so nobody needs Python to build FeverLink3.

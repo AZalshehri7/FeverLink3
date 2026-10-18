@@ -59,11 +59,11 @@ The listing and the user security page make these statements. Each one is true o
 | 7 | Hooks (counters, hold), the pool patch and the Lua seed pin are installed by default on a known game build and each is turned off with its variable set to `0` (`FEVERLINK3_HOOKS`, `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, `FEVERLINK3_LUA_SEED`); the diagnostic hooks are off unless set to `1` | `Select-String -Path native\src\*.rs -Pattern "attach_from_env"` and read `native/src/plan.rs` | called only from `DllMain`; the installer, the window and the release never set the variables. If that changes, rewrite the sections "What the DLL does" and "What may change" of `docs/SECURITY_FOR_USERS.md` and the listing first |
 | 8 | Only game build 40420 is known | `native/src/build_table.rs`, `BUILDS` | one row |
 | 9 | No telemetry, no update check | no network client code in `launcher/` or `native/` other than the session and Steam paths; `launcher/src/update.rs` has no fetch | none |
-| 10 | Names of buttons and texts in the window | `mod/feverlink3_1/content/feverlink3_ui.script.lua` | the strings used in `docs/PLAYING.md`, the description and `shot-list.md` |
+| 10 | Names of buttons and texts in the window | `mod/feverlink3/content/feverlink3_ui.script.lua` | the strings used in `docs/PLAYING.md`, the description and `shot-list.md` |
 | 11 | What `feverlink3 install` prints and installs | run `feverlink3 install --dry-run` | one line per item: mod, `steam_appid.txt`, `winhttp.dll`, `feverlink3_path.txt` |
-| 12 | The files and folders in the table of `docs/SECURITY_FOR_USERS.md` | `launcher/src/install.rs`, `launcher/src/live.rs`, `mod/feverlink3_1/content/feverlink3_common.lua` | same names and places |
+| 12 | The files and folders in the table of `docs/SECURITY_FOR_USERS.md` | `launcher/src/install.rs`, `launcher/src/live.rs`, `mod/feverlink3/content/feverlink3_common.lua` | same names and places |
 | 13 | The verified and not-verified lists | `docs/ROADMAP.md`, proof milestones | the same everywhere |
-| 14 | `modinfo.json` description | `mod/feverlink3_1/_metadata/modinfo.json` | **It still says the mod "does nothing unless the game was started by FeverLink3.exe", which has been wrong since live mode, and the game shows this text in its mod list.** Fix it before the release |
+| 14 | `modinfo.json` description | `mod/feverlink3/_metadata/modinfo.json` | **It still says the mod "does nothing unless the game was started by FeverLink3.exe", which has been wrong since live mode, and the game shows this text in its mod list.** Fix it before the release |
 
 ## Placeholders
 

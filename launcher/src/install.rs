@@ -4,7 +4,7 @@
 //!
 //! 1. the native module, copied into the game folder as `winhttp.dll` (the game imports `WINHTTP.dll` and
 //!    Windows searches the application folder first, so the game loads it itself);
-//! 2. the mod, mirrored into the user mods folder as `mods/feverlink3_1/`;
+//! 2. the mod, mirrored into the user mods folder as `mods/feverlink3/`;
 //! 3. `feverlink3_path.txt` next to the game executable, holding the launcher's own path so a game started by
 //!    Steam can find the launcher.
 //!
@@ -13,7 +13,8 @@
 //! only removed when it holds exactly our app id.
 //!
 //! Rules: never overwrite a `winhttp.dll` that is not ours (another mod's proxy); never touch anything outside
-//! these four paths; every operation is idempotent; the result is a [`Report`] that says what happened to each.
+//! these four paths (plus an old copy of the mod under an earlier folder name, [`crate::LEGACY_MOD_IDS`], which
+//! install and uninstall remove so the game does not load two copies); every operation is idempotent; the result is a [`Report`] that says what happened to each.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::steam::mods_dir;
-use crate::{APP_ID, MOD_ID, NATIVE_MARKER};
+use crate::{APP_ID, LEGACY_MOD_IDS, MOD_ID, NATIVE_MARKER};
 
 /// File name of the native module in the game folder.
 pub const DLL_NAME: &str = "winhttp.dll";
@@ -34,7 +35,7 @@ pub const PATH_FILE: &str = "feverlink3_path.txt";
 /// What the launcher has to offer for installation.
 #[derive(Debug, Clone, Copy)]
 pub struct Payload<'a> {
-    /// The mod folder to mirror into `mods/feverlink3_1/`. `None`: not shipped with this launcher.
+    /// The mod folder to mirror into `mods/feverlink3/`. `None`: not shipped with this launcher.
     pub mod_source: Option<&'a Path>,
     /// The native module file to copy as `winhttp.dll`. `None`: not shipped with this launcher.
     pub native_dll: Option<&'a Path>,
@@ -259,6 +260,21 @@ fn install_mod(report: &mut Report, user_dirs: &[PathBuf], source: Option<&Path>
             }
             Err(e) => report.push(Item::Mod, &dst, Outcome::Failed, format!("could not compare: {e}")),
         }
+        remove_legacy_mods(report, user_dir, dry_run);
+    }
+}
+
+/// The folders of earlier names of the mod ([`LEGACY_MOD_IDS`]) that exist in this per-user folder.
+pub fn legacy_mod_dirs(user_local_dir: &Path) -> Vec<PathBuf> {
+    LEGACY_MOD_IDS.iter().map(|id| mods_dir(user_local_dir).join(id)).filter(|d| d.is_dir()).collect()
+}
+
+/// Removes an old copy of the mod under an earlier name, so the game does not load it next to the current one.
+/// Only reported when such a folder exists.
+fn remove_legacy_mods(report: &mut Report, user_dir: &Path, dry_run: bool) {
+    for old in legacy_mod_dirs(user_dir) {
+        let result = if dry_run { Ok(()) } else { fs::remove_dir_all(&old) };
+        report.record(Item::Mod, &old, &format!("removed the old mod folder (renamed to {MOD_ID})"), result);
     }
 }
 
@@ -372,6 +388,7 @@ pub fn uninstall(game_dir: &Path, user_dirs: &[PathBuf], dry_run: bool) -> Repor
         } else {
             report.push(Item::Mod, &dst, Outcome::Skipped, "not installed");
         }
+        remove_legacy_mods(&mut report, user_dir, dry_run);
     }
 
     let dll = game_dir.join(DLL_NAME);
@@ -684,6 +701,38 @@ mod tests {
     }
 
     #[test]
+    fn an_old_copy_under_the_earlier_folder_name_is_removed() {
+        let f = fixture();
+        let old = mods_dir(&f.users[0]).join(LEGACY_MOD_IDS[0]);
+        fs::create_dir_all(old.join("content")).unwrap();
+        fs::write(old.join("mod.json"), "{}").unwrap();
+        let other_mod = mods_dir(&f.users[0]).join("someone_else_1");
+        fs::create_dir_all(&other_mod).unwrap();
+
+        let dry = install(&f.game, &f.users, f.payload(), true);
+        assert!(dry.steps.iter().any(|s| s.path == old && s.outcome == Outcome::Done), "{dry}");
+        assert!(old.is_dir(), "a dry run leaves it");
+
+        let r = f.install();
+        assert!(r.ok(), "{r}");
+        let step = r.steps.iter().find(|s| s.path == old).unwrap();
+        assert_eq!((step.item, step.outcome), (Item::Mod, Outcome::Done));
+        assert!(step.reason.contains("old mod folder"), "{r}");
+        assert!(!old.exists());
+        assert!(mod_installed(&f.users[0]));
+        assert!(other_mod.is_dir());
+        // only reported while such a folder exists
+        assert!(f.install().steps.iter().all(|s| s.outcome == Outcome::Skipped));
+
+        // uninstall removes it too
+        fs::create_dir_all(&old).unwrap();
+        let u = uninstall(&f.game, &f.users, false);
+        assert!(u.ok(), "{u}");
+        assert!(!old.exists());
+        assert!(other_mod.is_dir());
+    }
+
+    #[test]
     fn uninstall_dry_run_changes_nothing() {
         let f = fixture();
         f.install();
@@ -730,10 +779,10 @@ mod tests {
     fn settings_lua_activation() {
         let s = "a = 1,\nmainMenuState = {\n  activeModsState = { \"other_1\", },\n  x = 2,\n},\n";
         let out = settings_with_mod_active(s, MOD_ID).unwrap();
-        assert!(out.contains("activeModsState = { \"feverlink3_1\", \"other_1\", }"));
+        assert!(out.contains("activeModsState = { \"feverlink3\", \"other_1\", }"));
         assert_eq!(settings_with_mod_active(&out, MOD_ID), None, "already active");
         assert_eq!(settings_with_mod_active("nothing here", MOD_ID), None);
         let empty = "activeModsState = {}";
-        assert_eq!(settings_with_mod_active(empty, MOD_ID).unwrap(), "activeModsState = { \"feverlink3_1\",}");
+        assert_eq!(settings_with_mod_active(empty, MOD_ID).unwrap(), "activeModsState = { \"feverlink3\",}");
     }
 }

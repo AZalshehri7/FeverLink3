@@ -95,6 +95,170 @@ fn the_lead_shrinks_only_after_staying_lower_for_eight_seconds() {
     assert_eq!(Lockstep::lead_for(1, 20.0), n.host.state().lead, "short again once it stayed low");
 }
 
+// ---------------------------------------------------------------- the measured clock cadence (bugs 4 and 6, 2026-10-18)
+
+#[test]
+fn a_clock_gap_of_one_step_adds_nothing_and_the_excess_is_bounded() {
+    for speed in 1..=4 {
+        let step_ms = 1000.0 / (Lockstep::STEPS_PER_SECOND * f64::from(speed));
+        for rtt in [0.0, 30.0, 150.0, 300.0] {
+            assert_eq!(
+                Lockstep::lead_for(speed, rtt),
+                Lockstep::lead_for_measured(speed, rtt, step_ms),
+                "x{speed} rtt {rtt}"
+            );
+            assert_eq!(Lockstep::lead_for(speed, rtt), Lockstep::lead_for_measured(speed, rtt, 0.0));
+            let jitter = Lockstep::lead_for_measured(speed, rtt, step_ms + 100.0);
+            assert!(jitter >= Lockstep::lead_for(speed, rtt));
+            if speed >= 2 {
+                assert!(
+                    jitter > Lockstep::lead_for(speed, rtt),
+                    "x{speed} rtt {rtt}: 100 ms of excess is a step at least"
+                );
+            }
+            // a stall of seconds is not hidden behind the lead: at most GAP_EXCESS_MAX_MS more
+            assert_eq!(
+                Lockstep::lead_for_measured(speed, rtt, step_ms + Lockstep::GAP_EXCESS_MAX_MS),
+                Lockstep::lead_for_measured(speed, rtt, 60_000.0)
+            );
+        }
+    }
+    for gap in [f64::NAN, f64::INFINITY, -5.0, 1e12] {
+        let lead = Lockstep::lead_for_measured(4, 100.0, gap);
+        assert!((3 * STEP..=24 * STEP).contains(&lead), "gap {gap}: {lead}");
+    }
+}
+
+#[test]
+fn the_meter_counts_only_the_gaps_of_a_running_game_and_ignores_rare_stalls() {
+    let mut m = LeadMeter::default();
+    let all = |_: u16| true;
+    // x1: a clock line per step, 167 ms apart
+    let mut at = 0.0;
+    let mut t = 10_000;
+    for _ in 0..40 {
+        at += 0.167;
+        t += STEP;
+        m.clock(1, t, at);
+    }
+    let base = m.gap_ms(at, all);
+    assert!((160.0..175.0).contains(&base), "{base}");
+    // standing at the barrier: keepalives every 250 ms with the same time, for 5 s, then running again
+    for _ in 0..20 {
+        at += 0.25;
+        m.clock(1, t, at);
+    }
+    for _ in 0..3 {
+        at += 0.167;
+        t += STEP;
+        m.clock(1, t, at);
+    }
+    assert!((160.0..175.0).contains(&m.gap_ms(at, all)), "a hold is no gap of a running game: {}", m.gap_ms(at, all));
+    // one stall of 2 s among many lines: not covered (the 95 % quantile)
+    at += 2.0;
+    t += STEP;
+    m.clock(1, t, at);
+    for _ in 0..30 {
+        at += 0.167;
+        t += STEP;
+        m.clock(1, t, at);
+    }
+    assert!(m.gap_ms(at, all) < 200.0, "{}", m.gap_ms(at, all));
+    // gaps age out of the window; a player that left is forgotten
+    assert_eq!(0.0, m.gap_ms(at + LeadMeter::GAP_WINDOW_SECONDS + 1.0, all));
+    m.forget(1);
+    assert_eq!(0.0, m.gap_ms(at, all));
+    // round trips: the 90 % quantile of the last eight, of the slowest player that is here
+    for ms in [100.0, 110.0, 105.0, 400.0, 102.0, 98.0, 101.0, 103.0] {
+        m.rtt(2, ms);
+    }
+    m.rtt(3, 500.0);
+    assert_eq!(110.0, m.rtt_ms(|id| id == 2), "one spike in eight is the quantile's top, the next one is taken");
+    assert_eq!(500.0, m.rtt_ms(all));
+}
+
+/// A tiny deterministic generator for the jitter (no dependency).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> f64 {
+        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn clock_at(t: i64, speed: i32) -> Vec<u8> {
+    json(&ClockMessage {
+        t,
+        speed,
+        ahead: 3,
+        need: None,
+        safe: Some(t + 6 * STEP),
+        pause: false,
+        stop: None,
+        hop: None,
+    })
+}
+
+/// Two games at `speed` over a link of `rtt_ms` round trip with jitter, each sending a clock line per step with its frames late by
+/// up to `frame_jitter_ms` now and then; the host's lead after `seconds`.
+fn run_link(rtt_ms: f64, frame_jitter_ms: f64, speed: i32, seconds: f64, seed: u64) -> (Net, i64) {
+    let mut n = Net::new();
+    let a = n.connect("A");
+    started(&mut n, speed);
+    let (mut rng, mut frames) = (Lcg(seed), Lcg(seed + 100));
+    let step_s = 1.0 / (Lockstep::STEPS_PER_SECOND * f64::from(speed));
+    let (mut t_host, mut t_a) = (10_000, 10_000);
+    let (mut next_host, mut next_a) = (n.time(), n.time());
+    let late = |r: &mut Lcg| if r.next() < 0.2 { frame_jitter_ms * r.next() / 1000.0 } else { 0.0 };
+    for ms in 0..(seconds * 1000.0) as i64 {
+        // the round trip: rtt_ms plus up to 30 % of jitter
+        n.set_latency(a, (rtt_ms * (1.0 + 0.3 * rng.next())) / 1000.0);
+        n.advance(0.001);
+        let now = n.time();
+        if now >= next_host {
+            t_host += STEP;
+            n.host_send(MessageKind::Clock, &clock_at(t_host, speed));
+            next_host = now + step_s + late(&mut frames);
+        }
+        if now >= next_a {
+            t_a += STEP;
+            n.send(a, MessageKind::Clock, &clock_at(t_a, speed));
+            next_a = now + step_s + late(&mut frames);
+        }
+        if ms % 250 == 0 {
+            n.tick();
+        }
+    }
+    let lead = n.host.state().lead;
+    (n, lead)
+}
+
+#[test]
+fn the_lead_converges_to_the_measured_round_trip_and_clock_jitter_and_stays_in_bounds() {
+    for (rtt, seed) in [(30.0, 1), (150.0, 2), (300.0, 3)] {
+        for speed in [1, 4] {
+            let (n, steady) = run_link(rtt, 0.0, speed, 40.0, seed);
+            // no jitter in the frames: the round trip alone (its jitter at most 30 %)
+            assert!(steady >= Lockstep::lead_for(speed, rtt), "rtt {rtt} x{speed}: {steady}");
+            // (one step of slack: the harness' clock lines are a millisecond apart at best, a hair over one step's real time)
+            assert!(steady <= Lockstep::lead_for(speed, rtt * 1.3) + STEP, "rtt {rtt} x{speed}: {steady}");
+            let (n2, jittery) = run_link(rtt, 300.0, speed, 40.0, seed);
+            assert!(jittery >= steady, "rtt {rtt} x{speed}: frames late by up to 300 ms never shorten the lead");
+            assert!(
+                jittery <= Lockstep::lead_for_measured(speed, rtt * 1.3, 1000.0 / (6.0 * f64::from(speed)) + 302.0),
+                "rtt {rtt} x{speed}: {jittery} covers at most the largest gap"
+            );
+            assert!((3 * STEP..=24 * STEP).contains(&jittery));
+            if speed == 4 {
+                assert!(jittery > steady, "rtt {rtt}: at x4 a step is 42 ms, 300 ms late frames are steps of lead");
+                assert!(n2.host_log.iter().any(|l| l.starts_with("link.lead ")), "the change is logged");
+            }
+            let _ = n;
+        }
+    }
+}
+
 #[test]
 fn a_higher_speed_gets_a_lead_that_covers_the_same_real_time() {
     let mut n = Net::new();

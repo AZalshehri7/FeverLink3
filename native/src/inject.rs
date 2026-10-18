@@ -461,6 +461,19 @@ pub fn build_verified(
     donor: Option<usize>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Built, String> {
+    build_proved(c, poke, text, donor, true, say)
+}
+
+/// [`build_verified`]; `r4`: whether the informational R4 comparison of the donor's unnamed construction words runs (two more engine
+/// copies of the donor). The originator's own proof ([`own_proof`]) skips it: its donor is the command its text was written from.
+fn build_proved(
+    c: &Ctx,
+    poke: &dyn Poke,
+    text: &str,
+    donor: Option<usize>,
+    r4: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<Built, String> {
     let lines = rebuild::lines_of(text);
     let cons = count(&lines, "toAdd.#");
     let wanted = donor_counts(text);
@@ -472,7 +485,7 @@ pub fn build_verified(
         ));
     }
     let mut r4_report = String::new();
-    if let Some(donor) = donor.filter(|_| cons > 0) {
+    if let Some(donor) = donor.filter(|_| cons > 0 && r4) {
         // R4 (informational): what the two sides' unnamed construction words look like after their differential masks
         r4_report = entity_equivalence(c, text, donor, say);
     }
@@ -480,8 +493,7 @@ pub fn build_verified(
     // command keeps its own Context), so it is neither rebuilt nor proved: rt4 R6 (2026-10-14), the real bulldozer over a town house,
     // was refused on both games for the 17 list and bucket pointers of a one-entry `refundableEntities` that the injection would not
     // have used.
-    let take =
-        |f: &F| !(hybrid && is_donor_member(f.name)) && !outside_proposal_container(f) && nc::selected(f, &lines);
+    let take = |f: &F| takes(f, hybrid, &lines);
     let built = match rebuild::build_selected(text, c.base, c.alloc, Some(&take)) {
         Ok(b) => b,
         Err(e) => {
@@ -489,21 +501,9 @@ pub fn build_verified(
             return Err(format!("the text cannot be built: {e}"));
         }
     };
-    let unresolved: Vec<&rebuild::Blocked> = built
-        .blocked
-        .iter()
-        .filter(|b| b.kind == "heap pointer" && !(hybrid && is_donor_member(&rebuild::member_of(&b.path))))
-        .collect();
-    if !unresolved.is_empty() {
-        let n = unresolved.len();
-        let all: Vec<String> = unresolved.iter().map(|b| b.path.clone()).collect();
+    if let Some(why) = unresolved_refusal(&built, hybrid) {
         c.alloc.free_all();
-        return Err(format!(
-            "{n} heap pointers in the text cannot be resolved: {}{}; copying a null where the engine expects an object could crash the game{REPORT_MARK}{n} unresolved pointer(s), each at <member or @B block>+<byte offset in it>:\n{}\n",
-            all.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
-            if n > 20 { format!(" and {} more", n - 20) } else { String::new() },
-            all.join("\n")
-        ));
+        return Err(why);
     }
     // the engine-made source: its containers are the engine's, the rest comes from the text
     let mut p = Scratch::new();
@@ -596,6 +596,99 @@ pub fn build_verified(
     })
 }
 
+/// Whether [`build_verified`] takes member `f` from the text into the engine-made source: not the members the receiver's own conversion
+/// supplies (a text with constructions or edge objects), not a container past the Proposal (never swapped in), and only what the text
+/// describes completely ([`nc::selected`]).
+fn takes(f: &F, hybrid: bool, lines: &std::collections::BTreeMap<&str, &str>) -> bool {
+    !(hybrid && is_donor_member(f.name)) && !outside_proposal_container(f) && nc::selected(f, lines)
+}
+
+/// The refusal of a built text whose heap pointers (`P`) cannot be resolved in the members that are taken from the text, `None` when it
+/// has none. The pointers are part of the text, so every game that reads the same text comes to the same verdict.
+fn unresolved_refusal(built: &rebuild::Built, hybrid: bool) -> Option<String> {
+    let unresolved: Vec<&rebuild::Blocked> = built
+        .blocked
+        .iter()
+        .filter(|b| b.kind == "heap pointer" && !(hybrid && is_donor_member(&rebuild::member_of(&b.path))))
+        .collect();
+    if unresolved.is_empty() {
+        return None;
+    }
+    let n = unresolved.len();
+    let all: Vec<String> = unresolved.iter().map(|b| b.path.clone()).collect();
+    Some(format!(
+        "{n} heap pointers in the text cannot be resolved: {}{}; copying a null where the engine expects an object could crash the game{REPORT_MARK}{n} unresolved pointer(s), each at <member or @B block>+<byte offset in it>:\n{}\n",
+        all.iter().take(20).cloned().collect::<Vec<_>>().join(", "),
+        if n > 20 { format!(" and {} more", n - 20) } else { String::new() },
+        all.join("\n")
+    ))
+}
+
+/// The originator's verdict on its own text BEFORE it is shipped: the part of every receiver's proof that depends on the text alone (it
+/// parses and builds, no heap pointer of a member taken from it is left unresolved), run on the same text with the same rules, so a text
+/// that every receiver would refuse is never shipped. `None`: the text passes. Our code only (the rebuild into a Rust arena; no engine
+/// call), so the caller may run it inside `log::guarded`.
+///
+/// Why: a text with unresolved pointers was shipped and then refused at the stamp on every game, the originator's own copy included
+/// (owner airport run 2026-10-15, key 20; friend test 2026-10-16, keys 20, 28, 29): the build was lost after the player saw it accepted,
+/// and every game asked for a resync. The originator decides now, before anything leaves it.
+pub fn text_refusal(text: &str, image_base: usize) -> Option<String> {
+    let lines = rebuild::lines_of(text);
+    let hybrid = donor_counts(text).iter().any(|&n| n > 0);
+    let take = |f: &F| takes(f, hybrid, &lines);
+    let arena = rebuild::Arena::new(nc::DRY_ARENA);
+    match rebuild::build_selected(text, image_base, &arena, Some(&take)) {
+        Ok(built) => unresolved_refusal(&built, hybrid),
+        Err(e) => Some(format!("the text cannot be built: {e}")),
+    }
+}
+
+/// The prefix of every refusal of the originator's own proof ([`own_checks`], [`own_proof`]), for the log and the mod's chat line.
+pub const OWN_PROOF: &str = "the engine proof on this game's own held command fails: ";
+
+/// The checks before the originator's own proof ([`own_proof`]) that call nothing of the engine: the held command at `held` is a
+/// `build_proposal` with sane vectors, and the command its own text describes as every receiver identifies its placeholder
+/// ([`same_build`]: the constructions, or the place). A text that identifies no command (it names no place) would wait on every
+/// receiver until its order expires (a refusal without a command, which asks for a resync): refused here instead. Returns the donor the
+/// proof needs: the held command itself when the text adds constructions or edge objects (receivers take those from their own
+/// conversion of the record; the originator's conversion is the held command the text was written from).
+pub fn own_checks(mem: &dyn Mem, held: usize, text: &str) -> Result<Option<usize>, String> {
+    is_proposal(mem, held).map_err(|why| format!("{OWN_PROOF}{why}"))?;
+    same_build(mem, held, text)
+        .map_err(|why| format!("{OWN_PROOF}the held command is not the build its text describes: {why}"))?;
+    Ok(donor_counts(text).iter().any(|&n| n > 0).then_some(held))
+}
+
+/// The originator's own proof BEFORE its text is shipped (owner decision 2026-10-18, #6): the same rebuild every receiver makes of the
+/// text, through the engine's own functions ([`build_verified`]: the engine constructor, the copy constructor of the donor and of the
+/// source, the frozen node lists, the text of the engine-built Proposal compared member by member with the input), and then destroyed
+/// ([`release`]): a dry rebuild, nothing is handed to the engine's command list or written into the held command. A failure fails the
+/// held command and nothing is shipped (fail closed). Returns `(nodes, segments, constructions)` of the proved Proposal.
+///
+/// Before (batch D), the originator ran only the text-only part ([`text_refusal`]); a text that passed it could still be refused by every
+/// receiver's engine rebuild or comparison at the stamp, and the build was then lost after the player saw it accepted, with a resync on
+/// every game. What the proof cannot see stays the receivers' own: their worlds (the mod's reference checks) and their own conversion
+/// of the constructions (the donor); a refusal there is repaired by the host's verdict comparison and the resync.
+///
+/// `donor` from [`own_checks`]. Calls the engine through `c`: never inside `log::guarded` (run [`dry_build`] on the same text first).
+/// On return, success or error, the allocator holds nothing and every Proposal it constructed is destroyed exactly once.
+pub fn own_proof(
+    c: &Ctx,
+    poke: &dyn Poke,
+    text: &str,
+    donor: Option<usize>,
+    say: &mut dyn FnMut(&str),
+) -> Result<(u64, u64, u64), String> {
+    crate::log::calls_engine("native inject: the originator's own proof (the Proposal functions, operator new)");
+    let built = build_proved(c, poke, text, donor, false, say);
+    c.alloc.free_all();
+    let built = built.map_err(|why| format!("{OWN_PROOF}{why}"))?;
+    let stats = (built.nodes, built.segments, built.constructions);
+    say("inject: own proof passed: calling the engine destructor on the proved Proposal (nothing of it is applied)");
+    release(c, built);
+    Ok(stats)
+}
+
 /// The dry pass of [`build_verified`] on `text` (`native_copy::dry_pass`): the same code with stand-ins for the engine, inside a guard.
 /// `Err` only when our code panicked on the text: the injection is then refused before the engine is called. `live` is the memory the
 /// real pass reads (the donor's conversion).
@@ -609,6 +702,20 @@ pub fn dry_build(
 ) -> Result<(), String> {
     nc::dry_pass("native inject: dry pass", live, base, set, build_name, |c| {
         let _ = build_verified(c, &nc::DryPoke, text, donor, &mut |_| {});
+    })
+}
+
+/// [`dry_build`] for [`own_proof`]: the same code as its real pass (no R4 comparison), with stand-ins, inside a guard.
+pub fn dry_own_proof(
+    live: &dyn Mem,
+    base: usize,
+    set: portable::Settings,
+    build_name: &str,
+    text: &str,
+    donor: Option<usize>,
+) -> Result<(), String> {
+    nc::dry_pass("native inject: own proof dry pass", live, base, set, build_name, |c| {
+        let _ = build_proved(c, &nc::DryPoke, text, donor, false, &mut |_| {});
     })
 }
 
@@ -737,16 +844,29 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
     let to_add = tri(TO_ADD);
     let objects = tri(EDGE_OBJECTS_TO_ADD);
     // the edge objects are the receiver's own conversion as well (see DONOR_MEMBERS): the command carries the text's number of them
-    let have_objects = (objects.1 - objects.0) / EDGE_OBJECT_STRIDE as u64;
+    let count = |v: (u64, u64, u64), stride: usize| v.1.saturating_sub(v.0) / stride as u64;
+    let have_objects = count(objects, EDGE_OBJECT_STRIDE);
+    let have = count(to_add, CONSTRUCTION_STRIDE);
+    // what the command builds, so a refusal that expires (`no_command`) shows whether the mod's own command was among those passed over
+    // (owner one-PC test 2026-10-15, a stop over town buildings: eleven commands "not the mod's", none of them told apart from a town's)
+    let shape = || {
+        format!(
+            " (this command: {} node(s) {} segment(s) added, {} segment(s) removed, {} construction(s) added, {} removed)",
+            count(tri(ADDED_NODES), NODE_STRIDE),
+            count(tri(ADDED_SEGMENTS), SEGMENT_STRIDE),
+            count(tri(REMOVED_SEGMENTS), SEGMENT_STRIDE),
+            have,
+            count(tri(TO_REMOVE), 4)
+        )
+    };
     if have_objects != edge_objects {
-        return Err(format!("the command has {have_objects} edge object(s), the text has {edge_objects}"));
+        return Err(format!("the command has {have_objects} edge object(s), the text has {edge_objects}{}", shape()));
     }
-    let have = (to_add.1 - to_add.0) / CONSTRUCTION_STRIDE as u64;
     match (constructions, have) {
         (0, 0) => Ok(()),
-        (0, _) => Err("the command already adds a construction: it is not a placeholder".into()),
+        (0, _) => Err(format!("the command already adds a construction: it is not a placeholder{}", shape())),
         (want, have) if want == have => Ok(()),
-        (want, have) => Err(format!("the command has {have} construction(s), the text has {want}")),
+        (want, have) => Err(format!("the command has {have} construction(s), the text has {want}{}", shape())),
     }
 }
 
@@ -1921,5 +2041,92 @@ toAdd[0].transf	m4:{t}
         let (arena, at, _) = world_text(true);
         let live = Both(&arena);
         assert_eq!(dry_build(&live, BASE, settings(), "40420", &bad, Some(at)), Ok(()));
+    }
+
+    /// Every engine stand-in call so far: constructions (constructor + copy constructor) and destructions.
+    fn made_and_destroyed() -> (usize, usize) {
+        (CTORS.load(Ordering::SeqCst) + COPIES.load(Ordering::SeqCst), DTORS.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn the_originators_own_proof_of_a_road_rebuilds_its_text_compares_it_and_destroys_it_without_applying_anything() {
+        // owner decision 2026-10-18 (#6): the originator runs the receivers' engine rebuild on its own held command before shipping
+        let (arena, at, text) = world_text(false);
+        let mem = Both(&arena);
+        let alloc = Counting { arena: &arena, held: Default::default(), made: Default::default() };
+        let ctx = Ctx { fns: fns(), alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let donor = own_checks(&mem, at, &text).expect("the held command is the build its text describes");
+        assert_eq!(donor, None, "a road needs no donor");
+        let held_before = arena.read(at, PAYLOAD_SIZE).unwrap();
+        let ((m0, d0), a0) = (made_and_destroyed(), ASSIGNS.load(Ordering::SeqCst));
+        assert_eq!(dry_own_proof(&mem, BASE, settings(), "40420", &text, donor), Ok(()));
+        assert_eq!(made_and_destroyed(), (m0, d0), "the dry pass calls no engine stand-in");
+        let mut said = Vec::new();
+        let t = std::time::Instant::now();
+        let stats = own_proof(&ctx, &ArenaPoke(&arena), &text, donor, &mut |l| said.push(l.to_string()))
+            .expect("the proof passes");
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(stats, (2, 1, 0));
+        let (m1, d1) = made_and_destroyed();
+        assert_eq!((m1 - m0, d1 - d0), (2, 2), "the source and the proved copy: each made once and destroyed once");
+        assert_eq!(ASSIGNS.load(Ordering::SeqCst), a0, "nothing is assigned into any command");
+        assert_eq!(arena.read(at, PAYLOAD_SIZE).unwrap(), held_before, "the held command is only read");
+        assert!(alloc.held.borrow().is_empty(), "the allocator holds nothing afterwards");
+        assert!(said.last().is_some_and(|l| l.contains("own proof passed")), "{said:?}");
+        // the cost of the code of ours in the proof (rebuild, comparison) on the synthetic proposal, for the report
+        eprintln!("own proof of the synthetic road: {ms:.2} ms (engine stand-ins)");
+    }
+
+    #[test]
+    fn the_originators_own_proof_of_a_depot_takes_the_constructions_from_its_own_held_command() {
+        let (arena, at, text) = world_text(true);
+        let mem = Both(&arena);
+        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let donor = own_checks(&mem, at, &text).expect("its constructions are the text's");
+        assert_eq!(donor, Some(at), "the donor is the held command the text was written from");
+        WORLD.with(|w| w.set(&arena));
+        let (m0, d0) = made_and_destroyed();
+        let r = own_proof(&ctx, &ArenaPoke(&arena), &text, donor, &mut |_| {});
+        WORLD.with(|w| w.set(core::ptr::null()));
+        assert_eq!(r, Ok((2, 1, 1)));
+        let (m1, d1) = made_and_destroyed();
+        // no R4 masks here: the source, the donor's copy and the proved copy, each destroyed once
+        assert_eq!((m1 - m0, d1 - d0), (3, 3));
+    }
+
+    #[test]
+    fn a_text_the_engines_rebuild_would_refuse_on_every_receiver_is_refused_by_the_originators_own_proof() {
+        // the engine's "copy" loses a vector: every receiver's comparison would fail at the stamp; the originator's fails first
+        unsafe extern "system-unwind" fn lossy(d: *mut u8, s: *const u8) -> *mut u8 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(s, d, PROPOSAL_SIZE);
+                core::ptr::write_bytes(d, 0, 24);
+            }
+            d
+        }
+        let (arena, at, text) = world_text(false);
+        assert_eq!(text_refusal(&text, BASE), None, "the text-only checks pass: only the engine proof can tell");
+        let mem = Both(&arena);
+        let alloc = Counting { arena: &arena, held: Default::default(), made: Default::default() };
+        let mut f = fns();
+        f.copy = lossy;
+        let ctx = Ctx { fns: f, alloc: &alloc, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        let donor = own_checks(&mem, at, &text).unwrap();
+        let d0 = DTORS.load(Ordering::SeqCst);
+        let why = own_proof(&ctx, &ArenaPoke(&arena), &text, donor, &mut |_| {}).unwrap_err();
+        assert!(why.starts_with(OWN_PROOF) && why.contains("differs from the text"), "{why}");
+        assert!(why.contains(REPORT_MARK), "the full report goes to native_refused_<id>.txt");
+        assert_eq!(DTORS.load(Ordering::SeqCst) - d0, 2, "the source and the failed copy are destroyed, nothing twice");
+        assert!(alloc.held.borrow().is_empty());
+        // a depot whose text says another construction than the held command's: refused before any engine call
+        let (arena, at, text) = world_text(true);
+        let mem = Both(&arena);
+        let other = text.replace("toAdd[0].fileName\tres:\"", "toAdd[0].fileName\tres:\"x");
+        assert_ne!(other, text);
+        let why = own_checks(&mem, at, &other).unwrap_err();
+        assert!(why.starts_with(OWN_PROOF) && why.contains("construction 0 is"), "{why}");
+        // a text that names no place identifies no receiver's command (its order would expire everywhere): refused here
+        let why = own_checks(&mem, at, "toAdd.#\tn:0\n").unwrap_err();
+        assert!(why.contains("names no place"), "{why}");
     }
 }

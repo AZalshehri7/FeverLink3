@@ -235,7 +235,7 @@ class PureBarrierTest(unittest.TestCase):
     def setUp(self):
         os.environ.pop("FEVERLINK3_SESSION_DIR", None)
         self.L = T.lupa.LuaRuntime(unpack_returned_tuples=True)
-        self.L.execute(T.COMMON_SRC)
+        T.load_common(self.L)
         self.K = self.L.execute(T.LOCKSTEP_SRC)
 
     def session(self, **kw):

@@ -95,11 +95,14 @@ end
 
 -- The common module's integral number text (feverlink3_common.lua C.integerText: "%d" raises above 2^31 in the game's Lua); this module
 -- also runs where the common module is not loadable (its own tests), then "%.0f", which is what the helper prints.
-local integerText
+local integerText, commonClock, commonTime
 do
 	local okC, C = pcall(ug_require, "feverlink3_common.lua")
-	if not okC then okC, C = pcall(ug_require, "feverlink3_1::/feverlink3_common.lua") end
+	if not okC then okC, C = pcall(ug_require, "feverlink3::/feverlink3_common.lua") end
 	integerText = okC and type(C) == "table" and C.integerText or function(n) return string.format("%.0f", n) end
+	-- the real clock and the wall clock of the link module (feverlink3_link.lua); a caller without the common module passes its own
+	commonClock = okC and type(C) == "table" and C.clock or nil
+	commonTime = okC and type(C) == "table" and C.time or nil
 end
 
 local function num(v)
@@ -144,9 +147,14 @@ function M.apiAccessors(api, entitiesWith, bits32)
 	function acc.networks() return entitiesWith("TRANSPORT_NETWORK") end
 	function acc.lines() return entitiesWith("LINE") end
 	function acc.lineUsage(e) return api.engine.util.town.getTownLineUsage(e) end
+	-- per land use, as getCargoSupplyAndLimit types it (`landUse? : LandUseType`): this game's api.type.enum.LandUseType values in the
+	-- documented order RESIDENTIAL, COMMERCIAL, INDUSTRIAL (tf3-docs api/type, api/engine/system); raises without the enum
 	function acc.supplyDemand(e)
 		local out = {}
-		for lu = 0, 2 do
+		local enum = api.type["enum"].LandUseType
+		for _, name in ipairs({ "RESIDENTIAL", "COMMERCIAL", "INDUSTRIAL" }) do
+			local lu = enum[name]
+			if lu == nil then error("api.type.enum.LandUseType has no " .. name, 0) end
 			local all = api.engine.system.townBuildingSystem.getCargoSupplyAndLimit(e, lu)
 			local ids = {}
 			for id in pairs(all) do ids[#ids + 1] = id end
@@ -160,6 +168,8 @@ function M.apiAccessors(api, entitiesWith, bits32)
 	-- experience and level of the town game script's state (town_cargo.gs), as town_cargo_util.getTownCargoState reads it
 	function acc.xp(e)
 		local gs = api.engine.system.gameScriptSystem.getEntityForGameScript("::/game_mechanics/towns/town_cargo.gs")
+		-- getComponent wants "a valid, existing entity" (tf3-docs api/engine): a game without that game script answers no entity here
+		if type(gs) ~= "number" or gs < 0 or not api.engine.entityExists(gs) then return nil end
 		local comp = api.engine.getComponent(gs, CT.GAME_SCRIPT)
 		local data
 		local native = comp and comp.state_native
@@ -181,7 +191,7 @@ function M.apiAccessors(api, entitiesWith, bits32)
 end
 
 -- opts: enabled (bool), towns (text of FEVERLINK3_TOWN_TRACE), acc, write(text) -> boolean, bits32(number) -> hex text,
--- clock() -> seconds of wall time for the flush (default os.clock), wall() -> whole seconds for gap detection (default os.time),
+-- clock() -> seconds of wall time for the flush (default C.clock), wall() -> whole seconds for gap detection (default C.time),
 -- randomProbe() -> table of facts for L4 (optional)
 function M.new(opts)
 	local self = { enabled = false, errors = 0 }
@@ -193,8 +203,8 @@ function M.new(opts)
 	end
 	self.enabled = true
 	local acc, write = opts.acc, opts.write
-	local clock = opts.clock or os.clock
-	local wall = opts.wall or os.time
+	local clock = opts.clock or commonClock or function() return 0 end
+	local wall = opts.wall or commonTime or function() return 0 end
 	local bits32 = opts.bits32 or function(x) return num(x) end
 	local townSpec = M.parseTowns(opts.towns)
 

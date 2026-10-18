@@ -25,6 +25,11 @@ pub struct ChecksumOutcome {
     pub time_skew: Option<BTreeMap<u16, i64>>,
     /// False for a light round: the heavy lanes were not compared (see `ChecksumPolicy::HEAVY_PARTS`).
     pub full: bool,
+    /// Parts some game could not hash in this round (its report named them not ready), with those games. Such a part is
+    /// unknown, not different: it is left out of `differences` and not compared in this round (seen in a real game: a game
+    /// that verified right after a reload, before its registry was read back from the loaded state, failed every repair
+    /// with "companies"). A part that two games both hashed and that differs is still a difference.
+    pub not_ready: BTreeMap<String, Vec<u16>>,
 }
 
 impl ChecksumOutcome {
@@ -33,12 +38,31 @@ impl ChecksumOutcome {
         self.time_skew.is_none()
     }
 
+    /// Every part was hashed by every game (nothing in `not_ready`).
+    pub fn ready(&self) -> bool {
+        self.not_ready.is_empty()
+    }
+
+    /// Comparable, every part measured on every game, and no part differs.
     pub fn identical(&self) -> bool {
-        self.comparable() && self.differences.is_empty()
+        self.comparable() && self.ready() && self.differences.is_empty()
     }
 
     pub fn differing_parts(&self) -> impl Iterator<Item = &str> {
         self.differences.iter().map(|d| d.part.as_str())
+    }
+
+    /// "companies on 1, townBuildings on 0, 1": the parts that were not measured, for a log line.
+    pub fn describe_not_ready(&self) -> String {
+        let named: Vec<String> = self
+            .not_ready
+            .iter()
+            .map(|(part, ids)| {
+                let ids: Vec<String> = ids.iter().map(u16::to_string).collect();
+                format!("{part} on {}", ids.join(", "))
+            })
+            .collect();
+        named.join("; ")
     }
 }
 
@@ -67,6 +91,8 @@ impl ChecksumRounds {
         let text_ok = |s: &String| s.len() <= Self::MAX_TEXT;
         report.parts.len() <= Self::MAX_PARTS
             && report.parts.iter().all(|(k, v)| text_ok(k) && text_ok(v))
+            && report.not_ready.len() <= Self::MAX_PARTS
+            && report.not_ready.iter().all(text_ok)
             && report.authority.as_ref().is_none_or(|a| a.len() <= Self::MAX_PARTS && a.keys().all(text_ok))
     }
 
@@ -80,6 +106,24 @@ impl ChecksumRounds {
     pub fn open_light(&mut self, n: i32) {
         self.rounds.insert(n, BTreeMap::new());
         self.light.insert(n);
+    }
+
+    /// Whether round `n` is still waiting for reports.
+    pub fn is_open(&self, n: i32) -> bool {
+        self.rounds.contains_key(&n)
+    }
+
+    /// Who of `expected` has not reported round `n` yet (empty when the round is not open).
+    pub fn missing(&self, n: i32, expected: &[u16]) -> Vec<u16> {
+        self.rounds
+            .get(&n)
+            .map_or_else(Vec::new, |round| expected.iter().copied().filter(|id| !round.contains_key(id)).collect())
+    }
+
+    /// Forgets round `n` without comparing it (it will never complete); later reports for it are ignored. True when it was open.
+    pub fn drop_round(&mut self, n: i32) -> bool {
+        self.light.remove(&n);
+        self.rounds.remove(&n).is_some()
     }
 
     fn finish(&mut self, n: i32, round: BTreeMap<u16, ChecksumReportMessage>) -> ChecksumOutcome {
@@ -97,6 +141,7 @@ impl ChecksumRounds {
         let mut report = report;
         if self.light.contains(&n) {
             report.parts.retain(|part, _| !ChecksumPolicy::is_heavy_part(part));
+            report.not_ready.retain(|part| !ChecksumPolicy::is_heavy_part(part));
         }
         round.insert(from, report);
         self.rounds.retain(|&k, _| k >= n.saturating_sub(Self::KEEP_ROUNDS));
@@ -126,9 +171,28 @@ impl ChecksumRounds {
         let time = reporters.first().map_or(0, |id| reports[id].time);
         if reports.values().any(|r| r.time != time) {
             let skew = reports.iter().map(|(&id, r)| (id, r.time)).collect();
-            return ChecksumOutcome { n, time, reporters, differences: Vec::new(), time_skew: Some(skew), full: true };
+            return ChecksumOutcome {
+                n,
+                time,
+                reporters,
+                differences: Vec::new(),
+                time_skew: Some(skew),
+                full: true,
+                not_ready: BTreeMap::new(),
+            };
         }
-        let parts: BTreeSet<&str> = reports.values().flat_map(|r| r.parts.keys().map(String::as_str)).collect();
+        // a part one game could not hash is unknown in this round on every game: not compared, never a difference
+        let mut not_ready: BTreeMap<String, Vec<u16>> = BTreeMap::new();
+        for (&id, r) in reports {
+            for part in r.not_ready.iter().collect::<BTreeSet<_>>() {
+                not_ready.entry(part.clone()).or_default().push(id);
+            }
+        }
+        let parts: BTreeSet<&str> = reports
+            .values()
+            .flat_map(|r| r.parts.keys().map(String::as_str))
+            .filter(|p| !not_ready.contains_key(*p))
+            .collect();
         let mut differences = Vec::new();
         for part in parts {
             let values: BTreeMap<u16, Option<String>> =
@@ -138,6 +202,6 @@ impl ChecksumRounds {
                 differences.push(ChecksumDifference { part: part.to_owned(), values });
             }
         }
-        ChecksumOutcome { n, time, reporters, differences, time_skew: None, full: true }
+        ChecksumOutcome { n, time, reporters, differences, time_skew: None, full: true, not_ready }
     }
 }

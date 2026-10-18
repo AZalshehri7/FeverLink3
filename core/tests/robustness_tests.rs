@@ -559,6 +559,11 @@ fn round_trip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T) {
     assert_eq!(codec::encode(&back), bytes, "the encoding is stable");
 }
 
+fn random_hops(r: &mut StdRng) -> Hops {
+    let mut some = || r.gen_bool(0.5).then(|| r.gen::<i64>());
+    Hops { g: some(), l: some(), h: some(), so: some(), sr: some(), w: some(), ro: some(), rr: some() }
+}
+
 fn finite_f64(r: &mut StdRng) -> f64 {
     loop {
         let v = if r.gen_bool(0.5) { r.gen::<f64>() * 1e6 - 5e5 } else { f64::from_bits(r.gen()) };
@@ -629,8 +634,9 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
         round_trip(PingMessage {
             n: rr.gen(),
             rtt: (0..rr.gen_range(0..6)).map(|_| (rr.gen(), finite_f64(rr))).collect(),
+            off: (0..rr.gen_range(0..6)).map(|_| (rr.gen(), rr.gen())).collect(),
         });
-        round_trip(PongMessage { n: rr.gen() });
+        round_trip(PongMessage { n: rr.gen(), w: rr.gen_bool(0.5).then(|| rr.gen()) });
         round_trip(PeerClockMessage {
             from: rr.gen(),
             t: rr.gen(),
@@ -638,8 +644,15 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             need: rr.gen_bool(0.5).then(|| rr.gen()),
             safe: rr.gen_bool(0.5).then(|| rr.gen()),
             pause: rr.gen(),
+            hop: rr.gen_bool(0.5).then(|| random_hops(rr)),
         });
-        round_trip(ChecksumRequestMessage { n: rr.gen(), at: rr.gen(), paused: rr.gen(), full: rr.gen() });
+        round_trip(ChecksumRequestMessage {
+            n: rr.gen(),
+            at: rr.gen(),
+            paused: rr.gen(),
+            full: rr.gen(),
+            spread: rr.gen(),
+        });
         round_trip(AuthorityMessage {
             n: rr.gen(),
             values: (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect(),
@@ -662,6 +675,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             safe: rr.gen_bool(0.5).then(|| rr.gen()),
             pause: rr.gen(),
             stop: rr.gen_bool(0.5).then(|| rr.gen()),
+            hop: None,
         });
         round_trip(SpeedRequestMessage { speed: rr.gen() });
         round_trip(ChecksumReportMessage {
@@ -671,6 +685,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             authority: rr
                 .gen_bool(0.5)
                 .then(|| (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect()),
+            not_ready: (0..rr.gen_range(0..3)).map(|_| random_text(rr, 8)).collect(),
         });
         round_trip(SaveDoneMessage {
             id: rr.gen(),
@@ -678,7 +693,13 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             detail: rr.gen_bool(0.5).then(|| random_text(rr, 20)),
         });
         round_trip(ReplayFailedMessage { detail: random_text(rr, 40) });
-        round_trip(ActionRefusedMessage { seq: rr.gen(), detail: random_text(rr, 40) });
+        round_trip(ActionRefusedMessage {
+            seq: rr.gen(),
+            detail: random_text(rr, 40),
+            from: rr.gen(),
+            applied: rr.gen(),
+            class: rr.gen_bool(0.5).then(|| random_text(rr, 10)),
+        });
         round_trip(ActionMessage {
             stamp: rr.gen(),
             seq: rr.gen(),
@@ -688,6 +709,8 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             allowed: rr.gen(),
             pause: rr.gen(),
             pause_seq: if rr.gen() { Some(rr.gen()) } else { None },
+            pause_upto: if rr.gen() { Some(rr.gen()) } else { None },
+            hop: None,
         });
         round_trip(Permissions {
             build: player_set(rr),
@@ -789,6 +812,7 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
                 safe: r.gen_bool(0.5).then(|| r.gen()),
                 pause: r.gen(),
                 stop: r.gen_bool(0.5).then(|| r.gen()),
+                hop: None,
             });
             mutate(r, &mut b);
             b
@@ -803,6 +827,8 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
                 allowed: r.gen(),
                 pause: r.gen(),
                 pause_seq: if r.gen() { Some(r.gen()) } else { None },
+                pause_upto: None,
+                hop: None,
             };
             codec::encode(&m)
         }
@@ -814,6 +840,7 @@ fn some_payload(r: &mut StdRng) -> Vec<u8> {
             safe: [None, Some(i64::MIN), Some(i64::MAX)][r.gen_range(0..3)],
             pause: r.gen(),
             stop: [None, Some(i64::MIN), Some(-1), Some(i64::MAX)][r.gen_range(0..4)],
+            hop: None,
         }),
         _ => codec::encode(&SpeedRequestMessage { speed: r.gen_range(-3..8) }),
     }

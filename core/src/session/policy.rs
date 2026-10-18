@@ -39,7 +39,9 @@ impl ChecksumPolicy {
     /// Corrected through Authority, never a reason to reload. The lanes the script reports are `balance` and `loan`
     /// (`money` is the older name); a rule written for "money" alone let a difference of 180 in `balance` reload the world.
     /// Lanes that cost much game thread time in a big world (the sum of one component read per edge, node, construction and town
-    /// building): a light round leaves them out. `townBuildings:<town>` is the per-town part of `townBuildings`.
+    /// building): a running full round reads them spread over the steps, and a light round leaves them out. Every regular round is
+    /// full by default since 2026-10-18 (`HostOptions::full_checksum_every`); light rounds remain for the lab switch and for an
+    /// older host. `townBuildings:<town>` is the per-town part of `townBuildings`.
     /// `ids` (the entity ids of edges, constructions and town buildings) is heavy too, and an ordinary part: ids that differ mean a build
     /// was applied at another step on one game, which the stamp rule should never let happen; the repair is a resync.
     pub const HEAVY_PARTS: [&'static str; 5] = ["edges", "constructions", "nodeConfigs", "townBuildings", "ids"];
@@ -51,6 +53,20 @@ impl ChecksumPolicy {
 
     pub fn config(&self) -> &ChecksumPolicyConfig {
         &self.config
+    }
+
+    /// The fastest game speed: a batch of the engine is at most this many steps.
+    pub const SPREAD_MAX_STEPS: u32 = 4;
+
+    /// Steps between two chunks of a spread full round (`ChecksumRequestMessage::spread`) at game speed `speed`: one engine batch,
+    /// so the chunks land where the batches fall anyway and the landing marks of the chunks never slow the game; 0 for a light or a
+    /// paused round, which are hashed whole at their stamp (light ones cost a few ms; at a pause the simulation does not run).
+    /// Real runs 2026-10-15/16: a full round read about 6500 entities in 370-480 ms (1.0 s at worst) of one step.
+    pub fn spread_steps(full: bool, paused: bool, speed: i32) -> u32 {
+        if !full || paused {
+            return 0;
+        }
+        u32::try_from(speed).unwrap_or(1).clamp(1, Self::SPREAD_MAX_STEPS)
     }
 
     pub fn is_heavy_part(part: &str) -> bool {
@@ -98,12 +114,13 @@ impl ChecksumPolicy {
         let drift: BTreeSet<String> = parts.iter().filter(|p| Self::is_drift_part(p)).cloned().collect();
         let other: BTreeSet<String> = parts.iter().filter(|p| !Self::is_drift_part(p)).cloned().collect();
 
-        // A light round did not measure the heavy lanes: what an earlier full round found there stands until the next full round
-        // (a streak made of heavy parts neither grows nor resets on a light round).
-        let all_heavy =
-            |s: &Option<BTreeSet<String>>| s.as_ref().is_some_and(|s| s.iter().all(|p| Self::is_heavy_part(p)));
-        let keep_drift = !outcome.full && drift.is_empty() && all_heavy(&self.last_drift);
-        let keep_other = !outcome.full && other.is_empty() && all_heavy(&self.last_other);
+        // A light round did not measure the heavy lanes, and a part some game reported not ready was not measured either: what an
+        // earlier round found there stands until a round measures it again (a streak made of unmeasured parts neither grows nor
+        // resets).
+        let unmeasured = |p: &str| (!outcome.full && Self::is_heavy_part(p)) || outcome.not_ready.contains_key(p);
+        let all_unmeasured = |s: &Option<BTreeSet<String>>| s.as_ref().is_some_and(|s| s.iter().all(|p| unmeasured(p)));
+        let keep_drift = drift.is_empty() && all_unmeasured(&self.last_drift);
+        let keep_other = other.is_empty() && all_unmeasured(&self.last_other);
         if keep_drift {
             // unchanged
         } else if drift.is_empty() {
@@ -149,6 +166,16 @@ impl ChecksumPolicy {
         }
         self.reset();
         Some("replay failed".to_owned())
+    }
+
+    /// The games' verdicts of action `key` at its stamp differ (one applied it, another refused it): a fork, resync at once,
+    /// cooldown permitting.
+    pub fn on_verdicts_differ(&mut self, now: f64, key: &str) -> Option<String> {
+        if self.in_cooldown(now) {
+            return None;
+        }
+        self.reset();
+        Some(format!("verdicts of {key} differ"))
     }
 
     /// A resync round ended (done or failed): starts the cooldown and forgets what was counted.

@@ -187,6 +187,7 @@ impl Model {
                                 safe: None,
                                 pause: false,
                                 stop: None,
+                                hop: None,
                             }),
                         ),
                     }

@@ -108,6 +108,9 @@ pub struct Runtime {
     input: crate::input::InputOut,
     /// `FEVERLINK3_NATIVE_INJECT`: the originator's full portable text of every held command (`native_text_<id>.txt`), and the receiver's order.
     text: crate::input::InputOut,
+    /// The originator's refusal of a held command's text before it is shipped (`native_refused_<id>.txt`, the reason): every receiver
+    /// would refuse the same text, so the mod fails the held command and ships nothing (`inject::text_refusal`).
+    refused_text: crate::input::InputOut,
     inject: crate::inject::State,
     inject_settings: OnceLock<portable::Settings>,
     inject_dir_path: Mutex<Option<std::path::PathBuf>>,
@@ -177,6 +180,7 @@ impl Runtime {
             patch: Default::default(),
             input: crate::input::InputOut::default(),
             text: crate::input::InputOut::with_prefix("native_text_"),
+            refused_text: crate::input::InputOut::with_prefix("native_refused_"),
             inject: Default::default(),
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
@@ -590,13 +594,12 @@ impl Runtime {
             kinds: self.build.kinds.iter().map(|(n, k)| (n.to_string(), *k)).collect(),
             sites: self.build.ui_add_sites.len(),
         };
-        let first_seq = events.next_seq();
+        let first = events.end();
         events.append(std::slice::from_ref(&ready))?;
         self.say(&format!(
-            "link: opened {} (control files from {}; events from seq {})",
+            "link: opened {} (control files: {}; events from {first})",
             dir.display(),
-            reader.describe(),
-            first_seq
+            reader.describe()
         ));
         if let Some(line) = ready.log_line() {
             self.say(&line);
@@ -612,6 +615,7 @@ impl Runtime {
         *lock(&self.writer) = Some(Writer { events, failed_logged: false });
         self.input.set_dir(dir);
         self.text.set_dir(dir);
+        self.refused_text.set_dir(dir);
         self.inject_dir(dir);
         if let Some(d) = self.dump.get() {
             d.set_dir(dir);
@@ -680,11 +684,16 @@ impl Runtime {
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(msg) => machine.handle(&msg, now),
-                Err(e) => machine.error("ctl", format!("line {} ({}): {e}", line.seq, line.kind), now),
+                Err(e) => machine.error("ctl", format!("line {}: {e}", line.kind), now),
             }
         }
         if poll.discarded > 0 {
             machine.error("ctl", format!("{} control line(s) discarded", poll.discarded), now);
+        }
+        // a Lua state made a control writer (docs/NATIVE_LINK.md section 3): which state, from the from column of its first line, for the question how many
+        // simulation states the game runs
+        for w in &poll.new_writers {
+            self.say(&format!("link: control writer {w} appeared"));
         }
         if let Some(e) = poll.error {
             machine.error("ctl", e, now);
@@ -1183,7 +1192,6 @@ fn current_thread_id() -> u32 {
 mod tests {
     use super::*;
     use crate::engine::{AddArgs, EngineFns, COMMAND_SIZE, HANDLE_SIZE, PROGRESS_SIZE};
-    use crate::link::CTL_FILE;
     use crate::testutil::TempDir;
     use std::cell::RefCell;
 
@@ -1371,12 +1379,17 @@ mod tests {
         Some(BASE + site as usize)
     }
 
+    /// The interface half's control file, named the way its writer names it (`native_ctl.gui.w<id>.log`).
+    fn ctl_path(dir: &Path) -> std::path::PathBuf {
+        crate::link::writer_log_path(dir, "native_ctl.gui", "1")
+    }
+
     fn ctl(dir: &Path, text: &str) {
         use std::io::Write;
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(CTL_FILE))
+            .open(ctl_path(dir))
             .unwrap()
             .write_all(text.as_bytes())
             .unwrap();
@@ -1410,7 +1423,7 @@ mod tests {
         events(dir).into_iter().map(|(k, _)| k).collect()
     }
 
-    const HOLD_ON: &str = "1\thold_on\t1\t{[\"kinds\"]={[1]=\"build_proposal\"}}\n";
+    const HOLD_ON: &str = "hold_on\t1\t{[\"kinds\"]={[1]=\"build_proposal\"}}\n";
 
     // ---- tests
 
@@ -1465,7 +1478,7 @@ mod tests {
         assert_eq!(kinds(dir.path()), ["ready", "holding", "held", "held"]);
 
         // the mod releases both and sends a command of its own to get the module's attention
-        ctl(dir.path(), "2\trelease\t1\t{[\"at\"]=0,[\"id\"]=2}\n3\trelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n");
+        ctl(dir.path(), "release\t1\t{[\"at\"]=0,[\"id\"]=2}\nrelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n");
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
         assert_eq!(
@@ -1513,7 +1526,7 @@ mod tests {
         rt.pump();
         let mut a = Call::new(52, 10);
         unsafe { rt.on_add(a.args(), at(SITE_A)) };
-        ctl(dir.path(), "2\thold_off\t1\t{}\n");
+        ctl(dir.path(), "hold_off\t1\t{}\n");
         rt.pump();
         assert!(rt.live.load(Relaxed), "something is still waiting to go back");
         let mut b = Call::new(52, 11);
@@ -1557,7 +1570,7 @@ mod tests {
         rt.pump();
         let mut a = Call::new(52, 10);
         unsafe { rt.on_add(a.args(), at(SITE_A)) };
-        ctl(dir.path(), "2\tcancel\t1\t{[\"id\"]=1}\n");
+        ctl(dir.path(), "cancel\t1\t{[\"id\"]=1}\n");
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
         assert_eq!(calls(), ["destroy command true", "add kind 27 tag 50"], "never added");
@@ -1573,7 +1586,7 @@ mod tests {
         rt.pump();
         let mut a = Call::new(52, 10);
         unsafe { rt.on_add(a.args(), at(SITE_A)) };
-        std::fs::remove_file(dir.path().join(CTL_FILE)).unwrap();
+        std::fs::remove_file(ctl_path(dir.path())).unwrap();
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
         assert_eq!(calls(), ["add kind 52 tag 10", "destroy command true", "add kind 27 tag 50"]);
@@ -1623,7 +1636,7 @@ mod tests {
         let (mut ok, mut refused) = (Call::new(52, 10), Call::new(52, 99));
         unsafe { rt.on_add(ok.args(), at(SITE_A)) };
         unsafe { rt.on_add(refused.args(), at(SITE_A)) };
-        ctl(dir.path(), "2\trelease\t1\t{[\"id\"]=1}\n3\trelease\t1\t{[\"id\"]=2}\n");
+        ctl(dir.path(), "release\t1\t{[\"id\"]=1}\nrelease\t1\t{[\"id\"]=2}\n");
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
         calls();
@@ -1676,7 +1689,7 @@ mod tests {
         unsafe { rt.on_add(other.args(), at(SITE_B)) };
         ctl(
             dir.path(),
-            "2	release	1	{[\"id\"]=1}
+            "release	1	{[\"id\"]=1}
 ",
         );
         let mut nop = Call::new(27, 50);
@@ -1736,7 +1749,7 @@ mod tests {
         unsafe { rt.on_add(call.args(), at(SITE_A)) };
         ctl(
             dir.path(),
-            "2	release	1	{[\"id\"]=1}
+            "release	1	{[\"id\"]=1}
 ",
         );
         let mut nop = Call::new(27, 50);
@@ -1840,7 +1853,7 @@ mod tests {
     fn ping_is_answered_by_the_pump_alone() {
         let dir = TempDir::new("rt-ping");
         let rt = runtime(Some(dir.path()));
-        ctl(dir.path(), "1\tping\t1\t{[\"n\"]=12}\n");
+        ctl(dir.path(), "ping\t1\t{[\"n\"]=12}\n");
         rt.pump();
         assert_eq!(events(dir.path())[1], ("pong".to_string(), "{[\"n\"]=12}".to_string()));
     }
@@ -1849,7 +1862,7 @@ mod tests {
     fn bad_control_lines_are_reported_not_fatal() {
         let dir = TempDir::new("rt-bad");
         let rt = runtime(Some(dir.path()));
-        ctl(dir.path(), "1\texplode\t1\t{}\n2\trelease\t1\t{}\ngarbage\n3\tping\t1\t{[\"n\"]=1}\n");
+        ctl(dir.path(), "explode\t1\t{}\nrelease\t1\t{}\ngarbage\nping\t1\t{[\"n\"]=1}\n");
         rt.pump();
         let k = kinds(dir.path());
         assert_eq!(k.iter().filter(|x| *x == "error").count(), 3, "{k:?}"); // two bad lines, one discarded line
@@ -1877,7 +1890,7 @@ mod tests {
         rt.pump();
         let mut a = Call::new(52, 10);
         unsafe { rt.on_add(a.args(), at(SITE_A)) };
-        ctl(dir.path(), "2\trelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n");
+        ctl(dir.path(), "release\t1\t{[\"at\"]=0,[\"id\"]=1}\n");
         THROW.with(|t| t.set(true));
         let mut nop = Call::new(27, 50);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { rt.on_add(nop.args(), at(0x999)) }));
@@ -1980,7 +1993,7 @@ mod tests {
         assert_eq!(calls(), ["add kind 52 tag 1"]);
     }
 
-    const PATCH_NEXT: &str = "1	patch_next	1	{[\"adds\"]=2,[\"frozen\"]={[1]=1}}
+    const PATCH_NEXT: &str = "patch_next	1	{[\"adds\"]=2,[\"frozen\"]={[1]=1}}
 ";
 
     #[test]
@@ -2009,7 +2022,7 @@ mod tests {
         ctl(
             dir.path(),
             &format!(
-                "{PATCH_NEXT}2	hold_on	1	{{[\"kinds\"]={{[1]=\"build_proposal\"}}}}
+                "{PATCH_NEXT}hold_on	1	{{[\"kinds\"]={{[1]=\"build_proposal\"}}}}
 "
             ),
         );
@@ -2199,7 +2212,7 @@ mod tests {
         );
     }
 
-    const INJECT_NEXT: &str = "1	inject_next	1	{[\"key\"]=5}
+    const INJECT_NEXT: &str = "inject_next	1	{[\"key\"]=5}
 ";
 
     #[test]
@@ -2250,7 +2263,7 @@ mod tests {
         });
         let mut sim = [0u8; 8];
         // 1. the side file is missing (unreadable): a foreign build_proposal (a town's road) goes by
-        ctl(dir.path(), "1\tinject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
+        ctl(dir.path(), "inject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
         let (mut town, _n1) = road_placeholder(400.0);
         let before = town.c.payload.to_vec();
         calls();
@@ -2265,7 +2278,7 @@ mod tests {
         assert!(lock(&rt.added).is_empty());
         // 2. a side file whose text names no place: no command can be identified by it either
         std::fs::write(dir.path().join(crate::inject::inject_file_name(6)), "toAdd.#\tn:0\n").unwrap();
-        ctl(dir.path(), "2\tinject_next\t1\t{[\"key\"]=6}\n");
+        ctl(dir.path(), "inject_next\t1\t{[\"key\"]=6}\n");
         rt.pump(); // the module reads it: it waits behind key 5
         let (mut town2, _n2) = road_placeholder(400.0);
         let before2 = town2.c.payload.to_vec();
@@ -2330,7 +2343,7 @@ mod tests {
             100f32.to_bits()
         );
         std::fs::write(dir.path().join(crate::inject::inject_file_name(5)), text).unwrap();
-        ctl(dir.path(), "1\tinject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
+        ctl(dir.path(), "inject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
         let mut sim = [0u8; 8];
         // a town's road elsewhere goes by first: not the mod's command, untouched, the order keeps waiting
         let (mut town, _n1) = road_placeholder(400.0);
@@ -2366,6 +2379,34 @@ mod tests {
         );
         // the held command is failed at once (here it is not in the ring, so the machine says it does not know it)
         assert!(ev.iter().any(|(k, w)| k == "error" && w.contains("no held command 3")), "{ev:?}");
+        inject::TEST_FNS.with(|f| f.set(None));
+    }
+
+    #[test]
+    fn the_originators_own_proof_fails_closed_when_it_cannot_be_made_and_calls_nothing_of_the_engine_then() {
+        let dir = TempDir::new("rt-own-proof");
+        let rt = runtime(Some(dir.path()));
+        let settings = portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap();
+        rt.enable_native_inject(settings);
+        inject::TEST_FNS.with(|f| {
+            f.set(Some(crate::native_copy::ProposalFns { ctor: p_ctor, dtor: p_dtor, copy: p_copy, assign: p_copy }))
+        });
+        let text = format!(
+            "proposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\tv3:{:08x},00000000,00000000\n",
+            100f32.to_bits()
+        );
+        let (held, _node) = road_placeholder(100.0);
+        let payload = held.c.payload.as_ptr() as usize;
+        calls();
+        // the functions are there (stand-ins), the game's allocator is not verified in the test process: refused, no engine call
+        let why = rt.inject_own_proof(payload, &text, settings).unwrap_err();
+        assert!(why.starts_with(crate::inject::OWN_PROOF) && why.contains("allocator was not verified"), "{why}");
+        assert!(calls().is_empty(), "nothing of the engine was called");
+        // a held command elsewhere than its text: refused by the checks before anything else
+        let (other, _n2) = road_placeholder(400.0);
+        let why = rt.inject_own_proof(other.c.payload.as_ptr() as usize, &text, settings).unwrap_err();
+        assert!(why.contains("not the build its text describes"), "{why}");
+        assert_eq!(crate::log::engine_calls_in_guard(), 0, "no engine call announced inside a guard");
         inject::TEST_FNS.with(|f| f.set(None));
     }
 
@@ -2430,7 +2471,7 @@ mod tests {
         let (mut a, mut b) = (Call::new(52, 10), Call::new(52, 11));
         unsafe { rt.on_add(a.args(), at(SITE_A)) };
         unsafe { rt.on_add(b.args(), at(SITE_B)) };
-        ctl(dir.path(), "2\trelease\t1\t{[\"at\"]=0,[\"id\"]=1}\n3\tcancel\t1\t{[\"id\"]=2}\n");
+        ctl(dir.path(), "release\t1\t{[\"at\"]=0,[\"id\"]=1}\ncancel\t1\t{[\"id\"]=2}\n");
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
         assert!(calls().iter().any(|c| c == "add kind 52 tag 10"), "the release reached Add");

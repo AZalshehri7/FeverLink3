@@ -22,7 +22,8 @@
 --
 -- Findings used from MPFever (MIT): proposals are rebuilt as SimpleProposals (the form the game's own scripts use);
 -- properties of engine objects return copies, so every nested change is read, changed and written back; a segment
--- needs lane configurations or the factory throws; transportModes of a lane may be written shifted by one; the
+-- needs lane configurations or the factory throws (a lane's transportModes is the documented map keyed by
+-- api.type.enum.TransportMode: it travels by the enum's names, common.lua C.modeNames / C.modeMap); the
 -- engine's own replaceSegment and makeSegmentsRemoveProposal rebuild upgrades and bulldozing exactly as the tools
 -- do; a stop or signal replaces its segment and is marked by a placeholder in the segment's object list; the
 -- entrance of a depot or street station cannot be built in the same proposal as its street part (street first,
@@ -31,7 +32,7 @@
 -- (BASE_NODE, BASE_EDGE), the street system's maps are used instead.
 
 local okC, C = pcall(ug_require, "feverlink3_common.lua")
-if not okC then C = ug_require("feverlink3_1::/feverlink3_common.lua") end
+if not okC then C = ug_require("feverlink3::/feverlink3_common.lua") end
 local log = C.logger("build")
 local unpack = table.unpack or unpack
 local floor, sqrt, abs = math.floor, math.sqrt, math.abs
@@ -74,6 +75,9 @@ end
 A.get = get
 
 -- Where the constructors of the engine's types live below `api`. A name with several paths is tried in order.
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): LaneConfig, LaneConnection, BaseEdgeStreet, PlayerOwned and
+-- BaseEdgeTrack have documented records but no documented constructor (the docs' Engine.Component note: build component values
+-- with api.type.<Name>.new()); the second paths are fallbacks of no documented standing. The documented path comes first.
 A.TYPES = {
 	SimpleProposal = { "type.SimpleProposal" },
 	ConstructionEntity = { "type.SimpleProposal.ConstructionEntity" },
@@ -112,6 +116,8 @@ function A.mat4(m)
 end
 
 -- The names of an engine object's members: its __members, on the object or on its metatable. Nil for plain tables.
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): `__members` is the engine binding's own member list; the
+-- docs give each record's fields but no reflection.
 function A.members(o)
 	local ok, m = pcall(function() return o.__members end)
 	if ok and type(m) == "table" then return m end
@@ -305,6 +311,129 @@ function A.edgeOfObject(o)
 	return nil
 end
 
+-- The three integers of an Engine.Revision ({ num = { a, b, c } }, script-doc api/engine.html), or of a plain { a, b, c }; nil if neither.
+function A.revNum(rev)
+	local num = get(rev, "num")
+	if num == nil then num = rev end
+	local out = {}
+	for i = 1, 3 do
+		local x = get(num, i)
+		if type(x) ~= "number" then return nil end
+		out[i] = x
+	end
+	return out
+end
+
+-- This game's revision of an entity (api.engine.getRevision: "Returns the revision of the entity"): the engine's object and its integers,
+-- or nil when it cannot be read.
+function A.revision(e)
+	local ok, rev = pcall(function() return api.engine.getRevision(e) end)
+	if not ok or rev == nil then return nil end
+	local num = A.revNum(rev)
+	if not num then return nil end
+	return rev, num
+end
+
+-- The entries of a Context's refundableEntities (the tool's list of what the player built recently; the engine refunds the removal of
+-- one of them). The game's API reference types the member `{{Engine.Entity, integer}, {Engine.Revision, integer}}`: a key of the entity
+-- and an integer, a value of the entity's revision and an integer (script-doc api/type.html; the native module reads the same four
+-- fields from the held command). Read here from that form ({ { e, k }, { rev, n } } per entry), from the native module's
+-- { e, k, r, n }, or from a bare entity id (k, r, n unknown). Returns { e, k, r = { a, b, c }, n } per entity, sorted by entity, no repeats.
+function A.refundEntries(v)
+	local out, seen = {}, {}
+	local function num(x) return type(x) == "number" and x or nil end
+	local function add(e, k, r, n)
+		if type(e) == "number" and e >= 0 and e == floor(e) and not seen[e] then
+			seen[e] = true
+			out[#out + 1] = { e = e, k = num(k), r = r and A.revNum(r) or nil, n = num(n) }
+		end
+	end
+	pcall(function()
+		for _, x in ipairs(A.items(v)) do
+			if type(x) == "number" then
+				add(x)
+			elseif get(x, "e") ~= nil then
+				add(get(x, "e"), get(x, "k"), get(x, "r"), get(x, "n"))
+			else
+				local key, val = get(x, 1), get(x, 2)
+				add(get(key, 1), get(key, 2), get(val, 1), get(val, 2))
+			end
+		end
+	end)
+	-- the map form: { [{ entity, integer }] = { revision, integer } } (A.setRefundable)
+	if #out == 0 and type(v) == "table" then
+		pcall(function()
+			for key, val in pairs(v) do
+				if type(key) == "table" then add(get(key, 1), get(key, 2), get(val, 1), get(val, 2)) end
+			end
+		end)
+	end
+	table.sort(out, function(a, b) return a.e < b.e end)
+	return out
+end
+
+-- An error value as text: the game's binding raises tables as well as strings (real run 2026-10-18: "table: 000001EFA9EF9080"), so a
+-- table's fields are listed.
+function A.errText(err)
+	if type(err) ~= "table" then return tostring(err) end
+	local parts = {}
+	pcall(function()
+		for k, x in pairs(err) do
+			if #parts >= 8 then break end
+			parts[#parts + 1] = tostring(k) .. "=" .. tostring(x):sub(1, 120)
+		end
+	end)
+	local mt = getmetatable(err)
+	local s = (mt and mt.__tostring) and tostring(err) or ""
+	return "table{" .. table.concat(parts, ", ") .. "}" .. (s ~= "" and (" " .. s) or "")
+end
+
+-- Puts entries { e, k, rev (this game's revision object, see refundIdsOf), num (its integers), n } into a Context's refundableEntities.
+-- The game's typed API declares the member `{{Engine.Entity, integer}, {Engine.Revision, integer}}` (api/tealdef/api/type.d.tl:2486); the
+-- generated definitions write a map as `{K, V}` (engine.d.tl:341 `tag2segments : {string, {Engine.Entity}}`) and a pair as `{A, B}`, so
+-- this is a map from the key { entity, integer } to the value { revision, integer }: a Lua table keyed by the key tables. The base game
+-- only copies the member from api.gui.construction.getRefundableEntities() (gui/entity_window/bridge_and_tunnel.tl:189-191) and builds
+-- revisions as plain { num = { a, b, c } } (scripts/entity_util.tl:8). Real run 2026-10-18: a list of entries and a list of ids were both
+-- refused ("The lua object can't be c..."), as a map converted key by key refuses the integer keys of a list. Tried: the map with this
+-- game's revision object, the map with plain revisions, the list of entries. The first form the binding takes without an error is kept
+-- (unproven in the real game; the read-back count is logged). Returns the form and the read-back count, or nil and why none was taken.
+function A.setRefundable(ctxObj, entries)
+	local tried = {}
+	for _, form in ipairs({ "map", "map-plain", "list" }) do
+		local v = {}
+		for i, x in ipairs(entries) do
+			local rev = x.rev
+			if form ~= "map" then rev = { num = { x.num[1], x.num[2], x.num[3] } } end
+			if form == "list" then v[i] = { { x.e, x.k }, { rev, x.n } } else v[{ x.e, x.k }] = { rev, x.n } end
+		end
+		local ok, err = pcall(function() ctxObj.refundableEntities = v end)
+		if ok then
+			return form, #A.refundEntries(get(ctxObj, "refundableEntities"))
+		end
+		tried[#tried + 1] = form .. ": " .. A.errText(err):sub(1, 200)
+	end
+	return nil, table.concat(tried, "; ")
+end
+
+-- What the interface's own refundable list looks like (api.gui.construction.getRefundableEntities, the value the base game copies into a
+-- Context): the Lua shape of its first entry, for the log. Interface state only; nil and why when it cannot be read.
+function A.guiRefundShape()
+	local ok, v = pcall(function() return api.gui.construction.getRefundableEntities() end)
+	if not ok or v == nil then return nil, tostring(v) end
+	local function shape(x, depth)
+		local t = type(x)
+		if t ~= "table" or depth > 3 then return t .. (t == "number" and ("=" .. tostring(x)) or "") end
+		local parts = {}
+		for k, y in pairs(x) do
+			if #parts >= 4 then break end
+			parts[#parts + 1] = "[" .. shape(k, depth + 1) .. "]=" .. shape(y, depth + 1)
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	local okS, s = pcall(shape, v, 0)
+	return type(v) .. " " .. (okS and s or tostring(s))
+end
+
 -- ---- looking for the entity at a place
 
 local function octree(p, radius, compName)
@@ -445,29 +574,15 @@ function A.templateLanes(template)
 	return lanes
 end
 
--- transportModes reads from index 0, but its writes may land shifted by one (tm[j] = x ends at j - 1): measured once
--- on a new lane (finding from MPFever (MIT))
-function A.laneShift()
-	if A.shift ~= nil then return A.shift end
-	A.shift = 0
-	pcall(function()
-		local lc = A.new("LaneConfig")
-		local tm = lc.transportModes
-		for j = 0, 15 do tm[j] = false end
-		tm[3] = true
-		lc.transportModes = tm
-		local back = lc.transportModes
-		if back[3] then A.shift = 0 elseif back[2] then A.shift = 1 end
-	end)
-	return A.shift
-end
-
--- one lane as plain data: speed, width, height, forward, offset and the transport modes that may use it
+-- one lane as plain data: speed, width, height, forward, offset and the transport modes that may use it (the names of the modes that
+-- are on, in the enum's documented order: a map keyed by api.type.enum.TransportMode, read by name; common.lua C.modeNames). A
+-- mode key the enum does not name raises: the lane cannot be told to another game.
 function A.readLane(l)
+	local names, why = C.modeNames(get(l, "transportModes"))
+	if not names then error("a lane's transport modes: " .. tostring(why), 0) end
 	local modes = {}
-	local tm = get(l, "transportModes")
-	for j = 0, 15 do
-		if get(tm, j) == true then modes[#modes + 1] = j end
+	for _, name in ipairs(C.TRANSPORT_MODE_NAMES) do
+		if names[name] == true then modes[#modes + 1] = name end
 	end
 	return { speed = get(l, "speed"), width = get(l, "width"), height = get(l, "height"), forward = get(l, "forward"),
 		offset = get(l, "offset"), modes = modes }
@@ -487,21 +602,23 @@ local function laneSignature(plainLanes)
 end
 
 function A.rebuildLanes(plainLanes)
-	local shift = A.laneShift()
 	local out = {}
 	for i, m in ipairs(plainLanes) do
 		local lc = A.new("LaneConfig")
 		for _, k in ipairs({ "speed", "width", "height", "forward", "offset" }) do
 			if m[k] ~= nil then pcall(function() lc[k] = m[k] end) end
 		end
-		local on = {}
-		for _, j in ipairs(m.modes or {}) do on[j] = true end
-		pcall(function()
-			local tm = lc.transportModes
-			-- a write at k lands at k - shift, and index 0 wraps to the end: so mode j is written at (j + shift) mod 16
-			for j = 0, 15 do tm[(j + shift) % 16] = on[j] == true end
-			lc.transportModes = tm
-		end)
+		-- the transport modes: every documented mode off, the record's on, keyed by this game's enum values (common.lua C.modeMap)
+		-- and assigned whole, as the game's own scripts do with such a map. A mode this game's enum lacks refuses the rebuild.
+		local names = {}
+		for _, name in ipairs(C.TRANSPORT_MODE_NAMES) do names[name] = false end
+		for _, name in ipairs(m.modes or {}) do
+			if names[name] == nil then error("lane " .. i .. ": unknown transport mode " .. tostring(name), 0) end
+			names[name] = true
+		end
+		local tm, why = C.modeMap(names)
+		if not tm then error("lane " .. i .. ": " .. tostring(why), 0) end
+		lc.transportModes = tm
 		out[i] = lc
 	end
 	return out
@@ -937,6 +1054,8 @@ local function readSegment(s, cap)
 	-- track build was refused on both games). Read as it is; the replay sets it only when it differs from a fresh BaseEdgeTrack.
 	local track = nil
 	do
+		-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): SegmentAndEntity.trackEdge (trackType, catenary) is not in
+		-- the docs; a track segment names its track only there.
 		local te = get(s, "trackEdge")
 		if te ~= nil then
 			local tt, cat = get(te, "trackType"), get(te, "catenary")
@@ -1224,14 +1343,79 @@ local function captureRecord(proposal, cap)
 	return rec
 end
 
-local function captureContext(c)
+-- The originator's refundableEntities as items { ref, k, r, n }: the entity as a reference of the kinds the record uses (node, segment,
+-- construction, edge object), so that every game puts ITS OWN entity into its replay's Context, and the entry's other fields (key integer,
+-- the revision the tool recorded, value integer) as the originator's Context has them, so that the engine refunds the removal as in a
+-- game without the mod (friend test 2026-10-16: a bulldozing replayed without them gave no money back on either game). An entity that
+-- names none of these kinds in this world is left out HERE, before the record travels, so every game gets the same list.
+-- Only what this command removes is kept (`rec`'s removal lists, an edge object also when its segment is removed): the tool's list holds
+-- every recent build of the player (25 entries for one road, friend test 2026-10-16), and a reference to an unrelated one that another
+-- command removed before the stamp would otherwise refuse the bulldozing. The kept ones are entities the removal names itself, so they
+-- resolve exactly when the removal does. Without a record (`rec` nil) the removed set is unknown: everything is kept and marked `loose`,
+-- and every game leaves out the ones it cannot resolve (refundIdsOf). Returns the references, how many were left out, and `loose`.
+local function refKeys(r)
+	if type(r) ~= "table" then return {} end
+	if r.__ref == "obj" then
+		local out = {}
+		for _, k in ipairs(refKeys(r.edge)) do out[#out + 1] = "obj:" .. k .. "#" .. tostring(r.i) end
+		return out
+	end
+	-- the key when it has one, and the place (a removed segment taken from the added one's ends carries no key)
+	local out = { tostring(r.__ref) .. "@" .. describe(r) }
+	if r.key then out[2] = tostring(r.__ref) .. ":" .. r.key end
+	return out
+end
+local function refundRefs(raw, cap, rec)
+	local removed, removedEdges, loose = {}, {}, type(rec) ~= "table"
+	if not loose then
+		for _, list in ipairs({ rec.rem, rec.rmNodes, rec.rmSegs, rec.rmObjs }) do
+			for _, r in ipairs(list or {}) do for _, k in ipairs(refKeys(r)) do removed[k] = true end end
+		end
+		for _, r in ipairs(rec.rmSegs or {}) do for _, k in ipairs(refKeys(r)) do removedEdges[k] = true end end
+	end
+	local function isRemoved(ref)
+		for _, k in ipairs(refKeys(ref)) do if removed[k] then return true end end
+		if ref.__ref == "obj" then
+			for _, k in ipairs(refKeys(ref.edge)) do if removedEdges[k] then return true end end
+		end
+		return false
+	end
+	local refs, dropped, unrelated = {}, 0, 0
+	for _, x in ipairs(A.refundEntries(raw)) do
+		local id = x.e
+		local fn = (A.comp(id, "BASE_EDGE") and cap.edge) or (A.comp(id, "BASE_NODE") and cap.node) or (A.conInfo(id) and cap.con)
+			or (A.comp(id, "EDGE_OBJECT") and cap.obj) or nil
+		local ok, ref = false, nil
+		if fn then ok, ref = pcall(fn, id) end
+		if not (ok and type(ref) == "table") then
+			dropped = dropped + 1
+		elseif loose or isRemoved(ref) then
+			refs[#refs + 1] = { ref = ref, k = x.k, r = x.r, n = x.n }
+		else
+			unrelated = unrelated + 1
+		end
+	end
+	if dropped > 0 then log("refund: " .. dropped .. " of the Context's refundable entities name nothing a record can reference here; left out on every game") end
+	if unrelated > 0 then log("refund: " .. unrelated .. " of the Context's refundable entities are not removed by this command; left out on every game") end
+	if loose then log("refund: the command's removed entities are not known here; all " .. #refs .. " refundable entities travel, and each game leaves out the ones it cannot find") end
+	return refs, dropped, loose
+end
+
+-- `cap` (optional) names the Context's refundableEntities by reference (refundRefs), kept to what `rec` removes.
+local function captureContext(c, cap, recd)
 	if c == nil or c == false then return false end
 	if type(c) == "table" and c.align ~= nil then return c end   -- already a record's flags (read before the build, see M.preState)
-	return {
+	local rec = {
 		align = get(c, "checkTerrainAlignment") == true, cleanup = get(c, "cleanupStreetGraph") == true,
 		buildings = get(c, "gatherBuildings") == true, fields = get(c, "gatherFields") == true,
 		redo = get(c, "extendProposalRedoPillars") == true,
 	}
+	local raw = cap and get(c, "refundableEntities")
+	if raw ~= nil and #A.refundEntries(raw) > 0 then
+		local refs, _, loose = refundRefs(raw, cap, recd)
+		if #refs > 0 then rec.refund, rec.refundLoose = refs, loose or nil end
+	end
+	return rec
 end
 
 -- ================================================================== plans
@@ -1434,6 +1618,9 @@ end
 
 -- The Context of the command: none when the original had none, otherwise the originator's flags as the record carries them (one rule
 -- for every plan; decodeBuildUnsafe has put the fallback in for a record that carries none). Always for this game's player.
+-- The originator's refundable entities are resolved to this game's own (refundIdsOf) and put into the Context, so that the engine itself
+-- refunds the removal of one of them, by its own rule and amount (nothing is booked here).
+local refundIdsOf   -- defined after the reference checks (okRef)
 local function newContext(c, R)
 	if type(c) ~= "table" then return nil end
 	local f = c
@@ -1444,11 +1631,40 @@ local function newContext(c, R)
 	pcall(function() obj.gatherBuildings = f.buildings == true end)
 	pcall(function() obj.gatherFields = f.fields == true end)
 	if f.redo ~= nil then pcall(function() obj.extendProposalRedoPillars = f.redo == true end) end
+	if f.refund ~= nil then
+		-- resolved once, at the first command (the world before the action); the Context of a later command of a chain names only those
+		-- still there: an earlier command of the same action, run as it was sent (postUpdate), removed the others and was refunded for them
+		local entries = {}
+		for _, x in ipairs(refundIdsOf(f, R)) do
+			if A.exists(x.e) then entries[#entries + 1] = x end
+		end
+		if #entries > 0 then
+			-- the binding behaves alike on every game (same game build), so a form it refuses is refused everywhere: no refund anywhere
+			local form, why = A.setRefundable(obj, entries)
+			if form and not R.refundSaid then
+				R.refundSaid = true
+				log("refund: set in the Context in the form '" .. form .. "' (" .. tostring(why) .. " of " .. #entries .. " entries read back)")
+			end
+			if not form and not R.refundWarned then
+				R.refundWarned = true
+				log("refund: the Context's refundableEntities cannot be set (" .. tostring(why) .. "); replayed without a refund")
+			end
+		end
+	end
 	return obj
 end
 
 local guardProposal   -- defined after newNodeConfig
 
+-- The factory's argument order is (proposal, context, ignoreErrors, playerInitiated, doDust). The script-doc page (api/cmd.html)
+-- names argument 4 doDust and argument 5 playerInitiated, and so do the @param lines of the game's own tealdef/api/cmd.d.tl; the
+-- typed signature in that same file says `ignoreErrors : boolean, playerInitiated : boolean, doDust? : boolean`, and the engine agrees
+-- with the signature (checked 2026-10-18 for the wiki audit A1, nothing changed): every held tool command has the byte at payload
+-- +0x3d2 = 1 and +0x9b0 (the byte the apply handler tests before the dust effect, SPIKE_NATIVE_COMMAND 3.1) = 0; our replays, sent
+-- with argument 4 = true and 5 = false, came out with the same two bytes (S0/S1 dumps 2026-10-13, "every named member is
+-- bit-identical"), and their apply_command events report param[4] = true like the tools' (sweep 20261018-083122 A1). The base game's
+-- own scripts pass four arguments (terrain/reforestation.script.tl, landmarks.script.tl: argument 4 = false), which fits an optional
+-- trailing doDust. So argument 4 sets the flag the tools set, and the event's param[4] the bridge filters on is that flag.
 local function commandArgs(proposal, ctxObj, ie, pi, dust)
 	guardProposal(proposal)
 	return { n = 5, proposal, ctxObj, ie, pi, dust }
@@ -1896,6 +2112,32 @@ local function part(rec, keep)
 	return out
 end
 
+-- The references of a later command of a chain name the world BEFORE the action (the originator's tool made the record there), but
+-- the command itself is made when its turn comes, after the earlier ones ran: the simulation half sends from postUpdate, and the engine
+-- runs a command there as it is sent (b2fcd7e; before it the commands of update ran after it, so a chain's step still saw the world
+-- before). Sweep 20261018-131047 B10: the removal of an underground station took two street pieces of its own, and the chained
+-- segment removal, looking them up afterwards, refused the bulldozing on both games ("unresolved segment 672.603,-13.631,-12.865 -
+-- 681.349,-18.479,-12.865"). So such a step's entities are resolved with the first command (`pin`, which refuses the action when one is
+-- missing, as any reference does), and at the step's turn `still` keeps those that are still there as they were; one gone, or whose id
+-- now names something else, was taken by an earlier command of the same action and is left out. Every game runs the same steps.
+local function pin(list, resolve)
+	local out = {}
+	for i, ref in ipairs(list) do out[i] = { ref = ref, e = resolve(ref) } end
+	return out
+end
+local function stillEdges(pins)
+	local out, gone = {}, 0
+	for _, p in ipairs(pins) do
+		local info = A.edgeInfo(p.e)
+		if info and edgeScore(info, p.ref) <= TOL_SAME then out[#out + 1] = p.e else gone = gone + 1 end
+	end
+	return out, gone
+end
+local function stillCon(p)
+	local info = A.conInfo(p.e)
+	return info ~= nil and info.file == p.ref.file and d3(info.p, p.ref.p) <= TOL_SAME + 0.5
+end
+
 dryRunPieces = function(rec)
 	if #rec.rem > 0 or #rec.old2new > 0 then return nil, "the record removes constructions" end
 	local ok, res = pcall(function()
@@ -2073,11 +2315,27 @@ end
 -- Street part first, then the construction on the street that is now cut (finding from MPFever (MIT): the engine
 -- refuses both in one proposal). The construction's own paths are left to its script; the second command ignores the
 -- non-critical collision with its own street connection.
+-- The constructions it removes (town buildings in the way) are found before the street part runs (`pin`): that command's Context
+-- gathers buildings, so it may take some of them itself, and the second command removes the ones still there.
 PLAN.withStreet = function(rec, R, f, notes, form)
-	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	local conOnly = part(rec, { "cons", "rem", "old2new" })
+	local pins = pin(conOnly.rem, R.con)
+	local first = commandArgs(streetProposal(rec, R, notes, with(form, { drop = true })), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	first.chain = { function()
-		return commandArgs(constructionProposal(conOnly, R), newContext(f.ctx, R), true, false, f.dust)
+		local kept, at, byRef = part(conOnly, { "cons" }), {}, {}
+		for i, p in ipairs(pins) do
+			if stillCon(p) then
+				kept.rem[#kept.rem + 1] = p.ref
+				at[i], byRef[p.ref] = #kept.rem, p.e
+			end
+		end
+		for _, pair in ipairs(conOnly.old2new) do
+			if at[pair[1]] then kept.old2new[#kept.old2new + 1] = { at[pair[1]], pair[2] } end
+		end
+		local gone = #pins - #kept.rem
+		if gone > 0 then log(gone .. " of " .. #pins .. " construction(s) the chained command removes were removed by the street part before it; " .. #kept.rem .. " left to remove") end
+		local RC = setmetatable({ con = function(ref) return byRef[ref] or R.con(ref) end }, { __index = R })
+		return commandArgs(constructionProposal(kept, RC), newContext(f.ctx, R), true, false, f.dust)
 	end }
 	return first
 end
@@ -2091,14 +2349,17 @@ PLAN.combined = function(rec, R, f, notes, form)
 end
 
 -- A bulldozing that takes constructions and street pieces: the constructions first, then the segments (the order the
--- game's own industry removal uses).
+-- game's own industry removal uses). The segments are found before the first command runs (`pin`): a construction's removal takes
+-- the street pieces its script made (an underground station's), and the segment removal is left the ones still there.
 PLAN.bulldoze = function(rec, R, f, notes)
-	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 	local list = removalList(rec)
-	if list then
+	local pins = list and pin(list, R.edge) or nil
+	local first = commandArgs(constructionProposal(part(rec, { "rem", "old2new" }), R), newContext(f.ctx, R), f.ie, f.pi, f.dust)
+	if pins then
 		first.chain = { function()
-			local edges = {}
-			for i, ref in ipairs(list) do edges[i] = R.edge(ref) end
+			local edges, gone = stillEdges(pins)
+			if gone > 0 then log(gone .. " of " .. #pins .. " segment(s) the chained removal names were removed by the command before it (the construction's own pieces); " .. #edges .. " left to remove") end
+			if #edges == 0 then return false end
 			return commandArgs(A.removeSegmentsProposal(edges), newContext(f.ctx, R), f.ie, f.pi, f.dust)
 		end }
 	end
@@ -2265,6 +2526,63 @@ local function okList(l, max) return type(l) == "table" and #l <= max end
 -- an owner: nobody or a number from the savegame, the acting player, or another entity by key
 local function okOwner(v) return v == nil or v == "player" or isNum(v) or (type(v) == "table" and v.__ref == "owner" and okText(v.key)) end
 
+-- The record's refundable entities (its Context's `refund`, items { ref, k, r, n } made by refundRefs) as this game's entries
+-- { e, k, rev, n }, sorted by entity. The entities are ones the command removes itself, so they are resolved like every other reference of
+-- the record: one that is malformed, cannot be found or is ambiguous refuses the whole build, on this game as on every other (that removal
+-- could not run anyway; the originator runs the same decode before it cancels its own command). A `refundLoose` list (the removed set was
+-- unknown at the capture) is the exception: an entry that does not resolve is left out, the same rule on every game.
+-- The revision: the entry keeps the one the originator's tool recorded. When this game's own revision of the entity (api.engine.getRevision)
+-- has the same integers, the engine's own object is used; when it differs (the entity changed since it was built: equal on identical
+-- worlds) the recorded integers are passed and the engine decides, as on the originator. The key and value integers travel unchanged; an
+-- entry captured as a bare id (no such fields: a script's Context) takes this game's revision, -1 and 0 (the values of every real entry seen).
+-- Resolved once per decode, at its first Context (the world before the build: a later command of a chain may already have removed them).
+local function okInts(v, n)
+	if type(v) ~= "table" or #v ~= n then return false end
+	for i = 1, n do if not isNum(v[i]) then return false end end
+	return true
+end
+refundIdsOf = function(c, R)
+	if R.refundFor == c then return R.refundIds end
+	local list = c.refund
+	if type(list) ~= "table" or #list > LIMIT.rem then fail("the Context's refundable entities are not a list") end
+	local out, seen, missing, stale = {}, {}, 0, 0
+	for i, item in ipairs(list) do
+		local ref = type(item) == "table" and item.ref
+		local kind = type(ref) == "table" and ref.__ref
+		local resolve = (kind == "node" or kind == "edge" or kind == "con" or kind == "obj") and okRef(ref, kind) and R[kind]
+		if not resolve or (item.k ~= nil and not isNum(item.k)) or (item.n ~= nil and not isNum(item.n)) or (item.r ~= nil and not okInts(item.r, 3)) then
+			fail("refundable entity " .. i .. ": bad reference")
+		end
+		local ok, e = true, nil
+		if c.refundLoose == true then ok, e = pcall(resolve, ref) else e = resolve(ref) end
+		if not ok then
+			missing = missing + 1
+		elseif not seen[e] then
+			seen[e] = true
+			local rev, num = A.revision(e)
+			local r = item.r or num
+			local same = num ~= nil and r ~= nil and num[1] == r[1] and num[2] == r[2] and num[3] == r[3]
+			if not same then
+				stale = stale + 1
+				rev = r and { num = { r[1], r[2], r[3] } } or nil
+			end
+			if rev ~= nil then
+				out[#out + 1] = { e = e, k = item.k or -1, rev = rev, n = item.n or 0, num = r }
+			else
+				missing = missing + 1
+			end
+		end
+	end
+	if missing > 0 then log("refund: " .. missing .. " refundable entit" .. (missing == 1 and "y" or "ies") .. " not found or without a revision here; left out") end
+	if stale > 0 then log("refund: " .. stale .. " refundable entit" .. (stale == 1 and "y has" or "ies have") .. " another revision here than the originator's tool recorded (or none readable): the recorded one is passed, the engine decides") end
+	table.sort(out, function(a, b) return a.e < b.e end)
+	R.refundFor, R.refundIds = c, out
+	local txt = {}
+	for _, x in ipairs(out) do txt[#txt + 1] = string.format("%d{%d}rev%s/%d", x.e, x.k, table.concat(x.num or {}, ","), x.n) end
+	log("refund: " .. #out .. " refundable entit" .. (#out == 1 and "y" or "ies") .. " of the originator's Context resolved here [" .. table.concat(txt, " ") .. "]")
+	return out
+end
+
 local function plainDepth(v, depth, budget)
 	local t = type(v)
 	if t == "number" then return isNum(v) end
@@ -2292,7 +2610,13 @@ local function normalise(rec)
 	end
 	local budget = { n = 0 }
 	for i, c in ipairs(rec.cons) do
-		if type(c) ~= "table" or not okText(c.file) or not c.file:find("%.con$") then return nil, "construction " .. i .. ": bad file name" end
+		if type(c) ~= "table" or not okText(c.file) or not c.file:find("%.con$") then
+			-- say which: an empty name is a construction entry the capture read with nothing in it (owner one-PC test 2026-10-15: the
+			-- vegetation tools' builds carried 2 or 4 constructions with file "", name "" and the identity transform; every one failed here)
+			local f = type(c) == "table" and c.file or nil
+			if f == "" then return nil, "construction " .. i .. ": bad file name (empty: the proposal's construction names no file)" end
+			return nil, "construction " .. i .. ": bad file name " .. string.format("%q", tostring(f)):sub(1, 80)
+		end
 		if c.name ~= nil and not okText(c.name) then return nil, "construction " .. i .. ": bad name" end
 		if type(c.transf) ~= "table" or #c.transf ~= 16 then return nil, "construction " .. i .. ": bad transform" end
 		for j = 1, 16 do if not isNum(c.transf[j]) then return nil, "construction " .. i .. ": bad transform" end end
@@ -2366,7 +2690,7 @@ local function encodeBuildUnsafe(name, args, ctx)
 	local plan, why = classify(rec)
 	if not plan then return nil, why end
 	if rec.terrain then log("a terrain edit of " .. rec.terrain.w .. "x" .. rec.terrain.h .. " cells comes with this build: the cells are not copied") end
-	local ctxRec = captureContext(args[2])
+	local ctxRec = captureContext(args[2], cap, rec)
 	local body = { fn = name, args = { n = 5, rec, ctxRec or (rec.src == "native" and { native = true } or false),
 		args[3] == true, args[4] == true, args[5] == true } }
 	local okS, text = pcall(C.serialize, body)
@@ -2536,18 +2860,37 @@ function M.contextText(c)
 		end
 		return "?"
 	end
+	-- the refundable entities only when there are any (a record's references, or an engine Context's ids)
+	local okR, n = pcall(function()
+		if type(c) == "table" and c.align ~= nil then return type(c.refund) == "table" and #c.refund or 0 end
+		return #A.refundEntries(get(c, "refundableEntities"))
+	end)
 	return string.format("align=%s cleanup=%s buildings=%s fields=%s redo=%s", flag("align", "checkTerrainAlignment"), flag("cleanup", "cleanupStreetGraph"),
 		flag("buildings", "gatherBuildings"), flag("fields", "gatherFields"), flag("redo", "extendProposalRedoPillars"))
+		.. ((okR and n > 0) and (" refund=" .. n) or "")
 end
 
 -- The held command's own flags (the native module read them from the command it holds: Context members, ignoreErrors, playerInitiated) go
 -- into a captured body, replacing what the capture of the tool's preview could only guess (a preview carries no Context). `flags` is the
--- table of the `held` event's ctx. Returns true when the body was changed.
-function M.withHeldFlags(body, flags)
+-- table of the `held` event's ctx; its `refund` (the Context's refundableEntities, this game's ids) is named by reference with `ctx` (how
+-- the bridge keys entities, see M.capture) while the command is held and the world is as the tool saw it. Returns true when the body was
+-- changed.
+function M.withHeldFlags(body, flags, ctx)
 	local args = type(body) == "table" and body.args
 	if type(flags) ~= "table" or type(args) ~= "table" then return false end
 	args[2] = { align = flags.align == true, cleanup = flags.cleanup == true, buildings = flags.buildings == true, fields = flags.fields == true,
 		redo = flags.redo == true }
+	if type(flags.refund) == "table" then
+		local rec = type(args[1]) == "table" and args[1] or nil
+		local refs, _, loose = refundRefs(flags.refund, newCapture(ctx or { plain = C.plain, keyOf = function(e) return "s:" .. tostring(e) end }, {}), rec)
+		if #refs > 0 then args[2].refund, args[2].refundLoose = refs, loose or nil end
+		-- evidence for the binding's form (the interface's own list, which the base game copies into a Context as it is): once per session
+		if #refs > 0 and not M.guiRefundLogged then
+			M.guiRefundLogged = true
+			local shape, why = A.guiRefundShape()
+			log("refund: the interface's refundable list (api.gui.construction.getRefundableEntities) is " .. tostring(shape or ("unreadable: " .. tostring(why))))
+		end
+	end
 	if type(flags.ie) == "boolean" then args[3] = flags.ie end
 	if type(flags.pi) == "boolean" then args[4] = flags.pi end
 	return true
@@ -2569,10 +2912,10 @@ end
 -- FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers) they are refused: not shipped, not replayed. The originator can only cancel such a
 -- build when the native module can fire the tool's completion callback (a cancel without it leaves the tool dead: real session).
 local REPLAY_IGNORE_ERRORS = false
-pcall(function() REPLAY_IGNORE_ERRORS = os.getenv("FEVERLINK3_REPLAY_IGNORE_ERRORS") == "1" end)
+pcall(function() REPLAY_IGNORE_ERRORS = C.env("FEVERLINK3_REPLAY_IGNORE_ERRORS") == "1" end)
 M.REPLAY_IGNORE_ERRORS = REPLAY_IGNORE_ERRORS
 local BLOCK_CONSTRUCTIONS = false
-pcall(function() BLOCK_CONSTRUCTIONS = os.getenv("FEVERLINK3_REMOTE_CONSTRUCTIONS") == "0" end)
+pcall(function() BLOCK_CONSTRUCTIONS = C.env("FEVERLINK3_REMOTE_CONSTRUCTIONS") == "0" end)
 M.CONSTRUCTIONS_BLOCKED_TEXT = "station/depot builds are not supported yet in this test build"
 M.CONSTRUCTIONS_INFO_TEXT = "station/depot builds are experimental in this test build"
 
@@ -2770,10 +3113,10 @@ end
 -- own conversion makes (found by a dry run of the construction, by geometry) is not input and is left out. Off unless
 -- FEVERLINK3_PORTABLE_REPLAY=1; anything it cannot do falls back to the record path, logged.
 local PORTABLE_REPLAY = false
-pcall(function() PORTABLE_REPLAY = os.getenv("FEVERLINK3_PORTABLE_REPLAY") == "1" end)
+pcall(function() PORTABLE_REPLAY = C.env("FEVERLINK3_PORTABLE_REPLAY") == "1" end)
 M.PORTABLE_REPLAY = PORTABLE_REPLAY
 local okPT, Portable = pcall(ug_require, "feverlink3_portable.lua")
-if not okPT then okPT, Portable = pcall(ug_require, "feverlink3_1::/feverlink3_portable.lua") end
+if not okPT then okPT, Portable = pcall(ug_require, "feverlink3::/feverlink3_portable.lua") end
 if not okPT or type(Portable) ~= "table" then Portable = nil end
 
 local function withPrefix(name)
@@ -3172,11 +3515,11 @@ end
 
 -- The components that make an entity of each kind the text names (Portable.oldRefs).
 local REF_COMPS = { node = { "BASE_NODE" }, edge = { "BASE_EDGE" }, edgeObject = { "EDGE_OBJECT" }, construction = { "CONSTRUCTION" } }
-local REF_POS_TOL = 0.25   -- metres: a node the text locates must be where the text says (two node ends of a station piece lie 2 m apart)
+local REF_POS_TOL = 0.25   -- metres: a named entity must be where the originator's print says (two node ends of a station piece lie 2 m apart)
 
 -- Before the native module injects the engine's Proposal built from the originator's text: every existing entity the text names must be,
--- in THIS game, an entity of the kind the member needs (a node where a node is named, with the node at the text's position when the text
--- gives one), or the injection is refused and nothing is applied here (the worlds differ: the ids lane and the resync repair that). The
+-- in THIS game, an entity of the kind the member needs (a node where a node is named) at the place the originator's print gives, or the
+-- injection is refused and nothing is applied here (the worlds differ: the ids lane and the resync repair that). The
 -- engine itself does not check: real run 2026-10-14 (rail-crash), the host's world had forked, the guest's track named node 50395, which was
 -- a station track piece (an edge) on the host, and the engine's assertion (`it != components.end()`, BaseNode) stopped the game.
 -- The kind alone does not find a fork that only PERMUTES ids (a late apply: the same set of ids, other entities behind them; runs n1/e3
@@ -3219,7 +3562,8 @@ local function printText(p)
 end
 
 -- Returns nil when every reference holds, else the reason; `checked` = how many references were looked at. `prints` = the originator's
--- body.refPrints (may be nil: a record of an older version, then the kind and the text's node positions are checked).
+-- body.refPrints (may be nil: a record of an older version, then the kind and the text's node positions are checked; with prints, the
+-- text's positions are not used: they are the proposal's geometry, not the entity's place).
 function M.checkInjectRefs(text, prints)
 	if not Portable or type(Portable.oldRefs) ~= "function" then return nil, 0 end
 	local refs = Portable.oldRefs(text)
@@ -3241,7 +3585,14 @@ function M.checkInjectRefs(text, prints)
 			table.sort(what)
 			return string.format("%s names %s %d, which is not a %s here (it is: %s)", r.path, r.kind, r.id, r.kind, #what > 0 and table.concat(what, "/") or "neither"), #refs
 		end
-		if r.kind == "node" and r.pos then
+		-- Where an entity IS is compared world against world: the originator's print of it with this game's entity. The position the text
+		-- writes after a node id is the PROPOSAL's geometry (the native encoder takes it from the element that names the node: a segment's
+		-- position0/position1), not where the node is: the engine lets a segment end away from its node (friend test 2026-10-16, host street
+		-- 0:2, highway_new_small: addedSegments[0].position1 lay on segment 89389, 11.16 m short of its end node 89384, which the text names
+		-- as node1; the host's engine built it, its own self-check refused it and the friend's game refused it, both worlds with node 89384 at
+		-- the same place, the printed one). Only a record without prints (an older version) is checked by the text's positions, the one place
+		-- evidence it has; it may then refuse such a build (fail closed).
+		if r.kind == "node" and r.pos and type(prints) ~= "table" then
 			local q = A.nodePos(r.id)
 			if q then
 				local d = sqrt((q.x - r.pos.x) ^ 2 + (q.y - r.pos.y) ^ 2 + (q.z - r.pos.z) ^ 2)
@@ -3288,7 +3639,10 @@ local function decodeBuildUnsafe(body, ctx)
 		local okR, bad, nRefs = pcall(M.checkInjectRefs, body.nativeText, body.refPrints)
 		if not okR then bad = "the check failed (" .. tostring(bad) .. ")" end
 		if bad then
-			local why = "inject_refused: " .. tostring(bad) .. " (this world differs from the originator's; nothing is applied here, the ids check and the resync repair it)"
+			-- At a stamp this is decided from this game's own world, so every game with the same world refuses alike (lab run 2026-10-18: a
+			-- town replaced the building a build removed during its lead; both games refused, the worlds were equal). The bridge sends it as
+			-- this game's verdict; the host compares the games' verdicts and repairs only when they differ.
+			local why = "inject_refused: " .. tostring(bad) .. " (refused from this game's own world, nothing is applied here; at a stamp every game with the same world refuses it alike, the host compares the games' verdicts)"
 			log("build inject (" .. plan .. ") REFUSED: " .. why)
 			C.tracer("build")("build.inject", string.format("%s inject_refused refs=%s reason=%s", tostring(ctx.traceKey or "-"), tostring(nRefs), tostring(bad)))
 			return nil, why
@@ -3325,7 +3679,7 @@ local function decodeBuildUnsafe(body, ctx)
 		end
 		-- Fail closed: the build is the originator's text or nothing. The record path below is this game's own guess of the build (another
 		-- plan, other flags, other node configurations), so it is never used in place of a text that cannot be injected: the build is
-		-- refused here, nothing is applied, and the bridge asks for the repair (it was applied on the games that could inject it).
+		-- refused here, nothing is applied, and the bridge sends the refusal as this game's verdict (the host repairs when another game applied it).
 		local why = "inject_refused: the placeholder command cannot be made here (" .. tostring(built):gsub("\nstack traceback:.*", ""):sub(1, 160)
 			.. "); nothing is applied here"
 		log("build inject (" .. plan .. ") REFUSED: " .. why)
@@ -3377,18 +3731,18 @@ local function decodeBuildUnsafe(body, ctx)
 	end
 	for i, form in ipairs(FORMS[plan] or { {} }) do
 		local notes = {}
-		local t0 = os.clock()
+		local t0 = C.clock()
 		local ok, built = pcall(PLAN[plan], rec, R, f, notes, form)
-		if tkey then trace("build.plan", string.format("%s plan=%s form=%d %s ms=%.1f%s", tkey, plan, i, ok and "built" or "failed", (os.clock() - t0) * 1000, ok and "" or (" error(" .. type(built) .. ")=" .. tostring(built))) ) end
+		if tkey then trace("build.plan", string.format("%s plan=%s form=%d %s ms=%.1f%s", tkey, plan, i, ok and "built" or "failed", (C.clock() - t0) * 1000, ok and "" or (" error(" .. type(built) .. ")=" .. tostring(built))) ) end
 		if not ok then
 			lastErr = tostring(built)
 			-- what cannot be found is not found in any form
 			if lastErr:find("^unresolved ") or lastErr:find("^ambiguous ") then return nil, lastErr end
 		else
-			local tF = os.clock()
+			local tF = C.clock()
 			local okF, errF = pcall(function() return api.cmd.makeWorldBuildProposalCmd(unpack(built, 1, built.n)) end)
 			if tkey then
-				trace("build.factory", string.format("%s plan=%s form=%d %s ms=%.1f ie=%s pi=%s dust=%s counts[%s]%s", tkey, plan, i, okF and "ok" or "THREW", (os.clock() - tF) * 1000,
+				trace("build.factory", string.format("%s plan=%s form=%d %s ms=%.1f ie=%s pi=%s dust=%s counts[%s]%s", tkey, plan, i, okF and "ok" or "THREW", (C.clock() - tF) * 1000,
 					tostring(built[3]), tostring(built[4]), tostring(built[5]), proposalCounts(built[1]),
 					okF and "" or (" error(" .. type(errF) .. ")=" .. tostring(errF))))
 			end
@@ -3587,7 +3941,7 @@ local previews = {}
 -- called, nothing is sent): says whether it rebuilds and how long that took. A few per tool and plan; the world is still
 -- as the tool saw it, so references resolve.
 local function previewRebuild(id, proposal, say)
-	local started = os.clock()
+	local started = C.clock()
 	local body, why = M.capture(proposal, {})
 	if not body then
 		local key = tostring(id) .. " refused " .. tostring(why)
@@ -3605,7 +3959,7 @@ local function previewRebuild(id, proposal, say)
 	local ctx = { player = A.player(), resolve = function(k) local n = tostring(k):match("^s:(%d+)$"); return n and tonumber(n) or nil end }
 	local args, err = decodeBuild(wire, ctx)
 	say("tool preview " .. tostring(id) .. ": " .. tostring(plan) .. (args and " rebuilds" or (" does NOT rebuild: " .. tostring(err)))
-		.. string.format(" (%.1f ms, %d bytes)", (os.clock() - started) * 1000, #C.serialize(body)))
+		.. string.format(" (%.1f ms, %d bytes)", (C.clock() - started) * 1000, #C.serialize(body)))
 end
 
 -- Called by the bridge for the engine's tool events (id = the tool: streetBuilder, trackBuilder, constructionBuilder,
@@ -3670,5 +4024,19 @@ M.portable = Portable
 M.normalise = normalise
 M.plans = PLAN
 M.resolver = newResolver
+
+-- The reference a build record makes for one existing network entity: kind "edge" (a segment by its key, end positions and
+-- tangents), "node" (by key and position) or "con" (by key, file and position). M.resolver(ctx)[kind](ref) is its inverse on the
+-- applying game. Used by the operations module for a line's waypoints, which name the transport network entity of a segment, node or
+-- construction (Waypoint.edgePos.edgeId.entity, api/tealdef/api/type.d.tl EdgeId: "The TransportNetwork entity"). nil and why when
+-- the entity cannot be described.
+function M.refOf(kind, id, ctx)
+	if kind ~= "edge" and kind ~= "node" and kind ~= "con" then return nil, "no reference of kind " .. tostring(kind) end
+	if type(id) ~= "number" or id < 0 then return nil, "not an entity id: " .. tostring(id) end
+	local ok, r = pcall(function() return newCapture(ctx or {}, {})[kind](id) end)
+	if not ok then return nil, tostring(r) end
+	if type(r) ~= "table" then return nil, kind .. " " .. tostring(id) .. " cannot be referred to" end
+	return r
+end
 
 return M

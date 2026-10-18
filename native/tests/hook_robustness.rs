@@ -17,8 +17,8 @@ use feverlink3_native::build_table::{self, BuildAddrs, Rva};
 use feverlink3_native::counters::{AddSource, AppliedWatch, Audit, Counters, MAX_SITES, WATCH_EXPIRY_MS, WATCH_SLOTS};
 use feverlink3_native::hold::{Action, Admit, HoldConfig, HoldMachine};
 use feverlink3_native::link::{
-    parse_ctl_line, valid_kind_name, AddCounts, CtlMessage, CtlReader, Event, EventWriter, CTL_FILE,
-    EVENTS_ROTATE_BYTES, MAX_HOLD_KINDS, MAX_LINE, MAX_READ,
+    parse_ctl_line, valid_kind_name, AddCounts, CtlMessage, CtlReader, Event, EventWriter, EVENTS_ROTATE_BYTES,
+    MAX_HOLD_KINDS, MAX_LINE, MAX_READ,
 };
 use feverlink3_native::plan::{plan, Feature, HookConfig, Image, Step};
 use rand::rngs::StdRng;
@@ -137,7 +137,7 @@ const CTL_TEMPLATES: &[(&str, &str)] = &[
 ];
 
 fn ctl_line(kind: &str, payload: &str) -> Line {
-    Line { seq: 1, kind: kind.into(), from: "1".into(), payload: payload.into() }
+    Line { kind: kind.into(), from: "1".into(), payload: payload.into() }
 }
 
 #[test]
@@ -209,23 +209,24 @@ fn append(path: &std::path::Path, bytes: &[u8]) {
 fn the_control_reader_survives_any_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut r = rng(11);
+    let ping_n = |payload: &str| -> Option<u64> { payload.strip_prefix("{[\"n\"]=")?.strip_suffix('}')?.parse().ok() };
     for round in 0..iters(150) {
         let path = dir.path().join(format!("ctl{round}.log"));
         let mut reader = CtlReader::new(path.clone());
-        let mut seq = 0u64;
+        let mut n = 0u64;
         let mut last = 0u64;
         for _ in 0..r.gen_range(1..12) {
             let mut chunk = Vec::new();
             for _ in 0..r.gen_range(0..8) {
                 match r.gen_range(0..8) {
                     0..=2 => {
-                        seq += r.gen_range(1..3);
-                        chunk.extend(format!("{seq}\tping\t1\t{{[\"n\"]={seq}}}\n").bytes());
+                        n += r.gen_range(1..3);
+                        chunk.extend(format!("ping\t1\t{{[\"n\"]={n}}}\n").bytes());
                     }
                     3 => chunk.extend(random_bytes(&mut r, 300)),
                     4 => chunk.extend(vec![b'x'; r.gen_range(MAX_LINE - 5..MAX_LINE + 50)]),
                     5 => chunk.push(b'\n'),
-                    6 => chunk.extend(format!("{}\tping\t1\t{{}}\n", r.gen_range(0..seq + 2)).bytes()),
+                    6 => chunk.extend(b"ping\t1\t{}\n"),
                     _ => chunk.extend(random_text(&mut r, 60).into_bytes()),
                 }
             }
@@ -233,8 +234,10 @@ fn the_control_reader_survives_any_file() {
             if r.gen_bool(0.06) {
                 let len = fs::metadata(&path).unwrap().len();
                 OpenOptions::new().write(true).open(&path).unwrap().set_len(r.gen_range(0..=len)).unwrap();
+                last = 0; // a shorter file is read again from its first byte
             } else if r.gen_bool(0.03) {
                 fs::remove_file(&path).unwrap();
+                last = 0;
             }
             let allowed_polls = fs::metadata(&path).map_or(0, |m| m.len() as usize) / MAX_READ + 3;
             let mut polls = 0;
@@ -242,15 +245,14 @@ fn the_control_reader_survives_any_file() {
                 polls += 1;
                 assert!(polls <= allowed_polls + 1, "a poll must take at most {MAX_READ} bytes");
                 let p = reader.poll();
-                if p.gone {
-                    last = 0;
-                }
                 for l in &p.lines {
-                    assert!(l.seq > last, "seq {} after {last}", l.seq);
                     assert!(l.payload.len() <= MAX_LINE && l.kind.len() <= MAX_LINE);
-                    last = l.seq;
+                    // the writer's lines come in its order, none twice (no rewrite in between)
+                    if let Some(k) = ping_n(&l.payload).filter(|_| l.kind == "ping") {
+                        assert!(k > last, "n {k} after {last}");
+                        last = k;
+                    }
                 }
-                assert_eq!(reader.last_seq(), last);
                 if !reader.has_news() {
                     break;
                 }
@@ -262,9 +264,9 @@ fn the_control_reader_survives_any_file() {
 #[test]
 fn a_huge_line_is_thrown_away_one_bounded_read_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(CTL_FILE);
+    let path = dir.path().join("ctl.log");
     let mut body = vec![b'a'; 1 << 20];
-    body.extend_from_slice(b"\n1\tping\t1\t{}\n");
+    body.extend_from_slice(b"\nping\t1\t{}\n");
     append(&path, &body);
     let mut reader = CtlReader::new(path);
     let (mut polls, mut lines, mut discarded) = (0usize, 0usize, 0usize);
@@ -314,12 +316,12 @@ fn random_event(r: &mut StdRng) -> Event {
     }
 }
 
-/// What the mod's reader needs of an event line: one line, four fields, a payload in the Lua subset.
-fn check_event_line(seq: u64, e: &Event) {
-    let text = EventWriter::line(seq, e);
+/// What the mod's reader needs of an event line: one line, three fields, a payload in the Lua subset.
+fn check_event_line(e: &Event) {
+    let text = EventWriter::line(e);
     assert!(text.ends_with('\n') && !text[..text.len() - 1].contains(['\n', '\r']), "{text:?}");
     let line = gamelink::parse_line(&text).unwrap_or_else(|| panic!("not a link line: {text:?}"));
-    assert_eq!((line.seq, line.kind.as_str(), line.from.as_str()), (seq, e.kind(), "native"));
+    assert_eq!((line.kind.as_str(), line.from.as_str()), (e.kind(), "native"));
     let json = luatext::lua_to_json(&line.payload).unwrap_or_else(|| panic!("payload is not Lua literal: {text:?}"));
     let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
     if let Event::Error { place, detail } = e {
@@ -331,22 +333,21 @@ fn check_event_line(seq: u64, e: &Event) {
 #[test]
 fn events_of_any_content_make_lines_the_mods_reader_accepts() {
     let mut r = rng(12);
-    for i in 0..iters(10_000) {
+    for _ in 0..iters(10_000) {
         let e = random_event(&mut r);
-        check_event_line(i as u64 + 1, &e);
+        check_event_line(&e);
     }
 }
 
 #[test]
-fn the_event_log_stays_bounded_and_numbering_survives_a_reopen() {
+fn the_event_log_stays_bounded_and_a_reopen_goes_on_at_its_end() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = EventWriter::open(dir.path()).unwrap();
-    assert_eq!(w.next_seq(), 1);
     let small = Event::Error { place: "p".into(), detail: "d".repeat(900) };
     for _ in 0..500 {
         w.append(std::slice::from_ref(&small)).unwrap();
     }
-    assert_eq!(EventWriter::open(dir.path()).unwrap().next_seq(), 501, "numbering continues after a reopen");
+    assert_eq!(EventWriter::open(dir.path()).unwrap().end(), w.end(), "a reopened writer goes on where the log ends");
     // a mod that never reads the log must not fill the disk: the writer goes on in new generations, never refuses
     let big = Event::Error { place: "p".into(), detail: "y".repeat(100_000) };
     for _ in 0..200 {
@@ -355,7 +356,7 @@ fn the_event_log_stays_bounded_and_numbering_survives_a_reopen() {
     let total: u64 = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
     let bound = (gamelink::KEEP_GENERATIONS + 1) * (EVENTS_ROTATE_BYTES + 200_000);
     assert!(total <= bound, "{total} bytes on disk, bound {bound}");
-    assert_eq!(EventWriter::open(dir.path()).unwrap().next_seq(), 701, "numbering continues across generations");
+    assert_eq!(EventWriter::open(dir.path()).unwrap().end(), w.end(), "also across generations");
     assert!(w.append(&[]).is_ok(), "an empty batch is not an error");
 }
 
@@ -442,7 +443,7 @@ fn the_hold_machine_never_loses_or_duplicates_a_command() {
                     let events = m.drain_events();
                     assert!(events.len() <= 520, "{} queued events", events.len());
                     for e in &events {
-                        check_event_line(1, e);
+                        check_event_line(e);
                     }
                 }
             }
@@ -530,7 +531,7 @@ fn the_counters_add_up_and_the_audit_speaks_only_of_changes() {
     assert_eq!(adds, AddCounts { tool, other, unknown });
     let want_sites: Vec<(usize, u64)> = (0..MAX_SITES).filter(|i| sites[*i] > 0).map(|i| (i, sites[i])).collect();
     assert_eq!(s, want_sites);
-    check_event_line(1, &c.snapshot());
+    check_event_line(&c.snapshot());
 
     // the audit event: every interval, and only when the counts differ from the last one reported
     let fresh = Counters::new();

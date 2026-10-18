@@ -46,7 +46,21 @@ end
 _G.COPY = COPY
 
 local DEFS = {}
-LANE_SHIFT = 0
+
+-- Context.refundableEntities takes only the typed API's form, a map { [{ entity, integer }] = { revision, integer } } with a revision
+-- { num = { 3 integers } } (api/tealdef/api/type.d.tl:2486), converted key by key; anything else raises a table, as the game's binding did
+-- for a list (real run 2026-10-18: "table: 000001EFA9EF9080", "The lua object can't be c...")
+function CHECK_REFUNDABLE(v)
+  local function bad(why) error({ what = "The lua object can't be converted", where = why }) end
+  if type(v) ~= "table" then bad("not a table") end
+  for key, val in pairs(v) do
+    if type(key) ~= "table" or type(key[1]) ~= "number" or type(key[2]) ~= "number" then bad("key " .. tostring(key)) end
+    if type(val) ~= "table" or type(val[2]) ~= "number" then bad("value") end
+    local rev = val[1]
+    local num = type(rev) == "table" and rev.num
+    if type(num) ~= "table" or type(num[1]) ~= "number" or type(num[2]) ~= "number" or type(num[3]) ~= "number" then bad("revision") end
+  end
+end
 
 local function D(typeName, init)
   local def = DEFS[typeName]
@@ -68,11 +82,16 @@ local function D(typeName, init)
     end,
     __newindex = function(_, k, v)
       if not def.set[k] then error("no writable member '" .. tostring(k) .. "' in " .. typeName, 2) end
-      if typeName == "LaneConfig" and k == "transportModes" and LANE_SHIFT ~= 0 then
-        -- a write at index k lands at k - shift, index 0 wraps to the end (finding from MPFever (MIT))
-        local shifted = {}
-        for j = 0, 15 do shifted[(j - LANE_SHIFT) % 16] = v[j] end
-        v = shifted
+      if typeName == "Context" and k == "refundableEntities" then CHECK_REFUNDABLE(v) end
+      if typeName == "LaneConfig" and k == "transportModes" then
+        -- the documented map {TransportMode : boolean}: keyed by api.type.enum.TransportMode values, every mode handed out on a read
+        local m = {}
+        for j = 0, 15 do m[j] = false end
+        for key, x in pairs(v) do
+          if type(key) ~= "number" or m[key] == nil then error("bad argument #2 (TransportMode expected as key, got " .. tostring(key) .. ")", 2) end
+          m[key] = x == true
+        end
+        v = m
       end
       store[k] = COPY(v)
     end,
@@ -309,6 +328,11 @@ function MAKE_API()
   T.Proposal = { new = function() return D("Proposal") end }
 
   local E = api.engine
+  -- an entity's revision (api.engine.getRevision): { num = { 3 integers } }; a test may set REVISION_OF(e) for other integers
+  E.getRevision = function(e)
+    if WORLD[e] == nil then return nil end
+    return { num = (REVISION_OF and REVISION_OF(e)) or { 1, 11, 0 } }
+  end
   local baseGet, baseEach = E.getComponent, E.forEachEntityWithComponent
   E.getComponent = function(e, t)
     local name = NAMES[t]
@@ -411,7 +435,9 @@ function MAKE_API()
       local mt = getmetatable(p)
       if mt and mt.__double == "Proposal" then error("bad argument #2 to 'makeProposalData' (SimpleProposal expected, got Proposal)") end
       local crit = VERDICT_CRITICAL and VERDICT_CRITICAL(p) or false
-      return { errorState = { critical = crit, messages = crit and { 'Construction Not Possible' } or {}, warnings = {} } }
+      -- VERDICT_COLLIDE(): the collisionInfo.collisionEntities a test wants the proposal data to name ({ { entity = id } ... })
+      return { errorState = { critical = crit, messages = crit and { 'Construction Not Possible' } or {}, warnings = {} },
+               collisionInfo = VERDICT_COLLIDE and { collisionEntities = VERDICT_COLLIDE(p) } or nil }
     end,
     -- the engine's own upgrade: the segment replaced by one with the template's lanes (finding from MPFever (MIT))
     replaceSegment = function(edge, tmpl)
@@ -589,6 +615,8 @@ function APPLY_BUILD(p)
   for _, e in ipairs(P.consRem) do
     FREED_IDS[#FREED_IDS + 1] = e
     local c = STORE(WORLD[e].CONSTRUCTION)
+    -- CON_OWNS[con] = { segments }: street pieces the construction's script made, which go with it (an underground station's own pieces)
+    for _, s in ipairs((CON_OWNS or {})[e] or {}) do WORLD[s] = nil end
     for _, d in ipairs(c.depots) do WORLD[d] = nil end
     for _, s in ipairs(c.stations) do
       local g = WORLD[s] and WORLD[s].GROUP
@@ -1031,6 +1059,17 @@ function NATIVE_NODECFG(spec)
   return P
 end
 
+-- a Context's refundableEntities in the API's form ({ [{ entity, key }] = { revision, value } }) as text: e{key}rev a,b,c/value, sorted
+function REFUND_TEXT(c)
+  local out = {}
+  for key, val in pairs(c.refundableEntities or {}) do
+    local num = val[1].num
+    out[#out + 1] = string.format("%d{%d}rev%d,%d,%d/%d", key[1], key[2], num[1], num[2], num[3], val[2])
+  end
+  table.sort(out)
+  return table.concat(out, " ")
+end
+
 function CONTEXT(align, cleanup, buildings, fields, redo)
   return D("Context", { player = 7, checkTerrainAlignment = align, cleanupStreetGraph = cleanup, gatherBuildings = buildings, gatherFields = fields, extendProposalRedoPillars = redo == true })
 end
@@ -1181,6 +1220,8 @@ function LOAD_BUILD()
   env.api = MAKE_API()
   env.package = { loaded = {} }
   env.ug_require = function(p)
+    if p:find("feverlink3_link.lua", 1, true) then return assert(load(LINK_SRC, "=link", "t", env))() end
+    if p:find("feverlink3_log.lua", 1, true) then return assert(load(LOG_SRC, "=log", "t", env))() end
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
@@ -1211,6 +1252,7 @@ class BuildGame(T.Game):
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = T.COMMON_SRC, T.LOCKSTEP_SRC, T.BRIDGE_SRC, T.HUD_SRC
         g.PORTABLE_SRC = T.PORTABLE_SRC
+        g.LINK_SRC, g.LOG_SRC = T.LINK_SRC, T.LOG_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
             cmds[stem] = src
@@ -1239,9 +1281,9 @@ class BuildGame(T.Game):
         """The body of every action this game sent, as the text of its serialised table."""
         out = []
         for l in self.lines(self.from_game):
-            parts = l.split(TAB, 3)
-            if parts[1] == "action":
-                p = lupa.LuaRuntime(unpack_returned_tuples=True).execute(T.COMMON_SRC).parse(parts[3])
+            parts = l.split(TAB, 2)
+            if parts[0] == "action":
+                p = T.load_common(lupa.LuaRuntime(unpack_returned_tuples=True)).parse(parts[2])
                 p = p[0] if isinstance(p, tuple) else p
                 out.append(str(p.body))
         return out
@@ -1453,10 +1495,8 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("#BUILD_LOG"), 2)
         self.assertEqual(self.A.sig().count("new_small_road"), 2)
 
-    def test_custom_lanes_survive_a_write_shift_of_transport_modes(self):
+    def test_custom_lanes_carry_their_transport_modes_by_name(self):
         self.start()
-        self.A.run("LANE_SHIFT = 1")
-        self.B.run("LANE_SHIFT = 1")
         self.B.issue("(function() local P = NATIVE_UPGRADE{ edges = { 110 }, template = 'street/new_small_road.street_template' }\n"
                      "  local sp = P.proposal; local added = sp.addedSegments; local s = added[1]; local c = s.comp\n"
                      "  local lanes = c.laneConfigs; lanes[3] = D('LaneConfig', { forward = true, speed = 9, width = 2, height = 0, offset = 0 })\n"
@@ -1466,9 +1506,9 @@ class BuildTest(unittest.TestCase):
                      "  return P end)()")
         self.tick(18)
         self.assertSameWorld("the lanes carry the same modes on both games")
-        # the originator's engine stored the shifted write (4 -> 3, 15 -> 14); the replay compensates with the measured shift
-        self.assertIn("f3,14", self.A.sig())
-        self.assertIn("f3,14", self.B.sig())
+        # TRUCK (4) and ELECTRIC_TRAM_TRACK (15), keyed by the enum on both games (the documented map; no shift)
+        self.assertIn("f4,15", self.A.sig())
+        self.assertIn("f4,15", self.B.sig())
 
     def test_bulldozing_a_session_built_segment_uses_the_engines_removal(self):
         self.start()
@@ -1483,6 +1523,145 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.A.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % ea)
         self.assertEqual(self.B.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % eb)
 
+    # the API's form (script-doc api/type.html: {{Engine.Entity, integer}, {Engine.Revision, integer}}), with the integers of a real entry
+    REFUND_CONTEXT = ("function REFUND_CONTEXT(ids) local c = CONTEXT(true, false, true, true); local l = {}; "
+                      "for _, e in ipairs(ids) do l[{ e, -1 }] = { { num = { 1, 11, 0 } }, 339 } end; c.refundableEntities = l; return c end")
+    APPLIED_REFUND = "REFUND_TEXT(GAME.applied[#GAME.applied].args[2])"
+
+    def test_bulldozing_a_fresh_build_carries_its_refundable_entities_and_each_game_puts_its_own_in_the_context(self):
+        # friend test 2026-10-16: a bulldozing gave no money back; the replay's Context had no refundableEntities. The originator's travel by
+        # reference and every game's replay names its OWN entities (the session's ids differ between the games), so the engine refunds alike.
+        self.start()
+        for g in (self.A, self.B):
+            g.run(self.REFUND_CONTEXT)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(14)
+        eb, ea = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)")), int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        nb, na = int(self.B.lua("FIND_NODE(300, 0, 0)")), int(self.A.lua("FIND_NODE(300, 0, 0)"))
+        self.assertNotEqual(ea, eb)
+        # 99999 is no entity: left out before the record travels, on every game alike
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb, ctx="REFUND_CONTEXT({ %d, %d, 99999 })" % (eb, nb))
+        self.tick(14)
+        self.assertSameWorld()
+        self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        body = self.B.shipped()[-1]
+        refund = body[body.index('["refund"]='):]
+        self.assertIn('["ref"]={["__ref"]="edge",["key"]="s:%d",["p0"]={["x"]=300' % eb, refund, "the segment by its ends")
+        self.assertEqual(refund.count('["ref"]='), 1)
+        self.assertNotIn('"node"', refund, "the node is refundable but this command does not remove it: left out")
+        self.assertIn('["k"]=-1,["n"]=339,["r"]={[1]=1,[2]=11,[3]=0}', refund, "the entry's key integer, value integer and recorded revision travel")
+        for g, e in ((self.A, ea), (self.B, eb)):
+            self.assertEqual(g.lua(self.APPLIED_REFUND), "%d{-1}rev1,11,0/339" % e, g.label)
+            self.assertIn("refundable entity of the originator's Context resolved here [%d{-1}rev1,11,0/339]" % e, g.log())
+            self.assertIn("refund: set in the Context in the form 'map' (1 of 1 entries read back)", g.log())
+            self.assertNotIn("another revision", g.log())
+        self.assertIn("name nothing a record can reference here; left out on every game", self.B.log())
+        self.assertIn("1 of the Context's refundable entities are not removed by this command", self.B.log())
+        self.assertNotEqual(na, nb)
+
+    def test_a_refundable_entity_removed_by_someone_else_before_the_stamp_does_not_refuse_the_bulldozing(self):
+        # only what the command removes travels: an unrelated recent build that vanishes before the stamp cannot refuse the removal
+        self.start()
+        for g in (self.A, self.B):
+            g.run(self.REFUND_CONTEXT)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 100, z = 0 }, b = { x = 400, y = 100, z = 0 } }")
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 200, z = 0 }, b = { x = 400, y = 200, z = 0 } }")
+        self.tick(14)
+        eb, ea = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)")), int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        meanwhile = {g.label: int(g.lua("FIND_EDGE(300, 100, 400, 100)")) for g in (self.A, self.B)}
+        earlier_b = int(self.B.lua("FIND_EDGE(300, 200, 400, 200)"))
+        # the other player bulldozes the third road first: B's tool still lists it (a stale id by now)
+        self.A.issue("NATIVE_BULLDOZE{ edges = { %d } }" % int(self.A.lua("FIND_EDGE(300, 200, 400, 200)")))
+        self.tick(14)
+        self.assertIsNone(self.B.lua("FIND_EDGE(300, 200, 400, 200)"))
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb, ctx="REFUND_CONTEXT({ %d, %d, %d })" % (eb, meanwhile["client"], earlier_b))
+        # the second road is gone from both worlds before the stamp (another command of the same step would do it)
+        for g in (self.A, self.B):
+            g.run("WORLD[%d] = nil" % meanwhile[g.label])
+        self.tick(14)
+        self.assertSameWorld()
+        for g, e in ((self.A, ea), (self.B, eb)):
+            self.assertIsNone(g.lua("FIND_EDGE(300, 0, 400, 0)"), "%s: the bulldozing ran" % g.label)
+            self.assertEqual(g.lua(self.APPLIED_REFUND), "%d{-1}rev1,11,0/339" % e, g.label)
+            self.assertNotIn("unresolved", g.log(), g.label)
+
+    def test_an_entity_changed_since_the_tool_recorded_it_passes_the_recorded_revision_on_every_game(self):
+        # the revision is the engine's check (keyed by entity and revision): an entity whose revision is no longer the recorded one gets the
+        # recorded integers on every game alike (identical worlds have identical revisions), and the engine decides as on the originator
+        self.start()
+        for g in (self.A, self.B):
+            g.run(self.REFUND_CONTEXT)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(14)
+        eb, ea = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)")), int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+        for g in (self.A, self.B):
+            g.run("REVISION_OF = function(e) return { 2, 11, 0 } end")
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb, ctx="REFUND_CONTEXT({ %d })" % eb)
+        self.tick(14)
+        self.assertSameWorld()
+        for g, e in ((self.A, ea), (self.B, eb)):
+            self.assertEqual(g.lua(self.APPLIED_REFUND), "%d{-1}rev1,11,0/339" % e, g.label)
+            self.assertIn("1 refundable entity has another revision here than the originator's tool recorded", g.log(), g.label)
+
+    def test_a_refundable_entity_the_command_removes_that_cannot_be_found_refuses_it_on_every_game_alike(self):
+        # among the removed entities the reference is the removal's own: it cannot run without it, and every game refuses alike
+        self.start()
+        for g in (self.A, self.B):
+            g.run(self.REFUND_CONTEXT)
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(14)
+        eb = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)"))
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d } }" % eb, ctx="REFUND_CONTEXT({ %d })" % eb)
+        for g in (self.A, self.B):
+            g.run("WORLD[%d] = nil" % int(g.lua("FIND_EDGE(300, 0, 400, 0)")))
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertIn("unresolved segment 300.000,0.000,0.000 - 400.000,0.000,0.000", g.log(), g.label)
+            self.assertEqual(g.lua("#GAME.applied"), 1, "%s: only the road was applied" % g.label)
+
+    def test_bulldozing_a_station_whose_removal_takes_its_own_street_pieces_removes_only_what_is_left(self):
+        # sweep 20261018-131047 B10: the bulldozer's proposal for an underground station removes the construction and two street pieces of
+        # its own (rmSegs=2). The engine runs a command as the simulation half sends it (postUpdate, since b2fcd7e), so the construction's
+        # removal had taken the two pieces when the chained segment removal looked them up: "unresolved segment 672.603,-13.631,-12.865 -
+        # 681.349,-18.479,-12.865" on both games. The morning run (sends from update, run after it) found them still there.
+        self.start()
+        ids = {}
+        for g, base in ((self.A, 97000), (self.B, 98000)):
+            g.run("ADD_NODE(%d, 100, 200, -12); ADD_NODE(%d, 140, 200, -12); ADD_NODE(%d, 140, 260, -12); "
+                  "ADD_EDGE(%d, %d, %d, 0, 'street/new_medium_road.street_template'); "
+                  "ADD_EDGE(%d, %d, %d, 0, 'street/new_medium_road.street_template'); "
+                  "CON_OWNS = { [54] = { %d } }" % (base, base + 1, base + 2, base + 10, base, base + 1, base + 11, base + 1, base + 2, base + 10))
+            ids[g.label] = base
+        b = ids[self.B.label]
+        # the construction's own piece and a piece that stays after the construction is gone (the record lists both)
+        self.B.issue("NATIVE_BULLDOZE{ edges = { %d, %d }, cons = { 54 } }" % (b + 10, b + 11))
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            base = ids[g.label]
+            self.assertNotIn("unresolved", g.log(), g.label)
+            self.assertIsNone(g.lua("WORLD[54]"), "%s: the station is gone" % g.label)
+            self.assertIsNone(g.lua("FIND_EDGE(100, 200, 140, 200)"), "%s: its own piece went with it" % g.label)
+            self.assertIsNone(g.lua("FIND_EDGE(140, 200, 140, 260)"), "%s: the other piece is removed by the chained command" % g.label)
+            self.assertEqual(g.lua("HELPER_CALLS[#HELPER_CALLS]"), "makeSegmentsRemoveProposal %d" % (base + 11), g.label)
+            self.assertIn("1 of 2 segment(s) the chained removal names were removed by the command before it", g.log(), g.label)
+
+    def test_bulldozing_a_station_that_takes_all_its_listed_pieces_sends_no_second_command(self):
+        self.start()
+        for g, base in ((self.A, 97000), (self.B, 98000)):
+            g.run("ADD_NODE(%d, 100, 200, -12); ADD_NODE(%d, 140, 200, -12); ADD_EDGE(%d, %d, %d, 0, 'street/new_medium_road.street_template'); "
+                  "CON_OWNS = { [54] = { %d } }" % (base, base + 1, base + 10, base, base + 1, base + 10))
+        self.B.issue("NATIVE_BULLDOZE{ edges = { 98010 }, cons = { 54 } }")
+        self.tick(14)
+        self.assertSameWorld()
+        for g in (self.A, self.B):
+            self.assertNotIn("unresolved", g.log(), g.label)
+            self.assertIsNone(g.lua("WORLD[54]"), g.label)
+            self.assertIsNone(g.lua("FIND_EDGE(100, 200, 140, 200)"), g.label)
+            self.assertNotIn("makeSegmentsRemoveProposal", str(g.lua("table.concat(HELPER_CALLS, ';')")), "%s: nothing left to remove" % g.label)
+
     def test_the_replay_verdict_stays_readable_for_simple_proposals_after_a_native_proposal_failed(self):
         self.start()
         for g in (self.A, self.B):
@@ -1496,6 +1675,20 @@ class BuildTest(unittest.TestCase):
         self.assertIn("builds that rebuild as a native Proposal", log)
         self.assertNotIn("from now on", log, "the reader is not switched off for every build")
         self.assertIn("plan=street cons=0 rem=0 nodes=2 segs=1 rmSegs=0 objs=0; verdict critical=false", log)
+
+    def test_the_verdict_names_a_colliding_track_by_its_road_type(self):
+        # street or track is BaseEdge.roadType (RoadType STREET / TRACK, tf3-docs api/engine), not a BASE_EDGE_TRACK component, which
+        # the API's ComponentType list does not have
+        self.start()
+        for g in (self.A, self.B):
+            g.run("VERDICT_MOCK = true; ADD_NODE(99001, 0, 500, 0); ADD_NODE(99002, 100, 500, 0); ADD_NODE(99004, 0, 600, 0); ADD_NODE(99005, 100, 600, 0); "
+                  "ADD_EDGE(99003, 99001, 99002, 1, 'street/new_medium_road.street_template', { roadType = 1 }); "
+                  "ADD_EDGE(99006, 99004, 99005, 0, 'street/new_medium_road.street_template', { roadType = 0 }); "
+                  "VERDICT_COLLIDE = function() return { { entity = 99003 }, { entity = 99006 } } end")
+        self.B.issue("SIMPLE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }")
+        self.tick(14)
+        log = self.A.log()
+        self.assertIn("collisions=[99003 TRACK edge 0,500-100,500; 99006 street edge 0,600-100,600]", log)
 
     def test_a_bridge_in_place_of_a_street_is_rebuilt_as_a_street_proposal_on_both_games(self):
         self.start()
@@ -1967,8 +2160,11 @@ class BuildTest(unittest.TestCase):
         self.B.issue("NATIVE_TERRAIN(10, 20, 12, 12)")
         self.tick(14)
         self.assertEqual(self.A.applied(), [])
-        self.assertEqual(len(self.B.applied()), 2)
+        # the map editor's terrain command cannot be replicated: refused on the sender too, never applied there alone; the tool's
+        # terrain build goes the build path (applied at the click, the simulation half says why it cannot ship it)
+        self.assertEqual(len(self.B.applied()), 1)
         self.assertEqual(self.B.shipped(), [])
+        self.assertIn("makeWorldReplaceTerrainCmd REFUSED: it cannot be replicated", self.B.log())
         self.assertIn("terrain cells cannot be read or written from a script", self.B.log())
         self.assertIn("a terrain edit: its cells cannot be read from a script", self.B.log())
 
@@ -2153,6 +2349,7 @@ class PureBuildTest(unittest.TestCase):
         self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         g = self.L.globals()
         g.COMMON_SRC, g.PORTABLE_SRC = T.COMMON_SRC, T.PORTABLE_SRC
+        g.LINK_SRC, g.LOG_SRC = T.LINK_SRC, T.LOG_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
             cmds[stem] = src
@@ -2173,6 +2370,36 @@ class PureBuildTest(unittest.TestCase):
 
     def ev(self, code):
         return self.L.eval(code)
+
+    def test_the_refundable_entities_are_written_in_the_typed_apis_map_form_and_a_refusal_says_what_the_binding_raised(self):
+        # the mock takes only { [{ entity, integer }] = { revision, integer } } and raises a table otherwise, as the game's binding does
+        run = ("(function() local M = PURE(); local A = M.adapter; local c = D('Context'); "
+               "local form, n = A.setRefundable(c, { { e = 5, k = -1, rev = %s, num = { 9, 11, 0 }, n = 2935 } }); "
+               "return tostring(form) .. ' | ' .. tostring(n) .. ' | ' .. REFUND_TEXT(c) end)()")
+        self.assertEqual(self.ev(run % "{ num = { 9, 11, 0 } }"), "map | 1 | 5{-1}rev9,11,0/2935")
+        # a revision object the binding cannot take in the map: the same map with a plain { num = ... } revision
+        self.assertEqual(self.ev(run % "'opaque'"), "map-plain | 1 | 5{-1}rev9,11,0/2935")
+        # nothing it takes: every form's error, a table's fields included
+        out = self.ev("(function() local M = PURE(); local A = M.adapter; local c = D('Context'); "
+                      "return select(2, A.setRefundable(c, { { e = 5, k = 'x', rev = 'opaque', num = { 9, 11, 0 }, n = 2935 } })) end)()")
+        self.assertIn("map: table{", out)
+        self.assertIn("what=The lua object can't be converted", out)
+        self.assertIn("list: table{", out)
+        self.assertEqual(self.ev("PURE().adapter.errText('plain')"), "plain")
+
+    def test_a_malformed_refundable_entity_refuses_the_build(self):
+        code = ("(function() local body = WIRE_RECORD(NATIVE_BULLDOZE{ edges = { 110 } }, { ctx = { align = true, cleanup = false, buildings = true, fields = true, "
+                "refund = { { ref = %s, k = -1, r = { 1, 11, 0 }, n = 339 } } } }); local args, why = DECODE(body); return tostring(args ~= nil) .. ' ' .. tostring(why) end)()")
+        good = "{ __ref = 'edge', key = 's:110', p0 = { x = 0, y = 0, z = 0 }, p1 = { x = 100, y = 0, z = 0 } }"
+        self.assertEqual(self.ev(code % "{ __ref = 'edge', key = 's:110' }"), "false refundable entity 1: bad reference")
+        self.assertEqual(self.ev(code % "{ __ref = 'vehicle', key = 's:110' }"), "false refundable entity 1: bad reference")
+        self.assertEqual(self.ev(code.replace("r = { 1, 11, 0 }", "r = { 1, 11 }") % good), "false refundable entity 1: bad reference", "a revision has 3 integers")
+        self.assertEqual(self.ev(code.replace("n = 339", "n = 'x'") % good), "false refundable entity 1: bad reference")
+        self.assertEqual(self.ev(code % good), "true nil", "a well-formed one that resolves passes")
+        nowhere = "{ __ref = 'edge', p0 = { x = 5000, y = 0, z = 0 }, p1 = { x = 5100, y = 0, z = 0 } }"
+        self.assertTrue(str(self.ev(code % nowhere)).startswith("false unresolved segment"), "strict: refused")
+        loose = code.replace("refund = {", "refundLoose = true, refund = {")
+        self.assertEqual(self.ev(loose % nowhere), "true nil", "a loose list (removed set unknown at the capture) leaves it out instead")
 
     def test_the_plan_chosen_for_each_shape_of_build(self):
         road = "a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 }"
@@ -2335,6 +2562,25 @@ class PureBuildTest(unittest.TestCase):
         f = self.L.eval(code)
         got = f(self.L.eval("function() VERDICT_MOCK = nil end")).split("|")
         self.assertIn(got[0], ("construction", "withStreet"))
+
+    def test_the_construction_step_of_with_street_removes_only_the_buildings_the_street_part_left(self):
+        # the engine runs the street part as it is sent (postUpdate) and its Context gathers buildings: a building the record removes may be
+        # gone when the second command is made. It was found before the first command ran; the second command removes what is left.
+        code = """(function(take)
+            local rec, M = WIRE_RECORD((function() local P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 } }; P.toRemove = { 56 }; return P end)())
+            rec = rec.args[1]
+            local plan = M.classify(rec)
+            local R = M.resolver({ player = 7, resolve = function() return nil end })
+            local first = M.plans.withStreet(rec, R, { ctx = { align = true, cleanup = true, buildings = true, fields = true }, ie = false, pi = true, dust = false }, {}, {})
+            if take then WORLD[56] = nil end
+            local ok, second = pcall(first.chain[1])
+            if not ok then return plan .. '|raised ' .. tostring(second) end
+            local sp = STORE(second[1])
+            return plan .. '|' .. #sp.constructionsToAdd .. '|' .. table.concat(sp.constructionsToRemove, ',')
+        end)"""
+        self.assertEqual(self.L.eval(code)(False), "withStreet|1|56", "the building still there is removed by the second command")
+        self.setUp()
+        self.assertEqual(self.L.eval(code)(True), "withStreet|1|", "the street part took it: not looked up again, not refused")
 
     def test_a_removed_segment_read_as_a_bare_id_after_the_build_does_not_crash_the_shape_test(self):
         # real session 2026-10-13: "attempt to index local 'rm' (a number value)" while the upgrade tool's applied build was classified
@@ -2652,12 +2898,19 @@ class PureBuildTest(unittest.TestCase):
                       "return v.x .. v.y .. v.z .. '|' .. #mm .. '|' .. mm[13] .. '|' .. #l .. '|' .. tostring(A.isObject(V(1, 2, 3))) .. tostring(A.isObject({})) end)()")
         self.assertEqual(got, "123|16|5|2|truefalse")
 
-    def test_the_lane_write_shift_is_measured_and_compensated(self):
-        for shift in (0, 1):
-            got = self.ev("(function() LANE_SHIFT = %d; local M = PURE(); local A = M.adapter; local measured = A.laneShift(); "
-                          "local lanes = A.rebuildLanes({ { forward = true, speed = 5, width = 2, height = 0, offset = 0, modes = { 0, 3, 15 } } }); "
-                          "local back = A.readLane(lanes[1]); LANE_SHIFT = 0; return measured .. '|' .. table.concat(back.modes, ',') end)()" % shift)
-            self.assertEqual(got, "%d|0,3,15" % shift, "shift %d" % shift)
+    def test_a_lanes_transport_modes_are_the_documented_map_by_name(self):
+        # {TransportMode : boolean} keyed by api.type.enum.TransportMode: read as the names of the modes that are on, rebuilt by
+        # setting each named key (wiki audit 2026-10-18 A5; the shift guess C.writeEngineArray is gone)
+        got = self.ev("(function() local M = PURE(); local A = M.adapter; "
+                      "local lanes = A.rebuildLanes({ { forward = true, speed = 5, width = 2, height = 0, offset = 0, modes = { 'PERSON', 'BUS', 'ELECTRIC_TRAM_TRACK' } } }); "
+                      "local on = {}; for j = 0, 15 do if STORE(lanes[1]).transportModes[j] then on[#on + 1] = j end end; "
+                      "local back = A.readLane(lanes[1]); return table.concat(back.modes, ',') .. '|' .. table.concat(on, ',') end)()")
+        self.assertEqual(got, "PERSON,BUS,ELECTRIC_TRAM_TRACK|0,3,15")
+        # fail closed: a name the enum lacks, a key the enum does not name
+        why = self.ev("(function() local ok, e = pcall(PURE().adapter.rebuildLanes, { { forward = true, modes = { 'ROCKET' } } }); return tostring(ok) .. ' ' .. tostring(e) end)()")
+        self.assertEqual(why, "false lane 1: unknown transport mode ROCKET")
+        why = self.ev("(function() local ok, e = pcall(PURE().adapter.readLane, { transportModes = { [42] = true } }); return tostring(ok) .. ' ' .. tostring(e) end)()")
+        self.assertIn("false a lane's transport modes: transport mode key 42 is not a value of api.type.enum.TransportMode", why)
 
 
 # ---------------------------------------------------------------- the additions to the lockstep module
@@ -3022,6 +3275,76 @@ class InjectReferenceCheckTest(PureBuildTest):
         bad = str(f(text, True)[0])
         self.assertIn("proposal.nodeConfigsToAdd[0].crosswalks[0] names edge 110, which the originator has at 0.00,0.00,0.00,100.00,0.00,0.00 and this game at "
                       "100.00,0.00,0.00,200.00,0.00,0.00", bad)
+
+    # Friend test 2026-10-16, host street 0:2 (highway_new_small): the text named node 89384 as the new segment's node1 with the segment's
+    # position1, which lay on segment 89389 11.16 m short of that node; both worlds had node 89384 at -4326.43,-2491.35,2.05 (the
+    # originator's print), the host's engine built it, and the old check (text position against the node) refused it on both games.
+    RAMP = """(function()
+        ADD_NODE(89384, -4326.43, -2491.35, 2.05); ADD_NODE(142929, -4311.37, -2535.05, 2.37); ADD_NODE(89380, -4399.42, -2540.50, 1.43)
+        ADD_EDGE(89389, 89380, 89384, 0, "street/new_medium_road.street_template")
+    end)()"""
+
+    def ramp_text(self):
+        end1 = (-4335.69, -2497.58, 2.05)   # on segment 89389, 11.16 m before its end node 89384
+        start = (-4311.37, -2535.05, 2.37)
+        return "\n".join([
+            "=== portable v1 layout=40420 event=inject key=57 site=none tool=none seq=0 t_ms=1 wall_ms=0 payload=0x1 ===",
+            "proposal.addedNodes.#\tn:0",
+            "proposal.addedSegments.#\tn:1",
+            "proposal.addedSegments[0].entity\tent:new#1",
+            "proposal.addedSegments[0].node0\tent:old#142929@%s,%s,%s" % tuple(_f32(v) for v in start),
+            "proposal.addedSegments[0].node1\tent:old#89384@%s,%s,%s" % tuple(_f32(v) for v in end1),
+            "proposal.addedSegments[0].position0\tv3:%s,%s,%s" % tuple(_f32(v) for v in start),
+            "proposal.addedSegments[0].position1\tv3:%s,%s,%s" % tuple(_f32(v) for v in end1),
+            "proposal.nodeConfigsToAdd.#\tn:1",
+            "proposal.nodeConfigsToAdd[0].laneConnections[0].segment0\tent:old#89389",
+            "proposal.nodeConfigsToAdd[0].entity\tent:old#89384@%s,%s,%s" % tuple(_f32(v) for v in end1),
+        ]) + "\n=== end portable #0 ===\n"
+
+    def ramp_check(self, move_node=False):
+        self.L.execute(self.RAMP)
+        f = self.L.eval("""function(t, move)
+            local M = PURE()
+            local prints = M.refPrints(t)   -- the originator's world, before the build
+            if move then ADD_NODE(89384, -4300.00, -2491.35, 2.05) end   -- a receiver whose node 89384 is elsewhere: a fork
+            local bad = M.checkInjectRefs(t, prints)
+            return tostring(bad), (prints['node:89384'] or {})[1]
+        end""")
+        r = f(self.ramp_text(), move_node)
+        return str(r[0]), r[1]
+
+    def test_a_segment_that_ends_away_from_its_node_passes_on_the_same_world(self):
+        bad, printed = self.ramp_check()
+        self.assertAlmostEqual(printed, -4326.43, places=2, msg="the print is where node 89384 is, not the segment's end")
+        self.assertEqual(bad, "nil", "the same world: the segment's end 11 m from its node is the proposal's geometry, not a fork")
+
+    def test_the_same_record_is_refused_on_a_world_whose_node_is_elsewhere(self):
+        bad, _ = self.ramp_check(move_node=True)
+        self.assertIn("names node 89384, which the originator has at -4326.43,-2491.35,2.05 and this game at -4300.00,-2491.35,2.05", bad)
+
+    def test_a_record_without_prints_is_still_checked_by_the_texts_positions(self):
+        # an older record: the text's position is the only place evidence; such a build is refused (fail closed), the 0:2 shape included
+        self.L.execute(self.RAMP)
+        bad = str(self.L.eval("function(t) local M = PURE(); return tostring((M.checkInjectRefs(t))) end")(self.ramp_text()))
+        self.assertIn("names node 89384 at -4335.69,-2497.58,2.05; that node is at -4326.43,-2491.35,2.05 here (11.16 m away)", bad)
+
+    def test_the_snapped_end_is_injected_at_the_decode_with_the_originators_prints(self):
+        self.L.execute(self.RAMP)
+        code = """(function(txt, move)
+            local M, C, ctx = PURE()
+            local body = WIRE_RECORD(NATIVE_ROAD{ a = { x = 100, y = 0, z = 0 }, b = { x = 200, y = 80, z = 0 } })
+            body.nativeText = txt
+            body.refPrints = M.refPrints(txt)
+            if move then ADD_NODE(89384, -4300.00, -2491.35, 2.05) end
+            local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '0:2',
+                resolve = function(key) local n = tostring(key):match('^s:(%d+)$'); return n and tonumber(n) or nil end })
+            if not args then return 'refused: ' .. tostring(why) end
+            return 'built ' .. tostring(args.plan) .. (args.inject and ' inject' or '')
+        end)"""
+        f = self.L.eval(code)
+        self.assertEqual(str(f(self.ramp_text(), False)), "built street inject")
+        got = str(f(self.ramp_text(), True))
+        self.assertTrue(got.startswith("refused: inject_refused: proposal.addedSegments[0].node1 names node 89384, which the originator has at"), got)
 
     def test_the_build_is_refused_at_the_decode_and_nothing_is_built_from_it(self):
         code = """(function(txt)

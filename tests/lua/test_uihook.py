@@ -1,4 +1,4 @@
-"""Tests for the UI-state hook (mod/feverlink3_1/content/feverlink3_uihook.lua).
+"""Tests for the UI-state hook (mod/feverlink3/content/feverlink3_uihook.lua).
 
 The game's windows live in a Lua state of their own; the hook wraps api.cmd there. These tests run the hook in a fresh Lua
 state with a mocked api (no second game) and check what it records for the bridge (ui_out.log) and what it passes on to the
@@ -17,13 +17,13 @@ sys.path.insert(0, HERE)
 import test_lockstep as T  # noqa: E402  (only for the lupa import and the mod folder)
 
 lupa = T.lupa
-CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3_1", "content")
+CONTENT = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content")
 
 SETUP = r'''
 local content = ...
 package.loaded["feverlink3_ui_orig_cmds"] = nil
 function ug_require(name)
-  name = name:gsub("^feverlink3_1::/", "")
+  name = name:gsub("^feverlink3::/", "")
   if package.loaded["ug:" .. name] ~= nil then return package.loaded["ug:" .. name] end
   local f = io.open(content .. "/" .. name, "rb")
   if not f then error("module not found: " .. name) end
@@ -74,10 +74,10 @@ class UiHookTest(unittest.TestCase):
             return []
         out = []
         for line in open(path, encoding="utf-8").read().splitlines():
-            parts = line.split("\t", 3)
-            if len(parts) == 4:
-                payload = self.lua.eval("function(s) return C.parse(s) end")(parts[3])
-                out.append((parts[1], payload))
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                payload = self.lua.eval("function(s) return C.parse(s) end")(parts[2])
+                out.append((parts[0], payload))
         return out
 
     def sent(self):
@@ -123,6 +123,30 @@ class UiHookTest(unittest.TestCase):
         self.lua.execute("CB = nil; Hook.poll()")
         self.assertTrue(self.lua.eval("CB == nil"), "once")
 
+    def test_the_timing_line_shows_where_the_time_between_two_commands_of_one_handler_went(self):
+        # Friend test 2026-10-16: a clone of two vehicles stood the game still for 16 s, 8 s between its two purchases, with no
+        # line saying whether the window, the engine or this hook took it. Here the window spends 5 s between its two commands.
+        self.runtime()
+        self.lua.execute("Hook.install()")
+        self.lua.execute("REAL_CLOCK = os.clock; T = 100; os.clock = function() return T end; Hook.poll()")
+        self.lua.execute('T = 100.25; api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Obtain", { 1, {} }), function() end)')
+        self.lua.execute('T = 105.25; api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Loan", "Repay", { 1, {} }), function() end)')
+        recs = self.records()
+        self.assertEqual(len({int(r[1]["grp"]) for r in recs}), 1, "one handler, one group")
+        self.assertEqual([float(r[1]["t"]["c"]) for r in recs], [100.25, 105.25], "the click travels with the record")
+        for i in (1, 2):
+            self.lua.execute("local i = ...; local w = C.newWriter(C.path('ui_in.log'), 1); C.writerSend(w, 'result', { id = i, success = true, "
+                             "tm = { r = 105.3, s = 105.31, a = 106.0, at = 2000, now = 1800, i = i, n = 2 } })", i)
+        self.lua.execute("T = 106.1; Hook.poll(); os.clock = REAL_CLOCK")
+        with open(os.path.join(self.tmp, "mod.log"), encoding="utf-8") as f:
+            log = f.read()
+        lines = [l for l in log.splitlines() if "timing window #" in l]
+        self.assertEqual(len(lines), 2, log)
+        self.assertIn("(1 of 2) stamp=2000 now=1800: since_tick=250 gap=-", lines[0])
+        self.assertIn("(2 of 2) stamp=2000 now=1800: since_tick=5250 gap=5000", lines[1])
+        self.assertIn("read=+50 shipped=+60 applied=+750 answered=+850 ms after the click", lines[1])
+        self.assertIn("5000 ms in the window since its previous command", log)
+
     def test_an_event_nobody_replicates_passes_through_without_a_record(self):
         self.runtime()
         self.lua.execute("Hook.install()")
@@ -137,6 +161,16 @@ class UiHookTest(unittest.TestCase):
         self.assertEqual(0, self.sent(), "the session speed is the host's to decide")
         recs = self.records()
         self.assertEqual([("speed", 2)], [(r[0], r[1]["n"]) for r in recs])
+
+    def test_a_speed_asked_every_frame_is_sent_once_a_second(self):
+        # friend test 2026-10-16, resync 4: the game's speed control asked "speed 4" every frame while the world loaded (2760 records)
+        self.runtime()
+        self.lua.execute("Hook.install()")
+        for _ in range(50):
+            self.lua.execute("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(4))")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeGameSetSpeedCmd(0))")
+        self.assertEqual([("speed", 4), ("speed", 0)], [(r[0], r[1]["n"]) for r in self.records()], "another speed goes at once")
+        self.assertEqual(0, self.sent())
 
     def test_the_entity_a_command_created_reaches_its_callback_from_the_bridges_answer(self):
         # a command with the generic schema (a player argument, an entity created, the field the window reads it from)
@@ -189,6 +223,28 @@ class UiHookTest(unittest.TestCase):
         self.answer(1, True)
         self.lua.execute("Hook.poll()")
         self.assertTrue(self.lua.eval("GOT == true"))
+
+    def test_a_command_that_cannot_be_replicated_is_refused_here_too_and_the_player_is_told(self):
+        # friend test 2026-10-16: line edits that "do not rebuild equal" went to the engine on the editing game only; the worlds
+        # differed and the resync erased the edit. Now nothing reaches the engine, the window hears no, the player reads why.
+        self.runtime()
+        self.lua.execute("""
+          local L = ug_require("feverlink3_lockstep.lua")
+          L.COMMANDS.makeFakeEditCmd = { category = "build", encode = function() return nil, "argument 2: does not rebuild equal at X.y.3" end }
+          L.COMMANDS.makeFakeFaultCmd = { category = "build", encode = function() error("boom") end }
+          api.cmd.makeFakeEditCmd = function(...) return { kind = "edit", ... } end
+          api.cmd.makeFakeFaultCmd = function(...) return { kind = "fault", ... } end
+        """)
+        self.lua.execute("Hook.install()")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeFakeEditCmd(71, {}), function(d, s) EDIT = { s } end)")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeFakeFaultCmd(71, {}), function(d, s) FAULT = { s } end)")
+        self.assertEqual(0, self.sent(), "the engine gets neither: never applied on this game alone")
+        self.assertTrue(self.lua.eval("EDIT ~= nil and EDIT[1] == false and FAULT ~= nil and FAULT[1] == false"), "both windows are told no")
+        recs = self.records()
+        self.assertEqual(["notice", "notice"], [r[0] for r in recs], "no cmd record: nothing to stamp")
+        self.assertIn("Your fake edit was not applied: it cannot be shared with the other players (argument 2: does not rebuild equal at X.y.3)",
+                      recs[0][1]["text"])
+        self.assertIn("boom", recs[1][1]["text"])
 
     def test_builds_are_left_to_the_bridge_which_sees_them_where_the_engine_applies_them(self):
         self.runtime()

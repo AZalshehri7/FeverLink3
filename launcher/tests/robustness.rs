@@ -279,23 +279,17 @@ fn log_lines_round_trip_and_garbage_is_not_a_line() {
     let mut r = rng(3);
     for i in 0..iters(3000) {
         let line = Line {
-            seq: r.gen_range(0..=gamelink::MAX_SEQ),
             kind: clean_field(&mut r),
             from: clean_field(&mut r),
             payload: random_text(&mut r, 60).replace(['\n', '\r'], " "),
         };
         assert_eq!(gamelink::parse_line(&gamelink::format_line(&line)), Some(line.clone()), "iteration {i}: {line:?}");
         // the same fields with the awkward characters left in come back cleaned, never corrupted
-        let rough = Line {
-            seq: line.seq,
-            kind: random_text(&mut r, 8),
-            from: random_text(&mut r, 8),
-            payload: random_text(&mut r, 30),
-        };
+        let rough =
+            Line { kind: random_text(&mut r, 8), from: random_text(&mut r, 8), payload: random_text(&mut r, 30) };
         let text = gamelink::format_line(&rough);
         assert_eq!(text.matches('\n').count(), 1, "iteration {i}: one physical line");
         let parsed = gamelink::parse_line(&text).unwrap_or_else(|| panic!("iteration {i}: {rough:?}"));
-        assert_eq!(parsed.seq, rough.seq);
         assert!(!parsed.kind.contains(['\t', '\n', '\r']) && !parsed.from.contains(['\t', '\n', '\r']));
 
         // anything at all: a line or nothing, and a line is within the rules
@@ -311,24 +305,20 @@ fn log_lines_round_trip_and_garbage_is_not_a_line() {
             ),
         };
         if let Some(l) = gamelink::parse_line(&garbage) {
-            assert!(l.seq <= gamelink::MAX_SEQ && !l.kind.contains('\t') && !l.from.contains('\t'), "{garbage:?}");
+            assert!(!l.kind.contains('\t') && !l.from.contains('\t'), "{garbage:?}");
         }
     }
 }
 
-/// What a tail must hand out for the complete lines of `content`: the lines whose number is above every number before.
+/// What a tail must hand out for the complete lines of `content`: every one that parses, in file order.
 fn model_of(content: &[u8]) -> Vec<Line> {
     let mut out = Vec::new();
-    let mut last = 0;
     let mut rest = content;
     while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
         let (line, after) = rest.split_at(nl + 1);
         rest = after;
         if let Some(l) = gamelink::parse_line(&String::from_utf8_lossy(line)) {
-            if l.seq > last {
-                last = l.seq;
-                out.push(l);
-            }
+            out.push(l);
         }
     }
     out
@@ -340,26 +330,20 @@ fn a_tail_reads_a_file_the_game_writes_in_any_pieces_and_any_state() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..iters(150) {
         let path = dir.path().join(format!("from_game_{i}.log"));
-        // the content: valid lines, lines with old or huge numbers, garbage, blank lines, a last line that ends
+        // the content: valid lines, repeated lines, garbage, blank lines, a last line that ends
         let mut content = Vec::new();
-        let mut seq = 0u64;
         for _ in 0..r.gen_range(1..40) {
             match r.gen_range(0..8) {
                 0 => content.extend(random_bytes(&mut r, 60)),
                 1 => content.push(b'\n'),
-                2 => {
-                    seq = seq.saturating_sub(r.gen_range(0..3));
-                    content.extend(
-                        gamelink::format_line(&Line { seq, kind: "x".into(), from: "0".into(), payload: "old".into() })
-                            .bytes(),
-                    );
-                }
+                2 => content.extend(
+                    gamelink::format_line(&Line { kind: "x".into(), from: "0".into(), payload: "again".into() })
+                        .bytes(),
+                ),
                 3 => content.extend(format!("{}\tx\t0\thuge\n", u64::MAX - r.gen_range(0..4)).bytes()),
                 _ => {
-                    seq += r.gen_range(1..4);
                     content.extend(
                         gamelink::format_line(&Line {
-                            seq,
                             kind: "action".into(),
                             from: "1".into(),
                             payload: random_text(&mut r, 30).replace(['\n', '\r'], " "),
@@ -372,7 +356,7 @@ fn a_tail_reads_a_file_the_game_writes_in_any_pieces_and_any_state() {
         content.push(b'\n');
         let expected = model_of(&content);
 
-        // written in pieces of random size, the tail polled in between, sometimes the file rewritten from the start
+        // written in pieces of random size, the tail polled in between
         let mut tail = Tail::new(path.clone());
         let mut got: Vec<Line> = Vec::new();
         let mut written = 0;
@@ -390,8 +374,7 @@ fn a_tail_reads_a_file_the_game_writes_in_any_pieces_and_any_state() {
         }
         got.extend(tail.poll().unwrap());
         assert_eq!(got, expected, "iteration {i}");
-        assert_eq!(tail.last_seq(), expected.last().map_or(0, |l| l.seq));
-        assert_eq!(gamelink::highest_seq(&path).unwrap(), tail.last_seq(), "iteration {i}");
+        assert_eq!(tail.position(), gamelink::Pos { gen: 1, offset: content.len() as u64 }, "iteration {i}");
         // the same file as one block
         assert_eq!(Tail::new(path.clone()).poll().unwrap(), expected);
     }
@@ -419,8 +402,7 @@ fn a_tail_given_endless_noise_without_a_newline_holds_a_bounded_amount() {
     // the noise ends, a real line follows: it is read
     file.write_all(b"\n").unwrap();
     file.write_all(
-        gamelink::format_line(&Line { seq: 1, kind: "hello".into(), from: "0".into(), payload: "{}".into() })
-            .as_bytes(),
+        gamelink::format_line(&Line { kind: "hello".into(), from: "0".into(), payload: "{}".into() }).as_bytes(),
     )
     .unwrap();
     file.flush().unwrap();
@@ -431,19 +413,14 @@ fn a_tail_given_endless_noise_without_a_newline_holds_a_bounded_amount() {
 #[test]
 fn what_the_game_could_say_to_the_session_is_checked_not_trusted() {
     let mut r = rng(6);
-    for i in 0..iters(3000) {
+    for _ in 0..iters(3000) {
         let row = &LINE_KINDS[r.gen_range(0..LINE_KINDS.len())];
         let payload = match r.gen_range(0..3) {
             0 => lua_like_text(&mut r),
             1 => luatext::json_to_lua(&serde_json::to_vec(&json_value(&mut r, 0)).unwrap()).unwrap(),
             _ => random_text(&mut r, 80),
         };
-        let line = Line {
-            seq: i as u64 + 1,
-            kind: row.name.to_owned(),
-            from: random_text(&mut r, 3),
-            payload: payload.clone(),
-        };
+        let line = Line { kind: row.name.to_owned(), from: random_text(&mut r, 3), payload: payload.clone() };
         match from_game_line(&line) {
             Ok((kind, json)) => {
                 assert!(row.from_game, "{} is not a kind a game sends", row.name);
@@ -574,7 +551,6 @@ fn the_controller_survives_whatever_is_in_the_command_file() {
         ["join", "leave", "start", "pause", "speed", "check", "resync", "steamtest", "host_not", "", "JOIN", "x\u{0}y"];
     let mut file = OpenOptions::new().create(true).append(true).open(dir.path().join(CMD_FILE)).unwrap();
     for i in 0..iters(400) {
-        let seq = i as u64 + 1;
         let code = match r.gen_range(0..4) {
             0 => random_text(&mut r, 100),
             1 => "A".repeat(r.gen_range(0..5000)),
@@ -593,7 +569,7 @@ fn the_controller_survives_whatever_is_in_the_command_file() {
             3 => format!("{{[\"port\"]={},[\"code\"]={}}}", r.gen::<i64>(), r.gen::<f64>()),
             _ => String::from_utf8_lossy(&random_bytes(&mut r, 80)).into_owned(),
         };
-        let line = Line { seq, kind: kinds[r.gen_range(0..kinds.len())].to_owned(), from: "0".into(), payload };
+        let line = Line { kind: kinds[r.gen_range(0..kinds.len())].to_owned(), from: "0".into(), payload };
         file.write_all(gamelink::format_line(&line).as_bytes()).unwrap();
         if r.gen_bool(0.1) {
             file.write_all(&random_bytes(&mut r, 200)).unwrap();

@@ -93,6 +93,10 @@ pub struct PlayerSession {
     host_floor: u64,
     roster: BTreeMap<u16, RosterEntry>,
     now: Box<dyn Fn() -> f64 + Send>,
+    /// The wall clock (ms since 1970) a pong carries for the host's offset estimate ([PlayerSession::set_wall_clock]). Logs only.
+    wall: Option<Box<dyn Fn() -> i64 + Send>>,
+    /// Each player's wall clock minus the host's, ms, as the host's pings report them.
+    offsets: BTreeMap<u16, i64>,
     dropped: u64,
     out: Vec<PlayerOutput>,
 }
@@ -167,6 +171,8 @@ impl PlayerSession {
             host_floor: 0,
             roster: BTreeMap::new(),
             now,
+            wall: None,
+            offsets: BTreeMap::new(),
             dropped: 0,
             out: Vec::new(),
         }
@@ -217,6 +223,18 @@ impl PlayerSession {
     /// ping has been answered and reported back.
     pub fn rtt_ms(&self) -> Option<f64> {
         self.id.and_then(|id| self.roster.get(&id)).and_then(|e| e.rtt_ms)
+    }
+
+    /// This player's wall clock minus the host's, in ms, as the host measured it and reported in its pings; None before that.
+    /// Logs only (the stamps of a line, [super::Hops]).
+    pub fn wall_offset_ms(&self) -> Option<i64> {
+        self.id.and_then(|id| self.offsets.get(&id).copied())
+    }
+
+    /// Gives the session a wall clock (ms since 1970): its pongs then carry it, so the host can measure this player's clock
+    /// offset for the latency logs. Changes nothing the session decides.
+    pub fn set_wall_clock(&mut self, wall: Box<dyn Fn() -> i64 + Send>) {
+        self.wall = Some(wall);
     }
 
     /// Call now and then: forgets a savegame transfer that has not finished within 10 minutes.
@@ -470,8 +488,12 @@ impl PlayerSession {
                 e.rtt_ms = Some(ms);
             }
         }
+        for (&id, &off) in &m.off {
+            self.offsets.insert(id, off);
+        }
+        let w = self.wall.as_ref().map(|w| w());
         if let Some(sealer) = self.sealer.as_mut() {
-            let frame = sealer.seal(MessageKind::Pong.into(), &codec::encode(&PongMessage { n: m.n }));
+            let frame = sealer.seal(MessageKind::Pong.into(), &codec::encode(&PongMessage { n: m.n, w }));
             self.out.push(PlayerOutput::SendToHost(frame));
         }
     }

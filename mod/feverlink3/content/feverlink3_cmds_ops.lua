@@ -20,7 +20,8 @@
 -- (it exists, it is of the expected kind): an action that fails the check is refused, never applied to whatever
 -- happens to share the id.
 
-local M = { commands = {}, events = {} }
+-- counters: the world searches the reference codec made (resolveConstruction) and their time, read by the UI hook's timing line
+local M = { commands = {}, events = {}, counters = { scans = 0, scanMs = 0 } }
 
 local function try(f, ...)
 	local ok, v = pcall(f, ...)
@@ -31,11 +32,15 @@ end
 -- What a game run needs to see to judge the guesses below (an id that differs from its model's name, a member the
 -- engine would not take) goes to mod.log, once per message. Silent where the log module is not there.
 local log = false
+local Common = nil   -- the common module: the logger and the transport-mode maps by name (C.modeNames / C.modeMap)
 do
 	local ok, C = pcall(ug_require, "feverlink3_common.lua")
-	if not ok then ok, C = pcall(ug_require, "feverlink3_1::/feverlink3_common.lua") end
-	if ok and type(C) == "table" and C.logger then log = C.logger("ops") end
+	if not ok then ok, C = pcall(ug_require, "feverlink3::/feverlink3_common.lua") end
+	if ok and type(C) == "table" then Common = C end
+	if Common and C.logger then log = C.logger("ops") end
 end
+-- the real clock of the timing notes (the link module's, feverlink3_link.lua); 0 without the common module
+local function clock() return Common and Common.clock and Common.clock() or 0 end
 local noted = {}
 local function note(msg)
 	if noted[msg] or not log then return end
@@ -50,7 +55,7 @@ local A = {}
 -- the component each kind of entity carries (names as the game's own scripts write them)
 local COMPONENT = {
 	vehicle = "TRANSPORT_VEHICLE", line = "LINE", depot = "VEHICLE_DEPOT", stationGroup = "STATION_GROUP",
-	station = "STATION", construction = "CONSTRUCTION", town = "TOWN",
+	station = "STATION", construction = "CONSTRUCTION", town = "TOWN", townBuilding = "TOWN_BUILDING",
 }
 -- the order a generic entity is classified in
 local KIND_ORDER = { "vehicle", "line", "stationGroup", "depot", "station", "town", "construction" }
@@ -162,9 +167,11 @@ function A.modelName(id)
 	return try(function() return api.res.modelRep.getName(id) end)
 end
 
+-- find answers "the id of the resource, -1 if the resource doesn't exist" (tf3-docs api/res ResTypeRep.find, res.d.tl:28): 0 is a
+-- model like any other (until 2026-10-18 this took ids > 0 only, which refused a vehicle of the model with id 0 on every game)
 function A.modelFind(name)
 	local id = try(function() return api.res.modelRep.find(name) end)
-	if type(id) == "number" and id > 0 then return id end
+	if type(id) == "number" and id >= 0 then return id end
 	return nil
 end
 
@@ -180,12 +187,20 @@ local TYPES = {
 	StationTerminal = function() return api.type.StationTerminal end,
 	Vec3f = function() return api.type.Vec3f end,
 	Date = function() return api.type.Date end,
+	Modifiers = function() return api.type.TransportVehicle.Modifiers end,
+	-- a line stop's waypoints (api/tealdef/api/type.d.tl: Waypoint { edgePos : EdgePos, pos : Vec3f, tag : integer }, EdgePos
+	-- { edgeId : EdgeId, param : number }, EdgeId.new(entity, index)); the game's line manager makes them with api.type.Waypoint.new()
+	-- and sets edgePos to the snap of the network edge clicked, or pos for a ship or aircraft (gui/line_vehicle_mgmt/manager_window.tl)
+	Waypoint = function() return api.type.Waypoint end,
+	EdgePos = function() return api.type.EdgePos end,
+	EdgeId = function() return api.type.EdgeId end,
 }
 -- constructors that take their members as arguments
 local CTOR_ARGS = {
 	Vec3f = function(t) return t.x, t.y, t.z end,
 	StationTerminal = function(t) return t.station, t.terminal end,
 	Date = function(t) return t.year, t.month, t.day end,
+	EdgeId = function(t) return t.entity, t.index end,
 }
 
 function A.new(typeName, tree)
@@ -200,6 +215,7 @@ function A.new(typeName, tree)
 	return obj
 end
 
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): `__members` (engine binding reflection).
 function A.members(o)
 	local ok, m = pcall(function() return o.__members end)
 	if ok and m ~= nil then return m end
@@ -284,17 +300,47 @@ local SCHEMA = {
 	TransportVehiclePart = { part = { inplace = "VehiclePart" } },
 	VehiclePart = { compartment2loadConfig = { list = "LoadConfig" }, color = "Vec3f" },
 	Line = { stops = { list = "LineStop" } },
-	LineStop = { alternativeTerminals = { list = "StationTerminal" }, stopConfig = "StopConfig", waypoints = false },
+	LineStop = { alternativeTerminals = { list = "StationTerminal" }, stopConfig = "StopConfig", waypoints = { list = "Waypoint" } },
+	Waypoint = { edgePos = "EdgePos", pos = "Vec3f" },
+	EdgePos = { edgeId = "EdgeId" },
 }
 
 local rebuild
 
--- Writes a table into member k of an engine object. Some members only take an engine object of their own type (the real
--- engine: Line.vehicleInfo is a LineVehicleInfo, and a plain table is refused with "bad argument #2 ... (const LineVehicleInfo
--- expected, got no value)" - seen in every real game that created a line). When the table is refused and the member holds an
--- engine object, it is filled in place, member by member; if that fails too, the first refusal stands.
+-- The members that are transport-mode maps ("transportModes: {TransportMode : boolean}", script-doc api/type.html), as paths from
+-- an object of each type. On the wire such a map is keyed by the enum's names (common.lua C.modeNames), and the receiving game
+-- keys it by its own api.type.enum.TransportMode values again (C.modeMap) before the object is rebuilt; a key the enum does not
+-- name, or a name this game lacks, refuses the command with the reason. LineVehicleInfo has no new(): it is filled through the copy
+-- the Line hands out and written back (setMember).
+local MODE_MAPS = { Line = { { "vehicleInfo", "transportModes" } } }
+
+local function convertModes(typeName, tree, way)
+	for _, path in ipairs(MODE_MAPS[typeName] or {}) do
+		local holder = tree
+		for i = 1, #path - 1 do holder = type(holder) == "table" and holder[path[i]] or nil end
+		local k = path[#path]
+		if type(holder) == "table" and holder[k] ~= nil then
+			if not (Common and Common[way]) then return nil, typeName .. "." .. table.concat(path, ".") .. ": no common module" end
+			local v, why = Common[way](holder[k])
+			if v == nil then return nil, typeName .. "." .. table.concat(path, ".") .. ": " .. tostring(why) end
+			holder[k] = v
+		end
+	end
+	return tree
+end
+
+-- Writes a table into member k of an engine object (a transport-mode map arrives here already keyed by this game's enum values,
+-- MODE_MAPS below, and is assigned whole). Some members only take an engine object of their own type (the real engine: Line.vehicleInfo is a LineVehicleInfo, and a plain
+-- table is refused with "bad argument #2 ... (const LineVehicleInfo expected, got no value)" - seen in every real game that
+-- created a line). When the table is refused and the member holds an engine object, that object is filled member by member and
+-- written back: a property of the engine hands out a copy (finding from MPFever (MIT)), and a filled copy that stays unwritten
+-- loses every member put into it. That was the friend test 2026-10-16: 115 line edits "do not rebuild equal at
+-- Line.vehicleInfo.transportModes.<the mode the line has>" (3 = BUS, 11 = SMALL_AIRCRAFT), each the first mode that was on, which
+-- is what a lost write reads back as. If the filling fails too, the first refusal stands.
 local function setMember(obj, k, val)
-	local ok, err = pcall(function() obj[k] = val end)
+	local ok, err = pcall(function()
+		obj[k] = val
+	end)
 	if ok then return end
 	if type(val) ~= "table" then error(err, 0) end
 	local cur = try(function() return obj[k] end)
@@ -303,6 +349,9 @@ local function setMember(obj, k, val)
 		for kk, vv in pairs(val) do setMember(cur, kk, vv) end
 	end)
 	if not okAll then error(err, 0) end
+	-- the object itself when the member handed it out, a copy otherwise: writing it back is harmless in the one case and needed in
+	-- the other (the member takes an object of its own type, which `cur` is)
+	pcall(function() obj[k] = cur end)
 end
 
 -- Sets the members of `obj` from `tree`. A member the engine calls read-only is left to it (`skipped`, and not
@@ -392,7 +441,19 @@ local function dryCtx(st)
 	return { player = A.player(), resolve = function(key) return st.seen[key] end }
 end
 
-local HOLDER = { depot = "depots", station = "stations" }
+local HOLDER = { depot = "depots", station = "stations", townBuilding = "townBuildings" }
+
+-- The construction of a town building (Engine.Component.TownBuilding.construction) and the building's 1-based place in that
+-- construction's townBuildings list (Engine.Component.Construction.townBuildings; tf3-docs api/engine Engine.Component).
+function A.townBuildingOwner(e)
+	local tb = A.component(e, "TOWN_BUILDING")
+	local con = tb and try(function() return tb.construction end)
+	if type(con) ~= "number" or not A.isKind(con, "construction") then return nil end
+	local c = A.component(con, "CONSTRUCTION")
+	local i = c and indexOf(try(function() return c.townBuildings end), e)
+	if i then return con, i end
+	return nil
+end
 
 local function conRef(ctx, st, con)
 	local key = ctx.keyOf(con)
@@ -404,6 +465,8 @@ local function describe(ctx, st, e, kind)
 	local con, i = nil, nil
 	if kind == "depot" or kind == "station" then
 		con, i = A.ownerOf(e, HOLDER[kind])
+	elseif kind == "townBuilding" then
+		con, i = A.townBuildingOwner(e)
 	elseif kind == "stationGroup" then
 		local stations = A.stationsOf(e)
 		local first = stations ~= nil and try(function() return stations[1] end)
@@ -429,10 +492,18 @@ local function resolveConstruction(ctx, r)
 	local e = r.key ~= nil and ctx.resolve(r.key) or nil
 	if e ~= nil and A.isKind(e, "construction") and matches(e, r) then return e end
 	if r.f == nil or r.p == nil then return nil end
-	for _, c in ipairs(A.entitiesWith("CONSTRUCTION")) do
-		if matches(c, r) then return c end
+	-- the one search over the whole world on this path (every construction, town buildings included, two component reads each):
+	-- counted and timed (M.counters, and a log line when it is slow), so a run shows whether a command paid for it
+	local t0 = clock()
+	local all = A.entitiesWith("CONSTRUCTION")
+	local found = nil
+	for _, c in ipairs(all) do
+		if matches(c, r) then found = c break end
 	end
-	return nil
+	local ms = (clock() - t0) * 1000
+	M.counters.scans, M.counters.scanMs = M.counters.scans + 1, M.counters.scanMs + ms
+	if ms >= 50 and log then log(string.format("construction search by file and place (%s): %d constructions in %.0f ms, %s", tostring(r.f), #all, ms, found and "found" or "not found")) end
+	return found
 end
 
 local function resolveAt(ctx, r, kind)
@@ -444,6 +515,7 @@ local function resolveAt(ctx, r, kind)
 	local con = resolveConstruction(ctx, at.con)
 	if con == nil then return nil end
 	if kind == "depot" then return A.holderEntity(con, "depots", at.i) end
+	if kind == "townBuilding" then return A.holderEntity(con, "townBuildings", at.i) end
 	local station = A.holderEntity(con, "stations", at.i)
 	if kind == "station" then return station end
 	return station ~= nil and A.groupOf(station) or nil
@@ -498,10 +570,11 @@ local function encodeRef(ctx, st, e, kind)
 		-- the building's key and the entity's place in it are its name
 		if r.at and not tostring(r.at.con.key):match("^s:") then r.key = nil end
 	end
-	-- the dry run: the reference must lead back to this very entity; a hint that misleads is dropped
-	if decodeRef(dryCtx(st), r, kind) ~= e and r.at then
-		r.at = nil
-	end
+	-- the dry run: the reference must lead back to this very entity; a hint that misleads is dropped (and the reference tried again
+	-- without it; when the first try led back, a second one would only repeat its engine reads)
+	if decodeRef(dryCtx(st), r, kind) == e then return r end
+	if not r.at then return nil, "cannot refer to entity " .. e .. " as a " .. kind end
+	r.at = nil
 	if decodeRef(dryCtx(st), r, kind) ~= e then return nil, "cannot refer to entity " .. e .. " as a " .. kind end
 	return r
 end
@@ -560,6 +633,26 @@ local function listArg(kind)
 end
 local VEHICLES = listArg("vehicle")
 
+-- makeTownBuildingSetBlockedDevelopmentCmd(townBuildingEntity, blockedDevelopment): "the entity Id of the town building" (tf3-docs
+-- api/cmd, cmd.d.tl:883). Until 2026-10-18 the argument had to be a construction. An entity that is a construction is still referred
+-- to as one (its file and place); a town building entity of its own (TOWN_BUILDING, whose `construction` names its building) is
+-- referred to through that construction and its place in the construction's townBuildings list, the way a depot is. Anything else
+-- refuses the command.
+local TOWN_BUILDING_ARG = {
+	enc = function(ctx, v, st)
+		if v == nil then return nil end
+		if A.isKind(v, "construction") then return encodeRef(ctx, st, v, "construction") end
+		if not A.isKind(v, "townBuilding") then return nil, "entity " .. tostring(v) .. " is neither a town building nor a construction" end
+		local r, why = encodeRef(ctx, st, v, "townBuilding")
+		if r then r.tb = true end
+		return r, why
+	end,
+	dec = function(ctx, w)
+		if w == nil then return nil end
+		return decodeRef(ctx, w, type(w) == "table" and w.tb and "townBuilding" or "construction")
+	end,
+}
+
 -- An engine object with its own type. `wireOf(ctx, st, tree)` turns the tree read from the object into the wire
 -- form (entity ids become references), `treeOf(ctx, wire)` is its inverse; both may fail with a reason. `read`
 -- replaces the member-list reading for an object whose fields are known (a date).
@@ -573,6 +666,8 @@ local function objectArg(typeName, wireOf, treeOf, read)
 		if w == nil then return nil end -- an argument the caller left out
 		if type(w) ~= "table" then return nil, "malformed " .. typeName end
 		local tree, why = treeOf(ctx, copy(w))
+		if tree == nil then return nil, why end
+		tree, why = convertModes(typeName, tree, "modeMap")
 		if tree == nil then return nil, why end
 		local skipped, failed = {}, {}
 		local ok, obj = pcall(rebuild, typeName, tree, typeName, skipped, failed)
@@ -591,12 +686,22 @@ local function objectArg(typeName, wireOf, treeOf, read)
 	-- with what the window's own object held (the translations of ids and names must lead back to the same values).
 	codec.enc = function(ctx, v, st)
 		if v == nil then return nil end
+		-- ctx.objMs (the UI hook's timing line): read = the window's object read member by member, wire = ids to names (model names),
+		-- dry = the rebuild into a new engine object and its read-back on this game
+		local t = type(ctx.objMs) == "table" and { clock() } or nil
 		local tree, why = read(v)
 		if tree == nil then return nil, why or "empty " .. typeName end
+		if t then t[2] = clock() end
 		local wire = copy(tree)
+		wire, why = convertModes(typeName, wire, "modeNames")
+		if wire == nil then return nil, why end
 		wire, why = wireOf(ctx, st, wire)
 		if wire == nil then return nil, why end
+		if t then t[3] = clock() end
 		local obj, why2, again, skipped = codec.dec(dryCtx(st), wire)
+		if t then
+			ctx.objMs[#ctx.objMs + 1] = string.format("%s read=%.1f wire=%.1f dry=%.1f", typeName, (t[2] - t[1]) * 1000, (t[3] - t[2]) * 1000, (clock() - t[3]) * 1000)
+		end
 		if obj == nil then return nil, why2 end
 		local same, path = contained(tree, again, typeName, skipped)
 		if not same then return nil, "does not rebuild equal at " .. path end
@@ -640,19 +745,110 @@ local CONFIG = objectArg("TransportVehicleConfig",
 		return tree
 	end)
 
--- A line: the station group of each stop is an entity; waypoints name network edges, whose ids no game shares, so a
--- line that has any is not replicated yet.
+-- ---- the network entity a waypoint names
+--
+-- A waypoint on a street or track is an EdgePos: the edge `index` (zero-based) of the TransportNetwork entity `entity`, and `param`, the
+-- position along that edge (api/tealdef/api/type.d.tl EdgeId, EdgePos; the game's line manager reads it as
+-- getComponent(edgeId.entity, TRANSPORT_NETWORK).edges[index + 1], gui/line_vehicle_mgmt/line_manager_panel.tl). The entity is a segment
+-- ("A BaseEdge usually also has a BaseEdgeStreet and a TransportNetwork", api/engine.d.tl), a node or a construction, and its id is not
+-- one the other games share. It travels as the reference the build records make for the same entity (feverlink3_cmds_build.lua M.refOf:
+-- a segment by key, end positions and tangents, a node by key and position, a construction by key, file and position), which every game
+-- resolves to its own entity or refuses the command (unresolved, ambiguous). The index and the param are the same on every game where
+-- the entity is the same; the number of edges of its network travels too (`n`), and a game whose entity has another number refuses.
+-- A ship's or an aircraft's waypoint is a position (Waypoint.pos) and travels as it is.
+
+local Build = nil   -- the build module, loaded the first time a waypoint needs it (false: it cannot be loaded here)
+local function buildModule()
+	if Build == nil then
+		local ok, B = pcall(ug_require, "feverlink3_cmds_build.lua")
+		if not ok then ok, B = pcall(ug_require, "feverlink3::/feverlink3_cmds_build.lua") end
+		Build = (ok and type(B) == "table" and type(B.refOf) == "function" and type(B.resolver) == "function") and B or false
+	end
+	return Build or nil
+end
+
+-- the number of edges in an entity's TransportNetwork component, nil when it cannot be read
+function A.networkEdges(e)
+	local tn = A.component(e, "TRANSPORT_NETWORK")
+	local edges = tn ~= nil and try(function() return tn.edges end) or nil
+	local n = edges ~= nil and try(function() return #edges end) or nil
+	return type(n) == "number" and n or nil
+end
+
+-- what kind of network entity e is, as the build module refers to it
+local NETWORK_KINDS = { { "edge", "BASE_EDGE" }, { "node", "BASE_NODE" }, { "con", "CONSTRUCTION" } }
+
+local function networkRef(ctx, st, e, index)
+	local B = buildModule()
+	if B == nil then return nil, "the build module is not loaded here (it names network entities)" end
+	local kind = nil
+	for _, k in ipairs(NETWORK_KINDS) do
+		if A.component(e, k[2]) ~= nil then kind = k[1] break end
+	end
+	if kind == nil then return nil, "network entity " .. tostring(e) .. " is neither a segment, a node nor a construction" end
+	local r, why = B.refOf(kind, e, ctx)
+	if r == nil then return nil, tostring(why) end
+	if r.key ~= nil then st.seen[r.key] = e end   -- (the dry run resolves the key to this very entity)
+	local n = A.networkEdges(e)
+	if n ~= nil and type(index) == "number" and index >= n then return nil, "edge " .. index .. " of network entity " .. e .. " which has " .. n end
+	return { __ref = "network", [kind] = r, n = n }
+end
+
+local function networkEntity(ctx, r, index)
+	local B = buildModule()
+	if B == nil then return nil, "the build module is not loaded here (it names network entities)" end
+	local kind = nil
+	for _, k in ipairs(NETWORK_KINDS) do
+		if type(r[k[1]]) == "table" then kind = k[1] break end
+	end
+	if r.__ref ~= "network" or kind == nil then return nil, "malformed network reference" end
+	local ok, e = pcall(function() return B.resolver(ctx)[kind](r[kind]) end)
+	if not ok then return nil, tostring(e) end
+	if type(e) ~= "number" then return nil, "unresolved network entity" end
+	local n = A.networkEdges(e)
+	if r.n ~= nil and n ~= nil and n ~= r.n then
+		return nil, "network entity " .. e .. " has " .. n .. " edges here and " .. tostring(r.n) .. " on the sending game"
+	end
+	if n ~= nil and type(index) == "number" and index >= n then return nil, "edge " .. index .. " of network entity " .. e .. " which has " .. n end
+	return e
+end
+
+-- calls fn(stop i, waypoint j, edgeId) for each waypoint of the tree's stops that names a network edge
+local function eachWaypointEdge(tree, fn)
+	local stops = tree.stops
+	for i = 1, type(stops) == "table" and #stops or 0 do
+		local wps = type(stops[i]) == "table" and stops[i].waypoints or nil
+		for j = 1, type(wps) == "table" and #wps or 0 do
+			local ep = type(wps[j]) == "table" and wps[j].edgePos or nil
+			local id = type(ep) == "table" and ep.edgeId or nil
+			if type(id) == "table" then
+				local why = fn(i, j, id)
+				if why then return why end
+			end
+		end
+	end
+	return nil
+end
+
+-- A line: the station group of each stop is an entity, and so is the network entity of each waypoint on a street or track (above).
 local LINE = objectArg("Line",
 	function(ctx, st, wire)
 		local stops = wire.stops
 		for i = 1, type(stops) == "table" and #stops or 0 do
 			local s = stops[i]
-			if type(s.waypoints) == "table" and next(s.waypoints) ~= nil then return nil, "stop " .. i .. " has waypoints (not replicated yet)" end
-			s.waypoints = nil
 			local r, why = encodeRef(ctx, st, s.stationGroup, "stationGroup")
 			if not r then return nil, "stop " .. i .. ": " .. tostring(why) end
 			s.stationGroup = r
 		end
+		local why = eachWaypointEdge(wire, function(i, j, id)
+			-- (a waypoint by position has no edge: its EdgeId names no entity, -1, and travels as it is)
+			if type(id.entity) ~= "number" or id.entity < 0 then return nil end
+			local r, whyR = networkRef(ctx, st, id.entity, id.index)
+			if r == nil then return "stop " .. i .. " waypoint " .. j .. ": " .. tostring(whyR) end
+			id.entity = r
+			return nil
+		end)
+		if why then return nil, why end
 		return wire
 	end,
 	function(ctx, tree)
@@ -662,6 +858,16 @@ local LINE = objectArg("Line",
 			if e == nil then return nil, "stop " .. i .. ": " .. tostring(why) end
 			stops[i].stationGroup = e
 		end
+		local why = eachWaypointEdge(tree, function(i, j, id)
+			-- a raw id of the sending game would name another entity here, or none: only "none" (-1) travels as a number
+			if type(id.entity) == "number" and id.entity >= 0 then return "stop " .. i .. " waypoint " .. j .. ": a raw entity id, not a reference" end
+			if type(id.entity) ~= "table" then return nil end
+			local e, whyE = networkEntity(ctx, id.entity, id.index)
+			if e == nil then return "stop " .. i .. " waypoint " .. j .. ": " .. tostring(whyE) end
+			id.entity = e
+			return nil
+		end)
+		if why then return nil, why end
 		return tree
 	end)
 
@@ -669,6 +875,9 @@ local function plainObject(typeName, read)
 	return objectArg(typeName, function(_, _, wire) return wire end, function(_, tree) return tree end, read)
 end
 local VEC3 = plainObject("Vec3f")
+-- a vehicle's modifiers (Engine.Component.TransportVehicle.Modifiers: topSpeedScale, noiseScale, pollutionScale, comfortScale, tf3-docs; the game's vehicle
+-- window copies one with api.type.TransportVehicle.Modifiers.new(tv.modifiers))
+local MODIFIERS = plainObject("Modifiers")
 -- a date has year, month and day (the game's calendar widget reads and builds it that way)
 local DATE = plainObject("Date", function(v)
 	local y, m, d = try(function() return v.year end), try(function() return v.month end), try(function() return v.day end)
@@ -772,8 +981,12 @@ local function command(def)
 		local n = args.n or #args
 		local st = newState()
 		local out = { n = n }
+		-- ctx.argMs (the UI hook's timing line): the ms each argument's codec took, with the dry run of its reference or object
+		local argMs = type(ctx.argMs) == "table" and ctx.argMs or nil
 		for i = 1, n do
+			local t0 = argMs and clock()
 			local w, why = (codecs[i] or PLAIN).enc(ctx, args[i], st)
+			if argMs then argMs[i] = (clock() - t0) * 1000 end
 			if w == nil and why then return nil, "argument " .. i .. ": " .. tostring(why) end
 			out[i] = w
 		end
@@ -795,20 +1008,27 @@ local function command(def)
 	return spec
 end
 
--- vehicles. Buying and replacing create the vehicle: the lockstep core binds it to the key of the action that made
--- it, on every game, so the next command can name it. (Whether a replacement is a new entity or the old one changed
--- in place is not known: docs/COVERAGE_OPS.md.)
+-- vehicles. Buying creates the vehicle (VehicleBuyCommandData.resultVehicleEntity): the lockstep core binds it to the key of the
+-- action that made it, on every game, so the next command can name it. Replacing does not: the game's typed definition gives
+-- VehicleReplaceCommandData only vehicleEntity, config and applyPurchaseCost, no result entity (tf3-docs api/cmd, cmd.d.tl:898), so
+-- the vehicle is changed in place and keeps its key. Until 2026-10-18 the replacement was modelled as creating a vehicle
+-- (`resultVehicleEntity`, a field that data does not have): the watch for it found nothing and answered the window's callback
+-- with a failure 10 steps after the replacement had applied. docs/COVERAGE_OPS.md V6 says what a real run checks.
 command{ name = "makeVehicleBuyCmd", category = "spend", args = { PLAYER, DEPOT, CONFIG }, creates = "TRANSPORT_VEHICLE", result = "resultVehicleEntity" }
-command{ name = "makeVehicleReplaceCmd", category = "spend", args = { VEHICLE, CONFIG }, creates = "TRANSPORT_VEHICLE", result = "resultVehicleEntity" }
+command{ name = "makeVehicleReplaceCmd", category = "spend", args = { VEHICLE, CONFIG } }
 command{ name = "makeVehicleSellCmd", category = "bulldoze", args = { VEHICLES } }
 command{ name = "makeVehicleSetLineCmd", category = "other", args = { VEHICLE, LINE_ENTITY } }
-command{ name = "makeVehicleSendToDepotCmd", category = "other", args = { VEHICLE } }
+-- (vehicleEntity, sellOnArrival, jumpToDepoEntity: "optional. If provided, then vehicle gets teleported to depot", script-doc
+-- api/cmd.html): the depot is an entity like any other and travels as a reference (a raw id would name another entity, or none,
+-- on the other games); one that cannot be referred to refuses the command
+command{ name = "makeVehicleSendToDepotCmd", category = "other", args = { VEHICLE, PLAIN, DEPOT } }
 command{ name = "makeVehicleReverseCmd", category = "other", args = { VEHICLE } }
 command{ name = "makeVehicleSetStoppedByUserCmd", category = "other", args = { VEHICLE } }
 -- not used by the base game's windows; registered with a vehicle first, as a mod may call them
 command{ name = "makeVehicleTryToDepartCmd", category = "other", args = { VEHICLE } }
 command{ name = "makeVehicleSetManualDepartureCmd", category = "other", args = { VEHICLE } }
-command{ name = "makeVehicleSetModifiersCmd", category = "other", args = { VEHICLE } }
+-- (vehicleEntity, modifiers : Engine.Component.TransportVehicle.Modifiers): an engine object, read and rebuilt like the others
+command{ name = "makeVehicleSetModifiersCmd", category = "other", args = { VEHICLE, MODIFIERS } }
 
 -- lines. Creating one yields the entity (its key is the action's); stops, waiting times, load modes, cargo filters
 -- and the reservation priority all travel inside the Line object of create and update.
@@ -832,7 +1052,7 @@ command{ name = "makeGameSetCloudCoverageCmd", category = "other" }
 
 -- towns, industries and cargo
 command{ name = "makeStockListDiscardCargoCmd", category = "other", args = { ANY } }
-command{ name = "makeTownBuildingSetBlockedDevelopmentCmd", category = "other", args = { entityArg("construction") } }
+command{ name = "makeTownBuildingSetBlockedDevelopmentCmd", category = "other", args = { TOWN_BUILDING_ARG } }
 command{ name = "makeTownSetDevelopmentActiveCmd", category = "other", args = { TOWN } }
 command{ name = "makeTownSetInitialLandUseCapacitiesCmd", category = "other", args = { TOWN } }
 command{ name = "makeTownCustomDistributionWeightsCmd", category = "other", args = { TOWN } }
@@ -872,9 +1092,11 @@ local function fieldEvent(category, fields)
 	}
 end
 
--- A plain event with a plain parameter (the dispatcher copies it). `check(param)` may veto it with a reason.
-local function plainEvent(category, check)
-	local h = { category = category }
+-- A plain event with a plain parameter (the dispatcher copies it). `check(param)` may veto it with a reason (it is then refused
+-- on every game, the sender's included). `localFor(param)` true: this one is the sender's own setting, never replicated
+-- (category "local", L.EVENT_SPEC).
+local function plainEvent(category, check, localFor)
+	local h = { category = category, localFor = localFor }
 	if check then
 		h.encode = guarded("encode", function(param)
 			local tree, why = marshal(param)
@@ -887,10 +1109,10 @@ local function plainEvent(category, check)
 	return h
 end
 
--- the time of day follows this machine's clock in the "Local" mode: no two games would agree
-local function notLocal(param)
-	if type(param) == "table" and (param.mode == "Local") then return "the Local time-of-day mode follows each machine's clock" end
-	return nil
+-- the time of day follows this machine's clock in the "Local" mode: no two games would agree, so it is each player's own setting
+local function localTimeMode(param)
+	local ok, mode = pcall(function() return param.mode end)
+	return ok and mode == "Local"
 end
 
 M.events = {
@@ -907,7 +1129,7 @@ M.events = {
 		setTownRatingSensitivity = fieldEvent("other", { townEntity = "town" }),
 		resetTownRatingSensitivity = fieldEvent("other", { townEntity = "town" }),
 	},
-	GameTime = { SetMode = plainEvent("other", notLocal), OnManualGameTimeChanged = plainEvent("other"), SkipPhase = plainEvent("other") },
+	GameTime = { SetMode = plainEvent("other", nil, localTimeMode), OnManualGameTimeChanged = plainEvent("other"), SkipPhase = plainEvent("other") },
 	CloudCoverage = { SetMode = plainEvent("other"), OnManualCloudCoverageChanged = plainEvent("other"), SkipPhase = plainEvent("other") },
 }
 

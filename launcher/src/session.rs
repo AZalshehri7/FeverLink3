@@ -50,7 +50,9 @@ use crate::steamnet::bulk_io::{BulkMode, BulkSettings};
 use crate::steamnet::par::wire::secret_from_key;
 use crate::testmargin;
 
+mod linkwatch;
 mod transfer;
+use linkwatch::LinkWatch;
 use transfer::HostIo;
 
 /// Period of the state machines' tick (session broadcast, checksum rounds).
@@ -85,7 +87,7 @@ const fn row(name: &'static str, kind: MessageKind, to_game: bool, from_game: bo
 /// The complete mapping, `docs/PROTOCOL.md` kinds to file-link kinds (documented in `launcher/README.md`).
 /// Names are the snake_case of the message kind, except `peerclock`, which is what the mod already reads.
 /// `resync_chunk` never goes to the game: the launcher streams savegame chunks to disk itself.
-pub const LINE_KINDS: [LineKind; 21] = [
+pub const LINE_KINDS: [LineKind; 22] = [
     row("welcome", MessageKind::Welcome, true, false),
     row("session", MessageKind::Session, true, false),
     row("peerclock", MessageKind::PeerClock, true, false),
@@ -103,6 +105,8 @@ pub const LINE_KINDS: [LineKind; 21] = [
     row("save_done", MessageKind::SaveDone, false, true),
     row("replay_failed", MessageKind::ReplayFailed, false, true),
     row("action_refused", MessageKind::ActionRefused, false, true),
+    // the same message kind: the game's verdict of an action at its stamp, here "applied" (the line kind sets pplied: true)
+    row("action_applied", MessageKind::ActionRefused, false, true),
     row("action", MessageKind::Action, true, true),
     row("chat", MessageKind::Chat, true, true),
     row("build_veto", MessageKind::BuildVeto, true, true),
@@ -139,10 +143,17 @@ pub fn to_game_line(kind: MessageKind, payload: &[u8]) -> Option<(&'static str, 
 /// A line from the game as a protocol message. The `from` column is ignored: the state machine knows who the game
 /// is. `Err` says why the line was refused.
 pub fn from_game_line(line: &Line) -> Result<(MessageKind, Vec<u8>), String> {
-    let kind = message_kind_for(&line.kind)
-        .ok_or_else(|| format!("line {}: kind {:?} is not accepted", line.seq, line.kind))?;
-    let json = luatext::lua_to_json(&line.payload)
-        .ok_or_else(|| format!("line {}: payload of {} is not Lua literal syntax", line.seq, line.kind))?;
+    let kind = message_kind_for(&line.kind).ok_or_else(|| format!("a line of kind {:?} is not accepted", line.kind))?;
+    let mut json = luatext::lua_to_json(&line.payload)
+        .ok_or_else(|| format!("the payload of a {} line is not Lua literal syntax", line.kind))?;
+    if line.kind == "action_applied" {
+        // the line kind is the verdict: an ction_applied line never reaches the host as a refusal
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&json).map_err(|e| format!("the payload of an action_applied line: {e}"))?;
+        let map = value.as_object_mut().ok_or("the payload of an action_applied line is not a table")?;
+        map.insert("applied".to_owned(), serde_json::Value::Bool(true));
+        json = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    }
     Ok((kind, json))
 }
 
@@ -289,11 +300,14 @@ struct Shared {
     bulk: Mutex<BulkSettings>,
     /// The per-transfer secret of parallel transfers, derived from the session key.
     par_secret: Mutex<[u8; 32]>,
+    /// The launcher's part of the latency logs (stamps on clock and action lines, a `link.launcher` line a minute).
+    watch: Mutex<LinkWatch>,
     echo: bool,
 }
 
 impl Shared {
     fn new(status: Status, echo: bool) -> Arc<Shared> {
+        let role = status.role.as_str();
         Arc::new(Shared {
             status: Mutex::new(status),
             logs: Mutex::new(Vec::new()),
@@ -302,6 +316,7 @@ impl Shared {
             goodbye: AtomicBool::new(true),
             bulk: Mutex::new(BulkSettings { mode: BulkMode::Off, ..BulkSettings::default() }),
             par_secret: Mutex::new([0; 32]),
+            watch: Mutex::new(LinkWatch::new(role)),
             echo,
         })
     }
@@ -326,6 +341,18 @@ impl Shared {
 
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    fn watch(&self) -> std::sync::MutexGuard<'_, LinkWatch> {
+        self.watch.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Once a minute: the launcher's `link.launcher` lines.
+    fn link_minute(&self) {
+        let lines = self.watch().minute(Instant::now());
+        for line in lines {
+            self.log(line);
+        }
     }
 }
 
@@ -424,6 +451,19 @@ fn write_to_game(link: &mut gamelink::Session, shared: &Shared, kind: MessageKin
         // the game is about to replace its world: silent until its new script says hello
         shared.update(|s| s.reloading = true);
     }
+    if kind == MessageKind::PlayerLeft {
+        if let Some(m) = codec::try_decode::<PlayerLeftMessage>(payload) {
+            shared.watch().forget(m.id);
+        }
+    }
+    // the latency logs: a peer clock or an action gets this launcher's stamp on its way to the game (LinkWatch::stamp_write)
+    let stamped;
+    let payload = if kind == MessageKind::PeerClock || kind == MessageKind::Action {
+        stamped = shared.watch().stamp_write(kind, payload.to_vec(), linkwatch::wall_ms(), Instant::now());
+        &stamped[..]
+    } else {
+        payload
+    };
     let view;
     let payload = if kind == MessageKind::Permissions {
         match resync::permissions_for_game(payload, me) {
@@ -463,7 +503,9 @@ fn read_from_game(link: &mut gamelink::Session, shared: &Shared) -> Vec<(Message
     let mut out = Vec::new();
     for line in lines {
         match from_game_line(&line) {
-            Ok(m) => {
+            Ok(mut m) => {
+                // the latency logs: a clock or an action gets this launcher's read stamp (LinkWatch::stamp_read)
+                m.1 = shared.watch().stamp_read(m.0, m.1, linkwatch::wall_ms(), Instant::now());
                 if m.0 == MessageKind::Hello {
                     // a script that starts says hello once: the world is up (again)
                     shared.update(|s| s.reloading = false);
@@ -521,6 +563,7 @@ pub fn run_host_over<T: HostTransport + Sync>(
     let par_secret = secret_from_key(key.key());
     let local_addr = net.local_addr();
     let mut host = HostSession::new(key, &name, clock_fn(), options);
+    host.set_wall_clock(Box::new(linkwatch::wall_ms));
     link.write_identity(HostSession::HOST_ID, host.host_name(), Role::Host.as_str())?;
     let shared = Shared::new(Status::new(Role::Host, host.host_name()), echo_log);
     *shared.bulk.lock().unwrap_or_else(|p| p.into_inner()) = bulk;
@@ -606,6 +649,7 @@ fn host_loop(
             outputs.extend(host.tick());
         }
         host_dispatch(outputs, link, io);
+        shared.link_minute();
         // a save on its way: a few more chunks, as far as the receivers take them
         io.pump(host, link);
         refresh_host_status(host, io.net, shared);
@@ -671,11 +715,17 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
             }
             HostOutput::ChecksumCompleted(outcome) => {
                 let result = SyncResult::from_outcome(&outcome);
+                // a part a game reported not ready was not compared: said in the line, never counted as a difference
+                let unknown = if outcome.ready() {
+                    String::new()
+                } else {
+                    format!("; not ready (not compared): {}", outcome.describe_not_ready())
+                };
                 shared.log(if result.identical() {
-                    format!("checksum {} identical across {} game(s)", result.n, result.reporters.len())
+                    format!("checksum {} identical across {} game(s){unknown}", result.n, result.reporters.len())
                 } else {
                     format!(
-                        "checksum {} differs in {}",
+                        "checksum {} differs in {}{unknown}",
                         result.n,
                         ChecksumPolicy::describe_parts(result.differing.iter().map(String::as_str))
                     )
@@ -796,6 +846,7 @@ pub fn run_player_over(
         progress,
     })?;
     let mut player = PlayerSession::new(config.key.clone(), &config.name, &config.version);
+    player.set_wall_clock(Box::new(linkwatch::wall_ms));
     player.set_capabilities(capabilities_of(first.as_ref(), !config.save_dirs.is_empty()));
     if first.par_capable() && !config.save_dirs.is_empty() {
         enable_par(first.as_ref(), &config);
@@ -976,6 +1027,17 @@ impl PlayerLoop {
             if self.dispatch(outputs, &mut clocks, shared) {
                 return;
             }
+            {
+                // the latency logs: this player's offset and round trip as the host's pings report them
+                let mut watch = shared.watch();
+                watch.offset = self.player.wall_offset_ms();
+                let rtt = self.player.rtt_ms();
+                if rtt.is_some() && rtt != watch.rtt_ms {
+                    watch.rtt_sample(rtt.unwrap_or(0.0));
+                }
+                watch.rtt_ms = rtt;
+            }
+            shared.link_minute();
             if self.net.is_some() && self.player.state() == PlayerState::Joined {
                 // welcomed: the outage is over, whatever it took
                 retry = None;
@@ -1087,6 +1149,7 @@ impl PlayerLoop {
                     Some(ticket) => PlayerSession::resuming(key, name, version, ticket),
                     None => PlayerSession::new(key, name, version),
                 };
+                self.player.set_wall_clock(Box::new(linkwatch::wall_ms));
                 self.player.set_capabilities(capabilities_of(net.as_ref(), !self.config.save_dirs.is_empty()));
                 if net.par_capable() && !self.config.save_dirs.is_empty() {
                     enable_par(net.as_ref(), &self.config);
@@ -1224,6 +1287,22 @@ mod tests {
     }
 
     #[test]
+    fn an_action_applied_line_is_an_applied_verdict_and_an_action_refused_line_a_refusal() {
+        let line = |kind: &str| Line {
+            kind: kind.to_owned(),
+            from: "0".to_owned(),
+            payload: r#"{seq=4,from=1,detail=""}"#.to_owned(),
+        };
+        let (kind, json) = from_game_line(&line("action_applied")).unwrap();
+        assert_eq!(kind, MessageKind::ActionRefused);
+        let m: feverlink3_core::session::ActionRefusedMessage = serde_json::from_slice(&json).unwrap();
+        assert!(m.applied && m.from == 1 && m.seq == 4);
+        let (_, json) = from_game_line(&line("action_refused")).unwrap();
+        let m: feverlink3_core::session::ActionRefusedMessage = serde_json::from_slice(&json).unwrap();
+        assert!(!m.applied);
+    }
+
+    #[test]
     fn the_host_holds_a_slot_longer_than_a_player_keeps_trying() {
         let dir = tempfile::tempdir().unwrap();
         let link = gamelink::Session::create_under(dir.path(), "p").unwrap();
@@ -1266,15 +1345,14 @@ mod tests {
         );
         assert!(to_game_line(MessageKind::Action, br#"{"stamp":1,"seq":1,"body":5}"#).is_none());
 
-        let line =
-            Line { seq: 1, kind: "hello".into(), from: "5".into(), payload: r#"{["time"]=1200,["name"]="x"}"#.into() };
+        let line = Line { kind: "hello".into(), from: "5".into(), payload: r#"{["time"]=1200,["name"]="x"}"#.into() };
         let (kind, json) = from_game_line(&line).unwrap();
         assert_eq!(kind, MessageKind::Hello);
         let hello: feverlink3_core::session::HelloMessage = codec::try_decode(&json).unwrap();
         assert_eq!(hello.time, 1200);
-        let line = Line { seq: 2, kind: "session".into(), from: "0".into(), payload: "{}".into() };
+        let line = Line { kind: "session".into(), from: "0".into(), payload: "{}".into() };
         assert!(from_game_line(&line).is_err());
-        let line = Line { seq: 3, kind: "clock".into(), from: "0".into(), payload: "os.exit()".into() };
+        let line = Line { kind: "clock".into(), from: "0".into(), payload: "os.exit()".into() };
         assert!(from_game_line(&line).is_err());
     }
 }

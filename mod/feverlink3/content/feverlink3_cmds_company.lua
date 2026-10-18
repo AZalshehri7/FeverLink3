@@ -52,7 +52,7 @@ end
 local integerText
 do
 	local okC, C = pcall(ug_require, "feverlink3_common.lua")
-	if not okC then okC, C = pcall(ug_require, "feverlink3_1::/feverlink3_common.lua") end
+	if not okC then okC, C = pcall(ug_require, "feverlink3::/feverlink3_common.lua") end
 	integerText = okC and type(C) == "table" and C.integerText or function(n) return string.format("%.0f", n) end
 end
 
@@ -588,29 +588,45 @@ end
 
 -- An applied action: info = { fn, category, cost?, created? = { key, kind } }. `cost` is the money the action took
 -- (negative: it paid back), nil when the account cannot be read: the action is counted and no money is booked.
+-- The money part of an applied action alone (Co.record's, also used when the cost is measured a step later: Co.bookCost).
+local function bookCost(co, led, from, at, category, cost)
+	cost = tonumber(cost)
+	if cost == nil or cost ~= cost then return false end
+	cost = round(cost)
+	if cost > 0 then
+		led.gross[category] = (led.gross[category] or 0) + cost
+		local idx = periodIndex(co.limits[from] and co.limits[from].per, at)
+		if led.per.idx ~= idx then led.per = { idx = idx, gross = 0 } end
+		led.per.gross = led.per.gross + cost
+	elseif cost < 0 then
+		led.refund = led.refund - cost
+	end
+	return cost ~= 0
+end
+
 function Co.record(co, from, at, info)
 	local led = ledgerOf(co, from)
 	local category = info.category or "other"
 	led.n[category] = (led.n[category] or 0) + 1
 	if info.fn then led.made[info.fn] = (led.made[info.fn] or 0) + 1 end
-	local cost = tonumber(info.cost)
-	if cost ~= nil and cost == cost then
-		cost = round(cost)
-		if cost > 0 then
-			led.gross[category] = (led.gross[category] or 0) + cost
-			local idx = periodIndex(co.limits[from] and co.limits[from].per, at)
-			if led.per.idx ~= idx then led.per = { idx = idx, gross = 0 } end
-			led.per.gross = led.per.gross + cost
-		elseif cost < 0 then
-			led.refund = led.refund - cost
-		end
-	end
+	bookCost(co, led, from, at, category, info.cost)
 	if info.created and info.created.key then
 		if co.made[info.created.key] == nil then co.nmade = co.nmade + 1 end
 		co.made[info.created.key] = { kind = info.created.kind, by = from, at = tonumber(at) or 0 }
 		if co.nmade > Co.MADE_MAX then forgetOldest(co) end
 	end
 	bump(co)
+end
+
+-- The cost of an action already recorded (counted by Co.record with no cost), measured later: the simulation state's sendCommand only
+-- queues the command and the engine runs it after the script's update, so the account read right after the send has not moved yet
+-- (friend test 2026-10-16: 82 builds and 15 vehicles bought, every ledger said spent 0). Gross and refund stay out of the checksum
+-- (Co.digest). Returns whether money was booked.
+function Co.bookCost(co, from, at, category, cost)
+	if type(co) ~= "table" or from == nil then return false end
+	local booked = bookCost(co, ledgerOf(co, from), from, at, category or "other", cost)
+	if booked then bump(co) end
+	return booked
 end
 
 -- ------------------------------------------------------------------ the bridge's two calls around an action
@@ -829,6 +845,8 @@ end
 -- And while a local company is set, engine.account and engine.bookJournal (the money the checksum compares and the host
 -- corrects) keep reading and booking the savegame's player, not the company the windows act as.
 -- deps.sender() -> the original api.cmd.sendCommand (the bridge's wrapped one would capture the booking as a player action).
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): setLocalCompany replaces api.engine.util.getPlayer; the API
+-- has no documented way to set the player the windows act as.
 function Co.extendEngine(engine, deps)
 	deps = deps or {}
 	-- The game's own getPlayer, kept in package.loaded: a savegame reload runs this file again in the same Lua state,
@@ -982,6 +1000,7 @@ commands.makeEntitySetPlayerCmd = {
 
 -- feverlink3Company({ op = ..., ... }): one registry operation, replicated like a game command (stamped, applied on
 -- every game at the stamp, in order) but with no engine command: the bridge makes its factory and runs `apply`.
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): a factory of the mod's own in api.cmd (no engine command).
 commands.feverlink3Company = {
 	virtual = true,
 	category = "other",

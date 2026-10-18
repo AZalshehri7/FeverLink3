@@ -31,17 +31,35 @@ function L.newSession()
 end
 
 -- Applies a `session` payload {started, speed, pauseAt?, lead}. Returns true when anything changed.
+-- `s.loadedAt` (L.loadedAt): this world was loaded by a resync at that time. A pause before it is the pause of the world this game
+-- left, a step this world never stood at: every game loaded the same save, so every game stands at loadedAt, and that is the pause.
+-- Real friend test 2026-10-16: the session still said pauseAt 10341800 after both games had loaded the save at 10342400; a build
+-- stamped at the stale pause reached the other game 3 steps after its stamp (LATE, a fork, another resync).
 function L.applySession(s, p)
 	if type(p) ~= "table" then return false end
 	local started = p.started == true
 	local speed = tonumber(p.speed) or 0
 	local pauseAt = tonumber(p.pauseAt)
+	if pauseAt and type(s.loadedAt) == "number" and pauseAt < s.loadedAt then pauseAt = s.loadedAt end
 	local lead = tonumber(p.lead) or s.lead
 	local changed = started ~= s.started or speed ~= s.speed or pauseAt ~= s.pauseAt or lead ~= s.lead
 	-- the pause that just ended: an item stamped at it may still arrive while this game sits at that time (L.applyNow)
 	if s.pauseAt ~= nil and pauseAt == nil then s.lastPauseAt = s.pauseAt end
 	s.started, s.speed, s.pauseAt, s.lead = started, speed, pauseAt, lead
 	return changed
+end
+
+-- This world was loaded by a resync at game time `t`: no pause of the session may lie before it (L.applySession), and one that
+-- already does moves to `t`. Returns the pause it replaced, or nil.
+function L.loadedAt(s, t)
+	if type(t) ~= "number" then return nil end
+	s.loadedAt = t
+	local old = s.pauseAt
+	if old and old < t then
+		s.pauseAt = t
+		return old
+	end
+	return nil
 end
 
 -- The lead a game adds to its clock when stamping. The host's value is the floor: a game may raise it (minLead),
@@ -92,6 +110,9 @@ end
 --                           skips the round: ChecksumOutcome.time_skew).
 function L.pace(s, peers, now, ahead, marks)
 	if not s.started then return 0 end
+	-- holdAt: every game holds at the place of a build in the pause order until its record came (the bridge's X.slotHold), the resume too
+	local hold = type(s.holdAt) == "number" and s.holdAt or nil
+	if hold and now >= hold then return 0 end
 	local want = s.speed or 0
 	-- standing at a pause, with an action of the pause the host stamped further on (pauseRun: one step past the furthest place a game
 	-- stands, see the bridge's pause order): run on to it, one step a batch, the least the pause's world can move. The simulation applies
@@ -110,6 +131,7 @@ function L.pace(s, peers, now, ahead, marks)
 		if room < want then want = room end
 	end
 	local stopAt = run and s.pauseRun or s.pauseAt
+	if hold and (stopAt == nil or hold < stopAt) then stopAt = hold end
 	local slowest = L.slowestPeer(peers)
 	if slowest then
 		local limit = slowest + (ahead or L.aheadFor(want)) * L.STEP
@@ -451,6 +473,11 @@ L.EVENT_SPEC = {
 	category = "other",
 	categoryFor = function(args)
 		local h = eventHandler(args[2], args[3])
+		-- a handler's localFor(param): this parameter makes the event the sender's own setting (the Local time-of-day mode)
+		if h and h.localFor then
+			local ok, own = pcall(h.localFor, args[4])
+			if ok and own then return "local" end
+		end
 		return h and h.category or "local"
 	end,
 	encode = function(name, args, ctx)
@@ -762,6 +789,12 @@ function L.categoryOf(name, args)
 	return "other"
 end
 
+-- A command's name in the player's words, for the chat: "makeLineUpdateCmd" -> "line update".
+function L.commandWords(name)
+	local s = tostring(name):gsub("^make", ""):gsub("Cmd$", "")
+	return (s:gsub("(%l)(%u)", "%1 %2"):lower())
+end
+
 -- Everything is allowed until the host says otherwise.
 function L.newPermissions()
 	return { build = true, bulldoze = true, spend = true, other = true }
@@ -906,33 +939,6 @@ local function stationsLane(engine)
 	return sortedItems(keys)
 end
 
--- road and rail edges: endpoints (canonical order), street type, template/style, decorations and the models of the edge
--- objects (signals, stops, ...) in a canonical order
-local function edgesLane(engine)
-	local keys = {}
-	for _, e in ipairs(engine.edges()) do
-		local a, b = r1(e.x0) .. "," .. r1(e.y0), r1(e.x1) .. "," .. r1(e.y1)
-		if a > b then a, b = b, a end
-		local objs = {}
-		for _, m in ipairs(e.objects or {}) do objs[#objs + 1] = tostring(m) end
-		table.sort(objs)
-		keys[#keys + 1] = a .. "-" .. b .. "/" .. tostring(e.type) .. "/" .. tostring(e.typeIndex) .. "/" .. tostring(e.roadType)
-			.. "/" .. tostring(e.template) .. "/" .. tostring(e.style) .. "/d" .. tostring(e.decorations or 0)
-			.. "/o" .. table.concat(objs, ",")
-	end
-	return sortedItems(keys)
-end
-
--- lane connections, crosswalks and traffic lights of the nodes (a drift part: see ChecksumPolicy::DRIFT_PARTS)
-local function nodeConfigsLane(engine)
-	local keys = {}
-	for _, n in ipairs(engine.nodeConfigs()) do
-		keys[#keys + 1] = r1(n.x) .. "," .. r1(n.y) .. "/" .. tostring(n.lanes) .. "/" .. tostring(n.crosswalks)
-			.. "/" .. tostring(n.preference) .. "/" .. tostring(n.light) .. "/" .. tostring(n.slip)
-	end
-	return sortedItems(keys)
-end
-
 -- vehicles (a drift part): per line key (name and stop count) the number of vehicles and their sorted coarse states
 -- (state, stopped by the player, to be sold); positions are left out on purpose
 local function vehiclesLane(engine)
@@ -951,24 +957,23 @@ local function vehiclesLane(engine)
 	return sortedItems(keys)
 end
 
--- names of station groups, lines, towns and players (engine.names() -> { stations = {...}, lines = {...}, ... })
+-- names of station groups, lines, towns and players (engine.names() -> { stations = {...}, lines = {...}, ... }), itemised one
+-- "<kind>|<name>" per entity like the other lanes, so the detail of a full round (detail_*.txt at a resync) says which entity's
+-- name differs (the friend test 2026-10-16 could only say "names")
 local function namesLane(engine)
-	local all, out = engine.names(), {}
+	local all, keys = engine.names(), {}
 	for _, kind in ipairs({ "stations", "lines", "towns", "players" }) do
-		local list = {}
-		for _, nm in ipairs(all[kind] or {}) do list[#list + 1] = tostring(nm) end
-		table.sort(list)
-		out[kind] = list
+		for _, nm in ipairs(all[kind] or {}) do keys[#keys + 1] = kind .. "|" .. tostring(nm) end
 	end
-	return out
+	return sortedItems(keys)
 end
 
 -- entity ids (a heavy lane, the only one that hashes ids): edges, constructions and town buildings, each sorted. The engine takes every new
 -- entity's id from one FIFO of free ids, so the ids are equal on every game only while every build is applied at the same step on every
 -- game (the stamp rule); any path that misses it shifts all later ids (native id trace, 2026-10-14) and a later build naming such an
 -- entity would touch another one. The content lanes cannot see that; this lane makes it a difference the host repairs.
-local function idsLane(engine)
-	local all, items = engine.entityIds(), {}
+local function idsLane(all)
+	local items = {}
 	for _, kind in ipairs({ "edges", "constructions", "townBuildings" }) do
 		local list = all[kind] or {}
 		local s = {}
@@ -978,42 +983,160 @@ local function idsLane(engine)
 	return { n = #items, items = items }
 end
 
+-- ---- the heavy lanes, read a chunk of entities at a time (a spread round)
+--
+-- Real runs 2026-10-15/16 (friend test, airport run): a full round read about 6500 entities (1600 edges, 1600 constructions, 1700 town
+-- buildings, their nodes) in 370-480 ms of ONE simulation step, 1.0 s at worst, 165-200 ms on the fastest PC: the game stood still about
+-- once a minute. A full round is now spread (ChecksumRequestMessage.spread): at its stamp every game hashes the light lanes and the
+-- ids lane and takes the entity lists of the heavy lanes; then, one chunk every `spread` steps after it, it reads the next CHECKSUM_CHUNK
+-- entities of those lists. The chunks are cut by COUNT, never by time, and fall at the same steps on every game (each is a landing
+-- mark, L.pace): every game reads every entity at the same simulation step, so games that agree give the same hashes and a world that
+-- differs still shows. What a round sees is the world of each chunk's step (an entity built or grown after the stamp is not in the
+-- lists; one removed reads as nothing), the same on every game. Each entity's key is hashed as it is read and the lane is the
+-- order-free sum of those hashes (a multiset hash, mod 2^32): no sort and no rehash of the whole lane at the end.
+L.CHECKSUM_CHUNK = 200       -- entities a step reads (about 80 us each on the slowest PC measured: ~16 ms; owner's target <= 16-30 ms)
+L.CHECKSUM_MAX_CHUNKS = 48   -- a larger world reads more entities a chunk, so a round never lasts longer than this many chunks
+L.CHECKSUM_FRAME_BUDGET_MS = 30  -- what one step of a spread round should cost at most: a chunk above it is counted in the round's log line
+L.TOWN_PART_LIMIT = 48       -- `townBuildings:<town>` parts for the first this many towns (the host accepts at most 128 parts)
+
+-- the key of one entity of a heavy lane: the same text from a list accessor (mocks) and from the one-entity readers (the game)
+local CS = {}
+function CS.construction(c) return string.format("%s@%.2f,%.2f,%.2f", tostring(c.file), c.x or 0, c.y or 0, c.z or 0) end
+-- road and rail edges: endpoints (canonical order), street type, template/style, decorations and the models of the edge
+-- objects (signals, stops, ...) in a canonical order
+function CS.edge(e)
+	local a, b = r1(e.x0) .. "," .. r1(e.y0), r1(e.x1) .. "," .. r1(e.y1)
+	if a > b then a, b = b, a end
+	local objs = {}
+	for _, m in ipairs(e.objects or {}) do objs[#objs + 1] = tostring(m) end
+	table.sort(objs)
+	return a .. "-" .. b .. "/" .. tostring(e.type) .. "/" .. tostring(e.typeIndex) .. "/" .. tostring(e.roadType)
+		.. "/" .. tostring(e.template) .. "/" .. tostring(e.style) .. "/d" .. tostring(e.decorations or 0)
+		.. "/o" .. table.concat(objs, ",")
+end
+-- lane connections, crosswalks and traffic lights of the nodes (a drift part: see ChecksumPolicy::DRIFT_PARTS)
+function CS.nodeConfig(n)
+	return r1(n.x) .. "," .. r1(n.y) .. "/" .. tostring(n.lanes) .. "/" .. tostring(n.crosswalks)
+		.. "/" .. tostring(n.preference) .. "/" .. tostring(n.light) .. "/" .. tostring(n.slip)
+end
+-- what the towns have grown (idea from MPFever (MIT): a `townBuildings` part): model, place, level, depth, parcels, time built
+function CS.townBuilding(b)
+	return string.format("%s@%.1f,%.1f,%.1f/L%s/D%s/P%s/T%s", tostring(b.file), b.x or 0, b.y or 0, b.z or 0, tostring(b.level),
+		tostring(b.depth), tostring(b.parcels or 0), tostring(b.timeBuilt))
+end
+
+-- Each heavy lane: `has` (the engine can give it), `ids` (the list taken at the stamp: entity ids, or the records of a list accessor) and
+-- `read` (one entry -> a record, nil when the entity is gone). Read in this order, one cursor across all of them.
+local function streetIds(engine, ctx)
+	if ctx.street == nil then ctx.street = engine.streetIds() or {} end
+	return ctx.street
+end
+L.SPREAD_LANES = {
+	{ name = "constructions", key = CS.construction,
+		has = function() return true end,   -- always a part (an engine without any accessor reports "error", as it always did)
+		ids = function(e, ctx)
+			if e.construction then return ctx.ids and ctx.ids.constructions or e.constructionIds() end
+			return e.constructions()
+		end,
+		read = function(e, x) if e.construction then return e.construction(x) end return x end },
+	{ name = "edges", key = CS.edge,
+		has = function(e) return (e.edge and e.streetIds) or e.edges end,
+		ids = function(e, ctx) if e.edge and e.streetIds then return streetIds(e, ctx).edges or {} end return e.edges() end,
+		read = function(e, x, ctx) if e.edge and e.streetIds then return e.edge(x, ctx) end return x end },
+	{ name = "nodeConfigs", key = CS.nodeConfig,
+		has = function(e) return (e.nodeConfig and e.streetIds) or e.nodeConfigs end,
+		ids = function(e, ctx) if e.nodeConfig and e.streetIds then return streetIds(e, ctx).nodes or {} end return e.nodeConfigs() end,
+		read = function(e, x) if e.nodeConfig and e.streetIds then return e.nodeConfig(x) end return x end },
+	{ name = "townBuildings", key = CS.townBuilding, towns = true,
+		has = function(e) return e.townBuilding end,
+		ids = function(e, ctx) return ctx.ids and ctx.ids.townBuildings or e.townBuildingIds() end,
+		read = function(e, x) return e.townBuilding(x) end },
+}
+
+function CS.readRange(r, ln, from, to)
+	local spec, engine, ctx, keyHash = ln.spec, r.engine, r.ctx, r.keyHash
+	for i = from, to do
+		local v = spec.read(engine, ln.ids[i], ctx)
+		if v ~= nil then
+			local key = spec.key(v)
+			local h = keyHash(key)
+			ln.n, ln.sum = ln.n + 1, (ln.sum + h) % 4294967296
+			if spec.towns then
+				local town = v.town or -1
+				local t = ln.towns[town]
+				if not t then t = { n = 0, sum = 0 }; ln.towns[town] = t end
+				t.n, t.sum = t.n + 1, (t.sum + h) % 4294967296
+				if ln.keys then ln.keys[#ln.keys + 1] = tostring(town) .. "|" .. key end
+			elseif ln.keys then
+				ln.keys[#ln.keys + 1] = key
+			end
+		end
+	end
+end
+
+function CS.finishLane(r, ln)
+	local name, parts, hash = ln.spec.name, r.parts, r.hash
+	if ln.failed then
+		parts[name] = "error"
+		r.errors[name] = ln.failed
+		return
+	end
+	if ln.spec.towns then
+		-- `townBuildings` = "<total>/<hash of all towns>", `townBuildings:<town id>` = "<count>/<hash>" for the first TOWN_PART_LIMIT towns
+		-- (the town entity id only names the part: towns come from the savegame, so it agrees)
+		local towns, all = {}, {}
+		for town in pairs(ln.towns) do towns[#towns + 1] = town end
+		table.sort(towns)
+		for i, town in ipairs(towns) do
+			local t = ln.towns[town]
+			all[i] = { town = town, n = t.n, sum = t.sum }
+			if i <= L.TOWN_PART_LIMIT then parts[name .. ":" .. tostring(town)] = t.n .. "/" .. hash({ n = t.n, sum = t.sum }) end
+		end
+		parts[name] = ln.n .. "/" .. hash(all)
+	else
+		parts[name] = hash({ n = ln.n, sum = ln.sum })
+	end
+	if r.detail and ln.keys then r.detail[name] = ln.keys end
+end
+
 -- Parts over an engine accessor:
 --   engine.gameTime()       -> number
 --   engine.account()        -> balance, loan
---   engine.constructions()  -> list of { file = string, x, y, z }
 --   engine.lines()          -> list of { stops = number }
+--   heavy lanes (L.SPREAD_LANES): engine.constructionIds() + engine.construction(e) -> { file, x, y, z }, or engine.constructions() -> list of
+--   those; engine.streetIds() -> { edges = {...}, nodes = {...} } + engine.edge(e, ctx) / engine.nodeConfig(n), or engine.edges() /
+--   engine.nodeConfigs(); engine.townBuildingIds() + engine.townBuilding(e) -> { town, file, x, y, z, level, depth, parcels, timeBuilt }
 -- Each part is hashed separately so the launcher can name the differing one. Entity ids enter only the `ids` lane:
 -- constructions are compared by file and position, lines by their stop counts, both sorted.
--- `timing` (optional table): filled with the seconds each part took (observation only, never part of the result).
--- `light` (optional, true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
+-- `light` (true): a light round, the heavy lanes are left out (L.HEAVY_LANES; the host asks for a full round every Nth time,
 -- see ChecksumRequestMessage.full). Each of those costs one component read per edge, node, construction or town building.
+-- opts: detail (a table: filled with the itemised keys of every lane), clock (seconds; observation only, never part of the result),
+-- keyHash (key -> 32-bit number; default: the hex of hashFn), chunk (entities a step reads), maxChunks.
+-- What it does now: the time, the light lanes, the ids lane and the entity lists of the heavy lanes. L.checksumRoundStep reads the rest.
 L.HEAVY_LANES = { constructions = true, edges = true, nodeConfigs = true, townBuildings = true, ids = true }
-function L.checksumParts(engine, hashFn, timing, light, detail)
-	local parts = {}
-	local clock = timing and function() local ok, v = pcall(os.clock); return ok and tonumber(v) or 0 end or nil
+function L.newChecksumRound(engine, hashFn, light, opts)
+	opts = opts or {}
+	local clock = opts.clock or function() return 0 end
+	local r = {
+		engine = engine, hash = hashFn, light = light == true, parts = {}, timing = {}, detail = opts.detail, errors = {}, lanes = {},
+		li = 1, pos = 1, total = 0, ctx = {}, clock = clock, steps = 0, frameMax = 0, frameLanes = {},
+		keyHash = opts.keyHash or function(k) return tonumber(hashFn(k), 16) or 0 end,
+	}
+	local parts, timing, detail = r.parts, r.timing, r.detail
+	local t0 = clock()
 	local function part(name, fn)
-		if light and L.HEAVY_LANES[name] then return end
-		local t0 = clock and clock() or 0
+		if r.light and L.HEAVY_LANES[name] then return end
+		local tp = clock()
 		local ok, v = pcall(fn)
 		parts[name] = ok and hashFn(v) or "error"
 		if ok and detail and type(v) == "table" and type(v.items) == "table" then detail[name] = v.items end
-		if clock then timing[name] = clock() - t0 end
+		timing[name] = clock() - tp
 	end
 	local okT, t = pcall(engine.gameTime)
-	t = okT and t or -1
-	parts.time = hashFn(t)
+	r.time = okT and t or -1
+	parts.time = hashFn(r.time)
 	part("balance", function() local balance = engine.account(); return balance end)
 	part("loan", function() local _, loan = engine.account(); return loan end)
-	part("constructions", function()
-		local list = engine.constructions()
-		local keys = {}
-		for _, c in ipairs(list) do
-			keys[#keys + 1] = string.format("%s@%.2f,%.2f,%.2f", tostring(c.file), c.x or 0, c.y or 0, c.z or 0)
-		end
-		table.sort(keys)
-		return { n = #list, items = keys }
-	end)
 	part("lines", function()
 		local list = engine.lines()
 		local keys = {}
@@ -1024,18 +1147,95 @@ function L.checksumParts(engine, hashFn, timing, light, detail)
 	-- wider lanes: each is skipped when the engine has no accessor of that name
 	local function lane(name, fn) if engine[name] then part(name, function() return fn(engine) end) end end
 	lane("stations", stationsLane)
-	lane("edges", edgesLane)
-	lane("nodeConfigs", nodeConfigsLane)
 	lane("vehicles", vehiclesLane)
 	lane("names", namesLane)
-	if engine.entityIds then part("ids", function() return idsLane(engine) end) end
-	return parts, t
+	if engine.entityIds then part("ids", function() local all = engine.entityIds(); r.ctx.ids = all; return idsLane(all) end) end
+	if not r.light then
+		for _, spec in ipairs(L.SPREAD_LANES) do
+			if spec.has(engine) then
+				local tl = clock()
+				local ok, ids = pcall(spec.ids, engine, r.ctx)
+				local ln = { spec = spec, ids = (ok and type(ids) == "table") and ids or {}, n = 0, sum = 0, towns = {}, keys = detail and {} or nil }
+				if not ok then ln.failed = tostring(ids) end
+				r.lanes[#r.lanes + 1] = ln
+				r.total = r.total + #ln.ids
+				timing[spec.name] = clock() - tl
+			end
+		end
+	end
+	r.chunk = math.max(opts.chunk or L.CHECKSUM_CHUNK, math.ceil(r.total / (opts.maxChunks or L.CHECKSUM_MAX_CHUNKS)))
+	r.chunks = math.ceil(r.total / r.chunk)   -- the steps after the stamp that read entities (0: nothing to read)
+	r.startCost = clock() - t0
+	r.done = #r.lanes == 0
+	return r
 end
 
--- A `checksum_request` payload {n, at, paused} as a queue item.
+-- Reads the next chunk (r.chunk entities, across the lanes in order) and finishes every lane it completes. True once every lane is done:
+-- r.parts is then final. r.frame is what this call cost (seconds, by lane); r.frameMax / r.frameLanes the costliest call so far.
+function L.checksumRoundStep(r)
+	local budget, clock, frame, total = r.chunk, r.clock, {}, 0
+	while r.li <= #r.lanes do
+		local ln = r.lanes[r.li]
+		local count = #ln.ids
+		if budget <= 0 and r.pos <= count then break end
+		local last = math.min(count, r.pos + budget - 1)
+		local t0 = clock()
+		if not ln.failed and last >= r.pos then
+			local ok, err = pcall(CS.readRange, r, ln, r.pos, last)
+			if not ok then ln.failed = tostring(err) end
+		end
+		if last >= r.pos then budget = budget - (last - r.pos + 1) end
+		if last >= count then
+			CS.finishLane(r, ln)
+			r.li, r.pos = r.li + 1, 1
+		else
+			r.pos = last + 1
+		end
+		local dt = clock() - t0
+		local name = ln.spec.name
+		frame[name] = (frame[name] or 0) + dt
+		r.timing[name] = (r.timing[name] or 0) + dt
+		total = total + dt
+	end
+	r.steps = r.steps + 1
+	r.frame = frame
+	if total > r.frameMax then r.frameMax, r.frameLanes = total, frame end
+	r.done = r.li > #r.lanes
+	return r.done
+end
+
+-- The whole round at once (a light round, a paused one, a request without `spread`): parts and the time they were taken at.
+-- `timing` (optional table): filled with the seconds each part took (observation only, never part of the result).
+function L.checksumParts(engine, hashFn, timing, light, detail, keyHash)
+	local clock = timing and function() local ok, v = pcall(L.clock); return ok and tonumber(v) or 0 end or nil
+	local r = L.newChecksumRound(engine, hashFn, light, { detail = detail, clock = clock, keyHash = keyHash, chunk = math.huge })
+	while not r.done do L.checksumRoundStep(r) end
+	if timing then for k, v in pairs(r.timing) do timing[k] = v end end
+	return r.parts, r.time
+end
+
+-- A `checksum_request` payload {n, at, paused, full?, spread?} as a queue item.
 function L.checksumItem(p)
 	if type(p) ~= "table" or type(p.n) ~= "number" or type(p.at) ~= "number" then return nil end
-	return { kind = "checksum", at = p.at, n = p.n, paused = p.paused == true, full = p.full ~= false }
+	local spread = math.floor(tonumber(p.spread) or 0)
+	if spread < 0 or spread > 16 then spread = 0 end
+	return { kind = "checksum", at = p.at, n = p.n, paused = p.paused == true, full = p.full ~= false, spread = spread }
+end
+
+-- The steps at which a spread round reads its chunks (each a landing mark, so every game reads it at exactly that step): the
+-- CHECKSUM_MAX_CHUNKS steps `spread` apart after the stamp (a game knows how many it needs only at the stamp; the marks of the chunks a
+-- round did not need are dropped when its report is sent). Empty for a round hashed whole.
+function L.checksumMarks(it)
+	local out = {}
+	if type(it) == "table" and it.full and not it.paused and (it.spread or 0) > 0 then
+		for k = 1, L.CHECKSUM_MAX_CHUNKS do out[k] = it.at + k * it.spread * L.STEP end
+	end
+	return out
+end
+
+-- The step at which chunk k (1-based) of round r is read: `spread` steps apart after the step the round started at.
+function L.checksumChunkAt(r, k)
+	return r.start + k * r.spread * L.STEP
 end
 
 -- An `action` record from the link as a queue item; `from` is the sender id the launcher attached.

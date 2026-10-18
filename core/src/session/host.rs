@@ -8,17 +8,20 @@ use sha2::Sha256;
 use super::checksum::{ChecksumOutcome, ChecksumRounds};
 use super::kind::MessageKind;
 use super::limits::RateLimiter;
-use super::lockstep::{Lockstep, PlayerClock};
+use super::linkstats::{HostLinkStats, OffsetEstimate};
+use super::lockstep::{LeadMeter, Lockstep, PlayerClock};
 use super::messages::{
-    codec, ActionMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage, ChallengeMessage, ChatMessage,
-    ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, JoinMessage, PeerClockMessage, Permissions,
-    PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage, PongMessage, RejectMessage, ReplayFailedMessage,
-    ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState, SpeedRequestMessage, WelcomeMessage,
+    codec, ActionMessage, ActionRefusedMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage,
+    ChallengeMessage, ChatMessage, ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, HelloMessage, Hops,
+    JoinMessage, PeerClockMessage, Permissions, PingMessage, PlayerInfo, PlayerJoinedMessage, PlayerLeftMessage,
+    PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState,
+    SpeedRequestMessage, WelcomeMessage,
 };
 use super::names::Names;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
 use super::resync::ResyncState;
 use super::roster::{ConnectionState, RosterEntry};
+use super::verdict::VerdictBook;
 use crate::crypto::{Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
 
@@ -47,10 +50,17 @@ pub struct HostOptions {
     /// With a reloading host: send the host's game its load while the players still download (default true) instead of
     /// together with them after the transfer. A lab experiment switch (FEVERLINK3_HOST_LOAD_EARLY=0).
     pub host_loads_early: bool,
-    /// Every Nth checksum round is a FULL one; the rounds in between are light (no edges, constructions, node settings or town
-    /// buildings: about a second of game thread in a big world, see `ChecksumPolicy::HEAVY_PARTS`). 1 makes every round full.
-    /// Paused rounds and the verification round of a resync are always full.
+    /// Every Nth checksum round is a FULL one; the rounds in between are light (no edges, constructions, node settings, town
+    /// buildings or ids, see `ChecksumPolicy::HEAVY_PARTS`). Default 1: every round is full. A running full round is spread over
+    /// the steps (chunks of entities, `ChecksumPolicy::spread_steps`), which made the light rounds unnecessary (lab 2026-10-18: 2896
+    /// entities in 15 chunks of 200 every 3 steps, step max 6.0 ms against a 30 ms budget; no round over 54 ms). A value above 1
+    /// (FEVERLINK3_FULL_CHECKSUM_EVERY) gives back the old light/full split for the lab. Paused rounds and the verification
+    /// round of a resync are always full and hashed whole.
     pub full_checksum_every: u32,
+    /// A regular (running) checksum round that has not been reported by every ready game after this long is dropped: a game
+    /// left mid-round or reloaded, and its report will never come. Until then the next regular round waits for it, so two
+    /// spread rounds never run at once.
+    pub checksum_round_timeout_seconds: f64,
     /// Frames per second one connection may send, on average. The frame that takes it over the limit gets the
     /// connection refused with reason `flood`. 0 turns the limit off. The host's own game is never limited.
     pub max_frames_per_second: u32,
@@ -86,7 +96,8 @@ impl Default for HostOptions {
             auto_resync: true,
             host_reloads: true,
             host_loads_early: true,
-            full_checksum_every: 6,
+            full_checksum_every: 1,
+            checksum_round_timeout_seconds: 60.0,
             max_frames_per_second: 500,
             frame_burst: 2000,
             max_bytes_per_second: 2 << 20,
@@ -98,6 +109,20 @@ impl Default for HostOptions {
         }
     }
 }
+
+/// Regular checksum rounds delayed because the previous one was still running (logged at most once a minute).
+#[derive(Debug, Default, Clone, Copy)]
+struct RoundWaits {
+    /// Start of the counting period (None: nothing counted yet).
+    since: Option<f64>,
+    count: u32,
+    longest: f64,
+    /// When the round now waiting first had to wait.
+    waiting_since: Option<f64>,
+}
+
+/// How often at most the host logs how many regular checksum rounds waited for the previous one.
+const ROUND_WAIT_LOG_SECONDS: f64 = 60.0;
 
 /// How long the lead wanted by the measured delays must stay below the one in force before the lead is shortened.
 const LEAD_SHRINK_AFTER_SECONDS: f64 = 8.0;
@@ -213,8 +238,17 @@ pub struct HostSession {
     clocks: BTreeMap<u16, PlayerClock>,
     /// Smoothed round-trip time per connected player, milliseconds.
     rtt_ms: BTreeMap<u16, f64>,
-    /// Pings sent and not yet answered, per player, oldest first: (n, host time sent).
-    pings: BTreeMap<u16, VecDeque<(u32, f64)>>,
+    /// Pings sent and not yet answered, per player, oldest first: (n, host time sent, host wall clock sent).
+    pings: BTreeMap<u16, VecDeque<(u32, f64, Option<i64>)>>,
+    /// The host's wall clock in ms since 1970 ([HostSession::set_wall_clock]); without it no line carries host stamps and no
+    /// offset is measured. Logs only.
+    wall: Option<Box<dyn Fn() -> i64 + Send>>,
+    /// Each player's wall clock offset to the host's, from the pongs (PongMessage::w).
+    wall_off: BTreeMap<u16, OffsetEstimate>,
+    /// The per-minute link.host lines: round trips and the gaps between the clocks the host handles.
+    link_stats: HostLinkStats,
+    /// The recent round trips and clock cadences the lead is made from ([`LeadMeter`], [`HostSession::wanted_lead`]).
+    lead_meter: LeadMeter,
     ping_n: u32,
     last_ping: f64,
     /// Host time of the last call that paces the host (a frame, a tick).
@@ -223,6 +257,8 @@ pub struct HostSession {
     /// counted against them.
     stall_until: f64,
     checksums: ChecksumRounds,
+    /// Every game's verdict of a build at its stamp, compared: only games whose verdicts differ have forked (verdict.rs).
+    verdicts: VerdictBook,
     /// Checksum rounds completed, and how many of them were skipped because the games hashed at different sim times.
     rounds_done: u32,
     rounds_skewed: u32,
@@ -242,6 +278,12 @@ pub struct HostSession {
     /// stayed lower for a while, so a single quick ping cannot make it too short).
     lead_lower_since: Option<f64>,
     last_checksum: f64,
+    /// The running checksum round still waiting for reports (its number and when it was asked): the next regular round waits
+    /// for it (`regular_round_running`).
+    running_round: Option<(i32, f64)>,
+    /// Regular rounds that had to wait for the previous one since the last log line about it: since when counted, how many,
+    /// the longest wait, and since when the current wait lasts.
+    round_waits: RoundWaits,
     host_name: String,
     state: SessionState,
     actions_relayed: u64,
@@ -304,11 +346,16 @@ impl HostSession {
             clocks: BTreeMap::new(),
             rtt_ms: BTreeMap::new(),
             pings: BTreeMap::new(),
+            wall: None,
+            wall_off: BTreeMap::new(),
+            link_stats: HostLinkStats::default(),
+            lead_meter: LeadMeter::default(),
             ping_n: 0,
             last_ping: f64::NEG_INFINITY,
             last_call: f64::NEG_INFINITY,
             stall_until: f64::NEG_INFINITY,
             checksums: ChecksumRounds::new(),
+            verdicts: VerdictBook::new(),
             rounds_done: 0,
             rounds_skewed: 0,
             permissions: Permissions::default(),
@@ -323,6 +370,8 @@ impl HostSession {
             last_session_broadcast: f64::NEG_INFINITY,
             lead_lower_since: None,
             last_checksum: f64::NEG_INFINITY,
+            running_round: None,
+            round_waits: RoundWaits::default(),
             host_name,
             state: SessionState {
                 started: false,
@@ -699,6 +748,11 @@ impl HostSession {
                 // the payload is the player's: a few bytes of it are enough for a log line
                 let shown = String::from_utf8_lossy(payload.get(..160).unwrap_or(payload));
                 self.log(format!("{} ready {}", self.name(from), clip(&shown, 120)));
+                // after a resync load: the session's pause moves to where the loaded world stands (before the round moves on, so the
+                // verify round and the session line this player is sent below already carry it)
+                if let Some(m) = codec::try_decode::<HelloMessage>(payload) {
+                    self.on_load_hello(from, m.time);
+                }
                 self.resync_step();
                 if from != Self::HOST_ID {
                     if let Some(connection) = self.connection_of(from) {
@@ -722,7 +776,10 @@ impl HostSession {
                         // a stop is the time the clock shows, nothing else; a game that makes no pause promise (an older mod)
                         // counts as standing still where its clock shows speed 0
                         let stop = if m.pause { m.stop.filter(|&s| s == m.t) } else { (m.speed == 0).then_some(m.t) };
-                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: self.now(), safe, stop });
+                        let now = self.now();
+                        self.clocks.insert(from, PlayerClock { t: m.t, speed: m.speed, at: now, safe, stop });
+                        self.link_stats.clock(from, now);
+                        self.lead_meter.clock(from, m.t, now);
                         self.resync_step();
                         self.flush_pause();
                         // a player cannot push every other game's stamps into the far future with an absurd margin
@@ -734,6 +791,7 @@ impl HostSession {
                             need,
                             safe,
                             pause: m.pause && safe.is_some(),
+                            hop: m.hop.as_ref().map(|h| self.relayed_hops(h, from)),
                         };
                         self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
                     }
@@ -760,6 +818,9 @@ impl HostSession {
                         self.log(format!("{who} may not {}; action relayed as refused", m.category));
                     }
                     m.pause_seq = None;
+                    m.pause_upto = None;
+                    m.hop = m.hop.as_ref().map(|h| self.relayed_hops(h, from));
+                    self.link_stats.action(from);
                     if m.pause {
                         // made during a pause: stamped by the host and relayed to every game, the sender too (flush_pause)
                         self.pause_held.push(PauseItem::Action(m));
@@ -784,6 +845,7 @@ impl HostSession {
                 if let Some(mut m) = codec::try_decode::<BuildCommitMessage>(payload) {
                     m.from = from;
                     m.pause_seq = None;
+                    m.pause_upto = None;
                     if m.pause {
                         self.pause_held.push(PauseItem::Commit(m));
                         self.flush_pause();
@@ -812,8 +874,12 @@ impl HostSession {
                             self.log(format!("speed request from {who} dropped (not allowed)"));
                         }
                     } else if self.resync.is_some() {
-                        let who = self.name(from);
-                        self.log(format!("speed request from {who} ignored (resync in progress)"));
+                        // once per player and round: a game's speed control asks every frame while its world loads (friend test
+                        // 2026-10-16: 1210 of these lines in one resync)
+                        if self.first_time(format!("speed-resync/{from}/{}", self.resync_counter)) {
+                            let who = self.name(from);
+                            self.log(format!("speed request from {who} ignored (resync in progress; further ones in this round are not logged)"));
+                        }
                     } else if self.state.started {
                         let same = (m.speed > 0 && self.state.pause_at.is_none() && m.speed == self.state.speed)
                             || (m.speed <= 0 && self.state.pause_at.is_some());
@@ -866,9 +932,15 @@ impl HostSession {
                 }
             }
 
+            MessageKind::ActionRefused => {
+                if let Some(m) = codec::try_decode::<ActionRefusedMessage>(payload) {
+                    self.on_action_verdict(from, m);
+                }
+            }
+
             MessageKind::Pong if from != Self::HOST_ID => {
                 if let Some(m) = codec::try_decode::<PongMessage>(payload) {
-                    self.on_pong(from, m.n);
+                    self.on_pong(from, m.n, m.w);
                 }
             }
 
@@ -949,17 +1021,80 @@ impl HostSession {
         self.resync_step();
         self.watch_connections(t);
         self.ping_players(t);
+        let wall = self.wall_ms();
+        let offsets: BTreeMap<u16, i64> =
+            self.wall_off.iter().filter_map(|(&id, o)| o.value().map(|v| (id, v))).collect();
+        for line in
+            self.link_stats.minute(t, wall, |id| if id == Self::HOST_ID { Some(0) } else { offsets.get(&id).copied() })
+        {
+            self.log(line);
+        }
         self.adapt_lead(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
+        let running = self.regular_round_running(t);
         if self.state.started
             && self.state.pause_at.is_none()
             && t - self.last_checksum >= self.options.checksum_seconds
         {
-            self.request_checksum_inner();
+            if running {
+                // the previous round is still being read (spread over the steps) or reported: the next one waits for it, so two
+                // spread rounds never run at once and a slow game delays the interval instead of piling rounds up
+                self.round_waits.waiting_since.get_or_insert(t);
+            } else {
+                if let Some(since) = self.round_waits.waiting_since.take() {
+                    let w = &mut self.round_waits;
+                    w.since.get_or_insert(since);
+                    w.count += 1;
+                    w.longest = w.longest.max(t - since);
+                }
+                self.request_checksum_inner();
+            }
         }
+        self.log_round_waits(t);
         self.drain()
+    }
+
+    /// Whether the last running checksum round still waits for reports. A round open longer than
+    /// `checksum_round_timeout_seconds` is dropped here (a game left mid-round or reloaded and will never report it).
+    fn regular_round_running(&mut self, t: f64) -> bool {
+        let Some((n, asked)) = self.running_round else { return false };
+        let expected = self.expected_reporters();
+        let missing = self.checksums.missing(n, &expected);
+        if missing.is_empty() {
+            // complete, or waiting for no ready game (none has said hello): nothing to wait for
+            self.running_round = None;
+            return false;
+        }
+        if t - asked < self.options.checksum_round_timeout_seconds {
+            return true;
+        }
+        let missing: Vec<String> = missing.into_iter().map(|id| self.name(id)).collect();
+        self.checksums.drop_round(n);
+        self.running_round = None;
+        self.log(format!(
+            "checksum round {n} dropped: not reported by {} after {:.0} s",
+            missing.join(", "),
+            t - asked
+        ));
+        false
+    }
+
+    /// At most once a minute: how many regular rounds had to wait for the previous one, and the longest wait.
+    fn log_round_waits(&mut self, t: f64) {
+        let w = self.round_waits;
+        let Some(since) = w.since else { return };
+        if t - since < ROUND_WAIT_LOG_SECONDS {
+            return;
+        }
+        self.log(format!(
+            "checksum: {} round(s) waited for the previous one in the last {:.0} s (longest wait {:.1} s)",
+            w.count,
+            t - since,
+            w.longest
+        ));
+        self.round_waits = RoundWaits { waiting_since: w.waiting_since, ..RoundWaits::default() };
     }
 
     /// What the resync round is doing, for the players' windows (None when no round runs). Tells everyone when it changes.
@@ -976,9 +1111,19 @@ impl HostSession {
         self.rtt_ms.iter().filter(|(id, _)| self.players.contains_key(id)).map(|(_, &ms)| ms).fold(0.0, f64::max)
     }
 
-    /// The lead the measured delays ask for at this speed.
+    /// The round trip and the clock gap the lead covers now (ms): the larger of the slowest smoothed round trip and the slowest
+    /// player's high quantile of its last round trips (jitter), and the slowest game's high quantile of its recent clock gaps
+    /// (the host's own game included: its clocks reach every other game).
+    fn lead_inputs(&self) -> (f64, f64) {
+        let here = |id: u16| self.players.contains_key(&id);
+        let rtt = self.slowest_rtt_ms().max(self.lead_meter.rtt_ms(here));
+        (rtt, self.lead_meter.gap_ms(self.now(), here))
+    }
+
+    /// The lead the measured delays ask for at this speed ([`Lockstep::lead_for_measured`]).
     pub(super) fn wanted_lead(&self, speed: i32) -> i64 {
-        Lockstep::lead_for(speed, self.slowest_rtt_ms())
+        let (rtt, gap) = self.lead_inputs();
+        Lockstep::lead_for_measured(speed, rtt, gap)
     }
 
     /// Keeps `state.lead` in step with the measured delays: longer at once, shorter only after eight seconds of being lower.
@@ -986,7 +1131,9 @@ impl HostSession {
         if !self.state.started {
             return;
         }
-        let want = self.wanted_lead(self.state.speed.max(1));
+        let speed = self.state.speed.max(1);
+        let want = self.wanted_lead(speed);
+        let old = self.state.lead;
         if want > self.state.lead {
             self.state.lead = want;
             self.lead_lower_since = None;
@@ -1000,6 +1147,16 @@ impl HostSession {
             }
         } else {
             self.lead_lower_since = None;
+        }
+        if self.state.lead != old {
+            // bug 4/6: what the lead was made from, each time it changes (the lab run checks the steps against link.ping and link.host)
+            let (rtt, gap) = self.lead_inputs();
+            self.log(format!(
+                "link.lead lead_steps={} was_steps={} speed={speed} rtt_ms={rtt:.0} gap_ms={gap:.0} step_ms={:.0}",
+                self.state.lead / Lockstep::STEP,
+                old / Lockstep::STEP,
+                1000.0 / (Lockstep::STEPS_PER_SECOND * f64::from(speed))
+            ));
         }
     }
 
@@ -1041,6 +1198,7 @@ impl HostSession {
         self.checksum_n += 1;
         let n = self.checksum_n;
         // Every Nth round (the first one too) and every paused round is a full check; the rounds between leave out the heavy lanes.
+        // N is 1 by default: every round is full (a running one spread over the steps).
         let every = i64::from(self.options.full_checksum_every.max(1));
         let full = paused || (i64::from(n) - 1) % every == 0;
         if full {
@@ -1052,9 +1210,21 @@ impl HostSession {
             Some(furthest) => furthest,
             None => self.future_stamp(),
         };
-        let request = ChecksumRequestMessage { n, at, paused, full };
+        let spread = ChecksumPolicy::spread_steps(full, paused, self.state.speed);
+        let request = ChecksumRequestMessage { n, at, paused, full, spread };
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
         self.last_checksum = self.now();
+        if !paused {
+            // a paused round is hashed whole at once and never holds up the timer (which does not run at a pause)
+            self.running_round = Some((n, self.last_checksum));
+        }
+    }
+
+    /// Forgets the running round being waited for (a resync's reload makes its reports moot), and drops it.
+    pub(super) fn forget_running_round(&mut self) {
+        if let Some((n, _)) = self.running_round.take() {
+            self.checksums.drop_round(n);
+        }
     }
 
     /// The fastest game's estimated clock now; 0 with no clocks.
@@ -1167,6 +1337,9 @@ impl HostSession {
         self.flush_pause();
         self.rtt_ms.remove(&id);
         self.pings.remove(&id);
+        self.wall_off.remove(&id);
+        self.link_stats.forget(id);
+        self.lead_meter.forget(id);
         let hold = hold && self.options.reconnect_window_seconds > 0.0;
         match self.identities.get_mut(&id) {
             Some(identity) if hold => {
@@ -1306,29 +1479,70 @@ impl HostSession {
         self.ping_n = self.ping_n.wrapping_add(1);
         let n = self.ping_n;
         let rtt: BTreeMap<u16, f64> = self.rtt_ms.iter().map(|(&id, &ms)| (id, (ms * 10.0).round() / 10.0)).collect();
-        let payload = codec::encode(&PingMessage { n, rtt });
+        let off: BTreeMap<u16, i64> = self.wall_off.iter().filter_map(|(&id, o)| o.value().map(|v| (id, v))).collect();
+        let payload = codec::encode(&PingMessage { n, rtt, off });
+        let wall = self.wall_ms();
         let targets: Vec<(ConnectionId, u16)> =
             self.connections.values().filter_map(|c| c.player.map(|id| (c.id, id))).collect();
         for (connection, player) in targets {
             self.send(connection, MessageKind::Ping, &payload);
             let queue = self.pings.entry(player).or_default();
-            queue.push_back((n, t));
+            queue.push_back((n, t, wall));
             while queue.len() > 8 {
                 queue.pop_front();
             }
         }
     }
 
-    fn on_pong(&mut self, from: u16, n: u32) {
+    /// `w`: the player's wall clock when it answered (newer players), for its clock offset.
+    fn on_pong(&mut self, from: u16, n: u32, w: Option<i64>) {
         let now = self.now();
+        let back = self.wall_ms();
         let Some(queue) = self.pings.get_mut(&from) else { return };
-        let Some(at) = queue.iter().position(|&(k, _)| k == n) else { return };
-        let sent = queue[at].1;
+        let Some(at) = queue.iter().position(|&(k, _, _)| k == n) else { return };
+        let (_, sent, sent_wall) = queue[at];
         // older pings that were never answered are not going to be
         queue.drain(..=at);
         let sample = ((now - sent) * 1000.0).max(0.0);
         let smoothed = self.rtt_ms.get(&from).map_or(sample, |old| old * 0.75 + sample * 0.25);
         self.rtt_ms.insert(from, smoothed);
+        self.link_stats.rtt(from, sample);
+        self.lead_meter.rtt(from, sample);
+        let off = match (sent_wall, w.filter(|v| Hops::plausible_ms(*v)), back) {
+            (Some(s), Some(p), Some(b)) => Some(self.wall_off.entry(from).or_default().sample(s, p, b)),
+            _ => None,
+        };
+        // one line per answered ping (every ping_seconds): the round trip's own cadence next to the clocks' (bug 4, a 5 s cadence)
+        let off = off.map_or_else(|| "?".to_owned(), |o| o.to_string());
+        self.log(format!(
+            "link.ping wall={} peer={from} rtt_ms={sample:.1} srtt_ms={smoothed:.1} off_ms={off}",
+            back.unwrap_or(0)
+        ));
+    }
+
+    /// Gives the host a wall clock (ms since 1970), for the latency logs: the stamps it adds to relayed clocks and actions
+    /// ([`Hops`]) and the players' clock offsets. Without one neither is made. Changes nothing the session decides.
+    pub fn set_wall_clock(&mut self, wall: Box<dyn Fn() -> i64 + Send>) {
+        self.wall = Some(wall);
+    }
+
+    fn wall_ms(&self) -> Option<i64> {
+        self.wall.as_ref().map(|w| w())
+    }
+
+    /// A player's wall clock minus the host's, in ms, as measured from its pongs; 0 for the host's own game, `None` before
+    /// the first measurement (or with a player or host that does not stamp).
+    pub fn wall_offset_ms(&self, player: u16) -> Option<i64> {
+        if player == Self::HOST_ID {
+            return self.wall.as_ref().map(|_| 0);
+        }
+        self.wall_off.get(&player).and_then(OffsetEstimate::value)
+    }
+
+    /// The stamps of a line from `from` as the host relays them (see [`Hops::relayed`]).
+    fn relayed_hops(&self, h: &Hops, from: u16) -> Hops {
+        let rtt = if from == Self::HOST_ID { Some(0.0) } else { self.rtt_ms.get(&from).copied() };
+        h.relayed(self.wall_ms(), self.wall_offset_ms(from), rtt)
     }
 
     // ---------------------------------------------------------------- sending
@@ -1355,26 +1569,46 @@ impl HostSession {
         if self.pause_held.is_empty() && !self.pending_paused_checksum {
             return;
         }
+        // from the save to the load the games' stops describe the world that is being replaced: a stamp counted from them can lie
+        // before the save's time (the host's game, loading early, is not counted, so the furthest stop is a guest's, behind the host's
+        // save) and would be applied late on every reloaded game. Held until every game stands still in the loaded world.
+        if self.resync_replaces_world() {
+            return;
+        }
         let stamp = match self.state.pause_at {
-            None => self.future_stamp(),
+            // after the resume: past the last stamp of the pause plus one step. Every game runs on to that step (the pause order's
+            // run-on, the mod's pauseRun), and a peer whose last clock is still its pause promise lets it stand there (the mod's
+            // L.barrier), so a stamp there would already be passed; a clock-plus-lead stamp counted from games that had not said where
+            // they stand yet could lie behind it. The lead's floor of three steps hid this; a mock with a one-step lead showed it (a
+            // breach after the resume, 2026-10-18).
+            None => {
+                let s = self.future_stamp();
+                self.pause_last.map_or(s, |l| s.max(l.saturating_add(2 * Lockstep::STEP)))
+            }
             Some(p) => match self.pause_stops(p) {
                 Some(furthest) => Lockstep::round_up_to_step(furthest as f64) + Lockstep::STEP,
                 None => return,
             },
         };
         let paused = self.state.pause_at.is_some();
-        for item in std::mem::take(&mut self.pause_held) {
+        let held = std::mem::take(&mut self.pause_held);
+        // the batch marker: every item of this flush names the number of its last one (a game runs on to the flush's stamp only once
+        // it has read them all; mock with jitter, 2026-10-18: the run-on of the first of two passed the stamp of the second)
+        let upto = Some(self.pause_seq + held.len() as u64);
+        for item in held {
             self.pause_seq += 1;
             match item {
                 PauseItem::Action(mut m) => {
                     m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
                     m.pause_seq = Some(self.pause_seq);
+                    m.pause_upto = upto;
                     self.broadcast(MessageKind::Action, &codec::encode(&m), None);
                     self.actions_relayed += 1;
                 }
                 PauseItem::Commit(mut m) => {
                     m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
                     m.pause_seq = Some(self.pause_seq);
+                    m.pause_upto = upto;
                     self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), None);
                 }
             }

@@ -46,11 +46,14 @@
 
 -- The common module's integral number text (feverlink3_common.lua C.integerText: "%d" raises above 2^31 in the game's Lua); this module
 -- also runs where the common module is not loadable (its own tests), then "%.0f", which is what the helper prints.
-local integerText
+local integerText, commonClock, commonTime
 do
 	local okC, C = pcall(ug_require, "feverlink3_common.lua")
-	if not okC then okC, C = pcall(ug_require, "feverlink3_1::/feverlink3_common.lua") end
+	if not okC then okC, C = pcall(ug_require, "feverlink3::/feverlink3_common.lua") end
 	integerText = okC and type(C) == "table" and C.integerText or function(n) return string.format("%.0f", n) end
+	-- the real clock and the wall clock of the link module (feverlink3_link.lua); a caller without the common module passes its own
+	commonClock = okC and type(C) == "table" and C.clock or nil
+	commonTime = okC and type(C) == "table" and C.time or nil
 end
 
 local M = {}
@@ -203,6 +206,20 @@ function M.bits64(x) return hexOf(">d", x) end
 M.CMD_FACTORIES = { makeTownUpdateSizeCmd = "size", makeTownUpdateCargoNeedsCmd = "needs" }
 M.ERRORS_MAX = 5
 
+-- The three land uses in the order the enum documents them (api.type.enum.LandUseType: RESIDENTIAL, COMMERCIAL, INDUSTRIAL; tf3-docs
+-- api/type "LandUseType"), as this game's enum values. Raises when the enum or a name is missing.
+M.LAND_USES = { "RESIDENTIAL", "COMMERCIAL", "INDUSTRIAL" }
+function M.landUses(api)
+	local enum = api.type["enum"].LandUseType
+	local out = {}
+	for i, name in ipairs(M.LAND_USES) do
+		local v = enum[name]
+		if v == nil then error("api.type.enum.LandUseType has no " .. name, 0) end
+		out[i] = v
+	end
+	return out
+end
+
 -- Accessors on the real (or mocked) engine api; `entitiesWith(name)` returns the sorted ids with a component.
 function M.apiAccessors(api, entitiesWith)
 	local CT = api.type.ComponentType
@@ -230,7 +247,9 @@ function M.apiAccessors(api, entitiesWith)
 			local ok, v = pcall(function() return tc[k] end)
 			if ok then out[k] = v end
 		end
-		local ok, emis = pcall(function() return api.engine.util.getTownEmissionDB(e) end)
+		-- the town's emission in decibel: api.engine.util.town.getTownEmissionDB(townEntity) (tf3-docs api/engine/util, util.d.tl:625;
+		-- until 2026-10-18 this read api.engine.util.getTownEmissionDB, which the API does not have, so the value was never logged)
+		local ok, emis = pcall(function() return api.engine.util.town.getTownEmissionDB(e) end)
 		if ok then out.emission = emis end
 		return out
 	end
@@ -241,10 +260,12 @@ function M.apiAccessors(api, entitiesWith)
 		return gt and gt.updateCount
 	end
 	function acc.lineUsage(e) return api.engine.util.town.getTownLineUsage(e) end
-	-- { {supply, limit} per land use 0..2 }, summed over the cargo types in id order (a fixed order, whatever pairs() gives)
+	-- { {supply, limit} per land use RESIDENTIAL, COMMERCIAL, INDUSTRIAL }, summed over the cargo types in id order (a fixed order, whatever
+	-- pairs() gives). The land use is getCargoSupplyAndLimit's typed `landUse? : LandUseType`, the values of api.type.enum.LandUseType
+	-- (tf3-docs api/engine/system, system.d.tl:113), not bare integers; without that enum this raises (the caller guards).
 	function acc.supplyDemand(e)
 		local out = {}
-		for lu = 0, 2 do
+		for _, lu in ipairs(M.landUses(api)) do
 			local all = api.engine.system.townBuildingSystem.getCargoSupplyAndLimit(e, lu)
 			local ids = {}
 			for id in pairs(all) do ids[#ids + 1] = id end
@@ -278,7 +299,7 @@ local function attrText(b)
 end
 
 -- `opts`: spec (text of the env var), acc (accessors), write (function(text) -> boolean, one append), hash
--- (function(table) -> string), clock (function() -> seconds of wall time, default os.clock)
+-- (function(table) -> string), clock (function() -> seconds of wall time, default C.clock)
 function M.new(opts)
 	local self = {}
 	local spec = M.parseSpec(opts.spec)
@@ -294,7 +315,7 @@ function M.new(opts)
 	self.enabled = true
 	self.cmds = opts.cmds == true
 	local acc, write, hash = opts.acc, opts.write, opts.hash
-	local clock = opts.clock or os.clock
+	local clock = opts.clock or commonClock or function() return 0 end
 	local buf, lastFlush = {}, clock()
 	local cache = {} -- building entity -> { sig, key } (never logged)
 	local prev = {} -- town -> { n, h, items = { key -> attrText }, order = { key... } }
@@ -577,6 +598,7 @@ end
 -- package.loaded): { tracer = <current tracer or nil>, wrappers = {} }. `guard(fn)` (optional) runs fn(tracer) under the
 -- bridge's error counter. The wrapper logs FIRST (never raising), then returns exactly what the original returns for the
 -- very same arguments. Returns the number of factories newly wrapped.
+-- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the town commands' factories are wrapped to trace them.
 function M.installCmdWrappers(apiCmd, holder, guard)
 	holder.wrappers = holder.wrappers or {}
 	local n = 0

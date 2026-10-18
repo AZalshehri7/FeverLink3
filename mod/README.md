@@ -1,6 +1,6 @@
 # mod
 
-Game-script mod `feverlink3_1` for Transport Fever 3. Design: `docs/ARCHITECTURE.md` sections 2, 5, 6, 7 and 8; file link kinds: `docs/PROTOCOL.md`.
+Game-script mod `feverlink3` for Transport Fever 3. Design: `docs/ARCHITECTURE.md` sections 2, 5, 6, 7 and 8; file link kinds: `docs/PROTOCOL.md`.
 
 ## What it does
 
@@ -13,17 +13,19 @@ Nothing, until a session exists: the mod finds the session folder (the native mo
 - answers `checksum_request` lines by hashing the world at the named stamp (parts: `time`, `balance`, `loan`, `constructions`, `lines`) and writing a `checksum_report`;
 - turns the player's speed buttons into `speed_request` lines; the speed itself comes back from the host in the session state;
 - corrects money to the host (`authority` line): every checksum round the game keeps its own balance and loan; the host's report carries its values as `authority`, and when the matching `authority` line comes back a player books the balance difference as a journal entry (`makeJournalBookAssetCmd`) and moves the loan through `adjustLoan` (a `LOAN` journal entry and the same sum back as `OTHER`: TF3 has no loan command, see `docs/COVERAGE_OPS.md`). The host's own game is never corrected;
-- resyncs by savegame: `resync_save {id, name}` saves the game under that name and writes `save_done {id, name, ok, detail?}`; `resync_load {id, name}` writes the line's sequence number to `resync_cursor.txt`, then loads the named save. The reloaded scripts start the reader after that sequence (nothing is dispatched again), send `hello` again, and the window keeps its roster and chat. An unknown save name writes `replay_failed` and the game carries on;
+- resyncs by savegame: `resync_save {id, name}` saves the game under that name and writes `save_done {id, name, ok, detail?}`; `resync_load {id, name}` writes the place right after that line (`<gen>:<offset>` of `to_game.log`, and where the window's records were read to) to `resync_cursor.txt`, then loads the named save. The reloaded scripts start the reader at that place (nothing is dispatched again, nothing after it is lost), send `hello` again, and the window keeps its roster and chat. An unknown save name writes `replay_failed` and the game carries on;
 - enforces permissions: a `permissions` line `{build, bulldoze, spend, other}` (booleans; only an explicit `false` denies, a missing key keeps the grant, everything is allowed until the first line) gates local commands. A command belongs to one category (`makeVehicleBuyCmd` is `spend`, `makeLineCreateCmd` is `build`, `makeVehicleSetLineCmd` is `other`; other names are classed by their wording: bulldoze/remove/demolish, buy/purchase, construct/build/create, else `other`; a spec may decide from the arguments, as the events do, and the category is sent with every `action` so the host can mark what its sender had no grant for). A denied command is cancelled before it is stamped: nothing is shipped or applied, its callback gets a failed result, and `action_refused {seq = 0, detail}` is written. An `action` line carrying `allowed = false` is logged and not applied, and the game writes `replay_failed` to ask for a resync;
 - keeps a registry of companies and a per-player ledger in the script state, which the savegame carries: who built, bought and got back what, a spending limit and forbidden categories per player, payments between players. The `player` argument of every replicated command follows the sender's company (today there is one shared company; separate companies exist behind the host's explicit confirmation and are unverified in a game). The checksum report gets a part `companies` once anything was recorded. Design, findings and the experiments that need the game: `docs/COMPANIES.md`;
 - shows an in-game window (status, player list, chat). `welcome`, `player_joined`, `player_left`, `session` and `chat` lines feed a model of at most 200 chat lines; a typed line becomes a `chat {text}` line.
 
-Files in `feverlink3_1/content/`:
+Files in `feverlink3/content/`:
 
 | File | Role |
 |---|---|
 | `feverlink3.gs.lua` | Game-script registration (`update`, `handleEvent`, `guiUpdate`, `guiHandleEvent`). |
-| `feverlink3_common.lua` | Environment, deterministic serialisation, FNV-1a hash, link reader and writer. Pure Lua 5.2. |
+| `feverlink3_common.lua` | Environment, deterministic serialisation, FNV-1a hash, link records and positions. Pure Lua 5.2. |
+| `feverlink3_link.lua` | The only file that uses Lua's `io` and `os` libraries (not official TF3 API): file access, environment, clocks, link reader and writer. See "Official API" below. |
+| `feverlink3_log.lua` | The only way the mod writes `mod.log`, `trace.log` and diagnostic files (`C.logger`, `C.tracer`, `C.dump`). |
 | `feverlink3_lockstep.lua` | The lockstep core: session, peers, pacing, stamps, queue, command encoding, deterministic random, checksum parts. Pure functions over state tables. |
 | `feverlink3_hud.lua` | The window's model: player roster, bounded chat history (200), status text, and the two file hand-offs below. Pure Lua, tested. |
 | `feverlink3_ui.script.lua` | The window itself, drawn with the game's react toolkit. **Engine-bound and untested** (never run in a game). |
@@ -41,20 +43,33 @@ Files in `feverlink3_1/content/`:
 | `FEVERLINK3_PLAYER_ID` | This player's numeric sender id (0 = the host's own game). Required. |
 | `FEVERLINK3_PLAYER_NAME` | Display name; defaults to `player <id>`. |
 
+## Official API
+
+The mod uses the official TF3 scripting API (`api.*`, `app.*`, `debugPrint`, `ug_require`, game-script states and events) wherever it can (owner decision 2026-10-18). What the official API has no counterpart for is kept, but only in `feverlink3_link.lua`, which says why for each item:
+
+| Not official | Used for | Why it stays |
+|---|---|---|
+| `io` (from `package.loaded` where the global is hidden) | The link with the native module: `to_game`/`from_game`, `identity.txt`, `ctl_*`, `native_*`, `world.lock`; and the files between the mod's own Lua states (`hud_state.txt`, `companies.txt`, `binds.txt`, `ui_out`/`ui_in`, `resync_cursor.txt`) | The only file API, `app.saveUserdata`/`loadUserdata`, writes whole Lua tables to the userdata folder: no append, no read by position, nothing the native module follows. |
+| `os.getenv` | Session folder, player id and name, `LOCALAPPDATA`, `FEVERLINK3_*` switches | The game passes no environment or launch options to scripts. |
+| `os.clock`, `os.time`, `os.date` | Timeouts and budgets while paused, the native module's event clock, unique ids, log time stamps, the guest's save name | Game time stops while paused; there is no official real or wall clock. |
+| `os.remove` | Deleting an old generation of a link log | No official delete outside the userdata folder. |
+
+Logging (`mod.log`, `trace.log`, `raw_builds.txt`, `build_trace.txt`, `detail_*.txt`, the town traces, dev output) is debugging only and goes through `feverlink3_log.lua`. Without the link module the mod has no file access and does nothing (fail closed). `tests/lua/test_official_api.py` fails when `io`/`os` appear in any other file. Each half logs once `official api probe: ...` (which official replacements its Lua state has), to decide later moves with real-game evidence.
+
 ## File link
 
 Two append-only text files in the session folder, one record per line, fields separated by tabs:
 
 ```
-seq <TAB> kind <TAB> from <TAB> payload
+kind <TAB> from <TAB> payload
 ```
 
 - `to_game.log`: launcher → mod. `from` is the sender id the launcher attached (0 = host). The mod only accepts session control (`session`, `peerclock`, `checksum_request`, `player_left`, `chat`, `welcome`, `player_joined`, `authority`, `permissions`, `resync_save`, `resync_load`) from 0; `action` lines carry the originating player's id.
 - `from_game.log`: mod → launcher. `from` is this player's id. Kinds: `hello`, `clock`, `speed_request`, `action`, `action_refused`, `checksum_report`, `save_done`, `replay_failed`, `chat`.
-- `seq` increases by one per line per file. A reader remembers the last sequence it dispatched and never dispatches a lower one, so a truncated or re-written file cannot replay history. The mod's writer continues the sequence from what the file already holds, so a savegame reload does not restart it.
+- A line carries no number: its place in the file is its order. Every reader reads by position (the generation and the bytes it consumed), complete lines only, and drops nothing for what a line says; a file shorter than what was read (a cleaned folder) is read again from its first byte. Where a session begins (`identity.txt` `start=<gen>:<offset>`) and where a reloaded mod resumes (`resync_cursor.txt`) are places in the file. Every file is written from one thread only: the C runtime's append is a seek and a write, so two Lua states appending to one file at once overwrite each other's lines; the native control files, which several Lua states write, are one file per writer.
 - `payload` is one line of Lua literal syntax written by `feverlink3_common.lua`: keys sorted, integers as `%d`, other numbers as `%.17g`, strings escaped. It is parsed in an empty environment. An `action` payload is `{stamp, seq, body, from}` where `body` is itself a serialised command `{fn, args}`, opaque to the launcher.
-- Every link file has one writer and is a generation log: past 4 MiB the writer ends the file with a `rotate` line (`seq` 0, `{["gen"]=<n>}`) and goes on in `<name>.<n>.log`; `<name>.gen` names the newest file, the newest 4 are kept. Readers follow the `rotate` line, so nothing is lost or split, and never see a truncation.
-- `native_ctl.gui.log` / `native_ctl.sim.log`: mod → native module, one file per Lua state (interface half, simulation half), each with its own writer, made once, and its own numbering. `native_events.log`: module → mod, read with the file kept open (no open per frame); a reloaded script reads only its newest generation as history, whose top repeats the module's `ready` and clock lines.
+- Every link file has one writer and is a generation log: past 4 MiB the writer ends the file with a `rotate` line (`{["gen"]=<n>,["skip"]=<bytes>}`, `skip` = the writer's header at the top of the next file, which a reader that follows has read already) and goes on in `<name>.<n>.log`; `<name>.gen` names the newest file, the newest 4 are kept. Readers follow the `rotate` line, so nothing is lost or split, and never see a truncation.
+- `native_ctl.gui.w<id>.log` / `native_ctl.sim.w<id>.log`: mod → native module, one file per writer: each load of the script names its own file per half with an id unique without coordination (the address of the writer's table, the clocks, a count; no rename or exclusive open, the game's Lua has none) and writes only that file; the module lists the folder for them and reads each by position. `native_events.log`: module → mod, read with the file kept open (no open per frame); a reloaded script reads only its newest generation as history, whose top repeats the module's `ready` and clock lines.
 - `mod.log` in the same folder is the mod's own log (both script halves append to it); it goes on in `mod.2.log` ... every 8 MiB, whoever wrote them, and the newest 4 files are kept.
 
 ## Window and the bridge

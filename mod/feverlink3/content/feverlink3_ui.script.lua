@@ -11,13 +11,13 @@
 -- session folder, never directly: the bridge owns the file link.
 
 local okC, C = pcall(ug_require, "feverlink3_common.lua")
-if not okC then C = ug_require("feverlink3_1::/feverlink3_common.lua") end
+if not okC then C = ug_require("feverlink3::/feverlink3_common.lua") end
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
-if not okH then Hud = ug_require("feverlink3_1::/feverlink3_hud.lua") end
+if not okH then Hud = ug_require("feverlink3::/feverlink3_hud.lua") end
 
 -- The hook that wraps the game's command functions in this Lua state (the windows' own), feverlink3_uihook.lua
 local okK, Hook = pcall(ug_require, "feverlink3_uihook.lua")
-if not okK then okK, Hook = pcall(ug_require, "feverlink3_1::/feverlink3_uihook.lua") end
+if not okK then okK, Hook = pcall(ug_require, "feverlink3::/feverlink3_uihook.lua") end
 if not okK or type(Hook) ~= "table" then
 	print("[feverlink3] UI hook not loaded: " .. tostring(Hook))
 	Hook = nil
@@ -40,7 +40,7 @@ end
 -- the native module's state (nil until it has written the first one): true when it changed
 local function pollCtl()
 	C.poll()
-	if not U.firstSeen then U.firstSeen = os.clock() end
+	if not U.firstSeen then U.firstSeen = C.clock() end
 	local s = C.parse(C.readFile(C.path(CTL_STATUS)) or "")
 	if type(s) ~= "table" then return false end
 	if U.ctl and U.ctl.version == s.version then return false end
@@ -53,7 +53,7 @@ local function command(kind, params)
 	return C.writerSend(U.cmd, kind, params)
 end
 
--- ui_out.log has one writer (its sequence numbers only increase), which the hook owns when it is there
+-- ui_out.log has one writer in this Lua state, which the hook owns when it is there
 local function outbox()
 	if Hook then return Hook.outbox() end
 	if not U.outbox then U.outbox = Hud.newOutbox(C) end
@@ -146,7 +146,7 @@ local function setup(react, builtin)
 		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
 		-- paused (a guest's window must notice the host ending the session then too).
 		if not U.refresh then
-			U.refresh = Hud.newTicker(0.5, os.clock, function()
+			U.refresh = Hud.newTicker(0.5, C.clock, function()
 				if Hook then Hook.devPoll() end
 				local a = poll()
 				local b = pollCtl()
@@ -159,7 +159,7 @@ local function setup(react, builtin)
 			if Hook and Hook.poll then pcall(Hook.poll) end
 			if refresh() then tick:set(tick:old() + 1) end
 		end
-		react.onStepTimer(onRefresh, 0.5)   -- assumption: onStepTimer(fn, seconds), as in MPFever
+		react.onStepTimer(onRefresh, 0.5)   -- onStepTimer(fn, intervalSeconds?, jitter?) (tf3-docs base/scripts/react)
 		if react.onStep then react.onStep(onRefresh) end
 		local ctl = U.ctl
 		local rows = {}
@@ -189,7 +189,7 @@ local function setup(react, builtin)
 		if not state then
 			if not C.LIVE then
 				state = "launcher"   -- started by the feverlink3 launcher (developer mode): no in-game controller
-			elseif U.firstSeen and os.clock() - U.firstSeen > 15 then
+			elseif U.firstSeen and C.clock() - U.firstSeen > 15 then
 				state = "missing"
 			else
 				state = "starting"
@@ -429,6 +429,9 @@ do
 	local okB, builtin = pcall(ug_require, "::/gui/main/builtin.lua")
 	local okE, entry = pcall(ug_require, "::/gui/game_bar/game_bar_widgets.tl")
 	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
+	-- which official replacements of the link module's io/os uses the window's state offers (observation only, lab)
+	pcall(function() C.logger("ui")("official api probe (window state): " .. C.officialProbe()) end)
+	pcall(function() C.logger("ui")("app keys (window): " .. C.appKeys()) end)
 	if Hook and C.DIR and C.IO then
 		local okI, errI = pcall(Hook.install)
 		print("[feverlink3] UI hook: " .. (okI and (errI and "installed" or "not installed") or ("failed: " .. tostring(errI))))
