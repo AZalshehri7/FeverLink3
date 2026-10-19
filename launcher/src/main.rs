@@ -8,11 +8,13 @@
 //! feverlink3 doctor                 what is found on this machine; changes nothing
 //! feverlink3 install [--dry-run]    install the game-side pieces (or show the plan)
 //! feverlink3 uninstall [--dry-run]  remove exactly those pieces (or show the plan)
+//! feverlink3 update [--check] [--pre] [--from DIR] [--confirm] [--rollback]   signed update, asks first (updatecmd.rs)
 //! ```
 //!
 //! `host` and `join` run until the session ends or `quit` is typed. The game is started only with `--launch`.
 //! While a host runs, these commands can be typed: `start`, `pause`, `speed N` (1 to 4), `check`, `resync`, `status`, `quit`.
 
+mod updatecmd;
 mod wizard;
 // shared with build.rs, which writes the icon, version information and manifest of this executable; the tests of
 // that code run here
@@ -36,7 +38,8 @@ use feverlink3_launcher::{gamelink, net, selftest, steam, MOD_ID};
 
 const USAGE: &str = "usage: feverlink3 host [--port 28090] [--password P] [--name N] [--launch]\n       \
                      feverlink3 join CODE [--password P] [--name N] [--launch]\n       \
-                     feverlink3 selftest | doctor | install [--dry-run] | uninstall [--dry-run]";
+                     feverlink3 selftest | doctor | install [--dry-run] | uninstall [--dry-run]\n       \
+                     feverlink3 update [--check] [--pre] [--from DIR] [--confirm] [--rollback]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,6 +53,7 @@ fn main() -> ExitCode {
         Some("selftest" | "--selftest") => run_selftest(),
         Some("host") => fail_with(host(&args[1..])),
         Some("join") => fail_with(join(&args[1..])),
+        Some("update") => updatecmd::run(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

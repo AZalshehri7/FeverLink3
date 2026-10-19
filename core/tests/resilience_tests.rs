@@ -19,7 +19,7 @@ fn to_loading(n: &mut Net, save: &[u8]) -> (i32, i64) {
     let pause_at = n.host.state().pause_at.expect("paused");
     n.stop_all_at(pause_at);
     let id = n.host.resync_id().unwrap();
-    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     send_file(n, id, save);
     assert_eq!(ResyncState::Loading, n.host.resync_state());
     (id, pause_at)
@@ -93,7 +93,7 @@ fn a_participant_that_returns_mid_transfer_gets_no_half_a_save_and_the_whole_one
     let pause_at = n.host.state().pause_at.unwrap();
     n.stop_all_at(pause_at);
     let id = n.host.resync_id().unwrap();
-    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
 
     let save = blob(3 * ResyncLimits::CHUNK_SIZE - 100);
     let sha = sha256_hex(&save);
@@ -123,7 +123,7 @@ fn a_participant_that_returns_mid_transfer_gets_no_half_a_save_and_the_whole_one
     n.stop_all_at(pause_at);
     let id2 = n.host.resync_id().unwrap();
     assert_ne!(id, id2);
-    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id: id2, ok: true, detail: None }));
+    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id: id2, ok: true, detail: None, mods: None }));
     send_file(&mut n, id2, &save);
     assert_eq!(vec![(id2, sha, save)], n.peer(back).saves);
 }

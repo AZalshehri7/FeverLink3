@@ -1,5 +1,6 @@
 //! The lead: how far past the fastest game's clock an action is stamped, so that every game has it before it reaches the stamp.
-//! It grows with the measured delay and with the speed, floors at three steps, and shrinks only after staying lower for a while.
+//! It grows with the measured delay and with the speed, floors at three steps (one engine batch and the hand-off), and is a jitter
+//! buffer: it covers the latest arrival seen recently plus a safety margin, at once, and shrinks slowly (JitterBuffer).
 
 mod net;
 
@@ -65,7 +66,7 @@ fn the_host_lengthens_the_lead_at_once_when_a_player_turns_out_to_be_slow_and_te
     n.set_latency(b, 0.600);
     let before = n.host.state().lead;
     n.run_for(6.0, 0.25);
-    let want = Lockstep::lead_for(1, 600.0);
+    let want = Lockstep::lead_for_cover(1, 300.0 + JitterBuffer::SAFETY_MS);
     assert!(want > before);
     assert_eq!(want, n.host.state().lead, "the slowest player decides");
     for c in [a, b] {
@@ -75,24 +76,54 @@ fn the_host_lengthens_the_lead_at_once_when_a_player_turns_out_to_be_slow_and_te
 }
 
 #[test]
-fn the_lead_shrinks_only_after_staying_lower_for_eight_seconds() {
+fn the_lead_shrinks_slowly_a_step_at_a_time_after_the_latest_slow_round_trip_has_left_the_window() {
     let mut n = Net::new();
     let a = n.connect("A");
-    started(&mut n, 1);
+    started(&mut n, 4);
     n.set_latency(a, 0.600);
     n.run_for(6.0, 0.25);
     let long = n.host.state().lead;
-    assert_eq!(Lockstep::lead_for(1, 600.0), long);
+    assert_eq!(Lockstep::lead_for_cover(4, 300.0 + JitterBuffer::SAFETY_MS), long);
 
     n.set_latency(a, 0.020);
-    n.run_for(5.0, 0.25); // the smoothed round trip is already low, but not for long enough
-    assert!(
-        n.host.state().lead > Lockstep::lead_for(1, 100.0),
-        "still long after a few seconds: {}",
-        n.host.state().lead
+    n.run_for(5.0, 0.25); // the latest slow round trip is still one of the last eight
+    assert_eq!(long, n.host.state().lead, "still long a few seconds later: {}", n.host.state().lead);
+    // then the buffer shrinks by 50 ms a second: at x4 a step is 42 ms, so about a step a second, never a jump
+    let mut leads = vec![n.host.state().lead];
+    for _ in 0..40 {
+        n.run_for(0.5, 0.25);
+        leads.push(n.host.state().lead);
+    }
+    for w in leads.windows(2) {
+        assert!(w[1] <= w[0] && w[0] - w[1] <= 2 * STEP, "shrinks gradually: {leads:?}");
+    }
+    assert_eq!(
+        Lockstep::lead_for_cover(4, 10.0 + JitterBuffer::SAFETY_MS),
+        n.host.state().lead,
+        "short again once the slow round trips are gone: {leads:?}"
     );
-    n.run_for(30.0, 0.25);
-    assert_eq!(Lockstep::lead_for(1, 20.0), n.host.state().lead, "short again once it stayed low");
+}
+
+#[test]
+fn a_late_clock_grows_the_buffer_at_once_and_it_shrinks_back_over_seconds() {
+    let mut b = JitterBuffer::default();
+    assert_eq!(15.0 + JitterBuffer::SAFETY_MS, b.update(15.0, 0.0), "the one-way time of the friend test's 30 ms link");
+    // a clock 300 ms late (the friend test's peer clock gaps: 140 ms at the median, up to 825): covered at once
+    assert_eq!(315.0 + JitterBuffer::SAFETY_MS, b.update(315.0, 1.0));
+    // gone: 50 ms less every second, never below the arrival of now
+    assert_eq!(285.0, b.update(15.0, 2.0));
+    assert_eq!(135.0, b.update(15.0, 5.0));
+    assert_eq!(15.0 + JitterBuffer::SAFETY_MS, b.update(15.0, 30.0));
+    assert_eq!(JitterBuffer::SAFETY_MS, b.update(f64::NAN, 31.0), "not a number counts as nothing measured");
+    // the lead of the buffer never drops below one engine batch and the hand-off (907af4e)
+    for speed in 1..=4 {
+        assert_eq!(Lockstep::lead_for(speed, 0.0), Lockstep::lead_for_cover(speed, 0.0));
+        assert!(Lockstep::lead_for_cover(speed, 0.0) / STEP > i64::from(speed));
+    }
+    assert_eq!(
+        Lockstep::lead_for_measured(4, 30.0, 400.0),
+        Lockstep::lead_for_cover(4, Lockstep::cover_ms(30.0, 400.0))
+    );
 }
 
 // ---------------------------------------------------------------- the measured clock cadence (bugs 4 and 6, 2026-10-18)
@@ -168,7 +199,7 @@ fn the_meter_counts_only_the_gaps_of_a_running_game_and_ignores_rare_stalls() {
         m.clock(1, t, 1, at);
     }
     assert!((160.0..175.0).contains(&m.gap_ms(at, all)), "a hold is no gap of a running game: {}", m.gap_ms(at, all));
-    // one stall of 2 s among many lines: not covered (the 95 % quantile)
+    // one late clock of 2 s among many lines: the latest arrival is covered (the jitter buffer), up to GAP_EXCESS_MAX_MS of lead
     at += 2.0;
     t += STEP;
     m.clock(1, t, 1, at);
@@ -177,17 +208,26 @@ fn the_meter_counts_only_the_gaps_of_a_running_game_and_ignores_rare_stalls() {
         t += STEP;
         m.clock(1, t, 1, at);
     }
-    assert!(m.gap_ms(at, all) < 200.0, "{}", m.gap_ms(at, all));
+    assert!((1990.0..2010.0).contains(&m.gap_ms(at, all)), "{}", m.gap_ms(at, all));
+    assert_eq!(
+        Lockstep::lead_for_measured(1, 0.0, m.gap_ms(at, all)),
+        Lockstep::lead_for_measured(1, 0.0, 60_000.0),
+        "bounded: a stall is not hidden behind the lead"
+    );
     // gaps age out of the window; a player that left is forgotten
     assert_eq!(0.0, m.gap_ms(at + LeadMeter::GAP_WINDOW_SECONDS + 1.0, all));
     m.forget(1);
     assert_eq!(0.0, m.gap_ms(at, all));
-    // round trips: the 90 % quantile of the last eight, of the slowest player that is here
+    // round trips: the largest of the last eight (the latest arrival), of the slowest player that is here
     for ms in [100.0, 110.0, 105.0, 400.0, 102.0, 98.0, 101.0, 103.0] {
         m.rtt(2, ms);
     }
     m.rtt(3, 500.0);
-    assert_eq!(110.0, m.rtt_ms(|id| id == 2), "one spike in eight is the quantile's top, the next one is taken");
+    assert_eq!(400.0, m.rtt_ms(|id| id == 2), "the spike is covered while it is one of the last eight");
+    for ms in [100.0, 101.0, 102.0, 103.0] {
+        m.rtt(2, ms);
+    }
+    assert_eq!(103.0, m.rtt_ms(|id| id == 2), "and goes when it is older than that");
     assert_eq!(500.0, m.rtt_ms(all));
 }
 
@@ -277,11 +317,17 @@ fn the_lead_converges_to_the_measured_round_trip_and_clock_jitter_and_stays_in_b
             // no jitter in the frames: the round trip alone (its jitter at most 30 %)
             assert!(steady >= Lockstep::lead_for(speed, rtt), "rtt {rtt} x{speed}: {steady}");
             // (one step of slack: the harness' clock lines are a millisecond apart at best, a hair over one step's real time)
-            assert!(steady <= Lockstep::lead_for(speed, rtt * 1.3) + STEP, "rtt {rtt} x{speed}: {steady}");
+            let most = Lockstep::lead_for_cover(speed, rtt * 1.3 / 2.0 + JitterBuffer::SAFETY_MS) + STEP;
+            assert!(steady <= most, "rtt {rtt} x{speed}: {steady}");
             let (n2, jittery) = run_link(rtt, 300.0, speed, 40.0, seed);
             assert!(jittery >= steady, "rtt {rtt} x{speed}: frames late by up to 300 ms never shorten the lead");
             assert!(
-                jittery <= Lockstep::lead_for_measured(speed, rtt * 1.3, Lockstep::BATCH_SECONDS * 1000.0 + 302.0),
+                jittery
+                    <= Lockstep::lead_for_cover(
+                        speed,
+                        Lockstep::cover_ms(rtt * 1.3, Lockstep::BATCH_SECONDS * 1000.0 + 302.0)
+                            + JitterBuffer::SAFETY_MS
+                    ),
                 "rtt {rtt} x{speed}: {jittery} covers at most the largest gap"
             );
             assert!((3 * STEP..=24 * STEP).contains(&jittery));
@@ -305,5 +351,5 @@ fn a_higher_speed_gets_a_lead_that_covers_the_same_real_time() {
     n.host_call(|h| h.set_speed(3));
     let at_3 = n.host.state().lead;
     assert!(at_3 > at_1, "{at_3} vs {at_1}");
-    assert_eq!(Lockstep::lead_for(3, 100.0), at_3);
+    assert_eq!(Lockstep::lead_for_cover(3, 50.0 + JitterBuffer::SAFETY_MS), at_3);
 }

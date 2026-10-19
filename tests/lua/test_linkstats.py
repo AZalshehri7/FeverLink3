@@ -29,15 +29,14 @@ class LinkStatsTest(unittest.TestCase):
     def hop(self, **kw):
         return self.L.table_from(kw)
 
-    def test_every_hop_is_measured_on_the_hosts_clock(self):
+    def test_every_hop_is_measured_on_the_hosts_clock_and_a_minute_has_its_lines_and_starts_over(self):
         # sender 500 ms ahead of the host, receiver 300 behind
         x = self.S.hops(self.hop(g=W + 500, l=W + 510, h=W + 40, so=500, sr=20, w=W - 210, ro=-300, rr=30), W - 205)
         self.assertEqual((x.g2l, x.l2h, x.h2w, x.w2r, x.e2e, x.rtt), (10, 30, 50, 5, 95, 50))
         # without offsets only the one-machine hops
         x = self.S.hops(self.hop(g=W, l=W + 3, h=W + 9, w=W + 20), W + 21)
         self.assertEqual((x.g2l, x.l2h, x.h2w, x.w2r, x.e2e), (3, None, None, 1, None))
-
-    def test_a_minute_has_its_lines_and_starts_over(self):
+        # a minute has its lines and starts over
         st = self.S.new(0)
         for i in range(5):
             self.S.peerClock(st, 1, self.hop(g=W + 250 * i, l=W + 250 * i + 2, h=W + 250 * i + 20, so=0, w=W + 250 * i + 40, ro=0), 0.25 * i, W + 250 * i + 41)
@@ -60,7 +59,6 @@ class LinkStatsTest(unittest.TestCase):
         nxt = list(self.S.minute(st, 120).values())
         self.assertIn("stood_s=1.0 holds=1", nxt[0])
         self.assertIn("clock_gap_ms_n=0", nxt[0])
-
 
 class BridgeLinesTest(unittest.TestCase):
     def test_a_two_game_run_writes_barrier_details_and_changes_nothing_else(self):

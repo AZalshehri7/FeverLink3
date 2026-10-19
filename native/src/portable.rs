@@ -418,6 +418,8 @@ pub static PAYLOAD: &[F] = &[
     f(0x359, "context.gatherFields", Ty::U8),
     f(0x360, "context.checkTerrainAlignment", Ty::U8),
     f(0x362, "context.cleanupStreetGraph", Ty::U8),
+    // not in the Lua Context (a script command's is 0.0): the refund window, see `refund::WINDOW_OFFSET`
+    f(0x364, "context.refundWindow", Ty::F32),
     f(0x36c, "context.player", Ty::Ent),
     // an unordered container (load factor 1.0 at +0, bucket vector, mask 7, maxidx 8 seen at +0x30, +0x38 of it)
     f(0x370, "context.refundableEntities", Ty::Hash(&HASH_NODE_28)),
@@ -1829,6 +1831,7 @@ pub(crate) mod testdata {
         put(&mut p, 0x260, (cons + 0xe48) as u64);
         put(&mut p, 0x268, (cons + 0xe48) as u64);
         p[0x358] = 1;
+        put32(&mut p, 0x364, 60f32.to_bits()); // the bulldozer's refund window
         put32(&mut p, 0x36c, 34135);
         p[0x3d2] = 1;
         p[0x9b8] = 52;
@@ -2057,6 +2060,8 @@ mod tests {
         let raw = l.iter().find(|x| x.starts_with("toAdd[0].~0x")).expect("a raw region").to_string();
         assert!(raw.contains("I+500") && raw.contains(" P"), "image pointer as an offset, heap pointer marked: {raw}");
         assert!(has("context.gatherBuildings\tu8:01") && has("playerInitiated\tu8:01") && has("kind\tu8:34"));
+        assert!(has("context.refundWindow\tf32:42700000"), "the Context's refund window is a named member");
+        assert_eq!(crate::refund::window_of(&p.text).unwrap(), Some(60.0));
         assert!(
             !p.text.lines().skip(1).any(|x| x.contains("0x2000") || x.contains("20000000")),
             "no heap address in the body"

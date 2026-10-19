@@ -36,6 +36,17 @@ fn a_full_round_is_spread_one_engine_batch_apart() {
 }
 
 #[test]
+fn the_chunk_costs_about_the_target_on_the_slowest_game_within_bounds() {
+    assert_eq!(200, ChecksumPolicy::chunk_for(None, 0), "no cost yet: the games' default");
+    assert_eq!(700, ChecksumPolicy::chunk_for(None, 700), "no new cost: unchanged");
+    assert_eq!(400, ChecksumPolicy::chunk_for(Some(25_000), 200), "480 wanted, at most twice the last");
+    assert_eq!(480, ChecksumPolicy::chunk_for(Some(25_000), 400));
+    assert_eq!(80, ChecksumPolicy::chunk_for(Some(150_000), 2000), "a slow game shrinks it at once");
+    assert_eq!(ChecksumPolicy::CHUNK_MIN, ChecksumPolicy::chunk_for(Some(10_000_000), 200));
+    assert_eq!(ChecksumPolicy::CHUNK_MAX, ChecksumPolicy::chunk_for(Some(1), 4000));
+}
+
+#[test]
 fn identical_outcomes_never_request() {
     let mut p = policy();
     for t in 0..100 {

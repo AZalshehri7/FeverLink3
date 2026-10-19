@@ -16,8 +16,10 @@
 //! The player side reconnects: when the connection drops it tells the game `session started=false`, then tries
 //! every [`PlayerConfig::reconnect_interval`] (5 s) for [`PlayerConfig::reconnect_window`] (5 minutes). Each attempt
 //! asks for the id and slot the host gave in the first welcome (the [`ResumeTicket`]), so a player that is back
-//! inside the host's window is the same player, with the same permissions; the host then runs a hot-join round and
-//! the welcome tells the game the session state again. A player that stops on purpose says goodbye first, and the
+//! inside the host's window is the same player, with the same permissions. The new session carries the old one's last host
+//! frame and what the game sent unacknowledged ([`PlayerSession::carry_to`]): back within the host's grace (60 s) the game,
+//! which kept its world, is caught up (the frames it missed, its own resent; no reload); later, the host runs a hot-join
+//! round and the welcome tells the game the session state again (`docs/PROTOCOL.md`, "Catching up"). A player that stops on purpose says goodbye first, and the
 //! host frees its slot at once instead of holding it.
 
 use std::collections::BTreeMap;
@@ -31,6 +33,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use feverlink3_core::crypto::SessionKey;
+use feverlink3_core::session::mods::{self, ModFingerprint};
 use feverlink3_core::session::{
     codec, ChecksumOutcome, ChecksumPolicy, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep,
     MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession,
@@ -227,8 +230,14 @@ pub struct Status {
     /// Player: connection lost, retrying.
     pub reconnecting: bool,
     pub reconnect_attempts: u32,
-    /// Player: the host's reject reason (`bad-proof`, `version`, `full`, `malformed`).
+    /// Player: whole seconds since the connection dropped, while reconnecting (the window shows "reconnecting (N s)").
+    pub reconnecting_s: u32,
+    /// Player: the last welcome after a drop caught this game up (it kept its world) instead of reloading it.
+    pub caught_up: bool,
+    /// Player: the host's reject reason (`bad-proof`, `version`, `mods`, `full`, `malformed`).
     pub rejected: Option<String>,
+    /// Player refused for its mods: each difference to the host's game, `true` when it blocks (blocking lines first).
+    pub mod_report: Vec<(bool, String)>,
     /// Why a player gave up or the session ended abnormally.
     pub error: Option<String>,
     /// The thread has ended.
@@ -272,7 +281,10 @@ impl Status {
             connected: role == Role::Host,
             reconnecting: false,
             reconnect_attempts: 0,
+            reconnecting_s: 0,
+            caught_up: false,
             rejected: None,
+            mod_report: Vec::new(),
             error: None,
             finished: false,
             players: Vec::new(),
@@ -579,7 +591,7 @@ pub fn run_host_over<T: HostTransport + Sync>(
     let HostConfig { name, key, mut link, options, save_dirs, echo_log, bulk, .. } = config;
     // test switch FEVERLINK3_TEST_NET_DELAY_MS: everything the transport delivers reaches this thread that much later (crate::netdelay)
     let test_delay = netdelay::from_env();
-    let (net_tx, net_rx) = netdelay::channel(test_delay);
+    let (net_tx, net_rx) = netdelay::channel(test_delay.clone());
     let net = listen(net_tx)?;
     let par_secret = secret_from_key(key.key());
     let local_addr = net.local_addr();
@@ -592,12 +604,8 @@ pub fn run_host_over<T: HostTransport + Sync>(
     // the first status already lists the host's own game
     refresh_host_status(&host, &net, &shared);
     shared.log(format!("listening on {}", net.describe()));
-    if let Some(d) = test_delay {
-        shared.log(format!(
-            "TEST: {} = {} ms: every message from the players arrives that much later",
-            netdelay::ENV,
-            d.as_millis()
-        ));
+    if let Some(d) = &test_delay {
+        shared.log(format!("TEST: {}: every message from the players arrives that much later", d.describe()));
     }
     if let Some(line) = testmargin::note_from_env() {
         shared.log(line);
@@ -804,6 +812,8 @@ pub struct PlayerConfig {
     /// Pause between attempts, 5 s.
     pub reconnect_interval: Duration,
     pub echo_log: bool,
+    /// This game's mod list and builds, sent with the join (`modlist::from_params`). `None`: none sent.
+    pub mods: Option<ModFingerprint>,
 }
 
 impl PlayerConfig {
@@ -820,6 +830,7 @@ impl PlayerConfig {
             reconnect_window: Duration::from_secs(300),
             reconnect_interval: Duration::from_secs(5),
             echo_log: false,
+            mods: None,
         }
     }
 }
@@ -850,7 +861,7 @@ pub fn run_player_over(
     let mut connect: Connector = Box::new(connect);
     // test switch FEVERLINK3_TEST_NET_DELAY_MS, as on the host (crate::netdelay): reconnects keep using the same delayed channel
     let test_delay = netdelay::from_env();
-    let (net_tx, net_rx) = netdelay::channel(test_delay);
+    let (net_tx, net_rx) = netdelay::channel(test_delay.clone());
     let first = connect(ConnectContext {
         conn: 1,
         tx: net_tx.clone(),
@@ -861,17 +872,14 @@ pub fn run_player_over(
     let mut player = PlayerSession::new(config.key.clone(), &config.name, &config.version);
     player.set_wall_clock(Box::new(linkwatch::wall_ms));
     player.set_capabilities(capabilities_of(first.as_ref(), !config.save_dirs.is_empty()));
+    player.set_mods(config.mods.clone());
     if first.par_capable() && !config.save_dirs.is_empty() {
         enable_par(first.as_ref(), &config);
     }
     let shared = Shared::new(Status::new(Role::Player, &config.name), config.echo_log);
     shared.log(format!("connected to {}", first.describe()));
-    if let Some(d) = test_delay {
-        shared.log(format!(
-            "TEST: {} = {} ms: every message from the host arrives that much later",
-            netdelay::ENV,
-            d.as_millis()
-        ));
+    if let Some(d) = &test_delay {
+        shared.log(format!("TEST: {}: every message from the host arrives that much later", d.describe()));
     }
     if let Some(line) = testmargin::note_from_env() {
         shared.log(line);
@@ -1007,6 +1015,8 @@ impl PlayerLoop {
                             pause_at: None,
                             lead: Lockstep::lead_units(1),
                             resync: None,
+                            mod_warnings: Vec::new(),
+                            stalled: Vec::new(),
                         };
                         write_to_game(&mut self.config.link, shared, MessageKind::Session, &codec::encode(&lost), 0);
                         match retry.as_mut() {
@@ -1067,8 +1077,10 @@ impl PlayerLoop {
                 }
             }
             let joined = self.player.state() == PlayerState::Joined && self.net.is_some();
+            let outage_s = retry.as_ref().map_or(0, |r| u32::try_from(r.since.elapsed().as_secs()).unwrap_or(u32::MAX));
             shared.update(|s| {
                 s.connected = joined;
+                s.reconnecting_s = outage_s;
                 s.dropped = self.player.dropped();
                 if let Some(session) = self.player.session() {
                     s.session = Some(session.clone());
@@ -1159,11 +1171,18 @@ impl PlayerLoop {
                 shared.log(format!("reconnected to {} (attempt {})", net.describe(), retry.attempts));
                 let (key, name, version) = (self.config.key.clone(), &self.config.name, &self.config.version);
                 self.player = match self.ticket.clone() {
-                    Some(ticket) => PlayerSession::resuming(key, name, version, ticket),
+                    Some(ticket) => {
+                        // the last host frame and what the game sent unacknowledged go along: the host can then catch this game
+                        // up instead of reloading it (docs/PROTOCOL.md, "Catching up")
+                        let mut next = PlayerSession::resuming(key, name, version, ticket);
+                        self.player.carry_to(&mut next);
+                        next
+                    }
                     None => PlayerSession::new(key, name, version),
                 };
                 self.player.set_wall_clock(Box::new(linkwatch::wall_ms));
                 self.player.set_capabilities(capabilities_of(net.as_ref(), !self.config.save_dirs.is_empty()));
+                self.player.set_mods(self.config.mods.clone());
                 if net.par_capable() && !self.config.save_dirs.is_empty() {
                     enable_par(net.as_ref(), &self.config);
                 }
@@ -1215,6 +1234,7 @@ impl PlayerLoop {
                     }
                     shared.update(|s| {
                         s.reconnecting = false;
+                        s.caught_up = welcome.resumed && welcome.catch_up.is_some();
                         s.my_id = Some(welcome.you);
                         s.name = name;
                         s.players = welcome.players.clone();
@@ -1226,7 +1246,20 @@ impl PlayerLoop {
                         Some(d) => format!("{} ({d})", reject.reason),
                         None => reject.reason.clone(),
                     };
-                    shared.update(|s| s.rejected = Some(why));
+                    // refused for its mods: the host's list against ours, in lines for the window
+                    let report: Vec<(bool, String)> = match (&reject.mods, &self.config.mods) {
+                        (Some(host), Some(mine)) => {
+                            mods::diff(host, mine).into_iter().map(|d| (d.blocks, d.text)).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    for (blocks, line) in &report {
+                        shared.log(format!("mods: {} {line}", if *blocks { "refused:" } else { "warning:" }));
+                    }
+                    shared.update(|s| {
+                        s.rejected = Some(why);
+                        s.mod_report = report;
+                    });
                 }
                 PlayerOutput::SaveReceived { id, sha256, bytes } => {
                     let name = resync::save_name(id);
@@ -1253,6 +1286,8 @@ impl PlayerLoop {
 
 /// Bookkeeping of one outage.
 struct Retry {
+    /// When the connection dropped.
+    since: Instant,
     next_attempt: Instant,
     deadline: Instant,
     attempts: u32,
@@ -1261,7 +1296,12 @@ struct Retry {
 impl Retry {
     fn start(config: &PlayerConfig) -> Retry {
         let now = Instant::now();
-        Retry { next_attempt: now + config.reconnect_interval, deadline: now + config.reconnect_window, attempts: 0 }
+        Retry {
+            since: now,
+            next_attempt: now + config.reconnect_interval,
+            deadline: now + config.reconnect_window,
+            attempts: 0,
+        }
     }
 }
 

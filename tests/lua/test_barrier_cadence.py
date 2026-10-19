@@ -56,22 +56,47 @@ os.clock = function() return FAKE_CLOCK end
 '''
 
 
-def lead_for_measured(speed, rtt_ms, gap_ms):
-    """core/src/session/lockstep.rs Lockstep::lead_for_measured, in Python (the relay plays the host)."""
+def cover_ms(rtt_ms, gap_ms):
+    """core Lockstep::cover_ms: the one-way time and the clock gap's excess over one engine batch's real time (at most 500 ms)."""
+    excess = min(max(gap_ms - 1000.0 / 6.0, 0.0), 500.0)
+    return max(rtt_ms, 0.0) / 2.0 + excess
+
+
+def lead_for_cover(speed, cover):
+    """core Lockstep::lead_for_cover, in Python (the relay plays the host)."""
     per_second = 6.0 * max(speed, 1)
-    excess = min(max(gap_ms - 1000.0 / 6.0, 0.0), 500.0)   # over one engine batch's real time (BATCH_SECONDS)
-    seconds = rtt_ms / 2000.0 + 0.06 + excess / 1000.0
+    seconds = max(cover, 0.0) / 1000.0 + 0.06
     steps = math.ceil(seconds * per_second) + 1 + min(max(speed, 1), 4)   # the hand-off step and one batch of `speed` steps
     return STEP * min(max(steps, 3), 24)
+
+
+def lead_for_measured(speed, rtt_ms, gap_ms):
+    """core/src/session/lockstep.rs Lockstep::lead_for_measured, in Python (the relay plays the host)."""
+    return lead_for_cover(speed, cover_ms(rtt_ms, gap_ms))
+
+
+class JitterBuffer:
+    """core JitterBuffer: the latest arrival plus 20 ms, at once when it is later, shrinking by 50 ms a second otherwise."""
+    SAFETY_MS, SHRINK_MS_PER_SECOND = 20.0, 50.0
+
+    def __init__(self):
+        self.ms, self.at = 0.0, None
+
+    def update(self, cover, now_s):
+        target = max(cover, 0.0) + self.SAFETY_MS
+        dt = 0.0 if self.at is None else max(0.0, now_s - self.at)
+        self.at = now_s
+        self.ms = target if target >= self.ms else max(target, self.ms - self.SHRINK_MS_PER_SECOND * dt)
+        return self.ms
 
 
 ROUND_MS = 1000.0 / 6 / 4   # four relay rounds make an engine tick, a tick is a sixth of a second of real time at any speed
 
 
 class AdaptiveRelay(B.JitterRelay):
-    """The jittery relay as the host with the adaptive lead: the round trip is the link's (with its jitter's 90 % quantile), the
-    clock gaps are measured from the clock lines it relays (only lines of a running game, as LeadMeter), the lead grows at once and
-    shrinks after eight seconds."""
+    """The jittery relay as the host with the adaptive lead (core's jitter buffer): the round trip is the link's largest of eight
+    (this link model's 50 % of jitter: 1.5 times it), the clock gaps are measured from the clock lines it relays (only lines of a
+    running game, as LeadMeter; the largest in ten seconds), the lead covers them at once and shrinks by 50 ms a second."""
 
     def __init__(self, games, rng, delay, rtt_ms):
         super().__init__(games, rng, delay)
@@ -79,7 +104,7 @@ class AdaptiveRelay(B.JitterRelay):
         self.lead_units = lead_for_measured(1, rtt_ms, 0.0)
         self.last = {}
         self.gaps = {g.id: [] for g in games}
-        self.lower_since = None
+        self.buffer = JitterBuffer()
         self.leads = []
 
     @property
@@ -103,19 +128,11 @@ class AdaptiveRelay(B.JitterRelay):
         gap = 0.0
         for xs in self.gaps.values():
             if len(xs) >= 20:
-                v = sorted(g for _, g in xs)
-                gap = max(gap, v[round((len(v) - 1) * 0.95)])
-        want = lead_for_measured(max(self.speed, 1), self.rtt_ms * 1.27, gap)
-        changed = False
-        if want > self.lead_units:
-            self.lead_units, self.lower_since, changed = want, None, True
-        elif want < self.lead_units:
-            self.lower_since = self.round if self.lower_since is None else self.lower_since
-            if (self.round - self.lower_since) * ROUND_MS >= 8000:
-                self.lead_units, self.lower_since, changed = want, None, True
-        else:
-            self.lower_since = None
-        if changed:
+                gap = max(gap, max(g for _, g in xs))
+        ms = self.buffer.update(cover_ms(self.rtt_ms * 1.5, gap), self.round * ROUND_MS / 1000.0)
+        want = lead_for_cover(max(self.speed, 1), ms)
+        if want != self.lead_units:
+            self.lead_units = want
             self.session()
         self.leads.append(self.lead_units)
 
@@ -133,15 +150,8 @@ def link(rtt_ms):
     return delay
 
 
+@T.own_tests_only   # the harness of the barrier tests, not their tests (they run in test_input_barrier.py, on the real clock)
 class CadenceTest(B.BarrierTest):
-    # the harness of the barrier tests, not their tests (they run in test_input_barrier.py, on the real clock)
-    test_two_games_with_jitter_never_apply_late = None
-    test_two_games_with_jitter_never_apply_late_at_more_seeds = None
-    test_three_games_with_jitter_never_apply_late = None
-    test_pauses_and_resumes_with_jitter_never_apply_late = None
-    test_without_the_promises_the_same_network_applies_late = None
-    test_a_silent_peer_holds_the_barrier_and_its_leaving_releases_it = None
-
     def make(self, n, seed, delay, lead_steps=None, rtt_ms=None):
         super().make(n, seed, delay, lead_steps)
         if rtt_ms is not None:
@@ -162,7 +172,7 @@ class CadenceTest(B.BarrierTest):
 
     # ---- the company page: a budget per frame
 
-    def test_the_company_page_reads_lines_within_its_frame_budget_and_gets_them_all(self):
+    def test_the_company_page_keeps_its_frame_budget_gets_every_line_and_never_stalls_on_a_deleted_or_slow_one(self):
         self.make(2, 3, lambda rng, dest: 1)
         self.start(speed=1)
         host = self.games[0]
@@ -209,8 +219,6 @@ class CadenceTest(B.BarrierTest):
         for _ in range(9):
             host.frame()
         self.assertGreater(int(host.L.eval("READS")), before, "a pass every few seconds")
-
-    def test_the_company_page_never_stalls_a_frame_on_a_deleted_or_slow_line(self):
         # The pre5 friend test (2026-10-18): companies= 450-610 ms in one frame, once per pass for every deleted line. A late-game
         # registry here: 40 live lines (0.2 ms a read), 6 deleted ones whose keys stay bound to their old entity (2 of those ids reused by
         # a vehicle), every engine read of an entity that is no line costs 550 ms like in the log, and one live line whose read is slow
@@ -268,7 +276,7 @@ class CadenceTest(B.BarrierTest):
     def clocks_in(self, g):
         return sum(1 for line in T.read_text(g.from_game).splitlines() if line.startswith("clock\t"))
 
-    def test_a_game_standing_still_sends_its_clock_on_a_real_time_cadence_at_any_frame_rate(self):
+    def test_a_standing_game_sends_its_clock_on_a_real_time_cadence_and_a_build_stamp_takes_the_later_of_promise_and_margin(self):
         self.make(2, 7, lambda rng, dest: 1)
         self.start(speed=2)
         host, client = self.games
@@ -290,10 +298,7 @@ class CadenceTest(B.BarrierTest):
             client.frame()
         self.assertLessEqual(self.clocks_in(client) - before, 1000 // 30 + 5)
         self.assertGreaterEqual(self.clocks_in(client) - before, 1000 // 30)
-
-    # ---- a build's stamp: the later of the promise and the measured margin, not both
-
-    def test_a_build_stamp_takes_the_later_of_the_promise_and_the_margin(self):
+        # a build's stamp: the later of the promise and the measured margin, not both
         self.make(2, 9, lambda rng, dest: 1)
         self.start(speed=1)
         host = self.games[0]
@@ -323,14 +328,9 @@ class CadenceTest(B.BarrierTest):
         # barrier before (an action of the pause stamped after the resume behind the step every game had run on to; a later one behind
         # the run-on of an earlier one stamped after the resume; seed 29: two actions of one flush read in different frames, the first
         # one's run-on passing the second's stamp, until the flush carried its batch marker, pauseUpto). Seeds 22 and 29 by default (the
-        # first breach and the pauseUpto one); 31, 33, 35 and a sweep of further seeds in the full set (the next test).
-        for seed in (22, 29):
-            with self.subTest(seed=seed):
-                self.random_run(2, seed, 280, lead_choices=[1, 3], speeds=[1, 2, 4], pauses=True)
-
-    @T.full
-    def test_actions_of_a_pause_stamped_after_the_resume_never_land_behind_a_game_over_a_sweep_of_seeds(self):
-        for seed in (31, 33, 35) + tuple(range(36, 48)):
+        # first breach and the pauseUpto one); 31, 33, 35 and a sweep of further seeds in the full set.
+        seeds = (22, 29) + ((31, 33, 35) + tuple(range(36, 48)) if T.FULL else ())
+        for seed in seeds:
             with self.subTest(seed=seed):
                 self.random_run(2, seed, 280, lead_choices=[1, 3], speeds=[1, 2, 4], pauses=True)
 
@@ -354,22 +354,20 @@ class CadenceTest(B.BarrierTest):
         self.assert_no_late_and_same(issued)
         return self.relay.leads
 
-    def test_the_adaptive_lead_converges_and_never_applies_late_over_150_ms(self):
-        self.check_adaptive(((150, 32),))
-
-    @T.full
-    def test_the_adaptive_lead_converges_and_never_applies_late_over_30_and_300_ms(self):
-        self.check_adaptive(((30, 31), (300, 33)))
-
-    def check_adaptive(self, links):
-        for rtt, seed in links:
+    def test_the_adaptive_lead_converges_and_never_applies_late_over_150_ms_and_in_the_full_set_30_and_300_ms(self):
+        for rtt, seed in ((150, 32),) + (((30, 31), (300, 33)) if T.FULL else ()):
             with self.subTest(rtt=rtt):
                 leads = self.adaptive_run(rtt, seed, speeds=[1, 2, 4])
                 for lead in leads:
                     self.assertTrue(3 * STEP <= lead <= 24 * STEP, lead)
                 tail = leads[-60:]
-                self.assertLessEqual(len(set(tail)), 2, "the lead settles (%s)" % sorted(set(tail)))
                 speed = max(self.relay.speed, 1)
+                # a jitter buffer (core JitterBuffer): it grows at once on a late arrival and shrinks gradually, a step at a time, within
+                # what the link's latest arrivals ask for
+                for a, b in zip(tail, tail[1:]):
+                    self.assertLessEqual(a - b, STEP, "the lead shrinks a step at a time (%s)" % tail)
+                most = lead_for_cover(speed, cover_ms(rtt * 1.5, 1000.0 / 6 + 500.0) + JitterBuffer.SAFETY_MS)
+                self.assertLessEqual(max(tail), most, "bounded by the largest arrival it covers (%s)" % tail)
                 self.assertGreaterEqual(min(tail), lead_for_measured(speed, rtt, 0.0) - STEP)
 
 

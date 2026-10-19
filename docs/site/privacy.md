@@ -10,7 +10,7 @@ FeverLink3 has no accounts, no analytics, no advertising, and no server of the p
 
 ## What the project collects
 
-Nothing. The program does not report to the project: no telemetry, no crash reports, no update check (the update download is not written yet). If you send logs to the maintainer for a bug report, that is your choice; the log files hold no personal data besides your Windows user name and the paths of your Steam folders (see [Playing FeverLink3](../PLAYING.html), "If something goes wrong").
+Nothing. The program does not report to the project: no telemetry, no crash reports, no automatic update check (the developer program's `feverlink3 update` asks GitHub for the newest release only when you type it). If you send logs to the maintainer for a bug report, that is your choice; the log files hold no personal data besides your Windows user name and the paths of your Steam folders (see [Playing FeverLink3](../PLAYING.html), "If something goes wrong").
 
 ## What other players receive in a session
 

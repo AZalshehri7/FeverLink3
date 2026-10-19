@@ -135,6 +135,30 @@ pub fn any_game_running() -> bool {
     false
 }
 
+/// How many processes with this image name (for example `feverlink3.exe`) run, by `tasklist`. `None` when
+/// `tasklist` cannot be asked, so a caller that must be sure (the updater) can refuse instead of guessing.
+#[cfg(windows)]
+pub fn count_running(image: &str) -> Option<usize> {
+    let o = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH", "/FO", "CSV"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    o.status.success().then(|| count_csv_rows(&String::from_utf8_lossy(&o.stdout), image))
+}
+
+#[cfg(not(windows))]
+pub fn count_running(_image: &str) -> Option<usize> {
+    None
+}
+
+/// Rows of `tasklist /FO CSV /NH` output whose first field is `image` (case-insensitive).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn count_csv_rows(csv: &str, image: &str) -> usize {
+    let want = format!("\"{}\"", image.to_ascii_lowercase());
+    csv.lines().filter(|l| l.trim().to_ascii_lowercase().split(',').next() == Some(want.as_str())).count()
+}
+
 /// The game executable of a game folder, for callers that only need the path.
 pub fn game_exe(game_dir: &Path) -> PathBuf {
     game_dir.join(GAME_EXE)
@@ -183,6 +207,19 @@ mod tests {
         let cmd = command(&l);
         assert_eq!(env_of(&cmd, ENV_ROLE), Some(OsStr::new("player")));
         assert_eq!(env_of(&cmd, ENV_PLAYER_ID), Some(OsStr::new("7")));
+    }
+
+    #[test]
+    fn tasklist_rows_are_counted_by_image_name() {
+        let csv = "\"feverlink3.exe\",\"1200\",\"Console\",\"1\",\"9,000 K\"\r\n\
+                   \"FeverLink3.exe\",\"1300\",\"Console\",\"1\",\"9,100 K\"\r\n\
+                   \"feverlink3-speedtest.exe\",\"1400\",\"Console\",\"1\",\"1 K\"\r\n";
+        assert_eq!(count_csv_rows(csv, "feverlink3.exe"), 2);
+        // what tasklist prints when nothing matches
+        assert_eq!(
+            count_csv_rows("INFO: No tasks are running which match the specified criteria.\r\n", "feverlink3.exe"),
+            0
+        );
     }
 
     #[test]

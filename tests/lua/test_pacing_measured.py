@@ -14,7 +14,7 @@ The harness runs the two mocked games of test_lockstep.py in real time at a mill
 game's frames come every few milliseconds (the two PCs differ: 5-12 ms and 8-18 ms, now and then a stalled frame), its engine runs a
 batch of `speed` steps once 200 ms times the factor the mod last wrote to its control file (`pace {permille}`, native pace.rs) have
 passed, and the host's lead is made the way core/src/session/lockstep.rs makes it (LeadMeter over every clock line it relays, with
-the round trip, lead_for_measured, longer at once, shorter after 8 s). The network delays every line by the measured one-way time and
+the largest of eight pings, the jitter buffer: lead_for_cover of the latest arrival plus 20 ms, longer at once, 50 ms a second shorter). The network delays every line by the measured one-way time and
 its jitter. Measured per game: the stand-still seconds a minute (its mod holds the engine at speed 0 while the session runs), the
 time-weighted mean of the factor (link.minute's pace_mean), the game time it advanced, and the gaps between the peer clocks it read.
 
@@ -28,6 +28,10 @@ is never held nor stretched):
     before 9.6 s/min at pace_mean 1.87 and the slow guest slowed too (1.40), speed 0.54; after 1.6 s/min at 1.31, the guest at 1.00,
     speed 0.75 (its own pace);
   * x2, 30 ms (full set): unchanged, already fine before (lead 5).
+2026-10-19, the lead as a jitter buffer (the latest arrival plus 20 ms, 50 ms a second shorter) and pacing both ways (down to 0.8, 0.5
+while a stalled game catches up): x4, 30 ms: lead 11 steps (was 9), stood_s/min 0.0/0.0, pace_mean 1.01/1.00, speed 0.97; with the
+friend test's frame stalls: lead 19, stood_s/min 0.0/0.3 (was 0.4/0.5), pace_mean 0.99/1.05, speed 0.91/0.92 (was 0.89); the guest frozen
+7 s (the stall timeout): the host ran at 0.61 of full speed over those 7 s (3 s held, then on), the guest caught up 8 s after it ran again.
 
 Run:  python -I tests/lua/test_pacing_measured.py
 """
@@ -43,6 +47,7 @@ import test_barrier_cadence as BC  # noqa: E402
 import test_input_barrier as B  # noqa: E402
 import test_lockstep as T  # noqa: E402
 import test_smooth_pacing as SP  # noqa: E402
+import test_stall as ST  # noqa: E402
 
 STEP = T.STEP
 BATCH_MS = 200.0   # the engine's batch interval at factor 1 (pace_batch_ms 190-218 in the friend test)
@@ -67,7 +72,9 @@ class MeasuredRelay(B.JitterRelay):
         self.rtt_ms = rtt_ms
         self.lead_units = BC.lead_for_measured(1, rtt_ms, 0.0)
         self.meter = {g.id: {"last": None, "gaps": []} for g in games}
-        self.lower_since = None
+        self.buffer = BC.JitterBuffer()
+        # the host's pings, every 2 s over the same link (their own generator: the games' draws stay as they were)
+        self.ping_rng, self.pings, self.next_ping = random.Random(4242), [], 0.0
         self.leads = []
         self.peer_reads = {g.id: [] for g in games}
 
@@ -90,26 +97,29 @@ class MeasuredRelay(B.JitterRelay):
             c["last"] = (at_ms, t, False)
 
     def gap_ms(self, now_ms):
+        """core LeadMeter::gap_ms: the largest gap of a running game's clock in the last ten seconds (20 of them at least)."""
         gap = 0.0
         for c in self.meter.values():
-            xs = sorted(v for at, v in c["gaps"] if at >= now_ms - 10000)
+            xs = [v for at, v in c["gaps"] if at >= now_ms - 10000]
             if len(xs) >= 20:
-                gap = max(gap, xs[int(round((len(xs) - 1) * 0.95))])
+                gap = max(gap, max(xs))
         return gap
 
+    def rtt_max(self, now_ms):
+        """core LeadMeter::rtt_ms: the largest of the last eight pings (one every 2 s), each a line there and one back."""
+        while now_ms >= self.next_ping:
+            self.next_ping += 2000.0
+            self.pings = (self.pings + [self.delay(self.ping_rng, 0) + self.delay(self.ping_rng, 1)])[-8:]
+        return max(self.pings) if self.pings else self.rtt_ms
+
     def adapt(self, now_ms):
-        """host adapt_lead: the round trip's high quantile (30 % over the median) and the clock gaps; longer at once, shorter after 8 s."""
-        want = BC.lead_for_measured(max(self.speed, 1), self.rtt_ms * 1.3, self.gap_ms(now_ms))
-        if want > self.lead_units:
-            self.lead_units, self.lower_since = want, None
+        """host adapt_lead (core JitterBuffer): the latest arrival of the round trips and the clock gaps, plus 20 ms; longer at once,
+        shorter by 50 ms a second."""
+        ms = self.buffer.update(BC.cover_ms(self.rtt_max(now_ms), self.gap_ms(now_ms)), now_ms / 1000.0)
+        want = BC.lead_for_cover(max(self.speed, 1), ms)
+        if want != self.lead_units:
+            self.lead_units = want
             self.session()
-        elif want < self.lead_units:
-            self.lower_since = now_ms if self.lower_since is None else self.lower_since
-            if now_ms - self.lower_since >= 8000:
-                self.lead_units, self.lower_since = want, None
-                self.session()
-        else:
-            self.lower_since = None
         self.leads.append(self.lead_units)
 
     def deliver_until(self, ms):
@@ -126,11 +136,30 @@ class MeasuredRelay(B.JitterRelay):
         self.deliver_until(self.round + 1)
 
 
+class MeasuredStallRelay(MeasuredRelay):
+    """The measured link's host with core's stall rules (test_stall.StallRelay, the relay's time in milliseconds here: core's 3 s)."""
+
+    TIMEOUT = 3000.0
+
+    def __init__(self, games, rng, delay, rtt_ms):
+        super().__init__(games, rng, delay, rtt_ms)
+        ST.StallRelay.stall_init(self)
+
+    def deliver_until(self, ms):
+        super().deliver_until(ms)
+        self.watch_stalls()
+
+
+for _name in ("session", "future_stamp", "target", "send_proxy", "game", "broadcast", "follow", "send", "watch_stalls"):
+    setattr(MeasuredStallRelay, _name, ST.StallRelay.__dict__[_name])
+
+
 class MeasuredLinkTest(B.BarrierTest):
-    def setup_link(self, seed, rtt_ms, frames, batch_ms=(BATCH_MS, BATCH_MS), stalls=((0, 0, 0), (0, 0, 0)), paced=True):
+    def setup_link(self, seed, rtt_ms, frames, batch_ms=(BATCH_MS, BATCH_MS), stalls=((0, 0, 0), (0, 0, 0)), paced=True, relay=None):
         """`frames`: per game (lo, hi) ms of a frame; `stalls`: per game (per second, lo ms, hi ms) of a stalled frame."""
         self.make(2, seed, lambda rng, dest: 1)
-        self.relay = MeasuredRelay(self.games, self.rng, one_way(rtt_ms), rtt_ms)
+        self.relay = (relay or MeasuredRelay)(self.games, self.rng, one_way(rtt_ms), rtt_ms)
+        self.frozen = {}
         self.frames, self.batch_ms, self.stalls, self.paced = frames, batch_ms, stalls, paced
         self.now = 0.0
         ids = [g.id for g in self.games]
@@ -162,6 +191,11 @@ class MeasuredLinkTest(B.BarrierTest):
 
     def frame(self, i, g):
         now = self.now
+        if self.frozen.get(g.id, -1.0) > now:
+            # frozen (an autosave): no frame, no batch, no clock line; the engine's clock does not run on meanwhile
+            self.next_frame[g.id] = self.frozen[g.id]
+            self.last_frame[g.id] = self.last_batch[g.id] = self.frozen[g.id]
+            return
         g.L.execute("FAKE_CLOCK = %r" % (1000.0 + now / 1000.0))
         dt = now - self.last_frame[g.id]
         self.last_frame[g.id] = now
@@ -174,14 +208,13 @@ class MeasuredLinkTest(B.BarrierTest):
         g.frame()
         if float(g.L.eval("FIND_UP('X').clockSentAt or -1")) == 1000.0 + now / 1000.0:
             self.relay.clock_line(g.id, g.time(), g.speed(), now)
-        # the engine: a batch once the interval (times the factor of the native module) has passed since the last one
-        if now - self.last_batch[g.id] >= self.batch_ms[i]:
-            f = self.factor(g) if self.paced else 1.0
-            if now - self.last_batch[g.id] >= self.batch_ms[i] * f:
-                t0 = g.time()
-                g.step()
-                if g.time() != t0:
-                    self.last_batch[g.id] = now
+        # the engine: a batch once the interval (times the factor of the native module, 0.5 to 2) has passed since the last one
+        f = self.factor(g) if self.paced else 1.0
+        if now - self.last_batch[g.id] >= self.batch_ms[i] * f:
+            t0 = g.time()
+            g.step()
+            if g.time() != t0:
+                self.last_batch[g.id] = now
         self.held_prev[g.id] = self.held(g)
         self.relay.round = now
         self.relay.pump()
@@ -254,7 +287,7 @@ class MeasuredLinkTest(B.BarrierTest):
 
     FRIEND = dict(rtt_ms=30.0, frames=((5.0, 12.0), (8.0, 18.0)))
 
-    def test_a_fast_link_runs_at_full_speed_and_does_not_stand(self):
+    def test_the_friend_tests_link_at_x4_runs_at_full_speed_and_a_guest_frozen_7_s_no_longer_holds_the_host(self):
         self.setup_link(81, **self.FRIEND)
         self.start_link(speed=4)
         r = self.measure(30)
@@ -265,9 +298,42 @@ class MeasuredLinkTest(B.BarrierTest):
             self.assertGreater(v["speed"], 0.85, text)
         self.assertGreaterEqual(self.relay.lead_units, BC.lead_for_measured(4, 30.0, 0.0), "the lead holds a batch: " + text)
         self.assert_same_world()
+        # a guest frozen for seven seconds at x4 no longer holds the host and catches up at twice the pace
+        self.tearDown()
+        self.setUp()
+        # the stall timeout (core host/stall.rs) on the friend test's link: the guest's game freezes 7 s (a clone freeze of the owner's
+        # notes, 2026-10-17: 7-10 s); before, the host stood all that time at its barrier
+        self.setup_link(85, relay=MeasuredStallRelay, **self.FRIEND)
+        self.start_link(speed=4)
+        self.measure(6)
+        host, guest = self.games
+        t0, at = host.time(), self.now
+        self.frozen[guest.id] = self.now + 7000.0
+        self.run_ms(7000)
+        ran = (host.time() - t0) / STEP / (7000.0 / BATCH_MS * 4)
+        self.assertTrue(any(e[0] == "stalled" for e in self.relay.events), self.relay.events)
+        self.assertGreater(ran, 0.5, "the host ran on after the 3 s timeout: %.2f of full speed" % ran)
+        behind = (host.time() - guest.time()) // STEP
+        self.assertGreater(behind, 60, "the guest stood 7 s, the host ran on for the last 4: %d steps behind" % behind)
+        # back: batches twice as often (factor 0.5) until it has caught up; the host runs on at full speed meanwhile
+        caught = None
+        for k in range(60):
+            if k == 3:
+                guest.send_gui(B.BUY)
+                self.issued += 1
+            self.run_ms(500)
+            if not self.relay.stalls:
+                caught = (k + 1) * 0.5
+                break
+        print("\n  x4 30 ms, guest frozen 7 s: host ran %.2f of full speed during it, guest %d steps behind, caught up after %s s; events %s"
+              % (ran, behind, caught, self.relay.events))
+        self.assertIsNotNone(caught, "the stall ended: %r" % self.relay.events)
+        self.assertLess(caught, 20.0, "about 7 s of play made up at twice the pace (one extra batch per batch): %s s" % caught)
+        self.measure(6)
+        self.assert_same_world()
 
     @T.full
-    def test_a_fast_link_with_the_friend_tests_frame_stalls_and_actions(self):
+    def test_frame_stalls_x2_and_a_genuinely_slow_peer_followed_by_slowing_down_not_standing_still(self):
         # the host's company page stalled a frame for 450-800 ms every few seconds in that test (frame.slow companies=440-760, the clock
         # gaps' maximum of 700-825 ms), the guest's for about 240 ms
         self.setup_link(82, stalls=((0.2, 450.0, 800.0), (0.2, 230.0, 260.0)), **self.FRIEND)
@@ -278,9 +344,9 @@ class MeasuredLinkTest(B.BarrierTest):
             self.assertLess(v["pace_mean"], 1.15, "%s: %s" % (k, text))
             self.assertLess(v["stood_s"], 3.0, "%s: %s" % (k, text))
         self.assert_same_world()
-
-    @T.full
-    def test_a_fast_link_at_x2_runs_at_full_speed(self):
+        # a fast link at x2 runs at full speed
+        self.tearDown()
+        self.setUp()
         self.setup_link(83, **self.FRIEND)
         self.start_link(speed=2)
         r = self.measure(30)
@@ -288,15 +354,9 @@ class MeasuredLinkTest(B.BarrierTest):
         for k, v in r.items():
             self.assertLess(v["pace_mean"], 1.06, "%s: %s" % (k, text))
             self.assertLess(v["stood_s"], 0.5, "%s: %s" % (k, text))
-
-    # ---- a genuinely slow peer: its engine's batches come every 260 ms (it cannot keep x4); the pacing still helps
-
-    def slow_peer(self, paced):
-        self.setup_link(84, rtt_ms=30.0, frames=((5.0, 12.0), (8.0, 18.0)), batch_ms=(BATCH_MS, 260.0), paced=paced)
-        self.start_link(speed=4)
-        return self.measure(30)
-
-    def test_a_genuinely_slow_peer_is_followed_by_slowing_down_not_by_standing_still(self):
+        # a genuinely slow peer is followed by slowing down not by standing still
+        self.tearDown()
+        self.setUp()
         before = self.slow_peer(paced=False)
         t_before = self.line("slow peer, no pacing", before)
         self.tearDown()
@@ -311,6 +371,12 @@ class MeasuredLinkTest(B.BarrierTest):
         self.assertGreater(fast_after["speed"], 0.9 * fast_before["speed"], "the session is not slower for it: %s / %s" % (t_before, t_after))
         self.assert_same_world()
 
+    # ---- a genuinely slow peer: its engine's batches come every 260 ms (it cannot keep x4); the pacing still helps
+
+    def slow_peer(self, paced):
+        self.setup_link(84, rtt_ms=30.0, frames=((5.0, 12.0), (8.0, 18.0)), batch_ms=(BATCH_MS, 260.0), paced=paced)
+        self.start_link(speed=4)
+        return self.measure(30)
 
 # the harness's own tests run in their own file
 for _name in dir(B.BarrierTest):

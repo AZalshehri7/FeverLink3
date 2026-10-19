@@ -131,6 +131,10 @@ pub struct Runtime {
     preview_args: Mutex<Option<[u64; 5]>>,
     /// Holding as `sync_flags` last saw it.
     preview_holding: AtomicBool,
+    /// What went wrong in a way that may let this game differ from the others (`failsafe.rs`), until the service thread writes it.
+    faults: crate::failsafe::Faults,
+    /// Service-thread rounds in a row that panicked.
+    pump_panics: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -188,6 +192,40 @@ impl Runtime {
             preview_fn: AtomicUsize::new(0),
             preview_args: Mutex::new(None),
             preview_holding: AtomicBool::new(false),
+            faults: crate::failsafe::Faults::new(),
+            pump_panics: AtomicU64::new(0),
+        }
+    }
+
+    /// Fail loud (`failsafe.rs`): the log line now, the `fault` event with the next round of the service thread. Calls nothing of
+    /// the game, so it may be called inside a guard as well as outside.
+    pub(crate) fn fault(&self, place: &'static str, action: crate::failsafe::Action, detail: impl Into<String>) {
+        if let Some(f) = self.faults.trip(place, action, detail) {
+            crate::log::guarded("fault report", || self.say(&f.line()));
+            self.wake();
+        }
+    }
+
+    /// One round of the service thread ([`Runtime::pump`]) with its panic contained. A panicking round may have lost events the mod
+    /// waits for (a hold, a completion): a repair fault; three rounds in a row, a stop fault (the link no longer works).
+    pub fn pump_round(&self) -> usize {
+        match crate::log::guarded("service thread", || self.pump()) {
+            Some(n) => {
+                self.pump_panics.store(0, Relaxed);
+                n
+            }
+            None => {
+                let k = self.pump_panics.fetch_add(1, Relaxed) + 1;
+                let action = if k >= 3 { crate::failsafe::Action::Stop } else { crate::failsafe::Action::Repair };
+                self.fault(
+                    "service thread",
+                    action,
+                    format!(
+                        "a panic in a round of the service thread ({k} in a row): the events of that round may be lost"
+                    ),
+                );
+                0
+            }
         }
     }
 
@@ -390,8 +428,7 @@ impl Runtime {
             .build
             .kind_offset
             .and_then(|o| payload.checked_add(o as usize))
-            // SAFETY: the byte is read only after its range is checked.
-            .and_then(|at| unsafe { crate::mem::readable(at as *const u8, 1).then(|| *(at as *const u8)) })
+            .and_then(crate::memguard::byte)
             .unwrap_or(255);
         let head = Header {
             seq,
@@ -758,20 +795,36 @@ impl Runtime {
         }
         // smooth pacing (pace.rs): its first stretched batch and a line a minute, from this thread (never from the hook on the main thread)
         let pace_now = crate::pace::clock_ms();
-        for line in [crate::pace::PACER.first_line(), crate::pace::PACER.minute_line(pace_now)].into_iter().flatten() {
+        // and the free-id order's line a minute (freeorder.rs), counted by its hook on the simulation's threads
+        for line in [
+            crate::pace::PACER.first_line(),
+            crate::pace::PACER.minute_line(pace_now),
+            crate::freeorder::STATS.minute_line(pace_now),
+        ]
+        .into_iter()
+        .flatten()
+        {
             self.say(&line);
         }
         if let Some(audit) = lock(&self.audit).poll(now, &self.counters) {
             self.say(&audit_log_line(&audit, |k| self.build.kind_name(k)));
             events.push(audit);
         }
-        if events.is_empty() {
-            return 0;
-        }
         for e in &events {
             if let Some(line) = e.log_line() {
                 self.say(&line);
             }
+            // the session's start and end in the free-id order trace: past a game's `holding off` its world runs single-player
+            if let Event::Holding { on, reason, .. } = e {
+                crate::ids::mark(&format!("holding {} ({reason})", if *on { "on" } else { "off" }));
+            }
+        }
+        // taken last, when nothing but the write is left (a panic before it loses no fault); `fault` logged each one already
+        for f in self.faults.drain().into_iter().chain(crate::failsafe::GLOBAL.drain()) {
+            events.push(Event::Fault { place: f.place.to_string(), detail: f.detail, action: f.action.name() });
+        }
+        if events.is_empty() {
+            return 0;
         }
         let mut guard = lock(&self.writer);
         if let Some(w) = guard.as_mut() {
@@ -820,11 +873,36 @@ impl Runtime {
         let add = self.add_fn();
         // filled in as the planning goes, so that a panic half-way still leaves the part that was done (a command that
         // was taken out of the engine's hands must be given back, whatever happens)
-        let mut plan = AddPlan { due: Vec::new(), spill: None, held_here: false, now: 0, dump: None, preview: None };
-        let hold = crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan)).flatten();
+        let mut plan = AddPlan {
+            due: Vec::new(),
+            spill: None,
+            held_here: false,
+            now: 0,
+            dump: None,
+            preview: None,
+            tool: false,
+            passed: None,
+        };
+        let hold = match crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan)) {
+            Some(hold) => hold,
+            None => {
+                if plan.tool && self.live.load(Relaxed) {
+                    plan.passed = Some("a panic while deciding whether to hold it (the PANIC line above)");
+                }
+                None
+            }
+        };
         if let Some(hold) = hold {
             // SAFETY: the arguments of the live call, as the caller guarantees.
             unsafe { self.capture_and_hold(&args, hold, &mut plan) };
+        }
+        if let Some(why) = plan.passed {
+            // Fail loud: the other games apply this build at its stamp, this one at the click (or the mod never hears of it)
+            self.fault(
+                "add hook",
+                crate::failsafe::Action::Repair,
+                format!("a construction tool's command went to the engine at the click, not at its stamp: {why}"),
+            );
         }
         if self.patch.enabled() {
             crate::log::guarded("add hook (patch trail)", || self.patch_note_add(&args, caller, plan.held_here));
@@ -927,7 +1005,19 @@ impl Runtime {
         }
         let now = self.now_ms();
         plan.now = now;
-        let mut machine = try_lock_briefly(&self.machine)?;
+        plan.tool = tool.is_some();
+        let mut machine = match try_lock_briefly(&self.machine) {
+            Some(m) => m,
+            // a tool's command may be one to hold: wait a little for the service thread rather than pass it through
+            None if plan.tool => match lock_within(&self.machine, HOOK_WAIT) {
+                Some(m) => m,
+                None => {
+                    plan.passed = Some("the hold state stayed busy");
+                    return None;
+                }
+            },
+            None => return None,
+        };
         // the mod writes `release` and then sends a command to get here: look at the file now, do not wait for the pump
         self.ingest(&mut machine, now);
         plan.due = machine.take_due(self.game_time(), now);
@@ -936,6 +1026,9 @@ impl Runtime {
             // SAFETY: the kind is read only from readable memory.
             if let Some(kind) = unsafe { engine::command_kind(args.cmd, engine.kind_offset) } {
                 let admit = machine.admit(kind, now);
+                if admit == Admit::Full {
+                    plan.passed = Some("the hold ring is full");
+                }
                 if admit == Admit::Off {
                     machine.tool_while_silent(kind, now); // a tool at work while the mod is silent: not a pause menu
                     plan.due.extend(machine.take_due(self.game_time(), now)); // given back before this command passes
@@ -985,10 +1078,15 @@ impl Runtime {
                     plan.held_here = true;
                     held_id = Some((id, payload));
                 }
-                Err(back) => plan.spill = Some(back), // refused after capture: it goes straight on
+                Err(back) => {
+                    plan.spill = Some(back); // refused after capture: it goes straight on
+                    plan.passed = Some("the hold ring refused it after the capture");
+                }
             }
+        } else {
+            plan.passed = Some("the engine's command could not be taken out of the tool's call (capture refused)");
         }
-        crate::log::guarded("add hook (held)", || {
+        let reported = crate::log::guarded("add hook (held)", || {
             if let Some((id, payload)) = held_id {
                 if input.is_some() {
                     self.inject.report(Event::Timing {
@@ -1017,6 +1115,24 @@ impl Runtime {
             }
             self.sync_flags(&machine);
         });
+        if reported.is_none() {
+            if let Some((id, _)) = held_id {
+                // Fail closed: what the mod needs of the held command (its texts, its preview) may be missing: it is failed (its tool
+                // callback fired with a failed result at the next Add), so no game applies it; the mod may have shipped it already
+                machine.handle(&crate::link::CtlMessage::Fail { id }, plan.now);
+                plan.preview = None;
+                plan.dump = None;
+                self.sync_flags(&machine);
+                drop(machine);
+                self.fault(
+                    "add hook (held)",
+                    crate::failsafe::Action::Repair,
+                    format!("a panic after command {id} was held: it is failed, nothing of it is applied on this game"),
+                );
+                self.wake();
+                return;
+            }
+        }
         drop(machine);
         if plan.held_here || !plan.due.is_empty() {
             self.wake();
@@ -1064,6 +1180,13 @@ impl Runtime {
                 let kind = unsafe { engine::command_kind(cmd, kind_offset) };
                 self.note_apply_orders(kind, claimed.is_some())
             });
+            if mine.is_none() {
+                self.fault(
+                    "apply hook (orders)",
+                    crate::failsafe::Action::Repair,
+                    "a panic while matching a command the simulation applies to its inject order: it is applied as the script sent it",
+                );
+            }
             if mine == Some(true) {
                 // calls the engine when an order is carried out: guards its own bookkeeping
                 used = self.apply_orders(cmd);
@@ -1170,6 +1293,27 @@ struct AddPlan {
     dump: Option<DumpJob>,
     /// A held `build_proposal` command to give to the scripts as a preview (`give_preview`): its id and payload.
     preview: Option<(crate::hold::HoldId, usize)>,
+    /// The command comes from a construction tool's call site (known before anything can fail).
+    tool: bool,
+    /// Why a tool's command that holding should have taken goes to the engine at the click (a fault, `failsafe.rs`).
+    passed: Option<&'static str>,
+}
+
+/// How long the command hook waits for the hold state for a tool's command (the service thread holds it while it reads the control
+/// file and writes events: well under a millisecond as a rule). Longer, and the command passes and a fault is raised.
+const HOOK_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The lock, or `None` after `wait`.
+fn lock_within<T>(m: &Mutex<T>, wait: std::time::Duration) -> Option<MutexGuard<'_, T>> {
+    let until = Instant::now() + wait;
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() < until => std::thread::yield_now(),
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
 }
 
 /// A tool's command [`Runtime::plan_add`] decided to hold: the machine, still locked, and what the hold records about the
@@ -1296,7 +1440,9 @@ mod tests {
             town_edges: None,
             town_sort_call: None,
             town_pick_call: None,
+            town_field_call: None,
             batch_pace: None,
+            free_order: None,
             game_time_getter: None,
             script_pool: None,
             lua_makeseed: None,
@@ -1622,21 +1768,70 @@ mod tests {
         assert_eq!(calls(), ["add kind 52 tag 200"], "the 65th is not held");
         rt.pump();
         assert!(kinds(dir.path()).contains(&"error".to_string()));
+        assert_eq!(
+            faults(dir.path()),
+            ["add hook repair"],
+            "and it is loud: the build went in at the click on this game only"
+        );
+    }
+
+    /// The `fault` events written so far, as "place action".
+    fn faults(dir: &Path) -> Vec<String> {
+        events(dir)
+            .into_iter()
+            .filter(|(k, _)| k == "fault")
+            .map(|(_, p)| {
+                let field = |name: &str| {
+                    let at = p.find(&format!("[\"{name}\"]=\"")).map(|i| i + name.len() + 6).unwrap_or(0);
+                    p[at..].split('"').next().unwrap_or("").to_string()
+                };
+                format!("{} {}", field("where"), field("action"))
+            })
+            .collect()
     }
 
     #[test]
-    fn a_busy_state_never_makes_the_hook_wait() {
+    fn a_busy_state_makes_a_tools_command_wait_briefly_and_then_pass_loudly() {
         let dir = TempDir::new("rt-busy");
         let rt = runtime(Some(dir.path()));
         ctl(dir.path(), HOLD_ON);
         rt.pump();
-        let guard = rt.machine.lock().unwrap(); // the service thread, say, in the middle of something
+        let guard = rt.machine.lock().unwrap(); // the service thread, say, stuck in the middle of something
+        let mut other = Call::new(27, 9);
+        let started = Instant::now();
+        unsafe { rt.on_add(other.args(), at(0x999)) };
+        assert!(started.elapsed() < HOOK_WAIT, "a command from no tool site never waits");
         let mut c = Call::new(52, 1);
         let started = Instant::now();
         unsafe { rt.on_add(c.args(), at(SITE_A)) };
-        assert!(started.elapsed().as_millis() < 500, "no waiting");
+        assert!(started.elapsed() >= HOOK_WAIT && started.elapsed().as_millis() < 500, "a short wait, then no more");
         drop(guard);
-        assert_eq!(calls(), ["add kind 52 tag 1"], "it simply passed through, the command is not lost");
+        assert_eq!(calls(), ["add kind 27 tag 9", "add kind 52 tag 1"], "it passed through, the command is not lost");
+        rt.pump();
+        assert_eq!(faults(dir.path()), ["add hook repair"], "one fault, for the tool's command only");
+        assert!(events(dir.path()).iter().any(|(k, p)| k == "fault" && p.contains("the hold state stayed busy")));
+    }
+
+    #[test]
+    fn a_tools_command_waits_out_a_short_busy_spell_and_is_held() {
+        let dir = TempDir::new("rt-busy-short");
+        let rt = std::sync::Arc::new(runtime(Some(dir.path())));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = rt.clone();
+        let t = std::thread::spawn(move || {
+            let _g = other.machine.lock().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        });
+        rx.recv().unwrap();
+        let mut c = Call::new(52, 1);
+        unsafe { rt.on_add(c.args(), at(SITE_A)) };
+        t.join().unwrap();
+        assert!(calls().is_empty(), "held, not passed on");
+        rt.pump();
+        assert!(faults(dir.path()).is_empty());
     }
 
     #[test]
@@ -1949,8 +2144,10 @@ mod tests {
         let out = unsafe { rt.on_add(c.args(), at(SITE_A)) };
         assert_eq!(out, c.args().out);
         assert_eq!(calls(), ["add kind 52 tag 1"], "the game's call was made as if the module were not there");
-        // the lock the planning died holding is poisoned, not stuck: later calls still work
         rt.clock = None;
+        rt.pump();
+        assert_eq!(faults(dir.path()), ["add hook repair"], "but not silently: the build went in at the click");
+        // the lock the planning died holding is poisoned, not stuck: later calls still work
         let mut next = Call::new(27, 2);
         unsafe { rt.on_add(next.args(), at(SITE_A)) };
         assert_eq!(calls(), ["add kind 27 tag 2"]);
@@ -1985,6 +2182,30 @@ mod tests {
         assert!(calls().is_empty(), "held, not passed on");
         rt.pump();
         assert!(kinds(dir.path()).contains(&"held".to_string()));
+    }
+
+    #[test]
+    fn a_panicking_service_round_is_a_repair_fault_and_three_in_a_row_a_stop() {
+        let dir = TempDir::new("rt-pump-panic");
+        let mut rt = runtime(Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.log = panicking_log; // the round's log lines (the holding event's) panic
+        assert_eq!(rt.pump_round(), 0);
+        rt.log = quiet;
+        rt.pump_round();
+        assert_eq!(faults(dir.path()), ["service thread repair"]);
+        rt.log = panicking_log;
+        for _ in 0..3 {
+            ctl(dir.path(), "bogus\t1\t{}\n"); // an error event: a log line, which panics
+            rt.pump_round();
+        }
+        rt.log = quiet;
+        rt.pump_round();
+        assert_eq!(
+            faults(dir.path()),
+            ["service thread repair", "service thread repair", "service thread repair", "service thread stop"]
+        );
+        assert!(rt.faults.stopped());
     }
 
     #[test]
@@ -2469,6 +2690,25 @@ mod tests {
         let why = rt.refund_job(5, 2, dir.path(), zero.as_ptr() as usize).err().unwrap();
         assert!(why.contains("refund: the Context's refundableEntities has no load factor"), "{why}");
         inject::TEST_REFUND_FNS.with(|f| f.set(None));
+    }
+
+    #[test]
+    fn the_originators_refund_window_goes_into_the_commands_context() {
+        use crate::refund::{tests::Synthetic, WINDOW_OFFSET};
+        let dir = TempDir::new("rt-refund-window");
+        let mut rt = runtime(Some(dir.path()));
+        rt.log = keep;
+        // the script command's Context: the Lua Context has no field for the window, so the conversion leaves 0.0 (every donor text)
+        let mut s = Synthetic::new(&[]);
+        let dest = s.payload.as_mut_ptr() as usize;
+        rt.refund_window(9, dest, 60.0).expect("written");
+        assert_eq!(&s.payload[WINDOW_OFFSET..WINDOW_OFFSET + 4], &60.0f32.to_le_bytes());
+        let said = SAID.with(|l| l.borrow().clone());
+        assert!(
+            said.iter().any(|l| l.contains("key 9: refund window 60 s of the originator's Context written")
+                && l.contains("the script's conversion had 0)")),
+            "{said:?}"
+        );
     }
 
     #[test]

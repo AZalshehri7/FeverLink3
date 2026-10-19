@@ -9,13 +9,12 @@ MOD = os.path.join(HERE, "..", "..", "mod", "feverlink3")
 
 
 class ContentIndexTest(unittest.TestCase):
-    def test_every_file_in_content_is_listed_in_the_games_index(self):
+    def test_every_file_is_listed_none_formats_large_values_with_percent_d_and_each_keeps_room_below_200_locals(self):
         listed = set(json.load(open(os.path.join(MOD, "_content.json"), encoding="utf-8"))["files"])
         present = set(os.listdir(os.path.join(MOD, "content")))
         self.assertEqual(set(), present - listed, "files the game would not find")
         self.assertEqual(set(), listed - present, "files listed but missing")
-
-    def test_modules_that_carry_values_never_format_with_percent_d(self):
+        # modules that carry values never format with percent d
         # The game's Lua raises on "%d" beyond 32 bits (a balance of 5 billion, sweep 2026-10-13): numbers that may be money or another
         # large value go through C.integerText (feverlink3_common.lua), never string.format("%d").
         import re
@@ -28,8 +27,7 @@ class ContentIndexTest(unittest.TestCase):
         # the two trace modules count things with "%d" (small by construction) but prints its sampled values through the helper
         for name in ("feverlink3_towntrace.lua", "feverlink3_livevsloaded.lua"):
             self.assertNotIn('format("%d", v)', open(os.path.join(MOD, "content", name), encoding="utf-8").read(), name)
-
-    def test_every_mod_file_keeps_room_below_the_games_limit_of_200_locals(self):
+        # every mod file keeps room below the games limit of 200 locals
         # Lua allows 200 active locals per function, and a file's main chunk is one function. The game's Lua refused the bridge with "too
         # many local variables (limit is 200) in main function" when six top-level locals were added (real run rc1, 2026-10-14): 191 names
         # loaded, 197 did not although lupa compiled them (the game counts a few more of its own), and every entry point of the bridge then
@@ -44,11 +42,10 @@ class ContentIndexTest(unittest.TestCase):
                 n = peak_locals(f.read(), name)
             self.assertLessEqual(n, caps.get(name, 100), "%s: %d active locals at its peak (game limit 200, minus a few)" % (name, n))
 
-
 class ModDefinitionTest(unittest.TestCase):
     """mod.json and _metadata as the docs describe them (wiki modding:general:moddefinition; tf3-docs guides/mod-structure.html)."""
 
-    def test_mod_json_has_the_documented_fields_and_no_empty_hooks(self):
+    def test_mod_json_has_the_documented_fields_and_the_cover_is_a_1920_by_1080_png(self):
         with open(os.path.join(MOD, "mod.json"), encoding="utf-8") as f:
             m = json.load(f)
         self.assertEqual("feverlink3", m["modId"])
@@ -63,8 +60,7 @@ class ModDefinitionTest(unittest.TestCase):
         allowed = {"modId", "revision", "severityAdd", "severityRemove", "dependencies", "incompatibilities", "params", "visible",
                    "cosmetic", "autoActivate", "url"}
         self.assertEqual(set(), set(m) - allowed, "fields the docs do not describe")
-
-    def test_the_cover_is_a_1920_by_1080_png_below_8_mb(self):
+        # the cover is a 1920 by 1080 png below 8 mb
         import struct
         path = os.path.join(MOD, "_metadata", "0.png")
         with open(path, "rb") as f:
@@ -73,7 +69,6 @@ class ModDefinitionTest(unittest.TestCase):
         self.assertEqual(b"IHDR", head[12:16])
         self.assertEqual((1920, 1080), struct.unpack(">II", head[16:24]))
         self.assertLess(os.path.getsize(path), 8 * 1024 * 1024)
-
 
 def peak_locals(text, name):
     """The most locals active at once at any column-0 statement of the file (its main chunk and its top-level functions), as Lua 5.2's

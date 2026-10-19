@@ -31,24 +31,38 @@ pub fn init(path: PathBuf) {
     *cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(path);
 }
 
+/// Appends one line. The lock is held only to read the path, never while the file is opened and written: the hooks log on the
+/// game's threads, and a write that waits (a scanner holding the file, a slow disk) must not make every other thread that logs wait
+/// behind it (labs L and L2, 2026-10-19: a game hung while loading with the deep growth log on; `hookwatch` names the place).
 pub fn line(text: &str) {
     let Some(cell) = PATH.get() else { return };
-    let guard = cell.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(path) = guard.as_ref() {
-        append(path, text);
+    let path = cell.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if let Some(path) = path {
+        let _inside = crate::hookwatch::NATIVE_LOG.enter();
+        append(&path, text);
     }
 }
 
+/// [`line`] without even the path's lock (the `hookwatch` dump: it must be written while another thread is stuck anywhere).
+pub fn line_unlocked(text: &str) {
+    append_unlocked(text);
+}
+
+/// One `write_all` of the whole line: a single append is not split between writers (this process's threads and the other game,
+/// which shares the file), where `writeln!` wrote the text and the line end separately.
 fn append(path: &Path, text: &str) {
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else { return };
     let len = file.metadata().map_or(0, |m| m.len());
     if len >= MAX_BYTES {
         return;
     }
-    let _ = writeln!(file, "{text}");
-    if len + text.len() as u64 + 1 >= MAX_BYTES {
-        let _ = writeln!(file, "(log full: further lines are dropped until the next start)");
+    let mut buf = String::with_capacity(text.len() + 1);
+    buf.push_str(text);
+    buf.push('\n');
+    if len + buf.len() as u64 >= MAX_BYTES {
+        buf.push_str("(log full: further lines are dropped until the next start)\n");
     }
+    let _ = file.write_all(buf.as_bytes());
 }
 
 /// Most backtrace frames written for one panic.

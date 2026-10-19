@@ -7,6 +7,32 @@ title: FeverLink3 changelog
 All notable changes of each release. FeverLink3 is an unfinished test project: read the status in the README before using it.
 Only changes that matter to a player or tester are listed here.
 
+## 0.2.0-pre7
+
+A large round of fixes and new features. **Not yet played by a person:** tested in the automatic tests and in lab runs on one PC (two game windows, game speed x4, real tool clicks and scripted builds, a forced repair sync, a 5 s freeze of one game). Not tested over the internet or between two PCs.
+
+### New
+- **Steam invites:** invite friends with Steam's own invite dialog (the FeverLink3 window's "Invite friends (Steam)" button) or from the Steam friends list (Invite to Game / Join Game). The host lets each friend in; the session key is never shown in what Steam shows other friends. Needs a test between two PCs.
+- **A frozen game no longer stops everyone:** if one player's game stops answering for 3 s (an autosave, a slow PC), the others play on and that game catches up afterwards with the same actions.
+- **Short drops:** a player who loses the connection for less than a minute comes back without a reload.
+- **Mod check:** a player whose game build, FeverLink3 version or mods (the ones the host's world uses) differ is told what differs before the world is sent.
+- **The bulldozer's refund** for something you have just built now works in multiplayer (75 % back in the lab, the same on every game).
+- When FeverLink3 cannot carry a build to the other players, the tool says so in red before you click.
+
+### Improved
+- The games compare their worlds about every 5 seconds instead of every 10-60, still spread over many small steps.
+- Smoother pacing: the game that is behind catches up a little faster instead of the other one standing still.
+- The game's two simulation script states now share everything a step needs (some builds were not copied natively, and a session end could clear the next session's queue).
+- Freed object ids are reused in the same order on every game.
+- Native safety: a part that cannot do its job stops the session loudly instead of letting one game run differently; bad engine memory reads are refused instead of crashing.
+- Every build writes one result line to the logs (verdict, objects, money, refund), which makes problem reports much more useful.
+
+### Known gaps
+- Not yet played by a person, not tested over the internet, Steam invites not tested between two PCs.
+- In 2 of 8 lab starts one of the two games did not finish loading the world (only with an extra diagnostic log switched on; the cause is not known yet). If it happens, restart that game.
+- Two players building at the same spot within about a second: one of the two builds can be refused on both games (the worlds stay equal).
+- The speed icon may still flicker briefly while the game waits for the other player.
+
 ## 0.2.0-pre6
 
 Fixes from the internet test of 0.2.0-pre5 with a friend. **Not yet played by a person:** tested in the automatic tests and one short lab run on one PC (two windows, scripted and real-tool builds, a build during a pause, a forced repair sync). Not tested over the internet.

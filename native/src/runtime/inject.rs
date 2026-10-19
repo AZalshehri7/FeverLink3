@@ -77,7 +77,7 @@ impl Runtime {
         let Some(mut job) =
             crate::log::guarded("native inject: text", || self.inject_encode_text(payload, id, settings, t0, mask))
         else {
-            return;
+            return self.refuse_text_after_panic(id, "native inject: text");
         };
         // Owner decision 2026-10-18 (#6): a text that passes the text-only checks is also proved by the engine on this game, before
         // anything leaves it: the same rebuild every receiver makes at the stamp, destroyed again (the engine calls are not guarded)
@@ -90,7 +90,34 @@ impl Runtime {
                 Err(why) => job.refusal = Some(why),
             }
         }
-        crate::log::guarded("native inject: text (ship)", || self.inject_write_text(id, t0, wall0, job));
+        if crate::log::guarded("native inject: text (ship)", || self.inject_write_text(id, t0, wall0, job)).is_none() {
+            self.refuse_text_after_panic(id, "native inject: text (ship)");
+        }
+    }
+
+    /// Fail closed when our own code panicked on a held command's text: a refusal file (the mod fails the held command and ships
+    /// nothing; it reads the refusal before the text) instead of no file at all, which the mod took as "no native text, build it from
+    /// the record" (fail open).
+    fn refuse_text_after_panic(&self, id: u64, site: &str) {
+        let why = format!("our own code panicked on this command's text in {site} (the PANIC line in native.log)");
+        let written = self.refused_text.write(id, &format!("{why}\n"));
+        crate::log::guarded("native inject: text refusal", || {
+            self.say(&format!(
+                "native inject: hold {id}: REFUSED BEFORE SHIPPING: {why}; native_refused_{id}.txt {}",
+                if written.is_ok() {
+                    "written: the mod fails the held command and ships nothing"
+                } else {
+                    "NOT written"
+                }
+            ))
+        });
+        if written.is_err() {
+            self.fault(
+                "native inject: text",
+                crate::failsafe::Action::Repair,
+                format!("hold {id}: {why}; the refusal file could not be written"),
+            );
+        }
     }
 
     /// The originator's own engine proof of its text (`inject::own_proof`) on the held command at `payload`: the checks and the dry
@@ -396,7 +423,17 @@ impl Runtime {
     /// guarded, the engine part is not. Never call it inside a guard.
     pub(super) fn inject_add(&self, args: &AddArgs, caller: Option<usize>) -> Option<Used> {
         crate::log::calls_engine("native inject: an order may be carried out");
-        let job = crate::log::guarded("native inject: order", || self.inject_take(args, caller)).flatten();
+        let job = match crate::log::guarded("native inject: order", || self.inject_take(args, caller)) {
+            Some(job) => job,
+            None => {
+                self.fault(
+                    "native inject: order",
+                    crate::failsafe::Action::Repair,
+                    "a panic while matching a command to its inject order: the command passed untouched (it may be the mod's placeholder)",
+                );
+                None
+            }
+        };
         let InjectJob { order, dest, t0, rb0, prepared } = job?;
         let forced = order.forced.clone();
         let run = match prepared {
@@ -419,7 +456,16 @@ impl Runtime {
         // The order was matched to this command by its identity before (inject_take), so every error here is a refusal.
         let refused = !order.link_only && run.is_err();
         let outcome = refused.then(|| self.inject_neutralise(order.key, dest));
-        crate::log::guarded("native inject: result", || self.inject_finish(order, (t0, rb0), run, outcome))
+        let key = order.key;
+        let used = crate::log::guarded("native inject: result", || self.inject_finish(order, (t0, rb0), run, outcome));
+        if used.is_none() {
+            self.fault(
+                "native inject: result",
+                crate::failsafe::Action::Repair,
+                format!("key {key}: a panic in the report of a carried-out order: the mod is not told its outcome"),
+            );
+        }
+        used
     }
 
     /// The engine's Proposal functions; a test sets stand-ins (`TEST_FNS`).
@@ -715,7 +761,8 @@ impl Runtime {
             EngineAlloc::at(self.base).map_err(|why| format!("the game's allocator was not verified: {why}"))?;
         let donor = counts.iter().any(|&n| n > 0).then_some(dest);
         let refund = if refund > 0 { Some(self.refund_job(key, refund, &dir, dest)?) } else { None };
-        Ok(Prepared { fns, alloc, settings, dir, text, donor, refund })
+        let window = crate::refund::window_of(&text).map_err(|e| format!("refund: {e}"))?;
+        Ok(Prepared { fns, alloc, settings, dir, text, donor, refund, window })
     }
 
     /// The refund part of an order (owner decision 2026-10-18: the bulldoze refund natively, `refund.rs`): the side file's entries,
@@ -774,7 +821,7 @@ impl Runtime {
     /// command (copy assignment) and destroyed. Not inside `log::guarded`, so that an exception of the engine reaches the game's own
     /// handler; the reports in between, which call nothing of the engine, are guarded.
     fn inject_engine(&self, key: u64, dest: usize, p: Prepared) -> Result<(u64, u64, u64), String> {
-        let Prepared { fns, alloc, settings, dir, text, donor, refund } = p;
+        let Prepared { fns, alloc, settings, dir, text, donor, refund, window } = p;
         let live = LiveMem;
         let ctx =
             nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
@@ -804,7 +851,25 @@ impl Runtime {
         if let Some(job) = refund {
             self.refund_engine(key, dest, job)?;
         }
+        // the Context's refund window as the originator's tool set it (`refund::WINDOW_OFFSET`): without it the engine refunds nothing,
+        // whatever the list holds (lab O, 2026-10-19); a plain float of the Context, written on every game from the same text
+        if let Some(w) = window {
+            self.refund_window(key, dest, w)?;
+        }
         Ok(stats)
+    }
+
+    /// Writes the originator's refund window into the command's Context (`refund::set_window`) and says what the script's conversion
+    /// had there. `Err` (the order is refused) when the write failed.
+    pub(super) fn refund_window(&self, key: u64, dest: usize, w: f32) -> Result<(), String> {
+        let had =
+            LiveMem.read(dest + crate::refund::WINDOW_OFFSET, 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        crate::refund::set_window(&super::cmd_patch::LivePoke, dest, w).map_err(|e| format!("refund: {e}"))?;
+        self.say(&format!(
+            "native inject: key {key}: refund window {w} s of the originator's Context written into the command's Context (the script's conversion had {})",
+            had.map_or("an unreadable value".to_string(), |h| h.to_string())
+        ));
+        Ok(())
     }
 
     /// Hybrid injections only (the construction is the receiver's own conversion): writes what that conversion looked like next to the
@@ -910,6 +975,8 @@ struct Prepared {
     donor: Option<usize>,
     /// The order's refund entries and the plan for the command's Context container (`None`: the order names none).
     refund: Option<RefundJob>,
+    /// The originator's Context refund window from the text (`None`: the text names none; the command keeps its own).
+    window: Option<f32>,
 }
 
 /// The refund part of an order, checked before the engine is called ([`Runtime::refund_job`]).

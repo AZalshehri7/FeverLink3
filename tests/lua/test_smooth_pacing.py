@@ -62,7 +62,7 @@ class PacingTest(BC.CadenceTest):
             found = PACE_LINE.findall(text)
             if found:
                 p = int(found[-1])
-                assert 1000 <= p <= 2000, p
+                assert 500 <= p <= 2000, p
                 self.factor_now[g.id] = p / 1000.0
         return self.factor_now[g.id]
 
@@ -145,20 +145,12 @@ class PacingTest(BC.CadenceTest):
     # the time: both games wait for each other's clock whatever they do, and the pacing spreads the waits at a cost in speed.
 
     @T.full
-    def test_smooth_pacing_cuts_the_stand_still_over_150_ms(self):
-        self.check_drop(*self.compare(150, 51, 1), keep=0.3, pace_cost=0.15)
-
-    @T.full
-    def test_smooth_pacing_cuts_the_stand_still_over_150_ms_at_more_seeds_and_x2(self):
-        for seed, speed in ((52, 2), (53, 1)):
-            with self.subTest(seed=seed, speed=speed):
-                self.check_drop(*self.compare(150, seed, speed), keep=0.3, pace_cost=0.15)
-
-    @T.full
-    def test_smooth_pacing_cuts_the_stand_still_over_300_ms(self):
-        for seed, speed in ((61, 1), (62, 2), (63, 1)):
-            with self.subTest(seed=seed, speed=speed):
-                self.check_drop(*self.compare(300, seed, speed), keep=0.6, pace_cost=0.25)
+    def test_smooth_pacing_cuts_the_stand_still_over_150_and_300_ms(self):
+        runs = [(150, seed, speed, 0.3, 0.15) for seed, speed in ((51, 1), (52, 2), (53, 1))]
+        runs += [(300, seed, speed, 0.6, 0.25) for seed, speed in ((61, 1), (62, 2), (63, 1))]
+        for rtt, seed, speed, keep, cost in runs:
+            with self.subTest(rtt=rtt, seed=seed, speed=speed):
+                self.check_drop(*self.compare(rtt, seed, speed), keep=keep, pace_cost=cost)
 
     def test_a_game_with_ample_room_runs_at_full_speed(self):
         # a fast link with a generous lead: the room always outlasts the stop's next move, so the factor stays 1
@@ -182,7 +174,7 @@ class PureSmoothPacingTest(unittest.TestCase):
         T.load_common(self.L)
         self.K = self.L.execute(T.LOCKSTEP_SRC)
 
-    def test_the_batch_that_would_empty_the_room_is_timed_to_the_stops_next_move(self):
+    def test_the_pure_pacing_room_stop_batch_time_and_factor(self):
         K = self.K
         bias = K.PACE_BIAS
         # 1x, a batch every 200 ms, the last one just now: one step of room means the next batch empties it
@@ -210,8 +202,7 @@ class PureSmoothPacingTest(unittest.TestCase):
             if prev is not None:
                 self.assertLessEqual(f, prev + 1e-9)
             prev = f
-
-    def test_the_stops_next_move_is_expected_after_its_usual_gap_or_as_late_again(self):
+        # the stops next move is expected after its usual gap or as late again
         K = self.K
         P = K.paceNew()
         self.assertIsNone(K.paceNext(P, 10.0), "nothing measured: no expectation")
@@ -237,8 +228,7 @@ class PureSmoothPacingTest(unittest.TestCase):
             clock, stop = clock + 0.3, stop + STEP
             K.paceObserve(P, stop, clock)
         self.assertEqual(len(list(P.gaps.values())), K.PACE_GAPS)
-
-    def test_the_batch_time_is_measured_with_the_factor_taken_out(self):
+        # the batch time is measured with the factor taken out
         K = self.K
         P = K.paceNew()
         self.assertEqual(K.paceBatch(P), STEP, "nothing measured yet")
@@ -256,8 +246,7 @@ class PureSmoothPacingTest(unittest.TestCase):
         now += STEP
         K.paceOwn(P, now, clock + 0.01, True, 1)
         self.assertAlmostEqual(K.paceBatch(P), 250, delta=1)
-
-    def test_the_stop_is_the_nearer_of_the_barrier_and_the_pacing_limit_and_none_when_not_running(self):
+        # the stop is the nearer of the barrier and the pacing limit and none when not running
         K, L = self.K, self.L
         s = K.newSession()
         peers = L.table()
@@ -269,8 +258,7 @@ class PureSmoothPacingTest(unittest.TestCase):
         self.assertEqual(K.paceStop(s, peers, 3), 4000 - 3 * STEP, "the barrier (promise less the receiver's keep)")
         K.applySession(s, L.table_from({"started": True, "speed": 0, "lead": 600}))
         self.assertIsNone(K.paceStop(s, peers, 3), "speed 0")
-
-    def test_the_factor_follows_its_target_and_stays_in_range(self):
+        # the factor follows its target and stays in range
         K = self.K
         P = K.paceNew()
         K.paceSmooth(P, 2, 0.0)

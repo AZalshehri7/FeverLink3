@@ -21,6 +21,7 @@ pub struct Player {
     pub game: Vec<(MessageKind, Vec<u8>)>,
     pub log: Vec<String>,
     pub saves: Vec<(i32, String, Vec<u8>)>,
+    pub rejected: Option<RejectMessage>,
 }
 
 impl Player {
@@ -79,13 +80,24 @@ impl Harness {
 
     /// A player whose join message announces these capabilities.
     pub fn connect_with_caps(&mut self, name: &str, caps: &[&str]) -> ConnectionId {
+        self.connect_full(name, caps, None)
+    }
+
+    /// A player whose join carries this mod list.
+    pub fn connect_with_mods(&mut self, name: &str, mods: Option<ModFingerprint>) -> ConnectionId {
+        self.connect_full(name, &[], mods)
+    }
+
+    fn connect_full(&mut self, name: &str, caps: &[&str], mods: Option<ModFingerprint>) -> ConnectionId {
         self.next_connection += 1;
         let c = self.next_connection;
         let clock = Arc::clone(&self.now);
         let mut session =
             PlayerSession::with_clock(self.key.clone(), name, "0.1", Box::new(move || *clock.lock().unwrap()));
         session.set_capabilities(caps.iter().map(|c| (*c).to_owned()).collect());
-        self.players.insert(c, Player { session, game: Vec::new(), log: Vec::new(), saves: Vec::new() });
+        session.set_mods(mods);
+        let player = Player { session, game: Vec::new(), log: Vec::new(), saves: Vec::new(), rejected: None };
+        self.players.insert(c, player);
         self.routable.insert(c);
         let outs = self.host.connection_opened(c);
         self.pump_host(outs);
@@ -151,7 +163,8 @@ impl Harness {
                 PlayerOutput::SaveReceived { id, sha256, bytes } => {
                     self.players.get_mut(&c).unwrap().saves.push((id, sha256, bytes));
                 }
-                PlayerOutput::Welcomed(_) | PlayerOutput::Rejected(_) => {}
+                PlayerOutput::Rejected(r) => self.players.get_mut(&c).unwrap().rejected = Some(r),
+                PlayerOutput::Welcomed(_) => {}
             }
         }
     }
@@ -268,7 +281,7 @@ impl Harness {
         self.stop_all_at(pause_at);
         assert_eq!(ResyncState::Saving, self.host.resync_state());
         let id = self.host.resync_id().unwrap();
-        self.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+        self.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
         assert_eq!(ResyncState::Transferring, self.host.resync_state());
         id
     }

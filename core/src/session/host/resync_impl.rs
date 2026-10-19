@@ -230,8 +230,10 @@ impl HostSession {
             return;
         }
         self.resync_counter += 1;
-        // every game gets the host's world: what the verdicts of the old worlds said no longer matters
+        // every game gets the host's world: what the verdicts of the old worlds said no longer matters, and a player away now
+        // keeps the old one, so it cannot be caught up any more
         self.verdicts.clear();
+        self.forget_away_logs("a resync round replaced the others' world while it was away");
         let id = self.resync_counter;
         // Tell everyone before the games pause: a repair copies the host's world to everybody, so a build that never reached the host
         // (a kind that is not replicated yet) is lost on the other game.
@@ -473,6 +475,9 @@ impl HostSession {
             return;
         }
         if m.ok {
+            // before any world data goes out: the players' mods against the ones this world uses
+            let world = m.world_mods();
+            self.check_world_mods(world.as_deref());
             self.enter(ResyncState::Transferring, "waiting for the launcher to read the save".to_owned());
         } else {
             let detail = m.detail.unwrap_or_default();
@@ -614,7 +619,7 @@ impl HostSession {
             r.verify_n = Some(n);
         }
         self.enter(ResyncState::Verifying, "comparing the paused checksums".to_owned());
-        let request = ChecksumRequestMessage { n, at, paused: true, full: true, spread: 0 };
+        let request = ChecksumRequestMessage::new(n, at, true, true, 0);
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
         self.last_checksum = self.now();
     }
@@ -677,6 +682,9 @@ impl HostSession {
     pub(super) fn on_checksum_outcome(&mut self, outcome: ChecksumOutcome) {
         let verify = self.resync.as_ref().and_then(|r| r.verify_n);
         self.count_round(!outcome.comparable());
+        if verify != Some(outcome.n) {
+            self.note_round_for_detail(&outcome);
+        }
         self.out.push(HostOutput::ChecksumCompleted(outcome.clone()));
         if self.resync.is_some() {
             if verify == Some(outcome.n) {
@@ -731,10 +739,39 @@ impl HostSession {
         if !self.state.started {
             return;
         }
+        if self.check_caught_up(&outcome) {
+            return;
+        }
         let now = self.now();
         if let Some(reason) = self.policy.on_outcome(now, &outcome) {
             self.request_resync(reason);
         }
+    }
+
+    /// The first compared round a player caught up after a drop took part in (`HostSession::begin_catch_up`): the same world, or a
+    /// repair at once (today's resync: every game gets the host's world), without waiting for the policy's second round. True when
+    /// the repair was asked for.
+    fn check_caught_up(&mut self, outcome: &ChecksumOutcome) -> bool {
+        if !outcome.comparable() {
+            return false;
+        }
+        let checked: Vec<u16> = outcome.reporters.iter().copied().filter(|id| self.resume_checks.remove(id)).collect();
+        if checked.is_empty() {
+            return false;
+        }
+        let names = checked.iter().map(|&id| self.name(id)).collect::<Vec<_>>().join(", ");
+        if outcome.differences.is_empty() {
+            self.log(format!("resume: {names} caught up and the worlds match (checksum round {})", outcome.n));
+            return false;
+        }
+        let parts: Vec<&str> = outcome.differing_parts().collect();
+        self.log(format!(
+            "resume: {names} caught up but the worlds differ in checksum round {} ({}): repair",
+            outcome.n,
+            parts.join(", ")
+        ));
+        self.request_resync(format!("{names}'s world differs after catching up"));
+        true
     }
 
     pub(super) fn on_replay_failed(&mut self, from: u16, detail: &str) {

@@ -44,14 +44,14 @@ One IPv4 endpoint gives 53 characters. Anything that fails the check or the shap
 
 ```
 host   → conn    Challenge  { nonce: 16 bytes, protocol: 1, version: "0.1" }      unsealed, sender 65535
-conn   → host    Join       { name, version, proof, resume? }                      unsealed, sender 65535
+conn   → host    Join       { name, version, proof, resume?, caps?, mods? }        unsealed, sender 65535
                  proof = HMAC-SHA256(key, nonce ‖ UTF8(name))
-                 resume = { id, mac }, from a player coming back (see Reconnect)
-host   → conn    Welcome    { you, hostName, version, players[], session, resume?, resumed? }  sealed, sender 0
-   or            Reject     { reason, detail? }  then the host closes the connection  unsealed
+                 resume = { id, mac, last? }, from a player coming back (see Reconnect, Catching up)
+host   → conn    Welcome    { you, hostName, version, players[], session, resume?, resumed?, modsChecked?, catchUp? }  sealed, sender 0
+   or            Reject     { reason, detail?, mods? }  then the host closes the connection  unsealed
 ```
 
-Reject reasons: `bad-proof` (wrong key or password), `version` (detail names both versions), `full` (detail: `8 players`, and how many of them are away and holding their slot), `malformed`, `flood` (too many frames, see Limits), `timeout` (the handshake did not finish in time).
+Reject reasons: `bad-proof` (wrong key or password), `version` (detail names both versions, or says the player's FeverLink3 sends no mod list), `mods` (see "Mod list"), `full` (detail: `8 players`, and how many of them are away and holding their slot), `malformed`, `flood` (too many frames, see Limits), `timeout` (the handshake did not finish in time).
 
 After Welcome the player seals with its assigned id. The host checks that the sender id in every frame equals the id bound to that connection; a mismatch is dropped. A player accepts sealed frames from sender 0 only. An unsealed Reject is honoured only before the Welcome; afterwards the host ends a session with the sealed Kicked (see Leave and removal), because anyone on the path can write an unsealed frame.
 
@@ -59,38 +59,48 @@ A player answers a Challenge only if its nonce is 16 bytes and the protocol numb
 
 Before a connection has joined, the host reads its first frame with a limit of 4096 bytes (`FrameCodec::HANDSHAKE_MAX_LENGTH`), closes it if no accepted Join arrived within 15 s of opening, and holds at most 32 such connections at once. The transport adds its own limits (64 connections, 16 per address, a 10 s write timeout, 1000 frames and 1 MiB per second per connection); see `docs/SECURITY.md`, section 6.
 
+### Mod list
+
+Two games that load the same save but run other mods, another game build or another FeverLink3 build run apart from the first minute (`core/src/session/mods.rs`). Two checks, both before any world data is sent:
+
+- **At join, the builds.** Join `mods = {game, feverlink3, native, tags, more?, unread?}`: the game build (`getBuildVersion()`, tf3-docs reference/api/main.html), the FeverLink3 version and the SHA-256 of the native module file in clear, and per installed mod (sorted by id) 4 bytes of `SHA-256("FeverLink3 mod", id, revision)` and 4 bytes of the same over id, revision and files hash (zero: files unknown), base64, at most 256 mods (`more` when the player has more). It keeps the join far inside the 4096-byte first frame. A different build refuses the join: `Reject {reason: "mods", detail, mods}` with the host's builds; an empty build (not readable) is not compared.
+- **Between the save and the transfer, the mods the host's WORLD uses.** The host's game reads them from the save it just made: `app.findAllSavegames`, `app.getSavegameInfo(id):get()` (`Async<SaveGameData>`), `info.metadata.gameModDescs[i].modId.name` (tf3-docs reference/api/app.html; `SaveGameData`, `GameMetadata`, `Async` on reference/api/api/type; `Mod.GameModDesc` on reference/api/api/type/mod.html), and sends the ids in `SaveDone.mods`. Revision, cosmetic flag and files hash of each come from the host's installed list: the window reads `app.getUserProfile():getModRep()`, `getInstalledMods()`, `getModDesc(id).revision` / `.cosmetic` (reference/api/api/type, `UserProfile` and `ModRep`; `Mod.ModDesc` on type/mod.html), and the session controller hashes each mod's files, found by the `modId` of the `mod.json` in the user's `staging_area/` and `mods/` and the game's `mods/` (`mods/release/`, tf3-docs mod-structure). The hash covers every file but `_metadata/`, sorted by path: path, size and, for files up to 4 MiB and while 256 MiB in all have not been read, the content's SHA-256. mod.io downloads live in a folder no page documents: those mods are compared by revision only. A player with a proven difference in a world mod (missing, another revision, the same revision with other files when both hashes are known) is removed before the transfer with a sealed `Kicked {reason: "mods", detail, mods}`, `mods` being the world's list; the player turns it into readable lines ("host has X revision 2, you have revision 1", "missing Y") for its window. Installed mods the world does not use never matter, on either side.
+- **Warnings, not refusals.** A difference in a mod whose `mod.json` says `cosmetic` (the only documented sign that a mod does not change the simulation), a files hash unknown on one side, a player with more mods than the join names, and a list one side could not read (`unread`, or a `SaveDone` without `mods`) are not proven mismatches: the host logs them (`MOD WARNING`) and puts them in `Session.modWarnings` (the newest 8), which every window shows.
+- **Old peers.** A host with a list refuses a join without one with `version` ("compares mod lists and yours does not"). A host compares nothing when it has no list (the developer launcher). A player that sent a list and gets a Welcome without `modsChecked` talks to an older host: it sends Leave at once and reports `version`, so neither side runs on.
+- **Not covered.** A session started without a round (every game already at the same time) sends no world, so only the builds were compared.
+
 ## Who may send what
 
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
 | Challenge | 1 | host → connection | `{nonce, protocol, version}` |
-| Join | 2 | connection → host | `{name, version, proof, resume?: {id, mac}}` |
-| Reject | 3 | host → connection | `{reason, detail?}` |
-| Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session, resume?: {token, epoch}, resumed?}` |
-| Session | 11 | host → all | `{started, speed, pauseAt?, lead}` |
-| PeerClock | 12 | host → all but origin | `{from, t, ahead, need?, safe?, pause?, hop?}` |
+| Join | 2 | connection → host | `{name, version, proof, resume?: {id, mac, last?}, caps?, mods?}` |
+| Reject | 3 | host → connection | `{reason, detail?, mods?}` |
+| Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session, resume?: {token, epoch}, resumed?, modsChecked?, catchUp?}` (`catchUp`: see Catching up) |
+| Session | 11 | host → all | `{started, speed, pauseAt?, lead, resync?, modWarnings?, stalled?}` (`stalled`: the ids of the stalled games, see the stall timeout) |
+| PeerClock | 12 | host → all but origin | `{from, t, ahead, need?, safe?, pause?, stalled?, hop?}` (`stalled`: made by the host for a stalled game, `safe` is the host's promise for it) |
 | PlayerJoined | 13 | host → all but the joiner | `{player: {id, name, ready}}` |
 | PlayerLeft | 14 | host → all | `{id, name, away?}` (`away` = the connection dropped and the slot is held) |
-| ChecksumRequest | 15 | host → all | `{n, at, paused, full?, spread?}` (`full: false` = a light round; absent = full; `spread` = a full round read a chunk every `spread` steps, absent = hashed whole at `at`) |
+| ChecksumRequest | 15 | host → all | `{n, at, paused, full?, spread?, chunk?, detail?}` (`full: false` = a light round; absent = full; `spread` = a full round read a chunk every `spread` steps, absent = hashed whole at `at`; `chunk` = entities a chunk reads, absent = the game's 200; `detail` = keep the itemised keys in the game-script state for the dump at a repair) |
 | Authority | 16 | host → players | `{n, values: {name: number}}` |
 | ResyncSave | 17 | host → its own game | `{id, name}` |
 | ResyncChunk | 18 | host → players | `{id, index, count, sha256, data}` |
 | ResyncLoad | 19 | host → all | `{id, name, sha256}` |
 | Permissions | 20 | host → all | `{build, bulldoze, spend, speed, other?}`, each `"everyone"`, `"hostOnly"` or `{"only": [ids]}` |
-| Ping | 21 | host → player | `{n, rtt?: {id: ms}, off?: {id: ms}}`, answered by the player's session layer; never given to the game |
+| Ping | 21 | host → player | `{n, rtt?: {id: ms}, off?: {id: ms}, ack?}`, answered by the player's session layer; never given to the game (`ack`: the counter of the last frame the host received from this player, see Catching up) |
 | Kicked | 22 | host → player | `{reason, detail?}` (the shape of Reject), sealed: the host ended this player's session |
 | Hello | 30 | game → host | `{time, save?}` |
 | Clock | 31 | game → host | `{t, speed, ahead, need?, safe?, pause?, stop?, hop?}` (`stop`: the game stands still at the pause at `t`; see the pause order) |
 | SpeedRequest | 32 | game → host | `{speed}` 0 = pause |
 | ChecksumReport | 33 | game → host | `{n, time, parts: {name: hash}, authority?: {name: number}, notReady?: [name]}` |
-| SaveDone | 34 | host's game → host | `{id, ok, detail?}` |
+| SaveDone | 34 | host's game → host | `{id, ok, detail?, mods?}` (`mods`: ids of the mods the saved world uses, see "Mod list") |
 | ReplayFailed | 35 | game → host | `{detail}` |
 | ActionRefused | 36 | game → host | `{seq, from, detail, applied?, class?}`: the game's verdict of action `from:seq` at its stamp (see "Action verdicts") |
 | Pong | 37 | player → host | `{n, w?}`, sent by the player's session layer, not by its game |
 | Leave | 38 | player → host | `{}`: the player goes on purpose |
 | Action | 50 | game → host → all but origin (a `pause` action: all) | `{stamp, seq, body, category?, from, allowed, pause?, pauseSeq?, pauseUpto?, hop?}` (`from`, `allowed`, `pauseSeq` and `pauseUpto` set by the host; `pauseUpto` is the `pauseSeq` of the last item of the same flush of the pause order, and a game runs on to the flush's stamp only once it has read that one; `category` is `build`, `bulldoze`, `spend` or `other`, default `other`; see the pause order) |
 | Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name}` (set by the host) |
-| BuildVeto | 52 | game → host → all but origin | `{seq, owner, why ≤ 300, from, name}` (`from`, `name` set by the host). "I cannot build action `owner`:`seq`", sent only by a game that dry-ran a held strict build and found it cannot be rebuilt; silence means yes. The originator cancels its held command, every game drops the queued replay. |
+| BuildVeto | 52 | game → host → all but origin | `{seq, owner, why ≤ 300, from, name}` (`from`, `name` set by the host). "I cannot build action `owner`:`seq`", sent only by a game that dry-ran a held strict build and found it cannot be rebuilt; silence means yes. The originator cancels its held command, every game drops the queued replay. `host?` (only the host's own, cleared on relay): the host refuses the action on every game, its origin included (see the stall timeout). |
 | BuildCommit | 53 | game → host → all but origin | `{seq, owner, stamp, from}` (`from` set by the host). The originator of a held strict build made while the game is PAUSED waits a real-time grace for vetoes (the peers dry-run the record and park it, applying nothing), then sends this; every game applies the parked build at `stamp` (the pause time, or a normal stamp when the game was unpaused meanwhile) and the originator releases its own command. A veto during the grace drops the build everywhere. |
 
 A player may send kinds 30 to 38 and 50 to 52. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
@@ -112,11 +122,12 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 - **Start**: `started = true`, `speed = 0`, `pauseAt` = the games' common time when they agree, and a checksum round is requested at once.
 - **Pause** is a stamp: `pauseAt = futureStamp`; every game stops at exactly that step. **Speed** 1..4 clears `pauseAt`.
 - **SpeedRequest** from a player allowed by the `speed` permission is obeyed while the session is started, no resync round is running and the value differs; from any other player it is dropped (see Permissions).
-- **Checksum rounds**: every 10 s while running, the host sends `{n, at, paused}`. When `paused`, `at` is the latest time any game stopped at. Every game that said Hello must report; the round completes when they all have, compares the per-part hashes, and reports the differing parts with each game's value. A part a game names in `notReady` (it could not hash it: right after a load its company registry is not read back yet, or the lane failed) is unknown in that round: it is not compared on any game and is never a difference, while a part both hashed, or one only one world has, is compared as always. A paused verify round with nothing different but a part not ready is asked again up to 3 times, then the repair fails as "could not be verified" (not as "still differ"). Values from the host's report under `authority` are relayed to the players as Authority, which they apply to themselves (money correction). Rounds older than 20 are forgotten.
+- **Checksum rounds**: every 5 s while running (10 s up to 2026-10-18; `FEVERLINK3_FAST_CHECKSUM=0` gives it back), the host sends `{n, at, paused}`. When `paused`, `at` is the latest time any game stopped at. Every game that said Hello must report; the round completes when they all have, compares the per-part hashes, and reports the differing parts with each game's value. A part a game names in `notReady` (it could not hash it: right after a load its company registry is not read back yet, or the lane failed) is unknown in that round: it is not compared on any game and is never a difference, while a part both hashed, or one only one world has, is compared as always. A paused verify round with nothing different but a part not ready is asked again up to 3 times, then the repair fails as "could not be verified" (not as "still differ"). Values from the host's report under `authority` are relayed to the players as Authority, which they apply to themselves (money correction). Rounds older than 20 are forgotten.
 - **Actions** are relayed in the order the host received them, to every game but the origin, with `from` and `allowed` filled in by the host. The body is the mod's own serialisation and is opaque here.
+- **The stall timeout** (`core/src/session/host/stall.rs`, `FEVERLINK3_STALL_TIMEOUT_S`, default 3 s, 0 = off). A ready game whose Clock lines have not come for that long while the session runs and another game's still come (an autosave, a frozen or minimised window) is STALLED: Session lists it in `stalled`, and the host keeps a promise for it that follows the largest promise of the games that run, sent to every other game as a PeerClock of that game flagged `stalled` (its `t` is the game's last clock). A game keeps to that `safe` like any promise but does not pace itself to the stalled game's `t`. Every action of the stalled game passes the host, which holds the promise: one marked `pause` (a stalled game marks every action so, mod: `X.hostStamps`) gets the pause order's running stamp, past every promise and every kept one, and goes to every game, the origin included; one stamped at or after the kept promise is relayed as it is; one stamped before it is not relayed and is refused on every game with a BuildVeto flagged `host` (queued copies dropped, a held build cancelled, a waiting window command failed): never applied late. The stalled game, once it runs again, catches up (mod `L.catchUp`: engine batches of up to 4 steps, a batch interval down to half), and its window says so. The kept promise stops following the others once the game's clock is within the lead of the furthest one, and the stall ends at the first Clock of the game whose own `safe` has reached it: from there its own clocks are relayed again, never below what the others were promised. A hello (a load) ends a stall too; a game that falls silent again while catching up has its promise follow the others again. The host's log says `stall: ...` at each change. No step is skipped or changed: the stalled game runs every step later, with the same actions at the same stamps.
 - **The pause order.** An Action (or BuildCommit) its game made while standing at the session's pause carries `pause: true`. No game stands AT the pause: speed 0 takes effect a few steps late, by a different amount on each game (real run pause3, 2026-10-15: pauseAt 534400, both games stood at 535000). So the host holds it until every ready game has said where it stands still (`stop` in its Clock, at or past the last stamp the host gave in this pause), then STAMPS it one step past the furthest of those places, gives it the next `pauseSeq` (a session counter, never reset; a player's own values are overwritten) and relays it to EVERY game, the origin included. Every game applies it at that stamp like any action (a stopped game runs on to it, a step or a few; the simulation applies it exactly there, whatever the overshoot), the origin only once it came back. A checksum round asked for at a pause is stamped where the furthest game stands, once every game said so. Held items left at the resume get a normal stamp (past every clock and promise) after the resume line; one that reaches the host after the resume gets one too.
 - **A build without a record in the pause order (mod only, 2026-10-18).** A held tool command that has no record before the engine applies it (no capture: no preview, a site the strict table does not know) cannot travel before its apply. In a pause its game keeps it held and sends only its place: an ordinary pause Action whose body is `{fn = "pauseSlot", held}` (category `build`). The host numbers and stamps it like any other. At that number every game holds (no run-on past the slot's stamp plus a step, the later numbers wait, a resume waits too); the origin releases its command once every game stands still at or past that point and it stands at or past every other one, its engine applies it there, and the record goes out as a plain Action stamped at that time with `pauseSlot` (the slot's key) in its body. Every other game, standing at or before it, applies it there and then handles the waiting numbers, each stamped at least one step after the build. A `BuildVeto` from the origin naming the slot gives it up (no record could be made): nothing of it is applied, the numbers follow.
-- **Leaving**: a closed connection takes the player out of the game at once: its clock is dropped and PlayerLeft goes to everyone, with `away: true` because the host holds the slot for a return (see Reconnect). A player that says Leave first is gone for good (`away` left out).
+- **Leaving**: a closed connection takes the player out of the game at once: its clock is dropped and PlayerLeft goes to everyone, with `away: true` because the host holds the slot for a return (see Reconnect). The others run on without it; a return within the grace is caught up (see Catching up). A player that says Leave first is gone for good (`away` left out).
 
 ## Resync round
 
@@ -159,7 +170,7 @@ Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused:
 
 ## Hot join
 
-`PlayerJoined` while the session is started starts a round with reason `new player` (`player returned` when the joiner is a player coming back, see Reconnect); the joiner is a participant, so it receives the save and says Hello after loading it. If a round is already running and has not yet announced its file (Pausing, Saving, Transferring before `resync_file_ready`), the joiner simply takes part in it. If the file has been announced (Transferring after the announcement, Loading, Verifying) the joiner is remembered and a new round `new player` starts when the running one ends, whether it succeeded or failed. A hot-join round ignores the cooldown. Before `start` a join starts nothing.
+`PlayerJoined` while the session is started starts a round with reason `new player` (`player returned` when the joiner is a player coming back that cannot be caught up, see Reconnect); the joiner is a participant, so it receives the save and says Hello after loading it. If a round is already running and has not yet announced its file (Pausing, Saving, Transferring before `resync_file_ready`), the joiner simply takes part in it. If the file has been announced (Transferring after the announcement, Loading, Verifying) the joiner is remembered and a new round `new player` starts when the running one ends, whether it succeeded or failed. A hot-join round ignores the cooldown. Before `start` a join starts nothing.
 
 ## Resync policy
 
@@ -180,11 +191,14 @@ Rounds are judged on their non-money parts, so `money` never hides another diffe
 Every game sends its verdict of every build at its stamp: `action_applied` (applied; for a build injected from the originator's text, once the native module answered `injected`) or `action_refused` (refused, with the reason and its `class`: `inject_refused`, `decode`, `engine`, `company`, `module`). Both are kind 36; the launcher sets `applied: true` for the `action_applied` line. A refusal decided at the stamp from the game's own world is deterministic: identical worlds refuse an action identically, so a refusal alone asks for no repair (lab run 2026-10-18: a town replaced a building during a build's lead and every game refused the build at its stamp). The host keeps each action's verdicts (`VerdictBook`, at most 256 open actions) until every ready game has answered; as soon as two games answer differently the worlds have forked at that action and the policy asks for a resync at once (`verdicts of <from:seq> differ`, cooldown permitting). A resync forgets every open action.
 **Every round is full.** Since full rounds are spread over the steps (below), every regular round is a full one (`full_checksum_every` default 1; lab 2026-10-18: 2896 entities in 15 chunks of 200 every 3 steps, step max 6.0 ms against the 30 ms budget, no round over 54 ms). `ids` and every heavy lane are therefore compared in every round, and the policy's streak, drift and not-ready rules judge every part every round.
 
-**No overlap.** The host asks for the next regular round only when the previous running round has been reported by every ready game. When the 10 s timer (`checksum_seconds`) fires while a round is still being read or reported, the next round waits and starts at the first tick after the last report: the interval is 10 s, or the round's own length when that is longer. The host logs at most once a minute `checksum: <k> round(s) waited for the previous one in the last <s> s (longest wait <w> s)`. A round that is not complete after `checksum_round_timeout_seconds` (60 s: a game left mid-round or reloaded) is dropped (`checksum round <n> dropped: not reported by <names> after <s> s`); its late reports are ignored. A resync's verification round drops a regular round still open from before the reload. Paused rounds and the verification round are asked as before and do not hold up the timer.
+**No overlap.** The host asks for the next regular round only when the previous running round has been reported by every ready game. When the 5 s timer (`checksum_seconds`) fires while a round is still being read or reported, the next round waits and starts at the first tick after the last report: the interval is 10 s, or the round's own length when that is longer. The host logs at most once a minute `checksum: <k> round(s) waited for the previous one in the last <s> s (longest wait <w> s)`. A round that is not complete after `checksum_round_timeout_seconds` (60 s: a game left mid-round or reloaded) is dropped (`checksum round <n> dropped: not reported by <names> after <s> s`); its late reports are ignored. A resync's verification round drops a regular round still open from before the reload. Paused rounds and the verification round are asked as before and do not hold up the timer.
 
 **Light rounds (lab switch and older peers).** `FEVERLINK3_FULL_CHECKSUM_EVERY=<n>` with n > 1 gives back the old split: the heavy lanes (`ChecksumPolicy::HEAVY_PARTS`: `edges`, `constructions`, `nodeConfigs`, `townBuildings` with its `townBuildings:<town>` parts, `ids`) only in every n-th round (the first round, every paused round and the verification round of a resync are always full). The other rounds carry `full: false`; a game then leaves the heavy lanes out, and the host drops them from the reports of a light round anyway (an older game that sends everything is not a difference). The policy counts a heavy part only over full rounds: a light round neither grows nor resets a streak or a drift clock that consists of heavy parts only; any other part is judged every round as before.
 
 **Spread full rounds.** A full round that is not paused carries `spread` (`ChecksumPolicy::spread_steps`: the game speed, 1..4 steps, one engine batch). At `at` every game hashes the light lanes and the `ids` lane and takes the entity lists of the heavy lanes; then it reads `L.CHECKSUM_CHUNK` (200) entities of those lists at each step `at + k * spread` (k = 1, 2, ...; at most `L.CHECKSUM_MAX_CHUNKS` chunks, a bigger world reads more per chunk). The chunks are cut by count, never by time, and each chunk step is a landing mark, so every game reads every entity at the same step: equal worlds give equal parts, and a world that differs (before the stamp or during the round) still differs. A heavy lane is the order-free sum of its entities' key hashes. The report carries `time = at`; a game that read a chunk after its step (a batch that missed its mark) reports `at` plus the lateness, so the host skips that round as `time_skew` instead of comparing different worlds. Actions are applied at their stamps as always while a round is read; a chunk read after them sees what they built, on every game at the same step. Light rounds, paused rounds and the resync's verification round are hashed whole (`spread` absent).
+
+**Chunk size and detail (2026-10-19).** A report of a spread round carries `cost: {entityNs, stepMaxUs, chunk}` (the dearer of the costliest chunk's and the round's average time per entity on that game). The host sizes the next rounds' `chunk` from the dearest cost of each present game's last three rounds so that the slowest game's chunk costs about 12 ms of the 30 ms step budget (`ChecksumPolicy::chunk_for`: 50..4000 entities, at most twice the last one, a change logged as `checksum chunk: N entities a step from now on (...)`). Every game gets the same number, so the chunks still fall at the same steps and the comparison stays exact. After a compared round that differed, the next rounds carry `detail` until one is identical: such a round keeps every chunk's itemised keys in the game-script state (whichever simulation Lua state read it), so the `detail_<time>_<player>.txt` dump at the repair is complete and of the same chunks on every game (header `complete: detail round N`); without a detail round the dump is this state's own keys, said `partial`.
+
 
 A decision is emitted as `HostOutput::ResyncRequested { reason }` and, with the host option `auto_resync` (default true), the round starts at once. With `auto_resync = false` only the request is emitted and the launcher decides, for example by calling `start_resync(reason)`. Nothing is requested before the session starts or while a round is running.
 
@@ -215,12 +229,14 @@ A player whose connection dropped and that returns within the window gets its **
 ```
 first Welcome   resume = { token: 16 random bytes, epoch: 0 }       sealed, so only holders of the session key see it
 drop            the host takes the player out of the game, holds the slot, broadcasts PlayerLeft { away: true }
-new connection  Join { name, version, proof, resume: { id, mac } }
-                mac = HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ u16 id ‖ UTF8(name))
+new connection  Join { name, version, proof, resume: { id, mac, last? } }
+                mac = HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ u16 id ‖ UTF8(name) [‖ "last" ‖ u64 last])
 host            token valid, slot held (or still bound to a connection the host has not noticed is dead) →
-                Welcome { you: id, ..., resume: { token, epoch: epoch + 1 }, resumed: true }
-                PlayerJoined to the others, Permissions to the returner, and in a started session a hot-join round
-                (reason `player returned`); the returner is not ready until it says Hello after loading the save
+                Welcome { you: id, ..., resume: { token, epoch: epoch + 1 }, resumed: true, catchUp? }
+                caught up (see Catching up): the messages it missed, PlayerJoined to the others, Permissions to the
+                returner; it stays ready and catches up as a stalled game, no round
+                otherwise: PlayerJoined to the others, Permissions to the returner, and in a started session a hot-join
+                round (reason `player returned`); the returner is not ready until it says Hello after loading the save
                 anything else → a plain join, a new id, `resumed` left out
 ```
 
@@ -232,6 +248,19 @@ host            token valid, slot held (or still bound to a connection the host 
 - The game never sees the token: the launcher removes `resume` from the welcome it writes to `to_game.log`. It does see `resumed: true`.
 - A player that stops on purpose sends Leave first (below), so the slot is not held.
 
+### Catching up
+
+A short drop (a Wi-Fi blip, a Steam relay hiccup) does not reload the returner: its game kept its world, so it is given exactly what it missed and runs on from there (`core/src/session/resume.rs`, `HostSession::resume`, `begin_catch_up`). One mechanism, the same for every message kind:
+
+- **What each end keeps.** The host keeps every message of the game's stream it seals for a player (everything but the handshake, Ping, Kicked and a save's chunks and load) with the frame counter it went out under, and, while the player is away, every message it would have sent it. A Pong answers a Ping over one ordered connection, so the player has everything sealed for it before that ping, and the host drops it. The player's session layer keeps every message its game sends (all but Pong and Leave) with its counter until a Ping's `ack` (the last counter the host received from it) covers it, and, while it waits for a welcome, keeps what its game sends unsealed. At most 32 MiB each way.
+- **The claim.** A returning launcher hands the old session's last received host frame counter and its kept messages to the new session (`PlayerSession::carry_to`). The join's `resume.last` is that counter, covered by the mac, so nobody on the path can make the host skip frames. A launcher that kept nothing, or had to drop something unacknowledged, sends no `last`.
+- **The host catches up** when `last` is given, `HostOptions::resume_grace_seconds` (60 s; 0 = off) has not passed since the drop, no resync round is running or ran while the player was away (the others' world was replaced), the returner had said hello in the session's world, and the host still keeps every frame after `last`. The Welcome then carries `catchUp` = the last counter it received from this player, and the missed messages follow it at once, in their first order, sealed anew. The player resends every kept message after `catchUp`, in order. Nothing is skipped and nothing arrives twice.
+- **Lockstep stays exact.** The returner's game stood still while the link was down (the launcher told it `started = false`, and no new promise reached it). Every missed action is stamped at or after the promises it read before the drop, so it reaches the game before its stamp. In a started session the returner is a stalled game from the first moment (see the stall timeout): the host keeps a promise for it that follows the games that run (they run on), its game catches up with the mod's catch-up, every action it ships is host-stamped or refused on every game if its stamp lies before that promise (an action resent from before the drop included: never applied late), and the stall ends when its own promise reaches the host's. No step is skipped or changed.
+- **The check.** The first compared checksum round the returner reports decides: the same world (`resume: <name> caught up and the worlds match`), or a repair at once (`resume: <name> caught up but the worlds differ ... repair`), without waiting for the policy's second round.
+- **Otherwise** (away longer than the grace, a resync meanwhile, no `last`, frames no longer kept) the welcome carries no `catchUp`, the player drops what it kept, and a started session reloads it with the hot-join round as before (`resume: <name> cannot be caught up (<why>): its game gets the host's world`). The host logs `resume: <name> is caught up: N message(s) ...` when it does; the player's launcher `resume: caught up by the host; N message(s) of the game ... are sent again`.
+- **The window** shows "Reconnecting (N s)" while the launcher retries (`reconnectingS` in the controller's status).
+- **Not proven** over a real network or Steam relay; the tests cut a loopback TCP link (`launcher/tests/reconnect.rs`) and the in-memory harness (`core/tests/resume_tests.rs`).
+
 ## Leave and removal
 
 - **Leave** (38, player → host, sealed): the player goes on purpose. The host closes the connection, frees the slot at once and broadcasts PlayerLeft without `away`.
@@ -242,6 +271,42 @@ host            token valid, slot held (or still bound to a connection the host 
 ## Ping and round-trip time
 
 Every `ping_seconds` (2 s) the host sends each connected player `Ping { n, rtt? }`. The player's session layer answers at once with `Pong { n }`; neither reaches the game. The host measures `now − time the ping n was sent` on its own clock, keeps up to 8 unanswered pings per player (an older unanswered one is forgotten when a later one is answered) and smooths the samples: the first sets the value, each later one moves it a quarter of the way. `rtt` in a Ping is the smoothed value in milliseconds, one decimal, of every connected player the host has measured, so every player can show everyone's round-trip time. The host's own game is 0. A Pong with an `n` that was not sent, or was already answered, is ignored.
+
+## Steam invites
+
+Implemented in `core/src/admission.rs` (token, messages, the host's `Gate`) and `launcher/src/steam_admit.rs` (the
+exchange over Steam); the Steam side is `docs/STEAM_TRANSPORT.md`, section 14. A pasted join code works as before.
+
+**Connect token.** What Steam carries: `+feverlink3_join <payload>`, payload
+`1:<host steamID64, 17 digits>:<session, 16 hex>[:<ticket, 16 hex>]`. `1` is the token format; a reader that finds
+another number says "update FeverLink3". `session` and `ticket` are 64 random bits each, new for every hosted session.
+The token without the ticket is public: it is the host's rich presence `connect` value (every friend sees it). The
+overlay invite dialog carries the token with the ticket. **Neither ever holds the secret, the password or the key.**
+At most 255 bytes (Steam's limit for a rich presence value); a token is about 75.
+
+**Admission exchange.** The friend's game connects to the host's Steam ID on virtual port 3; Steam authenticates both
+accounts and encrypts the connection. One Steam message each: `FL3A` then UTF-8 JSON, at most 2048 bytes.
+
+```
+friend → host   request   { session: hex16, ticket?: hex16, name, version }
+host → friend   waiting   {}                            the host's player is asked
+host → friend   admitted  { key: hex of the 32-byte session key }   then the host closes
+             or refused   { reason }                    then the host closes
+```
+
+The host decides on the account Steam reports for the connection, never on the name in the request:
+
+- `session` is not this session's: `refused stale`.
+- `ticket` equals this session's ticket (the friend came through the host's overlay invite), or the account was
+  admitted earlier in this session: `admitted` at once.
+- Otherwise the request waits for the host's player (`waiting`; the window lists it): `admit` sends `admitted`,
+  `refuse` sends `refused refused` and refuses further requests of that account for 60 s; nobody answers within 120 s:
+  `refused timeout`; more than 8 waiting: `refused busy`; the host stops: `refused ended`. Unreadable: `refused
+  malformed`. A connection that sends nothing for 15 s is closed; at most 16 admission connections at once.
+
+The admitted friend joins the session on virtual port 0 with the key it received, through the normal handshake. The
+key, not the secret, crosses: the friend never learns the secret or the password. Steam's friend list "Invite to game"
+carries the public token (rich presence), so such a friend is asked for like a "Join game" click.
 
 ## Limits
 

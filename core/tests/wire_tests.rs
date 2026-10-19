@@ -50,9 +50,9 @@ fn join_carries_the_claim_only_when_there_is_one() {
     assert_eq!(json!({"name": "Ann", "version": "0.1", "proof": "AQID"}), value(&plain));
 
     let mut back = plain.clone();
-    back.resume = Some(ResumeClaim { id: 3, mac: vec![4, 5, 6] });
+    back.resume = Some(ResumeClaim { id: 3, mac: vec![4, 5, 6], last: Some(9) });
     assert_eq!(
-        json!({"name": "Ann", "version": "0.1", "proof": "AQID", "resume": {"id": 3, "mac": "BAUG"}}),
+        json!({"name": "Ann", "version": "0.1", "proof": "AQID", "resume": {"id": 3, "mac": "BAUG", "last": 9}}),
         value(&back)
     );
     assert_eq!(Some(back.clone()), codec::try_decode::<JoinMessage>(&codec::encode(&back)));
@@ -63,7 +63,15 @@ fn join_carries_the_claim_only_when_there_is_one() {
 
 #[test]
 fn welcome_carries_the_grant_and_says_when_it_gave_a_slot_back() {
-    let session = SessionState { started: false, speed: 0, pause_at: None, lead: 1200, resync: None };
+    let session = SessionState {
+        started: false,
+        speed: 0,
+        pause_at: None,
+        lead: 1200,
+        resync: None,
+        mod_warnings: Vec::new(),
+        stalled: Vec::new(),
+    };
     let host = PlayerInfo { id: 0, name: "H".into(), ready: false };
     let mut w = WelcomeMessage {
         you: 2,
@@ -74,6 +82,8 @@ fn welcome_carries_the_grant_and_says_when_it_gave_a_slot_back() {
         nonce: vec![9, 8, 7],
         resume: Some(ResumeGrant { token: vec![1, 2, 3], epoch: 2 }),
         resumed: true,
+        mods_checked: false,
+        catch_up: None,
     };
     let v = value(&w);
     assert_eq!(json!({"token": "AQID", "epoch": 2}), v["resume"]);
@@ -110,12 +120,13 @@ fn player_left_says_when_the_slot_is_held() {
 
 #[test]
 fn ping_and_pong_are_tiny() {
-    let ping = PingMessage { n: 7, rtt: [(1, 23.4), (3, 150.0)].into_iter().collect(), off: Default::default() };
+    let ping =
+        PingMessage { n: 7, rtt: [(1, 23.4), (3, 150.0)].into_iter().collect(), off: Default::default(), ack: None };
     assert_eq!(json!({"n": 7, "rtt": {"1": 23.4, "3": 150.0}}), value(&ping));
     assert_eq!(Some(ping), codec::try_decode(br#"{"n":7,"rtt":{"1":23.4,"3":150.0}}"#));
     assert_eq!(
         json!({"n": 7}),
-        value(&PingMessage { n: 7, rtt: Default::default(), off: Default::default() }),
+        value(&PingMessage { n: 7, rtt: Default::default(), off: Default::default(), ack: None }),
         "no table, no key"
     );
     assert_eq!(json!({"n": 7}), value(&PongMessage { n: 7, w: None }));

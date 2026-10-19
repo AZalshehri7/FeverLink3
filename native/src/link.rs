@@ -102,7 +102,7 @@ pub enum CtlMessage {
     /// `refund` (optional, 0: none) is how many refund entries the mod wrote in `native_refund_<key>.txt` (this game's own entities):
     /// the module puts them into the command's Context `refundableEntities` with the engine's insert (`refund.rs`).
     InjectNext { key: u64, ttl: u64, held: u64, tm: String, refuse: String, refund: u64 },
-    /// Smooth pacing (`pace.rs`): stretch the engine's batch interval by `permille` / 1000 (1000 to 2000, held to that range). The mod
+    /// Smooth pacing (`pace.rs`): scale the engine's batch interval by `permille` / 1000 (500 to 2000, held to that range). The mod
     /// sends it when the factor changes and every second while it is not 1; one not refreshed for `pace::STALE_MS` goes back to 1.
     Pace { permille: u32 },
 }
@@ -295,7 +295,7 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
         "pace" => {
             let p = required(&p, "permille", "pace needs a factor in thousandths")?;
             let permille = crate::pace::accept_permille(p)
-                .ok_or(CtlError::BadPayload("permille must be a factor from 1000 to 2000"))?;
+                .ok_or(CtlError::BadPayload("permille must be a factor from 500 to 2000"))?;
             Ok(CtlMessage::Pace { permille })
         }
         other => Err(CtlError::UnknownKind(other.chars().take(40).collect())),
@@ -932,6 +932,13 @@ pub enum Event {
         place: String,
         detail: String,
     },
+    /// A hook could not do its part and this game may now differ from the others (`failsafe.rs`): `action` `repair` (the mod asks the
+    /// host for the repair) or `stop` (a determinism piece is missing for the rest of this run: the player is told to leave and restart).
+    Fault {
+        place: String,
+        detail: String,
+        action: &'static str,
+    },
 }
 
 impl Event {
@@ -954,6 +961,7 @@ impl Event {
             Event::Holding { .. } => "holding",
             Event::Pong { .. } => "pong",
             Event::Error { .. } => "error",
+            Event::Fault { .. } => "fault",
         }
     }
 
@@ -987,6 +995,7 @@ impl Event {
                 format!("event holding {} ({reason}) [{}]", if *on { "on" } else { "off" }, kinds.join(", "))
             }
             Event::Error { place, detail } => format!("event error [{place}]: {detail}"),
+            Event::Fault { place, detail, action } => format!("event fault [{place}] ({action}): {detail}"),
             Event::Patched { frozen, adds, allocated } => {
                 format!("event patched: frozenNodes {frozen:?} of {adds} added nodes (new block: {allocated})")
             }
@@ -1115,6 +1124,9 @@ impl Event {
                 ("site", Lua::Int(site.map_or(-1, i64::from))),
             ]),
             Event::Error { place, detail } => Lua::map([("detail", Lua::str(detail)), ("where", Lua::str(place))]),
+            Event::Fault { place, detail, action } => {
+                Lua::map([("action", Lua::str(*action)), ("detail", Lua::str(detail)), ("where", Lua::str(place))])
+            }
         };
         v.text()
     }
@@ -1177,7 +1189,8 @@ impl EventWriter {
             let line = EventWriter::line(e);
             match e {
                 Event::Ready { .. } => header = Some(line.clone()),
-                Event::Timing { what: "clock", .. } => {
+                // a stop fault is the module's state for the rest of the run, like `ready`: a reloaded mod finds it in the header
+                Event::Timing { what: "clock", .. } | Event::Fault { action: "stop", .. } => {
                     let h = header.get_or_insert_with(|| self.header.clone());
                     if !h.is_empty() {
                         h.push_str(&line);

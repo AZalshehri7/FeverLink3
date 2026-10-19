@@ -53,6 +53,7 @@ unsafe extern "system-unwind" fn add_hook(
     done: *mut u8,
     progress: *mut u8,
 ) -> *mut u8 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::ADD_HOOK);
     // first, before anything can change the frames above us: the return address of the call that got here
     let caller = hook_caller();
     match RUNTIME.get() {
@@ -64,6 +65,7 @@ unsafe extern "system-unwind" fn add_hook(
 
 /// The function the game's command application is made to jump to (may unwind, like `add_hook`).
 unsafe extern "system-unwind" fn apply_hook(sim: *mut u8, cmd: *mut u8) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::APPLY_HOOK);
     match RUNTIME.get() {
         // SAFETY: the arguments of the live call this function was jumped to from.
         Some(rt) => unsafe { rt.on_apply(sim, cmd) },
@@ -86,6 +88,7 @@ unsafe extern "system-unwind" fn convert_hook(
     a7: u64,
     a8: u64,
 ) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::CONVERT_HOOK);
     // first, before anything can change the frames above us
     let caller = hook_caller();
     let original = CONVERT_ORIGINAL.load(Ordering::Acquire);
@@ -107,6 +110,7 @@ unsafe extern "system-unwind" fn convert_hook(
 /// made to jump to: lets the runtime put the armed order's frozenNodes into the proposal BEFORE the update adds the construction's
 /// own entrance street, calls the original with every slot as given, and lets the runtime log what the update left.
 unsafe extern "system-unwind" fn convert_update_hook(rcx: u64, rdx: u64, r8: u64, r9: u64, a5: u64, a6: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::CONVERT_UPDATE_HOOK);
     let original = CONVERT_UPDATE_ORIGINAL.load(Ordering::Acquire);
     if original == 0 {
         return 0; // unreachable once installed
@@ -139,6 +143,7 @@ unsafe extern "system-unwind" fn preview_hook(
     data: u64,
     out: u64,
 ) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::PREVIEW_HOOK);
     let original = PREVIEW_ORIGINAL.load(Ordering::Acquire);
     if original == 0 {
         return 0; // unreachable once installed
@@ -198,6 +203,7 @@ unsafe extern "system-unwind" fn town_seed_hook(
     a11: u64,
     a12: u64,
 ) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::TOWN_SEED_HOOK);
     // first, before anything can change the frames above us: the return address of the call that got here
     let caller = hook_caller();
     let original = TOWN_SEED_ORIGINAL.load(Ordering::Acquire);
@@ -308,6 +314,8 @@ fn growth_settings() -> Settings {
 fn growth_file_line(line: &str) {
     let dir = GROWTH_DIR.lock().unwrap_or_else(|p| p.into_inner()).clone();
     if let Some(dir) = dir {
+        // no lock is held here: the folder was cloned out of it
+        let _inside = crate::hookwatch::GROWTH_FILE.enter();
         use std::io::Write;
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(growth::LOG_FILE)) {
@@ -390,6 +398,7 @@ struct DeepDev {
     d: u64,
     cand_j: u32,
     edge_j: u32,
+    field_j: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -435,13 +444,11 @@ impl Drop for DeepDevGuard {
     }
 }
 
-/// The u32 at `addr` when the address is aligned and the bytes are committed and readable.
+/// The u32 at `addr` when the address is aligned and the bytes are committed and readable. Through the guarded reader
+/// (`memguard`): the deep log reads the engine's heap on the engine's own threads, and a block freed between the OS's answer and
+/// the read was an access fault on a game thread (which a worker's own exception handling may swallow half-done) for a log line.
 fn deep_read_u32(addr: u64) -> Option<u32> {
-    if addr == 0 || !addr.is_multiple_of(4) {
-        return None;
-    }
-    // SAFETY: the range is checked to be readable first.
-    unsafe { mem::readable(addr as *const u8, 4).then(|| core::ptr::read_volatile(addr as *const u32)) }
+    crate::memguard::read_value::<u32>(usize::try_from(addr).ok()?)
 }
 
 /// Where the lines of the current thread belong: the `Develop` it is in, else a numbered orphan (the first
@@ -473,21 +480,9 @@ fn deep_place(is_cand: bool) -> Option<(growth::DeepKey, u32, bool)> {
 /// The payload layout is that of the handler at `0x9e12b0` (`mov r8d,[r15]`, `vmovsd [r15+4]`, `mov ecx,[r15+0xc]`,
 /// `movzx r9d,byte [r15+0x10]`).
 fn deep_payload(payload: u64, time: Option<u32>) -> Option<DeepCmdGuard> {
-    // SAFETY: only asks the OS whether the 0x11 bytes are readable.
-    if payload == 0 || !unsafe { mem::readable(payload as *const u8, 0x11) } {
-        return None;
-    }
-    let p = payload as *const u8;
-    // SAFETY: just checked readable.
-    let (town, b1, b2, b3, flag) = unsafe {
-        (
-            core::ptr::read_unaligned(p as *const u32),
-            core::ptr::read_unaligned(p.add(4) as *const u32),
-            core::ptr::read_unaligned(p.add(8) as *const u32),
-            core::ptr::read_unaligned(p.add(0xc) as *const u32),
-            *p.add(0x10),
-        )
-    };
+    let p = crate::memguard::read(usize::try_from(payload).ok()?, 0x11).ok()?;
+    let u = |at: usize| u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+    let (town, b1, b2, b3, flag) = (u(0), u(4), u(8), u(0xc), p[0x10]);
     let n = DEEP_CMD_N.fetch_add(1, Ordering::Relaxed) + 1;
     let traced = GROWTH_TRACE.lock().unwrap_or_else(|p| p.into_inner()).contains(town);
     let want = traced || growth::sampled(n, town, time.unwrap_or(0));
@@ -510,7 +505,7 @@ fn deep_dev_enter(town: u32, seed: u32, n: u64, time: Option<u32>) -> DeepDevGua
             (time, 0, traced || growth::sampled(n, town, seed))
         }
     };
-    deep_ctx_update(|c| c.dev = Some(DeepDev { town, t, k, want, d: n, cand_j: 0, edge_j: 0 }));
+    deep_ctx_update(|c| c.dev = Some(DeepDev { town, t, k, want, d: n, cand_j: 0, edge_j: 0, field_j: 0 }));
     DeepDevGuard(ctx.dev)
 }
 
@@ -532,8 +527,8 @@ fn deep_candidates(out: u64) {
     if !want || out == 0 {
         return;
     }
-    // SAFETY: only asks the OS first; `out` is the vector the gather just filled.
-    let Ok(hdr) = (unsafe { mem::read(out as *const u8, 16) }) else { return };
+    // `out` is the vector the gather just filled
+    let Ok(hdr) = crate::memguard::read(out as usize, 16) else { return };
     let begin = u64::from_le_bytes(hdr[..8].try_into().unwrap_or([0; 8]));
     let end = u64::from_le_bytes(hdr[8..].try_into().unwrap_or([0; 8]));
     let empty = growth::digest_records(&[]);
@@ -551,8 +546,7 @@ fn deep_candidates(out: u64) {
         growth_file_line(&growth::cand_line(&key, j, &growth::Digest { n, ..empty }, true));
         return;
     }
-    // SAFETY: checked readable by `read`.
-    match unsafe { mem::read(begin as *const u8, len as usize) } {
+    match crate::memguard::read(begin as usize, len as usize) {
         Ok(bytes) => growth_file_line(&growth::cand_line(&key, j, &growth::digest_records(&bytes), false)),
         Err(_) => growth_file_line(&growth::cand_line(&key, j, &growth::Digest { n, ..empty }, true)),
     }
@@ -572,6 +566,7 @@ unsafe extern "system-unwind" fn candidates_hook(
     a8: u64,
     a9: u64,
 ) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::CANDIDATES_HOOK);
     let original = CANDS_ORIGINAL.load(Ordering::Acquire);
     if original == 0 {
         return rcx;
@@ -589,6 +584,7 @@ unsafe extern "system-unwind" fn candidates_hook(
 /// The edge selection `(centre*, radius [xmm1], world, ctx [r9], arg5, u32* rng) -> void`: logs the rng state before and
 /// after. Calls the original with every slot as given. Changes nothing.
 unsafe extern "system-unwind" fn edges_hook(rcx: u64, radius: f32, r8: u64, r9: u64, a5: u64, rng: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::EDGES_HOOK);
     let original = EDGES_ORIGINAL.load(Ordering::Acquire);
     if original == 0 {
         return 0;
@@ -644,8 +640,7 @@ fn deep_vector(begin: u64, end: u64, size: u64, max: usize) -> Result<Vec<u8>, u
     if n as usize > max {
         return Err(n);
     }
-    // SAFETY: checked readable by `read`.
-    unsafe { mem::read(begin as *const u8, len as usize) }.map_err(|_| n)
+    crate::memguard::read(begin as usize, len as usize).map_err(|_| n)
 }
 
 /// What is known before the sort.
@@ -675,9 +670,7 @@ fn deep_sort_after(pre: SortPre, begin: u64, end: u64, ctx: u64) {
     let mut ties = None;
     if !pre.capped {
         // the centre is a pointer to two floats at `ctx+0x20`: read the pointer, then the floats
-        // SAFETY: only after the OS says the 8 bytes are readable.
-        let ptr = (ctx != 0 && unsafe { mem::readable(ctx.wrapping_add(0x20) as *const u8, 8) })
-            .then(|| unsafe { core::ptr::read_unaligned(ctx.wrapping_add(0x20) as *const u64) });
+        let ptr = ctx.checked_add(0x20).and_then(|a| crate::memguard::word(a as usize));
         if let (Some(p), Ok(bytes)) = (ptr, deep_vector(begin, end, growth::RECORD_LEN as u64, growth::MAX_RECORDS)) {
             if let (Some(cx), Some(cy)) = (deep_read_u32(p), deep_read_u32(p.wrapping_add(4))) {
                 let (cx, cy) = (f32::from_bits(cx), f32::from_bits(cy));
@@ -717,8 +710,7 @@ fn deep_pick_before(rng: u64, frame: u64) -> Option<PickPre> {
     }
     let before = deep_read_u32(rng);
     let empty = growth::digest_ids(&[]);
-    // SAFETY: only asks the OS first.
-    let hdr = frame.checked_sub(0x40).and_then(|a| unsafe { mem::read(a as *const u8, 16) }.ok());
+    let hdr = frame.checked_sub(0x40).and_then(|a| crate::memguard::read(a as usize, 16).ok());
     let Some(hdr) = hdr else {
         return Some(PickPre { key, j, digest: empty, capped: true, before });
     };
@@ -739,6 +731,7 @@ fn deep_pick_after(pre: PickPre, rng: u64, idx: u32) {
 /// The call `std::sort(begin, end, count, ctx)` at `0x967c16`, reached through a thunk the module placed at the call.
 /// Logs the records as gathered, calls the real sort with every argument as given, then logs the ties. Changes nothing.
 unsafe extern "system-unwind" fn sort_hook(begin: u64, end: u64, count: u64, ctx: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::SORT_HOOK);
     let callee = SORT_CALLEE.load(Ordering::Acquire);
     if callee == 0 {
         return 0;
@@ -762,6 +755,7 @@ unsafe extern "system-unwind" fn sort_hook(begin: u64, end: u64, count: u64, ctx
 /// (`rbp`, where the id vector lives) in `r9`, which the callee does not use. Logs the candidates, calls the real
 /// function with `(rng, lo, n)` as given and logs the draw. Changes nothing.
 unsafe extern "system-unwind" fn pick_hook(rng: u64, lo: u64, n: u64, frame: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::PICK_HOOK);
     let callee = PICK_CALLEE.load(Ordering::Acquire);
     if callee == 0 {
         return 0;
@@ -781,6 +775,108 @@ unsafe extern "system-unwind" fn pick_hook(rng: u64, lo: u64, n: u64, frame: u64
     ret
 }
 
+/// Where the redirected river field lookup leads after [`field_hook`]: the real `RiverField::At` (`0x2b7a1b0`); 0 until published.
+static FIELD_CALLEE: AtomicUsize = AtomicUsize::new(0);
+/// Lookups outside any `Develop` that were logged (another caller of the open pass, a script's develop command).
+static FIELD_ORPHANS: AtomicU64 = AtomicU64::new(0);
+/// The field objects seen, in the order first seen: the line's `buf` (one field per engine, and the game runs two).
+static FIELD_OBJECTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Where a river field line belongs (as [`deep_place`], with its own counter `j`).
+fn deep_place_field() -> Option<(growth::DeepKey, u32, bool)> {
+    let pid = std::process::id();
+    match deep_ctx().dev {
+        Some(d) => {
+            deep_ctx_update(|c| {
+                if let Some(d) = c.dev.as_mut() {
+                    d.field_j += 1;
+                }
+            });
+            Some((growth::DeepKey { pid, t: d.t, town: d.town, k: d.k }, d.field_j, d.want))
+        }
+        None => {
+            let n = FIELD_ORPHANS.fetch_add(1, Ordering::Relaxed);
+            (n < growth::ORPHAN_MAX).then_some((growth::DeepKey { pid, t: None, town: 0, k: 0 }, n as u32, true))
+        }
+    }
+}
+
+/// The u64 at `addr` when the address is aligned and the bytes are committed and readable.
+fn deep_read_u64(addr: u64) -> Option<u64> {
+    crate::memguard::read_value::<u64>(usize::try_from(addr).ok()?)
+}
+
+/// The cache size of a river field (`std::map` at `+0x18`: head pointer, then the size at `+0x20`).
+fn field_entries(field: u64) -> Option<u64> {
+    deep_read_u64(field.checked_add(0x20)?)
+}
+
+/// After the lookup: the line, from the cache size before (`before`) and the field, point and answer as they are now.
+fn deep_field(field: u64, point: u64, out: u64, before: Option<u64>) {
+    let Some((key, j, want)) = deep_place_field() else { return };
+    if !want {
+        return;
+    }
+    let (Some(px), Some(py)) = (deep_read_u32(point), deep_read_u32(point.wrapping_add(4))) else { return };
+    let entries = field_entries(field);
+    let sources = match (deep_read_u64(field), deep_read_u64(field.wrapping_add(8))) {
+        (Some(b), Some(e)) if e >= b && (e - b).is_multiple_of(growth::FIELD_SOURCE_LEN) => {
+            Some((e - b) / growth::FIELD_SOURCE_LEN)
+        }
+        _ => None,
+    };
+    let mut answer = [0u32; 5];
+    let mut read_all = true;
+    for (i, slot) in answer.iter_mut().enumerate() {
+        match deep_read_u32(out.wrapping_add(4 * i as u64)) {
+            Some(v) => *slot = v,
+            None => read_all = false,
+        }
+    }
+    let buffer = {
+        let mut seen = FIELD_OBJECTS.lock().unwrap_or_else(|p| p.into_inner());
+        match seen.iter().position(|&f| f == field) {
+            Some(i) => i,
+            None => {
+                seen.push(field);
+                seen.len() - 1
+            }
+        }
+    };
+    let call = growth::FieldCall {
+        point: (px, py),
+        hit: growth::field_hit(before, entries),
+        entries,
+        sources,
+        answer: read_all.then_some(answer),
+        buffer,
+    };
+    growth_file_line(&growth::field_line(&key, j, &call));
+}
+
+/// The call `RiverField::At(field, out, point, flag)` at `0x96962e` (the street developer's open pass bends a new street's end
+/// towards the river field), reached through a thunk the module placed at the call. Reads the cache size, calls the real `At` with
+/// every register argument as given (it takes no stack argument), then logs the point, the answer and whether it came from the
+/// cache. Changes nothing (TOWN_CACHE_20261019: the cache is per engine and not saved).
+unsafe extern "system-unwind" fn field_hook(field: u64, out: u64, point: u64, flag: u64) -> u64 {
+    // the only function the game jumps to that had no barrier (7337e4e): a panic here unwound into the street developer
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::FIELD_HOOK);
+    let callee = FIELD_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return out;
+    }
+    let deep = GROWTH_DEEP.load(Ordering::Acquire);
+    let before = if deep { crate::log::guarded("growth deep field", || field_entries(field)).flatten() } else { None };
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+    // SAFETY: the real function at the call's original target, which takes these four register slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    let ret = unsafe { original(field, out, point, flag) };
+    if deep {
+        crate::log::guarded("growth deep field", || deep_field(field, point, out, before));
+    }
+    ret
+}
+
 /// Where the redirected call of `CGame::Sync` (`0x11f690`) leads after [`pace_hook`]; 0 until published (before the call is patched).
 static PACE_CALLEE: AtomicUsize = AtomicUsize::new(0);
 
@@ -790,6 +886,7 @@ static PACE_CALLEE: AtomicUsize = AtomicUsize::new(0);
 /// batch (`al` = 1) stretches the batch interval by the mod's factor. The real `Sync` runs in this plain frame, outside any guard
 /// (log.rs THE RULE); only the module's own reads and the one write after it are guarded.
 unsafe extern "system-unwind" fn pace_hook(cgame: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::PACE_HOOK);
     let callee = PACE_CALLEE.load(Ordering::Acquire);
     if callee == 0 {
         return 0;
@@ -804,6 +901,65 @@ unsafe extern "system-unwind" fn pace_hook(cgame: u64, arg2: u64, arg3: u64, arg
         crate::log::guarded("batch pace", || unsafe { pace_after_sync(&crate::pace::PACER, cgame as usize, now) });
     }
     ret
+}
+
+/// Where the redirected free-id append leads after [`free_order_hook`]: the real `deque<int>::_Insert_range` (`0x2bb62a0`); 0 until
+/// published (before the call is patched).
+static FREE_ORDER_CALLEE: AtomicUsize = AtomicUsize::new(0);
+
+/// The call `deque<int>::_Insert_range(queue, &ret, where, first, last)` at `0x2bba103` in `ecs::Engine::EndModification` (the
+/// simulation's threads, once per modification), reached through a thunk the module placed at the call (`FEVERLINK3_FREE_ORDER`,
+/// `freeorder.rs`). `[first, last)` is the modification's own vector of removed ids, read by nothing after this call: it is sorted
+/// by entity id in place, then the real insert runs with every argument as given (four registers and the fifth on the stack, where
+/// the thunk's plain jump leaves it). The insert allocates through the game's `operator new`, so it runs in this plain frame, outside
+/// any guard (log.rs THE RULE); only the sort, which calls nothing of the game, is guarded.
+unsafe extern "system-unwind" fn free_order_hook(queue: u64, ret: u64, at: u64, first: u64, last: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::FREE_ORDER_HOOK);
+    let callee = FREE_ORDER_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return ret;
+    }
+    // SAFETY: nothing is written before the guarded reader read the whole range (sort_freed).
+    crate::log::guarded("free order", || unsafe { sort_freed(first, last) });
+    type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64) -> u64;
+    // SAFETY: the real function at the call's original target, which takes these five slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    unsafe { original(queue, ret, at, first, last) }
+}
+
+/// Sorts the batch of freed ids `[first, last)` by entity id where it lies. A range that is not a readable run of ids is left as it
+/// is and raises a stop fault: this game would then reuse ids in another order than the others for the rest of its run.
+///
+/// # Safety
+/// Any range is allowed: it is checked (`freeorder::batch_len`) and read whole through the guarded reader before the sorted ids are
+/// written back over it; a range the reader accepts is the engine's own heap vector, which is writable.
+unsafe fn sort_freed(first: u64, last: u64) {
+    let refuse = |why: String| {
+        crate::failsafe::global(
+            "free order",
+            crate::failsafe::Action::Stop,
+            format!("a batch of freed ids was not sorted ({why}): this game reuses ids in the engine's order, the others in id order"),
+        )
+    };
+    let n = match crate::freeorder::batch_len(first, last) {
+        Ok(n) => n,
+        Err(why) => return refuse(why),
+    };
+    if n < 2 {
+        crate::freeorder::STATS.note(n, false);
+        return;
+    }
+    let bytes = match crate::memguard::read(first as usize, n * 4) {
+        Ok(b) => b,
+        Err(why) => return refuse(format!("{n} ids at {first:#x} not readable: {why:?}")),
+    };
+    let mut ids: Vec<i32> = bytes.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect();
+    let changed = crate::freeorder::canonical(&mut ids);
+    if changed {
+        // SAFETY: the n ids just read whole, 4-byte aligned (batch_len); the engine's vector on its heap.
+        unsafe { core::ptr::copy_nonoverlapping(ids.as_ptr(), first as *mut i32, n) };
+    }
+    crate::freeorder::STATS.note(n, changed);
 }
 
 /// After a `Sync` that handed out a batch: the engine's interval at `[[cgame+0x1f0]+0x218]` (i32 us) is replaced by what the pacer
@@ -850,6 +1006,7 @@ unsafe fn pace_after_sync(pacer: &crate::pace::Pacer, cgame: usize, now: u64) {
 /// does a few instructions later (`[[this+8]+0x28]` is the `GameTime` system, `0x2a96c0` the getter), keeps it for
 /// `Develop` to see, and calls the original with the arguments as given. Changes nothing.
 unsafe extern "system-unwind" fn growth_cmd_hook(this: u64, payload: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::GROWTH_CMD_HOOK);
     let original = GROWTH_CMD_ORIGINAL.load(Ordering::Acquire);
     if original == 0 {
         return 0;
@@ -891,6 +1048,7 @@ unsafe extern "system-unwind" fn growth_cmd_hook(this: u64, payload: u64) -> u64
 ///
 /// The original's result is ignored by its only growth caller; it is forwarded as received.
 unsafe extern "system-unwind" fn growth_hook(rcx: u64, rdx: u64, r8: u64, r9: u64, a5: u64, a6: u64, a7: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::GROWTH_HOOK);
     let original = GROWTH_ORIGINAL.load(Ordering::Acquire);
     if original == 0 {
         return 0;
@@ -997,6 +1155,7 @@ fn is_diagnostic(name: &str) -> bool {
             | "town_edges"
             | "town_sort"
             | "town_pick"
+            | "town_field"
     )
 }
 
@@ -1012,11 +1171,15 @@ pub struct Targets {
     pub edges: usize,
     pub sort: usize,
     pub pick: usize,
+    /// The call-site hook of the river field lookup ([`field_hook`], deep growth log).
+    pub field: usize,
     pub convert: usize,
     pub convert_update: usize,
     pub preview: usize,
     /// The call-site hook of smooth pacing ([`pace_hook`]).
     pub pace: usize,
+    /// The call-site hook of the free-id order ([`free_order_hook`]).
+    pub free_order: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -1060,6 +1223,11 @@ impl Installed {
 
     pub fn step_seed(&self) -> bool {
         self.step_seed_patch.as_ref().is_some_and(AppliedPatch::is_applied)
+    }
+
+    /// The free-id append in `EndModification` leads to the sort.
+    pub fn free_order(&self) -> bool {
+        self.call_patches.iter().any(|(n, p)| *n == crate::freeorder::HOOK_NAME && p.is_applied())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1244,16 +1412,18 @@ pub unsafe fn execute(
             let (hook, prefix): (usize, &[u8]) = match feature {
                 Feature::GrowthSort => (targets.sort, &[]),
                 Feature::BatchPace => (targets.pace, &[]),
+                Feature::FreeOrder => (targets.free_order, &[]),
+                Feature::GrowthField => (targets.field, &[]),
                 // `mov r9, rbp`: the caller's frame pointer as a fourth argument the callee ignores
                 _ => (targets.pick, &[0x4C, 0x8B, 0xCD]),
             };
             let callee_addr = base + *callee as usize;
-            if *feature == Feature::GrowthSort {
-                SORT_CALLEE.store(callee_addr, Ordering::Release);
-            } else if *feature == Feature::BatchPace {
-                PACE_CALLEE.store(callee_addr, Ordering::Release);
-            } else {
-                PICK_CALLEE.store(callee_addr, Ordering::Release);
+            match feature {
+                Feature::GrowthSort => SORT_CALLEE.store(callee_addr, Ordering::Release),
+                Feature::BatchPace => PACE_CALLEE.store(callee_addr, Ordering::Release),
+                Feature::FreeOrder => FREE_ORDER_CALLEE.store(callee_addr, Ordering::Release),
+                Feature::GrowthField => FIELD_CALLEE.store(callee_addr, Ordering::Release),
+                _ => PICK_CALLEE.store(callee_addr, Ordering::Release),
             }
             let mut thunk = prefix.to_vec();
             thunk.extend_from_slice(&crate::detour::jmp_abs(hook as u64));
@@ -1275,6 +1445,12 @@ pub unsafe fn execute(
             match unsafe { AppliedPatch::apply(at as *mut u8, expected, &replacement) } {
                 Ok(p) => {
                     lines.push(format!("hooks: {name}: call at rva {rva:#x} redirected to a thunk at {thunk_at:#x}"));
+                    if *feature == Feature::FreeOrder {
+                        lines.push(format!(
+                            "free-id order: freed ids join the free-id queue sorted by entity id (EndModification's append, call at rva {rva:#x}; {}=0 off, must match on every game)",
+                            crate::freeorder::FREE_ORDER_VAR
+                        ));
+                    }
                     inst.call_patches.push((name, p));
                 }
                 Err(e) => lines.push(format!("hooks: {name}: NOT installed, the call was not patched: {e}")),
@@ -1384,6 +1560,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         log(&l);
     }
     if plan.steps.is_empty() {
+        missing_patches_fail_loud(&cfg, None);
         log("hooks: nothing to install");
         return;
     }
@@ -1472,10 +1649,12 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         edges: edges_hook as *const () as usize,
         sort: sort_hook as *const () as usize,
         pick: pick_hook as *const () as usize,
+        field: field_hook as *const () as usize,
         convert: convert_hook as *const () as usize,
         convert_update: convert_update_hook as *const () as usize,
         preview: preview_hook as *const () as usize,
         pace: pace_hook as *const () as usize,
+        free_order: free_order_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1492,6 +1671,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     for l in lines {
         log(&l);
     }
+    missing_patches_fail_loud(&cfg, Some(&installed));
     let mod_hooks: Vec<&'static str> = installed.hook_names().into_iter().filter(|n| !is_diagnostic(n)).collect();
     let seed_logged = installed.hook_names().contains(&"town_seed");
     let growth_logged = installed.hook_names().contains(&"town_develop");
@@ -1500,6 +1680,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
     let edges_on = installed.hook_names().contains(&"town_edges");
     let sort_on = installed.hook_names().contains(&"town_sort");
     let pick_on = installed.hook_names().contains(&"town_pick");
+    let field_on = installed.hook_names().contains(&"town_field");
     rt.set_installed(mod_hooks.clone(), installed.poolpatch());
     let anything = !installed.is_empty();
     let hooked = !mod_hooks.is_empty();
@@ -1525,12 +1706,13 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         log("hooks: town_develop: TOWN GROWTH log: 'growth n=.. pid=.. town=.. seed=.. [t=<tick of 200 ms>] [used=..] r9b=.. a6=.. a7=.. ret=.. caller=..' (first 2000 calls, then about 1 in 50; every call of the towns in FEVERLINK3_TOWN_TRACE); also appended to growth.log in this game's live folder");
         if g.deep {
             log(&format!(
-                "hooks: town_develop: DEEP growth log (FEVERLINK3_LOG_GROWTH_DEEP): 'gdeep-payload|dev|cand|edge ...' lines in growth.log only (payload: {}, rng end state: yes, candidates: {}, edge rng: {}, sort input: {}, edge pick: {}); read-only",
+                "hooks: town_develop: DEEP growth log (FEVERLINK3_LOG_GROWTH_DEEP): 'gdeep-payload|dev|cand|edge|field ...' lines in growth.log only (payload: {}, rng end state: yes, candidates: {}, edge rng: {}, sort input: {}, edge pick: {}, river field cache: {}); read-only",
                 if time_read { "yes" } else { "NO, the TownUpdateSize hook is missing" },
                 if cands_on { "yes" } else { "NO, not installed" },
                 if edges_on { "yes" } else { "NO, not installed" },
                 if sort_on { "yes" } else { "NO, not installed" },
                 if pick_on { "yes" } else { "NO, not installed" },
+                if field_on { "yes" } else { "NO, not installed" },
             ));
         }
         if !time_read {
@@ -1558,6 +1740,26 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         spawn_service(rt, link, since, log);
     } else {
         log("hooks: no session folder: counters only in memory, no control link");
+    }
+}
+
+/// Fail loud (`failsafe.rs`): a determinism patch the switches ask for (each is on unless its variable says 0, and must match on every
+/// game) that is not in place makes this game run as shipped where the others do not, for the whole run: a stop fault, which the mod
+/// shows the player and the host's repair cannot cure. Before 2026-10-19 this was one log line ("NOT applied") and the session went on.
+fn missing_patches_fail_loud(cfg: &HookConfig, installed: Option<&Installed>) {
+    let pieces = [
+        ("script pool patch", cfg.poolpatch, installed.is_some_and(Installed::poolpatch)),
+        ("lua seed patch", cfg.luaseed, installed.is_some_and(Installed::lua_seed)),
+        ("step seed patch", cfg.step_seed, installed.is_some_and(Installed::step_seed)),
+        ("free order patch", cfg.free_order, installed.is_some_and(Installed::free_order)),
+    ];
+    for name in crate::failsafe::missing_patches(&pieces) {
+        crate::failsafe::global(
+            name,
+            crate::failsafe::Action::Stop,
+            "asked for by the switches but NOT in place (the lines above say why): this game runs as shipped where the others do \
+             not; leave the session and restart the game",
+        );
     }
 }
 
@@ -1602,6 +1804,15 @@ fn wait_until_written(path: &Path, since: SystemTime, timeout: Duration, poll: D
     }
 }
 
+/// The `hookwatch` dump, when due: every 5 s until the simulation applied its first command (labs L/L2 of 2026-10-19, a game that
+/// hung while loading with the deep growth log on). Written without the log's lock.
+fn hookwatch_tick() {
+    let started = crate::hookwatch::sim_started();
+    if let Some(l) = crate::hookwatch::SCHEDULE.due(crate::pace::clock_ms(), started, &crate::hookwatch::ALL) {
+        crate::log::line_unlocked(&l);
+    }
+}
+
 /// The service thread: opens the control link once the session folder is ready, then pumps every 20 ms.
 fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&str)) {
     let spawned = std::thread::Builder::new().name("feverlink3-native".into()).spawn(move || {
@@ -1609,17 +1820,31 @@ fn spawn_service(rt: &'static Runtime, link: Link, since: SystemTime, log: fn(&s
             // the in-process controller clears the folder when it starts and then writes identity.txt: wait for
             // a file newer than this process, or the first events would be deleted under us
             let identity = link.dir.join("identity.txt");
-            if !wait_until_written(&identity, since, Duration::from_secs(120), Duration::from_millis(100)) {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut announced = false;
+            while !announced && Instant::now() < deadline {
+                hookwatch_tick();
+                announced = wait_until_written(&identity, since, Duration::from_secs(1), Duration::from_millis(100));
+            }
+            if !announced {
                 log("link: the session controller did not announce itself within 120 s; opening the folder anyway");
             }
         }
         if let Err(e) = rt.open_link(&link.dir) {
             log(&format!("link: cannot open {}: {e}", link.dir.display()));
+            // no link, but the dump still names a hook a game thread is stuck in
+            while !crate::hookwatch::sim_started() {
+                hookwatch_tick();
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            hookwatch_tick();
             return;
         }
         loop {
+            // before the round: a round that waits on something a stuck hook holds must not silence the dump that names it
+            hookwatch_tick();
             // a failure in one round (a panic, under `unwind`) costs that round, not the link
-            crate::log::guarded("service thread", || rt.pump());
+            rt.pump_round();
             std::thread::park_timeout(Duration::from_millis(20));
         }
     });
@@ -1698,7 +1923,9 @@ mod tests {
             }),
             town_sort_call: Some(call_site(SORT_CALL_RVA, SORT_CALLEE_RVA, sort_callee_probe as *const () as usize)),
             town_pick_call: Some(call_site(PICK_CALL_RVA, PICK_CALLEE_RVA, pick_callee_probe as *const () as usize)),
+            town_field_call: None,
             batch_pace: None,
+            free_order: None,
             game_time_getter: Some(CallSite { rva: GETTER_RVA, prologue: &GETTER_FN }),
             script_pool: Some(pool.clone()),
             lua_makeseed: Some(seed.clone()),
@@ -1793,10 +2020,12 @@ mod tests {
             edges: edges_hook as *const () as usize,
             sort: sort_hook as *const () as usize,
             pick: pick_hook as *const () as usize,
+            field: field_hook as *const () as usize,
             convert: convert_hook as *const () as usize,
             convert_update: convert_update_hook as *const () as usize,
             preview: preview_hook as *const () as usize,
             pace: pace_hook as *const () as usize,
+            free_order: free_order_hook as *const () as usize,
         }
     }
 
@@ -1907,6 +2136,72 @@ mod tests {
         assert_eq!(t.interval(), 250_000, "factor 1: the engine's interval");
         PACE_CALLEE.store(before, SeqCst);
         FAKE_SYNC_ARGS.lock().unwrap().clear();
+    }
+
+    // ---- the free-id order: the hook in front of the queue append, on a fake insert
+
+    /// What the fake insert saw: its five arguments and the ids in `[first, last)` at the moment it ran.
+    static FAKE_INSERT_SEEN: Mutex<Vec<(Vec<u64>, Vec<i32>)>> = Mutex::new(Vec::new());
+
+    /// A fake `deque<int>::_Insert_range(queue, &ret, where, first, last) -> &ret` that appends the range to a fake queue (`queue`
+    /// points at a `Vec<i32>`), in range order, as the real one does.
+    unsafe extern "system-unwind" fn fake_insert(queue: u64, ret: u64, at: u64, first: u64, last: u64) -> u64 {
+        let n = ((last - first) / 4) as usize;
+        let ids =
+            if n == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(first as *const i32, n) }.to_vec() };
+        unsafe { (*(queue as *mut Vec<i32>)).extend_from_slice(&ids) };
+        FAKE_INSERT_SEEN.lock().unwrap_or_else(|p| p.into_inner()).push((vec![queue, ret, at, first, last], ids));
+        ret
+    }
+
+    /// One `EndModification` of a fake engine: the removed ids in the engine's order go through the hook into the queue.
+    fn end_modification(queue: &mut Vec<i32>, removed: &mut [i32]) -> u64 {
+        let range = removed.as_mut_ptr_range();
+        let (first, last) = (range.start as u64, range.end as u64);
+        unsafe { free_order_hook(queue as *mut Vec<i32> as u64, 0x5eed, queue.len() as u64, first, last) }
+    }
+
+    #[test]
+    fn the_free_order_hook_sorts_each_batch_before_the_real_insert_and_passes_every_argument() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let before = FREE_ORDER_CALLEE.swap(fake_insert as *const () as usize, SeqCst);
+        FAKE_INSERT_SEEN.lock().unwrap().clear();
+        // the M lab of 2026-10-19: the same ids in two games' history orders give one queue
+        let (mut q1, mut q2) = (vec![3, 4], vec![3, 4]);
+        let mut b1 = [50859, 49942, 48057, 50861];
+        let mut b2 = [49942, 48057, 50861, 50859];
+        assert_eq!(end_modification(&mut q1, &mut b1), 0x5eed, "the insert's result comes back");
+        end_modification(&mut q2, &mut b2);
+        assert_eq!(q1, [3, 4, 48057, 49942, 50859, 50861]);
+        assert_eq!(q1, q2);
+        assert_eq!(b1, [48057, 49942, 50859, 50861], "sorted where it lies: the engine frees the vector right after");
+        let seen = FAKE_INSERT_SEEN.lock().unwrap().clone();
+        let range = b1.as_ptr_range();
+        assert_eq!(seen[0].0[1..], [0x5eed, 2, range.start as u64, range.end as u64], "every argument as given");
+        assert_eq!(seen[0].1, [48057, 49942, 50859, 50861], "the insert sees the sorted range");
+        // an empty batch and a single id pass as they are
+        let mut none: [i32; 0] = [];
+        end_modification(&mut q1, &mut none);
+        let mut one = [7];
+        end_modification(&mut q1, &mut one);
+        assert_eq!(q1[6..], [7]);
+        FREE_ORDER_CALLEE.store(before, SeqCst);
+        FAKE_INSERT_SEEN.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_range_that_is_not_a_batch_of_ids_is_left_alone_and_is_a_stop_fault() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // unaligned, backwards, and unmapped: nothing is written, the game goes on, the player is told to restart
+        let mut ids = [9i32, 8, 7];
+        let p = ids.as_mut_ptr() as u64;
+        unsafe { sort_freed(p + 1, p + 9) };
+        unsafe { sort_freed(p + 8, p) };
+        unsafe { sort_freed(0x10, 0x20) };
+        assert_eq!(ids, [9, 8, 7]);
+        assert!(crate::failsafe::GLOBAL.stopped(), "a stop fault was raised");
+        unsafe { sort_freed(p, p + 12) };
+        assert_eq!(ids, [7, 8, 9]);
     }
 
     #[test]
@@ -3081,6 +3376,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The deep log reads the engine's heap on the engine's threads: memory that goes away after it was found readable is a
+    /// refused read (no line), not an access fault on a game thread.
+    #[test]
+    fn deep_reads_of_memory_that_went_away_are_refused_not_faults() {
+        use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_NOACCESS, PAGE_READWRITE};
+        let p = Pages::new(&[PAGE_READWRITE]);
+        let mut payload = [0u8; 0x11];
+        payload[..4].copy_from_slice(&7u32.to_le_bytes());
+        p.fill(0, &payload);
+        let at = p.at(0) as u64;
+        assert_eq!(deep_read_u32(at), Some(7), "read once: the region is cached as readable");
+        assert_eq!(deep_read_u64(at), Some(7));
+        let mut old = 0u32;
+        assert_ne!(unsafe { VirtualProtect(p.at(0) as *const _, 0x1000, PAGE_NOACCESS, &mut old) }, 0);
+        let faults = crate::memguard::stats().faults;
+        assert_eq!(deep_read_u32(at), None);
+        assert_eq!(deep_read_u64(at), None);
+        assert!(deep_payload(at, Some(1)).is_none());
+        assert!(deep_vector(at, at + 0x40, 0x40, 4).is_err());
+        assert!(crate::memguard::stats().faults > faults, "the stale cache entry faulted inside the guarded copy");
+        assert_eq!(deep_read_u32(at + 2), None, "misaligned");
+        assert_eq!(deep_read_u64(0), None);
+    }
+
+    /// Every function the game jumps to counts itself in and out (`hookwatch`), also when it returns early.
+    #[test]
+    fn the_field_hook_counts_itself_in_and_out() {
+        let before = crate::hookwatch::FIELD_HOOK.read();
+        FIELD_CALLEE.store(0, SeqCst);
+        assert_eq!(unsafe { field_hook(0, 5, 0, 0) }, 5, "not armed: passes the out pointer back");
+        let after = crate::hookwatch::FIELD_HOOK.read();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+    }
+
     #[test]
     #[ignore = "full set: the deep town trace past its 2000-command sampling threshold, 4 s; the plain trace test covers every-call and sampling (cargo test -- --include-ignored)"]
     fn traced_towns_are_logged_on_every_call_in_the_deep_log() {
@@ -3324,6 +3653,81 @@ mod tests {
         // the shared log is not flooded by the traced town: it keeps the sampling
         assert!(growth_lines().len() < 2600 + 2600, "{}", growth_lines().len());
         unsafe { inst.uninstall_all() };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache of the fake `RiverField::At`: (field, cell, answer), as the game keeps one per field object.
+    type FakeFieldEntry = (u64, (i32, i32), [u32; 5]);
+    static FAKE_FIELD_CACHE: Mutex<Vec<FakeFieldEntry>> = Mutex::new(Vec::new());
+
+    /// A fake `At(field, out, point, flag) -> out` that behaves like the game's: a cell asked before is answered from the cache
+    /// (the answer of the first point asked there), a new cell is computed from the point and inserted (size at `field+0x20` + 1).
+    extern "system" fn fake_field_at(field: u64, out: u64, point: u64, _flag: u64) -> u64 {
+        let p = point as *const f32;
+        let (x, y) = unsafe { (*p, *p.add(1)) };
+        let cell = growth::field_cell(x, y);
+        let mut cache = FAKE_FIELD_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        let answer = match cache.iter().find(|(f, c, _)| *f == field && *c == cell) {
+            Some((_, _, a)) => *a,
+            None => {
+                let a = [x.to_bits(), y.to_bits(), 1.0f32.to_bits(), 0, 7.5f32.to_bits()];
+                cache.push((field, cell, a));
+                unsafe { *((field + 0x20) as *mut u64) += 1 };
+                a
+            }
+        };
+        let o = out as *mut u32;
+        for (i, v) in answer.iter().enumerate() {
+            unsafe { *o.add(i) = *v };
+        }
+        out
+    }
+
+    #[test]
+    fn the_field_trace_tells_a_cached_answer_from_a_computed_one_and_changes_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("field");
+        *GROWTH_DIR.lock().unwrap_or_else(|p| p.into_inner()) = Some(dir.clone());
+        GROWTH_DEEP.store(true, SeqCst);
+        FIELD_ORPHANS.store(0, SeqCst);
+        FIELD_OBJECTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        FAKE_FIELD_CACHE.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        FIELD_CALLEE.store(fake_field_at as *const () as usize, SeqCst);
+        // two field objects (one per engine): two sources each (32 bytes), empty caches
+        let sources = Box::leak(Box::new([0u8; 32]));
+        let mk = || {
+            let f: &'static mut [u64; 6] = Box::leak(Box::new([0u64; 6]));
+            f[0] = sources.as_ptr() as u64;
+            f[1] = f[0] + 32;
+            f.as_mut_ptr() as u64
+        };
+        let (a, b) = (mk(), mk());
+        let call = |field: u64, x: f32, y: f32| -> [u32; 5] {
+            let point = [x, y];
+            let mut out = [0u32; 5];
+            let ret = unsafe { field_hook(field, out.as_mut_ptr() as u64, point.as_ptr() as u64, 0) };
+            assert_eq!(ret, out.as_ptr() as u64, "the callee's result is passed back");
+            out
+        };
+        let first = call(a, 10.0, 10.0);
+        let cached = call(a, 20.0, 5.0); // same cell (0,0): the first point's answer
+        assert_eq!(cached, first, "the fake answers from its cache like the game");
+        let other_engine = call(b, 20.0, 5.0); // the other engine has not seen the cell: computed at this point
+        assert_ne!(other_engine, first);
+        FIELD_CALLEE.store(0, SeqCst);
+        GROWTH_DEEP.store(false, SeqCst);
+        *GROWTH_DIR.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let text = std::fs::read_to_string(dir.join(growth::LOG_FILE)).expect("growth.log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        let pid = std::process::id();
+        assert!(lines[0]
+            .starts_with(&format!("gdeep-field pid={pid} t=- town=0 k=0 j=0 cell=0,0 p=0x41200000,0x41200000 ")));
+        assert!(lines[0].ends_with(" hit=0 n=1 src=2 buf=0"), "{}", lines[0]);
+        assert!(lines[1].contains(" j=1 cell=0,0 p=0x41a00000,0x40a00000 a=0x41200000,0x41200000,"), "{}", lines[1]);
+        assert!(lines[1].ends_with(" hit=1 n=1 src=2 buf=0"), "{}", lines[1]);
+        assert!(lines[2].contains(" a=0x41a00000,0x40a00000,"), "{}", lines[2]);
+        assert!(lines[2].ends_with(" hit=0 n=1 src=2 buf=1"), "{}", lines[2]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

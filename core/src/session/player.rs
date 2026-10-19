@@ -8,7 +8,9 @@ use super::messages::{
     codec, ChallengeMessage, JoinMessage, Permissions, PingMessage, PlayerJoinedMessage, PlayerLeftMessage,
     PongMessage, RejectMessage, ResumeClaim, ResyncChunkMessage, ResyncLoadMessage, SessionState, WelcomeMessage,
 };
+use super::mods::ModFingerprint;
 use super::names::Names;
+use super::resume::Outbox;
 use super::resync::IncomingSave;
 use super::roster::{ConnectionState, RosterEntry};
 use crate::crypto::{Opener, Sealer, SessionKey};
@@ -81,6 +83,8 @@ pub struct PlayerSession {
     incoming: IncomingSave,
     /// What the join message announces (see [`super::CAP_BULK_DGRAM`]).
     caps: Vec<String>,
+    /// This game's mod list and builds, sent in compact form with the join (see [`super::mods`]).
+    mods: Option<ModFingerprint>,
     /// The slot this session asks for in its join, if it is a return.
     resume: Option<ResumeTicket>,
     /// What the welcome granted for the next return.
@@ -91,6 +95,12 @@ pub struct PlayerSession {
     /// a frame with a counter at or below it is a replay from an earlier connection, which a fresh replay window
     /// cannot know.
     host_floor: u64,
+    /// The counter of the last host frame received, over this connection or the ones before it ([`PlayerSession::carry_to`]): a
+    /// return asks to be caught up from there ([`ResumeClaim::last`]).
+    host_last: Option<u64>,
+    /// What this player's game sent and the host has not acknowledged yet (its pings' `ack`), resent after a resume that catches
+    /// up (`resume.rs`); while a returning session waits for its welcome, what the game sends is kept here unsealed.
+    outbox: Outbox,
     roster: BTreeMap<u16, RosterEntry>,
     now: Box<dyn Fn() -> f64 + Send>,
     /// The wall clock (ms since 1970) a pong carries for the host's offset estimate ([PlayerSession::set_wall_clock]). Logs only.
@@ -165,10 +175,13 @@ impl PlayerSession {
             permissions: Permissions::default(),
             incoming: IncomingSave::new(),
             caps: Vec::new(),
+            mods: None,
             resume,
             ticket: None,
             challenge: None,
             host_floor: 0,
+            host_last: None,
+            outbox: Outbox::default(),
             roster: BTreeMap::new(),
             now,
             wall: None,
@@ -311,9 +324,13 @@ impl PlayerSession {
             let proof = HostSession::proof(&self.key, &ch.nonce, &self.name).to_vec();
             let mut join = JoinMessage::new(&self.name, &self.version, proof);
             join.caps = self.caps.clone();
+            join.mods = self.mods.as_ref().map(ModFingerprint::tags);
+            // asks to be caught up only when it can resend everything its game sent that the host may not have
+            let last = self.host_last.filter(|_| !self.outbox.is_broken());
             join.resume = self.resume.as_ref().map(|t| ResumeClaim {
                 id: t.id,
-                mac: HostSession::resume_proof(&t.token, &ch.nonce, t.id, &self.name).to_vec(),
+                mac: HostSession::resume_proof(&t.token, &ch.nonce, t.id, &self.name, last).to_vec(),
+                last,
             });
             let header =
                 FrameHeader::new(FrameHeader::CURRENT_VERSION, MessageKind::Join.into(), HostSession::UNASSIGNED, 0);
@@ -354,6 +371,7 @@ impl PlayerSession {
             self.drop(kind_byte, "before welcome".to_owned());
             return;
         }
+        self.host_last = Some(frame.header.counter);
         match kind {
             MessageKind::Session => {
                 if let Some(s) = codec::try_decode::<SessionState>(&plain) {
@@ -448,6 +466,8 @@ impl PlayerSession {
         };
         self.id = Some(w.you);
         self.host_floor = counter;
+        // what the host sends from here on is kept for the next return; what it sent before (the welcome included) is in this world
+        self.host_last = Some(counter);
         self.assigned_name =
             Some(w.players.iter().find(|p| p.id == w.you).map_or_else(|| self.name.clone(), |p| p.name.clone()));
         self.host_name = Some(w.host_name.clone());
@@ -469,6 +489,17 @@ impl PlayerSession {
             .collect();
         self.sealer = Some(sealer);
         self.state = PlayerState::Joined;
+        if self.mods.is_some() && !w.mods_checked {
+            // an older host: it did not compare the mod lists and is about to send its world; leave before that
+            let detail =
+                "the host runs an older FeverLink3 that does not compare mod lists; both must run the same version";
+            let leave = self.leave();
+            self.out.extend(leave);
+            self.state = PlayerState::Rejected;
+            self.log(format!("leaving {}'s session: {detail}", w.host_name));
+            self.out.push(PlayerOutput::Rejected(RejectMessage::new("version", Some(detail))));
+            return;
+        }
         let back = if w.resumed { " (back in its old slot)" } else { "" };
         self.log(format!(
             "joined {}'s session as {} (#{}){back}",
@@ -477,8 +508,56 @@ impl PlayerSession {
             w.you
         ));
         let for_game = without_secret(plain);
+        let catch_up = w.catch_up.filter(|_| w.resumed);
         self.out.push(PlayerOutput::Welcomed(w));
         self.out.push(PlayerOutput::DeliverToLocalGame { kind: MessageKind::Welcome, payload: for_game });
+        self.resend_after(catch_up);
+    }
+
+    /// After the welcome of a return. Caught up (`heard`: the last frame the host has from this player): everything the game sent
+    /// after it goes again, in order, sealed anew. Not caught up (a plain welcome, or one that reloads this game): nothing is resent,
+    /// the host's world replaces this one.
+    fn resend_after(&mut self, heard: Option<u64>) {
+        let kept = self.outbox.take();
+        let Some(heard) = heard else {
+            if !kept.is_empty() {
+                self.log(format!(
+                    "{} message(s) of the game from before the welcome not sent: the host does not catch this game up",
+                    kept.len()
+                ));
+            }
+            return;
+        };
+        let again: Vec<_> = kept.into_iter().filter(|k| k.counter.is_none_or(|c| c > heard)).collect();
+        self.log(format!(
+            "resume: caught up by the host; {} message(s) of the game the host did not have are sent again",
+            again.len()
+        ));
+        for k in again {
+            self.seal_and_send(k.kind, &k.payload);
+        }
+    }
+
+    /// Seals a message of the game, keeps it until the host acknowledges it, and sends it.
+    fn seal_and_send(&mut self, kind: MessageKind, payload: &[u8]) {
+        let Some(sealer) = self.sealer.as_mut() else { return };
+        match sealer.try_seal(kind.into(), payload) {
+            Ok(frame) => {
+                if Outbox::replayable_from_player(kind) {
+                    self.outbox.push(Some(frame.header.counter), kind, payload, true);
+                }
+                self.out.push(PlayerOutput::SendToHost(frame));
+            }
+            Err(e) => self.drop(kind.into(), format!("not sent: {e}")),
+        }
+    }
+
+    /// For the next connection after this one was lost: hands it the last host frame received and what the game sent that the
+    /// host has not acknowledged, so the host can catch this game up instead of reloading it (`docs/PROTOCOL.md`, "Catching up").
+    /// Call before the next session handles its first frame; it must be one made with [`PlayerSession::resuming`].
+    pub fn carry_to(&mut self, next: &mut PlayerSession) {
+        next.host_last = self.host_last;
+        next.outbox = std::mem::take(&mut self.outbox);
     }
 
     /// Notes the round-trip times the host reports and answers with the same `n`.
@@ -491,6 +570,9 @@ impl PlayerSession {
         for (&id, &off) in &m.off {
             self.offsets.insert(id, off);
         }
+        if let Some(ack) = m.ack {
+            self.outbox.ack(ack);
+        }
         let w = self.wall.as_ref().map(|w| w());
         if let Some(sealer) = self.sealer.as_mut() {
             let frame = sealer.seal(MessageKind::Pong.into(), &codec::encode(&PongMessage { n: m.n, w }));
@@ -501,6 +583,17 @@ impl PlayerSession {
     /// What this player's end can do, announced in the join message: set before the connection's first frame is handled.
     pub fn set_capabilities(&mut self, caps: Vec<String>) {
         self.caps = caps;
+    }
+
+    /// This game's mod list for the join: set before the connection's first frame is handled. `None` sends none (a host
+    /// that compares mod lists then refuses the join).
+    pub fn set_mods(&mut self, mods: Option<ModFingerprint>) {
+        self.mods = mods;
+    }
+
+    /// The mod list given with [`PlayerSession::set_mods`].
+    pub fn mods(&self) -> Option<&ModFingerprint> {
+        self.mods.as_ref()
     }
 
     /// A savegame that arrived whole over another route than `ResyncChunk` frames (bulk datagrams): the same checks, the
@@ -555,16 +648,16 @@ impl PlayerSession {
 
     /// A message from this player's game, sealed and sent to the host. Dropped (and counted) before the welcome:
     /// the game should not be running before the host has accepted us.
+    /// A returning session (made with [`PlayerSession::resuming`]) keeps what the game sends before the welcome, for the host to get
+    /// once it has caught this game up; with a plain welcome it is dropped then.
     pub fn local_game_message(&mut self, kind: MessageKind, payload: &[u8]) -> Vec<PlayerOutput> {
-        match self
-            .sealer
-            .as_mut()
-            .filter(|_| self.state == PlayerState::Joined)
-            .map(|s| s.try_seal(kind.into(), payload))
+        if self.state == PlayerState::Joined && self.sealer.is_some() {
+            self.seal_and_send(kind, payload);
+        } else if self.state == PlayerState::Connecting && self.resume.is_some() && Outbox::replayable_from_player(kind)
         {
-            Some(Ok(frame)) => self.out.push(PlayerOutput::SendToHost(frame)),
-            Some(Err(e)) => self.drop(kind.into(), format!("not sent: {e}")),
-            None => self.drop(kind.into(), "not joined".to_owned()),
+            self.outbox.push(None, kind, payload, true);
+        } else {
+            self.drop(kind.into(), "not joined".to_owned());
         }
         self.drain()
     }
@@ -592,6 +685,7 @@ fn without_secret(plain: &[u8]) -> Vec<u8> {
     match serde_json::from_slice::<serde_json::Value>(plain) {
         Ok(serde_json::Value::Object(mut map)) => {
             map.remove("resume");
+            map.remove("catchUp");
             serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_default()
         }
         _ => Vec::new(),

@@ -169,10 +169,21 @@ pub struct BuildAddrs {
     /// The call `RandomInt(rng, 0, n)` that picks the country edge in `0x95d100` (`0x95d627`): the id vector at
     /// `[rbp-0x40, rbp-0x38)` is read just before it.
     pub town_pick_call: Option<CallPatchSite>,
+    /// The call `RiverField::At(field, out, point, flag)` in the street developer's open pass (`0x96962e` in `0x969140`;
+    /// `FEVERLINK3_LOG_GROWTH_DEEP`, read-only): the river direction field a new town street is bent towards. `At` answers
+    /// from a per-50-m-cell `std::map` cache at `field+0x18` (size at `+0x20`) that is not saved and exists once per
+    /// engine; the trace logs whether the answer came from that cache (`docs/research/TOWN_CACHE_20261019.md`, local).
+    pub town_field_call: Option<CallPatchSite>,
     /// The call of `CGame::Sync` in `CGame::Step` (main thread, every frame): smooth pacing redirects it and, after a `Sync` that handed
     /// the simulation a batch, stretches the batch interval by the mod's factor (`pace.rs`). Static analysis of build 40420 (`Step` at
     /// `0x11f3f0`); the place is TPF3-MP's (MIT) "batch interval" by way of MPFever 0.3.15 (MIT), found again here in the executable.
     pub batch_pace: Option<CallPatchSite>,
+    /// The call `deque<int>::_Insert_range(free queue, &ret, where = size, first, last)` in `ecs::Engine::EndModification`, where the
+    /// ids a modification removed join the back of the FIFO free-id queue (`AddEntity` takes its front). `FEVERLINK3_FREE_ORDER`
+    /// redirects it and sorts `[first, last)` by entity id first, so the order the ids are reused in no longer depends on the order
+    /// the engine visited the removed entities (`freeorder.rs`). Static analysis of build 40420; the place is MPFever 0.3.14's (MIT,
+    /// from TPF3-MP, MIT) "freed ids", found again here in the executable and patched at the call instead of the function.
+    pub free_order: Option<CallPatchSite>,
     /// `GameTime` getter: `fn(system*) -> u32` (the dword at `+0x40` of the `GameTime` component). Called, never
     /// hooked; the prologue is compared first.
     pub game_time_getter: Option<CallSite>,
@@ -321,6 +332,19 @@ pub const BUILDS: &[BuildAddrs] = &[
                 ],
             },
         }),
+        // `call 0x2b7a1b0` (RiverField::At, our name; TPF3-MP calls it StreetField::At) at `0x96962e` in the street developer's
+        // open pass `0x969140`, its only caller; callee: `push rbp,rsi,r12,r13,r14,r15 ; sub rsp,98h` (18 bytes)
+        town_field_call: Some(CallPatchSite {
+            rva: 0x0096_962e,
+            expected: &[0xE8, 0x7D, 0x0B, 0x21, 0x02],
+            callee: CallSite {
+                rva: 0x02b7_a1b0,
+                prologue: &[
+                    0x40, 0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x98, 0x00,
+                    0x00, 0x00,
+                ],
+            },
+        }),
         // `call 0x11f690` (CGame::Sync) at `0x11f446` in CGame::Step (`0x11f3f0`), after `movsxd rdi,[rdx+218h] ; mov rcx,rbx ;
         // add rdi,[rdx+1A8h] ; mov rdx,rsi` and before `test al,al ; je`; callee: `mov [rsp+10h],rbx ; push rbp,rsi,rdi,r12,r13,r14,r15`
         batch_pace: Some(CallPatchSite {
@@ -330,6 +354,21 @@ pub const BUILDS: &[BuildAddrs] = &[
                 rva: 0x0011_f690,
                 prologue: &[
                     0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+                ],
+            },
+        }),
+        // `call 0x2bb62a0` (deque<int>::_Insert_range, its only caller) at `0x2bba103` in ecs::Engine::EndModification (`0x2bb9ea0`),
+        // after `lea rcx,[r13+0D8h] ; mov r9,[r12] ; mov rax,[r9+8] ; mov [rsp+20h],rax ; mov r9,[r9] ; mov r8,[r13+0F8h] ;
+        // lea rdx,[rbp-79h]` (r12 = &engine->modification, its removed ids at [+0]..[+8]) and before `mov rdx,[r12] ; mov [r12],r15`
+        // (the modification is released); callee: `mov [rsp+8],rbx ; mov [rsp+10h],rbp ; mov [rsp+18h],rsi ; push rdi ; push r12`
+        free_order: Some(CallPatchSite {
+            rva: 0x02bb_a103,
+            expected: &[0xE8, 0x98, 0xC1, 0xFF, 0xFF],
+            callee: CallSite {
+                rva: 0x02bb_62a0,
+                prologue: &[
+                    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+                    0x41, 0x54,
                 ],
             },
         }),
@@ -441,7 +480,9 @@ mod tests {
         town_edges: None,
         town_sort_call: None,
         town_pick_call: None,
+        town_field_call: None,
         batch_pace: None,
+        free_order: None,
         game_time_getter: None,
         tick_count_getter: None,
         script_pool: None,
@@ -590,8 +631,13 @@ mod tests {
         assert_eq!(b.town_update_size.as_ref().unwrap().rva, 0x9e12b0);
         assert_eq!(b.town_candidates.as_ref().unwrap().rva, 0x9677c0);
         assert_eq!(b.town_edges.as_ref().unwrap().rva, 0x95d100);
-        for (site, call) in [(&b.town_sort_call, 0x967c16u32), (&b.town_pick_call, 0x95d627), (&b.batch_pace, 0x11f446)]
-        {
+        for (site, call) in [
+            (&b.town_sort_call, 0x967c16u32),
+            (&b.town_pick_call, 0x95d627),
+            (&b.town_field_call, 0x96962e),
+            (&b.batch_pace, 0x11f446),
+            (&b.free_order, 0x2bba103),
+        ] {
             let s = site.as_ref().unwrap();
             assert_eq!(s.rva, call);
             // the displacement leads to the recorded callee

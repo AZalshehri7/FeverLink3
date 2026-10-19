@@ -84,6 +84,12 @@ out, so a game slows down without changing the steps it runs (its "batch interva
 in build 40420 and re-implemented it in its own form (`native/src/pace.rs`, the factor from the measured room and stop cadence in
 `mod/feverlink3/content/feverlink3_lockstep.lua`, "smooth pacing"). On by default; `FEVERLINK3_SMOOTH_PACE=0` turns it off.
 
+From TPF3-MP, as ported by MPFever 0.3.14: the finding that `ecs::Engine::EndModification` appends the ids a modification
+removed to the FIFO free-id queue in the order the engine visited the entities, and that sorting each batch first makes the ids
+handed out independent of that order. FeverLink3 found the place again in build 40420 and re-implemented it in its own form: a
+redirect of the one call that appends the batch (`native/src/build_table.rs`, `free_order`; `native/src/freeorder.rs`). On by
+default; `FEVERLINK3_FREE_ORDER=0` turns it off.
+
 ```
 MIT License
 

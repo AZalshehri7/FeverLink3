@@ -21,9 +21,53 @@
 //!
 //! The source range is our own: a call of an engine function on our data. It is a plain list of nodes laid out as the engine's list
 //! nodes are (the read side is proved by `engine::refundable_entities` on real commands), only read by the engine.
+//!
+//! The list alone pays nothing: the engine also needs the Context's refund window ([`WINDOW_OFFSET`]). Lab O (2026-10-19): the real
+//! bulldozer removed a street 9.4 s after the real street tool built it; on both games, the originator included, the injected command's
+//! container held the tool's own entry (`50458{-1}rev7,11,0/3875`, native.log "1 were there from the script's conversion") and the
+//! removal still cost 1023 with no refund. Where the engine decides (build 40420, read-only disassembly): the build command's apply
+//! (`0x9e2900`) passes the payload's Context (`lea rcx,[rdi+0x358]`) to the proposal evaluation (`0xa212d0` -> `0xa21460` ->
+//! `0xa101b0`); for every removed entity the latter refunds only when `Context+0xc > 0.0` (`vcomiss xmm0,0; jbe` before each of its
+//! three calls of the check, and in `0xa0fdd4`), and the check (`0xa119c0`) finds `{entity, key}` in `Context+0x18` (the list), compares
+//! the entry's first revision word with the entity's current one (`0x2bbae90`) and wants `now - value < round(window * 5 + 0.5)`
+//! updates (`now` from `0x2a96c0`, the counter `updateRefundableEntities` (`0xa11ad0`) stores as the value; 5 updates are a second
+//! at the 200 ms step, so the window is in seconds). The tools' commands carry 60.0 there (every held text with a non-empty list:
+//! `~0x363 raw:b:..00007042..`); a script command's Context has no Lua field for it and keeps 0.0 (every donor text). The injection
+//! swaps only the Proposal into the script command, so the replay, the originator's own included, ran with window 0: no refund. The
+//! text now names the window (`context.refundWindow`) and the injection writes the originator's value into the command's Context.
 
+use crate::cmd_patch::Poke;
 use crate::dump::{u64_at, Mem};
 use crate::engine::{RefundEntry, REFUNDABLE_MAX, REFUNDABLE_NODE, REFUNDABLE_OFFSET, REFUNDABLE_VALUE};
+
+/// The Context's refund window in a build command's payload (`Context+0xc`, the Context at +0x358): seconds of game time in which a
+/// listed entity is refunded when it is removed; 0.0 refunds nothing (see the module comment).
+pub const WINDOW_OFFSET: usize = 0x364;
+
+/// The text's member of the window (`portable::PAYLOAD`).
+pub const WINDOW_NAME: &str = "context.refundWindow";
+
+/// The originator's refund window as its text names it: `None` when the text has no such line (a text of an older module: the command
+/// keeps its own); `Err` when the value is not a finite, non-negative float (the order is refused).
+pub fn window_of(text: &str) -> Result<Option<f32>, String> {
+    let Some(v) = text.lines().find_map(|l| l.strip_prefix(WINDOW_NAME).and_then(|r| r.strip_prefix('\t'))) else {
+        return Ok(None);
+    };
+    let w = v.trim_end().strip_prefix("f32:").and_then(|h| u32::from_str_radix(h, 16).ok()).map(f32::from_bits);
+    match w {
+        Some(w) if w.is_finite() && w >= 0.0 => Ok(Some(w)),
+        _ => Err(format!("the text's {WINDOW_NAME} {v:?} is not a finite, non-negative f32")),
+    }
+}
+
+/// Writes `window` into the command's Context (a plain float of the Context, no allocation); `Err` when the write failed.
+pub fn set_window(poke: &dyn Poke, payload: usize, window: f32) -> Result<(), String> {
+    if poke.poke(payload + WINDOW_OFFSET, &window.to_le_bytes()) {
+        Ok(())
+    } else {
+        Err(format!("the Context's refund window at payload+{WINDOW_OFFSET:#x} could not be written"))
+    }
+}
 
 /// `std::_Hash<...refundableEntities...>::_Insert_range_unchecked(this, first, last)`, build 40420.
 pub const INSERT_RANGE_RVA: u32 = 0x004b_e210;
@@ -498,6 +542,42 @@ pub(crate) mod tests {
         let p = plan(&LiveMem, s.addr(), &want).unwrap();
         unsafe { insert(&RefundFns { insert: lazy }, s.addr(), &p) };
         assert!(check(&LiveMem, s.addr(), &want, &p).unwrap_err().contains("0 entries, 1 expected"));
+    }
+
+    #[test]
+    fn the_refund_window_is_read_from_the_text_and_written_into_the_context() {
+        // the bulldozer's own command (held text, 2026-10-18 live/native_text_22.txt: `~0x363 raw:b:c4000070420000403f`) has 60.0
+        let text =
+            "context.cleanupStreetGraph\tu8:01\ncontext.refundWindow\tf32:42700000\ncontext.player\tent:old#34135\n";
+        assert_eq!(window_of(text).unwrap(), Some(60.0));
+        assert_eq!(window_of("context.player\tent:old#1\n").unwrap(), None, "an older text: the command keeps its own");
+        assert_eq!(window_of("context.refundWindow\tf32:00000000\n").unwrap(), Some(0.0));
+        for bad in ["f32:7fc00000", "f32:bf800000", "f32:7f800000", "u8:01", "f32:zz"] {
+            assert!(window_of(&format!("context.refundWindow\t{bad}\n")).is_err(), "{bad} is refused");
+        }
+        // the write lands at Context+0xc of the payload and nowhere else
+        struct Raw;
+        impl Poke for Raw {
+            fn poke(&self, addr: usize, data: &[u8]) -> bool {
+                // SAFETY: the test pokes only into its own synthetic payload.
+                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
+                true
+            }
+        }
+        let mut s = Synthetic::new(&[entry(5, 1, 10)]);
+        let before = s.payload.to_vec();
+        set_window(&Raw, s.payload.as_mut_ptr() as usize, 60.0).unwrap();
+        assert_eq!(&s.payload[WINDOW_OFFSET..WINDOW_OFFSET + 4], &60.0f32.to_le_bytes());
+        let changed: Vec<usize> = (0..before.len()).filter(|&i| before[i] != s.payload[i]).collect();
+        assert_eq!(changed, vec![WINDOW_OFFSET + 2, WINDOW_OFFSET + 3], "only the float's bytes (60.0 = 00 00 70 42)");
+        assert_eq!(read_container(&LiveMem, s.addr()).unwrap().0, vec![entry(5, 1, 10)], "the list is untouched");
+        struct Refuses;
+        impl Poke for Refuses {
+            fn poke(&self, _: usize, _: &[u8]) -> bool {
+                false
+            }
+        }
+        assert!(set_window(&Refuses, s.addr(), 60.0).is_err());
     }
 
     #[test]

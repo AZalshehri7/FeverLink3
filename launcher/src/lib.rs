@@ -8,7 +8,9 @@
 //! - [`gamelink`]: the file link with one game instance: a per-session folder, `to_game.log` written by the
 //!   launcher, `from_game.log` tailed by it, every line carrying a sequence number so history is never dispatched
 //!   twice.
-//! - [`update`]: update decision, signature and hash checks and the file-swap plan, over bytes (no network yet).
+//! - [`update`]: update decision, signature check against the trusted keys (with expiry), hash checks, the
+//!   file-swap plan, the journal, the start check and the rollback, over bytes and files (the download is the
+//!   binary's `update` command).
 //! - [`process`]: starting `TransportFever3.exe` with the session environment.
 //!
 //! - [`net`], [`session`], [`luatext`]: TCP transport, the session threads that wire the core crate's state
@@ -24,6 +26,7 @@ pub mod guard;
 pub mod install;
 pub mod live;
 pub mod luatext;
+pub mod modlist;
 pub mod net;
 pub mod netdelay;
 pub mod process;
@@ -32,6 +35,8 @@ pub mod selftest;
 pub mod session;
 pub mod speedtest;
 pub mod steam;
+pub mod steam_admit;
+pub mod steam_friends;
 pub mod steam_persona;
 pub mod steam_transport;
 pub mod steamnet;

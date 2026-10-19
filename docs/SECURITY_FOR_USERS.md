@@ -55,7 +55,7 @@ These are statements about the code in this repository; you can search for the c
 - It does not make itself start with Windows: no registry writes at all, no startup entries, no scheduled tasks, no services. It does not need or ask for administrator rights.
 - It does not read your documents, browser data, passwords or other programs' files. The files it reads are its own text files, the game's save folder entry named above, and the Steam path in the registry.
 - It does not log keys, take screenshots or record audio.
-- It does not contact any server of the project, send analytics or ads, or check for updates (the update check is not written yet in this version).
+- It does not contact any server of the project, send analytics or ads, or check for updates. (The update check is a command of the separate program `feverlink3.exe`, below, and runs only when you type it.)
 - It does not download or run programs. (A joined session does load the host's savegame in your game, and a savegame can carry game scripts, as a mod can. That is why you should only join people you trust; see "Who you are trusting".)
 - It does not use WinHTTP for its own traffic, so your game's web traffic and FeverLink3's session traffic are separate.
 
@@ -72,7 +72,7 @@ The switched-off code is meant to be turned on for players in a later version: t
 
 ## The installer program, `feverlink3.exe`
 
-It is a separate program that you start yourself (a double-click shows a numbered menu; `install`, `uninstall` and `doctor` also work on the command line). It checks your PC (the same Steam registry values and folders as above), writes or removes the files in the table below, and on request starts `steam.exe` from your Steam folder to launch the game, opens `%LOCALAPPDATA%\FeverLink3` in Explorer, and copies a diagnostics text to the clipboard through `clip.exe` (the text replaces your Windows user name with `<user>` and leaves join codes out; it can still contain folder names). It starts those programs by their full paths, makes no network connection, and asks for no administrator rights. The development commands `host` and `join` are described in `launcher/README.md`.
+It is a separate program that you start yourself (a double-click shows a numbered menu; `install`, `uninstall` and `doctor` also work on the command line). It checks your PC (the same Steam registry values and folders as above), writes or removes the files in the table below, and on request starts `steam.exe` from your Steam folder to launch the game, opens `%LOCALAPPDATA%\FeverLink3` in Explorer, and copies a diagnostics text to the clipboard through `clip.exe` (the text replaces your Windows user name with `<user>` and leaves join codes out; it can still contain folder names). It starts those programs by their full paths and asks for no administrator rights. It makes no network connection, except `feverlink3 update`, which you type yourself: it asks GitHub's release API for the newest release and downloads its files with Windows' own `curl.exe` (HTTPS only), checks the Ed25519 signature against the release keys built into the program before using anything, and installs only after you type `yes` and only while neither the game nor another FeverLink3 program runs. The development commands `host` and `join` are described in `launcher/README.md`.
 
 ## Files FeverLink3 creates or changes
 
@@ -86,6 +86,8 @@ It is a separate program that you start yourself (a double-click shows a numbere
 | `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`; emptied at every game start | the DLL and the mod | no, delete the folder by hand |
 | `<Steam>\userdata\<id>\3493540\local\save\feverlink3-resync-<number>.sav` | the host's world while it is synced to the players. These are ordinary game saves and can be large | the game and the DLL | no, delete them when you do not need them |
 | `%TEMP%\feverlink3\` | session files of the command-line development launcher (`host` / `join`) | only if you run those commands | no |
+| the install folder of an update (the game folder, or the folder of `feverlink3.exe`) | `*.old` copies of the replaced files, `feverlink3_update_journal.json` (until the update is confirmed or rolled back), `feverlink3_update_skip.txt` (versions that failed their start check), `feverlink3_update_tmp\` (during the swap) | `feverlink3 update`, only if you run it | no |
+| `%TEMP%\feverlink3_update_<number>\` | the downloaded release files, deleted when the command ends | `feverlink3 update` | deleted by the command itself |
 
 `<game folder>` is `<Steam library>\steamapps\common\Transport Fever 3\`. `feverlink3 doctor` prints where it is on your PC and changes nothing.
 
@@ -97,7 +99,7 @@ What FeverLink3 uses to connect players, in this version:
 - **Status, plainly:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered (2026-10-10). A connection between two different Steam accounts, and a whole session carried over it, has not been tested yet; the first is what this test build is for.
 - **No server of the project is involved.** The path between two players is Steam's. If that ever changes, this page will say what is added and what it can see.
 - **The host does not open an inbound TCP port in normal use.** The command-line development launcher (`feverlink3.exe host`, not used by the in-game window) is the only part that listens on a TCP port (default 28090, or the port you give it), and only if you type that command yourself.
-- **Nothing else leaves the PC.** No analytics, no advertising, no update check, no account, no web requests of its own.
+- **Nothing else leaves the PC.** No analytics, no advertising, no automatic update check, no account, no web requests of its own. The only web request is `feverlink3 update`, when you type it (to GitHub, see above).
 
 What the other players receive: the display name you chose (it starts as your Windows user name, so change it if you prefer), your game actions, world checksums, chat lines, and, if you host, the world itself. A player who tests the connection by Steam ID shares that Steam ID with the person they test with.
 
@@ -134,7 +136,7 @@ $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json
 
 The values in each pair must be identical, and equal to the ones in the release notes. If they differ, do not use the file. Use the path of your own game folder in the last command.
 
-What this does and does not prove: the zip is assembled reproducibly (the same inputs give the same bytes), so the zip hash proves that you have the file the release job produced. We have not verified that two independent compilations of the DLL give identical bytes, so the way to check the code itself is to read it and build it yourself (`cargo build --release -p feverlink3_native`, see the README) and compare behaviour, not to expect the same hash. The manifest signature (Ed25519) is meant to be checked by the launcher's updater (whose download step is not written yet); a check by hand needs an Ed25519 tool and the project's release public key. As of 2026-10-10 the key in the repository is a placeholder, and the first release's notes will say whether its manifest is signed. The programs themselves are not Authenticode-signed (`docs/SIGNING.md` has the plan).
+What this does and does not prove: the zip is assembled reproducibly (the same inputs give the same bytes), so the zip hash proves that you have the file the release job produced. We have not verified that two independent compilations of the DLL give identical bytes, so the way to check the code itself is to read it and build it yourself (`cargo build --release -p feverlink3_native`, see the README) and compare behaviour, not to expect the same hash. The manifest signature (Ed25519) is checked by the launcher's updater (`feverlink3 update`) against the release keys built into it, or by hand with `feverlink3_release verify --manifest manifest.json` from the tagged source. As of 2026-10-19 the program trusts no key yet (the release key is not generated), so it refuses every update, and the releases so far are unsigned; each release's notes say whether its manifest is signed. The programs themselves are not Authenticode-signed (`docs/SIGNING.md` has the plan).
 
 Get the file only from the project's release page. A file called `winhttp.dll` from anywhere else is not ours.
 

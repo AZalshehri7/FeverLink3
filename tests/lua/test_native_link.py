@@ -65,7 +65,7 @@ class NativeLinkTest(unittest.TestCase):
     def table(self, text):
         return self.L.eval(text)
 
-    def test_the_mods_writer_produces_the_control_lines_the_module_parses(self):
+    def test_the_mods_writer_produces_the_control_lines_the_module_parses_also_after_a_restart(self):
         path = os.path.join(self.tmp, "native_ctl.log")
         w = self.C.newWriter(path, 1)
         send = lambda kind, payload: self.assertTrue(self.C.writerSend(w, kind, self.table(payload)))
@@ -77,18 +77,13 @@ class NativeLinkTest(unittest.TestCase):
         send("terrain_apply", "{ id = 2, stamp = 400 }")
         with open(path, encoding="utf-8", newline="") as f:
             self.assertEqual(f.read(), CTL_FILE)
-
-    def test_a_restarted_writer_goes_on_at_the_end_of_the_file(self):
         # a savegame reload restarts the script: its new writer appends after what the file holds, and the module reads by position
-        path = os.path.join(self.tmp, "native_ctl.log")
-        w = self.C.newWriter(path, 1)
-        self.C.writerSend(w, "ping", self.table("{ n = 1 }"))
         w2 = self.C.newWriter(path, 1)
         self.C.writerSend(w2, "ping", self.table("{ n = 2 }"))
-        with open(path, encoding="utf-8") as f:
-            self.assertEqual(f.read(), 'ping\t1\t{["n"]=1}\nping\t1\t{["n"]=2}\n')
+        with open(path, encoding="utf-8", newline="") as f:
+            self.assertEqual(f.read(), CTL_FILE + 'ping\t1\t{["n"]=2}\n')
 
-    def test_the_mod_reads_every_event_the_module_writes(self):
+    def test_the_mod_reads_every_event_the_module_writes_as_the_file_grows_and_after_a_truncation(self):
         r = self.C.newReader("unused")
         recs = self.C.readerFeed(r, EVENTS_FILE)
         records = list(recs.values())
@@ -118,8 +113,7 @@ class NativeLinkTest(unittest.TestCase):
         self.assertEqual((parsed["held"]["id"], parsed["held"]["kind"], parsed["held"]["site"]), (3, 52, 5060975))
         self.assertEqual((parsed["released"]["id"], parsed["released"]["reason"]), (3, "silence"))
         self.assertEqual(parsed["pong"]["n"], 4)
-
-    def test_the_mod_reads_the_events_file_as_it_grows_and_after_a_truncation(self):
+        # the mod reads the events file as it grows and after a truncation
         path = os.path.join(self.tmp, "native_events.log")
         r = self.C.newReader(path)
         lines = EVENTS_FILE.splitlines(keepends=True)
@@ -136,7 +130,6 @@ class NativeLinkTest(unittest.TestCase):
         with open(path, "a", encoding="utf-8", newline="") as f:
             f.write("".join(lines[1:]))
         self.assertEqual([x.kind for x in self.C.readerPoll(r).values()], ["holding", "audit", "error", "held", "released", "pong"])
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,7 +8,9 @@ import lupa.lua52 as lupa
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "..", "mod", "feverlink3", "content", "feverlink3_portable.lua")
-REAL = os.path.join(HERE, "..", "..", "docs", "research", "spike-dumps-20261013", "s0s1", "guest", "native_portable.log")
+RESEARCH = os.path.join(HERE, "..", "..", "docs", "research")
+REAL = os.path.join(RESEARCH, "spike-dumps-20261013", "s0s1", "guest", "native_portable.log")
+CRASH = os.path.join(RESEARCH, "rail-crash-run-20261014", "host", "native_inject_3.txt")
 
 
 BS = chr(92)
@@ -37,7 +39,7 @@ DEPOT = "\n".join([
     "proposal.addedSegments[0].typeIndex\ti32:ffffffff",
     "proposal.addedSegments[0].laneConfigs.bytes\tn:96",
     "proposal.addedSegments[0].roadTemplate\tres:\"infrastructure/street/constructions/entrance_new.street_template\"",
-    "proposal.addedSegments[0].roadStyle	res:"+'"'+"a "+BS+'"'+"quoted"+BS+'"'+" "+BS+"x41 "+BS+BS+" name"+'"',
+    "proposal.addedSegments[0].roadStyle\tres:"+'"'+"a "+BS+'"'+"quoted"+BS+'"'+" "+BS+"x41 "+BS+BS+" name"+'"',
     "proposal.addedSegments[0].playerOwned\tent:old#34135",
     "proposal.removedNodes.#\tn:0",
     "proposal.nodeConfigsToAdd.#\tn:1",
@@ -72,13 +74,17 @@ class PortableTest(unittest.TestCase):
         self.assertIsNotNone(t, info)
         return t
 
-    def test_floats_come_from_their_bits(self):
-        for x in (0.0, 1.0, -2.5, 1388.276, 5.374, 1e-40, 3.4e38):
-            bits = int(f32(x), 16)
-            self.assertAlmostEqual(self.M.float(bits), struct.unpack("<f", struct.pack("<f", x))[0], places=30 if abs(x) < 1e-30 else 4)
-        self.assertEqual(self.M.float(0x7F800000), float("inf"))
+    def refs(self, text):
+        out = []
+        for r in self.M.oldRefs(text).values():
+            pos = r.pos and (round(r.pos.x, 2), round(r.pos.y, 2), round(r.pos.z, 2))
+            out.append((str(r.path), int(r.id), str(r.kind), pos))
+        return out
 
-    def test_a_depot_shaped_text_becomes_a_tree(self):
+    def test_a_depot_shaped_text_becomes_a_tree_with_its_counts_and_the_existing_entities_it_names(self):
+        for x in (0.0, 1.0, -2.5, 1388.276, 5.374, 1e-40, 3.4e38):   # floats come from their bits
+            self.assertAlmostEqual(self.M.float(int(f32(x), 16)), struct.unpack("<f", struct.pack("<f", x))[0], places=30 if abs(x) < 1e-30 else 4)
+        self.assertEqual(self.M.float(0x7F800000), float("inf"))
         t = self.parse(DEPOT)
         p = t.proposal
         self.assertEqual((p.addedNodes.n, p.addedSegments.n, p.removedNodes.n, p.nodeConfigsToAdd.n), (2, 1, 0, 1))
@@ -88,65 +94,23 @@ class PortableTest(unittest.TestCase):
         seg = p.addedSegments[1]
         self.assertEqual((seg.node0.old, seg.node1.new, seg.entity.new), (39106, 1, 3))
         self.assertAlmostEqual(seg.node0.pos.x, 1369.5)
-        self.assertEqual(seg.typeIndex, -1)
-        self.assertEqual(seg.laneConfigs.bytes, 96)
+        self.assertEqual((seg.typeIndex, seg.laneConfigs.bytes), (-1, 96))
         self.assertEqual(seg.roadTemplate, "infrastructure/street/constructions/entrance_new.street_template")
         self.assertEqual(seg.roadStyle, 'a "quoted" A ' + BS + ' name')
         self.assertEqual(seg.playerOwned.old, 34135)
         self.assertEqual((t.toRemove.n, t.toRemove[1].old, t.toRemove[2].old), (2, 39259, 39481))
-        self.assertEqual(t.toAdd[1].fileName, "depots/road/road_depot/road_depot.con")
-        self.assertEqual(t.toAdd[1].name, "Road Depot")
+        self.assertEqual((t.toAdd[1].fileName, t.toAdd[1].name), ("depots/road/road_depot/road_depot.con", "Road Depot"))
         self.assertAlmostEqual(t.toAdd[1].transf[13], 10.5)
         self.assertEqual((t.context.gatherBuildings, t.context.cleanupStreetGraph, t.ignoreErrors, t.playerInitiated, t.kind), (1, 0, 0, 1, 52))
         self.assertEqual(p.frozenNodes[1].old, 77)
-
-    def test_what_carries_no_input_is_skipped(self):
-        t = self.parse(DEPOT)
+        # what carries no input is skipped
         self.assertIsNone(t.proposal.hash90)
         self.assertIsNone(t.toAdd[1]["~0x40"])
-
-    def test_counts_are_those_of_the_build_record(self):
-        c = self.M.counts(self.parse(DEPOT))
-        self.assertEqual(self.M.countsText(c), "cons=1 rem=2 nodes=2 segs=1 rmNodes=0 rmSegs=0 objs=0 rmObjs=0 ncfg=1 rmNcfg=0 frozen=1")
-
-    def test_a_text_that_cannot_be_read_is_refused_whole(self):
-        for bad in ("", "no tab here", "a\tu32:zz"):
+        self.assertEqual(self.M.countsText(self.M.counts(t)), "cons=1 rem=2 nodes=2 segs=1 rmNodes=0 rmSegs=0 objs=0 rmObjs=0 ncfg=1 rmNcfg=0 frozen=1",
+                         "the counts of the build record")
+        for bad in ("", "no tab here", "a	u32:zz"):
             t, why = self.M.parse(bad)
-            self.assertIsNone(t, bad)
-            self.assertTrue(why)
-
-    @unittest.skipUnless(os.path.exists(REAL), "local research file")
-    def test_the_real_held_road_of_the_spike_run(self):
-        text = open(REAL, encoding="utf-8", errors="replace").read()
-        part = [p for p in text.split("=== portable v1")[1:] if "event=held" in p.split("\n")[0]][0]
-        t = self.parse("=== portable v1" + part)
-        self.assertEqual(self.M.countsText(self.M.counts(t)), "cons=0 rem=0 nodes=2 segs=1 rmNodes=0 rmSegs=0 objs=0 rmObjs=0 ncfg=2 rmNcfg=0 frozen=0")
-        seg = t.proposal.addedSegments[1]
-        self.assertEqual(seg.roadTemplate, "infrastructure/street/town/town_new_small.street_template")
-        self.assertEqual((seg.node0.new, seg.node1.new, seg.playerOwned.old), (1, 2, 34135))
-        self.assertEqual((t.context.checkTerrainAlignment, t.context.extendProposalRedoPillars, t.playerInitiated), (1, 1, 1))
-
-    @unittest.skipUnless(os.path.exists(REAL), "local research file")
-    def test_every_real_text_of_the_spike_run_reads(self):
-        text = open(REAL, encoding="utf-8", errors="replace").read()
-        parts = text.split("=== portable v1")[1:]
-        for part in parts:
-            if " REFUSED " in part.split(chr(10))[0]:
-                t, why = self.M.parse("=== portable v1" + part)
-                self.assertIsNone(t, "a refused text is not data")
-                continue
-            t, info = self.M.parse("=== portable v1" + part)
-            self.assertIsNotNone(t, info)
-            self.assertEqual(t.kind, 52)
-
-    def refs(self, text):
-        out = []
-        for r in self.M.oldRefs(text).values():
-            pos = r.pos and (round(r.pos.x, 2), round(r.pos.y, 2), round(r.pos.z, 2))
-            out.append((str(r.path), int(r.id), str(r.kind), pos))
-        return out
-
-    def test_the_existing_entities_a_text_names_with_their_kind(self):
+            self.assertTrue(t is None and why, "a text that cannot be read is refused whole: %r" % bad)
         text = DEPOT + "\nproposal.old2newSegments.keys\tkeys:000098c9=[fffffffb;fffffffc]\nproposal.new2oldNodes.keys\tkeys:fffffffa=[00009a00]\n"
         self.assertEqual(self.refs(text), [
             ("proposal.addedSegments[0].node0", 39106, "node", (1369.5, 300.0, 5.0)),
@@ -156,15 +120,30 @@ class PortableTest(unittest.TestCase):
             ("proposal.new2oldNodes.keys", 0x9a00, "node", None),
         ], "playerOwned, playerEntity and frozenNodes are not checked; node 39106 is named twice and listed once")
 
-    CRASH = os.path.join(HERE, "..", "..", "docs", "research", "rail-crash-run-20261014", "host", "native_inject_3.txt")
-
-    @unittest.skipUnless(os.path.exists(CRASH), "local research file")
-    def test_the_track_of_the_rail_crash_names_one_existing_node(self):
-        with open(self.CRASH, encoding="utf-8") as f:
-            text = f.read()
-        refs = self.refs(text)
-        self.assertEqual([(p, i, k) for p, i, k, _ in refs], [("proposal.addedSegments[0].node0", 50395, "node")])
-        self.assertIsNotNone(refs[0][3], "with the position the receiver compares")
+    @unittest.skipUnless(os.path.exists(REAL) or os.path.exists(CRASH), "local research files")
+    def test_the_real_texts_of_the_spike_run_and_the_rail_crash(self):
+        if os.path.exists(REAL):
+            text = open(REAL, encoding="utf-8", errors="replace").read()
+            parts = text.split("=== portable v1")[1:]
+            for part in parts:
+                t, info = self.M.parse("=== portable v1" + part)
+                if " REFUSED " in part.split(chr(10))[0]:
+                    self.assertIsNone(t, "a refused text is not data")
+                else:
+                    self.assertIsNotNone(t, info)
+                    self.assertEqual(t.kind, 52)
+            held = [x for x in parts if "event=held" in x.split("\n")[0]][0]
+            t = self.parse("=== portable v1" + held)
+            self.assertEqual(self.M.countsText(self.M.counts(t)), "cons=0 rem=0 nodes=2 segs=1 rmNodes=0 rmSegs=0 objs=0 rmObjs=0 ncfg=2 rmNcfg=0 frozen=0")
+            seg = t.proposal.addedSegments[1]
+            self.assertEqual(seg.roadTemplate, "infrastructure/street/town/town_new_small.street_template")
+            self.assertEqual((seg.node0.new, seg.node1.new, seg.playerOwned.old), (1, 2, 34135))
+            self.assertEqual((t.context.checkTerrainAlignment, t.context.extendProposalRedoPillars, t.playerInitiated), (1, 1, 1))
+        if os.path.exists(CRASH):
+            with open(CRASH, encoding="utf-8") as f:
+                refs = self.refs(f.read())
+            self.assertEqual([(p, i, k) for p, i, k, _ in refs], [("proposal.addedSegments[0].node0", 50395, "node")], "the track names one existing node")
+            self.assertIsNotNone(refs[0][3], "with the position the receiver compares")
 
 
 if __name__ == "__main__":

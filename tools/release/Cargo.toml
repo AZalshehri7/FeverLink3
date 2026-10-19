@@ -13,6 +13,9 @@ name = "feverlink3_release"
 path = "src/main.rs"
 
 [dependencies]
+# The signature format and the check against the trusted keys are the launcher's own code (launcher/src/update.rs),
+# so the release job verifies its signature with exactly what players will run.
+feverlink3_launcher = { path = "../../launcher" }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 getrandom = "0.2.16"
 serde = { version = "1.0.229", features = ["derive"] }

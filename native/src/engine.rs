@@ -21,7 +21,7 @@
 //! All of it is `unsafe` code that can only be exercised for real in the game; the tests run it against fake
 //! engine functions and a fake `std::function` laid out the same way, which checks the sequence and the offsets.
 
-use crate::mem;
+use crate::memguard;
 
 pub const COMMAND_SIZE: usize = 0x38;
 /// Room for a [`COMMAND_SIZE`] command, rounded up.
@@ -104,23 +104,17 @@ impl EngineFns {
 /// # Safety
 /// `f` points to a live `std::function` object (or any memory: every read is checked).
 pub unsafe fn done_call_target(f: *const u8) -> Option<usize> {
-    unsafe {
-        let slot = f.wrapping_add(FUNCTION_IMPL);
-        if !mem::readable(slot, core::mem::size_of::<usize>()) {
-            return None;
-        }
-        let callable = *(slot as *const *const u8);
-        if callable.is_null() || !mem::readable(callable, core::mem::size_of::<usize>()) {
-            return None;
-        }
-        let vtable = *(callable as *const *const usize);
-        let entry = vtable.wrapping_add(2);
-        if vtable.is_null() || !mem::readable(entry as *const u8, core::mem::size_of::<usize>()) {
-            return None;
-        }
-        let target = *entry;
-        (target != 0).then_some(target)
+    // every word through the guarded reader (`memguard`): a callable or vtable that went away is a `None`, not a fault
+    let callable = memguard::word(f.wrapping_add(FUNCTION_IMPL) as usize)? as usize;
+    if callable == 0 {
+        return None;
     }
+    let vtable = memguard::word(callable)? as usize;
+    if vtable == 0 {
+        return None;
+    }
+    let target = memguard::word(vtable.checked_add(2 * core::mem::size_of::<usize>())?)? as usize;
+    (target != 0).then_some(target)
 }
 
 /// The arguments of a call to `CommandList::Add`.
@@ -183,8 +177,7 @@ impl Held {
 pub unsafe fn command_kind(cmd: *const u8, kind_offset: usize) -> Option<u8> {
     let payload = unsafe { payload_of(cmd) }?;
     let at = payload.checked_add(kind_offset)?;
-    // SAFETY: readable was checked for exactly this byte.
-    unsafe { mem::readable(at as *const u8, 1).then(|| *(at as *const u8)) }
+    memguard::byte(at)
 }
 
 /// The payload pointer of the command at `cmd`, when `cmd` is readable and it is not null.
@@ -192,8 +185,7 @@ pub unsafe fn command_kind(cmd: *const u8, kind_offset: usize) -> Option<u8> {
 /// # Safety
 /// `cmd` may be any value.
 pub unsafe fn payload_of(cmd: *const u8) -> Option<usize> {
-    // SAFETY: readable was checked for the pointer-sized field.
-    let payload = unsafe { mem::readable(cmd, core::mem::size_of::<usize>()).then(|| *(cmd as *const usize)) }?;
+    let payload = memguard::word(cmd as usize)? as usize;
     (payload != 0).then_some(payload)
 }
 
@@ -248,8 +240,7 @@ pub unsafe fn build_flags(payload: usize) -> Option<BuildFlags> {
     let mut v = [false; 7];
     for (flag, off) in v.iter_mut().zip(FLAG_OFFSETS) {
         let at = payload.checked_add(off)?;
-        // SAFETY: readable was checked for exactly this byte.
-        *flag = unsafe { mem::readable(at as *const u8, 1).then(|| *(at as *const u8)) }? != 0;
+        *flag = memguard::byte(at)? != 0;
     }
     Some(BuildFlags {
         gather_buildings: v[0],
@@ -271,10 +262,7 @@ pub unsafe fn build_flags(payload: usize) -> Option<BuildFlags> {
 /// # Safety
 /// `payload` may be any value; only readable memory is read.
 pub unsafe fn refundable_entities(payload: usize) -> Option<Vec<RefundEntry>> {
-    let word = |at: usize| -> Option<usize> {
-        // SAFETY: readable was checked for the pointer-sized word.
-        unsafe { mem::readable(at as *const u8, 8).then(|| *(at as *const usize)) }
-    };
+    let word = |at: usize| -> Option<usize> { memguard::word(at).map(|w| w as usize) };
     let c = payload.checked_add(REFUNDABLE_OFFSET)?;
     let head = word(c.checked_add(8)?)?;
     let size = word(c.checked_add(0x10)?)?;
@@ -287,11 +275,13 @@ pub unsafe fn refundable_entities(payload: usize) -> Option<Vec<RefundEntry>> {
         if node == head || node == 0 {
             return None;
         }
-        let value = node.checked_add(REFUNDABLE_VALUE)?;
-        // SAFETY: readable was checked for the node's whole block; the entry is six 4-byte words at +0x10.
-        let w = unsafe {
-            mem::readable(node as *const u8, REFUNDABLE_NODE).then(|| (value as *const [u32; 6]).read_unaligned())
-        }?;
+        // the node's whole block must be readable; the entry is six 4-byte words at +0x10
+        let mut block = [0u8; REFUNDABLE_NODE];
+        memguard::read_into(node, &mut block).ok()?;
+        let w: [u32; 6] = core::array::from_fn(|i| {
+            let o = REFUNDABLE_VALUE + 4 * i;
+            u32::from_le_bytes([block[o], block[o + 1], block[o + 2], block[o + 3]])
+        });
         ids.push(RefundEntry {
             entity: w[0],
             key: w[1] as i32,
@@ -308,9 +298,7 @@ pub unsafe fn refundable_entities(payload: usize) -> Option<Vec<RefundEntry>> {
 /// # Safety
 /// `cmd` may be any value.
 pub unsafe fn command_result(cmd: *const u8) -> Option<bool> {
-    let at = cmd.wrapping_add(RESULT_OFFSET);
-    // SAFETY: readable was checked for this byte.
-    unsafe { mem::readable(at, 1).then(|| *at != 0) }
+    memguard::byte(cmd.wrapping_add(RESULT_OFFSET) as usize).map(|b| b != 0)
 }
 
 /// Moves an `std::function` of 0x40 bytes: `dst` is overwritten, `src` is left empty. A callable stored inside

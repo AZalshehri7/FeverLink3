@@ -609,9 +609,11 @@ function X.csBegin(co, where, it)
 	local w0 = clock()
 	local light = it.full == false
 	-- each key is hashed as it is read (C.fnv1a of the key itself): a lane is the sum of its keys' hashes, so no step sorts or rehashes it
-	local r = L.newChecksumRound(engine, C.hashValue, light, { detail = (not light) and {} or nil, clock = clock, keyHash = C.fnv1a })
+	-- it.chunk: the host's chunk size (from the games' measured cost), the same on every game, so every game cuts the lists alike
+	local r = L.newChecksumRound(engine, C.hashValue, light, { detail = (not light) and {} or nil, clock = clock, keyHash = C.fnv1a, chunk = it.chunk })
 	r.n, r.where, r.wall0, r.slip, r.late, r.over = it.n, where or "gui", w0, 0, 0, 0
 	r.spread = (not light and not it.paused and type(it.spread) == "number") and it.spread or 0
+	r.detailShared = r.spread > 0 and it.detail == true or nil
 	r.start = r.time
 	local t1 = clock()
 	-- `co` false: this half's registry is not read yet (X.guiChecksum), so the part is not ready rather than the empty registry's
@@ -654,7 +656,44 @@ end
 
 -- What the bridge adds to a round's progress (L.checksumRoundSave keeps the rest): its number, session, half, start, spread, how late
 -- its chunks were, its cost so far and the account taken at its stamp.
-X.CS_FIELDS = { "n", "epoch", "where", "wall0", "slip", "late", "over", "spread", "start", "work", "account" }
+X.CS_FIELDS = { "n", "epoch", "where", "wall0", "slip", "late", "over", "spread", "start", "work", "account", "detailShared" }
+
+-- ---- the itemised keys of a detail round, shared by the simulation Lua states (TWO_STATE_AUDIT_20261019, DETAIL.last)
+--
+-- A spread round's chunks are read by whichever simulation Lua state runs their step, so a state's own keys (DETAIL.last) cover only
+-- its chunks, and the two games' dumps covered different chunks: their diff misled. Keeping every round's keys in the game-script state
+-- costs about 0.5 MB of state a round, so only a round the host marks `detail` (it does after a round that differed, until one is
+-- identical again: the rounds before a repair) keeps them there: each chunk's keys go into the round's record as one text per lane
+-- (rec.dkeys), the start's light lanes too (rec.dstart). The finished round leaves them in st.csDetail, which the dump at a resync
+-- writes and clears (the save stays small); a later round without `detail` clears them too. Same round, same chunks, same steps on
+-- every game, and complete whichever state read what.
+function X.csDetailStart(r, rec)
+	local d = {}
+	for name, items in pairs(r.detail or {}) do d[name] = table.concat(items, "\n") end
+	rec.dstart, rec.dkeys = d, {}
+end
+
+-- the keys this state read in its last chunk (each lane's keys past `had`) into the record
+function X.csDetailChunk(r, rec, had)
+	rec.dkeys = rec.dkeys or {}
+	for i, ln in ipairs(r.lanes) do
+		local keys = ln.keys or {}
+		if #keys > (had[i] or 0) then
+			local name = ln.spec.name
+			local list = rec.dkeys[name] or {}
+			list[#list + 1] = table.concat(keys, "\n", (had[i] or 0) + 1, #keys)
+			rec.dkeys[name] = list
+		end
+	end
+end
+
+-- the complete keys of a finished detail round: { time, n, lanes = { name = text } }
+function X.csDetailDone(rec, t)
+	local lanes = {}
+	for name, text in pairs(rec.dstart or {}) do lanes[name] = text end
+	for name, list in pairs(rec.dkeys or {}) do lanes[name] = table.concat(list, "\n") end
+	return { time = t, n = rec.n, lanes = lanes }
+end
 
 -- Round r's progress into its record in the game-script state (`rec`, or a new one): every simulation Lua state reads it from there
 -- (L.checksumRoundSave says why).
@@ -698,12 +737,18 @@ function X.csAdvance(holder, st, now)
 			local r
 			r, key = X.csLive(live, rec)
 			local steps = r.steps
-			if not X.csStep(r, now) then
+			local had = {}
+			for i, ln in ipairs(r.lanes) do had[i] = ln.keys and #ln.keys or 0 end
+			local done = X.csStep(r, now)
+			if r.detailShared and r.steps ~= steps then X.csDetailChunk(r, rec, had) end
+			if not done then
 				if r.steps ~= steps then X.csSave(r, rec) end
 				return false
 			end
 			local parts, t = X.csFinish(r)
-			st.reports[#st.reports + 1] = { n = r.n, time = t, parts = parts, account = r.account }
+			-- a detail round leaves its complete keys for the dump at a resync; a round without (the last one was identical) clears them
+			st.csDetail = r.detailShared and X.csDetailDone(rec, t) or nil
+			st.reports[#st.reports + 1] = { n = r.n, time = t, parts = parts, account = r.account, cost = L.checksumCost(r) }
 			stored = r.n
 			pcall(X.csLateNote, st, r, now)
 			return true
@@ -771,9 +816,13 @@ function X.csFinish(r)
 			local lanes = {}
 			for i = 1, math.min(6, #names) do lanes[i] = string.format("%s %.0f", names[i], r.timing[names[i]] * 1000) end
 			local late = r.late > 0 and string.format("; %d chunk(s) read after their step (+%s ms game time): this round reports t=%s, compared only with games late by as much", r.late, C.integerText(r.slip), C.integerText(t)) or ""
-			C.logger(r.where)(string.format("checksum round %s spread: %d entities in %d chunk(s) of %d, every %d step(s) from t=%s to t=%s; start %.1f ms, step max %.1f ms (budget %d ms, %d chunk(s) over), work %.0f ms, wall %.2f s%s; lanes: %s",
+			-- the cost per entity goes to the host with the report (core ChecksumPolicy::chunk_for sizes the next rounds' chunks from it)
+			local cost = L.checksumCost(r)
+			C.logger(r.where)(string.format("checksum round %s spread: %d entities in %d chunk(s) of %d, every %d step(s) from t=%s to t=%s; start %.1f ms, step max %.1f ms (budget %d ms, %d chunk(s) over), work %.0f ms, wall %.2f s, cost %s us an entity%s%s; lanes: %s",
 				tostring(r.n), r.total, r.steps, r.chunk, r.spread, C.integerText(r.start), C.integerText(L.checksumChunkAt(r, r.steps)), r.startCost * 1000,
-				r.frameMax * 1000, L.CHECKSUM_FRAME_BUDGET_MS, r.over, (r.startCost + (r.work or 0)) * 1000, clock() - r.wall0, late, table.concat(lanes, ", ")))
+				r.frameMax * 1000, L.CHECKSUM_FRAME_BUDGET_MS, r.over, (r.startCost + (r.work or 0)) * 1000, clock() - r.wall0,
+				cost and string.format("%.1f", cost.entityNs / 1000) or "?", r.detailShared and ", detail kept (complete, in the game-script state)" or "",
+				late, table.concat(lanes, ", ")))
 		end)
 	else
 		checksumNote(r.timing, clock() - r.wall0, r.where, r.light)
@@ -802,6 +851,24 @@ end
 -- ================================================================== simulation half
 
 local logSim = C.logger("sim")
+-- ---- one game, several simulation Lua states (docs/research/TWO_STATE_AUDIT_20261019.md, local)
+--
+-- The game runs this script's simulation half in more than one Lua state and shares one game's steps between them: two states install
+-- the session's math.random at the same game time (friend test of pre5, 2026-10-18, 22:01:34 and every reload after it), a spread
+-- checksum round kept in one state read its chunks at two steps in four while an action was applied at its stamp in between (see
+-- X.csAdvance). Each event reaches one of them: both states log their first event "at handleEvent" (lab K 2026-10-19 00:17:33), and none
+-- of the 136 actions the host's "queue" events brought in that friend test was applied twice. The docs name no such split: update "is
+-- executed in parallel for every game script" (wiki modding:scripting:gamescripts), and the one thing every state of the script shares is
+-- its GameScriptState: "Persistent state object of a game script, passed to update, postUpdate and handleEvent ... The state table is
+-- saved with the game; change it by reading with get, modifying and writing back with set" (tf3-docs reference/base/scripts/gamescript).
+-- Module tables are a Lua state's own ("it is not possible to directly share variables between them", the wiki on threads).
+-- So, one rule for every value of this half: what a step or an event must see whichever state runs it lives in the game-script state
+-- `st` (the queue, bindings, watches, binders, replay marks, held-command notes, checksum rounds, costs, the native module's
+-- capabilities, the session it belongs to, the results of script builds); module values (SIM, SIMO, X) keep only what cannot go there or
+-- is this state's own: functions (a script's build callback, the wrapped api.cmd), live copies of shared records (X.csLive), this state's
+-- control writer, caches and log throttles. A state's own values are brought up to the shared record at each of its steps and events
+-- (X.simCatchUp). Work on shared data is done once, by whichever state runs the step or gets the event; work on a state's own values
+-- (its math.random, its callbacks) in every state, and never twice on the shared data (X.simSessionOff).
 local SIM = { rng = nil, subscribed = false }
 
 -- Live vs loaded log (feverlink3_livevsloaded.lua): off unless FEVERLINK3_LIVE_VS_LOADED=1. Observe-only, own guard.
@@ -888,8 +955,11 @@ end
 
 local function simCtx(st, it)
 	local ctx = actionCtx(it, st.co, function(key) return L.resolveKey(st.bind, key) end)
-	ctx.canInject = NATIVE_INJECT and SIM.nativeInject == true
-	ctx.canPatch = NATIVE_PATCH and SIM.nativePatch == true   -- (told by the interface half when the module reported the capability; not in the saved state, a load would lose it)
+	-- the native module's capabilities, told by the interface half (event nativecaps, which reaches one simulation state): kept in the
+	-- game-script state, so a stamp reached by the other state injects the originator's copy too (it decoded by the record path before)
+	local caps = type(st.caps) == "table" and st.caps or {}
+	ctx.canInject = NATIVE_INJECT and caps.inject == true
+	ctx.canPatch = NATIVE_PATCH and caps.patch == true
 	return ctx
 end
 
@@ -1019,6 +1089,223 @@ function X.simRefundMoney(st, now)
 	st.refundWatch = #keep > 0 and keep or nil
 end
 
+-- build.result (trace.log and mod.log): ONE line for every build this game applies at a stamp, whatever it is (street, track,
+-- construction, stop, removal, bulldozing; this game's own and the others'; refused ones too), all by the same path. CLAUDE.md: full
+-- build records in this testing phase; before 2026-10-19 only builds that key entities (constructions, stops, depots) had one.
+-- X.buildResultBegin, at the apply (simApplyAction): the verdict this game reached there (refused with its class, sent, or applied
+-- natively by its own tool), the account before, and, for a build that is sent, the world's entity lists of X.BRES_COMPS (one read per
+-- step, shared by the step's builds). X.simBuildResults, at the next step (the engine runs a command the simulation sent after that
+-- update: lab 2026-10-18, the account had not moved right after the send): the lists again, the difference (entities added and
+-- removed), whether the engine announced the build (its replay mark was spent), the account after, and the line. Everything lives in
+-- the game-script state: the next step may run in the other simulation Lua state (TWO_STATE_AUDIT_20261019). Builds of one step share
+-- the step's difference and money (the line names them: shared=[keys]); a town's own build in that step is in the figures too.
+-- Money: the acting company's account (api.engine.util.finance.getPlayersBalance, "Get balance of the player's bank account",
+-- tf3-docs reference/api/api/engine/util) or this game's player's ACCOUNT component (Account.balance, tf3-docs Engine.Component), as
+-- X.refundMoney reads it. The engine's own cost of the build: ProposalData.costs from the replay's verdict (engineVerdict; a native
+-- Proposal has none); a negative one is the refund the engine reports, else a rise of the account is the refund measured.
+X.BRES_COMPS = { "BASE_NODE", "BASE_EDGE", "CONSTRUCTION", "EDGE_OBJECT", "TOWN_BUILDING" }
+
+-- The lists as text (cheap to keep in st). The engine does not loop over BASE_NODE / BASE_EDGE ("Cannot loop over this component type"):
+-- the nodes and the segments come from the street graph, streetSystem.getNode2SegmentMap (as the build trace reads them).
+function X.bresSnapshot()
+	local s = {}
+	local nodes, edges, seen = {}, {}, {}
+	pcall(function()
+		for n, segs in pairs(api.engine.system.streetSystem.getNode2SegmentMap()) do
+			nodes[#nodes + 1] = n
+			for i = 1, #segs do
+				if not seen[segs[i]] then seen[segs[i]] = true; edges[#edges + 1] = segs[i] end
+			end
+		end
+	end)
+	table.sort(nodes)
+	table.sort(edges)
+	s.BASE_NODE, s.BASE_EDGE = table.concat(nodes, ","), table.concat(edges, ",")
+	for _, comp in ipairs(X.BRES_COMPS) do
+		if not s[comp] then s[comp] = table.concat(entitiesWith(comp), ",") end
+	end
+	return s
+end
+
+-- The facts of a build at its apply (both halves: the pause path applies from the interface half, guiApplyNow). `how`:
+-- { verdict = "refused"|"sent"|"native", class, detail, held, costs }. Nil for an action that is no build.
+function X.bresEntry(it, ctx, now, how)
+	if not (it.body and it.body.fn == "makeWorldBuildProposalCmd") then return nil end
+	local plan = "?"
+	pcall(function() plan = tostring(Build.recSummary(it.body).plan) end)
+	return { key = it.key, at = now, verdict = how.verdict, class = how.class, detail = how.detail and tostring(how.detail):sub(1, 400) or nil,
+		held = how.held or nil, costs = how.costs, plan = plan, kind = it.body.category or buildCategory(it.body),
+		role = (it.from == C.PLAYER_ID) and (it.scriptOut and "originator(script)" or "originator") or "replay",
+		b0 = X.refundMoney(ctx), p = ctx and ctx.player or nil }
+end
+
+-- The line itself, the same for both halves. `changes`: X.bresDiff's text or nil (not measured); `announced`: yes/no/n/a/callback.
+function X.bresWrite(trace, log, e, now, changes, announced, shared)
+	local verdict = e.verdict
+	if verdict == "sent" then
+		-- unseen: nothing changed here and the engine announced nothing: refused by the engine, or emptied by the native module (build.verdict)
+		verdict = ((changes ~= nil and changes ~= "") or announced == "yes" or announced == "callback") and "applied" or "unseen"
+	elseif verdict == "refused" then
+		verdict = "refused(" .. tostring(e.class) .. ")"
+	end
+	local b1 = X.refundMoney(e.p and { player = e.p } or nil)
+	local spent, refund = "?", "none"
+	if type(e.b0) == "number" and type(b1) == "number" then
+		spent = string.format("%.0f", e.b0 - b1)
+		if b1 > e.b0 then refund = string.format("%.0f(account)", b1 - e.b0) end
+	end
+	if type(e.costs) == "number" and e.costs < 0 then refund = string.format("%.0f(engine)", -e.costs) end
+	local line = string.format("%s role=%s kind=%s plan=%s verdict=%s announced=%s entities[%s] money %s -> %s spent=%s engine_costs=%s refund=%s applied_t=%s measured_t=%s%s%s",
+		tostring(e.key), e.role, tostring(e.kind), tostring(e.plan), verdict, tostring(announced or "n/a"),
+		changes == nil and "n/a" or (changes == "" and "none" or changes), e.b0 and string.format("%.0f", e.b0) or "?", b1 and string.format("%.0f", b1) or "?",
+		spent, e.costs and string.format("%.0f", e.costs) or "n/a", refund, tostring(e.at), tostring(now),
+		(shared and #shared > 0) and (" shared=[" .. table.concat(shared, " ") .. "]") or "",
+		e.detail and (" detail=" .. tostring(e.detail):gsub("%s+", " "):sub(1, 200)) or "")
+	trace("build.result", line)
+	log("build.result " .. line)
+end
+
+function X.buildResultBegin(st, it, ctx, now, how)
+	local ok, err = pcall(function()
+		local e = X.bresEntry(it, ctx, now, how)
+		if not e then return end
+		if how.verdict == "sent" then
+			st.bresSnap = type(st.bresSnap) == "table" and st.bresSnap or {}
+			local k = tostring(now)
+			if not st.bresSnap[k] then st.bresSnap[k] = X.bresSnapshot() end
+			e.snap = k
+		end
+		st.bres = type(st.bres) == "table" and st.bres or {}
+		st.bres[#st.bres + 1] = e
+	end)
+	if not ok then logSim("build.result of " .. tostring(it.key) .. " cannot be prepared: " .. tostring(err)) end
+end
+
+-- A later fact of the build begun at `now` (an engine refusal at the send, the engine's costs). Returns whether the build's entry has
+-- its step snapshot (so X.simBuildResults will know what it made).
+function X.buildResultSet(st, key, now, fields)
+	local snapped = false
+	for _, e in ipairs(type(st.bres) == "table" and st.bres or {}) do
+		if e.key == key and e.at == now then
+			for k, v in pairs(fields) do e[k] = v end
+			if fields.verdict == "refused" then e.snap = nil end
+			snapped = snapped or e.snap ~= nil
+		end
+	end
+	return snapped
+end
+
+-- The entities a build made, from its step's two snapshots: the ids of BASE_NODE, BASE_EDGE, CONSTRUCTION and EDGE_OBJECT that are new
+-- (what a WorldBuildProposalCommandData's resultEntities names: the proposal's new entities; town buildings are the town's), sorted.
+X.RESULT_COMPS = { "BASE_NODE", "BASE_EDGE", "CONSTRUCTION", "EDGE_OBJECT" }
+function X.bresAdded(before, after)
+	local out = {}
+	for _, comp in ipairs(X.RESULT_COMPS) do
+		local had = {}
+		for id in (before[comp] or ""):gmatch("[^,]+") do had[id] = true end
+		for id in (after[comp] or ""):gmatch("[^,]+") do
+			if not had[id] and tonumber(id) then out[#out + 1] = tonumber(id) end
+		end
+	end
+	table.sort(out)
+	return out
+end
+
+-- The answer of this game's own script build (shipLocal: a build an interface-state script sent with a callback), given a step after
+-- its apply, when the snapshots say what it made: the engine runs a command the simulation sends after that update, so the callback
+-- comes when single-player's would, with the build's result entities. Lab M 2026-10-19 (X6A): the answer at the apply carried none and
+-- no command data, so a callback that hands `cmdData.resultEntities` to api.gui.construction.updateRefundableEntities (as the game's
+-- bridge_and_tunnel.tl:195-203 does) could not, the new street never entered the interface's refundable list, and its bulldozing
+-- 7 s later refunded nothing on either game. Builds of one step share the difference (`shared`): each gets all of it, said in the log.
+function X.answerBuild(st, e, snaps, after, changes, announced, shared)
+	local ok, list = pcall(function()
+		if not (e.snap and snaps[e.snap] and after) then return {} end
+		return X.bresAdded(snaps[e.snap], after)
+	end)
+	if not ok then list = {} end
+	local success = e.verdict ~= "refused" and ((changes ~= nil and changes ~= "") or announced == "yes" or (changes == nil and announced == "n/a"))
+	st.results[#st.results + 1] = { key = e.key, at = e.at, success = success, entities = list }
+	logSim(string.format("action %s: answered to its script with %d result entit%s%s%s", tostring(e.key), #list, #list == 1 and "y" or "ies",
+		success and "" or " (nothing of it is seen here: failed)", (shared and #shared > 0) and (" (shared with " .. table.concat(shared, " ") .. ")") or ""))
+end
+
+-- "+BASE_EDGE[1:50012] -CONSTRUCTION[2:54 60]" (at most 12 ids a list), "" when nothing changed
+function X.bresDiff(before, after)
+	local parts = {}
+	for _, comp in ipairs(X.BRES_COMPS) do
+		local b, a = before[comp] or "", after[comp] or ""
+		if a ~= b then
+			local had, has = {}, {}
+			for id in b:gmatch("[^,]+") do had[id] = true end
+			local added, removed = {}, {}
+			for id in a:gmatch("[^,]+") do
+				has[id] = true
+				if not had[id] then added[#added + 1] = id end
+			end
+			for id in b:gmatch("[^,]+") do if not has[id] then removed[#removed + 1] = id end end
+			local function list(sign, l)
+				if #l == 0 then return end
+				local shown = {}
+				for i = 1, math.min(#l, 12) do shown[i] = l[i] end
+				parts[#parts + 1] = string.format("%s%s[%d:%s%s]", sign, comp, #l, table.concat(shown, " "), #l > 12 and " ..." or "")
+			end
+			list("+", added)
+			list("-", removed)
+		end
+	end
+	return table.concat(parts, " ")
+end
+
+function X.simBuildResults(st, now)
+	local list = st.bres
+	if type(list) ~= "table" or #list == 0 then return end
+	local keep, done, diffs, groups = {}, {}, {}, {}
+	for _, e in ipairs(list) do
+		-- a held command (this game's own, released by the interface half after the stamp step) is measured a step later
+		local due = (tonumber(e.at) or now) + (e.held and 2 or 1) * STEP <= now
+		if due then
+			done[#done + 1] = e
+			groups[tostring(e.at)] = (groups[tostring(e.at)] or 0) + 1
+		else
+			keep[#keep + 1] = e
+		end
+	end
+	st.bres = #keep > 0 and keep or nil
+	local snaps = type(st.bresSnap) == "table" and st.bresSnap or {}
+	local marks = {}
+	for _, m in ipairs(type(st.replay) == "table" and type(st.replay.marks) == "table" and st.replay.marks or {}) do marks[tostring(m.k)] = true end
+	local after = nil
+	for _, e in ipairs(done) do
+		local changes, announced = nil, "n/a"
+		if e.snap and snaps[e.snap] then
+			if diffs[e.snap] == nil then
+				after = after or X.bresSnapshot()
+				diffs[e.snap] = X.bresDiff(snaps[e.snap], after)
+			end
+			changes = diffs[e.snap]
+			announced = (e.held and "n/a") or (marks[tostring(e.key)] and "no" or "yes")
+		end
+		local shared = {}
+		if (groups[tostring(e.at)] or 0) > 1 then
+			for _, x in ipairs(done) do if x ~= e and x.at == e.at then shared[#shared + 1] = tostring(x.key) end end
+		end
+		local okW, errW = pcall(X.bresWrite, traceSim, logSim, e, now, changes, announced, shared)
+		if not okW then logSim("build.result of " .. tostring(e.key) .. " failed: " .. tostring(errW)) end
+		if e.answer then
+			local okA, errA = pcall(X.answerBuild, st, e, snaps, after, changes, announced, shared)
+			if not okA then
+				st.results[#st.results + 1] = { key = e.key, at = e.at, success = true }
+				logSim("action " .. tostring(e.key) .. ": its script's answer has no result entities: " .. tostring(errA))
+			end
+		end
+	end
+	-- the step snapshots no waiting build refers to any more
+	local used = {}
+	for _, e in ipairs(keep) do if e.snap then used[e.snap] = true end end
+	for k in pairs(snaps) do if not used[k] then snaps[k] = nil end end
+	st.bresSnap = next(snaps) and snaps or nil
+end
+
 -- Applies one due action in the simulation state. No callback here (finding from MPFever (MIT): the engine
 -- rejects callbacks from inside the simulation update; postUpdate, where this runs now, is taken to be the same: unproven), so an entity the command creates is found afterwards by
 -- comparing the entity lists (a watch), and the result reaches the originator through the state.
@@ -1029,9 +1316,10 @@ end
 -- The engine's own verdict on a rebuilt build proposal, without applying it (what a tool's preview reads): critical flag, messages and
 -- warnings of the proposal data's errorState. The second argument of makeProposalData must be a Context (a command whose context
 -- was left out made `bad argument #2 to 'makeProposalData'`): a default one with this game's player is made when the command has none.
--- Returns `critical, messages, warnings` (lists of strings) or nil and the reason it could not be read. Never raises.
+-- Returns `critical, messages, warnings` (lists of strings), the collisions and the proposal's `costs` ("Total cost of the proposal, in
+-- game currency", ProposalData.costs, tf3-docs reference/api/api/type; nil when not readable), or nil and the reason. Never raises.
 function engineVerdict(args)
-	local ok, critical, msgs, warns, coll = pcall(function()
+	local ok, critical, msgs, warns, coll, costs = pcall(function()
 		local ctx = args[2]
 		if ctx == nil or ctx == false then
 			ctx = api.type.Context.new()
@@ -1073,11 +1361,13 @@ function engineVerdict(args)
 				coll[#coll + 1] = d
 			end
 		end)
-		return es.critical == true, list(es.messages), list(es.warnings), coll
+		local costs = nil
+		pcall(function() if type(pd.costs) == "number" then costs = pd.costs end end)
+		return es.critical == true, list(es.messages), list(es.warnings), coll, costs
 	end)
 	if not ok then return nil, tostring(critical):sub(1, 160) end
 	if critical == nil then return nil, "no errorState" end
-	return critical, msgs, warns, coll
+	return critical, msgs, warns, coll, costs
 end
 
 -- One log line for EVERY build this game applies, before it is applied (the replay of another game's build, and the originator's own
@@ -1107,7 +1397,7 @@ local function describeBuild(it, args, role)
 			local chained = type(args) == "table" and type(args.chain) == "table" and #args.chain > 0
 			parts[#parts + 1] = string.format("resolved removals %d of %d [%s]%s", n, sum.rem, table.concat(ids, " "), (chained and n < sum.rem) and " (first command only; the others are in the chained command)" or "")
 		end
-		local verdict = "n/a"
+		local verdict, costs = "n/a", nil
 		-- (real session 2026-10-13: makeProposalData answered "SimpleProposal expected, got Proposal" for a removal, and the one failure
 		-- switched the reader off for every build. It only fails for the native Proposal type, so only that type is skipped.)
 		local nativeType = false
@@ -1115,7 +1405,8 @@ local function describeBuild(it, args, role)
 		if nativeType and REPLAY_VERDICT.nativeNoData then
 			verdict = "n/a (a native Proposal: the engine reads proposal data of a SimpleProposal only)"
 		elseif not REPLAY_VERDICT.failed then
-			local critical, msgs, warns, coll = engineVerdict(args)
+			local critical, msgs, warns, coll, pdCosts = engineVerdict(args)
+			costs = pdCosts
 			if critical == nil and msgs and tostring(msgs):find("SimpleProposal expected", 1, true) then
 				REPLAY_VERDICT.nativeNoData = true
 				verdict = "n/a (a native Proposal: the engine reads proposal data of a SimpleProposal only)"
@@ -1133,7 +1424,7 @@ local function describeBuild(it, args, role)
 		end
 		parts[#parts + 1] = "verdict " .. verdict
 		parts[#parts + 1] = string.format("ie=%s pi=%s", tostring(args[3] == true), tostring(args[4] == true))
-		return table.concat(parts, "; "), { sum = sum, removed = ids, removedN = n, verdict = verdict }
+		return table.concat(parts, "; "), { sum = sum, removed = ids, removedN = n, verdict = verdict, costs = costs }
 	end)
 	if ok and text then
 		logSim(string.format("build %s (%s): %s", it.key, role, text))
@@ -1687,6 +1978,36 @@ local function simFlushScriptBuilds(st)
 	trim(st.out, OUT_KEEP)
 end
 
+-- A script build applied at its stamp (simApplyAction): its result goes to the game-script state, where the state that took the build
+-- and keeps its callback finds it (X.simCatchUp); the stamp may be reached by another simulation state.
+function X.scriptBuildDone(st, n, ok)
+	st.scriptDone = type(st.scriptDone) == "table" and st.scriptDone or {}
+	st.scriptDone[#st.scriptDone + 1] = { n = n, ok = ok == true }
+	trim(st.scriptDone, OUT_KEEP)   -- a result whose state is gone (a reload) is not kept for ever
+end
+
+-- This simulation state's own values brought up to the game-script state `st` (the rule at the top of this half): at every step and
+-- every event of the state, before and after its work. Writes only what belongs to this state, plus the removal of the script results
+-- it delivered; the caller stores st.
+function X.simCatchUp(st)
+	local caps = type(st.caps) == "table" and st.caps or nil
+	if caps and type(caps.wall0) == "number" then X.WALL0 = caps.wall0 end   -- the timing lines' wall clock (X.wallNow)
+	local done = st.scriptDone
+	if type(done) == "table" and #done > 0 then
+		local keep = {}
+		for _, d in ipairs(done) do
+			local cb = SIMO.cbs[d.n]
+			if cb then
+				SIMO.cbs[d.n] = nil
+				pcall(cb, nil, d.ok == true)
+			else
+				keep[#keep + 1] = d   -- another state's, or one whose state is gone
+			end
+		end
+		st.scriptDone = #keep > 0 and keep or nil
+	end
+end
+
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): sendCommand and makeWorldBuildProposalCmd are replaced in
 -- this state's api.cmd; the API has no command hook, and a script's player build must be stamped like every other build.
 local function simWrapCommands()
@@ -1725,6 +2046,7 @@ local function simApplyAction(st, it, now)
 		-- the engine applied this build when its player made it; the record only exists to reach the other games
 		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
 		X.simVerdict(st, it, now)
+		X.buildResultBegin(st, it, simCtx(st, it), now, { verdict = "native", detail = "applied by this game's own tool when it was made; the record only reaches the other games" })
 		return
 	end
 	if it.lateSteps and it.lateSteps > 0 and not it.waited then
@@ -1773,6 +2095,7 @@ local function simApplyAction(st, it, now)
 		-- refused at the stamp from this world: this game's verdict, no resync of its own (X.refusalClass)
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err, class = X.refusalClass(err, "decode"),
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
+		X.buildResultBegin(st, it, ctx, now, { verdict = "refused", class = X.refusalClass(err, "decode"), detail = err })
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
@@ -1783,6 +2106,7 @@ local function simApplyAction(st, it, now)
 		logSim("action " .. it.key .. " refused: " .. tostring(fx))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = fx, class = "company",
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
+		X.buildResultBegin(st, it, ctx, now, { verdict = "refused", class = "company", detail = fx })
 		return
 	end
 	coEffects(ctx, fx, logSim)
@@ -1804,6 +2128,8 @@ local function simApplyAction(st, it, now)
 	-- lists, the binders that key what the build creates). The interface half releases the held command when it sees the
 	-- "#release" result below, after this snapshot (so the new entities are not in it).
 	local held = it.heldId ~= nil and it.from == C.PLAYER_ID
+	-- build.result: the account and the world's entity lists before this build is sent (completed at the next step)
+	X.buildResultBegin(st, it, ctx, now, { verdict = "sent", held = held })
 	local ok, e = true, nil
 	local preInfo = nil
 	local injects = {}   -- the inject orders written for this build: the module's answers decide this game's verdict (X.simVerdict)
@@ -1872,6 +2198,7 @@ local function simApplyAction(st, it, now)
 		traceSim("build.error", string.format("%s type=%s value=%s", it.key, type(e), tostring(e)))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e), class = X.refusalClass(e, "engine"),
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
+		X.buildResultSet(st, it.key, now, { verdict = "refused", class = X.refusalClass(e, "engine"), detail = tostring(e) })
 		return
 	end
 	-- What appeared during this action's own send: the simulation state runs a command as it is sent (a build's entities are keyed at
@@ -1887,6 +2214,7 @@ local function simApplyAction(st, it, now)
 		end
 	end
 	X.simVerdict(st, it, now, injects)
+	if preInfo and preInfo.costs ~= nil then X.buildResultSet(st, it.key, now, { costs = preInfo.costs }) end
 	X.simQueueCost(st, ctx, it, category, balance0, coAfter(ctx, it, spec, category, balance0, logSim), now)
 	logSim("action " .. it.key .. " " .. it.body.fn .. (held and (" due at t=" .. now .. ": the native module holds this game's own copy (held " .. tostring(it.heldId) .. "), the interface half releases it") or (" applied at t=" .. now)))
 	-- a window command (shipUiCommand): its timing line on every game, the originator's and the others' (click, read, received, stamp, apply)
@@ -1899,17 +2227,17 @@ local function simApplyAction(st, it, now)
 	end
 	if spec.creates then
 		st.watches[#st.watches + 1] = { key = it.key, comp = spec.creates, result = spec.result, before = before, steps = 0, at = now, sent = sentW }
+	elseif not held and it.from == C.PLAYER_ID and not it.scriptOut and it.body.fn == "makeWorldBuildProposalCmd"
+		and X.buildResultSet(st, it.key, now, { answer = true }) then
+		-- this game's own script build: answered a step later with what it made (X.answerBuild)
 	else
 		st.results[#st.results + 1] = { key = it.key, at = now, success = true }
 	end
 	if held then
 		st.results[#st.results + 1] = { key = it.key .. "#release" .. tostring(it.heldId), of = it.key, at = now, success = true, release = it.heldId }
 	end
-	local scb = it.scriptOut and SIMO.cbs[it.scriptOut]
-	if scb then
-		SIMO.cbs[it.scriptOut] = nil
-		pcall(scb, nil, true)
-	end
+	-- a script's build: its callback is kept by the simulation state that took the build, which may not be this one (X.simCatchUp)
+	if it.scriptOut then X.scriptBuildDone(st, it.scriptOut, true) end
 end
 
 -- companies: an action the interface half applied during a pause ran its registry and ledger part on the interface
@@ -2030,7 +2358,7 @@ local function simAdvanceBinders(st, now)
 				local keys = {}
 				for k, e in pairs(map) do keys[#keys + 1] = k .. "=" .. tostring(e) end
 				table.sort(keys)
-				traceSim("build.result", string.format("%s ok=true steps=%d made=%d [%s] keys[%s] money %s -> %s", b.key, b.steps, #made, table.concat(ents, " "),
+				traceSim("build.bind", string.format("%s ok=true steps=%d made=%d [%s] keys[%s] money %s -> %s", b.key, b.steps, #made, table.concat(ents, " "),
 					table.concat(keys, " "), tostring(b.money0), tostring(engine.account())))
 			end)
 		elseif b.steps >= WATCH_STEPS then
@@ -2082,7 +2410,7 @@ local function simAdvanceBinders(st, now)
 						if #ents < 16 then ents[#ents + 1] = comp .. ":" .. entLine(e) end
 					end
 				end
-				traceSim("build.result", string.format("%s ok=false steps=%d new entities [%s] money %s -> %s record=%s", b.key, b.steps, table.concat(ents, " "),
+				traceSim("build.bind", string.format("%s ok=false steps=%d new entities [%s] money %s -> %s record=%s", b.key, b.steps, table.concat(ents, " "),
 					tostring(b.money0), tostring(engine.account()), C.serialize(b.body)))
 			end)
 			pcall(function()
@@ -2194,18 +2522,46 @@ end
 -- the native module holds goes back to the engine when the interface half switches holding off (the module fails a deferred one), and
 -- the callbacks of commands that were stamped and not applied are failed there. What belongs to the world stays: the bindings
 -- (st.bind) and the company registry. Script builds this half took for stamping are failed (their callbacks run with a failure).
+-- Every simulation Lua state sees the end on its own (identity.txt on its own clock, or the `sessionoff` event, which reaches one of
+-- them), so the game-script state is cleared only by the first: it is cleared when it still belongs to the session that ends (st.sid,
+-- X.simJoin), never when another state has cleared it or a newer session has taken it (the late state emptied the next session's queue
+-- and epoch: test_session_end TwoSimulationStatesSessionTest). This state's own values (its script builds and callbacks, math.random,
+-- live round copies) go in every state.
+function X.sessionKey()
+	return tostring(C.SESSION) .. "@" .. C.posText(C.SESSION_START)
+end
+
+-- This state joins the session C.SESSION names: the game-script state is stamped with it (the session its queue and outputs belong to).
+function X.simJoin(state)
+	SIM.gen, SIM.sid = C.GEN, X.sessionKey()
+	pcall(function()
+		local st = state:get()
+		if type(st) == "table" and st.sid ~= SIM.sid then
+			st.sid = SIM.sid
+			state:set(st)
+		end
+	end)
+end
+
 function X.simSessionOff(state, why)
-	SIM.gen = nil
+	local ending = SIM.sid or X.sessionKey()
+	SIM.gen, SIM.sid = nil, nil
 	local n = { queue = 0, out = 0, binders = 0, scripts = #SIMO.pending }
+	local shared = false
 	pcall(function()
 		local st = simState(state)
+		if not (st.sid == ending or (st.sid == nil and st.offSid ~= ending)) then return end
+		shared = true
 		n.queue, n.out, n.binders = #st.queue, #(st.out or {}), #st.binders
 		st.queue, st.out, st.binders, st.watches = {}, nil, {}, {}
 		st.heldOut, st.heldInput, st.heldNative, st.nbinds = nil, nil, nil, nil
 		st.results, st.reports, st.refused, st.notes, st.late = {}, {}, {}, nil, 0
-		st.costs = nil
-		st.csRounds, st.csLate = nil, nil   -- the spread checksum rounds of the session (X.csAdvance)
+		st.costs, st.refundWatch, st.scriptDone = nil, nil, nil
+		st.bres, st.bresSnap = nil, nil   -- build.result lines not yet written (X.simBuildResults)
+		st.csRounds, st.csLate, st.csDetail = nil, nil, nil   -- the spread checksum rounds of the session and a detail round's keys (X.csAdvance)
+		st.caps = nil    -- the native module's capabilities: the interface half of the next session tells them again
 		st.epoch = nil   -- the next interface run stamps it again
+		st.sid, st.offSid = nil, ending
 		state:set(st)
 	end)
 	for _, p in ipairs(SIMO.pending) do
@@ -2219,9 +2575,14 @@ function X.simSessionOff(state, why)
 		if SIM.random0 then math.random = SIM.random0 end
 		SIM.rng = nil
 	end
-	logSim(string.format("session over (%s): single-player again; dropped %d queued action(s), %d native build(s) not yet shipped, %d binder(s), %d script build(s) (failed)",
-		tostring(why), n.queue, n.out, n.binders, n.scripts))
-	traceSim("session", string.format("off why=%s queue=%d out=%d binders=%d scripts=%d", tostring(why), n.queue, n.out, n.binders, n.scripts))
+	if shared then
+		logSim(string.format("session over (%s): single-player again; dropped %d queued action(s), %d native build(s) not yet shipped, %d binder(s), %d script build(s) (failed)",
+			tostring(why), n.queue, n.out, n.binders, n.scripts))
+	else
+		logSim(string.format("session over (%s): single-player again; the game-script state was cleared by another simulation state already (or belongs to a newer session): left as it is; %d script build(s) of this state failed",
+			tostring(why), n.scripts))
+	end
+	traceSim("session", string.format("off why=%s shared=%s queue=%d out=%d binders=%d scripts=%d", tostring(why), tostring(shared), n.queue, n.out, n.binders, n.scripts))
 end
 
 -- Every update and every event of the interface half: a session this half started in that is over (or replaced by another) ends here.
@@ -2229,7 +2590,7 @@ function X.simSessionCheck(state)
 	if SIM.gen ~= nil and (not C.ACTIVE or SIM.gen ~= C.GEN) then
 		X.simSessionOff(state, C.ACTIVE and "another session began" or "the session ended")
 	end
-	if C.ACTIVE and SIM.gen == nil then SIM.gen = C.GEN end
+	if C.ACTIVE and SIM.gen == nil then X.simJoin(state) end
 end
 
 -- The simulation step, in two calls (official wiki, modding:scripting:gamescripts): "updateScript ... As it is executed in parallel for
@@ -2346,17 +2707,21 @@ function X.simStep(state, now)
 	local ok, err = pcall(function()
 		local stored = nil
 		local st = simState(state)
+		X.simCatchUp(st)
 		-- the cost of the actions the engine ran after the last step (X.simQueueCost), before this step's actions move the account
 		local okK, errK = pcall(X.simBookCosts, st, now)
 		if not okK then logSim("company cost booking failed: " .. tostring(errK)) end
 		local okR, errR = pcall(X.simRefundMoney, st, now)
 		if not okR then logSim("refund (native): the money measurement failed: " .. tostring(errR)) end
+		-- the builds applied at an earlier step: one build.result line each (before this step's actions change the world)
+		local okBR, errBR = pcall(X.simBuildResults, st, now)
+		if not okBR then logSim("build.result failed: " .. tostring(errBR)) end
 		-- spread checksum rounds: a chunk due at this step is read before the step's items, as a round's own start is (L.itemBefore)
 		stored = X.csAdvance(SIM, st, now)
 		local due = L.takeDue(st.queue, now)
 		for _, it in ipairs(due) do
 			if it.kind == "checksum" and (it.spread or 0) > 0 and it.full ~= false and not it.paused then
-				-- a full round spread over the next steps (L.SPREAD_LANES): no step reads more than L.CHECKSUM_CHUNK entities. The step's
+				-- a full round spread over the next steps (L.SPREAD_LANES): no step reads more than the round's chunk (the host's, else L.CHECKSUM_CHUNK). The step's
 				-- actions are applied as always, at their stamps; a chunk after them reads what they built, at the same step on every game.
 				local okB, r = pcall(X.csBegin, st.co, "sim", it)
 				if okB then
@@ -2366,6 +2731,7 @@ function X.simStep(state, now)
 					r.mine = 0
 					st.csRounds = st.csRounds or {}
 					local rec = X.csSave(r, nil)
+					if r.detailShared then X.csDetailStart(r, rec) end
 					st.csRounds[#st.csRounds + 1] = rec
 					SIM.csLive = SIM.csLive or {}
 					SIM.csLive[tostring(rec.epoch) .. "/" .. tostring(rec.n) .. "/" .. tostring(rec.start)] = r
@@ -2386,6 +2752,7 @@ function X.simStep(state, now)
 		simAdvanceWatches(st, now)
 		simAdvanceBinders(st, now)
 		simFlushScriptBuilds(st)
+		X.simCatchUp(st)   -- what this step's applies did for this state's own values (a script build's callback)
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
 		trim(st.refused, RESULT_KEEP)
@@ -2530,13 +2897,28 @@ function handleEvent(userParams, state, src, id, name, param)
 					-- carries them; applied now, every stamp in them would be due at once.
 					local stale = #st.queue + #st.binders
 					st.queue, st.binders, st.watches, st.heldOut, st.heldInput, st.heldNative, st.nbinds = {}, {}, {}, nil, nil, nil, nil
+					-- the module's capabilities a save carries are another game's: this session's interface half tells them (nativecaps)
+					st.caps, st.scriptDone = nil, nil
 					if stale > 0 then logSim("a new session: dropped " .. C.integerText(stale) .. " queued action(s) and binder(s) of an earlier session found in this world") end
 				end
 			end
 		elseif name == "queue" and type(param) == "table" then
 			L.enqueue(st.queue, param)
 		elseif name == "dumpdetail" and type(param) == "table" then
-			local d = DETAIL.last
+			-- the complete keys of the last detail round (the game-script state: every chunk, whichever state read it, X.csDetailStart);
+			-- without one (a repair asked by hand, no round differed before it) this state's own keys of the last full round, said partial
+			local shared, d = st.csDetail, nil
+			if type(shared) == "table" and type(shared.lanes) == "table" then
+				d = { time = shared.time, lanes = {}, complete = shared.n }
+				for lane, text in pairs(shared.lanes) do
+					local items = {}
+					for k in tostring(text):gmatch("[^\n]+") do items[#items + 1] = k end
+					d.lanes[lane] = items
+				end
+				st.csDetail = nil   -- written once; the resync save does not carry it
+			else
+				d = DETAIL.last
+			end
 			if d then
 				local lines = {}
 				for lane, items in pairs(d.lanes) do
@@ -2545,7 +2927,8 @@ function handleEvent(userParams, state, src, id, name, param)
 				-- sorted, so the two games' files diff line by line (a spread round keeps its keys in the order it read them)
 				table.sort(lines)
 				table.insert(lines, 1, "# itemised keys of the last full checksum round of this game: time=" .. tostring(d.time) .. " why=" .. tostring(param.why)
-					.. (d.partial and (" partial: the keys of the " .. d.partial .. " this simulation Lua state read") or ""))
+					.. (d.complete and (" complete: detail round " .. tostring(d.complete) .. ", every chunk at its step, the same on every game") or "")
+					.. (d.partial and (" partial: the keys of the " .. d.partial .. " this simulation Lua state read (no detail round ran: the host asks for one after a round that differed)") or ""))
 				local fname = "detail_" .. tostring(d.time) .. "_" .. tostring(C.PLAYER_ID) .. ".txt"
 				C.dumpReplace(fname, table.concat(lines, "\n") .. "\n")
 				traceSim("detail", string.format("%s: %d lines written to %s (diff the two games' files to see which entities differ)", tostring(param.why), #lines - 1, fname))
@@ -2578,9 +2961,8 @@ function handleEvent(userParams, state, src, id, name, param)
 			-- of a mark no engine event spent (friend test 2026-10-18 printed "nil@14282800, nil@14285000": these events carried no key)
 			markReplay(st, engine.gameTime(), nil, type(param) == "table" and type(param.key) == "string" and param.key or nil)
 		elseif name == "nativecaps" and type(param) == "table" then
-			SIM.nativePatch = param.patch == true
-			SIM.nativeInject = param.inject == true
-			if type(param.wall0) == "number" then X.WALL0 = param.wall0 end
+			-- into the game-script state: this event reaches one simulation state, every state's stamps decode with them (simCtx)
+			st.caps = { patch = param.patch == true, inject = param.inject == true, wall0 = type(param.wall0) == "number" and param.wall0 or nil }
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = C.clock() }
@@ -2632,6 +3014,7 @@ function handleEvent(userParams, state, src, id, name, param)
 		elseif name == "co" and Co and type(param) == "table" and type(param.it) == "table" then
 			simReplayCompany(st, param)
 		end
+		X.simCatchUp(st)
 		state:set(st)
 	end)
 	if not ok then logSim("event " .. tostring(name) .. " failed: " .. tostring(err)) end
@@ -2802,7 +3185,19 @@ function X.paceTick(now)
 	if X.PACE_ON and stop and s.pauseAt == nil and s.holdAt == nil then
 		target, left = L.paceTarget(stop - now, s.speed, L.paceNext(P, clock), L.paceBatch(P), P.ownAt and (clock - P.ownAt) * 1000 or 0)
 	end
+	-- both ways: behind the furthest peer with room before the stop, the batches come sooner (L.paceHurry)
+	if X.PACE_ON and target == 1 and s.started and (s.speed or 0) > 0 and s.pauseAt == nil and s.holdAt == nil then
+		local far = L.furthestPeer(G.peers)
+		if far then
+			target = L.paceHurry((far - now) / STEP, stop and (stop - now) / STEP or nil, s.speed, L.catchUp(s, G.peers, now) ~= nil)
+		end
+	end
 	P.room, P.left = stop and (stop - now) or nil, left
+	-- the window says how far this game is behind while the host has it as stalled (the HUD's "catching up")
+	if X.selfStalled() then
+		local behind = L.catchUp(s, G.peers, now)
+		pcall(Hud.setBehind, G.hud, behind and behind / (6 * math.max(1, s.speed or 1)) or 0)
+	end
 	local trim = L.paceSmooth(P, target, clock)
 	if X.LS and G.ls then X.LS.pace(G.ls, trim, clock) end
 	X.paceSend(P, clock, now)
@@ -2821,7 +3216,7 @@ function X.paceSend(P, clock, now)
 		N.lastWrite = C.clock()
 		if (sent == 1) ~= (P.trim == 1) then
 			traceGui("pace", string.format("%s at t=%s: factor %.2f (target %.2f, room_steps=%s, room_lasts_ms=%s, stop_moves_in_ms=%s, batch_ms=%.0f, jitter_ms=%.0f, x%s)",
-				P.trim == 1 and "back to 1" or "slowing", C.integerText(now), P.trim, P.target or 1, P.room and string.format("%.1f", P.room / STEP) or "-",
+				P.trim == 1 and "back to 1" or (P.trim > 1 and "slowing" or "hurrying"), C.integerText(now), P.trim, P.target or 1, P.room and string.format("%.1f", P.room / STEP) or "-",
 				P.left and string.format("%.0f", P.left) or "-", (function() local w = L.paceNext(P, clock); return w and string.format("%.0f", w) or "-" end)(), L.paceBatch(P), L.paceJitter(P), tostring(G.session.speed)))
 		end
 		P.sent, P.sentAt = P.trim, clock
@@ -2984,13 +3379,28 @@ local function refusalWhy(data)
 	return " (" .. table.concat(parts, "; "):sub(1, 400) .. ")"
 end
 
+-- The first argument of a build's callback, `data : WorldBuildProposalCommandData` (tf3-docs api/cmd: sendCommand's callback
+-- (data, success, resultEntities); cmd.d.tl:510-524 its fields), for a build this game's script sent and every game applied at the
+-- stamp: the proposal and context the script passed, its flags, and the result entities of this game's apply. The game's own windows
+-- read `cmdData.resultEntities` and `cmdData.proposal.proposal` (bridge_and_tunnel.tl:195-203, updateRefundableEntities: how a build
+-- enters the interface's refundable list that the bulldozer copies into its Context). Before 2026-10-19 the callback got nil.
+-- `proposal` is the script's object: a native Proposal as the game's windows pass (createBridgeOrTunnelProposal) is exactly the
+-- engine's; a SimpleProposal stays one (the engine's converted Proposal lives only where the command ran: unproven gap).
+function X.buildCmdData(args, list)
+	if type(args) ~= "table" then return nil end
+	return { proposal = args[1], context = args[2], ignoreErrors = args[3] == true, doDust = args[5], resultEntities = list }
+end
+
 local function deliverResult(key, data, success, entities)
 	local cb = G.pending[key]
+	local args = G.pendingArgs and G.pendingArgs[key]
+	if G.pendingArgs then G.pendingArgs[key] = nil end
 	if cb then
 		G.pending[key] = nil
 		-- the callback's third argument is {{Engine.Entity, Engine.Revision}} (C.resultEntities): a result from the simulation half
 		-- names the entity only, and gets this game's revision of it back here
 		local okR, list = pcall(C.resultEntities, entities)
+		if data == nil and args then data = X.buildCmdData(args, okR and list or {}) end
 		local ok, err = pcall(cb, data, success, okR and list or entities)
 		if not ok then logGui("callback of " .. key .. " failed: " .. tostring(err)) end
 	end
@@ -3022,7 +3432,8 @@ end
 -- out of the comparison (core ChecksumOutcome.not_ready; a verify round is asked again). A part that both games hashed is compared as
 -- always, and a part one world simply lacks (a town only it has) is still a difference.
 X.NOT_READY = "notready"
-local function reportRound(n, t, parts, account)
+-- `cost` (a spread round's, L.checksumCost): what the round cost this game, for the host to size the chunks of the next rounds
+local function reportRound(n, t, parts, account, cost)
 	G.reportsSent[n] = true
 	-- a spread round is complete: the marks of the chunks it did not need go (one entry each: another round's mark at the same step stays)
 	local cm = G.csMarks and G.csMarks[n]
@@ -3043,7 +3454,8 @@ local function reportRound(n, t, parts, account)
 		logGui("checksum round " .. C.integerText(n) .. ": not ready here: " .. table.concat(notReady, ", ") .. " (reported as not ready, not compared in this round)")
 		parts = measured
 	end
-	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil, notReady = (#notReady > 0) and notReady or nil })
+	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil, notReady = (#notReady > 0) and notReady or nil,
+		cost = type(cost) == "table" and cost or nil })
 	local waiting = G.authPending[n]
 	if waiting then
 		G.authPending[n] = nil
@@ -3129,9 +3541,20 @@ local function guiApplyNow(it, now)
 	end
 	if it.lateSteps and it.lateSteps > 0 then logGui("LATE action " .. it.key .. " for t=" .. it.at .. " applied at " .. now) end
 	local ctx = guiCtx(it)
+	-- build.result of a build applied during the pause (X.bresWrite): the game stands still, so it is measured right at the engine's answer
+	local function bres(how, changes, announced)
+		pcall(function()
+			local e = X.bresEntry(it, ctx, now, how)
+			if e then
+				if how.b0 ~= nil then e.b0 = how.b0 end
+				X.bresWrite(traceGui, logGui, e, now, changes, announced)
+			end
+		end)
+	end
 	local args, err = L.decodeCommand(it.body, ctx)
 	if not args then
 		err = L.refusalDetail(err, it.body)
+		bres({ verdict = "refused", class = X.refusalClass(err, "decode"), detail = err })
 		logGui("action " .. it.key .. " refused: " .. tostring(err))
 		send("action_refused", { seq = it.seq, from = it.from, detail = err })
 		deliverResult(it.key, nil, false, {})
@@ -3143,6 +3566,7 @@ local function guiApplyNow(it, now)
 	-- companies: the registry and ledger part runs here on the mirror and is replayed on the simulation state (coToSim)
 	local okC, fx = coBefore(ctx, it, spec, args, category, logGui)
 	if not okC then
+		bres({ verdict = "refused", class = "company", detail = fx })
 		logGui("action " .. it.key .. " refused: " .. tostring(fx))
 		send("action_refused", { seq = it.seq, from = it.from, detail = fx })
 		deliverResult(it.key, nil, false, {})
@@ -3165,8 +3589,16 @@ local function guiApplyNow(it, now)
 	-- this game's verdict of the build (docs/PROTOCOL.md "Action verdicts"); `injects`: the inject orders written for it
 	local verdict = { key = it.key, of = it.key, from = it.from, seq = it.seq }
 	local injects = {}
+	local isBuildAction = it.body.fn == "makeWorldBuildProposalCmd"
+	local bresBefore, bresB0 = nil, nil
+	if isBuildAction then
+		pcall(function() bresBefore, bresB0 = X.bresSnapshot(), X.refundMoney(ctx) end)
+	end
 	local function finish(data, success, entities)
 		if it.body.fn == "makeWorldBuildProposalCmd" then
+			local okD, changes = pcall(function() return bresBefore and X.bresDiff(bresBefore, X.bresSnapshot()) or nil end)
+			bres({ verdict = success and "sent" or "refused", class = "engine", detail = (not success) and ("the engine refused it" .. refusalWhy(data)) or nil, b0 = bresB0 },
+				okD and changes or nil, "callback")
 			verdict.injects = (#injects > 0) and injects or nil
 			if success then pcall(X.verdictOf, verdict) else pcall(X.sendVerdict, verdict, false, "the engine refused it" .. refusalWhy(data), "engine") end
 		end
@@ -3243,6 +3675,7 @@ local function guiApplyNow(it, now)
 	end
 	if not okS then
 		X.engineHas[it.key] = nil
+		if isBuildAction then bres({ verdict = "refused", class = X.refusalClass(errS, "engine"), detail = tostring(errS), b0 = bresB0 }) end
 		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
 		-- refused at its (pause) stamp from this world: this game's verdict, no resync of its own (X.refusalClass)
 		X.sendVerdict(verdict, false, tostring(errS), X.refusalClass(errS, "engine"))
@@ -3351,12 +3784,31 @@ function X.isPauseStamp(at)
 	return p ~= nil and at == p
 end
 
--- After this game shipped `it`: a pause action waits for the host's pause order; anything else goes the usual way.
+-- This game is stalled in the host's eyes (core host/stall.rs: its clocks did not come for the stall timeout, the others ran on and the
+-- host keeps a promise for it that this game's own stamps may lie before): every action it ships goes the way of the pause order, stamped
+-- by the host past every promise and applied by every game at that stamp, this one too (X.routeOwn, X.pauseArrived). Until the host says
+-- it has caught up.
+function X.selfStalled()
+	return L.isStalled(G.session, C.PLAYER_ID)
+end
+
+-- An action stamped `at` is stamped by the host: made during the pause, or by this game while it is stalled.
+function X.hostStamps(at)
+	if X.isPauseStamp(at) then return true end
+	return X.selfStalled() and not pausedNow()
+end
+
+-- After this game shipped `it`: a pause action (or one of a stalled game, X.hostStamps) waits for the host's stamp; anything else goes
+-- the usual way.
 function X.routeOwn(it)
 	if not it.pause then return route(it) end
 	G.pauseOwn = G.pauseOwn or {}
 	G.pauseOwn[it.key] = it
-	logGui("action " .. it.key .. " made during the pause (t=" .. tostring(it.at) .. "): applied when the host's pause order brings it back")
+	if X.isPauseStamp(it.at) then
+		logGui("action " .. it.key .. " made during the pause (t=" .. tostring(it.at) .. "): applied when the host's pause order brings it back")
+	else
+		logGui("stall: action " .. it.key .. " made while this game catches up (its own stamp " .. tostring(it.at) .. "): applied at the stamp the host gives it")
+	end
 end
 
 -- Where this game really stands during a pause (ClockMessage.stop: the host stamps the actions of the pause one step past the furthest):
@@ -3615,6 +4067,16 @@ function stampAfterFastest(now, extraSteps, marginSteps)
 		at = at + math.max(extraSteps, math.floor(L.leadOf(G.session) / STEP / 2)) * STEP
 	end
 	if marginSteps then at = at + marginSteps * STEP end
+	if X.selfStalled() and not (G.session.pauseAt and base >= G.session.pauseAt) then
+		-- stalled (host/stall.rs): the host keeps a promise for this game that follows the others' promises, and refuses on every game an
+		-- action stamped before it. Most actions are stamped by the host (X.hostStamps); one that cannot be (a build held until its stamp)
+		-- lies past the furthest promise known here plus a lead, the time that promise may have moved on meanwhile
+		local far = nil
+		for _, pc in pairs(G.peers) do
+			if type(pc) == "table" and type(pc.safe) == "number" and not pc.pause and (far == nil or pc.safe > far) then far = pc.safe end
+		end
+		if far then at = math.max(at, L.roundUpStep(far + L.leadOf(G.session))) end
+	end
 	-- the input barrier: never before what this game promised its peers (L.clampStamp); at a pause, the pause stop is promised first
 	X.promisePause(now)
 	at = L.clampStamp(G.session, now, at, G.promiseFloor)
@@ -3806,7 +4268,7 @@ function shipNative(o)
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
 	-- a script's command made during the pause is applied in the host's pause order (X.routeOwn); a native build is applied here already
-	local pause = (o.script and X.isPauseStamp(at)) or nil
+	local pause = (o.script and X.hostStamps(at)) or nil
 	send("action", { stamp = at, seq = G.seq, body = o.body, category = category, pause = pause })
 	G.nativeShipped = (G.nativeShipped or 0) + 1
 	if o.script then
@@ -3879,7 +4341,7 @@ function shipUiCommand(ps)
 		made[i] = { p = p, body = body }
 	end
 	local at = stampAfterFastest(now)
-	local pause = X.isPauseStamp(at) or nil
+	local pause = X.hostStamps(at) or nil
 	local wall = X.wallNow()
 	local first = L.itemKey(C.PLAYER_ID, seq0 + 1)
 	-- every text first: nothing of the order is sent before all of it is ready
@@ -3921,10 +4383,17 @@ function shipLocal(tag, cb)
 	if #note > 0 then body.diverged = note end
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
-	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.isPauseStamp(at) or nil }
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.hostStamps(at) or nil }
 	-- the category rides along so the host can mark an action its sender had no grant for (docs/PROTOCOL.md, Permissions)
 	send("action", { stamp = at, seq = G.seq, body = C.serialize(body), category = L.categoryOf(tag.name, tag.args), pause = it.pause })
-	if cb then G.pending[it.key] = cb end
+	if cb then
+		G.pending[it.key] = cb
+		-- a build's callback gets its command data (deliverResult): the script's own proposal and context
+		if tag.name == "makeWorldBuildProposalCmd" then
+			G.pendingArgs = G.pendingArgs or {}
+			G.pendingArgs[it.key] = tag.args
+		end
+	end
 	logGui("action " .. it.key .. " " .. tag.name .. " stamped " .. at .. " (now " .. now .. ")")
 	X.routeOwn(it)
 	return true
@@ -4656,7 +5125,7 @@ local function natDecideUnsafe(h, cap)
 	h.ship = ship   -- natDecide's fault handler reads it: from here on a fault never releases the command
 	-- made during the pause (defer and cancel flows: applied by every game at once): every game applies it in the host's pause order,
 	-- this one too when it comes back numbered (X.routeOwn). A held build of a paused game is parked by the others and its COMMIT is.
-	it.pause = (flow ~= "held" and X.isPauseStamp(at)) or nil
+	it.pause = (flow ~= "held" and X.hostStamps(at)) or nil
 	local okS, errS = C.writerSend(G.writer, "action", X.stampHop({ stamp = at, seq = seq, body = text, category = category, pause = it.pause }))
 	if not okS then
 		h.ship = nil   -- nothing went out: no game has the build, and given back it would be on this game alone
@@ -5126,6 +5595,30 @@ function natCapture(id, name, param)
 	natPair()
 end
 
+-- The refusal hint: what guiHandleEvent returns for a tool preview (builder.proposalCreate) that FeverLink3 will refuse to carry, so the
+-- player reads why in the tool itself, red like the game's own "cannot build here", before the click instead of a cancel after it.
+-- UNDOCUMENTED API (owner rule 2026-10-19: allowed with caution for hints and messages only). tf3-docs (guides/scripting.html,
+-- reference/api/api/gui.html) gives guiHandleEvent the return type `any` and says only that a GUI script event "can return a value (like
+-- an error string to prevent the operation)"; the wiki's Game Scripts / User Interface pages are "Coming Soon"; neither names builder
+-- events or `errorMessages`. Evidence for the shape `{ errorMessages = { [text] = true } }`: the TPF3-MP build probe (MIT, read only,
+-- docs/research/TPF3MP_REVIEW_20261019.md 2.8) notes the base game's company script refuses a proposal this way from proposalCreate.
+-- It only reads what natCapture already decided for this very preview (no engine read, no work per frame beyond the tool's own preview
+-- events), and it is given only where natDecideUnsafe refuses the held command anyway (a capture that failed for a reason other than
+-- "has no model", of a tool some held site pairs with): the outcome is the same, nothing is built and nothing is sent to any game, so
+-- the hint has no gameplay or sync effect. Empty previews ("nothing to build") get none. Any fault drops the hint (pcall at the caller).
+function X.refusalHint(id)
+	local N = G.nat
+	if not N or N.dead or not N.holdSent then return nil end
+	local cap = N.preview
+	if not cap or cap.body or cap.tool ~= tostring(id) then return nil end
+	local why = tostring(cap.why)
+	if why:find("has no model", 1, true) or why:find("nothing to build", 1, true) or why:find("carries no", 1, true) then return nil end
+	local paired = false
+	for _, info in pairs(SITES) do if info.tools[cap.tool] then paired = true break end end
+	if not paired then return nil end
+	return { errorMessages = { ["FeverLink3 cannot carry this build to the other players: " .. why:sub(1, 120)] = true } }
+end
+
 -- ---- events of the module
 
 -- The module refused an inject order (`inject_refused {key, held, outcome, reason}`). The build is applied exactly as the originator's text
@@ -5204,6 +5697,29 @@ function X.injectAnswered(key, refusal)
 	end
 end
 
+-- The native module failed LOUD (native/src/failsafe.rs, 2026-10-19): a hook could not do its part and this game may now differ from
+-- the others. `repair`: one thing went wrong (a tool's command reached the engine at the click, ...): the player is told and the host
+-- is asked for the repair. `stop`: a determinism piece is missing for the rest of this game run (a patch not in place), so every repair
+-- would fork again: the player is told to leave and restart the game. A stop fault is the module's state (a reloaded script finds it
+-- in the history and says it again); an old repair fault is past. At most one repair request per 10 s.
+function X.natFaultEvent(p, history)
+	local place, detail, action = tostring(p.where or "?"), tostring(p.detail or ""), tostring(p.action or "repair")
+	if history and action ~= "stop" then return end
+	logGui(string.format("native module FAULT [%s] (%s): %s", place, action, detail))
+	if action == "stop" then
+		pcall(vetoChat, "natstop:" .. place, tostring(C.PLAYER_NAME) .. "'s game cannot stay identical to the others (" .. place
+			.. " is missing): leave the session and restart the game.")
+	else
+		pcall(vetoChat, "natfault:" .. place .. ":" .. math.floor(C.clock() / 60), tostring(C.PLAYER_NAME) .. "'s game hit an internal fault ("
+			.. place .. "); the games will be synchronised.")
+	end
+	local now = C.clock()
+	if not history and (X.natFaultAt == nil or now - X.natFaultAt >= 10) then
+		X.natFaultAt = now
+		pcall(send, "replay_failed", { detail = "native module fault [" .. place .. "] (" .. action .. "): " .. detail:sub(1, 160) })
+	end
+end
+
 local function natEvent(N, rec, p, history)
 	local kind = rec.kind
 	local now = C.clock()
@@ -5273,6 +5789,8 @@ local function natEvent(N, rec, p, history)
 				end
 			end
 		end
+	elseif kind == "fault" then
+		X.natFaultEvent(p, history)
 	elseif history then
 		return   -- held / released / dropped / audit of an earlier run of this script: not news
 	elseif kind == "held" then
@@ -5697,6 +6215,7 @@ end
 local H = {}
 
 H.session = function(rec, p)
+	G.session.self = C.PLAYER_ID   -- this game's id, for L.catchUp
 	Hud.setSession(G.hud, p)
 	local loaded, asked = G.session.loadedAt, type(p) == "table" and tonumber(p.pauseAt) or nil
 	if loaded and asked and asked < loaded and G.session.pauseAt ~= loaded then
@@ -5704,7 +6223,22 @@ H.session = function(rec, p)
 			.. " (the pause of the world before the resync load): the pause is " .. C.integerText(loaded))
 	end
 	if L.applySession(G.session, p) then
-		logGui("session: started=" .. tostring(G.session.started) .. " speed=" .. G.session.speed .. " pauseAt=" .. tostring(G.session.pauseAt) .. " lead=" .. tostring(G.session.lead))
+		logGui("session: started=" .. tostring(G.session.started) .. " speed=" .. G.session.speed .. " pauseAt=" .. tostring(G.session.pauseAt) .. " lead=" .. tostring(G.session.lead)
+			.. ((G.session.stalledKey or "") ~= "" and (" stalled=" .. G.session.stalledKey) or ""))
+	end
+	-- the stall timeout (host/stall.rs): this game was stalled and catches up, or it has caught up
+	local mine = X.selfStalled()
+	if mine ~= (G.wasStalled == true) then
+		G.wasStalled = mine
+		local now = engine.gameTime()
+		local far = L.furthestPeer(G.peers)
+		if mine then
+			logGui("stall: the host has this game as stalled (its clocks did not come for the stall timeout; the others ran on): catching up from t="
+				.. C.integerText(now) .. (far and (", " .. string.format("%.0f", (far - now) / STEP) .. " step(s) behind the furthest peer") or "") .. "; every action is stamped by the host until it has caught up")
+		else
+			logGui("stall: caught up at t=" .. C.integerText(now) .. ": actions are stamped by this game again")
+			pcall(Hud.setBehind, G.hud, nil)
+		end
 	end
 end
 
@@ -5762,7 +6296,12 @@ H.resync_save = function(rec, p)
 		pcall(toSim, "dumpdetail", { why = "resync " .. tostring(p.name) })
 		engine.saveGame(p.name, function(ok, err)
 			logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
-			send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil })
+			-- the mods this world uses, read from the save just made: the host compares them with every player's before
+			-- any of the save is sent (docs/PROTOCOL.md, "Mod list"); nil when they cannot be read (the host then warns)
+			local mods, why = nil, nil
+			if ok then mods, why = Hud.worldMods(app, p.name) end
+			if why then logGui("resync: MOD WARNING: the world's mods could not be read: " .. tostring(why)) end
+			send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil, mods = mods })
 		end)
 	end
 	-- no held build may stay held across the save (a held command is in no world, a queued replay is in the save): settle them first
@@ -5896,7 +6435,10 @@ H.build_veto = function(rec, p)
 	local why = tostring(p.why or "?")
 	local by = tonumber(p.from) or tonumber(rec.from)
 	local who = tostring(p.name or by)
-	if by == C.PLAYER_ID then return end
+	-- the host's own refusal (host/stall.rs: an action of a stalled game stamped before the promise the host kept for it) holds for every
+	-- game, the sender's and the host's own included
+	local byHost = p.host == true and tonumber(rec.from) == 0
+	if by == C.PLAYER_ID and not byHost then return end
 	if G.slot and G.slot.key == key then
 		-- the originator gave up the slot (no record of its build): nothing of it is applied here, the waiting numbers follow
 		X.slotClose("its originator has no record of the build (" .. why .. "): nothing of it is applied here", nil, nil)
@@ -5907,6 +6449,20 @@ H.build_veto = function(rec, p)
 	toSim("drop", { key = key, why = who .. ": " .. why })
 	logGui("VETO of " .. key .. " by " .. who .. ": " .. why)
 	G.graces[key], G.parked[key] = nil, nil
+	if byHost and p.owner == C.PLAYER_ID then
+		-- this game's own action: nothing of it may stay here (queued: dropped above; held: cancelled; a window waits: it fails)
+		local pending = G.pauseOwn and G.pauseOwn[key]
+		if G.pauseOwn then G.pauseOwn[key] = nil end
+		local cancelled = natVeto(key, who, why)
+		if pending and pending.deferId then X.sendHeldOrder("fail", { id = pending.deferId }, key) end
+		deliverResult(key, nil, false, {})
+		logGui("stall: action " .. key .. " of this game was refused by the host on every game (" .. why .. ")")
+		pcall(Hud.addChat, G.hud, "FeverLink3", "[FeverLink3] An action made while this game stood still could not be carried and was undone on every game: please do it again.", -1)
+		if cancelled == false then
+			send("replay_failed", { detail = "action " .. key .. " was applied here before the host refused it (stalled game): " .. why:sub(1, 100) })
+		end
+		return
+	end
 	if p.owner == C.PLAYER_ID then
 		local cancelled = natVeto(key, who, why)
 		local me, cause = tostring(C.PLAYER_NAME), vetoWords(why, who)
@@ -6089,7 +6645,7 @@ function collectFromSim(state)
 	for _, r in ipairs(st.reports or {}) do
 		if not G.reportsSent[r.n] then
 			traceGui("checksum.collect", "round " .. C.integerText(r.n) .. " read from the game-script state (account " .. tostring(r.account and r.account.balance) .. ")")
-			reportRound(r.n, r.time, r.parts, r.account)
+			reportRound(r.n, r.time, r.parts, r.account, r.cost)
 		end
 	end
 	if (st.late or 0) > G.lateSeen then
@@ -6375,6 +6931,7 @@ function X.sessionOff(why, state)
 			G.pending[key] = cb   -- applied from this state during a pause: the engine runs it and its answer reaches the callback
 		else
 			n.pending = n.pending + 1
+			if G.pendingArgs then G.pendingArgs[key] = nil end
 			local okC, errC = pcall(cb, nil, false, {})
 			if not okC then logGui("session over: the callback of " .. tostring(key) .. " failed: " .. tostring(errC)) end
 		end
@@ -6682,6 +7239,11 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	if name == "builder.proposalCreate" and G.nat then
 		local ok, err = pcall(natCapture, id, name, param)
 		if not ok then natFault("capture", err) end
+		-- the refusal hint for this preview (X.refusalHint, undocumented return): a fault only drops it
+		if ok and not ownPreview then
+			local okH, hint = pcall(X.refusalHint, id)
+			if okH and hint then return hint end
+		end
 	end
 end
 

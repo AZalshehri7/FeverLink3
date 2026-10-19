@@ -20,7 +20,8 @@
 //!
 //! Only the `Proposal` (the first 0x358 bytes of the payload) is replaced; the Context the mod gave the command stays (the mod ships and
 //! sets the originator's Context flags itself), except its `refundableEntities`: an order with refund entries (the mod resolved them to
-//! this game's own entities) has them inserted into the command's own container by the engine's insert after the swap (`refund.rs`).
+//! this game's own entities) has them inserted into the command's own container by the engine's insert after the swap (`refund.rs`),
+//! and the Context's refund window (`context.refundWindow`, not in the Lua Context) is written from the text.
 //! The move variants of the engine's functions are never used on a held command.
 
 use std::sync::atomic::{AtomicBool, Ordering};

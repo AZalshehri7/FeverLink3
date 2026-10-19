@@ -708,6 +708,10 @@ fn expected_bytes(b: &BuildAddrs) -> Vec<(Rva, &'static [u8])> {
     for s in [&b.script_pool, &b.tick_count_getter].into_iter().flatten() {
         v.push((s.rva, s.expected));
     }
+    for c in [&b.free_order].into_iter().flatten() {
+        v.push((c.rva, c.expected));
+        v.push((c.callee.rva, c.callee.prologue));
+    }
     v
 }
 
@@ -742,6 +746,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 step_seed: r.gen(),
                 native_patch: r.gen(),
                 smooth_pace: r.gen(),
+                free_order: r.gen(),
             };
             let p = plan(build, cfg, &image);
             with_steps += usize::from(!p.steps.is_empty());
@@ -765,8 +770,9 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
             assert!(!p.has(Feature::PoolPatch) || cfg.poolpatch);
             assert!(!p.has(Feature::Hold) || (p.engine.is_some() && p.kind_offset.is_some()));
             assert!(cfg.any() || p.steps.is_empty());
-            assert!(p.steps.len() <= 5);
+            assert!(p.steps.len() <= 6);
             assert!(!p.has(Feature::StepSeed) || cfg.step_seed);
+            assert!(!p.has(Feature::FreeOrder) || cfg.free_order);
             assert!(!p.has(Feature::TownSeed) || cfg.town_seed);
             for line in p.report() {
                 assert!(line.starts_with("hooks: "), "{line}");
@@ -786,12 +792,12 @@ fn the_switches_read_any_text_a_lone_zero_turns_a_default_off_and_a_lone_one_an_
         // any text is a verdict (a number or an error) for the forced seed, never a panic
         let _ = feverlink3_native::plan::parse_seed(&value);
         let on = value.trim() == "1";
-        // hooks, hold, the pool patch, the seed pin and the step seed are on unless the text is a lone zero
+        // hooks, hold, the pool patch, the seed pin, the step seed and the free order are on unless the text is a lone zero
         let default_on = value.trim() != "0";
         assert_eq!(cfg.town_seed, on, "{value:?}");
         assert_eq!(
-            (cfg.hooks, cfg.hold, cfg.poolpatch, cfg.luaseed, cfg.step_seed),
-            (default_on, default_on, default_on, default_on, default_on),
+            (cfg.hooks, cfg.hold, cfg.poolpatch, cfg.luaseed, cfg.step_seed, cfg.free_order),
+            (default_on, default_on, default_on, default_on, default_on, default_on),
             "{value:?}"
         );
         assert_eq!(cfg.any(), on || default_on);

@@ -11,10 +11,9 @@ mock's stand-in for the engine Proposal built from the text); a refused one is E
 Run:  python -I -m unittest discover -s tests/lua -p "test_inject_fail_closed.py"
 """
 import os
-import shutil
+import re
 import struct
 import sys
-import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -280,149 +279,188 @@ class InjectGame(S.StrictGame):
         self.reload()
 
 
-class InjectFailClosedTest(S.StrictTest):
+class InjectTest(S.StrictTest):
+    """The harness: two games with the fake module of the deferred inject flow (`game`: the class of both games)."""
+
     strict_cancel = None   # the default (removals): with the inject and defer capabilities every build goes the deferred inject flow
     extra_env = {"FEVERLINK3_STRICT_FIRE_DONE": "0", "FEVERLINK3_DEBUG_REFUSE_INJECT": None, "FEVERLINK3_NATIVE_INJECT": None}
+    game = InjectGame
 
-    def setUp(self):
-        self._saved_env = {k: os.environ.get(k) for k in self.extra_env}
-        for k, v in self.extra_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-        self._old_cancel = os.environ.get("FEVERLINK3_STRICT_CANCEL")
-        os.environ.pop("FEVERLINK3_STRICT_CANCEL", None)
-        self.tmp = tempfile.mkdtemp(prefix="feverlink3-inject-")
-        self.clock = S.Clock()
-        self.A = InjectGame("host", 0, self.tmp, 50000, self.clock)
-        self.B = InjectGame("client", 1, self.tmp, 51000, self.clock)
+    def make_games(self):
+        self.A = self.game("host", 0, self.tmp, 50000, self.clock)
+        self.B = self.game("client", 1, self.tmp, 51000, self.clock)
         self.relay = T.Relay([self.A, self.B])
 
-    def tearDown(self):
-        super().tearDown()
-        shutil.rmtree(self.tmp, ignore_errors=True)
+    def texts(self, native, inputs=None, games=None):
+        """What the module writes for every held command of `games` (both by default): its native text and its input-level text."""
+        for g in games or (self.A, self.B):
+            g.native.native_text = native
+            g.native.input_text = native if inputs is None else inputs
 
-    def build_on_b(self):
+    def build_on_b(self, native=None):
         """B's road tool builds; both games run to well past the stamp."""
         self.start()
         self.strict_on(self.A, self.B)
-        for g in (self.A, self.B):
-            g.native.native_text = road_text()
-            g.native.input_text = road_text()
+        self.texts(native or road_text(), road_text())
         self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
         self.tick(30)
 
     def replay_failed_by(self, gid):
         return [d for g, d in self.relay.replay_failed if g == gid]
 
-    def test_the_happy_path_injects_on_both_games_and_completes_the_originators_held_command(self):
-        self.build_on_b()
-        self.assertIn("defer", self.B.native.ctl_kinds(), "the originator keeps its command until its own stamp apply")
+    def assertInjectedOnBoth(self):
         self.assertEqual((len(self.A.native.injected), len(self.B.native.injected)), (1, 1), self.log())
         self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")], "the tool's callback took the stamp apply's result")
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
         self.assertSameWorld()
         self.assertEqual(self.relay.replay_failed, [])
-        # each game's verdict, sent once the module said `injected`: both applied, the action is closed
-        for g in (self.A, self.B):
-            self.assertEqual(sum(1 for l in g.lines(g.from_game) if l.split(T.TAB)[0] == "action_applied"), 1, g.label)
-        self.assertEqual((self.relay.verdicts, self.relay.verdict_resyncs), ({}, []))
 
-    def test_a_receiver_that_cannot_inject_applies_nothing_asks_for_a_resync_and_the_originators_tool_is_freed(self):
-        self.A.native.refuse_all = "the proof refused the text"
-        self.build_on_b()
-        # the receiver: the order was refused, the command emptied; nothing of the build (and no rebuild of the record) is applied there
-        # the order's own key, made by its writer (the bridge's X.nextInjectKey): the one the receiver's inject_next named
-        key = [int(p["key"]) for _, k, p in self.A.native.ctl_records() if k == "inject_next"][0]
-        self.assertEqual(self.A.native.refused, [key])
-        self.assertEqual(self.A.native.emptied, 1)
-        self.assertEqual(self.A.builds_applied(), 0, "no build on the refusing game: neither the text nor a guess of it")
-        self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
-        self.assertNotIn("the record path builds it", self.A.log())
-        # the refusal is the receiver's verdict; the originator applied the build: the verdicts differ, the host asks for the repair
-        self.assertEqual(self.relay.replay_failed, [], "no game asks for a resync by itself")
-        self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
-        self.assertTrue(any("inject order %d refused here (nothing)" % key in d for g, _, d in self.relay.refused if g == 0), self.relay.refused)
-        self.assertIn("this is this game's verdict", self.A.log())
-        # the originator built it and its held command completed with that apply: the tool is free
-        self.assertEqual(self.B.builds_applied(), 1)
-        self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
-        self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0, "nothing is held any more on the originator")
-        self.assertEqual(self.replay_failed_by(1), [], "the originator's world has the build: it asks for nothing")
-
-    def test_the_originators_own_refused_copy_applies_nothing_there_and_fails_its_held_command(self):
-        os.environ["FEVERLINK3_DEBUG_REFUSE_INJECT"] = "1"   # read when the bridge loads: reload B's halves
-        self.B.reload()
-        self.build_on_b()
-        orders = [p for _, k, p in self.B.native.ctl_records() if k == "inject_next"]
-        self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0].get("refuse"), "FEVERLINK3_DEBUG_REFUSE_INJECT=1")
-        self.assertEqual(self.B.builds_applied(), 0, "the originator applies nothing of a copy it could not make")
-        self.assertEqual(self.B.native.completed, [(1, False, "fail")], "its held command failed: the tool callback fired, the tool is free")
-        self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
-        self.assertEqual(self.relay.replay_failed, [])
-        self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the originator refused what the other game applied")
-        # the other game injected it
-        self.assertEqual(self.A.builds_applied(), 1)
-
-    def test_an_originator_whose_own_self_check_fails_builds_nothing_and_nothing_is_shipped(self):
-        """Bug 8 (friend test 2026-10-16, host street 0:2): the originator's own rebuild of its record failed (the reference check of its
-        native text) but the held command was released: applied on the host, refused the same way on the friend's game, a fork. Fail
-        closed: the held command is failed (the tool is free), no action is shipped, neither game builds, the player is told."""
-        self.start()
-        self.strict_on(self.A, self.B)
-        node = UNBUILDABLE_NODE
-        for g in (self.A, self.B):
-            g.native.native_text = road_text_naming(node, (100.0, 0.0, 0.0))
-            g.native.input_text = road_text()
-        before = self.B.sig()
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        self.tick(30)
-        log = self.B.log()
-        self.assertIn("REFUSED: it cannot be rebuilt here (inject_refused: proposal.addedSegments[0].node0 names node %d" % node, log)
-        self.assertNotIn("release written", log)
-        self.assertNotIn("native build captured", log, "the engine never applied it here, so the simulation half shipped nothing")
-        self.assertEqual(self.B.action_records(), [], "nothing was shipped")
-        self.assertEqual(self.B.native.completed, [(1, False, "fail")], "its held command failed: the tool callback fired, the tool is free")
-        self.assertNotIn("release", self.B.native.ctl_kinds())
+    def assertBuiltNowhereAndToldOnce(self):
+        """B's held command failed before shipping: the tool is free, nothing was shipped, no game builds it, nobody needs a repair."""
+        self.assertIn("fail", self.B.native.ctl_kinds(), "the originator's held command is failed")
+        self.assertNotIn("release", self.B.native.ctl_kinds(), "never released: the build would be on the originator only")
+        self.assertEqual(self.B.native.completed, [(1, False, "fail")], "the tool's callback fired with a failed result: the tool is free")
         self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0, "nothing is held any more")
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "neither game built it")
-        self.assertEqual(self.B.sig(), before)
+        self.assertEqual(self.A.action_records() + self.B.action_records(), [], "nothing was shipped")
+        self.assertEqual(self.A.native.used + self.B.native.used, [], "no inject order anywhere")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "no game builds it")
+        self.assertEqual((self.relay.replay_failed, self.relay.verdict_resyncs), ([], []), "the worlds are equal: no repair")
         self.assertSameWorld()
-        self.assertEqual(self.relay.replay_failed, [], "no game has the build: nothing to repair")
-        self.assertEqual(len(self.relay.chats), 1, "the player is told")
-        self.assertIn("build was cancelled: it cannot be rebuilt the same way on every game", self.relay.chats[0][1])
-        # and the next build, whose check passes, goes the normal way
-        for g in (self.A, self.B):
-            g.native.native_text = g.native.input_text = road_text(500.0, 600.0)
+
+    def next_build_goes_the_normal_way(self):
+        self.texts(road_text(500.0, 600.0))
         self.B.tool(self.road(500, 0, 600, 0), make="NATIVE_ROAD")
         self.tick(30)
         self.assertEqual(self.B.native.completed[-1], (2, True, "stamp_apply"))
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertEqual((self.relay.replay_failed, self.relay.verdict_resyncs), ([], []))
         self.assertSameWorld()
-        self.assertEqual(self.relay.replay_failed, [])
 
-    def test_a_segment_ending_away_from_its_existing_node_passes_the_self_check_and_is_built_on_both_games(self):
-        """Friend test 2026-10-16, host street 0:2: the text named existing node 89384 with the segment's end, which lay 11.16 m from that
-        node (the engine lets a segment end away from its node); the check took the segment's end for the node's place and refused the
-        build on the host's own self-check and on the friend's game, both worlds having the node where the host's print said. The place is
-        now compared world against world (the originator's print), so the build goes the normal way."""
-        self.start()
-        self.strict_on(self.A, self.B)
-        node = int(self.B.lua("FIND_NODE(100, 0, 0)"))
-        for g in (self.A, self.B):
-            g.native.native_text = road_text_naming(node, (111.16, 0.0, 0.0))
-            g.native.input_text = road_text()
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        self.tick(30)
-        log = self.B.log()
-        self.assertNotIn("inject_refused", log + self.A.log())
-        self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")], self.B.log())
-        self.assertEqual((len(self.A.native.injected), len(self.B.native.injected)), (1, 1))
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
-        self.assertSameWorld()
-        self.assertEqual(self.relay.replay_failed, [])
+
+class InjectFailClosedTest(InjectTest):
+    def test_a_build_whose_exact_copy_passes_is_injected_on_both_games_and_completes_the_originators_held_command(self):
+        def happy_path():
+            self.build_on_b()
+            self.assertIn("defer", self.B.native.ctl_kinds(), "the originator keeps its command until its own stamp apply")
+            self.assertInjectedOnBoth()
+            # each game's verdict, sent once the module said `injected`: both applied, the action is closed
+            for g in (self.A, self.B):
+                self.assertEqual(sum(1 for l in g.lines(g.from_game) if l.split(T.TAB)[0] == "action_applied"), 1, g.label)
+            self.assertEqual((self.relay.verdicts, self.relay.verdict_resyncs), ({}, []))
+
+        def segment_away_from_its_node():
+            # friend test 2026-10-16, host street 0:2: the text named existing node 89384 with the segment's end, which lay 11.16 m from that
+            # node (the engine lets a segment end away from its node); the check took the segment's end for the node's place and refused the
+            # build on the host's own self-check and on the friend's game. The place is now compared world against world.
+            self.build_on_b(road_text_naming(int(self.B.lua("FIND_NODE(100, 0, 0)")), (111.16, 0.0, 0.0)))
+            self.assertNotIn("inject_refused", self.log())
+            self.assertInjectedOnBoth()
+
+        self.cases([("the happy path", {}, happy_path), ("a segment ending away from its existing node", {}, segment_away_from_its_node)])
+
+    def test_a_copy_one_game_cannot_apply_is_applied_nowhere_there_and_the_differing_verdicts_ask_for_the_repair(self):
+        def receiver_refuses():
+            self.A.native.refuse_all = "the proof refused the text"
+            self.build_on_b()
+            # the receiver: the order (its own key, made by the bridge's X.nextInjectKey) was refused, the command emptied; nothing of the
+            # build (and no rebuild of the record) is applied there
+            key = [int(p["key"]) for _, k, p in self.A.native.ctl_records() if k == "inject_next"][0]
+            self.assertEqual((self.A.native.refused, self.A.native.emptied), ([key], 1))
+            self.assertEqual(self.A.builds_applied(), 0, "no build on the refusing game: neither the text nor a guess of it")
+            self.assertIsNone(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
+            self.assertNotIn("the record path builds it", self.A.log())
+            self.assertEqual(self.relay.replay_failed, [], "no game asks for a resync by itself")
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
+            self.assertTrue(any("inject order %d refused here (nothing)" % key in d for g, _, d in self.relay.refused if g == 0), self.relay.refused)
+            self.assertIn("this is this game's verdict", self.A.log())
+            # the originator built it and its held command completed with that apply: the tool is free
+            self.assertEqual(self.B.builds_applied(), 1)
+            self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
+            self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0, "nothing is held any more on the originator")
+
+        def originator_refuses():
+            os.environ["FEVERLINK3_DEBUG_REFUSE_INJECT"] = "1"   # read when the bridge loads: reload B's halves
+            self.B.reload()
+            self.build_on_b()
+            orders = [p for _, k, p in self.B.native.ctl_records() if k == "inject_next"]
+            self.assertEqual([o.get("refuse") for o in orders], ["FEVERLINK3_DEBUG_REFUSE_INJECT=1"])
+            self.assertEqual(self.B.builds_applied(), 0, "the originator applies nothing of a copy it could not make")
+            self.assertEqual(self.B.native.completed, [(1, False, "fail")], "its held command failed: the tool callback fired, the tool is free")
+            self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
+            self.assertEqual(self.relay.replay_failed, [])
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the originator refused what the other game applied")
+            self.assertEqual(self.A.builds_applied(), 1, "the other game injected it")
+
+        def receiver_placeholder():
+            # the factory refuses the receiver's placeholder: before, the record path's other forms built a guess of the road there
+            self.start()
+            self.strict_on(self.A, self.B)
+            self.texts(road_text())
+            self.A.run("FACTORY_REJECT = function() return 'Unknown exception' end")
+            self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+            self.tick(30)
+            self.assertEqual(self.A.builds_applied(), 0)
+            self.assertEqual(self.A.native.injected + self.A.native.refused, [], "no order was written: nothing was sent")
+            self.assertIn("inject_refused: the placeholder command cannot be made here", self.A.log())
+            self.assertTrue(any("inject_refused: the placeholder" in d for g, _, d in self.relay.refused if g == 0), self.relay.refused)
+            self.assertEqual(self.relay.replay_failed, [])
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the receiver refused what the originator applied")
+            self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
+
+        self.cases([("a receiver that cannot inject", {}, receiver_refuses), ("the originator's own copy refused", {}, originator_refuses),
+                    ("a receiver whose placeholder cannot be made", {}, receiver_placeholder)])
+
+    def test_a_build_every_game_would_refuse_is_refused_by_its_originator_before_shipping(self):
+        def own_self_check_fails():
+            # bug 8 (friend test 2026-10-16, host street 0:2): the originator's own rebuild of its record failed (the reference check of its
+            # native text) but the held command was released: applied on the host, refused the same way on the friend's game, a fork
+            self.start()
+            self.strict_on(self.A, self.B)
+            self.texts(road_text_naming(UNBUILDABLE_NODE, (100.0, 0.0, 0.0)), road_text())
+            before = self.B.sig()
+            self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+            self.tick(30)
+            log = self.B.log()
+            self.assertIn("REFUSED: it cannot be rebuilt here (inject_refused: proposal.addedSegments[0].node0 names node %d" % UNBUILDABLE_NODE, log)
+            self.assertNotIn("release written", log)
+            self.assertNotIn("native build captured", log, "the engine never applied it here, so the simulation half shipped nothing")
+            self.assertEqual(self.B.sig(), before)
+            self.assertBuiltNowhereAndToldOnce()
+            self.assertEqual(len(self.relay.chats), 1, "the player is told")
+            self.assertIn("build was cancelled: it cannot be rebuilt the same way on every game", self.relay.chats[0][1])
+            self.next_build_goes_the_normal_way()
+
+        def module_refuses_its_text():
+            # open bug 7: the originator decides. Its module refused its own text before shipping (every game would refuse it at the stamp:
+            # owner airport run 2026-10-15, friend test 2026-10-16)
+            self.start()
+            self.strict_on(self.A, self.B)
+            self.texts(road_text())
+            self.B.native.refuse_text = "2 heap pointers in the text cannot be resolved: @B24+0x10, @B36+0x10"
+            self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+            self.tick(30)
+            self.assertIn("REFUSED BEFORE SHIPPING", self.B.log())
+            self.assertBuiltNowhereAndToldOnce()
+
+        def engine_proof_refuses():
+            # owner decision 2026-10-18 (#6): the text-only checks pass, but the engine's rebuild of the text (the receivers' proof) would
+            # refuse it on every game. The originator runs that same engine proof on its own held command before shipping. A refusal on a
+            # receiver only stays the resync's (the test above).
+            self.start()
+            self.strict_on(self.A, self.B)
+            self.texts(road_text() + "proposal.engineRefuses\tu8:01\n", road_text())
+            for g in (self.A, self.B):
+                g.native.engine_refuses = ("proposal.engineRefuses", "proposal.addedNodes.#: n:2 against n:1")
+            self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+            self.tick(30)
+            self.assertIn("REFUSED BEFORE SHIPPING, every game would refuse its exact copy: the engine proof on this game's own held command fails", self.B.log())
+            self.assertBuiltNowhereAndToldOnce()
+            self.assertEqual(len(self.relay.chats), 1, "the player is told")
+            self.assertIn("cannot be copied exactly to the other games", self.relay.chats[0][1])
+            self.next_build_goes_the_normal_way()
+
+        self.cases([("its own self-check fails", {}, own_self_check_fails), ("its module refuses its text", {}, module_refuses_its_text),
+                    ("its engine proof refuses", {}, engine_proof_refuses)])
 
     def build_naming_a_node_a_world_event_removes(self, games):
         """B's road starts at the savegame's node at (100, 0, 0), which every game has under the same id; the originator's self-check
@@ -432,9 +470,7 @@ class InjectFailClosedTest(S.StrictTest):
         self.start()
         self.strict_on(self.A, self.B)
         node = int(self.B.lua("FIND_NODE(100, 0, 0)"))
-        for g in (self.A, self.B):
-            g.native.native_text = road_text_naming(node, (100.0, 0.0, 0.0))
-            g.native.input_text = road_text()
+        self.texts(road_text_naming(node, (100.0, 0.0, 0.0)), road_text())
         self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
         for _ in range(4):
             if self.B.action_records():
@@ -445,38 +481,41 @@ class InjectFailClosedTest(S.StrictTest):
         for g in games:
             self.assertLess(int(g.lua("GAME.time")), stamp, "%s: the world event comes before the stamp" % g.label)
             g.run("REMOVE_NODE(%d)" % node)
-        self.assertNotIn("refused", self.A.log() + self.B.log(), "the node went before the stamp %d" % stamp)
+        self.assertNotIn("refused", self.log(), "the node went before the stamp %d" % stamp)
         self.tick(30)
         return node
 
-    def test_a_build_whose_entity_a_world_event_removed_before_its_stamp_is_refused_alike_on_every_game_without_a_resync(self):
-        node = self.build_naming_a_node_a_world_event_removes((self.A, self.B))
-        gone = "names node %d, which does not exist here" % node
-        for g in (self.A, self.B):
-            self.assertIn("refused at its stamp (inject_refused)", g.log(), g.label)
-            self.assertIn(gone, g.log(), g.label)
-            self.assertEqual(g.builds_applied(), 0, "%s: nothing of it is applied" % g.label)
-            self.assertNotIn("asking the host for a resync", g.log(), g.label)
-            self.assertNotIn("this world differs from the originator's", g.log(), g.label)
-        self.assertEqual(self.relay.replay_failed, [], "identical worlds refused alike: no game asks for a resync")
-        self.assertEqual(self.relay.verdict_resyncs, [], "the verdicts agree: the host asks for nothing")
-        self.assertEqual(sorted(g for g, _, _ in self.relay.refused), [0, 1], "each game's verdict went to the host")
-        self.assertEqual(self.relay.verdicts, {}, "every game answered: the action is closed")
-        self.assertSameWorld()
-        # the originator's tool is freed with a failed result, and its player is told why
-        self.assertEqual(self.B.native.completed, [(1, False, "fail")])
-        self.assertIn("FAILED without a stamp apply (fail)", self.B.log())
-        self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
-        self.assertIn("told the player: Your build 1:1 was not applied: the world changed before its turn: proposal.addedSegments[0].node0 " + gone, self.B.log())
-        self.assertNotIn("told the player", self.A.log(), "only the originator's player is told")
+    def test_a_build_whose_entity_a_world_event_removed_before_its_stamp(self):
+        def on_every_game():
+            node = self.build_naming_a_node_a_world_event_removes((self.A, self.B))
+            gone = "names node %d, which does not exist here" % node
+            for g in (self.A, self.B):
+                self.assertIn("refused at its stamp (inject_refused)", g.log(), g.label)
+                self.assertIn(gone, g.log(), g.label)
+                self.assertEqual(g.builds_applied(), 0, "%s: nothing of it is applied" % g.label)
+                self.assertNotIn("asking the host for a resync", g.log(), g.label)
+                self.assertNotIn("this world differs from the originator's", g.log(), g.label)
+            self.assertEqual(self.relay.replay_failed, [], "identical worlds refused alike: no game asks for a resync")
+            self.assertEqual(self.relay.verdict_resyncs, [], "the verdicts agree: the host asks for nothing")
+            self.assertEqual(sorted(g for g, _, _ in self.relay.refused), [0, 1], "each game's verdict went to the host")
+            self.assertEqual(self.relay.verdicts, {}, "every game answered: the action is closed")
+            self.assertSameWorld()
+            # the originator's tool is freed with a failed result, and its player is told why
+            self.assertEqual(self.B.native.completed, [(1, False, "fail")])
+            self.assertIn("FAILED without a stamp apply (fail)", self.B.log())
+            self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
+            self.assertIn("told the player: Your build 1:1 was not applied: the world changed before its turn: proposal.addedSegments[0].node0 " + gone, self.B.log())
+            self.assertNotIn("told the player", self.A.log(), "only the originator's player is told")
 
-    def test_a_build_refused_on_one_game_and_applied_on_the_other_asks_for_a_resync(self):
-        node = self.build_naming_a_node_a_world_event_removes((self.A,))
-        self.assertIn("names node %d, which does not exist here" % node, self.A.log())
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 1))
-        self.assertEqual(self.relay.replay_failed, [], "neither game asks by itself")
-        self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the worlds forked: the host asks for the repair")
-        self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
+        def on_one_game():
+            node = self.build_naming_a_node_a_world_event_removes((self.A,))
+            self.assertIn("names node %d, which does not exist here" % node, self.A.log())
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 1))
+            self.assertEqual(self.relay.replay_failed, [], "neither game asks by itself")
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the worlds forked: the host asks for the repair")
+            self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
+
+        self.cases([("on every game: refused alike, no resync", {}, on_every_game), ("on one game: a resync", {}, on_one_game)])
 
     def test_a_released_build_whose_self_check_fails_is_not_shipped_and_its_originator_asks_for_the_repair(self):
         """A held command with no tool capture is released (no check could be made before the engine applied it); the simulation half's
@@ -484,9 +523,7 @@ class InjectFailClosedTest(S.StrictTest):
         (every other game would refuse it the same way): the originator asks for the repair at once and the player is told."""
         self.start()
         self.strict_on(self.A, self.B)
-        for g in (self.A, self.B):
-            g.native.native_text = road_text_naming(UNBUILDABLE_NODE, (100.0, 0.0, 0.0))
-            g.native.input_text = road_text()
+        self.texts(road_text_naming(UNBUILDABLE_NODE, (100.0, 0.0, 0.0)), road_text())
         self.B.tool(self.road(300, 0, 400, 0), event=False, make="NATIVE_ROAD")   # no preview: released, the old path
         self.tick(30)
         log = self.B.log()
@@ -499,169 +536,118 @@ class InjectFailClosedTest(S.StrictTest):
         self.assertIn("applied on its originator only", self.replay_failed_by(1)[0])
         self.assertTrue(any("could not be sent to the other games" in c[1] for c in self.relay.chats), self.relay.chats)
 
-    def test_a_text_the_originator_refuses_is_shipped_to_nobody_and_built_nowhere(self):
-        """Open bug 7: the originator decides. Its module refused its own text before shipping (every game would refuse it at the stamp:
-        owner airport run 2026-10-15, friend test 2026-10-16): the held command is failed (the tool is free), nothing is shipped, no game
-        builds it, and nobody needs a resync."""
-        self.start()
-        self.strict_on(self.A, self.B)
-        for g in (self.A, self.B):
-            g.native.native_text = road_text()
-            g.native.input_text = road_text()
-        self.B.native.refuse_text = "2 heap pointers in the text cannot be resolved: @B24+0x10, @B36+0x10"
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        self.tick(30)
-        self.assertIn("REFUSED BEFORE SHIPPING", self.B.log())
-        self.assertIn("fail", self.B.native.ctl_kinds(), "the originator's held command is failed")
-        self.assertNotIn("release", self.B.native.ctl_kinds(), "never released: the build would be on the originator only")
-        self.assertEqual(self.B.native.completed, [(1, False, "fail")], "the tool's callback fired with a failed result")
-        self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "no game builds it")
-        self.assertEqual(self.A.action_records() + self.B.action_records(), [], "nothing was shipped")
-        self.assertEqual(self.A.native.used + self.B.native.used, [], "no inject order anywhere")
-        self.assertEqual(self.relay.replay_failed, [], "the worlds are equal: no repair")
-        self.assertSameWorld()
-
-    def test_a_text_every_receivers_engine_rebuild_would_refuse_is_refused_by_the_originators_own_proof_before_shipping(self):
-        """Owner decision 2026-10-18 (#6): the text-only checks pass, but the engine's rebuild of the text (the receivers' proof) would
-        refuse it on every game. The originator runs that same engine proof on its own held command before shipping: refused there, the
-        held command is failed (the tool is free), the player is told, nothing is shipped, no game builds it, and no resync is needed.
-        Without the marker the same build goes the normal way; a refusal on a receiver only stays the resync's (test above)."""
-        self.start()
-        self.strict_on(self.A, self.B)
-        marked = road_text() + "proposal.engineRefuses\tu8:01\n"
-        for g in (self.A, self.B):
-            g.native.native_text = marked
-            g.native.input_text = road_text()
-            g.native.engine_refuses = ("proposal.engineRefuses", "proposal.addedNodes.#: n:2 against n:1")
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        self.tick(30)
-        log = self.B.log()
-        self.assertIn("REFUSED BEFORE SHIPPING, every game would refuse its exact copy: the engine proof on this game's own held command fails", log)
-        self.assertIn("fail", self.B.native.ctl_kinds(), "the originator's held command is failed")
-        self.assertNotIn("release", self.B.native.ctl_kinds(), "never released: the build would be on the originator only")
-        self.assertEqual(self.B.native.completed, [(1, False, "fail")], "the tool's callback fired with a failed result")
-        self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
-        self.assertEqual(self.A.action_records() + self.B.action_records(), [], "nothing was shipped")
-        self.assertEqual(self.A.native.used + self.B.native.used, [], "no inject order anywhere")
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "no game builds it")
-        self.assertEqual(len(self.relay.chats), 1, "the player is told")
-        self.assertIn("cannot be copied exactly to the other games", self.relay.chats[0][1])
-        self.assertEqual((self.relay.replay_failed, self.relay.verdict_resyncs), ([], []), "the worlds are equal: no repair")
-        self.assertSameWorld()
-        # the next build, whose engine proof passes, is shipped and injected on both games
-        for g in (self.A, self.B):
-            g.native.native_text = g.native.input_text = road_text(500.0, 600.0)
-        self.B.tool(self.road(500, 0, 600, 0), make="NATIVE_ROAD")
-        self.tick(30)
-        self.assertEqual(self.B.native.completed[-1], (2, True, "stamp_apply"))
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
-        self.assertEqual((self.relay.replay_failed, self.relay.verdict_resyncs), ([], []))
-        self.assertSameWorld()
-
-    def test_a_receiver_whose_placeholder_cannot_be_made_refuses_at_the_decode_and_asks_for_a_resync(self):
-        # the factory refuses the receiver's placeholder: before, the record path's other forms built a guess of the road there
-        self.start()
-        self.strict_on(self.A, self.B)
-        for g in (self.A, self.B):
-            g.native.native_text = road_text()
-            g.native.input_text = road_text()
-        self.A.run("FACTORY_REJECT = function() return 'Unknown exception' end")
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        self.tick(30)
-        self.assertEqual(self.A.builds_applied(), 0)
-        self.assertEqual(self.A.native.injected + self.A.native.refused, [], "no order was written: nothing was sent")
-        self.assertIn("inject_refused: the placeholder command cannot be made here", self.A.log())
-        self.assertTrue(any("inject_refused: the placeholder" in d for g, _, d in self.relay.refused if g == 0), self.relay.refused)
-        self.assertEqual(self.relay.replay_failed, [])
-        self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], "the receiver refused what the originator applied")
-        self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
-
-    def test_two_players_builds_stamped_in_the_same_step_are_both_applied_and_each_tool_takes_its_own_builds_result(self):
+    def test_two_players_builds_stamped_in_the_same_step_each_take_their_own_order_and_result(self):
         """Open bug 7: two builds due in one step write two orders on every game. Each command takes its own order (by its place), the
-        originator's held command takes the result of its own build's apply (not the other player's), and both tools are free."""
-        self.two_players_in_one_step(late=False)
+        originator's held command takes the result of its own build's apply (not the other player's), and both tools are free. Also with
+        the engine applying the step's build commands only after the script's step: both orders of the step wait in the module at once
+        (one slot kept only the newest before)."""
+        for late in (False, True):
+            with self.subTest(late=late):
+                if late:
+                    self.fresh()
+                self.start()
+                self.strict_on(self.A, self.B)
+                self.texts(road_text(600.0, 700.0), games=(self.A,))
+                self.texts(road_text(300.0, 400.0), games=(self.B,))
+                if late:
+                    for g in (self.A, self.B):
+                        g.run("LATE_APPLIES = {}")
+                # both players confirm their road in the same frame
+                self.A.tool(self.road(600, 0, 700, 0), make="NATIVE_ROAD")
+                self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+                for _ in range(30):
+                    self.tick(1)
+                    for g in (self.A, self.B):
+                        g.run("FLUSH_LATE()")
+                stamps = [r["stamp"] for g in (self.A, self.B) for r in g.action_records()]
+                self.assertEqual(len(stamps), 2)
+                self.assertEqual(stamps[0], stamps[1], "both builds are due in the same step")
+                for g in (self.A, self.B):
+                    orders = [p for _, k, p in g.native.ctl_records() if k == "inject_next"]
+                    self.assertEqual(len(orders), 2, "%s: one order per build" % g.label)
+                    self.assertEqual(len(g.native.injected), 2, "%s: both builds injected\n%s" % (g.label, self.log()))
+                    self.assertEqual(g.native.orders, [], "%s: no order left waiting" % g.label)
+                    self.assertEqual(g.builds_applied(), 2)
+                    self.assertIsNotNone(g.lua("FIND_EDGE(300, 0, 400, 0)"))
+                    self.assertIsNotNone(g.lua("FIND_EDGE(600, 0, 700, 0)"))
+                    self.assertEqual(int(g.lua("NATIVE_HELD_COUNT()")), 0, "%s: nothing is held any more: the tool is free" % g.label)
+                    if late:
+                        self.assertEqual(g.native.most_waiting, 2, "%s: both orders waited together" % g.label)
+                # the same order of builds on both games (the stamp order: the host's action, then the client's)
+                first_x = [[min(u[3]) for u in g.native.used] for g in (self.A, self.B)]
+                self.assertEqual(first_x, [[600.0, 300.0], [600.0, 300.0]])
+                # each originator's held command took its own build's apply: A's held 1 by the command at x 600, B's held 1 by the one at x 300
+                self.assertEqual((self.A.native.completed, self.B.native.completed), ([(1, True, "stamp_apply")], [(1, True, "stamp_apply")]))
+                self.assertEqual([(u[2], min(u[3])) for u in self.A.native.used if u[2]], [(1, 600.0)])
+                self.assertEqual([(u[2], min(u[3])) for u in self.B.native.used if u[2]], [(1, 300.0)])
+                self.assertSameWorld()
+                self.assertEqual(self.relay.replay_failed, [])
 
-    def test_with_both_orders_waiting_before_either_command_each_command_still_takes_its_own(self):
-        """The same with the engine applying the step's build commands only after the script's step: both orders of the step wait in
-        the module at once (one slot kept only the newest before), and each command is matched to its own by its place."""
-        self.two_players_in_one_step(late=True)
-        for g in (self.A, self.B):
-            self.assertEqual(g.native.most_waiting, 2, "%s: both orders waited together" % g.label)
-
-    def test_two_simulation_states_that_take_turns_never_lose_an_order(self):
-        """Real run b3real (2026-10-15): the game ran the simulation half in two Lua states that took turns, sharing the script's
-        state; each kept its own control writer, so every other order carried a number the other state had already used and the
-        module dropped it as old ("1 control line(s) discarded"): the originator's command went by without its order, its held
-        command was failed 9 s after the stamp, the other game injected the build (a fork). Here B's simulation half alternates
-        between two states every step; one player builds four roads one after the other."""
-        self.start()
-        self.strict_on(self.A, self.B)
-        self.B.run("SIM_OTHER = LOAD_HALF('sim')")
-        # both states have heard the native module's capabilities (nativecaps, every 60 frames) before the first build: a state that has
-        # not replays the build instead of injecting it, which is no lost order. Which state reaches the first stamp depended on how many
-        # steps ahead it lay; since 2026-10-18 a build is stamped at the later of the promise and the margin, a step sooner here.
-        for _ in range(64):
-            self.tick(1)
-            self.B.run("SIM, SIM_OTHER = SIM_OTHER, SIM")
-        texts = []
-        for i in range(4):
-            x0 = 300.0 + 200.0 * i
-            text = road_text(x0, x0 + 100.0)
-            texts.append(text)
-            for g in (self.A, self.B):
-                g.native.native_text = g.native.input_text = text
-            self.B.tool(self.road(int(x0), 0, int(x0) + 100, 0), make="NATIVE_ROAD")
-            for _ in range(13):
+    def test_two_simulation_states_sharing_a_games_steps_never_lose_or_misroute_an_order(self):
+        def originator_alternates():
+            # real run b3real (2026-10-15): the game ran the simulation half in two Lua states that took turns, sharing the script's state;
+            # each kept its own control writer, so every other order carried a number the other state had already used and the module
+            # dropped it as old ("1 control line(s) discarded"): the originator's command went by without its order, its held command was
+            # failed 9 s after the stamp, the other game injected the build (a fork). Here B's simulation half alternates between two states
+            # every step; one player builds four roads one after the other.
+            self.start()
+            self.strict_on(self.A, self.B)
+            self.B.run("SIM_OTHER = LOAD_HALF('sim')")
+            # both states have heard the native module's capabilities (nativecaps, every 60 frames) before the first build: a state that has
+            # not replays the build instead of injecting it, which is no lost order
+            for _ in range(64):
                 self.tick(1)
-                self.B.run("SIM, SIM_OTHER = SIM_OTHER, SIM")   # the next step runs in the other state
-        held = [p for _, k, p in self.B.native.ctl_records() if k == "inject_next"]
-        self.assertEqual(len(held), 4, held)
-        self.assertEqual(self.B.native.completed, [(i, True, "stamp_apply") for i in range(1, 5)], self.log())
-        self.assertEqual(getattr(self.B.native, "discarded", 0), 0, "no control line was dropped as old")
-        self.assertEqual(len(self.B.native.injected), 4)
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (4, 4))
-        self.assertSameWorld()
-        self.assertEqual(self.relay.replay_failed, [])
+                self.B.run("SIM, SIM_OTHER = SIM_OTHER, SIM")
+            for i in range(4):
+                x0 = 300.0 + 200.0 * i
+                self.texts(road_text(x0, x0 + 100.0))
+                self.B.tool(self.road(int(x0), 0, int(x0) + 100, 0), make="NATIVE_ROAD")
+                for _ in range(13):
+                    self.tick(1)
+                    self.B.run("SIM, SIM_OTHER = SIM_OTHER, SIM")   # the next step runs in the other state
+            self.assertEqual(len([p for _, k, p in self.B.native.ctl_records() if k == "inject_next"]), 4)
+            self.assertEqual(self.B.native.completed, [(i, True, "stamp_apply") for i in range(1, 5)], self.log())
+            self.assertEqual(getattr(self.B.native, "discarded", 0), 0, "no control line was dropped as old")
+            self.assertEqual(len(self.B.native.injected), 4)
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (4, 4))
+            self.assertSameWorld()
+            self.assertEqual(self.relay.replay_failed, [])
 
-    def two_players_in_one_step(self, late):
-        self.start()
-        self.strict_on(self.A, self.B)
-        self.A.native.native_text = self.A.native.input_text = road_text(600.0, 700.0)
-        self.B.native.native_text = self.B.native.input_text = road_text(300.0, 400.0)
-        if late:
-            for g in (self.A, self.B):
-                g.run("LATE_APPLIES = {}")
-        # both players confirm their road in the same frame
-        self.A.tool(self.road(600, 0, 700, 0), make="NATIVE_ROAD")
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        for _ in range(30):
-            self.tick(1)
-            for g in (self.A, self.B):
-                g.run("FLUSH_LATE()")
-        stamps = [r["stamp"] for g in (self.A, self.B) for r in g.action_records()]
-        self.assertEqual(len(stamps), 2)
-        self.assertEqual(stamps[0], stamps[1], "both builds are due in the same step")
-        for g in (self.A, self.B):
-            orders = [p for _, k, p in g.native.ctl_records() if k == "inject_next"]
-            self.assertEqual(len(orders), 2, "%s: one order per build" % g.label)
-            self.assertEqual(len(g.native.injected), 2, "%s: both builds injected\n%s" % (g.label, self.log()))
-            self.assertEqual(g.native.orders, [], "%s: no order left waiting" % g.label)
-            self.assertEqual(g.builds_applied(), 2)
-            self.assertIsNotNone(g.lua("FIND_EDGE(300, 0, 400, 0)"))
-            self.assertIsNotNone(g.lua("FIND_EDGE(600, 0, 700, 0)"))
-            self.assertEqual(int(g.lua("NATIVE_HELD_COUNT()")), 0, "%s: nothing is held any more: the tool is free" % g.label)
-        # the same order of builds on both games (the stamp order: the host's action, then the client's)
-        first_x = [[min(u[3]) for u in g.native.used] for g in (self.A, self.B)]
-        self.assertEqual(first_x[0], first_x[1])
-        self.assertEqual(first_x[0], [600.0, 300.0])
-        # each originator's held command took its own build's apply: A's held 1 by the command at x 600, B's held 1 by the one at x 300
-        self.assertEqual(self.A.native.completed, [(1, True, "stamp_apply")])
-        self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])
-        self.assertEqual([(u[2], min(u[3])) for u in self.A.native.used if u[2]], [(1, 600.0)])
-        self.assertEqual([(u[2], min(u[3])) for u in self.B.native.used if u[2]], [(1, 300.0)])
-        self.assertSameWorld()
-        self.assertEqual(self.relay.replay_failed, [])
+        def receiver_shares():
+            # each event reaches one of the two states (the mock's SIM_FOR_EVENT). The native module's capabilities came in an event
+            # (nativecaps) and were kept in the module table of the state it reached: a stamp reached by the other state decoded the build by
+            # the record path instead of injecting the originator's exact copy (a fork). Now they live in the game-script state. The two
+            # states of one world load apart (friend test pre5, host: 22:01:00 and 22:01:28): the receiver's first state runs every step of
+            # the start, when the module reports its capabilities; the first build's stamp is the first step of the other state, then the
+            # two take turns every step and three more builds come one after the other.
+            self.A.split_sim("function(t) return ONLY_STATE or (math.floor(t / 200) % 2 + 1) end")
+            self.A.run("ONLY_STATE = 1")
+            self.start()
+            self.strict_on(self.A, self.B)
+            for i in range(4):
+                if i == 1:
+                    self.A.run("ONLY_STATE = nil")
+                x0 = 300.0 + 200.0 * i
+                self.texts(road_text(x0, x0 + 100.0))
+                self.B.tool(self.road(int(x0), 0, int(x0) + 100, 0), make="NATIVE_ROAD")
+                if i == 0:
+                    # the first state runs every step up to the stamp; the stamp is the first step the other state runs
+                    for _ in range(20):
+                        if self.B.action_records() and self.A.time() + T.STEP >= int(self.B.action_records()[0]["stamp"]):
+                            break
+                        self.tick(1)
+                    self.A.run("ONLY_STATE = 2")
+                self.tick(13)
+            self.tick(10)
+            runs = self.A.sim_runs()
+            self.assertGreater(min(runs[1], runs[2]), 20, runs)
+            self.assertEqual(len(self.A.native.injected), 4, "every replay on the receiver injected the originator's copy\n" + self.A.log())
+            self.assertNotIn("not injected", self.A.log())
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (4, 4))
+            self.assertSameWorld()
+            self.assertEqual((self.relay.replay_failed, self.relay.verdict_resyncs), ([], []))
+
+        self.cases([("the originator's states take turns", {}, originator_alternates), ("the receiver's states share its steps", {}, receiver_shares)])
 
     def test_a_bulldozings_inject_order_carries_each_games_own_resolved_refund_entries(self):
         # The bulldoze refund made natively (owner decision 2026-10-18, native/src/refund.rs): MPFever measured that a refundableEntities
@@ -669,13 +655,7 @@ class InjectFailClosedTest(S.StrictTest):
         # game resolved to its OWN entities (the session's ids differ between the games here), in native_refund_<key>.txt with the count
         # in the order, and the module inserts them into the injected command's own Context with the engine's insert. The account is read
         # before the send and again at the next step, on every game.
-        self.start()
-        self.strict_on(self.A, self.B)
-        for g in (self.A, self.B):
-            g.native.native_text = road_text()
-            g.native.input_text = road_text()
-        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
-        self.tick(30)
+        self.build_on_b()
         eb, ea = int(self.B.lua("FIND_EDGE(300, 0, 400, 0)")), int(self.A.lua("FIND_EDGE(300, 0, 400, 0)"))
         self.assertNotEqual(ea, eb)
         before = {g.label: len([1 for _, k, _ in g.native.ctl_records() if k == "inject_next"]) for g in (self.A, self.B)}
@@ -698,6 +678,45 @@ class InjectFailClosedTest(S.StrictTest):
         first = [p for _, k, p in self.A.native.ctl_records() if k == "inject_next"][0]
         self.assertNotIn("refund", first)
         self.assertFalse(os.path.exists(os.path.join(self.A.dir, "native_refund_%d.txt" % int(first["key"]))))
+
+    def test_every_build_kind_refused_or_applied_gets_one_build_result_line_on_every_game(self):
+        """CLAUDE.md: full build records. Only builds that key entities had a build.result line; a street, a bulldozing and a refused build
+        had none. Now each build applied at a stamp gets exactly one, on every game, measured at the next step from the game-script state,
+        so the receiver's two simulation states (taking turns: the apply in one, the line in the other) write it once. The mock's engine
+        charges a build and refunds a removal as the real one does (10000 per segment built, 5000 back per segment removed)."""
+        for g in (self.A, self.B):
+            g.run("local base = APPLY_BUILD; APPLY_BUILD = function(p) "
+                  "local n0 = 0; for _, w in pairs(WORLD) do if w.BASE_EDGE then n0 = n0 + 1 end end; "
+                  "local ok, res = base(p); "
+                  "local n1 = 0; for _, w in pairs(WORLD) do if w.BASE_EDGE then n1 = n1 + 1 end end; "
+                  "if ok then ACCOUNT.balance = ACCOUNT.balance - 10000 * math.max(n1 - n0, 0) + 5000 * math.max(n0 - n1, 0) end; "
+                  "return ok, res end")
+        self.A.split_sim("function(t) return math.floor(t / 200) % 2 + 1 end")
+        self.build_naming_a_node_a_world_event_removes((self.A, self.B))   # the refused build: 1:1
+        self.texts(road_text())
+        self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")         # the street: 1:2
+        self.tick(30)
+        edges = {g.label: int(g.lua("FIND_EDGE(300, 0, 400, 0)")) for g in (self.A, self.B)}
+        self.B.tool("{ edges = { %d } }" % edges["client"], make="NATIVE_BULLDOZE")      # the removal: 1:3
+        self.tick(30)
+        runs = self.A.sim_runs()
+        self.assertGreater(min(runs[1], runs[2]), 20, runs)
+        for g in (self.A, self.B):
+            lines = [l.split("build.result ", 1)[1] for l in g.log().splitlines() if "build.result " in l]
+            by_key = {}
+            for l in lines:
+                by_key.setdefault(l.split(" ", 1)[0], []).append(l)
+            self.assertEqual(sorted(by_key), ["1:1", "1:2", "1:3"], "%s: one key each\n%s" % (g.label, "\n".join(lines)))
+            for key, ls in by_key.items():
+                self.assertEqual(len(ls), 1, "%s %s: exactly one line\n%s" % (g.label, key, "\n".join(ls)))
+                applied, measured = (int(re.search(r"%s=(\d+)" % f, ls[0]).group(1)) for f in ("applied_t", "measured_t"))
+                self.assertEqual(measured - applied, 200, "%s %s: measured at the next step" % (g.label, key))
+            refused, street, removal = by_key["1:1"][0], by_key["1:2"][0], by_key["1:3"][0]
+            self.assertRegex(refused, r"verdict=refused\(inject_refused\) announced=n/a entities\[n/a\] money (\d+) -> \1 spent=0 .*detail=.*does not exist here", g.label)
+            self.assertRegex(street, r"role=%s kind=build .*verdict=applied announced=yes entities\[.*\+BASE_EDGE\[1:%d\]\S*\] .*spent=10000 "
+                             % ("originator" if g is self.B else "replay", edges[g.label]), g.label)
+            self.assertRegex(removal, r"kind=bulldoze .*verdict=applied announced=yes entities\[.*-BASE_EDGE\[1:%d\]\S*\] .*spent=-5000 .*refund=5000\(account\)"
+                             % edges[g.label], g.label)
 
 
 if __name__ == "__main__":

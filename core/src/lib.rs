@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod admission;
 pub mod crypto;
 pub mod lobby;
 pub mod protocol;

@@ -32,27 +32,23 @@ class SpeedTextTest(unittest.TestCase):
         out = fn(self.lua.eval(speed_lua) if speed_lua is not None else None, self.C)
         return [out[i] for i in range(1, len(out) + 1)]
 
-    def test_no_test_started_shows_nothing(self):
+    def test_the_speed_test_lines_size_mode_and_command(self):
         self.assertEqual([], self.lines(None))
         self.assertEqual([], self.lines("{}"))
-
-    def test_progress_shows_the_status_line(self):
+        # progress shows the status line
         self.assertEqual(
             ["Speed test, sending to your friend: 4.2 of 32 MB, 1.50 MB/s"],
             self.lines('{running=true, status="Speed test, sending to your friend: 4.2 of 32 MB, 1.50 MB/s", lines={}}'),
         )
-
-    def test_a_failure_shows_the_reason(self):
+        # a failure shows the reason
         self.assertEqual(
             ["Speed test failed: no data for 60 s"],
             self.lines('{running=false, status="Speed test failed: no data for 60 s", lines={}}'),
         )
-
-    def test_a_result_shows_all_its_lines_not_the_status(self):
+        # a result shows all its lines not the status
         speed = '{running=false, status="a", lines={"a","b","c","d"}}'
         self.assertEqual(["a", "b", "c", "d"], self.lines(speed))
-
-    def test_the_size_is_one_of_the_offered_choices(self):
+        # the size is one of the offered choices
         choice = self.C.speedChoice
         self.assertEqual([8, 32, 80], [self.C.SPEED_CHOICES[i] for i in (1, 2, 3)])
         self.assertEqual(80, choice(80))
@@ -60,14 +56,12 @@ class SpeedTextTest(unittest.TestCase):
         self.assertEqual(32, choice(32))
         for odd in (None, 0, 5, "huge", 1e9):
             self.assertEqual(32, choice(odd), odd)
-
-    def test_the_command_carries_the_id_and_the_size(self):
-        params = self.C.speedParams("76561199000000042", 80)
-        self.assertEqual("76561199000000042", params["id"])
+        # the command carries the id and the size
+        params = self.C.speedParams("76561190000000001", 80)
+        self.assertEqual("76561190000000001", params["id"])
         self.assertEqual(80, params["mb"])
         self.assertEqual(32, self.C.speedParams("1", 7)["mb"])
-
-    def test_the_mode_is_one_of_the_offered_words(self):
+        # the mode is one of the offered words
         mode = self.C.speedMode
         self.assertEqual(
             ["reliable", "dgram", "both", "parallel", "auto"], [self.C.SPEED_MODES[i] for i in (1, 2, 3, 4, 5)]
@@ -77,11 +71,15 @@ class SpeedTextTest(unittest.TestCase):
             self.assertEqual(word, mode(word))
         for odd in (None, "", "all", "DGRAM", 5):
             self.assertEqual("reliable", mode(odd), odd)
-        params = self.C.speedParams("76561199000000042", 8, "dgram")
-        self.assertEqual(("76561199000000042", 8, "dgram"), (params["id"], params["mb"], params["mode"]))
+        params = self.C.speedParams("76561190000000001", 8, "dgram")
+        self.assertEqual(("76561190000000001", 8, "dgram"), (params["id"], params["mb"], params["mode"]))
         self.assertEqual("reliable", self.C.speedParams("1", 8)["mode"])
 
-    def test_the_window_says_how_a_transfer_over_several_connections_is_going(self):
+    def test_the_window_script_compiles_and_says_how_a_transfer_goes_and_who_wants_to_join(self):
+        check = self.lua.eval("function(src) local f, err = load(src, 'ui', 't'); return f ~= nil, err end")
+        ok, err = check(read("feverlink3_ui.script.lua"))
+        self.assertTrue(ok, err)
+        # the window says how a transfer over several connections is going
         import re
 
         src = read("feverlink3_ui.script.lua")
@@ -113,11 +111,24 @@ class SpeedTextTest(unittest.TestCase):
             self.assertEqual(
                 "Syncing: Receiving the host's world: 50%", sync_text(self.lua.table_from(sync), False), odd
             )
+        # the window names join requests and counts what waits for an answer
+        import re
 
-    def test_the_window_script_still_compiles(self):
-        check = self.lua.eval("function(src) local f, err = load(src, 'ui', 't'); return f ~= nil, err end")
-        ok, err = check(read("feverlink3_ui.script.lua"))
-        self.assertTrue(ok, err)
+        src = read("feverlink3_ui.script.lua")
+        found = re.search(r"local function requestLabel\(r\).*?\nend\n.*?local function askCount\(ctl\).*?\nend\n", src, re.S)
+        self.assertIsNotNone(found, "requestLabel and askCount are in the window script")
+        fns = self.lua.eval("function(src) return load(src .. ' return requestLabel, askCount', 'inv', 't')() end")
+        label, count = fns(found.group(0))
+        t = self.lua.table_from
+        # Steam's name for the account first; the name its game sent only when it differs
+        self.assertEqual("Ben (Benny) wants to join", label(t({"id": "1", "name": "Benny", "steam": "Ben"})))
+        self.assertEqual("Ben wants to join", label(t({"id": "1", "name": "Ben", "steam": "Ben"})))
+        self.assertEqual("Benny wants to join", label(t({"id": "1", "name": "Benny"})))
+        self.assertEqual("A Steam friend wants to join", label(t({"id": "1", "name": ""})))
+        reqs = t({"requests": t({1: t({"id": "1"}), 2: t({"id": "2"})})})
+        self.assertEqual(3, count(t({"invites": reqs, "invite": t({"host": "Ann"})})))
+        self.assertEqual(0, count(t({"state": "idle"})))
+        self.assertEqual(0, count(None))
 
 
 if __name__ == "__main__":

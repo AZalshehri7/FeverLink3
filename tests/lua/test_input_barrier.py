@@ -185,23 +185,13 @@ class BarrierTest(unittest.TestCase):
         self.random_run(2, 1, 260, lead_choices=[1, 2, 3, 6], speeds=[1, 2, 3, 4])
 
     @T.full
-    def test_two_games_with_jitter_never_apply_late_at_more_seeds(self):
-        for seed in (2, 3):
-            with self.subTest(seed=seed):
-                self.random_run(2, seed, 260, lead_choices=[1, 2, 3, 6], speeds=[1, 2, 3, 4])
-
-    @T.full
-    def test_three_games_with_jitter_never_apply_late(self):
-        self.random_run(3, 11, 260, lead_choices=[1, 3, 5], speeds=[1, 3, 4])
-
-    @T.full
-    def test_pauses_and_resumes_with_jitter_never_apply_late(self):
-        for seed in (21, 22):
-            with self.subTest(seed=seed):
-                self.random_run(2, seed, 280, lead_choices=[1, 3], speeds=[1, 2, 4], pauses=True)
-
-    @T.full
-    def test_without_the_promises_the_same_network_applies_late(self):
+    def test_more_seeds_three_games_pauses_and_a_control_without_the_promises(self):
+        runs = [("two games", 2, s, 260, [1, 2, 3, 6], [1, 2, 3, 4], False) for s in (2, 3)]
+        runs += [("three games", 3, 11, 260, [1, 3, 5], [1, 3, 4], False)]
+        runs += [("pauses and resumes", 2, s, 280, [1, 3], [1, 2, 4], True) for s in (21, 22)]
+        for name, n, seed, ticks, leads, speeds, pauses in runs:
+            with self.subTest(name, seed=seed):
+                self.random_run(n, seed, ticks, lead_choices=leads, speeds=speeds, pauses=pauses)
         # The control: stamps by the rule before the barrier (the sender's clock plus the lead) and no promises, so only the pacing
         # holds the client (at most `ahead` steps past the slowest clock it knows). The same kind of network then makes the client
         # pass stamps before their items arrive. So the runs above do test the barrier.
@@ -252,7 +242,7 @@ class PureBarrierTest(unittest.TestCase):
         self.K.applySession(s, self.L.table_from(dict({"started": True, "speed": 1, "lead": 600}, **kw)))
         return s
 
-    def test_promise_floor_and_clamp(self):
+    def test_promise_floor_clamp_barrier_pace_and_the_pause_stop(self):
         K = self.K
         s = self.session(speed=1, lead=600)
         safe, floor, pause = K.promise(s, 1000, None)
@@ -269,9 +259,8 @@ class PureBarrierTest(unittest.TestCase):
         self.assertEqual((safe, floor2, pause), (1400, 2200, True))
         self.assertEqual(K.clampStamp(s, 1400, 1400, floor2), 1400, "at the pause the stamp is the pause time")
         self.assertEqual(K.clampStamp(s, 1200, 1400, floor2), 2200, "before reaching the pause it is held to the promise")
-
-    def test_barrier_pace_and_pause_stop(self):
-        K, L = self.K, self.L
+        # the barrier: the smallest promise of the peers less the receiver's margin, a batch ends on it, a pause stop exactly
+        L = self.L
         s = self.session(speed=4, lead=800)
         peers = L.table()
         self.assertIsNone(K.barrier(s, peers), "no peer: no barrier")
@@ -290,9 +279,7 @@ class PureBarrierTest(unittest.TestCase):
         self.assertEqual(K.barrier(s, peers), 2000, "a pause stop is reached exactly")
         self.assertEqual(K.pace(s, peers, 1800, 99), 1)
         self.assertEqual(K.pace(s, peers, 2000, 99), 0)
-
-    def test_an_item_stamped_at_the_pause_that_ended_applies_while_the_game_sits_there(self):
-        K, L = self.K, self.L
+        # an item stamped at the pause that ended applies while the game still sits there
         s = self.session(speed=2, pauseAt=4000)
         it = L.table_from({"at": 4000})
         self.assertTrue(K.applyNow(s, 4000, it))

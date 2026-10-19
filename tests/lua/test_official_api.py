@@ -25,7 +25,7 @@ def lua_files():
 
 
 class OnlyTheLinkModuleUsesIoAndOs(unittest.TestCase):
-    def test_no_mod_file_but_the_link_module_names_io_or_os(self):
+    def test_only_the_link_module_names_io_or_os_and_it_documents_why(self):
         found = []
         for name in lua_files():
             if name == LINK:
@@ -35,13 +35,11 @@ class OnlyTheLinkModuleUsesIoAndOs(unittest.TestCase):
                     if RAW.search(line):
                         found.append("%s:%d: %s" % (name, i, line.strip()))
         self.assertEqual([], found, "io/os outside feverlink3_link.lua (route it through C.env / C.clock / C.readFile ...)")
-
-    def test_the_link_module_documents_why_each_kind_of_use_stays(self):
+        # the link module documents why each kind of use stays
         with open(os.path.join(CONTENT, LINK), encoding="utf-8") as f:
             head = f.read().split("local Link = {}")[0]
         for word in ("os.getenv", "os.clock", "os.time", "os.date", "os.remove", "package.loaded", "app.saveUserdata"):
             self.assertIn(word, head, word)
-
 
 class Modules(unittest.TestCase):
     def setUp(self):
@@ -72,7 +70,32 @@ function ug_require(p)
 end''')
         return rt, rt.execute(T.COMMON_SRC)
 
-    def test_with_both_modules_the_mod_is_active_and_logs_to_its_folder(self):
+    def test_without_the_link_module_the_mod_is_inactive_without_the_log_module_it_logs_nowhere_with_both_it_logs(self):
+        _rt, C = self.bare(missing=("feverlink3_link",))
+        self.assertFalse(C.LINK_MODULE)
+        self.assertIsNone(C.IO)
+        self.assertFalse(C.ACTIVE)
+        self.assertIsNone(C.DIR)   # the session folder comes from the environment, which only the link module reads
+        self.assertIsNone(C.env("FEVERLINK3_SESSION_DIR"))
+        self.assertFalse(C.appendFile(os.path.join(self.tmp, "x.txt"), "x"))
+        self.assertIsNone(C.readFile(os.path.join(self.tmp, "x.txt")))
+        w = C.newWriter(os.path.join(self.tmp, "from_game.log"), 1)
+        self.assertEqual((False, "no file access"), tuple(C.writerSend(w, "k", {})))
+        self.assertEqual(0, len(list(C.readerPoll(C.newReader(os.path.join(self.tmp, "to_game.log"))).values())))
+        self.assertFalse(C.poll(True))
+        C.logger("t")("no file")   # never raises
+        self.assertFalse(C.dump("diag.txt", "a"))
+        self.assertEqual([], os.listdir(self.tmp))
+        # without the log module the mod still runs and logs nowhere
+        _rt, C = self.bare(missing=("feverlink3_log",))
+        self.assertTrue(C.LINK_MODULE)
+        self.assertFalse(C.LOG_MODULE)
+        self.assertTrue(C.ACTIVE)
+        C.logger("t")("no file")
+        C.tracer("sim")("tag", "text")
+        self.assertFalse(C.dump("diag.txt", "a"))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "mod.log")))
+        # with both modules the mod is active and logs to its folder
         _rt, C = self.bare()
         self.assertTrue(C.LINK_MODULE and C.LOG_MODULE)
         self.assertTrue(C.ACTIVE)
@@ -90,34 +113,7 @@ end''')
         self.assertEqual(C.env("FEVERLINK3_PLAYER_NAME"), "p")
         self.assertIsInstance(C.clock(), float)
 
-    def test_without_the_link_module_nothing_is_read_or_written_and_the_mod_stays_inactive(self):
-        _rt, C = self.bare(missing=("feverlink3_link",))
-        self.assertFalse(C.LINK_MODULE)
-        self.assertIsNone(C.IO)
-        self.assertFalse(C.ACTIVE)
-        self.assertIsNone(C.DIR)   # the session folder comes from the environment, which only the link module reads
-        self.assertIsNone(C.env("FEVERLINK3_SESSION_DIR"))
-        self.assertFalse(C.appendFile(os.path.join(self.tmp, "x.txt"), "x"))
-        self.assertIsNone(C.readFile(os.path.join(self.tmp, "x.txt")))
-        w = C.newWriter(os.path.join(self.tmp, "from_game.log"), 1)
-        self.assertEqual((False, "no file access"), tuple(C.writerSend(w, "k", {})))
-        self.assertEqual(0, len(list(C.readerPoll(C.newReader(os.path.join(self.tmp, "to_game.log"))).values())))
-        self.assertFalse(C.poll(True))
-        C.logger("t")("no file")   # never raises
-        self.assertFalse(C.dump("diag.txt", "a"))
-        self.assertEqual([], os.listdir(self.tmp))
-
-    def test_without_the_log_module_the_mod_still_runs_and_logs_nowhere(self):
-        _rt, C = self.bare(missing=("feverlink3_log",))
-        self.assertTrue(C.LINK_MODULE)
-        self.assertFalse(C.LOG_MODULE)
-        self.assertTrue(C.ACTIVE)
-        C.logger("t")("no file")
-        C.tracer("sim")("tag", "text")
-        self.assertFalse(C.dump("diag.txt", "a"))
-        self.assertFalse(os.path.exists(os.path.join(self.tmp, "mod.log")))
-
-    def test_the_capped_log_starts_a_new_generation_with_one_open_per_line_and_deletes_the_old(self):
+    def test_the_capped_log_the_official_api_probe_and_the_clock(self):
         rt, C = self.bare()
         base = os.path.join(self.tmp, "cap.log")
         for i in range(8):
@@ -128,8 +124,7 @@ end''')
         with open(os.path.join(self.tmp, "cap.4.log"), encoding="utf-8") as f:
             self.assertEqual("line 6 ab0123456789\nline 7 ab0123456789\n", f.read())
         self.assertEqual("full", C.appendCapped(base, "more\n" * 10, 40, None, 4))
-
-    def test_the_official_api_probe_never_raises_and_names_what_it_found(self):
+        # the official api probe never raises and names what it found
         rt, C = self.bare()
         text = C.officialProbe()
         for word in ("app=no", "saveUserdata=no", "getUserDataFolder=no", "io_global=table", "userdata=no"):
@@ -138,14 +133,12 @@ end''')
         self.assertIn("userdata=U", C.officialProbe())
         rt.execute("app = { getUserDataFolder = function() error('no') end }")
         self.assertIn("userdata=no", C.officialProbe())
-
-    def test_the_clock_is_read_when_used_so_a_swapped_os_clock_is_seen(self):
+        # the clock is read when used so a swapped os clock is seen
         rt, C = self.bare()
         rt.execute("os.clock = function() return 42 end")
         self.assertEqual(42, C.clock())
         rt.execute("os.clock = nil")
         self.assertRaises(Exception, C.clock)   # where the old direct call raised, this raises too
-
 
 if __name__ == "__main__":
     unittest.main()

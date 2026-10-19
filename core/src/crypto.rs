@@ -64,6 +64,12 @@ impl SessionKey {
         Self { key }
     }
 
+    /// The key itself, as a host hands it to a friend it admitted through a Steam invite (`docs/PROTOCOL.md`, "Steam
+    /// invites"): the friend never learns the secret or the password, only the key they make.
+    pub fn from_key_bytes(key: [u8; Self::KEY_SIZE]) -> Self {
+        Self { key }
+    }
+
     /// 32 key bytes. Treat as secret; never log.
     pub fn key(&self) -> &[u8; Self::KEY_SIZE] {
         &self.key

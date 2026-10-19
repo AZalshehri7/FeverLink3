@@ -173,46 +173,46 @@ class SessionEndTest(S.StrictTest):
         self.assertEqual(self.B.builds_applied(), 1)
         self.assertEqual(len(self.B.records("action")), actions_before)
 
-    def test_a_command_waiting_for_the_pause_order_fails_and_the_gone_hosts_pause_holds_nothing(self):
-        self.start(speed=2)
-        self.strict_on(self.A, self.B)
-        self.relay.pauseAt = self.relay.future_stamp()
-        self.relay.session()
-        self.tick(20)
-        self.assertEqual(self.B.time(), self.relay.pauseAt)
-        # a window command made during the pause waits for the host's pause order, which never comes: the host is gone
-        pump = self.relay.pump
-        self.relay.pump = lambda: None
-        self.B.window(BUY % "WIN_CB")
-        self.frames(4)
-        self.assertIn("applied when the host's pause order brings it back", self.B.log())
-        self.end_session(self.B)
-        self.relay.pump = pump
-        self.assertIn("1 stamped command(s) not applied (callbacks failed); dropped 1 peer(s), 1 pause-order item(s)", self.B.log())
-        self.assertTrue(self.B.lua("WIN_CB ~= nil and WIN_CB[1] == false"))
-        # the session's speed is back: the gone host's pause does not hold this game any more
-        self.tick(5)
-        self.assertEqual(self.B.speed(), 2)
-        self.assertGreater(self.B.time(), self.relay.pauseAt)
-        self.assertEqual(self.B.vehicles(), 0, "the paused action of the ended session is applied nowhere here")
+    def again(self):
+        """A fresh pair of games for the next variant of one test."""
+        self.tearDown()
+        self.setUp()
 
-    def test_a_paused_command_the_host_stamped_but_the_game_has_not_reached_fails_and_is_applied_nowhere_here(self):
-        # the pause order (pause-align): the host stamps a paused action one step past where the games stand still, and every game's
-        # simulation applies it there. The session ends after the stamp came back and before this game ran on to it.
-        self.start(speed=2)
-        self.relay.pauseAt = self.relay.future_stamp()
-        self.relay.session()
-        self.tick(20)
-        self.B.window(BUY % "WIN_CB")
-        self.frames(30)   # frames only: the stamp comes back, the simulation does not step
-        self.assertIn("pause order #1: 1:1 stamped", self.B.log())
-        self.assertTrue(self.B.lua("WIN_CB == nil"), "it waits for its stamp")
-        self.end_session(self.B)
-        self.assertIn("1 stamped command(s) not applied (callbacks failed)", self.B.log())
-        self.assertTrue(self.B.lua("WIN_CB ~= nil and WIN_CB[1] == false"))
-        self.tick(10)
-        self.assertEqual(self.B.vehicles(), 0, "the simulation's queue of the ended session is gone: nothing applied late")
-        self.assertGreater(self.B.time(), self.relay.pauseAt, "no run-to-stamp or pause holds this game any more")
+    def test_a_paused_command_of_the_ended_session_fails_and_its_pause_holds_nothing(self):
+        # (1) waiting for the host's pause order, which never comes: the host is gone. (2) the pause order (pause-align) stamped it one
+        # step past where the games stand still; the session ends after the stamp came back and before this game ran on to it.
+        for waits_for_order in (True, False):
+            with self.subTest(waits_for_order=waits_for_order):
+                if not waits_for_order:
+                    self.again()
+                self.start(speed=2)
+                if waits_for_order:
+                    self.strict_on(self.A, self.B)
+                self.relay.pauseAt = self.relay.future_stamp()
+                self.relay.session()
+                self.tick(20)
+                self.assertEqual(self.B.time(), self.relay.pauseAt)
+                pump = self.relay.pump
+                if waits_for_order:
+                    self.relay.pump = lambda: None
+                self.B.window(BUY % "WIN_CB")
+                if waits_for_order:
+                    self.frames(4)
+                    self.assertIn("applied when the host's pause order brings it back", self.B.log())
+                else:
+                    self.frames(30)   # frames only: the stamp comes back, the simulation does not step
+                    self.assertIn("pause order #1: 1:1 stamped", self.B.log())
+                    self.assertTrue(self.B.lua("WIN_CB == nil"), "it waits for its stamp")
+                self.end_session(self.B)
+                self.relay.pump = pump
+                self.assertIn("1 stamped command(s) not applied (callbacks failed)" +
+                              ("; dropped 1 peer(s), 1 pause-order item(s)" if waits_for_order else ""), self.B.log())
+                self.assertTrue(self.B.lua("WIN_CB ~= nil and WIN_CB[1] == false"))
+                # the session's speed is back: no run-to-stamp or pause of the gone host holds this game any more
+                self.tick(10)
+                self.assertEqual(self.B.speed(), 2)
+                self.assertGreater(self.B.time(), self.relay.pauseAt)
+                self.assertEqual(self.B.vehicles(), 0, "the paused action of the ended session is applied nowhere here")
 
     # ---- #16: the next session
 
@@ -252,40 +252,82 @@ class SessionEndTest(S.StrictTest):
         self.assertTrue(self.B.lua("GUI_CB3 ~= nil and GUI_CB3[1] == true"))
         self.assertEqual(self.relay.replay_failed, [])
 
-    def test_a_second_session_in_the_same_lua_state_does_not_replay_the_first_ones_lines(self):
-        self.second_session(reload=False)
-        self.check_nothing_replayed()
+    def test_the_next_session_never_replays_or_applies_an_ended_sessions_lines_or_saved_queue(self):
+        for reload in (False, True):
+            with self.subTest(reload=reload):
+                if reload:
+                    self.again()
+                self.second_session(reload=reload)
+                if reload:
+                    self.assertIn("session s2 begins here (fresh): to_game.log from 1:%d" % self.starts[self.B.id], self.B.log())
+                self.check_nothing_replayed()
+        with self.subTest("a save made mid-session"):
+            self.again()
+            self.start()
+            self.B.send_gui(BUY % "GUI_CB")
+            self.frames(2)
+            self.tick(1)
+            # the world's game-script state holds the stamped action now: a save made at this moment carries it
+            self.assertEqual(int(self.B.lua("#STATE:get().queue")), 1)
+            self.B.run("SAVED_QUEUE = STATE:get().queue")
+            self.end_session(self.A, self.B)
+            self.tick(2)
+            self.assertEqual(int(self.B.lua("#STATE:get().queue")), 0, "the ended session's queue is gone")
+            # that save is loaded later and a new session is hosted on it
+            self.B.run("local st = STATE:get(); st.queue = SAVED_QUEUE; STATE:set(st)")
+            for g in (self.A, self.B):
+                g.reload()
+            self.relay.started, self.relay.speed, self.relay.pauseAt, self.relay.safes = False, 0, None, {}
+            for g in (self.A, self.B):
+                identity(g, "s2", log_end(g), "host" if g.id == 0 else "player")
+            self.look()
+            self.tick(2)
+            self.assertIn("a new session: dropped 1 queued action(s) and binder(s) of an earlier session", self.B.log())
+            self.relay.started, self.relay.speed = True, 1
+            self.relay.session()
+            self.tick(15)
+            self.assertEqual((self.A.vehicles(), self.B.vehicles()), (0, 0), "the saved queue's action is applied nowhere")
 
-    def test_a_second_session_in_a_fresh_lua_state_skips_to_its_start_line(self):
-        self.second_session(reload=True)
-        self.assertIn("session s2 begins here (fresh): to_game.log from 1:%d" % self.starts[self.B.id], self.B.log())
-        self.check_nothing_replayed()
 
-    def test_a_save_made_mid_session_brings_no_queued_action_into_the_next_session(self):
+@T.own_tests_only
+class TwoSimulationStatesSessionTest(SessionEndTest):
+    """The real game shares one game's steps between two simulation Lua states (the mock's SIM_SPLIT); each sees a session end on its own
+    (identity.txt, read at most once a second, or the interface half's `sessionoff`, which reaches one of them). The clean-up of the
+    game-script state ran in each state that saw the end: a state that saw it after the next session had begun emptied that session's
+    queue, outputs and epoch (an action applied on the other games only)."""
+
+    def test_a_state_that_sees_the_end_late_leaves_the_next_sessions_queue_alone(self):
+        self.A.split_sim("function(t) return ONLY_STATE or (math.floor(t / 200) % 2 + 1) end")
         self.start()
         self.B.send_gui(BUY % "GUI_CB")
-        self.frames(2)
-        self.tick(1)
-        # the world's game-script state holds the stamped action now: a save made at this moment carries it
-        self.assertEqual(int(self.B.lua("#STATE:get().queue")), 1)
-        self.B.run("SAVED_QUEUE = STATE:get().queue")
+        self.tick(15)
+        self.assertEqual((self.A.vehicles(), self.B.vehicles()), (1, 1))
+        runs = self.A.sim_runs()
+        self.assertGreater(min(runs[1], runs[2]), 5, "both states took part in session 1: %s" % runs)
+        # session 1 ends and session 2 begins while the host's first state runs every step
+        self.A.run("ONLY_STATE = 1")
         self.end_session(self.A, self.B)
         self.tick(2)
-        self.assertEqual(int(self.B.lua("#STATE:get().queue")), 0, "the ended session's queue is gone")
-        # that save is loaded later and a new session is hosted on it
-        self.B.run("local st = STATE:get(); st.queue = SAVED_QUEUE; STATE:set(st)")
-        for g in (self.A, self.B):
-            g.reload()
         self.relay.started, self.relay.speed, self.relay.pauseAt, self.relay.safes = False, 0, None, {}
         for g in (self.A, self.B):
             identity(g, "s2", log_end(g), "host" if g.id == 0 else "player")
         self.look()
-        self.tick(2)
-        self.assertIn("a new session: dropped 1 queued action(s) and binder(s) of an earlier session", self.B.log())
         self.relay.started, self.relay.speed = True, 1
         self.relay.session()
+        self.tick(5)
+        self.B.send_gui(BUY % "GUI_CB2")
+        for _ in range(10):
+            self.tick(1)
+            if int(self.A.lua("#STATE:get().queue")) > 0:
+                break
+        self.assertEqual(int(self.A.lua("#STATE:get().queue")), 1, "session 2's action is queued on the host")
+        # the host's other state runs again: it sees session 1's end only now
+        self.A.run("ONLY_STATE = nil")
         self.tick(15)
-        self.assertEqual((self.A.vehicles(), self.B.vehicles()), (0, 0), "the saved queue's action is applied nowhere")
+        self.assertEqual((self.A.vehicles(), self.B.vehicles()), (2, 2), "session 2's action lands on both games\n" + self.A.log())
+        self.assertTrue(self.B.lua("GUI_CB2 ~= nil and GUI_CB2[1] == true"))
+        self.assertIn("cleared by another simulation state", self.A.log())
+        self.assertEqual(self.relay.replay_failed, [])
 
 
 class IdentityTest(unittest.TestCase):

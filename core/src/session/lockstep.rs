@@ -56,11 +56,24 @@ impl Lockstep {
     /// steps at x4, which is exactly one batch: every game had at most one batch of room, both games stood at their barriers about
     /// 20 times a minute and the smooth pacing slowed both to 0.6x nearly all the time (pace_mean 1.58, paced_s 60).
     pub fn lead_for_measured(speed: i32, rtt_ms: f64, gap_ms: f64) -> i64 {
+        Self::lead_for_cover(speed, Self::cover_ms(rtt_ms, gap_ms))
+    }
+
+    /// The real time (ms) a lead must cover for a round trip and a clock gap: the one-way time and the gap's excess over one batch's
+    /// real time (at most [`Self::GAP_EXCESS_MAX_MS`]). Not a number or negative counts as 0.
+    pub fn cover_ms(rtt_ms: f64, gap_ms: f64) -> f64 {
         let rtt = if rtt_ms.is_finite() { rtt_ms.max(0.0) } else { 0.0 };
-        let per_second = Self::STEPS_PER_SECOND * f64::from(speed.max(1));
         let gap = if gap_ms.is_finite() { gap_ms.max(0.0) } else { 0.0 };
         let excess = (gap - Self::BATCH_SECONDS * 1000.0).clamp(0.0, Self::GAP_EXCESS_MAX_MS);
-        let seconds = rtt / 2000.0 + Self::HANDLING_SECONDS + excess / 1000.0;
+        rtt / 2.0 + excess
+    }
+
+    /// The lead that covers `cover_ms` of real time at this speed: `ceil((cover + handling) * steps_per_second * speed) + 1 + speed`
+    /// steps, bounded to 3..=24. The hand-off step and one engine batch (the 907af4e fix of 2026-10-18) are its floor.
+    pub fn lead_for_cover(speed: i32, cover_ms: f64) -> i64 {
+        let cover = if cover_ms.is_finite() { cover_ms.clamp(0.0, 60_000.0) } else { 0.0 };
+        let per_second = Self::STEPS_PER_SECOND * f64::from(speed.max(1));
+        let seconds = cover / 1000.0 + Self::HANDLING_SECONDS;
         let batch = i64::from(speed.clamp(1, 4));
         let steps = (seconds * per_second).ceil() as i64 + 1 + batch;
         Self::STEP * steps.clamp(Self::MIN_LEAD_STEPS, Self::MAX_LEAD_STEPS)
@@ -69,6 +82,46 @@ impl Lockstep {
     /// The lead on a connection with no measured delay (the floor for a speed).
     pub fn lead_units(speed: i32) -> i64 {
         Self::lead_for(speed, 0.0)
+    }
+}
+
+/// The host's lead as a jitter buffer (TPF3-MP's playout idea, Juliansgith, MIT; our own measure): it covers the LATEST arrival seen
+/// recently, not a quantile of them, plus a small safety margin, grows at once when a later one comes and then shrinks slowly. A
+/// quantile left the top 5-10 % of the arrivals uncovered, and those spikes are what stood a game at its barrier (friend test of
+/// 0.2.0-pre5, x4 over 30 ms: the guest stood 6-7 s a minute; its clock gaps were 140 ms at the median and up to 825 ms).
+///   * the arrival: [`LeadMeter`] gives the largest round trip of each player's last eight and the largest clock gap of each running
+///     game in ten seconds ([`Lockstep::cover_ms`] of them: the one-way time and the gap's excess over a batch, at most 500 ms);
+///   * the buffer is that plus [`Self::SAFETY_MS`]; a larger value replaces it at once, a smaller one only as the buffer shrinks by
+///     [`Self::SHRINK_MS_PER_SECOND`] of real time (playing the backlog off at 105 %, as TPF3-MP does), never below it;
+///   * the lead is [`Lockstep::lead_for_cover`] of the buffer: never below one engine batch plus the hand-off step.
+///
+/// It replaced "the 90 % / 95 % quantile, shorter only after eight seconds lower", which dropped a whole step-down at once.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JitterBuffer {
+    ms: f64,
+    at: Option<f64>,
+}
+
+impl JitterBuffer {
+    /// Kept on top of the latest arrival (ms): a frame of the receiving game and the file hand-off's polling (20 ms).
+    pub const SAFETY_MS: f64 = 20.0;
+    /// How fast the buffer shrinks towards a smaller arrival (ms per second of real time: 5 %).
+    pub const SHRINK_MS_PER_SECOND: f64 = 50.0;
+
+    /// The buffer after the arrival `cover_ms` ([`Lockstep::cover_ms`]) was measured at host time `now` (seconds).
+    pub fn update(&mut self, cover_ms: f64, now: f64) -> f64 {
+        let target = if cover_ms.is_finite() { cover_ms.max(0.0) } else { 0.0 } + Self::SAFETY_MS;
+        let dt = self.at.map_or(0.0, |a| if now.is_finite() { (now - a).max(0.0) } else { 0.0 });
+        if now.is_finite() {
+            self.at = Some(now);
+        }
+        self.ms = if target >= self.ms { target } else { (self.ms - Self::SHRINK_MS_PER_SECOND * dt).max(target) };
+        self.ms
+    }
+
+    /// The buffer now (ms); 0 before the first update.
+    pub fn ms(&self) -> f64 {
+        self.ms
     }
 }
 
@@ -97,16 +150,17 @@ struct ClockCadence {
 impl LeadMeter {
     /// Round trips kept per player (a ping every 2 s: the last 16 s or so).
     pub const RTT_KEEP: usize = 8;
-    /// Quantile of those round trips the lead covers (of 8: the second largest).
-    pub const RTT_QUANTILE: f64 = 0.9;
+    /// Quantile of those round trips the lead covers: the largest (the latest arrival, [`JitterBuffer`]).
+    pub const RTT_QUANTILE: f64 = 1.0;
     /// Clock gaps are counted over this many seconds of host time...
     pub const GAP_WINDOW_SECONDS: f64 = 10.0;
     /// ...at most this many per game...
     pub const GAP_KEEP: usize = 512;
     /// ...and only once a game has this many in the window (a few gaps are no quantile).
     pub const GAP_MIN: usize = 20;
-    /// Quantile of the gaps the lead covers: jitter is covered, a rare stall is not (see [`Lockstep::GAP_EXCESS_MAX_MS`]).
-    pub const GAP_QUANTILE: f64 = 0.95;
+    /// Quantile of the gaps the lead covers: the largest (the latest arrival, [`JitterBuffer`]); a stall is still not hidden behind the
+    /// lead (the excess is at most [`Lockstep::GAP_EXCESS_MAX_MS`]) and a game that stops for seconds is a stall (host/stall.rs).
+    pub const GAP_QUANTILE: f64 = 1.0;
 
     pub fn rtt(&mut self, player: u16, ms: f64) {
         if !ms.is_finite() || ms < 0.0 {
@@ -138,6 +192,14 @@ impl LeadMeter {
             // the first line, or a clock that went back (a reload): no gap until the next move
             _ => Some((at, t, false)),
         };
+    }
+
+    /// A game's clock lines start over (it was stalled, host/stall.rs): the silence is no gap of a running game, so the next move is
+    /// counted from the line after it, not from the line before the silence.
+    pub fn restart_cadence(&mut self, player: u16) {
+        if let Some(c) = self.clocks.get_mut(&player) {
+            c.last = None;
+        }
     }
 
     /// A player left: its measurements go (a gap across its absence says nothing about the link).

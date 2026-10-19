@@ -534,10 +534,113 @@ pub fn edge_line(key: &DeepKey, j: u32, before: Option<u32>, after: Option<u32>)
     format!("{} j={j} before={} after={}", key.head("edge"), f(before), f(after))
 }
 
+/// Side of the cells of the river field's cache (`RiverField::At`, `0x2b7a1b0`, build 40420: `x/50 + 0.5`, rounded down).
+pub const FIELD_CELL_M: f32 = 50.0;
+/// Bytes of one source of the river field (`[field]..[field+8]`).
+pub const FIELD_SOURCE_LEN: u64 = 16;
+/// Bytes of `At`'s answer: the two axes (four floats) and the distance to the nearest source.
+pub const FIELD_ANSWER_LEN: usize = 0x14;
+
+/// The cache cell `At` files a point under: `floor(x/50 + 0.5)`, likewise `y` (the same float operations as the engine:
+/// a divide, an add, a round down, a truncating convert).
+pub fn field_cell(x: f32, y: f32) -> (i32, i32) {
+    let c = |v: f32| (v / FIELD_CELL_M + 0.5).floor() as i32;
+    (c(x), c(y))
+}
+
+/// Whether `At` answered from its cache, from the size of the cache before and after the call: the miss path always
+/// inserts the new cell (`0x2b79d80`, a unique `std::map` insert reached only when the cell is absent), a hit inserts
+/// nothing. `None` when a size was unreadable or changed by anything else.
+pub fn field_hit(before: Option<u64>, after: Option<u64>) -> Option<bool> {
+    match (before, after) {
+        (Some(b), Some(a)) if a == b => Some(true),
+        (Some(b), Some(a)) if a == b.wrapping_add(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// One lookup of the river field by the street developer's open pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldCall {
+    /// The point asked (raw float bits).
+    pub point: (u32, u32),
+    pub hit: Option<bool>,
+    /// Cells in the cache after the call.
+    pub entries: Option<u64>,
+    /// Sources of the field (river pieces); 0 means the answer is the same everywhere and the cache is harmless.
+    pub sources: Option<u64>,
+    /// The answer (raw float bits): two axes, then the distance to the nearest source.
+    pub answer: Option<[u32; 5]>,
+    /// Which field object, numbered in the order this game first saw them (one per engine: 0 and 1 normally).
+    pub buffer: usize,
+}
+
+/// The line of one river field lookup, the `j`-th of this `Develop`. Two games are compared on `j`, `cell`, `p` and
+/// `a`: equal points with unequal answers mean the cache state differed; `hit`, `n` and `buf` explain why.
+pub fn field_line(key: &DeepKey, j: u32, c: &FieldCall) -> String {
+    let (px, py) = (f32::from_bits(c.point.0), f32::from_bits(c.point.1));
+    let (cx, cy) = field_cell(px, py);
+    let opt = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+    let hit = match c.hit {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => "-",
+    };
+    let answer =
+        c.answer.map_or("-".to_string(), |a| a.iter().map(|b| format!("{b:#010x}")).collect::<Vec<_>>().join(","));
+    format!(
+        "{} j={j} cell={cx},{cy} p={:#010x},{:#010x} a={answer} hit={hit} n={} src={} buf={}",
+        key.head("field"),
+        c.point.0,
+        c.point.1,
+        opt(c.entries),
+        opt(c.sources),
+        c.buffer
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_field_cell_rounds_to_the_nearest_50_m() {
+        assert_eq!(field_cell(0.0, 0.0), (0, 0));
+        assert_eq!(field_cell(24.9, -24.9), (0, 0));
+        assert_eq!(field_cell(25.0, -25.0), (1, 0), "x/50+0.5 rounded down: 25 -> 1, -25 -> 0");
+        assert_eq!(field_cell(-25.1, 74.9), (-1, 1));
+        assert_eq!(field_cell(-2356.4, -20690.8), (-47, -414));
+    }
+
+    #[test]
+    fn a_lookup_that_inserts_nothing_was_a_hit() {
+        assert_eq!(field_hit(Some(5), Some(5)), Some(true));
+        assert_eq!(field_hit(Some(5), Some(6)), Some(false));
+        assert_eq!(field_hit(Some(5), Some(0)), None, "cleared meanwhile");
+        assert_eq!(field_hit(None, Some(1)), None);
+        assert_eq!(field_hit(Some(0), Some(2)), None);
+    }
+
+    #[test]
+    fn a_field_line_has_the_fields_in_a_fixed_order() {
+        let key = DeepKey { pid: 7, t: Some(354_480), town: 62_486, k: 0 };
+        let call = FieldCall {
+            point: (25.0f32.to_bits(), (-74.0f32).to_bits()),
+            hit: Some(true),
+            entries: Some(12),
+            sources: Some(340),
+            answer: Some([1, 2, 3, 4, 5]),
+            buffer: 1,
+        };
+        assert_eq!(
+            field_line(&key, 3, &call),
+            "gdeep-field pid=7 t=354480 town=62486 k=0 j=3 cell=1,-1 p=0x41c80000,0xc2940000 \
+             a=0x00000001,0x00000002,0x00000003,0x00000004,0x00000005 hit=1 n=12 src=340 buf=1"
+        );
+        let unread = FieldCall { hit: None, entries: None, sources: None, answer: None, ..call };
+        assert!(field_line(&key, 0, &unread).ends_with("a=- hit=- n=- src=- buf=1"));
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

@@ -42,11 +42,25 @@ function L.applySession(s, p)
 	local pauseAt = tonumber(p.pauseAt)
 	if pauseAt and type(s.loadedAt) == "number" and pauseAt < s.loadedAt then pauseAt = s.loadedAt end
 	local lead = tonumber(p.lead) or s.lead
-	local changed = started ~= s.started or speed ~= s.speed or pauseAt ~= s.pauseAt or lead ~= s.lead
+	-- the stalled games (core SessionState::stalled, host/stall.rs): a list of player ids
+	local stalled, key = {}, {}
+	for _, id in ipairs(type(p.stalled) == "table" and p.stalled or {}) do
+		if type(id) == "number" then stalled[id] = true; key[#key + 1] = id end
+	end
+	table.sort(key)
+	key = table.concat(key, ",")
+	local changed = started ~= s.started or speed ~= s.speed or pauseAt ~= s.pauseAt or lead ~= s.lead or key ~= (s.stalledKey or "")
 	-- the pause that just ended: an item stamped at it may still arrive while this game sits at that time (L.applyNow)
 	if s.pauseAt ~= nil and pauseAt == nil then s.lastPauseAt = s.pauseAt end
 	s.started, s.speed, s.pauseAt, s.lead = started, speed, pauseAt, lead
+	s.stalled, s.stalledKey = stalled, key
 	return changed
+end
+
+-- Whether the host has game `id` as stalled (host/stall.rs): this game, if it is that one, has every action it ships stamped by the host
+-- (the bridge's X.hostStamps) and catches up; the others run on without waiting for it.
+function L.isStalled(s, id)
+	return type(s.stalled) == "table" and s.stalled[id] == true
 end
 
 -- This world was loaded by a resync at game time `t`: no pause of the session may lie before it (L.applySession), and one that
@@ -76,7 +90,8 @@ function L.applyPeerClock(peers, p, selfId)
 	local need = tonumber(p.need)
 	if need then need = math.max(0, math.min(L.MARGIN_MAX, math.floor(need))) end
 	-- the promise is taken as it is, never as the larger of old and new: the sender lowers it at a pause (L.promise)
-	peers[p.from] = { t = p.t, ahead = tonumber(p.ahead), need = need, safe = tonumber(p.safe), pause = p.pause == true }
+	-- `stalled`: the host keeps this promise for a game that stopped answering (host/stall.rs); its `t` is where it stopped
+	peers[p.from] = { t = p.t, ahead = tonumber(p.ahead), need = need, safe = tonumber(p.safe), pause = p.pause == true, stalled = p.stalled == true or nil }
 	return true
 end
 
@@ -84,12 +99,37 @@ function L.removePeer(peers, id)
 	peers[id] = nil
 end
 
+-- The slowest peer clock this game paces itself to. A stalled peer (the host keeps its promise, host/stall.rs) is not waited for: it
+-- catches up by itself, and its promise still bounds this game (L.barrier).
 function L.slowestPeer(peers)
 	local m = nil
 	for _, pc in pairs(peers) do
-		if m == nil or pc.t < m then m = pc.t end
+		if not pc.stalled and (m == nil or pc.t < m) then m = pc.t end
 	end
 	return m
+end
+
+-- The furthest clock of the peers that run (nil: none).
+function L.furthestPeer(peers)
+	local m = nil
+	for _, pc in pairs(peers) do
+		if type(pc) == "table" and type(pc.t) == "number" and not pc.stalled and (m == nil or pc.t > m) then m = pc.t end
+	end
+	return m
+end
+
+-- Catching up: the host has this game as stalled (`s.self`, this game's id, set by the bridge; host/stall.rs: its clocks did not come for
+-- the stall timeout and the others ran on) and it is behind the furthest peer that runs. It then asks the engine for batches of up to
+-- L.CATCHUP_SPEED steps whatever the session's speed (the steps are the same steps: the engine runs `speed` of them per batch, and L.pace
+-- already sets fewer to land on a stop) and, with smooth pacing, a shorter batch interval. Only while stalled: two games in step see each
+-- other a few steps behind (a peer's clock is a one-way trip old), and must not take turns to race. Returns the steps it is behind, or nil.
+L.CATCHUP_SPEED = 4
+function L.catchUp(s, peers, now)
+	if not s.started or (s.speed or 0) <= 0 or s.pauseAt ~= nil or s.holdAt ~= nil then return nil end
+	if s.self == nil or not L.isStalled(s, s.self) then return nil end
+	local far = L.furthestPeer(peers)
+	if not far or far <= now then return nil end
+	return (far - now) / L.STEP
 end
 
 -- How many steps this game may run ahead of the slowest peer (the `ahead` it reports in its clock). More speed
@@ -129,6 +169,13 @@ function L.pace(s, peers, now, ahead, marks)
 		return 0
 	end
 	local bar = L.barrier(s, peers)
+	if not run and L.catchUp(s, peers, now) then
+		-- catching up: batches of up to L.CATCHUP_SPEED steps, as long as one more such batch still lies before the barrier (the interface
+		-- may see the game time of the batch before, see marginTarget)
+		local boost = L.CATCHUP_SPEED
+		if bar then boost = math.min(boost, math.floor((bar - now) / L.STEP) - L.CATCHUP_SPEED) end
+		if boost > want then want = boost end
+	end
 	if bar then
 		-- no shortened last step here (the pause's math.max(room, 1) below): one step too far is the late apply itself
 		local room = math.floor((bar - now) / L.STEP)
@@ -276,7 +323,14 @@ end
 --   * L.paceSmooth: the factor follows its target over L.PACE_UP_S / L.PACE_DOWN_S of real time, so the speed changes gradually.
 -- No stretch is asked for when the room outlasts the stop's next move, so a game with ample room (the one behind, a fast link) runs at 1,
 -- and the factor follows the stop as it is now (it does not average a slower past into the future), so it does not feed itself.
+-- Both ways since 2026-10-19 (L.paceHurry): a game that is behind the furthest peer by more than a batch, with room before its stop, runs
+-- its batches sooner (a factor below 1, down to L.PACE_MIN, L.PACE_CATCHUP_MIN while it is stalled and catches up) until it is level
+-- again. Before, time a game lost (a slow frame, a stand at its barrier) was never made up: the others slowed down to it for good. The
+-- game ahead never hurries (it sees the others behind it), and a peer's clock is a trip old, so two games level do not take turns.
 L.PACE_MAX = 2
+L.PACE_MIN = 0.8          -- the most a game behind hurries (TPF3-MP's two-way trim goes 0.8-1.25)
+L.PACE_CATCHUP_MIN = 0.5  -- the most a stalled game hurries while it catches up (L.catchUp; the native module's limit)
+L.PACE_HURRY_S = 3        -- a game behind makes up the steps over about this much real time
 L.PACE_GAPS = 32          -- the stop's last moves kept
 L.PACE_GAP_PCT = 50       -- the stop is expected to move after this percentile of its gaps
 L.PACE_BIAS = 0.9         -- the batches are stretched a little less than to the stop's expected move (see L.paceTarget)
@@ -393,15 +447,28 @@ function L.paceTarget(room, speed, waitMs, batchMs, sinceMs)
 	if f <= 1 then return 1, left end
 	return math.min(L.PACE_MAX, f), left
 end
--- Moves the factor towards `target` over the real time since the last call (`clock`, seconds).
+-- The factor below 1 of a game `behind` steps behind the furthest peer that runs, with `room` steps before its stop (nil: no stop), at
+-- session speed `speed`; `catching`: it is stalled and catches up (L.catchUp). 1 within a batch (a peer's clock is a trip old: a game
+-- level with it sees it that far behind or ahead) or with less than three batches of room (the slow-down of L.paceTarget is for that).
+-- Otherwise the steps beyond a batch are made up over L.PACE_HURRY_S of real time, the factor at least L.PACE_MIN (L.PACE_CATCHUP_MIN).
+function L.paceHurry(behind, room, speed, catching)
+	local per = math.max(1, math.min(4, speed or 1))
+	if type(behind) ~= "number" or behind <= per then return 1 end
+	if type(room) == "number" and room < 3 * per then return 1 end
+	local f = 1 / (1 + (behind - per) / (L.PACE_HURRY_S * 6 * per))
+	return math.max(catching and L.PACE_CATCHUP_MIN or L.PACE_MIN, math.min(1, f))
+end
+
+-- Moves the factor towards `target` over the real time since the last call (`clock`, seconds): towards a slower one quickly (the
+-- batch after this one needs it), towards a faster one gently.
 function L.paceSmooth(P, target, clock)
 	local dt = P.at and math.max(0, clock - P.at) or 0
 	P.at, P.target = clock, target
 	local tau = target > P.trim and L.PACE_UP_S or L.PACE_DOWN_S
 	local a = 1 - math.exp(-dt / tau)
 	local trim = P.trim + (target - P.trim) * a
-	if target <= 1 and trim < 1.01 then trim = 1 end
-	P.trim = math.max(1, math.min(L.PACE_MAX, trim))
+	if target == 1 and math.abs(trim - 1) < 0.01 then trim = 1 end
+	P.trim = math.max(L.PACE_CATCHUP_MIN, math.min(L.PACE_MAX, trim))
 	return P.trim
 end
 -- ------------------------------------------------------------------ measured stamp margin
@@ -1393,6 +1460,7 @@ end
 -- r.parts is then final. r.frame is what this call cost (seconds, by lane); r.frameMax / r.frameLanes the costliest call so far.
 function L.checksumRoundStep(r)
 	local budget, clock, frame, total = r.chunk, r.clock, {}, 0
+	local read = 0   -- the entities this call reads (the cost per entity the host sizes the chunks with: L.checksumCost)
 	while r.li <= #r.lanes do
 		local ln = r.lanes[r.li]
 		local count = #ln.ids
@@ -1403,7 +1471,7 @@ function L.checksumRoundStep(r)
 			local ok, err = pcall(CS.readRange, r, ln, r.pos, last)
 			if not ok then ln.failed = tostring(err) end
 		end
-		if last >= r.pos then budget = budget - (last - r.pos + 1) end
+		if last >= r.pos then budget, read = budget - (last - r.pos + 1), read + (last - r.pos + 1) end
 		if last >= count then
 			CS.finishLane(r, ln)
 			r.li, r.pos = r.li + 1, 1
@@ -1418,9 +1486,21 @@ function L.checksumRoundStep(r)
 	end
 	r.steps = r.steps + 1
 	r.frame = frame
-	if total > r.frameMax then r.frameMax, r.frameLanes = total, frame end
+	if total > r.frameMax then r.frameMax, r.frameLanes, r.frameMaxN = total, frame, read end
 	r.done = r.li > #r.lanes
 	return r.done
+end
+
+-- What a finished spread round cost on this game, for the host to size the next rounds' chunks (core ChecksumPolicy::chunk_for):
+-- `entityNs` the dearer of the costliest chunk's and the whole round's time per entity, `stepMaxUs` the costliest chunk, `chunk`
+-- the entities a chunk read. nil when there is nothing to measure (no chunk of 20 entities or more, or a clock that never moved).
+L.COST_MIN_ENTITIES = 20
+function L.checksumCost(r)
+	local n, work = r.frameMaxN or 0, r.work or 0
+	if n < L.COST_MIN_ENTITIES or (r.frameMax or 0) <= 0 then return nil end
+	local per = r.frameMax / n
+	if (r.total or 0) > 0 and work / r.total > per then per = work / r.total end
+	return { entityNs = math.floor(per * 1e9 + 0.5), stepMaxUs = math.floor(r.frameMax * 1e6 + 0.5), chunk = r.chunk }
 end
 
 -- The whole round at once (a light round, a paused one, a request without `spread`): parts and the time they were taken at.
@@ -1433,12 +1513,19 @@ function L.checksumParts(engine, hashFn, timing, light, detail, keyHash)
 	return r.parts, r.time
 end
 
--- A `checksum_request` payload {n, at, paused, full?, spread?} as a queue item.
+-- A `checksum_request` payload {n, at, paused, full?, spread?, chunk?, detail?} as a queue item. `chunk`: the entities a chunk of a
+-- spread round reads, the same number on every game (the host sizes it from the games' measured cost; absent or out of range: the
+-- game's own L.CHECKSUM_CHUNK). `detail`: the round keeps its itemised keys in the game-script state (the host asks for it after a
+-- round that differed), so the dump at a resync is complete and the same round on every game.
+L.CHECKSUM_CHUNK_MAX = 20000
 function L.checksumItem(p)
 	if type(p) ~= "table" or type(p.n) ~= "number" or type(p.at) ~= "number" then return nil end
 	local spread = math.floor(tonumber(p.spread) or 0)
 	if spread < 0 or spread > 16 then spread = 0 end
-	return { kind = "checksum", at = p.at, n = p.n, paused = p.paused == true, full = p.full ~= false, spread = spread }
+	local chunk = math.floor(tonumber(p.chunk) or 0)
+	if chunk < 1 or chunk > L.CHECKSUM_CHUNK_MAX then chunk = nil end
+	return { kind = "checksum", at = p.at, n = p.n, paused = p.paused == true, full = p.full ~= false, spread = spread, chunk = chunk,
+		detail = p.detail == true }
 end
 
 -- The steps at which a spread round reads its chunks (each a landing mark, so every game reads it at exactly that step): the
@@ -1468,7 +1555,7 @@ end
 -- writes (the stamped queue lives there for the same reason): L.checksumRoundSave writes it after a chunk, L.checksumRoundSync reads it
 -- into a state's own copy before the next, and L.checksumRoundRestore makes that copy in a state that has none. The entity lists taken
 -- at the stamp travel once, packed as text (L.packIds); each state unpacks them once a round.
-local ROUND_FIELDS = { "time", "light", "li", "pos", "total", "chunk", "chunks", "steps", "done", "frameMax", "startCost" }
+local ROUND_FIELDS = { "time", "light", "li", "pos", "total", "chunk", "chunks", "steps", "done", "frameMax", "frameMaxN", "startCost" }
 
 local function flatCopy(t)
 	local out = {}

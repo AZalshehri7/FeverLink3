@@ -136,6 +136,17 @@ impl Net {
         self.attach(session)
     }
 
+    /// A new connection of the player of connection `old`, as its launcher makes it: the ticket of the old one, and what the old
+    /// session kept for a catch-up (the last host frame, what its game sent unacknowledged).
+    pub fn reconnect(&mut self, old: ConnectionId) -> ConnectionId {
+        let ticket = self.ticket(old);
+        let name = self.peers[&old].session.assigned_name().unwrap_or("?").to_owned();
+        let mut session =
+            PlayerSession::resuming_with_clock(self.key.clone(), &name, "0.1", ticket, Box::new(self.clock()));
+        self.peers.get_mut(&old).unwrap().session.carry_to(&mut session);
+        self.attach(session)
+    }
+
     pub fn attach(&mut self, session: PlayerSession) -> ConnectionId {
         self.next_connection += 1;
         let c = self.next_connection;

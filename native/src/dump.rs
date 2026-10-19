@@ -142,11 +142,8 @@ pub struct LiveMem;
 #[cfg(windows)]
 impl Mem for LiveMem {
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
-        if addr < 0x1_0000 {
-            return None;
-        }
-        // SAFETY: `mem::read` asks the OS whether the range is committed and readable before it copies.
-        unsafe { crate::mem::read(addr as *const u8, len) }.ok()
+        // checked address, cached regions, and a copy whose fault is contained (`memguard`): a bad engine pointer is a refused read
+        crate::memguard::read(addr, len).ok()
     }
 }
 

@@ -536,6 +536,7 @@ fn decode_every_message_type(bytes: &[u8]) {
         HelloMessage,
         ClockMessage,
         SpeedRequestMessage,
+        ChecksumCost,
         ChecksumReportMessage,
         SaveDoneMessage,
         ReplayFailedMessage,
@@ -592,6 +593,8 @@ fn session_state(r: &mut StdRng) -> SessionState {
         pause_at: r.gen_bool(0.5).then(|| r.gen()),
         lead: r.gen(),
         resync: None,
+        mod_warnings: Vec::new(),
+        stalled: (0..r.gen_range(0..3)).map(|_| r.gen()).collect(),
     }
 }
 
@@ -609,13 +612,19 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             name: random_text(rr, 30),
             version: random_text(rr, 10),
             proof: random_bytes(rr, 40),
-            resume: rr.gen_bool(0.5).then(|| ResumeClaim { id: rr.gen(), mac: random_bytes(rr, 40) }),
+            resume: rr.gen_bool(0.5).then(|| ResumeClaim {
+                id: rr.gen(),
+                mac: random_bytes(rr, 40),
+                last: rr.gen_bool(0.5).then(|| rr.gen()),
+            }),
             caps: (0..rr.gen_range(0..3)).map(|_| random_text(rr, 12)).collect(),
+            mods: None,
         });
         round_trip(ResumeGrant { token: random_bytes(rr, 40), epoch: rr.gen() });
         round_trip(RejectMessage {
             reason: random_text(rr, 10),
             detail: rr.gen_bool(0.5).then(|| random_text(rr, 30)),
+            mods: None,
         });
         round_trip(session_state(rr));
         round_trip(player_info(rr));
@@ -628,6 +637,8 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             nonce: random_bytes(rr, 40),
             resume: rr.gen_bool(0.5).then(|| ResumeGrant { token: random_bytes(rr, 40), epoch: rr.gen() }),
             resumed: rr.gen(),
+            mods_checked: false,
+            catch_up: None,
         });
         round_trip(PlayerJoinedMessage { player: player_info(rr) });
         round_trip(PlayerLeftMessage { id: rr.gen(), name: random_text(rr, 20), away: rr.gen() });
@@ -635,6 +646,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             n: rr.gen(),
             rtt: (0..rr.gen_range(0..6)).map(|_| (rr.gen(), finite_f64(rr))).collect(),
             off: (0..rr.gen_range(0..6)).map(|_| (rr.gen(), rr.gen())).collect(),
+            ack: rr.gen_bool(0.5).then(|| rr.gen()),
         });
         round_trip(PongMessage { n: rr.gen(), w: rr.gen_bool(0.5).then(|| rr.gen()) });
         round_trip(PeerClockMessage {
@@ -644,6 +656,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             need: rr.gen_bool(0.5).then(|| rr.gen()),
             safe: rr.gen_bool(0.5).then(|| rr.gen()),
             pause: rr.gen(),
+            stalled: rr.gen(),
             hop: rr.gen_bool(0.5).then(|| random_hops(rr)),
         });
         round_trip(ChecksumRequestMessage {
@@ -652,6 +665,8 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             paused: rr.gen(),
             full: rr.gen(),
             spread: rr.gen(),
+            chunk: rr.gen(),
+            detail: rr.gen(),
         });
         round_trip(AuthorityMessage {
             n: rr.gen(),
@@ -686,11 +701,17 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
                 .gen_bool(0.5)
                 .then(|| (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect()),
             not_ready: (0..rr.gen_range(0..3)).map(|_| random_text(rr, 8)).collect(),
+            cost: rr.gen_bool(0.5).then(|| ChecksumCost {
+                entity_ns: rr.gen(),
+                step_max_us: rr.gen(),
+                chunk: rr.gen(),
+            }),
         });
         round_trip(SaveDoneMessage {
             id: rr.gen(),
             ok: rr.gen(),
             detail: rr.gen_bool(0.5).then(|| random_text(rr, 20)),
+            mods: None,
         });
         round_trip(ReplayFailedMessage { detail: random_text(rr, 40) });
         round_trip(ActionRefusedMessage {
@@ -734,10 +755,20 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             host_name: "Host".into(),
             version: "0.1".into(),
             players: vec![PlayerInfo { id: 3, name: "A".into(), ready: true }],
-            session: SessionState { started: true, speed: 2, pause_at: Some(4000), lead: 1600, resync: None },
+            session: SessionState {
+                started: true,
+                speed: 2,
+                pause_at: Some(4000),
+                lead: 1600,
+                resync: None,
+                mod_warnings: Vec::new(),
+                stalled: Vec::new(),
+            },
             nonce: vec![7; 16],
             resume: Some(ResumeGrant { token: vec![9; 16], epoch: 3 }),
             resumed: true,
+            mods_checked: false,
+            catch_up: None,
         });
         mutate(&mut r, &mut damaged);
         decode_every_message_type(&damaged);
@@ -974,7 +1005,7 @@ fn a_join_that_claims_an_old_slot_gets_it_only_with_the_token() {
         let proof = HostSession::proof(&h.key, &nonce, &name).to_vec();
         let mut join = JoinMessage::new(&name, "0.1", proof);
         let claimed = if r.gen_bool(0.7) { before[r.gen_range(0..before.len())].0 } else { r.gen() };
-        join.resume = Some(ResumeClaim { id: claimed, mac: random_bytes(&mut r, 40) });
+        join.resume = Some(ResumeClaim { id: claimed, mac: random_bytes(&mut r, 40), last: None });
         let header =
             FrameHeader::new(FrameHeader::CURRENT_VERSION, MessageKind::Join.into(), HostSession::UNASSIGNED, 0);
         let outs = h.host.frame_received(connection, &Frame::new(header, codec::encode(&join)));

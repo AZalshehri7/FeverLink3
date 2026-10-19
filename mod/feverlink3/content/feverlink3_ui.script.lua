@@ -48,6 +48,16 @@ local function pollCtl()
 	return true
 end
 
+-- `host` / `join` carry this game's mods and build for the join's comparison (docs/PROTOCOL.md, "Mod list"); read at
+-- the click, so a mod installed meanwhile counts. getBuildVersion() is documented (tf3-docs reference/api/main.html).
+local function withMods(params)
+	local mods, why = Hud.modList(app)
+	if mods then params.mods = mods else log("mod list not readable: " .. tostring(why)) end
+	local okB, build = pcall(function() return getBuildVersion() end)
+	if okB and build ~= nil then params.game = tostring(build) end
+	return params
+end
+
 local function command(kind, params)
 	if not U.cmd then U.cmd = C.newWriter(C.path(CTL_CMD), 0) end
 	return C.writerSend(U.cmd, kind, params)
@@ -93,6 +103,25 @@ local function syncText(sync, host)
 		return "Syncing: checking that the worlds match..."
 	end
 	return "Syncing..."
+end
+
+-- A join request in the host's window (ctl.invites.requests[i] = { id, name, steam? }): the Steam name Steam gave for the
+-- account that asked (the friend cannot choose it), and the name its game sent when that differs.
+local function requestLabel(r)
+	if type(r) ~= "table" then return nil end
+	local steam = (type(r.steam) == "string" and r.steam ~= "") and r.steam or nil
+	local name = (type(r.name) == "string" and r.name ~= "") and r.name or nil
+	if steam and name and name ~= steam then return steam .. " (" .. name .. ") wants to join" end
+	return tostring(steam or name or "A Steam friend") .. " wants to join"
+end
+
+-- How many things wait for this player in the window: join requests (host) and an invite from Steam (friend).
+local function askCount(ctl)
+	if type(ctl) ~= "table" then return 0 end
+	local n = 0
+	if type(ctl.invites) == "table" and type(ctl.invites.requests) == "table" then n = n + #ctl.invites.requests end
+	if type(ctl.invite) == "table" then n = n + 1 end
+	return n
 end
 
 local function setup(react, builtin)
@@ -217,11 +246,11 @@ local function setup(react, builtin)
 			add(section("Your name"))
 			add(field("name", myName(), function(v) nameIn:set(v) end))
 			add(gap())
-			add(button("Host a game", function() command("host", { name = myName() }) end, "primary"))
+			add(button("Host a game", function() command("host", withMods({ name = myName() })) end, "primary"))
 			add(gap())
 			add(section("Join a friend's game"))
 			add(field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end))
-			add(button("Join", function() command("join", { name = myName(), code = codeIn:old() }) end, "primary"))
+			add(button("Join", function() command("join", withMods({ name = myName(), code = codeIn:old() })) end, "primary"))
 
 			-- Steam connection test: can two players reach each other through Steam, without any router setup?
 			-- Folded away by default (it shows the player's Steam ID).
@@ -282,6 +311,23 @@ local function setup(react, builtin)
 				add(note(tostring(ctl.result.ok and "Copied. Paste it into a message to your friend (Ctrl+V)." or ctl.result.message)))
 			end
 			if ctl.password then add(note("They also need the password.")) end
+			-- Steam invites: Steam's own invite window (Shift+Tab overlay); friends who accept join without a code. Friends who
+			-- click "Join game" in their Steam friends list are asked for here.
+			if type(ctl.invites) == "table" then
+				add(button("Invite friends (Steam)", function() command("invite", {}) end, "secondary"))
+				if ctl.result and ctl.result.kind == "invite" then add(note(tostring(ctl.result.message))) end
+				for _, r in ipairs(ctl.invites.requests or {}) do
+					local id = r.id
+					add(text(requestLabel(r), "font-scale-title-3"))
+					add(box(H, {
+						button("Let in", function() command("admit", { id = id }) end, "primary", math.floor(WIDTH / 2) - 10),
+						button("Refuse", function() command("refuse", { id = id }) end, "negative", math.floor(WIDTH / 2) - 10),
+					}))
+				end
+				if ctl.result and (ctl.result.kind == "admit" or ctl.result.kind == "refuse") then
+					add(note(tostring(ctl.result.message)))
+				end
+			end
 			add(gap())
 			players(ctl.me, true)
 			add(gap())
@@ -301,7 +347,8 @@ local function setup(react, builtin)
 				}))
 			end
 		elseif state == "joining" then
-			add(heading("Joining..."))
+			-- a dropped link: the controller retries and the host catches this game up within its grace (no reload)
+			add(heading(ctl.reconnecting and ("Reconnecting (" .. tostring(tonumber(ctl.reconnectingS) or 0) .. " s)") or "Joining..."))
 			add(text(tostring(ctl.progress or "contacting the host"), "font-scale-title-3"))
 			add(gap())
 			add(button("Cancel", function() command("leave", {}) end, "negative"))
@@ -316,6 +363,24 @@ local function setup(react, builtin)
 			players(ctl.me)
 			add(gap())
 			add(button("Leave the session", function() command("leave", {}) end, "primary"))
+		end
+		-- a join refused over mods (what differs from the host's game) and what the mod comparison could not do
+		local modLines = Hud.modLines(ctl)
+		if #modLines > 0 then
+			add(gap())
+			add(note("Mods (they must match the host's world):"))
+			for _, line in ipairs(modLines) do add(note("   " .. line)) end
+		end
+
+		-- an invite Steam handed to this game (a friend's "Join game" or an accepted invite) that did not start by itself
+		-- because this game is in a session: Join leaves it first
+		if ctl and type(ctl.invite) == "table" and not ctl.invite.auto then
+			add(gap())
+			add(section(tostring(ctl.invite.host or "A friend") .. " invited you through Steam"))
+			add(box(H, {
+				button("Join", function() command("accept_invite", {}) end, "primary", math.floor(WIDTH / 2) - 10),
+				button("Not now", function() command("dismiss_invite", {}) end, "secondary", math.floor(WIDTH / 2) - 10),
+			}))
 		end
 
 		-- the game side: status and chat, once the mod is part of a session
@@ -386,6 +451,10 @@ local function setup(react, builtin)
 						tick:set(tick:old() + 1)
 						if began then pcall(open) end
 					end
+					-- a new join request (host) or a Steam invite (friend) opens the window too: it waits for an answer there
+					local asks = askCount(U.ctl)
+					if asks > (U.asksShown or 0) then pcall(open) end
+					U.asksShown = asks
 				end, 0.5)
 			end)
 		end
@@ -432,6 +501,8 @@ do
 	-- which official replacements of the link module's io/os uses the window's state offers (observation only, lab)
 	pcall(function() C.logger("ui")("official api probe (window state): " .. C.officialProbe()) end)
 	pcall(function() C.logger("ui")("app keys (window): " .. C.appKeys()) end)
+	-- once per load: can this state read the mod repository, and what each step returns (lab L3 2026-10-19 saw no mod list)
+	pcall(function() C.logger("ui")("mod list (window): " .. Hud.modShape(app)) end)
 	if Hook and C.DIR and C.IO then
 		local okI, errI = pcall(Hook.install)
 		print("[feverlink3] UI hook: " .. (okI and (errI and "installed" or "not installed") or ("failed: " .. tostring(errI))))

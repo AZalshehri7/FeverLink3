@@ -3,19 +3,28 @@ name: Release
 # A release is built here, never on a developer's PC, and only from a commit on main whose message starts with the
 # version, for example `V0.1.0: First beta release` (a dash in the version, `V0.2.0-test1: ...`, makes a pre-release).
 # Every other commit only runs CI. See docs/RELEASING.md.
+#
+# Three jobs, so the signing key is reachable from as little as possible:
+#   build   no secrets: tests, build, package; hands `dist/` on as an artifact.
+#   sign    the only job with the key. It runs in the GitHub environment `release-signing`, which the owner sets up
+#           to require his approval and to accept main only; the key is a secret of that environment, not of the
+#           repository. It signs manifest.json and checks the signature with the launcher's own trusted-key list.
+#   publish creates the GitHub release from the build's files and the signature; it never sees the key.
 on:
   push:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     if: ${{ startsWith(github.event.head_commit.message, 'V') }}
     runs-on: windows-latest
+    outputs:
+      release: ${{ steps.parse.outputs.release }}
+      version: ${{ steps.parse.outputs.version }}
     env:
-      SIGNING_KEY: ${{ secrets.FEVERLINK3_SIGNING_KEY }}
       COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
     steps:
       - name: Read the version from the commit message
@@ -56,32 +65,107 @@ jobs:
           cargo run --release -p feverlink3_release -- package --version $version --out dist
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - if: steps.parse.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    needs: build
+    if: ${{ needs.build.outputs.release == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    runs-on: windows-latest
+    # Protection rules (required reviewer, main only) live in the repository settings: docs/RELEASING.md.
+    environment: release-signing
+    outputs:
+      signed: ${{ steps.check.outputs.signed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      # built before the key is in reach; the signing step only runs the finished program
+      - run: cargo build --release -p feverlink3_release
+
       - name: Sign manifest
-        if: ${{ steps.parse.outputs.release == 'true' && env.SIGNING_KEY != '' }}
         shell: pwsh
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) {
+            # A pre-release may go out unsigned (the updater refuses it); a full release may not.
+            if ("$env:VERSION" -match '-') { Write-Host "no signing key: the pre-release is published UNSIGNED"; exit 0 }
+            Write-Error "RELEASE_SIGNING_KEY is not set in the release-signing environment; a full release must be signed"
+            exit 1
+          }
           # The key is written to the runner's temp folder, used once and deleted.
           $keyFile = Join-Path $env:RUNNER_TEMP 'feverlink3_release.key'
           Set-Content -NoNewline -Path $keyFile -Value $env:SIGNING_KEY
           try {
-            cargo run --release -p feverlink3_release -- sign --key $keyFile --manifest dist/manifest.json
+            ./target/release/feverlink3_release.exe sign --key $keyFile --manifest dist/manifest.json
             if ($LASTEXITCODE -ne 0) { exit 1 }
           } finally {
             Remove-Item -Force $keyFile
           }
 
+      - name: Check the signature as the launcher will
+        id: check
+        shell: pwsh
+        run: |
+          # The launcher's TRUSTED_KEYS, its expiry rule and the zip hash: a signature players would refuse stops here.
+          if (Test-Path dist/manifest.json.sig) {
+            ./target/release/feverlink3_release.exe verify --manifest dist/manifest.json
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            "signed=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "signed=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - if: steps.check.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signature
+          path: dist/manifest.json.sig
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [build, sign]
+    if: ${{ needs.build.outputs.release == 'true' }}
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      # an unsigned pre-release has no signature artifact
+      - if: needs.sign.outputs.signed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: signature
+          path: dist
+
       - name: Publish GitHub Release
-        if: steps.parse.outputs.release == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.parse.outputs.version }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           $version = $env:VERSION
           $zip = "FeverLink3-$version.zip"
           $sha = (Get-Content "dist/$zip.sha256").Split(' ')[0]
+          if ((Get-FileHash "dist/$zip" -Algorithm SHA256).Hash.ToLower() -ne $sha) { Write-Error "zip hash changed between jobs"; exit 1 }
           $signed = Test-Path dist/manifest.json.sig
-          $sigLine = if ($signed) { "The manifest is signed with Ed25519 (manifest.json.sig)." } else { "This build is UNSIGNED: the signing key was not configured, so the in-app updater will refuse it." }
+          if (-not $signed -and "$version" -notmatch '-') { Write-Error "a full release must be signed"; exit 1 }
+          $sigLine = if ($signed) { "The manifest is signed with Ed25519 (manifest.json.sig, checked against the launcher's trusted keys)." } else { "This pre-release is UNSIGNED: the in-app updater refuses it." }
           $log = Get-Content docs/CHANGELOG.md -Raw
           $m = [regex]::Match($log, "(?ms)^## $([regex]::Escape($version))\b[^\n]*\r?\n(.*?)(?=^## |\z)")
           if (-not $m.Success) { $m = [regex]::Match($log, "(?ms)^## Unreleased[^\n]*\r?\n(.*?)(?=^## |\z)") }

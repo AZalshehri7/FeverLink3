@@ -5,7 +5,10 @@
 //! median 14 s a minute, single holds up to 16.6 s. The mod now measures, every frame, how much room is left before that stop and how
 //! long the stop takes to move (`L.paceTarget` in `feverlink3_lockstep.lua`) and sends a factor from 1 to 2 (`pace {permille}`, 1000
 //! to 2000). This module applies it to the engine's own batch interval, so the game runs a little slower as it nears the stop
-//! instead of running into it and standing still.
+//! instead of running into it and standing still. Since 2026-10-19 the factor also goes below 1, down to 0.5 (`L.paceHurry`): a game
+//! that is behind its peers with room before its stop runs its batches sooner and catches up, instead of the others slowing down to
+//! it for good (a game that lost time never got it back: the session ran at the pace of its slowest moment). Its batches are the same
+//! batches, only sooner.
 //!
 //! Where the interval lives (static analysis of build 40420, `TransportFever3.exe` read from disk, 2026-10-18): the main thread's
 //! `CGame::Step` (RVA `0x11f3f0`) adds the frame's time to an accumulator and calls `CGame::Sync` (`0x11f690`, the call at
@@ -47,6 +50,8 @@ pub const SMOOTH_PACE_VAR: &str = "FEVERLINK3_SMOOTH_PACE";
 pub const ONE: u32 = 1000;
 /// The largest factor: half speed.
 pub const MAX_PERMILLE: u32 = 2000;
+/// The smallest factor: twice the speed (a game catching up, `L.paceHurry`).
+pub const MIN_PERMILLE: u32 = 500;
 /// A factor the mod has not refreshed for this long goes back to 1 (a mod that stopped, a game that left the session). The mod
 /// refreshes it every second while it is not 1.
 pub const STALE_MS: u64 = 3000;
@@ -67,17 +72,19 @@ pub fn clock_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// A factor the mod sent, held to 1..2. `None` when it is not a factor at all (0, absurd): the line is refused.
+/// A factor the mod sent, held to 0.5..2. `None` when it is not a factor at all (0, absurd): the line is refused.
 pub fn accept_permille(p: u64) -> Option<u32> {
-    (u64::from(ONE / 2)..=u64::from(MAX_PERMILLE) * 4).contains(&p).then(|| (p as u32).clamp(ONE, MAX_PERMILLE))
+    (u64::from(MIN_PERMILLE / 2)..=u64::from(MAX_PERMILLE) * 4)
+        .contains(&p)
+        .then(|| (p as u32).clamp(MIN_PERMILLE, MAX_PERMILLE))
 }
 
 /// The factor in force at `now`: the mod's, unless it is older than [`STALE_MS`].
 pub fn effective(permille: u32, set_at: u64, now: u64) -> u32 {
-    if permille <= ONE || now.saturating_sub(set_at) > STALE_MS {
+    if permille == ONE || now.saturating_sub(set_at) > STALE_MS {
         ONE
     } else {
-        permille.min(MAX_PERMILLE)
+        permille.clamp(MIN_PERMILLE, MAX_PERMILLE)
     }
 }
 
@@ -103,9 +110,9 @@ pub fn scale(engine: i32, written: i32, base: i32, permille: u32) -> Option<Scal
     } else {
         engine
     };
-    let permille = permille.clamp(ONE, MAX_PERMILLE);
+    let permille = permille.clamp(MIN_PERMILLE, MAX_PERMILLE);
     let want = (i64::from(base) * i64::from(permille) / i64::from(ONE))
-        .clamp(i64::from(base), 2 * i64::from(base))
+        .clamp(i64::from(base) / 2, 2 * i64::from(base))
         .clamp(i64::from(MIN_INTERVAL_US), i64::from(MAX_INTERVAL_US)) as i32;
     Some(Scale { base, write: (want != engine).then_some(want) })
 }
@@ -121,9 +128,12 @@ pub struct Pacer {
     base: AtomicI32,
     off: AtomicBool,
     off_why: OnceLock<String>,
-    /// The minute's numbers: batches seen, batches stretched, the sum and the largest factor of the batches seen.
+    /// The minute's numbers: batches seen, batches stretched (factor above 1) and hurried (below 1), the sum, the largest and the
+    /// smallest factor of the batches seen.
     batches: AtomicU64,
     stretched: AtomicU64,
+    hurried: AtomicU64,
+    min: AtomicU32,
     sum: AtomicU64,
     max: AtomicU32,
     minute_at: AtomicU64,
@@ -144,6 +154,8 @@ impl Pacer {
             off_why: OnceLock::new(),
             batches: AtomicU64::new(0),
             stretched: AtomicU64::new(0),
+            hurried: AtomicU64::new(0),
+            min: AtomicU32::new(ONE),
             sum: AtomicU64::new(0),
             max: AtomicU32::new(ONE),
             minute_at: AtomicU64::new(0),
@@ -155,7 +167,7 @@ impl Pacer {
 
     /// The mod's factor (already accepted), received at `now`.
     pub fn set(&self, permille: u32, now: u64) {
-        self.permille.store(permille.clamp(ONE, MAX_PERMILLE), Relaxed);
+        self.permille.store(permille.clamp(MIN_PERMILLE, MAX_PERMILLE), Relaxed);
         self.set_at.store(now, Relaxed);
         self.lines.fetch_add(1, Relaxed);
         self.minute_lines.fetch_add(1, Relaxed);
@@ -206,7 +218,7 @@ impl Pacer {
             self.skipped.fetch_add(1, Relaxed);
             return None;
         };
-        self.count(permille, permille > ONE);
+        self.count(permille, permille != ONE);
         if permille == ONE {
             // back to the engine's own interval: written once, then the field is the engine's again
             self.written.store(0, Relaxed);
@@ -218,18 +230,21 @@ impl Pacer {
         s.write
     }
 
-    fn count(&self, permille: u32, stretched: bool) {
+    fn count(&self, permille: u32, scaled: bool) {
         self.batches.fetch_add(1, Relaxed);
         self.sum.fetch_add(u64::from(permille), Relaxed);
         self.max.fetch_max(permille, Relaxed);
-        if stretched {
+        self.min.fetch_min(permille, Relaxed);
+        if scaled && permille > ONE {
             self.stretched.fetch_add(1, Relaxed);
+        } else if scaled && permille < ONE {
+            self.hurried.fetch_add(1, Relaxed);
         }
     }
 
-    /// The first stretched batch, once (for `native.log`): the engine's interval and what was written.
+    /// The first stretched (or hurried) batch, once (for `native.log`): the engine's interval and what was written.
     pub fn first_line(&self) -> Option<String> {
-        if self.stretched.load(Relaxed) == 0 || self.first_logged.swap(true, Relaxed) {
+        if self.stretched.load(Relaxed) + self.hurried.load(Relaxed) == 0 || self.first_logged.swap(true, Relaxed) {
             return None;
         }
         Some(format!(
@@ -252,8 +267,10 @@ impl Pacer {
         self.minute_at.store(now, Relaxed);
         let batches = self.batches.swap(0, Relaxed);
         let stretched = self.stretched.swap(0, Relaxed);
+        let hurried = self.hurried.swap(0, Relaxed);
         let sum = self.sum.swap(0, Relaxed);
         let max = self.max.swap(ONE, Relaxed);
+        let min = self.min.swap(ONE, Relaxed);
         let lines = self.minute_lines.swap(0, Relaxed);
         let skipped = self.skipped.swap(0, Relaxed);
         if batches == 0 && lines == 0 && !self.is_off() {
@@ -261,9 +278,10 @@ impl Pacer {
         }
         let mean = if batches > 0 { sum as f64 / batches as f64 / f64::from(ONE) } else { 1.0 };
         Some(format!(
-            "{HOOK_NAME}: last {:.0} s: {batches} batches, {stretched} stretched, factor mean {mean:.2} max {:.2}, now {:.2}, {lines} pace line(s) from the mod, engine interval {} us{}{}",
+            "{HOOK_NAME}: last {:.0} s: {batches} batches, {stretched} stretched, {hurried} hurried, factor mean {mean:.2} max {:.2} min {:.2}, now {:.2}, {lines} pace line(s) from the mod, engine interval {} us{}{}",
             now.saturating_sub(at) as f64 / 1000.0,
             f64::from(max) / f64::from(ONE),
+            f64::from(min) / f64::from(ONE),
             f64::from(self.factor(now)) / f64::from(ONE),
             self.base.load(Relaxed),
             if skipped > 0 { format!(", {skipped} implausible interval(s) left alone") } else { String::new() },
@@ -289,12 +307,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_factor_is_held_to_one_to_two_and_absurd_ones_are_refused() {
+    fn a_factor_is_held_to_a_half_to_two_and_absurd_ones_are_refused() {
         assert_eq!(accept_permille(1000), Some(1000));
         assert_eq!(accept_permille(1500), Some(1500));
         assert_eq!(accept_permille(2600), Some(2000), "more than half speed is never asked for: capped");
-        assert_eq!(accept_permille(800), Some(1000), "never faster than the session's speed");
+        assert_eq!(accept_permille(800), Some(800), "a game behind its peers runs its batches sooner");
+        assert_eq!(accept_permille(300), Some(500), "never more than twice as fast: capped");
         assert_eq!(accept_permille(0), None);
+        assert_eq!(accept_permille(100), None);
         assert_eq!(accept_permille(100_000), None);
     }
 
@@ -303,7 +323,9 @@ mod tests {
         assert_eq!(effective(1500, 10_000, 10_000), 1500);
         assert_eq!(effective(1500, 10_000, 10_000 + STALE_MS), 1500);
         assert_eq!(effective(1500, 10_000, 10_001 + STALE_MS), ONE, "a mod that stopped refreshing: back to 1");
-        assert_eq!(effective(900, 10_000, 10_000), ONE);
+        assert_eq!(effective(900, 10_000, 10_000), 900);
+        assert_eq!(effective(900, 10_000, 10_001 + STALE_MS), ONE, "a hurry not refreshed goes back to 1 too");
+        assert_eq!(effective(100, 10_000, 10_000), MIN_PERMILLE);
         assert_eq!(effective(5000, 10_000, 10_000), MAX_PERMILLE);
     }
 
@@ -318,6 +340,10 @@ mod tests {
         assert_eq!(scale(300_000, 375_000, 250_000, 1500), Some(Scale { base: 300_000, write: Some(450_000) }));
         // back to 1 while the field is still stretched: the engine's interval again
         assert_eq!(scale(375_000, 375_000, 250_000, ONE), Some(Scale { base: 250_000, write: Some(250_000) }));
+        // hurried: the engine's 250 ms, factor 0.8: 200 ms; never less than half of it
+        assert_eq!(scale(250_000, 0, 0, 800), Some(Scale { base: 250_000, write: Some(200_000) }));
+        assert_eq!(scale(200_000, 200_000, 250_000, 800), Some(Scale { base: 250_000, write: None }), "not compounded");
+        assert_eq!(scale(250_000, 0, 0, 100).unwrap().write, Some(125_000));
         // never more than twice the engine's interval, never outside the plausible range
         assert_eq!(scale(250_000, 0, 0, 9000).unwrap().write, Some(500_000));
         assert_eq!(scale(1_500_000, 0, 0, 2000).unwrap().write, Some(MAX_INTERVAL_US));
@@ -367,7 +393,12 @@ mod tests {
         }
         assert_eq!(p.minute_line(30_000), None, "not a minute yet");
         let line = p.minute_line(61_000).expect("a minute");
-        assert!(line.starts_with("batch_pace: last 60 s: 4 batches, 4 stretched, factor mean 1.50 max 1.50"), "{line}");
+        assert!(
+            line.starts_with(
+                "batch_pace: last 60 s: 4 batches, 4 stretched, 0 hurried, factor mean 1.50 max 1.50 min 1.00"
+            ),
+            "{line}"
+        );
         assert!(line.contains("1 pace line(s) from the mod") && line.contains("engine interval 250000 us"), "{line}");
         assert_eq!(p.minute_line(121_000), None, "a quiet minute says nothing");
     }

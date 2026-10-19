@@ -36,6 +36,10 @@
 //!    draws from that getter (vehicle reservations, town and street development). Which pseudo-random sequence is drawn
 //!    changes, no rule does. A one-byte patch, independent of the others (`build_table::BuildAddrs::tick_count_getter`).
 //!
+//! 8. `FEVERLINK3_FREE_ORDER` (on by default, `=0` off, and then on every game of the session): the ids a modification removed join
+//!    the engine's FIFO free-id queue sorted by entity id instead of in the order the engine visited the entities, so which id a new
+//!    entity gets no longer depends on engine history (`freeorder.rs`). A call-site redirect, independent of the other switches.
+//!
 //! Switches 4 and 5 are off unless the value is exactly `1` (after trimming blanks). Five pieces are ON by default because a
 //! session of several games needs them to stay in step: the counters and the hold hook (1, 2: the hold hook holds nothing
 //! until the mod writes `hold_on`, which the mod does for the strict build flow), the single-worker script pool (3), the
@@ -103,6 +107,9 @@ pub struct HookConfig {
     /// Smooth pacing (`pace.rs`): the call of `CGame::Sync` in `CGame::Step` is redirected so that the batch interval can be stretched by
     /// the mod's factor. On by default with the hooks; `FEVERLINK3_SMOOTH_PACE=0` off.
     pub smooth_pace: bool,
+    /// Freed ids join the free-id queue sorted by entity id (`freeorder.rs`); on by default, `FEVERLINK3_FREE_ORDER=0` off, and then
+    /// on every game of the session.
+    pub free_order: bool,
 }
 
 impl HookConfig {
@@ -123,6 +130,7 @@ impl HookConfig {
             step_seed: !off(STEP_SEED_VAR),
             native_patch: on(crate::cmd_patch::PATCH_VAR),
             smooth_pace: !off(crate::pace::SMOOTH_PACE_VAR),
+            free_order: !off(crate::freeorder::FREE_ORDER_VAR),
         }
     }
 
@@ -135,12 +143,13 @@ impl HookConfig {
             || self.growth.active()
             || self.luaseed
             || self.step_seed
+            || self.free_order
     }
 
     pub fn describe(&self) -> String {
         let f = |b: bool| if b { "on" } else { "off" };
         format!(
-            "hooks={} hold={} poolpatch={} luaseed={} step_seed={} town_seed={} fire_done={} smooth_pace={}{}{}",
+            "hooks={} hold={} poolpatch={} luaseed={} step_seed={} town_seed={} fire_done={} smooth_pace={} free_order={}{}{}",
             f(self.hooks),
             f(self.hold),
             f(self.poolpatch),
@@ -149,6 +158,7 @@ impl HookConfig {
             f(self.town_seed),
             f(self.fire_done),
             f(self.hooks && self.smooth_pace),
+            f(self.free_order),
             self.force_seed.map(|v| format!(" force_seed={v:#010x}")).unwrap_or_default(),
             self.growth.describe()
         )
@@ -209,6 +219,8 @@ pub enum Feature {
     GrowthSort,
     /// The call-site redirect before the country-edge pick (deep growth log).
     GrowthPick,
+    /// The call-site redirect of the river field lookup in the street developer's open pass (deep growth log).
+    GrowthField,
     /// The pinned Lua string-hash seed.
     LuaSeed,
     /// The tickCount getter that returns the step count.
@@ -221,6 +233,8 @@ pub enum Feature {
     PreviewEvent,
     /// The call-site redirect of `CGame::Sync` in `CGame::Step`: the batch interval stretched by the mod's factor (`pace.rs`).
     BatchPace,
+    /// The call-site redirect of the free-id queue's append in `EndModification`: each batch of freed ids sorted by id (`freeorder.rs`).
+    FreeOrder,
 }
 
 impl Feature {
@@ -236,12 +250,14 @@ impl Feature {
             Feature::GrowthEdges => "town_edges",
             Feature::GrowthSort => "town_sort",
             Feature::GrowthPick => "town_pick",
+            Feature::GrowthField => "town_field",
             Feature::LuaSeed => "luaseed",
             Feature::StepSeed => "step_seed",
             Feature::Convert => "script_convert",
             Feature::ConvertUpdate => "script_convert_update",
             Feature::PreviewEvent => "preview_event",
             Feature::BatchPace => crate::pace::HOOK_NAME,
+            Feature::FreeOrder => crate::freeorder::HOOK_NAME,
         }
     }
 }
@@ -403,6 +419,9 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
     if cfg.step_seed {
         plan_patch(Feature::StepSeed, "tick_count_getter", &build.tick_count_getter, image, &mut p);
     }
+    if cfg.free_order {
+        plan_free_order(build, image, &mut p);
+    }
     p
 }
 
@@ -552,11 +571,12 @@ fn plan_growth_deep(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
-/// The two call-site redirects of the deep log: the call bytes and the callee's prologue must both match.
+/// The three call-site redirects of the deep log: the call bytes and the callee's prologue must both match.
 fn plan_growth_calls(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     for (feature, name, site) in [
         (Feature::GrowthSort, "town_sort", &build.town_sort_call),
         (Feature::GrowthPick, "town_pick", &build.town_pick_call),
+        (Feature::GrowthField, "town_field", &build.town_field_call),
     ] {
         let Some(site) = site else {
             p.skipped.push(Skip { feature, name, reason: "the build table has no such site for this build".into() });
@@ -582,6 +602,28 @@ fn plan_growth_calls(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
 fn plan_batch_pace(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     let (feature, name) = (Feature::BatchPace, crate::pace::HOOK_NAME);
     let Some(site) = &build.batch_pace else { return };
+    let checked = verify(image, site.rva, site.expected)
+        .and_then(|()| verify(image, site.callee.rva, site.callee.prologue).map_err(|e| format!("callee: {e}")));
+    match checked {
+        Ok(()) => p.steps.push(Step::CallPatch {
+            feature,
+            name,
+            rva: site.rva,
+            expected: site.expected,
+            callee: site.callee.rva,
+        }),
+        Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+    }
+}
+
+/// The canonical free-id order: the call in `EndModification` and the callee's prologue must both match. Unlike smooth pacing a build
+/// without the site is a skip with its reason: the switch asked for a determinism piece (the caller makes the missing piece a stop fault).
+fn plan_free_order(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let (feature, name) = (Feature::FreeOrder, crate::freeorder::HOOK_NAME);
+    let Some(site) = &build.free_order else {
+        p.skipped.push(Skip { feature, name, reason: format!("the build table has no {name} site for this build") });
+        return;
+    };
     let checked = verify(image, site.rva, site.expected)
         .and_then(|()| verify(image, site.callee.rva, site.callee.prologue).map_err(|e| format!("callee: {e}")));
     match checked {
@@ -680,7 +722,10 @@ mod tests {
         }
         let g = b.game_time_getter.as_ref().unwrap();
         img.write(g.rva, g.prologue);
-        for c in [&b.town_sort_call, &b.town_pick_call, &b.batch_pace].into_iter().flatten() {
+        for c in [&b.town_sort_call, &b.town_pick_call, &b.town_field_call, &b.batch_pace, &b.free_order]
+            .into_iter()
+            .flatten()
+        {
             img.write(c.rva, c.expected);
             img.write(c.callee.rva, c.callee.prologue);
         }
@@ -715,6 +760,7 @@ mod tests {
             step_seed: true,
             fire_done: true,
             smooth_pace: true,
+            free_order: true,
             ..Default::default()
         };
         assert_eq!(
@@ -730,13 +776,21 @@ mod tests {
             (STEP_SEED_VAR, "0"),
             (FIRE_DONE_VAR, "0"),
             (crate::pace::SMOOTH_PACE_VAR, "0"),
+            (crate::freeorder::FREE_ORDER_VAR, "0"),
         ]));
         assert_eq!(none, HookConfig::default(), "=0 turns each of them off");
         assert!(!HookConfig::default().any());
         let all = HookConfig::from_lookup(env(&[(HOOKS_VAR, "1"), (HOLD_VAR, "1"), (POOLPATCH_VAR, "1")]));
         assert_eq!(
             all,
-            HookConfig { luaseed: true, step_seed: true, fire_done: true, smooth_pace: true, ..cfg(true, true, true) }
+            HookConfig {
+                luaseed: true,
+                step_seed: true,
+                fire_done: true,
+                smooth_pace: true,
+                free_order: true,
+                ..cfg(true, true, true)
+            }
         );
         for off in ["", "0", "true", "yes", "on", "2", "11", "-1", "one"] {
             let c = HookConfig::from_lookup(|k| (k != FORCE_TOWN_SEED_VAR).then(|| off.to_string()));
@@ -751,6 +805,7 @@ mod tests {
                     step_seed: on_by_default,
                     fire_done: on_by_default,
                     smooth_pace: on_by_default,
+                    free_order: on_by_default,
                     ..Default::default()
                 },
                 "{off:?} must not switch anything else on"
@@ -761,17 +816,17 @@ mod tests {
         assert!(only_pool.any() && !only_pool.hooks, "the pool patch is its own switch");
         assert_eq!(
             all.describe(),
-            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=off fire_done=on smooth_pace=on"
+            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=off fire_done=on smooth_pace=on free_order=on"
         );
         assert_eq!(
             HookConfig::default().describe(),
-            "hooks=off hold=off poolpatch=off luaseed=off step_seed=off town_seed=off fire_done=off smooth_pace=off"
+            "hooks=off hold=off poolpatch=off luaseed=off step_seed=off town_seed=off fire_done=off smooth_pace=off free_order=off"
         );
         let seed = HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "1")]));
         assert!(seed.any() && seed.town_seed, "its own switch");
         assert_eq!(
             seed.describe(),
-            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=on fire_done=on smooth_pace=on"
+            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=on fire_done=on smooth_pace=on free_order=on"
         );
         assert!(!HookConfig::from_lookup(env(&[(TOWN_SEED_VAR, "true")])).town_seed, "only the exact value 1");
     }
@@ -792,7 +847,7 @@ mod tests {
         assert_eq!((c.force_seed, c.town_seed, c.any()), (Some(16), true, true), "forcing installs the hook");
         assert_eq!(
             c.describe(),
-            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=on fire_done=on smooth_pace=on force_seed=0x00000010"
+            "hooks=on hold=on poolpatch=on luaseed=on step_seed=on town_seed=on fire_done=on smooth_pace=on free_order=on force_seed=0x00000010"
         );
         let bad = HookConfig::from_lookup(env(&[(FORCE_TOWN_SEED_VAR, "nope")]));
         assert_eq!(bad, HookConfig::from_lookup(env(&[])), "an invalid value switches nothing on");
@@ -973,19 +1028,48 @@ mod tests {
         let b = select(0x6ac5_0427).unwrap();
         let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
         assert!(deep.any() && deep.growth.deep);
-        let deep = HookConfig { hooks: false, hold: false, poolpatch: false, luaseed: false, step_seed: false, ..deep }; // on by default; not what this test is about
+        let deep = HookConfig {
+            hooks: false,
+            hold: false,
+            poolpatch: false,
+            luaseed: false,
+            step_seed: false,
+            free_order: false,
+            ..deep
+        }; // on by default; not what this test is about
         let p = plan(b, deep, &image_of_40420());
         assert_eq!(
             names(&p),
-            ["town_develop", "town_update_size", "town_candidates", "town_edges", "town_sort", "town_pick"],
+            [
+                "town_develop",
+                "town_update_size",
+                "town_candidates",
+                "town_edges",
+                "town_sort",
+                "town_pick",
+                "town_field"
+            ],
             "{:?}",
             p.report()
         );
         let mut img = image_of_40420();
         img.write(0x9677c0 + 6, &[0x90]);
         let p = plan(b, deep, &img);
-        assert_eq!(names(&p), ["town_develop", "town_update_size", "town_edges", "town_sort", "town_pick"]);
+        assert_eq!(
+            names(&p),
+            ["town_develop", "town_update_size", "town_edges", "town_sort", "town_pick", "town_field"]
+        );
         assert!(p.skipped.iter().any(|s| s.name == "town_candidates"));
+        // the river field lookup: a changed callee skips only that redirect
+        let mut img = image_of_40420();
+        img.write(0x2b7a1b0 + 1, &[0x00]);
+        let p = plan(b, deep, &img);
+        assert!(!names(&p).contains(&"town_field") && names(&p).contains(&"town_pick"));
+        assert!(
+            p.skipped.iter().any(|s| s.name == "town_field" && s.reason.starts_with("callee: ")),
+            "{:?}",
+            p.skipped
+        );
         // a changed call or callee skips only that redirect
         let mut img = image_of_40420();
         img.write(0x967c16 + 1, &[0x00]);
@@ -997,7 +1081,15 @@ mod tests {
         assert!(p.skipped.iter().any(|s| s.name == "town_pick" && s.reason.starts_with("callee: ")), "{:?}", p.skipped);
         // without the deep switch neither is planned
         let log = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH", "1")]));
-        let log = HookConfig { hooks: false, hold: false, poolpatch: false, luaseed: false, step_seed: false, ..log };
+        let log = HookConfig {
+            hooks: false,
+            hold: false,
+            poolpatch: false,
+            luaseed: false,
+            step_seed: false,
+            free_order: false,
+            ..log
+        };
         assert_eq!(names(&plan(b, log, &image_of_40420())), ["town_develop", "town_update_size"]);
     }
 
@@ -1072,7 +1164,9 @@ mod tests {
         town_edges: None,
         town_sort_call: None,
         town_pick_call: None,
+        town_field_call: None,
         batch_pace: None,
+        free_order: None,
         game_time_getter: None,
         script_pool: None,
         lua_makeseed: None,
@@ -1224,6 +1318,42 @@ mod tests {
         let leaked: &'static BuildAddrs = Box::leak(Box::new(BARE.clone()));
         let p = plan(leaked, on, &img);
         assert!(p.steps.is_empty() && p.skipped[0].reason.contains("no tick_count_getter site"));
+    }
+
+    #[test]
+    fn the_free_order_is_on_unless_zero_and_planned_only_when_the_call_and_the_callee_match() {
+        let env = |v: Option<&'static str>| {
+            HookConfig::from_lookup(
+                move |n| if n == crate::freeorder::FREE_ORDER_VAR { v.map(String::from) } else { None },
+            )
+        };
+        for on in [None, Some(""), Some("1"), Some("on")] {
+            assert!(env(on).free_order, "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0 ")] {
+            assert!(!env(off).free_order, "{off:?}");
+        }
+        let on = HookConfig { free_order: true, ..Default::default() };
+        assert!(on.any(), "the free order alone makes the module touch the game's code");
+        let (b, img) = (select(0x6ac5_0427).unwrap(), image_of_40420());
+        let p = plan(b, on, &img);
+        assert_eq!(names(&p), ["free_order"], "{:?}", p.report());
+        let Step::CallPatch { feature, rva, callee, .. } = &p.steps[0] else { panic!("not a call patch") };
+        assert_eq!((*feature, *rva, *callee), (Feature::FreeOrder, 0x2bba103, 0x2bb62a0));
+        assert!(plan(b, HookConfig::default(), &img).steps.is_empty(), "nothing without the switch");
+
+        // another call there, or another function behind it: a skip with the reason (the caller makes it a stop fault)
+        for (at, what) in [(0x2bba104u32, "bytes at rva 0x2bba103"), (0x2bb62a0, "callee: ")] {
+            let mut other = img.clone();
+            other.write(at, &[0x90]);
+            let p = plan(b, on, &other);
+            assert!(p.steps.is_empty());
+            assert_eq!((p.skipped[0].name, p.skipped[0].feature), ("free_order", Feature::FreeOrder));
+            assert!(p.skipped[0].reason.contains(what), "{}", p.skipped[0].reason);
+        }
+        let leaked: &'static BuildAddrs = Box::leak(Box::new(BARE.clone()));
+        let p = plan(leaked, on, &img);
+        assert!(p.steps.is_empty() && p.skipped[0].reason.contains("no free_order site"), "{:?}", p.report());
     }
 
     #[test]

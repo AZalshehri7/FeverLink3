@@ -154,7 +154,7 @@ fn a_full_resync_round_with_seven_players_and_the_host() {
     n.stop_all_at(pause_at);
     assert_eq!(ResyncState::Saving, n.host.resync_state());
     let id = n.host.resync_id().unwrap();
-    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
 
     let save = blob(2 * ResyncLimits::CHUNK_SIZE + 77);
     let sha = sha256_hex(&save);
@@ -284,7 +284,11 @@ fn players_cannot_send_what_only_the_host_may_say() {
     let b = n.connect("Bob");
     let before = n.host.dropped();
     n.send(a, MessageKind::Kicked, &json(&RejectMessage::new("kicked", Some("by Alice"))));
-    n.send(a, MessageKind::Ping, &json(&PingMessage { n: 1, rtt: Default::default(), off: Default::default() }));
+    n.send(
+        a,
+        MessageKind::Ping,
+        &json(&PingMessage { n: 1, rtt: Default::default(), off: Default::default(), ack: None }),
+    );
     assert_eq!(before + 2, n.host.dropped());
     assert!(n.peer(b).rejected.is_none());
     assert_eq!(PlayerState::Joined, n.peer(b).session.state());

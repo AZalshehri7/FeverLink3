@@ -119,7 +119,7 @@ fn saving_fails_when_the_host_game_reports_failure() {
     let pause_at = h.host.state().pause_at.unwrap();
     h.stop_all_at(pause_at);
     let id = h.host.resync_id().unwrap();
-    let done = SaveDoneMessage { id, ok: false, detail: Some("disk full".to_owned()) };
+    let done = SaveDoneMessage { id, ok: false, detail: Some("disk full".to_owned()), mods: None };
     h.host_game(MessageKind::SaveDone, &json(&done));
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     assert!(h.failures()[0].contains("disk full"));
@@ -147,11 +147,11 @@ fn save_done_from_a_player_or_with_another_id_is_ignored() {
     let pause_at = h.host.state().pause_at.unwrap();
     h.stop_all_at(pause_at);
     let id = h.host.resync_id().unwrap();
-    h.player_game(ids[0], MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    h.player_game(ids[0], MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     assert_eq!(ResyncState::Saving, h.host.resync_state());
-    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id: id + 7, ok: true, detail: None }));
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id: id + 7, ok: true, detail: None, mods: None }));
     assert_eq!(ResyncState::Saving, h.host.resync_state());
-    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     assert_eq!(ResyncState::Transferring, h.host.resync_state());
 }
 
@@ -873,7 +873,7 @@ fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_a
     assert_eq!(ResyncState::Saving, h.host.resync_state());
 
     let id = h.host.resync_id().unwrap();
-    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     let bytes = blob(1000);
     h.send_file(id, &bytes);
     assert_eq!(vec![(id, sha256_hex(&bytes), bytes.clone())], h.p(p).saves);
@@ -1468,7 +1468,7 @@ fn after_the_load_the_pause_is_the_time_the_games_loaded_at() {
     h.player_game(ids[0], MessageKind::Clock, &still(p, p));
     assert_eq!(ResyncState::Saving, h.host.resync_state());
     let id = h.host.resync_id().unwrap();
-    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     h.send_file(id, &blob(600 * 1024));
     assert_eq!(ResyncState::Loading, h.host.resync_state());
 
@@ -1527,7 +1527,7 @@ fn an_action_of_the_pause_made_before_the_load_is_stamped_after_the_loaded_time(
     // (the action may be stamped from these stops already: then the stamp is past the furthest, the host's save)
     let before: Vec<(i64, i64)> = pause_order(&h.p(ids[0]).game);
     assert!(before.iter().all(|&(_, at)| at > saved), "{before:?}");
-    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     let sha = sha256_hex(&blob(600 * 1024));
     h.host_call(|host| host.resync_file_ready(id, &sha, 600 * 1024));
     // the host's game loads early: its clock is gone, the player's old stop alone is left

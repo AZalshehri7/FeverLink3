@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::mods::{ModFingerprint, ModTags};
+
 /// JSON encoding of every payload.
 pub mod codec {
     use serde::de::DeserializeOwned;
@@ -64,6 +66,10 @@ pub struct JoinMessage {
     /// know; a host that predates the field ignores the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caps: Vec<String>,
+    /// The player's game, mods and builds in compact form (see [`super::mods`]). A host that compares mod lists refuses
+    /// a join without it (`version`: an older FeverLink3); an older host ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mods: Option<ModTags>,
 }
 
 /// Capability: the player can receive a savegame as bulk datagrams (own reliability and congestion control over Steam's
@@ -76,12 +82,12 @@ pub const CAP_BULK_PAR: &str = "bulk-par-1";
 
 impl JoinMessage {
     pub fn new(name: &str, version: &str, proof: Vec<u8>) -> Self {
-        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None, caps: Vec::new() }
+        Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None, caps: Vec::new(), mods: None }
     }
 }
 
-/// "I am player `id`": `HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ u16 id ‖ UTF8(name))` with the token from
-/// the player's earlier welcome and the nonce of this connection's challenge. The token itself never travels again,
+/// "I am player `id`": `HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ u16 id ‖ UTF8(name) [‖ "last" ‖ u64 last])` with the
+/// token from the player's earlier welcome and the nonce of this connection's challenge. The token itself never travels again,
 /// and a claim cannot be replayed on another connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,20 +95,28 @@ pub struct ResumeClaim {
     pub id: u16,
     #[serde(with = "base64_bytes")]
     pub mac: Vec<u8>,
+    /// The counter of the last host frame this player received: its game kept its world and asks to be caught up from there
+    /// (`docs/PROTOCOL.md`, "Catching up"). Covered by the mac. Absent: the player cannot be caught up (it kept nothing it sent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<u64>,
 }
 
-/// Host to a connection it will close. Reasons: `bad-proof`, `version`, `full`, `malformed`.
+/// Host to a connection it will close. Reasons: `bad-proof`, `version`, `mods`, `full`, `malformed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RejectMessage {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// With reason `mods`: the host's full list, from which the player makes the readable diff. Sent only after the
+    /// join's proof was verified (only holders of the code see it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mods: Option<ModFingerprint>,
 }
 
 impl RejectMessage {
     pub fn new(reason: &str, detail: Option<&str>) -> Self {
-        Self { reason: reason.to_owned(), detail: detail.map(str::to_owned) }
+        Self { reason: reason.to_owned(), detail: detail.map(str::to_owned), mods: None }
     }
 }
 
@@ -125,6 +139,19 @@ pub struct SessionState {
     /// windows say so, because their games just stand still while the host's world is prepared and sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resync: Option<String>,
+    /// What could not be compared or only differs in cosmetic mods (`docs/PROTOCOL.md`, "Mod list"): every window shows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mod_warnings: Vec<String>,
+    /// The games whose clocks have not come for the stall timeout (`HostOptions::stall_timeout_seconds`) while the session runs: the
+    /// others run on without waiting for them (the host keeps their promises, see `PeerClockMessage::stalled`), and each of them, once
+    /// it runs again, catches up and has every action it ships stamped by the host (as in the pause order) until it is out of this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalled: Vec<u16>,
+}
+
+impl SessionState {
+    /// Mod warnings a session state carries at most (the newest).
+    pub const MOD_WARNINGS_KEPT: usize = 8;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +183,15 @@ pub struct WelcomeMessage {
     /// The player came back with a valid claim and holds the id it had before.
     #[serde(default, skip_serializing_if = "is_false")]
     pub resumed: bool,
+    /// The host compared this player's mod list and it matched. A player that sent one and gets a welcome without
+    /// this flag is talking to an older host and leaves (`version`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mods_checked: bool,
+    /// The host catches this returner up instead of reloading it: the frames it missed follow this welcome, and the number is the
+    /// counter of the last frame the host received from it, so it sends the rest of what its game sent (`docs/PROTOCOL.md`,
+    /// "Catching up"). Read by the session layer only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up: Option<u64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -269,6 +305,11 @@ pub struct PeerClockMessage {
     /// `safe` is the pause the game is stopped at (ClockMessage::pause).
     #[serde(default, skip_serializing_if = "is_false")]
     pub pause: bool,
+    /// The game `from` is stalled (`SessionState::stalled`): `t` is its last clock and `safe` is the host's promise for it, not the
+    /// game's own: every action of that game the host relays after this line is stamped at or after `safe` (the host stamps them, or
+    /// refuses one on every game). A receiving game keeps to `safe` as to any promise but does not pace itself to `t`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stalled: bool,
     /// The clock line's stamps so far ([`Hops`]), when its game sent any. Logs only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hop: Option<Hops>,
@@ -290,6 +331,22 @@ pub struct ChecksumRequestMessage {
     /// round at `at`, as before: light and paused rounds, and an older host.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spread: u32,
+    /// Entities every game reads per chunk of a spread round, sized by the host from the games' measured cost
+    /// (`ChecksumPolicy::chunk_for`). The same number goes to every game, so every game cuts the entity lists at the same places.
+    /// 0 (absent) = the game's own default (200 entities), as before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub chunk: u32,
+    /// The round keeps its itemised keys in the game-script state, complete and the same on every game, for the dump at a resync.
+    /// The host asks for it after a round that differed, until one is identical again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detail: bool,
+}
+
+impl ChecksumRequestMessage {
+    /// A round without a host chunk size or detail keys.
+    pub fn new(n: i32, at: i64, paused: bool, full: bool, spread: u32) -> Self {
+        Self { n, at, paused, full, spread, chunk: 0, detail: false }
+    }
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -349,6 +406,9 @@ pub struct PingMessage {
     /// player can put the stamps of a line ([`Hops`]) on one clock. Logs only; absent from an older host.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub off: BTreeMap<u16, i64>,
+    /// The counter of the last frame the host received from this player: what the player keeps for a resume up to it can go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<u64>,
 }
 
 // ---- player -> host
@@ -440,11 +500,35 @@ pub struct ChecksumReportMessage {
     /// unknown, not different. They are not in `parts`; the host does not compare them in this round.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_ready: Vec<String>,
+    /// What a spread round cost this game (absent for a round hashed whole): the host sizes the next rounds' chunks from it.
+    /// A cost that does not read (a float, a string) is dropped, never the report: the report is what is compared.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_cost")]
+    pub cost: Option<ChecksumCost>,
+}
+
+fn lenient_cost<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ChecksumCost>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
+}
+
+/// The cost of one spread checksum round on one game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksumCost {
+    /// Nanoseconds an entity: the dearer of the costliest chunk's and the whole round's average.
+    #[serde(default)]
+    pub entity_ns: u32,
+    /// The costliest chunk, microseconds.
+    #[serde(default)]
+    pub step_max_us: u32,
+    /// The entities a chunk read in that round.
+    #[serde(default)]
+    pub chunk: u32,
 }
 
 impl ChecksumReportMessage {
     pub fn new(n: i32, time: i64, parts: BTreeMap<String, String>) -> Self {
-        Self { n, time, parts, authority: None, not_ready: Vec::new() }
+        Self { n, time, parts, authority: None, not_ready: Vec::new(), cost: None }
     }
 }
 
@@ -455,6 +539,21 @@ pub struct SaveDoneMessage {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The ids of the mods the saved world uses (`app.getSavegameInfo`, feverlink3_hud.lua `H.worldMods`), as the game
+    /// writes them: a list of strings (an empty Lua table arrives as `{}`). Absent: they could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mods: Option<serde_json::Value>,
+}
+
+impl SaveDoneMessage {
+    /// The world's mod ids, `None` when the game could not read them (or wrote something else).
+    pub fn world_mods(&self) -> Option<Vec<String>> {
+        match self.mods.as_ref()? {
+            serde_json::Value::Array(a) => a.iter().map(|v| v.as_str().map(str::to_owned)).collect(),
+            serde_json::Value::Object(o) if o.is_empty() => Some(Vec::new()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,6 +743,10 @@ pub struct BuildVetoMessage {
     pub from: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The host itself refuses the action on every game, its sender's included: a stalled game's action stamped before the promise the
+    /// host made for that game while it stood still (`PeerClockMessage::stalled`). Never taken from a player (the host clears it on relay).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host: bool,
 }
 
 /// "Apply it": the commit of a held strict build made in a paused game (`owner`:`seq` names the action; `stamp` is the game time to

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 
 use hmac::digest::KeyInit;
@@ -9,7 +9,7 @@ use super::checksum::{ChecksumOutcome, ChecksumRounds};
 use super::kind::MessageKind;
 use super::limits::RateLimiter;
 use super::linkstats::{HostLinkStats, OffsetEstimate};
-use super::lockstep::{LeadMeter, Lockstep, PlayerClock};
+use super::lockstep::{JitterBuffer, LeadMeter, Lockstep, PlayerClock};
 use super::messages::{
     codec, ActionMessage, ActionRefusedMessage, AuthorityMessage, BuildCommitMessage, BuildVetoMessage,
     ChallengeMessage, ChatMessage, ChecksumReportMessage, ChecksumRequestMessage, ClockMessage, HelloMessage, Hops,
@@ -17,8 +17,10 @@ use super::messages::{
     PongMessage, RejectMessage, ReplayFailedMessage, ResumeClaim, ResumeGrant, SaveDoneMessage, SessionState,
     SpeedRequestMessage, WelcomeMessage,
 };
+use super::mods::{ModFingerprint, ModTags};
 use super::names::Names;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
+use super::resume::{Missed, Outbox};
 use super::resync::ResyncState;
 use super::roster::{ConnectionState, RosterEntry};
 use super::verdict::VerdictBook;
@@ -26,7 +28,9 @@ use crate::crypto::{Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
 
 mod resync_impl;
+mod stall;
 use resync_impl::ResyncRound;
+use stall::Stall;
 
 /// A transport connection, numbered by the caller.
 pub type ConnectionId = u64;
@@ -38,7 +42,14 @@ pub struct HostOptions {
     /// player who dropped counts.
     pub max_players: usize,
     pub session_broadcast_seconds: f64,
+    /// Seconds between two regular checksum rounds (a round still being read delays the next; they never overlap). Default 5
+    /// since 2026-10-19 (10 before): with chunks sized to the measured cost a round of the friend-test world (7400 entities) is
+    /// read in about 3-4 s, so a fork shows in the next round within about 5-9 s and the repair (two rounds in a row) follows
+    /// about 5 s later. FEVERLINK3_FAST_CHECKSUM=0 gives back 10 s and the fixed chunk for lab comparisons.
     pub checksum_seconds: f64,
+    /// Size the chunks of spread rounds from the games' measured cost ([`ChecksumPolicy::chunk_for`], default true); false sends
+    /// no chunk size and every game reads its default of 200 entities a chunk (the behaviour up to 2026-10-18).
+    pub sized_checksum_chunks: bool,
     /// Start a resync round by itself when the checksum policy asks for one (default true). When false the host
     /// only emits [`HostOutput::ResyncRequested`] and the launcher decides.
     pub auto_resync: bool,
@@ -84,6 +95,22 @@ pub struct HostOptions {
     pub idle_timeout_seconds: f64,
     /// A connection that has not completed the handshake after this long is closed. 0 turns it off.
     pub handshake_timeout_seconds: f64,
+    /// This game's mod list and builds (`docs/PROTOCOL.md`, "Mod list"). `Some`: every join is compared with it and refused
+    /// before the welcome (so before any save is sent) when a difference would make the worlds run apart. `None`: not
+    /// compared (the developer launcher, tests).
+    pub mods: Option<ModFingerprint>,
+    /// A running game whose clock lines have not come for this long while another game's have is STALLED (an autosave, a frozen or
+    /// minimised window): the host keeps its promise for it and the others run on instead of standing at their input barriers until
+    /// it is back; it catches up afterwards (`stall.rs`). 0 turns it off (`FEVERLINK3_STALL_TIMEOUT_S`). Default 3 s: twelve times the
+    /// 0.25 s a running or standing game sends a clock line at the latest (the mod's X.CLOCK_KEEP_S), six times the clock gap the lead
+    /// still counts as jitter (`Lockstep::GAP_EXCESS_MAX_MS`), above the single slow frames of the friend tests (company page 450-800 ms,
+    /// one engine call 450-610 ms), and below an autosave or a clone freeze (7-10 s, owner notes 2026-10-17), which held every game.
+    pub stall_timeout_seconds: f64,
+    /// A player whose connection dropped and that comes back within this many seconds is caught up instead of reloaded: the host
+    /// keeps what it sent (or would have sent) the player and sends it the rest, and its game keeps its world (`docs/PROTOCOL.md`,
+    /// "Catching up"). Away longer, or a world replaced meanwhile, and the return reloads the host's world as before. 0 keeps
+    /// nothing. Default 60 s: a Wi-Fi blip or a Steam relay hiccup, well inside the 330 s slot window.
+    pub resume_grace_seconds: f64,
 }
 
 impl Default for HostOptions {
@@ -92,7 +119,8 @@ impl Default for HostOptions {
             version: "0.1".to_owned(),
             max_players: 8,
             session_broadcast_seconds: 3.0,
-            checksum_seconds: 10.0,
+            checksum_seconds: 5.0,
+            sized_checksum_chunks: true,
             auto_resync: true,
             host_reloads: true,
             host_loads_early: true,
@@ -106,9 +134,15 @@ impl Default for HostOptions {
             ping_seconds: 2.0,
             idle_timeout_seconds: 30.0,
             handshake_timeout_seconds: 10.0,
+            mods: None,
+            stall_timeout_seconds: 3.0,
+            resume_grace_seconds: 60.0,
         }
     }
 }
+
+/// A ping sent and not yet answered: its n, host time and wall clock sent, and the counter of its frame.
+type PingSent = (u32, f64, Option<i64>, u64);
 
 /// Regular checksum rounds delayed because the previous one was still running (logged at most once a minute).
 #[derive(Debug, Default, Clone, Copy)]
@@ -123,9 +157,6 @@ struct RoundWaits {
 
 /// How often at most the host logs how many regular checksum rounds waited for the previous one.
 const ROUND_WAIT_LOG_SECONDS: f64 = 60.0;
-
-/// How long the lead wanted by the measured delays must stay below the one in force before the lead is shortened.
-const LEAD_SHRINK_AFTER_SECONDS: f64 = 8.0;
 
 /// What the host asks its caller to do, in this order.
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +232,14 @@ struct Identity {
     ready: bool,
     /// The capabilities its last join announced.
     caps: Vec<String>,
+    /// The mods its last join named, compared with the host's world when a save is sent.
+    mods: Option<ModTags>,
+    /// The counter of the last frame received from it (any connection): a returner resends what it sent after it.
+    heard: u64,
+    /// What the host sent it and has no acknowledgement for, and what it would have sent while it is away (`resume.rs`).
+    log: Outbox,
+    /// Its last clock before the drop: where a returner that is caught up stands.
+    last_clock: Option<PlayerClock>,
 }
 
 impl fmt::Debug for Identity {
@@ -238,8 +277,8 @@ pub struct HostSession {
     clocks: BTreeMap<u16, PlayerClock>,
     /// Smoothed round-trip time per connected player, milliseconds.
     rtt_ms: BTreeMap<u16, f64>,
-    /// Pings sent and not yet answered, per player, oldest first: (n, host time sent, host wall clock sent).
-    pings: BTreeMap<u16, VecDeque<(u32, f64, Option<i64>)>>,
+    /// Pings sent and not yet answered, per player, oldest first: (n, host time sent, host wall clock sent, its frame counter).
+    pings: BTreeMap<u16, VecDeque<PingSent>>,
     /// The host's wall clock in ms since 1970 ([HostSession::set_wall_clock]); without it no line carries host stamps and no
     /// offset is measured. Logs only.
     wall: Option<Box<dyn Fn() -> i64 + Send>>,
@@ -277,9 +316,8 @@ pub struct HostSession {
     next_player_id: u16,
     checksum_n: i32,
     last_session_broadcast: f64,
-    /// Since when the lead wanted by the measured delays has been below the one in force (a lead only shrinks after it has
-    /// stayed lower for a while, so a single quick ping cannot make it too short).
-    lead_lower_since: Option<f64>,
+    /// The real time the lead covers ([`JitterBuffer`]): the latest arrival, grown at once, shrunk slowly.
+    jitter: JitterBuffer,
     last_checksum: f64,
     /// The running checksum round still waiting for reports (its number and when it was asked): the next regular round waits
     /// for it (`regular_round_running`).
@@ -287,6 +325,13 @@ pub struct HostSession {
     /// Regular rounds that had to wait for the previous one since the last log line about it: since when counted, how many,
     /// the longest wait, and since when the current wait lasts.
     round_waits: RoundWaits,
+    /// The chunk size of spread rounds ([`ChecksumPolicy::chunk_for`]): sized from `round_costs`, 0 = the games' own default.
+    checksum_chunk: u32,
+    /// Each game's cost per entity (ns) in its last few spread rounds ([`ChecksumPolicy::COST_ROUNDS`]).
+    round_costs: BTreeMap<u16, VecDeque<u32>>,
+    /// The last compared round differed: the next rounds keep their itemised keys (`ChecksumRequestMessage::detail`) until one
+    /// is identical, so the dump at the resync that follows is complete and the same round on every game.
+    checksum_detail: bool,
     host_name: String,
     state: SessionState,
     actions_relayed: u64,
@@ -299,6 +344,10 @@ pub struct HostSession {
     pause_last: Option<i64>,
     /// A checksum round asked for at a pause before every game said where it stands: stamped at the furthest once they have.
     pending_paused_checksum: bool,
+    /// The stalled games and the promise the host keeps for each (`stall.rs`).
+    stalls: BTreeMap<u16, Stall>,
+    /// Players caught up after a drop whose world has not been compared in a checksum round yet: a difference reloads them at once.
+    resume_checks: BTreeSet<u16>,
     dropped: u64,
     out: Vec<HostOutput>,
 }
@@ -373,23 +422,30 @@ impl HostSession {
             next_player_id: 1,
             checksum_n: 0,
             last_session_broadcast: f64::NEG_INFINITY,
-            lead_lower_since: None,
+            jitter: JitterBuffer::default(),
             last_checksum: f64::NEG_INFINITY,
             running_round: None,
             round_waits: RoundWaits::default(),
+            checksum_chunk: 0,
+            round_costs: BTreeMap::new(),
+            checksum_detail: false,
             host_name,
             state: SessionState {
                 started: false,
                 speed: 0,
                 pause_at: None,
                 lead: Lockstep::lead_units(1),
+                stalled: Vec::new(),
                 resync: None,
+                mod_warnings: Vec::new(),
             },
             actions_relayed: 0,
             pause_seq: 0,
             pause_held: Vec::new(),
             pause_last: None,
             pending_paused_checksum: false,
+            stalls: BTreeMap::new(),
+            resume_checks: BTreeSet::new(),
             dropped: 0,
             out: Vec::new(),
         }
@@ -532,7 +588,13 @@ impl HostSession {
                 match self.opener.try_open(frame) {
                     Err(err) => self.drop(connection, kind_byte, err.to_string()),
                     Ok(plain) => match kind {
-                        Some(k) if k.allowed_from_player() => self.handle_message(player, k, &plain),
+                        Some(k) if k.allowed_from_player() => {
+                            // authentic and in order (the replay window): what a returner resends starts after it
+                            if let Some(i) = self.identities.get_mut(&player) {
+                                i.heard = i.heard.max(frame.header.counter);
+                            }
+                            self.handle_message(player, k, &plain);
+                        }
                         Some(_) => self.drop(connection, kind_byte, "host only".to_owned()),
                         None => self.drop(connection, kind_byte, "unknown kind".to_owned()),
                     },
@@ -559,6 +621,9 @@ impl HostSession {
             self.reject(connection, "bad-proof", None);
             return;
         }
+        if !self.mods_match(connection, &join) {
+            return;
+        }
         if let Some(claim) = &join.resume {
             if self.resume(connection, &nonce, &join, claim) {
                 return;
@@ -567,6 +632,104 @@ impl HostSession {
             self.log(format!("connection {connection}: no slot #{} to give back; joining as a new player", claim.id));
         }
         self.admit(connection, &join);
+    }
+
+    /// The mod-list check of a join whose proof holds. False: the connection was refused (`version` for a FeverLink3 that
+    /// sends no list, `mods` with the host's list for a difference that blocks). Warnings are logged only.
+    fn mods_match(&mut self, connection: ConnectionId, join: &JoinMessage) -> bool {
+        let Some(own) = self.options.mods.clone() else { return true };
+        let Some(theirs) = &join.mods else {
+            let detail =
+                "the host's FeverLink3 compares mod lists and yours does not; install the host's FeverLink3 version";
+            self.reject(connection, "version", Some(detail));
+            return false;
+        };
+        // the mods are compared when the host's world is saved for this player (check_world_mods): only the builds now
+        let block = own.check_builds(theirs);
+        let who = clip(&join.name, 24);
+        if theirs.unread {
+            self.mod_warning(format!("{who}: the player's game could not list its mods; they will not be compared"));
+        }
+        if block.is_empty() {
+            return true;
+        }
+        for b in block.iter().take(20) {
+            self.log(format!("{who}: build difference: {b}"));
+        }
+        let detail = format!("{} difference(s) in the builds, first: {}", block.len(), clip(&block[0], 120));
+        let mut why = RejectMessage::new("mods", Some(&detail));
+        // the builds only: which mods matter is known once the world is saved
+        why.mods = Some(ModFingerprint { mods: Vec::new(), ..own });
+        self.log(format!("connection {connection} rejected: mods {detail}"));
+        self.send_unsealed(connection, MessageKind::Reject, codec::encode(&why));
+        self.connections.remove(&connection);
+        self.out.push(HostOutput::CloseConnection(connection));
+        false
+    }
+
+    /// A warning about the mod lists: logged and shown in every window (`SessionState::mod_warnings`, the newest kept).
+    pub(super) fn mod_warning(&mut self, text: String) {
+        self.log(format!("MOD WARNING: {text}"));
+        let w = &mut self.state.mod_warnings;
+        if !w.contains(&text) {
+            w.push(clip(&text, 200));
+            let over = w.len().saturating_sub(SessionState::MOD_WARNINGS_KEPT);
+            w.drain(..over);
+            self.broadcast_session();
+        }
+    }
+
+    /// The round's save is made: before any of it is sent, every player's mods are compared with the ones the host's
+    /// WORLD uses (`world`: the ids the save names, `None` when they could not be read). A player with a proven difference
+    /// that blocks is removed with a sealed `Kicked` (reason `mods`, the world's list for its diff); it gets no world data.
+    pub(super) fn check_world_mods(&mut self, world: Option<&[String]>) {
+        let Some(own) = self.options.mods.clone() else { return };
+        let Some(ids) = world else {
+            self.mod_warning(
+                "the host's world could not list its mods: the players' mods were not compared".to_owned(),
+            );
+            return;
+        };
+        if own.unread {
+            self.mod_warning(
+                "the host's game could not list its installed mods: the players' mods were not compared".to_owned(),
+            );
+            return;
+        }
+        let (world, unknown) = own.world(ids);
+        if !unknown.is_empty() {
+            self.mod_warning(format!("not compared, not in the host's mod list: {}", unknown.join(", ")));
+        }
+        let players: Vec<(u16, Option<ModTags>)> = self
+            .identities
+            .iter()
+            .filter(|(id, i)| i.away_since.is_none() && self.players.contains_key(id))
+            .map(|(id, i)| (*id, i.mods.clone()))
+            .collect();
+        for (id, tags) in players {
+            let Some(tags) = tags else { continue };
+            let who = self.name(id);
+            let (block, warn) = world.check(&tags);
+            for w in warn {
+                self.mod_warning(format!("{who}: {w}"));
+            }
+            if block.is_empty() {
+                continue;
+            }
+            for b in block.iter().take(20) {
+                self.log(format!("{who}: mod difference: {b}"));
+            }
+            let detail = format!("{} difference(s) in the mods, first: {}", block.len(), clip(&block[0], 120));
+            self.log(format!("{who} is removed before the world is sent: {detail}"));
+            if let Some(connection) = self.connection_of(id) {
+                let mut why = RejectMessage::new("mods", Some(&detail));
+                why.mods = Some(world.clone());
+                self.connections.remove(&connection);
+                self.send(connection, MessageKind::Kicked, &codec::encode(&why));
+                self.out.push(HostOutput::CloseConnection(connection));
+                self.remove_player(id, false);
+            }
+        }
     }
 
     /// A player joining for the first time (or whose claim to an old slot did not hold).
@@ -604,15 +767,28 @@ impl HostSession {
             .collect();
         let name = Names::unique(&Names::sanitize(&join.name), id, taken);
         let caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
-        self.identities
-            .insert(id, Identity { name: name.clone(), token, epoch: 0, away_since: None, ready: false, caps });
+        self.identities.insert(
+            id,
+            Identity {
+                name: name.clone(),
+                token,
+                epoch: 0,
+                away_since: None,
+                ready: false,
+                caps,
+                mods: join.mods.clone(),
+                heard: 0,
+                log: Outbox::default(),
+                last_clock: None,
+            },
+        );
         let info = PlayerInfo { id, name: name.clone(), ready: false };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
             c.player = Some(id);
         }
         self.log(format!("{name} joined (connection {connection})"));
-        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch: 0 }, false);
+        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch: 0 }, false, None);
     }
 
     /// A player coming back. True when `claim` proves it holds the token of a slot this host still keeps, and the
@@ -621,7 +797,7 @@ impl HostSession {
         let id = claim.id;
         let Some(identity) = self.identities.get(&id) else { return false };
         if identity.epoch >= Sealer::MAX_EPOCH
-            || !Self::verify_resume(&identity.token, nonce, id, &join.name, &claim.mac)
+            || !Self::verify_resume(&identity.token, nonce, id, &join.name, claim.last, &claim.mac)
         {
             return false;
         }
@@ -633,26 +809,81 @@ impl HostSession {
             self.out.push(HostOutput::CloseConnection(old));
             self.remove_player(id, true);
         }
+        let plan = self.catch_up_plan(id, claim.last);
         let Some(identity) = self.identities.get_mut(&id) else { return false };
         identity.epoch += 1;
         identity.away_since = None;
         identity.caps = join.caps.iter().take(16).map(|c| clip(c, 32)).collect();
-        let (name, token, epoch) = (identity.name.clone(), identity.token, identity.epoch);
-        // before the start nothing is reloaded for the returner, so it is as ready as it was; in a started session the
-        // hot-join round reloads it and it says hello again
-        let ready = identity.ready && !self.state.started;
+        identity.mods = join.mods.clone();
+        // the stream to this player starts again here: what is replayed below is kept anew under the counters it goes out with
+        identity.log.clear();
+        let (name, token, epoch, heard) = (identity.name.clone(), identity.token, identity.epoch, identity.heard);
+        // a returner caught up keeps its world, so it is as ready as it was; otherwise, before the start nothing is reloaded for
+        // it either, and in a started session the hot-join round reloads it and it says hello again
+        let ready = identity.ready && (plan.is_ok() || !self.state.started);
         let info = PlayerInfo { id, name: name.clone(), ready };
         self.players.insert(id, info.clone());
         if let Some(c) = self.connections.get_mut(&connection) {
             c.player = Some(id);
         }
         self.log(format!("{name} is back (connection {connection}), slot #{id}"));
-        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch }, true);
+        let catch_up = match plan {
+            Ok(missed) => {
+                let last = claim.last.unwrap_or(0);
+                self.log(format!(
+                    "resume: {name} is caught up: {} message(s) it missed after host frame {last} follow the welcome, it resends what it sent after its frame {heard}; its game keeps its world (no reload)",
+                    missed.len()
+                ));
+                Some((heard, missed))
+            }
+            Err(why) => {
+                if self.state.started {
+                    self.log(format!("resume: {name} cannot be caught up ({why}): its game gets the host's world"));
+                }
+                None
+            }
+        };
+        self.greet(connection, info, ResumeGrant { token: token.to_vec(), epoch }, true, catch_up);
         true
     }
 
-    /// The welcome, the others told, the permissions, and for a started session the hot-join round.
-    fn greet(&mut self, connection: ConnectionId, info: PlayerInfo, grant: ResumeGrant, resumed: bool) {
+    /// Whether a returner whose last received host frame is `last` can be caught up, and with what: every message for it after that
+    /// frame, in order. `Err` says why not; the return then reloads the host's world as for any player joining a running session.
+    fn catch_up_plan(&self, id: u16, last: Option<u64>) -> Result<Missed, String> {
+        let grace = self.options.resume_grace_seconds;
+        if grace.is_nan() || grace <= 0.0 {
+            return Err("catching up is off".to_owned());
+        }
+        let Some(identity) = self.identities.get(&id) else { return Err("no slot".to_owned()) };
+        let Some(last) = last else {
+            return Err("its launcher kept nothing to catch up from".to_owned());
+        };
+        if self.resync.is_some() {
+            return Err("a resync round is running".to_owned());
+        }
+        if self.state.started && !identity.ready {
+            return Err("its game had not said hello in the session's world".to_owned());
+        }
+        if let Some(since) = identity.away_since {
+            let away = self.now() - since;
+            if away > grace {
+                return Err(format!("away {away:.0} s, longer than the {grace:.0} s kept"));
+            }
+        }
+        identity.log.after(last)
+    }
+
+    /// The welcome, the others told, the permissions, and for a started session the hot-join round. `catch_up`: a returner that keeps
+    /// its world (the counter of the last frame received from it, and the messages it missed, sent right after the welcome); it gets no
+    /// round, and in a started session it catches up as a stalled game does (`stall.rs`).
+    fn greet(
+        &mut self,
+        connection: ConnectionId,
+        info: PlayerInfo,
+        grant: ResumeGrant,
+        resumed: bool,
+        catch_up: Option<(u64, Missed)>,
+    ) {
         let id = info.id;
         let nonce = self.connections.get(&connection).map(|c| c.nonce.to_vec()).unwrap_or_default();
         let welcome = WelcomeMessage {
@@ -664,13 +895,51 @@ impl HostSession {
             nonce,
             resume: Some(grant),
             resumed,
+            mods_checked: self.options.mods.is_some(),
+            catch_up: catch_up.as_ref().map(|(heard, _)| *heard),
         };
         self.send(connection, MessageKind::Welcome, &codec::encode(&welcome));
+        let caught_up = catch_up.is_some();
+        for (kind, payload) in catch_up.map(|(_, missed)| missed).unwrap_or_default() {
+            self.send(connection, kind, &payload);
+        }
         let joined = PlayerJoinedMessage { player: info.clone() };
         self.broadcast(MessageKind::PlayerJoined, &codec::encode(&joined), Some(id));
         self.send(connection, MessageKind::Permissions, &codec::encode(&self.permissions));
         self.out.push(HostOutput::PlayerJoined(info));
-        self.on_new_player(if resumed { "player returned" } else { "new player" });
+        if caught_up {
+            self.begin_catch_up(id);
+        } else {
+            self.on_new_player(if resumed { "player returned" } else { "new player" });
+        }
+    }
+
+    /// A returner caught up in a started session stands where its game stood when the link dropped, behind the others: it is a
+    /// stalled game from the first moment (`stall.rs`). The host keeps its promise, which follows the games that run, so they run on;
+    /// every action it ships is stamped by the host or refused on every game if its stamp lies before that promise (never applied
+    /// late); its game catches up (the mod's catch-up, faster batches) and the stall ends when its own promise reaches the host's. Its
+    /// world is compared in the next checksum round it reports: a difference reloads it at once (`resume_checks`).
+    fn begin_catch_up(&mut self, id: u16) {
+        if !self.state.started {
+            return;
+        }
+        let now = self.now();
+        let last = self.identities.get(&id).and_then(|i| i.last_clock);
+        let own = last.and_then(|c| c.safe.or(Some(c.t))).unwrap_or(i64::MIN);
+        let proxy = self.proxy_target().unwrap_or_else(|| self.future_stamp()).max(own);
+        let t = last.map_or(0, |c| c.t);
+        self.stalls.insert(id, Stall { since: now, proxy, t, ahead: 0, need: None, back: None, caught: false });
+        if !self.state.stalled.contains(&id) {
+            self.state.stalled.push(id);
+            self.state.stalled.sort_unstable();
+        }
+        self.resume_checks.insert(id);
+        let who = self.name(id);
+        self.log(format!(
+            "stall: {who} returns at t={t} after a dropped connection: the others run on, the host keeps the promise {proxy} for it until it has caught up"
+        ));
+        self.broadcast_session();
+        self.send_proxy(id);
     }
 
     fn reject(&mut self, connection: ConnectionId, reason: &str, detail: Option<&str>) {
@@ -698,21 +967,27 @@ impl HostSession {
     }
 
     /// What a returning player sends to claim its old slot: `HMAC-SHA256(token, "FeverLink3 resume" ‖ nonce ‖ id ‖
-    /// name)`. The token never travels again, and the nonce makes a claim good for one connection only.
-    pub fn resume_proof(token: &[u8], nonce: &[u8], id: u16, name: &str) -> [u8; 32] {
-        Self::resume_mac(token, nonce, id, name).finalize().into_bytes().into()
+    /// name [‖ "last" ‖ u64 last])`. The token never travels again, and the nonce makes a claim good for one connection only.
+    /// `last` (the last host frame it received, [`ResumeClaim::last`]) is covered, so nobody on the path can make the host skip
+    /// frames the player never had.
+    pub fn resume_proof(token: &[u8], nonce: &[u8], id: u16, name: &str, last: Option<u64>) -> [u8; 32] {
+        Self::resume_mac(token, nonce, id, name, last).finalize().into_bytes().into()
     }
 
-    fn verify_resume(token: &[u8], nonce: &[u8], id: u16, name: &str, mac: &[u8]) -> bool {
-        Self::resume_mac(token, nonce, id, name).verify_slice(mac).is_ok()
+    fn verify_resume(token: &[u8], nonce: &[u8], id: u16, name: &str, last: Option<u64>, mac: &[u8]) -> bool {
+        Self::resume_mac(token, nonce, id, name, last).verify_slice(mac).is_ok()
     }
 
-    fn resume_mac(token: &[u8], nonce: &[u8], id: u16, name: &str) -> Hmac<Sha256> {
+    fn resume_mac(token: &[u8], nonce: &[u8], id: u16, name: &str, last: Option<u64>) -> Hmac<Sha256> {
         let mut mac = Hmac::<Sha256>::new_from_slice(token).expect("HMAC takes any key length");
         mac.update(b"FeverLink3 resume");
         mac.update(nonce);
         mac.update(&id.to_be_bytes());
         mac.update(name.as_bytes());
+        if let Some(last) = last {
+            mac.update(b"last");
+            mac.update(&last.to_be_bytes());
+        }
         mac
     }
 
@@ -758,6 +1033,8 @@ impl HostSession {
                 if let Some(m) = codec::try_decode::<HelloMessage>(payload) {
                     self.on_load_hello(from, m.time);
                 }
+                // a game that (re)loaded a world makes its promises from it again
+                self.end_stall(from, "it loaded a world");
                 self.resync_step();
                 if from != Self::HOST_ID {
                     if let Some(connection) = self.connection_of(from) {
@@ -789,16 +1066,21 @@ impl HostSession {
                         self.flush_pause();
                         // a player cannot push every other game's stamps into the far future with an absurd margin
                         let need = m.need.map(|n| n.clamp(0, ClockMessage::MAX_NEED));
-                        let peer = PeerClockMessage {
-                            from,
-                            t: m.t,
-                            ahead: m.ahead,
-                            need,
-                            safe,
-                            pause: m.pause && safe.is_some(),
-                            hop: m.hop.as_ref().map(|h| self.relayed_hops(h, from)),
-                        };
-                        self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
+                        // a stalled game's own promise lies behind the one the host keeps for it: the others get the host's (stall.rs)
+                        if !self.stalled_clock(from, m.t, m.ahead, need, safe) {
+                            let peer = PeerClockMessage {
+                                from,
+                                t: m.t,
+                                ahead: m.ahead,
+                                need,
+                                safe,
+                                pause: m.pause && safe.is_some(),
+                                stalled: false,
+                                hop: m.hop.as_ref().map(|h| self.relayed_hops(h, from)),
+                            };
+                            self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
+                        }
+                        self.follow_stalls();
                     }
                 }
             }
@@ -827,10 +1109,11 @@ impl HostSession {
                     m.hop = m.hop.as_ref().map(|h| self.relayed_hops(h, from));
                     self.link_stats.action(from);
                     if m.pause {
-                        // made during a pause: stamped by the host and relayed to every game, the sender too (flush_pause)
+                        // made during a pause (or by a stalled game, stall.rs): stamped by the host and relayed to every game, the
+                        // sender too (flush_pause)
                         self.pause_held.push(PauseItem::Action(m));
                         self.flush_pause();
-                    } else {
+                    } else if !self.refuse_stalled(from, m.seq, m.stamp, "action") {
                         self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
                         self.actions_relayed += 1;
                     }
@@ -842,6 +1125,8 @@ impl HostSession {
                     m.from = from;
                     m.name = Some(self.name(from));
                     m.why = m.why.chars().take(300).collect();
+                    // only the host refuses on every game (stall.rs)
+                    m.host = false;
                     self.broadcast(MessageKind::BuildVeto, &codec::encode(&m), Some(from));
                 }
             }
@@ -854,7 +1139,7 @@ impl HostSession {
                     if m.pause {
                         self.pause_held.push(PauseItem::Commit(m));
                         self.flush_pause();
-                    } else {
+                    } else if !self.refuse_stalled(from, m.seq, m.stamp, "commit") {
                         self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), Some(from));
                     }
                 }
@@ -912,6 +1197,13 @@ impl HostSession {
                         }
                     }
                     if self.players.get(&from).is_some_and(|p| p.ready) {
+                        if let Some(cost) = m.cost.filter(|c| c.entity_ns > 0) {
+                            let costs = self.round_costs.entry(from).or_default();
+                            costs.push_back(cost.entity_ns);
+                            while costs.len() > ChecksumPolicy::COST_ROUNDS {
+                                costs.pop_front();
+                            }
+                        }
                         let expected = self.expected_reporters();
                         if let Some(outcome) = self.checksums.report(from, m, &expected) {
                             self.on_checksum_outcome(outcome);
@@ -1035,6 +1327,7 @@ impl HostSession {
             self.log(line);
         }
         self.adapt_lead(t);
+        self.watch_stalls(t);
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
@@ -1125,40 +1418,31 @@ impl HostSession {
         (rtt, self.lead_meter.gap_ms(self.now(), here))
     }
 
-    /// The lead the measured delays ask for at this speed ([`Lockstep::lead_for_measured`]).
+    /// The lead the measured delays ask for at this speed: the jitter buffer, or the arrival measured now if that is later
+    /// ([`Lockstep::lead_for_cover`]).
     pub(super) fn wanted_lead(&self, speed: i32) -> i64 {
         let (rtt, gap) = self.lead_inputs();
-        Lockstep::lead_for_measured(speed, rtt, gap)
+        let now = Lockstep::cover_ms(rtt, gap) + JitterBuffer::SAFETY_MS;
+        Lockstep::lead_for_cover(speed, self.jitter.ms().max(now))
     }
 
-    /// Keeps `state.lead` in step with the measured delays: longer at once, shorter only after eight seconds of being lower.
+    /// Keeps `state.lead` in step with the jitter buffer: longer at once, shorter as the buffer shrinks (a step at a time).
     fn adapt_lead(&mut self, t: f64) {
+        let (rtt, gap) = self.lead_inputs();
+        let buffer = self.jitter.update(Lockstep::cover_ms(rtt, gap), t);
         if !self.state.started {
             return;
         }
         let speed = self.state.speed.max(1);
-        let want = self.wanted_lead(speed);
+        let want = Lockstep::lead_for_cover(speed, buffer);
         let old = self.state.lead;
-        if want > self.state.lead {
+        if want != old {
             self.state.lead = want;
-            self.lead_lower_since = None;
             self.broadcast_session();
-        } else if want < self.state.lead {
-            let since = *self.lead_lower_since.get_or_insert(t);
-            if t - since >= LEAD_SHRINK_AFTER_SECONDS {
-                self.state.lead = want;
-                self.lead_lower_since = None;
-                self.broadcast_session();
-            }
-        } else {
-            self.lead_lower_since = None;
-        }
-        if self.state.lead != old {
             // bug 4/6: what the lead was made from, each time it changes (the lab run checks the steps against link.ping and link.host)
-            let (rtt, gap) = self.lead_inputs();
             self.log(format!(
-                "link.lead lead_steps={} was_steps={} speed={speed} rtt_ms={rtt:.0} gap_ms={gap:.0} step_ms={:.0}",
-                self.state.lead / Lockstep::STEP,
+                "link.lead lead_steps={} was_steps={} speed={speed} rtt_ms={rtt:.0} gap_ms={gap:.0} buffer_ms={buffer:.0} step_ms={:.0}",
+                want / Lockstep::STEP,
                 old / Lockstep::STEP,
                 1000.0 / (Lockstep::STEPS_PER_SECOND * f64::from(speed))
             ));
@@ -1172,7 +1456,6 @@ impl HostSession {
         let speed = speed.clamp(1, 4);
         self.last_running_speed = speed;
         let lead = self.wanted_lead(speed);
-        self.lead_lower_since = None;
         self.state = SessionState { speed, pause_at: None, lead, ..self.state.clone() };
         self.broadcast_session();
         // actions of the pause still held (a game had not said where it stands): a normal stamp now, after the resume line
@@ -1216,12 +1499,64 @@ impl HostSession {
             None => self.future_stamp(),
         };
         let spread = ChecksumPolicy::spread_steps(full, paused, self.state.speed);
-        let request = ChecksumRequestMessage { n, at, paused, full, spread };
+        let mut request = ChecksumRequestMessage::new(n, at, paused, full, spread);
+        if spread > 0 {
+            request.chunk = self.next_chunk();
+            request.detail = self.checksum_detail;
+        }
         self.broadcast(MessageKind::ChecksumRequest, &codec::encode(&request), None);
         self.last_checksum = self.now();
         if !paused {
             // a paused round is hashed whole at once and never holds up the timer (which does not run at a pause)
             self.running_round = Some((n, self.last_checksum));
+        }
+    }
+
+    /// The chunk size of the next spread round: from the dearest cost per entity any present game reported in its last rounds
+    /// ([`ChecksumPolicy::chunk_for`]); 0 (the games' default) with sizing off. A change is logged.
+    fn next_chunk(&mut self) -> u32 {
+        if !self.options.sized_checksum_chunks {
+            return 0;
+        }
+        let slowest = self
+            .round_costs
+            .iter()
+            .filter(|(id, _)| self.players.contains_key(id))
+            .filter_map(|(&id, c)| c.iter().max().map(|&ns| (ns, id)))
+            .max();
+        let chunk = ChecksumPolicy::chunk_for(slowest.map(|(ns, _)| ns), self.checksum_chunk);
+        if chunk != self.checksum_chunk {
+            let why = slowest.map_or_else(
+                || "no cost measured yet".to_owned(),
+                |(ns, id)| format!("slowest game {}: {:.1} us an entity", self.name(id), f64::from(ns) / 1000.0),
+            );
+            self.log(format!(
+                "checksum chunk: {chunk} entities a step from now on ({why}; target {} ms of the {} ms step budget)",
+                ChecksumPolicy::CHUNK_TARGET_MS,
+                ChecksumPolicy::STEP_BUDGET_MS
+            ));
+            self.checksum_chunk = chunk;
+        }
+        chunk
+    }
+
+    /// After every compared round: a round that differed makes the next rounds keep their itemised keys (`detail`) until one is
+    /// identical again.
+    pub(super) fn note_round_for_detail(&mut self, outcome: &ChecksumOutcome) {
+        if !outcome.comparable() {
+            return;
+        }
+        let differs = !outcome.differences.is_empty();
+        if differs != self.checksum_detail {
+            self.checksum_detail = differs;
+            self.log(if differs {
+                format!(
+                    "checksum round {} differs: the next rounds keep their itemised keys for the dump at a repair",
+                    outcome.n
+                )
+            } else {
+                format!("checksum round {} identical again: the rounds no longer keep their itemised keys", outcome.n)
+            });
         }
     }
 
@@ -1248,7 +1583,14 @@ impl HostSession {
         let by_lead = Lockstep::round_up_to_step(
             self.max_clock().saturating_add(self.wanted_lead(self.state.speed.max(1))) as f64,
         );
-        let promised = self.clocks.values().filter_map(|c| c.safe).max().unwrap_or(by_lead);
+        // the promises the host keeps for stalled games count like the games' own (stall.rs)
+        let promised = self
+            .clocks
+            .values()
+            .filter_map(|c| c.safe)
+            .chain(self.stalls.values().map(|s| s.proxy))
+            .max()
+            .unwrap_or(by_lead);
         by_lead.max(Lockstep::round_up_to_step(promised as f64))
     }
 
@@ -1337,7 +1679,12 @@ impl HostSession {
     fn remove_player(&mut self, id: u16, hold: bool) {
         let Some(info) = self.players.remove(&id) else { return };
         let now = self.now();
-        self.clocks.remove(&id);
+        let last_clock = self.clocks.remove(&id);
+        self.resume_checks.remove(&id);
+        if self.stalls.remove(&id).is_some() {
+            self.state.stalled.retain(|&p| p != id);
+            self.broadcast_session();
+        }
         // the actions of a pause may have waited for this game to say where it stands
         self.flush_pause();
         self.rtt_ms.remove(&id);
@@ -1350,6 +1697,11 @@ impl HostSession {
             Some(identity) if hold => {
                 identity.away_since = Some(now);
                 identity.ready = info.ready;
+                identity.last_clock = last_clock;
+                if self.resync.is_some() {
+                    // its world may be half replaced: a return reloads it
+                    identity.log.break_with("it dropped during a resync round".to_owned());
+                }
             }
             _ => {
                 self.identities.remove(&id);
@@ -1472,6 +1824,30 @@ impl HostSession {
         for id in gone {
             self.release_slot(id, |name| format!("{name} did not come back within {window:.0} s; the slot is free"));
         }
+        // a player away longer than the grace is reloaded when it returns: what was kept for it goes
+        let grace = self.options.resume_grace_seconds;
+        let expired: Vec<u16> = self
+            .identities
+            .iter()
+            .filter(|(_, i)| !i.log.is_broken() && i.away_since.is_some_and(|since| t - since > grace))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            if let Some(i) = self.identities.get_mut(&id) {
+                i.log.break_with(format!("away longer than {grace:.0} s"));
+                let name = i.name.clone();
+                self.log(format!(
+                    "resume: {name} has been away longer than {grace:.0} s: what was kept to catch it up is dropped; a return reloads its game"
+                ));
+            }
+        }
+    }
+
+    /// The world every game has is about to be replaced by the host's: a player away now cannot be caught up to it.
+    pub(super) fn forget_away_logs(&mut self, why: &str) {
+        for i in self.identities.values_mut().filter(|i| i.away_since.is_some()) {
+            i.log.break_with(why.to_owned());
+        }
     }
 
     /// Every `ping_seconds`: a ping to each connected player, carrying the round-trip times known so far.
@@ -1485,14 +1861,16 @@ impl HostSession {
         let n = self.ping_n;
         let rtt: BTreeMap<u16, f64> = self.rtt_ms.iter().map(|(&id, &ms)| (id, (ms * 10.0).round() / 10.0)).collect();
         let off: BTreeMap<u16, i64> = self.wall_off.iter().filter_map(|(&id, o)| o.value().map(|v| (id, v))).collect();
-        let payload = codec::encode(&PingMessage { n, rtt, off });
         let wall = self.wall_ms();
         let targets: Vec<(ConnectionId, u16)> =
             self.connections.values().filter_map(|c| c.player.map(|id| (c.id, id))).collect();
         for (connection, player) in targets {
-            self.send(connection, MessageKind::Ping, &payload);
+            // the last frame heard from this player: what it keeps for a resume up to there can go
+            let ack = self.identities.get(&player).map(|i| i.heard).filter(|&h| h > 0);
+            let payload = codec::encode(&PingMessage { n, rtt: rtt.clone(), off: off.clone(), ack });
+            let Some(counter) = self.send(connection, MessageKind::Ping, &payload) else { continue };
             let queue = self.pings.entry(player).or_default();
-            queue.push_back((n, t, wall));
+            queue.push_back((n, t, wall, counter));
             while queue.len() > 8 {
                 queue.pop_front();
             }
@@ -1504,10 +1882,14 @@ impl HostSession {
         let now = self.now();
         let back = self.wall_ms();
         let Some(queue) = self.pings.get_mut(&from) else { return };
-        let Some(at) = queue.iter().position(|&(k, _, _)| k == n) else { return };
-        let (_, sent, sent_wall) = queue[at];
+        let Some(at) = queue.iter().position(|&(k, ..)| k == n) else { return };
+        let (_, sent, sent_wall, counter) = queue[at];
         // older pings that were never answered are not going to be
         queue.drain(..=at);
+        // one ordered connection: the player has every frame sealed for it before this ping, so the host need not keep them
+        if let Some(i) = self.identities.get_mut(&from) {
+            i.log.ack(counter);
+        }
         let sample = ((now - sent) * 1000.0).max(0.0);
         let smoothed = self.rtt_ms.get(&from).map_or(sample, |old| old * 0.75 + sample * 0.25);
         self.rtt_ms.insert(from, smoothed);
@@ -1650,6 +2032,12 @@ impl HostSession {
         for connection in targets {
             self.send(connection, kind, payload);
         }
+        // a player away for a moment gets it when it is back (resume.rs)
+        if Outbox::replayable(kind) && self.options.resume_grace_seconds > 0.0 {
+            for (_, i) in self.identities.iter_mut().filter(|(&id, i)| Some(id) != except && i.away_since.is_some()) {
+                i.log.push(None, kind, payload, false);
+            }
+        }
         if except != Some(Self::HOST_ID) {
             if self.holds_for_load(Self::HOST_ID, kind) {
                 self.hold_for_load(Self::HOST_ID, kind, payload);
@@ -1659,22 +2047,36 @@ impl HostSession {
         }
     }
 
-    fn send(&mut self, connection: ConnectionId, kind: MessageKind, payload: &[u8]) {
+    /// Seals and sends; the frame's counter, `None` when nothing went out (held for a load, or too big to seal).
+    fn send(&mut self, connection: ConnectionId, kind: MessageKind, payload: &[u8]) -> Option<u64> {
         // sealed only when it is sent: a frame sealed now and sent later would arrive behind newer counters (replay window)
-        if let Some(to) = self.connections.get(&connection).and_then(|c| c.player) {
+        let to = self.connections.get(&connection).and_then(|c| c.player);
+        if let Some(to) = to {
             if self.holds_for_load(to, kind) {
                 self.hold_for_load(to, kind, payload);
-                return;
+                return None;
             }
         }
         match self.sealer.try_seal(kind.into(), payload) {
-            Ok(frame) => self.out.push(HostOutput::SendToConnection { connection, frame }),
+            Ok(frame) => {
+                let counter = frame.header.counter;
+                // kept until the player shows it has it, so a drop on the way can be caught up (resume.rs)
+                let grace = self.options.resume_grace_seconds > 0.0;
+                if let Some(i) = to.and_then(|id| self.identities.get_mut(&id)).filter(|_| grace) {
+                    if Outbox::replayable(kind) {
+                        i.log.push(Some(counter), kind, payload, false);
+                    }
+                }
+                self.out.push(HostOutput::SendToConnection { connection, frame });
+                Some(counter)
+            }
             // a relayed message that grew past the frame limit when the host added its fields, say
             Err(e) => {
                 self.dropped += 1;
                 if self.first_time(format!("seal/{kind:?}")) {
                     self.log(format!("{kind:?} not sent to connection {connection}: {e}"));
                 }
+                None
             }
         }
     }

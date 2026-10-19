@@ -361,7 +361,7 @@ fn in_a_started_session_the_return_starts_a_hot_join_round_that_brings_it_back_i
     n.stop_all_at(pause_at);
     assert_eq!(ResyncState::Saving, n.host.resync_state(), "the returner, not ready, is not waited for");
     let id = n.host.resync_id().unwrap();
-    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     assert_eq!(ResyncState::Transferring, n.host.resync_state());
 
     let save = blob(300_000);
@@ -405,7 +405,7 @@ fn a_return_during_a_round_waits_for_the_next_one_when_the_files_are_moving() {
     let pause_at = n.host.state().pause_at.unwrap();
     n.stop_all_at(pause_at);
     let id = n.host.resync_id().unwrap();
-    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None }));
+    n.host_send(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     let save = blob(1000);
     let sha = sha256_hex(&save);
     n.host_call(|h| h.resync_file_ready(id, &sha, 1000));

@@ -3,6 +3,7 @@
 //! ```text
 //! feverlink3_release package --version V --out DIR [--root DIR] [--layout overlay|portable]
 //! feverlink3_release sign    --key FILE --manifest FILE
+//! feverlink3_release verify  --manifest FILE      (against the launcher's TRUSTED_KEYS, and the zip beside it)
 //! feverlink3_release keygen  --out DIR
 //! ```
 
@@ -58,12 +59,25 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{}", sig.display());
             Ok(())
         }
+        Some("verify") => {
+            // the release job runs this after signing: a signature the launcher would refuse fails the release
+            let manifest = PathBuf::from(required(rest, "--manifest")?);
+            let key = sign::verify_file(
+                &manifest,
+                feverlink3_launcher::update::TRUSTED_KEYS,
+                feverlink3_launcher::update::now_unix(),
+            )?;
+            println!("signature ok (trusted key {key:?}); zip matches the manifest");
+            Ok(())
+        }
         Some("keygen") => {
             let out = PathBuf::from(required(rest, "--out")?);
             let public = sign::keygen(&out)?;
-            println!("public key (embed in launcher/src/update.rs): {public}");
+            println!("public key: {public} (key id {})", sign::key_id_of(&public)?);
+            println!("add it to TRUSTED_KEYS in launcher/src/update.rs:");
+            println!("    TrustedKey {{ name: \"release key\", public_hex: \"{public}\", expires: (YYYY, MM, DD) }},");
             Ok(())
         }
-        _ => Err("usage: feverlink3_release package --version V --out DIR [--root DIR] [--layout overlay|portable] | sign --key FILE --manifest FILE | keygen --out DIR".into()),
+        _ => Err("usage: feverlink3_release package --version V --out DIR [--root DIR] [--layout overlay|portable] | sign --key FILE --manifest FILE | verify --manifest FILE | keygen --out DIR".into()),
     }
 }

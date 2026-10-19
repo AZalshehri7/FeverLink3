@@ -268,11 +268,19 @@ fn host_only_kinds_from_a_player_are_dropped_and_never_relayed() {
     let a = h.connect("A");
     let b = h.connect("B");
     let before = h.p(b).game.len();
-    let state = SessionState { started: true, speed: 4, pause_at: None, lead: 0, resync: None };
+    let state = SessionState {
+        started: true,
+        speed: 4,
+        pause_at: None,
+        lead: 0,
+        resync: None,
+        mod_warnings: Vec::new(),
+        stalled: Vec::new(),
+    };
     h.player_game(a, MessageKind::Session, &json(&state));
     let load = ResyncLoadMessage { id: 1, name: "evil".into(), sha256: "00".into() };
     h.player_game(a, MessageKind::ResyncLoad, &json(&load));
-    let request = ChecksumRequestMessage { n: 9, at: 0, paused: false, full: true, spread: 0 };
+    let request = ChecksumRequestMessage::new(9, 0, false, true, 0);
     h.player_game(a, MessageKind::ChecksumRequest, &json(&request));
     assert_eq!(3, h.host.dropped());
     assert_eq!(before, h.p(b).game.len());
@@ -1007,6 +1015,45 @@ fn every_regular_round_is_full_and_spread_by_default() {
 }
 
 #[test]
+fn the_chunk_follows_the_slowest_games_cost_and_a_round_that_differed_asks_for_detail_until_one_is_identical() {
+    // (no repair: the differing rounds stay regular rounds)
+    let (mut h, a) = running_pair(HostOptions { auto_resync: false, ..HostOptions::default() });
+    // (host cost, player cost in ns an entity, player's roads hash) per round
+    let script =
+        [(20_000, 25_000, "r"), (20_000, 25_000, "x"), (20_000, 60_000, "x"), (20_000, 60_000, "r"), (0, 0, "r")];
+    let mut seen = Vec::new();
+    for (host_ns, player_ns, roads) in script {
+        h.advance(5.5);
+        h.host_call(HostSession::tick);
+        let r = running_requests(&h, a).pop().expect("a round every 5 s");
+        seen.push((r.chunk, r.detail));
+        let cost = |ns: u32| (ns > 0).then_some(ChecksumCost { entity_ns: ns, step_max_us: 0, chunk: r.chunk });
+        let host = ChecksumReportMessage {
+            cost: cost(host_ns),
+            ..ChecksumReportMessage::new(r.n, r.at, parts(&[("roads", "r")]))
+        };
+        let player = ChecksumReportMessage {
+            cost: cost(player_ns),
+            ..ChecksumReportMessage::new(r.n, r.at, parts(&[("roads", roads)]))
+        };
+        h.host_game(MessageKind::ChecksumReport, &json(&host));
+        h.player_game(a, MessageKind::ChecksumReport, &json(&player));
+    }
+    // 200 until a cost is known; 12 ms / 25 us = 480, but at most twice the last (400), then 480; 12 ms / 60 us = 200 at once
+    // (the dearest of each game's last three rounds counts); detail from the round after the one that differed until an identical one
+    assert_eq!(seen, [(200, false), (400, false), (480, true), (200, true), (200, false)], "{:?}", h.host_log);
+    assert!(h
+        .host_log
+        .iter()
+        .any(|l| l.contains("checksum chunk: 400 entities a step") && l.contains("25.0 us an entity")));
+    // the old cadence for lab comparisons: no chunk size, the games' own 200
+    let (mut h, a) = running_pair(HostOptions { sized_checksum_chunks: false, ..HostOptions::default() });
+    h.advance(5.5);
+    h.host_call(HostSession::tick);
+    assert_eq!(0, running_requests(&h, a).pop().expect("a round").chunk);
+}
+
+#[test]
 fn a_regular_round_waits_for_a_slow_game_and_starts_right_after_it_reported() {
     let (mut h, a) = running_pair(HostOptions::default());
     h.advance(10.5);
@@ -1118,7 +1165,15 @@ fn player_ignores_frames_not_from_the_host_and_messages_before_welcome() {
     let mut h = Harness::new();
     let a = h.connect("A");
     let mut other = Sealer::new(&h.key, 2);
-    let state = SessionState { started: true, speed: 4, pause_at: None, lead: 0, resync: None };
+    let state = SessionState {
+        started: true,
+        speed: 4,
+        pause_at: None,
+        lead: 0,
+        resync: None,
+        mod_warnings: Vec::new(),
+        stalled: Vec::new(),
+    };
     let frame = other.seal(MessageKind::Session.into(), &json(&state));
     h.players.get_mut(&a).unwrap().session.frame_received(&frame);
     assert_eq!(1, h.p(a).session.dropped());

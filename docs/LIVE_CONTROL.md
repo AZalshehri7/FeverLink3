@@ -56,6 +56,11 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 | `permissions` | `{build?, bulldoze?, spend?, speed?, other?}` | `hosting` | Sets who may do what and tells every game. Each value is `"everyone"`, `"hostOnly"` or `{only = {ids}}`. **Keys not named keep their value**, so a command may carry one key. At least one key is required; a value that is none of the three refuses the whole command (nothing changes) and says which key. Answers in `result`. See below. |
 | `steamtest` | `{id, mb?}` | any | Steam connection test: pings the Steam ID (17 digits, as a string) through Steam's networking. The progress is `steam.test`; a bad ID or no Steam shows in `steam.note`. With `mb` (1 to 128; the window offers 8, 32 and 80) it runs the speed test of that many MB each way instead (docs/STEAM_TRANSPORT.md section 7.1); `mode` picks how the data travels: `reliable` (default), `dgram`, `both`, `parallel`, `auto` (the resync's parallel connections, section 7.3) or `all`; the progress and result are `steam.speed`. |
 
+| `invite` | `{}` | `hosting` over Steam | Opens Steam's overlay invite dialog (`ActivateGameOverlayInviteDialogConnectString`) with this session's invite token. Steam does not tell the game whom the player invites. Answers in `result` (an error when Steam or the overlay function is not there). |
+| `admit` / `refuse` | `{id}` | `hosting` | Answers the join request of the Steam account `id` (a string, from `invites.requests`): `admit` sends it the session key and it joins; `refuse` tells it no (it cannot ask again for 60 s). Answers in `result`. |
+| `accept_invite` | `{}` | any | Joins through the pending Steam `invite`, leaving the current session first. |
+| `dismiss_invite` | `{}` | any | Forgets the pending Steam `invite`. |
+
 #### `permissions` values
 
 | Key | What it gates |
@@ -106,6 +111,8 @@ changed.
 | `resync` | string | `hosting`, after the first round | State of the last resync round: `Pausing`, `Saving`, `Transferring`, `Loading`, `Verifying`, `Idle` (finished and resumed) or `failed: <reason>`. |
 | `reconnecting` | boolean | `joining` after a lost connection | The connection to the host dropped; the launcher is trying again, asking for its old id and slot. |
 | `attempts` | number | with `reconnecting` | Attempts so far in this outage. |
+| `invites` | table | `hosting` over Steam | Steam invites: `ready` (Steam's friends interface was found) and `requests`, the join requests waiting for the host, oldest first: `{id, name, steam?}` (`id` the account's Steam ID as a string, `name` what its game sent, `steam` its Steam name when Steam knows it). |
+| `invite` | table | a Steam invite is pending | `{host, auto}`: a "Join game" or accepted invite Steam handed to this game. With `auto` true (idle) it starts by itself as soon as a world is loaded; otherwise the window offers `accept_invite` / `dismiss_invite`. |
 | `result` | table | after a `kick` or `permissions` | How the last command that can be refused ended. Fields below. Cleared by `leave` and when a host session starts. |
 
 ### `players[i]`

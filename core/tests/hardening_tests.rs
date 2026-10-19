@@ -237,10 +237,20 @@ fn a_second_welcome_does_not_restart_the_players_counter() {
         host_name: "Hote".into(),
         version: "0.1".into(),
         players: vec![],
-        session: SessionState { started: false, speed: 0, pause_at: None, lead: 1200, resync: None },
+        session: SessionState {
+            started: false,
+            speed: 0,
+            pause_at: None,
+            lead: 1200,
+            resync: None,
+            mod_warnings: Vec::new(),
+            stalled: Vec::new(),
+        },
         nonce: vec![],
         resume: None,
         resumed: false,
+        mods_checked: false,
+        catch_up: None,
     };
     let frame = sealed(&h, HostSession::HOST_ID, 100_000, MessageKind::Welcome, &json(&welcome));
     let session = &mut h.players.get_mut(&c).unwrap().session;

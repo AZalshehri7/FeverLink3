@@ -21,8 +21,12 @@ pub mod cmd_patch;
 pub mod counters;
 pub mod detour;
 pub mod dump;
+pub mod failsafe;
+pub mod freeorder;
 pub mod growth;
 pub mod hold;
+pub mod hookwatch;
+pub mod idorder;
 pub mod ids;
 pub mod inject;
 pub mod input;
@@ -45,6 +49,8 @@ pub mod hooks;
 pub mod log;
 #[cfg(windows)]
 pub mod mem;
+#[cfg(windows)]
+pub mod memguard;
 #[cfg(windows)]
 pub mod proxy;
 #[cfg(windows)]

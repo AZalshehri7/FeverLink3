@@ -20,15 +20,18 @@
 //!
 //! Everything is a function of the folder's files, so the tests drive it with files and need no game.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use feverlink3_core::admission::{ConnectToken, Gate, TokenError};
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::lobby::JoinCode;
 use feverlink3_core::session::{ConnectionState, HostOptions, Permissions, PlayerSet, RosterEntry};
@@ -37,9 +40,11 @@ use serde_json::{json, Value};
 use crate::gamelink::{self, Tail};
 use crate::guard;
 use crate::session::{self, Command, HostConfig, PlayerConfig, SessionHandle, Status};
+use crate::steam_admit::{self, AdmitHost};
+use crate::steam_friends::{self, Friends, JoinRequest, JoinSource};
 use crate::steam_transport::SteamEndpoint;
 use crate::steamnet::CoreRef;
-use crate::{clipboard, luatext, net, resync, steam, steam_persona, steam_transport, steamnet};
+use crate::{clipboard, luatext, modlist, net, resync, steam, steam_persona, steam_transport, steamnet};
 
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
@@ -70,6 +75,11 @@ const RELOAD_GRACE: Duration = Duration::from_secs(300);
 /// What the window shows when the heartbeat ended the session.
 pub const WORLD_CLOSED_NOTICE: &str = "Your world was closed, so the session ended";
 
+/// FEVERLINK3_FAST_CHECKSUM (on unless `0`): checksum rounds every 5 s with chunks sized to the measured cost.
+fn fast_checksum() -> bool {
+    !std::env::var("FEVERLINK3_FAST_CHECKSUM").is_ok_and(|v| v.trim() == "0")
+}
+
 /// The heartbeat limit for an environment value: unset or not a number is [`HEARTBEAT_SECONDS`], zero or less is off
 /// (`None`).
 fn heartbeat_setting(value: Option<&str>) -> Option<Duration> {
@@ -98,6 +108,8 @@ enum State {
     Joining {
         rx: Receiver<Result<SessionHandle, String>>,
         progress: Arc<Mutex<String>>,
+        /// Set by `leave`: an admission request that waits for the host's answer gives up.
+        cancel: Arc<AtomicBool>,
     },
     Joined {
         handle: SessionHandle,
@@ -116,7 +128,36 @@ struct Hosting {
     password: bool,
     /// The Steam ID the code carries: the session is hosted over Steam (no address, no port). `None` for TCP.
     steam_id: Option<u64>,
+    /// Steam invites (`steam_admit.rs`): the admission listener of a session hosted over Steam, `None` for TCP or when
+    /// Steam would not open it (a pasted code still works then).
+    admit: Option<AdmitHost>,
 }
+
+/// A FeverLink3 invite Steam handed to this game ("Join game" clicked, an invite accepted): kept until it is used, the
+/// window dismisses it, or another one replaces it.
+struct PendingInvite {
+    token: ConnectToken,
+    source: JoinSource,
+    /// The host's Steam name, when Steam knows it (a friend).
+    host_name: Option<String>,
+}
+
+/// How the join thread reaches the host.
+enum JoinTarget {
+    Code(JoinCode, SessionKey),
+    /// A Steam invite: ask the host to be let in first; the key comes from the host.
+    Invite(ConnectToken),
+}
+
+/// What the controller last set in Steam's rich presence (`steam_friends::KEY_CONNECT`, `KEY_STATUS`).
+#[derive(Default, PartialEq, Eq)]
+struct RichPresence {
+    connect: String,
+    status: String,
+}
+
+/// The rich presence `status` while hosting ("view game info" in the friends list).
+pub const PRESENCE_STATUS: &str = "Hosting a FeverLink3 multiplayer game";
 
 impl Hosting {
     /// The join code for the direct (developer) transport: the machine's local addresses and the secret.
@@ -306,6 +347,22 @@ pub struct Controller {
     presence: Option<PresenceLock>,
     published: String,
     version: u64,
+    /// Steam's friends interface: rich presence, the overlay invite dialog, join requests (the tests give a model).
+    friends: Box<dyn Friends>,
+    /// A Steam invite waiting for a loaded world or for the window's Join.
+    invite: Option<PendingInvite>,
+    /// What rich presence holds now, as far as the controller set it.
+    rich: RichPresence,
+    /// The process's command line was looked at for a cold-start invite; the launch command line once Steam was up.
+    cmdline_read: bool,
+    launch_read: bool,
+    /// Steam names of the accounts that asked to join, looked up once each.
+    names: HashMap<u64, Option<String>>,
+    /// Why the last join was refused for its mods: each difference to the host's game, `true` when it blocks. Shown by the
+    /// window under the failure until the next host or join.
+    mod_report: Vec<(bool, String)>,
+    /// The `mods` and `game` of the window's last `host` / `join` command (`Value::Null` before one).
+    mod_params: Value,
 }
 
 impl Controller {
@@ -360,6 +417,17 @@ impl Controller {
                 // FEVERLINK3_AUTO_RESYNC=0 (an experiment switch): differences are logged and the policy still says "a
                 // resync is requested", but none is started by itself; only the window's Sync button starts one.
                 auto_resync: !std::env::var("FEVERLINK3_AUTO_RESYNC").is_ok_and(|v| v.trim() == "0"),
+                // FEVERLINK3_FAST_CHECKSUM=0 (a lab comparison switch): the checksum cadence up to 2026-10-18, a round every 10 s
+                // with the games' fixed chunk of 200 entities, instead of every 5 s with chunks sized to the measured cost
+                checksum_seconds: if fast_checksum() { HostOptions::default().checksum_seconds } else { 10.0 },
+                sized_checksum_chunks: fast_checksum(),
+                // FEVERLINK3_STALL_TIMEOUT_S=<seconds> (default 3, 0 = off): a game whose clock lines stop for that long is stalled,
+                // the others run on and it catches up later (core host/stall.rs)
+                stall_timeout_seconds: std::env::var("FEVERLINK3_STALL_TIMEOUT_S")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or(HostOptions::default().stall_timeout_seconds),
                 ..HostOptions::default()
             },
             commands,
@@ -384,6 +452,14 @@ impl Controller {
             presence: None,
             published: String::new(),
             version: 0,
+            friends: steam_friends::native(),
+            invite: None,
+            rich: RichPresence::default(),
+            cmdline_read: false,
+            launch_read: false,
+            names: HashMap::new(),
+            mod_report: Vec::new(),
+            mod_params: Value::Null,
         };
         c.publish();
         Ok(c)
@@ -406,6 +482,12 @@ impl Controller {
     /// Where "Copy code" puts the join code instead of the system clipboard (tests).
     pub fn with_clipboard(mut self, put: impl Fn(&str) -> bool + Send + 'static) -> Controller {
         self.clipboard = Box::new(put);
+        self
+    }
+
+    /// Steam's friends interface to use instead of the game's (tests).
+    pub fn with_friends(mut self, friends: impl Friends + 'static) -> Controller {
+        self.friends = Box::new(friends);
         self
     }
 
@@ -450,6 +532,7 @@ impl Controller {
         if let Some(probe) = &mut self.steam {
             probe.poll();
         }
+        self.invites_step();
         self.log_speed_test();
         self.write_session_log();
         self.publish();
@@ -565,6 +648,23 @@ impl Controller {
                 }
             }
             "steamloop" => self.steam_loop(),
+            "invite" => {
+                let outcome = self.open_invite_dialog();
+                self.note(n, kind, outcome);
+            }
+            "admit" | "refuse" => {
+                let outcome = self.answer_request(kind == "admit", params);
+                self.note(n, kind, outcome);
+            }
+            "accept_invite" => {
+                let outcome = self.accept_invite();
+                self.note(n, kind, outcome);
+            }
+            "dismiss_invite" => {
+                if self.invite.take().is_some() {
+                    self.append_session_log("invites: the player dismissed the invite");
+                }
+            }
             "start" | "pause" | "speed" | "check" | "resync" => {
                 if let State::Hosting(h) = &self.state {
                     let handle = &h.handle;
@@ -653,6 +753,28 @@ impl Controller {
             .map_or_else(|| self.default_name.clone(), |n| n.chars().take(24).collect())
     }
 
+    /// Keeps the window's mod list for the next join, an invite's included.
+    fn remember_mods(&mut self, params: &Value) {
+        if params.get("mods").is_some() {
+            self.mod_params = json!({ "mods": params["mods"], "game": params["game"] });
+        }
+    }
+
+    /// The user folders (`userdata/<id>/3493540/local`): the parents of the save folders.
+    fn user_dirs(&self) -> Vec<PathBuf> {
+        self.save_dirs.iter().filter_map(|d| d.parent().map(Path::to_path_buf)).collect()
+    }
+
+    /// The host options with this game's mod list from the window's `host` command (`docs/PROTOCOL.md`, "Mod list"). A
+    /// window that sent none (its Lua state could not read the mod repository) hosts without the comparison.
+    fn options_with_mods(&self, params: &Value) -> HostOptions {
+        let mods = modlist::from_params(params, &self.user_dirs(), modlist::running_game_dir().as_deref());
+        if mods.unread {
+            self.append_session_log("MOD WARNING: the window sent no mod list: the players' mods are not compared");
+        }
+        HostOptions { mods: Some(mods), ..self.host_options.clone() }
+    }
+
     fn idle_or_failed(&self) -> bool {
         matches!(self.state, State::Idle | State::Failed(_))
     }
@@ -662,6 +784,7 @@ impl Controller {
             return;
         }
         self.notice = None;
+        self.mod_report.clear();
         self.pulse = None;
         self.presence = None;
         // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
@@ -706,13 +829,14 @@ impl Controller {
             Ok(l) => l,
             Err(e) => return self.state = State::Failed(format!("cannot open the session folder: {e}")),
         };
+        let admit_key = key.clone();
         let config = HostConfig {
             bulk: steamnet::bulk_io::BulkSettings::from_env(),
             bind: SocketAddr::from(([0, 0, 0, 0], 0)), // not used by Steam
             name,
             key,
             link,
-            options: self.host_options.clone(),
+            options: self.options_with_mods(params),
             save_dirs: self.save_dirs.clone(),
             echo_log: false,
         };
@@ -727,6 +851,24 @@ impl Controller {
                 return self.state = State::Failed(format!("cannot make a join code: {e}"));
             }
         };
+        // Steam invites: the admission listener holds the key an admitted friend receives; the session number and the
+        // invite ticket are fresh for every hosted session. Without it the pasted code still works.
+        let admit = match Gate::random_numbers() {
+            Some((session, ticket)) => match AdmitHost::start(&core, Gate::new(session, ticket), &admit_key) {
+                Ok(admit) => {
+                    self.append_session_log(&format!(
+                        "invites: admission listener on Steam virtual port {}, session {session:016x}",
+                        steam_admit::ADMIT_PORT
+                    ));
+                    Some(admit)
+                }
+                Err(e) => {
+                    self.append_session_log(&format!("invites: no admission listener ({e}); only the join code works"));
+                    None
+                }
+            },
+            None => None,
+        };
         self.result = None;
         self.state = State::Hosting(Box::new(Hosting {
             handle,
@@ -737,6 +879,7 @@ impl Controller {
             endpoints: Vec::new(),
             password: password.is_some(),
             steam_id: Some(steam_id),
+            admit,
         }));
     }
 
@@ -765,7 +908,7 @@ impl Controller {
             name,
             key,
             link,
-            options: self.host_options.clone(),
+            options: self.options_with_mods(params),
             save_dirs: self.save_dirs.clone(),
             echo_log: false,
         });
@@ -784,6 +927,7 @@ impl Controller {
             endpoints: Vec::new(),
             password: password.is_some(),
             steam_id: None,
+            admit: None,
         };
         hosting.make_code();
         if hosting.code.is_empty() {
@@ -809,37 +953,237 @@ impl Controller {
             return;
         };
         let key = SessionKey::derive(&code.secret, password.as_deref());
+        self.remember_mods(params);
+        self.start_join(name, JoinTarget::Code(code, key));
+    }
+
+    /// Starts the connection on a thread of its own: `run_player` connects before it returns (5 s per TCP endpoint, up
+    /// to 30 s for a Steam route), and an invite first waits for the host's admission (up to two minutes).
+    fn start_join(&mut self, name: String, target: JoinTarget) {
         let (dir, save_dirs) = (self.dir.clone(), self.save_dirs.clone());
+        // the window's last mod list (a join from a Steam invite has no window command of its own)
+        let (user_dirs, params) = (self.user_dirs(), self.mod_params.clone());
+        self.mod_report.clear();
         let (tx, rx) = mpsc::channel();
         let progress = Arc::new(Mutex::new(String::new()));
-        let (core, said) = (self.steam_core(), Arc::clone(&progress));
-        // run_player connects before it returns (5 s per TCP endpoint, up to 30 s for a Steam route): off the
-        // controller's thread
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (core, said, stop) = (self.steam_core(), Arc::clone(&progress), Arc::clone(&cancel));
         let connect = move || {
-            let result = gamelink::Session::open(&dir)
-                .map_err(|e| format!("cannot open the session folder: {e}"))
-                .and_then(|link| match code.steam_id {
-                    // a code with a Steam ID is joined over Steam, whatever else it lists
+            // hashing the mod folders reads files: on this thread, not the controller's
+            let mods = Some(modlist::from_params(&params, &user_dirs, modlist::running_game_dir().as_deref()));
+            let mut say = |text: &str| *said.lock().unwrap_or_else(|p| p.into_inner()) = text.to_owned();
+            // a code with a Steam ID is joined over Steam, whatever else it lists; an invite is always over Steam
+            let route = match target {
+                JoinTarget::Code(code, key) => match code.steam_id {
+                    Some(id) => Ok((Some(id), code.endpoints, key)),
+                    None => Ok((None, code.endpoints, key)),
+                },
+                JoinTarget::Invite(token) => match &core {
+                    None => Err("Steam networking is not available in this game".to_owned()),
+                    Some(core) => {
+                        let cancelled = || stop.load(Ordering::Acquire);
+                        steam_admit::request_admission(core, &token, &name, &cancelled, &mut say)
+                            .map(|key| (Some(token.host), Vec::new(), key))
+                            .map_err(|why| format!("cannot join through the invite: {why}"))
+                    }
+                },
+            };
+            let result = route.and_then(|(steam_id, endpoints, key)| {
+                let link = gamelink::Session::open(&dir).map_err(|e| format!("cannot open the session folder: {e}"))?;
+                match steam_id {
                     Some(id) => {
                         let core = core.ok_or("Steam networking is not available in this game")?;
                         let mut config = steam_transport::steam_player_config(&name, key, link);
                         config.save_dirs = save_dirs;
-                        let mut say = |text: &str| *said.lock().unwrap_or_else(|p| p.into_inner()) = text.to_owned();
+                        config.mods = mods;
                         steam_transport::run_steam_player_on(&core, config, SteamEndpoint(id), &mut say)
                             .map_err(|e| format!("cannot reach the host over Steam: {e}"))
                     }
                     None => {
-                        let mut config = PlayerConfig::new(code.endpoints.clone(), &name, key, link);
+                        let mut config = PlayerConfig::new(endpoints, &name, key, link);
                         config.save_dirs = save_dirs;
+                        config.mods = mods;
                         session::run_player(config).map_err(|e| format!("cannot reach the host: {e}"))
                     }
-                });
+                }
+            });
             let _ = tx.send(result);
         };
         self.state = match thread::Builder::new().name("feverlink3-join".into()).spawn(connect) {
-            Ok(_) => State::Joining { rx, progress },
+            Ok(_) => State::Joining { rx, progress, cancel },
             Err(e) => State::Failed(format!("cannot start the connection: {e}")),
         };
+    }
+
+    // ---- Steam invites (steam_friends.rs, steam_admit.rs, docs/STEAM_TRANSPORT.md section 14)
+
+    /// `invite`: Steam's overlay invite dialog with this session's invite token (public token plus the invite ticket).
+    fn open_invite_dialog(&mut self) -> Result<String, String> {
+        let State::Hosting(h) = &self.state else { return Err("host a game first, then invite".into()) };
+        let (Some(admit), Some(host)) = (&h.admit, h.steam_id) else {
+            return Err("invites need a game hosted over Steam; send the join code instead".into());
+        };
+        let (_, invite) = admit.tokens(host);
+        self.friends.open_invite_dialog(&invite.connect_string())?;
+        self.append_session_log(
+            "invites: Steam's overlay invite dialog was opened (Steam does not say whom the player invites)",
+        );
+        Ok("Steam's invite window is open: pick your friends there. No window? Turn on the Steam overlay, or invite from your Steam friends list.".into())
+    }
+
+    /// `admit {id}` / `refuse {id}`: the host's answer to a join request.
+    fn answer_request(&mut self, admit: bool, params: &Value) -> Result<String, String> {
+        let State::Hosting(h) = &self.state else { return Err("only the host answers join requests".into()) };
+        let Some(gate) = &h.admit else { return Err("there are no join requests".into()) };
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .ok_or("that request has no account")?;
+        let outcome = if admit { gate.admit(id) } else { gate.refuse(id) };
+        for line in gate.take_log() {
+            self.append_session_log(&line);
+        }
+        outcome
+    }
+
+    /// `accept_invite`: the window's Join on a pending invite; a session this game is in ends first.
+    fn accept_invite(&mut self) -> Result<String, String> {
+        let Some(invite) = self.invite.take() else { return Err("there is no invite to accept".into()) };
+        if !self.idle_or_failed() {
+            self.leave();
+        }
+        self.join_invite(invite);
+        Ok("joining".into())
+    }
+
+    fn join_invite(&mut self, invite: PendingInvite) {
+        self.notice = None;
+        self.pulse = None;
+        self.presence = None;
+        let host = invite.host_name.clone().unwrap_or_else(|| steam_admit::short_id(invite.token.host));
+        self.append_session_log(&format!(
+            "invites: joining {host} through the invite from {} (session {:016x}, {})",
+            invite.source.text(),
+            invite.token.session,
+            if invite.token.ticket.is_some() { "an invite of the host" } else { "the public join token" }
+        ));
+        let name = self.default_name.clone();
+        self.start_join(name, JoinTarget::Invite(invite.token));
+    }
+
+    /// A connect string Steam handed over: a FeverLink3 token becomes the pending invite.
+    fn take_join_request(&mut self, request: JoinRequest) {
+        match ConnectToken::find(&request.connect) {
+            Ok(token) => {
+                let own = self.steam_core().and_then(|c| c.status().steam_id);
+                if own == Some(token.host) {
+                    self.append_session_log("invites: ignored a join request for this account's own session");
+                    return;
+                }
+                let host_name = self.friends.friend_name(token.host);
+                self.append_session_log(&format!(
+                    "invites: join request from {} for {} (session {:016x})",
+                    request.source.text(),
+                    host_name.clone().unwrap_or_else(|| steam_admit::short_id(token.host)),
+                    token.session
+                ));
+                self.invite = Some(PendingInvite { token, source: request.source, host_name });
+            }
+            Err(TokenError::Missing) => {
+                if request.source == JoinSource::Running {
+                    self.append_session_log("invites: Steam delivered a join request that is not FeverLink3's");
+                }
+            }
+            Err(why) => {
+                self.append_session_log(&format!("invites: unusable join request: {why}"));
+                self.notice = Some(sentence(&why.to_string()));
+            }
+        }
+    }
+
+    /// Every step: Steam's join requests in, rich presence and the admission listener out.
+    fn invites_step(&mut self) {
+        if let Some(note) = self.friends.take_note() {
+            self.append_session_log(&note);
+        }
+        let mut requests = Vec::new();
+        if !self.cmdline_read {
+            self.cmdline_read = true;
+            let line = self.friends.process_command_line();
+            requests.push(JoinRequest { friend: None, connect: line, source: JoinSource::CommandLine });
+        }
+        if !self.launch_read && self.friends.ready() {
+            self.launch_read = true;
+            if let Some(line) = self.friends.launch_command_line() {
+                requests.push(JoinRequest { friend: None, connect: line, source: JoinSource::CommandLine });
+            }
+        }
+        requests.extend(self.friends.take_join_requests());
+        for request in requests {
+            self.take_join_request(request);
+        }
+        // an invite starts by itself once this game is free and has a world loaded (the mod holds its presence lock);
+        // otherwise the window offers Join
+        if self.invite.is_some() && self.idle_or_failed() && lock_is_held(&self.dir.join(WORLD_LOCK_FILE)) == Some(true)
+        {
+            if let Some(invite) = self.invite.take() {
+                self.join_invite(invite);
+            }
+        }
+
+        let mut want = RichPresence::default();
+        let mut lines = Vec::new();
+        if let State::Hosting(h) = &self.state {
+            if let (Some(admit), Some(host)) = (&h.admit, h.steam_id) {
+                admit.tick();
+                lines = admit.take_log();
+                for p in admit.pending() {
+                    if !self.names.contains_key(&p.account) {
+                        let name = self.friends.friend_name(p.account);
+                        self.names.insert(p.account, name);
+                    }
+                }
+                want = RichPresence { connect: admit.tokens(host).0.connect_string(), status: PRESENCE_STATUS.into() };
+            }
+        }
+        for line in lines {
+            self.append_session_log(&line);
+        }
+        if want != self.rich {
+            let connect_ok = self.friends.set_rich_presence(steam_friends::KEY_CONNECT, &want.connect);
+            let status_ok = self.friends.set_rich_presence(steam_friends::KEY_STATUS, &want.status);
+            // Steam not up yet: tried again next step
+            if connect_ok && status_ok {
+                self.append_session_log(&if want.connect.is_empty() {
+                    "invites: rich presence cleared (no Join game)".to_owned()
+                } else {
+                    "invites: rich presence set: connect = the public join token, status = hosting".to_owned()
+                });
+                self.rich = want;
+            }
+        }
+    }
+
+    /// The host's join requests and the pending invite, for the status.
+    fn invites_json(&self, v: &mut Value) {
+        if let State::Hosting(h) = &self.state {
+            if let Some(admit) = &h.admit {
+                let requests: Vec<Value> = admit
+                    .pending()
+                    .iter()
+                    .map(|p| {
+                        let steam = self.names.get(&p.account).cloned().flatten();
+                        json!({ "id": p.account.to_string(), "name": p.name, "steam": steam })
+                    })
+                    .collect();
+                v["invites"] = json!({ "ready": self.friends.ready(), "requests": requests });
+            }
+        }
+        if let Some(invite) = &self.invite {
+            let host = invite.host_name.clone().unwrap_or_else(|| steam_admit::short_id(invite.token.host));
+            v["invite"] = json!({ "host": host, "auto": self.idle_or_failed() });
+        }
     }
 
     fn leave(&mut self) {
@@ -852,6 +1196,7 @@ impl Controller {
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Hosting(h) => h.handle.stop(),
             State::Joined { handle } => handle.stop(),
+            State::Joining { cancel, .. } => cancel.store(true, Ordering::Release),
             _ => {}
         }
         if let Ok(link) = gamelink::Session::open(&self.dir) {
@@ -903,6 +1248,7 @@ impl Controller {
             // a reject or an error is the thread's last word: it ends in the next breath, so do not show a gap
             if s.finished || s.rejected.is_some() || s.error.is_some() {
                 let why = ended_message(&s);
+                self.mod_report = s.mod_report.clone();
                 self.notice = Some(sentence(&why));
                 self.state = State::Failed(why);
                 self.pulse = None;
@@ -932,6 +1278,7 @@ impl Controller {
             State::Failed(why) => {
                 v["state"] = json!("failed");
                 v["message"] = json!(why);
+                add_mod_report(&mut v, &self.mod_report);
             }
             State::Joining { progress, .. } => {
                 v["state"] = json!("joining");
@@ -958,6 +1305,7 @@ impl Controller {
                     let why = ended_message(&s);
                     v["notice"] = json!(sentence(&why));
                     v["message"] = json!(why);
+                    add_mod_report(&mut v, &s.mod_report);
                     "failed"
                 } else if s.connected {
                     "joined"
@@ -967,6 +1315,13 @@ impl Controller {
                 if s.reconnecting {
                     v["reconnecting"] = json!(true);
                     v["attempts"] = json!(s.reconnect_attempts);
+                    // the window's heading: "Reconnecting (N s)"; the game keeps its world and is caught up when the link is back
+                    // within the host's grace (docs/PROTOCOL.md, "Catching up")
+                    v["reconnectingS"] = json!(s.reconnecting_s);
+                    v["progress"] = json!(format!(
+                        "connection lost {} s ago, attempt {}: your game waits with its world and catches up when the link is back",
+                        s.reconnecting_s, s.reconnect_attempts
+                    ));
                 }
                 v["state"] = json!(state);
                 add_session(&mut v, handle);
@@ -978,6 +1333,7 @@ impl Controller {
         if let Some(notice) = &self.notice {
             v["notice"] = json!(notice);
         }
+        self.invites_json(&mut v);
         v
     }
 
@@ -1061,6 +1417,10 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
     if let Some(sess) = &s.session {
         v["started"] = json!(sess.started);
         v["speed"] = json!(sess.speed);
+    }
+    // what the mod-list comparison could not do or only warns about (docs/PROTOCOL.md, "Mod list"), in every window
+    if let Some(w) = s.session.as_ref().map(|sess| &sess.mod_warnings).filter(|w| !w.is_empty()) {
+        v["modWarnings"] = json!(w);
     }
     if let Some(r) = &s.resync {
         v["resync"] = json!(r);
@@ -1202,6 +1562,14 @@ fn permissions_with(current: &Permissions, params: &Value) -> Result<Permissions
         return Err("name at least one of build, bulldoze, spend, speed, other".into());
     }
     Ok(next)
+}
+
+/// The differences to the host's mods as the window lists them: `mods = { {block = true, text = "..."}, ... }`.
+fn add_mod_report(v: &mut Value, report: &[(bool, String)]) {
+    if !report.is_empty() {
+        v["mods"] =
+            json!(report.iter().map(|(block, text)| json!({ "block": block, "text": text })).collect::<Vec<_>>());
+    }
 }
 
 /// `text` with its first letter capitalised: a message in the style of `ended_message` as a line of its own.
@@ -1728,6 +2096,41 @@ mod tests {
         pw.send("join", &join);
         assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
         assert_eq!(pw.status()["me"], 2);
+    }
+
+    /// The window's `host` / `join` payloads with a mod list (what feverlink3_hud.lua `H.modList` sends).
+    fn with_mods(payload: &str, build: &str, mods: &str) -> String {
+        format!("{},[\"game\"]=\"{build}\",[\"mods\"]={{{mods}}}}}", payload.trim_end_matches('}'))
+    }
+
+    #[test]
+    fn a_join_with_another_build_is_refused_and_the_window_lists_the_difference() {
+        let root = tempfile::tempdir().unwrap();
+        let (hd, pd) = (root.path().join("host"), root.path().join("player"));
+        let mut host = Controller::new(hd.clone(), "Host".into(), Vec::new()).unwrap().with_host_options(quick());
+        let mut player = Controller::new(pd.clone(), "Pat".into(), Vec::new()).unwrap();
+        let (mut hw, mut pw) = (Window::new(&hd), Window::new(&pd));
+        let host_mods = "{[\"id\"]=\"trains\",[\"revision\"]=3},{[\"id\"]=\"ui\",[\"revision\"]=2,[\"cosmetic\"]=true}";
+        let host_cmd = "{[\"name\"]=\"Hosty\",[\"port\"]=0,[\"transport\"]=\"tcp\",[\"bind\"]=\"loopback\"}";
+        hw.send("host", &with_mods(host_cmd, "1.4.2", host_mods));
+        assert!(until(&mut [&mut host], Duration::from_secs(10), || hw.status()["state"] == "hosting"));
+        let mut code = JoinCode::try_decode(hw.status()["code"].as_str().unwrap()).unwrap();
+        let port = code.endpoints.first().map_or(0, SocketAddr::port);
+        code.endpoints = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let join = format!("{{[\"code\"]=\"{}\"}}", code.encode());
+
+        // the builds are compared at join (the mods when the host's world is saved for the player: core mods_tests)
+        pw.send("join", &with_mods(&join, "1.4.3", host_mods));
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "failed"));
+        let st = pw.status();
+        assert!(st["message"].as_str().unwrap().contains("mods"), "{st}");
+        assert_eq!(st["mods"], json!([{"block": true, "text": "the game: host has 1.4.2, you have 1.4.3"}]), "{st}");
+        assert_eq!(hw.status()["players"].as_array().unwrap().len(), 1, "never joined");
+
+        // the same mods: welcomed
+        pw.send("join", &with_mods(&join, "1.4.2", host_mods));
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        assert!(pw.status()["mods"].is_null());
     }
 
     #[test]
@@ -2369,5 +2772,192 @@ mod tests {
         for bad in [json!(65536), json!(-1), json!(1.5), json!("1"), Value::Null] {
             assert_eq!(player_id(&bad), None, "{bad}");
         }
+    }
+
+    // ---- Steam invites
+
+    /// A PC whose game has Steam friends (the model) and, once `world` is called, a loaded world (the mod's lock).
+    struct InvitePc {
+        pc: SteamPc,
+        friends: crate::steam_friends::fake::FakeFriends,
+        _world: Option<fs::File>,
+    }
+
+    fn invite_pc(root: &Path, name: &str, command_line: &str) -> InvitePc {
+        let friends = crate::steam_friends::fake::FakeFriends::new();
+        friends.set_command_line(command_line);
+        let machine = FakeMachine::new();
+        let core = machine.core();
+        let dir = root.join(name);
+        let controller = Controller::with_core(dir.clone(), name.into(), Vec::new(), core.handle())
+            .unwrap()
+            .with_friends(friends.clone());
+        let pc = SteamPc { machine, _core: core, controller, window: Window::new(&dir), dir };
+        InvitePc { pc, friends, _world: None }
+    }
+
+    impl InvitePc {
+        /// The mod's presence lock is held: a world is loaded.
+        #[cfg(windows)]
+        fn world(&mut self) {
+            use std::os::windows::fs::OpenOptionsExt;
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(self.pc.dir.join(WORLD_LOCK_FILE))
+                .unwrap();
+            self._world = Some(lock);
+        }
+    }
+
+    fn steps(pcs: &mut [&mut InvitePc], timeout: Duration, mut done: impl FnMut(&[&mut InvitePc]) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            for p in pcs.iter_mut() {
+                p.pc.controller.step();
+            }
+            if done(pcs) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Everything that must never carry the secret or the key: what reached Steam (every rich presence value ever set,
+    /// the invite dialog's string) and every session log.
+    fn assert_no_secret(code: &str, key_hex: &str, pcs: &[&InvitePc]) {
+        for p in pcs {
+            let mut seen: Vec<String> = p.friends.history().into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+            seen.extend(p.friends.dialogs());
+            seen.push(fs::read_to_string(p.pc.dir.join(SESSION_LOG_FILE)).unwrap_or_default());
+            for text in seen {
+                assert!(!text.contains(code), "the join code leaked: {text}");
+                assert!(!text.to_ascii_lowercase().contains(key_hex), "the key leaked: {text}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn steam_invites_admit_the_invited_friend_ask_for_the_rest_and_never_publish_the_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let mut host = invite_pc(root.path(), "host", "TransportFever3.exe");
+        let mut ann = invite_pc(root.path(), "ann", "TransportFever3.exe");
+        let mut ben = invite_pc(root.path(), "ben", "TransportFever3.exe");
+        let mut cat = invite_pc(root.path(), "cat", "TransportFever3.exe");
+        let host_id = host.pc.machine.steam_id();
+        host.pc.window.send("host", "{[\"name\"]=\"Hosty\"}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(10), |p| p[0].friends.presence("connect").is_some()));
+        let code = host.pc.window.status()["code"].as_str().unwrap().to_owned();
+        let secret = JoinCode::try_decode(&code).unwrap().secret;
+        let key_hex: String = SessionKey::derive(&secret, None).key().iter().map(|b| format!("{b:02x}")).collect();
+        // rich presence: the public token only (host and session number), and a readable status
+        let connect = host.friends.presence("connect").unwrap();
+        let public = ConnectToken::find(&connect).expect("a token");
+        assert_eq!((public.host, public.ticket), (host_id, None));
+        assert!(connect.starts_with("+feverlink3_join 1:"), "{connect}");
+        assert_eq!(host.friends.presence("status").as_deref(), Some(PRESENCE_STATUS));
+
+        // the overlay invite carries the invite ticket; Steam tells the host nothing about whom it went to
+        host.pc.window.send("invite", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(5), |p| p[0].friends.dialogs().len() == 1));
+        let invite = host.friends.dialogs()[0].clone();
+        assert!(ConnectToken::find(&invite).unwrap().ticket.is_some());
+        assert_eq!(host.pc.window.status()["result"]["ok"], true);
+
+        // Ann accepted the overlay invite while her game ran with a world loaded: admitted without a prompt
+        ann.world();
+        ann.friends.deliver_join(Some(host_id), &invite);
+        assert!(steps(&mut [&mut host, &mut ann], Duration::from_secs(20), |p| {
+            p[1].pc.window.status()["state"] == "joined"
+        }));
+        // Ben clicked "Join game" on the host in his friends list (rich presence): the host's window lists him
+        ben.world();
+        host.friends.set_name(ben.pc.machine.steam_id(), "Ben on Steam");
+        ben.friends.deliver_join(Some(host_id), &connect);
+        assert!(steps(&mut [&mut host, &mut ann, &mut ben], Duration::from_secs(20), |p| {
+            p[0].pc.window.status()["invites"]["requests"].as_array().is_some_and(|r| r.len() == 1)
+                && p[2].pc.window.status()["progress"] == steam_admit::STATUS_WAITING
+        }));
+        let request = host.pc.window.status()["invites"]["requests"][0].clone();
+        assert_eq!(request["id"], ben.pc.machine.steam_id().to_string());
+        assert_eq!(request["steam"], "Ben on Steam");
+        host.pc.window.send("admit", &format!("{{[\"id\"]=\"{}\"}}", ben.pc.machine.steam_id()));
+        assert!(steps(&mut [&mut host, &mut ann, &mut ben], Duration::from_secs(20), |p| {
+            p[2].pc.window.status()["state"] == "joined"
+        }));
+        // Cat asks too and is refused: she is told so in words
+        cat.world();
+        cat.friends.deliver_join(None, &connect);
+        assert!(steps(&mut [&mut host, &mut ann, &mut ben, &mut cat], Duration::from_secs(20), |p| {
+            p[0].pc.window.status()["invites"]["requests"].as_array().is_some_and(|r| r.len() == 1)
+        }));
+        host.pc.window.send("refuse", &format!("{{[\"id\"]=\"{}\"}}", cat.pc.machine.steam_id()));
+        assert!(steps(&mut [&mut host, &mut ann, &mut ben, &mut cat], Duration::from_secs(20), |p| {
+            p[3].pc.window.status()["state"] == "failed"
+        }));
+        let message = cat.pc.window.status()["message"].as_str().unwrap_or("").to_owned();
+        assert!(message.contains("the host did not let you in"), "{message}");
+        assert!(steps(&mut [&mut host, &mut ann, &mut ben], Duration::from_secs(10), |p| {
+            p[0].pc.window.status()["players"].as_array().is_some_and(|p| p.len() == 3)
+        }));
+        let log = fs::read_to_string(host.pc.dir.join(SESSION_LOG_FILE)).unwrap();
+        assert!(log.contains("came through your invite: admitted"), "{log}");
+        assert!(log.contains("the host admitted ben") && log.contains("the host refused cat"), "{log}");
+
+        // stopping takes the Join game button away
+        host.pc.window.send("leave", "{}");
+        assert!(steps(&mut [&mut host, &mut ann, &mut ben], Duration::from_secs(10), |p| {
+            p[0].friends.presence("connect").is_none() && p[0].friends.presence("status").is_none()
+        }));
+        assert_no_secret(&code, &key_hex, &[&host, &ann, &ben, &cat]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_cold_start_invite_waits_for_a_world_then_joins_and_an_old_one_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let mut host = invite_pc(root.path(), "host", "TransportFever3.exe");
+        host.pc.window.send("host", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(10), |p| p[0].friends.presence("connect").is_some()));
+        host.pc.window.send("invite", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(5), |p| p[0].friends.dialogs().len() == 1));
+        let invite = host.friends.dialogs()[0].clone();
+
+        // Steam started the friend's game with the invite on its command line; the game sits in the main menu
+        let mut friend = invite_pc(root.path(), "friend", &format!("\"C:\\TF3\\TransportFever3.exe\" {invite}"));
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(5), |p| {
+            p[1].pc.window.status()["invite"]["host"].is_string()
+        }));
+        steps(&mut [&mut host, &mut friend], Duration::from_millis(300), |_| false);
+        assert_eq!(friend.pc.window.status()["state"], "idle", "no world yet: nothing starts");
+        // a world is loaded: the join starts by itself
+        friend.world();
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
+            p[1].pc.window.status()["state"] == "joined"
+        }));
+        let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
+        assert!(log.contains("invites: join request from the command line"), "{log}");
+
+        // the host hosts again: an invite of the old session is stale
+        host.pc.window.send("leave", "{}");
+        friend.pc.window.send("leave", "{}");
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(10), |p| {
+            p[0].pc.window.status()["state"] == "idle" && p[1].pc.window.status()["state"] == "idle"
+        }));
+        host.pc.window.send("host", "{}");
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(10), |p| {
+            p[0].pc.window.status()["state"] == "hosting" && p[0].friends.presence("connect").is_some()
+        }));
+        friend.friends.deliver_join(None, &invite);
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
+            p[1].pc.window.status()["message"].as_str().is_some_and(|m| m.contains("session that is over"))
+        }));
     }
 }

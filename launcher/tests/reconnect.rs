@@ -25,12 +25,92 @@ fn away(h: &SessionHandle, id: u16) -> bool {
 
 // ------------------------------------------------------------------ coming back
 
+/// How many lines of `kind` a game was given that carry `needle`.
+fn count(g: &Game, kind: &str, needle: &str) -> usize {
+    g.lines(kind).iter().filter(|l| l.payload.contains(needle)).count()
+}
+
+#[test]
+fn a_short_drop_is_caught_up_without_a_reload_and_what_was_lost_on_the_way_arrives_once() {
+    let root = tempfile::TempDir::new().unwrap();
+    let key = key();
+    let (host, mut host_game) = start_host(root.path(), &key, HostOptions::default(), vec![7; 1000]);
+    let addr = host.local_addr().unwrap();
+    let proxy = Proxy::start(addr);
+    let (alice, mut alice_game) = start_player(root.path(), &key, "Alice", proxy.addr);
+    assert!(alice.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+    let (bob, mut bob_game) = start_player(root.path(), &key, "Bob", addr);
+    assert!(bob.wait_for(WAIT, |s| s.connected && s.my_id.is_some()));
+    let a_id = alice.status().my_id.unwrap();
+    host_game.announce();
+    alice_game.announce();
+    bob_game.announce();
+    assert!(host.wait_for(WAIT, |s| s.clocks.len() == 3));
+    host.command(Command::Start);
+    {
+        let mut games = [&mut host_game, &mut alice_game, &mut bob_game];
+        assert!(wait_games(WAIT, &mut games, |gs| gs.iter().all(|g| g.saw("session", "[\"started\"]=true"))));
+    }
+
+    // the link goes silent: what either side sends now is lost on the way (the host believes Bob's action reached her)
+    proxy.blackhole(true);
+    bob_game.act("bob-lost-on-the-way", 1);
+    alice_game.act("alice-lost-on-the-way", 1);
+    {
+        let mut games = [&mut host_game, &mut alice_game, &mut bob_game];
+        assert!(wait_games(WAIT, &mut games, |gs| gs[0].saw("action", "bob-lost-on-the-way")));
+    }
+    thread_sleep_ms(300);
+    // then it drops; Bob plays on while she is away
+    proxy.refuse(true);
+    proxy.cut();
+    assert!(wait(WAIT, || away(&host, a_id)), "{:?}", host.status().roster);
+    bob_game.act("bob-while-she-is-away", 2);
+    assert!(alice.wait_for(WAIT, |s| s.reconnecting && s.reconnect_attempts >= 1), "{:?}", alice.status());
+
+    // the link is back within the grace: she is caught up, her game keeps its world
+    proxy.blackhole(false);
+    proxy.refuse(false);
+    assert!(alice.wait_for(WAIT, |s| s.connected && !s.reconnecting && s.my_id == Some(a_id)), "{:?}", alice.status());
+    assert!(alice.status().caught_up, "{:?}", alice.logs());
+    {
+        let mut games = [&mut host_game, &mut alice_game, &mut bob_game];
+        let all = wait_games(WAIT, &mut games, |gs| {
+            gs[1].saw("action", "bob-while-she-is-away") && gs[2].saw("action", "alice-lost-on-the-way")
+        });
+        assert!(all, "host log:\n{}\nalice log:\n{}", host.logs().join("\n"), alice.logs().join("\n"));
+        // whatever else is in flight settles
+        wait_games(Duration::from_millis(500), &mut games, |_| false);
+    }
+    assert_eq!(1, count(&alice_game, "action", "bob-lost-on-the-way"), "once, never twice");
+    assert_eq!(1, count(&alice_game, "action", "bob-while-she-is-away"));
+    assert_eq!(1, count(&bob_game, "action", "alice-lost-on-the-way"));
+    assert_eq!(1, count(&host_game, "action", "alice-lost-on-the-way"));
+    assert!(alice_game.lines("resync_load").is_empty(), "no reload");
+    assert!(host.status().resync.is_none(), "no resync round: {:?}", host.status().resync);
+    assert!(host.logs().iter().any(|l| l.contains("resume: Alice is caught up")), "{:?}", host.logs());
+    assert!(host.logs().iter().any(|l| l.contains("stall: Alice returns")), "{:?}", host.logs());
+    // her action really was lost on the way and came again from what her launcher kept
+    let resent = alice.logs().into_iter().find(|l| l.contains("caught up by the host")).unwrap_or_default();
+    assert!(!resent.contains("; 0 message"), "{resent}");
+    for h in [&alice, &bob, &host] {
+        h.stop();
+    }
+}
+
+fn thread_sleep_ms(ms: u64) {
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// The fallback: a host that keeps nothing to catch a returner up (here: `resume_grace_seconds` 0; also a return after the grace,
+/// or after a resync replaced the others' world) brings it up to date with the host's world, as for any player joining.
 #[test]
 fn a_dropped_player_comes_back_as_itself_with_its_permissions_and_is_brought_up_to_date() {
     let root = tempfile::TempDir::new().unwrap();
     let key = key();
     let save: Vec<u8> = (0..(ResyncLimits::CHUNK_SIZE + 1234)).map(|i| (i % 247) as u8).collect();
-    let (host, mut host_game) = start_host(root.path(), &key, HostOptions::default(), save.clone());
+    let options = HostOptions { resume_grace_seconds: 0.0, ..HostOptions::default() };
+    let (host, mut host_game) = start_host(root.path(), &key, options, save.clone());
     let addr = host.local_addr().unwrap();
     let proxy = Proxy::start(addr);
 

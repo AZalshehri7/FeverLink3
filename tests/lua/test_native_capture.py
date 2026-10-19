@@ -98,7 +98,16 @@ class NativeCaptureTest(unittest.TestCase):
     def road(self, x0, y0, x1, y1):
         return "{ a = { x = %d, y = %d, z = 0 }, b = { x = %d, y = %d, z = 0 } }" % (x0, y0, x1, y1)
 
-    def test_a_road_made_with_a_native_tool_appears_on_the_other_game_once(self):
+    def fresh(self):
+        self.tearDown()
+        self.setUp()
+        self.start()
+
+    def queue(self, proposal, ctx="nil", ie="false"):
+        """What a native tool does with a proposal: its command goes straight into the engine's queue."""
+        self.B.run("GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(%s, %s, %s, true), nil }" % (proposal, ctx, ie))
+
+    def test_a_road_made_with_a_native_tool_appears_on_the_other_game_once_also_when_both_build_at_once(self):
         self.start()
         self.B.native(self.road(300, 0, 400, 0))
         self.tick(16)
@@ -110,8 +119,41 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.shipped_count(), 0, "a replay is not shipped again (it would come back as the host's own build)")
         self.assertIn("native build captured", self.B.log())
         self.assertNotIn("refused", self.A.log() + self.B.log())
+        self.A.native(self.road(0, 300, 0, 400))
+        self.B.native(self.road(500, 0, 600, 0))
+        self.tick(20)
+        self.assertEqual(self.A.sig(), self.B.sig())
+        self.assertIn("E 0.00,300.00,0.00 0.00,400.00,0.00", self.B.sig())
+        self.assertIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig())
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.A.shipped_count(), self.B.shipped_count()), (3, 3, 1, 2))
+        # seen in a real game: only the games that replayed an action recorded it in the company ledger, so every build made the games
+        # "differ in companies" until a resync copied everything
+        self.relay.checksum_request(1, self.relay.future_stamp(), False)
+        self.tick(40)
+        ta, pa = self.relay.reports[1][0]
+        tb, pb = self.relay.reports[1][1]
+        self.assertEqual(pa, pb, "every checksum part agrees")
+        self.assertIn("companies", pa, "the ledger is part of the checksum once an action was recorded")
 
-    def test_a_scripts_build_command_is_applied_at_the_stamp_on_every_game_the_sender_included(self):
+    def test_several_builds_in_a_row_each_land_once_and_the_marks_do_not_leak(self):
+        self.start()
+        for i in range(4):
+            self.B.native(self.road(300 + 150 * i, 0, 400 + 150 * i, 0))
+            self.tick(3)
+        for _ in range(40):
+            if self.A.builds_applied() == 4:
+                break
+            self.tick(1)
+        self.assertEqual(self.A.builds_applied(), 4)
+        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 4), "the replays were not shipped back")
+        # a real build of the other game the very moment after the last replay is still captured: a mark left behind must not swallow it
+        self.A.native(self.road(0, 700, 0, 800))
+        self.tick(20)
+        self.assertEqual(self.A.sig(), self.B.sig())
+        self.assertEqual(self.A.shipped_count(), 1, "the host's own build was captured")
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (5, 5))
+
+    def test_a_scripts_build_is_applied_at_the_stamp_on_every_game_and_a_game_scripts_own_build_stays_native(self):
         # real defaults run 2026-10-14: a script's build (the sweep's probes, sent in the simulation state) ran at once on the sending game
         # and at the stamp on the other, in another step; the free-id lists of the two engines then differed and a later real depot failed
         self.start()
@@ -126,45 +168,39 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertIn("a script's command: not sent here", self.B.log())
         self.assertEqual(self.A.shipped_count(), 0, "a replay is not shipped again")
         self.assertNotIn("refused", self.A.log() + self.B.log())
-
-    def test_a_game_scripts_own_world_build_is_not_taken_by_the_script_path(self):
         # the game's own scripts share the simulation state's api.cmd (terrain/reforestation.script, real run 2026-10-14) and send builds
         # every game makes by itself (playerInitiated false): they stay native and are not shipped
-        self.start()
+        self.fresh()
         self.B.run("SIM_ENV.api.cmd.sendCommand(SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, false, false))" % self.road(300, 0, 400, 0))
         self.tick(12)
         self.assertNotIn("a script's command", self.B.log())
         self.assertEqual(self.B.shipped_count(), 0)
 
-    def test_a_build_the_originators_engine_accepted_with_ignore_errors_is_replayed_with_ignore_errors(self):
-        # sweep run 20261013-061744 (B5): the guest applied a construction with ignoreErrors = true after "Empty Construction"; the host replayed it
-        # with false, the engine refused it silently and the games drifted
+    def test_a_scripts_build_callback_runs_when_the_other_simulation_state_applies_it_at_the_stamp(self):
+        # The real game shares one game's steps between two simulation Lua states (the mock's SIM_SPLIT). A script's build is taken in the
+        # state the script runs in, its callback (a function: it cannot go into the game-script state) kept there; the stamp is applied by
+        # whichever state runs that step. The callback ran only when that was the state that took it, else never (until the session end).
+        self.B.split_sim("function(t) return ONLY_STATE or (math.floor(t / 200) % 2 + 1) end")
         self.start()
-        for g in (self.A, self.B):
-            g.run("BUILD_NEEDS_IE = function(p) return true end")
-        self.B.run("GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, true, true), nil }" % self.road(300, 0, 400, 0))
+        self.B.run("ONLY_STATE = 1")
+        self.B.run("SIM_ENV.api.cmd.sendCommand(SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIMPLE_ROAD(%s), nil, false, true), "
+                   "function(res, ok) SCRIPT_CB = { ok } end)" % self.road(300, 0, 400, 0))
+        self.tick(1)   # the first state hands it to the interface half at its own step
+        self.B.run("ONLY_STATE = 2")   # every step up to and past the stamp runs in the other state
         self.tick(20)
-        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
-        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
-        self.assertEqual(self.A.builds_applied(), 1)
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+        self.assertEqual(self.A.sig(), self.B.sig())
+        self.B.run("ONLY_STATE = nil")   # the states take turns again
+        self.tick(2)
+        self.assertTrue(self.B.lua("SCRIPT_CB ~= nil and SCRIPT_CB[1] == true"), "the script's callback ran with the stamp apply's result\n" + self.B.log())
 
-    def test_the_originators_own_native_build_gets_its_keys_like_a_replay(self):
-        # a depot the engine built at the click and the capture shipped: the originator keys it too, so that a vehicle bought at it can be
-        # named for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here")
+    def test_a_build_read_after_it_ran_keeps_its_context_and_flags_and_reaches_the_other_game(self):
+        # the engine names the model of an edge object only when the build has run (a real game, 2026-10-11: "an edge object has no model" for
+        # every stop built with the stop tool, and the other game never got it); its deferred record was then replayed with the fallback flags
+        # (real run 2026-10-13: the post event has no Context)
         self.start()
-        self.B.run("DEPOT_P = NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }; "
-                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(DEPOT_P, nil, false, true), nil }")
-        self.tick(20)
-        for g in (self.A, self.B):
-            self.assertIn("1:1#c1", str(g.lua("BOUND_KEYS()")).split(), "%s keyed the depot" % g.label)
-        self.assertIn("this game's own native build is keyed here like a replay", self.B.log())
-
-    def test_a_stop_or_signal_without_a_model_before_the_build_is_read_after_it_and_reaches_the_other_game(self):
-        # the engine names the model of an edge object only when the build has run (a real game, 2026-10-11: "an edge object has no
-        # model" for every stop built with the stop tool, and the other game never got it)
-        self.start()
-        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; "
-                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIGNAL_P, nil, false, true), nil }")
+        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }")
+        self.queue("SIGNAL_P", ctx="CONTEXT(false, false, false, true)")
         self.tick(16)
         self.assertIn("has an edge object that the engine has not made yet", self.B.log())
         self.assertIn("native build captured", self.B.log())
@@ -173,58 +209,38 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
         self.assertIn("signal/signal_a.mdl@0.750k2", self.A.sig())
         self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.A.shipped_count(), self.B.shipped_count()), (1, 1, 0, 1))
-
-    def test_a_build_read_after_it_ran_keeps_the_context_of_the_pre_build_event_and_the_constructions_it_removes(self):
-        # real run 2026-10-13: the stop tool's deferred record was replayed with the fallback flags (the post event has no Context), and a depot
-        # over buildings could not be read after the build ("construction ... is not in the world")
-        self.start()
-        self.B.run("SIGNAL_P = NATIVE_SIGNAL{ edge = 130, param = 0.75 }; "
-                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(SIGNAL_P, CONTEXT(false, false, false, true), false, true), nil }")
-        self.tick(16)
-        self.assertNotIn("is not replicated", self.B.log())
         self.assertEqual(self.A.lua("BUILD_CTX[1]"), "align=false cleanup=false buildings=false fields=true player=7 ie=false pi=true")
         self.assertNotIn("carries no Context flags", self.A.log())
-
-    def test_the_originator_keys_its_own_native_stop_and_a_line_by_the_other_game_names_it(self):
-        # sweep run 20261013-081155 (F1): the guest built two stops natively, never keyed them itself ("native.bind: no snapshot stored"), and
-        # the host's line over them was refused on the guest, "unresolved stationGroup reference 1:12#o1/g"
-        self.start()
-        self.B.run("STOP_P = SIMPLE_STOP{ edge = 110, param = 0.5, left = true }; "
-                   "GAME.guiQueue[#GAME.guiQueue + 1] = { SIM_ENV.api.cmd.makeWorldBuildProposalCmd(STOP_P, nil, false, true), nil }")
-        self.tick(24)
+        # sweep run 20261013-061744 (B5): the guest applied a construction with ignoreErrors = true after "Empty Construction"; the host replayed
+        # it with false, the engine refused it silently and the games drifted
+        self.fresh()
         for g in (self.A, self.B):
-            keys = str(g.lua("BOUND_KEYS()")).split()
-            self.assertIn("1:1#o1", keys, "%s keyed the stop" % g.label)
-            self.assertIn("1:1#o1/g", keys, "%s keyed the stop's group" % g.label)
-        self.assertEqual(self.B.sig(), self.A.sig())
-
-    def test_the_same_in_the_other_direction(self):
-        self.start()
-        self.A.native(self.road(0, 300, 0, 400))
-        self.tick(16)
-        self.assertEqual(self.A.sig(), self.B.sig())
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
-        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (1, 0))
-
-    def test_several_builds_in_a_row_each_land_once_and_the_marks_do_not_leak(self):
-        self.start()
-        for i in range(4):
-            self.B.native(self.road(300 + 150 * i, 0, 400 + 150 * i, 0))
-            self.tick(3)
-        for _ in range(40):
-            if self.A.builds_applied() == 4:
-                break
-            self.tick(1)
-        self.assertEqual(self.A.builds_applied(), 4)
-        self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 4), "the replays were not shipped back")
-        # a real build the very moment after the last replay is still captured: a mark left behind must not swallow it
-        self.A.native(self.road(0, 700, 0, 800))
+            g.run("BUILD_NEEDS_IE = function(p) return true end")
+        self.queue("SIMPLE_ROAD(%s)" % self.road(300, 0, 400, 0), ie="true")
         self.tick(20)
-        self.assertEqual(self.A.sig(), self.B.sig())
-        self.assertEqual(self.A.shipped_count(), 1, "the host's own build was captured")
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (5, 5))
+        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
+        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
+        self.assertEqual(self.A.builds_applied(), 1)
 
-    def test_a_replay_the_engine_refused_is_named_and_does_not_take_the_next_ones_event(self):
+    def test_the_originator_keys_its_own_native_depot_and_stop_like_a_replay(self):
+        # a depot the engine built at the click and the capture shipped: the originator keys it too, so that a vehicle bought at it can be named
+        # for the other game (real session 2026-10-12: "stationGroup s:45494 does not exist here"); sweep run 20261013-081155 (F1): the guest
+        # built two stops natively, never keyed them itself ("native.bind: no snapshot stored"), and the host's line over them was refused on the
+        # guest, "unresolved stationGroup reference 1:12#o1/g"
+        for name, proposal, keys in (("depot", "NATIVE_DEPOT_ON_ROAD{ edge = 110, at = { x = 50, y = 0, z = 0 }, door = { x = 50, y = -30, z = 0 }, params = { seed = 260 } }", ["1:1#c1"]),
+                                     ("stop", "SIMPLE_STOP{ edge = 110, param = 0.5, left = true }", ["1:1#o1", "1:1#o1/g"])):
+            with self.subTest(name):
+                self.fresh()
+                self.queue(proposal)
+                self.tick(24)
+                for g in (self.A, self.B):
+                    for k in keys:
+                        self.assertIn(k, str(g.lua("BOUND_KEYS()")).split(), "%s keyed %s" % (g.label, k))
+                self.assertIn("this game's own native build is keyed here like a replay", self.B.log())
+                if name == "stop":
+                    self.assertEqual(self.B.sig(), self.A.sig())
+
+    def test_a_replay_the_engine_did_not_run_is_named_by_its_key_and_does_not_take_the_next_ones_event(self):
         # owner one-PC test 2026-10-15: 2:18 got no apply event (refused) on either game; the next two replays' events spent the marks one
         # behind, and the log said "the engine did not run the replayed build 2:20" on both games although 2:20 was applied on both
         self.start()
@@ -243,12 +259,10 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertNotIn("1:3@", named, "the last replay sent was applied")
         self.assertEqual(self.A.shipped_count(), 0, "no replay's event was taken for a new build of this game")
         self.assertEqual(self.A.builds_applied(), 3)
-
-    def test_a_mark_the_interface_half_sent_names_its_build_when_no_event_spent_it(self):
-        # friend test 2026-10-18 (0.2.0-pre5): the guest applied the host's builds 0:9 and 0:13 during a pause from its interface half,
-        # whose "replay" mark carried no key, and the report read "the engine did not run the replayed build nil@14282800,
-        # nil@14285000" (no apply event reached the simulation half then: its subscription by names, fixed in de15edb)
-        self.start()
+        # friend test 2026-10-18 (0.2.0-pre5): the guest applied the host's builds 0:9 and 0:13 during a pause from its interface half, whose
+        # "replay" mark carried no key, and the report read "the engine did not run the replayed build nil@14282800, nil@14285000" (no apply
+        # event reached the simulation half then: its subscription by names, fixed in de15edb)
+        self.fresh()
         self.A.run('SIM_EVENT("", "feverlink3", "replay", { key = "0:9" })')
         self.tick(14)
         self.A.run('SIM_EVENT("", "feverlink3", "replay", { key = "0:13" })')
@@ -259,29 +273,6 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertNotIn("nil", named)
         # the interface half's sends carry the key: the pause path, a released held command, hold_off
         self.assertEqual(T.BRIDGE_SRC.count('toSim("replay", {})') + T.BRIDGE_SRC.count('toSim, "replay", {})'), 0)
-
-    def test_both_games_building_at_once_end_up_with_both_roads(self):
-        self.start()
-        self.A.native(self.road(0, 300, 0, 400))
-        self.B.native(self.road(300, 0, 400, 0))
-        self.tick(20)
-        self.assertEqual(self.A.sig(), self.B.sig())
-        self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
-        self.assertIn("E 0.00,300.00,0.00 0.00,400.00,0.00", self.B.sig())
-
-    def test_the_company_ledger_counts_the_build_on_both_games_so_the_checksum_agrees(self):
-        # Seen in a real game: only the games that replayed an action recorded it in the company ledger, so every build made
-        # the games "differ in companies" until a resync copied everything.
-        self.start()
-        self.B.native(self.road(300, 0, 400, 0))
-        self.tick(16)
-        self.relay.checksum_request(1, self.relay.future_stamp(), False)
-        self.tick(40)
-        ta, pa = self.relay.reports[1][0]
-        tb, pb = self.relay.reports[1][1]
-        self.assertEqual(pa, pb, "every checksum part agrees")
-        self.assertIn("companies", pa, "the ledger is part of the checksum once an action was recorded")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -659,3 +659,41 @@ the host", "finding a route", "connected, direct"); a code without one uses TCP 
    host transport a per-connection send queue with a cap.
 5. **The probe listens all game long** (a 20 ms poll, a few tenths of a percent of one core). Alternative: open the
    listen socket only while the Steam test is on screen.
+
+## 14. Steam invites (Steam's own friends list, overlay and chat)
+
+The host invites from Steam itself, not from a friend list drawn in our window. Code: `launcher/src/steam_friends.rs`
+(the Steam calls), `steam_admit.rs` (virtual port 3), `live.rs` (`invites_step`); the token and the exchange are in
+`docs/PROTOCOL.md`, "Steam invites".
+
+- **Host.** While a session is hosted over Steam the controller sets rich presence `connect` = the public token and
+  `status` = "Hosting a FeverLink3 multiplayer game"; it removes both (`SetRichPresence(key, "")`, never
+  `ClearRichPresence`, which would clear TF3's own keys) when the session ends. `connect` gives friends "Join game" and
+  the friends list's "Invite to game". The window's **Invite friends (Steam)** opens
+  `ActivateGameOverlayInviteDialogConnectString` with the token plus the invite ticket. `steam_display` is not used: it
+  must name a localization token TF3's developer uploaded.
+- **What Steam does not tell us.** Neither the overlay dialog nor the friends list's "Invite to game" tells the game whom
+  the player invited. So the overlay invite carries a ticket (admitted without a prompt), and everyone else, the friends
+  list's invites included, appears as a join request with **Let in** / **Refuse** in the host's window (the window
+  opens by itself).
+- **Friend, game running.** Steam calls `GameRichPresenceJoinRequested_t` (337) with the connect string. We register a
+  `CCallbackBase` object of our own with `SteamAPI_RegisterCallback` once Steam is up; TF3's own
+  `SteamAPI_RunCallbacks` runs it on TF3's thread, where it only copies the request (no Steam call, no unwinding).
+- **Friend, game not running.** Steam starts TF3 with the connect string on its command line (or in
+  `GetLaunchCommandLine` if the app enabled "Use launch command line"); the controller reads both once. TF3 opens at the
+  main menu: the join starts by itself once any world is loaded (the mod's presence lock is held).
+- The friend's game then asks the host on port 3, waits for the answer ("waiting for the host to let you in"), and joins
+  on port 0 with the key it got. A refusal, a timeout, an old invite or a host that is gone ends in `failed` with the
+  reason in words. A friend already in a session sees "<host> invited you through Steam" with **Join** / **Not now**.
+- **Log lines** (`session.log`): `invites: rich presence set: ...`, `invites: rich presence cleared`, `invites:
+  admission listener on Steam virtual port 3`, `invites: Steam's overlay invite dialog was opened`, `invites: join
+  request from <name> (...1234): asking the host`, `... came through your invite: admitted`, `invites: the host
+  admitted|refused <name>`, `invites: join request from Steam (game running)|the command line ...`, `invites: joining
+  ...`, `invites: Steam's join callback 337 is registered`. Accounts appear as their last four digits; the key and the
+  ticket never appear.
+
+**Only a two-PC test (two Steam accounts) can show:** that callback 337 reaches our registered object inside TF3 (and
+that registering from our thread while TF3 pumps is safe); where and in what form the connect string arrives on a cold
+start and whether Steam asks the friend to confirm the launch arguments, and that TF3 starts normally with an unknown
+`+feverlink3_join`; that the overlay dialog and "Join game" work with TF3's app id, and what the friend sees; whether
+TF3 sets or clears rich presence itself; that Steam removes our rich presence when the game quits.

@@ -872,6 +872,10 @@ impl FakeMachine {
     }
 
     /// A core on this machine with quick timings, started and waited for until Steam is ready.
+    ///
+    /// Keep one live core per machine, as a game has one process-wide core: the machine has one status-callback
+    /// queue, and with two cores each `RunCallbacks` hands the events to whichever poller called it, so a core can
+    /// lose the events of its own connections to the other (as two pollers on one real Steam client would).
     pub fn core(&self) -> SteamCore {
         let core = self.core_with(fast());
         core.handle().wait_ready(Instant::now() + Duration::from_secs(10), &|| false).expect("the fake Steam is ready");

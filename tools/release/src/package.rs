@@ -152,6 +152,32 @@ mod tests {
         Inputs::from_root(root)
     }
 
+    /// What this tool packs is what the launcher's updater accepts: both layouts are recognised, and the swap plan
+    /// of an overlay touches only the DLL and the mod files.
+    #[test]
+    fn the_launcher_updater_accepts_both_layouts() {
+        use feverlink3_launcher::update as up;
+        let root = tempfile::tempdir().unwrap();
+        let inputs = fixture(root.path());
+        for (layout, want) in [(Layout::Overlay, up::Layout::Overlay), (Layout::Portable, up::Layout::Portable)] {
+            let out = tempfile::tempdir().unwrap();
+            package_with(&inputs, "1.2.3", out.path(), layout).unwrap();
+            let m: up::Manifest = serde_json::from_slice(&fs::read(out.path().join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(up::layout_of(&m), Ok(want));
+            let zip = fs::read(out.path().join(&m.zip_name)).unwrap();
+            up::verify_zip(&zip, &m).unwrap();
+            let plan = up::plan_swap(&zip, &m, Path::new("C:/game")).unwrap();
+            if want == up::Layout::Overlay {
+                for step in &plan.steps {
+                    if let up::Step::Install { to, .. } = step {
+                        let rel = to.strip_prefix("C:/game").unwrap().to_string_lossy().replace('\\', "/");
+                        assert!(rel == "winhttp.dll" || rel.starts_with("mods/release/feverlink3/"), "{rel}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_overlay_layout_ships_no_program_and_mirrors_the_game_folder() {
         let root = tempfile::tempdir().unwrap();

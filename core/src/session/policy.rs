@@ -69,6 +69,31 @@ impl ChecksumPolicy {
         u32::try_from(speed).unwrap_or(1).clamp(1, Self::SPREAD_MAX_STEPS)
     }
 
+    /// The games' own chunk (the mod's `L.CHECKSUM_CHUNK`), used until a cost was measured.
+    pub const CHUNK_DEFAULT: u32 = 200;
+    pub const CHUNK_MIN: u32 = 50;
+    pub const CHUNK_MAX: u32 = 4000;
+    /// What one chunk should cost on the slowest game: 40 % of the step budget, room for a slower moment (GC, a busy step).
+    pub const CHUNK_TARGET_MS: u32 = 12;
+    /// The mod's `L.CHECKSUM_FRAME_BUDGET_MS`: what one step of a spread round should cost at most.
+    pub const STEP_BUDGET_MS: u32 = 30;
+    /// Rounds of each game whose cost counts (the dearest of them).
+    pub const COST_ROUNDS: usize = 3;
+
+    /// Entities a chunk of a spread round reads, from the dearest cost per entity (ns) the games reported, so the slowest game's
+    /// chunk costs about `CHUNK_TARGET_MS`. The same number goes to every game (each cuts its lists at the same places, so the
+    /// comparison stays exact). Grows at most twice per round (a cheap round after a dear one is no proof), shrinks at once.
+    /// Measured 2026-10-18/19: 17-30 us an entity on the lab PC and in the friend test (step max 4-8 ms for 200): about 400-700
+    /// entities a chunk, 3-4x fewer chunks: a round of the friend-test world (7400 entities) in about 15 batches instead of 38.
+    pub fn chunk_for(slowest_ns: Option<u32>, previous: u32) -> u32 {
+        let previous = if previous == 0 { Self::CHUNK_DEFAULT } else { previous };
+        let Some(ns) = slowest_ns.filter(|&ns| ns > 0) else { return previous };
+        let wanted = (u64::from(Self::CHUNK_TARGET_MS) * 1_000_000 / u64::from(ns))
+            .clamp(u64::from(Self::CHUNK_MIN), u64::from(Self::CHUNK_MAX));
+        let wanted = u32::try_from(wanted).unwrap_or(Self::CHUNK_MAX);
+        wanted.min(previous.saturating_mul(2))
+    }
+
     pub fn is_heavy_part(part: &str) -> bool {
         Self::HEAVY_PARTS.contains(&part) || part.starts_with("townBuildings:")
     }

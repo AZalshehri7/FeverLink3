@@ -70,47 +70,50 @@ class ResyncPauseTest(unittest.TestCase):
         self.assertEqual((self.A.speed(), self.B.speed()), (0, 0), "and stay paused")
         return p, loaded
 
-    def test_a_native_build_right_after_the_load_is_stamped_at_the_loaded_time_and_applied_there_on_both_games(self):
-        p, loaded = self.paused_then_loaded(3)
-        self.A.native(N.NativeCaptureTest.road(None, 300, 0, 400, 0))
-        self.tick(16)
-        self.assertNotIn("LATE", self.A.log() + self.B.log())
-        self.assertNotIn("BREACHED", self.A.log() + self.B.log())
-        self.assertIn("stamped %d" % loaded, self.A.log(), "the stamp is where every game stands, not the stale pause %d" % p)
-        self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
-        self.assertEqual(self.A.lua(BUILD_AT), self.B.lua(BUILD_AT), "applied in the same step on both games")
-        self.assertEqual(int(self.B.lua(BUILD_AT)), loaded)
-        for g in (self.A, self.B):
-            self.assertIn("is before this world's load at %d" % loaded, g.log())
+    def test_after_a_resync_load_in_a_pause_every_stamp_lies_at_or_past_the_loaded_time(self):
+        def native_build_after_the_load(p, loaded):
+            self.A.native(N.NativeCaptureTest.road(None, 300, 0, 400, 0))
+            self.tick(16)
+            self.assertNotIn("LATE", self.A.log() + self.B.log())
+            self.assertNotIn("BREACHED", self.A.log() + self.B.log())
+            self.assertIn("stamped %d" % loaded, self.A.log(), "the stamp is where every game stands, not the stale pause %d" % p)
+            self.assertEqual(self.A.sig(), self.B.sig(), "both games hold the same world")
+            self.assertEqual(self.A.lua(BUILD_AT), self.B.lua(BUILD_AT), "applied in the same step on both games")
+            self.assertEqual(int(self.B.lua(BUILD_AT)), loaded)
+            for g in (self.A, self.B):
+                self.assertIn("is before this world's load at %d" % loaded, g.log())
 
-    def test_an_action_of_the_pause_after_the_load_is_applied_past_the_loaded_time_on_both_games(self):
-        p, loaded = self.paused_then_loaded(3)
-        self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
-        self.tick(10)
-        expected = ["makeVehicleBuyCmd@%d" % (loaded + STEP)]
-        self.assertEqual([a for a in self.A.applied() if a.startswith("makeVehicleBuyCmd")], expected)
-        self.assertEqual([a for a in self.B.applied() if a.startswith("makeVehicleBuyCmd")], expected)
-        self.assertNotIn("LATE", self.A.log() + self.B.log())
+        def action_of_the_pause(p, loaded):
+            self.B.send_gui('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function() end)')
+            self.tick(10)
+            expected = ["makeVehicleBuyCmd@%d" % (loaded + STEP)]
+            for g in (self.A, self.B):
+                self.assertEqual([a for a in g.applied() if a.startswith("makeVehicleBuyCmd")], expected, g.label)
+            self.assertNotIn("LATE", self.A.log() + self.B.log())
 
-    def test_after_the_resume_the_games_run_on_from_the_loaded_time(self):
-        p, loaded = self.paused_then_loaded(3)
-        self.relay.pauseAt, self.relay.speed = None, 2
-        self.relay.session()
-        self.tick(20)
-        self.assertGreater(self.A.time(), loaded)
-        self.assertGreater(self.B.time(), loaded)
-        self.A.native(N.NativeCaptureTest.road(None, 300, 0, 400, 0))
-        self.tick(20)
-        self.assertEqual(self.A.sig(), self.B.sig())
-        self.assertNotIn("LATE", self.A.log() + self.B.log())
+        def resume(p, loaded):
+            self.relay.pauseAt, self.relay.speed = None, 2
+            self.relay.session()
+            self.tick(20)
+            self.assertGreater(min(self.A.time(), self.B.time()), loaded, "the games run on from the loaded time")
+            self.A.native(N.NativeCaptureTest.road(None, 300, 0, 400, 0))
+            self.tick(20)
+            self.assertEqual(self.A.sig(), self.B.sig())
+            self.assertNotIn("LATE", self.A.log() + self.B.log())
 
-    def test_a_pause_at_or_after_the_load_is_kept_as_the_host_sends_it(self):
-        _, loaded = self.paused_then_loaded(3)
-        self.relay.pauseAt = loaded + 4 * STEP
-        self.relay.session()
-        self.tick(3)
-        for g in (self.A, self.B):
-            self.assertIn("pauseAt=%d" % (loaded + 4 * STEP), g.log())
+        def a_later_pause(p, loaded):
+            self.relay.pauseAt = loaded + 4 * STEP
+            self.relay.session()
+            self.tick(3)
+            for g in (self.A, self.B):
+                self.assertIn("pauseAt=%d" % (loaded + 4 * STEP), g.log(), "a pause at or after the load is kept as the host sends it")
+
+        for i, case in enumerate((native_build_after_the_load, action_of_the_pause, resume, a_later_pause)):
+            with self.subTest(case.__name__):
+                if i:
+                    self.tearDown()
+                    self.setUp()
+                case(*self.paused_then_loaded(3))
 
 
 class LoadedAtTest(unittest.TestCase):
@@ -126,6 +129,9 @@ class LoadedAtTest(unittest.TestCase):
 
     def test_a_pause_before_the_load_becomes_the_load_time_and_a_later_one_is_kept(self):
         s = self.M.newSession()
+        self.M.applySession(s, self.session(started=True, speed=0, pauseAt=200, lead=1000))
+        self.assertEqual(s.pauseAt, 200, "a session never loaded by a resync takes the pause as sent")
+        s = self.M.newSession()
         self.M.applySession(s, self.session(started=True, speed=0, pauseAt=10341800, lead=1000))
         self.assertEqual(self.M.loadedAt(s, 10342400), 10341800, "the pause it replaced")
         self.assertEqual(s.pauseAt, 10342400)
@@ -137,11 +143,6 @@ class LoadedAtTest(unittest.TestCase):
         self.M.applySession(s, self.session(started=True, speed=4, lead=1000))
         self.assertIsNone(s.pauseAt)
         self.assertEqual(s.lastPauseAt, 10343000)
-
-    def test_a_session_never_loaded_by_a_resync_takes_the_pause_as_sent(self):
-        s = self.M.newSession()
-        self.M.applySession(s, self.session(started=True, speed=0, pauseAt=200, lead=1000))
-        self.assertEqual(s.pauseAt, 200)
 
 
 if __name__ == "__main__":
