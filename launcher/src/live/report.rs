@@ -126,17 +126,127 @@ impl Reporter {
 }
 
 /// Opens a folder (the report selected) or an address with what Windows has for it; nothing in the tests.
+///
+/// Through the shell's own functions, never by starting a program from here: a child process of the game inherits the
+/// game's open files (`crate::https`, the crash of 2026-10-22). The shell hands the folder to Explorer and the address
+/// to the browser itself. On a thread of its own, which sets up COM as the shell functions need.
 fn default_open(target: &OpenTarget) {
     if cfg!(test) {
         return;
     }
-    let mut cmd = std::process::Command::new("explorer.exe");
-    match target {
-        OpenTarget::Folder(file) => cmd.arg(format!("/select,{}", file.display())),
-        OpenTarget::Address(url) => cmd.arg(url),
-    };
-    // explorer.exe exits with 1 even when it opened the window: only a failure to start counts, and that is not fatal
-    let _ = cmd.spawn();
+    let target = target.clone();
+    let _ = thread::Builder::new().name("feverlink3-open".into()).spawn(move || {
+        let _ = guard::guarded(|| shell::open(&target));
+    });
+}
+
+#[cfg(windows)]
+mod shell {
+    use super::OpenTarget;
+    use std::ffi::c_void;
+
+    // shell32 and ole32 are loaded here, by full path, when a report is opened: imported by the module they would load
+    // with the game, and a system DLL loaded with the game that imports `winhttp.dll` would be handed our proxy
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    type CoInitializeEx = unsafe extern "system" fn(*const c_void, u32) -> i32;
+    type CoUninitialize = unsafe extern "system" fn();
+    type IlCreateFromPathW = unsafe extern "system" fn(*const u16) -> *mut c_void;
+    type IlFree = unsafe extern "system" fn(*mut c_void);
+    type ShOpenFolderAndSelectItems = unsafe extern "system" fn(*const c_void, u32, *const *const c_void, u32) -> i32;
+    type ShellExecuteW =
+        unsafe extern "system" fn(*mut c_void, *const u16, *const u16, *const u16, *const u16, i32) -> *mut c_void;
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const SW_SHOWNORMAL: i32 = 1;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// `<system folder>\<dll>`, loaded (once per process; Windows counts the loads) and never freed.
+    fn system_dll(dll: &str) -> *mut c_void {
+        let mut dir = [0u16; 300];
+        // SAFETY: the buffer holds 300 wide characters; at most 260 are asked for, the length is returned.
+        let n = unsafe { GetSystemDirectoryW(dir.as_mut_ptr(), 260) } as usize;
+        if n == 0 || n >= 260 {
+            return std::ptr::null_mut();
+        }
+        let mut path: Vec<u16> = dir[..n].to_vec();
+        path.extend(format!("\\{dll}\0").encode_utf16());
+        // SAFETY: a NUL-terminated full path.
+        unsafe { LoadLibraryW(path.as_ptr()) }
+    }
+
+    /// The function `name` (NUL-terminated) of `module` as `F`, the type the Windows documentation gives it.
+    ///
+    /// # Safety
+    /// `F` must be that function's pointer type.
+    unsafe fn proc<F: Copy>(module: *mut c_void, name: &str) -> Option<F> {
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: a loaded module and a NUL-terminated name; the caller names the right type.
+        let p = unsafe { GetProcAddress(module, name.as_ptr()) };
+        (!p.is_null()).then(|| unsafe { std::mem::transmute_copy::<*mut c_void, F>(&p) })
+    }
+
+    pub fn open(target: &OpenTarget) {
+        let (ole, shell) = (system_dll("ole32.dll"), system_dll("shell32.dll"));
+        // SAFETY: each type is the documented signature of the function of that name
+        let (init, uninit, create, free, select, execute) = unsafe {
+            (
+                proc::<CoInitializeEx>(ole, "CoInitializeEx\0"),
+                proc::<CoUninitialize>(ole, "CoUninitialize\0"),
+                proc::<IlCreateFromPathW>(shell, "ILCreateFromPathW\0"),
+                proc::<IlFree>(shell, "ILFree\0"),
+                proc::<ShOpenFolderAndSelectItems>(shell, "SHOpenFolderAndSelectItems\0"),
+                proc::<ShellExecuteW>(shell, "ShellExecuteW\0"),
+            )
+        };
+        let (Some(init), Some(uninit), Some(create), Some(free), Some(select), Some(execute)) =
+            (init, uninit, create, free, select, execute)
+        else {
+            return;
+        };
+        // SAFETY: plain shell calls on this thread's own COM apartment; every string is NUL-terminated and lives across
+        // its call, the item list is freed once.
+        unsafe {
+            let com = init(std::ptr::null(), COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            match target {
+                OpenTarget::Folder(file) => {
+                    // the file's own item with no children: Explorer opens its folder with the file selected
+                    let path = wide(&file.to_string_lossy());
+                    let item = create(path.as_ptr());
+                    if !item.is_null() {
+                        select(item, 0, std::ptr::null(), 0);
+                        free(item);
+                    }
+                }
+                // only web addresses (the issue page): never a file or a program by this path
+                OpenTarget::Address(url) if url.starts_with("https://") => {
+                    let (verb, url) = (wide("open"), wide(url));
+                    let none = std::ptr::null();
+                    execute(std::ptr::null_mut(), verb.as_ptr(), url.as_ptr(), none, none, SW_SHOWNORMAL);
+                }
+                OpenTarget::Address(_) => {}
+            }
+            if com >= 0 {
+                uninit();
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod shell {
+    pub fn open(_target: &super::OpenTarget) {}
 }
 
 fn now_unix() -> u64 {
