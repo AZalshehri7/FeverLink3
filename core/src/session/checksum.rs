@@ -4,6 +4,37 @@ use super::policy::ChecksumPolicy;
 
 use super::messages::ChecksumReportMessage;
 
+/// The free-id queue's part (added by the session controller from the native module's order trace, not by the mod): `<epoch>|<n>:<h>|...`
+/// where `<epoch>` names the loaded world's starting queue and each `<n>:<h>` is the hash of the engine's id stream (ids handed out
+/// and ids freed, in order) after its `n`-th op. Not a hash of one moment: two games read it a little apart, so it is compared at the
+/// newest `n` every report names, and not at all when a game has no such part, another epoch, or no common `n` (unknown, not
+/// different). Equal `n` with another hash: the next entity ids will differ (friend test 2026-10-21: the same build got other ids
+/// 1-3 min after a fork the content lanes could not see).
+pub const FREEQ_PART: &str = "freeq";
+
+/// `(epoch, [(n, hash)])` of a `freeq` value, `None` when it does not read.
+fn freeq_fields(v: &str) -> Option<(&str, BTreeMap<u64, &str>)> {
+    let mut it = v.split('|');
+    let epoch = it.next().filter(|e| !e.is_empty())?;
+    let checks = it
+        .map(|c| c.split_once(':').and_then(|(n, h)| Some((n.parse::<u64>().ok()?, h))))
+        .collect::<Option<BTreeMap<u64, &str>>>()?;
+    Some((epoch, checks))
+}
+
+/// Whether the `freeq` values of every reporter disagree: one epoch, a common checkpoint, and another hash there.
+fn freeq_differs(values: &BTreeMap<u16, Option<String>>) -> bool {
+    let Some(read) = values.values().map(|v| v.as_deref().and_then(freeq_fields)).collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let Some((epoch, first)) = read.first() else { return false };
+    if read.iter().any(|(e, _)| e != epoch) {
+        return false;
+    }
+    let common = first.keys().rev().find(|n| read.iter().all(|(_, c)| c.contains_key(n)));
+    common.is_some_and(|n| read.iter().any(|(_, c)| c[n] != first[n]))
+}
+
 /// One part of the world whose hash differs between games, with each reporter's value (`None` = the reporter did
 /// not hash that part).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +229,11 @@ impl ChecksumRounds {
             let values: BTreeMap<u16, Option<String>> =
                 reporters.iter().map(|&id| (id, reports[&id].parts.get(part).cloned())).collect();
             let distinct: BTreeSet<&Option<String>> = values.values().collect();
-            if distinct.len() > 1 {
+            if part == FREEQ_PART {
+                if freeq_differs(&values) {
+                    differences.push(ChecksumDifference { part: part.to_owned(), values });
+                }
+            } else if distinct.len() > 1 {
                 differences.push(ChecksumDifference { part: part.to_owned(), values });
             }
         }

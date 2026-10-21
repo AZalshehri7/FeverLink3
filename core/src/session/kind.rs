@@ -36,6 +36,10 @@ pub enum MessageKind {
     Pong = 37,
     /// The player leaves on purpose: the host frees its slot at once instead of holding it for a return.
     Leave = 38,
+    /// A chunk of this player's save, uploaded to the host because the host's own world may be partly built (an engine exception
+    /// during an apply): the host asked this game for its save (`ResyncSave`) and repairs every game from it. Payload: a
+    /// `ResyncChunkMessage`. Sent by the player's launcher, never by its game.
+    ResyncUpload = 39,
 
     // ---- player -> host, relayed by the host to everyone else with the origin filled in
     Action = 50,
@@ -52,7 +56,7 @@ pub enum MessageKind {
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
     /// (session state, checksum requests, authority values, resynchronisation).
-    pub const FROM_PLAYER: [MessageKind; 13] = [
+    pub const FROM_PLAYER: [MessageKind; 14] = [
         MessageKind::Hello,
         MessageKind::Clock,
         MessageKind::SpeedRequest,
@@ -62,6 +66,7 @@ impl MessageKind {
         MessageKind::ActionRefused,
         MessageKind::Pong,
         MessageKind::Leave,
+        MessageKind::ResyncUpload,
         MessageKind::Action,
         MessageKind::Chat,
         MessageKind::BuildVeto,
@@ -97,6 +102,7 @@ impl MessageKind {
             36 => ActionRefused,
             37 => Pong,
             38 => Leave,
+            39 => ResyncUpload,
             50 => Action,
             51 => Chat,
             52 => BuildVeto,

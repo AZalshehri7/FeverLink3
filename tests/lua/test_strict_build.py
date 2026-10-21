@@ -605,18 +605,35 @@ class StrictOnTest(StrictTest):
         self.assertEqual([r["seq"] for r in self.B.action_records()], [1, 2, 3, 4])
         self.assertEqual(self.B.native.released, [1, 2, 3, 4])
         self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0)
-        # a preview is used once: a click with no preview of its own is not paired with the spent one (released, the old path ships it)
+        # a preview is used once: a click with no preview of its own is not paired with the spent one (no record: refused, pre7 id forks)
         self.B.tool(self.road(1100, 0, 1200, 0), event=False)
         self.tick(14)
-        self.assertEqual(self.B.native.released, [1, 2, 3, 4, 5])
+        self.assertEqual((self.B.native.released, self.B.native.dropped), ([1, 2, 3, 4], [5]))
         self.assertSameWorld()
-        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (5, 5))
+        self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (4, 4))
         # the company ledger (booked through the normal apply path) and every checksum part agree
         self.relay.checksum_request(1, self.relay.future_stamp(), False)
         self.tick(40)
         (_, pa), (_, pb) = self.relay.reports[1][0], self.relay.reports[1][1]
         self.assertEqual(pa, pb, "every checksum part agrees")
         self.assertIn("companies", pa)
+
+    def test_terrain_tools_are_switched_off_during_a_session_and_on_again_at_its_end(self):
+        """Owner decision 2026-10-21 (A3): a terrain edit runs on its maker's game alone (pre7: 2 of 8 free-id forks), so the terrain
+        menu's tools are disabled while a session runs (api.gui.byId.setEnabled) and the rule is removed when it ends."""
+        self.start()
+        self.B.L.execute("GUI_API.gui = GUI_API.gui or {}; ENABLED = {}; GUI_API.gui.byId = { setEnabled = function(id, on, only) "
+                         "ENABLED[#ENABLED + 1] = tostring(id) .. '=' .. tostring(on) .. '/' .. tostring(only) end }")
+        raise_ = "menu.construction.landscaping.landscaping_terrain.::/gui/construction/tools/terrain_raise_tool.res"
+        for name in ("idAdded", "visibilityChange"):
+            self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, '%s', '%s', {})" % (raise_, name))
+        self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'menu.construction.road', 'idAdded', {})")
+        calls = lambda: list(self.B.L.eval("ENABLED").values())
+        self.assertEqual(calls(), [raise_ + "=false/true"], "switched off once; other tools untouched")
+        self.assertIn("terrain tools: " + raise_ + " switched off for this session", self.B.log())
+        self.end_session_of_b()
+        self.frames(30)
+        self.assertEqual(calls(), [raise_ + "=false/true", raise_ + "=nil/true"], "the rule is removed at the session's end")
 
     def test_a_held_command_is_paired_with_the_preview_of_its_own_tool_only(self):
         def held_event_first():
@@ -638,10 +655,9 @@ class StrictOnTest(StrictTest):
             self.B.tool(self.road(500, 0, 600, 0))
             self.tick(20)
             self.assertSameWorld()
-            self.assertEqual((sorted(self.B.native.released), self.B.native.dropped), ([1, 2], []))
-            self.assertIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig())
-            self.assertIn("E 500.00,0.00,0.00 600.00,0.00,0.00", self.A.sig())
-            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (2, 2))
+            self.assertEqual((self.B.native.released, sorted(self.B.native.dropped)), ([], [1, 2]), "no record for either: both refused")
+            self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig() + self.B.sig())
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
 
         def preview_without_command():
             self.start()
@@ -669,10 +685,9 @@ class StrictOnTest(StrictTest):
             self.B.native.site = 0x537EE5
             self.B.L.execute("TOOL_ADD(%d, true)" % 1)
             self.tick(14)
-            self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []), "given back, not cancelled")
+            self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]), "no record: refused, never given back")
             self.assertNotIn("matched the capture", self.B.log())
-            self.assertIn("(site 0x537ee5, LaneModifier::Apply)", self.B.log(), "named by its site")
-            self.assertIn("accounted for, the simulation half shipped a native build", self.B.log(), "and checked that something shipped it")
+            self.assertIn("held 1 (site 0x537ee5) REFUSED", self.B.log(), "named by its site")
             self.assertSameWorld()
 
         def other_tools_preview():
@@ -680,7 +695,7 @@ class StrictOnTest(StrictTest):
             self.B.native.site = 0x4D396F                                  # the bulldozer's site; the preview is the street tool's
             self.B.tool(self.road(300, 0, 400, 0))
             self.tick(14)
-            self.assertEqual(self.B.native.released, [1])
+            self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]))
             self.assertIn("which does not issue commands there; not paired", self.B.log())
             self.assertNotIn("matched the capture", self.B.log())
 
@@ -702,14 +717,13 @@ class StrictOnTest(StrictTest):
             self.start()
             self.B.tool(self.road(300, 0, 400, 0), event=False)
             self.tick(14)
-            self.assertEqual((self.B.native.released, self.B.native.dropped), ([1], []), "released")
-            self.assertIn("release", self.B.native.ctl_kinds())
-            self.assertNotIn("cancel", self.B.native.ctl_kinds())
-            self.assertIn("no capture of a tool build; release written", self.B.log())
+            # friend test pre7 2026-10-21: released, it ran on the originator ~16 steps before the others (a free-id fork); now refused
+            self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]), "refused, never released")
+            self.assertNotIn("release", self.B.native.ctl_kinds())
+            self.assertIn("REFUSED: no record before the engine applies it (no capture of a tool build)", self.B.log())
             self.assertSameWorld()
-            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1), "the originator built natively, the other game at the stamp")
-            self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 1), "the simulation half shipped it, once")
-            self.assertIn("native build captured", self.B.log())
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0), "no game has it")
+            self.assertEqual((self.A.shipped_count(), self.B.shipped_count()), (0, 0))
 
         def both_players_at_once():
             self.start()
@@ -1508,11 +1522,13 @@ class CancelFlowTest(StrictTest):
                 self.assertIn("this module cannot fire the tool's callback", self.B.log(), "said, not hidden")
 
         def edge_object():
-            # a stop or signal gets its model when the build runs: no cancel, the record is read afterwards by the simulation half
+            # a stop or signal gets its model when the build runs and its record could not be completed from the held command's text: no
+            # record before the build, so refused like a build without a capture (pre7 id forks); the player is told once
             self.start()
-            self.flow(self.B, "{ edge = 130, param = 0.75 }", "NATIVE_SIGNAL", [], [1])
-            self.assertIn("waits for the build", self.B.log())
-            self.assertEqual(self.relay.chats, [])
+            self.flow(self.B, "{ edge = 130, param = 0.75 }", "NATIVE_SIGNAL", [1], [])
+            self.assertIn("has no record before the build", self.B.log())
+            self.assertEqual(len(self.relay.chats), 1)
+            self.assertIn("could not be carried to the other players", self.relay.chats[0][1])
 
         blocked = {"extra_env": {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}}
         self.cases([("constructions by default", {}, construction_default), ("constructions blocked", dict(blocked, fires=True), constructions_blocked),

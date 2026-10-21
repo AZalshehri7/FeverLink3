@@ -228,6 +228,8 @@ function MAKE_API()
   local cmd = {
     sendCommand = function(c, cb, progress)
       if GAME.phase == "update" then UPDATE_WRITES[#UPDATE_WRITES + 1] = "sendCommand " .. tostring(c and c.__cmd) end
+      -- GUI_THROWS (a test's): the interface's sendCommand throws for that command after it took it (D, the pause path)
+      if GUI_THROWS and not GAME.inUpdate and c and c.__cmd == GUI_THROWS then error("Unknown exception") end
       if GAME.inUpdate then
         -- finding from MPFever (MIT): callbacks are refused inside the simulation update
         if cb then error("Callbacks are currently disallowed") end
@@ -1632,7 +1634,8 @@ class StampedEverywhereTest(LockstepTest):
         return self.relay.pauseAt
 
     def test_actions_of_a_pause_are_applied_in_the_hosts_order_on_every_game(self):
-        cases = ("two players", "read after the resume", "assignment in the purchase's frame", "assignment a step later")
+        cases = ("two players", "read after the resume", "assignment in the purchase's frame", "assignment a step later",
+                 "the engine throws during a paused apply")
         for i, case in enumerate(cases):
             with self.subTest(case=case):
                 if i:
@@ -1715,6 +1718,16 @@ class StampedEverywhereTest(LockstepTest):
         self.assertEqual([a.split("@")[0] for a in g.applied()[-2:]], ["makeVehicleBuyCmd", "makeVehicleSetLineCmd"], g.applied())
         self.assertEqual(g.applied()[-1], "makeVehicleSetLineCmd@%d" % (now + STEP), "at its stamp")
         self.assertNotIn("action 0:92 refused", g.log())
+
+    def pause_case_4(self, paused_at):
+        # D on the pause path: the interface's send throws after the engine took the command. As at a stamp apply (simSendCommand), that
+        # is "the world may be PARTLY built": said, the verdict carries it (the host never repairs from this game), the repair is asked
+        g = self.B
+        g.L.execute(self.PAUSE_ITEMS + "GUI_THROWS = 'makeVehicleBuyCmd'; ROUTE(ITEM(91, NOW, BUY_BODY)); GUI_THROWS = nil")
+        self.assertIn("action 0:91 (applied during the pause): the engine threw DURING its apply: this game's world may be PARTLY built", g.log())
+        self.assertTrue(any("partly built" in str(p.detail) for p in self.shipped(g, "replay_failed")))
+        verdict = [p for p in self.shipped(g, "action_refused") if int(p.seq) == 91]
+        self.assertTrue(verdict and verdict[-1].partial is True, verdict)
 
 
 class ThreeGamesPauseOrderTest(unittest.TestCase):

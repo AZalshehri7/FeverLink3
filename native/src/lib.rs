@@ -154,6 +154,8 @@ mod entry {
                     None => log::line("could not read the game's PE header"),
                 }
                 if live {
+                    // the free-id queue's checksum part: the session controller runs in this process and adds it to every report
+                    feverlink3_launcher::session::set_checksum_part(ids::checksum_part);
                     // not started by the launcher executable: the session runs in this process, driven by the mod's window
                     log::line(if feverlink3_launcher::live::spawn().is_some() {
                         "live session controller started"

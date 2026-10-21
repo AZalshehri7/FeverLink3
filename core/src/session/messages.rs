@@ -80,6 +80,10 @@ pub const CAP_BULK_DGRAM: &str = "bulk-dgram-1";
 /// player's second virtual port), written straight to the save file. Only a Steam transport has it.
 pub const CAP_BULK_PAR: &str = "bulk-par-1";
 
+/// Capability: the player's launcher can upload its game's save to the host (`ResyncUpload`), so a repair can take its world from
+/// this game when the host's own world may be partly built. Announced by a launcher that knows the game's savegame folders.
+pub const CAP_RESYNC_SOURCE: &str = "resync-source-1";
+
 impl JoinMessage {
     pub fn new(name: &str, version: &str, proof: Vec<u8>) -> Self {
         Self { name: name.to_owned(), version: version.to_owned(), proof, resume: None, caps: Vec::new(), mods: None }
@@ -577,17 +581,21 @@ pub struct ActionRefusedMessage {
     /// The refusal's class (`inject_refused`, `decode`, `engine`, `company`, `module`), for the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    /// The engine threw while it applied the command (after the mod handed it over): the apply is not transactional, so the sending
+    /// game's world may be PARTLY built. The host never takes a repair's world from such a game (`HostSession::repair_source`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 impl ActionRefusedMessage {
     /// A refusal of action `from:seq` on the sending game.
     pub fn refused(from: u16, seq: i64, detail: impl Into<String>) -> Self {
-        Self { seq, detail: detail.into(), from, applied: false, class: None }
+        Self { seq, detail: detail.into(), from, applied: false, class: None, partial: false }
     }
 
     /// The action `from:seq` applied at its stamp on the sending game.
     pub fn applied(from: u16, seq: i64) -> Self {
-        Self { seq, detail: String::new(), from, applied: true, class: None }
+        Self { seq, detail: String::new(), from, applied: true, class: None, partial: false }
     }
 }
 

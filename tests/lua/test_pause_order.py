@@ -291,9 +291,10 @@ class PausedBuildTest(I.InjectTest):
                 g.native.site = UNKNOWN_SITE
             build_without_record(self.B)
             self.tick(30)
-            self.assertIn("no capture of a tool build; release written", self.B.log())
+            # outside a pause no game stands where the originator's engine would apply it: refused (pre7 id forks), never released
+            self.assertIn("REFUSED: no record before the engine applies it (no capture of a tool build)", self.B.log())
             self.assertNotIn("pauseSlot", self.B.log())
-            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
 
         self.cases([("the host's build, the client further on", {}, hosts_build), ("the client's build, the host further on", {}, clients_build),
                     ("a later build of the pause waits for the slot", {}, a_later_build_waits_for_the_slot),

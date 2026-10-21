@@ -17,7 +17,7 @@ mod resync;
 mod roster;
 mod verdict;
 
-pub use checksum::{ChecksumDifference, ChecksumOutcome, ChecksumRounds};
+pub use checksum::{ChecksumDifference, ChecksumOutcome, ChecksumRounds, FREEQ_PART};
 pub use host::{ConnectionId, HostOptions, HostOutput, HostSession};
 pub use kind::MessageKind;
 pub use limits::RateLimiter;

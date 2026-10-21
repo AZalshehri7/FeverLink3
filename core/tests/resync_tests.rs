@@ -155,6 +155,78 @@ fn save_done_from_a_player_or_with_another_id_is_ignored() {
     assert_eq!(ResyncState::Transferring, h.host.resync_state());
 }
 
+/// The engine threw during the apply of action 0:7 on the host (D: its world may be PARTLY built), on P0 as well, and P1 applied it.
+fn partly_built_host(caps: &[Vec<&str>]) -> (Harness, Vec<ConnectionId>) {
+    let (mut h, ids) = Harness::running_with_caps(caps, 1, quiet());
+    let mut threw = ActionRefusedMessage::refused(0, 7, "Unknown exception");
+    threw.partial = true;
+    h.host_game(MessageKind::ActionRefused, &json(&threw));
+    h.player_game(ids[0], MessageKind::ActionRefused, &json(&threw));
+    if ids.len() > 1 {
+        h.player_game(ids[1], MessageKind::ActionRefused, &json(&ActionRefusedMessage::applied(0, 7)));
+    }
+    if h.host.resync_state() == ResyncState::Idle {
+        h.host_call(|host| host.start_resync("replay failed"));
+    }
+    (h, ids)
+}
+
+#[test]
+fn a_partly_built_host_takes_the_repair_from_a_clean_player_and_never_copies_its_own_world() {
+    let (mut h, ids) = partly_built_host(&[vec![CAP_RESYNC_SOURCE], vec![CAP_RESYNC_SOURCE]]);
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.stop_all_at(pause_at);
+    assert_eq!(ResyncState::Saving, h.host.resync_state());
+    assert_eq!(
+        0,
+        h.host_game_count(MessageKind::ResyncSave),
+        "the host's partly built world is not saved for the others"
+    );
+    assert_eq!(0, h.p(ids[0]).count(MessageKind::ResyncSave), "nor a marked player's");
+    let id = h.p(ids[1]).last::<ResyncSaveMessage>(MessageKind::ResyncSave).id;
+    h.player_game(ids[1], MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
+    assert_eq!(ResyncState::Saving, h.host.resync_state(), "the file is still on its way");
+    // P1's launcher uploads its save; the host's launcher writes it where the host's own save would be and sends it as usual
+    let bytes = blob(600 * 1024);
+    let sha = sha256_hex(&bytes);
+    for (i, data) in bytes.chunks(ResyncLimits::CHUNK_SIZE).enumerate() {
+        let chunk = ResyncChunkMessage { id, index: i as i32, count: 3, sha256: sha.clone(), data: data.to_vec() };
+        h.player_game(ids[1], MessageKind::ResyncUpload, &json(&chunk));
+    }
+    let written: Vec<(i32, Vec<u8>)> = h
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            HostOutput::SourceSave { id, bytes, .. } => Some((*id, bytes.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(vec![(id, bytes.clone())], written);
+    assert_eq!(ResyncState::Transferring, h.host.resync_state());
+    h.send_file(id, &bytes);
+    assert_eq!(ResyncState::Loading, h.host.resync_state());
+    assert_eq!(1, h.host_game_count(MessageKind::ResyncLoad), "the host's game loads P1's world too");
+    assert!(ids.iter().all(|&c| h.p(c).count(MessageKind::ResyncLoad) == 1));
+    h.hello_all(pause_at, 0);
+    let req: ChecksumRequestMessage = h.host_game_last(MessageKind::ChecksumRequest);
+    report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
+    assert_eq!(ResyncState::Idle, h.host.resync_state());
+    assert!(h.failures().is_empty(), "{:?}", h.failures());
+    // every game loaded one world: the next repair is the host's again
+    h.host_call(|host| host.start_resync("manual"));
+    h.reach_transferring();
+}
+
+#[test]
+fn with_no_clean_game_that_can_send_its_save_the_host_world_is_copied_and_said_loudly() {
+    let (mut h, ids) = partly_built_host(&[vec![]]);
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.stop_all_at(pause_at);
+    assert_eq!(1, h.host_game_count(MessageKind::ResyncSave));
+    assert_eq!(0, h.p(ids[0]).count(MessageKind::ResyncSave));
+    assert!(h.host_log.iter().any(|l| l.starts_with("WARNING") && l.contains("AS IT IS")), "{:?}", h.host_log);
+}
+
 #[test]
 fn announced_files_outside_the_bounds_fail_the_round() {
     let sha = sha256_hex(b"x");

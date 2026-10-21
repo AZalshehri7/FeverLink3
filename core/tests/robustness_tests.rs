@@ -720,6 +720,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             from: rr.gen(),
             applied: rr.gen(),
             class: rr.gen_bool(0.5).then(|| random_text(rr, 10)),
+            partial: rr.gen(),
         });
         round_trip(ActionMessage {
             stamp: rr.gen(),

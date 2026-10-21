@@ -704,6 +704,7 @@ impl Runtime {
                     self.inject.arm_timed(key, ttl, held, tm, refuse, refund, now)
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
+                Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
                 _ => rest.push(line),
             }
         }
@@ -720,6 +721,7 @@ impl Runtime {
                     self.inject.arm_timed(key, ttl, held, tm, refuse, refund, now)
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
+                Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
                 Ok(crate::link::CtlMessage::Pace { permille }) => {
                     crate::pace::PACER.set(permille, crate::pace::clock_ms());
                     // the mod speaks: what is held keeps its liveness as with any other line
@@ -1698,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn silence_gives_everything_back_without_the_mod() {
+    fn silence_fails_what_the_mod_never_decided_on_without_the_mod() {
         let dir = TempDir::new("rt-silence");
         let rt = runtime(Some(dir.path()));
         ctl(dir.path(), HOLD_ON);
@@ -1712,12 +1714,12 @@ mod tests {
         rt.pump();
         let mut b = Call::new(52, 11);
         unsafe { rt.on_add(b.args(), at(SITE_A)) };
-        assert_eq!(calls(), ["add kind 52 tag 10", "destroy command true", "add kind 52 tag 11"]);
+        // the held command (no verdict of the mod) is failed, never added: it would run on this game alone
+        assert_eq!(calls(), ["destroy command true", "add kind 52 tag 11"]);
         rt.pump();
         let k = kinds(dir.path());
         assert!(k.contains(&"error".to_string()) && k.iter().filter(|x| *x == "holding").count() == 2, "{k:?}");
-        let reasons: Vec<_> = events(dir.path()).into_iter().filter(|(k, _)| k == "released").collect();
-        assert!(reasons[0].1.contains("silence"), "{reasons:?}");
+        assert!(!k.contains(&"released".to_string()), "{k:?}");
     }
 
     #[test]
@@ -1737,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn the_control_file_disappearing_releases_everything() {
+    fn the_control_file_disappearing_fails_what_the_mod_never_decided_on() {
         let dir = TempDir::new("rt-gone");
         let rt = runtime(Some(dir.path()));
         ctl(dir.path(), HOLD_ON);
@@ -1747,7 +1749,7 @@ mod tests {
         std::fs::remove_file(ctl_path(dir.path())).unwrap();
         let mut nop = Call::new(27, 50);
         unsafe { rt.on_add(nop.args(), at(0x999)) };
-        assert_eq!(calls(), ["add kind 52 tag 10", "destroy command true", "add kind 27 tag 50"]);
+        assert_eq!(calls(), ["destroy command true", "add kind 27 tag 50"], "never added");
     }
 
     #[test]
@@ -2612,6 +2614,67 @@ mod tests {
         );
         // the held command is failed at once (here it is not in the ring, so the machine says it does not know it)
         assert!(ev.iter().any(|(k, w)| k == "error" && w.contains("no held command 3")), "{ev:?}");
+        inject::TEST_FNS.with(|f| f.set(None));
+    }
+
+    #[test]
+    fn the_command_that_carries_its_sends_conversion_is_the_orders_and_its_text_only_a_cross_check() {
+        let dir = TempDir::new("rt-inject-positive");
+        let rt = runtime(Some(dir.path()));
+        rt.enable_native_inject(portable::Settings::from_var(|_| Some("1".into()), crate::inject::INJECT_VAR).unwrap());
+        inject::TEST_FNS.with(|f| {
+            f.set(Some(crate::native_copy::ProposalFns { ctor: p_ctor, dtor: p_dtor, copy: p_copy, assign: p_copy }))
+        });
+        // the text names x = 100, the mod's own command builds at x = 300: a content check that misses (friend test pre7)
+        let text = format!(
+            "proposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\tv3:{:08x},00000000,00000000\n",
+            100f32.to_bits()
+        );
+        std::fs::write(dir.path().join(crate::inject::inject_file_name(5)), text).unwrap();
+        ctl(dir.path(), "inject_next\t1\t{[\"held\"]=3,[\"key\"]=5}\n");
+        // the mod's send converts its command (the hook on scripting::Convert, this thread)
+        let (mut conv, _n0) = road_placeholder(300.0);
+        conv.c.payload[crate::native_copy::PROPOSAL_SIZE] = 1;
+        rt.inject_on_convert(conv.c.payload.as_ptr() as usize);
+        let mut sim = [0u8; 8];
+        // a town's road applied meanwhile on this thread: not the conversion, untouched, the order waits
+        let (mut town, _n1) = road_placeholder(400.0);
+        let town_before = town.c.payload.to_vec();
+        unsafe { rt.on_apply(sim.as_mut_ptr(), town.c.command.as_mut_ptr()) };
+        assert_eq!(town.c.payload.to_vec(), town_before, "someone else's command is never touched");
+        assert!(rt.inject.pending());
+        calls();
+        // the mod's command carries the conversion: it is the order's; its text does not fit: refused, and emptied before the apply
+        let (mut ours, _n2) = road_placeholder(300.0);
+        unsafe { rt.on_apply(sim.as_mut_ptr(), ours.c.command.as_mut_ptr()) };
+        assert_eq!(
+            calls(),
+            ["proposal ctor", "proposal assign", "proposal dtor", "apply tag 0"],
+            "emptied, then applied"
+        );
+        assert!(
+            ours.c.payload[..crate::native_copy::PROPOSAL_SIZE].iter().all(|&b| b == 0),
+            "the placeholder never applies"
+        );
+        // an order whose send ends without a command of it: refused at its send_done, not after its time to live
+        ctl(dir.path(), "inject_next\t1\t{[\"key\"]=6}\nsend_done\t1\t{[\"key\"]=6}\n");
+        rt.pump();
+        let ev = events(dir.path());
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("[\"key\"]=5")
+                && w.contains("[\"outcome\"]=\"nothing\"")
+                && w.contains(crate::inject::CROSS_CHECK)),
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter().any(|(k, w)| k == "inject_refused"
+                && w.contains("[\"key\"]=6")
+                && w.contains("no_command")
+                && w.contains("its send ended")),
+            "{ev:?}"
+        );
+        assert!(!rt.inject.pending());
         inject::TEST_FNS.with(|f| f.set(None));
     }
 

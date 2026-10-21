@@ -9,9 +9,9 @@ use crate::session::kind::MessageKind;
 use crate::session::lockstep::{Lockstep, PlayerClock};
 use crate::session::messages::{
     codec, ActionRefusedMessage, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage, ResyncSaveMessage,
-    SaveDoneMessage, SessionState,
+    SaveDoneMessage, SessionState, CAP_RESYNC_SOURCE,
 };
-use crate::session::resync::{normalize_sha256, ResyncLimits, ResyncState};
+use crate::session::resync::{normalize_sha256, IncomingSave, ResyncLimits, ResyncState};
 use crate::session::verdict::{Verdict, VerdictOutcome};
 
 /// The saved file as the launcher announced it.
@@ -64,6 +64,18 @@ pub(super) struct ResyncRound {
     /// What the games of the participants were sent while their save was on its way, held back until the load
     /// (`HostSession::holds_for_load`): (receiver, kind, payload), the host's own game as [`HostSession::HOST_ID`].
     held: Vec<(u16, MessageKind, Vec<u8>)>,
+    /// The game whose world the round copies to everyone: the host's, unless the host's may be partly built
+    /// (`HostSession::repair_source`).
+    source: u16,
+    /// A player's game is the source and said its save is done: its launcher uploads the file (`ResyncUpload`) into this.
+    upload: Option<IncomingSave>,
+}
+
+impl ResyncRound {
+    /// The player whose save is being uploaded to the host now.
+    pub(super) fn uploading_from(&self) -> Option<u16> {
+        (self.state == ResyncState::Saving && self.upload.is_some()).then_some(self.source)
+    }
 }
 
 /// At most this many messages are held for the games of a round while the save travels; more are dropped (counted
@@ -154,6 +166,11 @@ impl HostSession {
     /// received, and would hold the round in Loading until its timeout because it never says hello to that load.
     /// It takes part in the next round instead (`pending_new_player`).
     pub(super) fn forget_participant(&mut self, id: u16) {
+        if self.resync.as_ref().is_some_and(|r| r.source == id && r.state == ResyncState::Saving) {
+            let who = self.name(id);
+            self.fail(format!("{who}, whose world the repair was to take, left before its save arrived"));
+            return;
+        }
         if let Some(r) = self.resync.as_mut() {
             r.bulk.remove(&id);
             if let Some(participants) = r.participants.as_mut() {
@@ -279,6 +296,8 @@ impl HostSession {
             verify_not_ready: 0,
             host_loading: false,
             held: Vec::new(),
+            source: Self::HOST_ID,
+            upload: None,
         });
         self.set_resync_phase(Some("pausing"));
         self.progress(format!("pausing at {pause_at}: {reason}"));
@@ -376,8 +395,17 @@ impl HostSession {
                     }
                 }
                 ResyncState::Saving => {
-                    if waited >= ResyncLimits::SAVE_TIMEOUT {
-                        self.fail("the host's game did not finish saving within 180 s".to_owned());
+                    let source = self.resync.as_ref().map_or(Self::HOST_ID, |r| r.source);
+                    // a player's save also has to travel to the host in this state
+                    let limit = if source == Self::HOST_ID {
+                        ResyncLimits::SAVE_TIMEOUT
+                    } else {
+                        ResyncLimits::SAVE_TIMEOUT + ResyncLimits::TRANSFER_TIMEOUT
+                    };
+                    if waited >= limit {
+                        let who =
+                            if source == Self::HOST_ID { "the host's game".to_owned() } else { self.name(source) };
+                        self.fail(format!("{who} did not finish saving (and sending) its world within {limit:.0} s"));
                     }
                     return;
                 }
@@ -455,18 +483,76 @@ impl HostSession {
 
     fn enter_saving(&mut self) {
         let Some(id) = self.resync_id() else { return };
+        let source = self.repair_source(id);
+        if let Some(r) = self.resync.as_mut() {
+            r.source = source;
+        }
         let name = format!("feverlink3-resync-{id}");
-        self.enter(ResyncState::Saving, format!("saving {name}"));
-        let payload = codec::encode(&ResyncSaveMessage { id, name });
-        self.out.push(HostOutput::DeliverToLocalGame { kind: MessageKind::ResyncSave, payload });
+        let payload = codec::encode(&ResyncSaveMessage { id, name: name.clone() });
+        if source == Self::HOST_ID {
+            self.enter(ResyncState::Saving, format!("saving {name}"));
+            self.out.push(HostOutput::DeliverToLocalGame { kind: MessageKind::ResyncSave, payload });
+        } else {
+            let who = self.name(source);
+            self.enter(
+                ResyncState::Saving,
+                format!("{who}'s game saves {name}; its launcher then sends it to the host"),
+            );
+            let only: BTreeSet<u16> = [source].into();
+            self.send_to_players(MessageKind::ResyncSave, &payload, &only);
+        }
+    }
+
+    /// The game whose world a repair copies to everyone. The host's, unless the host's own world may be PARTLY built (an engine
+    /// exception during an apply, `partly_built`): copying it would hand the broken world to every game (owner, 2026-10-21, gap 1
+    /// of decision D). Then the first ready player whose world is not marked and whose launcher can upload its save is the source:
+    /// the host's game loads that player's save like everyone else. With none (every game threw on the same action, or no clean
+    /// one can send its save, or the host keeps its live world) the host's world is copied as it is, said loudly: it may be broken.
+    fn repair_source(&mut self, id: i32) -> u16 {
+        if !self.partly_built.contains(&Self::HOST_ID) {
+            return Self::HOST_ID;
+        }
+        let marked = self.partly_built.iter().map(|&g| self.name(g)).collect::<Vec<_>>().join(", ");
+        let clean = self
+            .players
+            .values()
+            .filter(|p| p.id != Self::HOST_ID && p.ready && !self.partly_built.contains(&p.id))
+            .map(|p| p.id)
+            .find(|&p| self.player_supports(p, CAP_RESYNC_SOURCE));
+        match clean.filter(|_| self.options.host_reloads) {
+            Some(source) => {
+                let who = self.name(source);
+                self.log(format!(
+                    "resync {id}: the host's world may be PARTLY built (marked: {marked}); the repair takes its world from {who}, whose game is not marked"
+                ));
+                self.announce(&format!(
+                    "The host's world may be partly built (an engine error in the middle of a build): this repair gives everyone {who}'s world instead."
+                ));
+                source
+            }
+            None => {
+                let why = if !self.options.host_reloads {
+                    "the host's game keeps its live world (it does not reload)"
+                } else {
+                    "no other game is unmarked, ready and able to send its save"
+                };
+                self.log(format!(
+                    "WARNING: resync {id}: the host's world may be PARTLY built (marked: {marked}) and {why}: the host's world is copied to everyone AS IT IS and may still be broken"
+                ));
+                self.announce(
+                    "Warning: the host's world may be partly built and no other game can give a clean one. It is copied as it is; if the game misbehaves, load an earlier save.",
+                );
+                Self::HOST_ID
+            }
+        }
     }
 
     pub(super) fn on_save_done(&mut self, from: u16, m: SaveDoneMessage) {
-        let Some((state, id)) = self.resync.as_ref().map(|r| (r.state, r.id)) else { return };
-        if from != Self::HOST_ID {
+        let Some((state, id, source)) = self.resync.as_ref().map(|r| (r.state, r.id, r.source)) else { return };
+        if from != source {
             if self.first_time(format!("savedone/{from}")) {
                 let who = self.name(from);
-                self.log(format!("SaveDone from {who} ignored (only the host's game saves)"));
+                self.log(format!("SaveDone from {who} ignored (only the game the round takes its world from saves)"));
             }
             return;
         }
@@ -478,10 +564,60 @@ impl HostSession {
             // before any world data goes out: the players' mods against the ones this world uses
             let world = m.world_mods();
             self.check_world_mods(world.as_deref());
-            self.enter(ResyncState::Transferring, "waiting for the launcher to read the save".to_owned());
+            if source == Self::HOST_ID {
+                self.enter(ResyncState::Transferring, "waiting for the launcher to read the save".to_owned());
+            } else {
+                let who = self.name(source);
+                if let Some(r) = self.resync.as_mut() {
+                    r.upload = Some(IncomingSave::new());
+                }
+                self.progress(format!("{who}'s game saved; waiting for its launcher to send the save"));
+            }
         } else {
             let detail = m.detail.unwrap_or_default();
-            self.fail(format!("the host's game could not save: {detail}"));
+            let who = if source == Self::HOST_ID {
+                "the host's game".to_owned()
+            } else {
+                format!("{}'s game", self.name(source))
+            };
+            self.fail(format!("{who} could not save: {detail}"));
+        }
+    }
+
+    /// A chunk of the source player's save (`ResyncUpload`). Complete and matching its SHA-256, the caller writes it where the
+    /// host's own save would be (`HostOutput::SourceSave`) and the round goes on as if the host's game had saved it.
+    pub(super) fn on_resync_upload(&mut self, from: u16, payload: &[u8]) {
+        let who = self.name(from);
+        let Some(m) = codec::try_decode::<ResyncChunkMessage>(payload) else {
+            self.dropped += 1;
+            self.log(format!("a save chunk from {who} does not decode; dropped"));
+            return;
+        };
+        let now = self.now();
+        let (index, save_id) = (m.index, m.id);
+        let Some(r) = self.resync.as_mut().filter(|r| r.id == save_id && r.uploading_from() == Some(from)) else {
+            self.dropped += 1;
+            if self.first_time(format!("upload/{from}/{save_id}")) {
+                self.log(format!("save chunk {index} of {who}'s save {save_id} ignored: no repair waits for it"));
+            }
+            return;
+        };
+        let Some(incoming) = r.upload.as_mut() else { return };
+        match incoming.accept(now, m) {
+            Ok(None) => {}
+            Ok(Some(save)) => {
+                self.log(format!(
+                    "resync {save_id}: {who}'s save arrived ({} bytes, SHA-256 {}): every game, the host's included, loads it",
+                    save.bytes.len(),
+                    &save.sha256[..12.min(save.sha256.len())]
+                ));
+                if let Some(r) = self.resync.as_mut() {
+                    r.upload = None;
+                }
+                self.out.push(HostOutput::SourceSave { id: save_id, sha256: save.sha256, bytes: save.bytes });
+                self.enter(ResyncState::Transferring, "waiting for the launcher to read the save".to_owned());
+            }
+            Err(e) => self.fail(format!("the save {who} sent cannot be used: {e}")),
         }
     }
 
@@ -797,6 +933,12 @@ impl HostSession {
             let class = m.class.as_deref().map(|c| format!(" ({})", clip(c, 40))).unwrap_or_default();
             self.log(format!("action {key} refused on {who} at its stamp{class}: {}", clip(&m.detail, 200)));
         }
+        // marked whatever else holds (a round running, a game not ready): the next repair must not copy this world
+        if m.partial && !m.applied && self.partly_built.insert(from) {
+            self.log(format!(
+                "WARNING: action {key}: the engine threw DURING its apply on {who}: that world may be PARTLY built; no repair takes its world from it"
+            ));
+        }
         if self.resync.is_some() || !self.state.started || !self.players.get(&from).is_some_and(|p| p.ready) {
             return;
         }
@@ -837,7 +979,18 @@ impl HostSession {
         self.set_resync_phase(None);
         self.set_speed_inner(r.resume_speed);
         self.policy.resync_finished(self.now());
-        if !matches!(r.reason.as_str(), "session start" | "new player" | "player returned") {
+        // every game loaded one world: what was partly built before is gone (or, with no clean source, everywhere alike)
+        if !self.partly_built.is_empty() {
+            self.log(format!(
+                "resync {}: the marks of partly built worlds are cleared (every game loaded one world)",
+                r.id
+            ));
+            self.partly_built.clear();
+        }
+        if r.source != Self::HOST_ID {
+            let who = self.name(r.source);
+            self.announce(&format!("The sync is done: everyone has {who}'s world."));
+        } else if !matches!(r.reason.as_str(), "session start" | "new player" | "player returned") {
             self.announce("The sync is done: everyone has the host's world again.");
         }
         self.out.push(HostOutput::ResyncProgress {

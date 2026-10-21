@@ -102,6 +102,10 @@ pub enum CtlMessage {
     /// `refund` (optional, 0: none) is how many refund entries the mod wrote in `native_refund_<key>.txt` (this game's own entities):
     /// the module puts them into the command's Context `refundableEntities` with the engine's insert (`refund.rs`).
     InjectNext { key: u64, ttl: u64, held: u64, tm: String, refuse: String, refund: u64 },
+    /// The mod's send of the command an `inject_next` (`key`, not 0) or a `complete_next` (`key` 0, its `held`) was written for has
+    /// returned (owner decision B, 2026-10-21: the order is the mod's own send's, not a guess by content). The order is armed only
+    /// between its line and this one; an order still waiting now was used by no command during its send and is refused at once.
+    SendDone { key: u64, held: u64 },
     /// Smooth pacing (`pace.rs`): scale the engine's batch interval by `permille` / 1000 (500 to 2000, held to that range). The mod
     /// sends it when the factor changes and every second while it is not 1; one not refreshed for `pace::STALE_MS` goes back to 1.
     Pace { permille: u32 },
@@ -278,6 +282,18 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             refuse: short_text(&p, "refuse")?,
             refund: optional(&p, "refund", "refund must be a number of entries")?,
         }),
+        "send_done" => {
+            let (key, held) = (
+                optional(&p, "key", "key must be an inject order's key")?,
+                optional(&p, "held", "held must be a held command id")?,
+            );
+            if key == 0 && held == 0 {
+                return Err(CtlError::BadPayload(
+                    "send_done needs the key of an inject_next or the held of a complete_next",
+                ));
+            }
+            Ok(CtlMessage::SendDone { key, held })
+        }
         "ping" => {
             let n = match p.get("n") {
                 None => 0,
@@ -1298,6 +1314,9 @@ mod tests {
             matches!(parse("inject_next", r#"{["key"]=3,["refund"]=-1}"#), Err(CtlError::BadPayload(_))),
             "refund is a count"
         );
+        assert_eq!(parse("send_done", r#"{["key"]=3}"#), Ok(CtlMessage::SendDone { key: 3, held: 0 }));
+        assert_eq!(parse("send_done", r#"{["held"]=7}"#), Ok(CtlMessage::SendDone { key: 0, held: 7 }));
+        assert!(matches!(parse("send_done", "{}"), Err(CtlError::BadPayload(_))), "it names its order");
         assert_eq!(parse("defer", r#"{["id"]=4}"#), Ok(CtlMessage::Defer { id: 4 }));
         assert_eq!(parse("fail", r#"{["id"]=4}"#), Ok(CtlMessage::Fail { id: 4 }));
         assert_eq!(

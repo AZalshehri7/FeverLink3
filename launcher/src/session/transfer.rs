@@ -163,6 +163,22 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
         self.outboxes.remove(&conn);
     }
 
+    /// The save of round `id` came from a player's game (`HostOutput::SourceSave`): written where the host's game would have saved
+    /// it, so that the transfer that follows finds it like the host's own save ([`HostIo::begin_transfer`]).
+    pub(super) fn write_source_save(&mut self, id: i32, sha256: &str, bytes: &[u8]) {
+        let name = resync::save_name(id);
+        match resync::write_save(self.save_dirs, &name, bytes) {
+            Ok(n) => self.shared.log(format!(
+                "resync {id}: the source player's save ({} bytes, SHA-256 {}) written to {n} folder(s) as {name}.sav",
+                bytes.len(),
+                &sha256[..12.min(sha256.len())]
+            )),
+            Err(e) => self
+                .shared
+                .log(format!("resync {id}: cannot write the source player's save: {e}; the round will time out")),
+        }
+    }
+
     /// The round entered Transferring: find and hash the save on a thread, then send it ([`HostIo::pump`]).
     pub(super) fn begin_transfer(&mut self, id: i32) {
         if self.round == Some(id) {

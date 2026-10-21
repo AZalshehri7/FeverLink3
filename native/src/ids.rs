@@ -24,6 +24,25 @@ pub fn mark(what: &str) {
     let _ = what;
 }
 
+/// The checksum's `freeq` part of this game ([`crate::idorder::EngineOrder::check_part`] of the engine that worked last), `None`
+/// when the order trace is off, `FEVERLINK3_FREEQ_CHECK=0`, or no engine has a checkpoint yet. Read by the session controller when
+/// it forwards a checksum report (`feverlink3_launcher::session::set_checksum_part`); never called from a hook.
+pub fn checksum_part() -> Option<(String, String)> {
+    #[cfg(windows)]
+    {
+        imp::checksum_part().map(|v| (FREEQ_PART.to_owned(), v))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The checksum part's name, compared by the host as the core says (`feverlink3_core::session::FREEQ_PART`).
+pub const FREEQ_PART: &str = feverlink3_core::session::FREEQ_PART;
+/// `FEVERLINK3_FREEQ_CHECK=0` leaves the `freeq` part out of this game's checksum reports (on with the order trace otherwise).
+pub const FREEQ_CHECK_VAR: &str = "FEVERLINK3_FREEQ_CHECK";
+
 /// The switch.
 pub const ID_TRACE_VAR: &str = "FEVERLINK3_ID_TRACE";
 
@@ -57,6 +76,8 @@ mod imp {
     /// The verbose trace (`FEVERLINK3_ID_TRACE=1`) and the compact order trace (`FEVERLINK3_TRACE`) are on.
     static VERBOSE: AtomicBool = AtomicBool::new(false);
     static COMPACT: AtomicBool = AtomicBool::new(false);
+    /// The `freeq` checksum part is sent (the order trace on and `FEVERLINK3_FREEQ_CHECK` not `0`).
+    static FREEQ: AtomicBool = AtomicBool::new(false);
     /// Per engine (its address) what the order trace has seen; a handful of engines per process (two per loaded world).
     static ORDER: Mutex<Vec<(usize, EngineOrder)>> = Mutex::new(Vec::new());
     /// The order trace's lines not yet written, and when the file was last written (ms, `pace::clock_ms`). Hooks only append
@@ -144,7 +165,7 @@ mod imp {
             let i = match g.iter().position(|(e, _)| *e == engine) {
                 Some(i) => i,
                 None => {
-                    let o = EngineOrder::new(engine & 0x00ff_ffff, free, ents(engine));
+                    let mut o = EngineOrder::new(engine & 0x00ff_ffff, free, ents(engine));
                     out.push(o.first_line(&ms(), &queue_ids(engine, 0, free as usize)));
                     g.push((engine, o));
                     g.len() - 1
@@ -194,6 +215,19 @@ mod imp {
         }
         order_write(out);
         order_flush(crate::pace::clock_ms());
+    }
+
+    /// The `freeq` part of the engine that worked last (the two engines of a loaded world run the same stream; an engine of a world
+    /// left behind, e.g. the menu's or the one before a resync load, stops working), `None` while that engine has no checkpoint yet:
+    /// never an older engine's part (two games' engines of the world before a resync load may have forked; that is what the load
+    /// repaired). From the session controller's thread; a hook holds the lock only briefly.
+    pub fn checksum_part() -> Option<String> {
+        if !FREEQ.load(Ordering::Relaxed) {
+            return None;
+        }
+        let _inside = crate::hookwatch::IDORDER_LOCK.enter();
+        let g = ORDER.lock().ok()?;
+        g.iter().map(|(_, o)| o).max_by_key(|o| o.last_ms())?.check_part()
     }
 
     /// Local wall time, as in trace.log.
@@ -356,27 +390,39 @@ mod imp {
         };
         // next to native.log: the session controller clears the live folder when it starts
         let live = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // A game started again (after a crash, or a quick start that is closed at once) used to truncate the trace of the game
+        // before it: the previous file is kept as `<prefix>_<live>.prev.log` (one generation). The full path goes to native.log:
+        // native.log is shared by every game of the PC and keeps old runs, so a bare name sent the reader of the friend test
+        // 2026-10-21 to an old empty `idorder_live1.log` of a lab run while the host's real trace was `idorder_live.log`.
         let open = |prefix: &str| {
             let name = format!("{prefix}_{live}.log");
             let path = dir.parent().map(|p| p.join(&name)).unwrap_or_else(|| dir.join(&name));
-            std::fs::File::create(path)
-                .map(|f| std::io::BufWriter::with_capacity(1 << 16, f))
-                .map_err(|e| log(&format!("id trace: {prefix}_{live}.log not opened: {e}")))
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+                let _ = std::fs::rename(&path, path.with_file_name(format!("{prefix}_{live}.prev.log")));
+            }
+            std::fs::File::create(&path)
+                .map(|f| (std::io::BufWriter::with_capacity(1 << 16, f), path.clone()))
+                .map_err(|e| log(&format!("id trace: {} not opened: {e}", path.display())))
                 .ok()
         };
         if verbose {
-            if let Some(w) = open("ids") {
+            if let Some((w, _)) = open("ids") {
                 *OUT.lock().unwrap_or_else(|p| p.into_inner()) = Some(w);
                 VERBOSE.store(true, Ordering::Release);
             }
         }
         if compact {
-            if let Some(w) = open("idorder") {
+            if let Some((w, path)) = open("idorder") {
                 // the order trace queues its own lines (order_write): the plain file, not a buffered writer
                 *ORDER_FILE.lock().unwrap_or_else(|p| p.into_inner()) = w.into_inner().ok();
                 COMPACT.store(true, Ordering::Release);
+                let freeq = std::env::var(FREEQ_CHECK_VAR).map(|v| v.trim() != "0").unwrap_or(true);
+                FREEQ.store(freeq, Ordering::Release);
                 log(&format!(
-                    "id order trace: on (idorder_{live}.log next to native.log; FEVERLINK3_TRACE=0 turns it off)"
+                    "id order trace: on, pid {} writes {} (the previous run's as idorder_{live}.prev.log; FEVERLINK3_TRACE=0 turns                      it off); checksum part {FREEQ_PART}: {} ({FREEQ_CHECK_VAR}=0 off)",
+                    std::process::id(),
+                    path.display(),
+                    if freeq { "on" } else { "off" }
                 ));
             }
         }

@@ -9,8 +9,9 @@
 //!    makes the Proposal that will be given away (a self-contained deep copy that owns its blocks), and that copy is written as
 //!    text again and compared with the input: every named member must be equal (the A1 `MATCH` rule). Anything else is refused and
 //!    nothing was handed to the game. Refused too: a text with heap pointers the rebuild cannot resolve.
-//! 2. [`check_destination`] and [`same_build`]: the command the mod's script sent (a placeholder of kind `build_proposal`, with the
-//!    receiver's own conversion of the constructions and edge objects, built at the text's place).
+//! 2. The command the mod's script sent (a placeholder of kind `build_proposal`, with the receiver's own conversion of the constructions
+//!    and edge objects): identified as the one that carries the conversion of the mod's own send ([`State`]), then cross-checked against
+//!    the text ([`check_destination`], [`same_build`]).
 //! 3. [`swap_into`]: the engine's copy assignment (`0x4ced30`) from the verified Proposal into the command's own Proposal (the engine
 //!    destroys what the placeholder held and allocates the new containers itself), then the verified Proposal is destroyed.
 //!
@@ -120,12 +121,20 @@ impl Outcome {
 ///
 /// The orders wait in a queue, in the order the mod wrote them (2026-10-15, open bug 7): before, one slot held one order and a second
 /// order replaced the first, so two builds due in the same step (two players building at once, a chain, the interface half's pause
-/// applies, which reach the command list before the simulation applies any of them) lost the first one's order: its command went by
-/// uninjected (the placeholder applied, or a refusal), and its deferred held command was failed or kept the tool busy. Now every
-/// command is matched to its own order by its identity (`same_build`: the place or the constructions of the order's text; a
-/// `complete_next` by its held command's place, see `same_command`), never by "the next build_proposal"; the first waiting order in
-/// the mod's order that the command passes is used, so that two orders of the same place are used in the order they were written.
-/// A command that is no order's passes untouched, and each order expires on its own.
+/// applies, which reach the command list before the simulation applies any of them) lost the first one's order.
+///
+/// Positive identity (owner decision B, 2026-10-21): an order is the command of the mod's own send. The mod writes the order, its send
+/// converts the command (`scripting::Convert`, on the thread of the mod's script: [`State::note_conversion`]) and the engine queues or
+/// applies it inside that same call (the simulation state's `sendCommand` reaches the apply hook, the interface state's the `Add` hook);
+/// then the mod writes `send_done` ([`State::close`]). The command on that thread that carries the conversion ([`Identity::within`]) is
+/// the order's, whatever the text says: the text is only a cross-check, and a mismatch refuses the order and empties the command
+/// (nothing of the build is applied here). Before, commands were matched by their content alone, and a content check that missed
+/// (friend test pre7, 2026-10-21: the engine's conversion of a bus stop added the town buildings it moves) took the mod's own command for
+/// someone else's: the placeholder applied untouched, threw mid-apply and the game crashed a second later. Town commands applied while an
+/// order waits (lab 2026-10-18: 12 of 48 orders saw one first) do not carry the conversion and pass untouched.
+/// Without a conversion seen on the command's thread (the hook not installed) the content decides as before: the first waiting order
+/// whose identity check the command passes (`same_build`; a `complete_next` by its held command, `same_command`). An order its send did
+/// not use is refused at `send_done`; the time to live stays as the last resort.
 #[derive(Default)]
 pub struct State {
     on: AtomicBool,
@@ -137,7 +146,33 @@ pub struct State {
     /// stamp apply result, so the runtime fails them at once (their tool callback fired), instead of leaving the tool busy until the age
     /// limit.
     failed: Mutex<Vec<u64>>,
+    /// The engine's conversions (`scripting::Convert`) seen while orders wait: the mod's own send converts its command after writing the
+    /// order and before the engine queues or applies it, on the thread of the mod's script ([`State::note_conversion`]).
+    conversions: Mutex<Vec<Conversion>>,
 }
+
+/// One conversion of a script `build_proposal` (`scripting::Convert`) made while orders waited: what it builds, on which thread, and
+/// the newest order armed when it was made (it can belong only to an order armed before it).
+#[derive(Debug)]
+pub struct Conversion {
+    pub upto_seq: u64,
+    pub thread: u32,
+    pub identity: Identity,
+}
+
+/// How a command relates to the conversions an order's send made on the command's thread ([`State::conversion_match`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvMatch {
+    /// The command carries what a conversion of the order's own send built: it is the mod's command (positive identity).
+    Ours,
+    /// The send converted something on this thread, and this command is not it (a town's command applied meanwhile): never this order's.
+    Other,
+    /// No conversion of the send was seen on this thread (the conversion hook is not installed): only the content can tell.
+    Unseen,
+}
+
+/// The most conversions kept while orders wait (a send converts one command; previews of the interface convert too).
+const MAX_CONVERSIONS: usize = 64;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -284,7 +319,84 @@ impl State {
         let mut q = lock(&self.orders);
         let o = q.iter().position(|o| o.seq == seq).and_then(|i| q.remove(i));
         self.pending.store(!q.is_empty(), Ordering::Release);
+        self.prune_conversions(&q);
         o
+    }
+
+    /// A conversion (`scripting::Convert`) made on `thread` while orders wait. Kept for the orders armed until now.
+    pub fn note_conversion(&self, thread: u32, identity: Identity) {
+        if !self.pending() {
+            return;
+        }
+        let upto_seq = self.next_seq.load(Ordering::Acquire);
+        let mut c = lock(&self.conversions);
+        if c.len() >= MAX_CONVERSIONS {
+            c.remove(0);
+        }
+        c.push(Conversion { upto_seq, thread, identity });
+    }
+
+    /// Whether the command `have` (its identity; `None`: unreadable) on `thread` is the one order `seq`'s send converted.
+    pub fn conversion_match(&self, seq: u64, thread: u32, have: Option<&Identity>) -> ConvMatch {
+        let c = lock(&self.conversions);
+        let mut mine = c.iter().filter(|c| c.upto_seq >= seq && c.thread == thread).peekable();
+        if mine.peek().is_none() {
+            return ConvMatch::Unseen;
+        }
+        match have {
+            Some(h) if mine.any(|c| c.identity.within(h)) => ConvMatch::Ours,
+            _ => ConvMatch::Other,
+        }
+    }
+
+    /// The conversions seen for order `seq` (any thread), for the log of an order its send did not use.
+    fn conversions_of(&self, seq: u64) -> usize {
+        lock(&self.conversions).iter().filter(|c| c.upto_seq >= seq).count()
+    }
+
+    /// Drops the conversions no waiting order can use (each belongs to the orders armed before it).
+    fn prune_conversions(&self, q: &std::collections::VecDeque<Order>) {
+        let first = q.iter().map(|o| o.seq).min();
+        lock(&self.conversions).retain(|c| first.is_some_and(|f| c.upto_seq >= f));
+    }
+
+    /// The mod's `send_done`: the send order `key` (an `inject_next`; 0: the `complete_next` of deferred command `held`) was written for
+    /// has returned. A command of that send took the order inside the send (positive identity, see [`State`]); an order still waiting
+    /// now was used by no command during its send (the send failed before the engine applied anything, or its command did not reach the
+    /// module): it is refused at once (`no_command`) and its held command failed, instead of waiting to take a later, unrelated command.
+    pub fn close(&self, key: u64, held: u64) {
+        let gone = {
+            let mut q = lock(&self.orders);
+            let i =
+                q.iter()
+                    .position(|o| if key != 0 { !o.link_only && o.key == key } else { o.link_only && o.held == held });
+            let gone = i.and_then(|i| q.remove(i));
+            self.pending.store(!q.is_empty(), Ordering::Release);
+            gone.map(|o| {
+                let seen = self.conversions_of(o.seq);
+                self.prune_conversions(&q);
+                (o, seen)
+            })
+        };
+        if let Some((o, seen)) = gone {
+            let what = if seen > 0 {
+                format!("{seen} conversion(s) were seen during it and no command carried one: the command may have applied as converted")
+            } else {
+                "no conversion was seen during it (the send failed before the engine converted it, or the hook is not installed)".to_string()
+            };
+            self.refuse(
+                o.key,
+                o.held,
+                Outcome::NoCommand,
+                format!(
+                    "key {} (held {}): its send ended and no command of it reached the module; {what}; {}",
+                    o.key,
+                    o.held,
+                    o.applies.text()
+                ),
+            );
+            self.fail_held(o.held);
+        }
     }
 
     /// Expires every order nobody used within its own time to live.
@@ -298,6 +410,7 @@ impl State {
                 std::mem::take(&mut *q).into_iter().partition(|o| now.saturating_sub(o.armed_ms) > o.ttl_ms);
             *q = keep.into();
             self.pending.store(!q.is_empty(), Ordering::Release);
+            self.prune_conversions(&q);
             gone
         };
         for o in gone {
@@ -536,7 +649,12 @@ fn build_proved(
         say("inject: calling the engine copy constructor on the script command's own Proposal (its conversion of the constructions and edge objects)");
         // SAFETY: `donor` is the live command's payload (only read by a copy constructor); `z` is scratch.
         unsafe { (c.fns.copy)(z.ptr(), donor as *const u8) };
-        let mismatch = DONOR_MEMBERS.iter().zip(&wanted).find_map(|(m, &n)| {
+        // Only a member the text adds is taken from the donor. A member the text has none of stays in the donor's copy and dies with it:
+        // the script's conversion adds the town buildings a street build moves or removes to its own toAdd/toRemove, the tool's held
+        // command does not (friend test 2026-10-21, host 0:22, a bus stop that moves 4 and removes 2 town buildings: the text 0
+        // constructions and 2 edge objects, the script command 4 constructions added and 6 removed). The text is the build; the
+        // swapped-in Proposal carries the text's toRemove, so none of the conversion's own handling of those buildings is kept.
+        let mismatch = DONOR_MEMBERS.iter().zip(&wanted).filter(|(_, &n)| n > 0).find_map(|(m, &n)| {
             let (b, e) = (u64_at(z.bytes(), m.1), u64_at(z.bytes(), m.1 + 8));
             let have = if e >= b { (e - b) / m.2 as u64 } else { u64::MAX };
             (have != n).then(|| format!("the conversion in the script command has {have} {}, the text has {n}", m.0))
@@ -544,7 +662,7 @@ fn build_proved(
         // the donated elements move into the source (on a mismatch they stay and die with the donor's copy); the donor's copy keeps empty lists
         if mismatch.is_none() {
             let (zb, pb) = (z.bytes_mut(), p.bytes_mut());
-            for m in DONOR_MEMBERS {
+            for (m, _) in DONOR_MEMBERS.iter().zip(&wanted).filter(|(_, &n)| n > 0) {
                 pb[m.1..m.1 + 24].copy_from_slice(&zb[m.1..m.1 + 24]);
                 zb[m.1..m.1 + 24].fill(0);
             }
@@ -839,16 +957,21 @@ pub fn is_proposal(mem: &dyn Mem, dest: usize) -> Result<Vec<u8>, String> {
     if bytes[0x9b8] != portable::KIND_BUILD_PROPOSAL {
         return Err(format!("the command is kind {}, not build_proposal", bytes[0x9b8]));
     }
-    for &(off, stride) in READ_VECTORS {
-        if !sane((u64_at(&bytes, off), u64_at(&bytes, off + 8), u64_at(&bytes, off + 16)), stride) {
-            return Err("the command's proposal has a vector that is not one".into());
-        }
-    }
+    vectors_sane(&bytes)?;
     Ok(bytes)
 }
 
-/// The command the script sent must be a `build_proposal` with sane vectors, and carry exactly `constructions` constructions: none for a
-/// text without (a placeholder), the receiver's own conversion of them for a text with.
+fn vectors_sane(bytes: &[u8]) -> Result<(), String> {
+    for &(off, stride) in READ_VECTORS {
+        if !sane((u64_at(bytes, off), u64_at(bytes, off + 8), u64_at(bytes, off + 16)), stride) {
+            return Err("the command's proposal has a vector that is not one".into());
+        }
+    }
+    Ok(())
+}
+
+/// The command the script sent must be a `build_proposal` with sane vectors, carry the text's number of edge objects and at least its
+/// `constructions` constructions (the receiver's own conversion of them; more when the conversion adds the town buildings the build moves).
 pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_objects: u64) -> Result<(), String> {
     let bytes = is_proposal(mem, dest)?;
     let tri = |off: usize| (u64_at(&bytes, off), u64_at(&bytes, off + 8), u64_at(&bytes, off + 16));
@@ -873,12 +996,15 @@ pub fn check_destination(mem: &dyn Mem, dest: usize, constructions: u64, edge_ob
     if have_objects != edge_objects {
         return Err(format!("the command has {have_objects} edge object(s), the text has {edge_objects}{}", shape()));
     }
-    match (constructions, have) {
-        (0, 0) => Ok(()),
-        (0, _) => Err(format!("the command already adds a construction: it is not a placeholder{}", shape())),
-        (want, have) if want == have => Ok(()),
-        (want, have) => Err(format!("the command has {have} construction(s), the text has {want}{}", shape())),
+    // More constructions than the text's do not tell the mod's command from another: the script's conversion adds the town buildings
+    // the build moves or removes (friend test 2026-10-21, host 0:22: a bus stop whose command added 4 and removed 6 town buildings was
+    // passed over as "not a placeholder", the order expired, and the mod's placeholder applied untouched: the engine threw mid-apply
+    // and the half-built segment crashed the game a second later). Identity is the place or the constructions ([`same_build`]); which
+    // elements are taken from the conversion is the proof's rule (`build_proved`: the text's members only, their counts exactly).
+    if have < constructions {
+        return Err(format!("the command has {have} construction(s), the text has {constructions}{}", shape()));
     }
+    Ok(())
 }
 
 /// The prefix of an error that means "this command is not the one the mod sent for this order": the order keeps waiting for its own
@@ -895,7 +1021,12 @@ pub const NOT_OURS: &str = "not the mod's command: ";
 /// refusal (`no_command`), which asks for the repair.
 pub const UNKNOWN: &str = "identity unknown: ";
 
-/// The order keeps waiting and is not used for this command ([`NOT_OURS`], [`UNKNOWN`]).
+/// The prefix of a refusal of the mod's own command (it carries the conversion of the mod's own send, positive identity) whose text does
+/// not fit it: the command is emptied, nothing of the build is applied on this game (friend test pre7, 2026-10-21: such a command was
+/// taken for someone else's and the mod's placeholder applied untouched; it threw mid-apply and the game crashed).
+pub const CROSS_CHECK: &str = "the cross-check failed: the mod's own command does not fit its text: ";
+
+/// The order keeps waiting and is not used for this command ([`NOT_OURS`], [`UNKNOWN`]): only without the positive identity.
 pub fn keeps_waiting(why: &str) -> bool {
     why.starts_with(NOT_OURS) || why.starts_with(UNKNOWN)
 }
@@ -993,9 +1124,13 @@ pub fn text_place(text: &str) -> Place {
 
 /// [`Place`] of the command at `dest` (its vectors checked by [`is_proposal`] first).
 pub fn command_place(mem: &dyn Mem, dest: usize) -> Result<Place, String> {
-    let bytes = is_proposal(mem, dest)?;
+    place_of(mem, &is_proposal(mem, dest)?)
+}
+
+/// [`Place`] of the proposal whose first bytes are `bytes` (its vectors checked first).
+fn place_of(mem: &dyn Mem, bytes: &[u8]) -> Result<Place, String> {
     let elems = |off: usize, stride: usize| -> Result<(Vec<u8>, usize), String> {
-        let (b, e) = (u64_at(&bytes, off) as usize, u64_at(&bytes, off + 8) as usize);
+        let (b, e) = (u64_at(bytes, off) as usize, u64_at(bytes, off + 8) as usize);
         let n = ((e - b) / stride).min(PLACE_MAX);
         if n == 0 {
             return Ok((Vec::new(), 0));
@@ -1061,7 +1196,11 @@ type Construction = (Vec<u8>, String);
 /// The first `n` constructions of the command at `dest` (the caller knows it has that many).
 fn constructions(mem: &dyn Mem, dest: usize, n: usize) -> Result<Vec<Construction>, String> {
     let bytes = mem.read(dest, PAYLOAD_SIZE).ok_or("the command's payload is not readable")?;
-    let b = u64_at(&bytes, TO_ADD) as usize;
+    constructions_at(mem, u64_at(&bytes, TO_ADD) as usize, n)
+}
+
+/// `n` constructions from `b` on (a proposal's `toAdd` begin).
+fn constructions_at(mem: &dyn Mem, b: usize, n: usize) -> Result<Vec<Construction>, String> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let e = mem.read(b + i * CONSTRUCTION_STRIDE, CONSTRUCTION_STRIDE).ok_or("a construction is not readable")?;
@@ -1080,11 +1219,10 @@ fn constructions(mem: &dyn Mem, dest: usize, n: usize) -> Result<Vec<Constructio
     Ok(out)
 }
 
-/// Every construction of the command at `dest` (its vectors checked by [`is_proposal`] first).
-fn command_constructions(mem: &dyn Mem, dest: usize) -> Result<Vec<Construction>, String> {
-    let bytes = is_proposal(mem, dest)?;
-    let n = ((u64_at(&bytes, TO_ADD + 8) - u64_at(&bytes, TO_ADD)) as usize / CONSTRUCTION_STRIDE).min(PLACE_MAX);
-    constructions(mem, dest, n)
+/// Every construction of the proposal whose first bytes are `bytes` (its vectors checked first).
+fn constructions_of(mem: &dyn Mem, bytes: &[u8]) -> Result<Vec<Construction>, String> {
+    let n = ((u64_at(bytes, TO_ADD + 8) - u64_at(bytes, TO_ADD)) as usize / CONSTRUCTION_STRIDE).min(PLACE_MAX);
+    constructions_at(mem, u64_at(bytes, TO_ADD) as usize, n)
 }
 
 /// The command's constructions are the text's: the same file and the same transform, in order. The script builds them from the
@@ -1123,7 +1261,52 @@ pub struct Identity {
 
 /// [`Identity`] of the command at `dest`.
 pub fn identity(mem: &dyn Mem, dest: usize) -> Result<Identity, String> {
-    Ok(Identity { place: command_place(mem, dest)?, constructions: command_constructions(mem, dest)? })
+    let bytes = is_proposal(mem, dest)?;
+    Ok(Identity { place: place_of(mem, &bytes)?, constructions: constructions_of(mem, &bytes)? })
+}
+
+/// [`Identity`] of the `Proposal` at `at` (a bare one, as `scripting::Convert` writes it: no command kind after it).
+pub fn proposal_identity(mem: &dyn Mem, at: usize) -> Result<Identity, String> {
+    let bytes = mem.read(at, nc::PROPOSAL_SIZE).ok_or("the proposal is not readable")?;
+    vectors_sane(&bytes)?;
+    Ok(Identity { place: place_of(mem, &bytes)?, constructions: constructions_of(mem, &bytes)? })
+}
+
+impl Identity {
+    /// How many constructions it adds.
+    pub fn construction_count(&self) -> usize {
+        self.constructions.len()
+    }
+
+    /// Builds nothing anywhere: identifies no command.
+    pub fn is_empty(&self) -> bool {
+        self.place.is_empty() && self.constructions.is_empty()
+    }
+
+    /// Everything this conversion builds is in `have` (exactly: the same float bits, the same entities, the same constructions): `have` is
+    /// the command made from it. The engine may add to a converted proposal before the command applies (the town buildings a build
+    /// moves or removes), never drop what the script asked for; a town's own command shares none of a script build's points.
+    pub fn within(&self, have: &Identity) -> bool {
+        let bits = |p: &[f32; 3]| p.map(f32::to_bits);
+        let mut points: Vec<[u32; 3]> = have.place.points.iter().map(bits).collect();
+        let mut cons: Vec<&Construction> = have.constructions.iter().collect();
+        !self.is_empty()
+            && self.place.removed.is_subset(&have.place.removed)
+            && self.place.points.iter().all(|p| match points.iter().position(|q| *q == bits(p)) {
+                Some(i) => {
+                    points.swap_remove(i);
+                    true
+                }
+                None => false,
+            })
+            && self.constructions.iter().all(|c| match cons.iter().position(|d| *d == c) {
+                Some(i) => {
+                    cons.swap_remove(i);
+                    true
+                }
+                None => false,
+            })
+    }
 }
 
 /// Whether the command at `dest` is the build of the command at `like`, for an order that has no text (`complete_next`): `like` is
@@ -1394,6 +1577,52 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_text_takes_its_edge_object_from_the_donor_but_not_the_town_buildings_of_the_conversion() {
+        // friend test 2026-10-21, host 0:22: the tool's text adds no construction, the script's conversion of the same stop added the
+        // town buildings it moves; that command is the mod's (its place decides) and the injected Proposal adds what the text adds
+        let (fake, at) = synthetic();
+        let arena = Arena::new(0x3000_0000_0000);
+        for (addr, data) in fake.0 {
+            arena.put(addr, data);
+        }
+        let town = arena.read(at + 0x258, 24).unwrap();
+        arena.write(at + 0x258, &[0u8; 24]);
+        let mut stop = [0u8; 0x1a0];
+        for s in [0x90, 0x168] {
+            stop[s + 0x18] = 15; // modelName, name: empty std::strings (inline, capacity 15)
+        }
+        let obj = arena.add(&stop) as u64;
+        let triple: Vec<u8> = [obj, obj + 0x1a0, obj + 0x1a0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        arena.write(at + 0x128, &triple);
+        let head = portable::Header {
+            seq: 0,
+            event: "held",
+            hold_id: None,
+            site_rva: None,
+            tool: None,
+            t_ms: 0,
+            wall_ms: 0,
+            payload: at,
+        };
+        let mem = Both(&arena);
+        let text =
+            portable::encode(&mem, Env { image_base: BASE }, graph_skip(settings()), "40420", &head).unwrap().text;
+        assert_eq!(donor_counts(&text), vec![1, 0]);
+        arena.write(at + 0x258, &town); // the receiver's conversion: one town building more than the text
+        check_destination(&mem, at, 0, 1).expect("the conversion's town building does not make it another command");
+        let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
+        WORLD.with(|w| w.set(&arena));
+        let r = build_verified(&ctx, &ArenaPoke(&arena), &text, Some(at), &mut |_| {});
+        WORLD.with(|w| w.set(core::ptr::null()));
+        let built = r.expect("proved equal to the text");
+        assert_eq!(built.constructions, 0);
+        let p = built.proposal.bytes();
+        assert_eq!(u64_at(p, 0x128), obj, "the edge object is the donor's");
+        assert_eq!(&p[0x258..0x270], &[0u8; 24], "no construction of the conversion is carried");
+        release(&ctx, built);
+    }
+
+    #[test]
     fn a_depot_text_without_a_donor_is_refused_and_a_converted_construction_that_differs_is_not_accepted() {
         let (arena, at, text) = world_text(true);
         let mem = Both(&arena);
@@ -1593,7 +1822,9 @@ mod tests {
         cons.bytes_mut()[0x258..0x260].copy_from_slice(&0x2000_0000_1000u64.to_le_bytes());
         cons.bytes_mut()[0x260..0x268].copy_from_slice(&(0x2000_0000_1000u64 + 0xe48).to_le_bytes());
         cons.bytes_mut()[0x268..0x270].copy_from_slice(&(0x2000_0000_1000u64 + 0xe48).to_le_bytes());
-        assert!(check_destination(&mem, cons.addr(), 0, 0).unwrap_err().contains("already adds a construction"));
+        // the script's conversion of a street build adds the town buildings it moves (2026-10-21, host 0:22): its place decides
+        assert!(check_destination(&mem, cons.addr(), 0, 0).is_ok());
+        assert!(check_destination(&mem, cons.addr(), 2, 0).unwrap_err().contains("1 construction(s), the text has 2"));
         let mut bad = placeholder(false);
         bad.bytes_mut()[0..8].copy_from_slice(&5u64.to_le_bytes());
         assert!(check_destination(&mem, bad.addr(), 0, 0).unwrap_err().contains("not one"));
@@ -1904,6 +2135,12 @@ toAdd[0].transf	m4:{t}
         assert_eq!(text_place(removal).removed.into_iter().collect::<Vec<_>>(), [54]);
         assert_eq!(same_build(&arena, command_at(&arena, None, &[54]), removal), Ok(()));
         assert!(same_build(&arena, command_at(&arena, None, &[55]), removal).unwrap_err().contains("builds elsewhere"));
+        // the conversion of the mod's own send: its command carries it even with the town buildings the engine adds (removed 54, 55),
+        // a town's road elsewhere does not, and a conversion that builds nothing identifies nothing
+        let conv = identity(&arena, command_at(&arena, Some([180.0, 20.0, 5.0]), &[])).unwrap();
+        assert!(conv.within(&identity(&arena, command_at(&arena, Some([180.0, 20.0, 5.0]), &[54, 55])).unwrap()));
+        assert!(!conv.within(&identity(&arena, town).unwrap()));
+        assert!(!identity(&arena, empty).unwrap().within(&identity(&arena, empty).unwrap()));
         // a text that names no place at all identifies no command: unknown, never taken for the mod's (and so never emptied)
         let why = same_build(&arena, town, "toAdd.#\tn:0\n").unwrap_err();
         assert!(why.starts_with(UNKNOWN) && keeps_waiting(&why), "{why}");

@@ -100,6 +100,8 @@ unsafe extern "system-unwind" fn convert_hook(
     let original: Original = unsafe { core::mem::transmute(original) };
     let ret = unsafe { original(rcx, rdx, r8, r9, a5, a6, a7, a8) };
     if let Some(rt) = RUNTIME.get() {
+        // what the conversion builds, while inject orders wait (positive identity of the mod's command; reads only, contained)
+        rt.inject_on_convert(rcx as usize);
         // guards its own bookkeeping: the write calls the game's allocator, which must not run inside a guard
         rt.on_convert(rcx as usize, caller);
     }

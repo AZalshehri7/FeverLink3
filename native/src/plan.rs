@@ -104,6 +104,9 @@ pub struct HookConfig {
     pub step_seed: bool,
     /// `FEVERLINK3_NATIVE_PATCH=1`: also hook `scripting::Convert`, to write `frozenNodes` into a script's converted proposal.
     pub native_patch: bool,
+    /// The native inject is on (`FEVERLINK3_NATIVE_INJECT` unset, or anything but `0`): hook `scripting::Convert` (not the construction
+    /// update inside it) to see the conversion of the mod's own send, the positive identity of its command (owner decision B, 2026-10-21).
+    pub inject_convert: bool,
     /// Smooth pacing (`pace.rs`): the call of `CGame::Sync` in `CGame::Step` is redirected so that the batch interval can be stretched by
     /// the mod's factor. On by default with the hooks; `FEVERLINK3_SMOOTH_PACE=0` off.
     pub smooth_pace: bool,
@@ -129,6 +132,7 @@ impl HookConfig {
             luaseed: !off(LUA_SEED_VAR),
             step_seed: !off(STEP_SEED_VAR),
             native_patch: on(crate::cmd_patch::PATCH_VAR),
+            inject_convert: !off(crate::inject::INJECT_VAR),
             smooth_pace: !off(crate::pace::SMOOTH_PACE_VAR),
             free_order: !off(crate::freeorder::FREE_ORDER_VAR),
         }
@@ -408,7 +412,10 @@ pub fn plan(build: &BuildAddrs, cfg: HookConfig, image: &dyn Image) -> Plan {
         }
     }
     if cfg.native_patch {
-        plan_convert(build, image, &mut p);
+        plan_convert(build, image, &mut p, true);
+    } else if cfg.inject_convert && cfg.hooks {
+        // the inject works on the hooked command paths: without the hooks there is nothing to identify
+        plan_convert(build, image, &mut p, false);
     }
     if cfg.poolpatch {
         plan_patch(Feature::PoolPatch, "script_pool", &build.script_pool, image, &mut p);
@@ -468,12 +475,16 @@ fn plan_counters(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     }
 }
 
-/// The hook on `scripting::Convert`: only with the patch switch, and only when the prologue matches.
-fn plan_convert(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+/// The hook on `scripting::Convert` (with the native inject or the patch switch) and on the construction update inside it (`update`: the
+/// patch switch only), each only when its prologue matches.
+fn plan_convert(build: &BuildAddrs, image: &dyn Image, p: &mut Plan, update: bool) {
     for (feature, name, site) in [
         (Feature::Convert, "script_convert", &build.script_convert),
         (Feature::ConvertUpdate, "script_convert_update", &build.convert_update),
     ] {
+        if feature == Feature::ConvertUpdate && !update {
+            continue;
+        }
         let Some(site) = site else {
             p.skipped.push(Skip {
                 feature,
@@ -761,6 +772,7 @@ mod tests {
             fire_done: true,
             smooth_pace: true,
             free_order: true,
+            inject_convert: true,
             ..Default::default()
         };
         assert_eq!(
@@ -777,6 +789,7 @@ mod tests {
             (FIRE_DONE_VAR, "0"),
             (crate::pace::SMOOTH_PACE_VAR, "0"),
             (crate::freeorder::FREE_ORDER_VAR, "0"),
+            (crate::inject::INJECT_VAR, "0"),
         ]));
         assert_eq!(none, HookConfig::default(), "=0 turns each of them off");
         assert!(!HookConfig::default().any());
@@ -789,6 +802,7 @@ mod tests {
                 fire_done: true,
                 smooth_pace: true,
                 free_order: true,
+                inject_convert: true,
                 ..cfg(true, true, true)
             }
         );
@@ -806,6 +820,7 @@ mod tests {
                     fire_done: on_by_default,
                     smooth_pace: on_by_default,
                     free_order: on_by_default,
+                    inject_convert: on_by_default,
                     ..Default::default()
                 },
                 "{off:?} must not switch anything else on"
@@ -1131,11 +1146,17 @@ mod tests {
     }
 
     #[test]
-    fn the_convert_hook_is_planned_only_with_the_patch_switch_and_a_matching_prologue() {
+    fn the_convert_hook_is_planned_with_the_inject_or_the_patch_switch_and_a_matching_prologue() {
         let b = select(0x6ac5_0427).unwrap();
         let image = image_of_40420();
         let off = HookConfig { hooks: true, ..Default::default() };
         assert!(!plan(b, off, &image).has(Feature::Convert));
+        // the native inject: Convert only (the conversion of the mod's own send identifies its command), not the update inside it
+        let inject = HookConfig { inject_convert: true, ..Default::default() };
+        assert!(names(&plan(b, inject, &image)).is_empty(), "nothing without the hooks");
+        let inject = HookConfig { hooks: true, inject_convert: true, ..Default::default() };
+        let p = plan(b, inject, &image);
+        assert!(p.has(Feature::Convert) && !p.has(Feature::ConvertUpdate), "{:?}", p.report());
         let on = HookConfig { native_patch: true, ..Default::default() };
         let p = plan(b, on, &image);
         assert_eq!(names(&p), ["script_convert", "script_convert_update"], "{:?}", p.report());

@@ -125,7 +125,8 @@ impl Outbox {
     /// Whether a kind the player's game sends is resent after a resume: all of them (clocks, actions, verdicts, reports, chat) but the
     /// session layer's own answers and a goodbye.
     pub fn replayable_from_player(kind: MessageKind) -> bool {
-        kind.allowed_from_player() && !matches!(kind, MessageKind::Pong | MessageKind::Leave)
+        kind.allowed_from_player()
+            && !matches!(kind, MessageKind::Pong | MessageKind::Leave | MessageKind::ResyncUpload)
     }
 }
 

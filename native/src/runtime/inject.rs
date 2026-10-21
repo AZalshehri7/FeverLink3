@@ -43,7 +43,7 @@ impl Runtime {
             Ok(_) => self.say(&format!("native inject: refund (native): the engine's insert of the Context's refundableEntities at {:#x} is verified: an order with refund entries puts them into its command's Context", crate::refund::INSERT_RANGE_RVA)),
             Err(e) => self.say(&format!("native inject: refund (native): {e}: an order with refund entries is refused")),
         }
-        self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and each inject_next order (queued in the mod's order) makes its own script build_proposal (matched by the text's place or constructions) take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
+        self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and each inject_next order (queued in the mod's order) makes its own script build_proposal (the one that carries the conversion of the mod's own send; without one seen, the text's place or constructions) take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
     }
 
     pub(super) fn inject_dir(&self, dir: &std::path::Path) {
@@ -330,6 +330,46 @@ impl Runtime {
         None
     }
 
+    /// `scripting::Convert` produced the `optional<Proposal>` at `out` (engaged when the byte after the Proposal is not 0) on the calling
+    /// thread. While orders wait, what it builds is kept with the thread ([`inj::State::note_conversion`]): the mod writes its order, then
+    /// its own send converts its command on the thread of its script, then the engine queues or applies that command, so the command that
+    /// carries this conversion on this thread is the mod's (positive identity, owner decision B 2026-10-21). Reads only; contained.
+    pub fn inject_on_convert(&self, out: usize) {
+        if !self.inject.enabled() {
+            return;
+        }
+        crate::log::guarded("native inject: convert", || {
+            let now = self.now_ms();
+            if !self.inject.pending() {
+                // the mod writes its order and converts its command in the same breath: look at the file now
+                self.ingest_patch_order(now);
+                if !self.inject.pending() {
+                    return;
+                }
+            }
+            if LiveMem.read(out + nc::PROPOSAL_SIZE, 1).is_none_or(|b| b[0] == 0) {
+                return; // the conversion produced no proposal (it failed): the factory throws, nothing is sent
+            }
+            let thread = super::current_thread_id();
+            match inj::proposal_identity(&LiveMem, out) {
+                Ok(id) if !id.is_empty() => {
+                    self.say(&format!(
+                        "native inject: conversion on thread {thread} while {} order(s) wait: {} point(s), {} removed, {} construction(s): the command that carries it is the mod's",
+                        self.inject.waiting_count(),
+                        id.place.points.len(),
+                        id.place.removed.len(),
+                        id.construction_count()
+                    ));
+                    self.inject.note_conversion(thread, id);
+                }
+                Ok(_) => self.say(&format!(
+                    "native inject: conversion on thread {thread} builds nothing: it identifies no command"
+                )),
+                Err(why) => self.say(&format!("native inject: conversion on thread {thread} cannot be read: {why}")),
+            }
+        });
+    }
+
     /// The command list's `Add` of a command that was not held (the interface half's script commands): an order matched to it is
     /// carried out now, and what it needs after the simulation's apply is kept with the command's identity (see [`Added`]).
     pub(super) fn inject_on_add(&self, args: &AddArgs, caller: Option<usize>) {
@@ -506,10 +546,14 @@ impl Runtime {
     /// The decision of [`Runtime::inject_add`]: which waiting order this command is, and everything the injection needs that does not
     /// call the engine (the side file, the destination's checks). `None` when it is no waiting order's command.
     ///
-    /// The waiting orders are tried in the order the mod wrote them, and the first whose identity check the command passes is used: an
-    /// `inject_next` by its text ([`Runtime::inject_prepare`], `inject::same_build`), a `complete_next` by its held command
-    /// ([`Runtime::same_as_held`]). An order the command fails, or whose identity cannot be told, keeps waiting; a command that is no
-    /// order's passes untouched.
+    /// Positive identity first (owner decision B, 2026-10-21): an order whose send converted its command on this thread
+    /// ([`Runtime::inject_on_convert`]) is used by the command that carries that conversion ([`inj::ConvMatch::Ours`]), whatever its
+    /// text says; the text is then only a cross-check, and a cross-check that fails refuses the order and empties the command (nothing of
+    /// the build is applied here), it never lets the command pass. A command on that thread that does not carry the conversion (a town's
+    /// own build applied meanwhile: lab A-new-run 2026-10-18, 12 of 48 orders saw one first) is never that order's.
+    /// Only without a conversion seen on this thread (the conversion hook not installed) does the content decide, as before:
+    /// `inject_next` by its text ([`Runtime::inject_prepare`], `inject::same_build`), `complete_next` by its held command
+    /// ([`Runtime::same_as_held`]); there, a command the order fails passes untouched and the order keeps waiting.
     fn inject_take(&self, args: &AddArgs, caller: Option<usize>) -> Option<InjectJob> {
         let site = caller.and_then(|c| c.checked_sub(self.base)).and_then(|rva| u32::try_from(rva).ok());
         if site.and_then(|rva| self.build.ui_site_index(rva)).is_some() {
@@ -530,23 +574,51 @@ impl Runtime {
         }
         // SAFETY: only readable memory is read.
         let dest = unsafe { engine::payload_of(args.cmd) }?; // no payload: no order can tell it is its command
+        let thread = super::current_thread_id();
+        let have = inj::identity(&LiveMem, dest).ok();
         for order in self.inject.waiting(now) {
+            let positive = match self.inject.conversion_match(order.seq, thread, have.as_ref()) {
+                inj::ConvMatch::Ours => true,
+                inj::ConvMatch::Other => {
+                    self.say(&format!(
+                        "native inject: key {} (held {}): a build_proposal on thread {thread} that does not carry the conversion of the mod's own send for this order: not its command, passed untouched{}",
+                        order.key,
+                        order.held,
+                        have.as_ref().map_or(" (unreadable)".to_string(), |h| format!(
+                            " ({} point(s), {} removed, {} construction(s))",
+                            h.place.points.len(),
+                            h.place.removed.len(),
+                            h.construction_count()
+                        ))
+                    ));
+                    continue;
+                }
+                inj::ConvMatch::Unseen => false,
+            };
             let prepared = if order.link_only {
                 match self.same_as_held(order.held, dest) {
                     Ok(()) => None,
+                    Err(why) if positive => {
+                        // the command of its own send all the same: this game's stamp apply of the build; the held command takes its result
+                        self.say(&format!(
+                            "native inject: complete_next held {}: cross-check: {why}; it carries the conversion of the mod's own send for this order: used",
+                            order.held
+                        ));
+                        None
+                    }
                     Err(why) => {
                         self.say(&format!(
-                            "native inject: complete_next held {}: {why}; the order waits for its own command",
+                            "native inject: complete_next held {}: {why}; the order waits for its own command (no conversion of its send seen on thread {thread})",
                             order.held
                         ));
                         continue;
                     }
                 }
             } else {
-                match self.inject_prepare(order.key, order.refund, dest) {
-                    Err(why) if inj::keeps_waiting(&why) => {
+                match self.inject_prepare(order.key, order.refund, dest, positive) {
+                    Err(why) if !positive && inj::keeps_waiting(&why) => {
                         self.say(&format!(
-                            "native inject: key {}: {why}; the order waits for its own command",
+                            "native inject: key {}: {why}; the order waits for its own command (no conversion of its send seen on thread {thread})",
                             order.key
                         ));
                         continue;
@@ -557,10 +629,15 @@ impl Runtime {
             // expired between the two looks: it was refused, the command is not its any more
             let Some(order) = self.inject.take(order.seq) else { continue };
             self.say(&format!(
-                "native inject: order {} (key {}, held {}) is this command's ({} order(s) still wait)",
+                "native inject: order {} (key {}, held {}) is this command's: {} on thread {thread} ({} order(s) still wait)",
                 order.seq,
                 order.key,
                 order.held,
+                if positive {
+                    "it carries the conversion of the mod's own send (positive identity)"
+                } else {
+                    "matched by its content (no conversion of its send seen)"
+                },
                 self.inject.waiting_count()
             ));
             return Some(InjectJob { order, dest, t0: std::time::Instant::now(), rb0: wall_ms(), prepared });
@@ -719,14 +796,15 @@ impl Runtime {
 
     /// What the injection needs before the engine is called: the side file, the destination's checks (is this the mod's command), then
     /// the functions and the allocator (their bytes checked). Calls nothing of the engine. A refusal empties the command, so it may only
-    /// come after the command was positively identified as the mod's placeholder for this order: every error before that (no side file,
-    /// an unreadable one, a text that names no place) is [`inj::UNKNOWN`] and a mismatch is [`inj::NOT_OURS`]; both leave the command
-    /// untouched and the order waiting (it expires into a refusal that asks for the repair). Emptying someone else's command on one game
-    /// only would itself fork the worlds.
+    /// come after the command was positively identified as the mod's placeholder for this order. `positive`: it carries the conversion of
+    /// the mod's own send ([`Runtime::inject_take`]), so every error is a refusal ([`inj::CROSS_CHECK`] for a text that does not fit).
+    /// Without it, every error before the content identity (no side file, an unreadable one, a text that names no place) is
+    /// [`inj::UNKNOWN`] and a mismatch is [`inj::NOT_OURS`]; both leave the command untouched and the order waiting (refused at its
+    /// `send_done`, or expired). Emptying someone else's command on one game only would itself fork the worlds.
     ///
     /// `refund`: how many refund entries the order's side file holds (`native_refund_<key>.txt`); read and checked here, with the
     /// command's Context container and the engine's insert function, so that the engine part only calls the insert ([`refund_job`]).
-    fn inject_prepare(&self, key: u64, refund: u64, dest: usize) -> Result<Prepared, String> {
+    fn inject_prepare(&self, key: u64, refund: u64, dest: usize, positive: bool) -> Result<Prepared, String> {
         let read = || -> Result<(portable::Settings, std::path::PathBuf, String), String> {
             let settings = self.inject_settings.get().copied().ok_or("no portable settings")?;
             let dir = super::lock(&self.inject_dir_path).clone().ok_or("no link folder")?;
@@ -741,13 +819,24 @@ impl Runtime {
                 .map_err(|e| format!("cannot read {}: {e}", inj::inject_file_name(key)))?;
             Ok((settings, dir, text))
         };
-        let (settings, dir, text) = read().map_err(|why| format!("{}{why}", inj::UNKNOWN))?;
+        // positive identity: the command is the mod's own (it carries its send's conversion), so every error is a refusal that empties it
+        let (settings, dir, text) =
+            read().map_err(|why| if positive { why } else { format!("{}{why}", inj::UNKNOWN) })?;
         let counts = inj::donor_counts(&text);
         let (edge_objects, constructions) = (counts[0], counts[1]);
-        // a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75): the order waits for the next
+        // without the positive identity, a command that does not fit the text is not the one the mod sent (a town's build_proposal, b75):
+        // the order waits for the next; with it, the text is a cross-check of the mod's own command, and a mismatch is a refusal
         inj::check_destination(&LiveMem, dest, constructions, edge_objects)
             .and_then(|()| inj::same_build(&LiveMem, dest, &text))
-            .map_err(|why| if why.starts_with(inj::UNKNOWN) { why } else { format!("{}{why}", inj::NOT_OURS) })?;
+            .map_err(|why| {
+                if positive {
+                    format!("{}{why}", inj::CROSS_CHECK)
+                } else if why.starts_with(inj::UNKNOWN) {
+                    why
+                } else {
+                    format!("{}{why}", inj::NOT_OURS)
+                }
+            })?;
         // from here on the command is the mod's placeholder for this order: a refusal empties it
         if self.build.name != portable::LAYOUT_BUILD {
             return Err(format!(

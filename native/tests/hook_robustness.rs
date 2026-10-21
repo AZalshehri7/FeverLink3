@@ -167,6 +167,7 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     }
                     CtlMessage::TerrainApply { id, stamp } => assert!(id <= 1 << 53 && stamp <= 1 << 53, "{line:?}"),
                     CtlMessage::Pace { permille } => assert!((1000..=2000).contains(&permille), "{line:?}"),
+                    CtlMessage::SendDone { key, held } => assert!(key != 0 || held != 0, "{line:?}"),
                     CtlMessage::HoldOff
                     | CtlMessage::Ping { .. }
                     | CtlMessage::PatchNext { .. }
@@ -745,6 +746,7 @@ fn a_plan_only_ever_contains_what_the_image_confirms() {
                 luaseed: r.gen(),
                 step_seed: r.gen(),
                 native_patch: r.gen(),
+                inject_convert: r.gen(),
                 smooth_pace: r.gen(),
                 free_order: r.gen(),
             };

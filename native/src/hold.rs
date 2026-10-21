@@ -13,8 +13,13 @@
 //!   scheduled entry is due at once, which is the right reading for a mod that has already stopped the game at
 //!   the stamp.
 //! - Nothing can be held forever. Holding switches itself off after [`HoldConfig::silence_ms`] without a line
-//!   from the mod (implicit `hold_off`), and an entry older than [`HoldConfig::max_hold_ms`] is released on its
-//!   own. When holding goes off, every entry is released in order.
+//!   from the mod (implicit `hold_off`), and an entry older than [`HoldConfig::max_hold_ms`] leaves on its
+//!   own. When the mod switches holding off (`hold_off`), every entry is released in order.
+//! - The module never gives a command back on its own that the mod has not decided on (still `Waiting`: no `release`, no
+//!   `defer`): on the age limit, a tool at work while the mod is silent or the control file gone, it is failed (its tool callback
+//!   fired with the command's own "not applied" result), never released. Released, it ran on this game alone, before or without the
+//!   other games (friend test pre7 2026-10-21: 4 of 8 free-id forks began with a held build given back with no record, applied ~16
+//!   steps before its stamp on the originator only). Only the mod's `release` or `hold_off` gives a waiting command back.
 //! - A silence is not a `hold_off`: the next line from the mod switches holding on again with the same kinds
 //!   (`holding {on = true, reason = "resume"}`). The game's pause menu stops every game script, so the mod falls
 //!   silent while the world is still there (real runs inj7 and s3, 2026-10-14: holding went off at the menu and was
@@ -381,6 +386,7 @@ impl<H> HoldMachine<H> {
             CtlMessage::PatchNext { .. }
             | CtlMessage::InjectNext { .. }
             | CtlMessage::CompleteNext { .. }
+            | CtlMessage::SendDone { .. }
             | CtlMessage::Pace { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, pace.rs)
         }
     }
@@ -388,7 +394,10 @@ impl<H> HoldMachine<H> {
     fn release_all(&mut self, reason: ReleaseReason) {
         for e in &mut self.entries {
             e.ready = true; // nobody is left to say when the interface's world is ready: a completed entry fires as before
-            if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) {
+            if e.phase == Phase::Waiting && reason != ReleaseReason::HoldOff {
+                // the mod never decided on it: given back, it would run on this game alone (see the module comment)
+                e.phase = Phase::Failed(reason.as_str());
+            } else if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) {
                 e.phase = Phase::Due(reason);
             } else if e.phase == Phase::Deferred {
                 // its build is applied at the stamp by this game's own replay: releasing it would build it twice; its tool callback is
@@ -478,7 +487,10 @@ impl<H> HoldMachine<H> {
         let (mut timed_out, mut unconfirmed) = (Vec::new(), Vec::new());
         let ages: Vec<u64> = self.entries.iter().map(|e| self.age(e, now)).collect();
         for (e, age) in self.entries.iter_mut().zip(ages) {
-            if matches!(e.phase, Phase::Waiting | Phase::Scheduled { .. }) && age >= max {
+            if e.phase == Phase::Waiting && age >= max {
+                e.phase = Phase::Failed("timeout"); // no verdict of the mod: failed, never released (see the module comment)
+                timed_out.push(e.id);
+            } else if matches!(e.phase, Phase::Scheduled { .. }) && age >= max {
                 e.phase = Phase::Due(ReleaseReason::Timeout);
                 timed_out.push(e.id);
             } else if e.phase == Phase::Deferred && age >= max {
@@ -490,7 +502,11 @@ impl<H> HoldMachine<H> {
             }
         }
         for id in timed_out {
-            self.error("hold", format!("command {id} held for {max} ms: released"), now);
+            self.error(
+                "hold",
+                format!("command {id} held for {max} ms: released if the mod asked for it, else failed"),
+                now,
+            );
         }
         for id in unconfirmed {
             self.error(
@@ -1020,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_working_while_the_mod_is_silent_gives_everything_back() {
+    fn a_tool_working_while_the_mod_is_silent_fails_what_waits_and_releases_nothing_undecided() {
         let mut m = machine();
         hold_on(&mut m, &["build_proposal"], 0);
         let (a, b) = (hold(&mut m, BUILD, 1), hold(&mut m, BUILD, 2));
@@ -1032,7 +1048,7 @@ mod tests {
         assert_eq!(
             m.take_due(None, 10_006),
             [
-                Action::Release { id: a, handle: a, reason: ReleaseReason::Silence },
+                Action::Fail { id: a, handle: a, reason: "silence" },
                 Action::Fail { id: b, handle: b, reason: "silence" }
             ]
         );
@@ -1116,18 +1132,26 @@ mod tests {
     }
 
     #[test]
-    fn an_old_entry_is_released_on_its_own_even_while_the_mod_talks() {
+    fn an_old_entry_leaves_on_its_own_even_while_the_mod_talks_failed_unless_the_mod_asked_for_its_release() {
         let mut m = machine();
         hold_on(&mut m, &["build_proposal"], 0);
         let a = hold(&mut m, BUILD, 1_000);
+        let s = hold(&mut m, BUILD, 1_000);
+        m.handle(&CtlMessage::Release { id: s, at: 999_999 }, 1_000);
         m.handle(&CtlMessage::Ping { n: 1, paused: false }, 29_000);
         let b = hold(&mut m, BUILD, 29_500);
         m.drain_events();
         m.tick(30_999);
-        assert!(m.take_due(None, 30_999).is_empty());
+        assert!(m.take_due(Some(0), 30_999).is_empty());
         m.tick(31_000);
-        let out = m.take_due(None, 31_000);
-        assert_eq!(out, [Action::Release { id: a, handle: a, reason: ReleaseReason::Timeout }]);
+        let out = m.take_due(Some(0), 31_000);
+        assert_eq!(
+            out,
+            [
+                Action::Fail { id: a, handle: a, reason: "timeout" },
+                Action::Release { id: s, handle: s, reason: ReleaseReason::Timeout }
+            ]
+        );
         assert!(m.enabled(), "a timeout does not switch holding off");
         assert_eq!(m.held(), [(b, BUILD)]);
     }
@@ -1147,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn the_control_file_disappearing_releases_everything() {
+    fn the_control_file_disappearing_fails_what_the_mod_never_decided_on() {
         let mut m = machine();
         hold_on(&mut m, &["build_proposal"], 0);
         let a = hold(&mut m, BUILD, 1);
@@ -1155,7 +1179,7 @@ mod tests {
         m.ctl_gone(5);
         assert!(!m.enabled());
         let out = m.take_due(None, 6);
-        assert_eq!(out, [Action::Release { id: a, handle: a, reason: ReleaseReason::ControlGone }]);
+        assert_eq!(out, [Action::Fail { id: a, handle: a, reason: "control_gone" }]);
         let mut idle = machine();
         idle.ctl_gone(5);
         assert!(idle.drain_events().is_empty(), "nothing held and not holding: nothing to say");

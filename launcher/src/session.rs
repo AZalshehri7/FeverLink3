@@ -37,7 +37,8 @@ use feverlink3_core::session::mods::{self, ModFingerprint};
 use feverlink3_core::session::{
     codec, ChecksumOutcome, ChecksumPolicy, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep,
     MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession,
-    PlayerState, ResumeTicket, ResyncLimits, ResyncState, RosterEntry, SessionState, CAP_BULK_DGRAM, CAP_BULK_PAR,
+    PlayerState, ResumeTicket, ResyncChunkMessage, ResyncLimits, ResyncSaveMessage, ResyncState, RosterEntry,
+    SaveDoneMessage, SessionState, CAP_BULK_DGRAM, CAP_BULK_PAR, CAP_RESYNC_SOURCE,
 };
 
 use crate::gamelink::{self, Line};
@@ -524,6 +525,30 @@ fn write_to_game(link: &mut gamelink::Session, shared: &Shared, kind: MessageKin
     }
 }
 
+/// A checksum part this process adds to the game's checksum reports (the native module's free-id queue part, `FREEQ_PART`): set once by
+/// the module that runs the session controller in the game's process, read when a report is forwarded.
+static CHECKSUM_PART: std::sync::OnceLock<ChecksumPartFn> = std::sync::OnceLock::new();
+
+/// The provider of an extra checksum part: `(name, value)`, or `None` for nothing to add this time.
+pub type ChecksumPartFn = fn() -> Option<(String, String)>;
+
+/// Registers the provider of an extra checksum part (the first one wins). `None` from it leaves the report as the game wrote it.
+pub fn set_checksum_part(provider: ChecksumPartFn) {
+    let _ = CHECKSUM_PART.set(provider);
+}
+
+/// A checksum report's JSON with `name` = `value` added to its parts (a part the game itself named stays as it is); the payload
+/// unchanged when it is not a report with parts.
+pub fn with_checksum_part(payload: Vec<u8>, name: &str, value: &str) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&payload) else { return payload };
+    let Some(parts) = v.get_mut("parts").and_then(serde_json::Value::as_object_mut) else { return payload };
+    if parts.contains_key(name) {
+        return payload;
+    }
+    parts.insert(name.to_owned(), serde_json::Value::String(value.to_owned()));
+    serde_json::to_vec(&v).unwrap_or(payload)
+}
+
 /// New messages from the game, in file order. Lines that cannot be translated are logged and skipped.
 fn read_from_game(link: &mut gamelink::Session, shared: &Shared) -> Vec<(MessageKind, Vec<u8>)> {
     let lines = match link.poll() {
@@ -539,6 +564,11 @@ fn read_from_game(link: &mut gamelink::Session, shared: &Shared) -> Vec<(Message
             Ok(mut m) => {
                 // the latency logs: a clock or an action gets this launcher's read stamp (LinkWatch::stamp_read)
                 m.1 = shared.watch().stamp_read(m.0, m.1, linkwatch::wall_ms(), Instant::now());
+                if m.0 == MessageKind::ChecksumReport {
+                    if let Some((name, value)) = CHECKSUM_PART.get().and_then(|f| f()) {
+                        m.1 = with_checksum_part(m.1, &name, &value);
+                    }
+                }
                 if m.0 == MessageKind::Hello {
                     // a script that starts says hello once: the world is up (again)
                     shared.update(|s| s.reloading = false);
@@ -738,6 +768,7 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
                     io.begin_transfer(id);
                 }
             }
+            HostOutput::SourceSave { id, sha256, bytes } => io.write_source_save(id, &sha256, &bytes),
             HostOutput::ResyncFailed { id, reason } => {
                 shared.log(format!("resync {id} failed: {reason}"));
                 shared.update(|s| s.resync = Some(format!("failed: {reason}")));
@@ -897,6 +928,8 @@ pub fn run_player_over(
                 net_tx,
                 ticket: None,
                 par_progress: None,
+                asked_save: None,
+                upload: None,
             };
             if let Err(why) = guard::guarded(|| state.run(&net_rx, &cmd_rx, &shared)) {
                 shared.log(format!("the player session stopped: {why}"));
@@ -923,6 +956,10 @@ fn capabilities_of(net: &dyn ClientTransport, has_save_dir: bool) -> Vec<String>
     if net.par_capable() && has_save_dir {
         caps.push(CAP_BULK_PAR.to_owned());
     }
+    // it can send its own save to the host when a repair takes this game's world (the host's may be partly built)
+    if has_save_dir {
+        caps.push(CAP_RESYNC_SOURCE.to_owned());
+    }
     caps
 }
 
@@ -946,7 +983,26 @@ struct PlayerLoop {
     ticket: Option<ResumeTicket>,
     /// How far the parallel receive in progress is: (when last heard, bytes, total bytes, text).
     par_progress: Option<(Instant, u64, u64, String)>,
+    /// The repair the host asked this game's save for (`ResyncSave` reaches a player only when the host's world may be partly
+    /// built): once the game says it is saved, the file goes up to the host.
+    asked_save: Option<i32>,
+    /// This game's save on its way up to the host (`ResyncUpload`).
+    upload: Option<Upload>,
 }
+
+/// This game's save being sent to the host, chunk by chunk.
+struct Upload {
+    id: i32,
+    path: PathBuf,
+    len: u64,
+    sha256: String,
+    count: u32,
+    next: u32,
+    started: Instant,
+}
+
+/// Save chunks sent to the host per turn of the player's loop at most, so pings and game lines are still handled in between.
+const UPLOAD_CHUNKS_PER_TURN: u32 = 4;
 
 impl PlayerLoop {
     fn run(&mut self, net_rx: &Receiver<NetEvent>, cmd_rx: &Receiver<Command>, shared: &Shared) {
@@ -1044,10 +1100,22 @@ impl PlayerLoop {
             }
             while cmd_rx.try_recv().is_ok() {}
 
+            let mut saved = None;
             for (kind, payload) in read_from_game(&mut self.config.link, shared) {
+                if kind == MessageKind::SaveDone {
+                    saved = codec::try_decode::<SaveDoneMessage>(&payload).filter(|m| m.ok).map(|m| m.id);
+                }
                 outputs.extend(self.player.local_game_message(kind, &payload));
             }
             if self.dispatch(outputs, &mut clocks, shared) {
+                return;
+            }
+            // the SaveDone went out above: the host now waits for the file
+            if let Some(id) = saved.filter(|&id| self.asked_save == Some(id)) {
+                self.asked_save = None;
+                self.begin_upload(id, shared);
+            }
+            if self.pump_upload(&mut clocks, shared) {
                 return;
             }
             {
@@ -1198,6 +1266,73 @@ impl PlayerLoop {
         }
     }
 
+    /// The host asked for this game's save (its own world may be partly built): find and hash the file the game just wrote.
+    fn begin_upload(&mut self, id: i32, shared: &Shared) {
+        let name = resync::save_name(id);
+        let found = resync::find_save(&self.config.save_dirs, &name)
+            .ok_or_else(|| format!("{name}.sav not found in the savegame folders"))
+            .and_then(|path| resync::hash_file(&path).map(|(sha, len)| (path, sha, len)).map_err(|e| e.to_string()));
+        let (path, sha256, len) = match found {
+            Ok(f) => f,
+            Err(why) => {
+                shared.log(format!(
+                    "resync {id}: this game's save cannot be sent to the host: {why}; the round will time out"
+                ));
+                return;
+            }
+        };
+        let Some(count) = ResyncLimits::chunk_count(len) else {
+            shared.log(format!(
+                "resync {id}: this game's save ({len} bytes) is too big to send; the round will time out"
+            ));
+            return;
+        };
+        shared.log(format!(
+            "resync {id}: the host takes its repair from this game's world: sending our save ({len} bytes, {count} chunk(s), SHA-256 {})",
+            &sha256[..12.min(sha256.len())]
+        ));
+        self.upload = Some(Upload { id, path, len, sha256, count, next: 0, started: Instant::now() });
+    }
+
+    /// Sends the next chunks of this game's save to the host. True when the session is over (rejected).
+    fn pump_upload(&mut self, clocks: &mut BTreeMap<u16, i64>, shared: &Shared) -> bool {
+        let Some(mut u) = self.upload.take() else { return false };
+        if self.net.is_none() || self.player.state() != PlayerState::Joined {
+            shared.log(format!("resync {}: the connection is gone; our save was not sent completely", u.id));
+            return false;
+        }
+        let mut budget = UPLOAD_CHUNKS_PER_TURN;
+        while u.next < u.count && budget > 0 {
+            let data = match resync::read_chunk(&u.path, u.len, u.next) {
+                Ok(data) => data,
+                Err(e) => {
+                    shared.log(format!("resync {}: cannot read chunk {} of our save: {e}", u.id, u.next));
+                    return false;
+                }
+            };
+            let msg = ResyncChunkMessage {
+                id: u.id,
+                index: u.next as i32,
+                count: u.count as i32,
+                sha256: u.sha256.clone(),
+                data,
+            };
+            let outputs = self.player.local_game_message(MessageKind::ResyncUpload, &codec::encode(&msg));
+            u.next += 1;
+            budget -= 1;
+            if self.dispatch(outputs, clocks, shared) {
+                return true;
+            }
+        }
+        if u.next < u.count {
+            self.upload = Some(u);
+        } else {
+            let secs = u.started.elapsed().as_secs_f64();
+            shared.log(format!("resync {}: our save was sent to the host ({} bytes in {secs:.1} s)", u.id, u.len));
+        }
+        false
+    }
+
     /// Acts on the state machine's outputs. True when the session is over (rejected).
     fn dispatch(&mut self, outputs: Vec<PlayerOutput>, clocks: &mut BTreeMap<u16, i64>, shared: &Shared) -> bool {
         for output in outputs {
@@ -1211,6 +1346,17 @@ impl PlayerLoop {
                 }
                 PlayerOutput::DeliverToLocalGame { kind, payload } => {
                     match kind {
+                        MessageKind::ResyncSave => {
+                            // only a repair whose source is this game asks a player to save (the host's world may be partly built)
+                            if let Some(m) = codec::try_decode::<ResyncSaveMessage>(&payload) {
+                                shared.log(format!(
+                                    "resync {}: the host asks for this game's save (its own world may be partly built)",
+                                    m.id
+                                ));
+                                self.asked_save = Some(m.id);
+                                self.upload = None;
+                            }
+                        }
                         MessageKind::PeerClock => {
                             if let Some(m) = codec::try_decode::<PeerClockMessage>(&payload) {
                                 clocks.insert(m.from, m.t);
@@ -1309,6 +1455,18 @@ impl Retry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_extra_checksum_part_joins_the_reports_parts_and_leaves_everything_else() {
+        let report = br#"{"n":3,"time":5,"parts":{"edges":"1"}}"#.to_vec();
+        let v: serde_json::Value =
+            serde_json::from_slice(&with_checksum_part(report.clone(), "freeq", "ab|1024:x")).unwrap();
+        assert_eq!(v["parts"]["freeq"], "ab|1024:x");
+        assert_eq!((v["n"].as_i64(), v["parts"]["edges"].as_str()), (Some(3), Some("1")));
+        let own = br#"{"n":3,"parts":{"freeq":"game"}}"#.to_vec();
+        assert_eq!(with_checksum_part(own.clone(), "freeq", "x"), own, "the game's own part stays");
+        assert_eq!(with_checksum_part(b"not json".to_vec(), "freeq", "x"), b"not json".to_vec());
+    }
+
     /// Owner's live test 2026-10-18: a round the games hashed at different sim times was logged "identical".
     #[test]
     fn a_round_hashed_at_different_times_is_logged_as_not_compared_never_identical() {
@@ -1342,8 +1500,9 @@ mod tests {
                 assert_eq!(message_kind_for(r.name), Some(r.kind));
             }
         }
-        // pings, pongs, leaving and being removed are the session layer's own talk: the game never sees them
-        let session_layer = [MessageKind::Ping, MessageKind::Pong, MessageKind::Leave, MessageKind::Kicked];
+        // pings, pongs, leaving, being removed and a repair source's save upload are the session layer's own talk: the game never sees them
+        let session_layer =
+            [MessageKind::Ping, MessageKind::Pong, MessageKind::Leave, MessageKind::Kicked, MessageKind::ResyncUpload];
         for k in MessageKind::FROM_PLAYER {
             assert_eq!(!session_layer.contains(&k), LINE_KINDS.iter().any(|r| r.kind == k && r.from_game), "{k:?}");
         }

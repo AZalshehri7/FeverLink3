@@ -196,6 +196,15 @@ pub enum HostOutput {
         state: ResyncState,
         detail: String,
     },
+    /// The save a repair takes its world from came from a player's game (the host's own world may be partly built,
+    /// `HostSession::repair_source`), complete and matching its SHA-256. The caller writes it to the host's savegame folders as
+    /// `feverlink3-resync-<id>.sav` before it acts on the next output: the round then goes on exactly as if the host's game had
+    /// saved it (`ResyncProgress` Transferring follows; the host's game loads it and every player is sent it).
+    SourceSave {
+        id: i32,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
     /// The round gave up. The session stays paused; resume with `set_speed`.
     ResyncFailed {
         id: i32,
@@ -348,6 +357,10 @@ pub struct HostSession {
     stalls: BTreeMap<u16, Stall>,
     /// Players caught up after a drop whose world has not been compared in a checksum round yet: a difference reloads them at once.
     resume_checks: BTreeSet<u16>,
+    /// Games whose world may be PARTLY built since their last load: the engine threw while it applied an action there
+    /// (`ActionRefusedMessage::partial`). A repair never takes its world from one of them (`repair_source`); a finished round
+    /// clears them (every game loaded one world).
+    partly_built: BTreeSet<u16>,
     dropped: u64,
     out: Vec<HostOutput>,
 }
@@ -446,6 +459,7 @@ impl HostSession {
             pending_paused_checksum: false,
             stalls: BTreeMap::new(),
             resume_checks: BTreeSet::new(),
+            partly_built: BTreeSet::new(),
             dropped: 0,
             out: Vec::new(),
         }
@@ -552,6 +566,11 @@ impl HostSession {
         };
         c.last_heard = now;
         let player = c.player;
+        // the save a repair asked this game for travels at the transport's pace, like the host's own transfer to the players
+        let upload = frame.header.kind == u8::from(MessageKind::ResyncUpload)
+            && player.is_some()
+            && player == self.resync.as_ref().and_then(|r| r.uploading_from());
+        let forgiven = forgiven || upload;
         let cost = (FrameHeader::SIZE + frame.body.len()).try_into().unwrap_or(u32::MAX);
         let over_frames = !forgiven && !c.limiter.allow(now);
         let over_bytes = !forgiven && !c.bytes.allow_cost(now, cost);
@@ -1241,6 +1260,12 @@ impl HostSession {
                 }
             }
 
+            MessageKind::ResyncUpload if from != Self::HOST_ID => {
+                self.on_resync_upload(from, payload);
+                // a save's chunk is not logged or observed further: hundreds of 256 KiB payloads
+                return;
+            }
+
             MessageKind::Leave if from != Self::HOST_ID => {
                 let who = self.name(from);
                 self.log(format!("{who} leaves the session"));
@@ -1681,6 +1706,8 @@ impl HostSession {
         let now = self.now();
         let last_clock = self.clocks.remove(&id);
         self.resume_checks.remove(&id);
+        // a game that returns is reloaded (or caught up and checked): its mark is of the world it left
+        self.partly_built.remove(&id);
         if self.stalls.remove(&id).is_some() {
             self.state.stalled.retain(|&p| p != id);
             self.broadcast_session();

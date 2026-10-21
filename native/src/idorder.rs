@@ -37,6 +37,13 @@ pub const GAP_MS: u64 = 10;
 /// A line never holds more ops than this (a load creates tens of thousands of entities in one burst).
 pub const MAX_OPS_PER_LINE: usize = 4096;
 
+/// Every this many ops an engine keeps a checkpoint `(n, h)` of its stream for the checksum's `freeq` part ([`EngineOrder::check_part`]).
+/// Friend test 2026-10-21: 170-270 ops a second at x4, so a checkpoint every few seconds.
+pub const CHECK_EVERY: u64 = 1024;
+/// The checkpoints an engine keeps (the newest ones): two games read theirs at slightly different moments, so the host
+/// compares the newest one both have.
+pub const CHECKS_KEPT: usize = 3;
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -84,6 +91,11 @@ pub struct EngineOrder {
     started: String,
     ents: u64,
     free: u64,
+    /// The queue's hash when this trace met the engine (the `fifo=` of the first-seen line): equal on two games that loaded the same
+    /// world. `None` before the first-seen line and after a reset (the stream's start is then not one two games share).
+    epoch: Option<u64>,
+    /// The newest checkpoints `(n, h)`, oldest first.
+    checks: Vec<(u64, u64)>,
 }
 
 impl EngineOrder {
@@ -101,11 +113,14 @@ impl EngineOrder {
             started: String::new(),
             ents,
             free,
+            epoch: None,
+            checks: Vec::new(),
         }
     }
 
-    /// The first-seen line: the queue as it stood when this trace met the engine.
-    pub fn first_line(&self, at: &str, queue: &[i32]) -> String {
+    /// The first-seen line: the queue as it stood when this trace met the engine (its hash starts the engine's epoch).
+    pub fn first_line(&mut self, at: &str, queue: &[i32]) -> String {
+        self.epoch = Some(queue_hash(queue));
         format!(
             "idorder e={:x} first seen at={at} ents={} free={} fifo={:016x} head={}",
             self.tag,
@@ -148,6 +163,8 @@ impl EngineOrder {
         } else if shrank {
             // shrank without an AddEntity: the queue was rebuilt (a load), the stream starts over from here
             self.flush(out);
+            self.epoch = None;
+            self.checks.clear();
             self.started = at.clone();
             out.push(format!(
                 "idorder e={:x} reset at={at} free={free_now} (was {}) n={} h={:016x}",
@@ -174,6 +191,12 @@ impl EngineOrder {
     fn push(&mut self, op: Op, out: &mut Vec<String>) {
         self.hash = hash_op(self.hash, op);
         self.ops += 1;
+        if self.ops.is_multiple_of(CHECK_EVERY) {
+            if self.checks.len() >= CHECKS_KEPT {
+                self.checks.remove(0);
+            }
+            self.checks.push((self.ops, self.hash));
+        }
         self.pending.push(op);
         if self.pending.len() >= MAX_OPS_PER_LINE {
             self.flush(out);
@@ -207,6 +230,23 @@ impl EngineOrder {
 }
 
 impl EngineOrder {
+    /// The checksum's `freeq` part: `<epoch>|<n>:<h>|...` (the epoch's low 32 bits as 8 hex digits, then the kept checkpoints
+    /// oldest first), or `None` without an epoch or a checkpoint. Two games in step pass the same `n` with the same `h`; equal `n`
+    /// with another `h` means the free-id queue (or the entities created and removed) differs, before any build uses the ids.
+    pub fn check_part(&self) -> Option<String> {
+        let epoch = self.epoch?;
+        if self.checks.is_empty() {
+            return None;
+        }
+        let checks = self.checks.iter().map(|(n, h)| format!("{n}:{h:016x}"));
+        Some(format!("{:08x}|{}", epoch as u32, checks.collect::<Vec<_>>().join("|")))
+    }
+
+    /// When this engine last did something (ms of the caller's clock).
+    pub fn last_ms(&self) -> u64 {
+        self.last_ms
+    }
+
     /// `<engine>:<n>:<hash>`, this engine's place in its stream for a mark line.
     pub fn place(&self) -> String {
         format!("{:x}:{}:{:016x}", self.tag, self.ops, self.hash)
@@ -378,7 +418,7 @@ mod tests {
 
     #[test]
     fn the_first_seen_line_names_the_queue() {
-        let e = EngineOrder::new(0x4da740, 3, 50);
+        let mut e = EngineOrder::new(0x4da740, 3, 50);
         let l = e.first_line("00:00:01.000", &[3, 4, 1942]);
         assert_eq!(
             l,
@@ -387,5 +427,42 @@ mod tests {
                 queue_hash(&[3, 4, 1942])
             )
         );
+    }
+
+    #[test]
+    fn checkpoints_name_the_epoch_and_the_stream_and_a_reset_ends_them() {
+        let run = |freed: [i32; 2]| {
+            let mut q = Fifo(Default::default(), 0);
+            let mut e = EngineOrder::new(1, 0, 0);
+            let mut out = Vec::new();
+            e.first_line("t", &[]);
+            assert_eq!(e.check_part(), None, "no checkpoint yet");
+            add(&mut e, &mut q, 0, &mut out);
+            q.0.extend(freed);
+            while e.ops < CHECK_EVERY * (CHECKS_KEPT as u64 + 1) {
+                add(&mut e, &mut q, 0, &mut out);
+            }
+            e
+        };
+        let a = run([5, 6]);
+        let part = a.check_part().unwrap();
+        let fields: Vec<&str> = part.split('|').collect();
+        assert_eq!(fields[0], format!("{:08x}", queue_hash(&[]) as u32));
+        assert_eq!(fields.len(), 1 + CHECKS_KEPT, "only the newest checkpoints: {part}");
+        assert!(
+            fields[1].starts_with(&format!("{}:", CHECK_EVERY * 2))
+                && fields[3].starts_with(&format!("{}:", CHECK_EVERY * 4))
+        );
+        assert_eq!(part, run([5, 6]).check_part().unwrap(), "the same stream, the same part");
+        assert_ne!(part, run([6, 5]).check_part().unwrap(), "another free order, another part");
+        let mut e = a;
+        let mut out = Vec::new();
+        e.enter(1, || "u".to_string(), 0, |_| unreachable!(), &mut out);
+        e.alloc(9, 0, 0, &mut out);
+        e.enter(2, || "v".to_string(), 0, |_| unreachable!(), &mut out);
+        assert!(e.free == 0 && e.check_part().is_some(), "no reset: the queue did not shrink");
+        e.expected_free = 5;
+        e.enter(3, || "w".to_string(), 1, |_| unreachable!(), &mut out);
+        assert_eq!(e.check_part(), None, "after a reset the stream is not one two games share");
     }
 }

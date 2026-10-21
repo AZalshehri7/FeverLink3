@@ -253,6 +253,9 @@ impl Runtime {
     /// The write allocates with the game's `operator new`: this guards its decision and its report itself and must not be called
     /// inside `log::guarded`.
     pub fn on_convert(&self, out: usize, caller: Option<usize>) {
+        if !self.patch.enabled() {
+            return; // the hook is there for the native inject's identity alone (`inject_on_convert`)
+        }
         crate::log::calls_engine("native patch: convert (operator new)");
         let job = crate::log::guarded("native patch: convert", || {
             let now = self.now_ms();

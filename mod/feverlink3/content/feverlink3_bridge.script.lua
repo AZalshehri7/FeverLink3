@@ -1720,6 +1720,14 @@ function X.sendHeldOrder(kind, payload, key)
 	return ok
 end
 
+-- The end of the mod's own send of an order's command (`send_done {key=n}` for an inject_next, `{held=h}` for a complete_next), written
+-- whether the send returned or threw. The module takes the order only for the command of that send (the one carrying the conversion the
+-- send made: positive identity, owner decision B 2026-10-21) and refuses an order still unused at this line, so it never waits on to
+-- take a later command.
+function X.sendDone(open, key)
+	if open then return X.sendHeldOrder("send_done", open, key) end
+end
+
 -- The inject order: the shipped text goes to native_inject_<n>.txt (closed before the order is written), then `inject_next {key=n}`, then the caller
 -- sends the replay's command at once (nothing in between). The module answers `injected` / `inject_refused` in native_events.log.
 -- `held`: this game's own held command of the same build (the originator, deferred completion): it takes this command's result, or fails
@@ -2035,10 +2043,24 @@ local function simWrapCommands()
 	end
 end
 
--- the mod's own sends of the simulation half: never through the wrapper above
-local function simSendCommand(fn, a)
+-- D (owner, 2026-10-21), one rule for every path where the engine applies a command the mod sent: the command is made first (a factory
+-- error is a clean refusal, nothing reached the engine), then handed over; `mark.applying` is true from the hand-over until the send
+-- returns. An exception then is NOT "nothing applied": the apply is not transactional (friend test pre7: stop 0:22 threw
+-- IsValidTransition mid-apply and left a half-built edge), so the caller says the world may be PARTLY built and asks for the repair
+-- (X.partlyBuilt), which never takes its world from such a game. Paths: the stamp apply (simSendCommand) and the pause apply from the
+-- interface (guiApplyNow). `cb` is passed only when there is one (the simulation state refuses callbacks).
+function X.handOver(send, cmd, cb, mark)
+	if mark then mark.applying = true end
+	if cb ~= nil then send(cmd, cb) else send(cmd) end
+	if mark then mark.applying = false end
+end
+
+-- the mod's own sends of the simulation half: never through the wrapper above. The simulation state applies the command inside
+-- sendCommand, so `mark` (X.handOver) says whether an exception came while the engine had it (simApplyAction)
+local function simSendCommand(fn, a, mark)
 	local factory = (fn == "makeWorldBuildProposalCmd" and SIMO.factory) or api.cmd[fn]
-	return (SIMO.send or api.cmd.sendCommand)(factory(unpack(a, 1, a.n)))
+	local cmd = factory(unpack(a, 1, a.n))
+	X.handOver(SIMO.send or api.cmd.sendCommand, cmd, nil, mark)
 end
 
 local function simApplyAction(st, it, now)
@@ -2128,6 +2150,7 @@ local function simApplyAction(st, it, now)
 	-- lists, the binders that key what the build creates). The interface half releases the held command when it sees the
 	-- "#release" result below, after this snapshot (so the new entities are not in it).
 	local held = it.heldId ~= nil and it.from == C.PLAYER_ID
+	local sending = {}   -- simSendCommand: applying = the engine threw (if it threw) while it applied the command
 	-- build.result: the account and the world's entity lists before this build is sent (completed at the next step)
 	X.buildResultBegin(st, it, ctx, now, { verdict = "sent", held = held })
 	local ok, e = true, nil
@@ -2165,9 +2188,13 @@ local function simApplyAction(st, it, now)
 					logSim("action " .. it.key .. ": " .. refuse .. ": the module is told to refuse this game's own replay (a forced refusal: nothing is applied here)")
 				end
 				local tm = isBuild and X.timingText(it, now) or nil
+				local open = nil   -- the order of this send, closed by send_done once the send returned or threw (X.sendDone)
 				if a.inject then
 					local okO, errO, nO = sendInjectOrder(a.inject, it.key, it.deferId, tm, refuse)
-					if okO and nO then injects[#injects + 1] = nO end
+					if okO and nO then
+						injects[#injects + 1] = nO
+						open = { key = nO }
+					end
 					-- no order, no command: the placeholder alone is this game's guess of the build, never the build (the pcall below refuses it)
 					if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
 				elseif it.deferId then
@@ -2175,15 +2202,18 @@ local function simApplyAction(st, it, now)
 					-- a refused injection never gets here any more, it refuses the build): this replay's command is still this game's stamp apply
 					-- of the build, so the held command takes its result (run rt1 C12: without this the bulldozer stayed busy until the 30 s age limit)
 					logSim("action " .. it.key .. ": held " .. tostring(it.deferId) .. " is deferred and this replay is not injected: it completes with this replay's result")
-					X.sendHeldOrder("complete_next", { held = it.deferId, tm = tm }, it.key)
+					if X.sendHeldOrder("complete_next", { held = it.deferId, tm = tm }, it.key) then open = { held = it.deferId } end
 				elseif isBuild then
 					-- no order: the record's rebuild is applied by the engine without the module's help; the line ends at the send
 					traceSim("build.timing", string.format("timing %s rebuild=- how=record (no order) apply=%.0f accepted=? total_ms=? late_steps=%s", tm, X.wallNow(), tostring((now - it.at) / STEP)))
 				end
 				-- a build whose order carries refund entries: the account before, measured again at the next step (X.simRefundMoney)
 				local refundN = a.inject and type(a.inject.refund) == "table" and #a.inject.refund or 0
-				local money0 = refundN > 0 and X.refundMoney(ctx) or nil
-				simSendCommand(it.body.fn, a)
+				local okM, money0 = pcall(function() return refundN > 0 and X.refundMoney(ctx) or nil end)
+				local okS, errS = true, nil
+				if okM then okS, errS = pcall(simSendCommand, it.body.fn, a, sending) else okS, errS = false, money0 end
+				X.sendDone(open, it.key)
+				if not okS then error(errS, 0) end
 				if refundN > 0 then X.watchRefund(st, it.key, refundN, money0, ctx, now) end
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -2194,10 +2224,17 @@ local function simApplyAction(st, it, now)
 			-- no stamp apply on this game: the deferred held command fails now (tool callback fired), it does not wait for the age limit
 			X.sendHeldOrder("fail", { id = it.deferId }, it.key)
 		end
+		-- D (owner, 2026-10-21): an exception while the engine applied the command is not "nothing applied": the apply is not
+		-- transactional (friend test pre7: stop 0:22 threw IsValidTransition mid-apply, left a half-built edge, and the game crashed a
+		-- second later). Said as such, to the player too, and the repair is asked for at once (collectFromSim), not left to the checksums.
+		local partial = sending.applying == true
+		if partial then
+			logSim("action " .. it.key .. ": the engine threw DURING its apply (" .. tostring(e) .. "): this game's world may be PARTLY built; the repair is asked for now")
+		end
 		logSim("action " .. it.key .. " refused by the engine: " .. tostring(e))
-		traceSim("build.error", string.format("%s type=%s value=%s", it.key, type(e), tostring(e)))
+		traceSim("build.error", string.format("%s type=%s value=%s during_apply=%s", it.key, type(e), tostring(e), tostring(partial)))
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e), class = X.refusalClass(e, "engine"),
-			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
+			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil, partial = partial or nil }
 		X.buildResultSet(st, it.key, now, { verdict = "refused", class = X.refusalClass(e, "engine"), detail = tostring(e) })
 		return
 	end
@@ -3644,6 +3681,7 @@ local function guiApplyNow(it, now)
 	end
 	-- the engine's factory may reject what was rebuilt: that refuses the action, like any other refusal
 	local okS, errS
+	local sending = {}   -- X.handOver: applying = the engine threw (if it threw) after it had the command
 	-- from here the engine has the command: its own answer (finish) reaches the callback, even after the session ended (X.sessionOff)
 	X.engineHas = X.engineHas or {}
 	X.engineHas[it.key] = true
@@ -3663,23 +3701,39 @@ local function guiApplyNow(it, now)
 			-- build is the originator's exact copy (inject) where the decode chose it, and this game's deferred held command takes its
 			-- result. (The pause path used to send the record's donor command alone: another build than on a running game.)
 			if a.patch then X.sendPatchOrder(a.patch, it.key) end
+			local open = nil   -- the order of this send, closed by send_done once the send returned or threw (X.sendDone)
 			if a.inject then
 				local okO, errO, nO = X.sendInjectOrder(a.inject, it.key, it.deferId, isBuild and X.timingText(it, now) or nil, nil)
-				if okO and nO then injects[#injects + 1] = nO end
+				if okO and nO then
+					injects[#injects + 1] = nO
+					open = { key = nO }
+				end
 				if not okO then error("inject_refused: the inject order could not be written (" .. tostring(errO) .. "); nothing is applied here", 0) end
 			elseif it.deferId then
-				X.sendHeldOrder("complete_next", { held = it.deferId }, it.key)
+				if X.sendHeldOrder("complete_next", { held = it.deferId }, it.key) then open = { held = it.deferId } end
 			end
-			O.sendCommand((O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n)), cb)
+			local okS2, errS2 = pcall(function()
+				local cmd = (O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n))
+				X.handOver(O.sendCommand, cmd, cb, sending)
+			end)
+			X.sendDone(open, it.key)
+			if not okS2 then error(errS2, 0) end
 		end, finish)
 	end
 	if not okS then
 		X.engineHas[it.key] = nil
+		-- the same rule as at a stamp apply (X.handOver): thrown after the engine had the command, the world may be partly built
+		local partial = sending.applying == true
 		if isBuildAction then bres({ verdict = "refused", class = X.refusalClass(errS, "engine"), detail = tostring(errS), b0 = bresB0 }) end
+		traceGui("build.error", string.format("%s type=%s value=%s during_apply=%s path=pause", it.key, type(errS), tostring(errS), tostring(partial)))
 		logGui("action " .. it.key .. " refused by the engine: " .. tostring(errS))
 		-- refused at its (pause) stamp from this world: this game's verdict, no resync of its own (X.refusalClass)
-		X.sendVerdict(verdict, false, tostring(errS), X.refusalClass(errS, "engine"))
-		if it.body.fn == "makeWorldBuildProposalCmd" then pcall(X.tellRefused, verdict, tostring(errS)) end
+		X.sendVerdict(verdict, false, tostring(errS), X.refusalClass(errS, "engine"), partial)
+		if partial then
+			X.partlyBuilt(it.key, errS, "applied during the pause")
+		elseif it.body.fn == "makeWorldBuildProposalCmd" then
+			pcall(X.tellRefused, verdict, tostring(errS))
+		end
 		-- no apply on this game: the deferred held command fails now (tool callback fired)
 		if it.deferId then X.sendHeldOrder("fail", { id = it.deferId }, it.key) end
 		deliverResult(it.key, nil, false, {})
@@ -4445,7 +4499,7 @@ do -- section: strict mode: the native link and the verdict (not indented, see S
 NAT_PING = 2.0      -- longest pause between lines written to the control file while holding
 NAT_CAP_TTL = 2.0   -- a capture without its `held` is dropped after this many seconds
 local NAT_CAP_MAX = 6     -- captures kept
-NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture before it is released
+NAT_GRACE = 0.4     -- a `held` waits this long (and 3 frames) for its capture; then decided without one (refused: X.natUncaptured)
 NAT_PREVIEW_TTL = 30.0 -- the latest preview of a tool counts for a `held` this long after it was made
 NAT_CONFIRM = 3.0   -- hold_on must be answered by `holding on` within this
 NAT_ALIVE = 6.0     -- a pong this recent proves the module reads the control file
@@ -4565,6 +4619,12 @@ function natStop(why)
 				natSay("held " .. h.id .. " (" .. h.key .. ") goes back to the engine before its stamp (" .. tostring(why) .. ")")
 			end
 		end
+		-- a command still waiting for its verdict has no record: `hold_off` would give it back to run on this game alone, so it is
+		-- refused first (X.natUncaptured; the module takes the `fail` before the `hold_off`)
+		for _, h in ipairs(N.parked) do
+			pcall(X.natUncaptured, h, "strict mode went off (" .. tostring(why) .. ") before its verdict")
+		end
+		N.parked = {}
 		pcall(natSend, "hold_off", {})
 		natTrigger()
 		natSay("mode off (" .. tostring(why) .. "), hold_off written")
@@ -4890,12 +4950,14 @@ local function natDecideUnsafe(h, cap)
 		local refusedWhy = X.natTextRefused(h)
 		if refusedWhy then return X.natFailUnshipped(h, refusedWhy) end
 	end
-	-- `release`: only where no check failed (no capture of a tool build; a record read after the build): the simulation half's capture
-	-- ships the build and checks it. `refuse`: a check of this build failed here; it is never given back (X.natRefuseHeld, fail closed).
-	-- made during a pause: not released at the click but at its place in the host's pause order (X.slotHold)
+	-- `release`: a held command with no record of its own before the engine applies it. Made during a pause: released at its place in
+	-- the host's pause order, where every game stands (X.slotHold). Otherwise REFUSED (X.natUncaptured): released at the click it ran
+	-- on this game alone, ~16 steps before the record the simulation half captured from it reached the others (friend test pre7
+	-- 2026-10-21: 4 of 8 free-id forks began with "no capture of a tool build; release written"). `refuse`: a check of this build failed
+	-- here; it is never given back (X.natRefuseHeld, fail closed).
 	local function release(why)
 		if X.slotWanted() then return X.slotHold(h, why) end
-		natUnaccounted(h, why)
+		X.natUncaptured(h, why)
 	end
 	local function refuse(why, words) X.natRefuseHeld(h, why, words) end
 	-- A command whose tool gave no preview is recorded from its own proposal: the native module gives every held build command to this
@@ -4944,10 +5006,11 @@ local function natDecideUnsafe(h, cap)
 	end
 	if not cap.body then
 		if tostring(cap.why):find("has no model", 1, true) then
-			-- an edge object (a stop) gets its model and parameters only when the build runs: the record is read AFTER the build (the
-			-- simulation half's deferred read, SIM.deferredBuild) and shipped then; nothing to cancel
-			if natInput(h) then pcall(toSim, "heldinput", { text = h.inputText }) end
-			return release("the capture of " .. tostring(cap.tool) .. " waits for the build (" .. tostring(cap.why) .. "): the record is read after it ran and shipped then")
+			-- an edge object (a stop) gets its model and parameters only when the build runs, and completing it from the held command's
+			-- text failed above: no record before the build, so the same rule as no capture (refused; in a pause: its place in the pause
+			-- order, the record read after the build by the simulation half, SIM.deferredBuild)
+			if X.slotWanted() and natInput(h) then pcall(toSim, "heldinput", { text = h.inputText }) end
+			return release("the capture of " .. tostring(cap.tool) .. " has no record before the build (" .. tostring(cap.why) .. ")")
 		end
 		-- A capture that failed is a failed check: released, the build went into this world at the click and was shipped (if at all) by
 		-- the simulation half's own capture, applied on the other games at another step (fail open). Refused on every module now: the
@@ -5218,7 +5281,7 @@ end
 -- any game: `fail` fires the tool's callback with a failed result (the tool is free; the module that can defer has it), an older module
 -- gets a cancel (its callback fired only where the module can), and the player is told in the game's chat. No game has the build, so
 -- no repair is needed. One rule for every tool and every check (natDecideUnsafe's refuse, natDecide's fault handler). Returns what was done.
-function X.natRefuseHeld(h, why, words)
+function X.natRefuseHeld(h, why, words, chatKey)
 	local N = G.nat
 	local id = h.id
 	h.refused = true
@@ -5234,9 +5297,21 @@ function X.natRefuseHeld(h, why, words)
 		how = "no native link"
 	end
 	natSay("held " .. tostring(id) .. " (site " .. natSite(h) .. ") REFUSED: " .. tostring(why) .. "; NOT released, nothing is shipped or applied on any game; " .. how)
-	pcall(vetoChat, "refused:" .. tostring(id) .. ":" .. tostring(C.clock()), tostring(C.PLAYER_NAME) .. "'s build was cancelled: " .. tostring(words or "it failed a check")
+	-- `chatKey`: one chat line per key and session (vetoChat), for a refusal that can repeat with every click
+	pcall(vetoChat, chatKey or ("refused:" .. tostring(id) .. ":" .. tostring(C.clock())), tostring(C.PLAYER_NAME) .. "'s build was cancelled: " .. tostring(words or "it failed a check")
 		.. ". Nothing was built on any game.")
 	return how
+end
+
+-- THE rule for a held command with no record of its own before the engine applies it (no capture of its tool, none from its own
+-- proposal, a stop whose model the record cannot get before the build, more than one command held at once): it is refused like a
+-- failed check (X.natRefuseHeld: failed, its tool callback fired as "not applied", nothing applied or shipped on any game), never
+-- released. Released at the click (until 2026-10-21), the engine applied it on this game at once and the simulation half's capture
+-- shipped it stamped ~16 steps later, so the other games applied it at another step or not at all: friend test pre7, 4 of 8 free-id
+-- forks (3 of them the first held build after a resync load). The one exception is a pause (X.slotHold: released where every game stands).
+function X.natUncaptured(h, why)
+	return X.natRefuseHeld(h, "no record before the engine applies it (" .. tostring(why) .. "), so it cannot be carried to the other games at its stamp",
+		"it could not be carried to the other players (try it again; FeverLink3 could not record this build)", "uncaptured")
 end
 
 -- A fault AFTER the action was shipped (natDecideUnsafe, h.ship): the other games apply the build at the stamp, so this game must not
@@ -5484,11 +5559,11 @@ local function natPair()
 	-- command had been given back). What is known while the command is held is the tool's latest PREVIEW (builder.proposalCreate):
 	-- the tool is blocked waiting for its command, so no newer preview can come, and the last one is the proposal that was clicked.
 	-- Two or more commands held at once cannot be told apart by one preview (a real tool is blocked after its click, so this
-	-- does not happen): give them all back rather than ship the wrong record for one of them.
+	-- does not happen): refuse them all (no record: X.natUncaptured) rather than ship the wrong record for one of them.
 	if #N.parked > 1 and not N.caps[1] then
 		N.preview = nil
 		while N.parked[1] do
-			natSay("held " .. N.parked[1].id .. ": more than one command held at once; released (the build goes through the old way)")
+			natSay("held " .. N.parked[1].id .. ": more than one command held at once; no record can be told apart for it")
 			natDecide(table.remove(N.parked, 1), nil)
 		end
 		return
@@ -5528,8 +5603,10 @@ local function natOnHeld(N, p)
 	if not id then return end
 	local h = { id = id, site = tonumber(p.site), t = C.clock(), frame = G.frames, done = p.done == true, ctx = type(p.ctx) == "table" and p.ctx or nil, gClick = engine.gameTime(), wSeen = X.wallNow() }
 	if not N.holdSent then
-		-- strict mode is being switched off: the module has not caught up; give the command back
-		natSay("held " .. id .. " while strict mode is off; release written")
+		-- strict mode is being switched off: the module has not caught up. Outside a session the command goes back to the engine; in a
+		-- session it has no record, so it is refused like every held command without one (X.natUncaptured)
+		if natSessionOn() then return X.natUncaptured(h, "held while strict mode is off") end
+		natSay("held " .. id .. " while strict mode is off and no session runs; release written")
 		natOrder("release", id)
 		return
 	end
@@ -5638,12 +5715,26 @@ end
 
 -- ---- action verdicts (docs/PROTOCOL.md "Action verdicts"): this game's verdict of every build at its stamp, for the host
 
-function X.sendVerdict(r, applied, detail, class)
+-- `partial`: the engine threw after it had the command (X.handOver): this game's world may be partly built; the host never repairs
+-- the others from it (ActionRefusedMessage.partial)
+function X.sendVerdict(r, applied, detail, class, partial)
 	if r.from == nil or r.seq == nil then return end
-	local p = { seq = r.seq, from = r.from, detail = applied and "" or tostring(detail or ""):sub(1, 300), class = (not applied) and class or nil }
+	local p = { seq = r.seq, from = r.from, detail = applied and "" or tostring(detail or ""):sub(1, 300), class = (not applied) and class or nil,
+		partial = (not applied and partial) and true or nil }
 	send(applied and "action_applied" or "action_refused", p)
 	traceGui("build.verdict", string.format("%s %s%s", tostring(r.of or r.key), applied and "applied" or "refused",
 		applied and "" or (" class=" .. tostring(class) .. ": " .. p.detail)))
+end
+
+-- D: the engine threw while it applied action `key` here (X.handOver): said in the log and to the player, and the repair is asked for
+-- at once (replay_failed), not left to the checksums. The verdict sent before it carries `partial`, so the host takes the repaired
+-- world from a game where the action did not fail half-way (the host's own world included: HostSession::repair_source).
+function X.partlyBuilt(key, err, where)
+	logGui("action " .. tostring(key) .. " (" .. tostring(where) .. "): the engine threw DURING its apply: this game's world may be PARTLY built; asking the host for a repair now")
+	send("replay_failed", { detail = "action " .. tostring(key) .. ": the engine threw during its apply, the world may be partly built here: " .. tostring(err):sub(1, 140) })
+	if X.noticeLocal then
+		pcall(X.noticeLocal, "Action " .. tostring(key) .. " failed half-way on this game (engine error): the world is being repaired from a game where it did not fail")
+	end
 end
 
 -- The originator's player is told why their build was not applied (in this game's chat only: nothing of it changed any world).
@@ -6030,7 +6121,7 @@ function natTick()
 			if N.rearms > 0 and now - N.activeSince > 60 then N.rearms = 0 end
 		end
 	end
-	-- a `held` whose capture did not come: released after the grace; an order whose Add did not come: another trigger
+	-- a `held` whose capture did not come: decided after the grace without one (no record: refused); an order whose Add did not come: another trigger
 	while N.parked[1] and now - N.parked[1].t >= NAT_GRACE and G.frames - N.parked[1].frame >= 3 do
 		N.owed[#N.owed + 1] = now
 		natDecide(table.remove(N.parked, 1), nil)
@@ -6634,8 +6725,11 @@ function collectFromSim(state)
 			if G.nat then pcall(natHeldRefused, { key = r.key }) end
 			-- Refused at its stamp from this game's own world: this game's verdict, no resync of its own. Identical worlds refuse alike;
 			-- the host compares every game's verdict and repairs only when they differ (X.refusalClass, lab run 2026-10-18).
-			X.sendVerdict(r, false, r.detail, r.class)
-			if r.build then
+			X.sendVerdict(r, false, r.detail, r.class, r.partial)
+			if r.partial then
+				-- the engine threw while it applied the command (simApplyAction, D): the world may be partly built, so the repair now
+				X.partlyBuilt(r.key, r.detail, "at its stamp")
+			elseif r.build then
 				logGui("action " .. tostring(r.key) .. " refused at its stamp (" .. tostring(r.class) .. "): nothing of it is applied here; the worlds may well be equal (the host compares the games' verdicts)")
 				pcall(X.tellRefused, r, r.detail)
 			end
@@ -6890,6 +6984,7 @@ end
 --   6. remembers where the link stands (G.linkFloor), so a next session in this Lua state never dispatches a line of this one.
 function X.sessionOff(why, state)
 	if X.readyHold then pcall(X.readyStart, "the session ended: " .. tostring(why)) end
+	pcall(X.terrainRestore)
 	if not G.started then return end
 	G.started = false
 	local s = G.session
@@ -7213,11 +7308,47 @@ end
 -- what it sees and what it would capture, so that the first game run shows the real shapes (finding from MPFever (MIT):
 -- these events reach guiHandleEvent). Nothing is replicated from them except in strict mode (natCapture).
 local seenOtherEvents, seenOtherN = {}, 0
+
+-- Terrain edits are refused during a session until terrain is replicated (owner decision 2026-10-21, option A3). A terrain edit's
+-- cells cannot be read from a script and the native module does not copy them, so the edit ran on its maker's game alone: friend test
+-- pre7, 2 of 8 free-id forks began with the friend's terrain edits ("a native build ... is not replicated: a terrain edit"), which
+-- freed and re-created original-world entities on his game only. The terrain tools' commands cannot be held and cancelled like the
+-- other tools' (their call site is not on the hold list; MPFever (MIT) left it out because holding its edit crashed the tool), so the
+-- tools are switched off where the player picks them: every GUI component of the terrain menu (`landscaping_terrain`, seen in the logs as
+-- menu.construction.landscaping.landscaping_terrain.::/gui/construction/tools/terrain_*_tool.res) is disabled as soon as an event names
+-- it, and enabled again at the end of the session. Official API: api.gui.byId.setEnabled(idOrTag, enabled, idOnly?), "nil sets to
+-- enabled and removes the rule" (tf3-docs reference/api/api/gui.html, Gui.ById; the base game's mission_sim.script.tl uses it the same
+-- way). Nothing changes outside a session (guiHandleEvent returns before this when no session runs). The player is told once.
+function X.terrainGate(id)
+	if type(id) ~= "string" or not id:find("landscaping_terrain", 1, true) then return end
+	G.terrainOff = G.terrainOff or {}
+	if G.terrainOff[id] then return end
+	api.gui.byId.setEnabled(id, false, true)
+	G.terrainOff[id] = true
+	logGui("terrain tools: " .. id .. " switched off for this session (terrain edits are not copied to the other games yet)")
+	if not G.terrainTold then
+		G.terrainTold = true
+		X.noticeLocal("Terrain tools are switched off during a FeverLink3 session: terrain edits cannot be carried to the other players yet.")
+	end
+end
+
+-- The end of a session: every terrain tool switched off by X.terrainGate is enabled again (the rule removed).
+function X.terrainRestore()
+	local n = 0
+	for id in pairs(G.terrainOff or {}) do
+		local ok, err = pcall(api.gui.byId.setEnabled, id, nil, true)
+		if ok then n = n + 1 else logGui("terrain tools: " .. id .. " could not be switched on again: " .. tostring(err)) end
+	end
+	if n > 0 then logGui("terrain tools: " .. n .. " switched on again (the session ended)") end
+	G.terrainOff, G.terrainTold = nil, nil
+end
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the `builder.*` event names are the tools' own; the docs
 -- list no GUI event names.
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	if not C.ACTIVE or type(name) ~= "string" then return end
 	if not name:find("^builder%.") then
+		local okT, errT = pcall(X.terrainGate, id)
+		if not okT then logGui("terrain tools: switching off failed: " .. tostring(errT)) end
 		-- A tool whose events are not "builder.*" is invisible to everything below. Each such event that smells of a tool is named once
 		-- (real session 2026-10-13: the lane / crosswalk tool produced no event at all that any log shows).
 		local key = tostring(id) .. "/" .. name

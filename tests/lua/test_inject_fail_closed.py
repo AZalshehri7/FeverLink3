@@ -517,25 +517,6 @@ class InjectFailClosedTest(InjectTest):
 
         self.cases([("on every game: refused alike, no resync", {}, on_every_game), ("on one game: a resync", {}, on_one_game)])
 
-    def test_a_released_build_whose_self_check_fails_is_not_shipped_and_its_originator_asks_for_the_repair(self):
-        """A held command with no tool capture is released (no check could be made before the engine applied it); the simulation half's
-        self-check of its record fails. The build is in the originator's world and cannot be taken back, but its record is not shipped
-        (every other game would refuse it the same way): the originator asks for the repair at once and the player is told."""
-        self.start()
-        self.strict_on(self.A, self.B)
-        self.texts(road_text_naming(UNBUILDABLE_NODE, (100.0, 0.0, 0.0)), road_text())
-        self.B.tool(self.road(300, 0, 400, 0), event=False, make="NATIVE_ROAD")   # no preview: released, the old path
-        self.tick(30)
-        log = self.B.log()
-        self.assertIn("no capture of a tool build; release written", log)
-        self.assertIn("native build self-check FAILED: inject_refused", log)
-        self.assertIn("its record is NOT shipped", log)
-        self.assertEqual(self.B.action_records(), [], "the record that no game can rebuild is not shipped")
-        self.assertEqual(self.A.builds_applied(), 0)
-        self.assertEqual(len(self.replay_failed_by(1)), 1, self.relay.replay_failed)
-        self.assertIn("applied on its originator only", self.replay_failed_by(1)[0])
-        self.assertTrue(any("could not be sent to the other games" in c[1] for c in self.relay.chats), self.relay.chats)
-
     def test_two_players_builds_stamped_in_the_same_step_each_take_their_own_order_and_result(self):
         """Open bug 7: two builds due in one step write two orders on every game. Each command takes its own order (by its place), the
         originator's held command takes the result of its own build's apply (not the other player's), and both tools are free. Also with

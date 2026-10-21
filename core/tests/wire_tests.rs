@@ -23,8 +23,8 @@ fn every_kind_number_maps_back_to_itself_and_nothing_else_does() {
     let known: Vec<u8> = (0..=255u8).filter(|&v| MessageKind::from_u8(v).is_some()).collect();
     assert_eq!(
         vec![
-            1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38, 50, 51,
-            52, 53
+            1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 50,
+            51, 52, 53
         ],
         known
     );
@@ -39,7 +39,7 @@ fn a_player_may_pong_and_leave_but_not_ping_or_kick() {
     assert!(MessageKind::Leave.allowed_from_player());
     assert!(!MessageKind::Ping.allowed_from_player());
     assert!(!MessageKind::Kicked.allowed_from_player());
-    assert_eq!(13, MessageKind::FROM_PLAYER.len());
+    assert_eq!(14, MessageKind::FROM_PLAYER.len());
     assert!(MessageKind::FROM_PLAYER.iter().all(|k| !k.is_unsealed()));
     assert!(!MessageKind::Ping.is_unsealed() && !MessageKind::Kicked.is_unsealed(), "both are sealed");
 }

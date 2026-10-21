@@ -149,6 +149,7 @@ impl Harness {
                 | HostOutput::PlayerLeft(_)
                 | HostOutput::ResyncRequested { .. }
                 | HostOutput::ResyncProgress { .. }
+                | HostOutput::SourceSave { .. }
                 | HostOutput::ResyncFailed { .. } => {}
             }
         }
@@ -899,6 +900,34 @@ fn a_part_a_game_reports_not_ready_is_not_compared_and_a_missing_part_still_diff
     // world has): only a part the game itself names not ready is unknown
     assert_eq!(vec!["b", "towns:7"], o.differing_parts().collect::<Vec<_>>());
     assert_eq!("companies on 1", o.describe_not_ready());
+}
+
+#[test]
+fn the_free_id_part_is_compared_at_the_newest_checkpoint_both_games_passed_and_never_without_one() {
+    let differs = |a: Option<&str>, b: Option<&str>| {
+        let rep = |v: Option<&str>| {
+            let mut p = parts(&[("a", "1")]);
+            if let Some(v) = v {
+                p.insert(FREEQ_PART.to_owned(), v.to_owned());
+            }
+            ChecksumReportMessage::new(1, 5, p)
+        };
+        let reports: BTreeMap<u16, ChecksumReportMessage> = [(0, rep(a)), (1, rep(b))].into_iter().collect();
+        let o = ChecksumRounds::compare(1, &reports);
+        assert!(o.comparable());
+        let forked = o.differing_parts().any(|p| p == FREEQ_PART);
+        forked
+    };
+    // the guest read its part one checkpoint later: compared at 2048, where both agree
+    assert!(!differs(Some("ab|1024:x|2048:y"), Some("ab|2048:y|3072:z")));
+    // the same checkpoint with another hash: the queues forked
+    assert!(differs(Some("ab|1024:x|2048:y"), Some("ab|2048:q|3072:z")));
+    assert!(differs(Some("ab|1024:x|2048:y"), Some("ab|1024:x|2048:q")), "the newest common one decides");
+    // unknown, never a difference: no common checkpoint, another loaded world, an older game without the part, a value that does not read
+    assert!(!differs(Some("ab|1024:x"), Some("ab|4096:q")));
+    assert!(!differs(Some("ab|1024:x"), Some("cd|1024:q")));
+    assert!(!differs(Some("ab|1024:x"), None));
+    assert!(!differs(Some("ab|1024:x"), Some("ab|n:q")));
 }
 
 #[test]
