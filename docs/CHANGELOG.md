@@ -6,6 +6,12 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.1 (2026-10-22)
+
+### Fixed
+- The automatic update check could make the game show 'Internal error' at start (it started a helper program that held a game file open); downloads now run inside the game, a while after it has started. 0.2.0 was withdrawn.
+- Report a problem opens the report's folder and the issue page through Windows' shell instead of starting Explorer from the game.
+
 ## 0.2.0 (2026-10-22: first public beta)
 
 Fixes from two internet tests with a friend (2026-10-20 and 2026-10-21), a new in-game interface, a way to report a problem, and a faster start of a session. The interface, the faster start and Report a problem were played over Steam with a friend on 2026-10-21; the fixes from that evening (listed last under Fixed) are tested in the automatic tests and in two game windows on one PC.

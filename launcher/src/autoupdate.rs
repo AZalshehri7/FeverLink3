@@ -6,7 +6,8 @@
 //! 1. **At every game start, in `DllMain`** (native `lib.rs`, before the game has run any of its own code, so before
 //!    it reads a mod): [`at_start`] finishes or undoes what an earlier run left in `<game>\feverlink3_update\`. File
 //!    renames only: no network, no waiting.
-//! 2. **Once per start, on a thread of its own** ([`start`]): unless the player turned it off, the module asks GitHub
+//! 2. **Once per start, on a thread of its own** ([`start`]), not before [`FIRST_CHECK_AFTER`] in the game: unless the
+//!    player turned it off, the module asks GitHub
 //!    for the newest full release. If it is newer, it is downloaded, checked ([`stage_update`], the trust model below)
 //!    and staged in `<game>\feverlink3_update\<version>\`. Never while a session runs: the thread waits until the
 //!    player is out of the session before it downloads or touches a file.
@@ -40,7 +41,8 @@
 //! - it comes from [`API_LATEST`] (the repository's newest full release: GitHub never lists a draft or a pre-release
 //!   there, and [`update::check_update`] refuses both again), and every file from
 //!   `https://github.com/AZalshehri7/FeverLink3/releases/download/<that tag>/`; HTTPS only, also for redirects, with
-//!   the certificate checked (Windows' own `curl.exe`, as the developer program's `update` command);
+//!   the certificate checked, GitHub's hosts only (WinHTTP inside the process, [`crate::https`]; never a helper
+//!   program, see [`FIRST_CHECK_AFTER`]);
 //! - the version is strictly newer than the running one and is the manifest's version;
 //! - the zip's SHA-256 equals the manifest's `zip_sha256` AND the published `.sha256` file;
 //! - every extracted file has the size and SHA-256 the manifest gives;
@@ -52,7 +54,6 @@
 //! key is listed in [`update::TRUSTED_KEYS`], [`update::accept_manifest`] requires a good signature again.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -97,6 +98,13 @@ pub const SETTINGS_FILE: &str = "settings.txt";
 
 /// How many starts a new version has to stay up for [`HEALTHY_AFTER`] before it is rolled back.
 pub const START_ATTEMPTS: u32 = 2;
+
+/// The first update check waits this long after the module loaded, so the game has finished starting (its shader
+/// cache, its first files) before anything of the update runs. Real game 2026-10-22, 0.2.0: the check began at once
+/// and started `curl.exe`, which inherited the game's open files; 3 s after the start the game's rename of
+/// `shader_cache\pipelines.cache.tmp` failed "being used by another process" and the game showed "Internal error".
+/// The download now runs inside the process (no child inherits anything), and it also waits.
+pub const FIRST_CHECK_AFTER: Duration = Duration::from_secs(120);
 
 /// A start counts as good when the game is still running this long after the module loaded.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(30);
@@ -311,86 +319,15 @@ pub trait Fetch {
     fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String>;
 }
 
-/// Downloads with Windows' own `curl.exe` (as the developer program's `update` command): HTTPS only, also after a
-/// redirect, TLS 1.2 or newer, the certificate checked by Windows, size and time limits, no console window.
-pub struct Curl {
-    pub dir: PathBuf,
-}
+/// Downloads inside this process with the system's WinHTTP ([`crate::https`]): HTTPS only, GitHub's hosts only (also
+/// after a redirect), TLS 1.2 or newer, the certificate checked by Windows, size and time limits. Never a helper
+/// program: a child of the game inherits the game's open files (the crash of 2026-10-22, `crate::https`).
+pub struct InProcess;
 
-impl Fetch for Curl {
+impl Fetch for InProcess {
     fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-        fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        let out = self.dir.join("download.tmp");
-        let _ = fs::remove_file(&out);
-        let result = curl_download(url, &out, max_bytes, true);
-        let _ = fs::remove_file(&out);
-        result
+        crate::https::get(url, max_bytes)
     }
-}
-
-/// `%SystemRoot%\System32\curl.exe`, part of Windows 10 1803 and later.
-pub fn curl_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    PathBuf::from(root).join("System32").join("curl.exe")
-}
-
-/// The arguments of one download: HTTPS only (also after a redirect), TLS 1.2 or newer, a size and time limit,
-/// a failure on any HTTP error status.
-pub fn curl_args(url: &str, out: &Path, max_bytes: u64) -> Vec<std::ffi::OsString> {
-    let mut a: Vec<std::ffi::OsString> = [
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--location",
-        "--max-redirs",
-        "5",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--tlsv1.2",
-        "--max-time",
-        "900",
-    ]
-    .iter()
-    .map(std::ffi::OsString::from)
-    .collect();
-    a.push("--max-filesize".into());
-    a.push(max_bytes.to_string().into());
-    a.push("--user-agent".into());
-    a.push(format!("feverlink3-updater/{VERSION}").into());
-    a.push("--output".into());
-    a.push(out.as_os_str().to_owned());
-    a.push(url.into());
-    a
-}
-
-/// Downloads `url` into `out` and returns the bytes. `hidden`: no console window (the game process has none).
-pub fn curl_download(url: &str, out: &Path, max_bytes: u64, hidden: bool) -> Result<Vec<u8>, String> {
-    if !url.starts_with("https://") {
-        return Err(format!("refusing a non-HTTPS address: {url}"));
-    }
-    let mut cmd = std::process::Command::new(curl_exe());
-    cmd.args(curl_args(url, out, max_bytes)).stdin(std::process::Stdio::null());
-    if hidden {
-        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-    }
-    let status = cmd.status().map_err(|e| format!("cannot run curl.exe: {e}"))?;
-    if !status.success() {
-        return Err(format!("download of {url} failed ({status})"));
-    }
-    let mut bytes = Vec::new();
-    fs::File::open(out).and_then(|f| f.take(max_bytes + 1).read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!("{} is larger than {max_bytes} bytes", out.display()));
-    }
-    Ok(bytes)
 }
 
 /// Why an update was not installed, in plain words for the player (the detail goes to the log).
@@ -631,12 +568,13 @@ pub fn start(game: PathBuf, settings: PathBuf, log: fn(&str)) {
             Start::Confirm { .. } | Start::Clear => {}
         }
     });
+    let loaded = std::time::Instant::now();
     let _ = std::thread::Builder::new().name("feverlink3-update".into()).spawn(move || {
-        let _ = crate::guard::guarded(|| run(paths, begun, enabled, log));
+        let _ = crate::guard::guarded(|| run(paths, begun, enabled, loaded, log));
     });
 }
 
-fn run(paths: Paths, begun: Start, enabled: bool, log: fn(&str)) {
+fn run(paths: Paths, begun: Start, enabled: bool, loaded: std::time::Instant, log: fn(&str)) {
     match begun {
         Start::Confirm { from, to } => {
             std::thread::sleep(HEALTHY_AFTER);
@@ -662,6 +600,8 @@ fn run(paths: Paths, begun: Start, enabled: bool, log: fn(&str)) {
         return;
     }
     let compare_with = pretend.clone().unwrap_or_else(|| VERSION.to_owned());
+    // the game first finishes starting (FIRST_CHECK_AFTER); `start` runs in DllMain, so the clock starts at the load
+    std::thread::sleep(FIRST_CHECK_AFTER.saturating_sub(loaded.elapsed()));
     while SESSION_BUSY.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(5));
     }
@@ -671,7 +611,7 @@ fn run(paths: Paths, begun: Start, enabled: bool, log: fn(&str)) {
         keys: update::TRUSTED_KEYS,
         now_unix: update::now_unix(),
     };
-    let fetch = Curl { dir: paths.downloads() };
+    let fetch = InProcess;
     let mut downloading = |v: &str| {
         log(&format!("update: downloading {v} (compared with {compare_with})"));
         set_status(|s| {
@@ -1063,22 +1003,5 @@ mod tests {
         write_enabled(&f, true).unwrap();
         assert!(read_enabled(&f));
         assert_eq!(fs::read_to_string(&f).unwrap(), "other=1\nautoupdate=on\n");
-    }
-
-    #[test]
-    fn downloads_are_https_only_and_limited() {
-        let a: Vec<String> = curl_args("https://x/y", Path::new("C:/t/o"), 1234)
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        let pair = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
-        assert_eq!(pair("--proto").as_deref(), Some("=https"));
-        assert_eq!(pair("--proto-redir").as_deref(), Some("=https"));
-        assert_eq!(pair("--max-filesize").as_deref(), Some("1234"));
-        assert!(a.contains(&"--fail".to_string()) && a.contains(&"--tlsv1.2".to_string()));
-        assert!(!a.iter().any(|x| x == "--insecure" || x == "-k"), "the certificate is always checked");
-        assert_eq!(a.last().map(String::as_str), Some("https://x/y"));
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(curl_download("http://x/y", &tmp.path().join("o"), 10, true).is_err(), "refused before curl runs");
     }
 }
