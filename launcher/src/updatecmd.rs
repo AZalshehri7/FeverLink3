@@ -11,8 +11,8 @@
 //! feverlink3 update --probe             the start check: print `feverlink3 <version>` and exit (used by the updater)
 //! ```
 //!
-//! The download uses Windows' own `curl.exe` (`%SystemRoot%\System32\curl.exe`, part of Windows 10 1803 and later)
-//! with HTTPS only, also for redirects: no HTTP or TLS crate is added to the program for one download.
+//! The download is the automatic update's: the system's WinHTTP inside the process (`feverlink3_launcher::https`),
+//! HTTPS only and GitHub's hosts only, also for redirects: no HTTP or TLS crate is added to the program.
 
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use feverlink3_launcher::update::{self, AfterStart, Decision, Journal, Layout, Pending, Probe, Version};
-use feverlink3_launcher::{autoupdate, process, steam};
+use feverlink3_launcher::{https, process, steam};
 
 /// The version of this program.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -124,10 +124,12 @@ fn guard() -> Result<(), String> {
 
 // --------------------------------------------------------------------------------------------------------- fetch
 
-/// Downloads `url` into `dir/name` and returns the bytes (the shared `curl.exe` download of
-/// `feverlink3_launcher::autoupdate`, with this console's output).
+/// Downloads `url` (the shared in-process download, `feverlink3_launcher::https`), keeps a copy as `dir/name` and
+/// returns the bytes.
 fn fetch(url: &str, dir: &Path, name: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-    autoupdate::curl_download(url, &dir.join(name), max_bytes, false)
+    let bytes = https::get(url, max_bytes)?;
+    std::fs::write(dir.join(name), &bytes).map_err(|e| e.to_string())?;
+    Ok(bytes)
 }
 
 /// A temporary download folder, removed when dropped.

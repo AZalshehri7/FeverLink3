@@ -26,6 +26,7 @@ pub mod autoupdate;
 pub mod clipboard;
 pub mod gamelink;
 pub mod guard;
+pub mod https;
 pub mod install;
 pub mod live;
 pub mod luatext;
