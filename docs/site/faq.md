@@ -4,7 +4,7 @@ title: FeverLink3 FAQ
 
 # Frequently asked questions
 
-Last updated 2026-10-10, for the test build 0.2.0-test1. [Back to the start page](../index.html).
+Last updated 2026-10-10, before the first version. [Back to the start page](../index.html).
 
 ## The project
 
@@ -81,7 +81,7 @@ Join only people you know. Your game loads the host's world, and a Transport Fev
 ## Getting it
 
 **Where do I download it?**
-From the [GitHub releases page](https://github.com/AZalshehri7/FeverLink3/releases). The first test build, 0.2.0-test1, is a pre-release containing a testing installer, the native module and the mod. A Nexus Mods page is planned.
+From the [GitHub releases page](https://github.com/AZalshehri7/FeverLink3/releases). Each release is one zip with the native module and the mod. A Nexus Mods page is planned.
 
 **Will it come to the in-game Mod Hub or the Steam Workshop?**
 Transport Fever 3 has no Steam Workshop (the developers' support page says so). The plan is to offer the mod in the game's own Mod Hub (which runs on mod.io) and on Nexus Mods like any other mod, with the native module as a separate download for now, and the installer then only for testing. Whether the Mod Hub accepts a mod that needs a separate native component is still being checked: its published rules allow only the official scripting API and no executable files. [The plan](../WORKSHOP.html) lists the options and the open questions.

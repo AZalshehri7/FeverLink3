@@ -88,7 +88,7 @@ impl Lockstep {
 /// The host's lead as a jitter buffer (TPF3-MP's playout idea, Juliansgith, MIT; our own measure): it covers the LATEST arrival seen
 /// recently, not a quantile of them, plus a small safety margin, grows at once when a later one comes and then shrinks slowly. A
 /// quantile left the top 5-10 % of the arrivals uncovered, and those spikes are what stood a game at its barrier (friend test of
-/// 0.2.0-pre5, x4 over 30 ms: the guest stood 6-7 s a minute; its clock gaps were 140 ms at the median and up to 825 ms).
+/// 2026-10-18, x4 over 30 ms: the guest stood 6-7 s a minute; its clock gaps were 140 ms at the median and up to 825 ms).
 ///   * the arrival: [`LeadMeter`] gives the largest round trip of each player's last eight and the largest clock gap of each running
 ///     game in ten seconds ([`Lockstep::cover_ms`] of them: the one-way time and the gap's excess over a batch, at most 500 ms);
 ///   * the buffer is that plus [`Self::SAFETY_MS`]; a larger value replaces it at once, a smaller one only as the buffer shrinks by

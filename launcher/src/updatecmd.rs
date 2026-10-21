@@ -14,14 +14,13 @@
 //! The download uses Windows' own `curl.exe` (`%SystemRoot%\System32\curl.exe`, part of Windows 10 1803 and later)
 //! with HTTPS only, also for redirects: no HTTP or TLS crate is added to the program for one download.
 
-use std::ffi::OsString;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use feverlink3_launcher::update::{self, AfterStart, Decision, Journal, Layout, Pending, Probe, Version};
-use feverlink3_launcher::{process, steam};
+use feverlink3_launcher::{autoupdate, process, steam};
 
 /// The version of this program.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -125,62 +124,10 @@ fn guard() -> Result<(), String> {
 
 // --------------------------------------------------------------------------------------------------------- fetch
 
-fn curl_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
-    PathBuf::from(root).join("System32").join("curl.exe")
-}
-
-/// The arguments of one download: HTTPS only (also after a redirect), TLS 1.2 or newer, a size and time limit,
-/// a failure on any HTTP error status.
-fn curl_args(url: &str, out: &Path, max_bytes: u64) -> Vec<OsString> {
-    let mut a: Vec<OsString> = [
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--location",
-        "--max-redirs",
-        "5",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--tlsv1.2",
-        "--max-time",
-        "900",
-    ]
-    .iter()
-    .map(OsString::from)
-    .collect();
-    a.push("--max-filesize".into());
-    a.push(max_bytes.to_string().into());
-    a.push("--user-agent".into());
-    a.push(format!("feverlink3-updater/{VERSION}").into());
-    a.push("--output".into());
-    a.push(out.as_os_str().to_owned());
-    a.push(url.into());
-    a
-}
-
-/// Downloads `url` into `dir/name` and returns the bytes.
+/// Downloads `url` into `dir/name` and returns the bytes (the shared `curl.exe` download of
+/// `feverlink3_launcher::autoupdate`, with this console's output).
 fn fetch(url: &str, dir: &Path, name: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-    if !url.starts_with("https://") {
-        return Err(format!("refusing a non-HTTPS address: {url}"));
-    }
-    let out = dir.join(name);
-    let status = Command::new(curl_exe())
-        .args(curl_args(url, &out, max_bytes))
-        .stdin(Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot run curl.exe: {e}"))?;
-    if !status.success() {
-        return Err(format!("download of {url} failed ({status})"));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(&out).and_then(|f| f.take(max_bytes + 1).read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!("{name} is larger than {max_bytes} bytes"));
-    }
-    Ok(bytes)
+    autoupdate::curl_download(url, &dir.join(name), max_bytes, false)
 }
 
 /// A temporary download folder, removed when dropped.
@@ -292,7 +239,11 @@ fn install(pre: bool, from: Option<&Path>) -> Result<(), String> {
                 return Ok(());
             };
             let m = fetch(&r.manifest.url, &tmp.0, "manifest.json", MAX_JSON)?;
-            let s = fetch(&r.signature.url, &tmp.0, "manifest.json.sig", MAX_SIG)?;
+            // no signature asset (unsigned until 1.0.0): the check below refuses it as unsigned
+            let s = match &r.signature {
+                Some(a) => fetch(&a.url, &tmp.0, "manifest.json.sig", MAX_SIG)?,
+                None => Vec::new(),
+            };
             (Some(r), m, s)
         }
     };
@@ -459,22 +410,5 @@ mod tests {
         assert!(parse(&args(&["--from"])).is_err());
         assert!(parse(&args(&["--check", "--rollback"])).is_err(), "one action at a time");
         assert!(parse(&args(&["--yes"])).is_err(), "there is no way to skip the question");
-    }
-
-    #[test]
-    fn downloads_are_https_only_and_limited() {
-        let a: Vec<String> = curl_args("https://x/y", Path::new("C:/t/o"), 1234)
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        let pair = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
-        assert_eq!(pair("--proto").as_deref(), Some("=https"));
-        assert_eq!(pair("--proto-redir").as_deref(), Some("=https"));
-        assert_eq!(pair("--max-filesize").as_deref(), Some("1234"));
-        assert!(a.contains(&"--fail".to_string()) && a.contains(&"--tlsv1.2".to_string()));
-        assert_eq!(a.last().map(String::as_str), Some("https://x/y"));
-        assert!(curl_exe().ends_with("System32/curl.exe") || curl_exe().ends_with(r"System32\curl.exe"));
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(fetch("http://x/y", tmp.path(), "o", 10).is_err(), "refused before curl runs");
     }
 }

@@ -219,7 +219,7 @@ class CadenceTest(B.BarrierTest):
         for _ in range(9):
             host.frame()
         self.assertGreater(int(host.L.eval("READS")), before, "a pass every few seconds")
-        # The pre5 friend test (2026-10-18): companies= 450-610 ms in one frame, once per pass for every deleted line. A late-game
+        # The friend test of 2026-10-18: companies= 450-610 ms in one frame, once per pass for every deleted line. A late-game
         # registry here: 40 live lines (0.2 ms a read), 6 deleted ones whose keys stay bound to their old entity (2 of those ids reused by
         # a vehicle), every engine read of an entity that is no line costs 550 ms like in the log, and one live line whose read is slow
         # by itself (500 ms). Over many passes no frame spends more than a few ms on the page, apart from the one read of the slow line.

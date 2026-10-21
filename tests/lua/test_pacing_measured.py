@@ -1,4 +1,4 @@
-"""Bug 4 again: smooth pacing over the link of the friend test of 0.2.0-pre5 (2026-10-18, x4, 30 ms round trip).
+"""Bug 4 again: smooth pacing over the link of the friend test of 2026-10-18 (x4, 30 ms round trip).
 
 That test's link.minute lines showed the pacing slowing both games almost all the time on a fast link (host 23:02: pace_mean=1.58
 pace_max=2.00 paced_s=60.0 rtt_ms=26/30/71 clock_gap_ms=0/125/825 stood_s=1.9 holds=14; guest 23:06-23:08: stood_s=6.1-7.3,

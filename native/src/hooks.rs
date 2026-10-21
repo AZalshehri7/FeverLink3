@@ -926,7 +926,10 @@ unsafe extern "system-unwind" fn free_order_hook(queue: u64, ret: u64, at: u64, 
     type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64) -> u64;
     // SAFETY: the real function at the call's original target, which takes these five slots.
     let original: Original = unsafe { core::mem::transmute(callee) };
-    unsafe { original(queue, ret, at, first, last) }
+    let r = unsafe { original(queue, ret, at, first, last) };
+    // the order trace takes the appended ids here, with this thread and step (ids.rs; read-only, guarded inside, nothing when off)
+    crate::ids::freed(queue);
+    r
 }
 
 /// Sorts the batch of freed ids `[first, last)` by entity id where it lies. A range that is not a readable run of ids is left as it

@@ -10,9 +10,17 @@ fn value<T: serde::Serialize>(m: &T) -> Value {
 
 #[test]
 fn the_new_kinds_have_their_documented_numbers() {
-    for (kind, number) in
-        [(MessageKind::Ping, 21u8), (MessageKind::Kicked, 22), (MessageKind::Pong, 37), (MessageKind::Leave, 38)]
-    {
+    for (kind, number) in [
+        (MessageKind::Ping, 21u8),
+        (MessageKind::Kicked, 22),
+        (MessageKind::ReportAsk, 23),
+        (MessageKind::ReportBundle, 24),
+        (MessageKind::ReportBusy, 25),
+        (MessageKind::Pong, 37),
+        (MessageKind::Leave, 38),
+        (MessageKind::ReportRequest, 40),
+        (MessageKind::ReportPart, 41),
+    ] {
         assert_eq!(number, u8::from(kind), "{kind:?}");
         assert_eq!(Some(kind), MessageKind::from_u8(number));
     }
@@ -23,8 +31,8 @@ fn every_kind_number_maps_back_to_itself_and_nothing_else_does() {
     let known: Vec<u8> = (0..=255u8).filter(|&v| MessageKind::from_u8(v).is_some()).collect();
     assert_eq!(
         vec![
-            1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 50,
-            51, 52, 53
+            1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37,
+            38, 39, 40, 41, 50, 51, 52, 53
         ],
         known
     );
@@ -39,7 +47,9 @@ fn a_player_may_pong_and_leave_but_not_ping_or_kick() {
     assert!(MessageKind::Leave.allowed_from_player());
     assert!(!MessageKind::Ping.allowed_from_player());
     assert!(!MessageKind::Kicked.allowed_from_player());
-    assert_eq!(14, MessageKind::FROM_PLAYER.len());
+    assert_eq!(16, MessageKind::FROM_PLAYER.len());
+    assert!(MessageKind::ReportRequest.allowed_from_player() && MessageKind::ReportPart.allowed_from_player());
+    assert!(!MessageKind::ReportAsk.allowed_from_player() && !MessageKind::ReportBundle.allowed_from_player());
     assert!(MessageKind::FROM_PLAYER.iter().all(|k| !k.is_unsealed()));
     assert!(!MessageKind::Ping.is_unsealed() && !MessageKind::Kicked.is_unsealed(), "both are sealed");
 }
@@ -71,6 +81,7 @@ fn welcome_carries_the_grant_and_says_when_it_gave_a_slot_back() {
         resync: None,
         mod_warnings: Vec::new(),
         stalled: Vec::new(),
+        loading: Vec::new(),
     };
     let host = PlayerInfo { id: 0, name: "H".into(), ready: false };
     let mut w = WelcomeMessage {

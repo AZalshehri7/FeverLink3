@@ -1,0 +1,51 @@
+name: Bug report
+description: Something went wrong in a FeverLink3 session or in the game with FeverLink3 installed.
+title: "Bug report "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting. If you pressed **Report a problem** in the game, a zip named `FeverLink3-report-<date>-<id>.zip` is on your Desktop (or in `Documents\FeverLink3\reports`): **drag it into the "What happened" box below** so it is attached. It holds the logs of every player in the session, with Windows user names, Steam IDs, IP addresses and join codes taken out (see the [privacy notes](https://github.com/AZalshehri7/FeverLink3/blob/main/docs/site/privacy.md)). Issues are public.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and the zip (drag it here).
+      placeholder: The road I built did not appear for my friend, then the game synced and my station was gone.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      placeholder: The road appears for both of us.
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: What you did before it happened, as far as you remember. How many players, who hosted.
+      placeholder: |
+        1. Hosted over Steam, one friend joined
+        2. Built a road through a town
+        3. ...
+    validations:
+      required: false
+  - type: input
+    id: report_id
+    attributes:
+      label: Report id
+      description: The last part of the zip's name (filled in when the game opened this page).
+      placeholder: a1b2c3
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: FeverLink3 version
+      description: Filled in when the game opened this page; else the version in the window's title or the download's name.
+      placeholder: 0.1.1
+    validations:
+      required: false

@@ -2,6 +2,8 @@
 
 Written on 2026-10-10 from public pages read that day (addresses at the end). Rules and prices change; the pages are the authority, this document is the preparation. Nothing here has been applied for yet.
 
+**Unsigned until 1.0.0 (owner decision 2026-10-22).** Releases before 1.0.0 are published without code signing and without the manifest signature; signing (both kinds) comes back at 1.0.0.
+
 **The licence changes the picture (owner decision of 2026-10-10).** FeverLink3 is now licensed under the PolyForm Noncommercial License 1.0.0, which is not an "OSI-approved Open Source license", and the commercial licence the owner offers is a form of commercial dual-licensing. The free SignPath Foundation programme states both conditions in so many words (below), so **the project probably does not qualify for it** and the free route should not be counted on. Signing then costs money, or the licence has to change. The options below are ordered with that in mind, and the decision is the owner's (last section).
 
 ## Why sign, and what signing will not do
@@ -14,7 +16,7 @@ The release has two programs that Windows and security products look at: `feverl
 
 What signing does not do: it does not switch SmartScreen off at once (reputation is built from downloads over time, for a new publisher too), and it does not stop every antivirus false positive. It makes the publisher visible, ties later builds to the same identity, and is the route that Microsoft's SmartScreen documentation points to.
 
-What would be signed: the two PE files, `feverlink3.exe` and `winhttp.dll`, before they go into the zip. A zip cannot carry an Authenticode signature. In the end state the installer is only a testing tool and the native module is delivered separately (`docs/WORKSHOP.md`), so `winhttp.dll` is the file that matters most for players, and the one the game loads by itself. The release manifest already has its own Ed25519 signature for the in-app updater (`docs/RELEASING.md`); that is separate and stays.
+What would be signed: the two PE files, `feverlink3.exe` and `winhttp.dll`, before they go into the zip. A zip cannot carry an Authenticode signature. In the end state the installer is only a testing tool and the native module is delivered separately (`docs/WORKSHOP.md`), so `winhttp.dll` is the file that matters most for players, and the one the game loads by itself. The release manifest has its own Ed25519 signature for the updater (`docs/RELEASING.md`); that is separate from code signing. Both are off until 1.0.0 (owner decision 2026-10-22): releases before 1.0.0 are published unsigned, and the in-game updater relies on HTTPS from GitHub and the SHA-256 checks (`docs/SECURITY_FOR_USERS.md`, "Automatic updates").
 
 ## The options
 
@@ -60,7 +62,7 @@ The Foundation can pause or end a subscription and revoke the certificate, even 
 | OSI-approved licence, no commercial dual-licensing | **PolyForm Noncommercial 1.0.0 (`LICENSE`), with a commercial licence offered separately: fails both** | not fixable without changing the licence |
 | No proprietary component | the dependencies are Rust crates; the game's `steam_api64.dll` is used from the player's installation and not shipped | before applying, list the licences of all crates in `Cargo.lock` (for example with `cargo-license`) |
 | Actively maintained | the repository started on 2026-10-09 and is changing daily | the terms set no minimum age or popularity, but a project that is days old is a risk; apply after a few weeks of releases if the first reply is a no |
-| Already released in the form to be signed | **no release yet** | publish the pre-release `v0.2.0-test1` (unsigned) first |
+| Already released in the form to be signed | **test versions only so far** (0.1.0, 0.1.5) | publish the first public beta, 0.2.0, first |
 | Functionality described on the download page | the README, the site (`docs/index.md`) and the release notes describe it | link them in the application |
 | No malware, no features that compromise users | the proxy-DLL technique draws questions; `docs/SECURITY_FOR_USERS.md` explains it file by file | link that page, and say plainly that it is not a cheat and not a security tool: it adds multiplayer to a single-player game |
 | No system changes without warnings | the installer writes into the game folder and the Steam user folder, prints each change, supports `--dry-run` | said in the README and `docs/PLAYING.md` |

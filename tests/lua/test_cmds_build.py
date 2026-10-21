@@ -1254,7 +1254,7 @@ class BuildGame(T.Game):
         T.fastio.install(self.L)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = T.COMMON_SRC, T.LOCKSTEP_SRC, T.BRIDGE_SRC, T.HUD_SRC
-        g.PORTABLE_SRC = T.PORTABLE_SRC
+        g.PORTABLE_SRC, g.TEXT_SRC = T.PORTABLE_SRC, T.TEXT_SRC
         g.LINK_SRC, g.LOG_SRC = T.LINK_SRC, T.LOG_SRC
         cmds = self.L.table()
         for stem, src in T.CMDS_SRC.items():
@@ -2577,6 +2577,9 @@ class PureBuildTest(unittest.TestCase):
                                  "body.args[1].cons[1].name = nil; local args = DECODE(body); local ce = STORE(args[1]).constructionsToAdd[1]; "
                                  "return STORE(ce).params.seed .. '|' .. STORE(ce).name .. '|' .. STORE(ce).playerEntity end)()"),
                          "2705|modular_station|7", "7x + 3y + z; the file's base name; the local player")
+        self.assertEqual(self.ev("(function() local body = CAPTURE(CON_PROPOSAL{ file = 'station/rail/modular_station.con', x = 300, y = 200, z = 5, params = {}, name = '' }); "
+                                 "local args = DECODE(body); return '[' .. STORE(STORE(args[1]).constructionsToAdd[1]).name .. ']' end)()"),
+                         "[]", "an empty captured name stays empty (a moved town building: the native compare refused the file's base name)")
         # the captured context and flags
         self.assertEqual(self.ev("(function() local body = CAPTURE(SIMPLE_ROAD{ a = { x = 1, y = 2, z = 0 }, b = { x = 5, y = 6, z = 0 } }, "
                                  "{ ctx = CONTEXT(true, false, true, false), ignoreErrors = true, playerInitiated = false }); local a = body.args; "

@@ -774,7 +774,7 @@ class CoGame(tl.Game):
         tl.fastio.install(self.L)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = tl.COMMON_SRC, tl.LOCKSTEP_SRC, tl.BRIDGE_SRC, tl.HUD_SRC
-        g.LINK_SRC, g.LOG_SRC = tl.LINK_SRC, tl.LOG_SRC
+        g.LINK_SRC, g.LOG_SRC, g.TEXT_SRC = tl.LINK_SRC, tl.LOG_SRC, tl.TEXT_SRC
         cmds = self.L.table()
         for stem, src in tl.CMDS_SRC.items():
             cmds[stem] = src

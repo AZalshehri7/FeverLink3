@@ -1,4 +1,4 @@
-# Playing FeverLink3 (test version 0.2.0-pre7)
+# Playing FeverLink3 (version 0.2.0)
 
 FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. Players connect to each other through Steam's own peer-to-peer networking: by design that means no port forwarding, no router settings, no VPN and nothing to open in the firewall. A first test between two Steam accounts reached through Steam's relay servers; the full host-and-join test is what this build is for. This is an early test build: expect rough edges, and tell the maintainer (Discord `azalshehri`) what happens.
 
@@ -22,7 +22,7 @@ There is no installer. You copy the files into the folder of the game:
    - If Windows says `winhttp.dll` already exists, **stop**: another mod uses the same file name. Do not replace it; tell the maintainer.
 5. Check: the game's folder now contains `winhttp.dll` next to `TransportFever3.exe`, and `mods\release\feverlink3` exists.
 
-**To update:** close the game and copy the new files over the old ones in the same way. If the game's folder still has `mods\release\feverlink3_1` (the mod's folder name in versions up to 0.2.0-pre2), delete that folder, or the game loads two copies of the mod. **To remove FeverLink3:** delete `winhttp.dll` and the folder `mods\release\feverlink3` from the game's folder. Steam's "Verify integrity of game files" leaves both in place.
+**Updates come by themselves** (from 0.2.0 on): at a game start FeverLink3 checks GitHub for a newer version, gets it ready and tells you in its window ("restart the game to finish"); one restart and you play the new version. You can turn this off in the window's Troubleshooting section. **To update by hand:** close the game and copy the new files over the old ones in the same way. If the game's folder still has `mods\release\feverlink3_1` (the mod's folder name in version 0.1.0), delete that folder, or the game loads two copies of the mod. **To remove FeverLink3:** delete `winhttp.dll` and the folder `mods\release\feverlink3` from the game's folder. Steam's "Verify integrity of game files" leaves both in place.
 
 ## 2. Start the game
 
@@ -47,6 +47,8 @@ Start Transport Fever 3 from **Steam as usual**.
 1. Start any game with *FeverLink3 Multiplayer* activated (a new game is fine; it is replaced) and click **FeverLink3** in the bottom bar.
 2. Click the field **paste the join code here**, press `Ctrl+V` to paste the host's code, and press **Join**. The window shows what it is doing (`contacting the host`, `finding a route`, `connected`).
 3. Keep the window open. When the host presses **Start the session**, the host's world is sent to you (about 30 MB; it takes up to a minute or two), your game reloads into it, and the session runs on both games. Open the window again after the reload (the reload closes it).
+
+**Joining through a Steam invite.** When the host invites you through Steam (or you click **Join game** on the host in your friends list), a game that already has a world loaded (with *FeverLink3 Multiplayer* activated) joins by itself, without opening the window. If the invite reaches you in the main menu, it waits: load any world (a new game is fine; it is replaced) and you join automatically. Until then the window shows "<host> invited you. Load any world and you join automatically" with **Join** and **Not now**. Transport Fever 3 has no documented way for a mod to load a save from the main menu, so a world must be loaded first. **This has not run between two PCs on Steam yet.**
 
 Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod.
 
@@ -107,7 +109,9 @@ A friend who does not own the game can take part with the small program `feverli
 
 ## If something goes wrong
 
-Send the maintainer these files (they hold no personal data besides your Windows user name and folder names):
+Press **Report a problem**: it is in the pop-up of the bar icon while the icon is red, at the bottom of the window's **Players** tab during a session, and under **Troubleshooting** on the start screen. If someone else's report is still being made, the window says so: that report reaches the player who asked for it. Type a line about what you were doing, if you like. In a session the host collects the logs of every player (up to a minute; the other players see a notice that their logs were sent to the host) and you get one zip, `FeverLink3-report-<date>-<id>.zip`, on your Desktop (or in `Documents\FeverLink3\reports`). Its folder opens, and so does a GitHub page with the bug report form filled in: drag the zip onto it and say what happened. Nothing is sent anywhere by itself. What the zip holds and what is taken out of it: [Privacy](site/privacy.html). **Not yet tried in a real game.**
+
+If the button does not work, send the maintainer these files instead (they hold no personal data besides your Windows user name and folder names):
 
 - `%LOCALAPPDATA%\FeverLink3\native.log`
 - `%LOCALAPPDATA%\FeverLink3\live\mod.log` and `ctl_status.txt`

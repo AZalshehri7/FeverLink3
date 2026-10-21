@@ -66,14 +66,30 @@ the order the engine appended them, which is the order they will be handed out a
 less than 10 ms apart), only when something happened:
 
 ```
-idorder e=<engine> g=<burst> n=<ops so far> at=<HH:MM:SS.mmm> ents=<id slots> free=<queue size> r=<removal requests> h=<rolling hash> ops=+12,-9,-7
+idorder e=<engine> g=<burst> n=<ops so far> at=<HH:MM:SS.mmm> ents=<id slots> free=<queue size> r=<removal requests> h=<rolling hash> s=<step>[..<step>] th=<thread>[+<thread>..] [xs=<n>] ops=+12,-9,#4711,@9012,-7
 idorder e=<engine> first seen at=.. ents=.. free=.. fifo=<hash of the whole queue> head=<first ids>
 idorder e=<engine> reset at=.. free=.. (was ..)        the queue shrank without an AddEntity: a load
 ```
 
-A burst is not a simulation step (the native module has no step clock; a game catching up runs several steps in one burst), so compare
-the flattened streams: `python -I tools/gametest/freed_id_diff.py` (local tool) prints the first op where the two games differ and whether
-only the order of a freed batch differs. The verbose per-call trace with call chains stays `FEVERLINK3_ID_TRACE=1` (`ids_live1.log`).
+When and on which thread (since 2026-10-21): `s=` is the simulation step of the line's first call (game time / 200, the mod's step;
+`..<step>` when the line ran into a later step; `?` before the first update or when the step read is not hooked), `th=` the OS thread
+ids of the line's calls in order of appearance. Inside `ops`, `#<step>` marks that the following ops ran in another step and `@<thread>`
+on another thread than the op before (the line starts on `s=`'s first step and `th=`'s first thread). `xs=<n>` (written only when not
+0) counts calls of this line on another thread than the first call of the same step on this engine: the engine worked on two threads
+within one step. Freed ids are taken where the engine appends them (`EndModification`, through the free-order hook), so a `-id` carries
+the appending thread and step; with `FEVERLINK3_FREE_ORDER=0` they carry the next `AddEntity`/`RemoveEntity` call's instead. The step
+comes from a read-only hook on the engine's game-time advance (native.log: `id trace: game_time_advance hooked`). Cost: an atomic load
+and the thread id per hooked call, one component lookup per update; about 20 bytes per line plus a marker per step or thread change.
+
+Reading a fork: `freed_id_diff.py` prints, at the first differing op, each game's step and thread there and the ops around it grouped
+by (step, thread). Same step on both games and a free run split across two threads on one of them (or `xs=` on that line): threads
+interleave within a step. The same ids freed at different steps (the run's `s` differs between the games): an engine job frees at
+another step.
+
+A burst is not a simulation step (a game catching up runs several steps in one burst), so compare the flattened streams:
+`python -I tools/gametest/freed_id_diff.py` (local tool) prints the first op where the two games differ and whether only the order of a
+freed batch differs. The verbose per-call trace with call chains stays `FEVERLINK3_ID_TRACE=1` (`ids_live1.log`); its lines now end
+with ` s=<step>`.
 
 ## Hooks a game thread is inside (native, before the simulation starts)
 

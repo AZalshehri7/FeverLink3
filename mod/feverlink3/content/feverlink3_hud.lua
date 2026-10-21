@@ -1,13 +1,15 @@
--- FeverLink3 in-game window model: the pure parts. Player roster, bounded chat history, status text, and the two
+-- FeverLink3 in-game window model: the pure parts. Player roster, bounded chat history, the system notices (`notices`, never in
+-- the chat; their words are in feverlink3_text.lua), status text, and the two
 -- small file hand-offs between the bridge (which owns the file link) and the window (which lives in the UI):
 --   hud_state.txt   bridge -> window: a versioned snapshot, rewritten when something changed
 --   ui_out.log      window -> bridge: appended records "seq <TAB> chat <TAB> 0 <TAB> {text=...}", one writer only
 -- No engine calls here; the drawing is in feverlink3_ui.script.lua. Everything in this file is tested by
--- tests/lua/test_lockstep.py.
+-- tests/lua/test_lockstep.py (and the window's words by test_speedtest.py).
 
 local H = {}
 
 H.HISTORY_MAX = 200
+H.NOTICES_MAX = 20
 H.TEXT_MAX = 500
 H.SNAPSHOT = "hud_state.txt"
 H.OUTBOX = "ui_out.log"
@@ -19,6 +21,7 @@ function H.new(selfId, selfName)
 		selfId = selfId, selfName = selfName,
 		roster = {},                                    -- id -> { id, name, ready }
 		history = {},                                   -- oldest first, at most HISTORY_MAX
+		notices = {},                                   -- system messages (never the chat): oldest first, at most NOTICES_MAX
 		session = { started = false, speed = 0 },
 		version = 0,
 	}
@@ -111,6 +114,30 @@ function H.addChat(h, name, text, from)
 	return true
 end
 
+-- A system message for the window's notices (the chat is for players): { text, level = "info"|"warn"|"error", t = os time }. The
+-- same text again, while it is in the list, moves to the end with a count ("... (x3)"), so a repeated problem shows once.
+-- Returns true when the list changed.
+function H.addNotice(h, text, level, t)
+	text = H.cleanText(text)
+	if not text then return false end
+	level = (level == "warn" or level == "error") and level or "info"
+	h.notices = h.notices or {}
+	local n = 1
+	for i = #h.notices, 1, -1 do
+		local e = h.notices[i]
+		if (e.base or e.text) == text then
+			n = (e.n or 1) + 1
+			table.remove(h.notices, i)
+			break
+		end
+	end
+	h.notices[#h.notices + 1] = { text = n > 1 and (text .. " (x" .. n .. ")") or text, level = level, t = tonumber(t) or 0,
+		base = n > 1 and text or nil, n = n > 1 and n or nil }
+	while #h.notices > H.NOTICES_MAX do table.remove(h.notices, 1) end
+	touch(h)
+	return true
+end
+
 -- ------------------------------------------------------------------ text
 
 function H.rosterList(h)
@@ -176,10 +203,12 @@ function H.snapshot(h)
 	for i, p in ipairs(H.rosterList(h)) do roster[i] = { id = p.id, name = p.name, ready = p.ready } end
 	local history = {}
 	for i, e in ipairs(h.history) do history[i] = { name = e.name, text = e.text, from = e.from } end
+	local notices = {}
+	for i, e in ipairs(h.notices or {}) do notices[i] = { text = e.text, level = e.level, t = e.t, base = e.base, n = e.n } end
 	return {
 		version = h.version, selfId = h.selfId, selfName = h.selfName,
 		session = { started = h.session.started, speed = h.session.speed, pauseAt = h.session.pauseAt, stalled = h.session.stalled, behind = h.session.behind },
-		roster = roster, history = history,
+		roster = roster, history = history, notices = notices,
 	}
 end
 
@@ -196,6 +225,13 @@ function H.fromSnapshot(snap)
 		end
 	end
 	while #h.history > H.HISTORY_MAX do table.remove(h.history, 1) end
+	for _, e in ipairs(type(snap.notices) == "table" and snap.notices or {}) do
+		if type(e) == "table" and type(e.text) == "string" then
+			h.notices[#h.notices + 1] = { text = e.text, level = (e.level == "warn" or e.level == "error") and e.level or "info",
+				t = tonumber(e.t) or 0, base = type(e.base) == "string" and e.base or nil, n = tonumber(e.n) }
+		end
+	end
+	while #h.notices > H.NOTICES_MAX do table.remove(h.notices, 1) end
 	if type(snap.session) == "table" then
 		h.session = { started = snap.session.started == true, speed = tonumber(snap.session.speed) or 0, pauseAt = tonumber(snap.session.pauseAt),
 			stalled = (stalledList(snap.session)), behind = tonumber(snap.session.behind) }
@@ -224,7 +260,10 @@ function H.readSnapshot(C, seenVersion)
 	if not text or #text == 0 then return nil end
 	local snap = C.parse(text)
 	if type(snap) ~= "table" or snap.version == seenVersion then return nil end
-	return H.fromSnapshot(snap)
+	local h = H.fromSnapshot(snap)
+	-- the bridge's system notices (`notices`, see H.notices); carried over here too in case the model does not keep them
+	if h and h.notices == nil and type(snap.notices) == "table" then h.notices = snap.notices end
+	return h
 end
 
 -- ------------------------------------------------------------------ outbox hand-off (window -> bridge)
@@ -357,6 +396,207 @@ function H.modLines(ctl)
 		out[#out + 1] = "Warning: " .. tostring(w)
 	end
 	return out
+end
+
+-- ------------------------------------------------------------------ bar icon, status line, sync progress, notices
+-- `ctl` is the native module's status (ctl_status.txt, launcher/src/live.rs status_json), `m` the window model above (may be nil).
+
+-- The bridge's system notices in the snapshot: `notices` = { {text, level = "info"|"warn"|"error", t = C.time() wall seconds}, ... }, newest
+-- last, at most 20. Read defensively: an absent or odd list is empty, an unknown level is "info".
+H.NOTICES_MAX = 20
+H.NOTICE_SHOWN_S = 10    -- the pop-up shows the newest notice this long
+H.NOTICE_ALARM_S = 30    -- an error notice keeps the bar icon red this long
+local LEVELS = { info = true, warn = true, error = true }
+
+function H.notices(m)
+	local out = {}
+	local list = type(m) == "table" and m.notices or nil
+	if type(list) ~= "table" then return out end
+	for _, n in ipairs(list) do
+		if type(n) == "table" and type(n.text) == "string" and n.text ~= "" then
+			out[#out + 1] = { text = n.text, level = LEVELS[n.level] and n.level or "info", t = tonumber(n.t) }
+		end
+	end
+	while #out > H.NOTICES_MAX do table.remove(out, 1) end
+	return out
+end
+
+-- The newest notice when it is at most `maxAge` seconds old at `now` (both C.time wall seconds of this PC), and its age.
+function H.latestNotice(m, now, maxAge)
+	local list = H.notices(m)
+	local n = list[#list]
+	if not n or not n.t or type(now) ~= "number" then return nil end
+	local age = now - n.t
+	if age < -5 or age > maxAge then return nil end
+	return n, math.max(0, age)
+end
+
+-- A join request in the host's window (ctl.invites.requests[i] = { id, name, steam? }): the Steam name Steam gave for the
+-- account that asked (the friend cannot choose it), and the name its game sent when that differs.
+function H.requestLabel(r)
+	if type(r) ~= "table" then return nil end
+	local steam = (type(r.steam) == "string" and r.steam ~= "") and r.steam or nil
+	local name = (type(r.name) == "string" and r.name ~= "") and r.name or nil
+	if steam and name and name ~= steam then return steam .. " (" .. name .. ") wants to join" end
+	return tostring(steam or name or "A Steam friend") .. " wants to join"
+end
+
+-- How many things wait for this player: join requests (host) and an invite from Steam (friend).
+function H.askCount(ctl)
+	if type(ctl) ~= "table" then return 0 end
+	local n = 0
+	if type(ctl.invites) == "table" and type(ctl.invites.requests) == "table" then n = n + #ctl.invites.requests end
+	if type(ctl.invite) == "table" then n = n + 1 end
+	return n
+end
+
+-- The games a sync round's load still waits for (sync.loading, names from the controller), joined for a sentence; nil when none
+-- is named. Friend test 2026-10-21: the host waited ~52 s for a guest's load and the window showed only the step.
+function H.loadingNames(sync)
+	local names = {}
+	for _, n in ipairs(type(sync) == "table" and type(sync.loading) == "table" and sync.loading or {}) do
+		if type(n) == "string" and n ~= "" then names[#names + 1] = n end
+	end
+	if #names == 0 then return nil end
+	if #names == 1 then return names[1] end
+	return table.concat(names, ", ", 1, #names - 1) .. " and " .. names[#names]
+end
+
+-- What a sync round is doing, in words (ctl.sync = { phase, done?, total?, note? } from the controller; absent when none runs).
+-- `host` says whose window it is: the players' games stand still while the host's world is prepared, sent and loaded, and
+-- without a word about it that looks like a hang.
+function H.syncText(sync, host)
+	if type(sync) ~= "table" then return nil end
+	local pct = nil
+	if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
+		pct = math.floor(100 * sync.done / sync.total)
+	end
+	local phase = sync.phase
+	if phase == "pausing" then
+		return host and "Syncing: stopping every game at the same moment..." or "Syncing: the host is stopping every game at the same moment..."
+	elseif phase == "saving" then
+		return host and "Syncing: saving your world..." or "Syncing: the host is saving its world..."
+	elseif phase == "sending" then
+		local what = host and "Sending your world to the players" or "Receiving the host's world"
+		-- sync.note: what a transfer over several Steam connections says about itself ("7 connections, 6.9 MB/s")
+		local note = (type(sync.note) == "string" and sync.note ~= "") and (" (" .. sync.note .. ")") or ""
+		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...") .. note
+	elseif phase == "loading" then
+		local who = H.loadingNames(sync)
+		if who then return "Syncing: waiting for " .. who .. " to load the world..." end
+		return host and "Syncing: the players are loading your world..." or "Syncing: loading the host's world. The game reloads and the window closes; open it again afterwards."
+	elseif phase == "verifying" then
+		return "Syncing: checking that the worlds match..."
+	end
+	return "Syncing..."
+end
+
+-- One sync round for the window's single heading and progress bar: the step in a word or two, the full sentence, and the
+-- transferred fraction (nil when the step has no count). nil when no round runs.
+local STEPS = { pausing = "stopping the games", saving = "saving", loading = "loading", verifying = "checking" }
+function H.syncInfo(sync, host)
+	local detail = H.syncText(sync, host)
+	if not detail then return nil end
+	-- the heading already says "Syncing: <step>" (UI run 2026-10-21: the line under it began with "Syncing:" again)
+	detail = detail:gsub("^Syncing:%s*", ""):gsub("^Syncing%.%.%.$", ""):gsub("^%l", string.upper)
+	local step = STEPS[sync.phase] or (sync.phase == "sending" and (host and "sending world" or "receiving world")) or "preparing"
+	local fraction, pct = nil, nil
+	if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
+		fraction = math.max(0, math.min(1, sync.done / sync.total))
+		pct = math.floor(100 * fraction)
+	end
+	-- after the pause no window draws for long: the host's game saves and (by default) reloads, the players' games load (UI run
+	-- 2026-10-21: ~35 s on the pause, then ~15 s of save, send and load without a frame, then done). Said before it happens.
+	local after = sync.phase == "pausing" and "Next the games reload: they stand still and this window closes for a moment." or nil
+	local short = "Syncing: " .. step .. (pct and (" " .. pct .. "%") or "...")
+	local who = sync.phase == "loading" and H.loadingNames(sync) or nil
+	if who then short = "Syncing: waiting for " .. who .. " to load the world" end
+	return { step = step, detail = detail, after = after, fraction = fraction, short = short }
+end
+
+local function inSession(ctl)
+	return type(ctl) == "table" and (ctl.state == "hosting" or ctl.state == "joined" or ctl.state == "joining")
+end
+
+local function resyncFailed(ctl)
+	return type(ctl.resync) == "string" and ctl.resync:sub(1, 6) == "failed" and ctl.sync == nil
+end
+
+local function stalledSet(m)
+	local set = {}
+	local s = type(m) == "table" and m.session or nil
+	for _, id in ipairs(type(s) == "table" and type(s.stalled) == "table" and s.stalled or {}) do set[id] = true end
+	return set
+end
+
+local function players(ctl)
+	local out = {}
+	for _, p in ipairs(type(ctl) == "table" and type(ctl.players) == "table" and ctl.players or {}) do
+		if type(p) == "table" then out[#out + 1] = p end
+	end
+	return out
+end
+
+-- The colour of the game bar icon (owner, 2026-10-21): "white" no session, "green" running and in sync, "yellow" syncing,
+-- joining or reconnecting, a player away or stalled, waiting for the start or for an answer to a join request, "red" a problem:
+-- a join that failed or was refused, a sync round that failed, an error notice of the bridge in the last NOTICE_ALARM_S seconds.
+function H.iconState(ctl, m, now)
+	if type(ctl) ~= "table" then return "white" end
+	if ctl.state == "failed" then return "red" end
+	if not inSession(ctl) then return "white" end
+	if resyncFailed(ctl) then return "red" end
+	local n = H.latestNotice(m, now, H.NOTICE_ALARM_S)
+	if n and n.level == "error" then return "red" end
+	if ctl.state == "joining" or ctl.reconnecting or ctl.sync ~= nil or ctl.started ~= true then return "yellow" end
+	for _, p in ipairs(players(ctl)) do
+		if p.state == "away" then return "yellow" end
+	end
+	if next(stalledSet(m)) ~= nil or H.askCount(ctl) > 0 then return "yellow" end
+	return "green"
+end
+
+-- The one status line of the bar's tooltip, the pop-up and the window: "Running x2 - in sync", "Syncing: sending world 45%",
+-- "Paused - Ben reconnecting", "Waiting for the host to start", "Not in a session".
+function H.statusLine(ctl, m)
+	if type(ctl) ~= "table" then return "Not in a session" end
+	if ctl.state == "failed" then return "Problem: " .. tostring(ctl.message or "could not connect") end
+	if ctl.state == "joining" then
+		if ctl.reconnecting then return "Reconnecting (" .. tostring(tonumber(ctl.reconnectingS) or 0) .. " s)" end
+		return "Joining..."
+	end
+	if not inSession(ctl) then return "Not in a session" end
+	local sync = H.syncInfo(ctl.sync, ctl.state == "hosting")
+	if sync then return sync.short end
+	if resyncFailed(ctl) then return "Sync failed: " .. ctl.resync:gsub("^failed:?%s*", "") end
+	if ctl.started ~= true then return ctl.state == "hosting" and "Not started yet - press Start" or "Waiting for the host to start" end
+	local s = type(m) == "table" and m.session or {}
+	local speed = tonumber(s.speed) or tonumber(ctl.speed) or 0
+	local what = (speed <= 0 or s.pauseAt ~= nil) and "Paused" or ("Running x" .. tostring(math.floor(speed)))
+	local stalled, why = stalledSet(m), {}
+	local me = tonumber(ctl.me) or (type(m) == "table" and m.selfId) or nil
+	if me and stalled[me] then
+		why[#why + 1] = "catching up" .. ((s.behind and s.behind > 0) and (" (" .. s.behind .. " s behind)") or "")
+	end
+	for _, p in ipairs(players(ctl)) do
+		if p.id ~= me then
+			if p.state == "away" then
+				why[#why + 1] = tostring(p.name) .. " reconnecting"
+			elseif stalled[p.id] then
+				why[#why + 1] = tostring(p.name) .. " stood still"
+			end
+		end
+	end
+	return what .. " - " .. (#why > 0 and table.concat(why, ", ") or "in sync")
+end
+
+-- A player's line parts: the dot colour ("green", or "yellow" when away or stalled) and the ping text ("12 ms",
+-- "reconnecting", or "" for this game itself and before a ping is measured).
+function H.playerState(p, me, m)
+	if type(p) ~= "table" then return "green", "" end
+	if p.state == "away" then return "yellow", "reconnecting" end
+	local dot = stalledSet(m)[p.id] and "yellow" or "green"
+	if p.id ~= me and type(p.rtt) == "number" and p.rtt > 0 then return dot, tostring(math.floor(p.rtt)) .. " ms" end
+	return dot, ""
 end
 
 -- A throttled ticker for the window's refresh. The step timer (react.onStepTimer) is not guaranteed to fire while the

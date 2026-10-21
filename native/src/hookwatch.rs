@@ -80,6 +80,7 @@ pub static GROWTH_CMD_HOOK: Watch = Watch::new("growth_cmd_hook");
 pub static GROWTH_HOOK: Watch = Watch::new("growth_hook");
 pub static IDS_ADD_HOOK: Watch = Watch::new("ids add_hook");
 pub static IDS_REMOVE_HOOK: Watch = Watch::new("ids remove_hook");
+pub static IDS_STEP_HOOK: Watch = Watch::new("ids step_hook");
 // the module's own spots where a game thread can wait: file writes and their locks
 pub static GROWTH_FILE: Watch = Watch::new("growth.log write");
 pub static IDORDER_LOCK: Watch = Watch::new("idorder state lock");
@@ -87,7 +88,7 @@ pub static IDORDER_FILE: Watch = Watch::new("idorder write");
 pub static NATIVE_LOG: Watch = Watch::new("native.log write");
 
 /// Every watch, in dump order.
-pub static ALL: [&Watch; 21] = [
+pub static ALL: [&Watch; 22] = [
     &APPLY_HOOK,
     &ADD_HOOK,
     &CONVERT_HOOK,
@@ -97,6 +98,7 @@ pub static ALL: [&Watch; 21] = [
     &FREE_ORDER_HOOK,
     &IDS_ADD_HOOK,
     &IDS_REMOVE_HOOK,
+    &IDS_STEP_HOOK,
     &TOWN_SEED_HOOK,
     &GROWTH_CMD_HOOK,
     &GROWTH_HOOK,

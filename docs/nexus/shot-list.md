@@ -45,7 +45,7 @@ For the person who drives the game. Each entry says what to capture, the exact s
 - **Purpose:** the thumbnail. Name: `nexus-01-cover.png`, 1920x1080.
 - **Steps:** start a new game with the mod activated (setup above). Move the camera over a town with some roads so the picture is not empty. Click **FeverLink3** in the bottom bar and run the Steam connection test as in S08 so that the result line is showing. Drag the window to a side so it does not hide the town. Take the screenshot with the bar and the window visible.
 - **Hide:** both Steam ID fields.
-- **Caption:** "The FeverLink3 window with the Steam connection test (test build 0.2.0-test1, tested against my own Steam ID)."
+- **Caption:** "The FeverLink3 window with the Steam connection test (connection-test build, tested against my own Steam ID)."
 - **Replace later:** when S17 (the test between two accounts) exists, use it as the cover instead.
 
 ## S02 - The game build
@@ -124,7 +124,7 @@ For the person who drives the game. Each entry says what to capture, the exact s
 ## S13 - `native.log`
 
 - **Purpose:** the module's own log is short and readable. Name: `nexus-13-native-log.png`.
-- **Steps:** after a game start, open `%LOCALAPPDATA%\FeverLink3\native.log` in Notepad. It holds lines such as "FeverLink3 native 0.2.0-test1 loaded", "game build 40420 (timestamp 0x6ac50427): hooks available" and "live session controller started".
+- **Steps:** after a game start, open `%LOCALAPPDATA%\FeverLink3\native.log` in Notepad. It holds lines such as "FeverLink3 native 0.2.0 loaded", "game build 40420 (timestamp 0x6ac50427): hooks available" and "live session controller started".
 - **Hide:** nothing in the file, but check that the title bar and path do not show the user name.
 - **Caption:** "The module's whole log. 'hooks available' only means that the game build is one the module knows; no hooks are installed unless a developer switches them on, and they have never run in the real game."
 

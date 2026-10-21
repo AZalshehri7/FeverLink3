@@ -336,7 +336,7 @@ function TOOL_EVENT(i)
   -- like the game: an interface state that subscribed to nothing gets no tool event (owner test 2026-10-18: the failed subscription by
   -- name left the interface half without builder events, and every build went the release-at-the-click path)
   -- the script's one subscription is made in the simulation state (SUBS): once it subscribed by name, an event outside the names is not
-  -- delivered to guiHandleEvent either (0.2.0-pre3 to pre5 subscribed the simulation half to its own names: 0 builds captured in real play)
+  -- delivered to guiHandleEvent either (earlier test builds subscribed the simulation half to its own names: 0 builds captured in real play)
   if (SUBS.all or SUBS.any) and not (SUBS.all or SUBS.names["builder.proposalCreate"]) then return end
   GUI.guiHandleEvent(nil, STATE, GSTATE, 0, "streetBuilder", "builder.proposalCreate", { TOOLS[i].p, {}, nil })
 end
@@ -605,7 +605,7 @@ class StrictOnTest(StrictTest):
         self.assertEqual([r["seq"] for r in self.B.action_records()], [1, 2, 3, 4])
         self.assertEqual(self.B.native.released, [1, 2, 3, 4])
         self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0)
-        # a preview is used once: a click with no preview of its own is not paired with the spent one (no record: refused, pre7 id forks)
+        # a preview is used once: a click with no preview of its own is not paired with the spent one (no record: refused, id forks of the friend test 2026-10-20)
         self.B.tool(self.road(1100, 0, 1200, 0), event=False)
         self.tick(14)
         self.assertEqual((self.B.native.released, self.B.native.dropped), ([1, 2, 3, 4], [5]))
@@ -619,7 +619,7 @@ class StrictOnTest(StrictTest):
         self.assertIn("companies", pa)
 
     def test_terrain_tools_are_switched_off_during_a_session_and_on_again_at_its_end(self):
-        """Owner decision 2026-10-21 (A3): a terrain edit runs on its maker's game alone (pre7: 2 of 8 free-id forks), so the terrain
+        """Owner decision 2026-10-21 (A3): a terrain edit runs on its maker's game alone (friend test 2026-10-20: 2 of 8 free-id forks), so the terrain
         menu's tools are disabled while a session runs (api.gui.byId.setEnabled) and the rule is removed when it ends."""
         self.start()
         self.B.L.execute("GUI_API.gui = GUI_API.gui or {}; ENABLED = {}; GUI_API.gui.byId = { setEnabled = function(id, on, only) "
@@ -717,7 +717,7 @@ class StrictOnTest(StrictTest):
             self.start()
             self.B.tool(self.road(300, 0, 400, 0), event=False)
             self.tick(14)
-            # friend test pre7 2026-10-21: released, it ran on the originator ~16 steps before the others (a free-id fork); now refused
+            # friend test 2026-10-21: released, it ran on the originator ~16 steps before the others (a free-id fork); now refused
             self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]), "refused, never released")
             self.assertNotIn("release", self.B.native.ctl_kinds())
             self.assertIn("REFUSED: no record before the engine applies it (no capture of a tool build)", self.B.log())
@@ -760,7 +760,8 @@ class StrictOnTest(StrictTest):
         self.assertEqual(self.B.L.eval("NATIVE_HELD_COUNT()"), 0, "nothing stays held")
         self.assertSameWorld()
         self.assertEqual(len(self.relay.chats), 1, "the player is told once")
-        self.assertIn("build was cancelled: ", self.relay.chats[0][1])
+        self.assertIn("build ", self.relay.chats[0][1])
+        self.assertIn("cancelled", self.relay.chats[0][1])
         if chat:
             self.assertIn(chat, self.relay.chats[0][1])
 
@@ -781,7 +782,7 @@ class StrictOnTest(StrictTest):
             self.B.L.execute("TOOL_ADD(%d, true)" % i)
             self.tick(14)
             self.assertIn("REFUSED: the capture of streetBuilder failed", self.B.log())
-            self.assertRefusedEverywhere("cannot be recorded yet")
+            self.assertRefusedEverywhere("this kind of build cannot be shared")
 
         def cannot_rebuild():
             # friend test 2026-10-16, host street 0:2: "it cannot be rebuilt here (...); release written, the native build goes through"
@@ -794,7 +795,7 @@ class StrictOnTest(StrictTest):
             self.assertIn("REFUSED: it cannot be rebuilt here", self.B.log())
             self.assertNotIn("release written", self.B.log())
             self.assertNotIn("E 300.00,0.00,0.00 400.00,0.00,0.00", self.A.sig() + self.B.sig())
-            self.assertRefusedEverywhere("cannot be rebuilt the same way on every game")
+            self.assertRefusedEverywhere("could not be shared with the other players and was cancelled")
 
         def fault_deciding():
             self.start()
@@ -842,10 +843,11 @@ class StrictOnTest(StrictTest):
             self.tick(3)
             self.assertEqual([g for g, d in self.relay.replay_failed], [1], "one repair request for a burst")
             self.assertIn("native module fault [add hook] (repair)", self.relay.replay_failed[0][1])
-            self.assertIn("internal fault (add hook)", self.relay.chats[-1][1])
+            self.assertIn("client's game hit a problem", self.relay.chats[-1][1])
+            self.assertNotIn("add hook", self.relay.chats[-1][1], "the technical text stays in the log")
             self.B.native.emit("fault", {"where": "step seed patch", "action": "stop", "detail": "not in place"})
             self.tick(3)
-            self.assertIn("leave the session and restart the game", self.relay.chats[-1][1])
+            self.assertIn("needs to leave the session and restart the game", self.relay.chats[-1][1])
             self.assertIn("native module FAULT [step seed patch] (stop)", self.B.log())
 
         self.cases([("a capture the module could not make", {}, capture_failed), ("a record this game cannot rebuild", {}, cannot_rebuild),
@@ -939,7 +941,7 @@ class StrictOnTest(StrictTest):
             self.assertEqual(self.A.native.held, [1])
             self.frames(500)   # the game is stopped (frames go on, the clock does not) for longer than the limit
             self.assertEqual((self.A.native.released, self.A.native.dropped), ([], [1]), "never given back early")
-            self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats))
+            self.assertTrue(any("game stayed paused too long" in c[1] for c in self.relay.chats))
             self.assertEqual(self.B.builds_applied(), 0)
 
         self.cases([("a late stamp", {}, late_stamp), ("given back early by the module", {}, given_back_early),
@@ -1350,9 +1352,9 @@ class VetoTest(StrictTest):
         self.tick(2)
         self.assertEqual(len(self.relay.chats), chats + 1)
         text = self.relay.chats[-1][1]
-        self.assertIn("client's build exists on their game only", text)
-        self.assertIn("the games will be synchronised", text)
-        self.assertNotIn("cancelled on every game", text)
+        self.assertIn("client's build could not be built in host's game", text)
+        self.assertIn("A sync will bring everyone back to the same world", text)
+        self.assertNotIn("cancelled", text)
         self.assertEqual(len(self.relay.replay_failed), resyncs + 1, "a resync is asked for")
         self.assertIn("came too late", self.B.log())
 
@@ -1474,12 +1476,13 @@ class CancelFlowTest(StrictTest):
 
     def test_constructions_and_builds_that_cannot_be_captured(self):
         def construction_default():
-            # remote constructions are replicated as before (hold-and-release); the player gets an informational chat line
+            # remote constructions are replicated as before (hold-and-release); the player gets an informational notice, on their own
+            # game only
             self.start()
             self.flow(self.B, DEPOT, "NATIVE_DEPOT_ON_ROAD", [], [1], ticks=20, same=False)
             self.assertEqual(self.B.shipped_count(), 1)
-            self.assertEqual(len(self.relay.chats), 1)
-            self.assertIn("experimental in this test build", self.relay.chats[0][1])
+            self.assertEqual(len(self.relay.chats), 0)
+            self.assertIn("told the player: Stations and depots are still experimental", self.B.log())
 
         def constructions_blocked():
             # FEVERLINK3_REMOTE_CONSTRUCTIONS=0 (developers): a build that adds a construction is cancelled at the originator (with a chat
@@ -1488,7 +1491,7 @@ class CancelFlowTest(StrictTest):
             self.flow(self.B, DEPOT, "NATIVE_DEPOT_ON_ROAD", [1], [], ticks=20)
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied(), self.B.shipped_count()), (0, 0, 0), "nothing is shipped")
             self.assertNotIn("C depot/road_depot.con", self.A.sig() + self.B.sig())
-            self.assertIn("not supported yet in this test build", self.relay.chats[0][1])
+            self.assertIn("this kind of build cannot be shared", self.relay.chats[0][1])
             self.B.tool(self.road(300, 0, 400, 0))
             self.tick(24)
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
@@ -1516,19 +1519,19 @@ class CancelFlowTest(StrictTest):
             self.assertSameWorld()
             if fires:
                 self.assertEqual(len(self.relay.chats), 1)
-                self.assertIn("cannot be recorded yet in this test build", self.relay.chats[0][1])
+                self.assertIn("this kind of build cannot be shared", self.relay.chats[0][1])
                 self.assertIn("(the tool's callback is fired)", self.B.log())
             else:
                 self.assertIn("this module cannot fire the tool's callback", self.B.log(), "said, not hidden")
 
         def edge_object():
             # a stop or signal gets its model when the build runs and its record could not be completed from the held command's text: no
-            # record before the build, so refused like a build without a capture (pre7 id forks); the player is told once
+            # record before the build, so refused like a build without a capture (id forks of the friend test 2026-10-20); the player is told once
             self.start()
             self.flow(self.B, "{ edge = 130, param = 0.75 }", "NATIVE_SIGNAL", [1], [])
             self.assertIn("has no record before the build", self.B.log())
             self.assertEqual(len(self.relay.chats), 1)
-            self.assertIn("could not be carried to the other players", self.relay.chats[0][1])
+            self.assertIn("could not be shared with the other players and was cancelled", self.relay.chats[0][1])
 
         blocked = {"extra_env": {"FEVERLINK3_REMOTE_CONSTRUCTIONS": "0"}}
         self.cases([("constructions by default", {}, construction_default), ("constructions blocked", dict(blocked, fires=True), constructions_blocked),
@@ -1583,17 +1586,16 @@ class PausedGraceTest(StrictTest):
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
             self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]), "cancelled: the build exists on no game")
             self.assertEqual(self.B.sig(), before)
-            # one chat line for this vetoed build, from the originator: cancelled everywhere, who and why in words
+            # one notice for this vetoed build, from the originator: cancelled everywhere, who and why in words
             self.assertEqual(len(self.relay.chats), 1)
             who, text = self.relay.chats[0]
             self.assertEqual(who, 1)
-            self.assertIn("client's build was cancelled on every game", text)
-            self.assertIn("missing on host's game", text)
+            self.assertIn("client's build was cancelled because it could not be built in host's game", text)
+            self.assertIn("is missing there", text)
             self.assertNotIn("unresolved", text, "the technical text stays in the log")
             self.assertNotIn("Player 1", text)
-            self.assertIn("[FeverLink3]", text)
             self.assertIn("unresolved segment", self.B.log())
-            self.assertEqual(self.A.log().count("chat client: [FeverLink3]"), 1, "the other game gets that one line")
+            self.assertEqual(self.A.log().count("notice client: client's build"), 1, "the other game gets that one notice, not a chat line")
 
         def unpaused_in_the_grace():
             self.pause()

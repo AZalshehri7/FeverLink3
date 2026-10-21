@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use feverlink3_core::lobby::JoinCode;
 use feverlink3_launcher::install::AppIdState;
+use feverlink3_launcher::report::redact::{redact_join_codes, redact_user};
 
 use super::facts::Facts;
 use super::screen::{checks, license_line, render_checks};
@@ -21,8 +21,6 @@ const LOG_TAIL_LINES: usize = 40;
 /// How much of the end of a log is read: enough for 40 ordinary lines, bounded for a log that grew for months.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 const LOG_LINE_CHARS: usize = 300;
-/// Fewest base32 characters a join code can have (26 bytes: version, time, secret, endpoint count, check).
-const MIN_JOIN_CODE_CHARS: usize = 42;
 
 fn path_text(p: &Path) -> String {
     p.display().to_string()
@@ -199,120 +197,6 @@ pub(super) fn build_diagnostics(
     redact_join_codes(&redact_user(&(lines.join("\n") + "\n"), user_names))
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Redaction
-// ---------------------------------------------------------------------------------------------------------------
-
-/// A name to take out of a text: the name itself, or its 8.3 short form (`EXAMPL~1`), which Windows shows for
-/// long user folder names in `%TEMP%` and other environment variables.
-struct UserPattern {
-    name: Vec<char>,
-    short_form: bool,
-}
-
-impl UserPattern {
-    /// The length in characters of the match at `at`, when there is one that starts and ends on a word boundary
-    /// (so that `Ann` is found in `C:\Users\Ann\Desktop` but not in `Annual`).
-    fn match_len(&self, chars: &[char], at: usize) -> Option<usize> {
-        let rest = chars.get(at..)?;
-        let head = rest.get(..self.name.len())?;
-        if !head.iter().zip(&self.name).all(|(a, b)| same_letter(*a, *b)) {
-            return None;
-        }
-        let mut len = self.name.len();
-        if self.short_form {
-            if rest.get(len) != Some(&'~') {
-                return None;
-            }
-            len += 1;
-            let digits = rest.get(len..)?.iter().take_while(|c| c.is_ascii_digit()).count();
-            if digits == 0 {
-                return None;
-            }
-            len += digits;
-        }
-        rest.get(len).is_none_or(|c| !c.is_alphanumeric()).then_some(len)
-    }
-}
-
-/// Equal ignoring case, letter by letter: Windows paths are case-insensitive and the registry shows them in
-/// lower case. Comparing per character keeps the lengths aligned for every alphabet.
-fn same_letter(a: char, b: char) -> bool {
-    a == b || a.to_lowercase().eq(b.to_lowercase())
-}
-
-/// The patterns for the names, longest first so that a long name wins over a short one inside it.
-fn user_patterns(names: &[String]) -> Vec<UserPattern> {
-    let mut patterns: Vec<UserPattern> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for raw in names {
-        let name = raw.trim();
-        if name.is_empty() || seen.contains(&name.to_lowercase()) {
-            continue;
-        }
-        seen.push(name.to_lowercase());
-        patterns.push(UserPattern { name: name.chars().collect(), short_form: false });
-        let short: Vec<char> = name.chars().filter(char::is_ascii_alphanumeric).take(6).collect();
-        if short.len() == 6 {
-            patterns.push(UserPattern { name: short, short_form: true });
-        }
-    }
-    patterns.sort_by_key(|p| std::cmp::Reverse(p.name.len()));
-    patterns
-}
-
-/// `text` with the Windows user name (and its short form) replaced by `<user>`, case-insensitively.
-fn redact_user(text: &str, names: &[String]) -> String {
-    let patterns = user_patterns(names);
-    if patterns.is_empty() {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    while let Some(&c) = chars.get(at) {
-        let starts_word = at == 0 || chars.get(at - 1).is_none_or(|p| !p.is_alphanumeric());
-        match starts_word.then(|| patterns.iter().find_map(|p| p.match_len(&chars, at))).flatten() {
-            Some(len) => {
-                out.push_str("<user>");
-                at += len;
-            }
-            None => {
-                out.push(c);
-                at += 1;
-            }
-        }
-    }
-    out
-}
-
-/// `text` with every join code taken out. A join code is the credential of a session (whoever has it can join), and
-/// a diagnostics text is made to be pasted into chats. Candidates are runs of base32 letters; only a run that
-/// decodes as a join code (checksum included) is replaced, so ordinary words and hashes stay.
-fn redact_join_codes(text: &str) -> String {
-    fn flush(out: &mut String, run: &mut String) {
-        let letters = run.chars().filter(|c| *c != '-').count();
-        if letters >= MIN_JOIN_CODE_CHARS && JoinCode::try_decode(run).is_some() {
-            out.push_str("<join code removed>");
-        } else {
-            out.push_str(run);
-        }
-        run.clear();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut run = String::new();
-    for c in text.chars() {
-        if c.is_ascii_alphabetic() || ('2'..='7').contains(&c) || c == '-' {
-            run.push(c);
-        } else {
-            flush(&mut out, &mut run);
-            out.push(c);
-        }
-    }
-    flush(&mut out, &mut run);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -320,7 +204,9 @@ mod tests {
     use std::path::PathBuf;
 
     use feverlink3_core::crypto::SessionKey;
+    use feverlink3_core::lobby::JoinCode;
     use feverlink3_launcher::install::DllState;
+    use feverlink3_launcher::report::redact::MIN_JOIN_CODE_CHARS;
     use tempfile::TempDir;
 
     use super::*;

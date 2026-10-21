@@ -5,15 +5,15 @@ A release is a commit on `main` whose message starts with the version, built by 
 ## Cut a release
 
 1. Rename the `Unreleased` heading in `docs/CHANGELOG.md` to the version (its section becomes the release message and the changelog page). Make sure `main` is green in CI and `docs/ROADMAP.md` is current. Re-check the claims made in the listing and in `docs/SECURITY_FOR_USERS.md` against the code you are about to tag (the table is in `docs/nexus/README.md`): what a release says about the network, the files it creates and what is verified must match the tagged code.
-2. Set the version (`[workspace.package] version` in `Cargo.toml`, for example `0.2.0-test1`) and commit. The same version appears in the DLL's `native.log`.
-3. Make the release commit and push it to `main`. Its first line is `V<version>: <title>`, for example `V0.1.0: First beta release`. A version with a dash (`V0.2.0-test1: Friend test`) becomes a GitHub pre-release, which the updater skips by default. The workflow creates the tag `v<version>` itself. Only the head commit of a push is read, so the release commit must be the last one pushed.
-4. The workflow has three jobs. `build` (no secrets) runs the workspace tests (the essential set, the same as CI), `cargo build --release`, then `feverlink3_release package`. `sign` runs in the protected environment `release-signing` and waits for the owner's approval in the Actions tab ("Review deployments"); it signs `manifest.json` with the environment secret `RELEASE_SIGNING_KEY` and checks the signature with `feverlink3_release verify`, which is the launcher's own check against its `TRUSTED_KEYS` (and the zip hash), so a key the launcher would refuse stops the release. `publish` creates the release with these assets:
+2. Set the version (`[workspace.package] version` in `Cargo.toml`, for example `0.2.0`) and commit. The same version appears in the DLL's `native.log`.
+3. Make the release commit and push it to `main`. Its first line is `V<version>: <title>`, for example `V0.1.0: First beta release`. A version with a dash (`V0.2.0-beta.1: Friend test`) becomes a GitHub pre-release, which the updater skips by default. The workflow creates the tag `v<version>` itself. Only the head commit of a push is read, so the release commit must be the last one pushed.
+4. The workflow has three jobs. `build` (no secrets) runs the workspace tests (the essential set, the same as CI), `cargo build --release` (with `FEVERLINK3_OFFICIAL_BUILD=1`, which lets the module update itself in the game: "Automatic updates" below), then `feverlink3_release package`. **Releases are unsigned until 1.0.0 (owner decision 2026-10-22):** `sign` is skipped unless the repository variable `RELEASE_SIGNING` is `on`, and `publish` then runs without it. When it is on, `sign` runs in the protected environment `release-signing` and waits for the owner's approval in the Actions tab ("Review deployments"); it signs `manifest.json` with the environment secret `RELEASE_SIGNING_KEY` and checks the signature with `feverlink3_release verify`, which is the launcher's own check against its `TRUSTED_KEYS` (and the zip hash), so a key the launcher would refuse stops the release. `publish` creates the release with these assets:
    - `FeverLink3-<version>.zip`: the files to copy into the game's folder (`winhttp.dll`, `mods/release/feverlink3/`, no program; `feverlink3_release package --layout portable` makes the developer layout with `feverlink3.exe`), plus `README.txt` (the repository's `README.md`), `HOW-TO-PLAY.txt` (`docs/PLAYING.md`), `LICENSE`, `THIRD_PARTY_NOTICES.md`)
    - `FeverLink3-<version>.zip.sha256`
    - `manifest.json`: version, every file with size and SHA-256, and the zip's SHA-256
-   - `manifest.json.sig`: the detached signature, one line `feverlink3-ed25519 <key id> <Ed25519 signature over the exact bytes of manifest.json, hex>`. The key id is the first 8 bytes of the public key's SHA-256. The signature covers the zip through its hash in the manifest.
+   - `manifest.json.sig` (only once signing is on): the detached signature, one line `feverlink3-ed25519 <key id> <Ed25519 signature over the exact bytes of manifest.json, hex>`. The key id is the first 8 bytes of the public key's SHA-256. The signature covers the zip through its hash in the manifest.
 
-   The zip SHA-256 is also in the release notes. Without the environment secret a pre-release (a dash in the version) is published unsigned and says so (the in-app updater refuses it); a full release fails.
+   The zip SHA-256 is also in the release notes. Until 1.0.0 every release (with or without a dash) is published without `manifest.json.sig` and its notes say so; the in-game updater accepts it on the hash checks alone ("Automatic updates" below, the trust model in `docs/SECURITY_FOR_USERS.md`). Once `RELEASE_SIGNING` is `on`, a release without a signature fails, because updaters that trust a key refuse unsigned releases.
 The zip is reproducible: entries are sorted, timestamps are fixed to 1980-01-01 and permissions are fixed, so the same inputs give the same bytes.
 
 ## Tests: the essential set and the full set
@@ -32,6 +32,8 @@ $env:FEVERLINK3_FULL_TESTS = '1'; python -I -m unittest discover -s tests/lua -p
 A tight wall-clock test of the full set can fail on a busy PC; run it again alone before taking it for a regression.
 
 ## The signing key
+
+**Unsigned until 1.0.0 (owner decision 2026-10-22).** Everything in this section is kept for 1.0.0 and is not in use before. To switch signing on: add the key to `TRUSTED_KEYS` (step 2 below), set up the environment (step 3), and set the repository variable `RELEASE_SIGNING` to `on` (Settings, Secrets and variables, Actions, Variables) in the same release. From that release on, every updater that has the key refuses an unsigned release.
 
 The launcher trusts the public keys in `TRUSTED_KEYS` in `launcher/src/update.rs`, each with a last valid day. **The list is empty in the repository**, so every update is refused until the owner adds the real key. (The former placeholder key's private half is public, it is the tests' seed; a test makes sure it is never trusted.) The private key signs `manifest.json` and nothing else, and only inside the `sign` job.
 
@@ -53,13 +55,37 @@ To sign and check by hand: `feverlink3_release sign --key <file> --manifest mani
 
 ## The updater (`feverlink3 update`)
 
-The launcher program's `update` command (`launcher/src/updatecmd.rs`, the checks in `launcher/src/update.rs`) runs only when typed:
+The developer program's `update` command (players use the automatic update below). It still requires a signature, so it refuses every release until 1.0.0. The launcher program's `update` command (`launcher/src/updatecmd.rs`, the checks in `launcher/src/update.rs`) runs only when typed:
 
 - `feverlink3 update --check [--pre]` asks the GitHub API for the newest release (with `--pre` also pre-releases) and says whether it is newer, or why a newer one cannot be installed (for example no `manifest.json.sig`).
 - `feverlink3 update [--pre]` downloads `manifest.json` and `manifest.json.sig`, checks the signature (trusted key, not expired, version newer than the running one, same version and zip name as the release), only then downloads the zip and checks its hash, refuses while Transport Fever 3 or another FeverLink3 program (a session) runs, shows what was verified and installs only after the player types `yes`. `--from DIR` does the same with the three files already in a folder.
 - A portable release (with `feverlink3.exe`) goes into the exe's folder. The new program is then started with `update --probe` and must report its version within 30 s; otherwise the previous files come back from their `.old` copies and the version goes on a skip list (`feverlink3_update_skip.txt`).
 - An overlay release (what the release job publishes) goes into the game folder: `winhttp.dll` and `mods/...` only, the documents are not copied there. The game cannot be started for the check, so the player starts it, then runs `feverlink3 update --confirm` or `--rollback`; until then no other update is installed.
 - Downloads use Windows' own `curl.exe` with HTTPS only (also for redirects) and size limits; no HTTP crate is in the program.
+## Automatic updates (in the game)
+
+The module updates itself; players never run `feverlink3.exe` (owner decision 2026-10-22). The code is `launcher/src/autoupdate.rs`, its documentation comment has the whole order and the reasons; the player's view and the trust model are in `docs/SECURITY_FOR_USERS.md`, "Automatic updates". In short:
+
+- **Which builds update themselves:** only modules built by the release workflow (`FEVERLINK3_OFFICIAL_BUILD=1` at `cargo build`). A module built on a developer's PC never replaces itself with GitHub's release (so a developer's test installs stay as they are), except for the real test below.
+- **Check:** once per game start, on its own thread, never while a session runs: `https://api.github.com/repos/AZalshehri7/FeverLink3/releases/latest` (full releases only).
+- **Trust until 1.0.0 (unsigned):** HTTPS (curl.exe, certificate checked), files only from `https://github.com/AZalshehri7/FeverLink3/releases/download/<tag>/`, version strictly newer, the zip's SHA-256 equal to `manifest.json` and to the `.sha256` asset, every extracted file equal to the manifest (size and SHA-256), names only `winhttp.dll` and `mods/release/feverlink3/**`. As soon as `TRUSTED_KEYS` has a key, the signature is required again (`update::accept_manifest`; a unit test covers both modes). So every release must publish `manifest.json` and the `.sha256` file (the workflow does).
+- **Apply order:** staged in `<game>\feverlink3_update\<version>\` and the loaded `winhttp.dll` renamed to `winhttp.dll.old-<old>` with the new one put in place, in the same run (the run keeps old DLL + old mod in memory, so it can still play); at the next start the NEW DLL's `DllMain` swaps `mods\release\feverlink3` (old one to `feverlink3_update\backup-<old>\`) before the game reads mods; after 30 s in the game the backup and the old DLL are deleted. One restart; no run mixes versions. A run whose files on disk do not match its DLL refuses Host and Join.
+- **Rollback:** a new version that does not stay up 30 s in two starts, or a mod swap that fails, puts the old DLL and mod back and skips the version (`feverlink3_update_skip.txt`).
+- **Compatibility rule:** every later version's `DllMain` must keep calling `autoupdate::start` with the same `feverlink3_update\state.json`: the old version downloads, the new version finishes.
+- **Logs:** `native.log`, lines starting with `update:`.
+
+## Testing the auto update
+
+Right after 0.2.0 is published on GitHub (a full release, not a pre-release), on the owner's PC, with no session running:
+
+1. Build the module of the commit that was released, on the PC: `cargo build --release -p feverlink3_native`. This build is not an official one, so it would not update itself.
+2. Install it like a player: close the game, copy `target\release\feverlink3_native.dll` as `winhttp.dll` and `mod\feverlink3` as `mods\release\feverlink3` into the game folder.
+3. Make it believe it is older: create `<game folder>\feverlink3_pretend_version.txt` with one line `0.1.9` (or set the user environment variable `FEVERLINK3_PRETEND_VERSION=0.1.9` and restart Steam so the game inherits it; remove the variable after the test, the file removes itself). No world needs to be loaded: everything happens in the main menu.
+4. Start the game from Steam and wait about a minute in the main menu. Expect in `%LOCALAPPDATA%\FeverLink3\native.log`: `update: downloading 0.2.0 (compared with 0.1.9)`, then `update: 0.2.0 staged and winhttp.dll replaced`. The window (Play together) shows "FeverLink3 was updated to 0.2.0: restart the game to finish". In the game folder: `winhttp.dll` now has the SHA-256 of the release's (compare with `manifest.json`), `winhttp.dll.old-0.2.0` is the local build, `feverlink3_update\0.2.0\` holds the new mod, `feverlink3_pretend_version.txt` is gone.
+5. Close and start the game again. Expect `FeverLink3 native 0.2.0 loaded` and `update: at start Confirm`, then about 30 s later `update: 0.2.0 started well`; the window shows "FeverLink3 is now 0.2.0". `mods\release\feverlink3` is the release's (its files match `manifest.json`), and `feverlink3_update\`, `winhttp.dll.old-0.2.0` are gone. The next start logs `update: up to date`.
+6. Rollback check (optional): repeat 2 to 4, then make the next two starts fail: end `TransportFever3.exe` in Task Manager within 20 s of starting it, twice (a start counts as good 30 s after the module loaded). The third start should log `at start Restart`, put the local build's DLL and mod back, show "Update failed: FeverLink3 0.2.0 did not start properly; you keep 0.2.0" and refuse Host/Join until a restart. Delete `feverlink3_update_skip.txt` afterwards, or 0.2.0 is never offered again on this PC.
+7. Switch check: Troubleshooting, "Automatic updates: on" -> off; `%LOCALAPPDATA%\FeverLink3\settings.txt` says `autoupdate=off` and the next start logs `update: no check`.
+
 ## Verify a download by hand
 
 PowerShell, in the folder with the files:
@@ -69,7 +95,7 @@ PowerShell, in the folder with the files:
 Get-Content FeverLink3-0.3.0.zip.sha256
 ```
 
-The two values must be equal, and equal to the SHA-256 in the release notes. The same hash is the `zip_sha256` field of `manifest.json`. The signature check is done by the launcher's updater (trusted public keys embedded in the exe), or by hand with `feverlink3_release verify --manifest manifest.json` from a checkout of the tagged source.
+The two values must be equal, and equal to the SHA-256 in the release notes. The same hash is the `zip_sha256` field of `manifest.json`. Until 1.0.0 there is no signature to check. From then on the signature check is done by the launcher's updater (trusted public keys embedded in the exe), or by hand with `feverlink3_release verify --manifest manifest.json` from a checkout of the tagged source.
 
 ## SmartScreen
 

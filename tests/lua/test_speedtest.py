@@ -79,13 +79,9 @@ class SpeedTextTest(unittest.TestCase):
         check = self.lua.eval("function(src) local f, err = load(src, 'ui', 't'); return f ~= nil, err end")
         ok, err = check(read("feverlink3_ui.script.lua"))
         self.assertTrue(ok, err)
-        # the window says how a transfer over several connections is going
-        import re
-
-        src = read("feverlink3_ui.script.lua")
-        found = re.search(r"local function syncText\(sync, host\).*?\nend\n", src, re.S)
-        self.assertIsNotNone(found, "syncText is in the window script")
-        sync_text = self.lua.eval("function(src) return load(src .. ' return syncText', 'sync', 't')() end")(found.group(0))
+        # the window says how a transfer over several connections is going (the words live in the tested window model)
+        hud = self.lua.execute(read("feverlink3_hud.lua"))
+        sync_text = hud.syncText
         # a chunk transfer: the percentage only
         self.assertEqual(
             "Syncing: Receiving the host's world: 63%",
@@ -112,13 +108,7 @@ class SpeedTextTest(unittest.TestCase):
                 "Syncing: Receiving the host's world: 50%", sync_text(self.lua.table_from(sync), False), odd
             )
         # the window names join requests and counts what waits for an answer
-        import re
-
-        src = read("feverlink3_ui.script.lua")
-        found = re.search(r"local function requestLabel\(r\).*?\nend\n.*?local function askCount\(ctl\).*?\nend\n", src, re.S)
-        self.assertIsNotNone(found, "requestLabel and askCount are in the window script")
-        fns = self.lua.eval("function(src) return load(src .. ' return requestLabel, askCount', 'inv', 't')() end")
-        label, count = fns(found.group(0))
+        label, count = hud.requestLabel, hud.askCount
         t = self.lua.table_from
         # Steam's name for the account first; the name its game sent only when it differs
         self.assertEqual("Ben (Benny) wants to join", label(t({"id": "1", "name": "Benny", "steam": "Ben"})))

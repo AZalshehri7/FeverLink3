@@ -595,6 +595,7 @@ fn session_state(r: &mut StdRng) -> SessionState {
         resync: None,
         mod_warnings: Vec::new(),
         stalled: (0..r.gen_range(0..3)).map(|_| r.gen()).collect(),
+        loading: (0..r.gen_range(0..3)).map(|_| r.gen()).collect(),
     }
 }
 
@@ -745,6 +746,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
             text: random_text(rr, 60),
             from: rr.gen(),
             name: rr.gen_bool(0.5).then(|| random_text(rr, 20)),
+            level: rr.gen_bool(0.5).then(|| random_text(rr, 5)),
         });
 
         // arbitrary JSON, and valid encodings with damage: no decoder may panic, whatever it makes of them
@@ -764,6 +766,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
                 resync: None,
                 mod_warnings: Vec::new(),
                 stalled: Vec::new(),
+                loading: Vec::new(),
             },
             nonce: vec![7; 16],
             resume: Some(ResumeGrant { token: vec![9; 16], epoch: 3 }),

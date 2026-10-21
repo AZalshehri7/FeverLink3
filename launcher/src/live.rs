@@ -46,6 +46,9 @@ use crate::steam_transport::SteamEndpoint;
 use crate::steamnet::CoreRef;
 use crate::{clipboard, luatext, modlist, net, resync, steam, steam_persona, steam_transport, steamnet};
 
+mod report;
+pub use report::{OpenTarget, Opener};
+
 /// The window's commands, appended by the mod.
 pub const CMD_FILE: &str = "ctl_cmd.log";
 /// The controller's state, rewritten by the controller.
@@ -244,7 +247,9 @@ impl Pulse {
 /// The mod's presence lock (`world.lock` in the session folder): the mod's interface script opens it once and never closes it, so the
 /// handle lives exactly as long as the script's Lua state, which the game destroys with the world. The pause menu only stops the
 /// script (the handle stays open); closing the world to the main menu frees it. A file that can be opened without sharing is held by
-/// nobody: a positive sign that the world is closed, seconds after the fact instead of the heartbeat's two minutes.
+/// nobody: a positive sign that the world is closed, seconds after the fact instead of the heartbeat's two minutes. The mod holds it
+/// whenever a world is loaded and this controller wrote `identity.txt`, in a session or not: a pending Steam invite starts on it
+/// (`Controller::invites_step`); the session's watch (`PresenceLock`) only looks while a session runs.
 pub const WORLD_LOCK_FILE: &str = "world.lock";
 
 /// Watches [`WORLD_LOCK_FILE`]: true once the lock was seen held in this session and is free now.
@@ -361,8 +366,10 @@ pub struct Controller {
     /// Why the last join was refused for its mods: each difference to the host's game, `true` when it blocks. Shown by the
     /// window under the failure until the next host or join.
     mod_report: Vec<(bool, String)>,
-    /// The `mods` and `game` of the window's last `host` / `join` command (`Value::Null` before one).
+    /// The `mods` and `game` of the window's last `host` / `join` / `report` command (`Value::Null` before one).
     mod_params: Value,
+    /// "Report a problem" (`report.rs`).
+    reporter: report::Reporter,
 }
 
 impl Controller {
@@ -460,6 +467,7 @@ impl Controller {
             names: HashMap::new(),
             mod_report: Vec::new(),
             mod_params: Value::Null,
+            reporter: report::Reporter::new(),
         };
         c.publish();
         Ok(c)
@@ -491,6 +499,14 @@ impl Controller {
         self
     }
 
+    /// What opens the report's folder and the issue page instead of Windows (tests), and the folders the player's copy goes to
+    /// instead of the Desktop.
+    pub fn with_report_output(mut self, opener: Opener, dirs: Vec<PathBuf>) -> Controller {
+        self.reporter.opener = opener;
+        self.reporter.dirs = Some(dirs);
+        self
+    }
+
     /// The options every game this controller hosts will use (player limit, flood limit, ping and reconnect timing).
     /// The defaults are what a player gets; tests shorten the timings.
     pub fn with_host_options(mut self, options: HostOptions) -> Controller {
@@ -511,6 +527,8 @@ impl Controller {
             self.command(self.commands_read, &line.kind, &params);
         }
         self.advance();
+        // the automatic update waits while a session runs (autoupdate.rs)
+        crate::autoupdate::set_session_busy(!matches!(self.state, State::Idle | State::Failed(_)));
         self.watch_game();
         if !self.name_from_steam && self.persona_attempts < 600 && self.persona_last.elapsed() >= Duration::from_secs(1)
         {
@@ -533,6 +551,7 @@ impl Controller {
             probe.poll();
         }
         self.invites_step();
+        self.report_step();
         self.log_speed_test();
         self.write_session_log();
         self.publish();
@@ -599,8 +618,17 @@ impl Controller {
 
     fn command(&mut self, n: u64, kind: &str, params: &Value) {
         match kind {
+            // the files on disk are another version than this module: playing now would mix versions (autoupdate.rs)
+            "host" | "join" | "accept_invite" if crate::autoupdate::restart_needed() => {
+                self.state = State::Failed(crate::autoupdate::RESTART_FIRST.to_owned());
+            }
             "host" => self.host(params),
             "join" => self.join(params),
+            "autoupdate" => {
+                let on = params.get("on").and_then(Value::as_bool).unwrap_or(true);
+                let outcome = crate::autoupdate::set_enabled(on);
+                self.note(n, kind, outcome);
+            }
             "leave" => self.leave(),
             "kick" => {
                 let outcome = self.kick(params);
@@ -648,6 +676,7 @@ impl Controller {
                 }
             }
             "steamloop" => self.steam_loop(),
+            "report" => self.report_command(params),
             "invite" => {
                 let outcome = self.open_invite_dialog();
                 self.note(n, kind, outcome);
@@ -1123,8 +1152,10 @@ impl Controller {
         for request in requests {
             self.take_join_request(request);
         }
-        // an invite starts by itself once this game is free and has a world loaded (the mod holds its presence lock);
-        // otherwise the window offers Join
+        // an invite starts by itself once this game is free and has a world loaded (the mod holds its presence lock, idle
+        // too: friend test 2026-10-21, the lock was taken only in a session and three join requests did nothing); otherwise
+        // it waits and the window offers Join. In the main menu there is no world: TF3 has no documented call for a mod to
+        // load a save from there, so the invite waits for the player to load any world (UNPROVEN in a two-PC Steam run).
         if self.invite.is_some() && self.idle_or_failed() && lock_is_held(&self.dir.join(WORLD_LOCK_FILE)) == Some(true)
         {
             if let Some(invite) = self.invite.take() {
@@ -1262,7 +1293,14 @@ impl Controller {
         }
         let State::Joining { rx, .. } = &self.state else { return };
         match rx.try_recv() {
-            Ok(Ok(handle)) => self.state = State::Joined { handle },
+            Ok(Ok(handle)) => {
+                self.state = State::Joined { handle };
+                // a Steam invite received before this join (friend test 2026-10-21: the invite did not join, the code
+                // did) is answered by the join itself; left pending it kept the bar icon yellow next to "in sync"
+                if self.invite.take().is_some() {
+                    self.append_session_log("invites: the pending invite was cancelled: this game joined a session");
+                }
+            }
             Ok(Err(why)) => self.state = State::Failed(why),
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => self.state = State::Failed("joining was interrupted".into()),
@@ -1332,6 +1370,13 @@ impl Controller {
         }
         if let Some(notice) = &self.notice {
             v["notice"] = json!(notice);
+        }
+        if let Some(r) = self.reporter.json() {
+            v["report"] = r;
+        }
+        let update = crate::autoupdate::status_json();
+        if !update.is_null() {
+            v["update"] = update;
         }
         self.invites_json(&mut v);
         v
@@ -1438,6 +1483,11 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
         if let Some(note) = &s.transfer_note {
             sync["note"] = json!(note);
         }
+        // the games the round's load still waits for, by name (SessionState::loading): "waiting for Ben to load the world"
+        let loading = s.session.as_ref().map(|sess| loading_names(&s, &sess.loading)).unwrap_or_default();
+        if !loading.is_empty() {
+            sync["loading"] = json!(loading);
+        }
         v["sync"] = sync;
     }
     // ping and route per connection, for transports that measure them (Steam)
@@ -1446,6 +1496,20 @@ fn add_session(v: &mut Value, handle: &SessionHandle) {
         .iter()
         .map(|l| json!({ "conn": l.conn, "ping": l.ping_ms, "route": l.route }))
         .collect::<Vec<_>>());
+}
+
+/// The names of the games `ids` (the roster's, else the plain player list's; "player <id>" for one neither knows).
+fn loading_names(s: &Status, ids: &[u16]) -> Vec<String> {
+    ids.iter()
+        .map(|&id| {
+            s.roster
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.name.clone())
+                .or_else(|| s.players.iter().find(|p| p.id == id).map(|p| p.name.clone()))
+                .unwrap_or_else(|| format!("player {id}"))
+        })
+        .collect()
 }
 
 /// Every player of the session, away ones included. Before the first roster exists, the plain player list.
@@ -2937,11 +3001,14 @@ mod tests {
         }));
         steps(&mut [&mut host, &mut friend], Duration::from_millis(300), |_| false);
         assert_eq!(friend.pc.window.status()["state"], "idle", "no world yet: nothing starts");
-        // a world is loaded: the join starts by itself
+        // the window's row: "<host> invited you. Load any world and you join automatically", with Join (ui.script.lua)
+        assert_eq!(friend.pc.window.status()["invite"]["auto"], true);
+        // a world is loaded (the mod holds its presence lock while idle too): the join starts by itself, no window command
         friend.world();
         assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
             p[1].pc.window.status()["state"] == "joined"
         }));
+        assert!(friend.pc.window.status()["invite"].is_null(), "the invite is answered: no yellow icon");
         let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
         assert!(log.contains("invites: join request from the command line"), "{log}");
 
@@ -2959,5 +3026,139 @@ mod tests {
         assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
             p[1].pc.window.status()["message"].as_str().is_some_and(|m| m.contains("session that is over"))
         }));
+    }
+
+    /// Friend test 2026-10-21: the invite did not join, the code did, and the invite stayed pending (yellow bar icon
+    /// next to "in sync"). A join answers it.
+    #[cfg(windows)]
+    #[test]
+    fn joining_with_the_code_cancels_a_pending_invite() {
+        let root = tempfile::tempdir().unwrap();
+        let mut host = invite_pc(root.path(), "host", "TransportFever3.exe");
+        host.pc.window.send("host", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(10), |p| p[0].friends.presence("connect").is_some()));
+        host.pc.window.send("invite", "{}");
+        assert!(steps(&mut [&mut host], Duration::from_secs(5), |p| p[0].friends.dialogs().len() == 1));
+        let invite = host.friends.dialogs()[0].clone();
+        let code = host.pc.window.status()["code"].as_str().unwrap().to_owned();
+        // the invite arrives while no world is loaded: it waits in the window
+        let mut friend = invite_pc(root.path(), "friend", &format!("\"C:\\TF3\\TransportFever3.exe\" {invite}"));
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(5), |p| {
+            p[1].pc.window.status()["invite"]["host"].is_string()
+        }));
+        friend.pc.window.send("join", &format!("{{[\"name\"]=\"Fred\",[\"code\"]=\"{code}\"}}"));
+        assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
+            p[1].pc.window.status()["state"] == "joined"
+        }));
+        assert!(friend.pc.window.status()["invite"].is_null(), "{}", friend.pc.window.status());
+        let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
+        assert!(log.contains("the pending invite was cancelled"), "{log}");
+    }
+
+    fn report_zip(dir: &Path) -> Option<PathBuf> {
+        fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "zip"))
+    }
+
+    fn zip_names(path: &Path) -> Vec<String> {
+        let bytes = fs::read(path).unwrap();
+        crate::report::zip_contents(&bytes).into_iter().map(|c| c.split(" (").next().unwrap().to_owned()).collect()
+    }
+
+    #[test]
+    fn outside_a_session_the_report_holds_this_games_logs_opens_its_folder_and_the_issue_page() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("live");
+        let out = root.path().join("desk");
+        let (opener, opened) = report::recording_opener();
+        let mut c = Controller::new(dir.clone(), "Solo".into(), Vec::new())
+            .unwrap()
+            .with_report_output(opener, vec![out.clone()]);
+        // the controller clears the folder at its start: the logs are written after it
+        fs::write(
+            dir.join("mod.log"),
+            "mod line from 10.0.0.9
+",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("native.log"),
+            "native line
+",
+        )
+        .unwrap();
+        let mut w = Window::new(&dir);
+        w.send("report", "{[\"note\"]=\"the road vanished\",[\"game\"]=\"40420\"}");
+        assert!(
+            until(&mut [&mut c], Duration::from_secs(20), || w.status()["report"]["state"] == "done"),
+            "{:?}",
+            w.status()
+        );
+        let st = w.status();
+        let zip = report_zip(&out).expect("the report is saved");
+        assert!(zip.file_name().unwrap().to_string_lossy().starts_with("FeverLink3-report-"));
+        let names = zip_names(&zip);
+        for want in
+            ["report.txt", "player-1/report.txt", "player-1/mod.log", "player-1/native.log", "player-1/ctl_status.txt"]
+        {
+            assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+        }
+        assert!(st["report"]["contents"].as_array().is_some_and(|c| c.len() == names.len()), "{st}");
+        assert!(st["report"]["message"].as_str().unwrap().contains("Drag the zip"));
+        let seen = opened.lock().unwrap().clone();
+        assert_eq!(OpenTarget::Folder(zip), seen[0]);
+        assert!(
+            matches!(&seen[1], OpenTarget::Address(u) if u.contains("template=bug_report.yml") && u.contains("report_id="))
+        );
+    }
+
+    #[test]
+    fn a_players_report_collects_both_games_logs_at_the_host_and_lands_with_the_player() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, player, mut hw, mut pw, join) = start_pair(root.path(), quick());
+        let (host_out, player_out) = (root.path().join("host-docs"), root.path().join("player-desk"));
+        let (ho, host_opened) = report::recording_opener();
+        let (po, player_opened) = report::recording_opener();
+        let mut host = host.with_report_output(ho, vec![host_out.clone()]);
+        let mut player = player.with_report_output(po, vec![player_out.clone()]);
+        pw.send("join", &join);
+        assert!(until(&mut [&mut host, &mut player], Duration::from_secs(15), || pw.status()["state"] == "joined"));
+        pw.send("report", "{[\"note\"]=\"it froze\"}");
+        assert!(
+            until(&mut [&mut host, &mut player], Duration::from_secs(30), || pw.status()["report"]["state"] == "done"),
+            "{:?}",
+            pw.status()
+        );
+        let zip = report_zip(&player_out).expect("the player's copy");
+        let names = zip_names(&zip);
+        for want in ["report.txt", "player-1/report.txt", "player-2/report.txt", "player-2/session.log"] {
+            assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+        }
+        let bytes = fs::read(&zip).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut top = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("report.txt").unwrap(), &mut top).unwrap();
+        assert!(
+            top.contains("asked by: Pat") && top.contains("note: it froze") && top.contains("missing parts: none"),
+            "{top}"
+        );
+        // the host kept a copy in its reports folder and opened nothing; the player got the folder and the issue page
+        assert!(report_zip(&host_out).is_some());
+        assert!(host_opened.lock().unwrap().is_empty());
+        assert_eq!(2, player_opened.lock().unwrap().len());
+        // the host's game was told in a notice who made the report
+        assert!(hw.status()["report"].is_null(), "the host's window shows no report of its own");
+        // a request while the host's own report runs is refused at once: the player's window names whose report it is and
+        // shows the button again (no five-minute wait for a bundle that will not come)
+        hw.send("report", "{}");
+        assert!(until(&mut [&mut host], Duration::from_secs(5), || hw.status()["report"]["state"] == "collecting"));
+        pw.send("report", "{}");
+        assert!(
+            until(&mut [&mut host, &mut player], Duration::from_secs(10), || pw.status()["report"]["state"] == "busy"),
+            "{:?}",
+            pw.status()
+        );
+        let busy = pw.status()["report"]["message"].as_str().unwrap().to_owned();
+        assert!(busy.starts_with("A bug report is already being made; it will reach "), "{busy}");
+        hw.send("leave", "{}");
     }
 }

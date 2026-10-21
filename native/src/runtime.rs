@@ -2625,7 +2625,7 @@ mod tests {
         inject::TEST_FNS.with(|f| {
             f.set(Some(crate::native_copy::ProposalFns { ctor: p_ctor, dtor: p_dtor, copy: p_copy, assign: p_copy }))
         });
-        // the text names x = 100, the mod's own command builds at x = 300: a content check that misses (friend test pre7)
+        // the text names x = 100, the mod's own command builds at x = 300: a content check that misses (friend test 2026-10-20)
         let text = format!(
             "proposal.addedNodes.#\tn:1\nproposal.addedNodes[0].position\tv3:{:08x},00000000,00000000\n",
             100f32.to_bits()

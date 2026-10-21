@@ -308,6 +308,31 @@ fn a_host_alone_skips_the_transfer() {
     assert_eq!(1, h.host.state().speed);
 }
 
+/// Friend test 2026-10-21: the host waited ~52 s for a guest's load and every window showed only the step. The session state now
+/// names the games still loading, on every game, and the round's progress says who.
+#[test]
+fn loading_names_the_games_still_loading_on_every_game() {
+    let (mut h, ids) = Harness::running(2, 1, quiet());
+    h.host_call(|host| host.start_resync("t"));
+    let id = h.reach_transferring();
+    h.send_file(id, &blob(1000));
+    assert_eq!(3, h.host.state().loading.len(), "the host's game and both players load");
+    let pause_at = h.host.state().pause_at.unwrap();
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(pause_at)));
+    h.hello_player(ids[0], pause_at, 0);
+    let waiting = h.host.state().loading.clone();
+    assert_eq!(1, waiting.len());
+    assert_eq!(Some(&waiting), h.p(ids[0]).session.session().map(|s| &s.loading), "the players see it too");
+    let said = h.events.iter().any(
+        |e| matches!(e, HostOutput::ResyncProgress { detail, .. } if detail == "waiting for P1 to load the world"),
+    );
+    assert!(said, "{:?}", h.events);
+    h.hello_player(ids[1], pause_at, 0);
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    assert!(h.host.state().loading.is_empty());
+    assert!(h.p(ids[0]).session.session().unwrap().loading.is_empty());
+}
+
 #[test]
 fn loading_logs_who_is_missing_after_600_seconds_and_continues() {
     let (mut h, ids) = Harness::running(2, 1, quiet());
@@ -571,6 +596,62 @@ fn a_player_joining_a_started_session_starts_a_round_and_gets_the_save() {
     report_all(&mut h, &all, req.n, req.at, &[("a", "1")], &[("a", "1")]);
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     assert_eq!(2, h.host.state().speed);
+}
+
+/// A player joining a running session brings the world of its own save: its clock (far behind here, with its own promise) neither
+/// holds the round's pause nor pushes the stamp, and the games already in the session's world are not paced to it.
+#[test]
+fn a_joiners_own_world_does_not_hold_or_push_the_pause_of_its_round() {
+    let (mut h, ids) = Harness::running(1, 1, quiet());
+    let joiner = h.connect("Joiner");
+    let pause_at = h.host.state().pause_at.expect("a pause stamp");
+    h.player_game(joiner, MessageKind::Hello, &json(&HelloMessage::new(400)));
+    let behind = ClockMessage {
+        t: 400,
+        speed: 0,
+        ahead: 3,
+        need: None,
+        safe: Some(900_000),
+        pause: false,
+        stop: None,
+        hop: None,
+    };
+    h.player_game(joiner, MessageKind::Clock, &json(&behind));
+    assert!(h.p(ids[0]).last::<PeerClockMessage>(MessageKind::PeerClock).stalled, "the others do not pace to it");
+    assert!(h.host.future_stamp() < 900_000, "its promise is of another world");
+    assert_eq!(ResyncState::Pausing, h.host.resync_state());
+    h.host_game(
+        MessageKind::Clock,
+        &json(&ClockMessage {
+            t: pause_at,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
+    );
+    h.player_game(
+        ids[0],
+        MessageKind::Clock,
+        &json(&ClockMessage {
+            t: pause_at,
+            speed: 0,
+            ahead: 3,
+            need: None,
+            safe: None,
+            pause: false,
+            stop: None,
+            hop: None,
+        }),
+    );
+    assert_eq!(
+        ResyncState::Saving,
+        h.host.resync_state(),
+        "every game that keeps a world stopped at the pause; the joiner is not waited for"
+    );
 }
 
 #[test]
@@ -902,48 +983,23 @@ fn started_at_different_times() -> (Harness, ConnectionId) {
 #[test]
 fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_at_once() {
     let (mut h, p) = started_at_different_times();
-    assert_eq!(ResyncState::Pausing, h.host.resync_state());
     let state = h.host.state().clone();
     let pause_at = state.pause_at.expect("a pause stamp");
-    assert!(state.speed > 0, "a stopped game never reaches a stamp ahead of it, so the games may run");
-    assert!(
-        pause_at > 87_000 && pause_at < 183_600,
-        "counted from the host's clock, not the furthest game's: {pause_at}"
+    assert!(state.speed > 0, "a game standing between two steps may run up to the next one");
+    assert_eq!(
+        87_000, pause_at,
+        "the step the host's game stands at: the session never ran, nothing is stamped anywhere"
     );
     assert_eq!(0, pause_at % Lockstep::STEP);
     assert_eq!(Some(pause_at), h.p(p).session.session().unwrap().pause_at);
+    // both games read that a sync starts: they stand still and reload, which without a word looks like a hang (UI run 2026-10-21)
+    let started: ChatMessage = h.p(p).last(MessageKind::Chat);
+    assert_eq!((notices::SYNC_STARTED, Some("info")), (started.text.as_str(), started.level.as_deref()));
+    assert_eq!(started, h.host_game_last::<ChatMessage>(MessageKind::Chat), "the host's own game too");
 
-    // the player's game was already past the stamp and holds; the host's game runs up to the stamp and stops there
-    assert_eq!(ResyncState::Pausing, h.host.resync_state(), "the host's game is still behind the stamp");
-    h.host_game(
-        MessageKind::Clock,
-        &json(&ClockMessage {
-            t: pause_at,
-            speed: 1,
-            ahead: 3,
-            need: None,
-            safe: None,
-            pause: false,
-            stop: None,
-            hop: None,
-        }),
-    );
-    assert_eq!(ResyncState::Pausing, h.host.resync_state(), "still running");
-    h.host_game(
-        MessageKind::Clock,
-        &json(&ClockMessage {
-            t: pause_at,
-            speed: 0,
-            ahead: 3,
-            need: None,
-            safe: None,
-            pause: false,
-            stop: None,
-            hop: None,
-        }),
-    );
+    // the host's game already stands at the pause and the player's world is replaced by the load: the save is asked at once
     assert_eq!(ResyncState::Saving, h.host.resync_state());
-
+    assert_eq!(1, h.host_game_count(MessageKind::ResyncSave));
     let id = h.host.resync_id().unwrap();
     h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
     let bytes = blob(1000);
@@ -957,6 +1013,73 @@ fn starting_with_games_at_different_times_brings_everyone_into_the_hosts_world_a
     assert_eq!(1, h.host.state().speed, "the session runs afterwards");
     assert_eq!(None, h.host.state().pause_at);
     assert!(h.failures().is_empty(), "{:?}", h.failures());
+    let done: ChatMessage = h.p(p).last(MessageKind::Chat);
+    assert_eq!(notices::SYNC_DONE, done.text);
+    assert_eq!(done, h.host_game_last::<ChatMessage>(MessageKind::Chat), "the host's own game too");
+}
+
+/// UI run 2026-10-21: the host's game stood at 128 800, the guest's world 35 000 game-ms behind it with its own promise. The start
+/// round's pause was the host's clock plus the lead, and every ready game had to reach it: the guest ran 37 s at x1 through a world
+/// the load then replaced, the host's game held by the guest's clock and promise meanwhile.
+#[test]
+fn a_start_round_neither_waits_for_nor_paces_the_host_to_a_game_whose_world_it_replaces() {
+    let mut h = Harness::with(quiet());
+    let p = h.connect("Guest");
+    h.host_game(MessageKind::Hello, &json(&HelloMessage::new(128_600)));
+    let host_clock = |t| ClockMessage {
+        t,
+        speed: 0,
+        ahead: 3,
+        need: None,
+        safe: Some(130_000),
+        pause: false,
+        stop: None,
+        hop: None,
+    };
+    h.host_game(MessageKind::Clock, &json(&host_clock(128_800)));
+    h.player_game(p, MessageKind::Hello, &json(&HelloMessage::new(93_600)));
+    let guest_clock = |t, speed| ClockMessage {
+        t,
+        speed,
+        ahead: 3,
+        need: Some(4),
+        safe: Some(t + 1_200),
+        pause: false,
+        stop: None,
+        hop: None,
+    };
+    h.player_game(p, MessageKind::Clock, &json(&guest_clock(93_800, 0)));
+    h.host_call(HostSession::start);
+
+    assert_eq!(Some(128_800), h.host.state().pause_at, "where the host's game stands, no lead on top");
+    assert_eq!(ResyncState::Saving, h.host.resync_state(), "not waiting for the guest to run 35 000 game-ms at x1");
+    assert!(h
+        .host_log
+        .iter()
+        .any(|l| l.contains("pause 128800 waits only for the games in the session's world; not for Guest")));
+
+    // the guest's clock still reaches the host's game, but as no one to pace to and with no promise to keep to
+    h.player_game(p, MessageKind::Clock, &json(&guest_clock(94_000, 1)));
+    let relayed: PeerClockMessage = h.host_game_last(MessageKind::PeerClock);
+    assert_eq!((94_000, true, None, None), (relayed.t, relayed.stalled, relayed.safe, relayed.need));
+    // an action made in the guest's old world is applied on no game
+    h.player_game(p, MessageKind::Action, &json(&ActionMessage::new(94_600, 1, "{}")));
+    assert_eq!(0, h.host_game_count(MessageKind::Action));
+    let veto: BuildVetoMessage = h.host_game_last(MessageKind::BuildVeto);
+    assert!(veto.host);
+    assert_eq!(veto, h.p(p).last::<BuildVetoMessage>(MessageKind::BuildVeto), "its own game drops it too");
+
+    // after the load the guest is in the session's world: its clock and promise count again
+    let id = h.host.resync_id().unwrap();
+    h.host_game(MessageKind::SaveDone, &json(&SaveDoneMessage { id, ok: true, detail: None, mods: None }));
+    h.send_file(id, &blob(1000));
+    h.hello_all(128_800, 0);
+    assert_eq!(ResyncState::Verifying, h.host.resync_state());
+    h.player_game(p, MessageKind::Clock, &json(&guest_clock(128_800, 0)));
+    let relayed: PeerClockMessage = h.host_game_last(MessageKind::PeerClock);
+    assert_eq!((false, Some(130_000)), (relayed.stalled, relayed.safe));
+    h.player_game(p, MessageKind::Action, &json(&ActionMessage::new(129_400, 2, "{}")));
+    assert_eq!(1, h.host_game_count(MessageKind::Action));
 }
 
 #[test]
@@ -1369,8 +1492,9 @@ fn a_repair_sync_is_announced_before_it_starts_and_its_end_after_it() {
     assert_eq!(before + 1, h.p(ids[0]).count(MessageKind::Chat), "one chat line to every player");
     let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
     assert_eq!(Some("FeverLink3"), chat.name.as_deref());
-    assert!(chat.text.contains("repair sync starts") && chat.text.contains("will be lost"), "{}", chat.text);
-    assert!(h.host_game_last::<ChatMessage>(MessageKind::Chat).text.contains("repair sync"), "the host's own game too");
+    assert_eq!(feverlink3_core::session::notices::SYNC_REPAIR_STARTED, chat.text);
+    assert_eq!(Some("warn"), chat.level.as_deref(), "a notice, not a chat line");
+    assert_eq!(chat, h.host_game_last::<ChatMessage>(MessageKind::Chat), "the host's own game too");
     let pause_at = h.host.state().pause_at.expect("pause stamp");
     let id = h.reach_transferring();
     h.send_file(id, &blob(1000));
@@ -1379,7 +1503,7 @@ fn a_repair_sync_is_announced_before_it_starts_and_its_end_after_it() {
     report_all(&mut h, &ids, req.n, req.at, &[("roads", "r")], &[("roads", "r")]);
     assert_eq!(ResyncState::Idle, h.host.resync_state());
     let chat: ChatMessage = h.p(ids[0]).last(MessageKind::Chat);
-    assert!(chat.text.contains("sync is done"), "{}", chat.text);
+    assert!(chat.text.contains("Sync done") && chat.level.as_deref() == Some("info"), "{chat:?}");
 }
 
 // ------------------------------------------------------------------ messages made while the save travels

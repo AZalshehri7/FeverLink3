@@ -176,6 +176,23 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertNotIn("a script's command", self.B.log())
         self.assertEqual(self.B.shipped_count(), 0)
 
+    def test_another_mods_own_rename_still_reaches_the_engine_and_the_player_is_warned_once(self):
+        # friend test 0.2.0 (2026-10-21): the Auto Line Namer renamed lines with its own sendCommand on each game, never shared, and the
+        # names drifted into resyncs. Warn only: the command still goes to the engine as before, the player is told once, every one logged.
+        self.B.run("RENAMES = 0; SIM_ENV.api.cmd.makeEntitySetNameCmd = function(...) return { __cmd = 'makeEntitySetNameCmd', args = { n = select('#', ...), ... } } end\n"
+                   "local base = EXECUTE; function EXECUTE(c, cb) if c.__cmd == 'makeEntitySetNameCmd' then RENAMES = RENAMES + 1; return end; return base(c, cb) end")
+        self.B.L.execute(T.FIND_UP)
+        self.start()
+        aln = 'local api = SIM_ENV.api; api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(58, "Bus 1-2-IC-1"))'
+        src = "@C:/Users/Public/mod.io/10640/mods/6414403/content/auto_line_namer/aln.script.lua"
+        for _ in range(2):
+            self.B.run("assert(load(%s, %s, 't', setmetatable({}, { __index = _G })))()" % (T.lua_str(aln), T.lua_str(src)))
+            self.tick(2)
+        self.assertEqual(int(self.B.lua("RENAMES")), 2, "both renames reached the engine")
+        self.assertEqual(self.B.log().count("kind=makeEntitySetNameCmd source=@C:/Users/Public/mod.io"), 2, self.B.log())
+        notes = self.B.lua("(function() local t = {}; for _, n in ipairs(FIND_UP('G').hud.notices or {}) do t[#t + 1] = n.level .. ' ' .. n.text end; return table.concat(t, '\\n') end)()")
+        self.assertEqual(notes.count("warn Another mod (auto line namer: it renamed something) changes the world on its own."), 1, notes)
+
     def test_a_scripts_build_callback_runs_when_the_other_simulation_state_applies_it_at_the_stamp(self):
         # The real game shares one game's steps between two simulation Lua states (the mock's SIM_SPLIT). A script's build is taken in the
         # state the script runs in, its callback (a function: it cannot go into the game-script state) kept there; the stamp is applied by
@@ -259,7 +276,7 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertNotIn("1:3@", named, "the last replay sent was applied")
         self.assertEqual(self.A.shipped_count(), 0, "no replay's event was taken for a new build of this game")
         self.assertEqual(self.A.builds_applied(), 3)
-        # friend test 2026-10-18 (0.2.0-pre5): the guest applied the host's builds 0:9 and 0:13 during a pause from its interface half, whose
+        # friend test 2026-10-18: the guest applied the host's builds 0:9 and 0:13 during a pause from its interface half, whose
         # "replay" mark carried no key, and the report read "the engine did not run the replayed build nil@14282800, nil@14285000" (no apply
         # event reached the simulation half then: its subscription by names, fixed in de15edb)
         self.fresh()

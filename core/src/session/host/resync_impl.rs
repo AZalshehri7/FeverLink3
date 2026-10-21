@@ -8,9 +8,10 @@ use crate::session::checksum::ChecksumOutcome;
 use crate::session::kind::MessageKind;
 use crate::session::lockstep::{Lockstep, PlayerClock};
 use crate::session::messages::{
-    codec, ActionRefusedMessage, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage, ResyncSaveMessage,
-    SaveDoneMessage, SessionState, CAP_RESYNC_SOURCE,
+    codec, ActionRefusedMessage, BuildVetoMessage, ChecksumRequestMessage, ResyncChunkMessage, ResyncLoadMessage,
+    ResyncSaveMessage, SaveDoneMessage, SessionState, CAP_RESYNC_SOURCE,
 };
+use crate::session::notices::{self, Level};
 use crate::session::resync::{normalize_sha256, IncomingSave, ResyncLimits, ResyncState};
 use crate::session::verdict::{Verdict, VerdictOutcome};
 
@@ -190,7 +191,21 @@ impl HostSession {
     /// its load early or when it does not reload.
     pub(super) fn holds_for_load(&self, to: u16, kind: MessageKind) -> bool {
         use MessageKind::*;
-        if matches!(kind, Challenge | Join | Reject | Welcome | ResyncChunk | ResyncLoad | Ping | Kicked) {
+        // a bug report's ask, bundle and busy answer are for the launcher, not the game: never held for a load
+        if matches!(
+            kind,
+            Challenge
+                | Join
+                | Reject
+                | Welcome
+                | ResyncChunk
+                | ResyncLoad
+                | Ping
+                | Kicked
+                | ReportAsk
+                | ReportBundle
+                | ReportBusy
+        ) {
             return false;
         }
         let Some(r) = self.resync.as_ref().filter(|r| r.state == ResyncState::Transferring) else {
@@ -237,6 +252,29 @@ impl HostSession {
 
     // ---------------------------------------------------------------- starting
 
+    /// An action or commit of an outsider (`HostSession::outsiders`) was made in a world that is not the session's: no game may apply
+    /// it (the others no longer keep to its promise either). Refused on every game, its sender's included, like a stalled game's late
+    /// one (stall.rs). Returns true when refused.
+    pub(super) fn refuse_outsider(&mut self, from: u16, seq: i64, what: &str) -> bool {
+        if !self.outsiders.contains(&from) {
+            return false;
+        }
+        let who = self.name(from);
+        self.log(format!(
+            "{what} {from}:{seq} of {who} refused on every game: its world is not the session's until a resync round loads it"
+        ));
+        let veto = BuildVetoMessage {
+            seq,
+            owner: from,
+            why: "made before this game loaded the session's world: refused on every game".to_owned(),
+            from: Self::HOST_ID,
+            name: Some("FeverLink3".to_owned()),
+            host: true,
+        };
+        self.broadcast(MessageKind::BuildVeto, &codec::encode(&veto), None);
+        true
+    }
+
     pub(super) fn begin_resync(&mut self, reason: &str) {
         if !self.state.started {
             self.log(format!("resync ({reason}) ignored: session not started"));
@@ -253,26 +291,29 @@ impl HostSession {
         self.forget_away_logs("a resync round replaced the others' world while it was away");
         let id = self.resync_counter;
         // Tell everyone before the games pause: a repair copies the host's world to everybody, so a build that never reached the host
-        // (a kind that is not replicated yet) is lost on the other game.
+        // (a kind that is not replicated yet) is lost on the other game. The rounds of a start, a join and a return are announced too:
+        // every game stands still and reloads in them, and without a word that looks like a hang (UI run 2026-10-21: a start sync with
+        // the guest at another date showed no notice in either game, these reasons were silent).
         match reason {
-            "session start" | "new player" | "player returned" => {}
-            "manual" => self.announce("A sync starts: everyone gets the host's world."),
-            other => self.announce(&format!(
-                "A repair sync starts ({other}): builds of this kind that did not reach the other game will be lost."
-            )),
+            "session start" | "new player" | "player returned" => self.announce(Level::Info, notices::SYNC_STARTED),
+            "manual" => self.announce(Level::Info, notices::SYNC_STARTED_BY_HOST),
+            _ => self.announce(Level::Warn, notices::SYNC_REPAIR_STARTED),
         }
         let resume_speed = if self.state.speed > 0 { self.state.speed } else { self.last_running_speed };
         if self.state.speed == 0 && self.state.pause_at.is_none() {
             // A session that has never run holds at speed 0 with no pause stamp (the games were at different times
-            // when it started). No game would ever reach a stamp in the future, so the games may run up to it, at
-            // the speed the session resumes at. The world that everyone gets is the host's, so the stamp is
-            // counted from the host's own clock, not from the furthest game's.
-            let base = match self.clocks.get(&Self::HOST_ID) {
-                Some(c) => c.estimate(self.now()) as i64,
-                None => self.max_clock(),
-            };
+            // when it started). The world that everyone gets is the host's, and it stands still where its clock shows:
+            // the session never ran, so no item is stamped anywhere and nothing may still arrive for an earlier step. The
+            // pause is that step (no lead), and the host's game is there already; the speed is the one the session resumes
+            // at only so that a game standing between two steps runs up to the next one. The other games are outsiders
+            // (`start`): their worlds are replaced, they hold nothing. UI run 2026-10-21: the stamp was the host's clock plus
+            // the lead and every game had to reach it; the guest's world stood 35 800 game-ms behind and ran 37 s at x1
+            // (session.log "Pausing pausing at 129400" to "Saving"), the host's game standing at 128 800 meanwhile.
             let lead = self.wanted_lead(resume_speed);
-            let at = Lockstep::round_up_to_step(base.saturating_add(lead) as f64);
+            let at = match self.clocks.get(&Self::HOST_ID) {
+                Some(c) => Lockstep::round_up_to_step(c.estimate(self.now())),
+                None => Lockstep::round_up_to_step(self.max_clock().saturating_add(lead) as f64),
+            };
             self.state = SessionState { speed: resume_speed, pause_at: Some(at), lead, ..self.state.clone() };
             self.broadcast_session();
         } else if self.state.pause_at.is_none() {
@@ -280,6 +321,15 @@ impl HostSession {
         }
         let pause_at = self.state.pause_at.unwrap_or(0);
         self.log(format!("resync {id} started: {reason}"));
+        let outside: Vec<String> =
+            self.outsiders.iter().filter(|o| self.players.contains_key(o)).map(|&o| self.name(o)).collect();
+        if !outside.is_empty() {
+            // the line to grep when a pause takes long: who is (not) waited for
+            self.log(format!(
+                "resync {id}: pause {pause_at} waits only for the games in the session's world; not for {} (another world, replaced by the load)",
+                outside.join(", ")
+            ));
+        }
         self.resync = Some(ResyncRound {
             id,
             state: ResyncState::Pausing,
@@ -304,11 +354,14 @@ impl HostSession {
         self.resync_step();
     }
 
-    /// A player joined (`new player`) or came back (`player returned`): a started session gets a round for it.
-    pub(super) fn on_new_player(&mut self, reason: &'static str) {
+    /// Player `id` joined (`new player`) or came back without its world (`player returned`): a started session gets a round for it,
+    /// and the player is an outsider until that round's load.
+    pub(super) fn on_new_player(&mut self, id: u16, reason: &'static str) {
         if !self.state.started {
             return;
         }
+        // its world is its own save until a round's load replaces it
+        self.outsiders.insert(id);
         match &self.resync {
             None => self.begin_resync(reason),
             Some(r) if r.participants.is_some() => {
@@ -352,7 +405,12 @@ impl HostSession {
         r.loaded_at = Some(loaded);
         r.pause_at = r.pause_at.max(loaded);
         let pause = r.pause_at;
+        let sent_load = r.state == ResyncState::Loading;
         self.clocks.remove(&from);
+        // its world is the session's now (a player is sent the load as the round enters Loading; a hello before that is not of the save)
+        if sent_load {
+            self.outsiders.remove(&from);
+        }
         if let Some(t) = earlier.filter(|&t| t != time) {
             // one save, one time: a game that says otherwise did not load what the others did (the verify round will tell)
             let who = self.name(from);
@@ -417,6 +475,11 @@ impl HostSession {
                 }
                 ResyncState::Loading => {
                     let missing = self.missing_hellos();
+                    if !missing.is_empty() && self.state.loading != missing {
+                        let names: Vec<String> = missing.iter().map(|&id| self.name(id)).collect();
+                        self.progress(format!("waiting for {} to load the world", names.join(", ")));
+                    }
+                    self.set_resync_loading(missing.clone());
                     if missing.is_empty() {
                         self.enter_verifying();
                     } else if waited >= ResyncLimits::LOAD_TIMEOUT {
@@ -443,10 +506,13 @@ impl HostSession {
         self.pause_laggards(pause_at).is_empty()
     }
 
+    /// The ready games of the session's world not yet stopped at or after `pause_at`. An outsider's world is replaced by the round's
+    /// load, so where it stands is never waited for (`HostSession::outsiders`); every game that keeps its world (the source, and any game
+    /// in the session's world) stops at the same pause.
     fn pause_laggards(&self, pause_at: i64) -> Vec<u16> {
         self.players
             .values()
-            .filter(|p| p.ready)
+            .filter(|p| p.ready && !self.outsiders.contains(&p.id))
             .filter(|p| !matches!(self.clocks.get(&p.id), Some(c) if c.t >= pause_at && c.speed == 0))
             .map(|p| p.id)
             .collect()
@@ -517,6 +583,7 @@ impl HostSession {
             .players
             .values()
             .filter(|p| p.id != Self::HOST_ID && p.ready && !self.partly_built.contains(&p.id))
+            .filter(|p| !self.outsiders.contains(&p.id))
             .map(|p| p.id)
             .find(|&p| self.player_supports(p, CAP_RESYNC_SOURCE));
         match clean.filter(|_| self.options.host_reloads) {
@@ -525,9 +592,7 @@ impl HostSession {
                 self.log(format!(
                     "resync {id}: the host's world may be PARTLY built (marked: {marked}); the repair takes its world from {who}, whose game is not marked"
                 ));
-                self.announce(&format!(
-                    "The host's world may be partly built (an engine error in the middle of a build): this repair gives everyone {who}'s world instead."
-                ));
+                self.announce(Level::Warn, &notices::sync_from_player(&who));
                 source
             }
             None => {
@@ -539,9 +604,7 @@ impl HostSession {
                 self.log(format!(
                     "WARNING: resync {id}: the host's world may be PARTLY built (marked: {marked}) and {why}: the host's world is copied to everyone AS IT IS and may still be broken"
                 ));
-                self.announce(
-                    "Warning: the host's world may be partly built and no other game can give a clean one. It is copied as it is; if the game misbehaves, load an earlier save.",
-                );
+                self.announce(Level::Error, notices::SYNC_DAMAGED_WORLD);
                 Self::HOST_ID
             }
         }
@@ -989,9 +1052,9 @@ impl HostSession {
         }
         if r.source != Self::HOST_ID {
             let who = self.name(r.source);
-            self.announce(&format!("The sync is done: everyone has {who}'s world."));
-        } else if !matches!(r.reason.as_str(), "session start" | "new player" | "player returned") {
-            self.announce("The sync is done: everyone has the host's world again.");
+            self.announce(Level::Info, &notices::sync_done_from_player(&who));
+        } else {
+            self.announce(Level::Info, notices::SYNC_DONE);
         }
         self.out.push(HostOutput::ResyncProgress {
             id: r.id,

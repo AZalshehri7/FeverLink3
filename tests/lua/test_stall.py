@@ -2,7 +2,7 @@
 the others at their input barriers; they run on, it catches up later, and every action is still applied at one stamp on every game.
 
 The real case: the owner's notes of 2026-10-17 (a clone froze one game for 7-10 s and held the other with it) and the friend test of
-0.2.0-pre5 (x4 over a 30 ms round trip). The mocked games of test_lockstep.py run the real mod; the relay is the jittery one of
+2026-10-18 (x4 over a 30 ms round trip). The mocked games of test_lockstep.py run the real mod; the relay is the jittery one of
 test_input_barrier.py with the host's stall rules on top, as core implements them (a test relay, like the rest of this harness):
   * a game whose clock lines have not come for TIMEOUT rounds while another's still come is stalled: the session lists it, the relay keeps
     a promise for it that follows the others' promises (a peer clock flagged `stalled`), and the others stop pacing themselves to it;

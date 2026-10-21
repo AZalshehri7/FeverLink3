@@ -42,7 +42,7 @@ Each player needs their own copy of the game and the same game version (the test
 
 ## Download
 
-Releases are published at [github.com/AZalshehri7/FeverLink3/releases](https://github.com/AZalshehri7/FeverLink3/releases). The first test build, **0.2.0-test1**, is a pre-release; until it has been published that page may be empty. Every release comes with a zip, a `.sha256` file and a `manifest.json`, so you can check what you downloaded: see [What is in winhttp.dll, and how to check it](SECURITY_FOR_USERS.html). A Nexus Mods page is planned.
+Releases are published at [github.com/AZalshehri7/FeverLink3/releases](https://github.com/AZalshehri7/FeverLink3/releases). The next version, **0.2.0**, is the first public beta. Every release comes with a zip, a `.sha256` file and a `manifest.json`, so you can check what you downloaded: see [What is in winhttp.dll, and how to check it](SECURITY_FOR_USERS.html). A Nexus Mods page is planned.
 
 ## FAQ
 

@@ -28,6 +28,10 @@ L.clock = C.clock   -- the real clock of its checksum timing (the lockstep modul
 
 local okH, Hud = pcall(ug_require, "feverlink3_hud.lua")
 if not okH then Hud = ug_require("feverlink3::/feverlink3_hud.lua") end
+-- every system message a player reads (feverlink3_text.lua); one local, the file's main chunk is near the game's limit of locals
+local T
+okH, T = pcall(ug_require, "feverlink3_text.lua")
+if not okH then T = ug_require("feverlink3::/feverlink3_text.lua") end
 
 -- Command schemas of the other areas (construction, operations, companies): one module each, all optional. A module
 -- that is missing or fails to load is skipped; the commands it would have carried stay native.
@@ -854,7 +858,7 @@ local logSim = C.logger("sim")
 -- ---- one game, several simulation Lua states (docs/research/TWO_STATE_AUDIT_20261019.md, local)
 --
 -- The game runs this script's simulation half in more than one Lua state and shares one game's steps between them: two states install
--- the session's math.random at the same game time (friend test of pre5, 2026-10-18, 22:01:34 and every reload after it), a spread
+-- the session's math.random at the same game time (friend test of 2026-10-18, 22:01:34 and every reload after it), a spread
 -- checksum round kept in one state read its chunks at two steps in four while an action was applied at its stamp in between (see
 -- X.csAdvance). Each event reaches one of them: both states log their first event "at handleEvent" (lab K 2026-10-19 00:17:33), and none
 -- of the 136 actions the host's "queue" events brought in that friend test was applied twice. The docs name no such split: update "is
@@ -2016,6 +2020,95 @@ function X.simCatchUp(st)
 	end
 end
 
+-- Another mod's command that FeverLink3 does not share (WARN ONLY, owner 2026-10-21): friend test 0.2.0 (ANALYSIS_NAMES_BUILD.md A),
+-- the Auto Line Namer renamed lines with its own sendCommand(makeEntitySetNameCmd) on each game at wall-clock times; nothing of it was
+-- shared, the line names drifted and the host resynced. Such a command still goes to the engine exactly as before (nothing is held,
+-- dropped or changed); it is logged, and the player is told once per session and mod/command kind (simFlushForeign -> X.foreignTell).
+-- The sender is the first Lua frame below the wrapped sendCommand (debug.getinfo); FeverLink3's own sends (journal bookings, the
+-- company sender) are recognised by their source and skipped. Only a source on a mod path is told to the player: a source that is
+-- not known (no debug library, or the game's own scripts, which every game runs alike) is only logged, once per source and kind.
+SIMO.kinds = setmetatable({}, { __mode = "k" })   -- a command made in this state -> its factory's name
+SIMO.foreign, SIMO.foreignSeen, SIMO.foreignSent = {}, {}, {}
+
+-- The mod a script source path belongs to, in words ("auto line namer"), or nil when the path is not a mod's.
+-- ".../mods/6414403/content/auto_line_namer/aln.script.lua" -> "auto line namer"
+function X.foreignModOf(src)
+	local p = tostring(src or ""):gsub("^@", ""):gsub("\\", "/")
+	local low = p:lower()
+	if not (low:find("/mods/", 1, true) or low:find("mod.io", 1, true) or low:find("staging_area", 1, true) or low:find("/workshop/", 1, true)) then
+		return nil
+	end
+	local rest = p:match(".*/content/(.*)$")
+	local dir = rest and rest:match("^([^/]+)/")
+	if not dir then dir = p:match(".*/([^/]+)/content/") or p:match("([^/]+)$") end
+	return (tostring(dir):gsub("_%d+$", ""):gsub("[_%-]", " "))
+end
+
+-- In the wrapped sendCommand, for a command that goes to the engine unshared during a session. No game-script state access here
+-- (state:get raises inside another script's call): queued in SIMO.foreign for this script's own postUpdate.
+local function simForeignSeen(cmd)
+	local kind = SIMO.kinds[cmd] or (SIMO.tags[cmd] and "makeWorldBuildProposalCmd") or "an unknown command"
+	local src = nil
+	if type(debug) == "table" and debug.getinfo then
+		local own = { [debug.getinfo(1, "S").source] = true }
+		if Co and Co.extendEngine then own[debug.getinfo(Co.extendEngine, "S").source] = true end
+		local past = false
+		for level = 2, 16 do
+			local info = debug.getinfo(level, "Sf")
+			if not info then break end
+			if info.func == SIMO.wrapper then
+				past = true
+			elseif past and info.source and info.source ~= "=[C]" then
+				if own[info.source] or info.source:lower():find("feverlink3", 1, true) then return end   -- FeverLink3's own send
+				src = info.source
+				break
+			end
+		end
+	end
+	local mod = src and X.foreignModOf(src)
+	local seen = tostring(src) .. "|" .. kind
+	if mod or not SIMO.foreignSeen[seen] then
+		logSim("another script's command goes to the engine unshared: kind=" .. kind .. " source=" .. tostring(src or "unknown") ..
+			(mod and (" mod=" .. mod) or " (not a mod's path: the player is not told)"))
+	end
+	SIMO.foreignSeen[seen] = true
+	if mod and #SIMO.foreign < 20 then SIMO.foreign[#SIMO.foreign + 1] = { mod = mod, kind = kind } end
+end
+
+-- In this script's own postUpdate: the mods seen since the last one go to the interface half (st.foreign), once per session and kind.
+local function simFlushForeign(st)
+	if #SIMO.foreign == 0 then return end
+	for _, f in ipairs(SIMO.foreign) do
+		local key = tostring(st.epoch) .. "|" .. f.mod .. "|" .. f.kind
+		if not SIMO.foreignSent[key] then
+			SIMO.foreignSent[key] = true
+			st.foreign = type(st.foreign) == "table" and st.foreign or {}
+			st.foreign[#st.foreign + 1] = { epoch = st.epoch, mod = f.mod, kind = f.kind }
+			trim(st.foreign, 20)
+		end
+	end
+	SIMO.foreign = {}
+end
+
+-- The command factories of this state learn the name of what they make (SIMO.kinds), only for the log and the player's words; the
+-- command itself is returned untouched. makeWorldBuildProposalCmd has its own wrapper (SIMO.tags).
+local function simTagKinds()
+	local names = {}
+	for name, f in pairs(api.cmd) do
+		if type(f) == "function" and type(name) == "string" and name:find("^make") and name ~= "makeWorldBuildProposalCmd" then names[#names + 1] = name end
+	end
+	for _, name in ipairs(names) do
+		local f = api.cmd[name]
+		pcall(function()
+			api.cmd[name] = function(...)
+				local cmd = f(...)
+				if cmd ~= nil then SIMO.kinds[cmd] = name end
+				return cmd
+			end
+		end)
+	end
+end
+
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): sendCommand and makeWorldBuildProposalCmd are replaced in
 -- this state's api.cmd; the API has no command hook, and a script's player build must be stamped like every other build.
 local function simWrapCommands()
@@ -2034,8 +2127,11 @@ local function simWrapCommands()
 				if okB and taken then return end
 				if not okB then logSim("a script's build command is sent natively (" .. tostring(taken) .. ")") end
 			end
+			if C.ACTIVE and cmd ~= nil then pcall(simForeignSeen, cmd) end
 			return SIMO.send(cmd, cb, ...)
 		end
+		SIMO.wrapper = api.cmd.sendCommand
+		pcall(simTagKinds)
 	end)
 	if not okI then
 		SIMO.send, SIMO.factory = nil, nil
@@ -2045,7 +2141,7 @@ end
 
 -- D (owner, 2026-10-21), one rule for every path where the engine applies a command the mod sent: the command is made first (a factory
 -- error is a clean refusal, nothing reached the engine), then handed over; `mark.applying` is true from the hand-over until the send
--- returns. An exception then is NOT "nothing applied": the apply is not transactional (friend test pre7: stop 0:22 threw
+-- returns. An exception then is NOT "nothing applied": the apply is not transactional (friend test of 2026-10-20: stop 0:22 threw
 -- IsValidTransition mid-apply and left a half-built edge), so the caller says the world may be PARTLY built and asks for the repair
 -- (X.partlyBuilt), which never takes its world from such a game. Paths: the stamp apply (simSendCommand) and the pause apply from the
 -- interface (guiApplyNow). `cb` is passed only when there is one (the simulation state refuses callbacks).
@@ -2225,7 +2321,7 @@ local function simApplyAction(st, it, now)
 			X.sendHeldOrder("fail", { id = it.deferId }, it.key)
 		end
 		-- D (owner, 2026-10-21): an exception while the engine applied the command is not "nothing applied": the apply is not
-		-- transactional (friend test pre7: stop 0:22 threw IsValidTransition mid-apply, left a half-built edge, and the game crashed a
+		-- transactional (friend test of 2026-10-20: stop 0:22 threw IsValidTransition mid-apply, left a half-built edge, and the game crashed a
 		-- second later). Said as such, to the player too, and the repair is asked for at once (collectFromSim), not left to the checksums.
 		local partial = sending.applying == true
 		if partial then
@@ -2789,6 +2885,7 @@ function X.simStep(state, now)
 		simAdvanceWatches(st, now)
 		simAdvanceBinders(st, now)
 		simFlushScriptBuilds(st)
+		pcall(simFlushForeign, st)
 		X.simCatchUp(st)   -- what this step's applies did for this state's own values (a script build's callback)
 		trim(st.results, RESULT_KEEP)
 		trim(st.reports, RESULT_KEEP)
@@ -2834,8 +2931,8 @@ X.GUI_EVENTS = { "builder.proposalCreate", "builder.proposalApply" }
 -- Subscribes once per load of this file and half. The simulation half subscribes to ALL events; the interface half makes no call.
 -- Evidence (real sessions, 2026-10-18): the game's interface state has neither subscribeToEvent nor subscribeToAllEvents ("attempt to
 -- call method ... (a nil value)" for both); guiHandleEvent receives the events of the script's one subscription, made in the simulation
--- state. 0.2.0-pre3 to pre5 subscribed the simulation half to the names above only, so the build tools' builder.* events no longer reached
--- guiHandleEvent: owner and friend tests had 0 builds captured (pre2 sessions: 56, 39, 13), every build went the release-at-the-click
+-- state. Earlier test builds subscribed the simulation half to the names above only, so the build tools' builder.* events no longer reached
+-- guiHandleEvent: owner and friend tests had 0 builds captured (earlier sessions: 56, 39, 13), every build went the release-at-the-click
 -- path, ids drifted and repair syncs followed. The lab did not see it: FEVERLINK3_DEV subscribed to all events. The names list above is
 -- kept as the record of what handleEvent acts on (its test), not as a subscription.
 function X.subscribeEvents(st, names, half, where, log)
@@ -3107,8 +3204,49 @@ local function originals()
 	return G.orig
 end
 
+-- This player's action numbers, kept over a savegame reload: a reload runs this file again in the same Lua state, so the counter of the
+-- session lives in package.loaded (as the original commands do, originals()). With the numbers the game-script state still names
+-- (L.seqFloor) it is where X.seqResume numbers on from: an action number is never given twice in a world, so a key names one entity on
+-- every game (friend test 2026-10-21 21:51: numbers began at 1 again after a resync, the new 1:4, a vehicle, took over the key of a line
+-- made before the resync, and three set-line commands that named the line were refused on both games).
+function X.seqCarry()
+	local ok, t = pcall(function()
+		local t = package.loaded["feverlink3_seq"]
+		if type(t) ~= "table" then t = {}; package.loaded["feverlink3_seq"] = t end
+		return t
+	end)
+	if ok then return t end
+	X.seqTable = X.seqTable or {}
+	return X.seqTable
+end
+
+-- an action number went out (every ship of an action line passes here, before or after its own send)
+function X.seqShipped(seq)
+	seq = tonumber(seq)
+	if not seq or seq <= 0 then return end
+	local t = X.seqCarry()
+	if t.sid ~= C.SESSION or t.player ~= C.PLAYER_ID then t.sid, t.player, t.seq = C.SESSION, C.PLAYER_ID, 0 end
+	if seq > (t.seq or 0) then t.seq = seq end
+end
+
+-- A session begins in this Lua state (the first frame after a load included): number on after every action number this player already
+-- used in the session (the carried counter) and every one the loaded world still names (bindings, queue, binders, watches).
+function X.seqResume(state)
+	local fromState = 0
+	pcall(function() fromState = L.seqFloor(C.PLAYER_ID, state:get()) end)
+	local t = X.seqCarry()
+	local carried = (t.sid == C.SESSION and t.player == C.PLAYER_ID) and (tonumber(t.seq) or 0) or 0
+	local floor = math.max(fromState, carried)
+	if floor > G.seq then
+		logGui(string.format("action numbers go on from %s:%d (the loaded world names up to %d, this session shipped up to %d): no key is given twice",
+			tostring(C.PLAYER_ID), floor + 1, fromState, carried))
+		G.seq = floor
+	end
+end
+
 local function send(kind, payload)
 	if kind == "clock" or kind == "action" then X.stampHop(payload) end
+	if kind == "action" and type(payload) == "table" then X.seqShipped(payload.seq) end
 	local ok, err = C.writerSend(G.writer, kind, payload)
 	if not ok then logGui("cannot send " .. kind .. ": " .. tostring(err)) end
 end
@@ -4253,7 +4391,7 @@ local function sendVeto(it, why)
 	G.vetoed[it.key] = why
 	toSim("drop", { key = it.key, why = why, own = true })
 	send("build_veto", { seq = it.seq, owner = it.from, why = tostring(why):sub(1, 300), name = C.PLAYER_NAME })
-	-- (the chat line is the originator's, once per vetoed build: it alone knows whether its build was still held; see H.build_veto)
+	-- (the notice is the originator's, once per vetoed build: it alone knows whether its build was still held; see H.build_veto)
 	logGui("VETO of " .. it.key .. ": this game cannot build it (" .. tostring(why) .. "); the build is dropped on this game")
 end
 
@@ -4294,8 +4432,7 @@ function shipNative(o)
 		if S and S.own and S.released and not S.shipped then pcall(X.slotGiveUp, S, "its record failed its own self-check") end
 		logGui("native build captured at t=" .. tostring(o.at) .. " NOT shipped: its own self-check failed (" .. why .. "); this game has it, no other game can build it: asking the host for a resync")
 		send("replay_failed", { detail = "a build applied on its originator only (its record cannot be rebuilt, not shipped): " .. why:sub(1, 160) })
-		pcall(vetoChat, "unbuildable:" .. tostring(o.n) .. ":" .. tostring(C.clock()), tostring(C.PLAYER_NAME)
-			.. "'s build could not be sent to the other games (it cannot be rebuilt the same way there); the games will be synchronised.")
+		pcall(vetoChat, "unbuildable:" .. tostring(o.n) .. ":" .. tostring(C.clock()), "build_not_shared_sync")
 		return false, "its own self-check failed"
 	end
 	local body = C.parse(o.body)
@@ -4850,7 +4987,8 @@ function X.slotHold(h, why)
 	local body = { fn = "pauseSlot", held = h.id }
 	-- `build`: the host's grant decides as for a build (the record itself goes out with its own category later)
 	local ok, err = C.writerSend(G.writer, "action", X.stampHop({ stamp = at, seq = seq, body = C.serialize(body), category = "build", pause = true }))
-	if not ok then return X.natRefuseHeld(h, "its place in the pause order cannot be sent (" .. tostring(err) .. ")", "it could not be sent to the other games") end
+	X.seqShipped(seq)
+	if not ok then return X.natRefuseHeld(h, "its place in the pause order cannot be sent (" .. tostring(err) .. ")") end
 	G.seq = seq
 	h.slotted = true
 	G.pauseOwn = G.pauseOwn or {}
@@ -4939,7 +5077,7 @@ function X.natFailUnshipped(h, why)
 		how = (ok and "cancel written" or "CANCEL NOT WRITTEN") .. ((FIRE_DONE and h.done) and " (the tool's callback is fired)" or " (this module cannot fire the tool's callback: the tool may stay busy)")
 	end
 	natSay("held " .. h.id .. " (site " .. natSite(h) .. "): REFUSED BEFORE SHIPPING, every game would refuse its exact copy: " .. tostring(why) .. "; " .. how .. "; nothing is shipped and no game builds it")
-	pcall(vetoChat, "unshipped:" .. tostring(h.id) .. ":" .. tostring(C.clock()), "This build cannot be copied exactly to the other games yet (" .. tostring(why):sub(1, 120) .. "); it was cancelled, so the games stay the same.")
+	pcall(vetoChat, "unshipped:" .. tostring(h.id) .. ":" .. tostring(C.clock()), "build_cancelled")
 end
 
 local function natDecideUnsafe(h, cap)
@@ -4952,14 +5090,14 @@ local function natDecideUnsafe(h, cap)
 	end
 	-- `release`: a held command with no record of its own before the engine applies it. Made during a pause: released at its place in
 	-- the host's pause order, where every game stands (X.slotHold). Otherwise REFUSED (X.natUncaptured): released at the click it ran
-	-- on this game alone, ~16 steps before the record the simulation half captured from it reached the others (friend test pre7
+	-- on this game alone, ~16 steps before the record the simulation half captured from it reached the others (friend test of 2026-10-20
 	-- 2026-10-21: 4 of 8 free-id forks began with "no capture of a tool build; release written"). `refuse`: a check of this build failed
 	-- here; it is never given back (X.natRefuseHeld, fail closed).
 	local function release(why)
 		if X.slotWanted() then return X.slotHold(h, why) end
 		X.natUncaptured(h, why)
 	end
-	local function refuse(why, words) X.natRefuseHeld(h, why, words) end
+	local function refuse(why, msg) X.natRefuseHeld(h, why, msg) end
 	-- A command whose tool gave no preview is recorded from its own proposal: the native module gives every held build command to this
 	-- script as the preview of the tool `held:<id>` before announcing it (natCapture keeps it in N.heldCaps). One rule for every tool;
 	-- run s4 2026-10-14: a station module added via Configure (UI::ModuleBuilder, site 0x542eba) sends no preview, was released at once
@@ -5015,8 +5153,7 @@ local function natDecideUnsafe(h, cap)
 		-- A capture that failed is a failed check: released, the build went into this world at the click and was shipped (if at all) by
 		-- the simulation half's own capture, applied on the other games at another step (fail open). Refused on every module now: the
 		-- module that can `fail` frees the tool (an older one gets the cancel, its callback fired where it can).
-		return refuse("the capture of " .. tostring(cap.tool) .. " failed (" .. tostring(cap.why) .. ")", "this kind of build (" .. tostring(cap.tool)
-			.. ") cannot be recorded yet in this test build")
+		return refuse("the capture of " .. tostring(cap.tool) .. " failed (" .. tostring(cap.why) .. ")", "build_kind_unsupported")
 	end
 	local body, text = cap.body, cap.text
 	-- The preview the capture was made from carries no Context; the held command does (the native module read it). Its flags replace the
@@ -5047,10 +5184,15 @@ local function natDecideUnsafe(h, cap)
 		if Build.constructionsBlocked(body) and h.done then
 			natSay("held " .. id .. ": adds constructions (" .. tostring(cap.tool) .. "), refused in this test build: cancelled")
 			natOrder("cancel", id)
-			vetoChat("gate:" .. tostring(id) .. ":" .. tostring(C.clock()), "Your build was cancelled: " .. Build.CONSTRUCTIONS_BLOCKED_TEXT .. ".")
+			vetoChat("gate:" .. tostring(id) .. ":" .. tostring(C.clock()), "build_kind_unsupported")
 			return
 		end
-		vetoChat("info:constructions", Build.CONSTRUCTIONS_INFO_TEXT .. " (a depot or station you build may not reach the other game, or may upset it).")
+		-- this player's own notice, once per session: the others need not read it
+		G.vetoChatted = G.vetoChatted or {}
+		if not G.vetoChatted["info:constructions"] then
+			G.vetoChatted["info:constructions"] = true
+			pcall(X.noticeLocal, "constructions_experimental")
+		end
 	end
 	-- never ship, and never apply, what this game could not rebuild itself
 	local wire = C.parse(text)
@@ -5061,7 +5203,7 @@ local function natDecideUnsafe(h, cap)
 		traceGui("build.ship", string.format("held=%d the record was over %d bytes: sent without its input-level text (%d bytes now)", id, ACTION_BODY_MAX, #text))
 	end
 	if #text > ACTION_BODY_MAX then
-		return refuse(string.format("its record (%d bytes) is over the %d bytes an action may have", #text, ACTION_BODY_MAX), "it is too big to be sent to the other games")
+		return refuse(string.format("its record (%d bytes) is over the %d bytes an action may have", #text, ACTION_BODY_MAX), "build_too_big")
 	end
 	local now = engine.gameTime()
 	local okD, args, whyD = pcall(L.decodeCommand, wire, guiCtx({ kind = "action", at = now, from = C.PLAYER_ID, seq = 0, key = "strict-check" }))
@@ -5069,7 +5211,7 @@ local function natDecideUnsafe(h, cap)
 	-- The self-check: this game rebuilds its own record (the reference check of its native text included) the way every other game will.
 	-- Failed, the build is refused, never released (friend test 2026-10-16, host street 0:2: "it cannot be rebuilt here (inject_refused:
 	-- ... names node 89384 ... 11.16 m away)"; release written, applied on the host, refused the same way on the friend's game: a fork).
-	if not args then return refuse("it cannot be rebuilt here (" .. tostring(whyD) .. ")", "it cannot be rebuilt the same way on every game") end
+	if not args then return refuse("it cannot be rebuilt here (" .. tostring(whyD) .. ")") end
 	local seq = G.seq + 1
 	local at
 	local cancelFlow = STRICT_CANCEL == "all"
@@ -5190,9 +5332,10 @@ local function natDecideUnsafe(h, cap)
 	-- this one too when it comes back numbered (X.routeOwn). A held build of a paused game is parked by the others and its COMMIT is.
 	it.pause = (flow ~= "held" and X.hostStamps(at)) or nil
 	local okS, errS = C.writerSend(G.writer, "action", X.stampHop({ stamp = at, seq = seq, body = text, category = category, pause = it.pause }))
+	X.seqShipped(seq)
 	if not okS then
 		h.ship = nil   -- nothing went out: no game has the build, and given back it would be on this game alone
-		return refuse("the action cannot be sent (" .. tostring(errS) .. ")", "it could not be sent to the other games")
+		return refuse("the action cannot be sent (" .. tostring(errS) .. ")")
 	end
 	ship.shipped = true
 	G.seq = seq
@@ -5270,7 +5413,7 @@ end
 -- The other games have a build this game failed after shipping it: the host is asked to repair them (and the player told).
 function X.natShippedRepair(key, why)
 	send("replay_failed", { detail = "build " .. key .. " was shipped but failed on its originator (" .. tostring(why):sub(1, 100) .. "): the other games have it" })
-	pcall(vetoChat, "shipfail:" .. key, "Your build could not be applied on your own game after it was sent; the games will be synchronised.")
+	pcall(vetoChat, "shipfail:" .. key, "build_failed_after_share")
 end
 
 -- THE rule for a held command that fails a check on its originator BEFORE anything was shipped (the batch-2 rule, fail closed): it is
@@ -5279,9 +5422,9 @@ end
 -- native build goes through"), so the host applied it at the click, the simulation half shipped it although its own self-check FAILED
 -- too, and the friend's game refused it the same way: the worlds forked until a resync. Now nothing is shipped and nothing is applied on
 -- any game: `fail` fires the tool's callback with a failed result (the tool is free; the module that can defer has it), an older module
--- gets a cancel (its callback fired only where the module can), and the player is told in the game's chat. No game has the build, so
+-- gets a cancel (its callback fired only where the module can), and the player is told in the notices. No game has the build, so
 -- no repair is needed. One rule for every tool and every check (natDecideUnsafe's refuse, natDecide's fault handler). Returns what was done.
-function X.natRefuseHeld(h, why, words, chatKey)
+function X.natRefuseHeld(h, why, msg, chatKey)
 	local N = G.nat
 	local id = h.id
 	h.refused = true
@@ -5297,9 +5440,9 @@ function X.natRefuseHeld(h, why, words, chatKey)
 		how = "no native link"
 	end
 	natSay("held " .. tostring(id) .. " (site " .. natSite(h) .. ") REFUSED: " .. tostring(why) .. "; NOT released, nothing is shipped or applied on any game; " .. how)
-	-- `chatKey`: one chat line per key and session (vetoChat), for a refusal that can repeat with every click
-	pcall(vetoChat, chatKey or ("refused:" .. tostring(id) .. ":" .. tostring(C.clock())), tostring(C.PLAYER_NAME) .. "'s build was cancelled: " .. tostring(words or "it failed a check")
-		.. ". Nothing was built on any game.")
+	-- `msg`: the notice (feverlink3_text.lua, default build_cancelled); `chatKey`: one notice per key and session (vetoChat), for a
+	-- refusal that can repeat with every click
+	pcall(vetoChat, chatKey or ("refused:" .. tostring(id) .. ":" .. tostring(C.clock())), msg or "build_cancelled")
 	return how
 end
 
@@ -5307,11 +5450,11 @@ end
 -- proposal, a stop whose model the record cannot get before the build, more than one command held at once): it is refused like a
 -- failed check (X.natRefuseHeld: failed, its tool callback fired as "not applied", nothing applied or shipped on any game), never
 -- released. Released at the click (until 2026-10-21), the engine applied it on this game at once and the simulation half's capture
--- shipped it stamped ~16 steps later, so the other games applied it at another step or not at all: friend test pre7, 4 of 8 free-id
+-- shipped it stamped ~16 steps later, so the other games applied it at another step or not at all: friend test of 2026-10-20, 4 of 8 free-id
 -- forks (3 of them the first held build after a resync load). The one exception is a pause (X.slotHold: released where every game stands).
 function X.natUncaptured(h, why)
 	return X.natRefuseHeld(h, "no record before the engine applies it (" .. tostring(why) .. "), so it cannot be carried to the other games at its stamp",
-		"it could not be carried to the other players (try it again; FeverLink3 could not record this build)", "uncaptured")
+		"build_cancelled", "uncaptured")
 end
 
 -- A fault AFTER the action was shipped (natDecideUnsafe, h.ship): the other games apply the build at the stamp, so this game must not
@@ -5357,7 +5500,7 @@ function natDecide(h, cap)
 		if not okF then pcall(natSay, "held " .. tostring(h.id) .. ": the failure after the ship itself failed (" .. tostring(errF) .. "); the command is NOT released") end
 		return
 	end
-	if N and not N.awaiting[h.id] and not h.refused and not h.slotted then pcall(X.natRefuseHeld, h, "a fault in the verdict (" .. tostring(err) .. ")", "a fault in FeverLink3 while checking it") end
+	if N and not N.awaiting[h.id] and not h.refused and not h.slotted then pcall(X.natRefuseHeld, h, "a fault in the verdict (" .. tostring(err) .. ")") end
 end
 end -- section: strict mode: the native link and the verdict
 
@@ -5472,7 +5615,7 @@ local function heldWatchdog(N, now)
 				send("build_veto", { seq = tonumber(key:match(":(%d+)$")), owner = C.PLAYER_ID, why = why, name = C.PLAYER_NAME })
 				-- cancelled, or FAILED where the callback cannot be fired (natVeto): never released, the other games drop it on the veto
 				natVeto(key, C.PLAYER_NAME, why)
-				vetoChat(key, tostring(C.PLAYER_NAME) .. "'s build was cancelled on every game: the game stayed paused too long before it could be applied.")
+				vetoChat(key, "build_paused_too_long")
 			end
 		end
 	end
@@ -5733,17 +5876,20 @@ function X.partlyBuilt(key, err, where)
 	logGui("action " .. tostring(key) .. " (" .. tostring(where) .. "): the engine threw DURING its apply: this game's world may be PARTLY built; asking the host for a repair now")
 	send("replay_failed", { detail = "action " .. tostring(key) .. ": the engine threw during its apply, the world may be partly built here: " .. tostring(err):sub(1, 140) })
 	if X.noticeLocal then
-		pcall(X.noticeLocal, "Action " .. tostring(key) .. " failed half-way on this game (engine error): the world is being repaired from a game where it did not fail")
+		pcall(X.noticeLocal, "action_failed_midway")
 	end
 end
 
--- The originator's player is told why their build was not applied (in this game's chat only: nothing of it changed any world).
+-- The originator's player is told that their build was not applied (a notice on this game only: nothing of it changed any world).
+-- The build key and the engine's reason stay in the log.
 function X.tellRefused(r, why)
 	if r.from ~= C.PLAYER_ID then return end
 	why = tostring(why or ""):gsub("^inject_refused: ", ""):gsub(" %(refused from this game's own world.*$", "")
-	local text = "Your build " .. tostring(r.of or r.key) .. " was not applied: the world changed before its turn: " .. why:sub(1, 200)
-	logGui("told the player: " .. text)
-	if X.noticeLocal then pcall(X.noticeLocal, text) end
+	-- the native compare of the rebuilt Proposal with the originator's text (native inject.rs) is not a world change: the copy differs
+	-- (friend test 2026-10-21: an empty town-building name; the player was told "the world changed ... Try again" and retried twice)
+	local remade = why:find("differs from the text", 1, true) ~= nil
+	logGui("build " .. tostring(r.of or r.key) .. " was not applied: " .. (remade and "the rebuilt build differs from the original: " or "the world changed before its turn: ") .. why:sub(1, 200))
+	if X.noticeLocal then pcall(X.noticeLocal, remade and "build_not_remade" or "build_world_changed", { thing = "build" }) end
 end
 
 -- A build applied at its stamp (X.simVerdict): its verdict goes now, or, with inject orders, once the module answered every one of them.
@@ -5798,11 +5944,9 @@ function X.natFaultEvent(p, history)
 	if history and action ~= "stop" then return end
 	logGui(string.format("native module FAULT [%s] (%s): %s", place, action, detail))
 	if action == "stop" then
-		pcall(vetoChat, "natstop:" .. place, tostring(C.PLAYER_NAME) .. "'s game cannot stay identical to the others (" .. place
-			.. " is missing): leave the session and restart the game.")
+		pcall(vetoChat, "natstop:" .. place, "game_cannot_sync")
 	else
-		pcall(vetoChat, "natfault:" .. place .. ":" .. math.floor(C.clock() / 60), tostring(C.PLAYER_NAME) .. "'s game hit an internal fault ("
-			.. place .. "); the games will be synchronised.")
+		pcall(vetoChat, "natfault:" .. place .. ":" .. math.floor(C.clock() / 60), "game_fault")
 	end
 	local now = C.clock()
 	if not history and (X.natFaultAt == nil or now - X.natFaultAt >= 10) then
@@ -6174,12 +6318,29 @@ end -- section: strict mode: commits, the ledger, events
 -- used outside this section:
 local installWrap, readLink, collectFromSim, serviceWindow, syncLocalCompany
 do -- section: the wrap, link handlers, the service window (not indented, see SECTIONS at the top)
--- A line for this player alone in the session chat (the window shows it): an action of theirs that was refused before it
--- left this game. Nothing is sent to the others: nothing of it reached them.
-local function noticeLocal(text)
-	pcall(Hud.addChat, G.hud, "FeverLink3", "[FeverLink3] " .. tostring(text), -1)
+-- A notice for this player alone (the window's notices, not the chat): message `msg` of feverlink3_text.lua with `args`, e.g. an
+-- action of theirs that was refused before it left this game. Nothing is sent to the others: nothing of it reached them.
+local function noticeLocal(msg, args)
+	local okT, text, level = pcall(T.say, msg, args)
+	if not okT then return end
+	logGui("told the player: " .. tostring(text))
+	pcall(Hud.addNotice, G.hud, text, level, C.time())
 end
 X.noticeLocal = noticeLocal   -- also for a build refused at its stamp (X.tellRefused)
+
+-- Another mod changed the world with a command FeverLink3 does not share (simForeignSeen): one warn notice per session and mod/kind.
+function X.foreignTell(st)
+	if type(st.foreign) ~= "table" then return end
+	G.foreignTold = G.foreignTold or {}
+	for _, f in ipairs(st.foreign) do
+		local key = tostring(f.epoch) .. "|" .. tostring(f.mod) .. "|" .. tostring(f.kind)
+		if f.epoch == G.epoch and not G.foreignTold[key] then
+			G.foreignTold[key] = true
+			logGui("another mod (" .. tostring(f.mod) .. ") sent " .. tostring(f.kind) .. " on its own: not shared, the worlds may drift")
+			noticeLocal("foreign_mod_change", { what = T.foreignWhat(f.mod, f.kind) })
+		end
+	end
+end
 
 -- Wraps the command factories (to know a command's name and arguments) and sendCommand (to hold it). A command the mod
 -- replicates but cannot encode is refused on this game too, and the player is told: applied here alone it made the worlds
@@ -6294,7 +6455,7 @@ function installWrap()
 			end
 			-- fail closed: applied here alone it would fork the worlds
 			logGui("command " .. tag.name .. " REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): " .. tostring(err))
-			noticeLocal("Your " .. L.commandWords(tag.name) .. " was not applied: it cannot be shared with the other players (" .. tostring(err):sub(1, 90) .. ").")
+			noticeLocal("action_not_shared", { thing = T.thing(tag.name) })
 			if cb then pcall(cb, {}, false, {}) end
 			return
 		end
@@ -6441,7 +6602,7 @@ H.action = function(rec, p)
 		logGui("action " .. key .. " made during the pause came back with allowed=false: applied on no game")
 		if own and own.deferId then X.sendHeldOrder("fail", { id = own.deferId }, key) end
 		if own and own.heldId and natHeldRefused then pcall(natHeldRefused, own) end
-		if own and own.slot then pcall(X.natRefuseHeld, own.slot.h, "the host refused its place in the pause order (no permission)", "you may not build") end
+		if own and own.slot then pcall(X.natRefuseHeld, own.slot.h, "the host refused its place in the pause order (no permission)", "build_not_allowed") end
 		deliverResult(key, nil, false, {})
 		return
 	end
@@ -6498,26 +6659,17 @@ end
 
 -- A game could not build a held strict build (rec.from is that game). Every game drops the queued replay; the originator
 -- cancels its held command and tells its player.
--- The cause of a veto in words for the chat; the technical text stays in the log.
-local function vetoWords(why, who)
-	why = tostring(why or "")
-	if why:find("^unresolved node") or why:find("^unresolved segment") or why:find("^unresolved construction") or why:find("^unresolved object") then
-		return "a road or building it connects to is missing on " .. who .. "'s game"
-	elseif why:find("^ambiguous") then
-		return "it matches more than one road on " .. who .. "'s game"
-	elseif why:find("^engine:") then
-		return "the engine on " .. who .. "'s game refuses it (" .. why:gsub("^engine: ", ""):sub(1, 60) .. ")"
-	end
-	return "it cannot be made on " .. who .. "'s game (" .. why:sub(1, 60) .. ")"
-end
-
-vetoChat = function(key, text)
+-- A notice about this player's action for every player (the window's notices, not the chat), once per `key` and session: message
+-- `msg` of feverlink3_text.lua, "Your ..." here, "<name>'s ..." for the others. The host relays it as a chat line with a level, which
+-- every game files under its notices (H.chat). The technical cause stays in the caller's log line.
+vetoChat = function(key, msg, args)
 	G.vetoChatted = G.vetoChatted or {}
 	if G.vetoChatted[key] then return end
 	G.vetoChatted[key] = true
-	text = "[FeverLink3] " .. text
-	pcall(Hud.addChat, G.hud, "FeverLink3", text, -1)
-	send("chat", { text = text })   -- the host relays it to everybody else: one line per vetoed build
+	local text, level = T.say(msg, args)
+	logGui("told the player: " .. text)
+	pcall(Hud.addNotice, G.hud, text, level, C.time())
+	send("chat", { text = (T.say(msg, args, C.PLAYER_NAME)), level = level })
 end
 
 H.build_veto = function(rec, p)
@@ -6548,7 +6700,7 @@ H.build_veto = function(rec, p)
 		if pending and pending.deferId then X.sendHeldOrder("fail", { id = pending.deferId }, key) end
 		deliverResult(key, nil, false, {})
 		logGui("stall: action " .. key .. " of this game was refused by the host on every game (" .. why .. ")")
-		pcall(Hud.addChat, G.hud, "FeverLink3", "[FeverLink3] An action made while this game stood still could not be carried and was undone on every game: please do it again.", -1)
+		X.noticeLocal("action_undone_catching_up")
 		if cancelled == false then
 			send("replay_failed", { detail = "action " .. key .. " was applied here before the host refused it (stalled game): " .. why:sub(1, 100) })
 		end
@@ -6556,14 +6708,14 @@ H.build_veto = function(rec, p)
 	end
 	if p.owner == C.PLAYER_ID then
 		local cancelled = natVeto(key, who, why)
-		local me, cause = tostring(C.PLAYER_NAME), vetoWords(why, who)
+		local args = { who = who, cause = T.cause(why) }
 		if cancelled == nil then
 			-- not held here (the old flow): the veto changes nothing on this game
 		elseif cancelled then
-			vetoChat(key, me .. "'s build was cancelled on every game: " .. cause .. ".")
+			vetoChat(key, "build_refused_elsewhere", args)
 		else
 			-- the command was released already: the build exists on this game, the vetoing game dropped it. The games differ now.
-			vetoChat(key, me .. "'s build exists on their game only (" .. cause .. "); the games will be synchronised.")
+			vetoChat(key, "build_only_here", args)
 			logGui("veto of " .. key .. " came too late: this game has the build, " .. who .. " does not; asking the host for a resync")
 			send("replay_failed", { detail = "build " .. key .. " exists on one game only (a veto came after it was applied): " .. why:sub(1, 100) })
 		end
@@ -6630,8 +6782,14 @@ H.checksum_request = function(rec, p)
 	route(it)
 end
 
+-- A line with a level (info/warn/error) is a system message, the session's (the host's announcements) or another player's game's
+-- (vetoChat): it goes to the window's notices. A line without one is a player's chat.
 H.chat = function(rec, p)
-	if type(p) == "table" then
+	if type(p) ~= "table" then return end
+	if T.LEVELS[tostring(p.level)] then
+		logGui("notice " .. tostring(p.name or rec.from) .. ": " .. tostring(p.text))
+		Hud.addNotice(G.hud, p.text, p.level, C.time())
+	else
 		logGui("chat " .. tostring(p.name or rec.from) .. ": " .. tostring(p.text))
 		Hud.addChat(G.hud, p.name, p.text, p.from or rec.from)
 	end
@@ -6692,6 +6850,7 @@ function collectFromSim(state)
 		return
 	end
 	G.notes = st.notes
+	pcall(X.foreignTell, st)
 	local highest = nil
 	for _, o in ipairs(st.out or {}) do
 		if not G.outSeen[o.n] then
@@ -6761,7 +6920,7 @@ end
 -- every line in one frame before (one engine.lineResult, a balance since the game's start, per line, every 5 s): a frame that stalls
 -- sends no clock line, and every peer waits at its input barrier for it (bug 4: friend test 2026-10-16, holds of 0.3 s and more on a
 -- 4.7-4.8 s median cadence; frame.slow's companies= shows what it cost).
--- The budget is checked between reads, so one read that is slow by itself is not sliced: it was (pre5 friend test 2026-10-18,
+-- The budget is checked between reads, so one read that is slow by itself is not sliced: it was (friend test 2026-10-18,
 -- companies= 450-610 ms in one frame twice every 5 s: calculateBalance on the entity of a deleted line, engine.lineResult now reads
 -- only live lines). Whatever else makes one read slow, a line whose single read took more than X.CO_READ_SLOW_S is not read again
 -- while its key stays bound to that entity (it keeps the result it had; logged once): at most one such frame per line and binding.
@@ -6847,7 +7006,7 @@ function serviceWindow()
 		-- the window holds them: it learns that they were applied nowhere (their callbacks run with a failure)
 		if not (okN and okShip) then
 			for _, p in ipairs(ps) do pcall(uiReply, p.id, nil, nil, false, {}, tostring(okN and whyShip or okShip)) end
-			noticeLocal("An action of yours was not applied: it could not be sent to the other players (" .. tostring(okN and whyShip or okShip):sub(1, 90) .. ").")
+			noticeLocal("action_not_shared", { thing = "action" })
 		end
 	end
 	for _, rec in ipairs(C.readerPoll(G.uiReader)) do
@@ -6870,8 +7029,7 @@ function serviceWindow()
 		elseif rec.kind == "notice" then
 			-- the UI hook refused a window command it cannot replicate (feverlink3_uihook.lua, refuse): the player reads why here
 			local p = C.parse(rec.payload)
-			local text = type(p) == "table" and Hud.cleanText(p.text) or nil
-			if text then noticeLocal(text) end
+			if type(p) == "table" and type(p.msg) == "string" then noticeLocal(p.msg, { thing = T.thing(p.cmd) }) end
 		elseif rec.kind == "speed" then
 			-- a speed button of the window: the session speed is the host's to decide, so it is a request, like the
 			-- one the game's own speed buttons make (0 pauses)
@@ -7182,13 +7340,16 @@ local function guiUpdate(userParams, state, guiState)
 		end
 	end
 	pcall(X.guestSaveOnEnd)
+	-- The presence lock is held whenever a world is loaded and the session controller is there (it wrote identity.txt, C.ROLE), also
+	-- outside a session: an accepted Steam invite starts by itself only on a game that holds it (launcher live.rs invites_step).
+	-- Friend test 2026-10-21: an idle player with a world loaded never took it here, so three join requests did nothing.
+	if C.ACTIVE or C.ROLE then pcall(X.holdWorldLock) end
 	if not C.ACTIVE then
 		if G.nat and G.nat.holdSent then pcall(natStop, "the mod is not active") end
 		if X.readyHold then pcall(X.readyStart, "the mod is not active") end
 		return
 	end
 	G.frames = G.frames + 1
-	pcall(X.holdWorldLock)
 	if not G.started then
 		-- a session begins on this game: the first frame of this Lua state in one, or the next one after X.sessionOff
 		G.started, G.gen, G.sid = true, C.GEN, C.SESSION
@@ -7246,6 +7407,7 @@ local function guiUpdate(userParams, state, guiState)
 		G.epoch = tostring(C.time()) .. "-" .. tostring(math.floor(C.clock() * 1000)) .. "-" .. tostring(C.PLAYER_ID)
 		-- `fresh`: a session begins in this world (no resync reload resumes one): the simulation half drops a saved queue of another session
 		G.sessionMsg = { epoch = G.epoch, sid = C.SESSION, fresh = (not resumed) or nil }
+		pcall(X.seqResume, state)
 		toSim("session", G.sessionMsg)
 		logGui("session " .. tostring(C.SESSION) .. " begins here (" .. (resumed and "resumed after a resync load" or "fresh") .. "): to_game.log from " .. C.posText(C.readerPos(G.reader)))
 		traceGui("session", string.format("on sid=%s gen=%s start=%s floor=%s resumed=%s", tostring(C.SESSION), tostring(C.GEN), C.posText(C.SESSION_START), C.posText(C.readerPos(G.reader)), tostring(resumed)))
@@ -7311,7 +7473,7 @@ local seenOtherEvents, seenOtherN = {}, 0
 
 -- Terrain edits are refused during a session until terrain is replicated (owner decision 2026-10-21, option A3). A terrain edit's
 -- cells cannot be read from a script and the native module does not copy them, so the edit ran on its maker's game alone: friend test
--- pre7, 2 of 8 free-id forks began with the friend's terrain edits ("a native build ... is not replicated: a terrain edit"), which
+-- friend test 2026-10-20, 2 of 8 free-id forks began with the friend's terrain edits ("a native build ... is not replicated: a terrain edit"), which
 -- freed and re-created original-world entities on his game only. The terrain tools' commands cannot be held and cancelled like the
 -- other tools' (their call site is not on the hold list; MPFever (MIT) left it out because holding its edit crashed the tool), so the
 -- tools are switched off where the player picks them: every GUI component of the terrain menu (`landscaping_terrain`, seen in the logs as
@@ -7328,7 +7490,7 @@ function X.terrainGate(id)
 	logGui("terrain tools: " .. id .. " switched off for this session (terrain edits are not copied to the other games yet)")
 	if not G.terrainTold then
 		G.terrainTold = true
-		X.noticeLocal("Terrain tools are switched off during a FeverLink3 session: terrain edits cannot be carried to the other players yet.")
+		X.noticeLocal("terrain_off")
 	end
 end
 

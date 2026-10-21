@@ -132,6 +132,15 @@ mod entry {
                 log::init(path);
                 log::install_panic_hook();
                 log::line(&format!("FeverLink3 native {} loaded", env!("CARGO_PKG_VERSION")));
+                if live {
+                    // First, while the game has not run any code of its own and so has read no mod: finish (or undo)
+                    // the update an earlier run staged, then check for a new one on a thread of its own
+                    // (launcher/src/autoupdate.rs: renames only here, never the network).
+                    let game = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+                    if let (Some(game), Some(settings)) = (game, feverlink3_launcher::autoupdate::settings_path()) {
+                        feverlink3_launcher::autoupdate::start(game, settings, log::line);
+                    }
+                }
                 match game_build() {
                     Some(ts) => match build_table::select(ts) {
                         Some(b) => {

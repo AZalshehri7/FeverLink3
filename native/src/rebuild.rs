@@ -1646,7 +1646,7 @@ mod tests {
     /// A `parcelsMap` (`std::map<Entity, Parcel>`, build 40420) in the arena laid out as the engine's: a 0x50-byte sentinel and one
     /// 0x50-byte node per parcel in a balanced tree, each value at +0x20 (key, streetSegment +0x28, left +0x2c, curveParam +0x30, offset
     /// +0x34, the face vector +0x38) with residue in its padding, four faces of 0x20 bytes each (points vector, collision flags +0x18,
-    /// residue at +0x1c) and four points per face. The shape is the owner's pre4 hold 1: 42 parcels, keys new#42..new#1, faces 0x80
+    /// residue at +0x1c) and four points per face. The shape is the owner's hold 1 of 2026-10-18: 42 parcels, keys new#42..new#1, faces 0x80
     /// bytes, points 0x30 bytes; the scalars are those of the h3 donor's parcels (streetSegment new#1, curve parameters 0.0855..0.83,
     /// offset 8.0). The point coordinates are made up (the logs hold no point bytes). Returns, per key, the value bytes as the engine's
     /// copy carries them (padding zero) and the faces' points.
@@ -1775,7 +1775,7 @@ mod tests {
 
     #[test]
     fn a_parcel_map_is_carried_by_value_without_a_single_unresolved_pointer_and_rebuilt_exactly() {
-        // owner pre4 run 2026-10-18, host hold 1: a plain street over town land was "REFUSED BEFORE SHIPPING ... 126 heap pointers in the
+        // owner run 2026-10-18, host hold 1: a plain street over town land was "REFUSED BEFORE SHIPPING ... 126 heap pointers in the
         // text cannot be resolved: @B7+0x38, @B7+0x40, @B7+0x48 ...": the three words of the face vector of each of the 42 parcels
         let (fake, at) = synthetic();
         let arena = world(fake.0);

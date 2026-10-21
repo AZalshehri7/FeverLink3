@@ -35,10 +35,11 @@ use std::time::{Duration, Instant};
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::session::mods::{self, ModFingerprint};
 use feverlink3_core::session::{
-    codec, ChecksumOutcome, ChecksumPolicy, ConnectionState, HostOptions, HostOutput, HostSession, Lockstep,
-    MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage, PlayerOutput, PlayerSession,
-    PlayerState, ResumeTicket, ResyncChunkMessage, ResyncLimits, ResyncSaveMessage, ResyncState, RosterEntry,
-    SaveDoneMessage, SessionState, CAP_BULK_DGRAM, CAP_BULK_PAR, CAP_RESYNC_SOURCE,
+    codec, sha256_hex, ChecksumOutcome, ChecksumPolicy, CollectedReport, ConnectionState, HostOptions, HostOutput,
+    HostReportEvent, HostSession, Lockstep, MessageKind, PeerClockMessage, Permissions, PlayerInfo, PlayerLeftMessage,
+    PlayerOutput, PlayerReportEvent, PlayerSession, PlayerState, ReportAskMessage, ResumeTicket, ResyncChunkMessage,
+    ResyncLimits, ResyncSaveMessage, ResyncState, RosterEntry, SaveDoneMessage, SessionState, CAP_BULK_DGRAM,
+    CAP_BULK_PAR, CAP_RESYNC_SOURCE,
 };
 
 use crate::gamelink::{self, Line};
@@ -319,6 +320,33 @@ pub enum Command {
     /// Remove a player from the session, or release the slot held for one that dropped. The player is told it was
     /// removed and does not reconnect. The host's own id is refused.
     Kick(u16),
+    /// Make a bug report (the note the player typed). Host and player alike: a player's request goes to the host, which asks
+    /// every game for its part ([`ReportEvent`]).
+    Report(String),
+    /// This game's part of report transfer `id`, built by the controller after a [`ReportEvent::BuildPart`].
+    ReportPart {
+        id: i32,
+        bytes: Vec<u8>,
+    },
+    /// Host: send the finished bundle of transfer `id` to player `to`, chunk by chunk like a save.
+    ReportSend {
+        id: i32,
+        to: u16,
+        bytes: Vec<u8>,
+    },
+}
+
+/// What a bug report needs from the session's owner (the in-game controller), taken with [`SessionHandle::take_report_events`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportEvent {
+    /// Build this game's part and give it back with [`Command::ReportPart`].
+    BuildPart(ReportAskMessage),
+    /// Host: every part is in or missing; write the bundle (and send it with [`Command::ReportSend`] when a player asked).
+    Collected(CollectedReport),
+    /// Player: the bundle of the report this player asked for arrived.
+    Bundle { id: i32, report: String, bytes: Vec<u8> },
+    /// The host refused this game's request: report `id`, asked by `by_name`, is still being made.
+    Busy { id: i32, by_name: String },
 }
 
 #[derive(Debug)]
@@ -336,6 +364,8 @@ struct Shared {
     par_secret: Mutex<[u8; 32]>,
     /// The launcher's part of the latency logs (stamps on clock and action lines, a `link.launcher` line a minute).
     watch: Mutex<LinkWatch>,
+    /// Bug report events for the session's owner ([`SessionHandle::take_report_events`]).
+    reports: Mutex<Vec<ReportEvent>>,
     echo: bool,
 }
 
@@ -351,6 +381,7 @@ impl Shared {
             bulk: Mutex::new(BulkSettings { mode: BulkMode::Off, ..BulkSettings::default() }),
             par_secret: Mutex::new([0; 32]),
             watch: Mutex::new(LinkWatch::new(role)),
+            reports: Mutex::new(Vec::new()),
             echo,
         })
     }
@@ -375,6 +406,10 @@ impl Shared {
 
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    fn report_event(&self, event: ReportEvent) {
+        self.reports.lock().unwrap_or_else(|p| p.into_inner()).push(event);
     }
 
     fn watch(&self) -> std::sync::MutexGuard<'_, LinkWatch> {
@@ -418,6 +453,11 @@ impl SessionHandle {
         let first_held = total.saturating_sub(logs.len() as u64);
         let skip = from.max(first_held).saturating_sub(first_held) as usize;
         (logs.iter().skip(skip).cloned().collect(), total)
+    }
+
+    /// The bug report events since the last call, oldest first.
+    pub fn take_report_events(&self) -> Vec<ReportEvent> {
+        std::mem::take(&mut *self.shared.reports.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Host: the address the listener is bound to.
@@ -698,6 +738,12 @@ fn host_loop(
                 Command::Resync => host.start_resync("manual"),
                 Command::SetPermissions(p) => host.set_permissions(p),
                 Command::Kick(id) => host.kick(id),
+                Command::Report(note) => host.request_report(&note),
+                Command::ReportPart { id, bytes } => host.report_part(id, bytes),
+                Command::ReportSend { id, to, bytes } => {
+                    io.send_report(id, to, bytes);
+                    Vec::new()
+                }
             });
         }
         for (kind, payload) in read_from_game(link, shared) {
@@ -785,6 +831,13 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
                 shared.update(|s| s.last_sync = Some(result));
             }
             HostOutput::Log(text) => shared.log(text),
+            HostOutput::Report(HostReportEvent::BuildPart(ask)) => shared.report_event(ReportEvent::BuildPart(ask)),
+            HostOutput::Report(HostReportEvent::Collected(report)) => {
+                shared.report_event(ReportEvent::Collected(report))
+            }
+            HostOutput::Report(HostReportEvent::Busy(m)) => {
+                shared.report_event(ReportEvent::Busy { id: m.id, by_name: m.by_name })
+            }
             HostOutput::PlayerJoined(_) | HostOutput::PlayerLeft(_) | HostOutput::Received { .. } => {}
         }
     }
@@ -930,6 +983,7 @@ pub fn run_player_over(
                 par_progress: None,
                 asked_save: None,
                 upload: None,
+                report_upload: None,
             };
             if let Err(why) = guard::guarded(|| state.run(&net_rx, &cmd_rx, &shared)) {
                 shared.log(format!("the player session stopped: {why}"));
@@ -988,17 +1042,51 @@ struct PlayerLoop {
     asked_save: Option<i32>,
     /// This game's save on its way up to the host (`ResyncUpload`).
     upload: Option<Upload>,
+    /// This game's part of a bug report on its way up to the host (`ReportPart`), the same way.
+    report_upload: Option<Upload>,
 }
 
-/// This game's save being sent to the host, chunk by chunk.
+/// What an upload sends: a file on disk (a save, never held whole) or bytes in memory (a bug report's part).
+enum UploadSource {
+    File(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+/// This game's save (or a bug report's part) being sent to the host, chunk by chunk.
 struct Upload {
     id: i32,
-    path: PathBuf,
+    /// `ResyncUpload` or `ReportPart`.
+    kind: MessageKind,
+    source: UploadSource,
     len: u64,
     sha256: String,
     count: u32,
     next: u32,
     started: Instant,
+}
+
+impl Upload {
+    /// `resync 4` / `report 2`: the start of its log lines.
+    fn what(&self) -> String {
+        let name = if self.kind == MessageKind::ReportPart { "report" } else { "resync" };
+        format!("{name} {}", self.id)
+    }
+
+    fn chunk(&self, index: u32) -> io::Result<Vec<u8>> {
+        match &self.source {
+            UploadSource::File(path) => resync::read_chunk(path, self.len, index),
+            UploadSource::Bytes(bytes) => {
+                let start = index as usize * ResyncLimits::CHUNK_SIZE;
+                let size = ResyncLimits::chunk_len(self.len, index).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("chunk {index} out of range"))
+                })?;
+                bytes
+                    .get(start..start + size)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "chunk out of range"))
+            }
+        }
+    }
 }
 
 /// Save chunks sent to the host per turn of the player's loop at most, so pings and game lines are still handled in between.
@@ -1073,6 +1161,7 @@ impl PlayerLoop {
                             resync: None,
                             mod_warnings: Vec::new(),
                             stalled: Vec::new(),
+                            loading: Vec::new(),
                         };
                         write_to_game(&mut self.config.link, shared, MessageKind::Session, &codec::encode(&lost), 0);
                         match retry.as_mut() {
@@ -1098,7 +1187,21 @@ impl PlayerLoop {
                     _ => {}
                 }
             }
-            while cmd_rx.try_recv().is_ok() {}
+            // a player's commands: only the bug report's (the host's controls are the host's)
+            while let Ok(command) = cmd_rx.try_recv() {
+                match command {
+                    Command::Report(note) => {
+                        if self.net.is_some() && self.player.state() == PlayerState::Joined {
+                            shared.log("report: asking the host for a bug report");
+                            outputs.extend(self.player.request_report(&note));
+                        } else {
+                            shared.log("report: not connected to the host; the request was not sent");
+                        }
+                    }
+                    Command::ReportPart { id, bytes } => self.begin_report_upload(id, bytes, shared),
+                    _ => {}
+                }
+            }
 
             let mut saved = None;
             for (kind, payload) in read_from_game(&mut self.config.link, shared) {
@@ -1115,7 +1218,7 @@ impl PlayerLoop {
                 self.asked_save = None;
                 self.begin_upload(id, shared);
             }
-            if self.pump_upload(&mut clocks, shared) {
+            if self.pump_upload(false, &mut clocks, shared) || self.pump_upload(true, &mut clocks, shared) {
                 return;
             }
             {
@@ -1291,22 +1394,54 @@ impl PlayerLoop {
             "resync {id}: the host takes its repair from this game's world: sending our save ({len} bytes, {count} chunk(s), SHA-256 {})",
             &sha256[..12.min(sha256.len())]
         ));
-        self.upload = Some(Upload { id, path, len, sha256, count, next: 0, started: Instant::now() });
+        self.upload = Some(Upload {
+            id,
+            kind: MessageKind::ResyncUpload,
+            source: UploadSource::File(path),
+            len,
+            sha256,
+            count,
+            next: 0,
+            started: Instant::now(),
+        });
     }
 
-    /// Sends the next chunks of this game's save to the host. True when the session is over (rejected).
-    fn pump_upload(&mut self, clocks: &mut BTreeMap<u16, i64>, shared: &Shared) -> bool {
-        let Some(mut u) = self.upload.take() else { return false };
+    /// This game's part of a bug report, built by the controller: sent to the host like a save.
+    fn begin_report_upload(&mut self, id: i32, bytes: Vec<u8>, shared: &Shared) {
+        let len = bytes.len() as u64;
+        let Some(count) = ResyncLimits::chunk_count(len) else {
+            shared.log(format!("report {id}: this game's part is empty or too big ({len} bytes); not sent"));
+            return;
+        };
+        shared.log(format!("report {id}: sending this game's logs to the host ({len} bytes, {count} chunk(s))"));
+        let sha256 = sha256_hex(&bytes);
+        self.report_upload = Some(Upload {
+            id,
+            kind: MessageKind::ReportPart,
+            source: UploadSource::Bytes(bytes),
+            len,
+            sha256,
+            count,
+            next: 0,
+            started: Instant::now(),
+        });
+    }
+
+    /// Sends the next chunks of this game's save (`report`: of its bug report part) to the host. True when the session is over
+    /// (rejected).
+    fn pump_upload(&mut self, report: bool, clocks: &mut BTreeMap<u16, i64>, shared: &Shared) -> bool {
+        let slot = if report { &mut self.report_upload } else { &mut self.upload };
+        let Some(mut u) = slot.take() else { return false };
         if self.net.is_none() || self.player.state() != PlayerState::Joined {
-            shared.log(format!("resync {}: the connection is gone; our save was not sent completely", u.id));
+            shared.log(format!("{}: the connection is gone; it was not sent completely", u.what()));
             return false;
         }
         let mut budget = UPLOAD_CHUNKS_PER_TURN;
         while u.next < u.count && budget > 0 {
-            let data = match resync::read_chunk(&u.path, u.len, u.next) {
+            let data = match u.chunk(u.next) {
                 Ok(data) => data,
                 Err(e) => {
-                    shared.log(format!("resync {}: cannot read chunk {} of our save: {e}", u.id, u.next));
+                    shared.log(format!("{}: cannot read chunk {}: {e}", u.what(), u.next));
                     return false;
                 }
             };
@@ -1317,7 +1452,7 @@ impl PlayerLoop {
                 sha256: u.sha256.clone(),
                 data,
             };
-            let outputs = self.player.local_game_message(MessageKind::ResyncUpload, &codec::encode(&msg));
+            let outputs = self.player.local_game_message(u.kind, &codec::encode(&msg));
             u.next += 1;
             budget -= 1;
             if self.dispatch(outputs, clocks, shared) {
@@ -1325,10 +1460,14 @@ impl PlayerLoop {
             }
         }
         if u.next < u.count {
-            self.upload = Some(u);
+            if report {
+                self.report_upload = Some(u);
+            } else {
+                self.upload = Some(u);
+            }
         } else {
             let secs = u.started.elapsed().as_secs_f64();
-            shared.log(format!("resync {}: our save was sent to the host ({} bytes in {secs:.1} s)", u.id, u.len));
+            shared.log(format!("{}: sent to the host ({} bytes in {secs:.1} s)", u.what(), u.len));
         }
         false
     }
@@ -1371,6 +1510,19 @@ impl PlayerLoop {
                     }
                     let me = self.player.id().unwrap_or(0);
                     write_to_game(&mut self.config.link, shared, kind, &payload, me);
+                }
+                PlayerOutput::Report(PlayerReportEvent::Asked(ask)) => {
+                    shared.log(format!(
+                        "report {}: {} made a bug report; building this game's part",
+                        ask.id, ask.by_name
+                    ));
+                    shared.report_event(ReportEvent::BuildPart(ask));
+                }
+                PlayerOutput::Report(PlayerReportEvent::Bundle { id, report, bytes }) => {
+                    shared.report_event(ReportEvent::Bundle { id, report, bytes });
+                }
+                PlayerOutput::Report(PlayerReportEvent::Busy(m)) => {
+                    shared.report_event(ReportEvent::Busy { id: m.id, by_name: m.by_name });
                 }
                 PlayerOutput::Welcomed(welcome) => {
                     self.ticket = self.player.ticket().cloned();
@@ -1500,9 +1652,20 @@ mod tests {
                 assert_eq!(message_kind_for(r.name), Some(r.kind));
             }
         }
-        // pings, pongs, leaving, being removed and a repair source's save upload are the session layer's own talk: the game never sees them
-        let session_layer =
-            [MessageKind::Ping, MessageKind::Pong, MessageKind::Leave, MessageKind::Kicked, MessageKind::ResyncUpload];
+        // pings, pongs, leaving, being removed, a repair source's save upload and a bug report are the session layer's own talk: the
+        // game never sees them
+        let session_layer = [
+            MessageKind::Ping,
+            MessageKind::Pong,
+            MessageKind::Leave,
+            MessageKind::Kicked,
+            MessageKind::ResyncUpload,
+            MessageKind::ReportRequest,
+            MessageKind::ReportPart,
+            MessageKind::ReportAsk,
+            MessageKind::ReportBundle,
+            MessageKind::ReportBusy,
+        ];
         for k in MessageKind::FROM_PLAYER {
             assert_eq!(!session_layer.contains(&k), LINE_KINDS.iter().any(|r| r.kind == k && r.from_game), "{k:?}");
         }

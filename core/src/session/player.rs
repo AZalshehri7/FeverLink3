@@ -10,6 +10,7 @@ use super::messages::{
 };
 use super::mods::ModFingerprint;
 use super::names::Names;
+use super::report::{PlayerReportEvent, ReportAskMessage, ReportBusyMessage, ReportLimits, ReportRequestMessage};
 use super::resume::Outbox;
 use super::resync::IncomingSave;
 use super::roster::{ConnectionState, RosterEntry};
@@ -57,6 +58,8 @@ pub enum PlayerOutput {
     /// The session is over and will not be retried: the host refused the join (before the welcome), or ended the
     /// session afterwards (`kicked`, `flood`).
     Rejected(RejectMessage),
+    /// A bug report needs the launcher: build this game's part, or the bundle this player asked for arrived.
+    Report(PlayerReportEvent),
     Log(String),
 }
 
@@ -81,6 +84,10 @@ pub struct PlayerSession {
     session: Option<SessionState>,
     permissions: Permissions,
     incoming: IncomingSave,
+    /// The bundle of a bug report this player asked for, on its way (the same checks as a save).
+    report_in: IncomingSave,
+    /// The last report the host asked this game's part of: (transfer id, report name), to name the bundle.
+    report_ask: Option<(i32, String)>,
     /// What the join message announces (see [`super::CAP_BULK_DGRAM`]).
     caps: Vec<String>,
     /// This game's mod list and builds, sent in compact form with the join (see [`super::mods`]).
@@ -174,6 +181,8 @@ impl PlayerSession {
             session: None,
             permissions: Permissions::default(),
             incoming: IncomingSave::new(),
+            report_in: IncomingSave::new(),
+            report_ask: None,
             caps: Vec::new(),
             mods: None,
             resume,
@@ -405,6 +414,36 @@ impl PlayerSession {
                 match codec::try_decode::<PingMessage>(&plain) {
                     Some(m) => self.answer_ping(&m),
                     None => self.drop(kind_byte, "malformed ping".to_owned()),
+                }
+                return;
+            }
+            MessageKind::ReportAsk => {
+                // for the launcher, never the game
+                match codec::try_decode::<ReportAskMessage>(&plain) {
+                    Some(m) => {
+                        self.log(format!("report {}: the host asks for this game's logs ({} asked)", m.id, m.by_name));
+                        self.report_ask = Some((m.id, m.report.clone()));
+                        self.out.push(PlayerOutput::Report(PlayerReportEvent::Asked(m)));
+                    }
+                    None => self.drop(kind_byte, "malformed report ask".to_owned()),
+                }
+                return;
+            }
+            MessageKind::ReportBundle => {
+                self.receive_bundle(&plain);
+                return;
+            }
+            MessageKind::ReportBusy => {
+                // for the launcher, never the game: the window goes back to the button
+                match codec::try_decode::<ReportBusyMessage>(&plain) {
+                    Some(m) => {
+                        self.log(format!(
+                            "report: refused, report {} (asked by {}) is still being made",
+                            m.id, m.by_name
+                        ));
+                        self.out.push(PlayerOutput::Report(PlayerReportEvent::Busy(m)));
+                    }
+                    None => self.drop(kind_byte, "malformed report busy".to_owned()),
                 }
                 return;
             }
@@ -644,6 +683,41 @@ impl PlayerSession {
             Ok(None) => {}
             Err(err) => self.drop(kind, err.to_string()),
         }
+    }
+
+    /// A chunk of the bug report bundle this player asked for.
+    fn receive_bundle(&mut self, plain: &[u8]) {
+        let kind = MessageKind::ReportBundle.into();
+        let Some(m) = codec::try_decode::<ResyncChunkMessage>(plain) else {
+            self.drop(kind, "malformed report chunk".to_owned());
+            return;
+        };
+        // a bundle is never over the report's limit: refused before anything is held
+        let most = super::ResyncLimits::chunk_count(ReportLimits::MAX_BUNDLE_BYTES).unwrap_or(1) as i32;
+        if m.count > most {
+            self.drop(kind, format!("report bundle of {} chunks (at most {most})", m.count));
+            return;
+        }
+        let now = (self.now)();
+        self.report_in.expire(now);
+        match self.report_in.accept(now, m) {
+            Ok(Some(b)) => {
+                let report = match &self.report_ask {
+                    Some((id, name)) if *id == b.id => name.clone(),
+                    _ => String::new(),
+                };
+                self.log(format!("report {}: the bundle arrived ({} bytes)", b.id, b.bytes.len()));
+                self.out.push(PlayerOutput::Report(PlayerReportEvent::Bundle { id: b.id, report, bytes: b.bytes }));
+            }
+            Ok(None) => {}
+            Err(err) => self.drop(kind, err.to_string()),
+        }
+    }
+
+    /// The window asks for a bug report: the host asks every game for its part and sends this player the bundle.
+    pub fn request_report(&mut self, note: &str) -> Vec<PlayerOutput> {
+        let note: String = note.chars().take(ReportLimits::NOTE_CHARS).collect();
+        self.local_game_message(MessageKind::ReportRequest, &codec::encode(&ReportRequestMessage { note }))
     }
 
     /// A message from this player's game, sealed and sent to the host. Dropped (and counted) before the welcome:

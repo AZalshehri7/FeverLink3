@@ -299,7 +299,7 @@ local DOC = {
 --   customFilters and reservationPriority (gui/line_vehicle_mgmt/manager_window.tl), the cargo filter window edits only the stops
 --   (cargofilter_window.tl), line.tl copies the component and sets reservationPriority; no base script writes vehicleInfo (they
 --   read it: achievements), and the engine has api.engine.util.getLineTransportModesUnion(line) (util.d.tl). Shipping it made every
---   edit of a line with a mode on fail its own check: the owner's live test of 0.2.0-pre5 (2026-10-18 22:11) refused each one with
+--   edit of a line with a mode on fail its own check: the owner's live test of 2026-10-18 (22:11) refused each one with
 --   "does not rebuild equal at Line.vehicleInfo.transportModes.9" (also .3, .2), the rebuilt Line keeping the engine's own value.
 --   (owner's decision, 2026-10-18)
 local DERIVED = {

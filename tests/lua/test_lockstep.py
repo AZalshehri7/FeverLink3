@@ -71,6 +71,7 @@ COMMON_SRC = read_src("feverlink3_common.lua")
 LOCKSTEP_SRC = read_src("feverlink3_lockstep.lua")
 BRIDGE_SRC = read_src("feverlink3_bridge.script.lua")
 HUD_SRC = read_src("feverlink3_hud.lua")
+TEXT_SRC = read_src("feverlink3_text.lua")
 HOOK_SRC = read_src("feverlink3_uihook.lua")
 TRACE_SRC = read_src("feverlink3_towntrace.lua")
 PORTABLE_SRC = read_src("feverlink3_portable.lua")
@@ -346,6 +347,7 @@ function LOAD_HALF(label)
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_text") then return assert(load(TEXT_SRC, "=text", "t", env))() end
     if p:find("feverlink3_towntrace") then return assert(load(TRACE_SRC, "=towntrace", "t", env))() end
     if p:find("feverlink3_livevsloaded") then return assert(load(LVL_SRC, "=livevsloaded", "t", env))() end
     if p:find("feverlink3_linkstats") then return assert(load(LINKSTATS_SRC, "=linkstats", "t", env))() end
@@ -368,8 +370,8 @@ GUI_API = GUI_ENV.api
 -- runs the script at that step). Each state has its own module tables; they share only the game-script state (STATE). SIM_RUNS counts
 -- the steps each state ran.
 -- The events (handleEvent) are shared out the same way: every simulation state receives events (real game: both states that ran
--- steps logged their first event "at handleEvent", lab K 2026-10-19 00:17:33 and friend test pre5 22:01:02 / 22:01:29), and each event
--- reaches ONE of them (friend test pre5, host: 136 stamped actions came in "queue" events, none applied twice). Which one the game picks
+-- steps logged their first event "at handleEvent", lab K 2026-10-19 00:17:33 and friend test 2026-10-18 22:01:02 / 22:01:29), and each event
+-- reaches ONE of them (friend test 2026-10-18, host: 136 stamped actions came in "queue" events, none applied twice). Which one the game picks
 -- is not documented; the model: the state that runs the engine step in which the command is executed. An interface state's command
 -- "is executed in the next simulation step" (tf3-docs api/cmd.html), so an event sent from there goes to the state of the next step; an
 -- engine event during a step (a build's apply_command) to the state running it. Without SIM_SPLIT every event goes to SIM, as before.
@@ -417,6 +419,7 @@ function UI_HOOK_NEW()
     if p:find("feverlink3_lockstep") then return assert(load(LOCKSTEP_SRC, "=lockstep", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_text") then return assert(load(TEXT_SRC, "=text", "t", env))() end
     if p:find("feverlink3_uihook") then return assert(load(HOOK_SRC, "=uihook", "t", env))() end
     local cmds = p:match("(feverlink3_cmds_[%w_]+)")
     if cmds and CMDS_SRC[cmds] then return assert(load(CMDS_SRC[cmds], "=" .. cmds, "t", env))() end
@@ -438,6 +441,7 @@ function UI_ENV_NEW()
     if p:find("feverlink3_common") then return assert(load(COMMON_SRC, "=common", "t", env))() end
     if p:find("feverlink3_portable") then return assert(load(PORTABLE_SRC, "=portable", "t", env))() end
     if p:find("feverlink3_hud") then return assert(load(HUD_SRC, "=hud", "t", env))() end
+    if p:find("feverlink3_text") then return assert(load(TEXT_SRC, "=text", "t", env))() end
     error("no module " .. tostring(p))
   end
   env.C, env.Hud = env.ug_require("feverlink3_common"), env.ug_require("feverlink3_hud")
@@ -532,7 +536,7 @@ class Game:
         fastio.install(self.L)
         g = self.L.globals()
         g.COMMON_SRC, g.LOCKSTEP_SRC, g.BRIDGE_SRC, g.HUD_SRC = COMMON_SRC, LOCKSTEP_SRC, BRIDGE_SRC, HUD_SRC
-        g.HOOK_SRC = HOOK_SRC
+        g.HOOK_SRC, g.TEXT_SRC = HOOK_SRC, TEXT_SRC
         g.TRACE_SRC = TRACE_SRC
         g.PORTABLE_SRC = PORTABLE_SRC
         g.LVL_SRC = LVL_SRC
@@ -800,8 +804,11 @@ class Relay:
                     self.verdict(g, p, True)
                 elif rec.kind == "chat":
                     self.chats.append((g.id, str(p.text)))
-                    # the host fills in the sender and relays to everyone but the origin, as a line from 0
-                    out = self.ser({"text": str(p.text), "from": g.id, "name": g.label})
+                    # the host fills in the sender and relays to everyone but the origin, as a line from 0; a notice keeps its level
+                    msg = {"text": str(p.text), "from": g.id, "name": g.label}
+                    if p.level in ("info", "warn", "error"):
+                        msg["level"] = str(p.level)
+                    out = self.ser(msg)
                     for o in self.games:
                         if o is not g:
                             self.send(o, "chat", 0, out)
@@ -1624,6 +1631,33 @@ class StampedEverywhereTest(LockstepTest):
             self.assertNotIn("nothing created", g.log())
             self.assertNotIn("refused", g.log())
 
+    def test_a_key_made_before_a_resync_load_still_names_its_entity_after_it(self):
+        # Friend test 2026-10-21 21:51: the numbers of a player's actions began at 1 again after a resync load while the loaded world still
+        # bound 1:4 to a line made before it; the vehicle bought as the new 1:4 took the key over and the set-line commands that named the
+        # line by 1:4 were refused on both games ("line 1:4 does not exist here").
+        self.start()
+        self.tick(5)
+        self.B.window(LINE % ("L", "LINE"))
+        self.tick(40)
+        line = int(self.B.L.eval("LINE"))
+        for g in (self.A, self.B):
+            self.relay.send(g, "resync_load", 0, self.relay.ser({"id": 21, "name": "hostsave", "sha256": "00"}))
+            g.frame()
+            self.assertTrue(g.reload_pending())
+            g.reload()
+        self.relay.session()
+        self.tick(10)
+        self.B.window(('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s) if s then '
+                       'api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(d.resultVehicleEntity, %d, 0), function(_, s2) SET = s2 end) end end)') % line)
+        self.tick(60)
+        self.assertSameApplies(3)
+        self.assertTrue(self.B.L.eval("SET"), self.B.log())
+        self.assertIn("action numbers go on from 1:2", self.B.log())
+        for g in (self.A, self.B):
+            sets = [int(g.L.eval("GAME.applied[%d].args[2]" % (i + 1))) for i, a in enumerate(g.applied()) if a.startswith("makeVehicleSetLineCmd@")]
+            self.assertEqual(sets, [line], g.label)
+            self.assertNotIn("refused", g.log())
+
     def pause_both(self):
         self.start(speed=2)
         self.tick(10, lag_b=True)
@@ -2119,6 +2153,42 @@ class PureTest(unittest.TestCase):
         applied, failed, _ = K.applyAuthority(eng, own, host, L.table_from({"balance": 200, "loan": 4}))
         self.assertEqual(applied.balance, None, "a difference that changed since the round before is not the same one")
 
+    def test_the_bar_icon_colour_the_status_line_and_the_notices_follow_the_session(self):
+        H, P = self.H, self.parsed
+        m = H.new(1, "me")
+        H.setSession(m, self.L.table_from({"started": True, "speed": 2}))
+        icon = lambda ctl, now=1000: H.iconState(P(ctl) if ctl else None, m, now)
+        line = lambda ctl: H.statusLine(P(ctl) if ctl else None, m)
+        ok = '{state = "joined", started = true, me = 1, players = {{id = 0, name = "Ann", state = "connected", rtt = 15}, {id = 1, name = "me"}}}'
+        # white without a session, red for a refused join or a failed sync, yellow while anything is pending, green otherwise
+        self.assertEqual((icon(None), icon('{state = "idle"}'), icon('{state = "failed", message = "refused"}')), ("white", "white", "red"))
+        self.assertEqual((icon(ok), line(ok)), ("green", "Running x2 - in sync"))
+        self.assertEqual(icon('{state = "joined", started = true, resync = "failed: disk full"}'), "red")
+        self.assertEqual(line('{state = "hosting", started = true, resync = "failed: disk full"}'), "Sync failed: disk full")
+        sync = '{state = "hosting", started = true, sync = {phase = "sending", done = 45, total = 100}}'
+        self.assertEqual((icon(sync), line(sync)), ("yellow", "Syncing: sending world 45%"))
+        info = H.syncInfo(P(sync).sync, False)
+        self.assertEqual((info.step, info.fraction, info.detail), ("receiving world", 0.45, "Receiving the host's world: 45%"))
+        # the load names the games it still waits for, on every game (friend test 2026-10-21: ~52 s with only the step shown)
+        loading = '{state = "joined", started = true, sync = {phase = "loading", loading = {"Arishi", "Ben"}}}'
+        self.assertEqual(line(loading), "Syncing: waiting for Arishi and Ben to load the world")
+        self.assertEqual(H.syncInfo(P(loading).sync, True).detail, "Waiting for Arishi and Ben to load the world...")
+        away = ok.replace('state = "connected"', 'state = "away"')
+        self.assertEqual((icon(away), line(away)), ("yellow", "Running x2 - Ann reconnecting"))
+        self.assertEqual(H.playerState(P(away).players[1], 1, m), ("yellow", "reconnecting"))
+        self.assertEqual(H.playerState(P(ok).players[1], 1, m), ("green", "15 ms"))
+        self.assertEqual(icon('{state = "joined", started = false}'), "yellow")
+        self.assertEqual(line('{state = "joining", reconnecting = true, reconnectingS = 7}'), "Reconnecting (7 s)")
+        # notices: read defensively, newest last; an error notice turns the icon red for a while
+        self.assertEqual(len(H.notices(m)), 0)
+        m.notices = P('{{text = "a", level = "info", t = 990}, {text = 5}, {text = "b", level = "odd", t = 995}}')
+        listed = H.notices(m)
+        self.assertEqual([(listed[i].text, listed[i].level) for i in (1, 2)], [("a", "info"), ("b", "info")])
+        self.assertEqual(H.latestNotice(m, 1000, 10)[0].text, "b")
+        self.assertIsNone(H.latestNotice(m, 1010, 10))
+        m.notices = P('{{text = "repair failed", level = "error", t = 995}}')
+        self.assertEqual((icon(ok, 1000), icon(ok, 1100)), ("red", "green"))
+
     def test_the_window_model_roster_chat_history_and_mod_lists(self):
         H, L = self.H, self.L
         h = H.new(1, "me")
@@ -2147,8 +2217,27 @@ class PureTest(unittest.TestCase):
         self.assertEqual((len(h.history), h.history[1].text, h.history[200].text), (200, "m51", "m250"))
         self.assertEqual(H.chatLines(h, 2)[2], "bob: m250")
         self.assertFalse(H.addChat(h, "bob", "  ", 3))
+        # system notices stay out of the chat: at most 20, a repeat moves to the end with a count
+        for i in range(1, 26):
+            H.addNotice(h, "n%d" % i, "info", 100 + i)
+        H.addNotice(h, "n10", "warn", 200)
+        H.addNotice(h, "n10", "bogus", 201)
+        self.assertEqual((len(h.notices), h.notices[1].text, h.notices[20].text, h.notices[20].level, h.notices[20].t),
+                         (20, "n6", "n10 (x3)", "info", 201))
+        self.assertEqual(len(h.history), 200, "no notice went into the chat")
         back = H.fromSnapshot(self.C.parse(self.C.serialize(H.snapshot(h))))
         self.assertEqual((back.version, len(back.history), back.history[200].text), (h.version, 200, "m250"))
+        H.addNotice(back, "n10", "error", 300)
+        self.assertEqual((len(back.notices), back.notices[20].text, back.notices[20].level), (20, "n10 (x4)", "error"))
+        # the catalogue (feverlink3_text.lua): plain words only, "Your ..." for the player, "<name>'s ..." for the others
+        T = self.L.execute(TEXT_SRC)
+        for key in list(T.MSG.keys()):
+            for owner in (None, "Pat"):
+                text, level = T.say(key, self.L.table_from({"who": "Bob", "cause": T.CAUSES.missing, "thing": "build"}), owner)
+                self.assertIn(level, ("info", "warn", "error"), key)
+                self.assertNotRegex(text.lower(), r"checksum|lane|\bids?\b|stamp|inject|verdict|resync|engine|\{|\d:\d", key)
+        self.assertEqual(T.say("build_cancelled", None)[0][:11], "Your build ")
+        self.assertEqual(T.say("build_cancelled", None, "Pat")[0][:12], "Pat's build ")
         self.assertEqual(H.rosterText(back), "me (you)")
         self.assertIsNone(H.fromSnapshot(L.table_from({"version": 1})))
         # the mod list from the documented repository (app.getUserProfile():getModRep(), getInstalledMods() of Mod.ModId records with

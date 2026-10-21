@@ -11,6 +11,14 @@
 //!
 //! The same two hooks feed the compact free-id order trace ([`crate::idorder`], `FEVERLINK3_TRACE`, on unless `=0`):
 //! `idorder_<live>.log` next to native.log, one line per burst. Either switch installs the hooks; each writes only its own file.
+//!
+//! The step clock of both traces (2026-10-21): a third, read-only hook on the engine's game-time advance (`0xbad780`,
+//! `(ecs::Engine*, world entity, delta)`, called once per simulation update by the update loop at `0x159503`, before the
+//! update's systems run) reads the new `GameTime.gameTime` (the component's first i64) through the same component lookup
+//! (`0x1445c0`) the function itself starts with, and keeps it in an atomic. Every hooked call then carries step =
+//! game time / 200, the step the mod stamps and checksums with (`C.STEP`, `Lockstep::STEP`), and its OS thread
+//! ([`crate::idorder::Ctx`]). Freed ids are taken where the engine appends them: the free-order hook (`hooks.rs`) calls
+//! [`freed`] right after the real insert, on the thread that ended the modification.
 
 #[cfg(windows)]
 pub use imp::install;
@@ -23,6 +31,38 @@ pub fn mark(what: &str) {
     #[cfg(not(windows))]
     let _ = what;
 }
+
+/// The free-order hook's real insert appended a modification's freed ids to `queue` (the engine's free-id deque, engine
+/// `+0xd8`): the order trace takes them now, with this thread and step. Nothing when the trace is off. Called in the hook's plain
+/// frame after the game's insert returned; the bookkeeping is guarded.
+pub fn freed(queue: u64) {
+    #[cfg(windows)]
+    imp::freed(queue);
+    #[cfg(not(windows))]
+    let _ = queue;
+}
+
+/// The step the traces stamp for a game time: game time / [`STEP`], the mod's `math.floor(engine.gameTime() / STEP)`.
+pub fn step_of(game_time: u64) -> u64 {
+    game_time / STEP
+}
+
+/// Game-time units per simulation step, the mod's `C.STEP`.
+pub const STEP: u64 = feverlink3_core::session::Lockstep::STEP as u64;
+
+/// The free-id deque's place in `ecs::Engine` (build 40420: `lea rcx,[r13+0xd8]` before the insert at `0x2bba103`).
+pub const FREE_QUEUE_OFFSET: u64 = 0xd8;
+
+/// Build 40420: the game-time advance `(ecs::Engine*, world entity, delta) -> void` (`0xbad780`) and its pushes, up to
+/// `sub rsp,50h` (16 bytes, no rip-relative operand).
+pub const GAME_TIME_ADVANCE_RVA: u32 = 0x00ba_d780;
+pub const GAME_TIME_ADVANCE_PROLOGUE: [u8; 16] =
+    [0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
+/// Build 40420: the component lookup `(ecs::Engine*, entity) -> GameTime*` (`0x1445c0`) the advance and the game-time getters call;
+/// its first bytes are compared before it is ever called.
+pub const COMPONENT_LOOKUP_RVA: u32 = 0x0014_45c0;
+pub const COMPONENT_LOOKUP_PROLOGUE: [u8; 15] =
+    [0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20];
 
 /// The checksum's `freeq` part of this game ([`crate::idorder::EngineOrder::check_part`] of the engine that worked last), `None`
 /// when the order trace is off, `FEVERLINK3_FREEQ_CHECK=0`, or no engine has a checkpoint yet. Read by the session controller when
@@ -59,7 +99,7 @@ pub const REMOVE_ENTITY_PROLOGUE: [u8; 15] =
 mod imp {
     use super::*;
     use crate::detour::Detour;
-    use crate::idorder::EngineOrder;
+    use crate::idorder::{Ctx, EngineOrder};
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -69,6 +109,12 @@ mod imp {
 
     static ADD_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
     static REMOVE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static ADVANCE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    /// The game's component lookup, 0 when its bytes were not the expected ones (then no step is read).
+    static LOOKUP: AtomicUsize = AtomicUsize::new(0);
+    /// The game time after the latest advance, with [`TIME_VALID`] set; 0 before the first one.
+    static GAME_TIME: AtomicU64 = AtomicU64::new(0);
+    const TIME_VALID: u64 = 1 << 63;
     static BASE: AtomicUsize = AtomicUsize::new(0);
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static OUT: Mutex<Option<std::io::BufWriter<std::fs::File>>> = Mutex::new(None);
@@ -88,6 +134,19 @@ mod imp {
     static ORDER_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
     /// Pending bytes past this are written at once, without waiting for the second to pass.
     const ORDER_CHUNK: usize = 1 << 16;
+
+    /// The calling thread and the current step (an atomic load and the thread id from the TEB: cheap enough for every hooked call).
+    fn ctx() -> Ctx {
+        let t = GAME_TIME.load(Ordering::Relaxed);
+        // SAFETY: no arguments.
+        let tid = unsafe { GetCurrentThreadId() };
+        Ctx { tid, step: (t & TIME_VALID != 0).then(|| step_of(t & !TIME_VALID)) }
+    }
+
+    /// The step for the verbose trace's lines.
+    fn step_text() -> String {
+        ctx().step.map_or_else(|| "?".to_string(), |s| s.to_string())
+    }
 
     /// A queue larger than this is not the field expected: not read.
     const QUEUE_MAX: usize = 50_000_000;
@@ -177,7 +236,8 @@ mod imp {
                 }
             }
             let o = &mut g[i].1;
-            o.enter(now, ms, free, |k| queue_ids(engine, (free as usize).saturating_sub(k), free as usize), &mut out);
+            let tail = |k| queue_ids(engine, (free as usize).saturating_sub(k), free as usize);
+            o.enter(now, ctx(), ms, free, tail, &mut out);
             f(o, &mut out);
         }
         drop(inside);
@@ -197,6 +257,15 @@ mod imp {
             }
         }
         order_write(out);
+    }
+
+    /// The free-order hook appended freed ids to `queue`: taken now (see [`super::freed`]).
+    pub fn freed(queue: u64) {
+        if !COMPACT.load(Ordering::Relaxed) || queue < FREE_QUEUE_OFFSET {
+            return;
+        }
+        let engine = (queue - FREE_QUEUE_OFFSET) as usize;
+        let _ = crate::log::guarded("id order trace", || order_call(engine, |_, _| {}));
     }
 
     /// A mark line in the order trace (`what`: the session's holding switched), after every engine's pending line, written
@@ -339,7 +408,13 @@ mod imp {
                 let n = SEQ.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: no arguments.
                 let tid = unsafe { GetCurrentThreadId() };
-                line(&format!("{n} {} +{id} e={:x} t={tid} free={f} {}", ms(), engine & 0x00ff_ffff, chain()));
+                line(&format!(
+                    "{n} {} +{id} e={:x} t={tid} free={f} {} s={}",
+                    ms(),
+                    engine & 0x00ff_ffff,
+                    chain(),
+                    step_text()
+                ));
             });
         }
         r
@@ -357,12 +432,13 @@ mod imp {
                 // SAFETY: no arguments.
                 let tid = unsafe { GetCurrentThreadId() };
                 line(&format!(
-                    "{n} {} -{} e={:x} t={tid} free={} {}",
+                    "{n} {} -{} e={:x} t={tid} free={} {} s={}",
                     ms(),
                     id as i32,
                     engine & 0x00ff_ffff,
                     rd(engine as usize, 0xf8),
-                    chain()
+                    chain(),
+                    step_text()
                 ));
             });
         }
@@ -370,6 +446,64 @@ mod imp {
         // SAFETY: the trampoline of RemoveEntity.
         let orig: Orig = unsafe { core::mem::transmute(REMOVE_ORIGINAL.load(Ordering::Acquire)) };
         unsafe { orig(engine, id, r8, r9) }
+    }
+
+    /// The engine's game-time advance (`0xbad780`, once per simulation update, before the update's systems run): calls the
+    /// original with every argument as given, then reads the new game time through the component lookup the original began
+    /// with (same engine, same entity, same thread, moments later; game code, so in this plain frame, outside any guard) and
+    /// keeps it for [`ctx`]. Changes nothing of the game.
+    unsafe extern "system-unwind" fn advance_hook(engine: u64, entity: u64, delta: u64, r9: u64) -> u64 {
+        let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::IDS_STEP_HOOK);
+        type Orig = unsafe extern "system-unwind" fn(u64, u64, u64, u64) -> u64;
+        // SAFETY: the trampoline of the advance, published before the jump was written.
+        let orig: Orig = unsafe { core::mem::transmute(ADVANCE_ORIGINAL.load(Ordering::Acquire)) };
+        let r = unsafe { orig(engine, entity, delta, r9) };
+        let lookup = LOOKUP.load(Ordering::Acquire);
+        if lookup != 0 && engine != 0 {
+            type Lookup = unsafe extern "system-unwind" fn(u64, u64) -> u64;
+            // SAFETY: the lookup whose bytes install() compared, with the arguments the original passed it (rcx, edx).
+            let get: Lookup = unsafe { core::mem::transmute(lookup) };
+            let component = unsafe { get(engine, entity & 0xffff_ffff) };
+            // read guarded: a component that is not readable leaves the step as it was
+            // (the game time is an i64: a negative one is not the field expected)
+            if let Some(t) = crate::memguard::word(component as usize).filter(|t| (*t as i64) >= 0) {
+                GAME_TIME.store(TIME_VALID | t, Ordering::Relaxed);
+            }
+        }
+        r
+    }
+
+    /// Hooks the game-time advance for the order trace's step (only with the order trace on). Without it, or when a byte differs,
+    /// the traces write `s=?`.
+    fn install_step(base: usize, log: fn(&str)) {
+        let lookup = base + COMPONENT_LOOKUP_RVA as usize;
+        // SAFETY: a read of the image's code, checked readable first.
+        match unsafe { crate::mem::read(lookup as *const u8, COMPONENT_LOOKUP_PROLOGUE.len()) } {
+            Ok(b) if b == COMPONENT_LOOKUP_PROLOGUE => {}
+            _ => {
+                return log("id order trace: the step is not read (the component lookup is not as on build 40420): s=?")
+            }
+        }
+        // SAFETY: called from DllMain before the game runs; the prologue is checked against the bytes in memory.
+        match unsafe {
+            Detour::prepare((base + GAME_TIME_ADVANCE_RVA as usize) as *mut u8, &GAME_TIME_ADVANCE_PROLOGUE)
+        } {
+            Ok(mut d) => {
+                ADVANCE_ORIGINAL.store(d.original() as usize, Ordering::Release);
+                LOOKUP.store(lookup, Ordering::Release);
+                match unsafe { d.commit(advance_hook as *const () as usize) } {
+                    Ok(()) => {
+                        log("id trace: game_time_advance hooked (the traces' step s= = game time / 200)");
+                        std::mem::forget(d);
+                    }
+                    Err(e) => {
+                        LOOKUP.store(0, Ordering::Release);
+                        log(&format!("id trace: game_time_advance NOT hooked: {e} (s=?)"))
+                    }
+                }
+            }
+            Err(e) => log(&format!("id trace: game_time_advance NOT hooked: {e} (s=?)")),
+        }
     }
 
     /// Installs the hooks when the verbose trace (`FEVERLINK3_ID_TRACE=1`) or the order trace (`FEVERLINK3_TRACE`, on
@@ -455,6 +589,7 @@ mod imp {
                 Err(e) => log(&format!("id trace: {name} NOT hooked: {e}")),
             }
         }
+        install_step(base, log);
     }
 
     #[cfg(test)]

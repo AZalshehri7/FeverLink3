@@ -60,6 +60,7 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 | `admit` / `refuse` | `{id}` | `hosting` | Answers the join request of the Steam account `id` (a string, from `invites.requests`): `admit` sends it the session key and it joins; `refuse` tells it no (it cannot ask again for 60 s). Answers in `result`. |
 | `accept_invite` | `{}` | any | Joins through the pending Steam `invite`, leaving the current session first. |
 | `dismiss_invite` | `{}` | any | Forgets the pending Steam `invite`. |
+| `report` | `{note?, mods?, game?}` | any | "Report a problem": a bug report zip (docs/PROTOCOL.md, "Bug reports"). `hosting` and `joined`: the host collects every game's logs; otherwise this game's logs alone. `note` (at most 300 characters) goes into the report's `report.txt`; `mods` and `game` as for `host`, for the part's mod list and game build. Ignored while a report is being made. The progress and the outcome are `report`. |
 
 #### `permissions` values
 
@@ -113,6 +114,7 @@ changed.
 | `attempts` | number | with `reconnecting` | Attempts so far in this outage. |
 | `invites` | table | `hosting` over Steam | Steam invites: `ready` (Steam's friends interface was found) and `requests`, the join requests waiting for the host, oldest first: `{id, name, steam?}` (`id` the account's Steam ID as a string, `name` what its game sent, `steam` its Steam name when Steam knows it). |
 | `invite` | table | a Steam invite is pending | `{host, auto}`: a "Join game" or accepted invite Steam handed to this game. With `auto` true (idle) it starts by itself as soon as a world is loaded; otherwise the window offers `accept_invite` / `dismiss_invite`. |
+| `report` | table | after a `report` | `{state, message, file?, contents?}`: `state` is `making` (this game alone), `collecting` (the host gathers every game's logs), `done`, `failed` or `busy` (the host refused: another player's report is still being made; the button is back); `message` says it in words for the player (where the zip is); `file` the zip's name and `contents` its entries with their sizes once `done`. |
 | `result` | table | after a `kick` or `permissions` | How the last command that can be refused ended. Fields below. Cleared by `leave` and when a host session starts. |
 
 ### `players[i]`

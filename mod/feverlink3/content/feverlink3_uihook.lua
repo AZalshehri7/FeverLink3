@@ -20,7 +20,7 @@
 --     of N vehicles is N purchases, then N line assignments from their callbacks) carry one group number, and the bridge ships each
 --     group as one order: one stamp, applied in one step on every game, refused as a whole when any of it cannot be shipped.
 --     One that cannot be encoded (it does not rebuild equal, it names what cannot travel, the hook itself fails) is REFUSED on
---     this game too: its callback fails and the player is told in the session chat. It is never applied here alone (refuse).
+--     this game too: its callback fails and the player is told in the window's notices. It is never applied here alone (refuse).
 --   * anything else (no schema, or an event no game replicates), and everything while no session is on: untouched.
 -- Entity ids never travel; the keys of entities created in the session come from binds.txt, which the bridge writes.
 --
@@ -353,18 +353,16 @@ local function speedAnswers()
 end
 M.speedAnswers = speedAnswers
 
-local words = L.commandWords
-
 -- A command this game cannot replicate is refused here too, never applied on this game alone: the engine applying it on the
 -- originator only made the worlds differ and the next resync erased the player's edit (friend test 2026-10-16: line edits that
 -- "do not rebuild equal" were applied on the editing game only, 9 of the 14 resyncs of that test followed from it). The window's
--- callback fails, the log says why, and the player reads it in the session chat (a `notice` record: the bridge adds it to this
--- game's chat only).
+-- callback fails, the log says why, and the player reads it in the window's notices (a `notice` record: the bridge adds it to this
+-- game's notices only).
 local function refuse(tag, cb, why)
 	U.stats.failed = U.stats.failed + 1
 	log("command " .. tag.name .. " is REFUSED: it cannot be replicated, so it is applied nowhere (not on this game alone either): " .. tostring(why))
-	send("notice", { text = "Your " .. words(tag.name) .. " was not applied: it cannot be shared with the other players (" .. tostring(why):sub(1, 90) .. ").",
-		sid = C.SESSION })
+	-- the bridge words it (feverlink3_text.lua, action_not_shared); the reason stays in the log line above
+	send("notice", { msg = "action_not_shared", cmd = tag.name, sid = C.SESSION })
 	fire(0, { cb = cb, name = tag.name }, {}, false, {})
 	return true
 end

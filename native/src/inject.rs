@@ -129,7 +129,7 @@ impl Outcome {
 /// then the mod writes `send_done` ([`State::close`]). The command on that thread that carries the conversion ([`Identity::within`]) is
 /// the order's, whatever the text says: the text is only a cross-check, and a mismatch refuses the order and empties the command
 /// (nothing of the build is applied here). Before, commands were matched by their content alone, and a content check that missed
-/// (friend test pre7, 2026-10-21: the engine's conversion of a bus stop added the town buildings it moves) took the mod's own command for
+/// (friend test 2026-10-21: the engine's conversion of a bus stop added the town buildings it moves) took the mod's own command for
 /// someone else's: the placeholder applied untouched, threw mid-apply and the game crashed a second later. Town commands applied while an
 /// order waits (lab 2026-10-18: 12 of 48 orders saw one first) do not carry the conversion and pass untouched.
 /// Without a conversion seen on the command's thread (the hook not installed) the content decides as before: the first waiting order
@@ -1022,7 +1022,7 @@ pub const NOT_OURS: &str = "not the mod's command: ";
 pub const UNKNOWN: &str = "identity unknown: ";
 
 /// The prefix of a refusal of the mod's own command (it carries the conversion of the mod's own send, positive identity) whose text does
-/// not fit it: the command is emptied, nothing of the build is applied on this game (friend test pre7, 2026-10-21: such a command was
+/// not fit it: the command is emptied, nothing of the build is applied on this game (friend test 2026-10-21: such a command was
 /// taken for someone else's and the mod's placeholder applied untouched; it threw mid-apply and the game crashed).
 pub const CROSS_CHECK: &str = "the cross-check failed: the mod's own command does not fit its text: ";
 

@@ -19,7 +19,9 @@ use super::messages::{
 };
 use super::mods::{ModFingerprint, ModTags};
 use super::names::Names;
+use super::notices;
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
+use super::report::{HostReportEvent, ReportRound};
 use super::resume::{Missed, Outbox};
 use super::resync::ResyncState;
 use super::roster::{ConnectionState, RosterEntry};
@@ -27,6 +29,7 @@ use super::verdict::VerdictBook;
 use crate::crypto::{Opener, Sealer, SessionKey};
 use crate::protocol::{Frame, FrameHeader};
 
+mod report_impl;
 mod resync_impl;
 mod stall;
 use resync_impl::ResyncRound;
@@ -210,6 +213,8 @@ pub enum HostOutput {
         id: i32,
         reason: String,
     },
+    /// A bug report needs the launcher: the host game's own part, or the bundle of a finished report.
+    Report(HostReportEvent),
     Log(String),
 }
 
@@ -321,6 +326,13 @@ pub struct HostSession {
     /// A player joined while a round was already past the point of taking it in: the reason of the round to start
     /// when that one ends.
     pending_new_player: Option<&'static str>,
+    /// Ready games whose world is not the session's yet: every game but the host's at a start with games at different times, a player
+    /// that joined (or came back without keeping its world) a started session. A round's load replaces their world (`on_load_hello`).
+    /// Until then their clock is not the session's: it holds no pause, sets no stamp, and the others neither pace themselves to it nor
+    /// keep to its promise (relayed flagged `stalled` with no promise); an action of theirs, made in another world, is refused on every
+    /// game. UI run 2026-10-21: the guest's world stood 35 800 game-ms behind the host's at the start, and the start round's pause waited
+    /// 37 s for it to run up to the host's step at x1, a world the load then threw away.
+    outsiders: BTreeSet<u16>,
     dropped_once: HashSet<String>,
     next_player_id: u16,
     checksum_n: i32,
@@ -361,6 +373,9 @@ pub struct HostSession {
     /// (`ActionRefusedMessage::partial`). A repair never takes its world from one of them (`repair_source`); a finished round
     /// clears them (every game loaded one world).
     partly_built: BTreeSet<u16>,
+    /// The bug report being collected (`report_impl.rs`), and the last transfer id given to one.
+    report: Option<ReportRound>,
+    report_counter: i32,
     dropped: u64,
     out: Vec<HostOutput>,
 }
@@ -431,6 +446,7 @@ impl HostSession {
             resync_counter: 0,
             last_running_speed: 1,
             pending_new_player: None,
+            outsiders: BTreeSet::new(),
             dropped_once: HashSet::new(),
             next_player_id: 1,
             checksum_n: 0,
@@ -449,6 +465,7 @@ impl HostSession {
                 pause_at: None,
                 lead: Lockstep::lead_units(1),
                 stalled: Vec::new(),
+                loading: Vec::new(),
                 resync: None,
                 mod_warnings: Vec::new(),
             },
@@ -460,6 +477,8 @@ impl HostSession {
             stalls: BTreeMap::new(),
             resume_checks: BTreeSet::new(),
             partly_built: BTreeSet::new(),
+            report: None,
+            report_counter: 0,
             dropped: 0,
             out: Vec::new(),
         }
@@ -561,6 +580,9 @@ impl HostSession {
         let now = self.now();
         self.note_time(now);
         let forgiven = now < self.stall_until;
+        // the parts of a bug report the host asked this game for pass the flood limit, like a repair's save
+        let report = frame.header.kind == u8::from(MessageKind::ReportPart)
+            && self.connections.get(&connection).and_then(|c| c.player).is_some_and(|p| self.report_upload_from(p));
         let Some(c) = self.connections.get_mut(&connection) else {
             return self.drain();
         };
@@ -570,7 +592,7 @@ impl HostSession {
         let upload = frame.header.kind == u8::from(MessageKind::ResyncUpload)
             && player.is_some()
             && player == self.resync.as_ref().and_then(|r| r.uploading_from());
-        let forgiven = forgiven || upload;
+        let forgiven = forgiven || upload || report;
         let cost = (FrameHeader::SIZE + frame.body.len()).try_into().unwrap_or(u32::MAX);
         let over_frames = !forgiven && !c.limiter.allow(now);
         let over_bytes = !forgiven && !c.bytes.allow_cost(now, cost);
@@ -929,7 +951,7 @@ impl HostSession {
         if caught_up {
             self.begin_catch_up(id);
         } else {
-            self.on_new_player(if resumed { "player returned" } else { "new player" });
+            self.on_new_player(id, if resumed { "player returned" } else { "new player" });
         }
     }
 
@@ -1086,7 +1108,20 @@ impl HostSession {
                         // a player cannot push every other game's stamps into the far future with an absurd margin
                         let need = m.need.map(|n| n.clamp(0, ClockMessage::MAX_NEED));
                         // a stalled game's own promise lies behind the one the host keeps for it: the others get the host's (stall.rs)
-                        if !self.stalled_clock(from, m.t, m.ahead, need, safe) {
+                        if self.outsiders.contains(&from) {
+                            // a clock of another world: no game paces itself to it or keeps to its promise (`outsiders`)
+                            let peer = PeerClockMessage {
+                                from,
+                                t: m.t,
+                                ahead: m.ahead,
+                                need: None,
+                                safe: None,
+                                pause: false,
+                                stalled: true,
+                                hop: None,
+                            };
+                            self.broadcast(MessageKind::PeerClock, &codec::encode(&peer), Some(from));
+                        } else if !self.stalled_clock(from, m.t, m.ahead, need, safe) {
                             let peer = PeerClockMessage {
                                 from,
                                 t: m.t,
@@ -1127,7 +1162,9 @@ impl HostSession {
                     m.pause_upto = None;
                     m.hop = m.hop.as_ref().map(|h| self.relayed_hops(h, from));
                     self.link_stats.action(from);
-                    if m.pause {
+                    if self.refuse_outsider(from, m.seq, "action") {
+                        // made in another world: applied nowhere
+                    } else if m.pause {
                         // made during a pause (or by a stalled game, stall.rs): stamped by the host and relayed to every game, the
                         // sender too (flush_pause)
                         self.pause_held.push(PauseItem::Action(m));
@@ -1155,7 +1192,9 @@ impl HostSession {
                     m.from = from;
                     m.pause_seq = None;
                     m.pause_upto = None;
-                    if m.pause {
+                    if self.refuse_outsider(from, m.seq, "commit") {
+                        // made in another world: applied nowhere
+                    } else if m.pause {
                         self.pause_held.push(PauseItem::Commit(m));
                         self.flush_pause();
                     } else if !self.refuse_stalled(from, m.seq, m.stamp, "commit") {
@@ -1168,7 +1207,9 @@ impl HostSession {
                 if let Some(m) = codec::try_decode::<ChatMessage>(payload) {
                     if !m.text.trim().is_empty() {
                         let text: String = m.text.chars().take(500).collect();
-                        let chat = ChatMessage { text, from, name: Some(self.name(from)) };
+                        // a game's notice keeps its level (one of the three names; anything else is chat)
+                        let level = m.level.as_deref().and_then(notices::Level::parse).map(|l| l.as_str().to_owned());
+                        let chat = ChatMessage { text, from, name: Some(self.name(from)), level };
                         self.broadcast(MessageKind::Chat, &codec::encode(&chat), Some(from));
                     }
                 }
@@ -1266,6 +1307,17 @@ impl HostSession {
                 return;
             }
 
+            MessageKind::ReportRequest => {
+                self.on_report_request(from, payload);
+                return;
+            }
+
+            MessageKind::ReportPart if from != Self::HOST_ID => {
+                self.on_report_part(from, payload);
+                // like a save's chunk: not logged or observed further
+                return;
+            }
+
             MessageKind::Leave if from != Self::HOST_ID => {
                 let who = self.name(from);
                 self.log(format!("{who} leaves the session"));
@@ -1295,7 +1347,13 @@ impl HostSession {
         self.broadcast_session();
         if times.len() > 1 {
             // The games report different times, so they are not in the same world: bring everyone into the
-            // host's world now instead of waiting for the host to ask.
+            // host's world now instead of waiting for the host to ask. The session's world is the host's: until the load
+            // replaces theirs, the other games are outsiders (their clocks hold no pause, `outsiders`).
+            if self.clocks.contains_key(&Self::HOST_ID) {
+                let others: Vec<u16> =
+                    self.players.values().filter(|p| p.ready && p.id != Self::HOST_ID).map(|p| p.id).collect();
+                self.outsiders.extend(others);
+            }
             self.begin_resync("session start");
         } else {
             self.request_checksum_inner();
@@ -1353,6 +1411,7 @@ impl HostSession {
         }
         self.adapt_lead(t);
         self.watch_stalls(t);
+        self.report_step();
         if t - self.last_session_broadcast >= self.options.session_broadcast_seconds {
             self.broadcast_session();
         }
@@ -1423,8 +1482,21 @@ impl HostSession {
     /// What the resync round is doing, for the players' windows (None when no round runs). Tells everyone when it changes.
     pub(super) fn set_resync_phase(&mut self, phase: Option<&str>) {
         let phase = phase.map(str::to_owned);
-        if self.state.resync != phase {
+        let mut changed = self.state.resync != phase;
+        if phase.as_deref() != Some("loading") && !self.state.loading.is_empty() {
+            self.state.loading.clear();
+            changed = true;
+        }
+        if changed {
             self.state.resync = phase;
+            self.broadcast_session();
+        }
+    }
+
+    /// The games a `loading` round still waits for (`SessionState::loading`); broadcast when the list changes.
+    pub(super) fn set_resync_loading(&mut self, waiting: Vec<u16>) {
+        if self.state.loading != waiting {
+            self.state.loading = waiting;
             self.broadcast_session();
         }
     }
@@ -1592,13 +1664,15 @@ impl HostSession {
         }
     }
 
-    /// The fastest game's estimated clock now; 0 with no clocks.
+    /// The clocks of the games in the session's world (not the `outsiders`).
+    fn world_clocks(&self) -> impl Iterator<Item = &PlayerClock> {
+        self.clocks.iter().filter(|(id, _)| !self.outsiders.contains(id)).map(|(_, c)| c)
+    }
+
+    /// The fastest game's estimated clock now, of the games in the session's world; 0 with no clocks.
     pub fn max_clock(&self) -> i64 {
-        if self.clocks.is_empty() {
-            return 0;
-        }
         let now = self.now();
-        self.clocks.values().map(|c| c.estimate(now)).fold(f64::NEG_INFINITY, f64::max) as i64
+        self.world_clocks().map(|c| c.estimate(now)).reduce(f64::max).map_or(0, |t| t as i64)
     }
 
     /// A stamp every game reaches after receiving a message sent now. Never before a promise a game has made (ClockMessage::safe):
@@ -1610,8 +1684,7 @@ impl HostSession {
         );
         // the promises the host keeps for stalled games count like the games' own (stall.rs)
         let promised = self
-            .clocks
-            .values()
+            .world_clocks()
             .filter_map(|c| c.safe)
             .chain(self.stalls.values().map(|s| s.proxy))
             .max()
@@ -1705,6 +1778,7 @@ impl HostSession {
         let Some(info) = self.players.remove(&id) else { return };
         let now = self.now();
         let last_clock = self.clocks.remove(&id);
+        self.outsiders.remove(&id);
         self.resume_checks.remove(&id);
         // a game that returns is reloaded (or caught up and checked): its mark is of the world it left
         self.partly_built.remove(&id);
@@ -1747,6 +1821,8 @@ impl HostSession {
             self.on_checksum_outcome(outcome);
         }
         self.resync_step();
+        // a bug report that waited for this game's part lists it as missing
+        self.report_player_left(id);
     }
 
     /// Frees the slot held for a player who is away, and tells the others it is gone for good (they had it as away).
@@ -1963,9 +2039,15 @@ impl HostSession {
 
     /// To every player connection and the local game, except `except`. One sealer, so the host's counter stream is
     /// shared by all connections; a receiver only ever sees it increase.
-    /// A chat line from the session itself to every game (the host's own included), named "FeverLink3".
-    pub(super) fn announce(&mut self, text: &str) {
-        let chat = ChatMessage { text: text.to_owned(), from: Self::HOST_ID, name: Some("FeverLink3".to_owned()) };
+    /// A notice from the session itself to every game (the host's own included), named "FeverLink3": a chat line with a level,
+    /// which the mod shows among the window's notices (the words: [`notices`]).
+    pub(super) fn announce(&mut self, level: notices::Level, text: &str) {
+        let chat = ChatMessage {
+            text: text.to_owned(),
+            from: Self::HOST_ID,
+            name: Some("FeverLink3".to_owned()),
+            level: Some(level.as_str().to_owned()),
+        };
         self.broadcast(MessageKind::Chat, &codec::encode(&chat), None);
     }
 
@@ -2040,7 +2122,7 @@ impl HostSession {
     fn pause_stops(&self, p: i64) -> Option<i64> {
         let floor = self.pause_last.unwrap_or(p).max(p);
         let mut furthest = p;
-        for player in self.players.values().filter(|x| x.ready) {
+        for player in self.players.values().filter(|x| x.ready && !self.outsiders.contains(&x.id)) {
             match self.clocks.get(&player.id).and_then(|c| c.stop) {
                 Some(s) if s >= floor => furthest = furthest.max(s),
                 _ => return None,

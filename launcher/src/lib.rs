@@ -11,6 +11,8 @@
 //! - [`update`]: update decision, signature check against the trusted keys (with expiry), hash checks, the
 //!   file-swap plan, the journal, the start check and the rollback, over bytes and files (the download is the
 //!   binary's `update` command).
+//! - [`autoupdate`]: the module's own update inside the game: the check at start, the trust rules until 1.0.0,
+//!   staging next to the game, the swap at the next start, the rollback.
 //! - [`process`]: starting `TransportFever3.exe` with the session environment.
 //!
 //! - [`net`], [`session`], [`luatext`]: TCP transport, the session threads that wire the core crate's state
@@ -20,6 +22,7 @@
 //! No UI: the window comes in a later stage. The protocol lives in the core crate. Every path and text
 //! transformation is a pure function over its inputs so the tests run on a machine without Steam or the game.
 
+pub mod autoupdate;
 pub mod clipboard;
 pub mod gamelink;
 pub mod guard;
@@ -30,6 +33,7 @@ pub mod modlist;
 pub mod net;
 pub mod netdelay;
 pub mod process;
+pub mod report;
 pub mod resync;
 pub mod selftest;
 pub mod session;

@@ -245,6 +245,7 @@ fn a_second_welcome_does_not_restart_the_players_counter() {
             resync: None,
             mod_warnings: Vec::new(),
             stalled: Vec::new(),
+            loading: Vec::new(),
         },
         nonce: vec![],
         resume: None,

@@ -1,4 +1,4 @@
-# FeverLink3 Multiplayer - early test build 0.2.0-test1
+# FeverLink3 Multiplayer - early connection-test build
 
 > **Experimental, and not a playable multiplayer game yet.** This first test build has one job: to find out whether two players can reach each other through Steam. It adds a window to the game with a **Steam connection test**. Hosting and joining a game over that connection come in the next test build, and building together after that. What is verified and what is not is listed below. If you would like to help test, you are very welcome.
 
@@ -72,7 +72,8 @@ The same loading technique is used by malware, and the file is **not code-signed
 ## What goes over the network
 
 - Between the players: Steam's peer-to-peer networking through the Steam library the game already runs. Steam may relay the traffic through its own servers. No server of the project is involved, and the host does not open an inbound TCP port in normal use.
-- Nothing else: no analytics, no update check, no advertising, no account, no web requests of its own. The mod needs the network for one thing only: connecting the players.
+- Automatic updates: once per game start FeverLink3 asks GitHub for a newer version of itself and checks every file's SHA-256 before it uses it (releases are unsigned until 1.0.0; you can turn it off in the window's Troubleshooting section).
+- Nothing else: no analytics, no advertising, no account, no other web requests. The mod needs the network for one thing only: connecting the players.
 - What the other tester's game receives in the connection test: short ping messages sent from your Steam account (their window only counts them). In later builds, other players will see your display name (it starts as your Windows user name; change it in the window), your game actions and chat; a host will also send the world.
 - Session traffic is encrypted and authenticated by the mod itself (AES-256-GCM, key derived from the join code).
 
@@ -120,7 +121,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 
 ## Changelog
 
-**0.2.0-test1 - first public test build**
+**Connection-test build (2026-10-10)**
 
 - In-game window with a button in the bottom bar and a Steam connection test (your Steam ID, test the connection to another player's Steam ID, result with round-trip time and route).
 - Hosting and joining over Steam are not finished in this build: the Host button says so.

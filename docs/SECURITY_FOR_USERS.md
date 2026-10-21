@@ -1,13 +1,14 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Written on 2026-10-10 for the test build 0.2.0-test1. Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Written on 2026-10-10, before the first version. Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
 - FeverLink3 puts one DLL named `winhttp.dll` in the Transport Fever 3 game folder. Windows loads it automatically when the game starts, because the game imports `WINHTTP.dll` and Windows looks in the game's own folder before the system folder.
 - The DLL passes the 14 WinHTTP functions the game uses to the real Windows file, unchanged. The game's own web traffic is not read or modified.
 - Besides that, inside the game it does three things: it writes a small log, it reads the game's build number from the game's own memory, and it starts one thread that runs the Steam connection test and, in later test builds, the multiplayer session that the player starts from the in-game window. In any other program it does nothing but pass calls through.
-- It does not inject into other programs, does not start with Windows, does not need administrator rights, sends no telemetry, and does not download or run programs.
+- It does not inject into other programs, does not start with Windows, does not need administrator rights and sends no telemetry.
+- **It updates itself** (from 0.2.0 on): once per game start it asks GitHub for the newest FeverLink3 release and, if it is newer, downloads it with Windows' own `curl.exe`, checks every file's SHA-256 and installs it for the next start. Releases are **not signed until 1.0.0**: you trust this repository's release page. You can turn it off in the window's Troubleshooting section. Details: "Automatic updates" below.
 - It is **not code-signed yet**. That is why Windows shows a warning the first time, and why some antivirus programs may look at it. The sections below explain how to verify the file, how to remove it, and how to report a false positive.
 
 ## Why a file called winhttp.dll
@@ -33,7 +34,8 @@ When Windows loads the DLL, its start routine does this and nothing else:
 1. It checks two things: whether the environment variable `FEVERLINK3_SESSION_DIR` is set (only the command-line development launcher sets it), and whether the program that loaded the DLL is `TransportFever3.exe`.
 2. If neither is true, it returns at once. In any other program the DLL is only the pass-through of step 1.
 3. Otherwise it creates the folder `%LOCALAPPDATA%\FeverLink3\` (or the session folder, when the development launcher started the game) and appends lines to `native.log` there: that it loaded, the game's build timestamp, and whether that build is one the module knows. The build is identified from the game's own program headers in memory (the link timestamp). Build 40420 is the only known build.
-4. Inside the game it starts one thread named `feverlink3-live`.
+4. Inside the game, if an earlier game run downloaded an update, it finishes it now (renames files in the game folder, before the game reads its mods) or puts the previous version back ("Automatic updates" below).
+5. Inside the game it starts one thread named `feverlink3-live` and one named `feverlink3-update` (the update check, once, then it ends).
 
 **On a known game build it patches the game's code in memory, and only while a FeverLink3 session exists.** The DLL contains inline detours and byte patches with the byte patterns of build 40420 (`native/src/hooks.rs`, `detour.rs`, `patch.rs`, `build_table.rs`). Five pieces are on by default: a hook that counts the simulation's commands, a hook on the command list that can hold a construction command until the session says when to apply it, a patch that makes the script pool single-threaded, a patch that pins the seed of Lua's string hash, and a one-byte patch that makes the engine's tickCount getter return the simulation's step count. Each checks the bytes it is about to change against the build table and installs nothing (and logs why) on an unknown build or different bytes; each is turned off by setting its variable to `0` (`FEVERLINK3_HOOKS`, `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, `FEVERLINK3_LUA_SEED`, `FEVERLINK3_STEP_SEED`). The diagnostic hooks (town seed and growth logs) are off unless a developer sets their variable to `1`. See "What may change" below.
 
@@ -55,8 +57,8 @@ These are statements about the code in this repository; you can search for the c
 - It does not make itself start with Windows: no registry writes at all, no startup entries, no scheduled tasks, no services. It does not need or ask for administrator rights.
 - It does not read your documents, browser data, passwords or other programs' files. The files it reads are its own text files, the game's save folder entry named above, and the Steam path in the registry.
 - It does not log keys, take screenshots or record audio.
-- It does not contact any server of the project, send analytics or ads, or check for updates. (The update check is a command of the separate program `feverlink3.exe`, below, and runs only when you type it.)
-- It does not download or run programs. (A joined session does load the host's savegame in your game, and a savegame can carry game scripts, as a mod can. That is why you should only join people you trust; see "Who you are trusting".)
+- It does not contact any server of the project or send analytics or ads. Its only web requests are the update check at game start and the update download, both to GitHub ("Automatic updates" below; off when you turn it off).
+- It does not download or run programs other than FeverLink3's own release (the automatic update, which starts Windows' `curl.exe` for the download). (A joined session does load the host's savegame in your game, and a savegame can carry game scripts, as a mod can. That is why you should only join people you trust; see "Who you are trusting".)
 - It does not use WinHTTP for its own traffic, so your game's web traffic and FeverLink3's session traffic are separate.
 
 ### 5. What may change
@@ -87,6 +89,9 @@ It is a separate program that you start yourself (a double-click shows a numbere
 | `<Steam>\userdata\<id>\3493540\local\save\feverlink3-resync-<number>.sav` | the host's world while it is synced to the players. These are ordinary game saves and can be large | the game and the DLL | no, delete them when you do not need them |
 | `%TEMP%\feverlink3\` | session files of the command-line development launcher (`host` / `join`) | only if you run those commands | no |
 | the install folder of an update (the game folder, or the folder of `feverlink3.exe`) | `*.old` copies of the replaced files, `feverlink3_update_journal.json` (until the update is confirmed or rolled back), `feverlink3_update_skip.txt` (versions that failed their start check), `feverlink3_update_tmp\` (during the swap) | `feverlink3 update`, only if you run it | no |
+| `<game folder>\feverlink3_update\` | the automatic update: `state.json` (what the next start must finish), `<version>\` (the checked new files), `backup-<version>\` (the previous mod, until the new version started well), `download\` (during a download) | the DLL | no, delete it by hand (only while the game is closed) |
+| `<game folder>\winhttp.dll.old-<version>`, `winhttp.dll.failed-<version>`, `feverlink3_update_skip.txt` | the previous DLL until the new one started well; a DLL that failed and was taken back; versions not to offer again | the DLL | no |
+| `%LOCALAPPDATA%\FeverLink3\settings.txt` | `autoupdate=off` when you turned automatic updates off | the DLL, when you click the switch | no |
 | `%TEMP%\feverlink3_update_<number>\` | the downloaded release files, deleted when the command ends | `feverlink3 update` | deleted by the command itself |
 
 `<game folder>` is `<Steam library>\steamapps\common\Transport Fever 3\`. `feverlink3 doctor` prints where it is on your PC and changes nothing.
@@ -99,7 +104,7 @@ What FeverLink3 uses to connect players, in this version:
 - **Status, plainly:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered (2026-10-10). A connection between two different Steam accounts, and a whole session carried over it, has not been tested yet; the first is what this test build is for.
 - **No server of the project is involved.** The path between two players is Steam's. If that ever changes, this page will say what is added and what it can see.
 - **The host does not open an inbound TCP port in normal use.** The command-line development launcher (`feverlink3.exe host`, not used by the in-game window) is the only part that listens on a TCP port (default 28090, or the port you give it), and only if you type that command yourself.
-- **Nothing else leaves the PC.** No analytics, no advertising, no automatic update check, no account, no web requests of its own. The only web request is `feverlink3 update`, when you type it (to GitHub, see above).
+- **Nothing else leaves the PC.** No analytics, no advertising, no account. The only web requests are the automatic update's (at game start, to GitHub's API and release files, "Automatic updates" below) and `feverlink3 update`, when you type it.
 
 What the other players receive: the display name you chose (it starts as your Windows user name, so change it if you prefer), your game actions, world checksums, chat lines, and, if you host, the world itself. A player who tests the connection by Steam ID shares that Steam ID with the person they test with.
 
@@ -118,6 +123,29 @@ Get-NetTCPConnection -OwningProcess $p -State Established # outgoing TCP connect
 
 (An error saying that no matching connection was found also means there is none.) For a closer look, Sysinternals Process Monitor with the filter "Process Name is TransportFever3.exe" and "Path contains FeverLink3" lists every file the DLL and the mod touch, and Wireshark or Resource Monitor shows the traffic. If you see a listening TCP socket you do not expect, or a file access outside the places in the table above, please tell us.
 
+## Automatic updates
+
+From 0.2.0 on, FeverLink3 updates itself (owner decision 2026-10-22). This section says exactly what it does and what it trusts. The code is `launcher/src/autoupdate.rs`; the checks are in `launcher/src/update.rs`.
+
+**When.** Once per game start, right after the module has loaded, on a thread of its own. It does not start while you are in a session and never changes a file during one (it waits until the session is over). It is not a background service: when the game is closed, nothing runs.
+
+**What it asks.** One HTTPS request to `https://api.github.com/repos/AZalshehri7/FeverLink3/releases/latest`, GitHub's page of the newest full release of this repository (drafts and pre-releases are never listed there, and the module refuses them again). If that release is not newer than yours, nothing else happens. The request carries no personal data beyond what any web request carries (your IP address reaches GitHub; the user agent is `feverlink3-updater/<version>`).
+
+**What it downloads, and the checks.** The release's `manifest.json`, its zip and the zip's `.sha256` file, only from `https://github.com/AZalshehri7/FeverLink3/releases/download/<that release's tag>/`, with Windows' own `curl.exe` (`C:\Windows\System32\curl.exe`, started hidden; HTTPS only, also for redirects, TLS 1.2 or newer, the server's certificate checked by Windows, size and time limits). The update is used only if all of these hold:
+
+1. the version is strictly newer than the one you run, and the manifest names that same version and zip;
+2. the zip's SHA-256 equals the manifest's `zip_sha256` and the published `.sha256` file;
+3. every file taken from the zip has exactly the size and SHA-256 the manifest lists;
+4. every file name is `winhttp.dll`, under `mods/release/feverlink3/`, or one of the documents (which are never copied), with no `..`, drive letter, absolute path or other trick; a release that carries anything else is refused as a whole.
+
+**Unsigned until 1.0.0.** Releases before 1.0.0 carry no signature. The checks above prove that the files are the ones published on this repository's release page and that nothing was changed on the way; they do **not** protect you if someone takes over the repository (a stolen GitHub account or token) and publishes a release. From 1.0.0 on the release manifest is signed with a key built into FeverLink3 (`docs/RELEASING.md`), and from then on an update without a good signature is refused. If you do not want to trust the repository's release page automatically, turn automatic updates off (below) and update by hand after checking a release yourself ("Verify what you downloaded").
+
+**How it changes your files.** The new files are checked and stored in `<game folder>\feverlink3_update\<version>\` first. Then, still in that game run, the running `winhttp.dll` is renamed to `winhttp.dll.old-<old version>` (Windows allows renaming a loaded DLL; the game keeps using the old one in memory) and the new one is put in its place. The window says "FeverLink3 was updated to X: restart the game to finish". At the next game start the new DLL loads first and, before the game reads any mod, moves `mods\release\feverlink3` to `feverlink3_update\backup-<old version>\` and the new mod folder into its place. 30 seconds into that game the backup, the old DLL and the staged files are deleted. Nothing else in the game folder is touched, and nothing outside it.
+
+**If something goes wrong.** If the new version does not stay up for 30 seconds in two starts, or the mod folder cannot be swapped, the old DLL and the old mod are put back, the version goes on the skip list (`feverlink3_update_skip.txt`) and is not offered again, and the window says "Update failed: <reason>; you keep <old version>". A game run whose files on disk no longer match the DLL in memory does not let you host or join until you restart it.
+
+**Turning it off.** In the FeverLink3 window, Troubleshooting, "Automatic updates: on" (click to switch to off). The setting is stored in `%LOCALAPPDATA%\FeverLink3\settings.txt` (`autoupdate=off`) and counts from the next game start. A FeverLink3 that you built yourself from the source never updates itself (only the release workflow's builds do).
+
 ## Verify what you downloaded
 
 Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.zip.sha256`, `manifest.json` (every file in the zip with its size and SHA-256, and the zip's SHA-256), and, when the release is signed, `manifest.json.sig`. The release notes repeat the zip's SHA-256. Releases are built by GitHub Actions from a tag; nothing is built on a developer's PC (`docs/RELEASING.md`).
@@ -125,8 +153,8 @@ Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.
 In PowerShell, in the folder with the downloaded files:
 
 ```powershell
-(Get-FileHash .\FeverLink3-0.2.0-test1.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content .\FeverLink3-0.2.0-test1.zip.sha256
+(Get-FileHash .\FeverLink3-0.2.0.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\FeverLink3-0.2.0.zip.sha256
 
 # the DLL you installed against the manifest (feverlink3 doctor prints the game folder)
 $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json
@@ -191,7 +219,7 @@ Tips that every vendor asks for: name the product and the detection, send the ex
 
 ## Who you are trusting
 
-- **This project's code and release.** You can read it, build it for noncommercial use and compare the release against the checks above.
+- **This project's code and release.** You can read it, build it for noncommercial use and compare the release against the checks above. With automatic updates on, you also trust this repository's release page for every later version (unsigned until 1.0.0, see "Automatic updates").
 - **The host of a session.** When you join, your game loads the host's savegame. A Transport Fever savegame can carry game scripts, as a mod can, so joining a session means trusting the host as you would trust a mod author. Only join people you know.
 - **Everyone who has the join code.** They can join the session and act in the world, within the permissions the host sets. Do not post a code in public, and stop hosting when you are done.
 - **Steam,** for the route between the games.
@@ -200,7 +228,7 @@ Tips that every vendor asks for: name the product and the detection, send the ex
 
 1. Close the game. Run `feverlink3 uninstall` (add `--dry-run` first to see the plan). It removes the mod, our `winhttp.dll`, `feverlink3_path.txt` and, if it holds our app id, `steam_appid.txt`. It never touches a `winhttp.dll` that is not ours.
 2. Optional: delete `%LOCALAPPDATA%\FeverLink3\` (logs and session files), `%TEMP%\feverlink3\`, and the files named `feverlink3-resync-*.sav` in your save folder.
-3. By hand, if you no longer have `feverlink3.exe`: delete `winhttp.dll` from the game folder (check that it is ours first, with the hash above) and the folder `userdata\<id>\3493540\local\mods\feverlink3`.
+3. By hand, if you no longer have `feverlink3.exe`: delete `winhttp.dll` (and any `winhttp.dll.old-*` / `.failed-*`, the folder `feverlink3_update` and `feverlink3_update_skip.txt`) from the game folder (check that it is ours first, with the hash above) and the folder `userdata\<id>\3493540\local\mods\feverlink3`.
 
 The game keeps no other trace of FeverLink3. The mod declares that removing it has no effect on a save (`severityRemove: None` in its `mod.json`); the game may still list it as missing when you load a save that was made with it.
 

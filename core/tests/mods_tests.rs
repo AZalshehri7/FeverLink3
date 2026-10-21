@@ -150,6 +150,21 @@ fn the_join_stays_inside_the_first_frame_limit_with_many_mods() {
 }
 
 #[test]
+fn a_newer_player_is_told_the_host_must_update() {
+    let host = game(Vec::new());
+    let mut mine = game(Vec::new());
+    mine.feverlink3 = "0.2.1".into();
+    let lines: Vec<String> = diff(&host, &mine).into_iter().map(|d| d.text).collect();
+    assert_eq!(
+        lines[0],
+        "FeverLink3: host has 0.2.0, you have 0.2.1. The host needs to restart their game so that FeverLink3 updates itself"
+    );
+    mine.feverlink3 = "0.2.0-beta.1".into();
+    let lines: Vec<String> = diff(&host, &mine).into_iter().map(|d| d.text).collect();
+    assert_eq!(lines[0], "FeverLink3: host has 0.2.0, you have 0.2.0-beta.1", "no advice without a plain version");
+}
+
+#[test]
 fn the_players_diff_reads_like_the_window_shows_it() {
     let host = game(vec![
         entry("trains_pack", 3, false, Some("f1")),
@@ -168,7 +183,11 @@ fn the_players_diff_reads_like_the_window_shows_it() {
     assert_eq!(
         lines,
         vec![
-            (true, "FeverLink3: host has 0.2.0, you have 0.1.9".to_owned()),
+            (
+                true,
+                "FeverLink3: host has 0.2.0, you have 0.1.9. An update is available: restart your game and FeverLink3 updates itself (Automatic updates, in Troubleshooting)"
+                    .to_owned()
+            ),
             (true, "missing maps (host has revision 1)".to_owned()),
             (true, "signals revision 4: same revision, different files".to_owned()),
             (true, "trains_pack: host has revision 3, you have revision 2".to_owned()),

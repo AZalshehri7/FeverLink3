@@ -118,7 +118,20 @@ impl Outbox {
         use MessageKind::*;
         !matches!(
             kind,
-            Challenge | Join | Reject | Welcome | ResyncSave | ResyncChunk | ResyncLoad | Ping | Kicked | Pong | Leave
+            Challenge
+                | Join
+                | Reject
+                | Welcome
+                | ResyncSave
+                | ResyncChunk
+                | ResyncLoad
+                | Ping
+                | Kicked
+                | Pong
+                | Leave
+                | ReportAsk
+                | ReportBundle
+                | ReportBusy
         )
     }
 
@@ -126,7 +139,14 @@ impl Outbox {
     /// session layer's own answers and a goodbye.
     pub fn replayable_from_player(kind: MessageKind) -> bool {
         kind.allowed_from_player()
-            && !matches!(kind, MessageKind::Pong | MessageKind::Leave | MessageKind::ResyncUpload)
+            && !matches!(
+                kind,
+                MessageKind::Pong
+                    | MessageKind::Leave
+                    | MessageKind::ResyncUpload
+                    | MessageKind::ReportRequest
+                    | MessageKind::ReportPart
+            )
     }
 }
 

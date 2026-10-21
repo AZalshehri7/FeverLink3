@@ -726,7 +726,7 @@ fn a_receiver_that_disconnects_mid_transfer_is_let_go_and_the_others_get_the_sav
     let started = Instant::now();
     pat.handle.crash();
     // "At once" means before the transfer's own 10 s give-up, not a fixed small time: the GitHub runner took 5.16 s
-    // (release run of 0.2.0-pre4, 2026-10-18), local runs well under 5 s.
+    // (release run of 2026-10-18), local runs well under 5 s.
     assert!(table.handle.wait_for(Duration::from_secs(8), |s| s.players.len() == 2), "{:?}", table.handle.logs());
     assert!(started.elapsed() < Duration::from_secs(8), "noticed in {:?}", started.elapsed());
     let done = wait(Duration::from_secs(120), || {

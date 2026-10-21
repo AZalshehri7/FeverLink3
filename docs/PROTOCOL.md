@@ -77,7 +77,7 @@ Two games that load the same save but run other mods, another game build or anot
 | Join | 2 | connection → host | `{name, version, proof, resume?: {id, mac, last?}, caps?, mods?}` |
 | Reject | 3 | host → connection | `{reason, detail?, mods?}` |
 | Welcome | 10 | host → player | `{you, hostName, version, players: [{id, name, ready}], session, resume?: {token, epoch}, resumed?, modsChecked?, catchUp?}` (`catchUp`: see Catching up) |
-| Session | 11 | host → all | `{started, speed, pauseAt?, lead, resync?, modWarnings?, stalled?}` (`stalled`: the ids of the stalled games, see the stall timeout) |
+| Session | 11 | host → all | `{started, speed, pauseAt?, lead, resync?, modWarnings?, stalled?, loading?}` (`stalled`: the ids of the stalled games, see the stall timeout; `loading`: while a round is `loading`, the ids of the games that have not said hello after the load, which every window names) |
 | PeerClock | 12 | host → all but origin | `{from, t, ahead, need?, safe?, pause?, stalled?, hop?}` (`stalled`: made by the host for a stalled game, `safe` is the host's promise for it) |
 | PlayerJoined | 13 | host → all but the joiner | `{player: {id, name, ready}}` |
 | PlayerLeft | 14 | host → all | `{id, name, away?}` (`away` = the connection dropped and the slot is held) |
@@ -89,6 +89,9 @@ Two games that load the same save but run other mods, another game build or anot
 | Permissions | 20 | host → all | `{build, bulldoze, spend, speed, other?}`, each `"everyone"`, `"hostOnly"` or `{"only": [ids]}` |
 | Ping | 21 | host → player | `{n, rtt?: {id: ms}, off?: {id: ms}, ack?}`, answered by the player's session layer; never given to the game (`ack`: the counter of the last frame the host received from this player, see Catching up) |
 | Kicked | 22 | host → player | `{reason, detail?}` (the shape of Reject), sealed: the host ended this player's session |
+| ReportAsk | 23 | host → players | `{id, report, by, byName, maxBytes, salt}`: build your part of bug report `report` and send it as transfer `id` (see "Bug reports"); read by the launcher, never given to the game |
+| ReportBundle | 24 | host → the player who asked | `{id, index, count, sha256, data}` (the shape of ResyncChunk): the finished bug report; launcher only |
+| ReportBusy | 25 | host → the player who asked | `{id, byName}`: the request was refused because report `id`, asked by `byName`, is still being made; launcher only |
 | Hello | 30 | game → host | `{time, save?}` |
 | Clock | 31 | game → host | `{t, speed, ahead, need?, safe?, pause?, stop?, hop?}` (`stop`: the game stands still at the pause at `t`; see the pause order) |
 | SpeedRequest | 32 | game → host | `{speed}` 0 = pause |
@@ -99,12 +102,14 @@ Two games that load the same save but run other mods, another game build or anot
 | Pong | 37 | player → host | `{n, w?}`, sent by the player's session layer, not by its game |
 | Leave | 38 | player → host | `{}`: the player goes on purpose |
 | ResyncUpload | 39 | player's launcher → host | `{id, index, count, sha256, data}` (the shape of ResyncChunk): the source player's save, see "Repair source"; never resent after a resume |
+| ReportRequest | 40 | player's launcher → host | `{note?}`: make a bug report (the window's button); see "Bug reports" |
+| ReportPart | 41 | player's launcher → host | `{id, index, count, sha256, data}` (the shape of ResyncChunk): this game's part of a bug report; never resent after a resume |
 | Action | 50 | game → host → all but origin (a `pause` action: all) | `{stamp, seq, body, category?, from, allowed, pause?, pauseSeq?, pauseUpto?, hop?}` (`from`, `allowed`, `pauseSeq` and `pauseUpto` set by the host; `pauseUpto` is the `pauseSeq` of the last item of the same flush of the pause order, and a game runs on to the flush's stamp only once it has read that one; `category` is `build`, `bulldoze`, `spend` or `other`, default `other`; see the pause order) |
-| Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name}` (set by the host) |
+| Chat | 51 | game → host → all but origin | `{text ≤ 500, from, name, level?}` (`from`, `name` set by the host; `level` = info/warn/error makes it a system notice the window shows apart from the chat, kept on relay) |
 | BuildVeto | 52 | game → host → all but origin | `{seq, owner, why ≤ 300, from, name}` (`from`, `name` set by the host). "I cannot build action `owner`:`seq`", sent only by a game that dry-ran a held strict build and found it cannot be rebuilt; silence means yes. The originator cancels its held command, every game drops the queued replay. `host?` (only the host's own, cleared on relay): the host refuses the action on every game, its origin included (see the stall timeout). |
 | BuildCommit | 53 | game → host → all but origin | `{seq, owner, stamp, from}` (`from` set by the host). The originator of a held strict build made while the game is PAUSED waits a real-time grace for vetoes (the peers dry-run the record and park it, applying nothing), then sends this; every game applies the parked build at `stamp` (the pause time, or a normal stamp when the game was unpaused meanwhile) and the originator releases its own command. A veto during the grace drops the build everywhere. |
 
-A player may send kinds 30 to 39 and 50 to 53. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
+A player may send kinds 30 to 41 and 50 to 53. Anything else from a player is dropped, counted and logged once. The host's own game is player 0 and is trusted like the host.
 
 What the host does with the content of those kinds, beyond decoding them (a message that does not decode is ignored, as always):
 
@@ -135,8 +140,10 @@ What the host does with the content of those kinds, beyond decoding them (a mess
 A resync makes every other game load the host game's save (and the host's own game too when `HostOptions::host_reloads` is true, the library default; the in-game module also reloads it unless `FEVERLINK3_HOST_RELOAD=0`, see "Host that does not reload" below). It runs in the host's state machine (`resync_state()`: `Idle`, `Pausing`, `Saving`, `Transferring`, `Loading`, `Verifying`), is driven by incoming messages and by `tick()` with the host's clock, and has one round at a time. Each round has an id (1, 2, ...). The session must be started. Every state change is reported to the host's UI as `ResyncProgress`; the session stays paused after a failed round.
 
 ```
-Pausing       host sets pauseAt (the usual future stamp; a pause already in force is kept) and broadcasts Session.
-              Waits until every ready game's last Clock has t >= pauseAt and speed 0.            timeout 120 s
+Pausing       host sets pauseAt (the usual future stamp; a pause already in force is kept; a session that never
+              ran: the step the host's game stands at) and broadcasts Session.
+              Waits until every ready game in the session's world has a last Clock with t >= pauseAt
+              and speed 0. Outsiders are not waited for (see below).                             timeout 120 s
 Saving        host → its own game   ResyncSave { id, name: "feverlink3-resync-<id>" }
               host's game → host    SaveDone { id, ok, detail? }                                   timeout 180 s
 Transferring  the launcher reads the file and calls resync_file_ready(id, sha256, len); the host
@@ -152,6 +159,8 @@ Verifying     a paused checksum round: ChecksumRequest { n, at: pauseAt, paused:
               Identical: the previous speed resumes (pauseAt cleared), round Idle.
               Different: ResyncFailed, the session stays paused, round Idle.
 ```
+
+**Outsiders.** A ready game whose world is not the session's yet: every game but the host's when the session starts with games at different times, and a player that joins (or comes back without its world) a started session. The round's load replaces its world; its Hello in Loading ends the mark. Until then its clock holds no pause and counts for no stamp (`max_clock`, `future_stamp`), it is relayed to the others as a PeerClock flagged `stalled` with no `safe` and no `need` (no game paces itself to it or keeps to its promise), and an Action or BuildCommit of it is refused on every game with a host `BuildVeto`. The host logs `resync <id>: pause <t> waits only for the games in the session's world; not for <names>`. UI run 2026-10-21: the start round's pause was the host's clock plus the lead and waited 37 s for a guest whose world stood 35 800 game-ms behind to run up to it at x1.
 
 **Host that does not reload (`host_reloads = false`).** The host's game saves the world only to send it and keeps playing its live world, so the host never sees a loading screen; only the players load. The paused checksum in Verifying is then the proof that the host's live world and the players' loaded copies agree: a difference fails the round and leaves the session paused exactly as in the reloading case. The checksum covers money, loan, constructions, lines and time, not every part of the simulation, so a world with many vehicles is the place to watch for drift. `FEVERLINK3_HOST_RELOAD=0` selects this mode in the in-game module; it is not the default because a live world drifts from a freshly loaded one. With `host_reloads` the host is sent its `ResyncLoad` as soon as the save is announced (during `Transferring`), so it reloads while the players download (`HostOptions::host_loads_early`, `FEVERLINK3_HOST_LOAD_EARLY=0` for the old order: the host's load goes out together with the players' after the transfer; lab runs on 2026-10-12 could not tell the two orders apart, see the maintainer's private notes).
 
@@ -312,6 +321,46 @@ The host decides on the account Steam reports for the connection, never on the n
 The admitted friend joins the session on virtual port 0 with the key it received, through the normal handshake. The
 key, not the secret, crosses: the friend never learns the secret or the password. Steam's friend list "Invite to game"
 carries the public token (rich presence), so such a friend is asked for like a "Join game" click.
+
+## Bug reports
+
+The window's "Report a problem" makes ONE zip that holds the logs of every game in the session, so a player can attach it to a GitHub
+issue (`core/src/session/report.rs`, `launcher/src/report.rs`, `launcher/src/live/report.rs`). Nothing is sent to the project by
+itself; the parts travel only between the session's games, like the world does.
+
+- **Asking.** Any game asks: the host's own window calls `HostSession::request_report`, a player's launcher sends `ReportRequest
+  {note?}` (cut to 300 characters). One report at a time: a request while one runs is refused at once with `ReportBusy {id, byName}` to its
+  sender only (the host's own window gets `HostOutput::Report(Busy)`). Its window says "A bug report is already being made; it
+  will reach <byName>." and shows the button again; it does not wait for a bundle.
+- **Collecting.** The host numbers the report (`id`, the transfer id, from 1), picks a name of six random hex digits (`report`) and a
+  random `salt`, and sends `ReportAsk` to every connected player; its own launcher gets the same ask as `HostOutput::Report(BuildPart)`.
+  `maxBytes` is the bundle's limit (24 MB less 256 KiB) shared equally by the games. Every game but the one that asked gets a notice:
+  a player "<name> made a bug report; your logs were sent to the host.", the host's own game "<name> made a bug report; your logs are
+  in it.".
+- **Parts.** Each game builds its part on its own PC: its logs redacted (below), cut from the front to `maxBytes`, zipped. A player's
+  launcher sends it as `ReportPart` chunks of transfer `id`, exactly like a repair source's save (`ResyncUpload`): 256 KiB chunks
+  with the whole part's SHA-256, a few per turn of its loop, checked and assembled at the host by the same `IncomingSave`. The host
+  lets them past its flood limit only while it waits for that game's part, and refuses a part announced bigger than `maxBytes`
+  before it holds anything. The host's own part comes from its launcher (`HostSession::report_part`).
+- **Timeout.** A game that has sent nothing within 60 s of the ask is missing; one whose part is on its way has 180 s. A game that
+  leaves is missing at once. The report completes anyway: `HostOutput::Report(Collected)` lists every game's part or the reason it is
+  missing.
+- **The bundle.** The host's launcher writes `FeverLink3-report-<YYYYMMDD-HHMMSS>-<report>.zip` (UTC): `report.txt` at the top
+  (report id, time, who asked, the note, the players, the missing parts and why, what was cut), then one folder per game, `player-1`
+  the host and `player-2`... in id order. When the host asked, it goes to the host's Desktop; when a player asked, the host keeps a
+  copy in `Documents\FeverLink3\reports` and sends it to that player as `ReportBundle` chunks through the connection's paced
+  outbox (the save transfer's, `launcher/src/session/transfer.rs`). The player who asked saves it to its Desktop (else
+  `Documents\FeverLink3\reports`), opens its folder and a prefilled GitHub issue. A player that does not get the bundle within 5
+  minutes (or whose session ends) makes a report of its own logs alone and says so in it. Outside a session the button makes a
+  report of this game alone, the same way.
+- **Redaction** (on the PC that wrote the logs, before anything is zipped or sent; `launcher/src/report/redact.rs`): join codes are
+  removed; a Steam ID (17 digits, `76561...`) becomes `steam-<8 hex>`, a hash with the report's salt, the same in every part of one
+  report; each part names its own game's tag (`selftag.txt`), and the host's bundle replaces it with that game's `player-N` (the salt
+  stays out of the bundle); Steam account numbers (`userdata\<n>`, the game's `userId`) become `%STEAMACCOUNT%`; IPv4 and IPv6
+  addresses become `<ipv4>` / `<ipv6>` (loopback stays); the Windows user name becomes `%USER%`.
+- **Old peers.** An older player ignores `ReportAsk` (unknown kind): it is listed as missing after 60 s. An older host drops
+  `ReportRequest`: the player's window falls back to its own logs after 5 minutes. An older player ignores `ReportBusy` and
+  falls back the same way. `ReportBusy` is for the launcher like `ReportAsk`: never held for a repair's load.
 
 ## Limits
 

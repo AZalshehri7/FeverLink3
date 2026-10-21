@@ -1,85 +1,76 @@
 # FeverLink3
 
-**Play Transport Fever 3 together: several players build in one shared world, each in their own copy of the game.**
+**Play Transport Fever 3 together. Several players build in one shared world, each in their own game.**
 
-[![Latest pre-release](https://img.shields.io/github/v/release/AZalshehri7/FeverLink3?include_prereleases&label=pre-release)](https://github.com/AZalshehri7/FeverLink3/releases)
+[![Latest release](https://img.shields.io/github/v/release/AZalshehri7/FeverLink3?include_prereleases&label=release)](https://github.com/AZalshehri7/FeverLink3/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/AZalshehri7/FeverLink3/ci.yml?branch=main&label=CI)](https://github.com/AZalshehri7/FeverLink3/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Transport%20Fever%203%20%C2%B7%20Windows-informational)](#install)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](docs/site/status.md)
+[![Status: beta](https://img.shields.io/badge/status-beta-yellow)](docs/site/status.md)
 
-[Playing guide](docs/PLAYING.md) · [Changelog](docs/CHANGELOG.md) · [Roadmap](docs/ROADMAP.md) · [Status](docs/site/status.md) · [FAQ](docs/site/faq.md) · [Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/PROTOCOL.md) · [Privacy](docs/site/privacy.md) · [Security for players](docs/SECURITY_FOR_USERS.md)
+[Playing guide](docs/PLAYING.md) · [Changelog](docs/CHANGELOG.md) · [Roadmap](docs/ROADMAP.md) · [FAQ](docs/site/faq.md) · [Privacy](docs/site/privacy.md) · [Architecture](docs/ARCHITECTURE.md)
 
-> **Under development.** FeverLink3 is an early test project. It can crash the game, make the worlds drift apart, reload your world for a repair, or leave a build tool stuck. Use a save you do not mind losing and keep backups.
+![The host (left) draws a road; the friend's game (right) shows it a moment later](docs/media/demo-build.gif)
 
-![The host (left) draws a road with the game's own road tool; the guest's game (right) shows it a moment later](docs/media/demo-build.gif)
+## What you get
 
-## Features
+- **Build together.** Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
+- **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
+- **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
+- **Inside the game.** Start Transport Fever 3 from Steam as usual. FeverLink3 lives in the game's bottom bar.
+- **Always the same world.** The games check each other all the time. If they ever drift apart, everyone gets the host's world back in a few seconds and play goes on.
+- **Shared speed, pause and chat.**
+- **Encrypted.** Everything between the games is encrypted; the join code works like a password.
+- **One-click bug reports.** "Report a problem" collects the logs of every player in the session into one zip, with personal data removed, ready to attach to a GitHub issue.
 
-How far each feature is proven:
-✅ seen in the real game (two game windows on one PC, or a test with a friend over the internet) ·
-🧪 lab only (two game windows on one PC, driven by scripts) ·
-⏳ automatic tests only, not yet seen in the game.
+## The interface
 
-**What sets it apart**
+A coloured icon in the game's bottom bar shows the session at a glance: white (no session), yellow (waiting), green (in sync), red (needs attention). Click it for the details.
 
-- ✅ **Steam peer-to-peer.** Players reach each other through Steam: no port forwarding, no router settings, no IP addresses. The host copies a join code and sends it to a friend; the friend pastes it and joins.
-- ⏳ **Steam invites.** Invite friends with Steam's own invite dialog or the friends list (Invite to Game, Join Game); the host lets them in, and the session key never appears in what Steam shows other friends.
-- ✅ **Runs inside the game.** No launcher or extra program to start. You start Transport Fever 3 from Steam as usual and open the FeverLink3 window from the game's bottom bar.
-- ✅ **The full game.** Town growth, traffic, pollution, noise and ratings work as in single player. Nothing is switched off to keep the worlds equal.
+![The FeverLink3 window: pop-up, host and join, players, sync, chat, host tools and bug report](docs/media/ui-overview.png)
 
-**Playing together**
+## Tested
 
-- ✅ **One shared world.** The host's world is sent to every player, and a player can join a running session later.
-- ✅ **Everyone builds.** Roads, junctions, bridges, tunnels, traffic lights, crosswalks, bulldozing, bus stops, stations and their modules, depots, rail track, switches and signals appear on every game.
-- ✅ **Lines, vehicles and money.** Lines, vehicles bought at a depot, renames and loans are shared. 🧪 Line edits while vehicles run, cloning vehicles, and the bulldozer's refund for something you have just built.
-- ✅ **Speed, pause and chat.** The game's own speed and pause buttons, and the window's chat, work for everyone.
-- ✅ **Encrypted.** Everything between the games is encrypted, and the join code works like a password for the session.
-- ✅ **Automatic world repair.** If the worlds differ, every game reloads the host's world and play goes on.
-- 🧪 **Regular world checks.** The games compare their worlds about every 5 seconds, spread over many small steps so the game does not stutter.
-- 🧪 **Stall tolerance.** A player whose game freezes for a few seconds (an autosave, a slow PC) does not stop the others; that game catches up afterwards.
-- 🧪 **Smooth pacing.** When one game falls a little behind, the other slows down slightly instead of standing still.
-- ⏳ **Short drops.** A player who loses the connection for less than a minute comes back without a reload.
-- ⏳ **Up to eight players** in one session.
+- Played with friends over the internet, and in long two-game sessions on one PC.
+- About 1,600 automatic tests run on every change: the network protocol, the sessions, the world checks and two complete games simulated side by side.
+- A test lab drives two real games with scripts to measure speed and catch drift.
 
-**Not yet:** terrain editing, ground paint and trees are not shared; one shared company for all players (separate companies are planned).
+Measured with two games on one PC (internet numbers follow):
 
-## Performance
+| | Result |
+|---|---|
+| Click to build on both games | about 0.6 s |
+| World check | every 5 s, without stutter |
+| A game freezing for a few seconds | the others play on; it catches up by itself |
+| Repair when the worlds differ | about 15 s for a 45 MB world |
 
-Measured in the lab: **one PC, two game windows**, so there is no internet delay. **Internet numbers are not measured yet.**
+## Coming next
 
-| What | Result | Conditions |
-|---|---|---|
-| Click to build on both games | median 600 to 650 ms | lab, game speed x3, real tool clicks and scripted builds |
-| World check | about every 5 s (12 rounds per minute), 0 differences in 41 rounds | lab, x4 |
-| Cost of the world check | at most 15 to 19 ms per step, inside a 30 ms budget | lab, x4 |
-| Standing still to wait for the other game | 0.0 to 0.5 s in the worst minute | lab, x3 |
-| One game frozen for 5.5 s on purpose | the other game ran on; the frozen one caught up in about 3.8 s, no repair needed | lab, x4 |
-| Copy of a build on the other game | capture 2 to 12 ms, rebuild 2 to 40 ms | two real windows, one PC |
+- Steam invites from the friends list
+- Coming back after a short drop without a reload
+- Separate companies for each player
+- Sharing terrain editing, ground paint and trees
+
+FeverLink3 is in beta: keep backups of the saves you play with.
 
 ## Install
 
-There is no installer: you copy two things into the game's folder.
+1. Download `FeverLink3-<version>.zip` from [Releases](https://github.com/AZalshehri7/FeverLink3/releases) and extract it.
+2. In Steam, right-click **Transport Fever 3** → **Manage** → **Browse local files**.
+3. Drag `winhttp.dll` and the `mods` folder into that folder (merge the folders when Windows asks).
+4. Start the game, and turn on **FeverLink3 Multiplayer** in the mod list when you start or load a game.
 
-1. Download `FeverLink3-<version>.zip` from [Releases](https://github.com/AZalshehri7/FeverLink3/releases) and extract it (right-click, **Extract All**). Inside the folder `FeverLink3-<version>` you find:
-   - `winhttp.dll` (the small native part the game loads at start),
-   - a `mods` folder with the mod in `mods\release\feverlink3`,
-   - `README.txt`, `HOW-TO-PLAY.txt`, `LICENSE` and `THIRD_PARTY_NOTICES.md` (to read, not to copy).
-2. Close the game. In Steam, right-click **Transport Fever 3**, choose **Manage**, then **Browse local files**. The game's folder opens (it holds `TransportFever3.exe`).
-3. Drag `winhttp.dll` and the `mods` folder into the game's folder. When Windows asks about the existing `mods` folder, choose to merge; nothing of the game is replaced. If Windows says a `winhttp.dll` is already there, stop: another mod uses that file name.
-4. Start the game from Steam as usual. When you start or load a game, activate **FeverLink3 Multiplayer** in the mod list.
+**Host:** click the FeverLink3 icon in the bottom bar → **Host a game** → **Copy code** and send it to your friend → **Start the session** when they appear.
 
-**Host:** click **FeverLink3** in the bottom bar, press **Host a game**, press **Copy code** and send the code to your friend. When the friend shows up under **Players**, press **Start the session**.
+**Join:** open the FeverLink3 window, paste the code (`Ctrl+V`) and press **Join**. Only join people you trust.
 
-**Join:** open the FeverLink3 window, click the field **paste the join code here**, paste with `Ctrl+V` and press **Join**. Your game loads the host's world when the host starts the session. Only join people you trust, as you would trust the author of a mod.
+Everyone needs the same game version. More in the [playing guide](docs/PLAYING.md).
 
-All players need the same game version. The full guide, including what to send when something goes wrong, is in [docs/PLAYING.md](docs/PLAYING.md).
-
-**Uninstall:** close the game and delete `winhttp.dll` and the folder `mods\release\feverlink3` from the game's folder. Without a session, the mod does nothing and the game plays as usual.
+**Uninstall:** delete `winhttp.dll` and `mods\release\feverlink3` from the game's folder.
 
 ## Build from source
 
-Requires [stable Rust](https://rustup.rs) (and Python with `lupa` for the Lua tests).
+Needs [stable Rust](https://rustup.rs), and Python with `lupa` for the Lua tests.
 
 ```
 cargo test --workspace --exclude feverlink3_native
@@ -88,16 +79,16 @@ cargo build --release -p feverlink3_native      # target/release/feverlink3_nati
 pip install lupa && python -I -m unittest discover -s tests/lua -p "test_*.py"
 ```
 
-Issues and pull requests are welcome; read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first. Bug reports go to [GitHub issues](https://github.com/AZalshehri7/FeverLink3/issues); Discord: `azalshehri`.
+Issues and pull requests are welcome. Bug reports: [GitHub issues](https://github.com/AZalshehri7/FeverLink3/issues) (use **Report a problem** in the game to make the zip); Discord: `azalshehri`.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE): free to use, study, change and share for noncommercial purposes; commercial use needs a separate license (ask on Discord).
+[PolyForm Noncommercial 1.0.0](LICENSE): free to use, study, change and share for noncommercial purposes. For commercial use, ask on Discord.
 
 ## Credits
 
-FeverLink3 builds on what earlier Transport Fever multiplayer projects found and documented; their licenses and credits are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The mod's use of the game's scripting API follows the official [Transport Fever 3 modding wiki](https://wiki.transportfever3.com/doku.php?id=modding) and the [TF3 docs](https://tf3-docs.transportfever.net/en/guides/index.html).
+FeverLink3 builds on what earlier Transport Fever multiplayer projects found and documented; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). It uses the game's official scripting API as described in the [Transport Fever 3 modding wiki](https://wiki.transportfever3.com/doku.php?id=modding) and the [TF3 docs](https://tf3-docs.transportfever.net/en/guides/index.html).
 
 ## Unofficial
 
-FeverLink3 is an unofficial fan project for Transport Fever 3 only (Windows, Steam). It is not affiliated with, endorsed by or supported by Urban Games or Paradox Interactive. Transport Fever is a trademark of its owners.
+FeverLink3 is an unofficial fan project for Transport Fever 3 (Windows, Steam). It is not affiliated with or endorsed by Urban Games or Paradox Interactive. Transport Fever is a trademark of its owners.

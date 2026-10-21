@@ -2,7 +2,7 @@
 
 Paste-ready text for each field of the mod page, in the order of the upload form. The long description is in `description.bbcode.txt` (paste into the Description box) and `description.md` (same text in Markdown, for GitHub or another host). Limits that Nexus does not publish are marked "check the form"; the texts are kept short enough to fit conservative limits.
 
-Everything here is written for the test build 0.2.0-test1 and the facts of 2026-10-10. `README.md` in this folder lists what to re-check against the tagged code before publishing.
+Everything here is written for a Steam connection-test build (never released) and the facts of 2026-10-10. **Out of date: rewrite it for 0.2.0 before publishing.** `README.md` in this folder lists what to re-check against the tagged code before publishing.
 
 ## Name
 
@@ -23,10 +23,8 @@ Early test of co-op multiplayer for Transport Fever 3, free for noncommercial us
 ## Version
 
 ```
-0.2.0-test1
+0.2.0
 ```
-
-If the form accepts only numbers and dots, use `0.2.0` and keep `test1` in the file name and description.
 
 ## Category, tags, flags
 
@@ -38,12 +36,12 @@ If the form accepts only numbers and dots, use `0.2.0` and keep `test1` in the f
 
 ## Main file
 
-- File name on the upload: `FeverLink3-0.2.0-test1.zip` (the zip from the GitHub release, unchanged, so that its SHA-256 matches the release notes). It holds the testing installer, the native module and the mod.
+- File name on the upload: `FeverLink3-0.2.0.zip` (the zip from the GitHub release, unchanged, so that its SHA-256 matches the release notes). It holds the testing installer, the native module and the mod.
 - Category: Main files.
 - File description (keep under 255 characters; the limit is reported by users, not published):
 
 ```
-FeverLink3 0.2.0-test1: testing installer (feverlink3.exe), winhttp.dll and the mod. Windows, Steam, game build 40420. Experimental, unsigned. SHA-256 is in the release notes on GitHub.
+FeverLink3 0.2.0: testing installer (feverlink3.exe), winhttp.dll and the mod. Windows, Steam, game build 40420. Experimental, unsigned. SHA-256 is in the release notes on GitHub.
 ```
 
 (185 characters.)
@@ -84,7 +82,7 @@ Credits: TpF2 Multiplayer by silver2127 (Transport Fever 2, MIT, https://silver2
 Not affiliated with Urban Games or Paradox Interactive. Much of the code and documentation was written with Claude (Anthropic) under the maintainer's direction.
 ```
 
-## Changelog tab (version 0.2.0-test1)
+## Changelog tab (connection-test build)
 
 ```
 First public test build. Its job is the Steam connection test between two players.
@@ -102,7 +100,7 @@ If more landed before the tag, add only what has been seen working, with the sam
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues of 0.2.0-test1
+Known issues of the connection-test build
 - Not a finished multiplayer game: this build tests the Steam connection only. Hosting and joining over Steam, building together, world transfer and the Steam connection between two accounts are not verified yet.
 - Game build 40420 only. After a game update, if the game does not start, run feverlink3 uninstall and tell us your build.
 - Unsigned: SmartScreen/antivirus may warn. Windows 11 Smart App Control may block the DLL (untested).

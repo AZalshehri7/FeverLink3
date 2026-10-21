@@ -17,14 +17,26 @@
 //! One line per burst of an engine's work (calls less than [`GAP_MS`] apart), only when something happened:
 //!
 //! ```text
-//! idorder e=<engine> g=<burst> n=<ops so far> at=<HH:MM:SS.mmm> ents=<id slots> free=<queue size> r=<removal requests> h=<hash> ops=+12,-7,-9
+//! idorder e=<engine> g=<burst> n=<ops so far> at=<HH:MM:SS.mmm> ents=<id slots> free=<queue size> r=<removal requests> h=<hash> s=<step>[..<step>] th=<thread>[+<thread>..] [xs=<n>] ops=+12,-7,#4711,@9012,-9
 //! ```
 //!
 //! `+id` = handed out by `AddEntity`, `-id` = joined the free-id queue (not a request: the order the queue holds them).
 //! `n` counts the `+`/`-` ops of this engine since it was first seen, `h` is a rolling FNV-1a over them, so equal `n`
-//! with unequal `h` on two games means the order differed before that point. The native module has no simulation step
-//! of its own (the game time is read only inside the growth command), so a burst is not a step: a game catching up runs
-//! several steps in one burst. Compare the flattened `ops` streams (`tools/gametest/freed_id_diff.py`), not the lines.
+//! with unequal `h` on two games means the order differed before that point. A burst is not a step: a game catching up
+//! runs several steps in one burst. Compare the flattened `ops` streams (`tools/gametest/freed_id_diff.py`), not the lines.
+//!
+//! When and where (2026-10-21, friend test 0.2.0: five forks of the freed-id order with both games at the same step and no
+//! build before them; whether two threads interleave inside a step or an engine job frees at another step could not be told
+//! from the trace). Every hooked call carries a [`Ctx`]: the OS thread that made it and the simulation step it ran in (the
+//! mod's step, game time / 200, read by `ids.rs` right after the engine advanced the game time of each update; `?` until the
+//! first update, or when that read is not installed). `s=` is the step at the line's first call and, when it moved inside
+//! the line, `..` the step at its last; `th=` the threads of the line's calls in order of appearance; inside `ops`, `#<step>`
+//! says the following ops ran in another step than the one before and `@<thread>` on another thread (the line starts on
+//! `s=`'s first step and `th=`'s first thread). `xs=<n>` (only when not 0) counts the calls of this line made on another
+//! thread than the first call of the same step on this engine: the engine worked on two threads within one step. The freed
+//! ids are taken when the engine appends them (`EndModification`, through the free-order hook, `ids::freed`), so a `-id`
+//! carries the thread and step of the append; with `FEVERLINK3_FREE_ORDER=0` they are taken at the next `AddEntity` or
+//! `RemoveEntity` and carry that call's thread and step instead. Parsers skip the `#`/`@` tokens.
 //!
 //! This file is the pure part (unit-tested); the hooks that feed it live in [`crate::ids`].
 
@@ -75,6 +87,16 @@ pub fn queue_hash(ids: &[i32]) -> u64 {
     ids.iter().fold(FNV_OFFSET, |h, &id| (h ^ u64::from(id as u32)).wrapping_mul(FNV_PRIME))
 }
 
+/// Where a hooked call ran: the OS thread and the simulation step (`None` while the step is not known).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ctx {
+    pub tid: u32,
+    pub step: Option<u64>,
+}
+
+/// A line names at most this many threads (`th=`); more are counted, not named.
+pub const MAX_THREADS_PER_LINE: usize = 8;
+
 /// What one engine has done since it was first seen.
 #[derive(Debug)]
 pub struct EngineOrder {
@@ -86,9 +108,20 @@ pub struct EngineOrder {
     /// The queue size after the last hooked call: anything beyond it was appended since.
     expected_free: u64,
     last_ms: u64,
-    pending: Vec<Op>,
+    pending: Vec<(Op, Ctx)>,
     removed: u32,
     started: String,
+    /// The call being handled (its ops carry it), the line's first call, and the step of its last call.
+    cur: Ctx,
+    line_start: Ctx,
+    line_last_step: Option<u64>,
+    /// The threads of the line's calls in order of appearance (at most [`MAX_THREADS_PER_LINE`]) and how many more there were.
+    threads: Vec<u32>,
+    more_threads: u32,
+    /// Calls of this line on another thread than the first call of the same step (`xs=`).
+    cross: u32,
+    /// The step of this engine's latest call with a known step and the thread of its first call in that step (across lines).
+    step_thread: Option<(u64, u32)>,
     ents: u64,
     free: u64,
     /// The queue's hash when this trace met the engine (the `fifo=` of the first-seen line): equal on two games that loaded the same
@@ -111,6 +144,13 @@ impl EngineOrder {
             pending: Vec::new(),
             removed: 0,
             started: String::new(),
+            cur: Ctx::default(),
+            line_start: Ctx::default(),
+            line_last_step: None,
+            threads: Vec::new(),
+            more_threads: 0,
+            cross: 0,
+            step_thread: None,
             ents,
             free,
             epoch: None,
@@ -135,12 +175,13 @@ impl EngineOrder {
         !self.pending.is_empty() || self.removed > 0
     }
 
-    /// Starts a hooked call at `now_ms` with the queue now `free_now` long. `tail(k)` reads the queue's last `k` ids
-    /// in order. Lines that are due go to `out`.
+    /// Starts a hooked call at `now_ms` made on `ctx` (thread, step) with the queue now `free_now` long. `tail(k)` reads the
+    /// queue's last `k` ids in order. Lines that are due go to `out`.
     /// `at()` is the wall time, asked for only when a line starts.
     pub fn enter(
         &mut self,
         now_ms: u64,
+        ctx: Ctx,
         at: impl FnOnce() -> String,
         free_now: u64,
         tail: impl FnOnce(usize) -> Vec<i32>,
@@ -155,6 +196,7 @@ impl EngineOrder {
             self.started = at.clone();
         }
         self.last_ms = now_ms;
+        self.note_call(ctx);
         if free_now > self.expected_free {
             let k = (free_now - self.expected_free) as usize;
             for id in tail(k) {
@@ -163,6 +205,7 @@ impl EngineOrder {
         } else if shrank {
             // shrank without an AddEntity: the queue was rebuilt (a load), the stream starts over from here
             self.flush(out);
+            self.note_call(ctx); // the next line starts with this call
             self.epoch = None;
             self.checks.clear();
             self.started = at.clone();
@@ -188,6 +231,36 @@ impl EngineOrder {
         self.removed += 1;
     }
 
+    /// Books a call's thread and step: the line's first call starts its `s=`/`th=`, a later one adds its thread, and a call on
+    /// another thread than the first call of the same step counts for `xs=`.
+    fn note_call(&mut self, ctx: Ctx) {
+        self.cur = ctx;
+        if !self.has_pending() {
+            self.line_start = ctx;
+            self.threads.clear();
+            self.more_threads = 0;
+            self.cross = 0;
+        }
+        self.line_last_step = ctx.step;
+        if !self.threads.contains(&ctx.tid) {
+            if self.threads.len() < MAX_THREADS_PER_LINE {
+                self.threads.push(ctx.tid);
+            } else {
+                self.more_threads += 1;
+            }
+        }
+        if let Some(step) = ctx.step {
+            match self.step_thread {
+                Some((s, t)) if s == step => {
+                    if t != ctx.tid {
+                        self.cross += 1;
+                    }
+                }
+                _ => self.step_thread = Some((step, ctx.tid)),
+            }
+        }
+    }
+
     fn push(&mut self, op: Op, out: &mut Vec<String>) {
         self.hash = hash_op(self.hash, op);
         self.ops += 1;
@@ -197,9 +270,13 @@ impl EngineOrder {
             }
             self.checks.push((self.ops, self.hash));
         }
-        self.pending.push(op);
+        self.pending.push((op, self.cur));
         if self.pending.len() >= MAX_OPS_PER_LINE {
             self.flush(out);
+            // the call goes on in the next line: that line starts on this call's thread and step
+            self.line_start = self.cur;
+            self.line_last_step = self.cur.step;
+            self.threads.push(self.cur.tid);
         }
     }
 
@@ -216,16 +293,43 @@ impl EngineOrder {
             return;
         }
         self.burst += 1;
-        let ops = join(self.pending.iter().map(|op| match op {
-            Op::Alloc(id) => format!("+{id}"),
-            Op::Freed(id) => format!("-{id}"),
-        }));
+        let mut ops = String::with_capacity(self.pending.len() * 8);
+        let mut prev = self.line_start;
+        for (op, ctx) in &self.pending {
+            if ctx.step != prev.step {
+                ops.push('#');
+                ops.push_str(&step_text(ctx.step));
+                ops.push(',');
+            }
+            if ctx.tid != prev.tid {
+                ops.push_str(&format!("@{},", ctx.tid));
+            }
+            prev = *ctx;
+            match op {
+                Op::Alloc(id) => ops.push_str(&format!("+{id},")),
+                Op::Freed(id) => ops.push_str(&format!("-{id},")),
+            }
+        }
+        ops.pop();
+        let mut steps = step_text(self.line_start.step);
+        if self.line_last_step != self.line_start.step {
+            steps.push_str("..");
+            steps.push_str(&step_text(self.line_last_step));
+        }
+        let mut threads = join(self.threads.iter().map(|t| t.to_string())).replace(',', "+");
+        if self.more_threads > 0 {
+            threads.push_str(&format!("+{}more", self.more_threads));
+        }
+        let cross = if self.cross > 0 { format!(" xs={}", self.cross) } else { String::new() };
         out.push(format!(
-            "idorder e={:x} g={} n={} at={} ents={} free={} r={} h={:016x} ops={ops}",
+            "idorder e={:x} g={} n={} at={} ents={} free={} r={} h={:016x} s={steps} th={threads}{cross} ops={ops}",
             self.tag, self.burst, self.ops, self.started, self.ents, self.free, self.removed, self.hash
         ));
         self.pending.clear();
         self.removed = 0;
+        self.threads.clear();
+        self.more_threads = 0;
+        self.cross = 0;
     }
 }
 
@@ -266,6 +370,11 @@ pub fn mark_line(at: &str, what: &str, engines: &mut [&mut EngineOrder], out: &m
     out.push(format!("idorder mark at={at} {what} engines={places}"));
 }
 
+/// A step as the trace writes it: the number, `?` when unknown.
+fn step_text(step: Option<u64>) -> String {
+    step.map_or_else(|| "?".to_string(), |s| s.to_string())
+}
+
 fn join(it: impl Iterator<Item = String>) -> String {
     it.collect::<Vec<_>>().join(",")
 }
@@ -292,7 +401,14 @@ mod tests {
     /// One AddEntity through the trace, as the hook does it.
     fn add(e: &mut EngineOrder, q: &mut Fifo, now: u64, out: &mut Vec<String>) -> i32 {
         let snapshot = q.0.clone();
-        e.enter(now, || "t".to_string(), q.0.len() as u64, |k| Fifo(snapshot, 0).tail(k), out);
+        e.enter(
+            now,
+            Ctx { tid: 7, step: Some(now / 100) },
+            || "t".to_string(),
+            q.0.len() as u64,
+            |k| Fifo(snapshot, 0).tail(k),
+            out,
+        );
         let id = q.add();
         e.alloc(id, q.0.len() as u64, q.1 as u64, out);
         id
@@ -368,14 +484,14 @@ mod tests {
     fn a_queue_that_shrinks_without_an_add_is_a_reset() {
         let mut e = EngineOrder::new(1, 5, 0);
         let mut out = Vec::new();
-        e.enter(0, || "t".to_string(), 5, |_| unreachable!(), &mut out);
+        e.enter(0, Ctx::default(), || "t".to_string(), 5, |_| unreachable!(), &mut out);
         e.alloc(1, 4, 9, &mut out);
-        e.enter(1, || "u".to_string(), 2, |_| unreachable!(), &mut out);
+        e.enter(1, Ctx::default(), || "u".to_string(), 2, |_| unreachable!(), &mut out);
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(out[0].ends_with("ops=+1"));
         assert!(out[1].starts_with("idorder e=1 reset at=u free=2 (was 4) n=1 h="), "{}", out[1]);
         // and it goes on from the new size
-        e.enter(2, || "v".to_string(), 3, |k| vec![42; k], &mut out);
+        e.enter(2, Ctx::default(), || "v".to_string(), 3, |k| vec![42; k], &mut out);
         e.flush(&mut out);
         assert!(out[2].ends_with("ops=-42"), "{}", out[2]);
     }
@@ -414,6 +530,49 @@ mod tests {
         add(&mut a, &mut qa, 100, &mut out);
         a.flush(&mut out);
         assert!(out[3].starts_with("idorder e=a g=2 n=3 "), "{}", out[3]);
+    }
+
+    /// One hooked call on `tid` in `step` with the queue `free` long and `tail` its newly appended ids.
+    fn call(e: &mut EngineOrder, tid: u32, step: Option<u64>, free: u64, tail: Vec<i32>, out: &mut Vec<String>) {
+        e.enter(0, Ctx { tid, step }, || "t".to_string(), free, |_| tail, out);
+    }
+
+    #[test]
+    fn a_line_names_its_steps_and_threads_and_counts_a_second_thread_within_one_step() {
+        let mut e = EngineOrder::new(1, 0, 6);
+        let mut out = Vec::new();
+        // step 10: thread 1 adds, thread 2 appends two freed ids; step 11: thread 1 adds again
+        call(&mut e, 1, Some(10), 0, vec![], &mut out);
+        e.alloc(5, 0, 6, &mut out);
+        call(&mut e, 2, Some(10), 2, vec![8, 9], &mut out);
+        call(&mut e, 1, Some(11), 2, vec![], &mut out);
+        e.alloc(8, 1, 6, &mut out);
+        e.flush(&mut out);
+        assert!(out[0].ends_with(" s=10..11 th=1+2 xs=1 ops=+5,@2,-8,-9,#11,@1,+8"), "{}", out[0]);
+        // the step's first thread is kept across lines: step 11 began on thread 1, so thread 3 in a new line counts
+        call(&mut e, 3, Some(11), 1, vec![], &mut out);
+        e.alloc(9, 0, 6, &mut out);
+        e.flush(&mut out);
+        assert!(out[1].contains(" s=11 th=3 xs=1 ops=+9"), "{}", out[1]);
+        // one thread in a new step: no xs, no marks
+        call(&mut e, 3, Some(12), 0, vec![], &mut out);
+        e.alloc(10, 0, 7, &mut out);
+        e.flush(&mut out);
+        assert!(out[2].contains(" s=12 th=3 ops=+10"), "{}", out[2]);
+    }
+
+    #[test]
+    fn an_unknown_step_is_a_question_mark_and_never_counts_as_a_second_thread() {
+        let mut e = EngineOrder::new(1, 0, 0);
+        let mut out = Vec::new();
+        call(&mut e, 1, None, 0, vec![], &mut out);
+        e.alloc(1, 0, 1, &mut out);
+        call(&mut e, 2, None, 0, vec![], &mut out);
+        e.removal();
+        call(&mut e, 2, Some(4), 0, vec![], &mut out);
+        e.alloc(2, 0, 2, &mut out);
+        e.flush(&mut out);
+        assert!(out[0].contains(" r=1 ") && out[0].contains(" s=?..4 th=1+2 ops=+1,#4,@2,+2"), "{}", out[0]);
     }
 
     #[test]
@@ -457,12 +616,12 @@ mod tests {
         assert_ne!(part, run([6, 5]).check_part().unwrap(), "another free order, another part");
         let mut e = a;
         let mut out = Vec::new();
-        e.enter(1, || "u".to_string(), 0, |_| unreachable!(), &mut out);
+        e.enter(1, Ctx::default(), || "u".to_string(), 0, |_| unreachable!(), &mut out);
         e.alloc(9, 0, 0, &mut out);
-        e.enter(2, || "v".to_string(), 0, |_| unreachable!(), &mut out);
+        e.enter(2, Ctx::default(), || "v".to_string(), 0, |_| unreachable!(), &mut out);
         assert!(e.free == 0 && e.check_part().is_some(), "no reset: the queue did not shrink");
         e.expected_free = 5;
-        e.enter(3, || "w".to_string(), 1, |_| unreachable!(), &mut out);
+        e.enter(3, Ctx::default(), || "w".to_string(), 1, |_| unreachable!(), &mut out);
         assert_eq!(e.check_part(), None, "after a reset the stream is not one two games share");
     }
 }

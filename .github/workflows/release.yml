@@ -1,7 +1,7 @@
 name: Release
 
 # A release is built here, never on a developer's PC, and only from a commit on main whose message starts with the
-# version, for example `V0.1.0: First beta release` (a dash in the version, `V0.2.0-test1: ...`, makes a pre-release).
+# version, for example `V0.1.0: First beta release` (a dash in the version, `V0.2.0-beta.1: ...`, makes a pre-release).
 # Every other commit only runs CI. See docs/RELEASING.md.
 #
 # Three jobs, so the signing key is reachable from as little as possible:
@@ -9,7 +9,10 @@ name: Release
 #   sign    the only job with the key. It runs in the GitHub environment `release-signing`, which the owner sets up
 #           to require his approval and to accept main only; the key is a secret of that environment, not of the
 #           repository. It signs manifest.json and checks the signature with the launcher's own trusted-key list.
-#   publish creates the GitHub release from the build's files and the signature; it never sees the key.
+#           SKIPPED until 1.0.0 (owner decision 2026-10-22): releases are published unsigned. The job runs only when
+#           the repository variable RELEASE_SIGNING is `on`; set it together with the first key in TRUSTED_KEYS
+#           (launcher/src/update.rs), and from then on a release without a signature fails (docs/RELEASING.md).
+#   publish creates the GitHub release from the build's files and the signature (if any); it never sees the key.
 on:
   push:
     branches: [main]
@@ -52,7 +55,11 @@ jobs:
         run: cargo test --workspace --exclude feverlink3_native
       - if: steps.parse.outputs.release == 'true'
         run: cargo test -p feverlink3_native -- --test-threads=1
+      # FEVERLINK3_OFFICIAL_BUILD marks the module as a release build: only those update themselves in the game
+      # (launcher/src/autoupdate.rs). A module built on a developer's PC never replaces itself with GitHub's release.
       - if: steps.parse.outputs.release == 'true'
+        env:
+          FEVERLINK3_OFFICIAL_BUILD: '1'
         run: cargo build --release --workspace
 
       - name: Package
@@ -75,7 +82,7 @@ jobs:
 
   sign:
     needs: build
-    if: ${{ needs.build.outputs.release == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    if: ${{ needs.build.outputs.release == 'true' && vars.RELEASE_SIGNING == 'on' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
     runs-on: windows-latest
     # Protection rules (required reviewer, main only) live in the repository settings: docs/RELEASING.md.
     environment: release-signing
@@ -98,9 +105,8 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) {
-            # A pre-release may go out unsigned (the updater refuses it); a full release may not.
-            if ("$env:VERSION" -match '-') { Write-Host "no signing key: the pre-release is published UNSIGNED"; exit 0 }
-            Write-Error "RELEASE_SIGNING_KEY is not set in the release-signing environment; a full release must be signed"
+            # RELEASE_SIGNING is on, so the updaters in the field expect a signature: no key is an error.
+            Write-Error "RELEASE_SIGNING is on but RELEASE_SIGNING_KEY is not set in the release-signing environment"
             exit 1
           }
           # The key is written to the runner's temp folder, used once and deleted.
@@ -136,7 +142,8 @@ jobs:
 
   publish:
     needs: [build, sign]
-    if: ${{ needs.build.outputs.release == 'true' }}
+    # runs when sign succeeded or was skipped (unsigned until 1.0.0), never after a failed or cancelled sign
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.release == 'true' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -146,7 +153,7 @@ jobs:
         with:
           name: dist
           path: dist
-      # an unsigned pre-release has no signature artifact
+      # an unsigned release has no signature artifact
       - if: needs.sign.outputs.signed == 'true'
         uses: actions/download-artifact@v4
         with:
@@ -158,14 +165,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
+          SIGNING: ${{ vars.RELEASE_SIGNING }}
         run: |
           $version = $env:VERSION
           $zip = "FeverLink3-$version.zip"
           $sha = (Get-Content "dist/$zip.sha256").Split(' ')[0]
           if ((Get-FileHash "dist/$zip" -Algorithm SHA256).Hash.ToLower() -ne $sha) { Write-Error "zip hash changed between jobs"; exit 1 }
           $signed = Test-Path dist/manifest.json.sig
-          if (-not $signed -and "$version" -notmatch '-') { Write-Error "a full release must be signed"; exit 1 }
-          $sigLine = if ($signed) { "The manifest is signed with Ed25519 (manifest.json.sig, checked against the launcher's trusted keys)." } else { "This pre-release is UNSIGNED: the in-app updater refuses it." }
+          # once signing is on (1.0.0), updaters require the signature: an unsigned release would reach nobody
+          if (-not $signed -and "$env:SIGNING" -eq 'on') { Write-Error "RELEASE_SIGNING is on: the release must be signed"; exit 1 }
+          $sigLine = if ($signed) { "The manifest is signed with Ed25519 (manifest.json.sig, checked against the launcher's trusted keys)." } else { "This release is NOT signed (unsigned until 1.0.0). The in-game updater checks the zip against manifest.json and the .sha256 file, and every file against manifest.json." }
           $log = Get-Content docs/CHANGELOG.md -Raw
           $m = [regex]::Match($log, "(?ms)^## $([regex]::Escape($version))\b[^\n]*\r?\n(.*?)(?=^## |\z)")
           if (-not $m.Success) { $m = [regex]::Match($log, "(?ms)^## Unreleased[^\n]*\r?\n(.*?)(?=^## |\z)") }

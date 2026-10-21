@@ -49,7 +49,7 @@ its callback with the real local result. None needs *replay on peers* or *poll*.
   derives itself (`DERIVED` in `feverlink3_cmds_ops.lua`, each with its evidence) are neither read, shipped, written nor
   compared: the object goes out with the engine's own default, as the game's windows send it. Today that is
   `Line.vehicleInfo` (the line's transport modes: no base game script writes it, the line manager sends a fresh
-  `api.type.Line.new()`; shipping it refused every line edit in the live test of 0.2.0-pre5 with "does not rebuild equal at
+  `api.type.Line.new()`; shipping it refused every line edit in the live test of 2026-10-18 with "does not rebuild equal at
   Line.vehicleInfo.transportModes.9"). The receiving game
   does the same check on what it rebuilds, so a body that does not fit the engine's object is refused, not applied half built.
   does the same check on what it rebuilds, so a body that does not fit the engine's object is refused, not applied half built.

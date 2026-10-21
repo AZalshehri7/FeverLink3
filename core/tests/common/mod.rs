@@ -22,6 +22,7 @@ pub struct Player {
     pub log: Vec<String>,
     pub saves: Vec<(i32, String, Vec<u8>)>,
     pub rejected: Option<RejectMessage>,
+    pub reports: Vec<PlayerReportEvent>,
 }
 
 impl Player {
@@ -96,7 +97,14 @@ impl Harness {
             PlayerSession::with_clock(self.key.clone(), name, "0.1", Box::new(move || *clock.lock().unwrap()));
         session.set_capabilities(caps.iter().map(|c| (*c).to_owned()).collect());
         session.set_mods(mods);
-        let player = Player { session, game: Vec::new(), log: Vec::new(), saves: Vec::new(), rejected: None };
+        let player = Player {
+            session,
+            game: Vec::new(),
+            log: Vec::new(),
+            saves: Vec::new(),
+            rejected: None,
+            reports: Vec::new(),
+        };
         self.players.insert(c, player);
         self.routable.insert(c);
         let outs = self.host.connection_opened(c);
@@ -165,6 +173,7 @@ impl Harness {
                 }
                 PlayerOutput::Rejected(r) => self.players.get_mut(&c).unwrap().rejected = Some(r),
                 PlayerOutput::Welcomed(_) => {}
+                PlayerOutput::Report(e) => self.players.get_mut(&c).unwrap().reports.push(e),
             }
         }
     }

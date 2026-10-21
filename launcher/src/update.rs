@@ -13,6 +13,10 @@
 //!    `.old`, move the new ones in, roll back on failure. Nothing outside the install folder is ever touched.
 //! 7. A [`Journal`] of what was swapped is written; after the start check ([`judge_start`]) it is either confirmed
 //!    ([`confirm`], the `.old` files go) or undone ([`rollback`]) and the version is put on the skip list.
+//!
+//! The in-game automatic update (`src/autoupdate.rs`) uses the same checks through [`accept_manifest`], which decides
+//! between the two trust modes: unsigned until 1.0.0 while [`TRUSTED_KEYS`] is empty (owner decision 2026-10-22),
+//! signature required as soon as a key is listed.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -40,9 +44,12 @@ pub struct TrustedKey {
 
 /// The keys an update may be signed with.
 ///
-/// EMPTY on purpose until the owner generates the real release key (`docs/RELEASING.md`, "The signing key"): with
-/// no trusted key every update is refused. The former placeholder key's private half was public (it is the test
-/// seed below), so it must never be trusted; a test checks that it is not in this list.
+/// EMPTY until 1.0.0 (owner decision 2026-10-22: releases are unsigned until then; `docs/RELEASING.md`, "The
+/// signing key"). While it is empty the developer program's `update` command refuses every update, and the in-game
+/// automatic update runs in the unsigned mode of [`accept_manifest`] (HTTPS from GitHub's API and the hash checks).
+/// The moment a key is listed here, [`accept_manifest`] requires a good signature by it again.
+/// The former placeholder key's private half was public (it is the test seed below), so it must never be trusted; a
+/// test checks that it is not in this list.
 pub const TRUSTED_KEYS: &[TrustedKey] = &[];
 
 /// First word of `manifest.json.sig`: the format and the algorithm.
@@ -231,7 +238,10 @@ pub struct Release {
     pub version: Version,
     pub zip: Asset,
     pub manifest: Asset,
-    pub signature: Asset,
+    /// `manifest.json.sig`: absent from the unsigned releases before 1.0.0.
+    pub signature: Option<Asset>,
+    /// `FeverLink3-<version>.zip.sha256`, the hash the release job published beside the zip.
+    pub sha256: Option<Asset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,15 +271,20 @@ struct ApiRelease {
 }
 
 fn pick(assets: &[ApiAsset], what: &'static str, matches: impl Fn(&str) -> bool) -> Result<Asset> {
+    pick_optional(assets, what, matches)?.ok_or(UpdateError::MissingAsset(what))
+}
+
+/// The one asset that `matches`, `None` when there is none; two are an error, and so is an address that is not HTTPS.
+fn pick_optional(assets: &[ApiAsset], what: &'static str, matches: impl Fn(&str) -> bool) -> Result<Option<Asset>> {
     let mut found = assets.iter().filter(|a| matches(&a.name));
-    let first = found.next().ok_or(UpdateError::MissingAsset(what))?;
+    let Some(first) = found.next() else { return Ok(None) };
     if found.next().is_some() {
         return Err(UpdateError::AmbiguousAsset(what));
     }
     if !first.browser_download_url.starts_with("https://") {
         return Err(UpdateError::InsecureUrl(first.browser_download_url.clone()));
     }
-    Ok(Asset { name: first.name.clone(), url: first.browser_download_url.clone(), size: first.size })
+    Ok(Some(Asset { name: first.name.clone(), url: first.browser_download_url.clone(), size: first.size }))
 }
 
 /// Parses one release object of the GitHub Releases API (`/releases/latest` or an element of `/releases`).
@@ -281,7 +296,10 @@ pub fn parse_release(json: &str) -> Result<(Release, bool)> {
         version,
         zip: pick(&api.assets, "FeverLink3-*.zip", |n| n.starts_with("FeverLink3-") && n.ends_with(".zip"))?,
         manifest: pick(&api.assets, "manifest.json", |n| n == "manifest.json")?,
-        signature: pick(&api.assets, "manifest.json.sig", |n| n == "manifest.json.sig")?,
+        signature: pick_optional(&api.assets, "manifest.json.sig", |n| n == "manifest.json.sig")?,
+        sha256: pick_optional(&api.assets, "FeverLink3-*.zip.sha256", |n| {
+            n.starts_with("FeverLink3-") && n.ends_with(".zip.sha256")
+        })?,
     };
     Ok((release, api.draft || api.prerelease))
 }
@@ -424,6 +442,65 @@ pub fn verify_signed_manifest<'k>(
     key.verify_strict(manifest_json, &Signature::from_bytes(&sig)).map_err(|_| UpdateError::BadSignature)?;
     let manifest = serde_json::from_slice(manifest_json).map_err(|e| UpdateError::BadJson(e.to_string()))?;
     Ok((manifest, trusted))
+}
+
+/// The two trust modes of the in-game update, decided by `keys` (normally [`TRUSTED_KEYS`]):
+///
+/// - **Unsigned (no key listed; every release before 1.0.0, owner decision 2026-10-22).** The manifest is taken as
+///   GitHub served it over HTTPS (certificate checked) from the repository's own release; a signature file, if one
+///   is there, is ignored. What protects the player is then the release page itself plus the hash chain the caller
+///   must check: the zip against this manifest and against the published `.sha256` ([`verify_zip`],
+///   [`verify_sha256_file`]), every extracted file against this manifest ([`extract_verified`]), the version
+///   ([`check_manifest_version`], strictly newer), the file names ([`check_auto_names`]). This does NOT protect
+///   against someone who can publish a release on the repository (a stolen GitHub account or token).
+/// - **Signed (at least one key listed).** The signature is required and checked as by [`verify_signed_manifest`];
+///   a release without `manifest.json.sig` is refused ([`UpdateError::Unsigned`]).
+pub fn accept_manifest(
+    manifest_json: &[u8],
+    signature_file: Option<&[u8]>,
+    keys: &[TrustedKey],
+    now_unix: i64,
+) -> Result<Manifest> {
+    if keys.is_empty() {
+        return serde_json::from_slice(manifest_json).map_err(|e| UpdateError::BadJson(e.to_string()));
+    }
+    let sig = signature_file.ok_or(UpdateError::Unsigned)?;
+    verify_signed_manifest(manifest_json, sig, keys, now_unix).map(|(m, _)| m)
+}
+
+/// The published `FeverLink3-<version>.zip.sha256` (`<hash>  <zip name>`, as `feverlink3_release package` writes
+/// it) must name the manifest's zip and agree with the manifest's hash and with the downloaded zip's.
+pub fn verify_sha256_file(text: &[u8], zip: &[u8], manifest: &Manifest) -> Result<()> {
+    let text = std::str::from_utf8(text).map_err(|_| UpdateError::ZipHashMismatch)?;
+    let mut fields = text.split_ascii_whitespace();
+    let (Some(hash), name) = (fields.next(), fields.next()) else { return Err(UpdateError::ZipHashMismatch) };
+    let name_ok = name.is_none_or(|n| n.trim_start_matches('*') == manifest.zip_name);
+    let zip_hash = sha256_hex(zip);
+    if !name_ok || !hash.eq_ignore_ascii_case(manifest.zip_sha256.trim()) || !hash.eq_ignore_ascii_case(&zip_hash) {
+        return Err(UpdateError::ZipHashMismatch);
+    }
+    Ok(())
+}
+
+/// The folder of the mod in an overlay release and in the game folder.
+pub const AUTO_MOD_DIR: &str = "mods/release/feverlink3";
+
+/// The names an automatic update may carry: `winhttp.dll`, files under `mods/release/feverlink3/` and the
+/// [`OVERLAY_DOCS`] (checked, never installed); each also passes [`safe_rel_path`]. Anything else (another mod's
+/// folder, a program, a portable release) refuses the whole update.
+pub fn check_auto_names(manifest: &Manifest) -> Result<()> {
+    let prefix = format!("{AUTO_MOD_DIR}/");
+    if !manifest.files.iter().any(|f| f.path == DLL_NAME) {
+        return Err(UpdateError::UnknownLayout);
+    }
+    for f in &manifest.files {
+        safe_rel_path(&f.path)?;
+        let ok = f.path == DLL_NAME || f.path.starts_with(&prefix) || OVERLAY_DOCS.contains(&f.path.as_str());
+        if !ok {
+            return Err(UpdateError::UnsafePath(f.path.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// A signed manifest must describe the release it was published with: the same version and the same zip.
@@ -595,9 +672,16 @@ pub fn plan_swap(zip: &[u8], manifest: &Manifest, install_dir: &Path) -> Result<
 /// Performs the `Extract` steps, checking each file's size and SHA-256 against the manifest while reading
 /// (a lying size header cannot make it write more than the manifest allows).
 pub fn stage(plan: &SwapPlan, zip: &[u8], manifest: &Manifest) -> Result<()> {
+    extract_verified(plan, zip, manifest, &plan.staging_dir)
+}
+
+/// The `Extract` steps of `plan` into `dest` (`dest/<rel>`) instead of the plan's staging folder, with the same size
+/// and SHA-256 check of every file against the manifest. The in-game update stages next to the game with it.
+pub fn extract_verified(plan: &SwapPlan, zip: &[u8], manifest: &Manifest, dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(zip)).map_err(|e| UpdateError::BadZip(e.to_string()))?;
     for step in &plan.steps {
-        let Step::Extract { entry, rel, staged } = step else { continue };
+        let Step::Extract { entry, rel, .. } = step else { continue };
+        let staged = dest.join(safe_rel_path(rel)?);
         let want =
             manifest.files.iter().find(|f| &f.path == rel).ok_or_else(|| UpdateError::NotInManifest(rel.clone()))?;
         let mut file = archive.by_name(entry).map_err(|e| UpdateError::BadZip(e.to_string()))?;
@@ -609,7 +693,7 @@ pub fn stage(plan: &SwapPlan, zip: &[u8], manifest: &Manifest) -> Result<()> {
         if let Some(parent) = staged.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(staged, &data)?;
+        fs::write(&staged, &data)?;
     }
     Ok(())
 }
@@ -819,7 +903,8 @@ pub fn read_skipped(install_dir: &Path) -> String {
     fs::read_to_string(install_dir.join(SKIP_FILE)).unwrap_or_default()
 }
 
-fn add_skipped(install_dir: &Path, version: &str) -> Result<()> {
+/// Puts `version` on the skip list of `install_dir` (once).
+pub fn add_skipped(install_dir: &Path, version: &str) -> Result<()> {
     let mut list = read_skipped(install_dir);
     if Version::parse(version).is_ok_and(|v| is_skipped(&list, &v)) {
         return Ok(());
@@ -916,14 +1001,19 @@ mod tests {
         assert_eq!(r.zip.name, "FeverLink3-1.2.0.zip");
         assert_eq!(r.zip.size, 2048);
         assert_eq!(r.manifest.name, "manifest.json");
-        assert_eq!(r.signature.name, "manifest.json.sig");
-        assert!(r.signature.url.ends_with("/manifest.json.sig"));
+        let sig = r.signature.as_ref().unwrap();
+        assert_eq!(sig.name, "manifest.json.sig");
+        assert!(sig.url.ends_with("/manifest.json.sig"));
+        assert_eq!(r.sha256.as_ref().unwrap().name, "FeverLink3-1.2.0.zip.sha256");
     }
 
     #[test]
     fn asset_problems_are_errors() {
+        // unsigned until 1.0.0: a release without the signature is read, without it
         let no_sig = RELEASE_JSON.replace("manifest.json.sig", "other.txt");
-        assert_eq!(parse_release(&no_sig).unwrap_err(), UpdateError::MissingAsset("manifest.json.sig"));
+        assert_eq!(parse_release(&no_sig).unwrap().0.signature, None);
+        let no_manifest = RELEASE_JSON.replace("\"manifest.json\"", "\"other.json\"");
+        assert_eq!(parse_release(&no_manifest).unwrap_err(), UpdateError::MissingAsset("manifest.json"));
         let http = RELEASE_JSON.replacen(
             "https://github.com/AZalshehri7/FeverLink3/releases/download/v1.2.0/FeverLink3-1.2.0.zip\"",
             "http://x/FeverLink3-1.2.0.zip\"",
@@ -1128,6 +1218,70 @@ mod tests {
         let mut bad = zip.clone();
         bad[30] ^= 1;
         assert_eq!(verify_zip(&bad, &m), Err(UpdateError::ZipHashMismatch));
+    }
+
+    #[test]
+    fn trust_modes_unsigned_without_keys_signed_with_keys() {
+        let (m, json) = signed_manifest();
+        let good = sig_file(&test_key(), &json);
+        // unsigned mode (no key listed, until 1.0.0): the manifest is accepted with or without a signature file
+        assert_eq!(accept_manifest(&json, None, &[], NOW), Ok(m.clone()));
+        assert_eq!(accept_manifest(&json, Some(b"junk"), &[], NOW), Ok(m.clone()));
+        assert!(matches!(accept_manifest(b"not json", None, &[], NOW), Err(UpdateError::BadJson(_))));
+        // signed mode (a key listed): required and checked
+        let keys = [TEST_TRUSTED];
+        assert_eq!(accept_manifest(&json, None, &keys, NOW), Err(UpdateError::Unsigned));
+        assert_eq!(accept_manifest(&json, Some(b""), &keys, NOW), Err(UpdateError::Unsigned));
+        assert_eq!(accept_manifest(&json, Some(good.as_bytes()), &keys, NOW), Ok(m));
+        let mut tampered = json.clone();
+        tampered[20] ^= 1;
+        assert_eq!(accept_manifest(&tampered, Some(good.as_bytes()), &keys, NOW), Err(UpdateError::BadSignature));
+        let by_other = sig_file(&other_key(), &json);
+        assert!(matches!(
+            accept_manifest(&json, Some(by_other.as_bytes()), &keys, NOW),
+            Err(UpdateError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn the_published_sha256_file_must_agree() {
+        let (zip, m) = good_zip();
+        let line = format!("{}  {}\n", m.zip_sha256, m.zip_name);
+        verify_sha256_file(line.as_bytes(), &zip, &m).unwrap();
+        verify_sha256_file(m.zip_sha256.to_uppercase().as_bytes(), &zip, &m).unwrap();
+        let other = sha256_hex(b"other");
+        for bad in
+            [format!("{other}  {}", m.zip_name), format!("{}  FeverLink3-9.9.9.zip", m.zip_sha256), String::new()]
+        {
+            assert_eq!(verify_sha256_file(bad.as_bytes(), &zip, &m), Err(UpdateError::ZipHashMismatch), "{bad:?}");
+        }
+        // the file and the manifest agree, the downloaded zip does not
+        let mut changed = zip.clone();
+        changed[30] ^= 1;
+        assert_eq!(verify_sha256_file(line.as_bytes(), &changed, &m), Err(UpdateError::ZipHashMismatch));
+    }
+
+    #[test]
+    fn automatic_updates_carry_only_the_dll_and_our_mod() {
+        let entry = |p: &str| FileEntry { path: p.into(), size: 1, sha256: sha256_hex(b"x") };
+        let with = |paths: &[&str]| Manifest {
+            version: "1.2.0".into(),
+            files: paths.iter().map(|p| entry(p)).collect(),
+            zip_name: "FeverLink3-1.2.0.zip".into(),
+            zip_sha256: String::new(),
+        };
+        check_auto_names(&with(&["winhttp.dll", "mods/release/feverlink3/mod.lua", "README.txt", "LICENSE"])).unwrap();
+        assert_eq!(check_auto_names(&with(&["mods/release/feverlink3/mod.lua"])), Err(UpdateError::UnknownLayout));
+        for bad in [
+            "mods/release/other/mod.lua",
+            "mods/release/feverlink3/../../../evil.dll",
+            "mods/release/feverlink3x/mod.lua",
+            "feverlink3.exe",
+            "TransportFever3.exe",
+            "../winhttp.dll",
+        ] {
+            assert!(check_auto_names(&with(&["winhttp.dll", bad])).is_err(), "{bad}");
+        }
     }
 
     #[test]

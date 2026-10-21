@@ -23,6 +23,12 @@ pub enum MessageKind {
     Ping = 21,
     /// The host ended this player's session on purpose (removed, too many frames); sealed, so only the host can say it.
     Kicked = 22,
+    /// A bug report: build this game's part (`ReportAskMessage`). Read by the player's launcher, never given to the game.
+    ReportAsk = 23,
+    /// A chunk of the finished bug report for the player who asked for it (a `ResyncChunkMessage`). Launcher only.
+    ReportBundle = 24,
+    /// A bug report request refused because another runs (`ReportBusyMessage`), to the player who asked. Launcher only.
+    ReportBusy = 25,
 
     // ---- player -> host, sealed
     Hello = 30,
@@ -40,6 +46,10 @@ pub enum MessageKind {
     /// during an apply): the host asked this game for its save (`ResyncSave`) and repairs every game from it. Payload: a
     /// `ResyncChunkMessage`. Sent by the player's launcher, never by its game.
     ResyncUpload = 39,
+    /// "Make a bug report" (`ReportRequestMessage`), from the player's launcher (the window's button).
+    ReportRequest = 40,
+    /// A chunk of this game's part of a bug report (a `ResyncChunkMessage`), sent by the player's launcher, never by its game.
+    ReportPart = 41,
 
     // ---- player -> host, relayed by the host to everyone else with the origin filled in
     Action = 50,
@@ -56,7 +66,7 @@ pub enum MessageKind {
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
     /// (session state, checksum requests, authority values, resynchronisation).
-    pub const FROM_PLAYER: [MessageKind; 14] = [
+    pub const FROM_PLAYER: [MessageKind; 16] = [
         MessageKind::Hello,
         MessageKind::Clock,
         MessageKind::SpeedRequest,
@@ -67,6 +77,8 @@ impl MessageKind {
         MessageKind::Pong,
         MessageKind::Leave,
         MessageKind::ResyncUpload,
+        MessageKind::ReportRequest,
+        MessageKind::ReportPart,
         MessageKind::Action,
         MessageKind::Chat,
         MessageKind::BuildVeto,
@@ -93,6 +105,9 @@ impl MessageKind {
             20 => Permissions,
             21 => Ping,
             22 => Kicked,
+            23 => ReportAsk,
+            24 => ReportBundle,
+            25 => ReportBusy,
             30 => Hello,
             31 => Clock,
             32 => SpeedRequest,
@@ -103,6 +118,8 @@ impl MessageKind {
             37 => Pong,
             38 => Leave,
             39 => ResyncUpload,
+            40 => ReportRequest,
+            41 => ReportPart,
             50 => Action,
             51 => Chat,
             52 => BuildVeto,

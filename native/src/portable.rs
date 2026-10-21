@@ -342,7 +342,7 @@ pub static VEC3F: Elem = Elem { name: "Vec3f", stride: 12, fields: &[f(0, "v", T
 /// `Parcel::Face` (0x20 bytes): `points` (`std::vector<Vec3f>`), `collision` (the api's `{CollisionType : boolean}`, a 4-byte set of
 /// flags), four bytes of padding. [Engine: the parcel copy `0x4c1df0` copies each face with `0xdf480` for the points (its element
 /// count is `(end - begin) / 12`: `imul 0x2aaaaaaaaaaaaaab`, `sar 1`; the bytes by `memmove`) and `mov eax,[src+0x18]; mov
-/// [dst+0x18],eax`, stride 0x20 (`add rdi,0x20`). Owner run 2026-10-18 (pre4, host hold 1): in each of the 13 nodes
+/// [dst+0x18],eax`, stride 0x20 (`add rdi,0x20`). Owner run 2026-10-18 (host hold 1): in each of the 13 nodes
 /// (of 42) whose pointers native.log details, the face vector is 0x80 bytes (four faces) and the first face's points 0x30 (four points).]
 pub static PARCEL_FACE: Elem = Elem {
     name: "ParcelFace",
@@ -356,7 +356,7 @@ pub static PARCEL_FACE: Elem = Elem {
 /// map at +0x2c8 from a 0x50-byte sentinel with `0x4bc770` -> `0x4bd1f0` (an `operator new(0x50)` node per entry, the value from +0x20
 /// copied by `0x4c1df0`): `mov eax,[src]` (key), `[src+8]` (4 bytes), `movzx [src+0xc]` (1 byte), `[src+0x10]`, `[src+0x14]` (4 bytes
 /// each), then the vector at +0x18 of 0x20-byte elements (`sar rbx,5`). The bytes +4..+8 and +0xd..+0x10 are never copied: padding.
-/// Owner run 2026-10-18 (pre4, host hold 1, a street built by the street tool over town land): 42 entries, keys new#42..new#1; every
+/// Owner run 2026-10-18 (host hold 1, a street built by the street tool over town land): 42 entries, keys new#42..new#1; every
 /// unresolved pointer of its refusal was one of +0x38/+0x40/+0x48 of a node, the faces vector (begin, end, capacity, end = capacity).
 /// The run of 2026-10-14 (h3, a station over town land, the untyped graph): +0x28 0xffffffff/0xfffffffe (the new segments new#1/#2),
 /// +0x2c 0 or 1 under residue bytes (0x435f4e00), +0x30 0.0855..0.83 (a curve parameter), +0x34 8.0.]
@@ -919,7 +919,7 @@ impl Enc<'_> {
                     self.line(&format!("{path}.keys"), &format!("keys:{keys}"))?;
                     // a typed value: every entry's members as named lines, in key order, so that the values are compared too. Not in the
                     // input level (the mod's text, bounded to 1 MB): the engine makes the parcels, a SimpleProposal has none, and their
-                    // points (16 per parcel, 42 parcels for one street in the owner's pre4 run) would only fill it
+                    // points (16 per parcel, 42 parcels for one street in the owner's run of 2026-10-18) would only fill it
                     if let (MapValue::Record(elem), false) = (&node.value, self.set.input_level) {
                         for (i, v) in values.iter().enumerate() {
                             self.record(&format!("{path}[{i}]"), v, elem.fields, elem.stride, depth + 1)?;
@@ -973,7 +973,7 @@ impl Enc<'_> {
     /// sentinel each. Only the segment maps used to be typed: the node maps of a station configure (inj3, 2026-10-14) were walked as
     /// generic maps of 0x50-byte nodes with their values left to the graph, and the walk followed the sets and the words beside them
     /// into the world (32768 blocks, a 7.6 MB text). A map whose value is a [`MapValue::Record`] (`parcelsMap`) has its nodes typed as
-    /// [`Kind::RecordNode`]: the value is carried by value, never as a pointer of the originator (owner run 2026-10-18, pre4: a street
+    /// [`Kind::RecordNode`]: the value is carried by value, never as a pointer of the originator (owner run 2026-10-18: a street
     /// over town land had 42 parcels whose untyped nodes left 126 pointers of their face vectors unresolved, and the originator refused
     /// its own text). Returns the sorted keys line (with each set's keys for the id maps) and the entries' value bytes (from +0x20) in
     /// key order.

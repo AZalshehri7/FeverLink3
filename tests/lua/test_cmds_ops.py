@@ -117,7 +117,7 @@ function NEW(typeName)
       -- the real engine (seen in every real game): Line.vehicleInfo is typed; a plain table is refused with this message. An object
       -- of its type is taken without a word and changes nothing: the engine derives the member itself (no base game script writes it,
       -- the line manager sends a fresh api.type.Line.new() with only stops, customFilters and reservationPriority set; the owner's
-      -- live test of 0.2.0-pre5, 2026-10-18 22:11: every line edit "does not rebuild equal at Line.vehicleInfo.transportModes.9",
+      -- live test of 2026-10-18, 22:11: every line edit "does not rebuild equal at Line.vehicleInfo.transportModes.9",
       -- with no refusal of the write, which is what a write the engine drops reads back as)
       if OPS.realVehicleInfo and typeName == "Line" and k == "vehicleInfo" then
         if not OBJECTS[v] then error("bad argument #2 to '?' (const LineVehicleInfo expected, got no value)") end
@@ -1331,7 +1331,7 @@ class LineEditTest(OpsBase):
     """A line edit made in the line window (the UI hook's path), with the engine's real ways: Line.vehicleInfo is a typed
     LineVehicleInfo the engine hands out as a copy (COPIES; or itself) and derives itself (a write of one changes nothing), and its
     transportModes is a map keyed by api.type.enum.TransportMode (PERSON 0, BUS 3, AIRCRAFT 9, SMALL_AIRCRAFT 11, ...). Friend test
-    2026-10-16 and the owner's live test of 0.2.0-pre5 (2026-10-18): every line edit with a mode on came back "does not rebuild
+    2026-10-16 and the owner's live test of 2026-10-18: every line edit with a mode on came back "does not rebuild
     equal at Line.vehicleInfo.transportModes.<that mode>". The member is derived data now: it neither travels nor is compared."""
     COPIES = True
 
@@ -1378,7 +1378,7 @@ class LineEditTest(OpsBase):
         self.assertIn("terminal=2", self.A.snapshot())
 
     def edits_of_a_line_whose_engine_derived_modes_are_on(self):
-        # The owner's live test of 0.2.0-pre5 (2026-10-18 22:11): the line window copies the line's component, whose vehicleInfo
+        # The owner's live test of 2026-10-18 (22:11): the line window copies the line's component, whose vehicleInfo
         # the engine derived (AIRCRAFT 9 on), and every edit was REFUSED with "does not rebuild equal at
         # Line.vehicleInfo.transportModes.9": the rebuilt Line.new() kept the engine's own vehicleInfo. The member is derived data
         # now: it neither travels nor is compared, and the stops, filters and priority still are, exactly.
@@ -1428,7 +1428,7 @@ class LineEditTest(OpsBase):
         self.agree("the worlds stay equal: no resync needed")
         self.assertIn("command makeLineUpdateCmd is " + NOWHERE +
                       "argument 2: stop 2 waypoint 1: network entity 80 is neither a segment, a node nor a construction", self.B.log())
-        self.assertIn("[FeverLink3] Your line update was not applied: it cannot be shared with the other players", self.hud_text(self.B))
+        self.assertIn("Your line update could not be shared with the other players, so it was not applied", self.hud_text(self.B))
         self.assertNotIn("Your line update", self.hud_text(self.A), "a line for this player alone")
         # an encoder that raises (an object that throws when it is read) is refused, not passed to the engine
         self.B.L.execute("EDITED = nil")

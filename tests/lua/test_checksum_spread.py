@@ -97,7 +97,7 @@ class TwoGames(unittest.TestCase):
 
 
 class TwoSimulationStatesTest(TwoGames):
-    """The real game shares the steps of one game between two simulation Lua states (owner's live test of 0.2.0-pre5, 2026-10-18,
+    """The real game shares the steps of one game between two simulation Lua states (owner's live test of 2026-10-18,
     22:08:51: round 20 read its chunks at t=13300200, 13300800, 13301000, 13301600, ... two steps in four, 37 of 38 late by 144400 ms in
     all; an action was applied at its stamp at a step between them, by the other state). Before the fix the round lived in the module
     table of the state that began it. Each game here splits its steps the way the live log shows (two steps in one state, two in the

@@ -150,7 +150,8 @@ impl Harness {
                 | HostOutput::ResyncRequested { .. }
                 | HostOutput::ResyncProgress { .. }
                 | HostOutput::SourceSave { .. }
-                | HostOutput::ResyncFailed { .. } => {}
+                | HostOutput::ResyncFailed { .. }
+                | HostOutput::Report(_) => {}
             }
         }
     }
@@ -167,7 +168,7 @@ impl Harness {
                 }
                 PlayerOutput::Log(line) => self.players.get_mut(&c).unwrap().log.push(line),
                 PlayerOutput::Rejected(r) => self.players.get_mut(&c).unwrap().reject = Some(r),
-                PlayerOutput::Welcomed(_) | PlayerOutput::SaveReceived { .. } => {}
+                PlayerOutput::Welcomed(_) | PlayerOutput::SaveReceived { .. } | PlayerOutput::Report(_) => {}
             }
         }
     }
@@ -277,6 +278,7 @@ fn host_only_kinds_from_a_player_are_dropped_and_never_relayed() {
         resync: None,
         mod_warnings: Vec::new(),
         stalled: Vec::new(),
+        loading: Vec::new(),
     };
     h.player_game(a, MessageKind::Session, &json(&state));
     let load = ResyncLoadMessage { id: 1, name: "evil".into(), sha256: "00".into() };
@@ -1202,6 +1204,7 @@ fn player_ignores_frames_not_from_the_host_and_messages_before_welcome() {
         resync: None,
         mod_warnings: Vec::new(),
         stalled: Vec::new(),
+        loading: Vec::new(),
     };
     let frame = other.seal(MessageKind::Session.into(), &json(&state));
     h.players.get_mut(&a).unwrap().session.frame_received(&frame);

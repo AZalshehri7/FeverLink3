@@ -10,8 +10,10 @@ mod lockstep;
 pub mod messages;
 pub mod mods;
 mod names;
+pub mod notices;
 mod player;
 mod policy;
+pub mod report;
 mod resume;
 mod resync;
 mod roster;
@@ -28,6 +30,10 @@ pub use mods::{ModDifference, ModEntry, ModFingerprint, ModTags};
 pub use names::Names;
 pub use player::{PlayerOutput, PlayerSession, PlayerState, ResumeTicket};
 pub use policy::{ChecksumPolicy, ChecksumPolicyConfig};
+pub use report::{
+    CollectedPart, CollectedReport, HostReportEvent, PlayerReportEvent, ReportAskMessage, ReportBusyMessage,
+    ReportLimits, ReportRequestMessage, ReportRound,
+};
 pub use resync::{normalize_sha256, sha256_hex, ChunkError, IncomingSave, ReceivedSave, ResyncLimits, ResyncState};
 pub use roster::{ConnectionState, RosterEntry};
 pub use verdict::{Verdict, VerdictBook, VerdictOutcome, VERDICTS_KEPT};

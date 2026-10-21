@@ -1,14 +1,22 @@
--- FeverLink3 in-game window: lobby (host or join), status, player list and chat.
+-- FeverLink3 in-game interface: the game bar icon, its pop-up, and the window (start screen; in a session the tabs Players,
+-- Chat and Host).
 --
--- ENGINE-BOUND. Everything with a rule in it (roster, history, status text, the snapshot and outbox files) is in
--- feverlink3_hud.lua and is tested; this file draws that model with the game's react toolkit. The lobby talks to
--- the native module, which runs the session inside the game: commands go out as lines of ctl_cmd.log, the answer
--- is ctl_status.txt (see launcher/src/live.rs). The names of the toolkit calls come from MPFever (MIT,
--- mpfever_ui.script.lua and mpfever_menu.lua); the ones not yet seen working in a game are marked.
+-- ENGINE-BOUND. Everything with a rule in it (roster, history, status line, icon colour, notices, the snapshot and outbox files)
+-- is in feverlink3_hud.lua and is tested; this file draws that model with the game's react toolkit. The lobby talks to the
+-- native module, which runs the session inside the game: commands go out as lines of ctl_cmd.log, the answer is
+-- ctl_status.txt (see launcher/src/live.rs).
 --
--- Registered through feverlink3_entry.res.lua (react-plugin on ModEntryPointExtension; finding from MPFever (MIT):
--- the plugin is mounted once for the whole UI session). The chat talks to the bridge through two files in the
--- session folder, never directly: the bridge owns the file link.
+-- Documented calls only (owner, 2026-10-21; tf3-docs reference/base): builtin widgets (scripts/builtin: Window, BoxLayout,
+-- Component, TextView, ImageView, Button, TextInputField, TabWidget, TabWidgetChild, ProgressBar), react hooks
+-- (scripts/react: RegisterRecipe, RegisterWrapperRecipe, RegisterPluginRecipe, useState, useSelfRef, onStep, onStepTimer,
+-- Meta fields class / tooltip / styleSheet, ReactNodeRef getPosition), styleutil.makeStyle (gui/main/styleutil: color, size),
+-- game_react_globals.getDefaultWindowApi (gui/main/game_react_globals), WindowAPI addSingletonWindow / addWindow /
+-- removeAllWindows, popover_react_util.PopoverWindow (gui/main/popover_react_util), GameBarInfoDisplayExtension
+-- (gui/game_bar/game_bar_widgets). Style class names are the base game's (gui/main/default.css.lua: primary, secondary,
+-- error-tape; font-scale-*). Marked "UNPROVEN" below: what was not yet seen in a real game.
+--
+-- Registered through feverlink3_entry.res.lua (react-plugin on GameBarInfoDisplayExtension). The chat talks to the bridge
+-- through two files in the session folder, never directly: the bridge owns the file link.
 
 local okC, C = pcall(ug_require, "feverlink3_common.lua")
 if not okC then C = ug_require("feverlink3::/feverlink3_common.lua") end
@@ -25,7 +33,8 @@ end
 
 local log = C.logger("ui")
 local M = {}
-local U = { model = nil, outbox = nil, ctl = nil, ctlVersion = nil, cmd = nil }
+-- rev counts changes of ctl or model; every recipe re-renders when it differs from what it drew
+local U = { model = nil, outbox = nil, ctl = nil, cmd = nil, rev = 0 }
 
 local CTL_STATUS = "ctl_status.txt"
 local CTL_CMD = "ctl_cmd.log"
@@ -47,6 +56,15 @@ local function pollCtl()
 	U.ctl = s
 	return true
 end
+
+-- One throttled refresh for every recipe (bar, pop-up, window). The step timer is not guaranteed to fire while the game is
+-- paused, so the window also drives it from onStep (every interface frame); Hud.newTicker keeps it to once per 0.5 s.
+U.refresh = Hud.newTicker(0.5, C.clock, function()
+	if Hook then Hook.devPoll() end
+	local a = poll()
+	local b = pollCtl()
+	if a or b then U.rev = U.rev + 1 end
+end)
 
 -- `host` / `join` carry this game's mods and build for the join's comparison (docs/PROTOCOL.md, "Mod list"); read at
 -- the click, so a mod installed meanwhile counts. getBuildVersion() is documented (tf3-docs reference/api/main.html).
@@ -74,75 +92,70 @@ local function send(text)
 	return Hud.sendChat(C, outbox(), text)
 end
 
+local function nowTime()
+	local ok, t = pcall(C.time)
+	return ok and t or nil
+end
+
+-- The window's state: what the controller says, or why there is nothing to say
+local function windowState(ctl)
+	if ctl and ctl.state then return ctl.state end
+	if not C.LIVE then return "launcher" end   -- started by the feverlink3 launcher (developer mode): no in-game controller
+	if U.firstSeen and C.clock() - U.firstSeen > 15 then return "missing" end
+	return "starting"
+end
+
 -- ---- drawing
 
-local WIDTH = 560 -- width of the window's content
+local WIDTH = 480      -- the window's fixed content width, every state (audit 2026-10-21: the width changed per state, title clipped)
+local POP_W = 340      -- the pop-up's content width
+local MOD = "feverlink3::/"   -- <modId>::/path, a file in this mod's content/ (tf3-docs guides/mod-structure)
+local COLOR = {
+	info = { 0.85, 0.85, 0.85, 1 }, warn = { 0.855, 0.647, 0.125, 1 }, error = { 0.94, 0.45, 0.45, 1 },
+	green = { 0.18, 0.69, 0.29, 1 }, yellow = { 0.95, 0.76, 0.19, 1 }, red = { 0.94, 0.45, 0.45, 1 }, white = { 1, 1, 1, 1 },
+}
 
--- What a sync round is doing, in words (ctl.sync = { phase, done?, total?, note? } from the controller; absent when none runs).
--- `host` says whose window it is: the players' games stand still while the host's world is prepared, sent and loaded, and
--- without a word about it that looks like a hang.
-local function syncText(sync, host)
-	if type(sync) ~= "table" then return nil end
-	local pct = nil
-	if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
-		pct = math.floor(100 * sync.done / sync.total)
-	end
-	local phase = sync.phase
-	if phase == "pausing" then
-		return host and "Syncing: stopping every game at the same moment..." or "Syncing: the host is stopping every game at the same moment..."
-	elseif phase == "saving" then
-		return host and "Syncing: saving your world..." or "Syncing: the host is saving its world..."
-	elseif phase == "sending" then
-		local what = host and "Sending your world to the players" or "Receiving the host's world"
-		-- sync.note: what a transfer over several Steam connections says about itself ("7 connections, 6.9 MB/s")
-		local note = (type(sync.note) == "string" and sync.note ~= "") and (" (" .. sync.note .. ")") or ""
-		return "Syncing: " .. what .. (pct and (": " .. pct .. "%") or "...") .. note
-	elseif phase == "loading" then
-		return host and "Syncing: the players are loading your world..." or "Syncing: loading the host's world. The game reloads and the window closes; open it again afterwards."
-	elseif phase == "verifying" then
-		return "Syncing: checking that the worlds match..."
-	end
-	return "Syncing..."
-end
-
--- A join request in the host's window (ctl.invites.requests[i] = { id, name, steam? }): the Steam name Steam gave for the
--- account that asked (the friend cannot choose it), and the name its game sent when that differs.
-local function requestLabel(r)
-	if type(r) ~= "table" then return nil end
-	local steam = (type(r.steam) == "string" and r.steam ~= "") and r.steam or nil
-	local name = (type(r.name) == "string" and r.name ~= "") and r.name or nil
-	if steam and name and name ~= steam then return steam .. " (" .. name .. ") wants to join" end
-	return tostring(steam or name or "A Steam friend") .. " wants to join"
-end
-
--- How many things wait for this player in the window: join requests (host) and an invite from Steam (friend).
-local function askCount(ctl)
-	if type(ctl) ~= "table" then return 0 end
-	local n = 0
-	if type(ctl.invites) == "table" and type(ctl.invites.requests) == "table" then n = n + #ctl.invites.requests end
-	if type(ctl.invite) == "table" then n = n + 1 end
-	return n
-end
-
-local function setup(react, builtin)
+local function setup(react, builtin, X)
 	local V = builtin.type.Orientation.Vertical
 	local H = builtin.type.Orientation.Horizontal
-	local function text(s, class, width)
-		return builtin.TextView{ meta = { class = class or "font-scale-title-4" }, text = s, width = width or WIDTH }
+	-- styleutil.makeStyle: documented keys color and size only; nil when the module is missing (then the game's default look)
+	local styles = {}
+	local function style(key, t)
+		if not X.styleutil then return nil end
+		if styles[key] == nil then
+			local ok, s = pcall(X.styleutil.makeStyle, t)
+			styles[key] = ok and s or false
+		end
+		return styles[key] or nil
 	end
-	local function gap() return text(" ", "font-scale-annotation") end
-	local function heading(s) return text(s, "font-scale-title-2") end
-	local function section(s) return text(s, "font-scale-title-3") end
-	local function note(s) return text(s, "font-scale-body") end
+	local function tinted(level, alpha)
+		local c = COLOR[level] or COLOR.info
+		local a = math.floor((alpha or 1) * 10 + 0.5) / 10
+		return style("c:" .. tostring(level) .. ":" .. a, { color = { c[1], c[2], c[3], a } })
+	end
+	-- two text sizes only (audit: several sizes of small grey text): body and heading
+	local function text(s, level, alpha, class)
+		return builtin.TextView{ meta = { class = class or "font-scale-title-4", styleSheet = level and tinted(level, alpha) or nil }, text = s }
+	end
+	local function heading(s, level) return text(s, level, nil, "font-scale-title-2") end
 	local function box(orientation, children) return builtin.BoxLayout{ orientation = orientation, children = children } end
 	local function column(children) return builtin.Component{ layout = box(V, children) } end
-	-- kind: "primary" (the main action), "secondary" (default) or "negative" (stops something)
-	local function button(label, onClick, kind, width)
-		return builtin.Button{
-			meta = { class = kind or "secondary" },
-			content = text(label, "font-scale-title-4", width or WIDTH),
-			onClick = onClick,
-		}
+	-- a column of a fixed width and its content's height: size { w, -1 }, -1 = "not fixed" on that axis, the way the game sizes
+	-- its own columns (gui/entity_window/industry_react_util.tl: a Component with makeStyle{ size = { w, -1 } } around a
+	-- BoxLayout). An empty spacer(WIDTH, 1) row did not hold the window's width (UI run 2026-10-21). UNPROVEN in the real game.
+	local function fixedColumn(w, children)
+		return builtin.Component{ meta = { styleSheet = style("s:" .. w .. "x-1", { size = { w, -1 } }) }, layout = box(V, children) }
+	end
+	-- an empty component of a fixed size (the gaps between rows; the pop-up's width)
+	local function spacer(w, h)
+		return builtin.Component{ meta = { styleSheet = style("s:" .. w .. "x" .. h, { size = { w, h } }) }, layout = box(H, {}) }
+	end
+	local function gap() return spacer(1, 8) end
+	-- kind: "primary" (the one main action of a screen), "secondary" (default) or "negative" (Leave, Stop, Kick, Refuse): the
+	-- base game's red "error-tape" look (gui/main/default.css.lua), a filled red button (UNPROVEN on a Button)
+	local function button(label, onClick, kind)
+		local class = kind == "negative" and "error-tape" or (kind or "secondary")
+		return builtin.Button{ meta = { class = class }, content = text(label), onClick = onClick }
 	end
 	local function field(placeholder, value, onTyping, displayOnly)
 		return builtin.TextInputField{
@@ -150,21 +163,148 @@ local function setup(react, builtin)
 			displayOnly = displayOnly, maxLength = 200,
 		}
 	end
-	-- "Anna  (host)" / "Ben  42 ms" / "Cleo  reconnecting"; width: narrower when a button sits next to the line
-	local function playerLine(p, me, width)
-		local line = "   " .. tostring(p.name)
-		if p.id == 0 then line = line .. "  (host)" end
-		if p.id == me then line = line .. "  (you)" end
-		if p.state == "away" then
-			line = line .. "  - reconnecting"
-		elseif p.rtt and p.rtt > 0 and p.id ~= me then
-			line = line .. "  - " .. tostring(p.rtt) .. " ms"
+	local function image(path, size)
+		return builtin.ImageView{ meta = { styleSheet = style("s:" .. size .. "x" .. size, { size = { size, size } }) }, path = path }
+	end
+	local function dot(colour) return image(MOD .. "feverlink3_dot_" .. colour .. ".tga", 12) end
+	-- Shared refresh for a recipe: re-render when ctl or the model changed, and once a second while a notice fades.
+	-- perFrame: also from onStep (the window must notice the host ending the session while the game is paused).
+	local function useLive(perFrame)
+		local drawn = react.useState("")
+		local function drive()
+			-- the stamp applies of the window commands the hook holds: their callbacks run as soon as the bridge has answered
+			if Hook and Hook.poll then pcall(Hook.poll) end
+			U.refresh()
+			local now = nowTime()
+			local fading = now and Hud.latestNotice(U.model, now, Hud.NOTICE_SHOWN_S) and now or ""
+			local key = U.rev .. ":" .. tostring(fading)
+			if drawn:old() ~= key then drawn:set(key) end
 		end
-		return text(line, nil, width)
+		react.onStepTimer(drive, 0.5)   -- onStepTimer(fn, intervalSeconds?, jitter?) (tf3-docs base/scripts/react)
+		if perFrame and react.onStep then react.onStep(drive) end
 	end
 
+	local function windowApi()
+		if not X.globals then return nil end
+		local ok, api = pcall(X.globals.getDefaultWindowApi)
+		return ok and api or nil
+	end
+
+	-- one player line: coloured dot, name, (host) / (you), the ping ("12 ms") or "reconnecting"; Kick next to it for the host
+	local function playerRow(p, ctl, canKick)
+		local colour, ping = Hud.playerState(p, ctl.me, U.model)
+		local label = tostring(p.name) .. (p.id == 0 and "  (host)" or "") .. (p.id == ctl.me and "  (you)" or "")
+		local children = { dot(colour), text("  " .. label) }
+		if ping ~= "" then children[#children + 1] = text("   " .. ping, ping == "reconnecting" and "warn" or "info") end
+		if canKick and p.id ~= 0 and p.id ~= ctl.me then
+			local id = p.id
+			children[#children + 1] = text("   ")
+			children[#children + 1] = button("Kick", function() command("kick", { id = id }) end, "negative")
+		end
+		return box(H, children)
+	end
+
+	-- the join requests the host must answer, each with Let in / Refuse; letIn: the button's kind (the one primary of the pop-up,
+	-- a secondary in the window, whose primary is the start or the chat's Send)
+	local function requestRows(ctl, add, letIn)
+		if ctl.state ~= "hosting" or type(ctl.invites) ~= "table" then return end
+		for _, r in ipairs(ctl.invites.requests or {}) do
+			local id = r.id
+			add(text(Hud.requestLabel(r), "warn"))
+			add(box(H, {
+				button("Let in", function() command("admit", { id = id }) end, letIn),
+				text("  "),
+				button("Refuse", function() command("refuse", { id = id }) end, "negative"),
+			}))
+		end
+		if ctl.result and (ctl.result.kind == "admit" or ctl.result.kind == "refuse") then add(text(tostring(ctl.result.message))) end
+	end
+
+	local function chatInput(typed, add, kind)
+		add(field("Type a message", typed:old(), function(v) typed:set(v) end))
+		add(button("Send", function() if send(typed:old()) then typed:set("") end end, kind))
+	end
+
+	-- "Report a problem": the note, the button, then what the controller says (ctl.report, launcher/src/live/report.rs). The
+	-- words are feverlink3_text.lua's T.REPORT; the note lives in U, not in a hook, because the pop-up shows this only while red.
+	local function texts()
+		if U.T == nil then
+			local ok, T = pcall(ug_require, "feverlink3_text.lua")
+			if not ok then ok, T = pcall(ug_require, "feverlink3::/feverlink3_text.lua") end
+			U.T = ok and type(T) == "table" and T or false
+		end
+		return U.T
+	end
+
+	-- the automatic update's line (launcher/src/autoupdate.rs): downloading, restart to finish, failed (T.UPDATE's words)
+	local function updateRow(add, ctl)
+		local T = texts()
+		if not (T and T.updateLine and type(ctl) == "table") then return end
+		local line, level = T.updateLine(ctl.update)
+		if line then add(text(line, level)) end
+	end
+
+	-- this run must restart before a session (the module refuses Host and Join too)
+	local function mustRestart(ctl)
+		return type(ctl) == "table" and type(ctl.update) == "table" and ctl.update.restart == true
+	end
+
+	local function reportRows(add, ctl)
+		texts()
+		local R = U.T and U.T.REPORT or { button = "Report a problem", note = "What were you doing? (optional)", explain = "", contents = "" }
+		local r = type(ctl) == "table" and type(ctl.report) == "table" and ctl.report or nil
+		add(field(R.note, U.reportNote or "", function(v) U.reportNote = v end))
+		if not (r and (r.state == "making" or r.state == "collecting")) then
+			add(button(R.button, function() command("report", withMods({ note = U.reportNote or "" })) end))
+		end
+		if not r then add(text(R.explain)); return end
+		add(text(tostring(r.message or ""), r.state == "failed" and "error" or nil))
+		if r.state == "done" and type(r.contents) == "table" then
+			add(text(R.contents))
+			for i, line in ipairs(r.contents) do if i <= 12 then add(text("  " .. tostring(line))) end end
+			if #r.contents > 12 then add(text("  ... and " .. (#r.contents - 12) .. " more")) end
+		end
+	end
+
+	local function openWindow() end   -- set below, once the window recipe exists
+
+	-- ---- the pop-up of the bar icon (popover_react_util.PopoverWindow)
+	local Popover = react.RegisterRecipe("FeverLink3Popover", function(params)
+		useLive(false)
+		local typed = react.useState("")
+		local ctl, m = U.ctl, U.model
+		local rows = { spacer(POP_W, 1) }
+		local function add(node) rows[#rows + 1] = node end
+		local now = nowTime()
+		add(text(Hud.statusLine(ctl, m), Hud.iconState(ctl, m, now) == "red" and "error" or nil, nil, "font-scale-title-3"))
+		local n, age = Hud.latestNotice(m, now, Hud.NOTICE_SHOWN_S)
+		-- the newest bridge notice, fading over its last seconds
+		if n then add(text(n.text, n.level, age > 7 and math.max(0.3, (Hud.NOTICE_SHOWN_S - age) / 3) or 1)) end
+		updateRow(add, ctl)
+		if Hud.iconState(ctl, m, now) == "red" then add(gap()); reportRows(add, ctl) end
+		local st = windowState(ctl)
+		if st == "hosting" or st == "joined" then
+			add(gap())
+			for _, p in ipairs(ctl.players or {}) do add(playerRow(p, ctl, false)) end
+			requestRows(ctl, add, "primary")
+			if m and C.ACTIVE then
+				add(gap())
+				for _, line in ipairs(Hud.chatLines(m, 3)) do add(text(line)) end
+				chatInput(typed, add, "secondary")
+			end
+		end
+		add(gap())
+		add(button("Open window", function()
+			if params and params.close then params.close() end
+			openWindow()
+		end, (st == "hosting" or st == "joined") and "secondary" or "primary"))
+		-- a layout itself: PopoverWindowContent refuses a Component ("Recipe child must be a layout", real game 2026-10-21)
+		return box(V, rows)
+	end)
+
+	-- ---- the window
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
-		local tick = react.useState(0)
+		useLive(true)
 		local typed = react.useState("")
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")
@@ -172,241 +312,230 @@ local function setup(react, builtin)
 		local mbIn = react.useState(32)
 		local modeIn = react.useState("reliable")
 		local showTest = react.useState(false)
-		-- Two drivers share one throttle: the step timer, and the per-frame onStep, which still runs while the game is
-		-- paused (a guest's window must notice the host ending the session then too).
-		if not U.refresh then
-			U.refresh = Hud.newTicker(0.5, C.clock, function()
-				if Hook then Hook.devPoll() end
-				local a = poll()
-				local b = pollCtl()
-				return a or b
-			end)
-		end
-		local refresh = U.refresh
-		local function onRefresh()
-			-- the stamp applies of the window commands the hook holds: their callbacks run as soon as the bridge has answered
-			if Hook and Hook.poll then pcall(Hook.poll) end
-			if refresh() then tick:set(tick:old() + 1) end
-		end
-		react.onStepTimer(onRefresh, 0.5)   -- onStepTimer(fn, intervalSeconds?, jitter?) (tf3-docs base/scripts/react)
-		if react.onStep then react.onStep(onRefresh) end
+		local tab = react.useState("players")
 		local ctl = U.ctl
+		local m = U.model
 		local rows = {}
 		local function add(node) rows[#rows + 1] = node end
 		local function myName() return nameIn:old() ~= "" and nameIn:old() or tostring(ctl and ctl.name or "") end
-		-- canRemove (the host's list): a red "X  Kick" button next to every player but the host, and under the list what the
-		-- last one did ("Pat was removed", or why it was refused)
-		local function players(me, canRemove)
-			add(section("Players"))
-			for _, p in ipairs(ctl.players or {}) do
-				if canRemove and p.id ~= 0 and p.id ~= me then
-					local id = p.id
-					add(box(H, {
-						playerLine(p, me, WIDTH - 140),
-						button("X  Kick", function() command("kick", { id = id }) end, "negative", 120),
-					}))
-				else
-					add(playerLine(p, me))
-				end
-			end
-			if canRemove and ctl.result and ctl.result.kind == "kick" and ctl.result.message then
-				add(note(tostring(ctl.result.message)))
-			end
-		end
+		local state = windowState(ctl)
+		-- every pending invite shows its Join row: one that waits for a world to start by itself (auto) used to be hidden, so a
+		-- friend whose auto-start could not run saw nothing (friend test 2026-10-21)
+		local inviteJoin = ctl and type(ctl.invite) == "table"
 
-		local state = ctl and ctl.state
-		if not state then
-			if not C.LIVE then
-				state = "launcher"   -- started by the feverlink3 launcher (developer mode): no in-game controller
-			elseif U.firstSeen and C.clock() - U.firstSeen > 15 then
-				state = "missing"
-			else
-				state = "starting"
-			end
-		end
-		if state == "launcher" then
-			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
-		elseif state == "missing" then
-			add(heading("FeverLink3 is not running"))
-			add(text("The helper file winhttp.dll is not next to TransportFever3.exe. Close the game, copy winhttp.dll into the game's folder (see HOW-TO-PLAY.txt) and start the game again from Steam."))
-		elseif state == "starting" then
-			add(text("Starting the multiplayer module..."))
-		elseif state == "idle" or state == "failed" then
-			add(heading("Play together"))
-			if ctl.notice then
-				-- how the last session ended by itself: the world was closed, the host ended it or removed this player
-				add(text(tostring(ctl.notice), "font-scale-title-3"))
-			elseif state == "failed" then
-				add(text("Could not connect: " .. tostring(ctl.message or "unknown problem"), "font-scale-title-3"))
-			end
-			if state ~= "failed" then
-				add(note("One player hosts and sends a code; the others join with it."))
-			end
-			add(gap())
-			add(section("Your name"))
-			add(field("name", myName(), function(v) nameIn:set(v) end))
-			add(gap())
-			add(button("Host a game", function() command("host", withMods({ name = myName() })) end, "primary"))
-			add(gap())
-			add(section("Join a friend's game"))
-			add(field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end))
-			add(button("Join", function() command("join", withMods({ name = myName(), code = codeIn:old() })) end, "primary"))
-
-			-- Steam connection test: can two players reach each other through Steam, without any router setup?
-			-- Folded away by default (it shows the player's Steam ID).
+		-- the troubleshooting tools, folded away (the Steam test shows the player's Steam ID)
+		local function troubleshooting()
 			local st = ctl.steam
+			reportRows(add, ctl)
 			add(gap())
-			add(button(showTest:old() and "Hide the connection test" or "Connection test...", function() showTest:set(not showTest:old()) end, "secondary"))
-			if showTest:old() then
-			add(section("Steam connection test"))
+			-- the automatic update's switch (stored by the module in %LOCALAPPDATA%\FeverLink3\settings.txt, default on)
+			local T, u = texts(), ctl.update
+			if T and type(u) == "table" then
+				local on = u.auto ~= false
+				add(button(on and T.UPDATE.on or T.UPDATE.off, function() command("autoupdate", { on = not on }) end))
+				add(text(u.official == false and T.UPDATE.dev or T.UPDATE.explain))
+				if ctl.result and ctl.result.kind == "autoupdate" and ctl.result.ok == false then add(text(tostring(ctl.result.message), "warn")) end
+				add(gap())
+			end
+			add(text("Steam connection test", nil, nil, "font-scale-title-3"))
 			if st and st.id then
-				add(note("Your Steam ID (send it to a friend, who pastes it below):"))
+				add(text("Your Steam ID (a friend pastes it below):"))
 				add(field("your Steam ID", tostring(st.id), function() end, true))
 			else
-				add(note("Steam: " .. tostring(st and st.state or "unknown")))
+				add(text("Steam: " .. tostring(st and st.state or "unknown")))
 			end
-			add(field("paste the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
+			add(field("the other player's Steam ID", steamIn:old(), function(v) steamIn:set(v) end))
 			add(button("Test the connection", function() command("steamtest", { id = steamIn:old() }) end))
-			-- Speed test: how long would the save of a synced game take over Steam? Both players keep this window open.
 			add(gap())
-			add(section("Speed test"))
-			add(note("Sends this much data each way. 80 MB is about the size of a save that has to cross."))
+			-- Speed test: how long would the save of a synced game take over Steam? Both players keep this window open.
+			add(text("Speed test (data sent each way; a synced save is about 80 MB)", nil, nil, "font-scale-title-3"))
 			local sizes = {}
 			for _, mb in ipairs(C.SPEED_CHOICES) do
 				local chosen = (C.speedChoice(mbIn:old()) == mb)
-				sizes[#sizes + 1] = button((chosen and "[ " or "") .. mb .. " MB" .. (chosen and " ]" or ""),
-					function() mbIn:set(mb) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_CHOICES) - 10)
+				sizes[#sizes + 1] = button((chosen and "[ " or "") .. mb .. " MB" .. (chosen and " ]" or ""), function() mbIn:set(mb) end)
 			end
 			add(box(H, sizes))
-			add(note("How the data travels: Steam's reliable stream, our own datagram protocol, both one after the other, the reliable stream on 1, 2 and 4 connections at once, or Auto (scaled): the way a synced save is sent, over several Steam connections at once (as many as the size needs)."))
 			local modes = {}
-			for _, m in ipairs(C.SPEED_MODES) do
-				local chosen = (C.speedMode(modeIn:old()) == m)
-				local label = C.SPEED_MODE_LABELS[m]
-				modes[#modes + 1] = button((chosen and "[ " or "") .. label .. (chosen and " ]" or ""),
-					function() modeIn:set(m) end, chosen and "primary" or "secondary", math.floor(WIDTH / #C.SPEED_MODES) - 10)
+			for _, mode in ipairs(C.SPEED_MODES) do
+				local chosen = (C.speedMode(modeIn:old()) == mode)
+				local label = C.SPEED_MODE_LABELS[mode]
+				modes[#modes + 1] = button((chosen and "[ " or "") .. label .. (chosen and " ]" or ""), function() modeIn:set(mode) end)
 			end
 			add(box(H, modes))
 			add(button("Run the speed test", function() command("steamtest", C.speedParams(steamIn:old(), mbIn:old(), modeIn:old())) end))
 			if st and st.speed then
-				for _, line in ipairs(C.speedLines(st.speed)) do add(note(line)) end
+				for _, line in ipairs(C.speedLines(st.speed)) do add(text(line)) end
 			end
-			if st and st.note then add(note(tostring(st.note))) end
+			if st and st.note then add(text(tostring(st.note))) end
 			if st and st.test then
 				local t = st.test
 				local line = "Test: " .. tostring(t.state) .. ", answers " .. tostring(t.pongs)
 				if t.rtt then line = line .. ", last round trip " .. tostring(t.rtt) .. " ms" end
 				if t.route and t.route ~= "" then line = line .. ", " .. tostring(t.route) end
-				add(note(line))
+				add(text(line))
 			end
-			if st and st.pings and st.pings > 0 then add(note("Pings received from other players: " .. tostring(st.pings))) end
+			if st and st.pings and st.pings > 0 then add(text("Pings received from other players: " .. tostring(st.pings))) end
+		end
+
+		local function playersTab(host)
+			local list = {}
+			for _, p in ipairs(ctl.players or {}) do list[#list + 1] = playerRow(p, ctl, host) end
+			if host and ctl.result and ctl.result.kind == "kick" and ctl.result.message then list[#list + 1] = text(tostring(ctl.result.message)) end
+			list[#list + 1] = gap()
+			if host and not ctl.started then
+				list[#list + 1] = button("Start the session", function() command("start", {}) end, "primary")
+			elseif not host then
+				list[#list + 1] = button("Leave the session", function() command("leave", {}) end, "negative")
 			end
-		elseif state == "hosting" then
-			add(heading("You are hosting"))
-			add(note("Send this join code to the other players:"))
-			-- the game's text fields cannot copy, so the button puts the code on the clipboard (done by the module)
-			add(field("join code", tostring(ctl.code or ""), function() end, true))
-			add(button("Copy code", function() command("copy", {}) end, "secondary"))
-			if ctl.result and ctl.result.kind == "copy" then
-				add(note(tostring(ctl.result.ok and "Copied. Paste it into a message to your friend (Ctrl+V)." or ctl.result.message)))
-			end
-			if ctl.password then add(note("They also need the password.")) end
-			-- Steam invites: Steam's own invite window (Shift+Tab overlay); friends who accept join without a code. Friends who
-			-- click "Join game" in their Steam friends list are asked for here.
-			if type(ctl.invites) == "table" then
-				add(button("Invite friends (Steam)", function() command("invite", {}) end, "secondary"))
-				if ctl.result and ctl.result.kind == "invite" then add(note(tostring(ctl.result.message))) end
-				for _, r in ipairs(ctl.invites.requests or {}) do
-					local id = r.id
-					add(text(requestLabel(r), "font-scale-title-3"))
-					add(box(H, {
-						button("Let in", function() command("admit", { id = id }) end, "primary", math.floor(WIDTH / 2) - 10),
-						button("Refuse", function() command("refuse", { id = id }) end, "negative", math.floor(WIDTH / 2) - 10),
-					}))
-				end
-				if ctl.result and (ctl.result.kind == "admit" or ctl.result.kind == "refuse") then
-					add(note(tostring(ctl.result.message)))
-				end
-			end
-			add(gap())
-			players(ctl.me, true)
-			add(gap())
-			if ctl.started and ctl.resync and ctl.resync ~= "Idle" then
-				add(note("Sending your world to the players: " .. tostring(ctl.resync)))
-			end
-			if ctl.started then
-				add(button("Sync everyone to my world", function() command("resync", {}) end))
-			end
-			if ctl.started then
-				-- the speed buttons of the Session section pause and resume
-				add(button("Stop hosting", function() command("leave", {}) end, "negative"))
+			-- at the bottom, while the icon is green too: a player reports what it saw (the pop-up has it only while red)
+			list[#list + 1] = gap()
+			reportRows(function(node) list[#list + 1] = node end, ctl)
+			return column(list)
+		end
+
+		local function chatTab()
+			local list = {}
+			if m and C.ACTIVE then
+				for _, line in ipairs(Hud.chatLines(m, 10)) do list[#list + 1] = text(line) end
+				chatInput(typed, function(node) list[#list + 1] = node end, "primary")
 			else
+				list[#list + 1] = text("The chat opens once the session runs in this game.")
+			end
+			-- the bridge's system messages, apart from what players wrote
+			local notices = Hud.notices(m)
+			if #notices > 0 then
+				list[#list + 1] = gap()
+				list[#list + 1] = text("Events", nil, nil, "font-scale-title-3")
+				for i = math.max(1, #notices - 9), #notices do list[#list + 1] = text(notices[i].text, notices[i].level) end
+			end
+			return column(list)
+		end
+
+		local function hostTab()
+			local list = {}
+			local function put(node) list[#list + 1] = node end
+			-- the game's text fields cannot copy, so the button puts the code on the clipboard (done by the module)
+			put(text("Join code"))
+			put(field("join code", tostring(ctl.code or ""), function() end, true))
+			local tools = { button("Copy code", function() command("copy", {}) end) }
+			-- Steam invites: Steam's own invite window (Shift+Tab overlay); friends who accept join without a code
+			if type(ctl.invites) == "table" then
+				tools[#tools + 1] = text("  ")
+				tools[#tools + 1] = button("Invite friends (Steam)", function() command("invite", {}) end)
+			end
+			put(box(H, tools))
+			if ctl.result and (ctl.result.kind == "copy" or ctl.result.kind == "invite") then
+				local copied = ctl.result.kind == "copy" and ctl.result.ok ~= false
+				put(text(copied and "Copied. Paste it into a message (Ctrl+V)." or tostring(ctl.result.message or "")))
+			end
+			if ctl.password then put(text("They also need the password.")) end
+			put(gap())
+			if ctl.started then
+				put(button("Sync everyone to my world", function() command("resync", {}) end))
+			end
+			put(button("Stop the session", function() command("leave", {}) end, "negative"))
+			return column(list)
+		end
+
+		if state == "launcher" then
+			add(text("This game was started by the FeverLink3 launcher (developer mode); the session is managed there."))
+		elseif state == "missing" then
+			add(heading("FeverLink3 is not running", "error"))
+			add(text("winhttp.dll is not next to TransportFever3.exe. Close the game, copy it there (see HOW-TO-PLAY.txt) and start the game from Steam."))
+		elseif state == "starting" then
+			add(text("Starting the multiplayer module..."))
+		elseif state == "idle" or state == "failed" then
+			add(heading("Play together"))
+			updateRow(add, ctl)
+			if ctl.notice then
+				-- how the last session ended by itself: the world was closed, the host ended it or removed this player
+				add(text(tostring(ctl.notice), state == "failed" and "error" or "warn"))
+			elseif state == "failed" then
+				add(text("Could not connect: " .. tostring(ctl.message or "unknown problem"), "error"))
+			end
+			add(gap())
+			add(text("Your name"))
+			add(field("name", myName(), function(v) nameIn:set(v) end))
+			add(gap())
+			if mustRestart(ctl) then
+				-- the files on disk are another version than this game runs: no Host or Join until the restart
+				add(text(texts() and texts().UPDATE.restart or "Restart the game before you play together.", "warn"))
+			else
+				add(button("Host a game", function() command("host", withMods({ name = myName() })) end, inviteJoin and "secondary" or "primary"))
+				add(gap())
+				add(text("Or join with a code"))
 				add(box(H, {
-					button("Start the session", function() command("start", {}) end, "primary", math.floor(WIDTH / 2) - 10),
-					button("Stop hosting", function() command("leave", {}) end, "negative", math.floor(WIDTH / 2) - 10),
+					field("paste the join code here", codeIn:old(), function(v) codeIn:set(v) end),
+					text("  "),
+					button("Join", function() command("join", withMods({ name = myName(), code = codeIn:old() })) end),
 				}))
 			end
+			add(gap())
+			add(button(showTest:old() and "Hide troubleshooting" or "Troubleshooting", function() showTest:set(not showTest:old()) end))
+			if showTest:old() then troubleshooting() end
 		elseif state == "joining" then
 			-- a dropped link: the controller retries and the host catches this game up within its grace (no reload)
-			add(heading(ctl.reconnecting and ("Reconnecting (" .. tostring(tonumber(ctl.reconnectingS) or 0) .. " s)") or "Joining..."))
-			add(text(tostring(ctl.progress or "contacting the host"), "font-scale-title-3"))
+			add(heading(Hud.statusLine(ctl, m), "warn"))
+			add(text(tostring(ctl.progress or "contacting the host")))
 			add(gap())
 			add(button("Cancel", function() command("leave", {}) end, "negative"))
-		elseif state == "joined" then
-			add(heading("Connected"))
-			if ctl.started then
-				add(note("The session is running. Anyone can change the speed or chat; the host can sync everyone to their world."))
+		elseif state == "hosting" or state == "joined" then
+			local host = state == "hosting"
+			local sync = Hud.syncInfo(ctl.sync, host)
+			if sync then
+				-- one heading, a progress bar (when the step has a count) and the sentence of the step
+				add(heading("Syncing: " .. sync.step))
+				if sync.fraction then
+					add(builtin.ProgressBar{
+						meta = { styleSheet = style("s:bar", { size = { WIDTH, 20 } }) },
+						value = sync.fraction, label = math.floor(sync.fraction * 100) .. "%",
+					})
+				end
+				if sync.detail ~= "" then add(text(sync.detail)) end
+				if sync.after then add(text(sync.after, "warn")) end
 			else
-				add(note("Wait for the host to start the session. The host's world is sent to you and your game reloads into it."))
+				local colour = Hud.iconState(ctl, m, nowTime())
+				add(text(Hud.statusLine(ctl, m), colour == "red" and "error" or (colour == "yellow" and "warn" or nil), nil, "font-scale-title-3"))
 			end
+			requestRows(ctl, add, "secondary")
 			add(gap())
-			players(ctl.me)
-			add(gap())
-			add(button("Leave the session", function() command("leave", {}) end, "primary"))
+			local tabs = {
+				builtin.TabWidgetChild{ localKey = "players", value = "players", indicator = text("Players"), item = playersTab(host) },
+				builtin.TabWidgetChild{ localKey = "chat", value = "chat", indicator = text("Chat"), item = chatTab() },
+			}
+			if host then
+				tabs[#tabs + 1] = builtin.TabWidgetChild{ localKey = "host", value = "host", indicator = text("Host"), item = hostTab() }
+			end
+			local current = tab:old()
+			if current == "host" and not host then current = "players" end
+			add(builtin.TabWidget{ tabs = tabs, value = current, onValueChange = function(v) if v then tab:set(v) end end })
 		end
-		-- a join refused over mods (what differs from the host's game) and what the mod comparison could not do
+		-- the mods: only when something differs from the host's game (a refused join, or the session's warnings)
 		local modLines = Hud.modLines(ctl)
 		if #modLines > 0 then
 			add(gap())
-			add(note("Mods (they must match the host's world):"))
-			for _, line in ipairs(modLines) do add(note("   " .. line)) end
+			add(text("Mods (they must match the host's world):", "warn"))
+			for _, line in ipairs(modLines) do add(text("   " .. line)) end
 		end
-
-		-- an invite Steam handed to this game (a friend's "Join game" or an accepted invite) that did not start by itself
-		-- because this game is in a session: Join leaves it first
-		if ctl and type(ctl.invite) == "table" and not ctl.invite.auto then
+		-- an invite Steam handed to this game (a friend's "Join game" or an accepted invite) that did not start by itself:
+		-- this game is in a session (Join leaves it first), or it is free and waits for a loaded world (auto). TF3 has no
+		-- documented call to load a save from the main menu, so an invite accepted there waits until any world is loaded
+		-- (UNPROVEN in a two-PC Steam run); Join starts it now.
+		if inviteJoin then
+			local who = tostring(ctl.invite.host or "A friend")
 			add(gap())
-			add(section(tostring(ctl.invite.host or "A friend") .. " invited you through Steam"))
+			add(text(ctl.invite.auto and (who .. " invited you. Load any world and you join automatically")
+				or (who .. " invited you through Steam"), "warn"))
 			add(box(H, {
-				button("Join", function() command("accept_invite", {}) end, "primary", math.floor(WIDTH / 2) - 10),
-				button("Not now", function() command("dismiss_invite", {}) end, "secondary", math.floor(WIDTH / 2) - 10),
+				button("Join", function() command("accept_invite", {}) end, "primary"),
+				text("  "),
+				button("Not now", function() command("dismiss_invite", {}) end),
 			}))
-		end
-
-		-- the game side: status and chat, once the mod is part of a session
-		local m = U.model
-		if m and C.ACTIVE then
-			add(gap())
-			add(section("Session"))
-			add(note(Hud.statusText(m)))
-			for _, line in ipairs(Hud.chatLines(m, 12)) do add(note(line)) end
-			add(field("Type a message and press Send", typed:old(), function(v) typed:set(v) end))
-			add(button("Send", function()
-				if send(typed:old()) then typed:set("") end
-			end))
-		end
-		-- while a sync round runs: say so, first thing in the window
-		do
-			local st = ctl and ctl.state
-			local line = syncText(ctl and ctl.sync, st == "hosting")
-			if line then
-				table.insert(rows, 1, heading(line))
-			end
 		end
 		-- developer test button (FEVERLINK3_DEV=1 only): runs dev_click.lua from inside a click, where commands may be sent.
 		-- The first row, so that its place in the window does not depend on what the window shows.
 		if Hook and Hook.dev then
-			table.insert(rows, 1, button("DEV run", function() Hook.devClick() end, "secondary"))
+			table.insert(rows, 1, button("DEV run", function() Hook.devClick() end))
 		end
 		return builtin.Window{
 			title = "FeverLink3 Multiplayer",
@@ -416,77 +545,123 @@ local function setup(react, builtin)
 			movable = true,
 			closable = true,
 			onClose = wp.onClose,
-			content = column(rows),
+			content = fixedColumn(WIDTH, rows),
 		}
 	end)
 
-	-- the bar plugin: a button in the game bar that opens the window
-	local function open()
-		local okG, globals = pcall(ug_require, "::/gui/main/game_react_globals.tl")
-		local okA, api = false, nil
-		if okG and globals then okA, api = pcall(globals.getDefaultWindowApi) end
-		if not okA then api = nil end
+	openWindow = function()
+		local api = windowApi()
 		if not api then log("no window api"); return end
 		local okO, err = pcall(function()
 			api.addSingletonWindow(Window, { onClose = function() api.removeAllWindows(Window) end })
 		end)
 		if not okO then log("cannot open the window: " .. tostring(err)) end
 	end
+
+	-- the pop-up: popover_react_util.PopoverWindow in the window container, as TogglePopoverButton does it
+	-- (gui/main/popover_react_util.tl); our own button so that the icon can have the bar's size and change its colour.
+	-- It closes on a click outside; a click on the icon then must not open it again at once.
+	local function closePopover()
+		local api = windowApi()
+		if api and X.popover then pcall(api.removeAllWindows, X.popover.PopoverWindow) end
+		U.popoverOpen = false
+		U.popoverClosedAt = C.clock()
+	end
+	local function togglePopover(selfRef)
+		local api = windowApi()
+		if not api or not X.popover then openWindow(); return end   -- the documented fallback: the window
+		if U.popoverOpen then closePopover(); return end
+		if U.popoverClosedAt and C.clock() - U.popoverClosedAt < 0.3 then return end
+		local x, y = nil, nil
+		local okP, errP = pcall(function()
+			-- the icon's top centre: getPosition(gravityX, gravityY) answers in fractions of the screen (0.58, 0.99 in the real
+			-- game 2026-10-21), the same units as a window's initialX/initialY; the pop-up gets that point as its x, y
+			local pos = selfRef:get():getPosition(0.5, 0.0)
+			x, y = pos.x or pos[1], pos.y or pos[2]
+			log("pop-up: icon at " .. tostring(x) .. "," .. tostring(y))
+		end)
+		if not okP then log("pop-up: no icon position: " .. tostring(errP)) end
+		local okA, err = pcall(function()
+			api.removeAllWindows(X.popover.PopoverWindow)
+			api.addWindow(X.popover.PopoverWindow, "feverlink3", {
+				onClose = closePopover, x = x, y = y, windowTitle = "FeverLink3",
+				recipe = Popover, params = { close = closePopover },
+			})
+		end)
+		if okA then U.popoverOpen = true else log("cannot open the pop-up: " .. tostring(err)); openWindow() end
+	end
+
+	-- the bar plugin: one round icon in the bar's colour of the session state, the status line as its tooltip
 	return function()
-		-- the button follows the session: it says "syncing" while a round runs, and the window opens by itself when a round
-		-- begins. Guarded: if this recipe cannot hold state in this game build, the button stays as it was.
-		local okT, tick = pcall(react.useState, 0)
+		-- Guarded: if this recipe cannot hold state in this game build, the icon stays as it was drawn.
+		local okT, tick = pcall(react.useState, "")
 		if not okT then tick = nil end
+		local okR, selfRef = pcall(react.useSelfRef)
+		if not okR then selfRef = nil end
 		if tick then
 			pcall(function()
 				react.onStepTimer(function()
 					-- the bar is always there, the window not: held window commands get their stamp applies here too
 					if Hook and Hook.poll then pcall(Hook.poll) end
-					pollCtl()
-					local want = U.ctl and U.ctl.sync ~= nil
-					local text = want and syncText(U.ctl.sync, U.ctl.state == "hosting") or nil
-					if want ~= U.syncShown or text ~= U.syncText then
-						local began = want and not U.syncShown
-						U.syncShown, U.syncText = want, text
-						tick:set(tick:old() + 1)
-						if began then pcall(open) end
-					end
-					-- a new join request (host) or a Steam invite (friend) opens the window too: it waits for an answer there
-					local asks = askCount(U.ctl)
-					if asks > (U.asksShown or 0) then pcall(open) end
+					U.refresh()
+					local ctl = U.ctl
+					local key = Hud.iconState(ctl, U.model, nowTime()) .. "|" .. Hud.statusLine(ctl, U.model)
+					if key ~= tick:old() then tick:set(key) end
+					-- a sync round beginning, a new join request (host) or a Steam invite (friend) opens the window
+					local syncing = ctl ~= nil and ctl.sync ~= nil
+					if syncing and not U.syncShown then pcall(openWindow) end
+					U.syncShown = syncing
+					local asks = Hud.askCount(ctl)
+					if asks > (U.asksShown or 0) then pcall(openWindow) end
 					U.asksShown = asks
 				end, 0.5)
 			end)
 		end
-		-- the label of a button in the bar is cut off at the bottom by the bar's height, so the button is an icon like the
-		-- game's own (eye, music): "multiple persons" from the entity window's icons. While a round runs the percentage
-		-- sits next to it ("45%"); the words of the round are in the window.
-		local pct = nil
-		if U.syncShown and U.ctl and type(U.ctl.sync) == "table" then
-			local sync = U.ctl.sync
-			if type(sync.total) == "number" and sync.total > 0 and type(sync.done) == "number" then
-				pct = math.floor(100 * sync.done / sync.total) .. "%"
-			else
-				pct = "..."
+		local colour = Hud.iconState(U.ctl, U.model, nowTime())
+		local line = Hud.statusLine(U.ctl, U.model)
+		-- The click, as the game's own CheckBox and ToggleButton take theirs (gui/main/builtin.lua): react.onMouseEvent on this
+		-- recipe, a left press over the node, the toggle on its release inside it (selfRef:containsPosition). Documented in
+		-- tf3-docs reference base/scripts/react (onMouseEvent, containsPosition) and api/gui (Gui.Mouse.Event: button 0 = left,
+		-- Type.Pressed "over the component", Type.Released). No Button: builtin.css.lua pads every Button and ToggleButton 8 px
+		-- a side, more than the info row holds (real game 2026-10-21: the icon drew at 8 px or squashed at every size we gave).
+		if selfRef then
+			local function onMouse(evt)
+				if evt.button ~= 0 then return false end
+				local T = api.gui.mouse.Event.Type
+				local inside = selfRef:get():containsPosition(api.type.Vec2i.new(evt.x, evt.y))
+				if evt.type == T.Pressed then
+					U.iconPressed = inside
+					return inside
+				elseif evt.type == T.Released then
+					local was = U.iconPressed
+					U.iconPressed = false
+					if was and inside then togglePopover(selfRef) end
+					return was == true
+				elseif evt.type == T.Clicked then
+					return inside
+				end
+				return false
 			end
+			-- an error in here must not reach the game's input handling: unhandled, the event goes on to the game
+			pcall(react.onMouseEvent, function(evt)
+				local ok, handled = pcall(onMouse, evt)
+				return ok and handled == true
+			end)
+			pcall(react.setMouseTransparent, false)
 		end
-		local icon = builtin.ImageView{
-			path = "::/gui/entity_window/icons/symbol_person_multiple.tga",
-			scaling = builtin.type.ImageViewScaling.AutoFit,
-		}
-		local content = icon
-		if pct then
-			content = builtin.BoxLayout{
-				orientation = builtin.type.Orientation.Horizontal,
-				children = { icon, builtin.TextView{ meta = { class = "font-scale-body" }, text = pct } },
-			}
-		end
+		-- The structure of the game's own info-row plugin (gui/game_bar/game_bar_display_transported_plugin: a Component with
+		-- the tooltip around a plain ImageView, no size style): the image draws at its own size like the row's people and cargo
+		-- symbols. Those are 48 x 48 files under an @2x name only (construction/menu/symbol_person@2x.tga, glyph 36 px inside),
+		-- asked for without the @2x; ours are the same, a 36 px disc in 48 (@2x) and 18 in 24 (1x). UNPROVEN in the real game.
 		return builtin.BoxLayout{
+			orientation = H,
 			children = {
-				builtin.Button{
-					meta = { tooltip = pct and ("FeverLink3 multiplayer: syncing " .. pct) or "FeverLink3 multiplayer" },
-					content = content,
-					onClick = open,
+				builtin.Component{
+					meta = { tooltip = "FeverLink3: " .. line },
+					layout = builtin.BoxLayout{
+						orientation = H,
+						children = { builtin.ImageView{ path = MOD .. "feverlink3_bar_" .. colour .. ".tga" } },
+					},
 				},
 			},
 		}
@@ -497,7 +672,16 @@ do
 	local okR, react = pcall(ug_require, "::/gui/main/react.lua")
 	local okB, builtin = pcall(ug_require, "::/gui/main/builtin.lua")
 	local okE, entry = pcall(ug_require, "::/gui/game_bar/game_bar_widgets.tl")
-	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE))
+	-- optional parts: without them the window still opens (game default look, no pop-up)
+	local X = {}
+	local okS, su = pcall(ug_require, "::/gui/main/styleutil.tl")
+	if okS then X.styleutil = su end
+	local okP, pop = pcall(ug_require, "::/gui/main/popover_react_util.tl")
+	if okP then X.popover = pop end
+	local okG, globals = pcall(ug_require, "::/gui/main/game_react_globals.tl")
+	if okG then X.globals = globals end
+	print("[feverlink3] ui: active=" .. tostring(C.ACTIVE) .. " dir=" .. tostring(C.DIR) .. " id=" .. tostring(C.PLAYER_ID) .. " io=" .. tostring(C.IO ~= nil) .. " react=" .. tostring(okR) .. " builtin=" .. tostring(okB) .. " entry=" .. tostring(okE)
+		.. " styleutil=" .. tostring(okS) .. " popover=" .. tostring(okP) .. " globals=" .. tostring(okG))
 	-- which official replacements of the link module's io/os uses the window's state offers (observation only, lab)
 	pcall(function() C.logger("ui")("official api probe (window state): " .. C.officialProbe()) end)
 	pcall(function() C.logger("ui")("app keys (window): " .. C.appKeys()) end)
@@ -508,14 +692,14 @@ do
 		print("[feverlink3] UI hook: " .. (okI and (errI and "installed" or "not installed") or ("failed: " .. tostring(errI))))
 	end
 	if okR and okB and okE and entry and entry.GameBarInfoDisplayExtension then
-		local okS, recipeFn = pcall(function()
-			if C.DIR and C.IO then return setup(react, builtin) end
+		local okU, recipeFn = pcall(function()
+			if C.DIR and C.IO then return setup(react, builtin, X) end
 			-- not started by the launcher: an empty, invisible entry so the game has a recipe to mount
 			return function() return builtin.BoxLayout { children = {} } end
 		end)
-		if okS then
-			local okP, recipe = pcall(react.RegisterPluginRecipe, entry.GameBarInfoDisplayExtension, "FeverLink3Bar", recipeFn)
-			if okP then M.FeverLink3Bar = recipe else print("[feverlink3] entry registration failed: " .. tostring(recipe)) end
+		if okU then
+			local okQ, recipe = pcall(react.RegisterPluginRecipe, entry.GameBarInfoDisplayExtension, "FeverLink3Bar", recipeFn)
+			if okQ then M.FeverLink3Bar = recipe else print("[feverlink3] entry registration failed: " .. tostring(recipe)) end
 		else
 			print("[feverlink3] window setup failed: " .. tostring(recipeFn))
 		end

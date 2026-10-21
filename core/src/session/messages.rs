@@ -151,6 +151,10 @@ pub struct SessionState {
     /// it runs again, catches up and has every action it ships stamped by the host (as in the pause order) until it is out of this list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalled: Vec<u16>,
+    /// While a resync round is `loading`: the games that have not yet said hello after the load (their world is still loading).
+    /// Every window names them, because the others only stand still meanwhile (friend test 2026-10-21: ~52 s with only the step shown).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loading: Vec<u16>,
 }
 
 impl SessionState {
@@ -778,7 +782,9 @@ pub struct BuildCommitMessage {
     pub pause_upto: Option<u64>,
 }
 
-/// `from` and `name` are set by the host on relay.
+/// `from` and `name` are set by the host on relay. With a `level` (`info`, `warn`, `error`: [`notices::Level`](super::notices::Level))
+/// the line is a system message, the session's own or a game's about its player's action: the mod shows it among the window's
+/// notices, never in the chat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
@@ -787,10 +793,12 @@ pub struct ChatMessage {
     pub from: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
 }
 
 impl ChatMessage {
     pub fn new(text: &str) -> Self {
-        Self { text: text.to_owned(), from: 0, name: None }
+        Self { text: text.to_owned(), from: 0, name: None, level: None }
     }
 }

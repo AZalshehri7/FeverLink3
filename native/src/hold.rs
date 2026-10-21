@@ -18,7 +18,7 @@
 //! - The module never gives a command back on its own that the mod has not decided on (still `Waiting`: no `release`, no
 //!   `defer`): on the age limit, a tool at work while the mod is silent or the control file gone, it is failed (its tool callback
 //!   fired with the command's own "not applied" result), never released. Released, it ran on this game alone, before or without the
-//!   other games (friend test pre7 2026-10-21: 4 of 8 free-id forks began with a held build given back with no record, applied ~16
+//!   other games (friend test 2026-10-21: 4 of 8 free-id forks began with a held build given back with no record, applied ~16
 //!   steps before its stamp on the originator only). Only the mod's `release` or `hold_off` gives a waiting command back.
 //! - A silence is not a `hold_off`: the next line from the mod switches holding on again with the same kinds
 //!   (`holding {on = true, reason = "resume"}`). The game's pause menu stops every game script, so the mod falls

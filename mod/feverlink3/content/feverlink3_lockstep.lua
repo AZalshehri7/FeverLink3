@@ -753,6 +753,28 @@ function L.resolveKey(bind, key)
 	return bind[key]
 end
 
+-- The highest action number of `player` that the game-script state still names: a binding ("<player>:<n>" and its sub-keys
+-- "<player>:<n>#..."), a queued action, a binder or a watch. The interface half numbers its actions on from there after a load.
+-- Friend test 2026-10-21 21:51: after a resync load the numbers began at 1 again while the save still bound 1:4 to a line made
+-- before the resync; a vehicle bought as the new 1:4 took the key over, and three set-line commands that named the line by 1:4
+-- were refused on both games ("line 1:4 does not exist here"). A key is unique within the world only when no number is reused.
+function L.seqFloor(player, st)
+	local top, prefix = 0, tostring(player) .. ":"
+	local function see(key)
+		if type(key) ~= "string" or key:sub(1, #prefix) ~= prefix then return end
+		local n = tonumber(key:match("^%d+:(%d+)"))
+		if n and n > top then top = n end
+	end
+	if type(st) ~= "table" then return top end
+	for key in pairs(type(st.bind) == "table" and st.bind or {}) do see(key) end
+	for _, list in ipairs({ st.queue, st.binders, st.watches }) do
+		for _, it in ipairs(type(list) == "table" and list or {}) do
+			if type(it) == "table" then see(it.key) end
+		end
+	end
+	return top
+end
+
 -- Window commands name an entity their own window command created a moment ago by a placeholder key "ui:<id>" (<id> is
 -- the record number the UI hook gave that command): the bridge's table of keys reaches the hook a second or so after the
 -- creation (a vehicle bought and put on a line within that second was sent as "s:<id>", an id no other game shares; seen in
@@ -1546,7 +1568,7 @@ end
 
 -- ---- a spread round shared by the simulation Lua states
 --
--- Real game 2026-10-18 (owner's live test of 0.2.0-pre5, and every lab run of that day since the rounds are spread): every spread round
+-- Real game 2026-10-18 (owner's live test, and every lab run of that day since the rounds are spread): every spread round
 -- logged "37 chunk(s) read after their step (+144400 ms game time)". The game runs the game scripts in more than one simulation Lua
 -- state, and the steps of one game are shared between them: two states installed the session's math.random at the same t=12998600, and
 -- round 24 (begun at t=13366600, one chunk a step) read its chunks only at t=13367200, 13367400, 13368000, 13368200, ..., two steps in

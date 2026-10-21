@@ -171,9 +171,9 @@ class UiHookTest(unittest.TestCase):
             self.assertTrue(self.lua.eval("EDIT ~= nil and EDIT[1] == false and FAULT ~= nil and FAULT[1] == false"), "both windows are told no")
             recs = self.records()
             self.assertEqual(["notice", "notice"], [r[0] for r in recs], "no cmd record: nothing to stamp")
-            self.assertIn("Your fake edit was not applied: it cannot be shared with the other players (argument 2: does not rebuild equal at X.y.3)",
-                          recs[0][1]["text"])
-            self.assertIn("boom", recs[1][1]["text"])
+            # the bridge words the notice (feverlink3_text.lua); the reason stays in the hook's log
+            self.assertEqual([("action_not_shared", "makeFakeEditCmd"), ("action_not_shared", "makeFakeFaultCmd")],
+                             [(r[1]["msg"], r[1]["cmd"]) for r in recs])
 
     def test_a_speed_button_becomes_a_request_sent_once_a_second_while_it_repeats(self):
         # friend test 2026-10-16, resync 4: the game's speed control asked "speed 4" every frame while the world loaded (2760 records)

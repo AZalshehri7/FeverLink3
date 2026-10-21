@@ -2,7 +2,7 @@
 //! input barriers; it catches up later, and the input barrier stays exact (no action of it is ever relayed stamped before a promise the
 //! others were given).
 //!
-//! Numbers from the friend test of 0.2.0-pre5 (2026-10-18): x4, round trip about 30 ms, a clock line per engine batch (4 steps, 167-218
+//! Numbers from the friend test of 2026-10-18: x4, round trip about 30 ms, a clock line per engine batch (4 steps, 167-218
 //! ms apart), the lead of the 907af4e fix (7 steps at x4 on that link) and the clone freezes of 7-10 s of the owner's notes of 2026-10-17
 //! as the stall.
 

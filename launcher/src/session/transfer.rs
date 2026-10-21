@@ -30,7 +30,8 @@ use std::time::Instant;
 
 use feverlink3_core::protocol::Frame;
 use feverlink3_core::session::{
-    ConnectionId, HostSession, MessageKind, ResyncLimits, ResyncState, CAP_BULK_DGRAM, CAP_BULK_PAR,
+    sha256_hex, ConnectionId, HostSession, MessageKind, ResyncChunkMessage, ResyncLimits, ResyncState, CAP_BULK_DGRAM,
+    CAP_BULK_PAR,
 };
 
 use super::{host_dispatch, par_note, sha_bytes, Shared};
@@ -95,6 +96,18 @@ struct SaveTransfer {
     stage: Stage,
 }
 
+/// A bug report's bundle on its way to the player who asked for it: the same chunks and the same paced outbox as a save,
+/// from memory (a bundle is at most 24 MB).
+struct ReportSend {
+    id: i32,
+    to: u16,
+    bytes: Vec<u8>,
+    sha256: String,
+    count: u32,
+    next: u32,
+    started: Instant,
+}
+
 /// What the host's loop owns besides the state machine: the transport, the outboxes of the connections that receive a
 /// save, and the transfer in progress. Every frame of the host goes out through [`HostIo::send`].
 pub(super) struct HostIo<'scope, 'env> {
@@ -106,6 +119,8 @@ pub(super) struct HostIo<'scope, 'env> {
     transfer: Option<SaveTransfer>,
     /// The round the transfer in progress (or being stepped) belongs to.
     round: Option<i32>,
+    /// A bug report's bundle being sent.
+    report: Option<ReportSend>,
 }
 
 impl<'scope, 'env> HostIo<'scope, 'env> {
@@ -115,12 +130,56 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
         shared: &'env Shared,
         save_dirs: &'env [PathBuf],
     ) -> Self {
-        HostIo { scope, net, shared, save_dirs, outboxes: BTreeMap::new(), transfer: None, round: None }
+        HostIo { scope, net, shared, save_dirs, outboxes: BTreeMap::new(), transfer: None, round: None, report: None }
     }
 
     /// A transfer is running: the loop should come back soon to seal the next chunks.
     pub(super) fn busy(&self) -> bool {
-        self.round.is_some()
+        self.round.is_some() || self.report.is_some()
+    }
+
+    /// Starts sending a bug report's bundle to player `to` (the one who asked). One at a time: a newer one replaces it.
+    pub(super) fn send_report(&mut self, id: i32, to: u16, bytes: Vec<u8>) {
+        let Some(count) = ResyncLimits::chunk_count(bytes.len() as u64) else {
+            self.shared.log(format!("report {id}: the bundle ({} bytes) cannot be sent", bytes.len()));
+            return;
+        };
+        self.shared
+            .log(format!("report {id}: sending the bundle ({} bytes, {count} chunk(s)) to player {to}", bytes.len()));
+        let sha256 = sha256_hex(&bytes);
+        self.report = Some(ReportSend { id, to, bytes, sha256, count, next: 0, started: Instant::now() });
+    }
+
+    /// Seals the next chunks of the bundle as far as the receiver's outbox has room.
+    fn pump_report(&mut self, host: &mut HostSession, link: &mut gamelink::Session) {
+        let Some(mut r) = self.report.take() else { return };
+        let Some(conn) = host.player_connection(r.to) else {
+            self.shared.log(format!("report {}: player {} is gone; the bundle was not sent", r.id, r.to));
+            return;
+        };
+        self.open_outbox(conn);
+        let mut budget = CHUNKS_PER_TURN;
+        while r.next < r.count && budget > 0 && self.has_room(conn) {
+            let start = r.next as usize * ResyncLimits::CHUNK_SIZE;
+            let size = ResyncLimits::chunk_len(r.bytes.len() as u64, r.next).unwrap_or(0);
+            let msg = ResyncChunkMessage {
+                id: r.id,
+                index: r.next as i32,
+                count: r.count as i32,
+                sha256: r.sha256.clone(),
+                data: r.bytes.get(start..start + size).unwrap_or_default().to_vec(),
+            };
+            let outputs = host.send_report_chunk(r.to, &msg);
+            host_dispatch(outputs, link, self);
+            r.next += 1;
+            budget -= 1;
+        }
+        if r.next < r.count {
+            self.report = Some(r);
+        } else {
+            let secs = r.started.elapsed().as_secs_f64();
+            self.shared.log(format!("report {}: the bundle went out to player {} in {secs:.1} s", r.id, r.to));
+        }
     }
 
     /// Writes a frame: through the connection's outbox when it has one (in order behind what is queued), directly
@@ -222,12 +281,14 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
                 self.end(t, host);
             }
         }
-        let receiving: BTreeSet<ConnectionId> = match &self.transfer {
+        self.pump_report(host, link);
+        let mut receiving: BTreeSet<ConnectionId> = match &self.transfer {
             Some(SaveTransfer { stage: Stage::Sending(_), .. }) => {
                 host.resync_receivers().iter().filter_map(|&p| host.player_connection(p)).collect()
             }
             _ => BTreeSet::new(),
         };
+        receiving.extend(self.report.as_ref().and_then(|r| host.player_connection(r.to)));
         self.outboxes.retain(|conn, o| receiving.contains(conn) || o.items.load(Ordering::Acquire) > 0);
     }
 

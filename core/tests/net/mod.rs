@@ -354,6 +354,7 @@ impl Net {
                     self.peers.get_mut(&c).unwrap().saves.push((id, sha256, bytes));
                 }
                 PlayerOutput::Welcomed(w) => self.peers.get_mut(&c).unwrap().welcomes.push(w),
+                PlayerOutput::Report(_) => {}
                 PlayerOutput::Rejected(r) => self.peers.get_mut(&c).unwrap().rejected = Some(r),
             }
         }

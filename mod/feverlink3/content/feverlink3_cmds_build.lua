@@ -1726,7 +1726,10 @@ local function newConstructionEntity(c, R)
 	req(ce, "params", params)
 	req(ce, "transf", A.mat4(c.transf))
 	req(ce, "playerEntity", R.owner(c.owner == nil and "player" or c.owner))
-	pcall(function() ce.name = (type(c.name) == "string" and c.name ~= "") and c.name or baseName(c.file) end)
+	-- the captured name as it is: an empty name stays empty (friend test 2026-10-21: a road upgrade that moves a town building, whose
+	-- name the engine's tool leaves "", was refused on every game, because "" became the file's base name and the native compare saw
+	-- `toAdd[0].name: "" <> "c_res_l1_4x4_01"`); only a record with no name at all gets the base name
+	pcall(function() ce.name = type(c.name) == "string" and c.name or baseName(c.file) end)
 	return ce
 end
 
@@ -2953,8 +2956,8 @@ pcall(function() REPLAY_IGNORE_ERRORS = C.env("FEVERLINK3_REPLAY_IGNORE_ERRORS")
 M.REPLAY_IGNORE_ERRORS = REPLAY_IGNORE_ERRORS
 local BLOCK_CONSTRUCTIONS = false
 pcall(function() BLOCK_CONSTRUCTIONS = C.env("FEVERLINK3_REMOTE_CONSTRUCTIONS") == "0" end)
+-- the reason in the logs and the refusal detail; the player reads build_kind_unsupported (feverlink3_text.lua)
 M.CONSTRUCTIONS_BLOCKED_TEXT = "station/depot builds are not supported yet in this test build"
-M.CONSTRUCTIONS_INFO_TEXT = "station/depot builds are experimental in this test build"
 
 local function constructionsBlocked(rec)
 	return BLOCK_CONSTRUCTIONS and type(rec) == "table" and type(rec.cons) == "table" and #rec.cons > 0

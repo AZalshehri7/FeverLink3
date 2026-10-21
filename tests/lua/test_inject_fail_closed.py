@@ -427,7 +427,7 @@ class InjectFailClosedTest(InjectTest):
             self.assertEqual(self.B.sig(), before)
             self.assertBuiltNowhereAndToldOnce()
             self.assertEqual(len(self.relay.chats), 1, "the player is told")
-            self.assertIn("build was cancelled: it cannot be rebuilt the same way on every game", self.relay.chats[0][1])
+            self.assertIn("build could not be shared with the other players and was cancelled", self.relay.chats[0][1])
             self.next_build_goes_the_normal_way()
 
         def module_refuses_its_text():
@@ -456,7 +456,7 @@ class InjectFailClosedTest(InjectTest):
             self.assertIn("REFUSED BEFORE SHIPPING, every game would refuse its exact copy: the engine proof on this game's own held command fails", self.B.log())
             self.assertBuiltNowhereAndToldOnce()
             self.assertEqual(len(self.relay.chats), 1, "the player is told")
-            self.assertIn("cannot be copied exactly to the other games", self.relay.chats[0][1])
+            self.assertIn("build could not be shared with the other players and was cancelled", self.relay.chats[0][1])
             self.next_build_goes_the_normal_way()
 
         self.cases([("its own self-check fails", {}, own_self_check_fails), ("its module refuses its text", {}, module_refuses_its_text),
@@ -504,7 +504,8 @@ class InjectFailClosedTest(InjectTest):
             self.assertEqual(self.B.native.completed, [(1, False, "fail")])
             self.assertIn("FAILED without a stamp apply (fail)", self.B.log())
             self.assertEqual(int(self.B.lua("NATIVE_HELD_COUNT()")), 0)
-            self.assertIn("told the player: Your build 1:1 was not applied: the world changed before its turn: proposal.addedSegments[0].node0 " + gone, self.B.log())
+            self.assertIn("build 1:1 was not applied: the world changed before its turn: proposal.addedSegments[0].node0 " + gone, self.B.log())
+            self.assertIn("told the player: Your build could not be built: the world changed before its turn", self.B.log())
             self.assertNotIn("told the player", self.A.log(), "only the originator's player is told")
 
         def on_one_game():
@@ -598,7 +599,7 @@ class InjectFailClosedTest(InjectTest):
             # each event reaches one of the two states (the mock's SIM_FOR_EVENT). The native module's capabilities came in an event
             # (nativecaps) and were kept in the module table of the state it reached: a stamp reached by the other state decoded the build by
             # the record path instead of injecting the originator's exact copy (a fork). Now they live in the game-script state. The two
-            # states of one world load apart (friend test pre5, host: 22:01:00 and 22:01:28): the receiver's first state runs every step of
+            # states of one world load apart (friend test 2026-10-18, host: 22:01:00 and 22:01:28): the receiver's first state runs every step of
             # the start, when the module reports its capabilities; the first build's stamp is the first step of the other state, then the
             # two take turns every step and three more builds come one after the other.
             self.A.split_sim("function(t) return ONLY_STATE or (math.floor(t / 200) % 2 + 1) end")

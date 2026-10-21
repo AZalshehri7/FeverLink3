@@ -214,6 +214,19 @@ class SessionEndTest(S.StrictTest):
                 self.assertGreater(self.B.time(), self.relay.pauseAt)
                 self.assertEqual(self.B.vehicles(), 0, "the paused action of the ended session is applied nowhere here")
 
+    def test_a_world_loaded_outside_a_session_holds_the_presence_lock(self):
+        # friend test 2026-10-21: the lock was taken only in a session, so a Steam invite (it starts on a held lock, launcher
+        # live.rs invites_step) never joined an idle player. Another save loaded after the end: a fresh state, idle, takes it.
+        self.end_session(self.B)
+        self.B.reload()
+        before = len(self.B.log())
+        sent = len(self.B.lines(self.B.from_game))
+        self.look()
+        after = self.B.log()[before:]
+        self.assertIn("presence lock world.lock held", after)
+        self.assertNotIn("begins here", after, "no session starts")
+        self.assertEqual(len(self.B.lines(self.B.from_game)), sent, "no line to the launcher outside a session")
+
     # ---- #16: the next session
 
     def second_session(self, reload):

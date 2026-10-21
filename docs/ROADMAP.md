@@ -1,160 +1,49 @@
 # Roadmap
 
-Status as of 2026-10-10. The project started on 2026-10-09, so everything marked done below happened in those two days. A stage ends when its tests pass and two people have played it; no stage has ended its playable part yet.
+Status as of 2026-10-21. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html).
 
-## Where things stand
+How to read the markers: `[x]` done, `[~]` done but not yet seen in the real game in the way that matters (for example only on one PC), `[ ]` not done.
 
-FeverLink3 is an early test build. It is not yet a playable multiplayer game. The first test build, `0.2.0-test1`, has one job: to find out whether two players can reach each other through Steam. Hosting and joining over that connection are the next test build. The line between "written and tested without the game", "run in the real game" and "proven between two real games" is kept sharp on purpose.
+## Versions
 
-**Verified in the real game (Transport Fever 3 build 40420, 2026-10-09):**
+### 0.1.0 (2026-10-14): first working multiplayer session (done)
 
-- The mod loads, and its window opens from a button in the bottom bar.
-- With an earlier build of the window, whose Host button used a direct connection (since taken out of the window, kept as a developer transport), hosting started a session inside the game process and showed a join code, and a second client (a test client, not a second copy of the game) joined that session by its code.
-- The mod can drive the game's own `app.saveGame` / `app.loadGame`, and after a reload it resumes its file link to the session.
-- The Steam peer-to-peer probe listens inside the game.
+- [x] Host and join from the in-game window; the host's world is sent and loaded on the other game; speed, pause and chat follow each other (seen in two real games on one PC, 2026-10-10).
+- [x] Builds copied natively from the game's own build command and applied at the same step on every game: roads, junctions, bridges, tunnels, rail, signals, stops, stations and modules, depots, lanes, crosswalks and bulldozing (seen in two real games on one PC, 2026-10-14).
+- [x] Lines, vehicles, renames and loans between the games (seen in two real games on one PC).
+- [x] World checks and the repair by loading the host's save.
 
-**Proven on 2026-10-10:** inside one running game, the game opened a Steam peer-to-peer connection to its own Steam ID and 6 pings were answered.
+### 0.1.5 (2026-10-19): feature-complete test version (done)
 
-**Not verified yet:** a Steam connection between two different accounts (the test of `0.2.0-test1`), hosting and joining over Steam (not finished), building together (command replication between two real games), savegame transfer between two real games, the native command hooks (in the code but switched off, never run in the game), and joining from a second real copy of the game.
+- [x] Sessions over Steam between two PCs: played in internet tests with a friend, the last one on 2026-10-20. These tests found problems (object ids out of order, held builds, a crash) that 0.2.0 fixes.
+- [~] Steam invites from Steam's own dialog and the friends list: tested in the automatic tests, not yet between two PCs.
+- [~] Signed updates (`feverlink3 update`): tested in the automatic tests.
+- [~] Mod check at join, stall catch-up (a frozen game no longer stops the others), coming back after a short drop: tested in the automatic tests and in lab runs on one PC.
 
-### Proof milestones
+### 0.2.0: first public beta (next)
 
-Each one is a thing that has to be seen working before the matching claim may appear in a README, a listing or a release note.
+- [~] The fixes from the friend test of 2026-10-20: object id order, held builds without a record refused, the crash, terrain tools off during a session. Tested in the automatic tests and in lab runs on one PC.
+- [~] New in-game interface: bar icon with colours, pop-up, window with tabs, plain messages, the list of events.
+- [~] Report a problem: one zip with every player's logs, collected by the host. Not yet tried in a real game.
+- [~] Faster session start: pause under 2 s, whole sync about 17 s (two games on one PC).
+- [x] README rewritten.
+- [ ] A session on two PCs over Steam with these changes, played by the owner, before the release.
 
-| # | Milestone | State |
-|---|---|---|
-| P1 | The mod loads in the real game and the window opens | verified 2026-10-09 |
-| P2 | Host from the window, a test client joins by the code (earlier build, direct connection, since taken out of the window) | verified 2026-10-09 |
-| P3 | Save and load driven by the mod, file link resumes after the reload | verified 2026-10-09 |
-| P4 | The Steam peer-to-peer listener starts inside the game | verified 2026-10-09 |
-| P5 | Steam peer-to-peer to the game's own Steam ID, one process, 6 pings answered | proven 2026-10-10 |
-| P6 | Steam peer-to-peer between two different Steam accounts on two PCs | being tested: this is what `0.2.0-test1` is for, the first run is still to come |
-| P7 | Hosting and joining over Steam: a session carried over the Steam connection | not yet, the next test build |
-| P8 | Two real games in one session, the host's world reaches the joiner and loads | not yet |
-| P9 | A road built in one game appears in the other (command replication, Lua path) | not yet |
-| P10 | Construction held and released at the same step by the native hooks | not yet |
-| P11 | An hour of play with identical checksums and no resync, then two people have played it | not yet |
+## Later
 
-### How to read the markers
+- [ ] Sharing terrain editing, ground paint, trees and rocks.
+- [ ] Separate companies for each player on one map, with station access and shared infrastructure rules.
+- [ ] Host permissions in the window (the model and the protocol are done).
+- [ ] Distribution beyond GitHub: Nexus Mods, and the game's Mod Hub if it accepts a mod with a native part (`docs/WORKSHOP.md`). Transport Fever 3 has no Steam Workshop.
+- [ ] Code signing of the files (`docs/SIGNING.md`).
+- [ ] Dedicated server: a game copy that hosts permanently, joining from its autosave.
 
-- `[x]` done and tested.
-- `[~]` written and tested without the game, not yet verified in the game (or not between two real games).
-- `[ ]` not done.
+## What gates 0.2.0
 
-### Timeline
-
-- **2026-10-09:** project skeleton and design; protocol core and its tests; session state machines; native module skeleton in Rust; Lua mod with lockstep core and a two-game lupa test; address tool and its first run on build 40420; launcher platform layer; release pipeline and update verification; resync round, checksum policy, hot join and permissions in the core; launcher TCP host/join; first run of the mod in the real game; live mode (the session runs inside the game, driven by the in-game window).
-- **2026-10-10:** Steam peer-to-peer probe, first one-process connection to the game's own Steam ID; the window became Steam-first and the connection research was written down (maintainer's private notes); the join code can carry the host's Steam ID; plug-in point in the mod for command schemas and the schemas for everyday operations (vehicles, lines, names, bookings, events) with their tests (`docs/COVERAGE_OPS.md`); CI runs every Lua test; documentation and listing material (this document set).
-
-## Workstreams
-
-Work after 2026-10-10 runs in parallel workstreams. Each one owns a part of the stages below and writes its own document in `docs/` as it merges (for example `LIVE_CONTROL.md`, `COMPANIES.md`, `COVERAGE_*.md`, `NATIVE_LINK.md`, `SECURITY.md`).
-
-| Workstream | Covers | Stages |
-|---|---|---|
-| Connection (Steam peer-to-peer) | Steam peer-to-peer as the way players reach each other: the first cross-account test (P6), then hosting and joining carried over it (P7), and what the window shows when it fails. Other transports only if Steam proves not to be enough (private research notes). Replaces the hole-punching item that used to sit in 0.8. | 0.2, 0.3 |
-| Session robustness and reconnect | A player who drops comes back without losing the world; hot join; host leaving; timeouts; what the window shows when something fails. | 0.2, 0.5 |
-| Construction and operations replication | Roads, tracks, stations, signals, terrain, bulldozing; vehicles, lines, orders, renames; coverage tables of which engine commands are replicated and how. | 0.3, 0.4 |
-| Companies | Separate companies on one map, own money and vehicles, station access, shared infrastructure rules. | 0.6, 0.7 |
-| Native hooks | The detours in the game executable that hold construction commands and release them at a stamp; the one-worker script pool; the control link to the mod. | 0.3 |
-| Launcher wizard | A guided install, uninstall, update check and diagnostics in a console menu (double-click) instead of terminal commands. | 0.2 |
-| Hardening | Review of everything that parses input or runs in the game process; a guard against panics aborting the game; limits; the release signing key; code signing. | all |
-| Listing and documentation | The Nexus Mods page text and screenshots, the user security explainer, the project site, the Mod Hub / Steam Workshop plan, the code signing plan. | 0.2, 0.3 |
-
-## 0.1 — Protocol core (complete 2026-10-09)
-
-- [x] Length-prefixed framing with size limit
-- [x] Sealed channel: AES-256-GCM, HKDF session key, replay window
-- [x] Join codes: base32, version, addresses, secret, checksum
-- [x] Session state machine (host and player sides) with in-memory transport tests
-- [x] Message kinds and JSON payload schemas (`docs/PROTOCOL.md`)
-- [x] Core ported from C# to Rust (`core/`, crate `feverlink3_core`), same tests, one Cargo workspace with the native module
-- [x] Resync round state machine (pause, save, transfer, load, verify, resume) with tests
-- [x] CI on every push
-
-## 0.2 — Launcher, connection and the first test release
-
-First tagged build: `v0.2.0-test1`, a GitHub pre-release (the in-app updater skips pre-releases by default). Its job is the Steam connection test between two accounts (P6); the zip holds a testing installer, the native module and the mod.
-
-- [x] Host / join by code, player allow-list, sender-id rewrite. The transport used so far is plain TCP, kept as a development and test transport (the window's Host button no longer starts it); the way players connect is the Steam item below.
-- [~] Game launch with session environment, file link with sequence numbers (command line `--launch`; unit-tested, not the path the in-game window uses)
-- [~] Savegame transfer with SHA-256, streamed from disk (tested over loopback; not between two real games)
-- [~] Session clock, speed, pause, checksum rounds, resync round (core state machines and loopback tests)
-- [x] `--selftest` over loopback
-- [x] Command-line install, uninstall and doctor: `feverlink3 install`, `uninstall`, `doctor`, each with `--dry-run` where it changes things
-- [~] Console wizard: a double-click on `feverlink3.exe` shows the checks and a numbered menu (install or repair, uninstall, compare with the installed files, start the game through Steam, open the logs, copy diagnostics) *(launcher wizard)*; tested over a fake PC and a fake Steam tree, not yet used on a clean PC by someone else
-- [x] Live mode: the session controller runs inside the game, driven by the in-game window (verified in the real game 2026-10-09, see P1 to P4)
-- [~] Players connect through Steam peer-to-peer *(connection)*: the listener starts and the game connected to its own Steam ID (P5); the connection between two different accounts (P6) is the test of `0.2.0-test1`; session traffic does not run over it yet (P7)
-- [~] The join code carries the host's Steam ID *(connection)*: the code format and its tests are in the core; the in-game controller does not write it yet
-- [~] Reconnect after a dropped connection *(session robustness)*: the player side retries for five minutes and, inside the host's 5.5 minute window, is the same player again (same id, slot and permissions) and gets the hot-join round; tested over loopback, not run between two real games
-- [x] Packaging: self-contained single-file exe, portable zip, reproducible release job with SHA-256 (job and `tools/release` done; the first tagged release is not cut yet)
-- [~] In-app updater with Ed25519-signed releases: signature, hash, version and file-swap logic are done and tested in `launcher/src/update.rs`; the network fetch is not written, and the public key in the repository is a placeholder whose private half is public, so no release may be signed with it *(hardening)*
-- [~] Project site (`docs/index.md`, `docs/site/`): written 2026-10-10; it goes live with the first tagged release, which supplies the download link
-- [~] Nexus Mods page text, screenshot list and security explainer (`docs/nexus/`, `docs/SECURITY_FOR_USERS.md`): written 2026-10-10; the screenshots are still to be captured and the claims re-checked against the final code before publishing
-
-## 0.3 — Game side (first playable)
-
-- [x] Native module skeleton in Rust: winhttp proxy, PE parsing, signature scanner, detour maths, build table, `cargo test`
-- [x] Address tool (`tools/addr`): finds hook sites in a game executable and prints a build-table row; first run against build 40420 in `tools/addr/out/6ac50427.txt`
-- [~] Native module logic *(native hooks)*, off unless switched on: counters on the simulation's command application, hold/release hook on the command list with the control file (`native_ctl.log` / `native_events.log`), single-worker script pool patch; installed all-or-none from `DllMain` behind `FEVERLINK3_HOOKS` / `FEVERLINK3_HOLD` / `FEVERLINK3_POOLPATCH`; tested on fake game functions, never run in the real game (`docs/NATIVE_LINK.md`)
-- [x] Native module verified in the game (2026-10-14, two real games on one PC): hold, copy and release with each construction tool (street, track, station and module, depot, stop, bulldozer, lane, crosswalk), pool patch; the game's own build command is copied natively and applied at the same step on every game
-- [x] Lua mod strict mode (2026-10-14, two real games on one PC; the watchdog was fixed after the first fast-building test): `hold_on`, ping, match `held`, stop at the stamp, `release` + trigger command, `cancel`, `hold_off` before a resync (`docs/NATIVE_LINK.md` section 7)
-- [ ] Native module size: `no_std` + `alloc` with a HeapAlloc allocator once the hook set is fixed
-- [~] Lua mod: stamping, barrier, replay, checksums, deterministic random. All of it runs in the two-game lupa test; in the real game the mod loads, the window opens, and save/load work (P1 to P3); replaying commands between two real games is not verified (P9)
-- [x] Lua lockstep test with lupa
-- [ ] First playable: two players, shared company, roads and vehicles (P8, P9, P11)
-- [ ] First public release: GitHub Releases zip, Nexus Mods listing, site updated. The pre-release `v0.2.0-test1` is the first step; the playable release needs P8 and P9
-
-## 0.4 — Everything a player does *(construction and operations replication)*
-
-- [~] Constructions against streets, upgrades, signals, decorations, terrain: roads, junctions, bridges, tunnels, rail, stations and modules, depots, stops, signals, lanes and crosswalks are seen working in two real games on one PC; terrain is not shared yet
-- [~] Lines, vehicle orders, renames, colours: lines, vehicles bought at a depot, renames and loans are seen working in two real games on one PC; orders and colours are not tested
-- [~] In-game player list and chat: the model and the window exist and are tested with mocks; not run with two real games
-- [~] 3 to 8 players: host limit of 8 games, ids, fan-out, flood limit, ping and round-trip times, a resync round and a kick with eight games are done in the core and the launcher and tested over loopback; waits for a game run
-
-## 0.5 — Playing with friends
-
-- [ ] Distribution: the mod in the game's own Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now; the installer stays a testing tool. **Transport Fever 3 has no Steam Workshop** (the developers' support page says it is not included). Whether the Mod Hub accepts a mod that needs a separate native component is being checked: its published rules allow only the official scripting API and no executable files. The sources, the likely blockers and the steps are in `docs/WORKSHOP.md`
-- [ ] Steam invitations and friends-list join *(connection)*
-- [ ] Host permissions: enforcement in the launcher and mod (model and protocol done in core; the in-game controller takes `permissions` and `kick` commands, `docs/LIVE_CONTROL.md`; the window and the game side are open)
-- [~] Hot join of a running game and reconnection that keeps the player's place *(session robustness)*: the same id, name, slot and permissions back within 5.5 minutes, then the hot-join round; core and launcher done and tested over loopback, waits for a game run
-
-## 0.6 — Companies *(companies)*
-
-- [ ] Separate companies on one map, own money and vehicles
-- [ ] Station access permissions, shared infrastructure rules
-
-## 0.7 — Mixed modes
-
-- [ ] Several players per company, joining and leaving companies
-- [ ] Shared infrastructure rules and fees
-
-## 0.8 — Reach
-
-- [ ] Optional public game list
-- [ ] Code signing *(hardening)*: the free SignPath Foundation programme needs an OSI-approved licence, so the project (PolyForm Noncommercial) probably does not qualify; the paid options, their cost and eligibility, and the decision for the owner are in `docs/SIGNING.md`
-
-The hole-punching and STUN items that used to be listed here are replaced by Steam peer-to-peer, which moved to 0.2 because players should never have to configure anything to connect.
-
-## 1.0 — Dedicated server
-
-- [ ] Headless host role: a game copy running the mod permanently, no window
-- [ ] Persistence by autosave; joining is the hot-join round from the server's save
-- [ ] Players join and leave a world that runs for days
-- [ ] Linux / Proton package for cheap hosting
-
-## Known issues / next
-
-- **Checksum cost grows with the world.** The checksum (constructions, lines, stations, edges, node settings, vehicles, names, town buildings, companies) is computed in the game thread at the checksum stamp. Measured in the lab world (about 3,700 constructions, 3,600 edges, 113 vehicles, 21 towns; lab runs 2026-10-12, 138 rounds per game): about 0.95 s per round on average, up to 1.4 s; the heavy parts are edges (about 0.33 s), town buildings (0.33 s), constructions (0.16 s) and node settings (0.11 s). A round every 10 s is therefore about 10% of the game thread at this size, and a bigger world costs more. Done 2026-10-12: the host asks for the heavy lanes (edges, constructions, node settings, town buildings) only in every 6th round (`FEVERLINK3_FULL_CHECKSUM_EVERY`, protocol `full` flag in `docs/PROTOCOL.md`); the light rounds in between cost about 14 ms (max 21 ms), a full round is still about 0.9 s once a minute. Still to do: spread the full round over several frames or rotate the heavy lanes over the rounds (the cost is the engine component reads, so a snapshot-and-hash-later design does not help), and a longer interval for big worlds. `mod.log` carries the numbers (`checksum slow: total .. ms: <worst parts>` for every round over 50 ms and a `checksum cost over 20 rounds` summary line), so the friend test with a real big save can read them there.
+1. A session on two PCs over Steam with the 0.2.0 changes, and the owner has played it.
+2. The claims in the README, `docs/PLAYING.md` and `docs/SECURITY_FOR_USERS.md` re-checked against the code that is released.
+3. The release is signed with the real key (`docs/RELEASING.md`).
 
 ## Credits
 
 FeverLink3 is a fresh implementation that builds on two earlier MIT-licensed projects: [TpF2 Multiplayer](https://silver2127.github.io/tpf2-multiplayer/) by silver2127 (Transport Fever 2) and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight / arthur (Transport Fever 3). Their licences are in `THIRD_PARTY_NOTICES.md`.
-
-## What gates the first release
-
-`v0.2.0-test1` is published only when the owner decides, and after:
-
-1. The claims in the listing and in `docs/SECURITY_FOR_USERS.md` have been re-checked against the code that is tagged (the list is in `docs/nexus/README.md`).
-2. A real release signing key exists and the placeholder in `launcher/src/update.rs` is replaced (`docs/RELEASING.md`).
-3. The wording about the connection reflects the result of P6: "being tested" until two different accounts have connected, and never "works over the internet" before that.

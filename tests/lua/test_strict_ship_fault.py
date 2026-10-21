@@ -218,7 +218,7 @@ class ShipFaultTest(S.StrictTest):
             self.assertIn("FAILED on the veto, NOT released", self.B.log())
             self.assertFailedOnB()
             self.assertEqual(self.A.builds_applied(), 0, "the other game dropped it on the veto")
-            self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats))
+            self.assertTrue(any("game stayed paused too long" in c[1] for c in self.relay.chats))
 
         def vetoed():
             # was a release: the build existed on this game only (the vetoing game dropped it) and a resync followed
@@ -232,7 +232,7 @@ class ShipFaultTest(S.StrictTest):
             self.assertFailedOnB()
             self.assertEqual(self.A.builds_applied(), 0, "no game has the build")
             self.assertEqual(self.relay.replay_failed, [], "so no repair")
-            self.assertTrue(any("cancelled on every game" in c[1] for c in self.relay.chats), self.relay.chats)
+            self.assertTrue(any("build was cancelled because it could not be built" in c[1] for c in self.relay.chats), self.relay.chats)
 
         def fault_after_the_commit():
             self.pause()

@@ -240,6 +240,24 @@ impl ModFingerprint {
     }
 }
 
+/// Who must update when the FeverLink3 versions differ, as the end of the diff line (`launcher/src/autoupdate.rs`
+/// updates the module at a game start, unless the player turned it off).
+fn update_advice(host: &str, mine: &str) -> &'static str {
+    // major.minor.patch, numbers only; a pre-release suffix or an unreadable version gives no advice
+    let core = |v: &str| -> Option<(u64, u64, u64)> {
+        let mut it = v.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u64>().ok());
+        let t = (it.next()??, it.next()??, it.next()??);
+        it.next().is_none().then_some(t)
+    };
+    match (core(host), core(mine)) {
+        (Some(h), Some(m)) if h > m => {
+            ". An update is available: restart your game and FeverLink3 updates itself (Automatic updates, in Troubleshooting)"
+        }
+        (Some(h), Some(m)) if h < m => ". The host needs to restart their game so that FeverLink3 updates itself",
+        _ => "",
+    }
+}
+
 fn shown(s: &str) -> &str {
     if s.is_empty() {
         "unknown"
@@ -270,7 +288,9 @@ pub fn diff(host: &ModFingerprint, mine: &ModFingerprint) -> Vec<ModDifference> 
     ];
     for (what, h, m) in builds {
         if !h.is_empty() && !m.is_empty() && h != m {
-            add(true, format!("{what}: host has {}, you have {}", shown(h), shown(m)));
+            // FeverLink3 itself: say who has to update (the module updates itself at the next game start)
+            let advice = if what == "FeverLink3" { update_advice(h, m) } else { "" };
+            add(true, format!("{what}: host has {}, you have {}{advice}", shown(h), shown(m)));
         }
     }
     let own: BTreeMap<&str, &ModEntry> = mine.mods.iter().map(|e| (e.id.as_str(), e)).collect();
