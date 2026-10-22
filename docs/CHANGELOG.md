@@ -12,6 +12,7 @@ The changes of each version that matter to a player or tester. Earlier test buil
 - A road that joins or splits an existing road no longer says "Your build could not be built ... Try again" when it was in fact built on every game. The game moves a few points of such a build by a few centimetres before it applies it; FeverLink3 now still recognises it as the player's own build. A player is never told a build failed when it was applied.
 - Configuring a station (adding or changing a module) right after a sync, before any other build tool was used, was refused with "Try again". It is now copied to every game like any other build.
 - Every game, not only the host, keeps its world details when a sync starts, before the sync replaces its world, so a difference between the games can be traced in the logs afterwards.
+- "Report a problem": when the host and a player asked for a report at nearly the same moment, the player's request could overtake the host's, and the host's own report was refused as busy. The host's own requests are now always handled in the order they were given.
 - `feverlink3.exe` never passes FeverLink3's own settings on to Steam when it starts the game, and its developer start of a game waits for Steam to be running.
 
 ## 0.2.2 (2026-10-22)

@@ -1,6 +1,6 @@
-# Nexus Mods and mod.io listing material (0.2.2)
+# Nexus Mods and mod.io listing material (0.2.3)
 
-Maintainer notes for publishing FeverLink3 0.2.2 on Nexus Mods and mod.io. Rewritten on 2026-10-22 for the release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.2 (it replaces the stale 2026-10-10 connection-test text). **Nothing here has been published or sent to anyone.** This folder is excluded from the project site on purpose.
+Maintainer notes for publishing FeverLink3 0.2.3 on Nexus Mods and mod.io. Rewritten on 2026-10-22 for the release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.3 (it replaces the stale 2026-10-10 connection-test text). **Nothing here has been published or sent to anyone.** This folder is excluded from the project site on purpose.
 
 | File | What it is |
 |---|---|
@@ -47,7 +47,7 @@ Maintainer notes for publishing FeverLink3 0.2.2 on Nexus Mods and mod.io. Rewri
 1. nexusmods.com → **Upload** (Add a mod) → game **Transport Fever 3**.
 2. Paste name, summary, version, category, language from `fields.md`. Tick the AI tag. Adult content: no.
 3. Description: paste `description.bbcode.txt`, open the preview. If a tag shows as text, remove that tag.
-4. **Files tab:** upload `FeverLink3-0.2.2.zip` **unchanged**, exactly as downloaded from the GitHub release (its SHA-256 must match the release's `.sha256`). Category: Main files. Version 0.2.2. File description from `fields.md`. Do not upload `manifest.json` or the `.sha256`.
+4. **Files tab:** upload `FeverLink3-0.2.3.zip` **unchanged**, exactly as downloaded from the GitHub release (its SHA-256 must match the release's `.sha256`). Category: Main files. Version 0.2.3. File description from `fields.md`. Do not upload `manifest.json` or the `.sha256`.
 5. **Images tab** (first image = thumbnail):
    1. `docs/nexus/media/cover-1920x1080.png` (the in-game window and bar icon; 0.4 MB)
    2. `docs/nexus/media/demo-build-480.gif` (the build demo, 480 px wide, 1.6 MB; if Nexus refuses a GIF, use `demo-build-still-1920x1080.png`)
@@ -59,7 +59,7 @@ Maintainer notes for publishing FeverLink3 0.2.2 on Nexus Mods and mod.io. Rewri
 ### After publishing
 
 1. Put the Nexus link in the release notes, `README.md`, the site and the Reddit draft (`docs/research/REDDIT_POST_0.2.2.md`). Owner approves before any push.
-2. Every release: upload the new zip as the new main file and move the old one to "Old versions"; update the version field and changelog.
+2. Every full release: the release workflow (job `nexus`) uploads the zip as a new version of the main file, archives the old one, updates the mod version and sends the version's CHANGELOG section as plain text (docs/RELEASING.md). Check the Files and Changelog tabs afterwards.
 
 ## Message to Nexus staff (send before publishing)
 

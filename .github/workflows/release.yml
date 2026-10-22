@@ -217,9 +217,10 @@ jobs:
   # The same zip on Nexus Mods (https://www.nexusmods.com/transportfever3/mods/19) as a new version of its main file.
   # Runs only for full releases and only when the owner has set the secret NEXUSMODS_API_KEY and the repository variables
   # NEXUS_MOD_ID and NEXUS_FILE_ID (the main file's id: Files tab, "Advanced"). Without them the job is skipped.
+  # `!cancelled()` and the explicit publish result: without them the skipped sign job made GitHub skip this job (0.2.3).
   nexus:
     needs: [build, publish]
-    if: ${{ !contains(needs.build.outputs.version, '-') && vars.NEXUS_FILE_ID != '' }}
+    if: ${{ !cancelled() && needs.publish.result == 'success' && !contains(needs.build.outputs.version, '-') && vars.NEXUS_FILE_ID != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
