@@ -10,14 +10,16 @@
 
 [Playing guide](docs/PLAYING.md) · [Changelog](docs/CHANGELOG.md) · [Roadmap](docs/ROADMAP.md) · [FAQ](docs/site/faq.md) · [Privacy](docs/site/privacy.md) · [Architecture](docs/ARCHITECTURE.md)
 
-![The host (left) draws a road; the friend's game (right) shows it a moment later](docs/media/demo-build.gif)
+![The host (left) draws a road; the second game (right) shows it 1.4 s after the click, in real time](docs/media/demo-build.gif)
+
+*Game speed x1 (normal), real time: the road stands on both games 1.4 s after the click (two games on one PC, a grown save with 6,393 inhabitants). The wait is a safety margin: every game builds at the same game step. In the beta, stability comes first.*
 
 ## What you get
 
+- **Built into the game, no separate launcher.** Start Transport Fever 3 from Steam as usual: hosting, joining, chat, syncing and updates all live in the game's bottom bar and window. There is no extra program to run.
 - **Build together.** Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
-- **Inside the game.** Start Transport Fever 3 from Steam as usual. FeverLink3 lives in the game's bottom bar.
 - **Always the same world.** The games check each other all the time. If they ever drift apart, everyone gets the host's world back in a few seconds and play goes on.
 - **Shared speed, pause and chat.**
 - **Encrypted.** Everything between the games is encrypted; the join code works like a password.
@@ -39,7 +41,7 @@ Measured with two games on one PC (internet numbers follow):
 
 | | Result |
 |---|---|
-| Click to build on both games | about 0.6 s |
+| Click to build on both games | 1.4 s at game speed x1 (the recording above: real time, a grown save with 6,393 inhabitants) |
 | World check | every 5 s, without stutter |
 | A game freezing for a few seconds | the others play on; it catches up by itself |
 | Repair when the worlds differ | about 15 s for a 45 MB world |

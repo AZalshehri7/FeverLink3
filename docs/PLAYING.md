@@ -1,17 +1,17 @@
-# Playing FeverLink3 (version 0.2.0)
+# Playing FeverLink3 (version 0.2.1)
 
-FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. Players connect to each other through Steam's own peer-to-peer networking: by design that means no port forwarding, no router settings, no VPN and nothing to open in the firewall. A first test between two Steam accounts reached through Steam's relay servers; the full host-and-join test is what this build is for. This is an early test build: expect rough edges, and tell the maintainer (Discord `azalshehri`) what happens.
+FeverLink3 lets two or more people play the same Transport Fever 3 game together. One player **hosts**, the others **join** with a code. It is built into the game: there is no launcher or program to run. Players connect through Steam: no port forwarding, no router settings, no VPN and nothing to open in the firewall. FeverLink3 is in beta: keep backups of the saves you play with, and tell the maintainer (Discord `azalshehri`) what happens.
 
 **Licence:** FeverLink3 is free for noncommercial use (PolyForm Noncommercial 1.0.0, see `LICENSE`); commercial use needs a separate licence from the maintainer.
 
 ## What you need
 
-- Windows 10 or 11, and Transport Fever 3 on Steam, **the same game version as the host** (the host says which; this build was made for build 40420, shown at the bottom right of the main menu).
+- Windows 10 or 11, and Transport Fever 3 on Steam, **the same game version as the host** (shown at the bottom right of the main menu).
 - Steam running and logged in (it is, if you start the game from Steam).
 
 ## 1. Install (once per PC): copy two things into the game folder
 
-There is no installer. You copy the files into the folder of the game:
+You install FeverLink3 by hand only once. After that it updates itself. There is no installer:
 
 1. Unzip `FeverLink3-<version>.zip`: right-click it, **Extract All**. Open the unzipped folder: it holds `winhttp.dll`, a folder called `mods`, and some text files. Do not run anything from inside the zip file itself.
 2. Close Transport Fever 3 if it is running.
@@ -22,13 +22,17 @@ There is no installer. You copy the files into the folder of the game:
    - If Windows says `winhttp.dll` already exists, **stop**: another mod uses the same file name. Do not replace it; tell the maintainer.
 5. Check: the game's folder now contains `winhttp.dll` next to `TransportFever3.exe`, and `mods\release\feverlink3` exists.
 
-**Updates come by themselves** (from 0.2.0 on): at a game start FeverLink3 checks GitHub for a newer version, gets it ready and tells you in its window ("restart the game to finish"); one restart and you play the new version. You can turn this off in the window's Troubleshooting section. **To update by hand:** close the game and copy the new files over the old ones in the same way. If the game's folder still has `mods\release\feverlink3_1` (the mod's folder name in version 0.1.0), delete that folder, or the game loads two copies of the mod. **To remove FeverLink3:** delete `winhttp.dll` and the folder `mods\release\feverlink3` from the game's folder. Steam's "Verify integrity of game files" leaves both in place.
+**Updates come by themselves.** Once per game start (never during a session) FeverLink3 asks GitHub whether a newer version exists. If so, it downloads it inside the game, only from the official GitHub releases over HTTPS, and checks every file's SHA-256 against the release. The window then says "restart the game to finish": after one restart you play the new version. You can turn automatic updates off in the window's **Troubleshooting** section. Releases are not code-signed until 1.0.0.
+
+**To update by hand:** close the game and copy the new files over the old ones in the same way. If the game's folder still has `modseleaseeverlink3_1` (the mod's folder name in version 0.1.0), delete that folder, or the game loads two copies of the mod.
+
+**To remove FeverLink3:** close the game and delete `winhttp.dll` and the folder `modseleaseeverlink3` from the game's folder. Steam's "Verify integrity of game files" leaves both in place.
 
 ## 2. Start the game
 
 Start Transport Fever 3 from **Steam as usual**.
 
-- Starting a new game: on the settings page open the **Add Mods** tab, click **Activate** under *FeverLink3 Multiplayer* (it is listed with the game's own mods), then Start Game. (Menu names as of build 40420.)
+- Starting a new game: on the settings page open the **Add Mods** tab, click **Activate** under *FeverLink3 Multiplayer* (it is listed with the game's own mods), then Start Game. 
 - In the game, click **FeverLink3** in the bar at the bottom of the screen (next to the item counters). A window called *FeverLink3 Multiplayer* opens.
 - The mod does nothing until you host or join: without a session, the game plays as it always does.
 - If the window says "The FeverLink3 module is not running", `winhttp.dll` is not next to `TransportFever3.exe`: close the game, check step 1, start the game from Steam again.
@@ -39,16 +43,16 @@ Start Transport Fever 3 from **Steam as usual**.
 
 1. Start a game (a new game, or load one) with *FeverLink3 Multiplayer* activated, and click **FeverLink3** in the bottom bar.
 2. Press **Host a game**. The window shows a **join code**. Press **Copy code** (the code is put on your clipboard; the game's text fields cannot copy by themselves) and paste it into a message to your friend with `Ctrl+V` (chat, Discord). Treat it like a password for the session.
-3. When your friend appears under **Players**, press **Start the session**. Your world is sent to the other player, whose game reloads into it; yours keeps running without a pause or a loading screen. The games compare a checksum before the session runs, so a difference would stop it instead of going unnoticed. The same happens for a player who joins later.
+3. When your friend appears under **Players**, press **Start the session**. Your world is sent to the other player, whose game reloads into it; yours keeps running after a short pause, without a loading screen. The games compare a checksum before the session runs, so a difference would stop it instead of going unnoticed. The same happens for a player who joins later.
 4. While you play, **Pause**, **1x**, **2x** and **3x** in the window's **Session** section change the speed in every game, and the chat line under them sends a message to the others. Every player can do both.
 
 **The player who joins:**
 
 1. Start any game with *FeverLink3 Multiplayer* activated (a new game is fine; it is replaced) and click **FeverLink3** in the bottom bar.
 2. Click the field **paste the join code here**, press `Ctrl+V` to paste the host's code, and press **Join**. The window shows what it is doing (`contacting the host`, `finding a route`, `connected`).
-3. Keep the window open. When the host presses **Start the session**, the host's world is sent to you (about 30 MB; it takes up to a minute or two), your game reloads into it, and the session runs on both games. Open the window again after the reload (the reload closes it).
+3. Keep the window open. When the host presses **Start the session**, the host's world is sent to you (usually well under a minute), your game reloads into it, and the session runs on both games. Open the window again after the reload (the reload closes it).
 
-**Joining through a Steam invite.** When the host invites you through Steam (or you click **Join game** on the host in your friends list), a game that already has a world loaded (with *FeverLink3 Multiplayer* activated) joins by itself, without opening the window. If the invite reaches you in the main menu, it waits: load any world (a new game is fine; it is replaced) and you join automatically. Until then the window shows "<host> invited you. Load any world and you join automatically" with **Join** and **Not now**. Transport Fever 3 has no documented way for a mod to load a save from the main menu, so a world must be loaded first. **This has not run between two PCs on Steam yet.**
+**Joining through a Steam invite.** When the host invites you through Steam (or you click **Join game** on the host in your friends list), a game that already has a world loaded (with *FeverLink3 Multiplayer* activated) joins by itself, without opening the window. If the invite reaches you in the main menu, it waits: load any world (a new game is fine; it is replaced) and you join automatically. Until then the window shows "<host> invited you. Load any world and you join automatically" with **Join** and **Not now**. Transport Fever 3 has no documented way for a mod to load a save from the main menu, so a world must be loaded first. **A fix for joining by itself is in 0.2.0 and has not yet been tested between two PCs; the join code always works.**
 
 Only join people you know. When you join, your game loads the host's world, and a Transport Fever savegame can carry game scripts, just as a mod can. Joining a session means trusting the host the way you would trust the author of a mod.
 
@@ -58,7 +62,7 @@ If joining fails, the window says why (wrong code, the host is not hosting, no r
 
 Press **Connection test...** in the window (under the join code field) to open the **Steam connection test**. It checks that two players can reach each other through Steam, without hosting: your **Steam ID** (17 digits) is shown; paste the other player's Steam ID into **paste the other player's Steam ID** and press **Test the connection**. Within about 20 seconds the window shows `connected` with the round-trip time and whether the route is `direct` or `through a Steam relay`. A Steam ID identifies your Steam account, so share it only with the person you are testing with.
 
-## 5. How to run the Steam speed test with a friend
+## 5. For testers: the Steam speed test
 
 This tells us whether a save of about 80 MB can be sent over Steam, and how long it takes. It needs two Steam accounts on two PCs (one account can only talk to itself). Both of you do steps 1 to 3; only one of you does step 4.
 
@@ -88,28 +92,30 @@ A friend who does not own the game can take part with the small program `feverli
 
 ## What works and what does not (yet)
 
-**Verified in the real game by the maintainer (game build 40420):**
+**Seen working in the real game** (two tests with a friend over the internet through Steam on 2026-10-20 and 2026-10-21, about 3.5 hours, and the maintainer's own tests):
 
-- The mod loads from the game's own `mods` folder, the in-game window opens from a button in the bottom bar, and **Host a game** over Steam shows a join code.
-- Two real copies of the game on one PC (joined over a developer connection that players never use) stay in step: the host's world is sent, the second game loads it, and both report identical world checksums.
-- The game's own save and load functions can be driven by the mod.
-- **Steam peer-to-peer works between two different accounts** (2026-10-10: a friend's connection test reached the maintainer through a Steam relay), and inside one game the transport's nine self-checks pass, including a frame the size of a savegame chunk.
+- Two players on two PCs connect over Steam with a join code; the host's world is sent to the friend.
+- Building together: roads, rail, stations, stops, depots, lines and vehicles.
+- The full game: towns grow, traffic flows, ratings change, as in single player. Nothing is switched off.
+- World checks run all the time; when the worlds drifted apart, an automatic repair sync gave everyone the host's world back (about 15 s for an 80 MB world over Steam).
+- Shared speed, pause and chat.
+- The in-game interface: the bar icon with its colours, the pop-up and the window.
+- **Report a problem** over Steam: one zip with both players' logs arrived.
+- Automatic updates, on the maintainer's PC: 0.2.1 downloaded, checked and installed itself, finished after one restart.
 
-**Not verified yet:**
+**Not yet seen in the real game** (tested automatically): joining from a Steam invite by itself (needs a two-PC test), the warning about other mods that change the world on their own, putting the previous version back when an update does not start, and the switch that turns automatic updates off.
 
-- Joining a host over Steam from a second Steam account, the world transfer over that connection, and playing together afterwards (this build is for that test).
-- Building together beyond the slice that was seen: the mod captures player actions (buying vehicles, stations, depots, rail, and more) and replays them on every game, but only roads, bulldozing, loans and lines have been checked with two real games.
-- The native hooks that hold construction commands back so every game builds at the same moment: switched off unless a developer turns them on; run in two real games for the road tools and the bulldozer, not for anything else.
+**Known gaps:**
 
-**Written and tested without the game, not yet seen in a real session:** reconnecting after a connection loss (the same player comes back within about five minutes), the host removing a player, up to eight players.
-
-**Towns and sync.** The game grows towns with choices that can differ from one computer to the next, so after a while two players' towns can differ, and a road or station built through such a town may fail on the other computer; FeverLink3 then repairs the world with a resync. Town growth is never switched off and no rating is changed; FeverLink3 does not alter how the game works. In our tests the two games' growth started from different random seeds and drifted apart about 10 seconds after each resync; making the seeds equal helped for a while (about 13 checks) but not for good, so the work continues on keeping growth identical on every computer. Until then, expect an occasional resync after building in or near a town.
-
-**Not built yet:** separate companies (one shared company for now), a dedicated server, towns that grow during a session.
+- Terrain editing, ground paint and trees are not shared yet; the terrain tools are switched off during a session.
+- Some extra repair syncs: the game sometimes orders its internal object ids differently on two PCs. FeverLink3 finds this within seconds and repairs it automatically.
+- Mods that change the world on their own (for example an automatic line namer) cause extra repair syncs. Turn their automatic changes off while playing together. Every player needs the same mods as the host.
+- Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).
+- All players share one company; separate companies and a dedicated server are planned.
 
 ## If something goes wrong
 
-Press **Report a problem**: it is in the pop-up of the bar icon while the icon is red, at the bottom of the window's **Players** tab during a session, and under **Troubleshooting** on the start screen. If someone else's report is still being made, the window says so: that report reaches the player who asked for it. Type a line about what you were doing, if you like. In a session the host collects the logs of every player (up to a minute; the other players see a notice that their logs were sent to the host) and you get one zip, `FeverLink3-report-<date>-<id>.zip`, on your Desktop (or in `Documents\FeverLink3\reports`). Its folder opens, and so does a GitHub page with the bug report form filled in: drag the zip onto it and say what happened. Nothing is sent anywhere by itself. What the zip holds and what is taken out of it: [Privacy](site/privacy.html). **Not yet tried in a real game.**
+Press **Report a problem**: it is in the pop-up of the bar icon while the icon is red, at the bottom of the window's **Players** tab during a session, and under **Troubleshooting** on the start screen. If someone else's report is still being made, the window says so: that report reaches the player who asked for it. Type a line about what you were doing, if you like. In a session the host collects the logs of every player (up to a minute; the other players see a notice that their logs were sent to the host) and you get one zip, `FeverLink3-report-<date>-<id>.zip`, on your Desktop (or in `Documents\FeverLink3\reports`). Its folder opens, and so does a GitHub page with the bug report form filled in: drag the zip onto it and say what happened. Nothing is sent anywhere by itself. What the zip holds and what is taken out of it: [Privacy](site/privacy.html). This was used over Steam with a friend on 2026-10-21.
 
 If the button does not work, send the maintainer these files instead (they hold no personal data besides your Windows user name and folder names):
 

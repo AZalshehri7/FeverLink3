@@ -4,52 +4,39 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-14. The project started on 2026-10-09. [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html)
+Last updated 2026-10-22, version 0.2.1 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
 
-FeverLink3 is an early test build and not yet a full multiplayer game: two real copies of the game can host and join and follow each other's speed, pause and chat commands, and a thin slice of building (roads, bulldozing, loans, lines) has been seen working between two games; stations, rail, vehicles and terrain have not been tried. This page keeps three things apart: what has been seen working in the real game, what has only been tested without the game, and what has not been done.
+This page keeps three things apart: what has been seen working in the real game, what has only been tested automatically, and the known gaps.
 
 ## Seen working in the real game
 
-Game build 40420, the maintainer's PC.
+Two tests with a friend over the internet through Steam (2026-10-20 and 2026-10-21, about 3.5 hours together), and the maintainer's own tests:
 
-| Date | What |
-|---|---|
-| 2026-10-09 | The mod loads, and its window opens from a button in the bottom bar. |
-| 2026-10-09 | With an earlier build of the window, whose Host button used a direct connection (since taken out of the window), hosting showed a join code, and a second client (a test client, not a second copy of the game) joined that session by its code. |
-| 2026-10-09 | The mod drives the game's own save and load, and after a reload it finds its session files again. |
-| 2026-10-09 | The Steam peer-to-peer listener starts inside the game. |
-| 2026-10-10 | Inside one running game, a Steam peer-to-peer connection to the game's own Steam ID opens and 6 pings are answered. |
-| 2026-10-10 | The Steam peer-to-peer connection between two different Steam accounts: the maintainer's friend reported `connected` with a round trip of 199 ms through a Steam relay (reported by the friend, not seen by the maintainer). |
-| 2026-10-10 | Two real copies of the game on one PC, over the developer connection on the loopback address (two games of one Steam account cannot reach each other through Steam): the host hosts and presses **Copy code**, the guest pastes the code with Ctrl+V and joins, the host presses **Start the session**, the host's world is sent in chunks and the guest's game loads it, and the paused checksum after the transfer matches. [Recording](../media/split-screen-demo.gif). |
-| 2026-10-10 | In the same two games: **2x**, **Pause** and **1x** pressed in the window of either game change the speed of both, with the same date on both, and a chat message typed in one game appears in the other. |
-| 2026-10-10 | System test in two real games (host and guest on one PC; worlds compared at one game time with an id-independent fingerprint, and a resync or a differing checksum round during a step counts as a failure): the game's own speed and pause buttons in the bottom bar control both games from either side; loans taken in the real Account window sync both ways without doubling; renaming a town, the company and a station group syncs both ways; creating a line syncs both ways; a road built with the real road tool shows on the other game about one second later, in both directions; bulldozing a road piece syncs (the refund shows up on the other game after the host's money correction, about 20 s). |
-| 2026-10-10 | The session buttons in two real games: the guest's **Leave the session** returns it to the start screen and the host's list drops it; the host's **Remove** next to a player removes it and the guest sees why; a returning guest is synced again (hot join); when the host returns to the main menu the host's session ends by itself and the guest sees "The host ended the session". |
-| 2026-10-10 | Town growth: two real games resynced to one world and left running with no action drifted apart within about 90 s (other building variants and levels in the same places, a house on one side only, one more street piece), also with pollution and noise neutralised as MPFever does. A test that held growth still made the worlds identical, but that approach was removed on 2026-10-11 because it removes a game mechanic; the fix has to keep growth working. |
-| 2026-10-11 | Town growth, measured in two real games with seed hooks: town growth is native code. A seed forced for map generation did not change growth. The seed given to the growth step is the same on both games at every logged call (1,717 calls, including the towns that still drifted), so the seed is not the cause; the cause is being traced (a per-step trace of the drifting towns and an analysis of the game executable). Growth is not switched off and no rating is changed. |
-| 2026-10-14 | Two real games on one PC (the developer connection on the loopback address; scripted sweep plus builds made by clicking with the real tools): roads, junctions, bridges, tunnels, traffic lights, crosswalks, bulldozing, bus stops, stations and their modules, road and rail depots, rail track, switches, signals, one-way lane changes, lines, vehicles and loans built by one game show on the other with the same entity ids and identical checksum rounds. Every game applies a build at the same step; the game's own build command is copied natively (capture and rebuild a few milliseconds each). A build appears on the other game after about 0.5 to 0.7 s at game speed x3 and 0.8 to 1.1 s at x1, also with a test delay of up to 100 ms one way. Not tested over the internet. |
-| 2026-10-14 | The maintainer's own first two-window test: the host crashed during fast building. Cause found in the logs (a watchdog switched the build sync off for the rest of the session after about 8 s of fast building, then a build naming stale objects crashed the game). Fixed; the fix was tried in two real games with 17 alternating builds in 64 s, not yet repeated by the maintainer. |
+- Two players on two PCs connect over Steam with a join code; the host's world is sent to the friend.
+- Building together: roads, rail, stations, stops, depots, lines and vehicles. A road stands on both games 1.4 s after the click (game speed x1, real time, two games on one PC, a grown save; 2026-10-22).
+- The full game: towns grow, traffic flows, ratings change, as in single player.
+- World checks run all the time; when the worlds drifted apart, an automatic repair sync gave everyone the host's world back (about 15 s for an 80 MB world over Steam).
+- Shared speed, pause and chat.
+- The new in-game interface: the bar icon with its colours, the pop-up and the window.
+- **Report a problem** over Steam: one zip with every player's logs.
+- Automatic updates, on the maintainer's PC: 0.2.1 downloaded, checked and installed itself, finished after one restart.
 
-## Tested without the game
+## Tested automatically only
 
-Written and covered by automated tests (unit tests, loopback sessions, two simulated games running the real mod code), but not yet seen between two real games:
+These are covered by the automatic tests (about 1,600 on every change) or by two game windows on one PC, but not yet seen between two PCs:
 
-- the sealed connection (encryption, join codes, who may send what),
-- stamping actions to a future step and applying them in the same order everywhere, including the schemas for everyday operations (vehicles, lines, names, bookings, events),
-- world checksums and the repair by loading the host's savegame (resync), including sending a save in chunks with a SHA-256 check,
-- permissions for building, bulldozing and spending,
-- the player-side reconnect (the same player back within about five minutes) and the hot join of a running session, the host removing a player, and eight games in one session,
-- install and uninstall of the game-side files, release packaging, and update verification.
+- Joining from a Steam invite by itself (fixed in 0.2.0; needs a two-PC test). The join code works.
+- The warning about other mods that change the world on their own.
+- Putting the previous version back when an update does not start.
+- The switch that turns automatic updates off.
 
-## Not done or not verified
+## Known gaps
 
-- Hosting and joining a whole session over Steam between two accounts (the connection test worked; carrying a session over it is the next test with a friend).
-- A busy world: every resync now reloads the host's game too, because a world that kept running drifts from a freshly loaded copy (measured in a lab with two games on one PC). This has not been checked in a real two-player game yet.
-- Not yet verified: terrain editing (its height grid cannot be read from a script, so it is not replicated), separate companies, two players building at the very same moment, and long sessions of many minutes of fast building.
-- Town growth is native and not the same on two games (see `ARCHITECTURE.md` section 7): towns drift apart within about 90 s and a build through a town can then fail on the other game. Towns are never switched off or changed to hide this. Measured so far (2026-10-11): the growth generator is seeded once per process, and forcing the same seed in both games kept constructions identical for about 13 checksum rounds before they differed; the cause of the original difference is not established, and resetting the generator at every sync point is the next step (in progress).
-- Money after a bulldozing: the refund the native tool books is not part of the replayed build, so the two games differ by that amount until the host's money correction (about 20 s).
-- The native hooks that hold construction commands back so every game builds at the same moment are on by default and ran in two real games on one PC (see the table above); they have not run in a game between two PCs.
-- Separate companies and a dedicated server. The installer's double-click menu has been tested on a fake PC only, not yet on a clean PC.
+- Terrain editing, ground paint and trees are not shared yet; the terrain tools are switched off during a session.
+- Some extra repair syncs: the game sometimes orders its internal object ids differently on two PCs. FeverLink3 finds this within seconds and repairs it automatically; the cause is being traced.
+- Mods that change the world on their own (for example an automatic line namer) cause extra repair syncs. Turn their automatic changes off while playing together.
+- Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).
+- All players share one company; separate companies are planned.
+- Releases are not code-signed until 1.0.0. Updates come only from the official GitHub releases over HTTPS, with every file's checksum checked.
 
-## What would change this page
-
-Each line above moves to "seen working" only after it has been seen in the real game, with the date. The proof milestones and the plan are in the [roadmap](../ROADMAP.html).
+Each item moves to "seen working" only after it has been seen in the real game.

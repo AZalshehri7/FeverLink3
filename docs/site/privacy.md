@@ -4,13 +4,13 @@ title: FeverLink3 privacy
 
 # Privacy
 
-Last updated 2026-10-21. [Back to the start page](../index.html)
+Last updated 2026-10-22 (version 0.2.1). [Back to the start page](../index.html)
 
 FeverLink3 has no accounts, no analytics, no advertising, and no server of the project that collects anything. This page says what leaves your PC and who sees it. The technical detail is in [What is in winhttp.dll, and how to check it](../SECURITY_FOR_USERS.html).
 
 ## What the project collects
 
-Nothing. The program does not report to the project: no telemetry, no crash reports, no usage data. The automatic update asks GitHub (`api.github.com` and the release files on `github.com`) for the newest FeverLink3 release once per game start; GitHub sees your IP address, as for any download. You can turn it off in the window's Troubleshooting section (details: [What is in winhttp.dll](../SECURITY_FOR_USERS.html), "Automatic updates"). If you send logs to the maintainer for a bug report, that is your choice; the log files hold no personal data besides your Windows user name and the paths of your Steam folders (see [Playing FeverLink3](../PLAYING.html), "If something goes wrong").
+Nothing. The program does not report to the project: no telemetry, no crash reports, no usage data. The automatic update asks GitHub (`api.github.com` and the release files on `github.com`) for the newest FeverLink3 release once per game start, and downloads a newer one inside the game (no other program is started); GitHub sees your IP address, as for any download. You can turn it off in the window's Troubleshooting section (details: [What is in winhttp.dll](../SECURITY_FOR_USERS.html), "Automatic updates"). If you send logs to the maintainer for a bug report, that is your choice; the log files hold no personal data besides your Windows user name and the paths of your Steam folders (see [Playing FeverLink3](../PLAYING.html), "If something goes wrong").
 
 ## If you make a bug report
 
@@ -22,8 +22,6 @@ The **Report a problem** button makes a zip file on your PC. Nothing is sent to 
 
 ## What other players receive in a session
 
-Sessions over Steam arrive in the next test build; this is what they are designed to share.
-
 - The display name you use. It starts as your Windows user name; the window has a name field, so change it before hosting or joining if you prefer another.
 - Your game actions, world checksums and chat lines.
 - If you host: your world, as a savegame, when a player joins or you press "Sync everyone to my world".
@@ -33,7 +31,7 @@ A join code contains the session secret, the time it was made and how to reach t
 
 ## What the connection reveals
 
-Players are connected through Steam's peer-to-peer networking. Steam decides whether two games talk directly or through its relay servers; Steam's own documentation says that relayed connections do not reveal the players' IP addresses to each other, and a direct connection, like any direct connection between two computers, does. The in-game connection test shows which route was used ("direct" or "through a Steam relay"). Steam sees which Steam IDs connect to each other, as it does for any Steam game. This is being tested; the first two-account test is still to come. If the project ever adds a server of its own to the path, this page will say so and say what it can and cannot see.
+Players are connected through Steam's peer-to-peer networking. Steam decides whether two games talk directly or through its relay servers; Steam's own documentation says that relayed connections do not reveal the players' IP addresses to each other, and a direct connection, like any direct connection between two computers, does. The in-game connection test shows which route was used ("direct" or "through a Steam relay"). Steam sees which Steam IDs connect to each other, as it does for any Steam game. If the project ever adds a server of its own to the path, this page will say so and say what it can and cannot see.
 
 ## Websites
 
