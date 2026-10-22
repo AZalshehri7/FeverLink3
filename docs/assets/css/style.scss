@@ -1,0 +1,55 @@
+---
+---
+
+@import "{{ site.theme }}";
+
+// FeverLink3 colours (the mod picture): dark navy, blue, light blue, white; replaces Cayman's green.
+// The header shows the FeverLink3 banner (docs/media/header.png, 1300x372) in place of the theme's title text.
+$fl3-navy: #0f1b2d;
+$fl3-blue: #3382eb;
+$fl3-blue-dark: #1f5fb8;
+$fl3-light: #bfd7ff;
+
+.page-header {
+  color: #fff;
+  background-color: $fl3-navy;
+  background-image: url("../../media/header.png"), linear-gradient(180deg, $fl3-navy 70%, #13284a);
+  background-repeat: no-repeat, no-repeat;
+  background-position: center 1.2rem, center;
+  background-size: min(560px, 90%) auto, cover;
+  padding-top: calc(min(560px, 90vw) * 372 / 1300 + 1.2rem);
+  padding-bottom: 1.5rem;
+}
+
+// the banner already carries the name
+.project-name {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+.project-tagline { color: $fl3-light; margin-top: 0; }
+
+.page-header { position: relative; }
+
+// "View on GitHub" in the top right corner of the header
+.page-header .btn {
+  position: absolute; top: 1rem; right: 1rem; margin: 0;
+  font-size: 0.85rem; padding: 0.45rem 0.9rem;
+}
+
+.btn {
+  color: #fff;
+  background-color: rgba(51, 130, 235, 0.25);
+  border-color: rgba(191, 215, 255, 0.45);
+  &:hover { color: #fff; background-color: rgba(51, 130, 235, 0.45); border-color: $fl3-light; }
+}
+
+.main-content {
+  a { color: $fl3-blue; }
+  h1, h2, h3, h4, h5, h6 { color: $fl3-blue-dark; }
+  blockquote { color: #4a5a72; border-left-color: $fl3-light; }
+  code { color: $fl3-navy; background-color: #eef4ff; }
+  pre { background-color: #f3f7ff; border-color: #d6e4ff; }
+  table th { color: $fl3-navy; }
+  hr { background-color: #d6e4ff; }
+  .site-footer { border-top-color: #d6e4ff; }
+  .site-footer-credits { color: #4a5a72; }
+}

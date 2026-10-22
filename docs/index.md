@@ -2,9 +2,7 @@
 title: FeverLink3
 ---
 
-# FeverLink3
-
-**Play Transport Fever 3 together. Several players build in one shared world, each in their own game.**
+**Several players build in one shared world, each in their own game.**
 
 Version 0.2.2 · Windows and Steam · source available (PolyForm Noncommercial) · unofficial · Last updated 2026-10-22
 
