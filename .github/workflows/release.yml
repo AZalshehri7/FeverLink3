@@ -196,3 +196,41 @@ jobs:
           $extra = @(); if ("$version" -match '-') { $extra += '--prerelease' }
           gh release create "v$version" @assets --target "${{ github.sha }}" --title "FeverLink3 $version" --notes-file notes.md @extra
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  # The same zip on Nexus Mods (https://www.nexusmods.com/transportfever3/mods/19) as a new version of its main file.
+  # Runs only for full releases and only when the owner has set the secret NEXUSMODS_API_KEY and the repository variables
+  # NEXUS_MOD_ID and NEXUS_FILE_ID (the main file's id: Files tab, "Advanced"). Without them the job is skipped.
+  nexus:
+    needs: [build, publish]
+    if: ${{ !contains(needs.build.outputs.version, '-') && vars.NEXUS_FILE_ID != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Changelog of this version
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '$0 ~ "^## "v"( |$)" {f=1; next} /^## / {f=0} f' docs/CHANGELOG.md > changelog.txt
+          { echo 'text<<EOF_CHANGELOG'; cat changelog.txt; echo 'EOF_CHANGELOG'; } >> "$GITHUB_OUTPUT"
+      # pinned to v1.0.0-beta.11 by commit
+      - uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: ${{ vars.NEXUS_MOD_ID }}
+          file_id: ${{ vars.NEXUS_FILE_ID }}
+          filename: dist/FeverLink3-${{ needs.build.outputs.version }}.zip
+          display_name: FeverLink3 ${{ needs.build.outputs.version }}
+          version: ${{ needs.build.outputs.version }}
+          description: Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. SHA-256 on the GitHub release v${{ needs.build.outputs.version }}. Updates itself (can be turned off).
+          category: main
+          archive_existing_version: true
+          update_mod_version: true
+          allow_mod_manager_download: false
+          primary_mod_manager_download: false
+          changelog: ${{ steps.notes.outputs.text }}

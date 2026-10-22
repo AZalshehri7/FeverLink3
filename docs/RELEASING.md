@@ -100,3 +100,7 @@ The two values must be equal, and equal to the SHA-256 in the release notes. The
 ## SmartScreen
 
 The exe is not code-signed yet, so the first run on a PC shows "Windows protected your PC" (More info, then Run anyway). This appears once per PC at the first run of a browser-downloaded file. Files the launcher downloads itself for updates carry no mark-of-the-web, so updates do not trigger it. Code signing is the only real fix; the options (the SignPath Foundation's free programme probably does not accept the project's PolyForm Noncommercial licence, so a paid certificate is the realistic route), their cost and the checklist are in `docs/SIGNING.md`.
+
+## Nexus Mods
+
+A full release (no dash in the version) also uploads its zip to [Nexus Mods](https://www.nexusmods.com/transportfever3/mods/19) as a new version of the main file, with the version's CHANGELOG section as its changelog (job `nexus` in `release.yml`, the official `Nexus-Mods/upload-action`, pinned by commit). It needs, once, in the repository settings: the secret `NEXUSMODS_API_KEY` (from https://www.nexusmods.com/settings/api-keys) and the variables `NEXUS_MOD_ID` = `19` and `NEXUS_FILE_ID` (the main file's id: the mod's Files tab, "Advanced"). Without `NEXUS_FILE_ID` the job is skipped. The mod page's description and images are edited by hand on Nexus.

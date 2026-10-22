@@ -86,7 +86,7 @@ Only join people you trust. Your game loads the host's world, and a Transport Fe
 From the [GitHub releases page](https://github.com/AZalshehri7/FeverLink3/releases/latest). Each release is one zip with `winhttp.dll` and the mod. The [start page](../index.html#quick-start) shows how to install it.
 
 **Is it on the Steam Workshop or the Mod Hub?**
-Transport Fever 3 has no Steam Workshop. Pages on the game's Mod Hub and on Nexus Mods are planned.
+Transport Fever 3 has no Steam Workshop. FeverLink3 is on [Nexus Mods](https://www.nexusmods.com/transportfever3/mods/19); a page on the game's Mod Hub is planned.
 
 **How do I uninstall it?**
 Close the game and delete `winhttp.dll` and the folder `mods\release\feverlink3` from the game's folder (in Steam: right-click Transport Fever 3, Manage, Browse local files).

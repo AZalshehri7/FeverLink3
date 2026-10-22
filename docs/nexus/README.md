@@ -1,70 +1,100 @@
-# Nexus Mods listing material
+# Nexus Mods and mod.io listing material (0.2.2)
 
-Maintainer notes for publishing FeverLink3 on Nexus Mods (the game has a page at https://www.nexusmods.com/transportfever3). Written on 2026-10-10 for a Steam connection-test build that was never released. **Out of date: rewrite it for 0.2.0 before publishing.** **Nothing here has been published or sent to anyone.** This folder is excluded from the project site on purpose.
+Maintainer notes for publishing FeverLink3 0.2.2 on Nexus Mods and mod.io. Rewritten on 2026-10-22 for the release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.2 (it replaces the stale 2026-10-10 connection-test text). **Nothing here has been published or sent to anyone.** This folder is excluded from the project site on purpose.
 
 | File | What it is |
 |---|---|
-| `description.bbcode.txt` | The long description in Nexus BBCode, ready to paste into the Description box (about 15,600 characters; tags checked for balance) |
-| `description.md` | The same text in Markdown, for GitHub or another host |
-| `fields.md` | Every other form field as paste-ready text: name, summary, version, file description, requirements, permissions and credits, changelog, pinned post, and the message to Nexus staff |
-| `shot-list.md` | The screenshots and GIFs to capture, with exact steps, what to hide, captions, and which ones are blocked |
+| `README.md` | This checklist: rules found, risks, exact upload steps, the message to Nexus staff |
+| `description.bbcode.txt` | The Nexus long description in BBCode, ready to paste |
+| `fields.md` | Every other Nexus form field: name, summary, category, version, file description, requirements, permissions, changelog, pinned post |
+| `MODIO.md` | The mod.io / in-game Mod Hub listing: texts, tags, package layout, a PowerShell command to build it, images |
+| `modio-description.html` | The mod.io / Mod Hub description as HTML (goes into the mod's `_metadata/description.html`, see `MODIO.md`) |
+| `media/` | Images made for the listings (see "Images" below). `docs/media` is untouched. |
+| `description.md`, `shot-list.md` | **Old (2026-10-10, connection-test build). Do not use.** Delete them or rewrite them later. |
 
-## What the listing says the connection-test build is
+## Rules found (read 2026-10-22)
 
-Following the owner's decisions of 2026-10-10: the first test build is the **Steam connection test** (two testers exchange Steam IDs in the window and read the result); hosting and joining over Steam are "the next test build" (in the code, the window's Host button answers that hosting over Steam is not finished); the zip holds a testing installer, the native module and the mod; the end state is the mod offered in the game's Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now. The description says all of this and promises nothing beyond it. If the build you tag does more (hosting over Steam works, for example), rewrite the sections "What this test build does" and "Status" first.
+**Nexus Mods** ([file submission guidelines](https://help.nexusmods.com/article/28-file-submission-guidelines)):
 
-## The rules the text follows
+1. "Files (especially executables) that connect to the internet to download or send information and/or files are prohibited unless where it is crucial for the functioning of the mod/utility." The same rule says **"auto update" functionality does not qualify as crucial**, and asks authors of such tools to contact staff or support with the source code. Nexus "reserve[s] the right to moderate and/or remove" files that talk to the internet.
+2. Generative AI: two tags. **AI-Generated Content** covers "AI-Generated code, user interface elements, ..."; **AI Assisted** is for "Developer-led code ... with limited AI involvement" and needs evidence such as commit history, or moderators may replace the tag. "If your mod is primarily generated with AI, you should apply the AI-Generated Content tag." Undisclosed or wrongly tagged AI use "may be subject to moderation action". Authors are responsible for the accuracy of every claim on the page, including AI-written text.
+3. Files must be functional, properly categorised and tagged; images relevant and not misleading; no placeholders.
+4. Game page: Nexus serves `https://www.nexusmods.com/games/transportfever3` behind a bot check, so its existence could not be confirmed from here (an earlier search snapshot on 2026-10-10 said it exists). If the game is missing in the "Add a mod" search, request it there with the official title "Transport Fever 3" ([how to add a game](https://help.nexusmods.com/article/104-how-can-i-add-a-new-game-to-nexus-mods)).
+5. Image size limits are not published; users report about 2 MB per image. `media/` has images under that.
 
-1. **Only what has been seen working.** The status block lists what was seen in the real game (build 40420, 2026-10-09 and 2026-10-10) and what was not. A claim moves from "not verified" to "seen working" only after it has been seen, with the date. The proof milestones are in `docs/ROADMAP.md`.
-2. **The connection is described as Steam peer-to-peer, "being tested".** Proven so far: inside one game, a connection to its own Steam ID (6 pings answered). The first test between two different Steam accounts is what the connection-test build was for; until it has been done the text must never say that it works over the internet. Hosting and joining over Steam are "the next test build". No other transport is announced (the owner has parked any server of the project; do not mention one). The text asks the player to do nothing to connect except share and paste the join code.
-3. **Both predecessors are credited** wherever the project is described: TpF2 Multiplayer by silver2127 and MPFever by dkdknight (arthur), both MIT.
-4. **Nexus's own rules are respected**: an executable that connects to the internet needs the staff's go-ahead with reasons and source code (message drafted in `fields.md`); AI-assisted work must be tagged and disclosed (see step 1 below); claims must be accurate.
-5. **The licence is the PolyForm Noncommercial License 1.0.0** (owner decision of 2026-10-10): free for noncommercial use, commercial use only with a separate licence from the owner. The text therefore says "source available", never "open source" (the PolyForm licence is not approved by the Open Source Initiative), repeats the "Required Notice" line, and answers the Nexus permission items with the strictest reading (use in sold or monetised mods: not allowed without a commercial licence). Nexus has no licence field, and its guidelines do not forbid a noncommercial licence; the licence text in the zip is `LICENSE`.
+**mod.io and the TF3 Mod Hub**: see `MODIO.md` (summary: the Mod Hub package can only be the mod folder; `winhttp.dll` cannot go through it).
 
-## Checklist, in order
+## Risks that could get an upload removed (highest first)
 
-### Before the page
+1. **Nexus: the automatic updater.** The `winhttp.dll` in the official zip downloads new versions from GitHub at game start (it can be turned off in Troubleshooting). Nexus explicitly says auto-update is not "crucial", so this is the most likely reason for removal. The Steam peer-to-peer traffic *is* the mod's function and should be acceptable after the staff message. Options, owner decides:
+   - A. Ask staff first (message below) and publish only after a yes. Recommended.
+   - B. A Nexus-specific build without the updater (the release workflow already enables updates only with `FEVERLINK3_OFFICIAL_BUILD=1`), uploaded as its own file. Needs a code/release change; not done.
+   - C. Publish the page without a file and link to GitHub. **Not allowed**: Nexus forbids non-functional pages and links to files it would not host.
+2. **AI tag.** The code and docs were written largely by Claude under the owner's direction. That matches **AI-Generated Content**, not "AI Assisted" ("limited AI involvement"). Choosing "AI Assisted" risks the tag being replaced and a moderation note. Recommendation: AI-Generated Content, and say in the description that the owner directs, reviews and tests every change.
+3. **Unsigned DLL.** Antivirus or Nexus's own scan may flag an unsigned proxy `winhttp.dll`. The page says it is unsigned until 1.0.0 and gives the SHA-256 on GitHub.
+4. **Mod Hub (mod.io):** see `MODIO.md`: the mod's `io` use (outside "only the official scripting API"), console players, and the stale `modinfo.json` description.
 
-1. **AI disclosure.** The Nexus guidelines require generative-AI tags and say that undisclosed AI use may be moderated. The code and docs of this project were largely written with Claude under your direction, and the commit messages say so. The description already says it in the credits. Decide which Nexus AI tag applies and set it when you create the page.
-2. **Cut the release.** Set the workspace version to the release version in `Cargo.toml` (so that `native.log` and the zip name agree), tag `v0.2.0`, push the tag, wait for the release job (`docs/RELEASING.md`). The real signing key must exist first; the key in the repository is a placeholder whose private half is public. Keep the zip byte for byte as the release asset: the SHA-256 in the release notes is what players compare.
-3. **Re-check the claims against the tagged code** (table below). Fix the text, not the table, if the code differs.
-4. **Capture the screenshots** (`shot-list.md`). Hide join codes, Steam IDs and your Windows user name.
-5. **Write to Nexus staff** with the message in `fields.md` and wait for the answer.
-6. **Look at the live form** for what could not be read: the summary and description length limits, the category list, the tag list, the file description limit, the image limits. If the description is too long, take the FAQ and the changelog spoiler blocks out (about 5,000 characters), put the changelog in the Changelogs tab and the FAQ in a pinned post.
+## Checklist for the owner, in order
 
-### Creating the page
+### Before anything
 
-1. New mod, game "Transport Fever 3". Paste the name, summary and the fields from `fields.md`. Paste `description.bbcode.txt` into the description and open the preview: if a tag shows up as text, remove that tag (Nexus validates BBCode strictly).
-2. Upload the zip from the GitHub release as the main file, with the file description from `fields.md`. Set the permissions, the requirements and the credits as written there. Add the images in the order given in `shot-list.md`.
-3. Pin the "known issues" post.
+1. Read `description.bbcode.txt` and `fields.md` and approve the wording (CLAUDE.md rule 6 applies to public text too).
+2. AI tag: AI Assisted (owner decision 2026-10-22).
+3. **Send the staff message** (below) through Nexus support (https://help.nexusmods.com, "Contact us" / submit a request) while logged in. Wait for the answer. If they want the updater off, that is option B above.
+
+### Creating the Nexus page (after a yes)
+
+1. nexusmods.com → **Upload** (Add a mod) → game **Transport Fever 3**.
+2. Paste name, summary, version, category, language from `fields.md`. Tick the AI tag. Adult content: no.
+3. Description: paste `description.bbcode.txt`, open the preview. If a tag shows as text, remove that tag.
+4. **Files tab:** upload `FeverLink3-0.2.2.zip` **unchanged**, exactly as downloaded from the GitHub release (its SHA-256 must match the release's `.sha256`). Category: Main files. Version 0.2.2. File description from `fields.md`. Do not upload `manifest.json` or the `.sha256`.
+5. **Images tab** (first image = thumbnail):
+   1. `docs/nexus/media/cover-1920x1080.png` (the in-game window and bar icon; 0.4 MB)
+   2. `docs/nexus/media/demo-build-480.gif` (the build demo, 480 px wide, 1.6 MB; if Nexus refuses a GIF, use `demo-build-still-1920x1080.png`)
+   3. `docs/media/ui-overview.png` (1.1 MB, the full interface sheet)
+   4. `mod/feverlink3/_metadata/0.png` (the mod picture, optional)
+6. **Requirements** and **Permissions & credits** tabs: from `fields.md`.
+7. Publish. Then pin the known-issues post from `fields.md`.
 
 ### After publishing
 
-1. Put the Nexus link on `docs/index.md`, `README.md` and the release notes, and change "planned" to the address.
-2. Update `docs/ROADMAP.md` (the stage 0.3 item about the Nexus listing).
-3. Watch the comments and the bug reports; update the pinned post when an issue is fixed or a new one appears. When the first two-account Steam test has been done, change every "being tested" accordingly: `Select-String -Path docs -Pattern "being tested" -Recurse`.
+1. Put the Nexus link in the release notes, `README.md`, the site and the Reddit draft (`docs/research/REDDIT_POST_0.2.2.md`). Owner approves before any push.
+2. Every release: upload the new zip as the new main file and move the old one to "Old versions"; update the version field and changelog.
 
-## Claims to re-check against the tagged code
+## Message to Nexus staff (send before publishing)
 
-The listing and the user security page make these statements. Each one is true of the code only if the check gives the expected result. Claims 1 and 2 depend on the in-game path not using the development transport (plain TCP, only started when the window asks for `transport = "tcp"`); check them first. If a check fails, the sentence is false: change the code, or change the sentences in `description.*`, `docs/SECURITY_FOR_USERS.md`, `docs/PLAYING.md`, `docs/site/privacy.md` and `docs/site/faq.md` before anything is published.
+```
+Subject: Request before publishing: co-op multiplayer mod with a native DLL that uses the network (FeverLink3, Transport Fever 3)
 
-| # | Claim | Check | Expected |
-|---|---|---|---|
-| 1 | The host does not open an inbound TCP port in normal use | With the game running and hosting: `Get-NetTCPConnection -OwningProcess (Get-Process TransportFever3).Id -State Listen`. In the source: where `TcpListener::bind` is reachable from `live::spawn` | no listening TCP socket owned by the game process; no call path from `live::spawn` to `TcpListener::bind` |
-| 2 | Nothing else leaves the PC besides the player-to-player path through Steam | `Select-String -Path launcher\src\*.rs -Pattern "ipify\|checkip\|icanhazip\|M-SEARCH\|PortMapping"`, and the outgoing connections listed by `Get-NetTCPConnection -OwningProcess ... -State Established` while hosting | no matches reachable from `live::spawn`; only the game's and Steam's own connections |
-| 3 | The Steam listener answers `ping ` messages only and ignores other data | read `launcher/src/steamnet.rs` (`reply_for`, `receive`) | unchanged, or update `docs/SECURITY_FOR_USERS.md` |
-| 4 | No server of the project is involved in the connection | `Select-String -Path launcher\src\*.rs,native\src\*.rs -Pattern "RelayAddr\|relay::"` | no use outside tests. If a server of the project is ever added to the path, `docs/SECURITY_FOR_USERS.md`, `docs/site/privacy.md` and the listing must say so first |
-| 5 | Steam between two accounts is "being tested" | the result of the first run (P6) | change the wording everywhere once it has been done, in either direction; hosting and joining stay "the next test build" until P7 |
-| 6 | The DLL passes 14 WinHTTP functions through | `Select-String -Path native\src\proxy.rs -Pattern "^relay!"` gives 14 lines; the address tool's report for the supported build says the lists are identical | 14, identical |
-| 7 | Hooks (counters, hold), the pool patch, the Lua seed pin and the step-count seeds are installed by default on a known game build and each is turned off with its variable set to `0` (`FEVERLINK3_HOOKS`, `FEVERLINK3_HOLD`, `FEVERLINK3_POOLPATCH`, `FEVERLINK3_LUA_SEED`, `FEVERLINK3_STEP_SEED`); the diagnostic hooks are off unless set to `1` | `Select-String -Path native\src\*.rs -Pattern "attach_from_env"` and read `native/src/plan.rs` | called only from `DllMain`; the installer, the window and the release never set the variables. If that changes, rewrite the sections "What the DLL does" and "What may change" of `docs/SECURITY_FOR_USERS.md` and the listing first |
-| 8 | Only game build 40420 is known | `native/src/build_table.rs`, `BUILDS` | one row |
-| 9 | No telemetry; the only update traffic is the automatic update (once per game start, to GitHub's API and release files, off in Troubleshooting) | no network client code in `native/` or in the launcher library other than the session, the Steam paths and `launcher/src/autoupdate.rs` (Windows' `curl.exe`, `API_LATEST`, `DOWNLOAD_PREFIX`); the developer program's `feverlink3 update` runs only when typed | unchanged, or update `docs/SECURITY_FOR_USERS.md` ("Automatic updates") |
-| 10 | Names of buttons and texts in the window | `mod/feverlink3/content/feverlink3_ui.script.lua` | the strings used in `docs/PLAYING.md`, the description and `shot-list.md` |
-| 11 | What `feverlink3 install` prints and installs | run `feverlink3 install --dry-run` | one line per item: mod, `steam_appid.txt`, `winhttp.dll`, `feverlink3_path.txt` |
-| 12 | The files and folders in the table of `docs/SECURITY_FOR_USERS.md` | `launcher/src/install.rs`, `launcher/src/live.rs`, `mod/feverlink3/content/feverlink3_common.lua` | same names and places |
-| 13 | The verified and not-verified lists | `docs/ROADMAP.md`, proof milestones | the same everywhere |
-| 14 | `modinfo.json` description | `mod/feverlink3/_metadata/modinfo.json` | **It still says the mod "does nothing unless the game was started by FeverLink3.exe", which has been wrong since live mode, and the game shows this text in its mod list.** Fix it before the release |
+Hello,
 
-## Placeholders
+I would like to publish FeverLink3 Multiplayer (version 0.2.2) for Transport Fever 3. It is a cooperative multiplayer mod: several players build in one world, each in their own game. The source is public under the PolyForm Noncommercial License 1.0.0 (source available, free for noncommercial use).
 
-None of the text contains a placeholder. The hash of the zip is deliberately not in the listing: the page points to the release notes, which are written by the release job.
+Your file submission guidelines ask authors of files that connect to the internet to contact you first with the reasoning and the source, so here they are:
+
+- Source: https://github.com/AZalshehri7/FeverLink3 (native/ is the DLL, launcher/ the session code it runs).
+- The download contains a Lua game mod and winhttp.dll, a proxy DLL the game loads from its own folder. No .exe, no installer.
+- Network use 1 (the mod's function): game-to-game traffic through Steam's peer-to-peer networking, encrypted with a key from the join code. No server of mine is involved, no ports are opened.
+- Network use 2 (I want to be upfront): at game start the DLL checks GitHub once for a newer FeverLink3 release and, if there is one, downloads it from the GitHub release only (HTTPS, GitHub hosts only), checks every file's SHA-256 against the release manifest and installs it after one restart. Players can turn this off in the in-game Troubleshooting section. I know your rules say auto-update does not count as crucial: if you want it off for the Nexus file, I can upload a build without the updater. Please tell me which you prefer.
+- No telemetry, no analytics, no ads, no account. "Report a problem" collects the session's logs (cleaned of personal details) from the players into one zip on the player's own PC, over the same encrypted session; nothing goes to any server.
+- What the DLL does, file by file: https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md
+- Releases are built by GitHub Actions; the zip, its SHA-256 and a manifest are on the release page. The DLL is not code-signed yet.
+- The code and docs were written largely with an AI assistant (Claude) under my direction; I will set the AI Assisted taged Content tag and say so on the page.
+
+May I publish it as described, and should the Nexus file have the updater on (with the off switch) or off?
+
+Thank you,
+Abdulaziz Alshehri (azalshehri on Discord)
+```
+
+## Images
+
+Made with Pillow from `docs/media` (which was not modified):
+
+| File | Size | Use |
+|---|---|---|
+| `media/cover-1920x1080.png` | 1920x1080, 0.4 MB | Nexus thumbnail; mod.io / Mod Hub cover (16:9, at least 512x288, under 8 MB; real game UI, no added text as the TF3 wiki asks) |
+| `media/demo-build-480.gif` | 480x353, 23 frames, 1.6 MB | Nexus image (the 5.4 MB original is likely over Nexus's limit). Same real-time timing as the original. |
+| `media/demo-build-still-1920x1080.png` | 1920x1080, 1.6 MB | Last frame of the demo on a 16:9 canvas, for mod.io's gallery (mod.io galleries take jpg/png only, no GIF) |
+
+Nothing else is missing. A video (YouTube link) would be the way to show the build demo moving on mod.io; none exists yet.

@@ -1,8 +1,6 @@
-# Nexus Mods page: the form fields
+# Nexus Mods page: the form fields (0.2.2)
 
-Paste-ready text for each field of the mod page, in the order of the upload form. The long description is in `description.bbcode.txt` (paste into the Description box) and `description.md` (same text in Markdown, for GitHub or another host). Limits that Nexus does not publish are marked "check the form"; the texts are kept short enough to fit conservative limits.
-
-Everything here is written for a Steam connection-test build (never released) and the facts of 2026-10-10. **Out of date: rewrite it for 0.2.0 before publishing.** `README.md` in this folder lists what to re-check against the tagged code before publishing.
+Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-22, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.2.
 
 ## Name
 
@@ -10,131 +8,113 @@ Everything here is written for a Steam connection-test build (never released) an
 FeverLink3 Multiplayer
 ```
 
-(22 characters. This is also the name the mod shows in the game's mod list.)
+22 characters; the same name the game shows in its mod list.
 
-## Summary (short description)
+## Summary (brief overview)
 
 ```
-Early test of co-op multiplayer for Transport Fever 3, free for noncommercial use. This first build only tests the Steam connection between two players; hosting and joining come next.
+Play Transport Fever 3 together: build, run lines and grow towns in one shared world. Fully integrated into the game, no launcher needed. Join friends over Steam.
 ```
 
-(183 characters. Check the form for the limit.)
+162 characters. Nexus does not publish the limit (not confirmed); if the form counts fewer, cut the last sentence.
 
 ## Version
 
 ```
-0.2.0
+0.2.2
 ```
 
 ## Category, tags, flags
 
-- Category: the closest of "Gameplay", "Utilities" or "Miscellaneous" in the game's category list (check the list; it was not readable when this was written).
-- Tags to look for: multiplayer, co-op, script. Do not add tags that do not describe the mod.
-- Adult content: no.
-- Generative AI tag: the file submission guidelines say that mods primarily made with AI should carry the "AI-Generated Content" tag and that undisclosed AI use may lead to moderation. The code and documentation of FeverLink3 were largely written with Claude under the maintainer's direction (the commit messages say so). The owner decides the tag; the description already discloses it. See `README.md`, step "AI disclosure".
-- Language: English.
+- Category: the game's list was not readable from outside. Pick the first that exists: **Gameplay**, then **Utilities**, then **Miscellaneous**.
+- Tags (only those that describe the mod): Multiplayer, Co-op, Gameplay, Scripts / Script mod, Windows.
+- **Generative AI tag: AI Assisted** (owner decision 2026-10-22). The description says how the mod was made in "How it was made".
+- Adult content: no. Language: English.
 
 ## Main file
 
-- File name on the upload: `FeverLink3-0.2.0.zip` (the zip from the GitHub release, unchanged, so that its SHA-256 matches the release notes). It holds the testing installer, the native module and the mod.
-- Category: Main files.
-- File description (keep under 255 characters; the limit is reported by users, not published):
+- Upload: `FeverLink3-0.2.2.zip` exactly as downloaded from the GitHub release (2,185,707 bytes). Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.2.zip.sha256` on the release page.
+- Name on Nexus: `FeverLink3 0.2.2`
+- Category: Main files. Version: 0.2.2.
+- File description (under 255 characters):
 
 ```
-FeverLink3 0.2.0: testing installer (feverlink3.exe), winhttp.dll and the mod. Windows, Steam, game build 40420. Experimental, unsigned. SHA-256 is in the release notes on GitHub.
+Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.2. Updates itself (can be turned off).
 ```
 
-(185 characters.)
-
-**Owner decision, 2026-10-10:** the end state is the mod offered in the game's Mod Hub (mod.io backend) and on Nexus Mods like any other mod, with the native module delivered separately for now, and the installer kept for testing. When the packaging changes, upload two files instead of this one: the mod (the `mod/feverlink3` folder, as a zip) as the main file, and the native module (`winhttp.dll` with a short text on where it goes and the hash) as a second file, and rewrite the Installation section of the description to match. Do not announce the Mod Hub listing before the Hub has accepted the mod (`docs/WORKSHOP.md`).
+(200 characters.)
 
 ## Requirements tab
 
-Required:
+Required (off-site):
 
 ```
-Transport Fever 3 (Steam), game build 40420
+Transport Fever 3 (Steam, Windows 10/11 64-bit), game build 40420 - all players on the same game version
 Steam client running and logged in
-Windows 10 or 11, 64-bit
 ```
 
-Conflicts, in the notes: `MPFever and any other mod that installs its own winhttp.dll in the game folder.`
+Notes / conflicts:
+
+```
+Not compatible with other mods that install their own winhttp.dll in the game folder. Mods that change the world on their own (for example automatic line namers) cause extra syncs; turn their automatic changes off while playing together.
+```
 
 ## Permissions and credits
 
-Nexus asks for these and has no free-text licence field, so the licence goes into the permission notes and into the description ("Credits and permissions"). The licence is the PolyForm Noncommercial License 1.0.0: free for noncommercial use, commercial use only with a separate licence from the author. The answers below are the strictest reading, so that the form never promises more than the licence gives.
+Nexus has no licence field, so the licence goes into the permissions and the credits box. The answers are the strictest reading of PolyForm Noncommercial 1.0.0.
 
 | Form item | Answer |
 |---|---|
-| Other users' assets | The mod contains no files or assets from other authors. It reuses findings (per-build game addresses, API names) documented by MPFever, MIT, credited in the files that use them. |
-| Upload permission (other sites) | Allowed for noncommercial purposes, with the `LICENSE` file or its web address, the "Required Notice" line and the credits kept. |
-| Modification permission | Allowed for noncommercial purposes under the same licence. |
-| Conversion permission | Allowed for noncommercial purposes under the same licence. |
-| Asset use permission | Allowed for noncommercial purposes under the same licence. |
-| Use in mods with donations / sold mods | **Not allowed** without a separate commercial licence from the author. |
-| Donation points | Off. |
+| Other users' assets | No files or assets from other authors. Findings and designs from TpF2 Multiplayer and MPFever (both MIT) are credited. |
+| Upload permission | Allowed for noncommercial purposes, with LICENSE (or its address), the Required Notice line and the credits kept |
+| Modification permission | Allowed for noncommercial purposes under the same licence |
+| Conversion permission | Allowed for noncommercial purposes under the same licence |
+| Asset use permission | Allowed for noncommercial purposes under the same licence |
+| Asset use in mods/files being sold | Not allowed |
+| Asset use in mods/files that earn donation points | Not allowed without the author's permission |
+| Donation points | Off |
 
 Credits and notes box:
 
 ```
-Author: Abdulaziz Alshehri (Discord azalshehri). Licence: PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/): free for noncommercial use, commercial use needs a separate licence from the author. Source: https://github.com/AZalshehri7/FeverLink3
-Credits: TpF2 Multiplayer by silver2127 (Transport Fever 2, MIT, https://silver2127.github.io/tpf2-multiplayer/) - replication modes, "no entity ids on the wire", join-code and sealed-transport trust model, host-included resync round. MPFever by dkdknight / arthur (Transport Fever 3, MIT, https://github.com/dkdknight/MPFever) - proxy-DLL approach, single-worker script pool fix, deterministic math.random, per-build game addresses and API names. Both licences are in THIRD_PARTY_NOTICES.md in the zip.
-Not affiliated with Urban Games or Paradox Interactive. Much of the code and documentation was written with Claude (Anthropic) under the maintainer's direction.
+Author: Abdulaziz Alshehri (Discord azalshehri). Source: https://github.com/AZalshehri7/FeverLink3
+Licence: PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0/) - source available, free for noncommercial use; commercial use needs a separate licence from the author.
+Required Notice: Copyright (c) 2026 Abdulaziz Alshehri (https://github.com/AZalshehri7)
+Credits: FeverLink3 builds on what earlier Transport Fever multiplayer projects found and documented: TpF2 Multiplayer by silver2127 and MPFever by dkdknight (both MIT; licences in THIRD_PARTY_NOTICES.md in the zip).
+Most of the code and documentation was written with Claude (Anthropic) under the author's direction.
+Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactive.
 ```
 
-## Changelog tab (connection-test build)
+## Changelog tab
 
 ```
-First public test build. Its job is the Steam connection test between two players.
-- In-game window (button in the bottom bar) with a Steam connection test: your Steam ID, test the connection to another player's Steam ID, result with round-trip time and route.
-- Hosting and joining over Steam are not finished in this build: the Host button says so.
-- For later builds, tested with simulated games only: lockstep core (actions applied at the same step on every game, world checksums, repair by loading the host's savegame, permissions model, command schemas for everyday operations).
-- Encrypted sessions (AES-256-GCM, key from the join code).
-- Native module winhttp.dll: passes the game's 14 WinHTTP functions through, runs the in-game controller. Its hook code is switched off by default and has never run in the real game.
-- Testing installer: feverlink3 install / uninstall / doctor, with --dry-run.
-- Unsigned. Seen working in the real game (build 40420): window, Steam connection to the game's own Steam ID, save/load. Not verified: the Steam connection between two accounts, hosting and joining over Steam, building together, world transfer between two real games.
-```
+0.2.2
+- Faster builds: a build stands on every game 1.4 s after the click at game speed x1 and 0.8 s at x4 (two games on one PC). At x4 the game really runs at four times the speed now.
+- Update messages in the pop-up and the window are shorter and no longer cut off; long texts break into several lines.
+- The empty feverlink3_update folder is removed after an update.
 
-If more landed before the tag, add only what has been seen working, with the same wording rules as the description.
+0.2.1
+- Fixed: the update check could make the game show "Internal error" at start; downloads now run inside the game.
+- Report a problem opens its folder and the issue page through Windows' shell.
+
+0.2.0 (first public beta)
+- New in-game interface (bar icon with the session colour, pop-up, window with tabs), plain messages, automatic updates, Report a problem, a faster session start, and many sync fixes.
+```
 
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues of the connection-test build
-- Not a finished multiplayer game: this build tests the Steam connection only. Hosting and joining over Steam, building together, world transfer and the Steam connection between two accounts are not verified yet.
-- Game build 40420 only. After a game update, if the game does not start, run feverlink3 uninstall and tell us your build.
-- Unsigned: SmartScreen/antivirus may warn. Windows 11 Smart App Control may block the DLL (untested).
-- Not compatible with MPFever or any other winhttp.dll mod.
-- The installer is a testing tool (double-click menu or command line), not yet tried on a clean PC by someone else.
+Known issues in 0.2.2
+- Steam invites (Steam's invite dialog) have not been tried on two PCs yet. The join code works.
+- Terrain editing, ground paint and trees are not shared; the terrain tools are off during a session.
+- Mods that change the world on their own cause extra syncs (FeverLink3 names them in a warning).
+- About one automatic repair (about 15 s) every 40 minutes in a long session over the internet.
+- winhttp.dll is not code-signed until 1.0.0; antivirus software may warn. Compare the SHA-256 with the GitHub release.
+- Not compatible with other mods that use their own winhttp.dll.
 
-How to report: Discord azalshehri or https://github.com/AZalshehri7/FeverLink3/issues. Attach %LOCALAPPDATA%\FeverLink3\native.log and live\mod.log, your game build and Windows version.
+How to report: press "Report a problem" in the FeverLink3 window (it makes one zip with every player's logs, personal details removed) and attach it to https://github.com/AZalshehri7/FeverLink3/issues or the Bugs tab here. Say what you were doing. Discord: azalshehri.
 ```
 
 ## Images
 
-Captions and the order are in `shot-list.md`. The first image becomes the thumbnail.
-
-## Message to Nexus staff (before publishing)
-
-The file submission guidelines say that executables or tools that connect to the internet are prohibited unless crucial to the mod's function, that an auto-update does not count, and that the author must contact staff or support with the reasoning and the source code. Send this through the support contact the site offers, and wait for the answer before publishing.
-
-```
-Subject: Request before publishing: multiplayer mod with a native component that uses the network (FeverLink3, Transport Fever 3)
-
-Hello,
-
-I would like to publish FeverLink3 Multiplayer for Transport Fever 3 on Nexus Mods. It is a cooperative multiplayer mod whose source code is public (PolyForm Noncommercial License 1.0.0), so network access is its function: the native module (a winhttp.dll that the game loads from its own folder) connects the players' games to each other through Steam's peer-to-peer networking.
-
-Per your file submission guidelines I am contacting you first, with the reasoning and the source:
-- Source code: https://github.com/AZalshehri7/FeverLink3 (folders native/ and launcher/ for the DLL). It is a fresh implementation that builds on two earlier MIT-licensed projects, TpF2 Multiplayer by silver2127 and MPFever by dkdknight (arthur), both credited in the README and on the page.
-- What the DLL does and does not do, file by file, and how to verify it: https://github.com/AZalshehri7/FeverLink3/blob/main/docs/SECURITY_FOR_USERS.md
-- Network use: player-to-player traffic through Steam's networking only; no server of the project is involved. No auto-update, no analytics, no telemetry, no advertising, no account, no download of code.
-- The release is built by GitHub Actions from a tag; the zip, its SHA-256 and a manifest are on the GitHub release page. The files are not code-signed yet.
-- The page states plainly what is verified in the real game and what is not (it is an experimental test build).
-- Another experimental multiplayer mod with a native component is already listed for this game, so I assume this kind of mod is acceptable; please tell me if you need anything changed.
-
-Please tell me whether I may publish it as described, or what you would like changed.
-
-Thank you,
-Abdulaziz Alshehri (azalshehri on Discord)
-```
+Order and files are in `README.md` ("Creating the Nexus page", step 5).

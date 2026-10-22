@@ -58,7 +58,7 @@ FeverLink3 is in beta: keep backups of the saves you play with.
 
 ## Install
 
-1. Download `FeverLink3-<version>.zip` from [Releases](https://github.com/AZalshehri7/FeverLink3/releases) and extract it.
+1. Download `FeverLink3-<version>.zip` from [GitHub Releases](https://github.com/AZalshehri7/FeverLink3/releases/latest) or [Nexus Mods](https://www.nexusmods.com/transportfever3/mods/19) and extract it.
 2. In Steam, right-click **Transport Fever 3** → **Manage** → **Browse local files**.
 3. Drag `winhttp.dll` and the `mods` folder into that folder (merge the folders when Windows asks).
 4. Start the game, and turn on **FeverLink3 Multiplayer** in the mod list when you start or load a game.
