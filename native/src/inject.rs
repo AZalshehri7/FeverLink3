@@ -161,12 +161,14 @@ pub struct Conversion {
 }
 
 /// How a command relates to the conversions an order's send made on the command's thread ([`State::conversion_match`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvMatch {
-    /// The command carries what a conversion of the order's own send built: it is the mod's command (positive identity).
-    Ours,
+    /// The command carries what a conversion of the order's own send built: it is the mod's command (positive identity). The text says
+    /// how closely its points matched ([`Identity::compare`]).
+    Ours(String),
     /// The send converted something on this thread, and this command is not it (a town's command applied meanwhile): never this order's.
-    Other,
+    /// The text says what of the conversion the command lacks.
+    Other(String),
     /// No conversion of the send was seen on this thread (the conversion hook is not installed): only the content can tell.
     Unseen,
 }
@@ -343,10 +345,15 @@ impl State {
         if mine.peek().is_none() {
             return ConvMatch::Unseen;
         }
-        match have {
-            Some(h) if mine.any(|c| c.identity.within(h)) => ConvMatch::Ours,
-            _ => ConvMatch::Other,
+        let Some(h) = have else { return ConvMatch::Other("the command is unreadable".into()) };
+        let mut misses = Vec::new();
+        for c in mine {
+            match c.identity.compare(h) {
+                Ok(how) => return ConvMatch::Ours(how),
+                Err(why) => misses.push(why),
+            }
         }
+        ConvMatch::Other(misses.join("; "))
     }
 
     /// The conversions seen for order `seq` (any thread), for the log of an order its send did not use.
@@ -1283,29 +1290,92 @@ impl Identity {
         self.place.is_empty() && self.constructions.is_empty()
     }
 
-    /// Everything this conversion builds is in `have` (exactly: the same float bits, the same entities, the same constructions): `have` is
-    /// the command made from it. The engine may add to a converted proposal before the command applies (the town buildings a build
-    /// moves or removes), never drop what the script asked for; a town's own command shares none of a script build's points.
+    /// Everything this conversion builds is in `have`: `have` is the command made from it ([`Identity::compare`]).
     pub fn within(&self, have: &Identity) -> bool {
+        self.compare(have).is_ok()
+    }
+
+    /// Whether everything this conversion builds is in `have` (the command made from it): `Ok` with how closely its points matched, `Err`
+    /// with the first thing of the conversion the command lacks (for the log: before, a miss said nothing of which element failed).
+    ///
+    /// The engine may add to a converted proposal before the command applies (the town buildings a build moves or removes), never drop
+    /// what the script asked for. What is compared:
+    /// - every point of the conversion has its own point of the command within [`PLACE_TOLERANCE_M`]. Until 2026-10-22 the float bits had
+    ///   to be equal, and the mod's own street builds that split an existing road failed it on every game alike (two-window run
+    ///   2026-10-22 x4, build 0:77, host and guest; friend test 2026-10-21: 7 orders of 15 to 63 points): conversion and command had the
+    ///   same counts (22 points, 10 removed, 0 constructions), yet the match said "not its command", the native text was not injected,
+    ///   the order closed as `no_command`, and the player was told "could not be built" of a road built on every game. So the engine
+    ///   rewrites some position between `scripting::Convert` and the apply (which one is not logged before this change: the miss now says
+    ///   it, see the `Err`). A town's own command applied meanwhile still fails: it would have to lay EVERY point of the script build
+    ///   within the tolerance, besides removing every world entity it removes;
+    /// - every existing world entity the conversion removes or configures is one the command removes or configures (exact ids). The
+    ///   proposal's placeholders of its own new entities (`new#N`, stored as -N) are names inside one proposal, not world entities, and
+    ///   are not compared: the engine is free to number them again when it makes the command (not proven to happen; it would give the
+    ///   same counts as the failures above);
+    /// - every construction is the command's, exactly (file and transform bits: the script builds them from the originator's record,
+    ///   and the positive matches with constructions of the friend test 2026-10-21 all passed exactly).
+    pub fn compare(&self, have: &Identity) -> Result<String, String> {
+        if self.is_empty() {
+            return Err("the conversion builds nothing".into());
+        }
+        let world = |e: &&u32| (**e as i32) >= 0;
+        if let Some(e) = self.place.removed.iter().filter(world).find(|e| !have.place.removed.contains(e)) {
+            return Err(format!("the command does not remove or configure entity {e}, which the conversion does"));
+        }
+        // the bit-equal points first (the usual case, and cheap), then the others by distance among the command's points left
         let bits = |p: &[f32; 3]| p.map(f32::to_bits);
-        let mut points: Vec<[u32; 3]> = have.place.points.iter().map(bits).collect();
+        let mut free: std::collections::HashMap<[u32; 3], usize> = std::collections::HashMap::new();
+        for q in &have.place.points {
+            *free.entry(bits(q)).or_default() += 1;
+        }
+        let mut rest = Vec::new();
+        for p in &self.place.points {
+            match free.get_mut(&bits(p)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => rest.push(*p),
+            }
+        }
+        let mut left = Vec::new();
+        for q in &have.place.points {
+            if let Some(n) = free.get_mut(&bits(q)).filter(|n| **n > 0) {
+                *n -= 1;
+                left.push(*q);
+            }
+        }
+        let dist = |p: &[f32; 3], q: &[f32; 3]| (0..3).map(|j| (p[j] - q[j]) * (p[j] - q[j])).sum::<f32>().sqrt();
+        let mut largest = 0.0f32;
+        for p in &rest {
+            let nearest = left.iter().enumerate().map(|(i, q)| (i, dist(p, q))).min_by(|a, b| a.1.total_cmp(&b.1));
+            match nearest {
+                Some((i, d)) if d <= PLACE_TOLERANCE_M => {
+                    largest = largest.max(d);
+                    left.swap_remove(i);
+                }
+                Some((_, d)) => {
+                    return Err(format!(
+                        "the conversion's point {p:?} is {d:.4} m from the nearest point of the command left (more than {PLACE_TOLERANCE_M} m)"
+                    ))
+                }
+                None => return Err(format!("the conversion's point {p:?} has no point of the command left")),
+            }
+        }
         let mut cons: Vec<&Construction> = have.constructions.iter().collect();
-        !self.is_empty()
-            && self.place.removed.is_subset(&have.place.removed)
-            && self.place.points.iter().all(|p| match points.iter().position(|q| *q == bits(p)) {
-                Some(i) => {
-                    points.swap_remove(i);
-                    true
+        for (i, c) in self.constructions.iter().enumerate() {
+            match cons.iter().position(|d| *d == c) {
+                Some(k) => {
+                    cons.swap_remove(k);
                 }
-                None => false,
-            })
-            && self.constructions.iter().all(|c| match cons.iter().position(|d| *d == c) {
-                Some(i) => {
-                    cons.swap_remove(i);
-                    true
+                None => {
+                    return Err(format!("the command lacks the conversion's construction {i} (file and transform)"))
                 }
-                None => false,
-            })
+            }
+        }
+        let n = self.place.points.len();
+        Ok(format!(
+            "{} of {n} point(s) bit-equal, {} within {PLACE_TOLERANCE_M} m (largest {largest:.4} m)",
+            n - rest.len(),
+            rest.len()
+        ))
     }
 }
 
@@ -2141,6 +2211,18 @@ toAdd[0].transf	m4:{t}
         assert!(conv.within(&identity(&arena, command_at(&arena, Some([180.0, 20.0, 5.0]), &[54, 55])).unwrap()));
         assert!(!conv.within(&identity(&arena, town).unwrap()));
         assert!(!identity(&arena, empty).unwrap().within(&identity(&arena, empty).unwrap()));
+        // run 2026-10-22 build 0:77: the engine rewrites a position between the conversion and the apply (same counts, other float bits):
+        // still the mod's command; a point moved further, or a world entity the command does not remove, is not
+        let off = |p: [f32; 3], removed: &[u32]| identity(&arena, command_at(&arena, Some(p), removed)).unwrap();
+        let how = conv.compare(&off([180.0001, 20.0, 5.0], &[])).unwrap();
+        assert!(how.starts_with("0 of 1 point(s) bit-equal, 1 within"), "{how}");
+        let why = conv.compare(&off([180.5, 20.0, 5.0], &[])).unwrap_err();
+        assert!(why.contains("0.5000 m from the nearest point"), "{why}");
+        // a proposal's placeholders of its own new entities (new#1 = -1) are not world entities: the engine may number them again
+        let (new1, new2) = ((-1i32) as u32, (-2i32) as u32);
+        assert!(off([180.0, 20.0, 5.0], &[new1, 54]).within(&off([180.0, 20.0, 5.0], &[new2, 54])));
+        let why = off([180.0, 20.0, 5.0], &[54]).compare(&off([180.0, 20.0, 5.0], &[55])).unwrap_err();
+        assert!(why.contains("entity 54"), "{why}");
         // a text that names no place at all identifies no command: unknown, never taken for the mod's (and so never emptied)
         let why = same_build(&arena, town, "toAdd.#\tn:0\n").unwrap_err();
         assert!(why.starts_with(UNKNOWN) && keeps_waiting(&why), "{why}");

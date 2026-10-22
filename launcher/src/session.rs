@@ -721,14 +721,14 @@ fn host_loop(
     let mut last_tick = Instant::now().checked_sub(TICK).unwrap_or_else(Instant::now);
     while !shared.stopping() {
         let mut outputs = Vec::new();
-        match net_rx.recv_timeout(if io.busy() { POLL_SENDING } else { POLL }) {
-            Ok(event) => outputs.extend(host_net_event(host, event, io)),
-            Err(RecvTimeoutError::Timeout) => {}
+        let woke_by = match net_rx.recv_timeout(if io.busy() { POLL_SENDING } else { POLL }) {
+            Ok(event) => Some(event),
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
-        }
-        while let Ok(event) = net_rx.try_recv() {
-            outputs.extend(host_net_event(host, event, io));
-        }
+        };
+        // the commands first: one queued while the loop waited was given before the network event that woke it (the
+        // host's own bug report, asked before a player's request arrived, was refused as busy for the player's: CI
+        // 2026-10-22, a_players_report_collects_both_games_logs_at_the_host_and_lands_with_the_player)
         while let Ok(command) = cmd_rx.try_recv() {
             outputs.extend(match command {
                 Command::Start => host.start(),
@@ -745,6 +745,9 @@ fn host_loop(
                     Vec::new()
                 }
             });
+        }
+        for event in woke_by.into_iter().chain(std::iter::from_fn(|| net_rx.try_recv().ok())) {
+            outputs.extend(host_net_event(host, event, io));
         }
         for (kind, payload) in read_from_game(link, shared) {
             outputs.extend(host.local_game_message(kind, &payload));

@@ -84,6 +84,9 @@ class InjectNative(S.FakeNative):
         # (marker, reason): the engine's rebuild of a text containing `marker` fails its comparison (inject::build_verified), on every game
         # alike: a receiver refuses such an order at the stamp, an originator's own proof (inject::own_proof) refuses it before shipping
         self.engine_refuses = None
+        # "pass" / "emptied": every inject order is refused as `no_command` (no command of its send took it: the identity check missed
+        # the mod's own command), and that command applies as it is ("pass") or nothing is applied ("emptied")
+        self.no_command = None
         self.orders = []          # the waiting inject_next / complete_next orders, in the order they were written
         self.used = []            # (kind, key, held, xs) of every order a command took, in that order
         self.most_waiting = 0     # the most orders that waited at once when a command came
@@ -160,6 +163,14 @@ class InjectNative(S.FakeNative):
             self.finish_held(held, True, "stamp_apply")
             return "pass"
         key = int(o.get("key", 0))
+        if self.no_command:
+            self.refused.append(key)
+            self.emit("inject_refused", {"key": key, "held": held, "outcome": "no_command",
+                                         "reason": "key %d (held %d): its send ended and no command of it reached the module" % (key, held)})
+            if held:
+                self.fail_held(held, "fail")
+            self.flush_events()
+            return self.no_command
         why = self.refuse_all or (o.get("refuse") and "forced refusal (%s)" % o.get("refuse")) or self.engine_verdict(self.order_text(o))
         if why:
             self.refused.append(key)
@@ -356,7 +367,34 @@ class InjectFailClosedTest(InjectTest):
             self.assertNotIn("inject_refused", self.log())
             self.assertInjectedOnBoth()
 
-        self.cases([("the happy path", {}, happy_path), ("a segment ending away from its existing node", {}, segment_away_from_its_node)])
+        def no_command(applies):
+            # two-window run 2026-10-22 (x4, build 0:77): the module's identity check missed the mod's own command on both games, the
+            # order closed as no_command and the command applied as it was: the road stood everywhere, yet the host's player was told
+            # "could not be built". The notice now follows this game's build.result, not the refusal alone.
+            for g in (self.A, self.B):
+                g.native.no_command = applies
+            self.build_on_b()
+            n = 1 if applies == "pass" else 0
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (n, n))
+            told = "told the player: Your build could not be built"
+            if n:
+                self.assertIn("build 1:1 was applied here (build.result verdict=applied) although the native module refused its order: the player is not told it failed", self.B.log())
+                self.assertNotIn(told, self.B.log())
+                # a refusal whose build.result never comes: the player is told after X.NOTICE_WAIT_S all the same
+                self.B.L.execute(T.FIND_UP)
+                self.B.L.execute('FIND_UP("X").tellRefused({ from = 1, of = "1:99" }, "inject order 9 refused here (no_command): lost"); '
+                                 'FIND_UP("G").noticeWait["1:99"].t = -100')
+                self.tick(2)
+                self.assertIn("build 1:99: no build.result within 5 s: the notice is given as it is", self.B.log())
+                self.assertEqual(self.B.log().count(told), 1)
+            else:
+                self.assertIn("the notice waits for this game's build.result", self.B.log())
+                self.assertEqual(self.B.log().count(told), 1, "nothing was built here: the player is told, once")
+            self.assertSameWorld()
+
+        self.cases([("the happy path", {}, happy_path), ("a segment ending away from its existing node", {}, segment_away_from_its_node),
+                    ("refused as no_command, the command applied", {}, lambda: no_command("pass")),
+                    ("refused as no_command, nothing applied", {}, lambda: no_command("emptied"))])
 
     def test_a_copy_one_game_cannot_apply_is_applied_nowhere_there_and_the_differing_verdicts_ask_for_the_repair(self):
         def receiver_refuses():

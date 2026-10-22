@@ -5,7 +5,7 @@ name: Release
 # Every other commit only runs CI. See docs/RELEASING.md.
 #
 # Three jobs, so the signing key is reachable from as little as possible:
-#   build   no secrets: tests, build, package; hands `dist/` on as an artifact.
+#   build   no secrets: build, package, wait for CI of the same commit (the tests run there); hands `dist/` on.
 #   sign    the only job with the key. It runs in the GitHub environment `release-signing`, which the owner sets up
 #           to require his approval and to accept main only; the key is a secret of that environment, not of the
 #           repository. It signs manifest.json and checks the signature with the launcher's own trusted-key list.
@@ -24,6 +24,9 @@ jobs:
   build:
     if: ${{ startsWith(github.event.head_commit.message, 'V') }}
     runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read   # the wait for CI of this commit
     outputs:
       release: ${{ steps.parse.outputs.release }}
       version: ${{ steps.parse.outputs.version }}
@@ -50,11 +53,6 @@ jobs:
       - if: steps.parse.outputs.release == 'true'
         uses: dtolnay/rust-toolchain@stable
 
-      # the essential set, as in CI (the full set is run on a developer's PC on demand: docs/RELEASING.md)
-      - if: steps.parse.outputs.release == 'true'
-        run: cargo test --workspace --exclude feverlink3_native
-      - if: steps.parse.outputs.release == 'true'
-        run: cargo test -p feverlink3_native -- --test-threads=1
       # FEVERLINK3_OFFICIAL_BUILD marks the module as a release build: only those update themselves in the game
       # (launcher/src/autoupdate.rs). A module built on a developer's PC never replaces itself with GitHub's release.
       - if: steps.parse.outputs.release == 'true'
@@ -71,6 +69,25 @@ jobs:
           $version = $env:VERSION
           cargo run --release -p feverlink3_release -- package --version $version --out dist
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The tests run once, in CI, for this same commit (owner 2026-10-23: the release job ran them a second time, ~5 min).
+      # Nothing is handed on to publish until that CI run has passed.
+      - name: Wait for CI of this commit to pass
+        if: steps.parse.outputs.release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $deadline = (Get-Date).AddMinutes(40)
+          while ((Get-Date) -lt $deadline) {
+            $run = gh run list --repo $env:GITHUB_REPOSITORY --workflow CI --commit $env:GITHUB_SHA --limit 1 --json status,conclusion | ConvertFrom-Json
+            if ($run -and $run[0].status -eq 'completed') {
+              if ($run[0].conclusion -eq 'success') { Write-Host 'CI passed'; exit 0 }
+              Write-Host "CI of this commit ended: $($run[0].conclusion)"; exit 1
+            }
+            Start-Sleep 20
+          }
+          Write-Host 'CI of this commit did not finish within 40 minutes'; exit 1
 
       - if: steps.parse.outputs.release == 'true'
         uses: actions/upload-artifact@v4
@@ -216,7 +233,8 @@ jobs:
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          awk -v v="$VERSION" '$0 ~ "^## "v"( |$)" {f=1; next} /^## / {f=0} f' docs/CHANGELOG.md > changelog.txt
+          # Nexus shows the changelog as plain text: drop the Markdown headings (### Fixed), backticks and bold marks
+          awk -v v="$VERSION" '$0 ~ "^## "v"( |$)" {f=1; next} /^## / {f=0} f' docs/CHANGELOG.md | sed -e '/^#/d' -e 's/`//g' -e 's/\*\*//g' | sed -e '/./,$!d' > changelog.txt
           { echo 'text<<EOF_CHANGELOG'; cat changelog.txt; echo 'EOF_CHANGELOG'; } >> "$GITHUB_OUTPUT"
       # pinned to v1.0.0-beta.11 by commit
       - uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2

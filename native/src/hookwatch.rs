@@ -68,6 +68,7 @@ pub static APPLY_HOOK: Watch = Watch::new("apply_hook");
 pub static CONVERT_HOOK: Watch = Watch::new("convert_hook");
 pub static CONVERT_UPDATE_HOOK: Watch = Watch::new("convert_update_hook");
 pub static PREVIEW_HOOK: Watch = Watch::new("preview_hook");
+pub static PREVIEW_OWNER_HOOK: Watch = Watch::new("preview_owner_hook");
 pub static TOWN_SEED_HOOK: Watch = Watch::new("town_seed_hook");
 pub static CANDIDATES_HOOK: Watch = Watch::new("candidates_hook");
 pub static EDGES_HOOK: Watch = Watch::new("edges_hook");
@@ -88,12 +89,13 @@ pub static IDORDER_FILE: Watch = Watch::new("idorder write");
 pub static NATIVE_LOG: Watch = Watch::new("native.log write");
 
 /// Every watch, in dump order.
-pub static ALL: [&Watch; 22] = [
+pub static ALL: [&Watch; 23] = [
     &APPLY_HOOK,
     &ADD_HOOK,
     &CONVERT_HOOK,
     &CONVERT_UPDATE_HOOK,
     &PREVIEW_HOOK,
+    &PREVIEW_OWNER_HOOK,
     &PACE_HOOK,
     &FREE_ORDER_HOOK,
     &IDS_ADD_HOOK,

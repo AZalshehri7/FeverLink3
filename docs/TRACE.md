@@ -110,8 +110,11 @@ The same name INSIDE in dump after dump, its `entered` not moving, is where the 
 
 * `checksum t=<time> light=<bool> lanes=.. items{lane=count ...} parts={...}`: every round of this game: the hash of every lane, the
   item count of each itemised lane (full rounds), and for light rounds the lanes that were left out.
-* `resync saving as <name> ...`: this game saved for a resync; the next line (`detail`) says which file holds the itemised keys of its
-  last full checksum round: `detail_<time>_<player>.txt`, one `lane<TAB>key` per line. Sort and diff the two games' files to see which
-  edges, constructions, stations, node settings or town buildings differ (ids are never part of a key).
+* `resync sync <id> (<name>) save|load: ...`: every game of a sync (the host where it saves, every other game before its load replaces its
+  world) asks for the itemised keys of its last full checksum round; the next `detail` line names the file:
+  `detail_s<sync>_<time>_<player>.txt`, one `lane<TAB>key` per line. The files of one sync share `s<sync>` (and `<time>` when they are
+  of the same round). Sort and diff them to see which edges, constructions, stations, node settings or town buildings differ (ids are
+  never part of a key). A guest's load waits for its file: `mod.log` says `resync: the detail of sync <id> written after <s> s; loading
+  now` (or `NOT confirmed ... within 3 s` when the simulation half did not answer; the load goes on).
 * The host's `session.log` has the cause of each resync (`checksum N differs in ...`, `resync N started: ...`) and the
   versions line: `version player=.. role=.. native_build=.. native_version=.. record_version=..` (`trace.log`, once per start).

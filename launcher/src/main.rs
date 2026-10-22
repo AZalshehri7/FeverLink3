@@ -196,6 +196,11 @@ fn start_game(role: Role, id: u16, name: &str, session_dir: &Path) -> Result<(),
         role,
         args: Vec::new(),
     };
+    // A closed Steam would be started by the game's Steam API with this process's FEVERLINK3_* variables, and Steam
+    // would hand them to every later game (friend test 2026-10-21). Unknown (no tasklist) is not a refusal.
+    if process::steam_running() == Some(false) {
+        return Err("Steam is not running; start Steam first, then run this again.".into());
+    }
     let game = process::start(&launch).map_err(|e| format!("cannot start the game: {e}"))?;
     println!("game started (pid {})", game.pid());
     Ok(())

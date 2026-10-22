@@ -235,6 +235,9 @@ pub enum Feature {
     ConvertUpdate,
     /// The hook on the interface's `builder.proposalCreate` emitter (a held build command given to the scripts as a preview).
     PreviewEvent,
+    /// The call-site redirect where the game interface makes a builder tool's preview listener: its captures give the emitter's
+    /// arguments before any tool preview of the world (`build_table::PreviewOwnerSite`).
+    PreviewOwner,
     /// The call-site redirect of `CGame::Sync` in `CGame::Step`: the batch interval stretched by the mod's factor (`pace.rs`).
     BatchPace,
     /// The call-site redirect of the free-id queue's append in `EndModification`: each batch of freed ids sorted by id (`freeorder.rs`).
@@ -260,6 +263,7 @@ impl Feature {
             Feature::Convert => "script_convert",
             Feature::ConvertUpdate => "script_convert_update",
             Feature::PreviewEvent => "preview_event",
+            Feature::PreviewOwner => "preview_owner",
             Feature::BatchPace => crate::pace::HOOK_NAME,
             Feature::FreeOrder => crate::freeorder::HOOK_NAME,
         }
@@ -696,7 +700,30 @@ fn plan_preview_event(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
     // a build without the site holds as before (a tool without a preview of its own is then released at once)
     let Some(site) = &build.preview_event else { return };
     match verify(image, site.rva, site.prologue) {
-        Ok(()) => p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue }),
+        Ok(()) => {
+            p.steps.push(Step::Detour { feature, name, rva: site.rva, expected: site.prologue });
+            plan_preview_owner(build, image, p);
+        }
+        Err(reason) => p.skipped.push(Skip { feature, name, reason }),
+    }
+}
+
+/// Where the game interface makes a builder tool's preview listener, part of the emitter's hook: without it a held command made before
+/// any tool preview of the loaded world has no record (friend test 2026-10-21: seven station configures after a resync load, refused).
+fn plan_preview_owner(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
+    let (feature, name) = (Feature::PreviewOwner, "preview_owner");
+    let Some(site) = &build.preview_owner else { return };
+    let call = &site.call;
+    let checked = verify(image, call.rva, call.expected)
+        .and_then(|()| verify(image, call.callee.rva, call.callee.prologue).map_err(|e| format!("callee: {e}")));
+    match checked {
+        Ok(()) => p.steps.push(Step::CallPatch {
+            feature,
+            name,
+            rva: call.rva,
+            expected: call.expected,
+            callee: call.callee.rva,
+        }),
         Err(reason) => p.skipped.push(Skip { feature, name, reason }),
     }
 }
@@ -740,6 +767,9 @@ mod tests {
             img.write(c.rva, c.expected);
             img.write(c.callee.rva, c.callee.prologue);
         }
+        let o = &b.preview_owner.as_ref().unwrap().call;
+        img.write(o.rva, o.expected);
+        img.write(o.callee.rva, o.callee.prologue);
         for s in [&b.command_move, &b.command_destroy, &b.handle_destroy].into_iter().flatten() {
             img.write(s.rva, s.prologue);
         }
@@ -927,7 +957,7 @@ mod tests {
     fn hold_adds_the_command_list_hook_after_the_counters() {
         let b = select(0x6ac5_0427).unwrap();
         let p = plan(b, cfg(true, true, false), &image_of_40420());
-        assert_eq!(names(&p), ["apply_command", "command_list_add", "preview_event"]);
+        assert_eq!(names(&p), ["apply_command", "command_list_add", "preview_event", "preview_owner"]);
         assert_eq!(
             p.engine,
             Some(EngineAddrs { command_move: 0x9d0430, command_destroy: 0x9d0670, handle_destroy: 0x3040c90 })
@@ -944,6 +974,7 @@ mod tests {
                 "hooks: apply_command: 14 bytes at rva 0x9e33b0 match the build table",
                 "hooks: command_list_add: 18 bytes at rva 0x9d4040 match the build table",
                 "hooks: preview_event: 14 bytes at rva 0xf44c00 match the build table",
+                "hooks: preview_owner: 5 bytes at rva 0x64cb41 match the build table",
                 "hooks: script_pool: 22 bytes at rva 0xab00fc match the build table",
             ]
         );
@@ -974,7 +1005,7 @@ mod tests {
             other => panic!("not a patch: {other:?}"),
         }
         let all = plan(b, cfg(true, true, true), &image_of_40420());
-        assert_eq!(names(&all), ["apply_command", "command_list_add", "preview_event", "script_pool"]);
+        assert_eq!(names(&all), ["apply_command", "command_list_add", "preview_event", "preview_owner", "script_pool"]);
     }
 
     #[test]
@@ -984,7 +1015,11 @@ mod tests {
         let apply = b.apply_command.as_ref().unwrap();
         img.write(apply.rva + 3, &[0x90]);
         let p = plan(b, cfg(true, true, true), &img);
-        assert_eq!(names(&p), ["command_list_add", "preview_event", "script_pool"], "the others are still installed");
+        assert_eq!(
+            names(&p),
+            ["command_list_add", "preview_event", "preview_owner", "script_pool"],
+            "the others are still installed"
+        );
         assert_eq!(p.skipped.len(), 1);
         let s = &p.skipped[0];
         assert_eq!((s.feature, s.name), (Feature::Counters, "apply_command"));
@@ -1181,6 +1216,7 @@ mod tests {
         script_convert: None,
         convert_update: None,
         preview_event: None,
+        preview_owner: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,

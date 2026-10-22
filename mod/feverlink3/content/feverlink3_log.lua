@@ -2,7 +2,7 @@
 --   C.logger(tag)      mod.log lines (and the game's own log through the official debugPrint)
 --   C.tracer(state)    trace.log lines (FEVERLINK3_TRACE, default on in test builds; docs/TRACE.md)
 --   C.dump(name, text) appends to a diagnostic file of the session folder (raw_builds.txt, build_trace.txt, the town trace, dev output)
---   C.dumpReplace(name, text)  writes a diagnostic file whole (detail_<time>_<id>.txt)
+--   C.dumpReplace(name, text)  writes a diagnostic file whole (detail_s<sync>_<time>_<id>.txt)
 --   C.appendCapped     the generation rule of mod.log / trace.log
 -- The files are written through the link module's primitives (feverlink3_link.lua: C.appendBelow, C.appendFile, C.writeFile,
 -- C.remove), the time of day comes from C.date: the official API has no file access and no wall clock (that module says why). Logging

@@ -282,12 +282,15 @@ class TwoSimulationStatesTest(TwoGames):
             self.assertTrue(all(s["step_max"] <= BUDGET_MS and s["over"] == 0 for s in lines), lines)
             self.assertGreater(lines[-1]["chunk"], CHUNK, "the chunk grew from the measured cost: %s" % lines[-1])
         self.assertNotIn("read after their step", self.A.log() + self.B.log())
-        # the repair's dump: the keys of detail round n2 from the game-script state, every chunk whichever state read it
-        for g in (self.A, self.B):
-            self.relay.send(g, "resync_save", 0, self.relay.ser({"id": 1, "name": "resync_1"}))
+        # the repair's dump: the keys of detail round n2 from the game-script state, every chunk whichever state read it. Every game
+        # writes it (TODO 0.2.3 item 4): the host where it saves, the guest before its load replaces its world (the load waits for it)
+        self.relay.send(self.A, "resync_save", 0, self.relay.ser({"id": 1, "name": "resync_1"}))
+        self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 1, "name": "hostsave", "sha256": "00"}))
         self.tick(3)
+        self.assertEqual(self.B.L.eval("LOADED"), "hostsave")
+        self.assertIn("resync: the detail of sync 1 written after", self.B.log())
         t = self.relay.reports[n2][0][0]
-        files = [T.read_text(os.path.join(g.dir, "detail_%d_%d.txt" % (t, g.id))).splitlines() for g in (self.A, self.B)]
+        files = [T.read_text(os.path.join(g.dir, "detail_s1_%d_%d.txt" % (t, g.id))).splitlines() for g in (self.A, self.B)]
         for f in files:
             self.assertIn("complete: detail round %d" % n2, f[0])
             self.assertEqual(sum(1 for x in f if x.startswith("townBuildings\t")), self.N + 3)

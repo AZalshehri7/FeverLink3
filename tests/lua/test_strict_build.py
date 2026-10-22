@@ -958,7 +958,7 @@ class StrictOnTest(StrictTest):
             self.B.run("local base = app.loadGame; app.loadGame = function(id, flag) local f = io.open(%s, 'rb'); CTL_AT_LOAD = f and f:read('*a') or ''; if f then f:close() end; return base(id, flag) end"
                        % T.lua_str(self.B.native.ctl))
             self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 3, "name": "hostsave", "sha256": "00"}))
-            self.B.frame()
+            self.B.frames_to_load()
             self.assertTrue(self.B.reload_pending())
             self.assertIn("hold_off", str(self.B.L.eval("CTL_AT_LOAD")), "hold_off was already written when the game was told to load")
             self.assertIn("hold_off", [k for _, k, _ in self.B.native.ctl_records()[n_ctl:]], "hold_off was written before the load")

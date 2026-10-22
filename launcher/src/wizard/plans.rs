@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use feverlink3_launcher::install::{self, Item, Outcome};
-use feverlink3_launcher::APP_ID;
+use feverlink3_launcher::{process, APP_ID};
 
 use super::facts::{folder_dir, installed_state, package_state, Facts, InstallState, Package};
 use super::problems::{classify_reason, failure_problems, Problem};
@@ -93,8 +93,10 @@ pub(super) fn plan_logs(f: &Facts) -> Result<&Path, Problem> {
 }
 
 /// `steam.exe -applaunch 3493540`, not yet started: Steam starts itself first if it is not running, then the game.
+/// Without any `FEVERLINK3_*` variable: a Steam started here keeps its environment for every later game.
 pub(super) fn steam_start_command(steam_path: &Path) -> Command {
     let mut cmd = Command::new(steam_path.join("steam.exe"));
+    process::without_feverlink3_env(&mut cmd);
     cmd.current_dir(steam_path)
         .args(["-applaunch", APP_ID])
         .stdin(Stdio::null())
@@ -348,6 +350,7 @@ mod tests {
         let cmd = steam_start_command(Path::new(r"C:\Program Files (x86)\Steam"));
         assert_eq!(cmd.get_program(), Path::new(r"C:\Program Files (x86)\Steam").join("steam.exe").as_os_str());
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-applaunch", "3493540"]);
+        assert!(cmd.get_envs().all(|(k, v)| v.is_none() || !process::is_feverlink3_var(k)));
         assert_eq!(cmd.get_current_dir(), Some(Path::new(r"C:\Program Files (x86)\Steam")));
     }
 

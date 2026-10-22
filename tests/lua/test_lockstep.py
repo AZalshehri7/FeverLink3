@@ -594,6 +594,13 @@ class Game:
     def frame(self):
         self.L.execute("FRAME()")
 
+    def frames_to_load(self):
+        """After a resync_load line: the frame that reads it asks the simulation half for this world's detail dump (X.syncDetail), the
+        engine runs that event (without a step: the game stands still), the next frame loads."""
+        self.frame()
+        self.L.execute("local q = GAME.guiQueue; GAME.guiQueue = {}; for _, c in ipairs(q) do EXECUTE(c[1], c[2]) end")
+        self.frame()
+
     def step(self):
         self.L.execute("SIMSTEP()")
 
@@ -1263,7 +1270,7 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(str(self.A.ui_view()).split("|")[2], "client: hello team !")
         # a reload keeps the roster and the chat of the window
         self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 1, "name": "hostsave", "sha256": "00"}))
-        self.B.frame()
+        self.B.frames_to_load()
         self.B.reload()
         self.tick(4)
         view = str(self.B.ui_view()).split("|")
@@ -1340,9 +1347,12 @@ class LockstepTest(unittest.TestCase):
         self.assertTrue(any(l.split(TAB)[0] == "action" for l in self.A.lines(self.A.to_game)), "the old action line is still in the file")
         self.tick(20)
         self.assertEqual(self.A.applied(), before, "re-written history was not dispatched again")
-        # a load of an unknown save fails without reloading; the game keeps reading its link
+        # a load of an unknown save fails without reloading; the game keeps reading its link: the line read with the load line (skipped
+        # while the load waited for the detail dump) is dispatched once after the failure
         self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 4, "name": "nope", "sha256": "00"}))
+        self.relay.send(self.B, "chat", 0, self.relay.ser({"text": "after the load line", "name": "Host"}))
         self.tick(3)
+        self.assertEqual(self.B.log().count("after the load line"), 1)
         self.assertFalse(self.B.reload_pending())
         self.assertEqual(len(self.relay.replay_failed), 1)
         self.assertEqual(read_text(os.path.join(self.B.dir, "resync_cursor.txt")), "")
@@ -1362,7 +1372,7 @@ class LockstepTest(unittest.TestCase):
         self.assertEqual(self.relay.hellos.count(1), 1)
         self.relay.send(self.B, "resync_load", 0, self.relay.ser({"id": 3, "name": "hostsave", "sha256": "00"}))
         after_load_line = os.path.getsize(self.B.to_game)
-        self.B.frame()
+        self.B.frames_to_load()
         self.assertEqual(self.B.L.eval("LOADED"), "hostsave")
         self.assertTrue(self.B.reload_pending())
         # the places right after the load line in to_game.log and where the window's records were read to (none yet)
@@ -1416,7 +1426,7 @@ class LockstepTest(unittest.TestCase):
         self.start()
         self.tick(10)
         self.relay.send(B, "resync_load", 0, self.relay.ser({"id": 3, "name": "hostsave", "sha256": "00"}))
-        B.frame()
+        B.frames_to_load()
         self.assertTrue(B.reload_pending())
         B.reload()
         if case == "off by default":
@@ -1642,7 +1652,7 @@ class StampedEverywhereTest(LockstepTest):
         line = int(self.B.L.eval("LINE"))
         for g in (self.A, self.B):
             self.relay.send(g, "resync_load", 0, self.relay.ser({"id": 21, "name": "hostsave", "sha256": "00"}))
-            g.frame()
+            g.frames_to_load()
             self.assertTrue(g.reload_pending())
             g.reload()
         self.relay.session()

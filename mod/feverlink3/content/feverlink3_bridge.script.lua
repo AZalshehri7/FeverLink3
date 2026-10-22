@@ -1167,6 +1167,7 @@ function X.bresWrite(trace, log, e, now, changes, announced, shared)
 		e.detail and (" detail=" .. tostring(e.detail):gsub("%s+", " "):sub(1, 200)) or "")
 	trace("build.result", line)
 	log("build.result " .. line)
+	return verdict
 end
 
 function X.buildResultBegin(st, it, ctx, now, how)
@@ -1295,6 +1296,10 @@ function X.simBuildResults(st, now)
 		end
 		local okW, errW = pcall(X.bresWrite, traceSim, logSim, e, now, changes, announced, shared)
 		if not okW then logSim("build.result of " .. tostring(e.key) .. " failed: " .. tostring(errW)) end
+		-- the originator's own build: what really happened here, for a refusal notice that waits for it (X.tellRefused)
+		if tostring(e.role):find("^originator") then
+			st.results[#st.results + 1] = { key = tostring(e.key) .. "#outcome", of = e.key, at = e.at, success = true, outcome = okW and errW or "?" }
+		end
 		if e.answer then
 			local okA, errA = pcall(X.answerBuild, st, e, snaps, after, changes, announced, shared)
 			if not okA then
@@ -2917,7 +2922,7 @@ end
 --   id "feverlink3" (this file's own messages, toSim -> makeScriptingSendEventCmd, "broadcasted to all scripts", api.cmd):
 --     session (test_lockstep start/resync), sessionoff (test_session_end), queue (every stamped action), drop (vetoes,
 --     test_strict_build), bind (test_lockstep line/vehicle keys), replay, heldout, heldgone, heldinput, heldnative, nativebind,
---     nativecaps (test_strict_build, test_native_capture), outack (test_lockstep), dumpdetail (resync save), co (companies,
+--     nativecaps (test_strict_build, test_native_capture), outack (test_lockstep), dumpdetail (every game at a sync, test_checksum_spread), co (companies,
 --     test_cmds_company). test_lockstep EventSubscriptionTest checks that every name toSim sends is here.
 -- "nop" is not in the list: it is the strict mode's trigger, a command whose only purpose is that the engine runs it (the native module
 -- runs its queue at the command, natTrigger); handleEvent ignores it. Since 2026-10-18 the script subscribes to ALL events again (see
@@ -3022,7 +3027,7 @@ function handleEvent(userParams, state, src, id, name, param)
 			-- the world and stay.
 			if st.epoch ~= param.epoch then
 				local dropped = #st.reports + #st.results + #st.refused + #(st.out or {})
-				st.reports, st.results, st.refused, st.out, st.notes, st.late = {}, {}, {}, nil, nil, 0
+				st.reports, st.results, st.refused, st.out, st.notes, st.late, st.detailAck = {}, {}, {}, nil, nil, 0, nil
 				st.epoch = param.epoch
 				traceSim("session", "epoch " .. tostring(param.epoch) .. ": dropped " .. C.integerText(dropped) .. " outputs of an earlier session")
 				if param.fresh then
@@ -3063,12 +3068,16 @@ function handleEvent(userParams, state, src, id, name, param)
 				table.insert(lines, 1, "# itemised keys of the last full checksum round of this game: time=" .. tostring(d.time) .. " why=" .. tostring(param.why)
 					.. (d.complete and (" complete: detail round " .. tostring(d.complete) .. ", every chunk at its step, the same on every game") or "")
 					.. (d.partial and (" partial: the keys of the " .. d.partial .. " this simulation Lua state read (no detail round ran: the host asks for one after a round that differed)") or ""))
-				local fname = "detail_" .. tostring(d.time) .. "_" .. tostring(C.PLAYER_ID) .. ".txt"
+				-- detail_s<sync>_<time>_<player>.txt: every game of one sync writes the same s<sync> (X.syncDetail), so `detail_s3_*` are that
+				-- sync's files of all games; the same <time> says they are of the same round
+				local fname = "detail_s" .. tostring(param.sync or 0) .. "_" .. tostring(d.time) .. "_" .. tostring(C.PLAYER_ID) .. ".txt"
 				C.dumpReplace(fname, table.concat(lines, "\n") .. "\n")
-				traceSim("detail", string.format("%s: %d lines written to %s (diff the two games' files to see which entities differ)", tostring(param.why), #lines - 1, fname))
+				traceSim("detail", string.format("%s: %d lines written to %s (diff the games' files of this sync to see which entities differ)", tostring(param.why), #lines - 1, fname))
 			else
-				traceSim("detail", "no full checksum round has run in this game yet")
+				traceSim("detail", tostring(param.why) .. ": no full checksum round has run in this game yet, no detail file")
 			end
+			-- the interface half waits for this before it loads (X.syncDetail): the event must run before the load replaces this world
+			st.detailAck = param.ack
 		elseif name == "nativebind" and type(param) == "table" then
 			local nb = SIM.nativeBinds and SIM.nativeBinds[param.n]
 			local saved = st.nbinds and st.nbinds[tostring(param.n)]
@@ -3722,7 +3731,8 @@ local function guiApplyNow(it, now)
 			local e = X.bresEntry(it, ctx, now, how)
 			if e then
 				if how.b0 ~= nil then e.b0 = how.b0 end
-				X.bresWrite(traceGui, logGui, e, now, changes, announced)
+				local v = X.bresWrite(traceGui, logGui, e, now, changes, announced)
+				if it.from == C.PLAYER_ID then X.buildOutcome(it.key, v) end
 			end
 		end)
 	end
@@ -5647,6 +5657,14 @@ function commitPump()
 		G.pendingSave = nil
 		ps.go()
 	end
+	-- a resync load waits for this world's detail dump (H.resync_load, X.syncDetail)
+	local written = G.pendingLoad and X.detailWritten()
+	if written then
+		local pl = G.pendingLoad
+		G.pendingLoad = nil
+		logGui(string.format("resync: the detail of sync %s %s after %.1f s; loading now", tostring(G.detailSync), written, clock - pl.since))
+		pl.go()
+	end
 	for key, pk in pairs(G.parked) do
 		if clock - pk.wall > PARK_MAX then
 			G.parked[key] = nil
@@ -5892,14 +5910,62 @@ end
 
 -- The originator's player is told that their build was not applied (a notice on this game only: nothing of it changed any world).
 -- The build key and the engine's reason stay in the log.
+-- A refusal of the native module that did not empty the command (`no_command`: no command took the order; `untouched`: it could not be
+-- emptied) says nothing of what this game applied: the command may have applied as it was (the mod's own rebuild of the record). The
+-- notice then waits for this game's build.result of the build (X.buildOutcome) and is given only when nothing of it was applied here.
+-- Two-window run 2026-10-22 (x4, build 0:77): the host was told "Your build could not be built ... Nothing was built. Try again" and
+-- the road stood on both games (build.result verdict=applied, +5 nodes +6 segments). The verdict sent to the host stays "refused"
+-- (X.injectStep): the build did not go as the originator's exact copy, and the host compares the games' verdicts.
 function X.tellRefused(r, why)
 	if r.from ~= C.PLAYER_ID then return end
+	local key = tostring(r.of or r.key)
+	if tostring(why or ""):find("refused here %((no_command)%)") or tostring(why or ""):find("refused here %((untouched)%)") then
+		local seen = G.bresOutcome and G.bresOutcome[key]
+		if seen == nil then
+			G.noticeWait = G.noticeWait or {}
+			G.noticeWait[key] = { r = r, why = why, t = C.clock() }
+			logGui("build " .. key .. ": the native module refused its order without emptying the command: the notice waits for this game's build.result")
+			return
+		end
+		G.bresOutcome[key] = nil
+		if seen == "applied" then
+			logGui("build " .. key .. " was applied here (build.result verdict=applied) although the native module refused its order: the player is not told it failed")
+			return
+		end
+	end
 	why = tostring(why or ""):gsub("^inject_refused: ", ""):gsub(" %(refused from this game's own world.*$", "")
 	-- the native compare of the rebuilt Proposal with the originator's text (native inject.rs) is not a world change: the copy differs
 	-- (friend test 2026-10-21: an empty town-building name; the player was told "the world changed ... Try again" and retried twice)
 	local remade = why:find("differs from the text", 1, true) ~= nil
 	logGui("build " .. tostring(r.of or r.key) .. " was not applied: " .. (remade and "the rebuilt build differs from the original: " or "the world changed before its turn: ") .. why:sub(1, 200))
 	if X.noticeLocal then pcall(X.noticeLocal, remade and "build_not_remade" or "build_world_changed", { thing = "build" }) end
+end
+
+-- This game's build.result verdict of its player's own build `key` ("applied", "unseen", "refused(...)"): a notice waiting for it is
+-- given or dropped now (X.tellRefused); else it is kept for a refusal that comes later (the last 64).
+function X.buildOutcome(key, verdict)
+	key = tostring(key)
+	G.bresOutcome, G.bresOrder = G.bresOutcome or {}, G.bresOrder or {}
+	G.bresOutcome[key] = tostring(verdict)
+	G.bresOrder[#G.bresOrder + 1] = key
+	if #G.bresOrder > 64 then G.bresOutcome[table.remove(G.bresOrder, 1)] = nil end
+	local w = G.noticeWait and G.noticeWait[key]
+	if w then
+		G.noticeWait[key] = nil
+		return X.tellRefused(w.r, w.why)
+	end
+end
+
+-- A waiting notice whose build.result has not come within X.NOTICE_WAIT_S of real time (it comes one or two steps after the stamp, or
+-- at once during a pause) is given as before: the player is never left untold (X.buildOutcome answers it as "unseen").
+X.NOTICE_WAIT_S = 5
+function X.noticeTimeouts(now)
+	for key, w in pairs(G.noticeWait or {}) do
+		if now - (w.t or now) > X.NOTICE_WAIT_S then
+			logGui("build " .. key .. ": no build.result within " .. X.NOTICE_WAIT_S .. " s: the notice is given as it is")
+			X.buildOutcome(key, "unseen")
+		end
+	end
 end
 
 -- A build applied at its stamp (X.simVerdict): its verdict goes now, or, with inject orders, once the module answered every one of them.
@@ -6550,12 +6616,39 @@ H.authority = function(rec, p)
 	end
 end
 
+-- The itemised keys of this game's last full checksum round (dumpdetail, detail_s<sync>_<time>_<player>.txt), written by EVERY game
+-- of a sync while it still has its own world: the host where it saves (H.resync_save), every other game before its load replaces that
+-- world (H.resync_load; join, return, start and repair syncs all end in it). Until 0.2.2 only the host's save wrote one, so the guest's
+-- world before the load was lost and a drift could not be diffed (friend test 2026-10-21). Once per sync: the host, which saves and
+-- then loads, writes one file. Returns true when the dump of this sync is done (asked earlier), false when it was asked now: the
+-- simulation half writes it at its next event and answers with st.detailAck (collectFromSim), which a load waits for (G.pendingLoad).
+-- Reads only the keys kept from the last round; no world is read and no command changes the world.
+function X.syncDetail(p, where)
+	local sync = tonumber(p.id) or 0
+	if G.detailSync == sync then return true end
+	G.detailSync = sync
+	G.detailAsked = tostring(G.epoch) .. "/" .. tostring(sync)
+	traceGui("resync", string.format("sync %s (%s) %s: the itemised keys of the last full checksum round of this game follow in detail_s%s_*.txt",
+		tostring(sync), tostring(p.name), where, tostring(sync)))
+	pcall(toSim, "dumpdetail", { why = "sync " .. tostring(sync) .. " " .. where .. " " .. tostring(p.name), sync = sync, ack = G.detailAsked })
+	return false
+end
+
+-- The simulation half has written this sync's detail file, or it did not answer in DETAIL_WAIT_S (the load goes on: a missing file
+-- must not hold a sync). Called every frame (commitPump).
+local DETAIL_WAIT_S = 3
+function X.detailWritten()
+	if G.simDetailAck == G.detailAsked then return "written" end
+	if C.clock() - G.pendingLoad.since > DETAIL_WAIT_S then return "NOT confirmed by the simulation half within " .. DETAIL_WAIT_S .. " s" end
+	return nil
+end
+
 H.resync_save = function(rec, p)
 	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_save"); return end
 	local function save()
 		logGui("resync: saving the game as '" .. p.name .. "'")
-		traceGui("resync", string.format("saving as %s id=%s now=%s balance=%s (the itemised keys of the last full checksum round of this game follow in detail_*.txt)", tostring(p.name), tostring(p.id), tostring(engine.gameTime()), tostring(engine.account())))
-		pcall(toSim, "dumpdetail", { why = "resync " .. tostring(p.name) })
+		traceGui("resync", string.format("saving as %s id=%s now=%s balance=%s", tostring(p.name), tostring(p.id), tostring(engine.gameTime()), tostring(engine.account())))
+		pcall(X.syncDetail, p, "save")
 		engine.saveGame(p.name, function(ok, err)
 			logGui("resync: save " .. (ok and "done" or ("failed: " .. tostring(err))))
 			-- the mods this world uses, read from the save just made: the host compares them with every player's before
@@ -6585,19 +6678,35 @@ H.resync_load = function(rec, p)
 	-- a reload while the native module holds commands is unsafe (docs/NATIVE_LINK.md stage 2, H): holding goes off first. The
 	-- reloaded script finds `ready` in native_events.log and switches strict mode on again.
 	pcall(natStop, "resync load")
-	C.writeFile(C.path(C.CURSOR), C.posText(C.recordEnd(rec)) .. " " .. C.posText(C.readerPos(G.uiReader)))
+	local after = C.recordEnd(rec)
+	C.writeFile(C.path(C.CURSOR), C.posText(after) .. " " .. C.posText(C.readerPos(G.uiReader)))
 	Hud.writeSnapshot(C, G.hud, { version = nil })
-	-- the loaded game waits for this file's start (X.readyLoad / X.readyBegin / X.readyGate)
-	X.readyAsked = false
-	pcall(X.readyLoad)
-	local ok, err = engine.loadGame(p.name)
-	if ok then
-		G.loading = true
-		pcall(X.readyLoaded)
+	-- the lines after this one belong to the reloaded game from here on, also while the load waits for the detail dump below
+	G.loading = true
+	local function load(deferred)
+		-- the loaded game waits for this file's start (X.readyLoad / X.readyBegin / X.readyGate)
+		X.readyAsked = false
+		pcall(X.readyLoad)
+		local ok, err = engine.loadGame(p.name)
+		if ok then
+			pcall(X.readyLoaded)
+		else
+			G.loading = false
+			-- a load that waited for the dump: the lines read with this one after it were skipped (readLink), so the link is read
+			-- again right after this line and they are dispatched as without the wait (a load at once goes on in the same batch)
+			if deferred and G.reader then C.readerNext(G.reader, after.gen, after.offset) end
+			C.writeFile(C.path(C.CURSOR), "")
+			logGui("resync: load failed: " .. tostring(err))
+			send("replay_failed", { detail = "resync_load failed: " .. tostring(err) })
+		end
+	end
+	-- this world's detail first (X.syncDetail): app.loadGame tears the world down within the frame (friend test 2026-10-21: the
+	-- interface's destroy events in the same second as "resync: loading"), before the simulation half would run a dump sent with it
+	local okD, done = pcall(X.syncDetail, p, "load")
+	if not okD or done then
+		load()
 	else
-		C.writeFile(C.path(C.CURSOR), "")
-		logGui("resync: load failed: " .. tostring(err))
-		send("replay_failed", { detail = "resync_load failed: " .. tostring(err) })
+		G.pendingLoad = { since = C.clock(), go = function() load(true) end }
 	end
 end
 
@@ -6836,6 +6945,7 @@ function collectFromSim(state)
 		return
 	end
 	G.stateFault = nil
+	G.simDetailAck = st.detailAck   -- the detail dump a resync load waits for (X.detailWritten)
 	-- companies: the mirror takes the state's registry when that is newer; during a pause it is ahead of the state
 	if Co and type(st.co) == "table" and (G.co == nil or (st.co.rev or 0) > (G.co.rev or 0)) then
 		coGuard("mirror", function() G.co = C.plain(st.co) end)
@@ -6881,6 +6991,8 @@ function collectFromSim(state)
 			deliverResult(r.key, r.data, r.success, r.entities or {})
 			-- strict mode: the simulation half reached the stamp of a build whose own copy this game's native module holds
 			if r.release and r.of and G.nat then pcall(natRelease, r.of) end
+			-- this game's build.result of its player's own build: a refusal notice may wait for it (X.tellRefused)
+			if r.outcome and r.of then pcall(X.buildOutcome, r.of, r.outcome) end
 			-- a build applied at its stamp: this game's verdict, for the host (X.verdictOf)
 			if r.verdict then
 				local okV, errV = pcall(X.verdictOf, r)
@@ -6888,6 +7000,7 @@ function collectFromSim(state)
 			end
 		end
 	end
+	if G.noticeWait then pcall(X.noticeTimeouts, C.clock()) end
 	for _, r in ipairs(st.refused or {}) do
 		if not G.refusedSent[r.key] then
 			G.refusedSent[r.key] = true
@@ -7207,6 +7320,7 @@ function X.sessionOff(why, state)
 	G.peers, G.session, G.marks = {}, L.newSession(), {}
 	G.graces, G.parked, G.dry, G.buildAts, G.vetoed = {}, {}, {}, {}, {}
 	G.pauseQ, G.pauseOwn, G.pauseLast, G.slot = nil, nil, nil, nil
+	G.bresOutcome, G.bresOrder, G.noticeWait = nil, nil, nil   -- build keys start again in the next session (X.buildOutcome)
 	-- where this game stood still at the pause (the clock's `stop`); the run on to a host's pause stamp (pauseRun) goes with G.session
 	G.still, X.curStop, G.lastStop = nil, nil, nil
 	G.promiseFloor, G.promisePause, G.barrier = nil, nil, nil
@@ -7215,7 +7329,7 @@ function X.sessionOff(why, state)
 	X.coPage, X.clockSentAt = nil, nil   -- the company page's line results (keys of this session) and the clock keepalive
 	X.pauseRunWant = nil                 -- a run-on of the pause order waiting for the rest of its flush
 	X.guiParked, X.guiMaking = nil, nil  -- actions waiting for an engine answer (their callbacks failed with the pending ones above)
-	G.authPending, G.accountAt, G.authLast, G.pendingSave = {}, {}, nil, nil
+	G.authPending, G.accountAt, G.authLast, G.pendingSave, G.pendingLoad = {}, {}, nil, nil, nil
 	G.perms, G.margin = L.newPermissions(), L.newMargin()
 	G.resultsSeen, G.reportsSent, G.refusedSent, G.lateSeen = {}, {}, {}, 0
 	G.injWait, G.injDone, G.injOrder = nil, nil, nil

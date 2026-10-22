@@ -13,7 +13,14 @@
 //! | `FEVERLINK3_ROLE`        | `host` or `player`                           |
 //!
 //! [`command`] builds the `Command` without running it, so it can be checked in tests; [`start`] runs it.
+//!
+//! Steam itself must never carry these variables: a Steam started from an environment holding them passes them on
+//! to every game it starts later (friend test 2026-10-21: a test script's `steam.exe -applaunch` found Steam closed,
+//! so Steam started with `FEVERLINK3_TRANSPORT`/`FEVERLINK3_LIVE_DIR` and the owner's next normal game inherited
+//! them). [`without_feverlink3_env`] strips them from a Steam command; [`steam_running`] lets a direct game start
+//! refuse while Steam is closed, because the game's Steam API could then start Steam with the session variables.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -75,6 +82,33 @@ pub fn command(launch: &Launch) -> Command {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd
+}
+
+/// Prefix of every variable FeverLink3 reads.
+pub const ENV_PREFIX: &str = "FEVERLINK3_";
+
+/// Steam's executable, for [`steam_running`].
+pub const STEAM_EXE: &str = "steam.exe";
+
+/// True for a `FEVERLINK3_*` variable name. Windows names are case-insensitive, so the comparison is too.
+pub fn is_feverlink3_var(name: &OsStr) -> bool {
+    name.to_string_lossy().get(..ENV_PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(ENV_PREFIX))
+}
+
+/// Removes every `FEVERLINK3_*` variable from what `cmd` passes on: the ones inherited from this process and the ones
+/// set on `cmd`. For commands that may start Steam, which must stay clean (see the module text).
+pub fn without_feverlink3_env(cmd: &mut Command) -> &mut Command {
+    let mut names: Vec<OsString> = std::env::vars_os().map(|(k, _)| k).filter(|k| is_feverlink3_var(k)).collect();
+    names.extend(cmd.get_envs().map(|(k, _)| k.to_os_string()).filter(|k| is_feverlink3_var(k)));
+    for name in names {
+        cmd.env_remove(name);
+    }
+    cmd
+}
+
+/// `Some(true)` while Steam runs, `Some(false)` when it does not, `None` when `tasklist` cannot be asked.
+pub fn steam_running() -> Option<bool> {
+    count_running(STEAM_EXE).map(|n| n > 0)
 }
 
 /// A started game.
@@ -167,7 +201,29 @@ pub fn game_exe(game_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+
+    #[test]
+    fn feverlink3_variables_are_recognised_in_any_case() {
+        assert!(is_feverlink3_var(OsStr::new("FEVERLINK3_LIVE_DIR")));
+        assert!(is_feverlink3_var(OsStr::new("feverlink3_transport")));
+        assert!(!is_feverlink3_var(OsStr::new("FEVERLINK3")));
+        assert!(!is_feverlink3_var(OsStr::new("FL3_DEMO_DEV")));
+        assert!(!is_feverlink3_var(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn a_scrubbed_command_passes_on_no_feverlink3_variable() {
+        let mut cmd = Command::new("steam.exe");
+        cmd.env("FEVERLINK3_TRANSPORT", "tcp-loopback").env("OTHER", "kept");
+        without_feverlink3_env(&mut cmd);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("FEVERLINK3_TRANSPORT"), None)));
+        assert!(envs.contains(&(OsStr::new("OTHER"), Some(OsStr::new("kept")))));
+        // every inherited FEVERLINK3_* (when the test runs in such a shell) is removed as well
+        for (k, _) in std::env::vars_os().filter(|(k, _)| is_feverlink3_var(k)) {
+            assert!(envs.contains(&(k.as_os_str(), None)));
+        }
+    }
 
     fn launch() -> Launch {
         Launch {

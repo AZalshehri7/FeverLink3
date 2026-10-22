@@ -152,6 +152,10 @@ unsafe extern "system-unwind" fn preview_hook(
     }
     if let Some(rt) = RUNTIME.get() {
         crate::log::guarded("preview hook", || rt.note_preview_args([a, b, c, d, e]));
+        // once per game interface: the arguments computed from its listener's captures compared with these (calls the engine's getter
+        // the listener itself has just called, so in this plain frame)
+        // SAFETY: on the interface thread inside the listener's own call, where the captures it was made with are alive.
+        unsafe { rt.check_preview_owner([a, b, c, d, e]) };
     }
     type Original = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
     // SAFETY: the trampoline of the emitter, which takes these nine slots.
@@ -161,6 +165,28 @@ unsafe extern "system-unwind" fn preview_hook(
 
 /// The unhooked `builder.proposalCreate` emitter (the trampoline), published before the jump is written; 0 until then.
 static PREVIEW_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Where the redirected call in `UI::CGameUI::CGameUI` leads after [`preview_owner_hook`]: the listener's `std::function` constructor
+/// (`0x642dc0`); 0 until published (before the call is patched).
+static PREVIEW_OWNER_CALLEE: AtomicUsize = AtomicUsize::new(0);
+
+/// The call `std::function(lambda)` at `0x64cb41` in `UI::CGameUI::CGameUI` (once per loaded world, `build_table::PreviewOwnerSite`),
+/// reached through a thunk: `captures` points at the builder-preview listener's three captures, which are kept
+/// ([`Runtime::note_preview_owner`], guarded reads only); then the real constructor (a leaf that copies them) runs with both arguments.
+unsafe extern "system-unwind" fn preview_owner_hook(function: u64, captures: u64) -> u64 {
+    let _barrier = crate::failsafe::Barrier::new(&crate::hookwatch::PREVIEW_OWNER_HOOK);
+    let callee = PREVIEW_OWNER_CALLEE.load(Ordering::Acquire);
+    if callee == 0 {
+        return function; // unreachable once installed
+    }
+    if let Some(rt) = RUNTIME.get() {
+        crate::log::guarded("preview owner hook", || rt.note_preview_owner(captures as usize));
+    }
+    type Original = unsafe extern "system-unwind" fn(u64, u64) -> u64;
+    // SAFETY: the real constructor at the call's original target, which takes these two slots.
+    let original: Original = unsafe { core::mem::transmute(callee) };
+    unsafe { original(function, captures) }
+}
 
 /// The unhooked town-seed function (the trampoline), published before the jump is written; 0 until then.
 static TOWN_SEED_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
@@ -1185,6 +1211,8 @@ pub struct Targets {
     pub pace: usize,
     /// The call-site hook of the free-id order ([`free_order_hook`]).
     pub free_order: usize,
+    /// The call-site hook where the game interface makes its builder-preview listener ([`preview_owner_hook`]).
+    pub preview_owner: usize,
 }
 
 /// A view of this process's image for the planner.
@@ -1418,6 +1446,7 @@ pub unsafe fn execute(
                 Feature::GrowthSort => (targets.sort, &[]),
                 Feature::BatchPace => (targets.pace, &[]),
                 Feature::FreeOrder => (targets.free_order, &[]),
+                Feature::PreviewOwner => (targets.preview_owner, &[]),
                 Feature::GrowthField => (targets.field, &[]),
                 // `mov r9, rbp`: the caller's frame pointer as a fourth argument the callee ignores
                 _ => (targets.pick, &[0x4C, 0x8B, 0xCD]),
@@ -1427,6 +1456,7 @@ pub unsafe fn execute(
                 Feature::GrowthSort => SORT_CALLEE.store(callee_addr, Ordering::Release),
                 Feature::BatchPace => PACE_CALLEE.store(callee_addr, Ordering::Release),
                 Feature::FreeOrder => FREE_ORDER_CALLEE.store(callee_addr, Ordering::Release),
+                Feature::PreviewOwner => PREVIEW_OWNER_CALLEE.store(callee_addr, Ordering::Release),
                 Feature::GrowthField => FIELD_CALLEE.store(callee_addr, Ordering::Release),
                 _ => PICK_CALLEE.store(callee_addr, Ordering::Release),
             }
@@ -1510,7 +1540,7 @@ fn apply_selftest(p: &mut Plan, report: &selftest::Report, log: fn(&str)) {
     let mut skipped = Vec::new();
     p.steps.retain(|s| {
         let remove = matches!(s, Step::Detour { feature, .. } if drop_all || (drop_hold && matches!(feature, Feature::Hold | Feature::PreviewEvent)))
-            || matches!(s, Step::CallPatch { .. } if drop_all);
+            || matches!(s, Step::CallPatch { feature, .. } if drop_all || (drop_hold && *feature == Feature::PreviewOwner));
         if remove {
             skipped.push(Skip { feature: s.feature(), name: s.name(), reason: why(s.feature()).to_string() });
         }
@@ -1660,6 +1690,7 @@ fn attach_at(base: usize, build: &'static BuildAddrs, cfg: HookConfig, link: Opt
         preview: preview_hook as *const () as usize,
         pace: pace_hook as *const () as usize,
         free_order: free_order_hook as *const () as usize,
+        preview_owner: preview_owner_hook as *const () as usize,
     };
     if plan.has(Feature::TownSeed) {
         arm_town_seed(base, log, cfg.force_seed);
@@ -1918,6 +1949,7 @@ mod tests {
             script_convert: None,
             convert_update: None,
             preview_event: None,
+            preview_owner: None,
             town_candidates: Some(HookSite {
                 rva: CANDS_RVA,
                 prologue: Box::leak(stub(cands_probe as *const () as usize)[..14].to_vec().into_boxed_slice()),
@@ -2031,6 +2063,7 @@ mod tests {
             preview: preview_hook as *const () as usize,
             pace: pace_hook as *const () as usize,
             free_order: free_order_hook as *const () as usize,
+            preview_owner: preview_owner_hook as *const () as usize,
         }
     }
 

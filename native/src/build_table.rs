@@ -113,6 +113,34 @@ pub struct CallPatchSite {
     pub callee: CallSite,
 }
 
+/// The game interface's builder-preview listener, read where it is made (`BuildAddrs::preview_owner`).
+///
+/// Static analysis of build 40420: each of the six listener lambdas that call the `builder.proposalCreate` emitter (`0xf44c00`)
+/// captures three pointers `[ui, y, z]` (closure `+8`, `+0x10`, `+0x18`) and computes the emitter's first five arguments from them
+/// when it runs: `a = [y+0x18]`, `b = [y+0xc8]`, `r = z->vtable[1](z)`, `c = [r+0x18]`, `dispatcher = [r+0x1d8]`, `e = [ui+0xb98]`
+/// (the same instructions before each of the six calls, `0x665ba5`..`0x667891`). The lambdas are made in `UI::CGameUI::CGameUI` (`0x647cb0`, its
+/// assertion string; `ui` is its `this`), a new game interface for every loaded world. `call` is the one call of the
+/// `std::function` constructor of the lambda whose call operator is `0x666420` (`0x642dc0`: its first bytes store that lambda's
+/// vtable) inside that constructor; `rdx` there points at the three captures.
+///
+/// Why (friend test 2026-10-21, 22:44-22:45): after a resync load the module had no emitter arguments (they come from a tool preview of
+/// the world being played, and are dropped when holding switches), the friend's first builds were seven station configures
+/// (`UI::ModuleBuilder`, which sends no preview): no record, all seven refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewOwnerSite {
+    pub call: CallPatchSite,
+    /// `a` and `b`: offsets into the second capture.
+    pub y_a: usize,
+    pub y_b: usize,
+    /// The vtable slot of the third capture's getter (called with the capture as `this`).
+    pub z_getter_slot: usize,
+    /// `c` and the dispatcher: offsets into what the getter returns.
+    pub r_c: usize,
+    pub r_dispatcher: usize,
+    /// `e`: offset into the game interface (the first capture).
+    pub ui_e: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildAddrs {
     /// PE link timestamp.
@@ -137,6 +165,10 @@ pub struct BuildAddrs {
     /// for a tool that sends no preview (UI::ModuleBuilder, the station configure: run s4 2026-10-14). Static analysis of build 40420:
     /// the only function that references the string, called by one listener lambda per builder tool.
     pub preview_event: Option<HookSite>,
+    /// Where the game interface (`UI::CGameUI::CGameUI`, once per loaded world) makes one builder tool's preview listener: the emitter's
+    /// first five arguments are computed from that lambda's three captures each time it runs, so a held command can be given to the
+    /// scripts before any tool preview of this world (`PreviewOwnerSite`).
+    pub preview_owner: Option<PreviewOwnerSite>,
     /// The simulation's command application: where held commands are counted and released at their stamp.
     pub apply_command: Option<HookSite>,
     /// Inside the game-script system's pool construction: `cmp eax,8 / jge / mov [rsp+20h],1 / call
@@ -292,6 +324,27 @@ pub const BUILDS: &[BuildAddrs] = &[
         preview_event: Some(HookSite {
             rva: 0x00f4_4c00,
             prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x55, 0x57, 0x41, 0x56],
+        }),
+        // `call 0x642dc0` at `0x64cb41` in UI::CGameUI::CGameUI (`0x647cb0`), after `mov [rbp+7A0h],r13 ; mov [rbp+7A8h],r12 ;
+        // mov rax,[rbp-48h] ; mov [rbp+7B0h],rax ; lea rdx,[rbp+7A0h]`; callee: `mov qword [rcx+38h],0 ; lea rax,[rip+...]` (the
+        // lambda's vtable `0x36cdee8`, whose call slot is `0x666420`)
+        preview_owner: Some(PreviewOwnerSite {
+            call: CallPatchSite {
+                rva: 0x0064_cb41,
+                expected: &[0xE8, 0x7A, 0x62, 0xFF, 0xFF],
+                callee: CallSite {
+                    rva: 0x0064_2dc0,
+                    prologue: &[
+                        0x48, 0xC7, 0x41, 0x38, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x05, 0x19, 0xB1, 0x08, 0x03,
+                    ],
+                },
+            },
+            y_a: 0x18,
+            y_b: 0xc8,
+            z_getter_slot: 1,
+            r_c: 0x18,
+            r_dispatcher: 0x1d8,
+            ui_e: 0xb98,
         }),
         // `push rbx,rbp,rsi,rdi,r12,r14,r15 ; sub rsp,50h`
         town_update_size: Some(HookSite {
@@ -476,6 +529,7 @@ mod tests {
         script_convert: None,
         convert_update: None,
         preview_event: None,
+        preview_owner: None,
         town_candidates: None,
         town_edges: None,
         town_sort_call: None,
@@ -631,8 +685,10 @@ mod tests {
         assert_eq!(b.town_update_size.as_ref().unwrap().rva, 0x9e12b0);
         assert_eq!(b.town_candidates.as_ref().unwrap().rva, 0x9677c0);
         assert_eq!(b.town_edges.as_ref().unwrap().rva, 0x95d100);
+        let owner = b.preview_owner.as_ref().map(|o| o.call.clone());
         for (site, call) in [
-            (&b.town_sort_call, 0x967c16u32),
+            (&owner, 0x64cb41u32),
+            (&b.town_sort_call, 0x967c16),
             (&b.town_pick_call, 0x95d627),
             (&b.town_field_call, 0x96962e),
             (&b.batch_pace, 0x11f446),

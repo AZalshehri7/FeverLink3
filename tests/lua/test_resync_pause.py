@@ -59,7 +59,7 @@ class ResyncPauseTest(unittest.TestCase):
         loaded = p + overshoot * STEP
         for g in (self.A, self.B):
             self.relay.send(g, "resync_load", 0, self.relay.ser({"id": 12, "name": "hostsave", "sha256": "00"}))
-            g.frame()
+            g.frames_to_load()
             self.assertTrue(g.reload_pending())
             g.run("GAME.time = %d" % loaded)   # the save's time: where the host's game stood still
             g.reload()

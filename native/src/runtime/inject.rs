@@ -577,11 +577,11 @@ impl Runtime {
         let thread = super::current_thread_id();
         let have = inj::identity(&LiveMem, dest).ok();
         for order in self.inject.waiting(now) {
-            let positive = match self.inject.conversion_match(order.seq, thread, have.as_ref()) {
-                inj::ConvMatch::Ours => true,
-                inj::ConvMatch::Other => {
+            let (positive, how) = match self.inject.conversion_match(order.seq, thread, have.as_ref()) {
+                inj::ConvMatch::Ours(how) => (true, how),
+                inj::ConvMatch::Other(why) => {
                     self.say(&format!(
-                        "native inject: key {} (held {}): a build_proposal on thread {thread} that does not carry the conversion of the mod's own send for this order: not its command, passed untouched{}",
+                        "native inject: key {} (held {}): a build_proposal on thread {thread} that does not carry the conversion of the mod's own send for this order: not its command, passed untouched{}: {why}",
                         order.key,
                         order.held,
                         have.as_ref().map_or(" (unreadable)".to_string(), |h| format!(
@@ -593,7 +593,7 @@ impl Runtime {
                     ));
                     continue;
                 }
-                inj::ConvMatch::Unseen => false,
+                inj::ConvMatch::Unseen => (false, String::new()),
             };
             let prepared = if order.link_only {
                 match self.same_as_held(order.held, dest) {
@@ -634,9 +634,9 @@ impl Runtime {
                 order.key,
                 order.held,
                 if positive {
-                    "it carries the conversion of the mod's own send (positive identity)"
+                    format!("it carries the conversion of the mod's own send (positive identity: {how})")
                 } else {
-                    "matched by its content (no conversion of its send seen)"
+                    "matched by its content (no conversion of its send seen)".to_string()
                 },
                 self.inject.waiting_count()
             ));

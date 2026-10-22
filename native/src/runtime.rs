@@ -21,7 +21,7 @@
 //! a fake engine and real files.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread::Thread;
 use std::time::Instant;
@@ -131,6 +131,13 @@ pub struct Runtime {
     preview_args: Mutex<Option<[u64; 5]>>,
     /// Holding as `sync_flags` last saw it.
     preview_holding: AtomicBool,
+    /// The three captures `[ui, y, z]` of the builder-preview listener of the newest game interface (`build_table::PreviewOwnerSite`),
+    /// replaced when the next world's interface is made (never dropped at a switch of holding: they belong to the interface, not to
+    /// holding). The emitter's arguments are computed from them when a held command comes before any tool preview of the world.
+    preview_owner: Mutex<Option<[u64; 3]>>,
+    /// Those computed arguments compared with a real tool preview of the same interface: OWNER_UNCHECKED, OWNER_EQUAL, or
+    /// OWNER_DIFFERENT (then they are not used until the next interface).
+    preview_owner_check: AtomicU8,
     /// What went wrong in a way that may let this game differ from the others (`failsafe.rs`), until the service thread writes it.
     faults: crate::failsafe::Faults,
     /// Service-thread rounds in a row that panicked.
@@ -151,6 +158,48 @@ fn try_lock_briefly<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
         }
     }
     None
+}
+
+/// `Runtime::preview_owner_check`: not compared with a tool preview yet, being compared, equal, different.
+const OWNER_UNCHECKED: u8 = 0;
+const OWNER_CHECKING: u8 = 1;
+const OWNER_EQUAL: u8 = 2;
+const OWNER_DIFFERENT: u8 = 3;
+
+/// The address range of the game's image at `base` (`SizeOfImage` of its PE header, guarded reads).
+fn image_range(base: usize) -> Option<core::ops::Range<usize>> {
+    let pe = crate::memguard::read_value::<u32>(base.checked_add(0x3c)?)? as usize;
+    // PE signature (4) + COFF header (20) + `SizeOfImage` at 0x38 of the optional header
+    let size = crate::memguard::read_value::<u32>(base.checked_add(pe + 4 + 20 + 0x38)?)? as usize;
+    Some(base..base.checked_add(size)?)
+}
+
+/// The getter the third capture `z` of the listener calls (`z->vtable[slot]`), which must lie in the game's image `code`.
+fn preview_getter(
+    z: u64,
+    site: &crate::build_table::PreviewOwnerSite,
+    code: core::ops::Range<usize>,
+) -> Result<usize, String> {
+    let vtable = crate::memguard::word(z as usize).ok_or_else(|| format!("the capture {z:#x} cannot be read"))?;
+    let f = crate::memguard::word((vtable as usize).wrapping_add(8 * site.z_getter_slot))
+        .ok_or_else(|| format!("the vtable {vtable:#x} cannot be read"))? as usize;
+    if !code.contains(&f) {
+        return Err(format!("the getter {f:#x} is not in the game's image"));
+    }
+    Ok(f)
+}
+
+/// The emitter's first five arguments from the listener's captures `[ui, y, z]` and what `z`'s getter returned (`r`).
+fn preview_args_from(
+    [ui, y, _]: [u64; 3],
+    r: u64,
+    site: &crate::build_table::PreviewOwnerSite,
+) -> Result<[u64; 5], String> {
+    let at = |base: u64, off: usize| {
+        crate::memguard::word((base as usize).wrapping_add(off))
+            .ok_or_else(|| format!("{base:#x}+{off:#x} cannot be read"))
+    };
+    Ok([at(y, site.y_a)?, at(y, site.y_b)?, at(r, site.r_c)?, at(r, site.r_dispatcher)?, at(ui, site.ui_e)?])
 }
 
 impl Runtime {
@@ -192,6 +241,8 @@ impl Runtime {
             preview_fn: AtomicUsize::new(0),
             preview_args: Mutex::new(None),
             preview_holding: AtomicBool::new(false),
+            preview_owner: Mutex::new(None),
+            preview_owner_check: AtomicU8::new(OWNER_UNCHECKED),
             faults: crate::failsafe::Faults::new(),
             pump_panics: AtomicU64::new(0),
         }
@@ -517,14 +568,81 @@ impl Runtime {
         }
     }
 
+    /// Called by the hook where a new game interface makes its builder-preview listener: `captures` points at the lambda's three
+    /// captures (guarded reads; nothing of the game is called).
+    pub fn note_preview_owner(&self, captures: usize) {
+        let read = |i: usize| crate::memguard::word(captures.wrapping_add(8 * i));
+        let (Some(ui), Some(y), Some(z)) = (read(0), read(1), read(2)) else {
+            self.say("preview: a game interface was made, but its builder-preview listener's captures could not be read: a held command before its first tool preview gets no preview of its own");
+            return;
+        };
+        *lock(&self.preview_owner) = Some([ui, y, z]);
+        self.preview_owner_check.store(OWNER_UNCHECKED, Relaxed);
+        self.say(&format!(
+            "preview: game interface {ui:#x} made (its builder-preview listener noted): a held command gets its own preview from it also before the first tool preview of this world"
+        ));
+    }
+
+    /// The emitter's first five arguments as the newest game interface's listener computes them (`build_table::PreviewOwnerSite`).
+    ///
+    /// # Safety
+    /// Calls the engine (the third capture's getter, as the listener does): only on the interface thread, outside `log::guarded`.
+    unsafe fn derived_preview_args(&self) -> Result<[u64; 5], String> {
+        let site = self.build.preview_owner.as_ref().ok_or("this build has no preview_owner site")?;
+        if self.preview_owner_check.load(Relaxed) == OWNER_DIFFERENT {
+            return Err("the arguments computed from the game interface differed from its real tool preview".into());
+        }
+        let caps = crate::log::guarded("preview owner", || *lock(&self.preview_owner))
+            .flatten()
+            .ok_or("no game interface was made since this module was loaded")?;
+        let code = image_range(self.base).ok_or("the game's image size cannot be read")?;
+        let getter = preview_getter(caps[2], site, code)?;
+        type Getter = unsafe extern "system-unwind" fn(u64) -> u64;
+        crate::log::calls_engine("the game interface's getter (the arguments of a held command's own preview)");
+        // SAFETY: a function of the game's image read from the capture's vtable, called with the capture as `this`, as the listener does.
+        let r = unsafe { core::mem::transmute::<usize, Getter>(getter)(caps[2]) };
+        preview_args_from(caps, r, site)
+    }
+
+    /// Once per game interface, at a real tool preview: are the arguments computed from the interface's listener the ones the tool gave?
+    /// Different, they are never used for this interface (a held command before a tool preview then has no preview of its own).
+    ///
+    /// # Safety
+    /// As [`Runtime::derived_preview_args`]: inside the listener's call on the interface thread, outside `log::guarded`.
+    pub unsafe fn check_preview_owner(&self, given: [u64; 5]) {
+        if self.build.preview_owner.is_none()
+            || self.preview_owner_check.compare_exchange(OWNER_UNCHECKED, OWNER_CHECKING, AcqRel, Relaxed).is_err()
+        {
+            return;
+        }
+        if crate::log::guarded("preview owner", || lock(&self.preview_owner).is_none()).unwrap_or(true) {
+            self.preview_owner_check.store(OWNER_UNCHECKED, Relaxed);
+            return;
+        }
+        let derived = unsafe { self.derived_preview_args() };
+        let (state, line) = match derived {
+            Ok(a) if a == given => {
+                (OWNER_EQUAL, "preview: the arguments computed from the game interface equal its tool preview's".to_string())
+            }
+            Ok(a) => (
+                OWNER_DIFFERENT,
+                format!("preview: the arguments computed from the game interface DIFFER from its tool preview's ({a:x?} vs {given:x?}): not used for this interface"),
+            ),
+            Err(why) => (OWNER_DIFFERENT, format!("preview: the arguments could not be computed from the game interface ({why}): not used for this interface")),
+        };
+        self.preview_owner_check.store(state, Relaxed);
+        crate::log::guarded("preview owner", || self.say(&line));
+    }
+
     /// Gives the held build command `id` to the game scripts as the preview of the tool `held:<id>`, through the engine's own emitter of
     /// `builder.proposalCreate` with the arguments of the newest tool preview, its own Proposal (the payload's start) and the ProposalData
     /// slot of its payload (`+0x3d8`, empty before the apply). The scripts' `guiHandleEvent` runs inside this call, so the mod has the
     /// record of the command before the `held` event reaches it. Why: a tool that sends no preview (UI::ModuleBuilder, a station module
     /// added via Configure: run s4 2026-10-14) left the mod without a record before the build, so its command was released at once and
     /// applied 7 steps before the stamp on this game alone (entity ids then differ between the games). Called on the thread of the tool
-    /// that added the command (the interface's), where the tools call the emitter themselves. Nothing happens without a preview seen
-    /// since holding was switched on.
+    /// that added the command (the interface's), where the tools call the emitter themselves. The arguments are those of the newest
+    /// tool preview since holding was switched on; before the first one of a world they are computed from the game interface's
+    /// listener (`note_preview_owner`; friend test 2026-10-21: seven station configures right after a resync load had none, refused).
     ///
     /// # Safety
     /// `payload` is the payload of a live held `build_proposal` command.
@@ -532,12 +650,23 @@ impl Runtime {
     unsafe extern "system-unwind" fn give_preview(&self, id: crate::hold::HoldId, payload: usize) {
         type Emit = unsafe extern "system-unwind" fn(u64, u64, u64, u64, u64, *const u8, usize, usize, *mut u8) -> u64;
         let emit = self.preview_fn.load(Acquire);
-        let args = crate::log::guarded("preview of a held command", || *lock(&self.preview_args)).flatten();
-        let (Some(a), true) = (args, emit != 0) else {
-            crate::log::line(&format!(
-                "hold: command {id}: no preview of its own (no tool preview seen since holding was switched on)"
-            ));
+        if emit == 0 {
+            crate::log::line(&format!("hold: command {id}: no preview of its own (the emitter is not hooked)"));
             return;
+        }
+        let args = crate::log::guarded("preview of a held command", || *lock(&self.preview_args)).flatten();
+        let (a, source) = match args {
+            Some(a) => (a, "the newest tool preview"),
+            // SAFETY: inside the Add hook on the interface thread, outside any guard
+            None => match unsafe { self.derived_preview_args() } {
+                Ok(a) => (a, "the game interface's listener: no tool preview since holding was switched on"),
+                Err(why) => {
+                    crate::log::line(&format!(
+                        "hold: command {id}: no preview of its own (no tool preview seen since holding was switched on, and {why})"
+                    ));
+                    return;
+                }
+            },
         };
         // a std::string in its short form (MSVC x64: 16 bytes of text, size, capacity 15)
         let name = format!("held:{id}");
@@ -554,7 +683,7 @@ impl Runtime {
         text[3] = 15;
         let mut handled = 0u8;
         crate::log::line(&format!(
-            "hold: command {id}: giving it to the game scripts as the preview of the tool {name}"
+            "hold: command {id}: giving it to the game scripts as the preview of the tool {name} (emitter arguments from {source})"
         ));
         // SAFETY: the emitter of this build (prologue checked when it was hooked), with the objects of the newest tool preview of this
         // session, the held command's Proposal and its ProposalData slot; the call into the scripts is synchronous.
@@ -1354,6 +1483,34 @@ mod tests {
     mod foreign;
     mod queue;
 
+    /// Friend test 2026-10-21: a held command before any tool preview of the world gets the emitter's arguments computed from the game
+    /// interface's listener captures, the way the listener computes them; a getter outside the game's image is never called.
+    #[test]
+    fn the_preview_arguments_come_from_the_game_interface_before_any_tool_preview() {
+        let site = crate::build_table::select(0x6ac5_0427).unwrap().preview_owner.as_ref().unwrap();
+        let mut ui = vec![0u64; 0xc00 / 8];
+        ui[0xb98 / 8] = 0xE;
+        let mut y = vec![0u64; 0x100 / 8];
+        (y[0x18 / 8], y[0xc8 / 8]) = (0xA, 0xB);
+        let mut r = vec![0u64; 0x200 / 8];
+        (r[0x18 / 8], r[0x1d8 / 8]) = (0xC, 0xD);
+        static R: AtomicU64 = AtomicU64::new(0);
+        R.store(r.as_ptr() as u64, SeqCst);
+        unsafe extern "system-unwind" fn getter(_this: u64) -> u64 {
+            R.load(SeqCst)
+        }
+        let vtable = [0u64, getter as *const () as u64];
+        let z = [vtable.as_ptr() as u64];
+        let caps = [ui.as_ptr() as u64, y.as_ptr() as u64, z.as_ptr() as u64];
+        let at = getter as *const () as usize;
+        let f = preview_getter(caps[2], site, at..at + 1).unwrap();
+        assert_eq!(f, at);
+        let got = unsafe { core::mem::transmute::<usize, unsafe extern "system-unwind" fn(u64) -> u64>(f)(caps[2]) };
+        assert_eq!(preview_args_from(caps, got, site).unwrap(), [0xA, 0xB, 0xC, 0xD, 0xE]);
+        assert!(preview_getter(caps[2], site, 0..1).unwrap_err().contains("not in the game's image"));
+        assert!(preview_args_from([0, 0, 0], 0, site).is_err(), "a null capture is refused, not read");
+    }
+
     // ---- a fake engine that records what the hooks do to it, per test thread
 
     thread_local! {
@@ -1438,6 +1595,7 @@ mod tests {
             script_convert: None,
             convert_update: None,
             preview_event: None,
+            preview_owner: None,
             town_candidates: None,
             town_edges: None,
             town_sort_call: None,
