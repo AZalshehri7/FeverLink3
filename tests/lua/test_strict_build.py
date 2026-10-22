@@ -1474,6 +1474,44 @@ class CancelFlowTest(StrictTest):
                     ("cancel all", {"strict_cancel": "1"}, cancel_all), ("cancel all: no dry-run veto", {"strict_cancel": "1"}, cancel_all_no_veto),
                     ("a veto without a fireable callback", {}, veto_without_callback)])
 
+    def test_a_build_every_game_applies_is_stamped_at_the_promise_floor_and_applied_at_that_step_on_both(self):
+        # option A of the build timing analysis (2026-10-22): no fastest clock, no extra; the input barrier keeps every game before the
+        # stamp (L.floorStamp). Both games at x4 and x1; the receiver's slack is at least what it keeps of every promise (marginTarget).
+        for speed, keep in ((4, 6), (1, 3)):
+            with self.subTest(speed=speed):
+                self.fresh(strict_cancel="1")
+                self.start(speed=speed)
+                self.tick(6)
+                self.B.tool(SPLIT, make="NATIVE_SPLIT")
+                self.tick(30)
+                self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1))
+                self.assertSameWorld()
+                # the promise floor when the build went out: the largest promise of the clock lines before the action, in file order
+                floor, stamp = None, None
+                for line in self.B.lines(self.B.from_game):
+                    kind, _frm, payload = line.split(TAB, 2)
+                    if kind == "clock":
+                        safe = to_py(self.B.native_C().parse(payload)).get("safe")
+                        floor = safe if floor is None else max(floor, safe)
+                    elif kind == "action":
+                        stamp = int(to_py(self.B.native_C().parse(payload))["stamp"])
+                        break
+                ship = re.search(r"build\.ship 1:1 .* stamp=(\d+) now=(\d+) lead=\d+ extra=(\w+)", self.trace(self.B))
+                self.assertIsNotNone(ship)
+                now = int(ship.group(2))
+                lead = self.relay.lead
+                self.assertEqual((int(ship.group(1)), ship.group(3)), (stamp, "0"), "no extra on a stamp the barrier covers")
+                self.assertEqual(stamp, max(floor, -(-(now + lead) // STEP) * STEP), "the floor, or now + lead when later")
+                for g in (self.A, self.B):
+                    rec = re.search(r"sim build\.record 1:1 role=\w+ from=1 stamp=(\d+) now=(\d+) late=(\d+)", self.trace(g))
+                    self.assertIsNotNone(rec, g.label)
+                    self.assertEqual((int(rec.group(1)), int(rec.group(2)), rec.group(3)), (stamp, stamp, "0"), "%s applied it at the stamp" % g.label)
+                margin = re.search(r"build\.margin 1:1 recv g\d+ stamp \d+ slack=(-?\d+) steps extra_used=0 ", self.trace(self.A))
+                self.assertIsNotNone(margin, self.trace(self.A))
+                self.assertGreaterEqual(int(margin.group(1)), keep, "the receiver got it at least marginTarget steps before the stamp")
+                self.assertFalse(re.search(r"LATE|BREACHED", self.log()), "nothing late")
+                self.assertEqual(self.relay.replay_failed, [])
+
     def test_constructions_and_builds_that_cannot_be_captured(self):
         def construction_default():
             # remote constructions are replicated as before (hold-and-release); the player gets an informational notice, on their own

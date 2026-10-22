@@ -12,7 +12,7 @@ Last updated 2026-10-22, for version 0.2.1. [Back to the start page](../index.ht
 A mod that lets several players build in one Transport Fever 3 world at the same time, each in their own game. It is built into the game: there is no separate launcher or program to run. You start Transport Fever 3 from Steam as usual, and hosting, joining, chat, sync and updates all live in the game's bottom bar and the FeverLink3 window. It is in beta, its source code is public, and it is unofficial.
 
 **Does it work?**
-Yes, for two players over Steam. In two tests with a friend over the internet (2026-10-20 and 2026-10-21, about 3.5 hours) the players joined with a join code and built together: roads, rail, stations, stops, depots, lines and vehicles. Towns grew as in single player, speed, pause and chat were shared, and when the worlds drifted apart the repair sync brought them back (about 15 s for an 80 MB world over Steam). The [status page](status.html) lists what has been seen in the real game and what not yet.
+Yes, for two players over Steam. FeverLink3 was played over the internet with a friend through Steam, in sessions of up to 3.5 hours: the players joined with a join code and built together: roads, rail, stations, stops, depots, lines and vehicles. Towns grew as in single player, speed, pause and chat were shared, and when the worlds drifted apart the repair sync brought them back (about 15 s for an 80 MB world over Steam). The [status page](status.html) lists what has been seen in the real game and what not yet.
 
 **What is the licence? Can I use it commercially?**
 FeverLink3 is licensed under the [PolyForm Noncommercial License 1.0.0](https://github.com/AZalshehri7/FeverLink3/blob/main/LICENSE): you may use, study, change and share it for any noncommercial purpose, keeping the copyright notice. That makes it source available, not "open source" in the sense of the Open Source Initiative. For commercial use, ask on Discord (`azalshehri`). The parts adapted from earlier projects stay under their own MIT licences ([notices](https://github.com/AZalshehri7/FeverLink3/blob/main/THIRD_PARTY_NOTICES.md)).
@@ -35,7 +35,7 @@ Yes, every player installs FeverLink3. A player who joins does not need to prepa
 Through Steam. No ports, no router settings, no IP addresses: the host sends a join code and the friend pastes it into the FeverLink3 window. Treat the code like a password for that session.
 
 **Can I join from a Steam invite?**
-The host can invite friends from Steam's friends list, and the host lets each friend in. Joining from an invite by itself had a bug that is fixed in 0.2.0, but the fix has not yet been tested between two PCs. The join code always works.
+The host can invite friends from Steam's friends list, and the host lets each friend in. Joining from an invite by itself had a bug that is fixed in 0.2.1, but the fix has not yet been tested between two PCs. The join code always works.
 
 **How many players?**
 The tests with real games were with two players. More are planned for in the design but have not been played yet.

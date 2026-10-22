@@ -1515,33 +1515,45 @@ impl HostSession {
         (rtt, self.lead_meter.gap_ms(self.now(), here))
     }
 
-    /// The lead the measured delays ask for at this speed: the jitter buffer, or the arrival measured now if that is later
-    /// ([`Lockstep::lead_for_cover`]).
-    pub(super) fn wanted_lead(&self, speed: i32) -> i64 {
-        let (rtt, gap) = self.lead_inputs();
-        let now = Lockstep::cover_ms(rtt, gap) + JitterBuffer::SAFETY_MS;
-        Lockstep::lead_for_cover(speed, self.jitter.ms().max(now))
+    /// The engine's batch interval the lead is counted with at this speed (ms): measured from the clock lines of the games that are
+    /// here ([`LeadMeter::batch_ms`]), the nominal one until then ([`Lockstep::batch_ms_or_nominal`]).
+    fn lead_batch_ms(&self, speed: i32) -> f64 {
+        let here = |id: u16| self.players.contains_key(&id);
+        Lockstep::batch_ms_or_nominal(self.lead_meter.batch_ms(self.now(), speed, here))
     }
 
-    /// Keeps `state.lead` in step with the jitter buffer: longer at once, shorter as the buffer shrinks (a step at a time).
+    /// The lead the measured delays ask for at this speed: the jitter buffer, or the arrival measured now if that is later
+    /// ([`Lockstep::lead_for_cover_at`], with the measured batch interval).
+    pub(super) fn wanted_lead(&self, speed: i32) -> i64 {
+        let (rtt, gap) = self.lead_inputs();
+        let batch = self.lead_batch_ms(speed);
+        let now = Lockstep::cover_ms_at(rtt, gap, batch) + JitterBuffer::SAFETY_MS;
+        Lockstep::lead_for_cover_at(speed, self.jitter.ms().max(now), batch)
+    }
+
+    /// Keeps `state.lead` in step with the jitter buffer: longer at once, shorter as the buffer shrinks (a step at a time). The real
+    /// time the buffer covers is counted in steps at the measured rate (the batch interval the clock lines show, about 200 ms in the
+    /// real game of 2026-10-22, not the 167 ms of `STEPS_PER_SECOND`), and only a gap's excess over that measured batch is jitter.
     fn adapt_lead(&mut self, t: f64) {
         let (rtt, gap) = self.lead_inputs();
-        let buffer = self.jitter.update(Lockstep::cover_ms(rtt, gap), t);
+        let speed = self.state.speed.max(1);
+        let batch = self.lead_batch_ms(speed);
+        let buffer = self.jitter.update(Lockstep::cover_ms_at(rtt, gap, batch), t);
         if !self.state.started {
             return;
         }
-        let speed = self.state.speed.max(1);
-        let want = Lockstep::lead_for_cover(speed, buffer);
+        let want = Lockstep::lead_for_cover_at(speed, buffer, batch);
         let old = self.state.lead;
         if want != old {
             self.state.lead = want;
             self.broadcast_session();
             // bug 4/6: what the lead was made from, each time it changes (the lab run checks the steps against link.ping and link.host)
             self.log(format!(
-                "link.lead lead_steps={} was_steps={} speed={speed} rtt_ms={rtt:.0} gap_ms={gap:.0} buffer_ms={buffer:.0} step_ms={:.0}",
+                "link.lead lead_steps={} was_steps={} speed={speed} rtt_ms={rtt:.0} gap_ms={gap:.0} buffer_ms={buffer:.0} batch_ms={batch:.0} steps_per_s={:.1} step_ms={:.0}",
                 want / Lockstep::STEP,
                 old / Lockstep::STEP,
-                1000.0 / (Lockstep::STEPS_PER_SECOND * f64::from(speed))
+                Lockstep::steps_per_second(speed, batch),
+                1000.0 / Lockstep::steps_per_second(speed, batch)
             ));
         }
     }
@@ -1593,6 +1605,11 @@ impl HostSession {
         }
         let at = match stopped {
             Some(furthest) => furthest,
+            // a running round on a batch boundary (a multiple of `speed` steps): with its spread marks `speed` steps apart every mark
+            // lies where a full batch ends, so no game shortens a batch to land on one (L.pace) and the game runs at the speed asked
+            // for. Rounding up keeps the stamp at or past every promise (future_stamp), and every game reads it at the same step as
+            // before. A round stamped while a pause is set but not reached stays as it was.
+            None if self.state.pause_at.is_none() => Lockstep::round_up_to_batch(self.future_stamp(), self.state.speed),
             None => self.future_stamp(),
         };
         let spread = ChecksumPolicy::spread_steps(full, paused, self.state.speed);

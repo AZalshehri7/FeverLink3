@@ -10,9 +10,9 @@
 
 [Playing guide](docs/PLAYING.md) · [Changelog](docs/CHANGELOG.md) · [Roadmap](docs/ROADMAP.md) · [FAQ](docs/site/faq.md) · [Privacy](docs/site/privacy.md) · [Architecture](docs/ARCHITECTURE.md)
 
-![The host (left) draws a road; the second game (right) shows it 1.4 s after the click, in real time](docs/media/demo-build.gif)
+![A road drawn on the host appears on the second game: at game speed x1 after 1.4 s, at x4 after 0.8 s, in real time](docs/media/demo-build.gif)
 
-*Game speed x1 (normal), real time: the road stands on both games 1.4 s after the click (two games on one PC, a grown save with 6,393 inhabitants). The wait is a safety margin: every game builds at the same game step. In the beta, stability comes first.*
+*Real time: the road stands on both games 1.4 s after the click at game speed x1 (normal) and 0.8 s at x4 (two games on one PC, a grown save with 6,393 inhabitants). The wait is a safety margin: every game builds at the same game step. In the beta, stability comes first.*
 
 ## What you get
 
@@ -20,6 +20,7 @@
 - **Build together.** Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
+- **Steam invites.** Invite friends from Steam's own invite dialog; with a world loaded they join by themselves (new in 0.2.1, not yet tried on two PCs).
 - **Always the same world.** The games check each other all the time. If they ever drift apart, everyone gets the host's world back in a few seconds and play goes on.
 - **Shared speed, pause and chat.**
 - **Encrypted.** Everything between the games is encrypted; the join code works like a password.
@@ -34,6 +35,7 @@ A coloured icon in the game's bottom bar shows the session at a glance: white (n
 ## Tested
 
 - Played with friends over the internet, and in long two-game sessions on one PC.
+- In a 3.5-hour session over Steam with a friend, an automatic repair was needed about once every 40 minutes (about 15 s each); other mods that change the world on their own can add more.
 - About 1,600 automatic tests run on every change: the network protocol, the sessions, the world checks and two complete games simulated side by side.
 - A test lab drives two real games with scripts to measure speed and catch drift.
 
@@ -41,14 +43,13 @@ Measured with two games on one PC (internet numbers follow):
 
 | | Result |
 |---|---|
-| Click to build on both games | 1.4 s at game speed x1 (the recording above: real time, a grown save with 6,393 inhabitants) |
+| Click to build on both games | 1.4 s at game speed x1, 0.8 s at x4 (the recording above: real time, a grown save with 6,393 inhabitants) |
 | World check | every 5 s, without stutter |
 | A game freezing for a few seconds | the others play on; it catches up by itself |
 | Repair when the worlds differ | about 15 s for a 45 MB world |
 
 ## Coming next
 
-- Steam invites from the friends list
 - Coming back after a short drop without a reload
 - Separate companies for each player
 - Sharing terrain editing, ground paint and trees

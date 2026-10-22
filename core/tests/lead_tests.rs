@@ -353,3 +353,129 @@ fn a_higher_speed_gets_a_lead_that_covers_the_same_real_time() {
     assert!(at_3 > at_1, "{at_3} vs {at_1}");
     assert_eq!(Lockstep::lead_for_cover(3, 50.0 + JitterBuffer::SAFETY_MS), at_3);
 }
+
+// ---------------------------------------------------------------- measured rates and batch boundaries (build timing, 2026-10-22)
+
+#[test]
+fn the_lead_counts_real_time_at_the_measured_batch_interval_and_the_nominal_one_changes_nothing() {
+    // the nominal batch gives exactly the old lead, at every speed and cover
+    let nominal = Lockstep::BATCH_SECONDS * 1000.0;
+    for speed in [i32::MIN, 0, 1, 2, 3, 4, 7] {
+        for cover in [0.0, 15.0, 125.0, 333.3, 600.0, f64::NAN] {
+            assert_eq!(
+                Lockstep::lead_for_cover(speed, cover),
+                Lockstep::lead_for_cover_at(speed, cover, nominal),
+                "x{speed} {cover}"
+            );
+            assert_eq!(Lockstep::lead_for_cover(speed, cover), Lockstep::lead_for_cover_at(speed, cover, f64::NAN));
+        }
+    }
+    assert_eq!(nominal, Lockstep::batch_ms_or_nominal(None));
+    assert_eq!(Lockstep::BATCH_MS_MIN, Lockstep::batch_ms_or_nominal(Some(5.0)), "a burst is no engine that fast");
+    assert_eq!(
+        Lockstep::BATCH_MS_MAX,
+        Lockstep::batch_ms_or_nominal(Some(900.0)),
+        "stretched batches do not shrink the lead for ever"
+    );
+    assert!((Lockstep::steps_per_second(4, 200.0) - 20.0).abs() < 1e-9);
+    assert!((Lockstep::steps_per_second(4, nominal) - 24.0).abs() < 1e-9);
+    // the real game of 2026-10-22 at x4: batches 200 ms apart, the largest clock gap 300 ms, a 10 ms round trip. Counted at 200 ms
+    // the gap's excess is 100 ms (not 133) and the real time goes into steps at 20 a second (not 24): 9 steps instead of 11
+    let measured = Lockstep::cover_ms_at(10.0, 300.0, 200.0) + JitterBuffer::SAFETY_MS;
+    let old = Lockstep::cover_ms(10.0, 300.0) + JitterBuffer::SAFETY_MS;
+    assert_eq!(
+        (9 * STEP, 11 * STEP),
+        (Lockstep::lead_for_cover_at(4, measured, 200.0), Lockstep::lead_for_cover(4, old))
+    );
+    // the floor stays one engine batch and the hand-off step, whatever the measure
+    for speed in 1..=4 {
+        for batch in [100.0, 200.0, 300.0] {
+            assert!(Lockstep::lead_for_cover_at(speed, 0.0, batch) / STEP > i64::from(speed));
+        }
+    }
+
+    // the meter: x4 lines of one full batch (4 steps) 200 ms apart, every fifth batch stretched to 400 ms by the smooth pacing, and
+    // batches shortened at a stop (1 step) that say nothing about the interval
+    let mut m = LeadMeter::default();
+    let all = |_: u16| true;
+    let (mut at, mut t) = (0.0, 10_000);
+    for i in 0..60 {
+        at += if i % 5 == 4 { 0.4 } else { 0.2 };
+        t += if i % 7 == 6 { STEP } else { 4 * STEP };
+        m.clock(1, t, 4, at);
+    }
+    let batch = m.batch_ms(at, 4, all).expect("measured");
+    assert!((195.0..205.0).contains(&batch), "{batch}");
+    assert_eq!(None, m.batch_ms(at, 2, all), "no full batch of x2 was seen");
+    assert_eq!(None, m.batch_ms(at + LeadMeter::GAP_WINDOW_SECONDS + 1.0, 4, all), "aged out");
+    // a second game with a faster engine: the fastest counts (the longer lead in steps)
+    let (mut at2, mut t2) = (at - 40.0 * 0.17, 10_000);
+    for _ in 0..40 {
+        at2 += 0.17;
+        t2 += 4 * STEP;
+        m.clock(2, t2, 4, at2);
+    }
+    let both = m.batch_ms(at, 4, all).expect("measured");
+    assert!((165.0..175.0).contains(&both), "{both}");
+    assert!((195.0..205.0).contains(&m.batch_ms(at, 4, |id| id == 1).unwrap()), "a game that left does not count");
+}
+
+#[test]
+fn the_host_counts_its_lead_with_the_batch_interval_the_clock_lines_show() {
+    // two games at x4 over a 100 ms round trip, a clock line per full batch, about 200 ms apart (the real game of 2026-10-22)
+    let mut n = Net::new();
+    let a = n.connect("A");
+    started(&mut n, 4);
+    n.set_latency(a, 0.100);
+    let (mut t_host, mut t_a, mut next) = (10_000, 10_000, n.time());
+    for ms in 0..8000 {
+        n.advance(0.001);
+        if n.time() >= next {
+            t_host += 4 * STEP;
+            t_a += 4 * STEP;
+            n.host_send(MessageKind::Clock, &clock_at(t_host, 4));
+            n.send(a, MessageKind::Clock, &clock_at(t_a, 4));
+            next = n.time() + 0.2;
+        }
+        if ms % 250 == 0 {
+            n.tick();
+        }
+    }
+    let lead = n.host.state().lead;
+    let line =
+        n.host_log.iter().rev().find(|l| l.starts_with("link.lead ")).expect("the lead's change is logged").clone();
+    assert!(line.contains(" batch_ms=20") && line.contains(" lead_steps=8 "), "{line}");
+    // the one-way 50 ms and the safety, at 20 steps a second: ceil(0.13 s * 20) + 1 + 4 = 8 steps; counted at the nominal 167 ms
+    // batch (24 steps a second, and 33 ms of every 200 ms gap taken for jitter) it was 9
+    assert_eq!(8 * STEP, lead, "{line}");
+    assert_eq!(9 * STEP, Lockstep::lead_for_cover(4, Lockstep::cover_ms(100.0, 201.0) + JitterBuffer::SAFETY_MS));
+}
+
+#[test]
+fn a_running_checksum_round_is_stamped_on_a_batch_boundary_with_its_marks_a_batch_apart() {
+    for (t0, speed) in [(10_000, 4), (10_200, 4), (10_600, 3), (10_200, 2), (10_200, 1)] {
+        let mut n = Net::new();
+        let a = n.connect("A");
+        n.hello_all(t0, 0);
+        n.host_call(HostSession::start);
+        n.host_call(|h| h.set_speed(speed));
+        n.host_send(MessageKind::Clock, &clock_at(t0 + 3 * STEP, speed));
+        n.host_call(HostSession::request_checksum);
+        let r = n.peer(a).last::<ChecksumRequestMessage>(MessageKind::ChecksumRequest);
+        let batch = STEP * i64::from(speed);
+        assert!(!r.paused);
+        assert_eq!(0, r.at % batch, "x{speed} from {t0}: stamp {} on a batch boundary", r.at);
+        assert_eq!(
+            u32::try_from(speed).unwrap(),
+            r.spread,
+            "the marks a batch apart: every one where a full batch ends"
+        );
+        assert!(r.at >= n.host.future_stamp(), "never before a promise or the lead");
+        assert!(r.at < n.host.future_stamp() + batch, "at most one batch later");
+    }
+    assert_eq!(Lockstep::round_up_to_batch(10_000, 4), 10_400);
+    assert_eq!(Lockstep::round_up_to_batch(10_400, 4), 10_400);
+    assert_eq!(Lockstep::round_up_to_batch(10_401, 4), 11_200);
+    assert_eq!(Lockstep::round_up_to_batch(10_200, 1), 10_200);
+    assert_eq!(Lockstep::round_up_to_batch(10_200, 9), Lockstep::round_up_to_batch(10_200, 4));
+}

@@ -1,11 +1,22 @@
 title: FeverLink3
-description: Cooperative multiplayer for Transport Fever 3 (beta, open source)
+description: Cooperative multiplayer for Transport Fever 3 (beta, source available)
 theme: jekyll-theme-cayman
 show_downloads: false
 lang: en
-# Not part of the public site: listing material for maintainers (paste-ready store text, publishing checklist),
-# internal research notes, and design notes for transports that are not announced.
+# Not part of the public site (the files stay in the repository for developers):
+# listing material for maintainers, internal research notes, design notes for transports that are not announced,
+# and developer notes that are internal or out of date (release and signing checklists, the live-control file format,
+# trace logs, coverage tables, the companies design, the Steam transport design, the publishing plan).
 exclude:
   - nexus
   - research
   - RELAY.md
+  - COMPANIES.md
+  - COVERAGE_BUILD.md
+  - COVERAGE_OPS.md
+  - LIVE_CONTROL.md
+  - RELEASING.md
+  - SIGNING.md
+  - STEAM_TRANSPORT.md
+  - TRACE.md
+  - WORKSHOP.md

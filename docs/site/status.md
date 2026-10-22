@@ -10,12 +10,13 @@ This page keeps three things apart: what has been seen working in the real game,
 
 ## Seen working in the real game
 
-Two tests with a friend over the internet through Steam (2026-10-20 and 2026-10-21, about 3.5 hours together), and the maintainer's own tests:
+Played over the internet with a friend through Steam, in sessions of up to 3.5 hours, and on the maintainer's PC:
 
 - Two players on two PCs connect over Steam with a join code; the host's world is sent to the friend.
-- Building together: roads, rail, stations, stops, depots, lines and vehicles. A road stands on both games 1.4 s after the click (game speed x1, real time, two games on one PC, a grown save; 2026-10-22).
+- Building together: roads, rail, stations, stops, depots, lines and vehicles. A road stands on both games 1.4 s after the click at game speed x1 and 0.8 s at x4 (real time, two games on one PC, a grown save).
 - The full game: towns grow, traffic flows, ratings change, as in single player.
 - World checks run all the time; when the worlds drifted apart, an automatic repair sync gave everyone the host's world back (about 15 s for an 80 MB world over Steam).
+- How often a repair was needed: in the 3.5-hour session over Steam with a friend, an automatic repair was needed about once every 40 minutes (5 times, from object ids in a different order). Other mods that change the world on their own can add more: an automatic line namer caused 5 more in the same session (plus 1 sync for the join).
 - Shared speed, pause and chat.
 - The new in-game interface: the bar icon with its colours, the pop-up and the window.
 - **Report a problem** over Steam: one zip with every player's logs.
@@ -25,7 +26,7 @@ Two tests with a friend over the internet through Steam (2026-10-20 and 2026-10-
 
 These are covered by the automatic tests (about 1,600 on every change) or by two game windows on one PC, but not yet seen between two PCs:
 
-- Joining from a Steam invite by itself (fixed in 0.2.0; needs a two-PC test). The join code works.
+- Joining from a Steam invite by itself (fixed in 0.2.1; needs a two-PC test). The join code works.
 - The warning about other mods that change the world on their own.
 - Putting the previous version back when an update does not start.
 - The switch that turns automatic updates off.

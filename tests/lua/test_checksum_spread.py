@@ -297,6 +297,55 @@ class TwoSimulationStatesTest(TwoGames):
         self.assertTrue(all(x.startswith("townBuildings\t") for x in diff), diff)
 
 
+class BatchBoundaryTest(TwoGames):
+    """Option B of the build timing analysis (2026-10-22): at x4 the real game ran at about x2.7, its batches 4,1,1,4,3,3,4 steps,
+    because L.pace shortened batches to land on checksum marks at other phases than its batches. The host now stamps a running round on a
+    batch boundary (core Lockstep::round_up_to_batch: a multiple of `speed` steps) and the spread marks are `speed` steps apart, so every
+    mark is where a full batch ends. The stamps here are made the way host.rs makes them."""
+
+    def ticks_batches(self, n):
+        """n ticks; the step counts of every batch each game ran (0: held)."""
+        sizes = {0: [], 1: []}
+        for _ in range(n):
+            for _ in range(4):
+                for g in (self.A, self.B):
+                    g.frame()
+                self.relay.pump()
+            for g in (self.A, self.B):
+                t0 = g.time()
+                g.step()
+                sizes[g.id].append((g.time() - t0) // STEP)
+        return sizes
+
+    def test_rounds_on_batch_boundaries_leave_every_batch_full_at_x4_and_are_read_at_the_same_steps(self):
+        self.start(speed=4)
+        self.ticks_batches(6)
+        self.relay.pump()
+        batch = 4 * STEP
+        shortened, full = [], 0
+        for n in (1, 2, 3):
+            at = -(-self.relay.future_stamp() // batch) * batch   # host.rs: round_up_to_batch(future_stamp, speed)
+            self.relay.checksum_request(n, at, False, spread=4)
+            sizes = self.ticks_batches(30)
+            shortened += [k for g in (0, 1) for k in sizes[g] if 0 < k < 4]
+            full += sum(1 for g in (0, 1) for k in sizes[g] if k == 4)
+            self.assertEqual(self.relay.reports[n][0], self.relay.reports[n][1], "the same parts and the same time on both games")
+            self.assertEqual(self.relay.reports[n][0][0], at, "every chunk read at its step")
+            for g in (self.A, self.B):
+                self.assertEqual(g.time() % batch, 0, "%s stands on a batch boundary" % g.label)
+        # the first round may shorten one batch to reach the grid (the games started off it); after that every batch is full
+        self.assertLessEqual(len(shortened), 2, shortened)
+        self.assertGreater(full, 150, "the games ran (180 batches, a few held by the pacing)")
+        self.assertNotIn("read after their step", self.A.log() + self.B.log())
+        # the control: a stamp off the grid (the stamps before) makes both games shorten batches to land on it and on its marks
+        self.relay.pump()
+        at = -(-self.relay.future_stamp() // batch) * batch + STEP
+        self.relay.checksum_request(4, at, False, spread=4)
+        sizes = self.ticks_batches(30)
+        self.assertTrue(all(any(0 < k < 4 for k in sizes[g]) for g in (0, 1)), sizes)
+        self.assertEqual(self.relay.reports[4][0], self.relay.reports[4][1])
+
+
 class LateRoundsAreLoudTest(TwoGames):
     """Rounds read late again and again are desync detection lost (the host skips a round whose games report different times): the
     simulation half says so in a WARNING line and a line every game minute, never only in a clause of the round's own line."""

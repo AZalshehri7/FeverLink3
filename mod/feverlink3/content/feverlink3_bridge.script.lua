@@ -3371,7 +3371,7 @@ function X.paceTick(now)
 	-- the window says how far this game is behind while the host has it as stalled (the HUD's "catching up")
 	if X.selfStalled() then
 		local behind = L.catchUp(s, G.peers, now)
-		pcall(Hud.setBehind, G.hud, behind and behind / (6 * math.max(1, s.speed or 1)) or 0)
+		pcall(Hud.setBehind, G.hud, behind and behind / L.stepsPerSecond(s.speed, L.paceBatch(P), #P.batches >= 4) or 0)
 	end
 	local trim = L.paceSmooth(P, target, clock)
 	if X.LS and G.ls then X.LS.pace(G.ls, trim, clock) end
@@ -5260,11 +5260,21 @@ local function natDecideUnsafe(h, cap)
 	else
 		-- every game applies the record at the stamp, the originator too, and a game that has passed the stamp applies it late and
 		-- allocates other entity ids (real run A1-1: the host was 1.8 game s ahead of the guest's clock when the guest's build
-		-- arrived, 3 steps late). The stamp is the fastest known clock plus the host's lead plus the MEASURED extra (L.marginExtra: the
-		-- largest need the peers report from the slack of the builds they received; was a fixed 6 steps, 1.8 s at x1). The extra goes
-		-- with the record, so every receiver can measure what it would have needed.
+		-- arrived, 3 steps late). Since the input barrier, the stamp is this game's promise floor (L.floorStamp); without it (below) the
+		-- fastest known clock plus the host's lead plus the MEASURED extra (L.marginExtra: the largest need the peers report from the
+		-- slack of the builds they received; was a fixed 6 steps, 1.8 s at x1). The extra goes with the record, so every receiver can
+		-- measure what it would have needed.
 		at = stampAfterFastest(now)
-		if not pausedNow() and next(G.peers) ~= nil then
+		local floorAt = (not pausedNow() and not X.TEST_MARGIN and not X.selfStalled() and L.barrierCovers(G.peers))
+			and L.floorStamp(G.session, now, G.promiseFloor) or nil
+		if floorAt then
+			-- the input barrier covers every peer: the stamp is this game's promise floor (L.floorStamp says why it is never late on any
+			-- game), with no extra (option A, 2026-10-22: the fastest clock + lead + an unmeasured default extra of aheadFor(speed)+1 was
+			-- 20 steps at x4, the floor about 16). wire.xs = 0: every receiver still measures its slack (build.margin), now as a check
+			at, wire.xs = floorAt, 0
+			text = C.serialize(wire)
+		elseif not pausedNow() and next(G.peers) ~= nil then
+			-- a peer without promises (an older mod), no promise sent yet, this game stalled or a test switch: the stamp as before
 			-- wire.xs: the extra the stamp really has past the fastest clock plus the lead (at least the measured margin)
 			at, wire.xs = stampAfterFastest(now, nil, L.marginExtra(G.peers, G.session.speed, X.TEST_MARGIN))
 			-- test switch FEVERLINK3_TEST_NO_LEAD: the host's lead goes too, down to leadOf's floor of one step past the fastest clock

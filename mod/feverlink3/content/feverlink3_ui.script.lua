@@ -109,6 +109,10 @@ end
 
 local WIDTH = 480      -- the window's fixed content width, every state (audit 2026-10-21: the width changed per state, title clipped)
 local POP_W = 340      -- the pop-up's content width
+-- How many characters of body text fit on a line (real game 2026-10-22: the pop-up cut a line after 38 characters, the
+-- window after 64), with a margin; a heading's larger font gets 4/5 of it. Set by the recipe that draws (pop-up or window).
+local POP_CHARS, WINDOW_CHARS = 34, 56
+local wrapChars = WINDOW_CHARS
 local MOD = "feverlink3::/"   -- <modId>::/path, a file in this mod's content/ (tf3-docs guides/mod-structure)
 local COLOR = {
 	info = { 0.85, 0.85, 0.85, 1 }, warn = { 0.855, 0.647, 0.125, 1 }, error = { 0.94, 0.45, 0.45, 1 },
@@ -133,9 +137,16 @@ local function setup(react, builtin, X)
 		local a = math.floor((alpha or 1) * 10 + 0.5) / 10
 		return style("c:" .. tostring(level) .. ":" .. a, { color = { c[1], c[2], c[3], a } })
 	end
-	-- two text sizes only (audit: several sizes of small grey text): body and heading
+	-- two text sizes only (audit: several sizes of small grey text): body and heading. A text longer than a line becomes a
+	-- column of TextViews, one per line (Hud.wrapLines: TextView itself does not wrap and cut long texts at the edge)
 	local function text(s, level, alpha, class)
-		return builtin.TextView{ meta = { class = class or "font-scale-title-4", styleSheet = level and tinted(level, alpha) or nil }, text = s }
+		class = class or "font-scale-title-4"
+		local meta = { class = class, styleSheet = level and tinted(level, alpha) or nil }
+		local lines = Hud.wrapLines(s, class == "font-scale-title-4" and wrapChars or math.floor(wrapChars * 4 / 5))
+		if #lines == 1 then return builtin.TextView{ meta = meta, text = s } end
+		local views = {}
+		for i, line in ipairs(lines) do views[i] = builtin.TextView{ meta = meta, text = line } end
+		return builtin.BoxLayout{ orientation = V, children = views }
 	end
 	local function heading(s, level) return text(s, level, nil, "font-scale-title-2") end
 	local function box(orientation, children) return builtin.BoxLayout{ orientation = orientation, children = children } end
@@ -271,6 +282,7 @@ local function setup(react, builtin, X)
 	-- ---- the pop-up of the bar icon (popover_react_util.PopoverWindow)
 	local Popover = react.RegisterRecipe("FeverLink3Popover", function(params)
 		useLive(false)
+		wrapChars = POP_CHARS
 		local typed = react.useState("")
 		local ctl, m = U.ctl, U.model
 		local rows = { spacer(POP_W, 1) }
@@ -305,6 +317,7 @@ local function setup(react, builtin, X)
 	-- ---- the window
 	local Window = react.RegisterWrapperRecipe("FeverLink3Window", builtin.Window, function(wp)
 		useLive(true)
+		wrapChars = WINDOW_CHARS
 		local typed = react.useState("")
 		local nameIn = react.useState("")
 		local codeIn = react.useState("")

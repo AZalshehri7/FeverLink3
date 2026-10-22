@@ -39,7 +39,7 @@ This site is hosted by GitHub Pages, and downloads are hosted by GitHub (and Nex
 
 ## Files on your PC
 
-The files FeverLink3 creates and where they are, including the ones the uninstaller leaves behind (logs and session files in `%LOCALAPPDATA%\FeverLink3`), are in the table in the [security page](../SECURITY_FOR_USERS.html).
+The files FeverLink3 creates and where they are, including the logs and session files in `%LOCALAPPDATA%\FeverLink3` that stay when you delete the DLL and the mod, are in the table in the [security page](../SECURITY_FOR_USERS.html).
 
 ## Contact
 

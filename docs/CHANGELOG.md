@@ -6,6 +6,15 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.2 (2026-10-22)
+
+### Changed
+- Faster builds: a build stands on every game 1.4 s after the click at game speed x1 and 0.8 s at x4 (measured with two games on one PC). At x4 the game really runs at four times the speed now.
+
+### Fixed
+- Update messages in the pop-up and the window are shorter and no longer cut off at the edge: "Updated to <version>. Restart the game to finish." and "Update to <version> failed: <reason>. You keep <old version>." Every long text in the window and the pop-up (update, Report a problem, events) now breaks into several lines.
+- After a finished update the empty `feverlink3_update` folder is removed from the game folder.
+
 ## 0.2.1 (2026-10-22)
 
 ### Fixed
@@ -14,7 +23,7 @@ The changes of each version that matter to a player or tester. Earlier test buil
 
 ## 0.2.0 (2026-10-22: first public beta)
 
-Fixes from two internet tests with a friend (2026-10-20 and 2026-10-21), a new in-game interface, a way to report a problem, and a faster start of a session. The interface, the faster start and Report a problem were played over Steam with a friend on 2026-10-21; the fixes from that evening (listed last under Fixed) are tested in the automatic tests and in two game windows on one PC.
+A new in-game interface, a way to report a problem, a faster start of a session, and many fixes. The interface, the faster start and Report a problem were played over the internet with a friend through Steam; the fixes for road upgrades that move a town building, references after a repair sync, Steam invites and the bar icon size are covered by the automatic tests and by two game windows on one PC.
 
 ### Added
 - **New in-game interface:** an icon in the game's bottom bar whose colour shows the session state (white, green, yellow, red), a pop-up above it with what matters now, and a window with tabs. Sync steps show their progress.
@@ -25,13 +34,13 @@ Fixes from two internet tests with a friend (2026-10-20 and 2026-10-21), a new i
 ### Fixed
 - Object ids stay in the same order on every game: a build the game holds without a FeverLink3 record is refused on every game, never let through on one game only.
 - The terrain tools are switched off during a session (a terrain edit ran on its maker's game alone).
-- A crash from the friend test: a bus stop whose build moves town buildings is handled as FeverLink3's own build again.
+- A bus stop whose build moves town buildings no longer crashes the game: it is handled as FeverLink3's own build again.
 - An engine error halfway through applying a build now asks for a repair sync, and a repair never copies a world that may be partly built.
 - The world check also compares the order of free object ids, so such a split is found at once.
-- From the 2026-10-21 test: a road upgrade that moves a town building is copied exactly again (it was refused on every game); a build refused because its copy differs now says so instead of "the world changed".
-- From the 2026-10-21 test: after a repair sync, a reference to something built before it can no longer point at something new (line assignments were refused).
-- From the 2026-10-21 test: a Steam invite joins by itself when a world is loaded; with no world loaded the window shows the invite with a Join button. Joining with the code cancels a waiting invite (it kept the icon yellow).
-- From the 2026-10-21 test: the bar icon is drawn at the size of the game's own icons; a sync names the players still loading the world.
+- A road upgrade that moves a town building is copied exactly now (it was refused on every game); a build refused because its copy differs now says so instead of "the world changed".
+- After a repair sync, a reference to something built before it can no longer point at something new (line assignments were refused).
+- A Steam invite joins by itself when a world is loaded; with no world loaded the window shows the invite with a Join button. Joining with the code cancels a waiting invite (it kept the icon yellow).
+- The bar icon is drawn at the size of the game's own icons; a sync names the players still loading the world.
 - Faster start of a session: a game whose world is about to be replaced no longer holds a pause. The pause at a session start is now under 2 s and the whole sync about 17 s (before: a pause of about 37 s; measured with two games on one PC).
 
 ### Changed
@@ -40,7 +49,7 @@ Fixes from two internet tests with a friend (2026-10-20 and 2026-10-21), a new i
 - The id-order trace (test logs) names the game step and thread of every change.
 
 ### Known gaps
-- The 2026-10-21 fixes are not yet played over Steam; the Steam invite fix needs a two-PC test.
+- The fixes for road upgrades, references after a repair sync, Steam invites and the bar icon are not yet played over the internet; the Steam invite fix needs a test between two PCs.
 - The engine sometimes frees object ids in a different order on two games (5 times in a 3.5-hour session): the world check finds it within seconds and a repair sync follows. The cause is being traced.
 - Terrain editing, ground paint, trees and rocks are not shared (the terrain tools are off during a session).
 - Automatic updates are tested with fake releases only; the first real update is the 0.2.0 test described in docs/RELEASING.md ("Testing the auto update").
@@ -48,7 +57,7 @@ Fixes from two internet tests with a friend (2026-10-20 and 2026-10-21), a new i
 
 ## 0.1.5 (2026-10-19)
 
-The feature-complete test version. Its last build was played over the internet with a friend on 2026-10-20; that test found the problems fixed in 0.2.0. Before that it was tested in the automatic tests and in lab runs with two game windows on one PC.
+The feature-complete test version. Its last build was played over the internet with a friend through Steam; that session showed the problems fixed in 0.2.0. Before that it was tested in the automatic tests and in lab runs with two game windows on one PC.
 
 ### Added
 - **Steam invites:** invite friends with Steam's own invite dialog or from the Steam friends list (Invite to Game / Join Game). The host lets each friend in; the session key is never shown to other friends.

@@ -19,10 +19,10 @@ class UpdateLine(unittest.TestCase):
         with open(os.path.join(CONTENT, "feverlink3_text.lua"), encoding="utf-8") as f:
             T = rt.execute(f.read())
         line = lambda **u: T.updateLine(rt.table_from(u))
-        self.assertEqual(("FeverLink3 0.2.1 is downloading.", "info"), line(state="downloading", version="0.2.1"))
-        self.assertEqual(("FeverLink3 was updated to 0.2.1: restart the game to finish.", "info"),
+        self.assertEqual(("Downloading FeverLink3 0.2.1.", "info"), line(state="downloading", version="0.2.1"))
+        self.assertEqual(("Updated to 0.2.1. Restart the game to finish.", "info"),
                          line(state="ready", version="0.2.1", current="0.2.0"))
-        self.assertEqual(("Update failed: GitHub could not be reached; you keep 0.2.0.", "warn"),
+        self.assertEqual(("Update to 0.2.1 failed: GitHub could not be reached. You keep 0.2.0.", "warn"),
                          line(state="failed", version="0.2.1", current="0.2.0", reason="GitHub could not be reached"))
         text, level = line(state="failed", version="0.2.1", current="0.2.0", reason="x", restart=True)
         self.assertTrue(text.endswith("Restart the game before you play together.") and level == "warn", text)
@@ -30,6 +30,18 @@ class UpdateLine(unittest.TestCase):
             self.assertIsNone(quiet)
         self.assertEqual("Automatic updates: on", T.UPDATE.on)
         self.assertEqual("Automatic updates: off", T.UPDATE.off)
+
+        # the window and the pop-up draw long texts as lines broken between words (TextView itself does not wrap)
+        with open(os.path.join(CONTENT, "feverlink3_hud.lua"), encoding="utf-8") as f:
+            Hud = rt.execute(f.read())
+        wrap = lambda s, w: list(Hud.wrapLines(s, w).values())
+        failed, _ = line(state="failed", version="0.2.1", current="0.2.0", reason="it did not start properly", restart=True)
+        lines = wrap(failed, 34)
+        self.assertEqual(failed, " ".join(lines))
+        self.assertTrue(len(lines) > 1 and all(len(x) <= 34 for x in lines), lines)
+        self.assertEqual(["  ab cd", "  ef"], wrap("  ab cd ef", 8), "the indent stays on every line")
+        self.assertEqual(["abcdefgh", "ij", "x"], wrap("abcdefghij\nx", 8), "a long word is cut, a newline breaks")
+        self.assertEqual([""], wrap("", 40))
 
         with open(os.path.join(CONTENT, "feverlink3_ui.script.lua"), encoding="utf-8") as f:
             ui = f.read()

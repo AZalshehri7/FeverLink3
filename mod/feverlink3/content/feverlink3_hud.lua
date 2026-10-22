@@ -104,6 +104,39 @@ function H.cleanText(text)
 	return text
 end
 
+-- A text as lines of at most `width` characters, broken between words. The game's TextView does not wrap and the
+-- documented style keys (styleutil.makeStyle) have no wrap switch (the base game wraps through its own stylesheets'
+-- textAutoWrap), so the window draws one TextView per line (real game 2026-10-22: update and report texts were cut at the
+-- window's edge). A word longer than a line is cut; a line's leading spaces stay on every line it becomes; "\n" breaks too.
+local function chars(s) return select(2, s:gsub("[^\128-\191]", "")) end
+function H.wrapLines(text, width)
+	width = math.max(8, math.floor(tonumber(width) or 45))
+	local lines = {}
+	for para in (tostring(text or "") .. "\n"):gmatch("(.-)\n") do
+		local indent = para:match("^%s*")
+		local room = math.max(1, width - #indent)
+		local line = ""
+		local function put(word)
+			if line ~= "" and chars(line) + 1 + chars(word) > room then
+				lines[#lines + 1] = indent .. line
+				line = ""
+			end
+			line = line == "" and word or (line .. " " .. word)
+		end
+		for word in para:gmatch("%S+") do
+			while chars(word) > room do
+				local cut = room
+				while cut > 1 and word:byte(cut + 1) and word:byte(cut + 1) >= 128 and word:byte(cut + 1) < 192 do cut = cut - 1 end
+				put(word:sub(1, cut))
+				word = word:sub(cut + 1)
+			end
+			put(word)
+		end
+		lines[#lines + 1] = indent .. line
+	end
+	return lines
+end
+
 -- Appends to the bounded history. Returns true when a line was added.
 function H.addChat(h, name, text, from)
 	text = H.cleanText(text)

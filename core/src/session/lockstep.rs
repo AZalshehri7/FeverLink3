@@ -62,17 +62,72 @@ impl Lockstep {
     /// The real time (ms) a lead must cover for a round trip and a clock gap: the one-way time and the gap's excess over one batch's
     /// real time (at most [`Self::GAP_EXCESS_MAX_MS`]). Not a number or negative counts as 0.
     pub fn cover_ms(rtt_ms: f64, gap_ms: f64) -> f64 {
+        Self::cover_ms_at(rtt_ms, gap_ms, Self::BATCH_SECONDS * 1000.0)
+    }
+
+    /// [`Self::cover_ms`] with the engine's batch interval as measured (`batch_ms`, [`Self::batch_ms_or_nominal`]) instead of
+    /// [`Self::BATCH_SECONDS`]: only the part of a clock gap beyond one real batch is jitter the lead must cover.
+    pub fn cover_ms_at(rtt_ms: f64, gap_ms: f64, batch_ms: f64) -> f64 {
         let rtt = if rtt_ms.is_finite() { rtt_ms.max(0.0) } else { 0.0 };
         let gap = if gap_ms.is_finite() { gap_ms.max(0.0) } else { 0.0 };
-        let excess = (gap - Self::BATCH_SECONDS * 1000.0).clamp(0.0, Self::GAP_EXCESS_MAX_MS);
+        let excess = (gap - Self::batch_ms_or_nominal(Some(batch_ms))).clamp(0.0, Self::GAP_EXCESS_MAX_MS);
         rtt / 2.0 + excess
+    }
+
+    /// The bounds a measured batch interval is taken within (ms). Below: a burst of clock lines that a delay on the link bunched
+    /// together, not an engine that fast. Above: batches stretched by the smooth pacing (up to 2x) or frames slower than the
+    /// engine; a lead counted from them would shrink with every stretch and stretch the batches further, so the bound stops that loop.
+    pub const BATCH_MS_MIN: f64 = 100.0;
+    pub const BATCH_MS_MAX: f64 = 300.0;
+
+    /// The engine's batch interval to count a lead with (ms): the measured one ([`LeadMeter::batch_ms`]) within
+    /// [`Self::BATCH_MS_MIN`]..=[`Self::BATCH_MS_MAX`], or [`Self::BATCH_SECONDS`] before anything is measured (or for a value that is
+    /// not a number).
+    pub fn batch_ms_or_nominal(measured: Option<f64>) -> f64 {
+        match measured {
+            Some(ms) if ms.is_finite() && ms > 0.0 => ms.clamp(Self::BATCH_MS_MIN, Self::BATCH_MS_MAX),
+            _ => Self::BATCH_SECONDS * 1000.0,
+        }
+    }
+
+    /// Steps of game time a running game simulates in one real second at `speed` with batches `batch_ms` apart: `speed` steps a
+    /// batch (L.pace runs full batches: the checksum marks lie on batch boundaries, [`Self::round_up_to_batch`]). With the nominal
+    /// batch it is [`Self::STEPS_PER_SECOND`] per speed unit; measured in the real game of 2026-10-22 about 200 ms a batch, 5 a speed unit.
+    pub fn steps_per_second(speed: i32, batch_ms: f64) -> f64 {
+        // as a ratio to the nominal batch, so that the nominal one gives STEPS_PER_SECOND exactly (no rounding moves a ceil)
+        let nominal = Self::BATCH_SECONDS * 1000.0;
+        Self::STEPS_PER_SECOND * f64::from(speed.clamp(1, 4)) * (nominal / Self::batch_ms_or_nominal(Some(batch_ms)))
+    }
+
+    /// `t` rounded up to a batch boundary at `speed`: a multiple of `speed` steps of game time. Every game runs full batches of
+    /// `speed` steps from such a boundary to the next, so a checksum stamp there (and its spread marks, `speed` steps apart) never
+    /// shortens a batch; the stamp is the same game time on every game (the host gives it), so the round is read at the same step
+    /// everywhere as before. Real game of 2026-10-22 at x4: the marks lay at other phases than the batches, L.pace shortened batches
+    /// to land on them (4,1,1,4,3,3,4 steps) and the game ran at about x2.7.
+    pub fn round_up_to_batch(t: i64, speed: i32) -> i64 {
+        let batch = Self::STEP * i64::from(speed.clamp(1, 4));
+        let up = t.saturating_add(batch - 1).div_euclid(batch);
+        up.saturating_mul(batch)
     }
 
     /// The lead that covers `cover_ms` of real time at this speed: `ceil((cover + handling) * steps_per_second * speed) + 1 + speed`
     /// steps, bounded to 3..=24. The hand-off step and one engine batch (the 907af4e fix of 2026-10-18) are its floor.
     pub fn lead_for_cover(speed: i32, cover_ms: f64) -> i64 {
+        Self::lead_for_cover_at(speed, cover_ms, Self::BATCH_SECONDS * 1000.0)
+    }
+
+    /// [`Self::lead_for_cover`] counted with the measured batch interval (`batch_ms`, [`Self::batch_ms_or_nominal`]): the real time is
+    /// turned into steps at [`Self::steps_per_second`] instead of the fixed [`Self::STEPS_PER_SECOND`]. The floor (the hand-off step and
+    /// one batch of `speed` steps) is in steps and does not change. A lead only decides how often a game waits at its input barrier,
+    /// never whether an item arrives in time (the promise does that), so a measure that is off costs waits, not sync.
+    pub fn lead_for_cover_at(speed: i32, cover_ms: f64, batch_ms: f64) -> i64 {
         let cover = if cover_ms.is_finite() { cover_ms.clamp(0.0, 60_000.0) } else { 0.0 };
-        let per_second = Self::STEPS_PER_SECOND * f64::from(speed.max(1));
+        let per_second = if speed > 4 {
+            // beyond the engine's x4: the old count (no batch of more than 4 steps is known)
+            Self::STEPS_PER_SECOND * f64::from(speed)
+        } else {
+            Self::steps_per_second(speed.max(1), batch_ms)
+        };
         let seconds = cover / 1000.0 + Self::HANDLING_SECONDS;
         let batch = i64::from(speed.clamp(1, 4));
         let steps = (seconds * per_second).ceil() as i64 + 1 + batch;
@@ -144,7 +199,8 @@ pub struct LeadMeter {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ClockCadence {
     last: Option<(f64, i64, bool)>,
-    gaps: VecDeque<(f64, f64)>,
+    /// (host time, gap ms, game time the move covered)
+    gaps: VecDeque<(f64, f64, i64)>,
 }
 
 impl LeadMeter {
@@ -180,7 +236,7 @@ impl LeadMeter {
         c.last = match c.last {
             Some((last_at, lt, ran)) if t > lt => {
                 if ran && at >= last_at {
-                    c.gaps.push_back((at, (at - last_at) * 1000.0));
+                    c.gaps.push_back((at, (at - last_at) * 1000.0, t - lt));
                     while c.gaps.len() > Self::GAP_KEEP {
                         c.gaps.pop_front();
                     }
@@ -226,13 +282,41 @@ impl LeadMeter {
             .iter()
             .filter(|(id, _)| here(**id))
             .filter_map(|(_, c)| {
-                let recent: Vec<f64> = c.gaps.iter().filter(|(at, _)| *at >= from).map(|&(_, g)| g).collect();
+                let recent: Vec<f64> = c.gaps.iter().filter(|(at, _, _)| *at >= from).map(|&(_, g, _)| g).collect();
                 if recent.len() < Self::GAP_MIN {
                     return None;
                 }
                 quantile(recent.into_iter(), Self::GAP_QUANTILE)
             })
             .fold(0.0, f64::max)
+    }
+}
+
+impl LeadMeter {
+    /// Quantile of a game's full-batch gaps taken as its engine's batch interval: a low one, the batches the smooth pacing did not
+    /// stretch (it stretches them up to 2x near a stop) and the frames did not delay.
+    pub const BATCH_QUANTILE: f64 = 0.25;
+
+    /// The engine's batch interval (ms) at `speed`, measured from the clock lines in the last [`Self::GAP_WINDOW_SECONDS`]: per game
+    /// that `here` accepts, the [`Self::BATCH_QUANTILE`] of the gaps before a move of exactly one full batch (`speed` steps: a batch
+    /// shortened at a stop or two batches seen in one frame say nothing about the interval), at least [`Self::GAP_MIN`] of them; the
+    /// shortest over the games (the fastest engine runs the most steps in a given real time, so the lead in steps is the longer one).
+    /// `None` until a game has enough. Real game of 2026-10-22: about 200 ms at x1 and x4 (the lead assumed 167 ms).
+    pub fn batch_ms(&self, now: f64, speed: i32, here: impl Fn(u16) -> bool) -> Option<f64> {
+        let from = now - Self::GAP_WINDOW_SECONDS;
+        let full = Lockstep::STEP * i64::from(speed.clamp(1, 4));
+        self.clocks
+            .iter()
+            .filter(|(id, _)| here(**id))
+            .filter_map(|(_, c)| {
+                let recent: Vec<f64> =
+                    c.gaps.iter().filter(|(at, _, dt)| *at >= from && *dt == full).map(|&(_, g, _)| g).collect();
+                if recent.len() < Self::GAP_MIN {
+                    return None;
+                }
+                quantile(recent.into_iter(), Self::BATCH_QUANTILE)
+            })
+            .reduce(f64::min)
     }
 }
 

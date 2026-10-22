@@ -1,49 +1,37 @@
 # Roadmap
 
-Status as of 2026-10-21. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html).
+Status as of 2026-10-22. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
 
-How to read the markers: `[x]` done, `[~]` done but not yet seen in the real game in the way that matters (for example only on one PC), `[ ]` not done.
+## Done
 
-## Versions
+**0.1.0 (2026-10-14): the first working session.** Host and join from the in-game window; builds copied from the game's own build command and applied at the same step on every game (roads, rail, stations, stops, depots, bulldozing); lines, vehicles, renames and loans; world checks and the repair from the host's world. Seen with two games on one PC.
 
-### 0.1.0 (2026-10-14): first working multiplayer session (done)
+**0.1.5 (2026-10-19): sessions over Steam.** Two PCs over Steam with a join code, Steam invites, the mod check at join, catching up after a stall. Played over the internet with a friend through Steam; that session showed problems (object id order, held builds, a crash) that 0.2.x fixes. Steam invites were not tried between two PCs.
 
-- [x] Host and join from the in-game window; the host's world is sent and loaded on the other game; speed, pause and chat follow each other (seen in two real games on one PC, 2026-10-10).
-- [x] Builds copied natively from the game's own build command and applied at the same step on every game: roads, junctions, bridges, tunnels, rail, signals, stops, stations and modules, depots, lanes, crosswalks and bulldozing (seen in two real games on one PC, 2026-10-14).
-- [x] Lines, vehicles, renames and loans between the games (seen in two real games on one PC).
-- [x] World checks and the repair by loading the host's save.
+**0.2.1 (2026-10-22): first public beta** (0.2.0 was withdrawn). A new in-game interface, Report a problem, a faster session start, automatic updates inside the game, and many fixes. Seen in the real game:
 
-### 0.1.5 (2026-10-19): feature-complete test version (done)
+- Played over the internet with a friend through Steam, in sessions of up to 3.5 hours (with the build before the release): building together, towns growing, shared speed, pause and chat, the new interface and Report a problem. In the longest session, 11 repair syncs: 1 for the join, 5 because another mod (Auto Line Namer) renamed lines on its own, 5 from object ids in a different order on the two games (each found within seconds and repaired automatically): about one such repair every 40 minutes.
+- Automatic updates on the maintainer's PC: 0.2.1 downloaded, checked and installed itself.
 
-- [x] Sessions over Steam between two PCs: played in internet tests with a friend, the last one on 2026-10-20. These tests found problems (object ids out of order, held builds, a crash) that 0.2.0 fixes.
-- [~] Steam invites from Steam's own dialog and the friends list: tested in the automatic tests, not yet between two PCs.
-- [~] Signed updates (`feverlink3 update`): tested in the automatic tests.
-- [~] Mod check at join, stall catch-up (a frozen game no longer stops the others), coming back after a short drop: tested in the automatic tests and in lab runs on one PC.
+Not yet seen in the real game: joining from a Steam invite by itself (fixed in 0.2.1), the warning about mods that change the world on their own, putting the previous version back when an update does not start.
 
-### 0.2.0: first public beta (next)
+## Next
 
-- [~] The fixes from the friend test of 2026-10-20: object id order, held builds without a record refused, the crash, terrain tools off during a session. Tested in the automatic tests and in lab runs on one PC.
-- [~] New in-game interface: bar icon with colours, pop-up, window with tabs, plain messages, the list of events.
-- [~] Report a problem: one zip with every player's logs, collected by the host. Not yet tried in a real game.
-- [~] Faster session start: pause under 2 s, whole sync about 17 s (two games on one PC).
-- [x] README rewritten.
-- [ ] A session on two PCs over Steam with these changes, played by the owner, before the release.
+- Release the faster builds (on `main`, not released yet): a road stands on both games 1.4 s after the click at game speed x1 and 0.8 s at x4 (two games on one PC).
+- Try Steam invites between two PCs.
+- Find the cause of the object id order differences, so these repair syncs stop.
+- Share the changes other mods make on their own (today FeverLink3 warns about such mods).
+- Separate companies for each player.
+- Share terrain editing, ground paint and trees (the terrain tools are off during a session).
+- Code signing of the files at 1.0.0 (releases are unsigned until then).
 
 ## Later
 
-- [ ] Sharing terrain editing, ground paint, trees and rocks.
-- [ ] Separate companies for each player on one map, with station access and shared infrastructure rules.
-- [ ] Host permissions in the window (the model and the protocol are done).
-- [ ] Distribution beyond GitHub: Nexus Mods, and the game's Mod Hub if it accepts a mod with a native part (`docs/WORKSHOP.md`). Transport Fever 3 has no Steam Workshop.
-- [ ] Code signing of the files (`docs/SIGNING.md`).
-- [ ] Dedicated server: a game copy that hosts permanently, joining from its autosave.
-
-## What gates 0.2.0
-
-1. A session on two PCs over Steam with the 0.2.0 changes, and the owner has played it.
-2. The claims in the README, `docs/PLAYING.md` and `docs/SECURITY_FOR_USERS.md` re-checked against the code that is released.
-3. The release is signed with the real key (`docs/RELEASING.md`).
+- More than two players in one session (planned for in the design, not played yet).
+- Host permissions in the window.
+- Distribution beyond GitHub: Nexus Mods, and the game's Mod Hub if it accepts a mod with a native part. Transport Fever 3 has no Steam Workshop.
+- A dedicated server: a game copy that hosts permanently.
 
 ## Credits
 
-FeverLink3 is a fresh implementation that builds on two earlier MIT-licensed projects: [TpF2 Multiplayer](https://silver2127.github.io/tpf2-multiplayer/) by silver2127 (Transport Fever 2) and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight / arthur (Transport Fever 3). Their licences are in `THIRD_PARTY_NOTICES.md`.
+FeverLink3 is a fresh implementation that builds on two earlier MIT-licensed projects: [TpF2 Multiplayer](https://silver2127.github.io/tpf2-multiplayer/) by silver2127 (Transport Fever 2) and [MPFever](https://github.com/dkdknight/MPFever) by dkdknight / arthur (Transport Fever 3). Their licences are in [THIRD_PARTY_NOTICES.md](https://github.com/AZalshehri7/FeverLink3/blob/main/THIRD_PARTY_NOTICES.md).

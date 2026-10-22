@@ -274,6 +274,37 @@ function L.clampStamp(s, now, at, floor)
 	return at
 end
 
+-- Whether the input barrier holds every peer to this game's promises: every peer sends promises of its own (a mod that has the barrier,
+-- L.barrier, which keeps it before every promise it received less marginTarget). nil peers or none: false (nobody to stamp against).
+function L.barrierCovers(peers)
+	local any = false
+	for _, pc in pairs(peers or {}) do
+		if type(pc) ~= "table" or type(pc.safe) ~= "number" then return false end
+		any = true
+	end
+	return any
+end
+
+-- The stamp of a build every game applies at its stamp (the defer and cancel flows), shipped at `now` with this game's promise floor
+-- `floor` (the largest promise its clock lines carried): the floor itself, or now + lead when that is later. Option A of the build
+-- timing analysis (2026-10-22): no longer the fastest peer clock plus the lead plus a measured extra (20 steps at x4 in the real game,
+-- 7 of them an unmeasured default). Why it is never late on any game, by construction:
+--   * on a peer: every promise this game sent is <= floor <= the stamp, and a peer simulates at most up to the smallest promise it
+--     holds less marginTarget(speed) steps (L.barrier, L.pace never runs a batch past it). The item travels the path of this game's
+--     clock lines, in order, so the peer has it before any later clock that could raise its barrier past the stamp, and still
+--     marginTarget steps before the stamp: the receiver's keep (its interface sees a batch late, one script event hands the item over);
+--   * on this game: now + lead >= now + marginTarget (the lead's floor is one hand-off step and one batch), and it routes the item to its
+--     own simulation at once;
+--   * a hold (holdAt, the pause order) or a pause only stops games earlier, and catching up (L.catchUp) never passes the barrier either.
+-- Only when L.barrierCovers says every peer keeps to the promises; the bridge keeps the old stamp otherwise (an older peer, no promise
+-- sent yet, this game stalled, a pause, the test switches). nil when there is no floor yet.
+function L.floorStamp(s, now, floor)
+	if type(floor) ~= "number" then return nil end
+	local at = L.stampFor(s, now)
+	if floor > at then at = floor end
+	return at
+end
+
 -- The last game time this game may simulate: the smallest promise of its peers, less the steps the receiver keeps (see above); a
 -- pause stop (pc.pause) exactly, as the pause itself. nil: no peer has promised anything (alone, or peers that send no promise).
 function L.barrier(s, peers)
@@ -426,6 +457,15 @@ end
 function L.paceBatch(P)
 	if #P.batches < 4 then return L.STEP end
 	return pctOf(P.batches, 50)
+end
+
+-- The steps a running game simulates in a real second at `speed` with batches `batchMs` apart (this game's measured L.paceBatch; nil or
+-- not a number: the nominal 6 steps a second per speed unit, core Lockstep::STEPS_PER_SECOND). Measured in the real game of 2026-10-22:
+-- about 200 ms a batch, so 5 steps a second per speed unit; the batch is bounded to 100..300 ms as in core (Lockstep::BATCH_MS_MIN/MAX).
+function L.stepsPerSecond(speed, batchMs, measured)
+	local per = math.max(1, math.min(4, speed or 1))
+	if not measured or type(batchMs) ~= "number" or batchMs ~= batchMs or batchMs <= 0 then return 6 * per end
+	return per * 1000 / math.max(100, math.min(300, batchMs))
 end
 
 -- The factor wanted: `room` game ms before the stop (nil: no stop) at session speed `speed`, the stop expected to move in `waitMs` (nil:

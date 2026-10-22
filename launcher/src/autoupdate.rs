@@ -183,8 +183,16 @@ impl Paths {
         fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, self.state())).map_err(|e| e.to_string())
     }
 
+    /// Removes the state file, then the update folder when nothing else is left in it (after a confirm, a rollback that
+    /// was reported, or a dropped update: the folder must not stay behind empty, real game 2026-10-22).
     fn clear_state(&self) {
         let _ = fs::remove_file(self.state());
+        self.remove_dir_if_empty();
+    }
+
+    /// `remove_dir` refuses a folder that still holds something (a staged version, a backup, a failed copy).
+    fn remove_dir_if_empty(&self) {
+        let _ = fs::remove_dir(self.dir());
     }
 }
 
@@ -198,8 +206,8 @@ pub enum Start {
     /// This start is the new version's and the mod was swapped in: [`confirm`] after [`HEALTHY_AFTER`].
     Confirm { from: String, to: String },
     /// Something failed in this start and the previous version's files were put back: the DLL in memory and the files
-    /// on disk differ, so no session until the game is restarted.
-    Restart { failed: String, kept: String, reason: String },
+    /// on disk differ, so no session until the game is restarted. `detail`: the technical cause, for `native.log` only.
+    Restart { failed: String, kept: String, reason: String, detail: String },
     /// The previous run took a failed version back: say so once.
     Failed { failed: String, kept: String, reason: String },
 }
@@ -221,16 +229,18 @@ pub fn at_start(paths: &Paths, running: &str) -> Start {
                 Start::Confirm { from, to }
             }
             Err(why) => {
-                let reason = format!("the new mod files could not be put in place ({why})");
+                // the player's words are short (the window's line); the technical cause goes to the log
+                let reason = "its files could not be put in place".to_owned();
                 rollback(paths, &from, &to, &reason);
-                Start::Restart { failed: to, kept: from, reason }
+                Start::Restart { failed: to, kept: from, reason, detail: why }
             }
         },
         Pending::Started { from, to, attempts } if to == running => {
             if attempts >= START_ATTEMPTS {
-                let reason = format!("FeverLink3 {to} did not start properly");
+                let reason = "it did not start properly".to_owned();
+                let detail = format!("{attempts} starts without reaching the healthy mark");
                 rollback(paths, &from, &to, &reason);
-                Start::Restart { failed: to, kept: from, reason }
+                Start::Restart { failed: to, kept: from, reason, detail }
             } else {
                 let _ =
                     paths.write_state(&Pending::Started { from: from.clone(), to: to.clone(), attempts: attempts + 1 });
@@ -290,6 +300,10 @@ pub fn rollback(paths: &Paths, from: &str, to: &str, reason: &str) {
         }
         if !live.exists() || fs::rename(&live, &failed).is_ok() {
             let _ = fs::rename(&backup, &live);
+        }
+        // the backup's own folder is empty now (its `feverlink3` moved back); `remove_dir` keeps it when it is not
+        if let Some(parent) = backup.parent() {
+            let _ = fs::remove_dir(parent);
         }
     }
     let old = paths.dll_old(from);
@@ -362,7 +376,8 @@ pub fn stage_update(
     may_touch_files: &dyn Fn() -> bool,
 ) -> Result<Option<String>, Refused> {
     const NET: &str = "GitHub could not be reached";
-    const BAD: &str = "the downloaded files did not match the release";
+    // short: the window's line is "Update to <version> failed: <this>. You keep <current>."
+    const BAD: &str = "the download did not match the release";
     let json = fetch.get(API_LATEST, MAX_JSON).map_err(|e| refused(NET, e))?;
     let json = String::from_utf8(json).map_err(|e| refused(NET, e))?;
     let release = match update::check_update(check.compare_with, &json, false) {
@@ -392,7 +407,7 @@ pub fn stage_update(
         _ => None,
     };
     let manifest = update::accept_manifest(&manifest_json, sig.as_deref(), check.keys, check.now_unix)
-        .map_err(|e| refused("the release is not signed by FeverLink3", e))?;
+        .map_err(|e| refused("the release is not signed", e))?;
     update::check_manifest_version(&manifest, &release).map_err(|e| refused(BAD, e))?;
     let compare = Version::parse(check.compare_with).map_err(|e| refused(BAD, e))?;
     if release.version <= compare {
@@ -407,7 +422,7 @@ pub fn stage_update(
     let stage = paths.stage(&to);
     let _ = fs::remove_dir_all(&stage);
     update::extract_verified(&plan, &zip, &manifest, &stage).map_err(|e| match e {
-        update::UpdateError::Io(io) => refused("the files could not be saved next to the game", io),
+        update::UpdateError::Io(io) => refused("the files could not be saved", io),
         other => refused(BAD, other),
     })?;
 
@@ -415,7 +430,7 @@ pub fn stage_update(
     while !may_touch_files() {
         std::thread::sleep(Duration::from_secs(2));
     }
-    let save = "the files could not be saved next to the game";
+    let save = "the files could not be saved";
     paths.write_state(&Pending::Staged { from: check.running.into(), to: to.clone() }).map_err(|e| refused(save, e))?;
     if let Err(e) = swap_dll(paths, check.running, &stage.join(update::DLL_NAME)) {
         paths.clear_state();
@@ -558,7 +573,7 @@ pub fn start(game: PathBuf, settings: PathBuf, log: fn(&str)) {
         s.official = OFFICIAL_BUILD;
         s.current = VERSION.into();
         match &begun {
-            Start::Restart { failed, kept, reason } | Start::Failed { failed, kept, reason } => {
+            Start::Restart { failed, kept, reason, .. } | Start::Failed { failed, kept, reason } => {
                 s.state = "failed".into();
                 s.version = failed.clone();
                 s.current = kept.clone();
@@ -622,6 +637,7 @@ fn run(paths: Paths, begun: Start, enabled: bool, loaded: std::time::Instant, lo
     let idle = || !SESSION_BUSY.load(Ordering::Relaxed);
     let result = stage_update(&paths, &fetch, &check, &mut downloading, &idle);
     let _ = fs::remove_dir_all(paths.downloads());
+    paths.remove_dir_if_empty();
     match result {
         Ok(None) => log("update: up to date"),
         Ok(Some(to)) => {
@@ -799,6 +815,7 @@ mod tests {
         assert!(!p.game.join("feverlink3_update/backup-0.2.0").exists());
         assert!(!p.game.join("feverlink3_update/0.2.1").exists());
         assert_eq!(p.read_state(), None);
+        assert!(!p.dir().exists(), "the empty update folder goes too");
         assert_eq!(at_start(&p, "0.2.1"), Start::Clear);
     }
 
@@ -825,7 +842,7 @@ mod tests {
         let bad_size = github("0.2.1", NEW, None, |m| m.files[0].size += 1);
         for gh in [bad_file, bad_zip, bad_size] {
             let r = stage(&p, &gh, &UNSIGNED).unwrap_err();
-            assert_eq!(r.plain, "the downloaded files did not match the release", "{r:?}");
+            assert_eq!(r.plain, "the download did not match the release", "{r:?}");
             untouched(&p);
         }
         // the published .sha256 disagrees with zip and manifest
@@ -868,7 +885,7 @@ mod tests {
             }
             let gh = github_with_zip("0.2.1", NEW, w.finish().unwrap().into_inner(), None, |_| {});
             let r = stage(&p, &gh, &UNSIGNED).unwrap_err();
-            assert_eq!(r.plain, "the downloaded files did not match the release", "{evil}: {r:?}");
+            assert_eq!(r.plain, "the download did not match the release", "{evil}: {r:?}");
             untouched(&p);
             assert!(!p.game.parent().unwrap().join("evil.dll").exists());
         }
@@ -918,7 +935,7 @@ mod tests {
         let (_t, p) = game();
         // an unsigned release is refused once a key is listed
         let r = stage(&p, &github("0.2.1", NEW, None, |_| {}), &signed).unwrap_err();
-        assert_eq!(r.plain, "the release is not signed by FeverLink3");
+        assert_eq!(r.plain, "the release is not signed");
         untouched(&p);
         // signed by another key
         let other = SigningKey::from_bytes(&[8u8; 32]);
@@ -943,6 +960,7 @@ mod tests {
         assert!(update::is_skipped(&update::read_skipped(&p.game), &Version::parse("0.2.1").unwrap()));
         // the old version starts and says so once
         assert!(matches!(at_start(&p, OLD), Start::Failed { .. }));
+        assert!(!p.dir().exists(), "the empty update folder goes after the rollback was reported");
         assert_eq!(at_start(&p, OLD), Start::Clear);
         assert!(!p.game.join("winhttp.dll.failed-0.2.1").exists());
         // the skipped version is not offered again
@@ -968,12 +986,14 @@ mod tests {
         assert_eq!(at_start(&p, OLD), Start::Clear);
         assert_eq!(p.read_state(), None);
         assert!(!p.stage("0.2.1").exists());
+        assert!(!p.dir().exists());
         assert_eq!(read(&p, "mods/release/feverlink3/mod.lua"), b"old mod");
-        // a damaged state file is dropped too
-        fs::create_dir_all(p.dir()).unwrap();
+        // a damaged state file is dropped too; a folder that still holds something stays
+        fs::create_dir_all(p.dir().join("other")).unwrap();
         fs::write(p.state(), b"{not json").unwrap();
         assert_eq!(at_start(&p, OLD), Start::Clear);
         assert!(!p.state().exists());
+        assert!(p.dir().join("other").exists());
     }
 
     #[test]

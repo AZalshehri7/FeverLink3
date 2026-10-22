@@ -82,24 +82,26 @@ T.MSG = {
 T.REPORT = {
 	button = "Report a problem",
 	note = "What were you doing? (optional)",
-	explain = "Makes one zip with the logs of every player in this session (Steam IDs, user names and addresses taken out) " ..
-		"and opens a GitHub page to attach it to. Nothing is sent anywhere by itself.",
+	explain = "Makes one zip with the logs of every player in this session (Steam IDs, user names and addresses " ..
+		"removed) and opens a GitHub page to attach it to. Nothing is sent anywhere by itself.",
 	contents = "The zip holds:",
 }
 
 -- The automatic update (launcher/src/autoupdate.rs; `update` in ctl_status.txt). {version} = the new version, {current} = the one
 -- the player keeps, {reason} = why it failed, in plain words from the module. Shown in the window and the pop-up by T.updateLine.
+-- Short sentences (at most ~45 characters each): the window and the pop-up wrap long lines at a word (Hud.wrapLines), but a
+-- short line reads at a glance (real game 2026-10-22: the old texts were cut at the pop-up's edge).
 T.UPDATE = {
-	downloading = "FeverLink3 {version} is downloading.",
-	ready = "FeverLink3 was updated to {version}: restart the game to finish.",
+	downloading = "Downloading FeverLink3 {version}.",
+	ready = "Updated to {version}. Restart the game to finish.",
 	updated = "FeverLink3 is now {version}.",
-	failed = "Update failed: {reason}; you keep {current}.",
+	failed = "Update to {version} failed: {reason}. You keep {current}.",
 	-- this game run must not play: the files on disk are another version than the one running
 	restart = "Restart the game before you play together.",
 	on = "Automatic updates: on",
 	off = "Automatic updates: off",
-	explain = "At every game start FeverLink3 asks GitHub for a newer version and gets it ready for the next start. " ..
-		"Never during a session. The switch counts from the next game start.",
+	explain = "At each game start FeverLink3 looks on GitHub for a newer version and gets it ready for the next start, " ..
+		"never during a session. A change here counts from the next start.",
 	dev = "This copy of FeverLink3 was not made by the release page, so it does not update itself.",
 }
 
