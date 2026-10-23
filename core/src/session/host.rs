@@ -694,6 +694,10 @@ impl HostSession {
         if block.is_empty() {
             return true;
         }
+        if !theirs.unsupported.is_empty() {
+            // the host's window says why that player cannot join (friend session 2026-10-23: nobody was told)
+            self.mod_warning(super::notices::player_game_unsupported(&who, &clip(&theirs.unsupported, 24)));
+        }
         for b in block.iter().take(20) {
             self.log(format!("{who}: build difference: {b}"));
         }

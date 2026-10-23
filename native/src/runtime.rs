@@ -341,7 +341,7 @@ impl Runtime {
             }
             let seq = sink.begin()?;
             let input = (|| -> Result<(rebuild::EngineAlloc, String, Vec<u8>), String> {
-                let alloc = rebuild::EngineAlloc::at(self.base)?;
+                let alloc = rebuild::EngineAlloc::at(self.base, &self.build.engine)?;
                 let head = portable::Header {
                     seq,
                     event,
@@ -353,7 +353,7 @@ impl Runtime {
                     payload,
                 };
                 let env = Env { image_base: self.base };
-                let text = portable::encode(&dump::LiveMem, env, sink.settings, self.build.name, &head)?.text;
+                let text = portable::encode(&dump::LiveMem, env, sink.settings, self.build.layout_name(), &head)?.text;
                 let original =
                     dump::Mem::read(&dump::LiveMem, payload, dump::PAYLOAD_SIZE).ok_or("payload unreadable")?;
                 Ok((alloc, text, original))
@@ -369,7 +369,7 @@ impl Runtime {
                 &dump::LiveMem,
                 self.base,
                 sink.settings,
-                self.build.name,
+                self.build.layout_name(),
                 |c| {
                     let _ = rebuild::roundtrip(&text, &original, self.base, sink.settings, c.alloc, c.mem, &place);
                 },
@@ -413,7 +413,7 @@ impl Runtime {
             &LiveMem,
             Env { image_base: self.base },
             portable::Settings::input_level(),
-            self.build.name,
+            self.build.layout_name(),
             &head,
         ) {
             Ok(p) => Some(p.text),
@@ -442,16 +442,21 @@ impl Runtime {
             wall_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()),
             payload,
         };
-        let text =
-            match portable::encode(&LiveMem, Env { image_base: self.base }, sink.settings, self.build.name, &head) {
-                Ok(p) => p.text,
-                Err(why) => format!(
-                    "=== portable v{} REFUSED event={event} key={} seq={seq} payload={payload:#x}: {why} ===
+        let text = match portable::encode(
+            &LiveMem,
+            Env { image_base: self.base },
+            sink.settings,
+            self.build.layout_name(),
+            &head,
+        ) {
+            Ok(p) => p.text,
+            Err(why) => format!(
+                "=== portable v{} REFUSED event={event} key={} seq={seq} payload={payload:#x}: {why} ===
 ",
-                    portable::VERSION,
-                    hold_id.map_or("none".to_string(), |k| k.to_string())
-                ),
-            };
+                portable::VERSION,
+                hold_id.map_or("none".to_string(), |k| k.to_string())
+            ),
+        };
         if let Err(e) = sink.write(&text) {
             self.say(&format!("portable: cannot write {}: {e}", portable::PORTABLE_FILE));
         }
@@ -1614,6 +1619,8 @@ mod tests {
             fire_done_calls: &[],
             kind_offset: Some(0x9b8),
             kinds: &[("build_proposal", 52)],
+            engine: crate::build_table::EngineFns::NONE,
+            layout: None,
         };
         &BUILD
     }

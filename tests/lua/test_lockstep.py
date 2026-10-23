@@ -2274,6 +2274,18 @@ class PureTest(unittest.TestCase):
         self.assertIn("profile:getModRep(): ", why)
         self.assertIn("no repository", why)
         self.assertIn("FAILED at profile:getModRep()", H.modShape(broken))
+        # a mod's player-facing name from its own information: the folder is its Mod Hub id (mod.io) or its mod id (user mod)
+        named = self.L.execute("""
+          local rep = {}
+          function rep:getInstalledMods() return { { name = "zhenya_auto_color_lines" }, { name = "trains" } } end
+          function rep:getGameModDesc(id) return ({ zhenya_auto_color_lines = { modhubModId = "6416672", name = "Auto Color Lines" },
+            trains = { modhubModId = "", name = "Trains" } })[id.name] end
+          local profile = {}
+          function profile:getModRep() return rep end
+          return { getUserProfile = function() return profile end }
+        """)
+        self.assertEqual([H.modName(named, "6416672"), H.modName(named, "trains"), H.modName(named, "999")], ["Auto Color Lines", "Trains", None])
+        self.assertIsNone(H.modName(broken, "6416672"))
         ctl = self.C.parse('{ mods = { {block = true, text = "missing maps (host has revision 1)"}, {block = false, text = "only you have x"} },'
                            ' modWarnings = { "the host could not list its mods" } }')
         lines = H.modLines(ctl)

@@ -9,6 +9,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [list]
 [*][b]Fully integrated into the game, no launcher.[/b] Start Transport Fever 3 from Steam as usual. Hosting, joining, chat, syncing and updates all live in the game's bottom bar and window. There is no extra program to run.
 [*][b]Build together.[/b] Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
+[*][b]Your other mods work together too.[/b] Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
 [*][b]The full game.[/b] Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 [*][b]Easy to join.[/b] Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
 [*][b]Always the same world.[/b] The games check each other all the time. If they ever drift apart, everyone gets the host's world back in a few seconds and play goes on.
@@ -48,7 +49,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [list]
 [*]Transport Fever 3 on Steam, Windows 10 or 11 (64-bit). Not for Mac, Linux or consoles.
 [*]Steam running and logged in.
-[*]Every player needs the same game version and the same FeverLink3 version (an older FeverLink3 is told to update). Made for game build 40420; if a game update changes what FeverLink3 depends on, it switches its hooks off instead of risking your game, and a FeverLink3 update follows.
+[*]Every player needs the same game version and the same FeverLink3 version (an older FeverLink3 is told to update). Made for game builds 40420 and 40423; on a game build it does not know yet, FeverLink3 switches its hooks off instead of risking your game, says so in the FeverLink3 window, does not host, and the host refuses that player with the reason. A FeverLink3 update follows.
 [*]Not compatible with other mods that put their own [b]winhttp.dll[/b] in the game folder.
 [/list]
 

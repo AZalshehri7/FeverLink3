@@ -38,15 +38,15 @@ impl Runtime {
             let seq = sink.begin()?;
             let key = hold_id.map_or("none".to_string(), |k| k.to_string());
             write(&format!("=== native copy #{seq} event={event} key={key} payload={payload:#x} ==="));
-            let prepared =
-                nc::ProposalFns::at(self.base).and_then(|f| rebuild::EngineAlloc::at(self.base).map(|a| (f, a)));
+            let prepared = nc::ProposalFns::at(self.base, &self.build.engine)
+                .and_then(|f| rebuild::EngineAlloc::at(self.base, &self.build.engine).map(|a| (f, a)));
             match prepared {
-                Ok((fns, alloc)) if self.build.name == portable::LAYOUT_BUILD => Some((seq, fns, alloc)),
+                Ok((fns, alloc)) if self.build.layout_name() == portable::LAYOUT_BUILD => Some((seq, fns, alloc)),
                 Ok(_) => {
                     write(&format!(
                         "REFUSED: the functions are those of game build {}, this is {}",
                         portable::LAYOUT_BUILD,
-                        self.build.name
+                        self.build.layout_name()
                     ));
                     None
                 }
@@ -60,9 +60,10 @@ impl Runtime {
         // the graph's block sizes come from the containers (see `Mem::heap_size` for why nothing asks the heap)
         let live = crate::dump::LiveMem;
         // the same steps first as a dry pass inside a guard (`native_copy::dry_pass`): a panic of ours is a refusal
-        let dry = nc::dry_pass("native copy: dry pass", &live, self.base, sink.settings, self.build.name, |c| {
-            let _ = nc::run(c, payload, &mut |_| {});
-        });
+        let dry =
+            nc::dry_pass("native copy: dry pass", &live, self.base, sink.settings, self.build.layout_name(), |c| {
+                let _ = nc::run(c, payload, &mut |_| {});
+            });
         if let Err(why) = dry {
             write(&format!("REFUSED: {why}"));
             return;
@@ -73,7 +74,7 @@ impl Runtime {
             mem: &live,
             base: self.base,
             set: sink.settings,
-            build_name: self.build.name,
+            build_name: self.build.layout_name(),
         };
         nc::run(&ctx, payload, &mut |line| write(line));
         let left = alloc.free_all();

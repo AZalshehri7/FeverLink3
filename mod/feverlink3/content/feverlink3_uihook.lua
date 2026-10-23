@@ -21,6 +21,9 @@
 --     group as one order: one stamp, applied in one step on every game, refused as a whole when any of it cannot be shipped.
 --     One that cannot be encoded (it does not rebuild equal, it names what cannot travel, the hook itself fails) is REFUSED on
 --     this game too: its callback fails and the player is told in the window's notices. It is never applied here alone (refuse).
+--   * another mod's own script event (its window sends a setting to its game script, makeScriptingSendEventCmd): no schema of ours
+--     knows it, but when its parameter is plain data it is shipped and held like the above (L.markForeignEvent), so every game's
+--     copy of that mod gets it at the stamp. Told apart by where the calling code lies (C.callerOf), never by a list of mods.
 --   * anything else (no schema, or an event no game replicates), and everything while no session is on: untouched.
 -- Entity ids never travel; the keys of entities created in the session come from binds.txt, which the bridge writes.
 --
@@ -413,6 +416,21 @@ local function handle(tag, cmd, cb, progress, t0)
 	if tag.name == "makeWorldBuildProposalCmd" then return false end
 	local spec = L.COMMANDS[tag.name]
 	if not spec or spec.virtual then return false end
+	-- another mod's own event (its window sends its settings to its game script): shipped like a window command, delivered at the stamp
+	-- on every game (L.markForeignEvent); one that is not plain data stays on this game as before
+	if tag.mod and tag.args.foreign == nil then
+		local okM, why = L.markForeignEvent(tag.args, tag.mod, C.plain)
+		local seen = tostring(tag.mod) .. "|" .. tostring(tag.args[2]) .. "|" .. tostring(tag.args[3])
+		U.foreignSeen = U.foreignSeen or {}
+		if not U.foreignSeen[seen] then
+			U.foreignSeen[seen] = true
+			if okM then
+				log("another mod's event " .. tostring(tag.args[2]) .. "/" .. tostring(tag.args[3]) .. " (mod=" .. tostring(tag.mod) .. ") is shared: every game delivers it at the stamp")
+			elseif why ~= "registered" then
+				log("another mod's event " .. tostring(tag.args[2]) .. "/" .. tostring(tag.args[3]) .. " (mod=" .. tostring(tag.mod) .. ") stays on this game unshared: " .. tostring(why))
+			end
+		end
+	end
 	local category = L.categoryOf(tag.name, tag.args)
 	-- what no game replicates (an event nobody registered: notifications, tutorial steps) is this game's own business
 	if category == "local" then return false end
@@ -500,9 +518,15 @@ function M.install()
 		if okw then wrapped = wrapped + 1 end
 	end
 	local oks = pcall(function()
-		api.cmd.sendCommand = function(cmd, cb, progress)
+		local wrapper
+		wrapper = function(cmd, cb, progress)
 			local t0 = C.clock()
 			local tag = cmd ~= nil and U.tags[cmd] or nil
+			if tag ~= nil and tag.name == "makeScriptingSendEventCmd" and tag.mod == nil then
+				-- who sends it: another mod's script (handle, L.markForeignEvent), or FeverLink3's / the game's own (nil)
+				local okW, _, mod = pcall(C.callerOf, wrapper)
+				if okW then tag.mod = mod or false end
+			end
 			if tag ~= nil then
 				if DEV then
 					local parts = {}
@@ -526,6 +550,7 @@ function M.install()
 			U.stats.untouched = U.stats.untouched + 1
 			return orig.sendCommand(cmd, cb, progress)
 		end
+		api.cmd.sendCommand = wrapper
 	end)
 	log("UI hook installed: " .. wrapped .. " command functions wrapped" .. (oks and "" or "; sendCommand is read-only"))
 	return oks

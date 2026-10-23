@@ -34,7 +34,9 @@ use std::time::{Duration, Instant, SystemTime};
 use feverlink3_core::admission::{ConnectToken, Gate, TokenError};
 use feverlink3_core::crypto::SessionKey;
 use feverlink3_core::lobby::JoinCode;
-use feverlink3_core::session::{ConnectionState, HostOptions, Permissions, PlayerSet, RosterEntry};
+use feverlink3_core::session::{
+    notices, ConnectionState, HostOptions, ModFingerprint, Permissions, PlayerSet, RosterEntry,
+};
 use serde_json::{json, Value};
 
 use crate::gamelink::{self, Tail};
@@ -370,6 +372,17 @@ pub struct Controller {
     mod_params: Value,
     /// "Report a problem" (`report.rs`).
     reporter: report::Reporter,
+    /// The game build this game's native module does not support ([`set_unsupported_game`]); `None`: supported.
+    unsupported: Option<String>,
+}
+
+/// The game build the native module of this process does not support, set once by the module before it starts the controller.
+static UNSUPPORTED_GAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Called by the native module when it does not know the running game's build (`build` as the player reads it): the controller
+/// then refuses to host, says so on the window's start screen, and every join it sends says so, so the host refuses it in words.
+pub fn set_unsupported_game(build: String) {
+    let _ = UNSUPPORTED_GAME.set(build);
 }
 
 impl Controller {
@@ -468,6 +481,7 @@ impl Controller {
             mod_report: Vec::new(),
             mod_params: Value::Null,
             reporter: report::Reporter::new(),
+            unsupported: UNSUPPORTED_GAME.get().cloned(),
         };
         c.publish();
         Ok(c)
@@ -484,6 +498,13 @@ impl Controller {
     /// the machine is).
     pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + 'static) -> Controller {
         self.clock = Box::new(now);
+        self
+    }
+
+    /// As if the native module did not know the game's build (tests; the game sets it with [`set_unsupported_game`]).
+    pub fn with_unsupported_game(mut self, build: &str) -> Controller {
+        self.unsupported = Some(build.to_owned());
+        self.publish();
         self
     }
 
@@ -621,6 +642,12 @@ impl Controller {
             // the files on disk are another version than this module: playing now would mix versions (autoupdate.rs)
             "host" | "join" | "accept_invite" if crate::autoupdate::restart_needed() => {
                 self.state = State::Failed(crate::autoupdate::RESTART_FIRST.to_owned());
+            }
+            // the game updated itself and this FeverLink3 has no addresses for it: no build hold, no determinism patches, so a
+            // session would drift from the first build. Hosting is refused here; a join goes on so that the host refuses it and
+            // its window names the player (friend session 2026-10-23: both games ran degraded and nobody was told)
+            "host" if self.unsupported.is_some() => {
+                self.state = State::Failed(notices::game_unsupported(self.unsupported.as_deref().unwrap_or("")));
             }
             "host" => self.host(params),
             "join" => self.join(params),
@@ -992,6 +1019,7 @@ impl Controller {
         let (dir, save_dirs) = (self.dir.clone(), self.save_dirs.clone());
         // the window's last mod list (a join from a Steam invite has no window command of its own)
         let (user_dirs, params) = (self.user_dirs(), self.mod_params.clone());
+        let unsupported = self.unsupported.clone().unwrap_or_default();
         self.mod_report.clear();
         let (tx, rx) = mpsc::channel();
         let progress = Arc::new(Mutex::new(String::new()));
@@ -999,7 +1027,11 @@ impl Controller {
         let (core, said, stop) = (self.steam_core(), Arc::clone(&progress), Arc::clone(&cancel));
         let connect = move || {
             // hashing the mod folders reads files: on this thread, not the controller's
-            let mods = Some(modlist::from_params(&params, &user_dirs, modlist::running_game_dir().as_deref()));
+            // a game whose build this FeverLink3 does not know still asks: the host refuses it and its window says why
+            let mods = Some(ModFingerprint {
+                unsupported,
+                ..modlist::from_params(&params, &user_dirs, modlist::running_game_dir().as_deref())
+            });
             let mut say = |text: &str| *said.lock().unwrap_or_else(|p| p.into_inner()) = text.to_owned();
             // a code with a Steam ID is joined over Steam, whatever else it lists; an invite is always over Steam
             let route = match target {
@@ -1370,6 +1402,13 @@ impl Controller {
         }
         if let Some(notice) = &self.notice {
             v["notice"] = json!(notice);
+        }
+        if let Some(build) = &self.unsupported {
+            // always in sight on the window's start screen (the field the window shows above Host and Join)
+            if v["notice"].is_null() {
+                v["notice"] = json!(notices::game_unsupported(build));
+            }
+            v["unsupportedGame"] = json!(build);
         }
         if let Some(r) = self.reporter.json() {
             v["report"] = r;
@@ -2190,6 +2229,23 @@ mod tests {
         assert!(st["message"].as_str().unwrap().contains("mods"), "{st}");
         assert_eq!(st["mods"], json!([{"block": true, "text": "the game: host has 1.4.2, you have 1.4.3"}]), "{st}");
         assert_eq!(hw.status()["players"].as_array().unwrap().len(), 1, "never joined");
+
+        // a game whose build this FeverLink3 does not know (friend session 2026-10-23): it cannot host, its window says so before
+        // anything is pressed, and its join (same builds otherwise) is refused by the host, whose window names the player
+        let od = root.path().join("odd");
+        let mut odd = Controller::new(od.clone(), "Ode".into(), Vec::new()).unwrap().with_unsupported_game("40423");
+        let mut ow = Window::new(&od);
+        assert!(until(&mut [&mut odd], Duration::from_secs(5), || !ow.status()["notice"].is_null()));
+        assert_eq!(ow.status()["notice"], json!(notices::game_unsupported("40423")));
+        ow.send("host", &with_mods(host_cmd, "1.4.2", host_mods));
+        assert!(until(&mut [&mut odd], Duration::from_secs(5), || ow.status()["state"] == "failed"));
+        assert!(ow.status()["message"].as_str().unwrap().contains("(build 40423)"));
+        ow.send("join", &with_mods(&join, "1.4.2", host_mods));
+        assert!(until(&mut [&mut host, &mut odd], Duration::from_secs(15), || ow.status()["mods"].is_array()));
+        let st = ow.status();
+        assert_eq!(st["mods"], json!([{"block": true, "text": notices::game_unsupported("40423")}]), "{st}");
+        assert!(until(&mut [&mut host], Duration::from_secs(5), || hw.status()["modWarnings"]
+            == json!([notices::player_game_unsupported("Ode", "40423")])));
 
         // the same mods: welcomed
         pw.send("join", &with_mods(&join, "1.4.2", host_mods));

@@ -6,6 +6,19 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.4 (2026-10-23)
+
+### Added
+- Support for Transport Fever 3 game build 40423 (the game's "Second Stability Update" of 2026-10-22). With an older FeverLink3 that game build ran without FeverLink3's build sync and drift fixes, and nobody was told.
+
+### Changed
+- Mods that change lines by themselves (for example Auto Line Namer, Auto Color Lines, Auto Assign Terminals) now work in a session: the host's copy of the mod makes the changes and every game applies them at the same moment, and a setting changed in such a mod's window reaches every game. The warning now appears only for a mod change FeverLink3 still cannot share. Seen with two games on one PC; a setting changed in such a mod's window not yet.
+
+### Fixed
+- On a game build FeverLink3 does not support yet, the FeverLink3 window now says "Transport Fever 3 was updated (build N); this FeverLink3 does not support it yet. An update of FeverLink3 is needed before you can play together." Hosting is refused; a player with such a game who tries to join is refused by the host, and the host's window names that player.
+- The warning about another mod that changes the world on its own names the mod as the game's mod list shows it (for example "Auto Color Lines"), not its folder number. One warning per mod and session.
+- A library FeverLink3's encryption uses (ctutils) is updated for a security advisory published on 2026-10-23 (RUSTSEC-2026-0385).
+
 ## 0.2.3 (2026-10-22)
 
 ### Fixed

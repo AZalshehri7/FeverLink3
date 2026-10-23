@@ -157,7 +157,18 @@ mod entry {
                             hooks::attach_from_env(b, link, log::line);
                         }
                         None => {
-                            log::line(&format!("unknown game build (timestamp {ts:#x}): hooks off, mod runs degraded"))
+                            // Friend session 2026-10-23: the game had updated itself to 40423 and both games ran like this,
+                            // drifting, with nobody told. Now the session controller refuses to host, says so on the
+                            // window's start screen, and a join it sends makes the host refuse it in words.
+                            let build = game_build_number().unwrap_or_else(|| format!("{ts:#x}"));
+                            log::line(&format!(
+                                "UNSUPPORTED GAME BUILD {build} (timestamp {ts:#x}): this FeverLink3 knows only {}; hooks off, \
+                                 hosting refused, joins refused by the host. An update of FeverLink3 is needed.",
+                                build_table::BUILDS.iter().map(|b| b.name).collect::<Vec<_>>().join(", ")
+                            ));
+                            if live {
+                                feverlink3_launcher::live::set_unsupported_game(build);
+                            }
                         }
                     },
                     None => log::line("could not read the game's PE header"),
@@ -182,6 +193,20 @@ mod entry {
             .ok()
             .and_then(|p| p.file_name().map(|n| n.eq_ignore_ascii_case(feverlink3_launcher::GAME_EXE)))
             .unwrap_or(false)
+    }
+
+    /// The game's own build number, read from its mapped `.rdata` (only for the message about an unknown build).
+    fn game_build_number() -> Option<String> {
+        // SAFETY: as in `game_build`: the image's headers, then its `.rdata` section, which the loader mapped readable
+        // (`VirtualSize` bytes from its RVA) for the whole process lifetime.
+        unsafe {
+            let base = GetModuleHandleW(core::ptr::null()) as *const u8;
+            if base.is_null() {
+                return None;
+            }
+            let rdata = pe::read_headers(base)?.section(".rdata")?.clone();
+            pe::build_number(core::slice::from_raw_parts(base.add(rdata.rva as usize), rdata.size as usize))
+        }
     }
 
     /// The link timestamp of the running executable, which identifies the game build.

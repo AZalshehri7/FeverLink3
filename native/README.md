@@ -48,9 +48,21 @@ Each piece is checked against the bytes in memory first, installed all-or-none f
 
 ## Adding a game build
 
-1. Run the address tool (`tools/addr/find_sites.py`, see its README) against the new `TransportFever3.exe`. It finds the hook sites and the engine helpers by signature and by anchors (string references, callers' idiom, how `CommandList::Add` uses them), extracts the prologue bytes, checks they are whole, position-independent instructions where a detour needs that, reads the command-kind offset and names the command kinds, and prints a `BuildAddrs` row with a confidence per site.
-2. Paste the row into `build_table::BUILDS`. The list of construction-tool call sites (`ui_add_sites`) is not found by the tool in a new build: it is verified from the previous build's list, so a new build starts with the hold hook off until a person has chosen the sites (the report lists every caller with the source file it names).
-3. Verify the import table still lists only the WinHTTP functions in `proxy.rs`; add any new one.
+Keep a copy of the executable of every supported build outside the repository before Steam updates the game: the port tool
+compares the old and the new one.
+
+1. Run the port tool (`tools/addr/port_build.py OLD.exe NEW.exe --out tools/addr/out`, see its README). It carries every site
+   of the old row over by comparing whole functions (relocations wildcarded, callees checked one level deep), finds the
+   hold list and the callbacks in the same tool functions, carries the offsets the preview listener reads, and checks the
+   layout witnesses of the portable form. A site it cannot prove stays `None` and its feature stays off.
+2. Run the address tool (`tools/addr/find_sites.py NEW.exe --out tools/addr/out`) as the independent check of the hold sites,
+   the command kinds and the WinHTTP import list (add any new import to `proxy.rs`).
+3. Write the row into `build_table::BUILDS` from the port report, add the build to `KNOWN_BUILDS` in
+   `launcher/src/wizard/versions.rs`, and extend the row test in `build_table.rs` to the new report. Game build 40423 was
+   added this way (`tools/addr/out/port-6ac50427-6ad0e4e5.txt`).
+
+A game build that is not in the table runs with every hook off; the in-game window says so, hosting is refused and a join is
+refused by the host with the reason (`docs/LIVE_CONTROL.md`).
 
 ## Size
 

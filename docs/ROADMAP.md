@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-22. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
+Status as of 2026-10-23. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
 
 ## Done
 
@@ -15,12 +15,15 @@ Status as of 2026-10-22. The project started on 2026-10-09. What changed in each
 
 Not yet seen in the real game: joining from a Steam invite by itself (fixed in 0.2.1), the warning about mods that change the world on their own, putting the previous version back when an update does not start.
 
+**0.2.2 and 0.2.3 (2026-10-22): faster builds and fixes.** A road stands on both games 1.4 s after the click at game speed x1 and 0.8 s at x4 (two games on one PC); no false "could not be built" on a road that joins an existing road (two games on one PC); every game keeps its world details at a sync. Seen in the real game: the automatic update from 0.2.2 to 0.2.3 on the maintainer's PC, and the warning about other mods on two PCs.
+
+**0.2.4 (2026-10-23): the game update and other mods.** Support for game build 40423 (the game's update of 2026-10-22), and a clear message in the window on a game build FeverLink3 does not know. Other mods that change the world on their own stay in sync: the host's copy makes the change and every game applies it at the same step. Seen with two games on one PC; not yet between two PCs.
+
 ## Next
 
-- Release the faster builds (on `main`, not released yet): a road stands on both games 1.4 s after the click at game speed x1 and 0.8 s at x4 (two games on one PC).
 - Try Steam invites between two PCs.
 - Find the cause of the object id order differences, so these repair syncs stop.
-- Share the changes other mods make on their own (today FeverLink3 warns about such mods).
+- See other mods' shared changes and settings between two PCs, and make line edits apply faster.
 - Separate companies for each player.
 - Share terrain editing, ground paint and trees (the terrain tools are off during a session).
 - Code signing of the files at 1.0.0 (releases are unsigned until then).
@@ -29,7 +32,7 @@ Not yet seen in the real game: joining from a Steam invite by itself (fixed in 0
 
 - More than two players in one session (planned for in the design, not played yet).
 - Host permissions in the window.
-- Distribution beyond GitHub: Nexus Mods, and the game's Mod Hub if it accepts a mod with a native part. Transport Fever 3 has no Steam Workshop.
+- Distribution beyond GitHub and Nexus Mods (live since 0.2.2): the game's Mod Hub if it accepts a mod with a native part. Transport Fever 3 has no Steam Workshop.
 - A dedicated server: a game copy that hosts permanently.
 
 ## Credits

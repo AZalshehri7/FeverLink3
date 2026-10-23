@@ -32,10 +32,7 @@ use crate::rebuild::{self, Alloc};
 pub const NATIVE_COPY_VAR: &str = "FEVERLINK3_NATIVE_COPY";
 pub const NATIVE_COPY_FILE: &str = "native_copy.log";
 
-pub const PROPOSAL_CTOR_RVA: u32 = 0x004c_6870;
-pub const PROPOSAL_DTOR_RVA: u32 = 0x0048_e220;
-pub const PROPOSAL_COPY_RVA: u32 = 0x004c_6640;
-pub const PROPOSAL_ASSIGN_RVA: u32 = 0x004c_ed30;
+/// The first bytes of the four `Proposal` functions (their places: `build_table::EngineFns`), the same in 40420 and 40423.
 pub const PROPOSAL_CTOR_BYTES: [u8; 23] = [
     0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec,
     0x30, 0x48, 0x8b, 0xf9,
@@ -72,26 +69,29 @@ pub struct ProposalFns {
 }
 
 impl ProposalFns {
-    /// The functions of the running game, after their first bytes are compared with build 40420's.
+    /// The functions of the running game at the build table's places, after their first bytes are compared.
     #[cfg(windows)]
-    pub fn at(base: usize) -> Result<ProposalFns, String> {
-        let check = |rva: u32, want: &[u8], what: &str| -> Result<(), String> {
+    pub fn at(base: usize, engine: &crate::build_table::EngineFns) -> Result<ProposalFns, String> {
+        let check = |rva: Option<u32>, want: &[u8], what: &str| -> Result<usize, String> {
+            let rva = crate::build_table::engine_rva(rva, what)?;
             let got = crate::dump::LiveMem
                 .read(base + rva as usize, want.len())
                 .ok_or_else(|| format!("{what} at {rva:#x} is not readable"))?;
-            (got == want).then_some(()).ok_or_else(|| format!("{what} at {rva:#x} does not have the expected bytes"))
+            (got == want)
+                .then_some(base + rva as usize)
+                .ok_or_else(|| format!("{what} at {rva:#x} does not have the expected bytes"))
         };
-        check(PROPOSAL_CTOR_RVA, &PROPOSAL_CTOR_BYTES, "Proposal::Proposal()")?;
-        check(PROPOSAL_DTOR_RVA, &PROPOSAL_DTOR_BYTES, "Proposal::~Proposal()")?;
-        check(PROPOSAL_COPY_RVA, &PROPOSAL_COPY_BYTES, "Proposal::Proposal(const Proposal&)")?;
-        check(PROPOSAL_ASSIGN_RVA, &PROPOSAL_ASSIGN_BYTES, "Proposal::operator=(const Proposal&)")?;
-        // SAFETY: the three addresses were just compared with the prologues of the engine functions of those signatures.
+        let ctor = check(engine.proposal_ctor, &PROPOSAL_CTOR_BYTES, "Proposal::Proposal()")?;
+        let dtor = check(engine.proposal_dtor, &PROPOSAL_DTOR_BYTES, "Proposal::~Proposal()")?;
+        let copy = check(engine.proposal_copy, &PROPOSAL_COPY_BYTES, "Proposal::Proposal(const Proposal&)")?;
+        let assign = check(engine.proposal_assign, &PROPOSAL_ASSIGN_BYTES, "Proposal::operator=(const Proposal&)")?;
+        // SAFETY: the four addresses were just compared with the prologues of the engine functions of those signatures.
         unsafe {
             Ok(ProposalFns {
-                ctor: core::mem::transmute::<usize, CtorFn>(base + PROPOSAL_CTOR_RVA as usize),
-                dtor: core::mem::transmute::<usize, DtorFn>(base + PROPOSAL_DTOR_RVA as usize),
-                copy: core::mem::transmute::<usize, CopyFn>(base + PROPOSAL_COPY_RVA as usize),
-                assign: core::mem::transmute::<usize, CopyFn>(base + PROPOSAL_ASSIGN_RVA as usize),
+                ctor: core::mem::transmute::<usize, CtorFn>(ctor),
+                dtor: core::mem::transmute::<usize, DtorFn>(dtor),
+                copy: core::mem::transmute::<usize, CopyFn>(copy),
+                assign: core::mem::transmute::<usize, CopyFn>(assign),
             })
         }
     }
@@ -1002,8 +1002,13 @@ mod tests {
     fn the_engine_functions_are_used_only_where_the_expected_bytes_are() {
         let mut image = vec![0u8; 0x80];
         // all three prologues in one buffer at their RVA distances is impossible; check the refusal and the byte tables
-        let base = (image.as_mut_ptr() as usize).wrapping_sub(PROPOSAL_CTOR_RVA as usize);
-        assert!(ProposalFns::at(base).is_err(), "zeroes are not the constructor");
+        let engine = &crate::build_table::select(0x6ac5_0427).unwrap().engine;
+        let base = (image.as_mut_ptr() as usize).wrapping_sub(engine.proposal_ctor.unwrap() as usize);
+        assert!(ProposalFns::at(base, engine).is_err(), "zeroes are not the constructor");
+        assert!(ProposalFns::at(base, &crate::build_table::EngineFns::NONE)
+            .err()
+            .unwrap()
+            .contains("not in the build table"));
         assert_eq!(PROPOSAL_CTOR_BYTES.len(), 23);
         assert_eq!(PROPOSAL_DTOR_BYTES.len(), 20);
         assert_eq!(PROPOSAL_COPY_BYTES.len(), 24);

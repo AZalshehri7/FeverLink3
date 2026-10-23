@@ -66,7 +66,7 @@ T.MSG = {
 	game_cannot_sync = { "error",
 		"Your game cannot stay in sync with the other players. Leave the session and restart the game.",
 		"{who}'s game cannot stay in sync with the others. {who} needs to leave the session and restart the game." },
-	-- another mod changed the world with its own command, which is not shared (the bridge's simForeignSeen); {what} = T.foreignWhat
+	-- another mod changed the world with its own command, which cannot be shared (the bridge's simForeign); {what} = the mod's own name (Hud.modName)
 	foreign_mod_change = { "warn",
 		"Another mod ({what}) changes the world on its own. FeverLink3 cannot share that yet, so the games may need extra syncs. " ..
 		"Turn off its automatic changes while playing together." },
@@ -133,22 +133,6 @@ function T.thing(name)
 	local s = name:gsub("^make", ""):gsub("Cmd$", "")
 	s = s:gsub("(%l)(%u)", "%1 %2"):lower()
 	return #s > 0 and s or "action"
-end
-
--- What another mod's own command did ({what} of foreign_mod_change), with the mod's name when it is known:
--- ("auto line namer", "makeEntitySetNameCmd") -> "auto line namer: it renamed something"
-T.FOREIGN_DID = {
-	makeEntitySetNameCmd = "renamed something",
-	makeEntitySetColorCmd = "recoloured something",
-	makeWorldBuildProposalCmd = "built something",
-}
-
-function T.foreignWhat(mod, kind)
-	local did = T.FOREIGN_DID[tostring(kind)]
-	if not did then
-		did = tostring(kind):find("^make") and ("changed something (" .. T.thing(kind) .. ")") or "changed something"
-	end
-	return (mod and (tostring(mod) .. ": ") or "") .. "it " .. did
 end
 
 local function fill(text, args)

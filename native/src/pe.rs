@@ -59,6 +59,31 @@ pub fn parse(image: &[u8]) -> Option<Headers> {
     Some(Headers { timestamp, size_of_headers, sections: out })
 }
 
+/// The game's own build number in its read-only data: `transportfever3`, `64-bit` and the digits follow each other there, each
+/// ended by NULs (the same place `tools/addr/find_sites.py` reads it from). `None` when the bytes do not hold it.
+pub fn build_number(rdata: &[u8]) -> Option<String> {
+    const TAG: &[u8] = b"transportfever3\0";
+    let mut from = 0;
+    while let Some(at) = rdata.get(from..)?.windows(TAG.len()).position(|w| w == TAG) {
+        let skip_nul = |mut i: usize| {
+            while rdata.get(i) == Some(&0) {
+                i += 1;
+            }
+            i
+        };
+        let mut i = skip_nul(from + at + TAG.len());
+        if rdata.get(i..i + 7) == Some(b"64-bit\0") {
+            i = skip_nul(i + 7);
+            let digits: Vec<u8> = rdata[i..].iter().take(9).take_while(|c| c.is_ascii_digit()).copied().collect();
+            if (4..=8).contains(&digits.len()) && rdata.get(i + digits.len()) == Some(&0) {
+                return String::from_utf8(digits).ok();
+            }
+        }
+        from += at + 1;
+    }
+    None
+}
+
 /// Reads the headers of a mapped image.
 ///
 /// # Safety
@@ -123,6 +148,14 @@ mod tests {
         let text = h.section(".text").unwrap();
         assert_eq!((text.rva, text.size), (0x1000, 0x2f0_0000));
         assert!(h.section(".data").is_none());
+    }
+
+    #[test]
+    fn reads_the_game_build_number_from_its_data() {
+        let data = b"xx transportfever3\0 transportfever3\0\0\0\x0064-bit\0\0\x0040423\0tail";
+        assert_eq!(build_number(data).as_deref(), Some("40423"));
+        assert_eq!(build_number(b"transportfever3\0\x0064-bit\0abc\0"), None);
+        assert_eq!(build_number(b"nothing here"), None);
     }
 
     #[test]

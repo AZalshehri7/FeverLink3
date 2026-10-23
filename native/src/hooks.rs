@@ -1582,7 +1582,7 @@ pub fn attach(build: &'static BuildAddrs, cfg: HookConfig, link: Option<Link>, l
     }
     // diagnostic, off unless FEVERLINK3_ID_TRACE=1
     let ids_dir = link.as_ref().map(|l| l.dir.clone()).or_else(feverlink3_launcher::live::live_dir);
-    crate::ids::install(build.name, base, ids_dir, log);
+    crate::ids::install(build, base, ids_dir, log);
     attach_at(base, build, cfg, link, log);
 }
 
@@ -1974,6 +1974,8 @@ mod tests {
             fire_done_calls: &[],
             kind_offset: Some(0x9b8),
             kinds: &[("build_proposal", 52)],
+            engine: crate::build_table::EngineFns::NONE,
+            layout: None,
         }))
     }
 

@@ -176,22 +176,54 @@ class NativeCaptureTest(unittest.TestCase):
         self.assertNotIn("a script's command", self.B.log())
         self.assertEqual(self.B.shipped_count(), 0)
 
-    def test_another_mods_own_rename_still_reaches_the_engine_and_the_player_is_warned_once(self):
+    def test_another_mods_own_commands_run_on_the_host_and_its_window_events_reach_every_game_at_the_stamp(self):
         # friend test 0.2.0 (2026-10-21): the Auto Line Namer renamed lines with its own sendCommand on each game, never shared, and the
-        # names drifted into resyncs. Warn only: the command still goes to the engine as before, the player is told once, every one logged.
-        self.B.run("RENAMES = 0; SIM_ENV.api.cmd.makeEntitySetNameCmd = function(...) return { __cmd = 'makeEntitySetNameCmd', args = { n = select('#', ...), ... } } end\n"
-                   "local base = EXECUTE; function EXECUTE(c, cb) if c.__cmd == 'makeEntitySetNameCmd' then RENAMES = RENAMES + 1; return end; return base(c, cb) end")
+        # names drifted into resyncs. Option A (owner 2026-10-23): a mod's command the codecs know is captured on the HOST and applied on
+        # every game at the stamp; the other games drop their copy's. A kind no codec knows still goes to the engine, with one warning.
+        for g in (self.A, self.B):
+            g.run("RENAMES, ODD = {}, 0; WORLD[58] = { LINE = { stops = {} } }\n"
+                  "for _, n in ipairs({ 'makeEntitySetNameCmd', 'makeOddModCmd' }) do SIM_ENV.api.cmd[n] = function(...) return { __cmd = n, args = { n = select('#', ...), ... } } end end\n"
+                  "local base = EXECUTE; function EXECUTE(c, cb) if c.__cmd == 'makeEntitySetNameCmd' then RENAMES[#RENAMES + 1] = c.args[2] .. '@' .. GAME.time; return end\n"
+                  "  if c.__cmd == 'makeOddModCmd' then ODD = ODD + 1; return end; return base(c, cb) end")
+            g.L.globals().HOOK_SRC = T.HOOK_SRC
         self.B.L.execute(T.FIND_UP)
+        # the mod's own information names it (Mod.GameModDesc of the documented mod repository), not a list of ours
+        self.B.run("local rep = {}; function rep:getInstalledMods() return { { name = 'urbangames_x' }, { name = 'aln_1' } } end\n"
+                   "function rep:getGameModDesc(id) return id.name == 'aln_1' and { modhubModId = '6414403', name = 'Auto Line Namer' } or { modhubModId = '', name = 'X' } end\n"
+                   "local profile = {}; function profile:getModRep() return rep end; app.getUserProfile = function() return profile end")
         self.start()
-        aln = 'local api = SIM_ENV.api; api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(58, "Bus 1-2-IC-1"))'
         src = "@C:/Users/Public/mod.io/10640/mods/6414403/content/auto_line_namer/aln.script.lua"
+
+        def mod(g, code, where="SIM_ENV.api"):
+            g.run("assert(load(%s, %s, 't', setmetatable({ api = %s }, { __index = _G })))()" % (T.lua_str(code), T.lua_str(src), where))
+
+        renames = "table.concat(RENAMES, ',')"
+        for g, name in ((self.A, "Host 1"), (self.B, "Guest 1")):   # every game's copy of the mod sends: only the host's counts
+            mod(g, 'api.cmd.sendCommand(api.cmd.makeEntitySetNameCmd(58, "%s"), function(res, ok) _G.MOD_CB = ok end)' % name)
+        self.assertEqual((self.A.lua(renames), self.B.lua(renames)), ("", ""), "sent nowhere at once")
+        self.tick(16)
+        self.assertEqual(self.A.lua(renames), self.B.lua(renames), "one rename, in the same step on both games")
+        self.assertEqual((self.A.lua("MOD_CB"), self.B.lua("MOD_CB")), (True, None), "the host's copy hears its stamp apply; a dropped one nothing")
+        self.assertTrue(self.A.lua(renames).startswith("Host 1@") and "," not in self.A.lua(renames), self.A.lua(renames))
+        self.assertIn("another mod's command is shared: kind=makeEntitySetNameCmd mod=6414403", self.A.log())
+        self.assertIn("another mod's command is dropped here: kind=makeEntitySetNameCmd mod=6414403", self.B.log())
+        # a kind no codec knows goes to the engine as before, and the player is told once
         for _ in range(2):
-            self.B.run("assert(load(%s, %s, 't', setmetatable({}, { __index = _G })))()" % (T.lua_str(aln), T.lua_str(src)))
+            mod(self.B, "api.cmd.sendCommand(api.cmd.makeOddModCmd(58))")
             self.tick(2)
-        self.assertEqual(int(self.B.lua("RENAMES")), 2, "both renames reached the engine")
-        self.assertEqual(self.B.log().count("kind=makeEntitySetNameCmd source=@C:/Users/Public/mod.io"), 2, self.B.log())
+        self.assertEqual((int(self.A.lua("ODD")), int(self.B.lua("ODD"))), (0, 2))
+        self.assertEqual(self.B.log().count("kind=an unknown command source=@C:/Users/Public/mod.io"), 2, self.B.log())   # not in the codec: its factory is not wrapped
         notes = self.B.lua("(function() local t = {}; for _, n in ipairs(FIND_UP('G').hud.notices or {}) do t[#t + 1] = n.level .. ' ' .. n.text end; return table.concat(t, '\\n') end)()")
-        self.assertEqual(notes.count("warn Another mod (auto line namer: it renamed something) changes the world on its own."), 1, notes)
+        self.assertEqual(notes.count("warn Another mod (Auto Line Namer) changes the world on its own."), 1, notes)
+        # the mod's window sends a setting to its game script (Auto Color Lines' setRules): every game gets it at the stamp; one that is
+        # not plain data stays on the clicking game as before
+        self.B.run("if not UI_HOOK then UI_HOOK_NEW() end")
+        mod(self.B, 'api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "acl", "setRules", { rules = { { cargo = "COAL", color = { 1, 0, 0 } } } }))', "UI_HOOK.api")
+        mod(self.B, 'api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "acl", "odd", { f = print }))', "UI_HOOK.api")
+        self.tick(16)
+        self.assertEqual((self.A.events_seen("acl"), self.B.events_seen("acl")), (1, 2), self.B.log())
+        self.assertIn("another mod's event acl/setRules (mod=6414403) is shared", self.B.log())
+        self.assertIn("another mod's event acl/odd (mod=6414403) stays on this game unshared", self.B.log())
 
     def test_a_scripts_build_callback_runs_when_the_other_simulation_state_applies_it_at_the_stamp(self):
         # The real game shares one game's steps between two simulation Lua states (the mock's SIM_SPLIT). A script's build is taken in the

@@ -1,0 +1,444 @@
+FeverLink3 port tool: tools/addr/port_build.py
+old 0x6ac50427 build 40420  ->  new 0x6ad0e4e5 build 40423
+====================================================================================================
+command_list_add  [func]  old 0x9d4040
+  whole function exact (0x35d bytes), one match
+  - 13 call(s) checked one level deep: every callee starts with the same code
+  new 0x9d9140  (shift +0x5100)
+  bytes (18): 40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 98  same as the old outside relocations
+====================================================================================================
+apply_command  [func]  old 0x9e33b0
+  whole function exact (0x36e bytes), one match
+  - 14 call(s) checked one level deep: every callee starts with the same code
+  new 0x9e84b0  (shift +0x5100)
+  bytes (14): 48 89 5C 24 18 48 89 74 24 20 55 57 41 54  same as the old outside relocations
+====================================================================================================
+town_seed  [func]  old 0x8d4270
+  whole function exact (0x1cd bytes), one match
+  - 3 call(s) checked one level deep: every callee starts with the same code
+  new 0x8d9380  (shift +0x5110)
+  bytes (20): 48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 48 89 4C 24 08  same as the old outside relocations
+====================================================================================================
+town_develop  [func]  old 0x8de0b0
+  whole function exact (0x1b79 bytes), one match
+  - 143 call(s) checked one level deep: every callee starts with the same code
+  new 0x8e31c0  (shift +0x5110)
+  bytes (15): 44 89 44 24 18 55 53 56 57 41 54 41 55 41 56  same as the old outside relocations
+====================================================================================================
+script_convert  [func]  old 0x10c6750
+  whole function exact (0x16ea bytes), one match
+  - 124 call(s) checked one level deep: every callee starts with the same code
+  new 0x10cd5a0  (shift +0x6e50)
+  bytes (14): 48 8B C4 53 56 57 41 54 41 55 41 56 41 57  same as the old outside relocations
+====================================================================================================
+convert_update  [func]  old 0x10c6020
+  whole function exact (0x4e3 bytes), one match
+  - 37 call(s) checked one level deep: every callee starts with the same code
+  new 0x10cce70  (shift +0x6e50)
+  bytes (14): 48 89 5C 24 08 55 56 57 41 54 41 55 41 56  same as the old outside relocations
+====================================================================================================
+preview_event  [func]  old 0xf44c00
+  whole function exact (0x1a4 bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0xf4ba50  (shift +0x6e50)
+  bytes (14): 48 89 5C 24 08 48 89 74 24 10 55 57 41 56  same as the old outside relocations
+====================================================================================================
+preview_owner  [call]  old 0x64cb41
+  whole function shape (structure offsets moved) (0x596a bytes), one match; the site keeps its offset +0x4e91
+  - host function: 567 displacement(s) moved (old 0x4b0 and up), by +0x228 x567
+  - callee: old 0x642dc0, the new call leads to 0x643c40; bytes (15) 48 C7 41 38 00 00 00 00 48 8D 05 59 14 0A 03 same as the old outside relocations
+  - callee by its own body: whole function exact (0x2d bytes), 37 copies; the one at the shift of its neighbours (0x642b60+0xe80, 0x643390+0xe80)
+  - listener call operator (vtable slot 2): old 0x666420, new 0x6671b0; whole function shape (structure offsets moved) (0x134 bytes), one match
+  - offset y_a: 0x18 -> 0x18
+  - offset y_b: 0xc8 -> 0xc8
+  - offset r_c: 0x18 -> 0x18
+  - offset r_dispatcher: 0x1d8 -> 0x1d8
+  - offset ui_e: 0xb98 -> 0xdc0
+  - the listener calls preview_event (0xf4ba50): yes
+  new 0x64d9c1  (shift +0xe80)
+====================================================================================================
+town_update_size  [func]  old 0x9e12b0
+  whole function exact (0x1d8 bytes), one match
+  - 14 call(s) checked one level deep: every callee starts with the same code
+  new 0x9e63b0  (shift +0x5100)
+  bytes (15): 40 53 55 56 57 41 54 41 56 41 57 48 83 EC 50  same as the old outside relocations
+====================================================================================================
+town_candidates  [func]  old 0x9677c0
+  whole function exact (0x4cd bytes), one match
+  - 12 call(s) checked one level deep: every callee starts with the same code
+  new 0x96c8c0  (shift +0x5100)
+  bytes (14): 48 89 5C 24 10 C5 FA 11 54 24 18 55 56 57  same as the old outside relocations
+====================================================================================================
+town_edges  [func]  old 0x95d100
+  whole function exact (0x14fa bytes), one match
+  - 69 call(s) checked one level deep: every callee starts with the same code
+  new 0x962200  (shift +0x5100)
+  bytes (14): 48 8B C4 48 89 58 08 55 56 57 41 54 41 55  same as the old outside relocations
+====================================================================================================
+town_sort_call  [call]  old 0x967c16
+  whole function exact (0x4cd bytes), one match; the site keeps its offset +0x456
+  - callee: old 0x966150, the new call leads to 0x96b250; bytes (16) 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 same as the old outside relocations
+  - callee by its own body: whole function exact (0x183 bytes), one match
+  new 0x96cd16  (shift +0x5100)
+====================================================================================================
+town_pick_call  [call]  old 0x95d627
+  whole function exact (0x14fa bytes), one match; the site keeps its offset +0x527
+  - callee: old 0x3055870, the new call leads to 0x306afc0; bytes (16) 48 83 EC 28 45 8D 48 FF 41 3B D1 7F 14 44 8B C2 same as the old outside relocations
+  - callee by its own body: whole function exact (0x42 bytes), one match
+  new 0x962727  (shift +0x5100)
+====================================================================================================
+town_field_call  [call]  old 0x96962e
+  whole function exact (0x810 bytes), one match; the site keeps its offset +0x4ee
+  - callee: old 0x2b7a1b0, the new call leads to 0x2b81850; bytes (18) 40 55 56 41 54 41 55 41 56 41 57 48 81 EC 98 00 00 00 same as the old outside relocations
+  - callee by its own body: whole function exact (0x219 bytes), one match
+  new 0x96e72e  (shift +0x5100)
+====================================================================================================
+batch_pace  [call]  old 0x11f446
+  whole function exact (0x157 bytes), one match; the site keeps its offset +0x56
+  - callee: old 0x11f690, the new call leads to 0x11f6a0; bytes (16) 48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 same as the old outside relocations
+  - callee by its own body: whole function exact (0x574 bytes), one match
+  new 0x11f456  (shift +0x10)
+====================================================================================================
+free_order  [call]  old 0x2bba103
+  whole function exact (0x3af bytes), one match; the site keeps its offset +0x263
+  - callee: old 0x2bb62a0, the new call leads to 0x2bbdbc0; bytes (18) 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 same as the old outside relocations
+  - callee by its own body: whole function exact (0x2d5 bytes), one match
+  new 0x2bc1a23  (shift +0x7920)
+====================================================================================================
+game_time_getter  [func]  old 0x2a96c0
+  whole function exact (0x1b bytes), one match
+  - 1 call(s) checked one level deep: every callee starts with the same code
+  new 0x2a96e0  (shift +0x20)
+  bytes (14): 48 83 EC 28 48 8B 41 10 48 8B 49 08 8B 10  same as the old outside relocations
+====================================================================================================
+tick_count_getter  [func]  old 0x2a9600
+  whole function exact (0x1b bytes), one match
+  - 1 call(s) checked one level deep: every callee starts with the same code
+  new 0x2a9620  (shift +0x20)
+  bytes (27): 48 83 EC 28 48 8B 41 10 48 8B 49 08 8B 10 E8 9D AF E9 FF 8B 40 3C 48 83 C4 28 C3  same as the old outside relocations
+====================================================================================================
+script_pool  [inside]  old 0xab00fc
+  whole function exact (0x272 bytes), one match; the site keeps its offset +0xac
+  new 0xab528c  (shift +0x5190)
+  bytes (22): 83 F8 08 0F 8D 25 01 00 00 C7 44 24 20 01 00 00 00 E8 7E 2A 5B 02  same as the old outside relocations
+====================================================================================================
+lua_makeseed  [func]  old 0x2fc8fe0
+  whole function exact (0x70 bytes), one match
+  - 2 call(s) checked one level deep: every callee starts with the same code
+  new 0x2fde370  (shift +0x15390)
+  bytes (26): 40 53 48 83 EC 50 48 8B 05 DB 96 D2 00 48 33 C4 48 89 44 24 48 48 8B D9 33 C9  same as the old outside relocations
+====================================================================================================
+command_move  [func]  old 0x9d0430
+  whole function exact (0x5b bytes), one match
+  - 0 call(s) checked one level deep: every callee starts with the same code
+  new 0x9d5530  (shift +0x5100)
+  bytes (16): 48 8B 02 45 33 D2 4C 89 12 48 89 01 48 8B 42 08  same as the old outside relocations
+====================================================================================================
+command_destroy  [func]  old 0x9d0670
+  whole function exact (0xae bytes), one match
+  - 2 call(s) checked one level deep: every callee starts with the same code
+  new 0x9d5770  (shift +0x5100)
+  bytes (16): 40 53 48 83 EC 20 48 8B D9 48 8B 49 28 48 85 C9  same as the old outside relocations
+====================================================================================================
+handle_destroy  [func]  old 0x3040c90
+  whole function exact (0x44 bytes), one match
+  - 0 call(s) checked one level deep: every callee starts with the same code
+  new 0x30563e0  (shift +0x15750)
+  bytes (18): 40 53 48 83 EC 20 48 8B 19 48 85 DB 74 30 48 8B 4B 08  same as the old outside relocations
+====================================================================================================
+ui_add_sites[0]  [ret]  old 0x4d396f
+  whole function shape (structure offsets moved) (0x4dd bytes), one match; the site keeps its offset +0x3da
+  - host function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the call leads to 0x9d9140
+  new 0x4d479f  (shift +0xe30)
+====================================================================================================
+ui_add_sites[1]  [ret]  old 0x51b56c
+  whole function shape (structure offsets moved) (0x934 bytes), one match; the site keeps its offset +0x557
+  - host function: 2 displacement(s) moved (old 0x700 and up), by +0x228 x2
+  - the call leads to 0x9d9140
+  new 0x51c3ac  (shift +0xe40)
+====================================================================================================
+ui_add_sites[2]  [ret]  old 0x528504
+  whole function shape (structure offsets moved) (0x6ab bytes), one match; the site keeps its offset +0x37f
+  - host function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the call leads to 0x9d9140
+  new 0x529334  (shift +0xe30)
+====================================================================================================
+ui_add_sites[3]  [ret]  old 0x537ee5
+  whole function shape (structure offsets moved) (0x139b bytes), one match; the site keeps its offset +0x8e0
+  - host function: 5 displacement(s) moved (old 0x4b8 and up), by +0x228 x5
+  - the call leads to 0x9d9140
+  new 0x538d15  (shift +0xe30)
+====================================================================================================
+ui_add_sites[4]  [ret]  old 0x538649
+  whole function shape (structure offsets moved) (0x139b bytes), one match; the site keeps its offset +0x1044
+  - host function: 5 displacement(s) moved (old 0x4b8 and up), by +0x228 x5
+  - the call leads to 0x9d9140
+  new 0x539479  (shift +0xe30)
+====================================================================================================
+ui_add_sites[5]  [ret]  old 0x5387cd
+  whole function shape (structure offsets moved) (0x139b bytes), one match; the site keeps its offset +0x11c8
+  - host function: 5 displacement(s) moved (old 0x4b8 and up), by +0x228 x5
+  - the call leads to 0x9d9140
+  new 0x5395fd  (shift +0xe30)
+====================================================================================================
+ui_add_sites[6]  [ret]  old 0x542eba
+  whole function shape (structure offsets moved) (0x74a bytes), one match; the site keeps its offset +0x4f5
+  - host function: 2 displacement(s) moved (old 0x700 and up), by +0x228 x2
+  - the call leads to 0x9d9140
+  new 0x543cea  (shift +0xe30)
+====================================================================================================
+ui_add_sites[7]  [ret]  old 0x5891b4
+  whole function shape (structure offsets moved) (0x780 bytes), one match; the site keeps its offset +0x54f
+  - host function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the call leads to 0x9d9140
+  new 0x589fc4  (shift +0xe10)
+====================================================================================================
+ui_add_sites[8]  [ret]  old 0x5948dd
+  whole function shape (structure offsets moved) (0x7fb bytes), one match; the site keeps its offset +0x598
+  - host function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the call leads to 0x9d9140
+  new 0x5956ed  (shift +0xe10)
+====================================================================================================
+ui_add_sites[9]  [ret]  old 0x5bf08d
+  whole function shape (structure offsets moved) (0x63a bytes), one match; the site keeps its offset +0x428
+  - host function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the call leads to 0x9d9140
+  new 0x5bfe9d  (shift +0xe10)
+====================================================================================================
+ui_add_sites[10]  [ret]  old 0x28a3024
+  whole function exact (0x3a2 bytes), one match; the site keeps its offset +0x2cf
+  - the call leads to 0x9d9140
+  new 0x28aa534  (shift +0x7510)
+====================================================================================================
+ui_add_sites[11]  [ret]  old 0x28a3871
+  whole function exact (0x392 bytes), one match; the site keeps its offset +0x2cc
+  - the call leads to 0x9d9140
+  new 0x28aad81  (shift +0x7510)
+====================================================================================================
+fire_done_calls[0]  [slot]  old 0x4d8860
+  slot 2 (_Do_call) of the vtable the tool function 0x4d3590 loads at +0x20a; tool function: whole function shape (structure offsets moved) (0x4dd bytes), one match
+  - tool function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the callback itself: whole function exact (0x51 bytes), one match
+  new 0x4d9690  (shift +0xe30)
+====================================================================================================
+fire_done_calls[1]  [slot]  old 0x58c0b0
+  slot 2 (_Do_call) of the vtable the tool function 0x588c60 loads at +0x394; tool function: whole function shape (structure offsets moved) (0x780 bytes), one match
+  - tool function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the callback itself: whole function exact (0x9 bytes), 1849 copies; the one at the shift of its neighbours (0x58bf30+0xe10, 0x58c140+0xe10)
+  new 0x58cec0  (shift +0xe10)
+====================================================================================================
+fire_done_calls[2]  [slot]  old 0x596a70
+  slot 2 (_Do_call) of the vtable the tool function 0x594340 loads at +0x3dc; tool function: whole function shape (structure offsets moved) (0x7fb bytes), one match
+  - tool function: 1 displacement(s) moved (old 0x700 and up), by +0x228 x1
+  - the callback itself: whole function exact (0x11a bytes), one match
+  new 0x597880  (shift +0xe10)
+====================================================================================================
+proposal_ctor  [func]  old 0x4c6870
+  whole function exact (0x194 bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c76a0  (shift +0xe30)
+  bytes (23): 48 89 5C 24 18 48 89 74 24 20 48 89 4C 24 08 57 48 83 EC 30 48 8B F9  same as the old outside relocations
+====================================================================================================
+proposal_dtor  [func]  old 0x48e220
+  whole function exact (0x141 bytes), one match
+  - 9 call(s) checked one level deep: every callee starts with the same code
+  new 0x48f050  (shift +0xe30)
+  bytes (20): 48 89 5C 24 08 57 48 83 EC 20 48 8B F9 48 81 C1 D8 02 00 00  same as the old outside relocations
+====================================================================================================
+proposal_copy  [func]  old 0x4c6640
+  whole function exact (0x22b bytes), one match
+  - 14 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c7470  (shift +0xe30)
+  bytes (24): 48 89 5C 24 18 48 89 6C 24 20 48 89 4C 24 08 56 57 41 54 41 56 41 57 48  same as the old outside relocations
+====================================================================================================
+proposal_assign  [func]  old 0x4ced30
+  whole function exact (0x2af bytes), one match
+  - 16 call(s) checked one level deep: every callee starts with the same code
+  new 0x4cfb60  (shift +0xe30)
+  bytes (24): 48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 20 48 8B F2 48 8B F9  same as the old outside relocations
+====================================================================================================
+engine_new  [func]  old 0x318c530
+  whole function exact (0x3c bytes), one match
+  - 4 call(s) checked one level deep: every callee starts with the same code
+  new 0x31a1c80  (shift +0x15750)
+  bytes (11): 40 53 48 83 EC 20 48 8B D9 EB 0F  same as the old outside relocations
+====================================================================================================
+engine_delete  [func]  old 0x318c56c
+  whole function exact (0x5 bytes), 148254 copies; the one at the shift of its neighbours (0x318c530+0x15750, 0x318c5b8+0x15750)
+  - 0 call(s) checked one level deep: every callee starts with the same code
+  new 0x31a1cbc  (shift +0x15750)
+  bytes (5): E9 FF 06 00 00  same as the old outside relocations
+====================================================================================================
+refund_insert  [func]  old 0x4be210
+  whole function exact (0x277 bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0x4bf040  (shift +0xe30)
+  bytes (234): 48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 48 89 4C 24 08 57 41 54 41 55 41 56 41 57 48 83 EC 40 49 8B F8 48 8B DA 4C 8B C1 48 3B D7 0F 84 19 02 00 00 4C 8D 71 08 66 0F 1F 84 00 00 00 00 00 48 8D 53 10 49 8B C8 E8 E4 B1 D6 FF 4C 8B E8 4C 8B 44 24 70 49 23 40 30 48 03 C0 49 8B 48 18 48 8B 74 C1 08 4D 8B 26 49 3B F4 75 08 49 8B F4 49 8B EC EB 2E 48 8B 0C C1 8B 53 10 0F 1F 44 00 00 3B 56 10 75 0C 8B 46 14 39 43 14 0F 84 AF 01 00 00 48 3B F1 74 06 48 8B 76 08 EB E4 4C 8B E6 48 8B EE 48 B8 66 66 66 66 66 66 66 06 49 39 40 10 0F 84 B4 01 00 00 4C 89 74 24 30 48 C7 44 24 38 00 00 00 00 B9 28 00 00 00 E8 72 2B CE 02 4C 8B F0 48 89 44 24 38 C5 F8 10 43 10 C5 F8 11 40 10 C5 FB 10 4B 20 C5 FB 11 48 20  same as the old outside relocations
+====================================================================================================
+add_entity  [func]  old 0x2bb8940
+  whole function exact (0x441 bytes), one match
+  - 14 call(s) checked one level deep: every callee starts with the same code
+  new 0x2bc0260  (shift +0x7920)
+  bytes (15): 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18  same as the old outside relocations
+====================================================================================================
+remove_entity  [func]  old 0x2bbc700
+  whole function exact (0x2ff bytes), one match
+  - 9 call(s) checked one level deep: every callee starts with the same code
+  new 0x2bc4020  (shift +0x7920)
+  bytes (15): 48 89 5C 24 10 44 88 44 24 18 55 56 57 41 54  same as the old outside relocations
+====================================================================================================
+game_time_advance  [func]  old 0xbad780
+  whole function exact (0x214 bytes), one match
+  - 17 call(s) checked one level deep: every callee starts with the same code
+  new 0xbb2970  (shift +0x51f0)
+  bytes (16): 48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57  same as the old outside relocations
+====================================================================================================
+component_lookup  [func]  old 0x1445c0
+  whole function exact (0x99 bytes), 3 copies; the one at the shift of its neighbours (0x144370+0x10, 0x1446a0+0x10)
+  - 2 call(s) checked one level deep: every callee starts with the same code
+  new 0x1445d0  (shift +0x10)
+  bytes (15): 48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20  same as the old outside relocations
+====================================================================================================
+layout:0x4c6640  [func]  old 0x4c6640
+  whole function exact (0x22b bytes), one match
+  - 14 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c7470  (shift +0xe30)
+====================================================================================================
+layout:0x4c6870  [func]  old 0x4c6870
+  whole function exact (0x194 bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c76a0  (shift +0xe30)
+====================================================================================================
+layout:0x48e220  [func]  old 0x48e220
+  whole function exact (0x141 bytes), one match
+  - 9 call(s) checked one level deep: every callee starts with the same code
+  new 0x48f050  (shift +0xe30)
+====================================================================================================
+layout:0x4ced30  [func]  old 0x4ced30
+  whole function exact (0x2af bytes), one match
+  - 16 call(s) checked one level deep: every callee starts with the same code
+  new 0x4cfb60  (shift +0xe30)
+====================================================================================================
+layout:0x4c78c0  [func]  old 0x4c78c0
+  whole function exact (0x3bf bytes), one match
+  - 29 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c86f0  (shift +0xe30)
+====================================================================================================
+layout:0x4bda90  [func]  old 0x4bda90
+  whole function exact (0x272 bytes), one match
+  - 4 call(s) checked one level deep: every callee starts with the same code
+  new 0x4be8c0  (shift +0xe30)
+====================================================================================================
+layout:0x4c31a0  [func]  old 0x4c31a0
+  whole function exact (0x92 bytes), 6 copies; the one at the shift of its neighbours (0x4c2f70+0xe30, 0x4c35a0+0xe30)
+  - 3 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c3fd0  (shift +0xe30)
+====================================================================================================
+layout:0x4bec80  [func]  old 0x4bec80
+  whole function exact (0x289 bytes), one match
+  - 4 call(s) checked one level deep: every callee starts with the same code
+  new 0x4bfab0  (shift +0xe30)
+====================================================================================================
+layout:0x4c1df0  [func]  old 0x4c1df0
+  whole function exact (0x13a bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c2c20  (shift +0xe30)
+====================================================================================================
+layout:0x4bc770  [func]  old 0x4bc770
+  whole function exact (0xa4 bytes), 17 copies; the one at the shift of its neighbours (0x4bc550+0xe30, 0x4bca30+0xe30)
+  - 1 call(s) checked one level deep: every callee starts with the same code
+  new 0x4bd5a0  (shift +0xe30)
+====================================================================================================
+layout:0x4bd1f0  [func]  old 0x4bd1f0
+  whole function exact (0xb5 bytes), one match
+  - 4 call(s) checked one level deep: every callee starts with the same code
+  new 0x4be020  (shift +0xe30)
+====================================================================================================
+layout:0x4c5fa0  [func]  old 0x4c5fa0
+  whole function exact (0x11f bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c6dd0  (shift +0xe30)
+====================================================================================================
+layout:0x63c10  [func]  old 0x63c10
+  whole function exact (0x314 bytes), one match
+  - 9 call(s) checked one level deep: every callee starts with the same code
+  new 0x63c20  (shift +0x10)
+====================================================================================================
+layout:0x4bd430  [func]  old 0x4bd430
+  whole function exact (0xb5 bytes), 4 copies; the one at the shift of its neighbours (0x4bd1f0+0xe30, 0x4bd4f0+0xe30)
+  - 4 call(s) checked one level deep: every callee starts with the same code
+  new 0x4be260  (shift +0xe30)
+====================================================================================================
+layout:0x4c2250  [func]  old 0x4c2250
+  whole function exact (0x6c bytes), one match
+  - 2 call(s) checked one level deep: every callee starts with the same code
+  new 0x4c3080  (shift +0xe30)
+====================================================================================================
+layout:0x284fc0  [func]  old 0x284fc0
+  whole function exact (0xad bytes), one match
+  - 3 call(s) checked one level deep: every callee starts with the same code
+  new 0x284fd0  (shift +0x10)
+====================================================================================================
+layout:0x4bc8d0  [func]  old 0x4bc8d0
+  whole function exact (0xa4 bytes), 17 copies; the one at the shift of its neighbours (0x4bc550+0xe30, 0x4bca30+0xe30)
+  - 1 call(s) checked one level deep: every callee starts with the same code
+  new 0x4bd700  (shift +0xe30)
+====================================================================================================
+layout:0xdf480  [func]  old 0xdf480
+  whole function exact (0xb6 bytes), one match
+  - 3 call(s) checked one level deep: every callee starts with the same code
+  new 0xdf490  (shift +0x10)
+====================================================================================================
+layout:0x4be210  [func]  old 0x4be210
+  whole function exact (0x277 bytes), one match
+  - 5 call(s) checked one level deep: every callee starts with the same code
+  new 0x4bf040  (shift +0xe30)
+====================================================================================================
+layout:0x10c6750  [func]  old 0x10c6750
+  whole function exact (0x16ea bytes), one match
+  - 124 call(s) checked one level deep: every callee starts with the same code
+  new 0x10cd5a0  (shift +0x6e50)
+====================================================================================================
+layout:0x10c6020  [func]  old 0x10c6020
+  whole function exact (0x4e3 bytes), one match
+  - 37 call(s) checked one level deep: every callee starts with the same code
+  new 0x10cce70  (shift +0x6e50)
+====================================================================================================
+layout:0x9e2900  [func]  old 0x9e2900
+  whole function exact (0xa7a bytes), one match
+  - 42 call(s) checked one level deep: every callee starts with the same code
+  new 0x9e7a00  (shift +0x5100)
+====================================================================================================
+layout witnesses: 22 of 22 exact -> the new build uses the layout table of 40420
+
+Rust for native/src/build_table.rs (new build):
+  command_list_add: Some(HookSite { rva: 0x9d9140, prologue: &[0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C, 0x24, 0x98] })
+  apply_command: Some(HookSite { rva: 0x9e84b0, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x54] })
+  town_seed: Some(HookSite { rva: 0x8d9380, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x4C, 0x24, 0x08] })
+  town_develop: Some(HookSite { rva: 0x8e31c0, prologue: &[0x44, 0x89, 0x44, 0x24, 0x18, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56] })
+  script_convert: Some(HookSite { rva: 0x10cd5a0, prologue: &[0x48, 0x8B, 0xC4, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57] })
+  convert_update: Some(HookSite { rva: 0x10cce70, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56] })
+  preview_event: Some(HookSite { rva: 0xf4ba50, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x55, 0x57, 0x41, 0x56] })
+  preview_owner: Some(CallPatchSite { rva: 0x64d9c1, expected: &[0xE8, 0x7A, 0x62, 0xFF, 0xFF], callee: CallSite { rva: 0x643c40, prologue: &[0x48, 0xC7, 0x41, 0x38, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x05, 0x59, 0x14, 0x0A, 0x03] } } y_a: 0x18, y_b: 0xc8, r_c: 0x18, r_dispatcher: 0x1d8, ui_e: 0xdc0)
+  town_update_size: Some(HookSite { rva: 0x9e63b0, prologue: &[0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x50] })
+  town_candidates: Some(HookSite { rva: 0x96c8c0, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x10, 0xC5, 0xFA, 0x11, 0x54, 0x24, 0x18, 0x55, 0x56, 0x57] })
+  town_edges: Some(HookSite { rva: 0x962200, prologue: &[0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55] })
+  town_sort_call: Some(CallPatchSite { rva: 0x96cd16, expected: &[0xE8, 0x35, 0xE5, 0xFF, 0xFF], callee: CallSite { rva: 0x96b250, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57] } })
+  town_pick_call: Some(CallPatchSite { rva: 0x962727, expected: &[0xE8, 0x94, 0x88, 0x70, 0x02], callee: CallSite { rva: 0x306afc0, prologue: &[0x48, 0x83, 0xEC, 0x28, 0x45, 0x8D, 0x48, 0xFF, 0x41, 0x3B, 0xD1, 0x7F, 0x14, 0x44, 0x8B, 0xC2] } })
+  town_field_call: Some(CallPatchSite { rva: 0x96e72e, expected: &[0xE8, 0x1D, 0x31, 0x21, 0x02], callee: CallSite { rva: 0x2b81850, prologue: &[0x40, 0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x98, 0x00, 0x00, 0x00] } })
+  batch_pace: Some(CallPatchSite { rva: 0x11f456, expected: &[0xE8, 0x45, 0x02, 0x00, 0x00], callee: CallSite { rva: 0x11f6a0, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57] } })
+  free_order: Some(CallPatchSite { rva: 0x2bc1a23, expected: &[0xE8, 0x98, 0xC1, 0xFF, 0xFF], callee: CallSite { rva: 0x2bbdbc0, prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x41, 0x54] } })
+  game_time_getter: Some(CallSite { rva: 0x2a96e0, prologue: &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x8B, 0x49, 0x08, 0x8B, 0x10] })
+  tick_count_getter: rva 0x2a9620, expected &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x8B, 0x49, 0x08, 0x8B, 0x10, 0xE8, 0x9D, 0xAF, 0xE9, 0xFF, 0x8B, 0x40, 0x3C, 0x48, 0x83, 0xC4, 0x28, 0xC3]
+  script_pool: rva 0xab528c, expected &[0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xE8, 0x7E, 0x2A, 0x5B, 0x02]
+  lua_makeseed: rva 0x2fde370, expected &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 0xDB, 0x96, 0xD2, 0x00, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x48, 0x48, 0x8B, 0xD9, 0x33, 0xC9]
+  command_move: Some(CallSite { rva: 0x9d5530, prologue: &[0x48, 0x8B, 0x02, 0x45, 0x33, 0xD2, 0x4C, 0x89, 0x12, 0x48, 0x89, 0x01, 0x48, 0x8B, 0x42, 0x08] })
+  command_destroy: Some(CallSite { rva: 0x9d5770, prologue: &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x8B, 0x49, 0x28, 0x48, 0x85, 0xC9] })
+  handle_destroy: Some(CallSite { rva: 0x30563e0, prologue: &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19, 0x48, 0x85, 0xDB, 0x74, 0x30, 0x48, 0x8B, 0x4B, 0x08] })
+  ui_add_sites: &[0x4d479f, 0x51c3ac, 0x529334, 0x538d15, 0x539479, 0x5395fd, 0x543cea, 0x589fc4, 0x5956ed, 0x5bfe9d, 0x28aa534, 0x28aad81]
+  fire_done_calls: &[0x4d9690, 0x58cec0, 0x597880]
+  engine: EngineFns { proposal_ctor: Some(0x4c76a0), proposal_dtor: Some(0x48f050), proposal_copy: Some(0x4c7470), proposal_assign: Some(0x4cfb60), engine_new: Some(0x31a1c80), engine_delete: Some(0x31a1cbc), refund_insert: Some(0x4bf040), add_entity: Some(0x2bc0260), remove_entity: Some(0x2bc4020), game_time_advance: Some(0xbb2970), component_lookup: Some(0x1445d0) }
+  layout: Some("40420")
+
+all sites located

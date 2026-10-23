@@ -39,8 +39,8 @@ impl Runtime {
         // blocks) is neither written nor needed
         let _ = self.inject_settings.set(portable::Settings { graph_skip: &["toAdd"], typed: true, ..settings });
         self.inject.enable();
-        match crate::refund::RefundFns::at(self.base) {
-            Ok(_) => self.say(&format!("native inject: refund (native): the engine's insert of the Context's refundableEntities at {:#x} is verified: an order with refund entries puts them into its command's Context", crate::refund::INSERT_RANGE_RVA)),
+        match crate::refund::RefundFns::at(self.base, &self.build.engine) {
+            Ok(_) => self.say(&format!("native inject: refund (native): the engine's insert of the Context's refundableEntities at {:#x} is verified: an order with refund entries puts them into its command's Context", self.build.engine.refund_insert.unwrap_or(0))),
             Err(e) => self.say(&format!("native inject: refund (native): {e}: an order with refund entries is refused")),
         }
         self.say("native inject: FEVERLINK3_NATIVE_INJECT is on: held commands are also written as native_text_<id>.txt (full portable text), and each inject_next order (queued in the mod's order) makes its own script build_proposal (the one that carries the conversion of the mod's own send; without one seen, the text's place or constructions) take the engine Proposal built from native_inject_<key>.txt (all checks first; a refusal empties the command: nothing of the build is applied on this game)");
@@ -54,9 +54,9 @@ impl Runtime {
     /// the `ready` event then lists `inject_next`.
     pub(super) fn inject_ready(&self) -> bool {
         self.inject.enabled()
-            && self.build.name == portable::LAYOUT_BUILD
-            && nc::ProposalFns::at(self.base).is_ok()
-            && EngineAlloc::at(self.base).is_ok()
+            && self.build.layout_name() == portable::LAYOUT_BUILD
+            && nc::ProposalFns::at(self.base, &self.build.engine).is_ok()
+            && EngineAlloc::at(self.base, &self.build.engine).is_ok()
     }
 
     /// The originator's side: the held command's full portable text, for the mod to ship (`native_text_<id>.txt`). The
@@ -71,8 +71,10 @@ impl Runtime {
         let wall0 = wall_ms();
         // R2: which unnamed bytes of the held command are values and which residue, by a differential engine copy (both copies destroyed)
         crate::log::calls_engine("native inject: residue mask (the engine's copy constructor)");
-        let mask = nc::ProposalFns::at(self.base).and_then(|fns| {
-            nc::residue_mask(&fns, &LiveMem, self.base, settings, self.build.name, payload, &mut |l| self.say(l))
+        let mask = nc::ProposalFns::at(self.base, &self.build.engine).and_then(|fns| {
+            nc::residue_mask(&fns, &LiveMem, self.base, settings, self.build.layout_name(), payload, &mut |l| {
+                self.say(l)
+            })
         });
         let Some(mut job) =
             crate::log::guarded("native inject: text", || self.inject_encode_text(payload, id, settings, t0, mask))
@@ -133,7 +135,7 @@ impl Runtime {
         let ready = crate::log::guarded("native inject: own proof (checks)", || -> Result<_, String> {
             let donor = inj::own_checks(&LiveMem, payload, text)?;
             let fns = self.proposal_fns().map_err(|why| format!("{}{why}", inj::OWN_PROOF))?;
-            let alloc = EngineAlloc::at(self.base)
+            let alloc = EngineAlloc::at(self.base, &self.build.engine)
                 .map_err(|why| format!("{}the game's allocator was not verified: {why}", inj::OWN_PROOF))?;
             Ok((donor, fns, alloc))
         });
@@ -141,11 +143,17 @@ impl Runtime {
             Some(r) => r?,
             None => return Err(format!("{}our own check panicked (the PANIC line in native.log)", inj::OWN_PROOF)),
         };
-        inj::dry_own_proof(&LiveMem, self.base, settings, self.build.name, text, donor)
+        inj::dry_own_proof(&LiveMem, self.base, settings, self.build.layout_name(), text, donor)
             .map_err(|why| format!("{}{why}", inj::OWN_PROOF))?;
         let live = LiveMem;
-        let ctx =
-            nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
+        let ctx = nc::Ctx {
+            fns,
+            alloc: &alloc,
+            mem: &live,
+            base: self.base,
+            set: settings,
+            build_name: self.build.layout_name(),
+        };
         let mut say = |l: &str| self.say(l);
         inj::own_proof(&ctx, &super::cmd_patch::LivePoke, text, donor, &mut say)
     }
@@ -188,8 +196,14 @@ impl Runtime {
         let mask_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let opts = portable::EncodeOpts { collect: None, mask: mask.as_ref().map(|m| &m.mask) };
         let t_enc = std::time::Instant::now();
-        let encoded =
-            portable::encode_with(&live, Env { image_base: self.base }, settings, self.build.name, &head, opts);
+        let encoded = portable::encode_with(
+            &live,
+            Env { image_base: self.base },
+            settings,
+            self.build.layout_name(),
+            &head,
+            opts,
+        );
         let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
         if let Ok(p) = &encoded {
             // every pointer the text could not follow: where it is, where it points (an address is for this log only) and what the
@@ -481,13 +495,15 @@ impl Runtime {
             Some(Ok(_)) if !forced.is_empty() => {
                 Err(format!("forced refusal ({forced}): the test switch FEVERLINK3_DEBUG_REFUSE_INJECT"))
             }
-            Some(Ok(p)) => match inj::dry_build(&LiveMem, self.base, p.settings, self.build.name, &p.text, p.donor) {
-                Err(why) => Err(why),
-                Ok(()) => {
-                    crate::log::calls_engine("native inject (the Proposal functions, operator new)");
-                    self.inject_engine(order.key, dest, p)
+            Some(Ok(p)) => {
+                match inj::dry_build(&LiveMem, self.base, p.settings, self.build.layout_name(), &p.text, p.donor) {
+                    Err(why) => Err(why),
+                    Ok(()) => {
+                        crate::log::calls_engine("native inject (the Proposal functions, operator new)");
+                        self.inject_engine(order.key, dest, p)
+                    }
                 }
-            },
+            }
             Some(Err(why)) => Err(why),
             None => Err(String::new()), // complete_next: the record's own command is this game's stamp apply; nothing to inject
         };
@@ -514,7 +530,7 @@ impl Runtime {
         if let Some(f) = TEST_FNS.with(|t| t.get()) {
             return Ok(f);
         }
-        nc::ProposalFns::at(self.base)
+        nc::ProposalFns::at(self.base, &self.build.engine)
     }
 
     /// Empties the command a refused order was used for (`inject::neutralise`): what became of it. Calls the engine: never inside a guard
@@ -838,16 +854,16 @@ impl Runtime {
                 }
             })?;
         // from here on the command is the mod's placeholder for this order: a refusal empties it
-        if self.build.name != portable::LAYOUT_BUILD {
+        if self.build.layout_name() != portable::LAYOUT_BUILD {
             return Err(format!(
                 "the layout is that of game build {}, this is {}",
                 portable::LAYOUT_BUILD,
-                self.build.name
+                self.build.layout_name()
             ));
         }
         let fns = self.proposal_fns()?;
-        let alloc =
-            EngineAlloc::at(self.base).map_err(|why| format!("the game's allocator was not verified: {why}"))?;
+        let alloc = EngineAlloc::at(self.base, &self.build.engine)
+            .map_err(|why| format!("the game's allocator was not verified: {why}"))?;
         let donor = counts.iter().any(|&n| n > 0).then_some(dest);
         let refund = if refund > 0 { Some(self.refund_job(key, refund, &dir, dest)?) } else { None };
         let window = crate::refund::window_of(&text).map_err(|e| format!("refund: {e}"))?;
@@ -873,7 +889,7 @@ impl Runtime {
         if let Some(f) = TEST_REFUND_FNS.with(|t| t.get()) {
             return Ok(f);
         }
-        crate::refund::RefundFns::at(self.base)
+        crate::refund::RefundFns::at(self.base, &self.build.engine)
     }
 
     /// The engine part of the refund: the engine's insert into the command's Context container, then the read-back (guarded). The
@@ -912,8 +928,14 @@ impl Runtime {
     fn inject_engine(&self, key: u64, dest: usize, p: Prepared) -> Result<(u64, u64, u64), String> {
         let Prepared { fns, alloc, settings, dir, text, donor, refund, window } = p;
         let live = LiveMem;
-        let ctx =
-            nc::Ctx { fns, alloc: &alloc, mem: &live, base: self.base, set: settings, build_name: self.build.name };
+        let ctx = nc::Ctx {
+            fns,
+            alloc: &alloc,
+            mem: &live,
+            base: self.base,
+            set: settings,
+            build_name: self.build.layout_name(),
+        };
         let mut say = |l: &str| self.say(l);
         let built = inj::build_verified(&ctx, &super::cmd_patch::LivePoke, &text, donor, &mut say);
         alloc.free_all();
@@ -979,7 +1001,8 @@ impl Runtime {
                 wall_ms: 0,
                 payload,
             };
-            portable::encode(&live, Env { image_base: self.base }, settings, self.build.name, &head).map(|p| p.text)
+            portable::encode(&live, Env { image_base: self.base }, settings, self.build.layout_name(), &head)
+                .map(|p| p.text)
         };
         let write = |name: String, body: &str| match std::fs::write(dir.join(&name), body) {
             Ok(()) => self.say(&format!("native inject: key {key}: wrote {name} ({} bytes)", body.len())),

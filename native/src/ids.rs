@@ -53,14 +53,13 @@ pub const STEP: u64 = feverlink3_core::session::Lockstep::STEP as u64;
 /// The free-id deque's place in `ecs::Engine` (build 40420: `lea rcx,[r13+0xd8]` before the insert at `0x2bba103`).
 pub const FREE_QUEUE_OFFSET: u64 = 0xd8;
 
-/// Build 40420: the game-time advance `(ecs::Engine*, world entity, delta) -> void` (`0xbad780`) and its pushes, up to
-/// `sub rsp,50h` (16 bytes, no rip-relative operand).
-pub const GAME_TIME_ADVANCE_RVA: u32 = 0x00ba_d780;
+/// The game-time advance `(ecs::Engine*, world entity, delta) -> void` (40420 `0xbad780`; its place: `build_table::EngineFns`) and
+/// its pushes, up to `sub rsp,50h` (16 bytes, no rip-relative operand). The bytes of this and the next three functions are the
+/// same in 40420 and 40423.
 pub const GAME_TIME_ADVANCE_PROLOGUE: [u8; 16] =
     [0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
-/// Build 40420: the component lookup `(ecs::Engine*, entity) -> GameTime*` (`0x1445c0`) the advance and the game-time getters call;
+/// The component lookup `(ecs::Engine*, entity) -> GameTime*` (40420 `0x1445c0`) the advance and the game-time getters call;
 /// its first bytes are compared before it is ever called.
-pub const COMPONENT_LOOKUP_RVA: u32 = 0x0014_45c0;
 pub const COMPONENT_LOOKUP_PROLOGUE: [u8; 15] =
     [0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20];
 
@@ -86,12 +85,10 @@ pub const FREEQ_CHECK_VAR: &str = "FEVERLINK3_FREEQ_CHECK";
 /// The switch.
 pub const ID_TRACE_VAR: &str = "FEVERLINK3_ID_TRACE";
 
-/// Build 40420: `ecs::Engine::AddEntity(Engine*, Entity* out) -> Entity*` and its first three instructions.
-pub const ADD_ENTITY_RVA: u32 = 0x2bb_8940;
+/// `ecs::Engine::AddEntity(Engine*, Entity* out) -> Entity*` (40420 `0x2bb8940`) and its first three instructions.
 pub const ADD_ENTITY_PROLOGUE: [u8; 15] =
     [0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18];
-/// Build 40420: `ecs::Engine::RemoveEntity(Engine*, Entity, bool)` and its first instructions.
-pub const REMOVE_ENTITY_RVA: u32 = 0x2bb_c700;
+/// `ecs::Engine::RemoveEntity(Engine*, Entity, bool)` (40420 `0x2bbc700`) and its first instructions.
 pub const REMOVE_ENTITY_PROLOGUE: [u8; 15] =
     [0x48, 0x89, 0x5C, 0x24, 0x10, 0x44, 0x88, 0x44, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54];
 
@@ -475,19 +472,24 @@ mod imp {
 
     /// Hooks the game-time advance for the order trace's step (only with the order trace on). Without it, or when a byte differs,
     /// the traces write `s=?`.
-    fn install_step(base: usize, log: fn(&str)) {
-        let lookup = base + COMPONENT_LOOKUP_RVA as usize;
+    fn install_step(engine: &crate::build_table::EngineFns, base: usize, log: fn(&str)) {
+        let (Some(lookup_rva), Some(advance_rva)) = (engine.component_lookup, engine.game_time_advance) else {
+            return log(
+                "id order trace: the step is not read (no component lookup or game-time advance for this build): s=?",
+            );
+        };
+        let lookup = base + lookup_rva as usize;
         // SAFETY: a read of the image's code, checked readable first.
         match unsafe { crate::mem::read(lookup as *const u8, COMPONENT_LOOKUP_PROLOGUE.len()) } {
             Ok(b) if b == COMPONENT_LOOKUP_PROLOGUE => {}
             _ => {
-                return log("id order trace: the step is not read (the component lookup is not as on build 40420): s=?")
+                return log(
+                    "id order trace: the step is not read (the component lookup does not have the expected bytes): s=?",
+                )
             }
         }
         // SAFETY: called from DllMain before the game runs; the prologue is checked against the bytes in memory.
-        match unsafe {
-            Detour::prepare((base + GAME_TIME_ADVANCE_RVA as usize) as *mut u8, &GAME_TIME_ADVANCE_PROLOGUE)
-        } {
+        match unsafe { Detour::prepare((base + advance_rva as usize) as *mut u8, &GAME_TIME_ADVANCE_PROLOGUE) } {
             Ok(mut d) => {
                 ADVANCE_ORIGINAL.store(d.original() as usize, Ordering::Release);
                 LOOKUP.store(lookup, Ordering::Release);
@@ -507,17 +509,21 @@ mod imp {
     }
 
     /// Installs the hooks when the verbose trace (`FEVERLINK3_ID_TRACE=1`) or the order trace (`FEVERLINK3_TRACE`, on
-    /// unless `0`) is on and the build is 40420. The detours stay for the process lifetime.
-    pub fn install(build_name: &str, base: usize, dir: Option<PathBuf>, log: fn(&str)) {
+    /// unless `0`) is on and the build table has the engine functions. The detours stay for the process lifetime.
+    pub fn install(build: &crate::build_table::BuildAddrs, base: usize, dir: Option<PathBuf>, log: fn(&str)) {
         let verbose = std::env::var(ID_TRACE_VAR).map(|v| v.trim() == "1").unwrap_or(false);
         let compact = crate::idorder::trace_on(std::env::var(crate::idorder::TRACE_VAR).ok().as_deref());
         if !verbose && !compact {
             return;
         }
-        if build_name != "40420" {
-            log("id trace: not installed (only build 40420 is known)");
+        let engine = &build.engine;
+        let (Some(add_rva), Some(remove_rva)) = (engine.add_entity, engine.remove_entity) else {
+            log(&format!(
+                "id trace: not installed (build {} has no AddEntity/RemoveEntity in the build table)",
+                build.name
+            ));
             return;
-        }
+        };
         let Some(dir) = dir else {
             log("id trace: not installed (no live folder)");
             return;
@@ -565,14 +571,8 @@ mod imp {
         }
         BASE.store(base, Ordering::Release);
         for (name, rva, pro, hook, slot) in [
-            ("add_entity", ADD_ENTITY_RVA, &ADD_ENTITY_PROLOGUE, add_hook as *const () as usize, &ADD_ORIGINAL),
-            (
-                "remove_entity",
-                REMOVE_ENTITY_RVA,
-                &REMOVE_ENTITY_PROLOGUE,
-                remove_hook as *const () as usize,
-                &REMOVE_ORIGINAL,
-            ),
+            ("add_entity", add_rva, &ADD_ENTITY_PROLOGUE, add_hook as *const () as usize, &ADD_ORIGINAL),
+            ("remove_entity", remove_rva, &REMOVE_ENTITY_PROLOGUE, remove_hook as *const () as usize, &REMOVE_ORIGINAL),
         ] {
             // SAFETY: called from DllMain before the game runs; the prologue is checked against the bytes in memory.
             match unsafe { Detour::prepare((base + rva as usize) as *mut u8, pro) } {
@@ -589,7 +589,7 @@ mod imp {
                 Err(e) => log(&format!("id trace: {name} NOT hooked: {e}")),
             }
         }
-        install_step(base, log);
+        install_step(engine, base, log);
     }
 
     #[cfg(test)]

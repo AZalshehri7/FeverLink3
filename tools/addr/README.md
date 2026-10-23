@@ -112,6 +112,10 @@ references `WorldBuildProposal`; the tool refuses to emit the name if that does 
 | Build | Timestamp | `command_list_add` | `apply_command` | `script_pool` | Report |
 |---|---|---|---|---|---|
 | 40420 | `0x6ac50427` (2026-10-06) | `0x9d4040` high | `0x9e33b0` high | `0xab00fc` high | [`out/6ac50427.txt`](out/6ac50427.txt) |
+| 40423 | `0x6ad0e4e5` (2026-10-15) | `0x9d9140` high | `0x9e84b0` high | `0xab528c` high | [`out/6ad0e4e5.txt`](out/6ad0e4e5.txt), port: [`out/port-6ac50427-6ad0e4e5.txt`](out/port-6ac50427-6ad0e4e5.txt) |
+
+Build 40423 is not in MPFever's table: its three sites were found by the 40420 signatures and the independent
+anchors (high), its other sites by `port_build.py` (below).
 
 Build 40420 is in MPFever's table; all three RVAs agree with it and with the independent anchors. The WinHTTP
 import list of 40420 is exactly the 14 functions `proxy.rs` relays.
@@ -121,8 +125,40 @@ Helpers of 40420, all high: `command_move` `0x9d0430`, `command_destroy` `0x9d06
 52, and all 12 hold-list entries are direct calls to `command_list_add`. `native/src/build_table.rs` has a
 test that parses the committed report and compares its row with the table.
 
+## port_build.py: the whole row, from the previous build
+
+`find_sites.py` knows six sites. The row has many more (the preview hooks, the convert hooks, the determinism patches,
+the callbacks the hold fires, the growth logs, the engine functions of the native transport). `port_build.py` carries
+every one of them from a build the table knows to the next:
+
+```
+.venv\Scripts\python -I port_build.py <old TransportFever3.exe> <new TransportFever3.exe> --out out
+```
+
+Keep a copy of the executable of each supported build before Steam updates the game (outside the repository). For each
+site the tool takes the whole function that holds it in the old executable, makes a pattern of it in which only relink
+fields are wildcards (rel32 targets, rip-relative displacements, jump-table RVAs), and needs exactly one match in the new
+`.text` (several copies of a small function: the one at the shift of its neighbour functions, if exactly one). Every
+call in a matched function is then followed one level deep: old and new callee must start with the same code. Places
+INSIDE a function that the module only calls through (the hold list, the tools' callback vtables, the preview listener's
+construction) may also match by shape (every 32-bit displacement a wildcard: a class that grew); the report lists every
+displacement that moved, and the offsets the module reads (`PreviewOwnerSite`) are carried by the shape match of the
+listener's call operator. The recorded bytes must equal the old ones outside relocations. The layout witnesses (the 22
+engine functions the portable form's layout table was read from) must all match exactly for the new build to keep the
+layout (`BuildAddrs::layout`). Whatever is not proven is printed `None`. Exit code 0 means every site was located.
+
+40420 to 40423: every hooked, patched and called function is unchanged code; the game interface class grew by `0x228`
+bytes (567 displacements above `0x4b0` moved in its constructor, one or a few in each tool function), which moved the
+preview listener's `ui_e` from `0xb98` to `0xdc0`; all 22 layout witnesses are unchanged; the refund insert's two call
+displacements moved (the module follows them instead of comparing them).
+
+A runtime search of an unknown build at game start was considered and left out: the proof above needs the previous
+executable, the unwind table and the call graph; at start only signatures are available, and a signature can match a
+function whose body a game update changed, which is exactly what a bug-fix update does.
+
 ## Adding a build
 
+0. Run `port_build.py` from the previous build first (above); paste its row.
 1. Run the tool against the new executable with `--out out` and commit the report.
 2. If every site is high or medium, paste the literal into `build_table::BUILDS`.
 3. Paste the derived signatures into `SITES[..].signature` in `find_sites.py` with `signature_from` set to

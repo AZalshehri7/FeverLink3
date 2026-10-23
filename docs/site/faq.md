@@ -41,7 +41,7 @@ The host can invite friends from Steam's friends list, and the host lets each fr
 The tests with real games were with two players. More are planned for in the design but have not been played yet.
 
 **Can I use other mods?**
-Yes, but every player needs the same mods as the host, because every game runs the same simulation. Mods that change the world on their own during a session (for example an automatic line namer) cause extra repair syncs, because their changes are not shared: turn their automatic changes off while playing together. FeverLink3 warns about such mods (this warning has not yet been seen in a real game). FeverLink3 cannot be used together with another mod that also places a `winhttp.dll` in the game folder.
+Yes, but every player needs the same mods as the host, because every game runs the same simulation. Mods that change the world on their own during a session (for example Auto Line Namer, Auto Color Lines or Auto Assign Terminals) are handled by FeverLink3 since 0.2.4: the host's copy of the mod makes the change and every game applies it at the same moment (seen with two games on one PC), and the settings you pick in such a mod's own window reach every game (not yet seen in the real game). A change FeverLink3 cannot share yet still causes extra repair syncs, and FeverLink3 then warns about that mod by name (the warning was seen in the real game). FeverLink3 cannot be used together with another mod that also places a `winhttp.dll` in the game folder.
 
 **Will it break my savegames?**
 The mod does nothing until you host or join. In a session every game loads the host's world, and a sync writes files named `feverlink3-resync-<number>.sav` into your save folder. FeverLink3 is in beta: keep backups of the saves you play with.
@@ -53,7 +53,7 @@ Yes. Without a session the game plays as it always does.
 Not yet. The terrain tools are switched off during a session. Everything else in the game works as usual.
 
 **What happens when the game updates?**
-Every player in a session needs the same game version. If a game update changes what FeverLink3 depends on, it switches its hooks off instead of risking your game; an update of FeverLink3 follows. If the game does not start at all after an update, delete `winhttp.dll` from the game folder.
+Every player in a session needs the same game version. On a game build FeverLink3 does not know yet, it switches its hooks off instead of risking your game, and the FeverLink3 window says that an update of FeverLink3 is needed; hosting is refused, and a host refuses such a player with the reason. An update of FeverLink3 follows (builds 40420 and 40423 are supported). If the game does not start at all after an update, delete `winhttp.dll` from the game folder.
 
 **Separate companies? A dedicated server?**
 Not yet. All players share one company for now. See the [roadmap](../ROADMAP.html).

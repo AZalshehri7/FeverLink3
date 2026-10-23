@@ -65,6 +65,10 @@ pub struct ModFingerprint {
     /// The native module's build (hash of its file), empty when unknown.
     #[serde(default)]
     pub native: String,
+    /// Set when this game's native module does not know the game build (an update of the game came first): the build, as the
+    /// player reads it. Such a game has no build hold and no determinism patches, so it cannot play together; empty: known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unsupported: String,
     pub mods: Vec<ModEntry>,
     /// The game could not list its mods (`mods` is empty and means nothing): nothing is compared, it is said instead.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -80,6 +84,9 @@ pub struct ModTags {
     pub feverlink3: String,
     #[serde(default)]
     pub native: String,
+    /// [`ModFingerprint::unsupported`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unsupported: String,
     #[serde(default)]
     pub tags: String,
     /// The player has more mods than the join can name.
@@ -131,6 +138,7 @@ impl ModFingerprint {
         self.game = clip(&self.game);
         self.feverlink3 = clip(&self.feverlink3);
         self.native = clip(&self.native);
+        self.unsupported = clip(&self.unsupported);
         let mut seen = BTreeMap::new();
         for mut e in self.mods {
             e.id = clip(&e.id);
@@ -154,6 +162,7 @@ impl ModFingerprint {
             game: self.game.clone(),
             feverlink3: self.feverlink3.clone(),
             native: self.native.clone(),
+            unsupported: self.unsupported.clone(),
             tags: STANDARD.encode(bytes),
             more: self.mods.len() > MAX_JOIN_MODS,
             unread: self.unread,
@@ -167,12 +176,20 @@ impl ModFingerprint {
             ("FeverLink3", &self.feverlink3, &guest.feverlink3),
             ("FeverLink3 native module", &self.native, &guest.native),
         ];
-        builds
+        let mut out: Vec<String> = builds
             .into_iter()
             // an empty build is one a game could not read: not a proven difference
             .filter(|(_, mine, theirs)| !mine.is_empty() && !theirs.is_empty() && mine != theirs)
             .map(|(what, mine, theirs)| format!("{what}: host {}, player {}", shown(mine), shown(&clip(theirs))))
-            .collect()
+            .collect();
+        // even with equal builds: the player's FeverLink3 runs without its native part, its game would drift from the first build
+        if !guest.unsupported.is_empty() {
+            out.push(format!(
+                "game build {} of the player is not supported by the player's FeverLink3 (its native module is off)",
+                clip(&guest.unsupported)
+            ));
+        }
+        out
     }
 
     /// The fingerprint of the mods a world uses: the builds of this one and, for each id the world's save names, its
@@ -280,6 +297,9 @@ pub fn diff(host: &ModFingerprint, mine: &ModFingerprint) -> Vec<ModDifference> 
     let mut add = |blocks: bool, text: String| out.push(ModDifference { blocks, text });
     if mine.unread {
         add(false, "your game could not list its mods: they were not compared".to_owned());
+    }
+    if !mine.unsupported.is_empty() {
+        add(true, super::notices::game_unsupported(&mine.unsupported));
     }
     let builds = [
         ("the game", &host.game, &mine.game),

@@ -433,6 +433,40 @@ function C.plain(v, depth)
 	return out
 end
 
+-- ------------------------------------------------------------------ who called a wrapped command function
+
+-- The folder of the mod a script source path belongs to, or nil when the path is not a mod's (the game's own scripts, which every
+-- game runs alike). The interface half turns it into the mod's own name (Hud.modName).
+-- ".../mods/6414403/content/auto_line_namer/aln.script.lua" -> "6414403"
+function C.modOfSource(src)
+	local p = tostring(src or ""):gsub("^@", ""):gsub("\\", "/")
+	local low = p:lower()
+	if not (low:find("/mods/", 1, true) or low:find("mod.io", 1, true) or low:find("staging_area", 1, true) or low:find("/workshop/", 1, true)) then
+		return nil
+	end
+	return p:match("^.-([^/]+)/content/") or p:match("([^/]+)$")
+end
+
+-- The code that called `wrapper` (a wrapped api.cmd.sendCommand): the first Lua frame below it on the stack (debug.getinfo; C frames
+-- and the wrapper's own pcalls are passed over). Returns its source and its mod (C.modOfSource); nil, nil, true for FeverLink3's own
+-- code (a source that names feverlink3, or one in `own`); nil when it is not known (no debug library). Another mod's commands are told
+-- apart this way only (owner 2026-10-23, option A): no list of mods, every mod's code is judged by where it lies.
+function C.callerOf(wrapper, own)
+	if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then return nil end
+	local past = false
+	for level = 2, 24 do
+		local info = debug.getinfo(level, "Sf")
+		if not info then break end
+		if info.func == wrapper then
+			past = true
+		elseif past and type(info.source) == "string" and info.source ~= "=[C]" then
+			if (own and own[info.source]) or info.source:lower():find("feverlink3", 1, true) then return nil, nil, true end
+			return info.source, C.modOfSource(info.source)
+		end
+	end
+	return nil
+end
+
 -- ------------------------------------------------------------------ a command callback's result entities
 
 -- The third argument of a sendCommand callback is `resultEntities : {{Engine.Entity, Engine.Revision}}` (tf3-docs api/cmd,

@@ -1235,6 +1235,8 @@ mod tests {
         fire_done_calls: &[],
         kind_offset: None,
         kinds: &[],
+        engine: crate::build_table::EngineFns::NONE,
+        layout: None,
     };
 
     #[test]

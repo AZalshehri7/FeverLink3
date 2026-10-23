@@ -726,6 +726,7 @@ end
 --   handler.encode(param, ctx)          -> plain param | nil, reason   (default: a plain deep copy)
 --   handler.decode(param, ctx)          -> param | nil, reason         (default: the shipped value)
 -- An event nobody registered stays native and is never refused: its category is "local", which no grant covers.
+-- Except another mod's own event (L.markForeignEvent, args.foreign): it travels as it is, see there.
 L.EVENTS = {}
 
 local function eventHandler(id, name)
@@ -733,10 +734,28 @@ local function eventHandler(id, name)
 	return byName and byName[name] or nil
 end
 
+-- Another mod's script event (owner 2026-10-23, option A; Auto Color Lines, Auto Assign Terminals: their windows send their settings with
+-- makeScriptingSendEventCmd("", <their id>, <name>, <plain table>), and only the clicking game's copy of the mod got them). No module of
+-- ours registers it, so it would stay on the sending game ("local"). Marked (args.foreign = the mod's folder, C.callerOf) it is shipped
+-- with its id, name and parameter unchanged and delivered at the stamp on every game, so every copy of the mod gets the setting in the
+-- same step. Only plain data travels (`plain` raises on anything else): such an event is not marked and stays as before. Returns true
+-- when marked, else false and why ("registered": a module has its own handler for it, which decides as for any player).
+function L.markForeignEvent(args, mod, plain)
+	if type(args) ~= "table" or mod == nil then return false, "not another mod's" end
+	if eventHandler(args[2], args[3]) then return false, "registered" end
+	if type(args[2]) ~= "string" or type(args[3]) ~= "string" then return false, "its id and name are not text" end
+	if args[1] ~= nil and type(args[1]) ~= "string" then return false, "its source is not text" end
+	local ok, why = pcall(plain, args[4])
+	if not ok then return false, "its parameter is not plain data (" .. tostring(why) .. ")" end
+	args.foreign = tostring(mod)
+	return true
+end
+
 L.EVENT_SPEC = {
 	category = "other",
 	categoryFor = function(args)
 		local h = eventHandler(args[2], args[3])
+		if not h and args.foreign then return "other" end
 		-- a handler's localFor(param): this parameter makes the event the sender's own setting (the Local time-of-day mode)
 		if h and h.localFor then
 			local ok, own = pcall(h.localFor, args[4])
@@ -746,6 +765,11 @@ L.EVENT_SPEC = {
 	end,
 	encode = function(name, args, ctx)
 		local h = eventHandler(args[2], args[3])
+		if not h and args.foreign then
+			local ok, param = pcall(ctx.plain, args[4])
+			if not ok then return nil, "event " .. tostring(args[2]) .. "/" .. tostring(args[3]) .. ": " .. tostring(param) end
+			return { fn = name, args = { n = 4, args[1], args[2], args[3], param, foreign = tostring(args.foreign) } }
+		end
 		if not h then return nil, "event " .. tostring(args[2]) .. "/" .. tostring(args[3]) .. " is not replicated" end
 		local param, why
 		if h.encode then
@@ -762,6 +786,11 @@ L.EVENT_SPEC = {
 	decode = function(body, ctx)
 		local a = body.args
 		local h = eventHandler(a[2], a[3])
+		if not h and type(a.foreign) == "string" then
+			-- another mod's event (L.markForeignEvent): delivered as it was sent; the mod's own script reads it
+			if type(a[2]) ~= "string" or type(a[3]) ~= "string" then return nil, "malformed event of another mod" end
+			return { n = 4, a[1], a[2], a[3], a[4], foreign = a.foreign }
+		end
 		if not h then return nil, "event " .. tostring(a[2]) .. "/" .. tostring(a[3]) .. " is unknown here" end
 		local param, why = a[4], nil
 		if h.decode then

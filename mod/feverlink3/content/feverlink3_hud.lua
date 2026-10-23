@@ -378,6 +378,24 @@ function H.modList(appApi)
 	return readMods(appApi, nil)
 end
 
+-- The player-facing name of the installed mod whose folder is `folder` (a mod.io mod's folder is its Mod Hub id, a user mod's its
+-- mod id), from the mod's own information, or nil. Documented API: ModRep:getGameModDesc(modId), Mod.GameModDesc.modhubModId and
+-- .name ("Display name of the mod (User facing)", tf3-docs reference/api/api/type/mod.html; api/tealdef/api/type/mod.d.tl 55-63).
+-- Owner 2026-10-23: the notice showed "6416672" (the folder) instead of the mod's name.
+function H.modName(appApi, folder)
+	folder = tostring(folder or "")
+	local ok, res = pcall(function()
+		local rep = appApi.getUserProfile():getModRep()
+		for _, modId in ipairs(rep:getInstalledMods()) do
+			local d = rep:getGameModDesc(modId)
+			if d and (tostring(d.modhubModId) == folder or tostring(modId.name) == folder) then
+				return type(d.name) == "string" and d.name ~= "" and d.name or nil
+			end
+		end
+	end)
+	return ok and res or nil
+end
+
 -- One compact line for the log (once per load of the window, and the lab's mod_list probe): the count or the failing step
 -- with its error, then the type of every value read on the way.
 function H.modShape(appApi)

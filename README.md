@@ -18,6 +18,7 @@
 
 - **Built into the game, no separate launcher.** Start Transport Fever 3 from Steam as usual: hosting, joining, chat, syncing and updates all live in the game's bottom bar and window. There is no extra program to run.
 - **Build together.** Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
+- **Your other mods work together too.** Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
 - **Steam invites.** Invite friends from Steam's own invite dialog; with a world loaded they join by themselves (new in 0.2.1, not yet tried on two PCs).

@@ -37,7 +37,9 @@ impl Runtime {
     /// The switch is on and the prerequisites hold (this layout's build, the allocator's prologues): the `ready` event then lists
     /// `patch_next` among the hooks, which is how the mod learns it may send the order.
     pub(super) fn patch_ready(&self) -> bool {
-        cp::announces(self.patch.enabled(), self.build.name, || EngineAlloc::at(self.base).is_ok())
+        cp::announces(self.patch.enabled(), self.build.layout_name(), || {
+            EngineAlloc::at(self.base, &self.build.engine).is_ok()
+        })
     }
 
     /// A `patch_next` order of the control file.
@@ -227,18 +229,18 @@ impl Runtime {
     /// The dry pass of a patch write (`native_copy::dry_pass`): `f` with stand-ins for the allocator and the live writes, inside a guard.
     fn patch_dry(&self, site: &'static str, f: impl FnOnce(&crate::native_copy::Ctx)) -> Result<(), String> {
         let set = crate::portable::Settings::input_level();
-        crate::native_copy::dry_pass(site, &crate::dump::LiveMem, self.base, set, self.build.name, f)
+        crate::native_copy::dry_pass(site, &crate::dump::LiveMem, self.base, set, self.build.layout_name(), f)
     }
 
     /// The allocator and layout checks both ways of patching need.
     fn patch_alloc(&self) -> Result<EngineAlloc, String> {
-        let alloc =
-            EngineAlloc::at(self.base).map_err(|why| format!("the game's allocator was not verified: {why}"))?;
-        if self.build.name != crate::portable::LAYOUT_BUILD {
+        let alloc = EngineAlloc::at(self.base, &self.build.engine)
+            .map_err(|why| format!("the game's allocator was not verified: {why}"))?;
+        if self.build.layout_name() != crate::portable::LAYOUT_BUILD {
             return Err(format!(
                 "the layout is that of game build {}, this is {}",
                 crate::portable::LAYOUT_BUILD,
-                self.build.name
+                self.build.layout_name()
             ));
         }
         Ok(alloc)

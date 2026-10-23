@@ -716,6 +716,11 @@ UI_ADD_SITES_KNOWN: dict[int, list[int]] = {
         0x5BF08D,   # UI::TrackModifier::Build
         0x28A3024, 0x28A3871,   # the entity window's builtins
     ],
+    # build 40423: the same twelve calls, carried over by port_build.py (same tool functions, same offsets inside them)
+    0x6AD0E4E5: [
+        0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
+        0x28AA534, 0x28AAD81,
+    ],
 }
 
 # The command kind the hold path is about, found by the string its handler references.

@@ -1988,7 +1988,8 @@ local function simFlushScriptBuilds(st)
 	st.out = st.out or {}
 	for _, p in ipairs(SIMO.pending) do
 		st.outSeq = (st.outSeq or 0) + 1
-		st.out[#st.out + 1] = { n = st.outSeq, at = p.at, body = p.text, script = true }
+		-- `foreign`: another mod's command captured on the host (simForeign), shipped the same way
+		st.out[#st.out + 1] = { n = st.outSeq, at = p.at, body = p.text, script = true, foreign = p.foreign }
 		if p.cb then SIMO.cbs[st.outSeq] = p.cb end
 	end
 	SIMO.pending = {}
@@ -2025,52 +2026,66 @@ function X.simCatchUp(st)
 	end
 end
 
--- Another mod's command that FeverLink3 does not share (WARN ONLY, owner 2026-10-21): friend test 0.2.0 (ANALYSIS_NAMES_BUILD.md A),
--- the Auto Line Namer renamed lines with its own sendCommand(makeEntitySetNameCmd) on each game at wall-clock times; nothing of it was
--- shared, the line names drifted and the host resynced. Such a command still goes to the engine exactly as before (nothing is held,
--- dropped or changed); it is logged, and the player is told once per session and mod/command kind (simFlushForeign -> X.foreignTell).
--- The sender is the first Lua frame below the wrapped sendCommand (debug.getinfo); FeverLink3's own sends (journal bookings, the
--- company sender) are recognised by their source and skipped. Only a source on a mod path is told to the player: a source that is
--- not known (no debug library, or the game's own scripts, which every game runs alike) is only logged, once per source and kind.
+-- Another mod's command from a game script (owner 2026-10-23, option A; before that WARN ONLY, owner 2026-10-21). Friend test 0.2.0
+-- (ANALYSIS_NAMES_BUILD.md A): the Auto Line Namer renamed lines with its own sendCommand(makeEntitySetNameCmd) on each game at
+-- wall-clock times; nothing of it was shared, the line names drifted and the host resynced. Auto Color Lines (makeEntitySetColorCmd) and
+-- Auto Assign Terminals (makeLineUpdateCmd) sweep the lines the same way (their code, mod.io 6416672 / 6416135: throttled by the wall
+-- clock, so each game decides at another step). Now, during a session, such a command of a kind the codecs know (L.COMMANDS, the
+-- same encode a player's command takes) is: on the HOST captured and not sent here; its record goes the way of a script's build
+-- (SIMO.pending -> st.out, `script = true` -> shipNative), stamped and applied on every game, the host's included, at the stamp. On every
+-- OTHER game it is dropped (logged once per mod and kind): the host's copy of the mod decides for every game. A kind no codec can encode
+-- (or a build, which has its own rules) goes to the engine as before, logged, and the player is told once per session and mod/command
+-- kind (simFlushForeign -> X.foreignTell). The sender is the first Lua frame below the wrapped sendCommand (C.callerOf); FeverLink3's own
+-- sends (journal bookings, the company sender) are recognised by their source and skipped. Only a source on a mod path counts: a source
+-- that is not known (no debug library, or the game's own scripts, which every game runs alike) is only logged, once per source and kind.
 SIMO.kinds = setmetatable({}, { __mode = "k" })   -- a command made in this state -> its factory's name
+SIMO.cargs = setmetatable({}, { __mode = "k" })   -- a command made in this state -> its factory's arguments (simForeign encodes them)
 SIMO.foreign, SIMO.foreignSeen, SIMO.foreignSent = {}, {}, {}
 
--- The mod a script source path belongs to, in words ("auto line namer"), or nil when the path is not a mod's.
--- ".../mods/6414403/content/auto_line_namer/aln.script.lua" -> "auto line namer"
-function X.foreignModOf(src)
-	local p = tostring(src or ""):gsub("^@", ""):gsub("\\", "/")
-	local low = p:lower()
-	if not (low:find("/mods/", 1, true) or low:find("mod.io", 1, true) or low:find("staging_area", 1, true) or low:find("/workshop/", 1, true)) then
-		return nil
-	end
-	local rest = p:match(".*/content/(.*)$")
-	local dir = rest and rest:match("^([^/]+)/")
-	if not dir then dir = p:match(".*/([^/]+)/content/") or p:match("([^/]+)$") end
-	return (tostring(dir):gsub("_%d+$", ""):gsub("[_%-]", " "))
+-- FeverLink3's own code in this Lua state (the bridge, the company sender): never another mod's (C.callerOf)
+function X.ownSources()
+	if X.OWN then return X.OWN end
+	local own = {}
+	pcall(function()
+		own[debug.getinfo(1, "S").source] = true
+		if Co and Co.extendEngine then own[debug.getinfo(Co.extendEngine, "S").source] = true end
+	end)
+	X.OWN = own
+	return own
 end
 
--- In the wrapped sendCommand, for a command that goes to the engine unshared during a session. No game-script state access here
--- (state:get raises inside another script's call): queued in SIMO.foreign for this script's own postUpdate.
-local function simForeignSeen(cmd)
+-- In the wrapped sendCommand during a session. Returns true when the command is taken (captured on the host, dropped elsewhere): it is
+-- not sent. No game-script state access here (state:get raises inside another script's call): what the interface half must hear waits
+-- in SIMO.pending / SIMO.foreign for this script's own postUpdate. `cb`: the mod's callback, kept with the record (X.simCatchUp).
+local function simForeign(cmd, cb)
 	local kind = SIMO.kinds[cmd] or (SIMO.tags[cmd] and "makeWorldBuildProposalCmd") or "an unknown command"
-	local src = nil
-	if type(debug) == "table" and debug.getinfo then
-		local own = { [debug.getinfo(1, "S").source] = true }
-		if Co and Co.extendEngine then own[debug.getinfo(Co.extendEngine, "S").source] = true end
-		local past = false
-		for level = 2, 16 do
-			local info = debug.getinfo(level, "Sf")
-			if not info then break end
-			if info.func == SIMO.wrapper then
-				past = true
-			elseif past and info.source and info.source ~= "=[C]" then
-				if own[info.source] or info.source:lower():find("feverlink3", 1, true) then return end   -- FeverLink3's own send
-				src = info.source
-				break
+	local src, mod, own = C.callerOf(SIMO.wrapper, X.ownSources())
+	if own then return false end   -- FeverLink3's own send
+	local args, spec = SIMO.cargs[cmd], L.COMMANDS[kind]
+	if mod and args and spec and not spec.virtual and kind ~= "makeWorldBuildProposalCmd" then
+		if kind == "makeScriptingSendEventCmd" then L.markForeignEvent(args, mod, C.plain) end
+		-- the same encode as a player's command; the keys are this state's (SIMO.rev, refreshed at every postUpdate), alike on every game
+		local okE, body, why = pcall(L.encodeCommand, kind, args, { plain = C.plain, keyOf = function(e) return L.keyFor(SIMO.rev or {}, e) end })
+		if not okE then body, why = nil, body end
+		local okS, text = false, nil
+		if body then okS, text = pcall(C.serialize, body) end
+		if okS then
+			local host = C.PLAYER_ID == 0
+			local seen = "shared|" .. mod .. "|" .. kind
+			if not SIMO.foreignSeen[seen] then
+				SIMO.foreignSeen[seen] = true
+				logSim(host and ("another mod's command is shared: kind=" .. kind .. " mod=" .. mod .. " (captured on the host, not sent here: every game applies it at the stamp; logged once)")
+					or ("another mod's command is dropped here: kind=" .. kind .. " mod=" .. mod .. " (the host's copy of the mod sends it for every game; logged once)"))
 			end
+			if host then SIMO.pending[#SIMO.pending + 1] = { at = engine.gameTime(), text = text, cb = cb, foreign = mod } end
+			return true
+		end
+		local seenW = "why|" .. mod .. "|" .. kind
+		if not SIMO.foreignSeen[seenW] then
+			SIMO.foreignSeen[seenW] = true
+			logSim("another mod's command cannot be shared: kind=" .. kind .. " mod=" .. mod .. ": " .. tostring(why or text))
 		end
 	end
-	local mod = src and X.foreignModOf(src)
 	local seen = tostring(src) .. "|" .. kind
 	if mod or not SIMO.foreignSeen[seen] then
 		logSim("another script's command goes to the engine unshared: kind=" .. kind .. " source=" .. tostring(src or "unknown") ..
@@ -2078,6 +2093,7 @@ local function simForeignSeen(cmd)
 	end
 	SIMO.foreignSeen[seen] = true
 	if mod and #SIMO.foreign < 20 then SIMO.foreign[#SIMO.foreign + 1] = { mod = mod, kind = kind } end
+	return false
 end
 
 -- In this script's own postUpdate: the mods seen since the last one go to the interface half (st.foreign), once per session and kind.
@@ -2095,23 +2111,37 @@ local function simFlushForeign(st)
 	SIMO.foreign = {}
 end
 
--- The command factories of this state learn the name of what they make (SIMO.kinds), only for the log and the player's words; the
--- command itself is returned untouched. makeWorldBuildProposalCmd has its own wrapper (SIMO.tags).
+-- The command factories of this state learn the name and the arguments of what they make (SIMO.kinds, SIMO.cargs: another mod's
+-- command is encoded from them, simForeign); the command itself is returned untouched. makeWorldBuildProposalCmd has its own
+-- wrapper (SIMO.tags).
+-- The names come from the codec's table (L.COMMANDS: only those can be shared anyway), as the interface half's wrapper does:
+-- the real game's api.cmd lists nothing through pairs, so every other mod's command stayed "an unknown command" (two windows,
+-- build 40423, 2026-10-23: Auto Color Lines and Auto Line Namer after new lines, both sent unshared on both games).
 local function simTagKinds()
 	local names = {}
-	for name, f in pairs(api.cmd) do
-		if type(f) == "function" and type(name) == "string" and name:find("^make") and name ~= "makeWorldBuildProposalCmd" then names[#names + 1] = name end
+	for name in pairs(L.COMMANDS) do
+		if type(name) == "string" and name:find("^make") and name ~= "makeWorldBuildProposalCmd" then names[#names + 1] = name end
 	end
+	table.sort(names)
+	local wrapped = 0
 	for _, name in ipairs(names) do
-		local f = api.cmd[name]
-		pcall(function()
-			api.cmd[name] = function(...)
-				local cmd = f(...)
-				if cmd ~= nil then SIMO.kinds[cmd] = name end
-				return cmd
-			end
-		end)
+		-- guarded as in installWrap: a build without this factory may refuse the lookup instead of answering nil
+		local okf, f = pcall(function() return api.cmd[name] end)
+		if okf and f ~= nil then
+			local okw = pcall(function()
+				api.cmd[name] = function(...)
+					local cmd = f(...)
+					if cmd ~= nil then
+						SIMO.kinds[cmd] = name
+						SIMO.cargs[cmd] = { n = select("#", ...), ... }
+					end
+					return cmd
+				end
+			end)
+			if okw then wrapped = wrapped + 1 end
+		end
 	end
+	logSim("other mods' commands: " .. wrapped .. " of " .. #names .. " command factories of this state learn what they make")
 end
 
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): sendCommand and makeWorldBuildProposalCmd are replaced in
@@ -2132,7 +2162,10 @@ local function simWrapCommands()
 				if okB and taken then return end
 				if not okB then logSim("a script's build command is sent natively (" .. tostring(taken) .. ")") end
 			end
-			if C.ACTIVE and cmd ~= nil then pcall(simForeignSeen, cmd) end
+			if C.ACTIVE and cmd ~= nil then
+				local okF, taken = pcall(simForeign, cmd, cb)
+				if okF and taken then return end
+			end
 			return SIMO.send(cmd, cb, ...)
 		end
 		SIMO.wrapper = api.cmd.sendCommand
@@ -2219,6 +2252,7 @@ local function simApplyAction(st, it, now)
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = err, class = X.refusalClass(err, "decode"),
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
 		X.buildResultBegin(st, it, ctx, now, { verdict = "refused", class = X.refusalClass(err, "decode"), detail = err })
+		if it.scriptOut then X.scriptBuildDone(st, it.scriptOut, false) end   -- a script's callback hears the refusal (X.simCatchUp)
 		return
 	end
 	local spec = L.COMMANDS[it.body.fn]
@@ -2230,6 +2264,7 @@ local function simApplyAction(st, it, now)
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = fx, class = "company",
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil }
 		X.buildResultBegin(st, it, ctx, now, { verdict = "refused", class = "company", detail = fx })
+		if it.scriptOut then X.scriptBuildDone(st, it.scriptOut, false) end
 		return
 	end
 	coEffects(ctx, fx, logSim)
@@ -2337,6 +2372,7 @@ local function simApplyAction(st, it, now)
 		st.refused[#st.refused + 1] = { key = it.key, from = it.from, seq = it.seq, detail = tostring(e), class = X.refusalClass(e, "engine"),
 			build = (it.body and it.body.fn == "makeWorldBuildProposalCmd") or nil, partial = partial or nil }
 		X.buildResultSet(st, it.key, now, { verdict = "refused", class = X.refusalClass(e, "engine"), detail = tostring(e) })
+		if it.scriptOut then X.scriptBuildDone(st, it.scriptOut, false) end
 		return
 	end
 	-- What appeared during this action's own send: the simulation state runs a command as it is sent (a build's entities are keyed at
@@ -4447,7 +4483,8 @@ function shipNative(o)
 	end
 	local body = C.parse(o.body)
 	if type(body) ~= "table" or type(body.args) ~= "table" then return false, "unreadable record" end
-	local category = buildCategory(body)
+	-- another mod's command captured on the host (simForeign) is any command kind: its category is counted as a player's would be
+	local category = o.foreign and L.categoryOf(body.fn, body.args) or buildCategory(body)
 	local now = engine.gameTime()
 	local S = G.slot
 	if S and S.own and S.released and not S.shipped and not o.script then
@@ -4475,7 +4512,11 @@ function shipNative(o)
 	if o.script then
 		-- a script's build command (simScriptBuild): not applied anywhere yet, so this game queues it like every other game does
 		local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), scriptOut = o.n, pause = pause }
-		logGui("native build " .. it.key .. " (a script's command) stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes): applied at the stamp on this game too")
+		if o.foreign then
+			logGui("action " .. it.key .. " " .. tostring(body.fn) .. " (another mod's command, mod=" .. tostring(o.foreign) .. ") stamped " .. at .. " (now " .. now .. "): applied at the stamp on every game, this one too")
+		else
+			logGui("native build " .. it.key .. " (a script's command) stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes): applied at the stamp on this game too")
+		end
 		X.routeOwn(it)
 		return true
 	end
@@ -6404,16 +6445,17 @@ local function noticeLocal(msg, args)
 end
 X.noticeLocal = noticeLocal   -- also for a build refused at its stamp (X.tellRefused)
 
--- Another mod changed the world with a command FeverLink3 does not share (simForeignSeen): one warn notice per session and mod/kind.
+-- Another mod changed the world with a command FeverLink3 cannot share (simForeign: a kind no codec encodes): one warn notice per
+-- session and mod. A command that is shared (captured on the host, dropped on the others) is not told.
 function X.foreignTell(st)
 	if type(st.foreign) ~= "table" then return end
 	G.foreignTold = G.foreignTold or {}
 	for _, f in ipairs(st.foreign) do
-		local key = tostring(f.epoch) .. "|" .. tostring(f.mod) .. "|" .. tostring(f.kind)
+		local key = tostring(f.epoch) .. "|" .. tostring(f.mod)
 		if f.epoch == G.epoch and not G.foreignTold[key] then
 			G.foreignTold[key] = true
 			logGui("another mod (" .. tostring(f.mod) .. ") sent " .. tostring(f.kind) .. " on its own: not shared, the worlds may drift")
-			noticeLocal("foreign_mod_change", { what = T.foreignWhat(f.mod, f.kind) })
+			noticeLocal("foreign_mod_change", { what = Hud.modName(app, f.mod) or tostring(f.mod) })
 		end
 	end
 end
@@ -6421,7 +6463,7 @@ end
 -- Wraps the command factories (to know a command's name and arguments) and sendCommand (to hold it). A command the mod
 -- replicates but cannot encode is refused on this game too, and the player is told: applied here alone it made the worlds
 -- differ, and the next resync erased it (friend test 2026-10-16, the line edits). Only what no game replicates (category
--- "local": an event nobody registered) goes to the engine untouched.
+-- "local": an event nobody registered) goes to the engine untouched; another mod's own event (L.markForeignEvent) is shipped.
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the command factories and sendCommand are replaced (no
 -- documented command hook), and api.cmd gets the mod's own factories for its virtual actions (feverlink3Company).
 function installWrap()
@@ -6472,9 +6514,21 @@ function installWrap()
 		end
 	end
 	local oks = pcall(function()
-		api.cmd.sendCommand = function(cmd, cb, progress)
+		local wrapper
+		wrapper = function(cmd, cb, progress)
 			local tag = cmd ~= nil and G.tags[cmd] or nil
 			if tag == nil then return O.sendCommand(cmd, cb, progress) end
+			-- another mod's own script event, sent in this state (a mod's game-script interface half): shipped like the player's commands
+			-- (L.markForeignEvent, the same rule as the UI hook's); one that is not plain data stays on this game as before
+			if tag.name == "makeScriptingSendEventCmd" and tag.args.foreign == nil and X.live() then
+				local okW, _, mod = pcall(C.callerOf, wrapper, X.ownSources())
+				if okW and mod then
+					local okM, why = L.markForeignEvent(tag.args, mod, C.plain)
+					if not okM and why ~= "registered" then
+						logGui("another mod's event " .. tostring(tag.args[2]) .. "/" .. tostring(tag.args[3]) .. " (mod=" .. tostring(mod) .. ") stays on this game unshared: " .. tostring(why))
+					end
+				end
+			end
 			if not X.live() then
 				-- no session (none began, or it ended: X.sessionOff): every command goes straight to the engine as in single-player, the
 				-- speed buttons included. A mod-level action has no engine command: it fails.
@@ -6535,6 +6589,7 @@ function installWrap()
 			if cb then pcall(cb, {}, false, {}) end
 			return
 		end
+		api.cmd.sendCommand = wrapper
 	end)
 	G.wrapped = oks
 	logGui("wrapped " .. wrapped .. " command factories" .. (oks and "" or "; sendCommand is read-only, commands stay native"))

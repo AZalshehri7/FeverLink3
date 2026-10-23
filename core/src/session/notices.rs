@@ -76,6 +76,23 @@ pub fn report_busy(who: &str) -> String {
     format!("A bug report is already being made; it will reach {who}.")
 }
 
+/// This game runs a Transport Fever 3 build the installed FeverLink3 does not know (the game updated itself first): its
+/// multiplayer part stays off, so it may not host and a host refuses its join. `build` is the game's build number.
+pub fn game_unsupported(build: &str) -> String {
+    format!(
+        "Transport Fever 3 was updated (build {build}); this FeverLink3 does not support it yet. \
+         An update of FeverLink3 is needed before you can play together."
+    )
+}
+
+/// What the host's window shows when such a game asked to join (it was refused).
+pub fn player_game_unsupported(who: &str, build: &str) -> String {
+    format!(
+        "{who} could not join: their Transport Fever 3 (build {build}) is newer than their FeverLink3 supports. \
+         They need an update of FeverLink3."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +114,8 @@ mod tests {
             report_made("Pat"),
             report_made_host("Pat"),
             report_busy("Pat"),
+            game_unsupported("40423"),
+            player_game_unsupported("Pat", "40423"),
         ];
         for text in &all {
             for word in INTERNAL {

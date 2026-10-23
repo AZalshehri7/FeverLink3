@@ -13,8 +13,15 @@ fn entry(id: &str, revision: i64, cosmetic: bool, files: Option<&str>) -> ModEnt
 }
 
 fn game(mods: Vec<ModEntry>) -> ModFingerprint {
-    ModFingerprint { game: "1.4.2".into(), feverlink3: "0.2.0".into(), native: "ab12".into(), mods, unread: false }
-        .normalized()
+    ModFingerprint {
+        game: "1.4.2".into(),
+        feverlink3: "0.2.0".into(),
+        native: "ab12".into(),
+        unsupported: String::new(),
+        mods,
+        unread: false,
+    }
+    .normalized()
 }
 
 /// The host has three mods installed; its world uses `trains_pack` and `nice_ui` only (`unused_pack` is installed, not used).

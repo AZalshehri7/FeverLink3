@@ -56,6 +56,8 @@ pub fn from_params(params: &Value, user_dirs: &[PathBuf], game_dir: Option<&Path
         game: params.get("game").and_then(Value::as_str).unwrap_or("").to_owned(),
         feverlink3: env!("CARGO_PKG_VERSION").to_owned(),
         native,
+        // set by the controller for a game its native module does not support (live.rs)
+        unsupported: String::new(),
         mods,
         unread,
     };
