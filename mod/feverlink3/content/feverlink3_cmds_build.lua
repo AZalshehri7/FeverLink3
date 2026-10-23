@@ -1990,14 +1990,18 @@ local function withStreet(sp, fn)
 end
 
 -- The record with its placeholders renumbered the way a script proposal numbers them: nodes and segments each from -1 in
--- list order (a tool numbers all new entities in one sequence).
-local function renumbered(rec)
+-- list order (a tool numbers all new entities in one sequence). `skip(s)`: a segment that is left out of the proposal (a
+-- construction's own piece under `drop`); the added ones are numbered first, so a placeholder is the segment's place in edgesToAdd.
+local function renumbered(rec, skip)
 	local nodeMap, segMap, kn, ks = {}, {}, 0, 0
 	for _, n in ipairs(rec.nodes) do
 		if type(n.id) == "number" and n.id < 0 then kn = kn + 1; nodeMap[n.id] = -kn end
 	end
-	for _, s in ipairs(rec.segs) do
-		if type(s.id) == "number" and s.id < 0 then ks = ks + 1; segMap[s.id] = -ks end
+	for pass = 1, 2 do
+		for _, s in ipairs(rec.segs) do
+			local left = skip ~= nil and skip(s) == true
+			if type(s.id) == "number" and s.id < 0 and left == (pass == 2) then ks = ks + 1; segMap[s.id] = -ks end
+		end
 	end
 	local function mapN(v) if type(v) == "number" and nodeMap[v] then return nodeMap[v] end return v end
 	local function mapS(v) if type(v) == "number" and segMap[v] then return segMap[v] end return v end
@@ -2006,7 +2010,10 @@ local function renumbered(rec)
 	for k, v in pairs(rec) do out[k] = v end
 	out.nodes, out.segs, out.objs, out.ncfg = {}, {}, {}, {}
 	for i, n in ipairs(rec.nodes) do out.nodes[i] = copy(n, function(o) o.id = mapN(n.id) end) end
-	for i, s in ipairs(rec.segs) do out.segs[i] = copy(s, function(o) o.id, o.n0, o.n1 = mapS(s.id), mapN(s.n0), mapN(s.n1) end) end
+	for i, s in ipairs(rec.segs) do
+		out.segs[i] = copy(s, function(o) o.id, o.n0, o.n1 = mapS(s.id), mapN(s.n0), mapN(s.n1) end)
+		if OWN_BY_SHAPE[s] then OWN_BY_SHAPE[out.segs[i]] = true end   -- (the copy is still the construction's own piece)
+	end
 	for i, e in ipairs(rec.objs) do out.objs[i] = copy(e, function(o) o.edge = mapS(e.edge) end) end
 	for i, c in ipairs(rec.ncfg) do
 		out.ncfg[i] = copy(c, function(o)
@@ -2024,7 +2031,16 @@ end
 -- renumber numbers the placeholders as a script does.
 local function streetProposal(rec, R, notes, opts)
 	opts = opts or {}
-	if opts.renumber then rec = renumbered(rec) end
+	-- An edge object on a new segment names it by its place in edgesToAdd: the engine's conversion asserts -#edgesToAdd <= edgeEntity < 0
+	-- (proposal_util.cpp:141). A tool numbers its new entities in one sequence, so a street re-laid under a road-side stop named segment -6
+	-- of 4 and the factory threw "Unknown exception" in every form that kept the tool's numbers (real session 2026-10-23c, held 246-248, the
+	-- inject placeholder, which has only the first form). Such a record is always renumbered, in every form and plan.
+	local skip = opts.drop and isConstructionSegment or nil
+	local onNew = false
+	for _, o in ipairs(rec.objs) do
+		if type(o.edge) == "number" and o.edge < 0 then onNew = true end
+	end
+	if opts.renumber or onNew then rec = renumbered(rec, skip) end
 	local sp = A.new("SimpleProposal")
 	local keepSeg, usedNode, dropped = {}, {}, {}
 	for _, s in ipairs(rec.segs) do
@@ -3140,9 +3156,17 @@ local function proposalVerdict(args)
 end
 
 -- What a proposal about to go to the engine holds, per kind, for the trace (build.cmp) on the originator and on the receivers.
-local function recCounts(rec)
-	return string.format("cons=%d rem=%d nodes=%d segs=%d rmNodes=%d rmSegs=%d objs=%d rmObjs=%d ncfg=%d rmNcfg=%d", #rec.cons, #rec.rem, #rec.nodes, #rec.segs,
+-- `withIds`: also the placeholders, the new node and segment ids in list order and the segment each edge object names
+local function recCounts(rec, withIds)
+	local out = string.format("cons=%d rem=%d nodes=%d segs=%d rmNodes=%d rmSegs=%d objs=%d rmObjs=%d ncfg=%d rmNcfg=%d", #rec.cons, #rec.rem, #rec.nodes, #rec.segs,
 		#rec.rmNodes, #rec.rmSegs, #rec.objs, #rec.rmObjs, #rec.ncfg, #rec.rmNcfg)
+	if not withIds then return out end
+	local function ids(list, key)
+		local t = {}
+		for _, x in ipairs(list) do t[#t + 1] = type(x[key]) == "number" and tostring(x[key]) or "ref" end
+		return table.concat(t, ",")
+	end
+	return string.format("%s; node ids [%s] segment ids [%s] edge objects on [%s]", out, ids(rec.nodes, "id"), ids(rec.segs, "id"), ids(rec.objs, "edge"))
 end
 
 -- ---- the replay through the portable text (B2.2)
@@ -3695,7 +3719,14 @@ local function decodeBuildUnsafe(body, ctx)
 			-- it, this game's conversion made 3 constructions of the text's 1 and the module refused. Errors are ignored so that the command
 			-- reaches the command list (its verdict is of a proposal that is replaced at the apply).
 			local b
-			if #rec.cons > 0 then
+			if #rec.cons > 0 and #rec.objs > 0 then
+				-- The module takes the edge objects from this command's own conversion too (DONOR_MEMBERS), so they go with the constructions, with
+				-- the new segments they stand on. Real session 2026-10-23c, 0:315 (a modular street station with a stop on its street): the
+				-- constructions alone were sent and the module refused ("the command has 0 edge object(s), the text has 1").
+				local sp = streetProposal(part(rec, { "nodes", "segs", "objs" }), R, {}, { cfg = false })
+				setConstructions(sp, part(rec, { "cons" }), R)
+				b = commandArgs(sp, newContext(f.ctx, R), true, false, f.dust)
+			elseif #rec.cons > 0 then
 				b = commandArgs(constructionProposal(part(rec, { "cons" }), R), newContext(f.ctx, R), true, false, f.dust)
 			else
 				b = PLAN[plan](rec, R, f, {}, (FORMS[plan] or { {} })[1])
@@ -3733,8 +3764,10 @@ local function decodeBuildUnsafe(body, ctx)
 		-- refused here, nothing is applied, and the bridge sends the refusal as this game's verdict (the host repairs when another game applied it).
 		local why = "inject_refused: the placeholder command cannot be made here (" .. tostring(built):gsub("\nstack traceback:.*", ""):sub(1, 160)
 			.. "); nothing is applied here"
-		log("build inject (" .. plan .. ") REFUSED: " .. why)
-		C.tracer("build")("build.inject", string.format("%s inject_refused placeholder=%s", tostring(ctx.traceKey or "-"), tostring(built)))
+		-- what the placeholder was made of, so the next such refusal shows its cause (session 2026-10-23c: the engine's own message was only
+		-- "Unknown exception"; the record's numbering, an edge object on segment -6 of 4, was the cause)
+		log("build inject (" .. plan .. ") REFUSED: " .. why .. "; record " .. recCounts(rec, true))
+		C.tracer("build")("build.inject", string.format("%s inject_refused placeholder=%s record[%s]", tostring(ctx.traceKey or "-"), tostring(built), recCounts(rec, true)))
 		return nil, why
 	end
 	if PORTABLE_REPLAY and type(body.input) == "string" then

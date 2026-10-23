@@ -72,6 +72,9 @@ pub const DEFAULT_PORT: u16 = 28090;
 /// the old way afterwards), so silence alone says little about a closed world: the limit is two minutes, longer than a
 /// visit to the menu. `FEVERLINK3_HEARTBEAT_SECONDS` changes it for tests; `0` turns the check off.
 pub const HEARTBEAT_SECONDS: f64 = 120.0;
+/// How long an automatic invite join waits for the window's mod list after a world was loaded (the window sends it within
+/// a second of the controller's first status; without it the host cannot compare the mods).
+const MODS_WAIT: Duration = Duration::from_secs(5);
 /// The environment variable that changes [`HEARTBEAT_SECONDS`].
 pub const HEARTBEAT_ENV: &str = "FEVERLINK3_HEARTBEAT_SECONDS";
 /// How long a world reload (the game was told to load the host's save, or the host's resync round runs) may silence the
@@ -368,8 +371,11 @@ pub struct Controller {
     /// Why the last join was refused for its mods: each difference to the host's game, `true` when it blocks. Shown by the
     /// window under the failure until the next host or join.
     mod_report: Vec<(bool, String)>,
-    /// The `mods` and `game` of the window's last `host` / `join` / `report` command (`Value::Null` before one).
+    /// The window's last `mods` and `game`, from its own `mods` command or a `host` / `join` / `report` (`Value::Null`
+    /// before one): every join and host uses them, a Steam-invite join too.
     mod_params: Value,
+    /// When an automatic invite join first waited for the window's mod list ([`MODS_WAIT`]).
+    mods_wait: Option<Instant>,
     /// "Report a problem" (`report.rs`).
     reporter: report::Reporter,
     /// The game build this game's native module does not support ([`set_unsupported_game`]); `None`: supported.
@@ -480,6 +486,7 @@ impl Controller {
             names: HashMap::new(),
             mod_report: Vec::new(),
             mod_params: Value::Null,
+            mods_wait: None,
             reporter: report::Reporter::new(),
             unsupported: UNSUPPORTED_GAME.get().cloned(),
         };
@@ -704,6 +711,7 @@ impl Controller {
             }
             "steamloop" => self.steam_loop(),
             "report" => self.report_command(params),
+            "mods" => self.remember_mods(params),
             "invite" => {
                 let outcome = self.open_invite_dialog();
                 self.note(n, kind, outcome);
@@ -809,11 +817,28 @@ impl Controller {
             .map_or_else(|| self.default_name.clone(), |n| n.chars().take(24).collect())
     }
 
-    /// Keeps the window's mod list for the next join, an invite's included.
+    /// Keeps the window's mod list and game build for every join and host, an invite's included. The window sends them
+    /// on its own (`mods`) once the controller answers and again when they change, and with `host` / `join` / `report`
+    /// (friend session 2026-10-23: a Steam-invite join had no window command, so the host warned "could not list its
+    /// mods" and the friend's report said "game build: unknown"). A key the window left out keeps its last value.
     fn remember_mods(&mut self, params: &Value) {
-        if params.get("mods").is_some() {
-            self.mod_params = json!({ "mods": params["mods"], "game": params["game"] });
+        let mut next = if self.mod_params.is_object() { self.mod_params.clone() } else { json!({}) };
+        for key in ["mods", "game"] {
+            if let Some(v) = params.get(key).filter(|v| !v.is_null()) {
+                next[key] = v.clone();
+            }
         }
+        if next.as_object().is_some_and(|o| o.is_empty()) || next == self.mod_params {
+            return;
+        }
+        let game = next.get("game").and_then(Value::as_str).unwrap_or("unknown").to_owned();
+        let mods = match next.get("mods") {
+            Some(Value::Array(a)) => format!("{} mods", a.len()),
+            Some(Value::Object(o)) if o.is_empty() => "0 mods".to_owned(),
+            _ => "no mod list (the window could not read it)".to_owned(),
+        };
+        self.mod_params = next;
+        self.append_session_log(&format!("mods: the window's list: {mods}, game build {game}"));
     }
 
     /// The user folders (`userdata/<id>/3493540/local`): the parents of the save folders.
@@ -821,10 +846,10 @@ impl Controller {
         self.save_dirs.iter().filter_map(|d| d.parent().map(Path::to_path_buf)).collect()
     }
 
-    /// The host options with this game's mod list from the window's `host` command (`docs/PROTOCOL.md`, "Mod list"). A
-    /// window that sent none (its Lua state could not read the mod repository) hosts without the comparison.
-    fn options_with_mods(&self, params: &Value) -> HostOptions {
-        let mods = modlist::from_params(params, &self.user_dirs(), modlist::running_game_dir().as_deref());
+    /// The host options with this game's mod list, the window's last one (`docs/PROTOCOL.md`, "Mod list"). A window that
+    /// sent none (its Lua state could not read the mod repository) hosts without the comparison.
+    fn options_with_mods(&self) -> HostOptions {
+        let mods = modlist::from_params(&self.mod_params, &self.user_dirs(), modlist::running_game_dir().as_deref());
         if mods.unread {
             self.append_session_log("MOD WARNING: the window sent no mod list: the players' mods are not compared");
         }
@@ -843,6 +868,7 @@ impl Controller {
         self.mod_report.clear();
         self.pulse = None;
         self.presence = None;
+        self.remember_mods(params);
         // Players never open ports or touch their router: sessions travel over Steam's peer-to-peer networking (and
         // a relay as the fallback). The direct TCP transport is for development and tests and must be asked for by
         // name.
@@ -892,7 +918,7 @@ impl Controller {
             name,
             key,
             link,
-            options: self.options_with_mods(params),
+            options: self.options_with_mods(),
             save_dirs: self.save_dirs.clone(),
             echo_log: false,
         };
@@ -964,7 +990,7 @@ impl Controller {
             name,
             key,
             link,
-            options: self.options_with_mods(params),
+            options: self.options_with_mods(),
             save_dirs: self.save_dirs.clone(),
             echo_log: false,
         });
@@ -1188,11 +1214,28 @@ impl Controller {
         // too: friend test 2026-10-21, the lock was taken only in a session and three join requests did nothing); otherwise
         // it waits and the window offers Join. In the main menu there is no world: TF3 has no documented call for a mod to
         // load a save from there, so the invite waits for the player to load any world (UNPROVEN in a two-PC Steam run).
+        // The window of the world just loaded sends its mod list a moment later (a Lua state of its own): the join waits
+        // for it up to MODS_WAIT, so the host can compare the mods.
         if self.invite.is_some() && self.idle_or_failed() && lock_is_held(&self.dir.join(WORLD_LOCK_FILE)) == Some(true)
         {
-            if let Some(invite) = self.invite.take() {
+            let now = Instant::now();
+            let since = *self.mods_wait.get_or_insert(now);
+            // a list, not only the build: just after the load the game refuses the repository for a moment ("API is currently
+            // restricted", two windows 2026-10-23), and the window's first message then carries the build alone
+            let have_list = self.mod_params.get("mods").is_some_and(|m| !m.is_null());
+            if !have_list && now.duration_since(since) < MODS_WAIT {
+                if since == now {
+                    self.append_session_log("invites: waiting for the window's mod list before joining");
+                }
+            } else if let Some(invite) = self.invite.take() {
+                self.mods_wait = None;
+                if self.mod_params.is_null() {
+                    self.append_session_log("invites: the window sent no mod list; joining without it");
+                }
                 self.join_invite(invite);
             }
+        } else {
+            self.mods_wait = None;
         }
 
         let mut want = RichPresence::default();
@@ -2917,9 +2960,18 @@ mod tests {
     }
 
     impl InvitePc {
-        /// The mod's presence lock is held: a world is loaded.
+        /// A world is loaded: the presence lock, and the window's own `mods` (feverlink3_ui.script.lua `shareMods`).
         #[cfg(windows)]
         fn world(&mut self) {
+            if self._world.is_none() {
+                self.lock_world();
+            }
+            self.pc.window.send("mods", "{[\"game\"]=\"40423\",[\"mods\"]={{[\"id\"]=\"trains\",[\"revision\"]=3}}}");
+        }
+
+        /// The mod's presence lock is held, before the window said anything.
+        #[cfg(windows)]
+        fn lock_world(&mut self) {
             use std::os::windows::fs::OpenOptionsExt;
             let lock = OpenOptions::new()
                 .read(true)
@@ -3059,7 +3111,12 @@ mod tests {
         assert_eq!(friend.pc.window.status()["state"], "idle", "no world yet: nothing starts");
         // the window's row: "<host> invited you. Load any world and you join automatically", with Join (ui.script.lua)
         assert_eq!(friend.pc.window.status()["invite"]["auto"], true);
-        // a world is loaded (the mod holds its presence lock while idle too): the join starts by itself, no window command
+        // a world is loaded (the mod holds its presence lock while idle too): the join starts by itself, no window command,
+        // once the window of that world sent its mods and build on its own (friend session 2026-10-23: the invite join
+        // had none, the host could not compare the mods and the report said "game build: unknown")
+        friend.lock_world();
+        steps(&mut [&mut host, &mut friend], Duration::from_millis(300), |_| false);
+        assert_eq!(friend.pc.window.status()["state"], "idle", "it waits for the window's mod list");
         friend.world();
         assert!(steps(&mut [&mut host, &mut friend], Duration::from_secs(20), |p| {
             p[1].pc.window.status()["state"] == "joined"
@@ -3067,6 +3124,15 @@ mod tests {
         assert!(friend.pc.window.status()["invite"].is_null(), "the invite is answered: no yellow icon");
         let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
         assert!(log.contains("invites: join request from the command line"), "{log}");
+        assert!(log.contains("invites: waiting for the window's mod list"), "{log}");
+        assert!(log.contains("mods: the window's list: 1 mods, game build 40423"), "{log}");
+        let warnings = host.pc.window.status()["modWarnings"].to_string();
+        assert!(!warnings.contains("could not list its mods"), "{warnings}");
+        let info = friend.pc.controller.report_info("r1").join(
+            "
+",
+        );
+        assert!(info.contains("game build: 40423") && info.contains("trains revision 3"), "{info}");
 
         // the host hosts again: an invite of the old session is stale
         host.pc.window.send("leave", "{}");

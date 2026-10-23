@@ -211,6 +211,10 @@ end
 
 local function serializeNumber(v)
 	if v ~= v then return "(0/0)" end
+	-- a record keeps the sign of zero (integerText drops it for log lines and money): the engine stores a roundabout's
+	-- transform with -0.0 (80000000) and the proof compares the rebuilt command bit for bit (two windows 2026-10-23:
+	-- "DIFF toAdd[0].transf: m4:3f800000,80000000,... <> m4:3f800000,00000000,...", every roundabout refused)
+	if v == 0 and 1 / v < 0 then return "-0.0" end
 	if v == math.huge then return "(1/0)" end
 	if v == -math.huge then return "(-1/0)" end
 	return C.integerText(v)

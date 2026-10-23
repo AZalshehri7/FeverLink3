@@ -465,6 +465,8 @@ mod tests {
             let back = lua(&v.to_string());
             assert_eq!(json(&back), v, "{text}");
         }
+        // a record's minus zero (a roundabout's transform, 2026-10-23) keeps its sign through the controller
+        assert_eq!(lua(&json("{[1]=-0.0}").to_string()), "{[1]=-0.0}");
         assert!(lua_to_json("{[1]=1e999}").is_none(), "an infinity is not JSON");
         assert!(
             lua_to_json("{[1]=--1}").is_none() && lua_to_json("{[1]=1e}").is_none() && lua_to_json("{[1]=-}").is_none()

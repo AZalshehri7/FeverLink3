@@ -57,20 +57,26 @@ local function pollCtl()
 	return true
 end
 
+-- defined below (it needs withMods and command); declared here so the refresh's closure sees the local, not a global nil
+-- (two windows 2026-10-23: the refresh called a global nil, no `mods` command was ever sent)
+local shareMods
+
 -- One throttled refresh for every recipe (bar, pop-up, window). The step timer is not guaranteed to fire while the game is
 -- paused, so the window also drives it from onStep (every interface frame); Hud.newTicker keeps it to once per 0.5 s.
 U.refresh = Hud.newTicker(0.5, C.clock, function()
 	if Hook then Hook.devPoll() end
 	local a = poll()
 	local b = pollCtl()
+	pcall(shareMods)
 	if a or b then U.rev = U.rev + 1 end
 end)
 
 -- `host` / `join` carry this game's mods and build for the join's comparison (docs/PROTOCOL.md, "Mod list"); read at
 -- the click, so a mod installed meanwhile counts. getBuildVersion() is documented (tf3-docs reference/api/main.html).
-local function withMods(params)
+-- `quiet`: the periodic re-read (shareMods) says nothing.
+local function withMods(params, quiet)
 	local mods, why = Hud.modList(app)
-	if mods then params.mods = mods else log("mod list not readable: " .. tostring(why)) end
+	if mods then params.mods = mods elseif not quiet then log("mod list not readable: " .. tostring(why)) end
 	local okB, build = pcall(function() return getBuildVersion() end)
 	if okB and build ~= nil then params.game = tostring(build) end
 	return params
@@ -79,6 +85,22 @@ end
 local function command(kind, params)
 	if not U.cmd then U.cmd = C.newWriter(C.path(CTL_CMD), 0) end
 	return C.writerSend(U.cmd, kind, params)
+end
+
+-- A join through a Steam invite has no window command of its own (friend session 2026-10-23: the host warned "could not list
+-- its mods", the friend's report said "game build: unknown"), so the window tells the controller its mods and build by
+-- itself (`mods`, docs/LIVE_CONTROL.md): once the controller answers, then again only when they changed (re-read every 30 s).
+local MODS_EVERY = 30
+shareMods = function()
+	-- no list read yet (the repository is refused for a moment after the load: "API is currently restricted", two windows
+	-- 2026-10-23): try again in 2 s, not 30
+	local every = U.modsRead and MODS_EVERY or 2
+	if not U.ctl or (U.modsAt and C.clock() - U.modsAt < every) then return end
+	U.modsAt = C.clock()
+	local params = withMods({}, U.modsKey ~= nil)
+	U.modsRead = params.mods ~= nil
+	local key = Hud.modsKey(params)
+	if key ~= U.modsKey and command("mods", params) then U.modsKey = key end
 end
 
 -- ui_out.log has one writer in this Lua state, which the hook owns when it is there
@@ -109,9 +131,15 @@ end
 
 local WIDTH = 480      -- the window's fixed content width, every state (audit 2026-10-21: the width changed per state, title clipped)
 local POP_W = 340      -- the pop-up's content width
+-- The one inner margin of the window's and the pop-up's content, every side (owner, 2026-10-23: no text touches the border).
+-- 8 px is what the game gives its own: the window title (builtin.css.lua Window::Title margin 4 + padding 4), a tab's content
+-- (TabWidget::Content padding 8) and a pop-up dialog's content (popover_react_util.css.lua padding 8), so our text lines up
+-- with the title above it.
+local PAD = 8
 -- How many characters of body text fit on a line (real game 2026-10-22: the pop-up cut a line after 38 characters, the
--- window after 64), with a margin; a heading's larger font gets 4/5 of it. Set by the recipe that draws (pop-up or window).
-local POP_CHARS, WINDOW_CHARS = 34, 56
+-- window after 64, both without PAD), with a margin; a heading's larger font gets 4/5 of it. Two characters fewer than
+-- before for the 2 x PAD the padding takes (~7.5 px a character). Set by the recipe that draws (pop-up or window).
+local POP_CHARS, WINDOW_CHARS = 32, 54
 local wrapChars = WINDOW_CHARS
 local MOD = "feverlink3::/"   -- <modId>::/path, a file in this mod's content/ (tf3-docs guides/mod-structure)
 local COLOR = {
@@ -154,8 +182,19 @@ local function setup(react, builtin, X)
 	-- a column of a fixed width and its content's height: size { w, -1 }, -1 = "not fixed" on that axis, the way the game sizes
 	-- its own columns (gui/entity_window/industry_react_util.tl: a Component with makeStyle{ size = { w, -1 } } around a
 	-- BoxLayout). An empty spacer(WIDTH, 1) row did not hold the window's width (UI run 2026-10-21). UNPROVEN in the real game.
+	-- The column also carries the one PAD margin on every side: api.gui.StyleSheet documents `padding` (Vec4f, one value per
+	-- side, top first; tf3-docs reference api/api/gui), which styleutil.makeStyle has no key for, so it is set on the sheet
+	-- makeStyle returns. Every row of the window and the pop-up sits inside it; no row has a margin of its own. If the field
+	-- cannot be set, the column keeps its size without the margin. UNPROVEN in the real game (an inline padding 0 on the bar's
+	-- Button did not take, 2026-10-21; a Component has no class padding to override it).
 	local function fixedColumn(w, children)
-		return builtin.Component{ meta = { styleSheet = style("s:" .. w .. "x-1", { size = { w, -1 } }) }, layout = box(V, children) }
+		local key = "s:" .. w .. "x-1:p" .. PAD
+		if styles[key] == nil then
+			local s = style("s:" .. w .. "x-1", { size = { w, -1 } })
+			if s then pcall(function() s.padding = api.type.Vec4f.new(PAD, PAD, PAD, PAD) end) end
+			styles[key] = s or false
+		end
+		return builtin.Component{ meta = { styleSheet = styles[key] or nil }, layout = box(V, children) }
 	end
 	-- an empty component of a fixed size (the gaps between rows; the pop-up's width)
 	local function spacer(w, h)
@@ -255,6 +294,30 @@ local function setup(react, builtin, X)
 		if line then add(text(line, level)) end
 	end
 
+	-- "Save and quit" under the update line (Hud.saveAndQuit): only while an update waits and no session runs. U.quit: nil, or
+	-- { at = clock } while the save runs, or { failed = reason }; a save that has not called back after QUIT_WAIT_S gives the
+	-- button back (the game stays open, today's "Restart the game to finish" stays).
+	local QUIT_WAIT_S = 300
+	local function quitRows(add, ctl)
+		local T = texts()
+		if not (T and T.UPDATE.quit and Hud.offerSaveAndQuit(ctl)) then return end
+		local q = U.quit
+		if q and q.at and C.clock() - q.at > QUIT_WAIT_S then
+			log("save and quit: no answer from the save after " .. QUIT_WAIT_S .. " s")
+			q = { failed = "the save did not finish" }
+			U.quit = q
+		end
+		if q and q.at then add(text(T.UPDATE.saving)); return end
+		if q and q.failed then add(text(T.quitFailed(q.failed), "warn")) end
+		add(button(T.UPDATE.quit, function()
+			if U.quit and U.quit.at then return end
+			U.quit = { at = C.clock() }
+			Hud.saveAndQuit(app, log, function(reason) U.quit = { failed = reason }; U.rev = U.rev + 1 end)
+			U.rev = U.rev + 1
+		end))
+		add(text(T.UPDATE.quitNote))
+	end
+
 	-- this run must restart before a session (the module refuses Host and Join too)
 	local function mustRestart(ctl)
 		return type(ctl) == "table" and type(ctl.update) == "table" and ctl.update.restart == true
@@ -285,7 +348,7 @@ local function setup(react, builtin, X)
 		wrapChars = POP_CHARS
 		local typed = react.useState("")
 		local ctl, m = U.ctl, U.model
-		local rows = { spacer(POP_W, 1) }
+		local rows = { spacer(POP_W - 2 * PAD, 1) }   -- the width inside the padded column (fixedColumn)
 		local function add(node) rows[#rows + 1] = node end
 		local now = nowTime()
 		add(text(Hud.statusLine(ctl, m), Hud.iconState(ctl, m, now) == "red" and "error" or nil, nil, "font-scale-title-3"))
@@ -293,6 +356,7 @@ local function setup(react, builtin, X)
 		-- the newest bridge notice, fading over its last seconds
 		if n then add(text(n.text, n.level, age > 7 and math.max(0.3, (Hud.NOTICE_SHOWN_S - age) / 3) or 1)) end
 		updateRow(add, ctl)
+		quitRows(add, ctl)
 		if Hud.iconState(ctl, m, now) == "red" then add(gap()); reportRows(add, ctl) end
 		local st = windowState(ctl)
 		if st == "hosting" or st == "joined" then
@@ -310,8 +374,9 @@ local function setup(react, builtin, X)
 			if params and params.close then params.close() end
 			openWindow()
 		end, (st == "hosting" or st == "joined") and "secondary" or "primary"))
-		-- a layout itself: PopoverWindowContent refuses a Component ("Recipe child must be a layout", real game 2026-10-21)
-		return box(V, rows)
+		-- a layout itself: PopoverWindowContent refuses a Component ("Recipe child must be a layout", real game 2026-10-21),
+		-- around the same padded column as the window's
+		return box(V, { fixedColumn(POP_W, rows) })
 	end)
 
 	-- ---- the window
@@ -460,6 +525,7 @@ local function setup(react, builtin, X)
 		elseif state == "idle" or state == "failed" then
 			add(heading("Play together"))
 			updateRow(add, ctl)
+			quitRows(add, ctl)
 			if ctl.notice then
 				-- how the last session ended by itself: the world was closed, the host ended it or removed this player
 				add(text(tostring(ctl.notice), state == "failed" and "error" or "warn"))
@@ -500,7 +566,7 @@ local function setup(react, builtin, X)
 				add(heading("Syncing: " .. sync.step))
 				if sync.fraction then
 					add(builtin.ProgressBar{
-						meta = { styleSheet = style("s:bar", { size = { WIDTH, 20 } }) },
+						meta = { styleSheet = style("s:bar", { size = { WIDTH - 2 * PAD, 20 } }) },
 						value = sync.fraction, label = math.floor(sync.fraction * 100) .. "%",
 					})
 				end

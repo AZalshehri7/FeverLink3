@@ -124,13 +124,14 @@ fn other_parts_reload_on_the_second_consecutive_round_with_the_same_set() {
 }
 
 #[test]
-fn a_changed_set_or_a_clean_round_resets_the_streak() {
+fn a_clean_round_resets_the_streak_a_changed_set_does_not() {
     let mut p = policy();
     p.on_outcome(0.0, &outcome(&["roads"]));
-    assert_eq!(None, p.on_outcome(10.0, &outcome(&["roads", "lines"])));
-    assert_eq!(None, p.on_outcome(20.0, &outcome(&[])));
-    assert_eq!(None, p.on_outcome(30.0, &outcome(&["roads", "lines"])));
-    assert!(p.on_outcome(40.0, &outcome(&["roads", "lines"])).is_some());
+    assert_eq!(None, p.on_outcome(10.0, &outcome(&[])));
+    assert_eq!(None, p.on_outcome(20.0, &outcome(&["roads"])));
+    // 2026-10-23: a fork spreads from lane to lane and the per-town parts change with each town; it still counts in a row
+    let reason = p.on_outcome(30.0, &outcome(&["townBuildings:7", "edges"])).expect("second differing round in a row");
+    assert!(reason.starts_with("edges, townBuildings:7 differ"), "{reason}");
 }
 
 #[test]
@@ -155,12 +156,45 @@ fn cooldown_of_120_seconds_after_a_resync_holds_the_decision_back() {
 }
 
 #[test]
-fn replay_failure_asks_at_once_unless_cooling_down() {
+fn a_repair_inside_the_cooldown_waits_for_its_end_and_is_never_dropped() {
     let mut p = policy();
     assert_eq!(Some("replay failed".to_owned()), p.on_replay_failed(5.0));
     p.resync_finished(10.0);
-    assert_eq!(None, p.on_replay_failed(129.0));
-    assert!(p.on_replay_failed(130.0).is_some());
+    // 2026-10-23 night: a replay failure 70 s after a resync was dropped and the worlds stayed forked for 8 minutes
+    assert_eq!(None, p.on_replay_failed(80.0), "inside the cooldown");
+    assert_eq!(None, p.on_verdicts_differ(90.0, "0:91"), "one repair waits, not two");
+    assert_eq!(Some("replay failed"), p.pending());
+    assert_eq!(None, p.due(129.0), "still cooling down");
+    assert_eq!(Some("replay failed (waited for the cooldown)".to_owned()), p.due(130.0));
+    assert_eq!(None, p.due(131.0), "handed out once");
+    // the repair round ends: a new cooldown, nothing left over
+    p.resync_finished(140.0);
+    assert_eq!(None, p.due(400.0));
+}
+
+#[test]
+fn a_checksum_difference_inside_the_cooldown_waits_too() {
+    // 2026-10-23 afternoon: rounds 647-656 differed for 95 s right after a resync; nobody repaired them
+    let mut p = policy();
+    p.resync_finished(0.0);
+    assert_eq!(None, p.on_outcome(10.0, &outcome(&["freeq", "ids"])));
+    assert_eq!(None, p.on_outcome(20.0, &outcome(&["ids", "nodeConfigs"])));
+    assert!(p.pending().is_some_and(|r| r.contains("in a row")), "{:?}", p.pending());
+    assert!(p.due(120.0).is_some());
+}
+
+#[test]
+fn a_waiting_repair_is_cancelled_by_a_full_round_that_finds_the_worlds_equal() {
+    let mut p = policy();
+    p.resync_finished(0.0);
+    p.on_replay_failed(30.0);
+    assert_eq!(None, p.on_outcome(40.0, &light(&[])), "a light round proves nothing");
+    assert!(p.pending().is_some());
+    assert_eq!(None, p.on_outcome(50.0, &not_ready(&[], &["edges"])), "an unmeasured part proves nothing");
+    assert!(p.pending().is_some());
+    assert_eq!(None, p.on_outcome(60.0, &outcome(&["balance"])), "money is corrected in place");
+    assert_eq!(None, p.pending());
+    assert_eq!(None, p.due(200.0));
 }
 
 #[test]

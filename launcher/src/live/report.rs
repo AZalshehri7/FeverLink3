@@ -499,7 +499,7 @@ impl Controller {
     }
 
     /// The part's `report.txt` lines about this game: versions, mods, the session as this game sees it.
-    fn report_info(&self, report: &str) -> Vec<String> {
+    pub(super) fn report_info(&self, report: &str) -> Vec<String> {
         let mut lines = vec![
             "FeverLink3 bug report: this game's part".to_owned(),
             format!("report id: {report}"),

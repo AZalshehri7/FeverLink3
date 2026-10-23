@@ -29,6 +29,7 @@ fn action(stamp: i64, seq: i64, pause: bool) -> Vec<u8> {
         category: "build".into(),
         allowed: true,
         pause,
+        applied: false,
         pause_seq: None,
         pause_upto: None,
         hop: None,

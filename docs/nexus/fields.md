@@ -1,6 +1,6 @@
-# Nexus Mods page: the form fields (0.2.4)
+# Nexus Mods page: the form fields (0.2.5)
 
-Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-23, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.4.
+Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-23, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.5.
 
 ## Name
 
@@ -21,7 +21,7 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 ## Version
 
 ```
-0.2.4
+0.2.5
 ```
 
 ## Category, tags, flags
@@ -33,13 +33,13 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 
 ## Main file
 
-- Upload: `FeverLink3-0.2.4.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.4.zip.sha256` on the release page.
-- Name on Nexus: `FeverLink3 0.2.4`
-- Category: Main files. Version: 0.2.4.
+- Upload: `FeverLink3-0.2.5.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.5.zip.sha256` on the release page.
+- Name on Nexus: `FeverLink3 0.2.5`
+- Category: Main files. Version: 0.2.5.
 - File description (under 255 characters):
 
 ```
-Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.4. Updates itself (can be turned off).
+Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.5. Updates itself (can be turned off).
 ```
 
 (200 characters.)
@@ -88,6 +88,13 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Changelog tab
 
 ```
+0.2.5
+- Roundabouts and streets with a bus stop on them now build in a session.
+- A repair needed right after a sync is no longer dropped; it starts by itself.
+- A change made while paused no longer forces a sync.
+- Text in the window keeps a margin from the edges; Save and quit button after an update.
+- A friend who joins through a Steam invite has their mods compared.
+
 0.2.4
 - Supports Transport Fever 3 build 40423 (the game update of 2026-10-22); on a game build FeverLink3 does not know, the window says so.
 - Other mods that change the world on their own (Auto Line Namer, Auto Color Lines, Auto Assign Terminals) stay in sync: the host's copy makes the change, every game applies it at the same moment.
@@ -115,7 +122,7 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues in 0.2.4
+Known issues in 0.2.5
 - Terrain editing, ground paint and trees are not shared; the terrain tools are off during a session.
 - A mod change FeverLink3 cannot share yet causes extra syncs (FeverLink3 names the mod in a warning).
 - After a Transport Fever 3 update, FeverLink3 needs an update too (the window says so).

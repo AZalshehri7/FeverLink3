@@ -703,6 +703,11 @@ fn build_proved(
             return fail(&mut d, why);
         }
     }
+    if hybrid && wanted.first().is_some_and(|&n| n > 0) {
+        if let Err(why) = set_edge_object_placeholders(c, poke, d.bytes(), &lines, say) {
+            return fail(&mut d, why);
+        }
+    }
     // the proof: the copy, written as text, equals the input in every named member
     let again = match nc::encode_scratch(c, &d, "inject") {
         Ok(t) => t,
@@ -915,6 +920,62 @@ fn set_construction_frozen(
             return Err(format!("toAdd[{i}].frozenNodes could not be written"));
         }
         c.alloc.forget_all(); // construction `i` owns its block now
+    }
+    Ok(())
+}
+
+/// The two ids of each donated edge object that name a NEW entity of the proposal (`resultEntity`, and `segmentEntity` when the object
+/// stands on a new segment) are placeholders, and the two sides number them differently: the tool numbers all new entities of its
+/// proposal in one sequence (nodes, segments, and -400000000 - k for edge objects), the script's conversion numbers its own (an edge
+/// object's segment is its place in edgesToAdd, which the engine asserts, proposal_util.cpp:141). Real session 2026-10-23c, held 246: the
+/// text's stop stood on segment new#6 of 4 and the conversion could never name it so. They are set from the text, where both sides hold a
+/// placeholder (an existing entity is never rewritten: the proof still compares it); the text's numbering is what its own maps
+/// (`old2newEdgeObjects`) and segments use. Every other member stays the conversion's, and the proof compares all of them.
+fn set_edge_object_placeholders(
+    c: &Ctx,
+    poke: &dyn Poke,
+    proposal: &[u8],
+    lines: &std::collections::BTreeMap<&str, &str>,
+    say: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let n = count(lines, "proposal.edgeObjectsToAdd.#");
+    let (b, e) = (u64_at(proposal, EDGE_OBJECTS_TO_ADD) as usize, u64_at(proposal, EDGE_OBJECTS_TO_ADD + 8) as usize);
+    if !pointer_like(b as u64) || e < b || (e - b) / EDGE_OBJECT_STRIDE != n as usize {
+        return Err(format!(
+            "the conversion in the script command has {} edge object(s), the text has {n}",
+            if e >= b { (e - b) / EDGE_OBJECT_STRIDE } else { 0 }
+        ));
+    }
+    let new_id = |v: &str| v.strip_prefix("ent:new#").and_then(|k| k.parse::<i32>().ok()).map(|k| (-k) as u32);
+    let mut changed = Vec::new();
+    for i in 0..n as usize {
+        let at = b + i * EDGE_OBJECT_STRIDE;
+        let now = c.mem.read(at, 12).ok_or_else(|| format!("edgeObjectsToAdd[{i}] is not readable"))?;
+        for (off, name) in [(0usize, "resultEntity"), (8, "segmentEntity")] {
+            let have = u32::from_le_bytes(now[off..off + 4].try_into().unwrap_or([0; 4]));
+            let Some(want) =
+                lines.get(format!("proposal.edgeObjectsToAdd[{i}].{name}").as_str()).and_then(|v| new_id(v))
+            else {
+                continue;
+            };
+            if have < 0x8000_0000 || have == want {
+                continue; // an existing entity (or already the text's): the proof decides
+            }
+            if !poke.poke(at + off, &want.to_le_bytes()) {
+                return Err(format!("edgeObjectsToAdd[{i}].{name} could not be written"));
+            }
+            changed.push(format!(
+                "[{i}].{name} new#{} -> new#{}",
+                (have as i32).unsigned_abs(),
+                (want as i32).unsigned_abs()
+            ));
+        }
+    }
+    if !changed.is_empty() {
+        say(&format!(
+            "inject: the conversion's edge object placeholders set to the text's numbering: {}",
+            changed.join(", ")
+        ));
     }
     Ok(())
 }
@@ -1196,9 +1257,61 @@ pub fn same_place(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> 
     ))
 }
 
-/// One construction a command adds, as [`same_constructions`] compares it: its file and its transform (16 words, as the text writes
-/// them).
-type Construction = (Vec<u8>, String);
+/// One construction a command adds, as [`same_constructions`] compares it: its file and its transform (the 16 float words' bits, as
+/// the text writes them; compared by [`same_transform`]).
+type Construction = (Vec<u8>, [u32; 16]);
+
+/// How far (absolute, per element) a construction's rotation and scale part (the 13 elements of its transform besides the
+/// translation) may differ from the text's to count as the same construction. Those elements are cosines, sines and scales near 1, so
+/// one f32 step of them is about 6e-8 and a Lua number rounded to f32 on the way is off by at most that: 1e-4 leaves three orders of
+/// magnitude for the engine's own arithmetic, and still turns a point 1 km from the construction's origin by at most 0.1 m (below
+/// [`PLACE_TOLERANCE_M`]); two placements a player can tell apart differ by far more. Real session 2026-10-23 (build 40423, owner and
+/// friend): every roundabout (`street_construction/roundabout.con`, five on the host, one of the friend's) was refused on both games
+/// as "stands elsewhere": the text, written from the held command, has -0.0 (`80000000`) as the second rotation element, the record
+/// the script command is converted from has 0 (`transf[2]=0`), the translation bits were the same. The words were compared as text,
+/// so -0.0 and 0.0 differed (friend test 2026-10-21: the same roundabouts, then passed over as "not the mod's" and expired).
+pub const TRANSFORM_EPS: f32 = 1e-4;
+
+/// The transform as the text writes it (`m4:` and 16 hex words).
+fn m4_of(v: &str) -> Option<[u32; 16]> {
+    let mut it = v.strip_prefix("m4:")?.split(',').map(|w| u32::from_str_radix(w, 16).ok());
+    let mut m = [0u32; 16];
+    for w in m.iter_mut() {
+        *w = it.next()??;
+    }
+    it.next().is_none().then_some(m)
+}
+
+/// How far two transforms lie apart: the distance of their translations (elements 12 to 14, metres) and the largest difference of
+/// any other element. Non-finite elements are infinitely far apart.
+fn transform_deviation(a: &[u32; 16], b: &[u32; 16]) -> (f32, f32) {
+    let (a, b) = (a.map(f32::from_bits), b.map(f32::from_bits));
+    let d = |k: usize| if a[k].is_finite() && b[k].is_finite() { (a[k] - b[k]).abs() } else { f32::INFINITY };
+    let moved = (12..15).map(|k| d(k) * d(k)).sum::<f32>().sqrt();
+    let turned = (0..16).filter(|k| !(12..15).contains(k)).map(d).fold(0.0f32, f32::max);
+    (moved, turned)
+}
+
+/// Two transforms are the same placement: the translations within [`PLACE_TOLERANCE_M`], every other element within
+/// [`TRANSFORM_EPS`] (the same rule as the points of [`Identity::compare`]; -0.0 and 0.0 are the same). `Err`: how far apart, for
+/// the log.
+fn same_transform(have: &[u32; 16], want: &[u32; 16]) -> Result<(), String> {
+    let (moved, turned) = transform_deviation(have, want);
+    if moved <= PLACE_TOLERANCE_M && turned <= TRANSFORM_EPS {
+        return Ok(());
+    }
+    let hex = |m: &[u32; 16]| m.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join(",");
+    Err(format!(
+        "translation {moved:.4} m off (tolerance {PLACE_TOLERANCE_M} m), rotation/scale {turned:.6} off (tolerance {TRANSFORM_EPS}); command m4:{}, text m4:{}",
+        hex(have),
+        hex(want)
+    ))
+}
+
+/// The two constructions are the same: the same file exactly and the same placement ([`same_transform`]).
+fn same_construction(have: &Construction, want: &Construction) -> bool {
+    have.0 == want.0 && same_transform(&have.1, &want.1).is_ok()
+}
 
 /// The first `n` constructions of the command at `dest` (the caller knows it has that many).
 fn constructions(mem: &dyn Mem, dest: usize, n: usize) -> Result<Vec<Construction>, String> {
@@ -1220,8 +1333,7 @@ fn constructions_at(mem: &dyn Mem, b: usize, n: usize) -> Result<Vec<Constructio
         } else {
             return Err(format!("construction {i}: not a file name"));
         };
-        let transf: Vec<String> = (0..16).map(|k| format!("{:08x}", u32_at(&e, 0xc98 + k * 4))).collect();
-        out.push((file, transf.join(",")));
+        out.push((file, std::array::from_fn(|k| u32_at(&e, 0xc98 + k * 4))));
     }
     Ok(out)
 }
@@ -1232,8 +1344,9 @@ fn constructions_of(mem: &dyn Mem, bytes: &[u8]) -> Result<Vec<Construction>, St
     constructions_at(mem, u64_at(bytes, TO_ADD) as usize, n)
 }
 
-/// The command's constructions are the text's: the same file and the same transform, in order. The script builds them from the
-/// originator's record, so the receiver's conversion keeps both; any other command that adds constructions (a town's) differs.
+/// The command's constructions are the text's: the same file and the same placement ([`same_transform`]), in order. The script
+/// builds them from the originator's record, so the receiver's conversion keeps both (within the float rounding of the record); any
+/// other command that adds constructions (a town's) differs in file or place.
 pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), String> {
     let lines = rebuild::lines_of(text);
     let n = count(&lines, "toAdd.#") as usize;
@@ -1250,10 +1363,11 @@ pub fn same_constructions(mem: &dyn Mem, dest: usize, text: &str) -> Result<(), 
                 String::from_utf8_lossy(&want)
             ));
         }
-        let want = lines.get(format!("toAdd[{i}].transf").as_str()).and_then(|v| v.strip_prefix("m4:")).unwrap_or("");
-        if transf != want {
-            return Err(format!("construction {i} stands elsewhere than the text's"));
-        }
+        let Some(want) = lines.get(format!("toAdd[{i}].transf").as_str()).and_then(|v| m4_of(v)) else {
+            return Err(format!("construction {i}: the text has no transform"));
+        };
+        same_transform(&transf, &want)
+            .map_err(|how| format!("construction {i} stands elsewhere than the text's: {how}"))?;
     }
     Ok(())
 }
@@ -1312,8 +1426,8 @@ impl Identity {
     ///   proposal's placeholders of its own new entities (`new#N`, stored as -N) are names inside one proposal, not world entities, and
     ///   are not compared: the engine is free to number them again when it makes the command (not proven to happen; it would give the
     ///   same counts as the failures above);
-    /// - every construction is the command's, exactly (file and transform bits: the script builds them from the originator's record,
-    ///   and the positive matches with constructions of the friend test 2026-10-21 all passed exactly).
+    /// - every construction is the command's: the same file exactly, the same placement ([`same_transform`]: the translation within
+    ///   [`PLACE_TOLERANCE_M`], the rest within [`TRANSFORM_EPS`]; until 2026-10-23 the bits, see [`TRANSFORM_EPS`]).
     pub fn compare(&self, have: &Identity) -> Result<String, String> {
         if self.is_empty() {
             return Err("the conversion builds nothing".into());
@@ -1361,7 +1475,7 @@ impl Identity {
         }
         let mut cons: Vec<&Construction> = have.constructions.iter().collect();
         for (i, c) in self.constructions.iter().enumerate() {
-            match cons.iter().position(|d| *d == c) {
+            match cons.iter().position(|d| same_construction(d, c)) {
                 Some(k) => {
                     cons.swap_remove(k);
                 }
@@ -1381,13 +1495,15 @@ impl Identity {
 
 /// Whether the command at `dest` is the build of the command at `like`, for an order that has no text (`complete_next`): `like` is
 /// this game's own held command of the same build, and the script's command is the rebuild of its record, so it adds the same
-/// constructions (file and transform, in order) or, without constructions, touches the same place (as [`same_place`]). A held
+/// constructions (file and placement, [`same_construction`], in order) or, without constructions, touches the same place (as [`same_place`]). A held
 /// command that cannot be read or names no place identifies nothing ([`UNKNOWN`]); any other mismatch is [`NOT_OURS`].
 pub fn same_command(mem: &dyn Mem, like: usize, dest: usize) -> Result<(), String> {
     let want = identity(mem, like).map_err(|e| format!("{UNKNOWN}the held command: {e}"))?;
     let have = identity(mem, dest).map_err(|e| format!("{NOT_OURS}{e}"))?;
     if !want.constructions.is_empty() || !have.constructions.is_empty() {
-        if want.constructions == have.constructions {
+        if want.constructions.len() == have.constructions.len()
+            && want.constructions.iter().zip(&have.constructions).all(|(w, h)| same_construction(h, w))
+        {
             return Ok(());
         }
         return Err(format!(
@@ -1661,6 +1777,9 @@ mod tests {
         for s in [0x90, 0x168] {
             stop[s + 0x18] = 15; // modelName, name: empty std::strings (inline, capacity 15)
         }
+        // session 2026-10-23c, held 246: the tool numbers the stop -400000000 and its new segment -6 (one sequence over the proposal)
+        stop[0..4].copy_from_slice(&(-400_000_000i32).to_le_bytes());
+        stop[8..12].copy_from_slice(&(-6i32).to_le_bytes());
         let obj = arena.add(&stop) as u64;
         let triple: Vec<u8> = [obj, obj + 0x1a0, obj + 0x1a0].iter().flat_map(|v| v.to_le_bytes()).collect();
         arena.write(at + 0x128, &triple);
@@ -1679,6 +1798,9 @@ mod tests {
             portable::encode(&mem, Env { image_base: BASE }, graph_skip(settings()), "40420", &head).unwrap().text;
         assert_eq!(donor_counts(&text), vec![1, 0]);
         arena.write(at + 0x258, &town); // the receiver's conversion: one town building more than the text
+                                        // and the script's numbering of the same stop: object -1 on segment -3 (its place in edgesToAdd)
+        arena.write(obj as usize, &(-1i32).to_le_bytes());
+        arena.write(obj as usize + 8, &(-3i32).to_le_bytes());
         check_destination(&mem, at, 0, 1).expect("the conversion's town building does not make it another command");
         let ctx = Ctx { fns: fns(), alloc: &arena, mem: &mem, base: BASE, set: settings(), build_name: "40420" };
         WORLD.with(|w| w.set(&arena));
@@ -1688,6 +1810,12 @@ mod tests {
         assert_eq!(built.constructions, 0);
         let p = built.proposal.bytes();
         assert_eq!(u64_at(p, 0x128), obj, "the edge object is the donor's");
+        let ids = arena.read(obj as usize, 12).unwrap();
+        assert_eq!(
+            (&ids[0..4], &ids[8..12]),
+            (&(-400_000_000i32).to_le_bytes()[..], &(-6i32).to_le_bytes()[..]),
+            "its placeholders are the text's"
+        );
         assert_eq!(&p[0x258..0x270], &[0u8; 24], "no construction of the conversion is carried");
         release(&ctx, built);
     }
@@ -2075,7 +2203,24 @@ toAdd[0].transf	m4:{t}
         };
         assert!(same_constructions(&arena, dest, &text("a.con", &m4("3f800000"))).is_ok());
         assert!(same_constructions(&arena, dest, &text("b.con", &m4("3f800000"))).unwrap_err().contains("b.con"));
-        assert!(same_constructions(&arena, dest, &text("a.con", &m4("40000000"))).unwrap_err().contains("elsewhere"));
+        let why = same_constructions(&arena, dest, &text("a.con", &m4("40000000"))).unwrap_err();
+        assert!(why.contains("elsewhere") && why.contains("rotation/scale 1.000000 off"), "{why}");
+        // the engine's float rounding is the same placement (session 2026-10-23: every roundabout's text had -0.0 where its command had
+        // 0.0), another place or turn is not
+        let at = |k: usize, x: f32| {
+            let mut m = [0u32; 16];
+            m[0] = 1.0f32.to_bits();
+            m[k] = x.to_bits();
+            m.map(|w| format!("{w:08x}")).join(",")
+        };
+        assert!(same_constructions(&arena, dest, &text("a.con", &at(1, -0.0))).is_ok());
+        assert!(same_constructions(&arena, dest, &text("a.con", &at(5, 0.00005))).is_ok());
+        assert!(same_constructions(&arena, dest, &text("a.con", &at(12, 0.2))).is_ok());
+        let why = same_constructions(&arena, dest, &text("a.con", &at(13, 0.3))).unwrap_err();
+        assert!(why.contains("translation 0.3000 m off"), "{why}");
+        assert!(same_constructions(&arena, dest, &text("a.con", &at(1, 0.001))).unwrap_err().contains("elsewhere"));
+        assert!(same_constructions(&arena, dest, &text("a.con", &at(1, f32::NAN))).is_err());
+        assert!(same_constructions(&arena, dest, &text("b.con", &at(1, -0.0))).unwrap_err().contains("b.con"));
         assert!(same_constructions(
             &arena,
             dest,
@@ -2097,6 +2242,9 @@ toAdd[0].transf	m4:{t}
         };
         let (held, rebuild, town) = (with(1.0), with(1.0), with(2.0));
         assert_eq!(same_command(&arena, held, rebuild), Ok(()));
+        assert_eq!(same_command(&arena, held, with(1.00001)), Ok(()), "rounding is the same placement");
+        let conv = identity(&arena, with(1.00001)).unwrap();
+        assert!(conv.within(&identity(&arena, held).unwrap()) && !conv.within(&identity(&arena, town).unwrap()));
         let why = same_command(&arena, held, town).unwrap_err();
         assert!(why.starts_with(NOT_OURS) && why.contains("construction"), "{why}");
         // ... or, without constructions, touches the same place

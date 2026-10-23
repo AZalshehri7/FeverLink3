@@ -1296,10 +1296,9 @@ function X.simBuildResults(st, now)
 		end
 		local okW, errW = pcall(X.bresWrite, traceSim, logSim, e, now, changes, announced, shared)
 		if not okW then logSim("build.result of " .. tostring(e.key) .. " failed: " .. tostring(errW)) end
-		-- the originator's own build: what really happened here, for a refusal notice that waits for it (X.tellRefused)
-		if tostring(e.role):find("^originator") then
-			st.results[#st.results + 1] = { key = tostring(e.key) .. "#outcome", of = e.key, at = e.at, success = true, outcome = okW and errW or "?" }
-		end
+		-- what really happened here, on every game: a verdict and a refusal notice that wait for it (X.tellRefused). Every role, not
+		-- only the originator: a receiver's module can close its order as no_command too, and its verdict must say what it applied.
+		st.results[#st.results + 1] = { key = tostring(e.key) .. "#outcome", of = e.key, at = e.at, success = true, outcome = okW and errW or "?" }
 		if e.answer then
 			local okA, errA = pcall(X.answerBuild, st, e, snaps, after, changes, announced, shared)
 			if not okA then
@@ -4080,6 +4079,11 @@ function X.pauseArrived(it, n)
 		local own = G.pauseOwn and G.pauseOwn[it.key]
 		if not own then
 			logGui("pause order #" .. tostring(n) .. ": " .. it.key .. " is this game's own but nothing waits for it here (made before a reload?): applied as received")
+			-- a build: its tool's held command went with the load (failed at hold_off); its build.result tells the player (X.buildOutcome)
+			if it.body and it.body.fn == "makeWorldBuildProposalCmd" then
+				G.builtLate = G.builtLate or {}
+				G.builtLate[tostring(it.key)] = true
+			end
 		else
 			G.pauseOwn[it.key] = nil
 			own.pauseSeq, own.at = n, it.at
@@ -4087,6 +4091,10 @@ function X.pauseArrived(it, n)
 		end
 	end
 	X.pauseStamped(it)
+	if it.applied and it.from == C.PLAYER_ID then
+		-- this game's own native build of the pause (shipNative): its engine applied it at this stamp already, nothing is applied again
+		return
+	end
 	if it.body and it.body.fn == "pauseSlot" then return X.slotOpen(it) end
 	route(it)
 end
@@ -4505,9 +4513,22 @@ function shipNative(o)
 	end
 	G.seq = G.seq + 1
 	local at = stampAfterFastest(now)
-	-- a script's command made during the pause is applied in the host's pause order (X.routeOwn); a native build is applied here already
+	-- a script's command made during the pause is applied in the host's pause order (X.routeOwn)
 	local pause = (o.script and X.hostStamps(at)) or nil
-	send("action", { stamp = at, seq = G.seq, body = o.body, category = category, pause = pause })
+	local applied = nil
+	if not o.script and X.isPauseStamp(at) then
+		-- a native build no hold caught (no slot, X.slotHold), made during the pause: this game's engine applied it where this game
+		-- stands still, so that is its stamp, and it goes through the host's pause order like every other item of the pause, its stamp
+		-- kept (`applied`): numbered in the one order and relayed after every stamp given before it, every other game runs on to it
+		-- (pauseRun) or stands there and applies it at that step. Until 2026-10-23 it was stamped at the pause stamp and relayed outside
+		-- the order (real session 2026-10-23: 1:399, a crossing's node configuration, stamped 50775200 while every game stood at 50885800
+		-- after the pause order's run-ons: "PAUSE LATE ... 553 steps late" on the host, a resync)
+		at, pause, applied = (type(o.at) == "number" and o.at) or now, true, true
+		local key = L.itemKey(C.PLAYER_ID, G.seq)
+		G.pauseOwn = G.pauseOwn or {}
+		G.pauseOwn[key] = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = key, pause = true, applied = true }
+	end
+	send("action", { stamp = at, seq = G.seq, body = o.body, category = category, pause = pause, applied = applied })
 	G.nativeShipped = (G.nativeShipped or 0) + 1
 	if o.script then
 		-- a script's build command (simScriptBuild): not applied anywhere yet, so this game queues it like every other game does
@@ -4520,7 +4541,8 @@ function shipNative(o)
 		X.routeOwn(it)
 		return true
 	end
-	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)")
+	logGui("native build " .. L.itemKey(C.PLAYER_ID, G.seq) .. " captured at t=" .. tostring(o.at) .. ", stamped " .. at .. " (now " .. now .. ", " .. #o.body .. " bytes)"
+		.. (applied and ": made during the pause, applied here already; numbered in the host's pause order at this stamp, every other game applies it there" or ""))
 	recordOriginator(body, G.seq, at, category)
 	pcall(toSim, "nativebind", { n = o.n, key = L.itemKey(C.PLAYER_ID, G.seq) })
 	return true
@@ -5914,14 +5936,16 @@ end
 -- says or not at all: `nothing` = the module emptied the command, nothing of it was applied here; `untouched` = it could not, and the mod's
 -- placeholder (this game's own guess of the build) was applied; `no_command` = no command took the order (expired, replaced). The refusal is
 -- this game's verdict of the build (X.injectAnswered): the host compares it with every other game's and asks for the repair only when they
--- differ (another game injected it). The module fails the held command of the same build itself (`held`): the originator's tool is freed
+-- differ (another game injected it). After `nothing` the verdict is refused; after `untouched` / `no_command` it is what this game's
+-- build.result saw (X.tellRefused: the command may have applied as it was). The module fails the held command of the same build itself (`held`): the originator's tool is freed
 -- with a failed result.
 function X.onInjectRefused(p)
 	local key, outcome = tonumber(p.key) or 0, tostring(p.outcome or "?")
 	natSay(string.format("the native module refused inject order %s (%s): %s", C.integerText(key), outcome, tostring(p.reason or p.detail)))
 	if key <= 0 then return end
-	logGui(string.format("inject order %s refused (outcome %s, held %s): nothing of the build is applied here; this is this game's verdict, the host compares it with the other games'",
-		C.integerText(key), outcome, tostring(p.held or 0)))
+	logGui(string.format("inject order %s refused (outcome %s, held %s): %s; the host compares this game's verdict with the other games'",
+		C.integerText(key), outcome, tostring(p.held or 0), outcome == "nothing" and "nothing of the build is applied here"
+			or "the command was not emptied, the verdict follows this game's build.result"))
 	X.injectAnswered(key, string.format("inject order %s refused here (%s): %s", C.integerText(key), outcome, tostring(p.reason or ""):sub(1, 160)))
 end
 
@@ -5953,27 +5977,36 @@ end
 -- The build key and the engine's reason stay in the log.
 -- A refusal of the native module that did not empty the command (`no_command`: no command took the order; `untouched`: it could not be
 -- emptied) says nothing of what this game applied: the command may have applied as it was (the mod's own rebuild of the record). The
--- notice then waits for this game's build.result of the build (X.buildOutcome) and is given only when nothing of it was applied here.
+-- notice, and with `verdict` this game's verdict for the host (X.injectStep), then wait for this game's build.result of the build
+-- (X.buildOutcome): "applied" sends action_applied and tells nobody it failed; anything else is the refusal as before.
 -- Two-window run 2026-10-22 (x4, build 0:77): the host was told "Your build could not be built ... Nothing was built. Try again" and
--- the road stood on both games (build.result verdict=applied, +5 nodes +6 segments). The verdict sent to the host stays "refused"
--- (X.injectStep): the build did not go as the originator's exact copy, and the host compares the games' verdicts.
-function X.tellRefused(r, why)
-	if r.from ~= C.PLAYER_ID then return end
+-- the road stood on both games (build.result verdict=applied, +5 nodes +6 segments). Friend session 2026-10-23c (0:374): the host's
+-- module said no_command and its road stood (build.result applied, +2 nodes +4 segments), the friend refused it; the host's verdict
+-- still said refused, so the host logged "refused alike on every game: no repair needed" and the fork stayed hidden. The verdict now
+-- says what this world has, and the host's compare sees the fork.
+function X.tellRefused(r, why, verdict)
+	local mine = r.from == C.PLAYER_ID
+	if not mine and not verdict then return end
 	local key = tostring(r.of or r.key)
 	if tostring(why or ""):find("refused here %((no_command)%)") or tostring(why or ""):find("refused here %((untouched)%)") then
 		local seen = G.bresOutcome and G.bresOutcome[key]
 		if seen == nil then
 			G.noticeWait = G.noticeWait or {}
-			G.noticeWait[key] = { r = r, why = why, t = C.clock() }
-			logGui("build " .. key .. ": the native module refused its order without emptying the command: the notice waits for this game's build.result")
+			G.noticeWait[key] = { r = r, why = why, t = C.clock(), verdict = verdict }
+			logGui("build " .. key .. ": the native module refused its order without emptying the command: the " .. (verdict and "verdict" or "notice") .. " waits for this game's build.result")
 			return
 		end
 		G.bresOutcome[key] = nil
 		if seen == "applied" then
-			logGui("build " .. key .. " was applied here (build.result verdict=applied) although the native module refused its order: the player is not told it failed")
+			logGui("build " .. key .. " was applied here (build.result verdict=applied) although the native module refused its order: " .. (verdict and "the verdict says applied, " or "") .. "the player is not told it failed")
+			if verdict then X.sendVerdict(r, true) end
+			-- the module failed the tool's held command with the refusal (its callback fired with a failed result): the player is told it stands
+			if mine and X.noticeLocal then pcall(X.noticeLocal, "build_built_after_all", { thing = "build" }) end
 			return
 		end
 	end
+	if verdict then X.sendVerdict(r, false, why, "module") end
+	if not mine then return end
 	why = tostring(why or ""):gsub("^inject_refused: ", ""):gsub(" %(refused from this game's own world.*$", "")
 	-- the native compare of the rebuilt Proposal with the originator's text (native inject.rs) is not a world change: the copy differs
 	-- (friend test 2026-10-21: an empty town-building name; the player was told "the world changed ... Try again" and retried twice)
@@ -5982,18 +6015,28 @@ function X.tellRefused(r, why)
 	if X.noticeLocal then pcall(X.noticeLocal, remade and "build_not_remade" or "build_world_changed", { thing = "build" }) end
 end
 
--- This game's build.result verdict of its player's own build `key` ("applied", "unseen", "refused(...)"): a notice waiting for it is
--- given or dropped now (X.tellRefused); else it is kept for a refusal that comes later (the last 64).
+-- This game's build.result verdict of build `key` ("applied", "unseen", "refused(...)"), every role: a verdict or notice waiting for it
+-- is settled now (X.tellRefused); else it is kept for a refusal that comes later (the last 64).
+-- A build of this game's player that a resync load cut from its tool (X.pauseArrived: G.builtLate; its held command was failed at
+-- hold_off, the tool's callback fired with a failed result) and that the host's pause order applied afterwards: the player is told it
+-- stands. Friend session 2026-10-23c (0:498): failed at 17:02:30 by hold_off, built on every game at 17:03:12, nobody said so.
 function X.buildOutcome(key, verdict)
 	key = tostring(key)
 	G.bresOutcome, G.bresOrder = G.bresOutcome or {}, G.bresOrder or {}
 	G.bresOutcome[key] = tostring(verdict)
 	G.bresOrder[#G.bresOrder + 1] = key
 	if #G.bresOrder > 64 then G.bresOutcome[table.remove(G.bresOrder, 1)] = nil end
+	if G.builtLate and G.builtLate[key] then
+		G.builtLate[key] = nil
+		if tostring(verdict) == "applied" then
+			logGui("build " .. key .. " was cut from its tool by the resync and applied after it (build.result verdict=applied): the player is told it stands")
+			if X.noticeLocal then pcall(X.noticeLocal, "build_built_after_all", { thing = "build" }) end
+		end
+	end
 	local w = G.noticeWait and G.noticeWait[key]
 	if w then
 		G.noticeWait[key] = nil
-		return X.tellRefused(w.r, w.why)
+		return X.tellRefused(w.r, w.why, w.verdict)
 	end
 end
 
@@ -6026,8 +6069,8 @@ function X.injectStep(w, refusal)
 	if w.sent then return end
 	if refusal then
 		w.sent = true
-		X.sendVerdict(w.r, false, refusal, "module")
-		return X.tellRefused(w.r, refusal)
+		-- the verdict (and the originator's notice) of a refusal that did not empty the command follow this game's build.result
+		return X.tellRefused(w.r, refusal, true)
 	end
 	w.left = w.left - 1
 	if w.left <= 0 then
@@ -7375,7 +7418,7 @@ function X.sessionOff(why, state)
 	G.peers, G.session, G.marks = {}, L.newSession(), {}
 	G.graces, G.parked, G.dry, G.buildAts, G.vetoed = {}, {}, {}, {}, {}
 	G.pauseQ, G.pauseOwn, G.pauseLast, G.slot = nil, nil, nil, nil
-	G.bresOutcome, G.bresOrder, G.noticeWait = nil, nil, nil   -- build keys start again in the next session (X.buildOutcome)
+	G.bresOutcome, G.bresOrder, G.noticeWait, G.builtLate = nil, nil, nil, nil   -- build keys start again in the next session (X.buildOutcome)
 	-- where this game stood still at the pause (the clock's `stop`); the run on to a host's pause stamp (pauseRun) goes with G.session
 	G.still, X.curStop, G.lastStop = nil, nil, nil
 	G.promiseFloor, G.promisePause, G.barrier = nil, nil, nil

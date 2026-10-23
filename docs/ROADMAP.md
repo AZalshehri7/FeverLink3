@@ -19,6 +19,8 @@ Not yet seen in the real game at that time: joining from a Steam invite by itsel
 
 **0.2.4 (2026-10-23): the game update and other mods.** Support for game build 40423 (the game's update of 2026-10-22), and a clear message in the window on a game build FeverLink3 does not know. Other mods that change the world on their own stay in sync: the host's copy makes the change and every game applies it at the same step. Seen with two games on one PC; not yet between two PCs. Joining from a Steam invite was played between two PCs over the internet.
 
+**0.2.5 (2026-10-23): fixes from the friend sessions.** Roundabouts and streets with a bus stop build in a session; a repair needed right after a sync is no longer dropped; a change made while paused no longer forces a sync; the host learns when a build stood on one game only; mods compared for Steam invite joins; text margins in the window; a Save and quit button after an update. Roundabouts, bus stops, mods and margins seen with two games on one PC.
+
 ## Next
 
 - Find the cause of the object id order differences, so these repair syncs stop.

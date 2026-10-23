@@ -728,7 +728,7 @@ fn drift_parts_request_only_after_five_minutes_of_continuous_drift() {
 }
 
 #[test]
-fn a_replay_failure_requests_a_resync_at_once_and_the_cooldown_holds_the_next() {
+fn a_replay_failure_requests_a_resync_at_once_and_one_inside_the_cooldown_waits_for_its_end() {
     let (mut h, ids) = Harness::running(2, 1, quiet());
     h.player_game(ids[0], MessageKind::ReplayFailed, &json(&ReplayFailedMessage { detail: "no node".to_owned() }));
     assert_eq!(vec!["replay failed".to_owned()], h.requests());
@@ -740,9 +740,14 @@ fn a_replay_failure_requests_a_resync_at_once_and_the_cooldown_holds_the_next() 
     h.advance(10.0);
     h.player_game(ids[1], MessageKind::ReplayFailed, &json(&ReplayFailedMessage { detail: "again".to_owned() }));
     assert_eq!(1, h.requests().len(), "inside the 120 s cooldown");
-    h.advance(120.0);
-    h.host_game(MessageKind::ReplayFailed, &json(&ReplayFailedMessage { detail: "host".to_owned() }));
+    h.advance(60.0);
+    h.host_call(HostSession::tick);
+    assert_eq!(1, h.requests().len(), "still cooling down");
+    // remembered, never dropped: the repair starts at the first tick after the cooldown
+    h.advance(60.0);
+    h.host_call(HostSession::tick);
     assert_eq!(2, h.requests().len());
+    assert!(h.requests()[1].starts_with("replay failed"), "{:?}", h.requests());
 }
 
 /// Lab run 2026-10-18 (A-stress): a town replaced a building during a build's lead; every game refused the build at its stamp.

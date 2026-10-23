@@ -628,6 +628,12 @@ pub struct ActionMessage {
     /// applies paused actions in that one order (the arrival order on its own connection would differ between games).
     #[serde(default, skip_serializing_if = "is_false")]
     pub pause: bool,
+    /// Set by the originator on a `pause` action: its own engine applied it already, at `stamp`, where its game stood still (a native
+    /// build no hold caught). The host numbers it in the pause order like any other but keeps its stamp: every other game runs on to
+    /// that step or stands there and applies it at that step (real session 2026-10-23: stamped at the pause stamp instead, 553 steps
+    /// before where every game stood, it was late on the host and forced a resync).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub applied: bool,
     /// Set by the host on a `pause` action (a player's own value is overwritten): its place in the session's pause order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_seq: Option<u64>,
@@ -654,6 +660,7 @@ impl ActionMessage {
             category: Self::default_category(),
             allowed: true,
             pause: false,
+            applied: false,
             pause_seq: None,
             pause_upto: None,
             hop: None,

@@ -1403,6 +1403,7 @@ impl HostSession {
         let t = self.now();
         self.note_time(t);
         self.resync_step();
+        self.start_due_repair();
         self.watch_connections(t);
         self.ping_players(t);
         let wall = self.wall_ms();
@@ -2114,23 +2115,30 @@ impl HostSession {
         let upto = Some(self.pause_seq + held.len() as u64);
         for item in held {
             self.pause_seq += 1;
-            match item {
+            let given = match item {
                 PauseItem::Action(mut m) => {
-                    m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
+                    // one its sender's engine applied already (`applied`, a native build no hold caught) keeps its stamp, the step
+                    // where it was applied: numbered in the one order, every other game runs on to it or stands there
+                    if !m.applied {
+                        m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
+                    }
                     m.pause_seq = Some(self.pause_seq);
                     m.pause_upto = upto;
                     self.broadcast(MessageKind::Action, &codec::encode(&m), None);
                     self.actions_relayed += 1;
+                    m.stamp
                 }
                 PauseItem::Commit(mut m) => {
                     m.stamp = if paused { stamp } else { stamp.max(m.stamp) };
                     m.pause_seq = Some(self.pause_seq);
                     m.pause_upto = upto;
                     self.broadcast(MessageKind::BuildCommit, &codec::encode(&m), None);
+                    m.stamp
                 }
-            }
+            };
             if paused {
-                self.pause_last = Some(stamp);
+                // the furthest stamp given: every game runs on to it, so the next flush waits for stops at or past it
+                self.pause_last = Some(self.pause_last.map_or(given, |l| l.max(given)));
             }
         }
         if paused && std::mem::take(&mut self.pending_paused_checksum) {

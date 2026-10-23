@@ -283,6 +283,22 @@ class PausedBuildTest(I.InjectTest):
             self.assertSameAndNotLate()
             self.assertGreater(self.A.time(), p + 10 * STEP, "and the games run on afterwards")
 
+        def no_hold_caught(over_host, over_client):
+            # real session 2026-10-23, 1:399: a native build the hold did not catch (here an Add that is not a tool's) is applied by its
+            # engine where its game stands; it was stamped at the pause stamp, 553 steps before every game (PAUSE LATE, a resync). Now it
+            # goes through the host's pause order at the step it was applied, and the other game applies it at that step
+            p = paused(over_host, over_client)
+            stood = self.A.time()
+            self.A.tool(self.road(300, 0, 400, 0), site=False, make="NATIVE_ROAD")
+            self.tick(16)
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (1, 1), self.log())
+            self.assertEqual(self.A.builds(), self.B.builds(), "at the same step on both games")
+            self.assertEqual(self.A.builds(), ["makeWorldBuildProposalCmd@%d" % stood], "where its engine applied it, not at the pause %d" % p)
+            self.assertIn("made during the pause, applied here already; numbered in the host's pause order", self.A.log())
+            self.assertEqual(self.relay.pause_seq, 1, "numbered by the host")
+            self.assertEqual((self.A.speed(), self.B.speed()), (0, 0), "in the pause")
+            self.assertSameAndNotLate()
+
         def outside_a_pause():
             self.start()
             self.strict_on(self.A, self.B)
@@ -299,6 +315,8 @@ class PausedBuildTest(I.InjectTest):
         self.cases([("the host's build, the client further on", {}, hosts_build), ("the client's build, the host further on", {}, clients_build),
                     ("a later build of the pause waits for the slot", {}, a_later_build_waits_for_the_slot),
                     ("the resume waits for the record of an open slot", {}, the_resume_waits),
+                    ("a native build no hold caught, both games past the pause", {}, lambda: no_hold_caught(2, 2)),
+                    ("a native build no hold caught, the other game behind", {}, lambda: no_hold_caught(3, 0)),
                     ("outside a pause: released at the click", {}, outside_a_pause)])
 
 

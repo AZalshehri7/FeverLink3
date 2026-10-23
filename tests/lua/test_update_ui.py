@@ -50,6 +50,43 @@ class UpdateLine(unittest.TestCase):
         idle = ui[ui.index('add(heading("Play together"))'):ui.index('elseif state == "joining" then')]
         self.assertLess(idle.index("if mustRestart(ctl) then"), idle.index('button("Host a game"'))
 
+        # one margin for every text: the window and the pop-up draw their rows in the one padded column
+        self.assertIn("content = fixedColumn(WIDTH, rows)", ui)
+        self.assertIn("return box(V, { fixedColumn(POP_W, rows) })", ui)
+        self.assertEqual(1, ui.count("s.padding = "), "the padding is set in one place")
+
+    def test_save_and_quit(self):
+        """Offered only for a staged update outside a session; saves as feverlink3-restart (not the player's default name),
+        quits only from the save's callback; a refused call says why and leaves the game open."""
+        rt = lupa.LuaRuntime(unpack_returned_tuples=True)
+        with open(os.path.join(CONTENT, "feverlink3_hud.lua"), encoding="utf-8") as f:
+            Hud = rt.execute(f.read())
+        offer = lambda state, u: Hud.offerSaveAndQuit(rt.table_from({"state": state, "update": rt.table_from(u)}))
+        self.assertTrue(offer("idle", {"state": "ready"}) and offer("failed", {"state": "ready"}))
+        for state, u in (("hosting", {"state": "ready"}), ("joined", {"state": "ready"}), ("idle", {"state": "updated"})):
+            self.assertFalse(offer(state, u), (state, u))
+        run = rt.eval('''function(Hud, refuse)
+            local calls, failed = {}, nil
+            local app = {
+                saveGame = function(name, cb, isMapEditor, skipSetName)
+                    if refuse == "save" then error("no world") end
+                    calls[#calls + 1] = "save " .. name .. " " .. tostring(isMapEditor) .. " " .. tostring(skipSetName)
+                    calls.cb = cb
+                end,
+                quit = function(instant)
+                    if refuse == "quit" then error("no") end
+                    calls[#calls + 1] = "quit " .. tostring(instant)
+                end,
+            }
+            local started = Hud.saveAndQuit(app, function() end, function(r) failed = r end)
+            local before = #calls
+            if calls.cb then calls.cb() end
+            return started, before, table.concat(calls, ","), failed
+        end''')
+        self.assertEqual((True, 1, "save feverlink3-restart false true,quit false", None), run(Hud, None))
+        self.assertEqual((False, 0, "", "the world could not be saved"), run(Hud, "save"))
+        self.assertEqual((True, 1, "save feverlink3-restart false true", "the game did not close"), run(Hud, "quit"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -760,8 +760,17 @@ function MAKE_API()
     local a = { n = select("#", ...), ... }
     local p = a[1]
     if TYPEOF(p) ~= "SimpleProposal" and TYPEOF(p) ~= "Proposal" then error("makeWorldBuildProposalCmd: argument 1 is not a proposal") end
-    for _, s in ipairs(PARTS(p).edgesAdd) do
+    local P = PARTS(p)
+    for _, s in ipairs(P.edgesAdd) do
       if #s.comp.laneConfigs == 0 then error("Unknown exception") end   -- finding from MPFever (MIT)
+    end
+    if TYPEOF(p) == "SimpleProposal" then
+      -- the conversion names an edge object's new segment by its place in edgesToAdd: proposal_util.cpp:141 asserts
+      -- edgeEntity < 0 and >= -#edgesToAdd (real session 2026-10-23c, a stop on segment -6 of 4: "Unknown exception")
+      for _, o in ipairs(P.objsAdd) do
+        local e = o.edgeEntity
+        if type(e) == "number" and e < 0 and e < -#P.edgesAdd then error("Unknown exception") end
+      end
     end
     if FACTORY_REJECT then
       -- (a test makes the factory strict about what the mod rebuilds: the proposal kind tells a rebuild from the original)
@@ -2996,6 +3005,46 @@ class PureBuildTest(unittest.TestCase):
         self.assertEqual(str(f(self.ramp_text(), False, False, True)[0]), "built street inject")
         got = str(f(self.ramp_text(), True, False, True)[0])
         self.assertTrue(got.startswith("refused: inject_refused: proposal.addedSegments[0].node1 names node 89384, which the originator has at"), got)
+        # real session 2026-10-23c, held 246 (the text in the fixture): a street re-laid under a road-side stop. The tool numbers its new
+        # entities in one sequence (segments -2,-4,-6,-7, the stop on -6); the placeholder kept those numbers and the engine's conversion
+        # asserts that an edge object's new segment is its place in edgesToAdd (-6 of 4: "Unknown exception", always cancelled).
+        self.assertEqual(str(self.L.eval(self.STOP_UNDER_STREET)(fixture("street_stop_input.txt"))), "built street inject|segment -3 of 4")
+
+    # the world, the record and the inject decode of a native text with edge objects on new segments, in the tool's own numbering
+    STOP_UNDER_STREET = """(function(txt)
+        local M = PURE()
+        local P = M.portable
+        local tree = P.parse(txt)
+        local pt = tree.proposal
+        local tmpl = 'street/new_medium_road.street_template'
+        local function pos(e) return { x = e.x, y = e.y, z = e.z } end
+        local function node(e) if e.new then return -e.new end if not WORLD[e.old] then ADD_NODE(e.old, e.pos.x, e.pos.y, e.pos.z) end return { __ref = 'node', p = pos(e.pos) } end
+        local rec = { v = 1, src = 'native', cons = {}, rem = {}, old2new = {}, nodes = {}, segs = {}, rmNodes = {}, rmSegs = {}, objs = {}, rmObjs = {}, ncfg = {}, rmNcfg = {} }
+        for i, s in ipairs(P.list(pt.removedSegments)) do
+            node(s.node0); node(s.node1)
+            ADD_EDGE(s.entity.old, s.node0.old, s.node1.old, 0, tmpl)
+            rec.rmSegs[i] = { __ref = 'edge', p0 = pos(s.position0), p1 = pos(s.position1) }
+            for j, o in ipairs(P.list(s.objects)) do
+                ADD_OBJECT(o.entity.old, s.entity.old, 'station/street/bus_stop.mdl', 0.5, 1)
+                rec.rmObjs[#rec.rmObjs + 1] = { __ref = 'obj', edge = rec.rmSegs[i], i = j }
+            end
+        end
+        for i, n in ipairs(P.list(pt.removedNodes)) do rec.rmNodes[i] = { __ref = 'node', p = pos(n.position) } end
+        for i, n in ipairs(P.list(pt.addedNodes)) do rec.nodes[i] = { id = -n.entity.new, pos = pos(n.position) } end
+        for i, s in ipairs(P.list(pt.addedSegments)) do
+            rec.segs[i] = { id = -s.entity.new, n0 = node(s.node0), n1 = node(s.node1), type = 0, owner = 'player', objects = {},
+                c = { roadTemplate = '::/' .. tmpl, roadStyle = '::/medium', typeIndex = -1, roadType = 1, p0 = pos(s.position0), p1 = pos(s.position1) } }
+        end
+        for i, o in ipairs(P.list(pt.edgeObjectsToAdd)) do rec.objs[i] = { edge = -o.segmentEntity.new, model = '::/' .. o.modelName, param = 0.5, name = o.name } end
+        -- the other segments the text names (lane connections at the old nodes) exist here; nothing resolves them by place
+        local a, b = pt.addedSegments[1].node1.old, pt.removedSegments[1].node1.old
+        for _, r in ipairs(P.oldRefs(txt)) do if r.kind == 'edge' and not WORLD[r.id] then ADD_EDGE(r.id, a, b, 0, tmpl) end end
+        local body = { fn = 'makeWorldBuildProposalCmd', args = { n = 5, rec, { align = true, cleanup = true, buildings = true, fields = true }, false, true, false }, nativeText = txt }
+        local args, why = M.commands.makeWorldBuildProposalCmd.decode(body, { player = 7, canInject = true, traceKey = '0:246', resolve = RESOLVE_KEY })
+        if not args then return 'refused: ' .. tostring(why) end
+        local ssp = STORE(STORE(args[1]).streetProposal)
+        return 'built ' .. tostring(args.plan) .. (args.inject and ' inject' or '') .. '|segment ' .. tostring(STORE(ssp.edgeObjectsToAdd[1]).edgeEntity) .. ' of ' .. #ssp.edgesToAdd
+    end)"""
 
 
 if __name__ == "__main__":

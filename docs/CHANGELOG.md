@@ -6,6 +6,20 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.5 (2026-10-23)
+
+### Added
+- When an update is ready, the FeverLink3 window and the pop-up have a **Save and quit** button (outside a session): it saves your world as "feverlink3-restart" and closes the game; start the game again from Steam and load that save to play the new version. Not yet seen in the game.
+
+### Fixed
+- A build the game applied at once while the session was paused (for example a change to a crossing's settings) no longer forces a resync: it was sent as if made at the moment of the pause, long before where every game stood, so the other games applied it late. It now takes its place in the host's order of the pause, at the step where it was made, and every game applies it there. Not yet seen in the game.
+- In the FeverLink3 window (every tab and screen) and in the pop-up of the bar icon, the text no longer touches the edges: there is now a small margin on every side, the same as in the game's own windows.
+- Roundabouts could not be built in a session: every game refused them and the player was told "Your build could not be built". The engine stores one rotation number of a roundabout as minus zero, which FeverLink3 took for a different placement; tiny rounding differences in where a construction stands no longer count, a different construction or place still does. Seen with two games on one PC.
+- Re-laying or extending a street that has a bus or tram stop on it (the street tool shows the stop moved, yellow) was always cancelled with "Your build could not be shared with the other players"; the same happened to a street station whose street carries a stop. Such builds are now shared like any other. Seen with two games on one PC.
+- A repair that was needed shortly after a sync (a build that failed on one game, or worlds that differed) was dropped, so the worlds stayed different until someone synced by hand (once for 8 minutes, with builds refused on one game). Now the repair waits and starts by itself as soon as the 2-minute pause between syncs is over, and worlds that differ in a changing set of places count as different. Not yet seen in the real game.
+- A build that was built on a game although FeverLink3's native module reported it as not taken is now reported to the host as built, so the host sees when another game refused it and repairs the difference instead of logging "refused alike, no repair needed" (it stayed a hidden difference between the worlds). A player whose build the game showed as failed (for example cut by a sync) and that was built all the same is now told "Your build was built after all". Not yet seen in the game.
+- A friend who joins through a Steam invite now has their mods compared with the host's: the host no longer warns that the player's game "could not list its mods", and the friend's part of a bug report shows their game build and mods instead of "unknown" (the game lets the window read the mod list only while a world loads, so FeverLink3 keeps that list). Seen with two games on one PC; not yet in a real invite join.
+
 ## 0.2.4 (2026-10-23)
 
 ### Added

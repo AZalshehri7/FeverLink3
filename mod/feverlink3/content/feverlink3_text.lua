@@ -44,6 +44,10 @@ T.MSG = {
 	-- refused at its turn because the world changed in the meantime (this player's game only: nothing was built)
 	build_world_changed = { "warn",
 		"Your {thing} could not be built: the world changed before its turn (for example, something it needed was removed). Nothing was built. Try again." },
+	-- a build of this player that the game showed as failed (its tool's command was failed: a refusal that did not empty it, a sync)
+	-- and that was built all the same (this game's build.result)
+	build_built_after_all = { "info",
+		"Your {thing} was built after all, although the game showed it as failed." },
 	-- refused at its turn because FeverLink3 could not remake it exactly as the game made it (not a world change: trying again fails the same way)
 	build_not_remade = { "warn",
 		"Your {thing} could not be built: FeverLink3 could not copy it exactly as your game made it, so it was not built anywhere. This is a FeverLink3 problem, not a change in the world." },
@@ -103,6 +107,12 @@ T.UPDATE = {
 	explain = "At each game start FeverLink3 looks on GitHub for a newer version and gets it ready for the next start, " ..
 		"never during a session. A change here counts from the next start.",
 	dev = "This copy of FeverLink3 was not made by the release page, so it does not update itself.",
+	-- "Save and quit" (Hud.saveAndQuit): the world is saved as feverlink3-restart, the game closes, the player starts it again
+	quit = "Save and quit",
+	quitNote = "Saves your world as feverlink3-restart and closes the game. Start the game again from Steam, " ..
+		"then load feverlink3-restart (Continue or Load Game).",
+	saving = "Saving your world. The game closes when it is done.",
+	quitFailed = "Save and quit did not work: {reason}. Restart the game to finish.",
 }
 
 -- Why another game could not build it ({cause}), from the technical reason (which stays in the log).
@@ -156,6 +166,11 @@ function T.say(key, args, owner)
 	a.whose = tostring(owner) .. "'s"
 	a.who = a.who or tostring(owner)
 	return fill(m[3] or m[2], a), m[1]
+end
+
+-- Why "Save and quit" did not work, in the player's words (T.UPDATE.quitFailed).
+function T.quitFailed(reason)
+	return fill(T.UPDATE.quitFailed, { reason = reason or "unknown problem" })
 end
 
 -- The window's line for the automatic update (ctl.update): text and level, or nil when there is nothing to say.

@@ -10,7 +10,7 @@ use super::checksum::ChecksumOutcome;
 pub struct ChecksumPolicyConfig {
     /// Drift parts must differ continuously this long (seconds).
     pub drift_seconds: f64,
-    /// Rounds in a row with the same differing set before an ordinary difference reloads.
+    /// Rounds in a row in which an ordinary part differs before the difference reloads (which parts may change from round to round).
     pub consecutive_rounds: u32,
     /// Minimum seconds between the end of one resync and the next policy-driven one.
     pub cooldown_seconds: f64,
@@ -31,6 +31,10 @@ pub struct ChecksumPolicy {
     last_other: Option<BTreeSet<String>>,
     streak: u32,
     last_resync_end: Option<f64>,
+    /// A repair asked for inside the cooldown: remembered (one, the first reason) and handed out by [`Self::due`] once the cooldown
+    /// is over. Real sessions 2026-10-23: a replay failure and a 95 s checksum difference that arrived inside the cooldown were
+    /// dropped and the worlds stayed forked until the owner synced by hand (8 min in one session).
+    pending: Option<String>,
 }
 
 impl ChecksumPolicy {
@@ -162,11 +166,13 @@ impl ChecksumPolicy {
         } else if other.is_empty() {
             self.last_other = None;
             self.streak = 0;
-        } else if self.last_other.as_ref() == Some(&other) {
-            self.streak += 1;
         } else {
+            // Any ordinary difference in rounds in a row counts, whichever parts it shows: builds are stamped and every game samples
+            // at the same step, so an ordinary part that differs is a fork, and a fork spreads from lane to lane (2026-10-23: rounds
+            // 647-656 showed freeq, ids, nodeConfigs, then edges, companies, townBuildings; the per-town `townBuildings:<town>`
+            // parts change with each town that grows). A rule that asked for the same set twice never fired on them.
             self.last_other = Some(other.clone());
-            self.streak = 1;
+            self.streak += 1;
         }
 
         let reason = if !other.is_empty() && self.streak >= self.config.consecutive_rounds {
@@ -176,34 +182,63 @@ impl ChecksumPolicy {
                 format!("{} drifted for {:.0} s", join(self.last_drift.as_ref().unwrap_or(&drift)), now - since)
             })
         };
-        let reason = reason?;
+        match reason {
+            Some(reason) => self.decide(now, reason),
+            None => {
+                // a full round in which every part was measured and only money (corrected in place) differs proves the worlds
+                // match: a repair still waiting for the cooldown is not needed any more
+                if outcome.full && outcome.ready() && parts.is_empty() {
+                    self.pending = None;
+                }
+                None
+            }
+        }
+    }
+
+    /// A game failed to replay an action: resync at once, or as soon as the cooldown is over.
+    pub fn on_replay_failed(&mut self, now: f64) -> Option<String> {
+        self.decide(now, "replay failed".to_owned())
+    }
+
+    /// The games' verdicts of action `key` at its stamp differ (one applied it, another refused it): a fork, resync at once, or as
+    /// soon as the cooldown is over.
+    pub fn on_verdicts_differ(&mut self, now: f64, key: &str) -> Option<String> {
+        self.decide(now, format!("verdicts of {key} differ"))
+    }
+
+    /// The repair that waited for the cooldown, once the cooldown is over (call it regularly while no resync runs). `None` while
+    /// cooling down or when nothing waits.
+    pub fn due(&mut self, now: f64) -> Option<String> {
+        if self.pending.is_none() || self.in_cooldown(now) {
+            return None;
+        }
+        let reason = self.pending.take();
+        self.reset();
+        reason.map(|r| format!("{r} (waited for the cooldown)"))
+    }
+
+    /// The repair waiting for the cooldown, if any.
+    pub fn pending(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
+    /// Seconds until the cooldown is over (0 outside it).
+    pub fn cooldown_left(&self, now: f64) -> f64 {
+        self.last_resync_end.map_or(0.0, |end| (self.config.cooldown_seconds - (now - end)).max(0.0))
+    }
+
+    /// A repair is needed: now, or (inside the cooldown) remembered for [`Self::due`]. Never dropped; one waits at a time.
+    fn decide(&mut self, now: f64, reason: String) -> Option<String> {
         if self.in_cooldown(now) {
+            self.pending.get_or_insert(reason);
             return None;
         }
         self.reset();
         Some(reason)
     }
 
-    /// A game failed to replay an action: resync at once, cooldown permitting.
-    pub fn on_replay_failed(&mut self, now: f64) -> Option<String> {
-        if self.in_cooldown(now) {
-            return None;
-        }
-        self.reset();
-        Some("replay failed".to_owned())
-    }
-
-    /// The games' verdicts of action `key` at its stamp differ (one applied it, another refused it): a fork, resync at once,
-    /// cooldown permitting.
-    pub fn on_verdicts_differ(&mut self, now: f64, key: &str) -> Option<String> {
-        if self.in_cooldown(now) {
-            return None;
-        }
-        self.reset();
-        Some(format!("verdicts of {key} differ"))
-    }
-
-    /// A resync round ended (done or failed): starts the cooldown and forgets what was counted.
+    /// A resync round ended (done or failed): starts the cooldown and forgets what was counted and what waited (that round was
+    /// the repair).
     pub fn resync_finished(&mut self, now: f64) {
         self.reset();
         self.last_resync_end = Some(now);
@@ -214,6 +249,7 @@ impl ChecksumPolicy {
         self.last_drift = None;
         self.last_other = None;
         self.streak = 0;
+        self.pending = None;
     }
 }
 

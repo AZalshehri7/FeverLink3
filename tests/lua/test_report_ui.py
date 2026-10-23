@@ -31,6 +31,11 @@ class ReportButton(unittest.TestCase):
             ui = f.read()
         self.assertEqual(1, len(re.findall(r'command\("report"', ui)), "one place sends it")
         self.assertIn('command("report", withMods({ note = U.reportNote or "" }))', ui)
+        # the mods and build reach the controller without a click too (a Steam-invite join has no window command)
+        self.assertEqual(1, len(re.findall(r'command\("mods"', ui)))
+        self.assertIn("pcall(shareMods)", ui)
+        # the refresh closure must see the local: declared before the call (two windows 2026-10-23: it called a global nil)
+        self.assertLess(ui.index("local shareMods"), ui.index("pcall(shareMods)"))
         # the pop-up (only while the bar icon is red), the Troubleshooting section and the Players tab (host and guest, any
         # icon colour) call the same function
         calls = re.findall(r"(?<!function )reportRows\(add, ctl\)", ui)

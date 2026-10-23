@@ -61,6 +61,7 @@ without an answer, except `kick` and `permissions`, which always answer in `resu
 | `accept_invite` | `{}` | any | Joins through the pending Steam `invite`, leaving the current session first. |
 | `dismiss_invite` | `{}` | any | Forgets the pending Steam `invite`. |
 | `report` | `{note?, mods?, game?}` | any | "Report a problem": a bug report zip (docs/PROTOCOL.md, "Bug reports"). `hosting` and `joined`: the host collects every game's logs; otherwise this game's logs alone. `note` (at most 300 characters) goes into the report's `report.txt`; `mods` and `game` as for `host`, for the part's mod list and game build. Ignored while a report is being made. The progress and the outcome are `report`. |
+| `mods` | `{mods?, game?}` | any | This game's installed mods (`[{id, revision, cosmetic}]`, what `feverlink3_hud.lua` `H.modList` reads; absent when the window could not read them) and game build (`getBuildVersion()`). The window sends it by itself once the controller answers, and again only when they changed (re-read every 30 s); `host`, `join` and `report` may carry the same two keys. The controller keeps the last of each (a key left out keeps its value) for every host and join, a Steam-invite join included, and for the bug report's game build and mod list; each change is logged in `session.log` (`mods: the window's list: N mods, game build B`). An automatic invite join waits up to 5 s after the world was loaded for it, then joins without (`invites: the window sent no mod list; joining without it`). No answer. |
 
 #### `permissions` values
 

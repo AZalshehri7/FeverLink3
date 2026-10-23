@@ -942,9 +942,9 @@ impl HostSession {
             return;
         }
         let now = self.now();
-        if let Some(reason) = self.policy.on_outcome(now, &outcome) {
-            self.request_resync(reason);
-        }
+        let waited = self.policy.pending().is_some();
+        let decision = self.policy.on_outcome(now, &outcome);
+        self.policy_decided(now, waited, decision);
     }
 
     /// The first compared round a player caught up after a drop took part in (`HostSession::begin_catch_up`): the same world, or a
@@ -980,9 +980,9 @@ impl HostSession {
             return;
         }
         let now = self.now();
-        if let Some(reason) = self.policy.on_replay_failed(now) {
-            self.request_resync(reason);
-        }
+        let waited = self.policy.pending().is_some();
+        let decision = self.policy.on_replay_failed(now);
+        self.policy_decided(now, waited, decision);
     }
 
     /// A game's verdict of an action at its stamp. A refusal decided at the stamp from the game's own world is deterministic: identical
@@ -1023,10 +1023,40 @@ impl HostSession {
                     "action {key}: applied on {applied}, refused on {refused} ({first}): the worlds forked at this action"
                 ));
                 let now = self.now();
-                if let Some(reason) = self.policy.on_verdicts_differ(now, &key) {
-                    self.request_resync(reason);
-                }
+                let waited = self.policy.pending().is_some();
+                let decision = self.policy.on_verdicts_differ(now, &key);
+                self.policy_decided(now, waited, decision);
             }
+        }
+    }
+
+    /// What a policy call decided: a repair now, a repair remembered for the end of the cooldown (logged once), a waiting repair
+    /// cancelled by a round that found the worlds equal (logged), or nothing.
+    fn policy_decided(&mut self, now: f64, waited: bool, decision: Option<String>) {
+        if let Some(reason) = decision {
+            self.request_resync(reason);
+            return;
+        }
+        match (waited, self.policy.pending().map(str::to_owned)) {
+            (false, Some(reason)) => self.log(format!(
+                "repair needed ({reason}) inside the resync cooldown: it starts in {:.0} s, when the cooldown is over",
+                self.policy.cooldown_left(now)
+            )),
+            (true, None) => self.log(
+                "the waiting repair is not needed any more: a full checksum round found the worlds equal".to_owned(),
+            ),
+            _ => {}
+        }
+    }
+
+    /// Called every tick: the repair that waited for the cooldown starts when the cooldown is over (one at a time: never while
+    /// a resync round runs).
+    pub(super) fn start_due_repair(&mut self) {
+        if self.resync.is_some() || !self.state.started {
+            return;
+        }
+        if let Some(reason) = self.policy.due(self.now()) {
+            self.request_resync(reason);
         }
     }
 

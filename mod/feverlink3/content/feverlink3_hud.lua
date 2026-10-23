@@ -374,8 +374,26 @@ local function readMods(appApi, seen)
 	return nil, step .. ": " .. tostring(res)
 end
 
+-- The installed mods cannot change while the game runs, and inside a running world the game refuses the repository most of
+-- the time ("API is currently restricted"; two windows 2026-10-23: readable while a world loads, refused in play), so the
+-- last list read is kept and answers a refused read.
+local lastMods = nil
 function H.modList(appApi)
-	return readMods(appApi, nil)
+	local list, why = readMods(appApi, nil)
+	if list then lastMods = list; return list end
+	if lastMods then return lastMods end
+	return nil, why
+end
+
+-- One text for the window's `mods` / `game` (withMods in feverlink3_ui.script.lua): the window sends them again only when it
+-- changed. A list that could not be read is "?".
+function H.modsKey(params)
+	local parts = { tostring(params.game or "") }
+	if type(params.mods) ~= "table" then parts[2] = "?" end
+	for _, m in ipairs(type(params.mods) == "table" and params.mods or {}) do
+		parts[#parts + 1] = tostring(m.id) .. ":" .. tostring(m.revision) .. (m.cosmetic and "c" or "")
+	end
+	return table.concat(parts, "|")
 end
 
 -- The player-facing name of the installed mod whose folder is `folder` (a mod.io mod's folder is its Mod Hub id, a user mod's its
@@ -401,6 +419,7 @@ end
 function H.modShape(appApi)
 	local seen = {}
 	local list, why = readMods(appApi, seen)
+	if list then lastMods = list end
 	local head = list and (#list .. " mods") or ("FAILED at " .. tostring(why))
 	return head .. "; " .. table.concat(seen, " ")
 end
@@ -663,6 +682,43 @@ function H.newTicker(interval, clock, fn)
 		last = now
 		return fn()
 	end
+end
+
+-- "Save and quit" once an update is staged (owner, 2026-10-23): the update finishes at the next game start, so the window offers
+-- to save the world and close the game in one click. FeverLink3 never starts a program (launcher/tests/no_child_process.rs), and
+-- app.restart is documented only as "Restart the application" (no word on whether it is a new process, which the new winhttp.dll
+-- needs), so the player starts the game again from Steam. The mod has no code in the main menu (mods are active per world; the
+-- window is a game bar plugin), so it cannot load the save there by itself: the player loads it.
+-- Documented calls (api/tealdef/app.d.tl, tf3-docs reference/api/app.html): saveGame(name, callBack, isMapEditor, skipSetName?)
+-- "callback when the savegame is finished", skipSetName = true keeps the player's own default save name; quit(instant) "Quit the
+-- application", called with false as the main menu's Quit does (gui/menu/main_page.tl 542; the pause menu's Return to Desktop calls
+-- app.quit(true) from the in-game interface, gui/main/pause_menu.tl 206).
+H.QUIT_SAVE = "feverlink3-restart"
+
+-- Shown only while an update waits for the restart and no session runs on this game (ctl.state idle or failed).
+function H.offerSaveAndQuit(ctl)
+	return type(ctl) == "table" and (ctl.state == "idle" or ctl.state == "failed")
+		and type(ctl.update) == "table" and ctl.update.state == "ready"
+end
+
+-- Saves the world as H.QUIT_SAVE, then quits. `failed(reason)` when a call is refused: the game stays open and nothing is lost.
+-- Returns false when the save could not even start.
+function H.saveAndQuit(appApi, log, failed)
+	local ok, err = pcall(appApi.saveGame, H.QUIT_SAVE, function()
+		log("save and quit: the world is saved as '" .. H.QUIT_SAVE .. "', quitting the game")
+		local okQ, errQ = pcall(appApi.quit, false)
+		if not okQ then
+			log("save and quit: app.quit refused: " .. tostring(errQ))
+			failed("the game did not close")
+		end
+	end, false, true)
+	if not ok then
+		log("save and quit: app.saveGame refused: " .. tostring(err))
+		failed("the world could not be saved")
+		return false
+	end
+	log("save and quit: saving the world as '" .. H.QUIT_SAVE .. "'")
+	return true
 end
 
 return H

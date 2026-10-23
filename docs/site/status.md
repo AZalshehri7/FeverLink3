@@ -4,7 +4,7 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-23, version 0.2.4 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
+Last updated 2026-10-23, version 0.2.5 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
 
 This page keeps three things apart: what has been seen working in the real game, what has only been tested automatically, and the known gaps.
 
@@ -30,6 +30,9 @@ These are covered by the automatic tests (about 1,600 on every change) or by two
 - A road that joins or splits an existing road no longer reports a false "could not be built" (two game windows on one PC, 5 roads at x1 and x4).
 - Every game keeps its world details when a sync starts (two game windows on one PC).
 - Game build 40423 (two game windows on one PC: hooks on, builds equal, no automatic sync).
+- Roundabouts, and re-laying a street that has a bus stop on it (two game windows on one PC, 0.2.5).
+- The mod comparison for every join, a Steam invite too (two game windows on one PC, 0.2.5; not yet a real invite join).
+- A repair needed right after a sync waits and starts by itself; a change made while paused goes through the pause order (0.2.5, automatic tests only).
 - Other mods that change the world on their own (Auto Line Namer, Auto Color Lines): the host's copy makes the change and both games apply it at the same step (two game windows on one PC, new lines made by hand). A setting changed in such a mod's own window is not yet seen.
 - Configuring a station right after a sync (0.2.3; not yet seen in the game).
 - Putting the previous version back when an update does not start.

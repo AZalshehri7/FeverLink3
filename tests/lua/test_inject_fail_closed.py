@@ -377,9 +377,13 @@ class InjectFailClosedTest(InjectTest):
             n = 1 if applies == "pass" else 0
             self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (n, n))
             told = "told the player: Your build could not be built"
+            verdicts = [sum(1 for l in g.lines(g.from_game) if l.split(T.TAB)[0] == "action_applied") for g in (self.A, self.B)]
             if n:
-                self.assertIn("build 1:1 was applied here (build.result verdict=applied) although the native module refused its order: the player is not told it failed", self.B.log())
+                self.assertIn("build 1:1 was applied here (build.result verdict=applied) although the native module refused its order: the verdict says applied, the player is not told it failed", self.B.log())
                 self.assertNotIn(told, self.B.log())
+                self.assertIn("told the player: Your build was built after all", self.B.log())
+                # friend session 2026-10-23c (0:374): the verdicts follow what applied, not the module's no_command
+                self.assertEqual((verdicts, self.relay.refused, self.relay.verdict_resyncs), ([1, 1], [], []))
                 # a refusal whose build.result never comes: the player is told after X.NOTICE_WAIT_S all the same
                 self.B.L.execute(T.FIND_UP)
                 self.B.L.execute('FIND_UP("X").tellRefused({ from = 1, of = "1:99" }, "inject order 9 refused here (no_command): lost"); '
@@ -387,14 +391,30 @@ class InjectFailClosedTest(InjectTest):
                 self.tick(2)
                 self.assertIn("build 1:99: no build.result within 5 s: the notice is given as it is", self.B.log())
                 self.assertEqual(self.B.log().count(told), 1)
+                # 0:498 of the same session: a resync load cut the build from its tool (failed at hold_off), the host's pause order
+                # applied it afterwards: the player is told it stands
+                self.B.L.execute('FIND_UP("G").builtLate = { ["1:98"] = true }; FIND_UP("X").buildOutcome("1:98", "applied")')
+                self.assertIn("build 1:98 was cut from its tool by the resync and applied after it", self.B.log())
+                self.assertEqual(self.B.log().count("told the player: Your build was built after all"), 2)
             else:
-                self.assertIn("the notice waits for this game's build.result", self.B.log())
+                self.assertIn("the verdict waits for this game's build.result", self.B.log())
                 self.assertEqual(self.B.log().count(told), 1, "nothing was built here: the player is told, once")
+                self.assertEqual((verdicts, self.relay.verdict_resyncs), ([0, 0], []), "refused alike: no repair")
             self.assertSameWorld()
+
+        def no_command_applied_on_the_originator_only():
+            # friend session 2026-10-23c (0:374): the host's module said no_command and its road stood, the friend refused the copy; the
+            # host's verdict said refused, the host logged "refused alike ... no repair needed" and the fork stayed hidden
+            self.B.native.no_command = "pass"
+            self.A.native.refuse_all = "node 221411 is not a node here"
+            self.build_on_b()
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 1))
+            self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
 
         self.cases([("the happy path", {}, happy_path), ("a segment ending away from its existing node", {}, segment_away_from_its_node),
                     ("refused as no_command, the command applied", {}, lambda: no_command("pass")),
-                    ("refused as no_command, nothing applied", {}, lambda: no_command("emptied"))])
+                    ("refused as no_command, nothing applied", {}, lambda: no_command("emptied")),
+                    ("no_command and applied on the originator only", {}, no_command_applied_on_the_originator_only)])
 
     def test_a_copy_one_game_cannot_apply_is_applied_nowhere_there_and_the_differing_verdicts_ask_for_the_repair(self):
         def receiver_refuses():
@@ -410,7 +430,7 @@ class InjectFailClosedTest(InjectTest):
             self.assertEqual(self.relay.replay_failed, [], "no game asks for a resync by itself")
             self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
             self.assertTrue(any("inject order %d refused here (nothing)" % key in d for g, _, d in self.relay.refused if g == 0), self.relay.refused)
-            self.assertIn("this is this game's verdict", self.A.log())
+            self.assertIn("nothing of the build is applied here; the host compares this game's verdict", self.A.log())
             # the originator built it and its held command completed with that apply: the tool is free
             self.assertEqual(self.B.builds_applied(), 1)
             self.assertEqual(self.B.native.completed, [(1, True, "stamp_apply")])

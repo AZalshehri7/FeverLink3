@@ -543,6 +543,28 @@ fn an_action_of_the_pause_is_stamped_past_the_furthest_place_a_game_really_stand
     for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
         assert_eq!(vec![(1, first, 1), (1, second, 2)], paused_actions(game));
     }
+    // a native build no hold caught, applied by its sender's engine where it stood (real session 2026-10-23, 1:399): numbered in the
+    // same order, its stamp kept; the next flush waits for stops at or past the furthest stamp given, not past one never given
+    let stand = second + Lockstep::STEP;
+    for (c, t) in [(a, stand), (b, stand)] {
+        h.player_game(c, MessageKind::Clock, &stopped(t, p));
+    }
+    h.host_game(MessageKind::Clock, &stopped(stand, p));
+    let mut native = ActionMessage::new(stand, 2, "{a2}").paused();
+    native.applied = true;
+    h.player_game(a, MessageKind::Action, &json(&native));
+    for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
+        assert_eq!(
+            vec![(1, first, 1), (1, second, 2), (2, stand, 3)],
+            paused_actions(game),
+            "kept where its engine applied it"
+        );
+    }
+    h.player_game(b, MessageKind::Action, &json(&ActionMessage::new(p, 2, "{b2}").paused()));
+    let third = stand + Lockstep::STEP;
+    for game in [&h.p(a).game, &h.p(b).game, &h.host_game] {
+        assert_eq!(Some(&(2, third, 4)), paused_actions(game).last(), "the next one past where every game stands");
+    }
 }
 
 #[test]

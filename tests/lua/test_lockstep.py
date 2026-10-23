@@ -711,7 +711,8 @@ class Relay:
         for kind, g, p in held:
             self.pause_seq += 1
             p["pauseUpto"] = upto
-            p["stamp"] = stamp if self.pauseAt is not None else max(stamp, int(p.stamp))
+            if not (kind == "action" and p.applied):   # host.rs: one its sender's engine applied already keeps its stamp
+                p["stamp"] = stamp if self.pauseAt is not None else max(stamp, int(p.stamp))
             p["pauseSeq"] = self.pause_seq
             if kind == "build_commit":
                 self.commits.append((g.id, int(p.owner), int(p.seq), int(p.stamp)))
@@ -719,7 +720,7 @@ class Relay:
             for o in self.games:
                 self.send(o, kind, g.id if kind == "action" else 0, payload)
             if self.pauseAt is not None:
-                self.pause_last = stamp
+                self.pause_last = max(self.pause_last or int(p.stamp), int(p.stamp))
 
     def future_stamp(self):
         t = max(self.clocks.values())
@@ -2266,13 +2267,16 @@ class PureTest(unittest.TestCase):
         mods = H.modList(app)
         self.assertEqual([(mods[i].id, mods[i].revision, mods[i].cosmetic) for i in (1, 2)], [("trains", 3, False), ("ui", 2, True)])
         self.assertIn("2 mods; getUserProfile=table", H.modShape(app))
+        # the window sends its list again only when this text changes (shareMods in feverlink3_ui.script.lua)
+        key = H.modsKey(self.L.table_from({"game": "40423", "mods": mods}))
+        self.assertEqual(key, "40423|trains:3|ui:2c")
+        self.assertNotEqual(key, H.modsKey(self.L.table_from({"game": "40423"})))
         self.assertIn("id1.name=string:trains", H.modShape(app))
         broken = self.L.execute("local p = {} function p:getModRep() error('no repository in this state') end"
                                 " return { getUserProfile = function() return p end }")
-        none, why = H.modList(broken)
-        self.assertIsNone(none)
-        self.assertIn("profile:getModRep(): ", why)
-        self.assertIn("no repository", why)
+        # a refused read (the game restricts the repository in a running world) answers with the last list read
+        cached = H.modList(broken)
+        self.assertEqual(cached[1].id, "trains")
         self.assertIn("FAILED at profile:getModRep()", H.modShape(broken))
         # a mod's player-facing name from its own information: the folder is its Mod Hub id (mod.io) or its mod id (user mod)
         named = self.L.execute("""
@@ -2286,6 +2290,12 @@ class PureTest(unittest.TestCase):
         """)
         self.assertEqual([H.modName(named, "6416672"), H.modName(named, "trains"), H.modName(named, "999")], ["Auto Color Lines", "Trains", None])
         self.assertIsNone(H.modName(broken, "6416672"))
+        # a record keeps the sign of zero (a roundabout's transform has -0.0; the proof compares bit for bit), logs do not
+        text = self.C.serialize(self.L.execute("return { -0.0, 0.0, 1.5 }"))
+        self.assertIn("-0.0", text)
+        # the sign is checked in Lua: lupa hands Lua 5.2's integral -0.0 to Python as the int 0
+        self.assertEqual(self.L.execute("return function(t) return 1 / t[1] end")(self.C.parse(text)), float("-inf"))
+        self.assertEqual(self.C.integerText(self.L.execute("return -0.0")), "0")
         ctl = self.C.parse('{ mods = { {block = true, text = "missing maps (host has revision 1)"}, {block = false, text = "only you have x"} },'
                            ' modWarnings = { "the host could not list its mods" } }')
         lines = H.modLines(ctl)
