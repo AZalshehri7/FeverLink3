@@ -103,7 +103,7 @@ A friend who does not own the game can take part with the small program `feverli
 - **Report a problem** over Steam: one zip with both players' logs arrived.
 - Automatic updates, on the maintainer's PC: 0.2.1 downloaded, checked and installed itself, finished after one restart.
 
-**Not yet seen in the real game** (tested automatically): joining from a Steam invite by itself (needs a two-PC test), the warning about other mods that change the world on their own, putting the previous version back when an update does not start, and the switch that turns automatic updates off.
+**Not yet seen in the real game** (tested automatically): putting the previous version back when an update does not start, and the switch that turns automatic updates off.
 
 **Known gaps:**
 

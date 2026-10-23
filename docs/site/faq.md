@@ -35,7 +35,7 @@ Yes, every player installs FeverLink3. A player who joins does not need to prepa
 Through Steam. No ports, no router settings, no IP addresses: the host sends a join code and the friend pastes it into the FeverLink3 window. Treat the code like a password for that session.
 
 **Can I join from a Steam invite?**
-The host can invite friends from Steam's friends list, and the host lets each friend in. Joining from an invite by itself had a bug that is fixed in 0.2.1, but the fix has not yet been tested between two PCs. The join code always works.
+The host can invite friends from Steam's friends list, and the host lets each friend in. Joining from an invite by itself works between two PCs over the internet (since 0.2.1). The join code always works too.
 
 **How many players?**
 The tests with real games were with two players. More are planned for in the design but have not been played yet.

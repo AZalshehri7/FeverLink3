@@ -21,7 +21,7 @@
 - **Your other mods work together too.** Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
 - **The full game.** Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 - **Easy to join.** Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
-- **Steam invites.** Invite friends from Steam's own invite dialog; with a world loaded they join by themselves (new in 0.2.1, not yet tried on two PCs).
+- **Steam invites.** Invite friends from Steam's own invite dialog; with a world loaded they join by themselves (played between two PCs over the internet).
 - **Always the same world.** The games check each other all the time. If they ever drift apart, everyone gets the host's world back in a few seconds and play goes on.
 - **Shared speed, pause and chat.**
 - **Encrypted.** Everything between the games is encrypted; the join code works like a password.

@@ -13,15 +13,14 @@ Status as of 2026-10-23. The project started on 2026-10-09. What changed in each
 - Played over the internet with a friend through Steam, in sessions of up to 3.5 hours (with the build before the release): building together, towns growing, shared speed, pause and chat, the new interface and Report a problem. In the longest session, 11 repair syncs: 1 for the join, 5 because another mod (Auto Line Namer) renamed lines on its own, 5 from object ids in a different order on the two games (each found within seconds and repaired automatically): about one such repair every 40 minutes.
 - Automatic updates on the maintainer's PC: 0.2.1 downloaded, checked and installed itself.
 
-Not yet seen in the real game: joining from a Steam invite by itself (fixed in 0.2.1), the warning about mods that change the world on their own, putting the previous version back when an update does not start.
+Not yet seen in the real game at that time: joining from a Steam invite by itself (fixed in 0.2.1; seen between two PCs on 2026-10-23), the warning about mods that change the world on their own, putting the previous version back when an update does not start.
 
 **0.2.2 and 0.2.3 (2026-10-22): faster builds and fixes.** A road stands on both games 1.4 s after the click at game speed x1 and 0.8 s at x4 (two games on one PC); no false "could not be built" on a road that joins an existing road (two games on one PC); every game keeps its world details at a sync. Seen in the real game: the automatic update from 0.2.2 to 0.2.3 on the maintainer's PC, and the warning about other mods on two PCs.
 
-**0.2.4 (2026-10-23): the game update and other mods.** Support for game build 40423 (the game's update of 2026-10-22), and a clear message in the window on a game build FeverLink3 does not know. Other mods that change the world on their own stay in sync: the host's copy makes the change and every game applies it at the same step. Seen with two games on one PC; not yet between two PCs.
+**0.2.4 (2026-10-23): the game update and other mods.** Support for game build 40423 (the game's update of 2026-10-22), and a clear message in the window on a game build FeverLink3 does not know. Other mods that change the world on their own stay in sync: the host's copy makes the change and every game applies it at the same step. Seen with two games on one PC; not yet between two PCs. Joining from a Steam invite was played between two PCs over the internet.
 
 ## Next
 
-- Try Steam invites between two PCs.
 - Find the cause of the object id order differences, so these repair syncs stop.
 - See other mods' shared changes and settings between two PCs, and make line edits apply faster.
 - Separate companies for each player.

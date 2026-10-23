@@ -116,7 +116,6 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 
 ```
 Known issues in 0.2.4
-- Steam invites (Steam's invite dialog) have not been tried on two PCs yet. The join code works.
 - Terrain editing, ground paint and trees are not shared; the terrain tools are off during a session.
 - A mod change FeverLink3 cannot share yet causes extra syncs (FeverLink3 names the mod in a warning).
 - After a Transport Fever 3 update, FeverLink3 needs an update too (the window says so).

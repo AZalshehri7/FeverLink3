@@ -12,7 +12,7 @@ This page keeps three things apart: what has been seen working in the real game,
 
 Played over the internet with a friend through Steam, in sessions of up to 3.5 hours, and on the maintainer's PC:
 
-- Two players on two PCs connect over Steam with a join code; the host's world is sent to the friend.
+- Two players on two PCs connect over Steam with a join code or a Steam invite; the host's world is sent to the friend.
 - Building together: roads, rail, stations, stops, depots, lines and vehicles. A road stands on both games 1.4 s after the click at game speed x1 and 0.8 s at x4 (real time, two games on one PC, a grown save).
 - The full game: towns grow, traffic flows, ratings change, as in single player.
 - World checks run all the time; when the worlds drifted apart, an automatic repair sync gave everyone the host's world back (about 15 s for an 80 MB world over Steam).
@@ -27,7 +27,6 @@ Played over the internet with a friend through Steam, in sessions of up to 3.5 h
 
 These are covered by the automatic tests (about 1,600 on every change) or by two game windows on one PC, but not yet seen between two PCs:
 
-- Joining from a Steam invite by itself (fixed in 0.2.1; needs a two-PC test). The join code works.
 - A road that joins or splits an existing road no longer reports a false "could not be built" (two game windows on one PC, 5 roads at x1 and x4).
 - Every game keeps its world details when a sync starts (two game windows on one PC).
 - Game build 40423 (two game windows on one PC: hooks on, builds equal, no automatic sync).
