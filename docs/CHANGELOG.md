@@ -6,10 +6,10 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
-## 0.2.6 (unreleased)
+## 0.2.6 (2026-10-24)
 
 ### Added
-- Support for Transport Fever 3 game build 40425 (the game update of 2026-10-22, PE 0x6ad9ce10). With 0.2.5 that game build ran without FeverLink3's hooks: the window said an update was needed and hosting was refused. Builds 40420 and 40423 stay supported.
+- Support for Transport Fever 3 game build 40425 (the game update of 2026-10-22, PE 0x6ad9ce10). With 0.2.5 that game build ran without FeverLink3's hooks: the window said an update was needed and hosting was refused. Builds 40420 and 40423 stay supported. Seen working in two windows on 40425.
 
 ## 0.2.5 (2026-10-23)
 
