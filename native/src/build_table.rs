@@ -1387,7 +1387,10 @@ mod tests {
         assert_eq!(port_lines(b), port_lines(old));
         assert_eq!(b.script_pool.as_ref().unwrap().replacement, old.script_pool.as_ref().unwrap().replacement);
         assert_eq!(b.lua_makeseed.as_ref().unwrap().replacement, old.lua_makeseed.as_ref().unwrap().replacement);
-        assert_eq!(b.tick_count_getter.as_ref().unwrap().replacement, old.tick_count_getter.as_ref().unwrap().replacement);
+        assert_eq!(
+            b.tick_count_getter.as_ref().unwrap().replacement,
+            old.tick_count_getter.as_ref().unwrap().replacement
+        );
         assert_eq!(b.preview_owner.as_ref().unwrap().z_getter_slot, old.preview_owner.as_ref().unwrap().z_getter_slot);
     }
 
