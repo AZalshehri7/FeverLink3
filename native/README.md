@@ -59,7 +59,8 @@ compares the old and the new one.
    the command kinds and the WinHTTP import list (add any new import to `proxy.rs`).
 3. Write the row into `build_table::BUILDS` from the port report, add the build to `KNOWN_BUILDS` in
    `launcher/src/wizard/versions.rs`, and extend the row test in `build_table.rs` to the new report. Game build 40423 was
-   added this way (`tools/addr/out/port-6ac50427-6ad0e4e5.txt`).
+   added this way (`tools/addr/out/port-6ac50427-6ad0e4e5.txt`), and 40425 the same way from 40420
+   (`tools/addr/out/port-6ac50427-6ad9ce10.txt`; its code sits at the same places as 40423's).
 
 A game build that is not in the table runs with every hook off; the in-game window says so, hosting is refused and a join is
 refused by the host with the reason (`docs/LIVE_CONTROL.md`).

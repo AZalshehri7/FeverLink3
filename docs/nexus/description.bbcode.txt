@@ -48,7 +48,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [list]
 [*]Transport Fever 3 on Steam, Windows 10 or 11 (64-bit). Not for Mac, Linux or consoles.
 [*]Steam running and logged in.
-[*]Every player needs the same game version and the same FeverLink3 version (an older FeverLink3 is told to update). Made for game builds 40420 and 40423; on a game build it does not know yet, FeverLink3 switches its hooks off instead of risking your game, says so in the FeverLink3 window, does not host, and the host refuses that player with the reason. A FeverLink3 update follows.
+[*]Every player needs the same game version and the same FeverLink3 version (an older FeverLink3 is told to update). Made for game builds 40420, 40423 and 40425; on a game build it does not know yet, FeverLink3 switches its hooks off instead of risking your game, says so in the FeverLink3 window, does not host, and the host refuses that player with the reason. A FeverLink3 update follows.
 [*]Not compatible with other mods that put their own [b]winhttp.dll[/b] in the game folder.
 [/list]
 

@@ -49,7 +49,7 @@ Copy winhttp.dll and the mods folder into the game folder (next to TransportFeve
 Required (off-site):
 
 ```
-Transport Fever 3 (Steam, Windows 10/11 64-bit), game build 40420 or 40423 - all players on the same game version
+Transport Fever 3 (Steam, Windows 10/11 64-bit), game build 40420, 40423 or 40425 - all players on the same game version
 Steam client running and logged in
 ```
 
@@ -96,7 +96,7 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 - A friend who joins through a Steam invite has their mods compared.
 
 0.2.4
-- Supports Transport Fever 3 build 40423 (the game update of 2026-10-22); on a game build FeverLink3 does not know, the window says so.
+- Supports Transport Fever 3 build 40425 (the game update of 2026-10-22); 40420 and 40423 stay supported; on a game build FeverLink3 does not know, the window says so.
 - Other mods that change the world on their own (Auto Line Namer, Auto Color Lines, Auto Assign Terminals) stay in sync: the host's copy makes the change, every game applies it at the same moment.
 - The warning about such a mod names it.
 
