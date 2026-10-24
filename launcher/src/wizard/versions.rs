@@ -21,7 +21,7 @@ pub(super) enum BuildCheck {
 /// Game builds the native module has hook addresses for: the PE link timestamp and the game's own build number.
 /// The launcher cannot link the native crate (the native crate links the launcher), so the list is copied from
 /// `native/src/build_table.rs`; the test `known_builds_match_the_native_build_table` fails when they drift apart.
-const KNOWN_BUILDS: &[(u32, &str)] = &[(0x6ac5_0427, "40420"), (0x6ad0_e4e5, "40423")];
+const KNOWN_BUILDS: &[(u32, &str)] = &[(0x6ac5_0427, "40420"), (0x6ad0_e4e5, "40423"), (0x6ad9_ce10, "40425")];
 /// Where the version of a launcher can be read without running it: this text sits in every launcher's data, the
 /// version after the prefix and a NUL after the version. `feverlink3_path.txt` names the launcher that installed
 /// FeverLink3; if that file still exists, its marker says which version put the files there.

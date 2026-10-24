@@ -721,6 +721,11 @@ UI_ADD_SITES_KNOWN: dict[int, list[int]] = {
         0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
         0x28AA534, 0x28AAD81,
     ],
+    # build 40425: the same twelve calls at the same RVAs as 40423, carried over by port_build.py
+    0x6AD9CE10: [
+        0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
+        0x28AA534, 0x28AAD81,
+    ],
 }
 
 # The command kind the hold path is about, found by the string its handler references.

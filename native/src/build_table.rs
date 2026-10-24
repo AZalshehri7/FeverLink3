@@ -790,6 +790,207 @@ pub const BUILDS: &[BuildAddrs] = &[
         // all 22 layout witnesses are the same code as in 40420
         layout: Some("40420"),
     },
+    // TransportFever3.exe build 40425: PE timestamp 0x6ad9ce10, linked 2026-10-22 08:49:20 UTC.
+    // Carried over from 40423 by tools/addr/port_build.py (report tools/addr/out/port-6ad0e4e5-6ad9ce10.txt): every one of
+    // the 71 sites is the same code at the same RVA as in 40423 (whole function exact, callees one level deep, shift +0x0),
+    // and all 22 layout witnesses are exact, so this row equals the 40423 row apart from the timestamp and the name.
+    // tools/addr/out/6ad9ce10.txt is find_sites.py's independent report of the hold sites.
+    BuildAddrs {
+        timestamp: 0x6ad9_ce10,
+        name: "40425",
+        command_list_add: Some(HookSite {
+            rva: 0x009d_9140,
+            prologue: &[
+                0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C, 0x24,
+                0x98,
+            ],
+        }),
+        apply_command: Some(HookSite {
+            rva: 0x009e_84b0,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x54],
+        }),
+        town_seed: Some(HookSite {
+            rva: 0x008d_9380,
+            prologue: &[
+                0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89,
+                0x4C, 0x24, 0x08,
+            ],
+        }),
+        town_develop: Some(HookSite {
+            rva: 0x008e_31c0,
+            prologue: &[0x44, 0x89, 0x44, 0x24, 0x18, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56],
+        }),
+        script_convert: Some(HookSite {
+            rva: 0x010c_d5a0,
+            prologue: &[0x48, 0x8B, 0xC4, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57],
+        }),
+        convert_update: Some(HookSite {
+            rva: 0x010c_ce70,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56],
+        }),
+        preview_event: Some(HookSite {
+            rva: 0x00f4_ba50,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x55, 0x57, 0x41, 0x56],
+        }),
+        // `call 0x643c40` at `0x64d9c1` in UI::CGameUI::CGameUI (`0x648b30`); the listener's call operator is `0x6671b0`, which
+        // reads the game interface's `e` at +0xdc0 (40420: +0xb98), the other captures' offsets unchanged
+        preview_owner: Some(PreviewOwnerSite {
+            call: CallPatchSite {
+                rva: 0x0064_d9c1,
+                expected: &[0xE8, 0x7A, 0x62, 0xFF, 0xFF],
+                callee: CallSite {
+                    rva: 0x0064_3c40,
+                    prologue: &[
+                        0x48, 0xC7, 0x41, 0x38, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x05, 0x59, 0x14, 0x0A, 0x03,
+                    ],
+                },
+            },
+            y_a: 0x18,
+            y_b: 0xc8,
+            z_getter_slot: 1,
+            r_c: 0x18,
+            r_dispatcher: 0x1d8,
+            ui_e: 0xdc0,
+        }),
+        town_update_size: Some(HookSite {
+            rva: 0x009e_63b0,
+            prologue: &[0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x50],
+        }),
+        town_candidates: Some(HookSite {
+            rva: 0x0096_c8c0,
+            prologue: &[0x48, 0x89, 0x5C, 0x24, 0x10, 0xC5, 0xFA, 0x11, 0x54, 0x24, 0x18, 0x55, 0x56, 0x57],
+        }),
+        town_edges: Some(HookSite {
+            rva: 0x0096_2200,
+            prologue: &[0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55],
+        }),
+        town_sort_call: Some(CallPatchSite {
+            rva: 0x0096_cd16,
+            expected: &[0xE8, 0x35, 0xE5, 0xFF, 0xFF],
+            callee: CallSite {
+                rva: 0x0096_b250,
+                prologue: &[
+                    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+                ],
+            },
+        }),
+        town_pick_call: Some(CallPatchSite {
+            rva: 0x0096_2727,
+            expected: &[0xE8, 0x94, 0x88, 0x70, 0x02],
+            callee: CallSite {
+                rva: 0x0306_afc0,
+                prologue: &[
+                    0x48, 0x83, 0xEC, 0x28, 0x45, 0x8D, 0x48, 0xFF, 0x41, 0x3B, 0xD1, 0x7F, 0x14, 0x44, 0x8B, 0xC2,
+                ],
+            },
+        }),
+        town_field_call: Some(CallPatchSite {
+            rva: 0x0096_e72e,
+            expected: &[0xE8, 0x1D, 0x31, 0x21, 0x02],
+            callee: CallSite {
+                rva: 0x02b8_1850,
+                prologue: &[
+                    0x40, 0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x98, 0x00,
+                    0x00, 0x00,
+                ],
+            },
+        }),
+        batch_pace: Some(CallPatchSite {
+            rva: 0x0011_f456,
+            expected: &[0xE8, 0x45, 0x02, 0x00, 0x00],
+            callee: CallSite {
+                rva: 0x0011_f6a0,
+                prologue: &[
+                    0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+                ],
+            },
+        }),
+        free_order: Some(CallPatchSite {
+            rva: 0x02bc_1a23,
+            expected: &[0xE8, 0x98, 0xC1, 0xFF, 0xFF],
+            callee: CallSite {
+                rva: 0x02bb_dbc0,
+                prologue: &[
+                    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+                    0x41, 0x54,
+                ],
+            },
+        }),
+        game_time_getter: Some(CallSite {
+            rva: 0x002a_96e0,
+            prologue: &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48, 0x8B, 0x49, 0x08, 0x8B, 0x10],
+        }),
+        // the call leads to the component lookup 0x1445d0
+        tick_count_getter: Some(PatchSite {
+            rva: 0x002a_9620,
+            expected: &TICK_GETTER_40423,
+            replacement: &STEP_GETTER_40423,
+        }),
+        script_pool: Some(PatchSite {
+            rva: 0x00ab_528c,
+            expected: &[
+                0x83, 0xF8, 0x08, 0x0F, 0x8D, 0x25, 0x01, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00,
+                0xE8, 0x7E, 0x2A, 0x5B, 0x02,
+            ],
+            replacement: &SCRIPT_POOL_PATCH,
+        }),
+        lua_makeseed: Some(PatchSite {
+            rva: 0x02fd_e370,
+            expected: &[
+                0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x05, 0xDB, 0x96, 0xD2, 0x00, 0x48, 0x33, 0xC4, 0x48,
+                0x89, 0x44, 0x24, 0x48, 0x48, 0x8B, 0xD9, 0x33, 0xC9,
+            ],
+            replacement: &LUA_SEED_PATCH,
+        }),
+        command_move: Some(CallSite {
+            rva: 0x009d_5530,
+            prologue: &[0x48, 0x8B, 0x02, 0x45, 0x33, 0xD2, 0x4C, 0x89, 0x12, 0x48, 0x89, 0x01, 0x48, 0x8B, 0x42, 0x08],
+        }),
+        command_destroy: Some(CallSite {
+            rva: 0x009d_5770,
+            prologue: &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x8B, 0x49, 0x28, 0x48, 0x85, 0xC9],
+        }),
+        handle_destroy: Some(CallSite {
+            rva: 0x0305_63e0,
+            prologue: &[
+                0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19, 0x48, 0x85, 0xDB, 0x74, 0x30, 0x48, 0x8B, 0x4B,
+                0x08,
+            ],
+        }),
+        // the same tools in the same order as 40420 and 40423
+        ui_add_sites: &[
+            0x004d_479f,
+            0x0051_c3ac,
+            0x0052_9334,
+            0x0053_8d15,
+            0x0053_9479,
+            0x0053_95fd,
+            0x0054_3cea,
+            0x0058_9fc4,
+            0x0059_56ed,
+            0x005b_fe9d,
+            0x028a_a534,
+            0x028a_ad81,
+        ],
+        fire_done_calls: &[0x004d_9690, 0x0058_cec0, 0x0059_7880],
+        kind_offset: Some(0x9b8),
+        kinds: &[("build_proposal", 52)],
+        engine: EngineFns {
+            proposal_ctor: Some(0x004c_76a0),
+            proposal_dtor: Some(0x0048_f050),
+            proposal_copy: Some(0x004c_7470),
+            proposal_assign: Some(0x004c_fb60),
+            engine_new: Some(0x031a_1c80),
+            engine_delete: Some(0x031a_1cbc),
+            refund_insert: Some(0x004b_f040),
+            add_entity: Some(0x02bc_0260),
+            remove_entity: Some(0x02bc_4020),
+            game_time_advance: Some(0x00bb_2970),
+            component_lookup: Some(0x0014_45d0),
+        },
+        // all 22 layout witnesses are the same code as in 40423 (and so as in 40420)
+        layout: Some("40420"),
+    },
 ];
 
 pub fn select(timestamp: u32) -> Option<&'static BuildAddrs> {
@@ -1060,6 +1261,8 @@ mod tests {
 
     /// The port tool's report from 40420 to 40423: the audit trail of the 40423 row.
     const PORT_40423: &str = include_str!("../../tools/addr/out/port-6ac50427-6ad0e4e5.txt");
+    /// The port tool's report from 40423 to 40425: the audit trail of the 40425 row.
+    const PORT_40425: &str = include_str!("../../tools/addr/out/port-6ad0e4e5-6ad9ce10.txt");
 
     /// A row written the way `tools/addr/port_build.py` prints it in its "Rust" section.
     fn port_lines(b: &BuildAddrs) -> Vec<String> {
@@ -1168,6 +1371,24 @@ mod tests {
         );
         // the 40420 row prints the same way as its own values (the renderer itself is checked on a known row)
         assert!(port_lines(old).iter().any(|l| l == "layout: Some(\"40420\")"));
+    }
+
+    #[test]
+    fn build_40425_row_equals_the_committed_port_report() {
+        let b = select(0x6ad9_ce10).expect("40425 row");
+        assert_eq!(b.name, "40425");
+        let report: Vec<&str> = PORT_40425.lines().map(str::trim).collect();
+        assert!(report.contains(&"all sites located"), "the port report located every site");
+        for line in port_lines(b) {
+            assert!(report.contains(&line.as_str()), "the port report has no line `{line}`");
+        }
+        // every site kept its RVA: the row is the 40423 row under a new timestamp and name
+        let old = select(0x6ad0_e4e5).unwrap();
+        assert_eq!(port_lines(b), port_lines(old));
+        assert_eq!(b.script_pool.as_ref().unwrap().replacement, old.script_pool.as_ref().unwrap().replacement);
+        assert_eq!(b.lua_makeseed.as_ref().unwrap().replacement, old.lua_makeseed.as_ref().unwrap().replacement);
+        assert_eq!(b.tick_count_getter.as_ref().unwrap().replacement, old.tick_count_getter.as_ref().unwrap().replacement);
+        assert_eq!(b.preview_owner.as_ref().unwrap().z_getter_slot, old.preview_owner.as_ref().unwrap().z_getter_slot);
     }
 
     #[test]
