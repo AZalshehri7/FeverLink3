@@ -32,6 +32,11 @@ pub const CRASH_RECENT: Duration = Duration::from_secs(24 * 3600);
 pub const SELF_TAG_FILE: &str = "selftag.txt";
 /// The part's and the bundle's own description.
 pub const REPORT_FILE: &str = "report.txt";
+/// The mods active in the world this game last saved or loaded (written by the mod, `X.logWorldMods`).
+pub const WORLD_MODS_FILE: &str = "world_mods.txt";
+/// How many of the newest repair detail files (`detail_s*.txt`) a part takes, and how much of each.
+pub const DETAIL_FILES: usize = 3;
+pub const DETAIL_TAIL: u64 = 4 << 20;
 
 /// Where one game's logs are: its live folder (`%LOCALAPPDATA%\FeverLink3\<live>`; `native.log` and the id-order trace are in
 /// the folder above it) and its Steam user folders (`userdata/<n>/3493540/local`, whose `crash_dump` has the game's crash files).
@@ -91,8 +96,22 @@ pub fn collect(src: &Sources, now: SystemTime) -> (Vec<Entry>, Vec<String>) {
             take(name, &file, LOG_TAIL, &mut files);
         }
     }
-    for name in ["session.log", crate::live::STATUS_FILE] {
+    for name in ["session.log", crate::live::STATUS_FILE, WORLD_MODS_FILE] {
         take(name.to_owned(), &live.join(name), LOG_TAIL, &mut files);
+    }
+    // the repair detail: the itemised checksum keys each game wrote at its last syncs (detail_s<sync>_<time>_<player>.txt, the
+    // mod's X.syncDetail); the bundle holds every game's, so the differing entities diff line by line (issue #3 had none)
+    let mut details: Vec<PathBuf> = fs::read_dir(live)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("detail_s")) && recent(p, now))
+        .collect();
+    details.sort_by_key(|p| std::cmp::Reverse(modified(p).unwrap_or(UNIX_EPOCH)));
+    for path in details.iter().take(DETAIL_FILES) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        take(name, path, DETAIL_TAIL, &mut files);
     }
     if let Some(local) = live.parent() {
         for name in ["native.log", "native.log.1"] {
@@ -561,6 +580,8 @@ mod tests {
         fs::write(live.join("mod.gen"), "2").unwrap();
         fs::write(live.join("mod.2.log"), "newest mod line\n").unwrap();
         fs::write(live.join("session.log"), "checksum 4 differs in lane:towns\n").unwrap();
+        fs::write(live.join("world_mods.txt"), "mods active in this world (save 'w'): 1: feverlink3\n").unwrap();
+        fs::write(live.join("detail_s3_100_1.txt"), "names\tstations|x\n").unwrap();
         fs::write(local.join("native.log"), "native\n").unwrap();
         fs::write(local.join("idorder_live2.log"), "x".repeat(100)).unwrap();
         fs::write(local.join("idorder_live1.log"), "another game's trace").unwrap();
@@ -576,6 +597,8 @@ mod tests {
                 "mod.log",
                 "mod.2.log",
                 "session.log",
+                "world_mods.txt",
+                "detail_s3_100_1.txt",
                 "native.log",
                 "idorder_live2.log",
                 "crash_dump-error.json",
@@ -593,7 +616,7 @@ mod tests {
         assert_eq!(r#"{"userId": "%STEAMACCOUNT%", "message": "boom"}"#, got["crash_dump-error.json"]);
         assert_eq!(tag, got[SELF_TAG_FILE]);
         assert!(got[REPORT_FILE].starts_with("role: player\n\nfiles:\n  mod.log ("), "{}", got[REPORT_FILE]);
-        assert_eq!(7, contents.len());
+        assert_eq!(9, contents.len());
         assert!(!got.keys().any(|n| n.ends_with(".dmp") || n.ends_with(".sav")));
     }
 

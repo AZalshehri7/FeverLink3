@@ -858,7 +858,9 @@ impl Controller {
             _ => "no mod list (the window could not read it)".to_owned(),
         };
         self.mod_params = next;
-        self.append_session_log(&format!("mods: the window's list: {mods}, game build {game}"));
+        self.append_session_log(&format!(
+            "installed mods (the window's list, not the world's): {mods}, game build {game}"
+        ));
     }
 
     /// The user folders (`userdata/<id>/3493540/local`): the parents of the save folders.
@@ -3152,7 +3154,7 @@ mod tests {
         let log = fs::read_to_string(friend.pc.dir.join(SESSION_LOG_FILE)).unwrap();
         assert!(log.contains("invites: join request from the command line"), "{log}");
         assert!(log.contains("invites: waiting for the window's mod list"), "{log}");
-        assert!(log.contains("mods: the window's list: 1 mods, game build 40423"), "{log}");
+        assert!(log.contains("installed mods (the window's list, not the world's): 1 mods, game build 40423"), "{log}");
         let warnings = host.pc.window.status()["modWarnings"].to_string();
         assert!(!warnings.contains("could not list its mods"), "{warnings}");
         let info = friend.pc.controller.report_info("r1").join(

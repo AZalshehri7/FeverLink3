@@ -893,6 +893,34 @@ fn identical_reports_give_an_identical_outcome() {
     assert_eq!(5, o.time);
 }
 
+// issue #3: "names differ" said nothing more; a detail round's samples name the item and both values (the JSON as the mod sends it)
+#[test]
+fn a_differing_part_with_samples_names_the_items_that_differ() {
+    let report = |name: &str, extra: &str| -> ChecksumReportMessage {
+        let text = format!(
+            r#"{{"n":1,"time":5,"parts":{{"names":"{name}"}},"samples":{{"names":{{"stations|7":"{name}","towns|3":"Tonbridge"{extra}}}}}}}"#
+        );
+        serde_json::from_str(&text).unwrap()
+    };
+    let reports: BTreeMap<u16, ChecksumReportMessage> =
+        [(0, report("Crop Farm", "")), (1, report("Bauernhof", r#","lines|9":"L1""#))].into_iter().collect();
+    let o = ChecksumRounds::compare(1, &reports);
+    assert_eq!(
+        Some(&vec!["stations|7 0='Crop Farm' 1='Bauernhof'".to_owned(), "lines|9 0=- 1='L1'".to_owned()]),
+        o.samples.get("names")
+    );
+    // an empty Lua table arrives as [] and a report without samples has none: no lines, the report still counts
+    let plain: BTreeMap<u16, ChecksumReportMessage> = [
+        (0, serde_json::from_str(r#"{"n":1,"time":5,"parts":{"names":"a"},"samples":[]}"#).unwrap()),
+        (1, ChecksumReportMessage::new(1, 5, parts(&[("names", "b")]))),
+    ]
+    .into_iter()
+    .collect();
+    let o = ChecksumRounds::compare(1, &plain);
+    assert_eq!(1, o.differences.len());
+    assert!(o.samples.is_empty());
+}
+
 #[test]
 fn reports_taken_at_different_sim_times_are_not_compared() {
     let reports: BTreeMap<u16, ChecksumReportMessage> = [

@@ -95,7 +95,7 @@ Two games that load the same save but run other mods, another game build or anot
 | Hello | 30 | game → host | `{time, save?}` |
 | Clock | 31 | game → host | `{t, speed, ahead, need?, safe?, pause?, stop?, hop?}` (`stop`: the game stands still at the pause at `t`; see the pause order) |
 | SpeedRequest | 32 | game → host | `{speed}` 0 = pause |
-| ChecksumReport | 33 | game → host | `{n, time, parts: {name: hash}, authority?: {name: number}, notReady?: [name]}` |
+| ChecksumReport | 33 | game → host | `{n, time, parts: {name: hash}, authority?: {name: number}, notReady?: [name], cost?, samples?: {part: {item: value}}}` (`samples`: only a detail round, the mod sends `names` by entity; never compared, the host logs the items that differ; samples over 512 items or 128 characters are dropped, never the report) |
 | SaveDone | 34 | the saving game → host | `{id, ok, detail?, mods?}` (`mods`: ids of the mods the saved world uses, see "Mod list"); accepted only from the round's source |
 | ReplayFailed | 35 | game → host | `{detail}` |
 | ActionRefused | 36 | game → host | `{seq, from, detail, applied?, class?, partial?}`: the game's verdict of action `from:seq` at its stamp (see "Action verdicts"; `partial`: the engine threw after it had the command, this game's world may be partly built, see "Repair source") |

@@ -831,6 +831,10 @@ fn host_dispatch(outputs: Vec<HostOutput>, link: &mut gamelink::Session, io: &mu
                     format!("; not ready (not compared): {}", outcome.describe_not_ready())
                 };
                 shared.log(result.log_line(&outcome, &unknown));
+                // which items of a differing part differ, with each game's value (a detail round's samples: the names)
+                for (part, lines) in &outcome.samples {
+                    shared.log(format!("checksum {} {part} differ at: {}", outcome.n, lines.join("; ")));
+                }
                 shared.update(|s| s.last_sync = Some(result));
             }
             HostOutput::Log(text) => shared.log(text),

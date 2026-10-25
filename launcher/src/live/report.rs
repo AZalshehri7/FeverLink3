@@ -7,6 +7,7 @@
 //! The player who asked gets the bundle on the Desktop (or `Documents\FeverLink3\reports`), its folder opens and the browser
 //! opens a prefilled GitHub issue. Nothing is uploaded anywhere: the player attaches the zip to the issue themselves.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -523,7 +524,7 @@ impl Controller {
         }
         match self.mod_params.get("mods").and_then(Value::as_array) {
             Some(mods) => {
-                lines.push(format!("mods ({}):", mods.len()));
+                lines.push(format!("installed mods ({}; not necessarily active in this world):", mods.len()));
                 for m in mods {
                     let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
                     let rev = m.get("revision").and_then(Value::as_i64).unwrap_or(0);
@@ -532,8 +533,15 @@ impl Controller {
                     lines.push(format!("  {id} revision {rev}{cosmetic}"));
                 }
             }
-            None => lines.push("mods: not known (the window sent no list)".to_owned()),
+            None => lines.push("installed mods: not known (the window sent no list)".to_owned()),
         }
+        // the mod writes the world's own mods (read from the save it last saved or loaded) to world_mods.txt (X.logWorldMods)
+        lines.push(match fs::read_to_string(self.dir.join(report::WORLD_MODS_FILE)) {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
+            _ => {
+                "mods active in this world: not known (no save of this session was saved or loaded here yet)".to_owned()
+            }
+        });
         lines
     }
 }

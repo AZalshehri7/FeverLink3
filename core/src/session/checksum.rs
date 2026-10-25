@@ -61,6 +61,10 @@ pub struct ChecksumOutcome {
     /// that verified right after a reload, before its registry was read back from the loaded state, failed every repair
     /// with "companies"). A part that two games both hashed and that differs is still a difference.
     pub not_ready: BTreeMap<String, Vec<u16>>,
+    /// For a differing part every game sent itemised values of (`ChecksumReportMessage::samples`, a detail round): the items
+    /// whose values differ, each as "<item> <id>='<value>' ..." (`-` = the game has no such item), at most
+    /// [`ChecksumRounds::MAX_SAMPLE_LINES`]. Only for the log: what is compared is the part's hash.
+    pub samples: BTreeMap<String, Vec<String>>,
 }
 
 impl ChecksumOutcome {
@@ -111,6 +115,10 @@ impl ChecksumRounds {
     pub const MAX_PARTS: usize = 128;
     /// Longest part name or hash in a report (characters). Hashes are 8 hex digits.
     pub const MAX_TEXT: usize = 128;
+    /// Most itemised values a report's samples may hold, over all its parts (the mod sends at most 400 names).
+    pub const MAX_SAMPLES: usize = 512;
+    /// Most differing items logged for one part.
+    pub const MAX_SAMPLE_LINES: usize = 8;
 
     pub fn new() -> Self {
         Self::default()
@@ -125,6 +133,37 @@ impl ChecksumRounds {
             && report.not_ready.len() <= Self::MAX_PARTS
             && report.not_ready.iter().all(text_ok)
             && report.authority.as_ref().is_none_or(|a| a.len() <= Self::MAX_PARTS && a.keys().all(text_ok))
+    }
+
+    /// Samples within the bounds; a report whose samples are not loses them, never the report (they are only for the log).
+    fn samples_ok(report: &ChecksumReportMessage) -> bool {
+        let text_ok = |s: &String| s.len() <= Self::MAX_TEXT;
+        report.samples.len() <= Self::MAX_PARTS
+            && report.samples.values().map(BTreeMap::len).sum::<usize>() <= Self::MAX_SAMPLES
+            && report.samples.iter().all(|(p, items)| text_ok(p) && items.iter().all(|(k, v)| text_ok(k) && text_ok(v)))
+    }
+
+    /// The items of `part` whose values differ between the games (`samples`), when every game sent that part's items; the
+    /// items every game has come first, then those some game lacks. At most [`Self::MAX_SAMPLE_LINES`].
+    fn sample_lines(part: &str, reports: &BTreeMap<u16, ChecksumReportMessage>) -> Option<Vec<String>> {
+        let samples: Vec<(u16, &BTreeMap<String, String>)> =
+            reports.iter().map(|(&id, r)| r.samples.get(part).map(|s| (id, s))).collect::<Option<_>>()?;
+        let keys: BTreeSet<&String> = samples.iter().flat_map(|(_, s)| s.keys()).collect();
+        let line = |k: &String| {
+            let vals: Vec<Option<&String>> = samples.iter().map(|(_, s)| s.get(k)).collect();
+            if vals.iter().all(|v| *v == vals[0]) {
+                return None;
+            }
+            let each: Vec<String> = samples
+                .iter()
+                .zip(&vals)
+                .map(|((id, _), v)| v.map_or_else(|| format!("{id}=-"), |v| format!("{id}='{v}'")))
+                .collect();
+            Some((vals.iter().any(Option::is_none), format!("{k} {}", each.join(" "))))
+        };
+        let mut lines: Vec<(bool, String)> = keys.into_iter().filter_map(line).collect();
+        lines.sort_by_key(|(missing, _)| *missing);
+        Some(lines.into_iter().take(Self::MAX_SAMPLE_LINES).map(|(_, l)| l).collect())
     }
 
     pub fn open(&mut self, n: i32) {
@@ -170,6 +209,9 @@ impl ChecksumRounds {
         let n = report.n;
         let round = self.rounds.get_mut(&n)?;
         let mut report = report;
+        if !Self::samples_ok(&report) {
+            report.samples.clear();
+        }
         if self.light.contains(&n) {
             report.parts.retain(|part, _| !ChecksumPolicy::is_heavy_part(part));
             report.not_ready.retain(|part| !ChecksumPolicy::is_heavy_part(part));
@@ -210,6 +252,7 @@ impl ChecksumRounds {
                 time_skew: Some(skew),
                 full: true,
                 not_ready: BTreeMap::new(),
+                samples: BTreeMap::new(),
             };
         }
         // a part one game could not hash is unknown in this round on every game: not compared, never a difference
@@ -237,6 +280,8 @@ impl ChecksumRounds {
                 differences.push(ChecksumDifference { part: part.to_owned(), values });
             }
         }
-        ChecksumOutcome { n, time, reporters, differences, time_skew: None, full: true, not_ready }
+        let samples =
+            differences.iter().filter_map(|d| Some((d.part.clone(), Self::sample_lines(&d.part, reports)?))).collect();
+        ChecksumOutcome { n, time, reporters, differences, time_skew: None, full: true, not_ready, samples }
     }
 }

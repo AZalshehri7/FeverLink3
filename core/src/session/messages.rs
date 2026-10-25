@@ -512,6 +512,19 @@ pub struct ChecksumReportMessage {
     /// A cost that does not read (a float, a string) is dropped, never the report: the report is what is compared.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_cost")]
     pub cost: Option<ChecksumCost>,
+    /// Itemised values of some parts, sent only by a detail round (the round after one that differed): part -> item key -> value
+    /// (the mod sends `names` as "<kind>|<entity id>" -> name). Never compared; the host logs which items of a differing part
+    /// differ (`ChecksumOutcome::samples`). Issue #3 (2026-10-25) could only say "names differ".
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "lenient_samples")]
+    pub samples: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+fn lenient_samples<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, D::Error> {
+    // a sample that does not read (an empty Lua table arrives as `[]`) is dropped, never the report
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 fn lenient_cost<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ChecksumCost>, D::Error> {
@@ -536,7 +549,7 @@ pub struct ChecksumCost {
 
 impl ChecksumReportMessage {
     pub fn new(n: i32, time: i64, parts: BTreeMap<String, String>) -> Self {
-        Self { n, time, parts, authority: None, not_ready: Vec::new(), cost: None }
+        Self { n, time, parts, authority: None, not_ready: Vec::new(), cost: None, samples: BTreeMap::new() }
     }
 }
 

@@ -46,6 +46,12 @@ Yes, but every player needs the same mods as the host, because every game runs t
 **Will it break my savegames?**
 The mod does nothing until you host or join. In a session every game loads the host's world, and a sync writes files named `feverlink3-resync-<number>.sav` into your save folder. FeverLink3 is in beta: keep backups of the saves you play with.
 
+**Why is there an `autosave_feverlink3-resync-...` file?**
+That is the game's own autosave. After a sync your world is the loaded save `feverlink3-resync-<number>`, so the game names its autosaves after it. FeverLink3 does not read or change the autosave setting; the game autosaves while its autosave option is on. In the one report so far (issue #3) the only such autosave came about 5 minutes after a sync loaded, before the player opened the game's options, and none came after that. If you get one with autosave turned off, please report it.
+
+**Can the players use different game languages?**
+Yes. The game names a new industry in each player's own language (for example "Crop Farm" and "Bauernhof"). Up to 0.2.6 this caused a repair sync each time an industry appeared. Since then FeverLink3 leaves those names out of its world comparison, so each player sees the name in their own language until the next sync, which copies the host's world with the host's names (not yet seen in the real game).
+
 **Can I still play on my own with it installed?**
 Yes. Without a session the game plays as it always does.
 

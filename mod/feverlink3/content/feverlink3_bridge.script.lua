@@ -483,12 +483,30 @@ do
 		return out
 	end
 
-	engine.names = function()
-		local out = {}
+	-- `withIds`: also out.ids[kind], the entity of each name (the names sample of a detail round, X.namesSample).
+	-- A station group no player owns (an industry's) is left out and only counted (out.unownedStations): the engine names it when it
+	-- spawns the industry, in each game's own language (issue #3, 2026-10-25: host "en", guest "de"; each of the three "names"
+	-- repairs of that session followed an industry spawn: host 'Tonbridge Crop Farm #1', guest 'Tonbridge Bauernhof'). That text is
+	-- not shared state; the industry itself is still compared (constructions, stations, ids). Station groups players build carry
+	-- PLAYER_OWNED (docs/COMPANIES.md), so their names stay compared.
+	local function ownedByPlayer(e)
+		local p = comp(e, "PLAYER_OWNED")
+		return p ~= nil and (tonumber(p.player) or -1) >= 0
+	end
+	engine.names = function(withIds)
+		local out = { unownedStations = 0, ids = withIds and {} or nil }
 		for kind, cname in pairs({ stations = "STATION_GROUP", lines = "LINE", towns = "TOWN", players = "PLAYER" }) do
-			local list = {}
-			for _, e in ipairs(entitiesWith(cname)) do list[#list + 1] = nameOf(e) end
+			local list, ids = {}, {}
+			for _, e in ipairs(entitiesWith(cname)) do
+				if kind == "stations" and not ownedByPlayer(e) then
+					out.unownedStations = out.unownedStations + 1
+				else
+					list[#list + 1] = nameOf(e)
+					ids[#ids + 1] = e
+				end
+			end
 			out[kind] = list
+			if withIds then out.ids[kind] = ids end
 		end
 		return out
 	end
@@ -752,7 +770,13 @@ function X.csAdvance(holder, st, now)
 			local parts, t = X.csFinish(r)
 			-- a detail round leaves its complete keys for the dump at a resync; a round without (the last one was identical) clears them
 			st.csDetail = r.detailShared and X.csDetailDone(rec, t) or nil
-			st.reports[#st.reports + 1] = { n = r.n, time = t, parts = parts, account = r.account, cost = L.checksumCost(r) }
+			-- a detail round also sends its names by entity, so the host can log which names differ (issue #3 could only say "names")
+			local samples = nil
+			if r.detailShared then
+				local okS, names = pcall(function() return L.namesSample(engine.names(true)) end)
+				samples = okS and names and { names = names } or nil
+			end
+			st.reports[#st.reports + 1] = { n = r.n, time = t, parts = parts, account = r.account, cost = L.checksumCost(r), samples = samples }
 			stored = r.n
 			pcall(X.csLateNote, st, r, now)
 			return true
@@ -3678,7 +3702,7 @@ end
 -- always, and a part one world simply lacks (a town only it has) is still a difference.
 X.NOT_READY = "notready"
 -- `cost` (a spread round's, L.checksumCost): what the round cost this game, for the host to size the chunks of the next rounds
-local function reportRound(n, t, parts, account, cost)
+local function reportRound(n, t, parts, account, cost, samples)
 	G.reportsSent[n] = true
 	-- a spread round is complete: the marks of the chunks it did not need go (one entry each: another round's mark at the same step stays)
 	local cm = G.csMarks and G.csMarks[n]
@@ -3700,7 +3724,7 @@ local function reportRound(n, t, parts, account, cost)
 		parts = measured
 	end
 	send("checksum_report", { n = n, time = t, parts = parts, authority = (C.PLAYER_ID == 0) and account or nil, notReady = (#notReady > 0) and notReady or nil,
-		cost = type(cost) == "table" and cost or nil })
+		cost = type(cost) == "table" and cost or nil, samples = type(samples) == "table" and samples or nil })
 	local waiting = G.authPending[n]
 	if waiting then
 		G.authPending[n] = nil
@@ -6790,7 +6814,7 @@ H.resync_save = function(rec, p)
 			-- the mods this world uses, read from the save just made: the host compares them with every player's before
 			-- any of the save is sent (docs/PROTOCOL.md, "Mod list"); nil when they cannot be read (the host then warns)
 			local mods, why = nil, nil
-			if ok then mods, why = Hud.worldMods(app, p.name) end
+			if ok then mods, why = X.logWorldMods(p.name, "saved") end
 			if why then logGui("resync: MOD WARNING: the world's mods could not be read: " .. tostring(why)) end
 			send("save_done", { id = p.id, name = p.name, ok = ok == true, detail = (not ok) and tostring(err) or nil, mods = mods })
 		end)
@@ -6805,12 +6829,27 @@ H.resync_save = function(rec, p)
 	save()
 end
 
+-- The mods ACTIVE in the world of save `name` (Hud.worldMods: the save's gameModDescs; the API lists no mods of the running world),
+-- logged and kept in world_mods.txt for the bug report (launcher report.rs), next to the window's list, which is the INSTALLED mods.
+-- Every join, return, start and repair sync loads a save (H.resync_load) and the host saves one first, so each world the session
+-- plays is named. Issue #3 (2026-10-25) listed only the installed mods, so the world's own were unknown. Returns Hud.worldMods'.
+function X.logWorldMods(name, what)
+	local mods, why = Hud.worldMods(app, name)
+	local line = mods and string.format("mods active in this world (save '%s', %s; read from the save): %d: %s", tostring(name), what, #mods,
+		#mods > 0 and table.concat(mods, ", ") or "none") or string.format("mods active in this world (save '%s', %s): could not be read: %s",
+		tostring(name), what, tostring(why))
+	logGui(line)
+	pcall(C.dumpReplace, "world_mods.txt", line .. "\n")
+	return mods, why
+end
+
 -- Loading restarts the scripts, and with them this reader. The place right after this very line, and the place the window's records
 -- were read to, are written to the cursor file first, so the reloaded mod resumes there and nothing already dispatched is dispatched
 -- again, nothing after it is lost; its hello (sent by the normal start-up) tells the host this game is back.
 H.resync_load = function(rec, p)
 	if type(p) ~= "table" or type(p.name) ~= "string" then logGui("malformed resync_load"); return end
 	logGui("resync: loading '" .. p.name .. "'")
+	pcall(X.logWorldMods, p.name, "about to be loaded")
 	-- a reload while the native module holds commands is unsafe (docs/NATIVE_LINK.md stage 2, H): holding goes off first. The
 	-- reloaded script finds `ready` in native_events.log and switches strict mode on again.
 	pcall(natStop, "resync load")
@@ -7157,7 +7196,7 @@ function collectFromSim(state)
 	for _, r in ipairs(st.reports or {}) do
 		if not G.reportsSent[r.n] then
 			traceGui("checksum.collect", "round " .. C.integerText(r.n) .. " read from the game-script state (account " .. tostring(r.account and r.account.balance) .. ")")
-			reportRound(r.n, r.time, r.parts, r.account, r.cost)
+			reportRound(r.n, r.time, r.parts, r.account, r.cost, r.samples)
 		end
 	end
 	if (st.late or 0) > G.lateSeen then

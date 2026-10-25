@@ -18,6 +18,7 @@ fn outcome(parts: &[&str]) -> ChecksumOutcome {
         time_skew: None,
         full: true,
         not_ready: BTreeMap::new(),
+        samples: BTreeMap::new(),
     }
 }
 

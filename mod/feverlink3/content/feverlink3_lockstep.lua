@@ -1342,7 +1342,31 @@ local function namesLane(engine)
 	for _, kind in ipairs({ "stations", "lines", "towns", "players" }) do
 		for _, nm in ipairs(all[kind] or {}) do keys[#keys + 1] = kind .. "|" .. tostring(nm) end
 	end
+	-- the station groups no player owns (industries') count, their names (each game's own language) do not (engine.names)
+	if all.unownedStations then keys[#keys + 1] = "stations~unowned#" .. tostring(all.unownedStations) end
 	return sortedItems(keys)
+end
+
+-- The names of a detail round (the host asks for one after a round that differed) as "<kind>|<entity id>" -> name, sent with the
+-- report so the host logs WHICH names differ, with each game's value (core ChecksumOutcome::samples). `all` is engine.names(true).
+-- At most L.NAMES_SAMPLE_MAX names of at most L.NAMES_SAMPLE_TEXT bytes (core ChecksumCollector::acceptable takes 128).
+L.NAMES_SAMPLE_MAX, L.NAMES_SAMPLE_TEXT = 400, 100
+function L.namesSample(all)
+	local out, n = {}, 0
+	for _, kind in ipairs({ "stations", "lines", "towns", "players" }) do
+		local names, ids = all[kind] or {}, (all.ids or {})[kind] or {}
+		for i = 1, #names do
+			if n >= L.NAMES_SAMPLE_MAX then return out end
+			if ids[i] ~= nil then
+				local s = tostring(names[i])
+				-- a cut name ends before its last non-ASCII run: half a UTF-8 character would break the report's JSON
+				if #s > L.NAMES_SAMPLE_TEXT then s = s:sub(1, L.NAMES_SAMPLE_TEXT):gsub("[\128-\255]+$", "") end
+				out[kind .. "|" .. tostring(ids[i])] = s
+				n = n + 1
+			end
+		end
+	end
+	return n > 0 and out or nil
 end
 
 -- entity ids (a heavy lane, the only one that hashes ids): edges, constructions and town buildings, each sorted. The engine takes every new

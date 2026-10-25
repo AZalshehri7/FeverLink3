@@ -702,6 +702,7 @@ fn every_message_round_trips_and_every_decoder_survives_every_shape_of_json() {
                 .gen_bool(0.5)
                 .then(|| (0..rr.gen_range(0..4)).map(|_| (random_text(rr, 8), finite_f64(rr))).collect()),
             not_ready: (0..rr.gen_range(0..3)).map(|_| random_text(rr, 8)).collect(),
+            samples: BTreeMap::new(),
             cost: rr.gen_bool(0.5).then(|| ChecksumCost {
                 entity_ns: rr.gen(),
                 step_max_us: rr.gen(),

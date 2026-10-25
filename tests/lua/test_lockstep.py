@@ -1958,6 +1958,11 @@ class PureTest(unittest.TestCase):
         self.K.checksumParts(e, self.C.hashValue, None, False, detail)
         self.assertEqual([detail["names"][i] for i in range(1, len(detail["names"]) + 1)],
                          ["lines|L1", "players|P", "stations|Alpha", "stations|Beta", "towns|T1"])
+        # issue #3: an industry's station group (no owner) counts, its name (each game's language) does not; a detail round's
+        # sample gives each name by entity, cut whole UTF-8 characters
+        self.assertNotEqual(wide(names=dict(nm, unownedStations=1))["names"], wide(names=dict(nm, unownedStations=2))["names"])
+        s = self.K.namesSample(L.table_from({"stations": ["Crop Farm", "a" * 99 + "ü"], "towns": ["T1"], "ids": {"stations": [7, 8]}}, recursive=True))
+        self.assertEqual((s["stations|7"], s["stations|8"], s["towns|1"]), ("Crop Farm", "a" * 99, None))
         # a failing accessor yields an error part, not a crash
         e = L.eval(self.WIDE_ENGINE)(L.table_from({"stations": [{"stations": 1}]}, recursive=True))
         e.stations = L.eval("function() error('boom') end")

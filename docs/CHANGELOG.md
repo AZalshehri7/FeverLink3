@@ -8,14 +8,19 @@ The changes of each version that matter to a player or tester. Earlier test buil
 
 ## Unreleased
 
+### Fixed
+- Players with different game languages no longer get a repair sync ("names differ in 2 checks in a row") each time the game adds an industry. The game names the industry in each player's own language, and FeverLink3 now leaves the names of station groups that no player owns out of the world comparison (issue #3; not yet seen in the real game).
+
 ### Changed
 - Every build and terrain stroke lands sooner: two steps less between your click and the moment every game applies it (at normal speed 0.8 s instead of 1.2 s, at x4 about 0.1 s less). In return a game waits a little more often for the others' clocks (the smooth pacing hides most of it). Not yet seen in the game.
+- The vegetation tools (trees, plants, rocks and the eraser) are switched off (shown grayed) during a session, like the terrain tools were. Their strokes changed only the game of the player who used them, which then needed repair syncs (issue #3). Sharing them is planned.
+- When names differ, the session log now says which names, with each game's value ("checksum N names differ at: stations|<id> 0='...' 1='...'").
+- Logs and bug reports now list the mods active in the world (read from each save a sync saves or loads, in `mod.log` and `world_mods.txt`) apart from the installed mods. A bug report also holds each game's newest repair detail files (`detail_s*.txt`).
 
 ### Added
 - FeverLink3 now finds the places it needs in the game at every start, with the same whole-function proof its address tool uses, instead of reading them from a list built into it. A Transport Fever 3 update therefore no longer always switches the multiplayer part off: when every place is proven the game plays, and only when not, it stays off as before. A build that was not yet played and checked (builds 40420, 40423 and 40425 were) shows "found by search, not yet confirmed" in the window, and only players whose games found exactly the same places can play together. The first start on a build takes about a third of a second longer; later starts reuse the result. Checked on the executables of builds 40420 and 40425; not yet seen in the game.
 - Terrain height edits are shared in a session: raise, lower, flatten, smooth and roughen work again and every game, yours included, applies the same ground change at the same moment (a short moment after your click). If the ground ends up different on two games, the host repairs it. Seen working in two windows (7 strokes, the ground the same on both games).
 - Ground paint is shared in a session the same way: every game paints the same ground at the same moment. There is no way yet to check the paint afterwards, so a difference would only show to the eye. Seen in a two-window lab run (5 paint strokes, the same on both games, the same money).
-- The tree, plant and rock brushes and the vegetation eraser are not shared yet: a stroke changes only your own game, and the host then syncs everyone to its world (what they carry is now known; sharing them is next).
 
 ## 0.2.6 (2026-10-24)
 
