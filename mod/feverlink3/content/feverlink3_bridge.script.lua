@@ -7733,11 +7733,13 @@ local seenOtherEvents, seenOtherN = {}, 0
 -- way). Nothing changes outside a session (guiHandleEvent returns before this when no session runs). The player is told once.
 --
 -- Height edits are shared since 2026-10-25 (owner decisions, TERRAIN_DESIGN step 2) when the native module says it can carry them
--- (`terrain_apply` in its hooks) and has been told to (X.terrainShareOn, once holding is on): raise, lower, flatten and smooth, with the
--- menu's own tab and indicator, then stay usable; everything else of the menu (Roughen, terrain_heightmap_tool, and whatever else the
--- menu holds) stays switched off exactly as before. Ground paint and the tree, plant and rock brushes are not in this menu and are
--- unchanged (owner decision 1: not gated).
-local TERRAIN_CARRIED = { "terrain_raise_tool.res", "terrain_lower_tool.res", "terrain_flatten_tool.res", "terrain_smooth_tool.res" }
+-- (`terrain_apply` in its hooks) and has been told to (X.terrainShareOn, once holding is on): raise, lower, flatten, smooth and Roughen
+-- (terrain_heightmap_tool, owner 2026-10-25: its result cells travel as data, so its randomness, if any, runs on the originator only; the
+-- module refuses an edit that carries anything beside its height grid), with the menu's own tab and indicator, then stay usable; anything
+-- else the menu may hold stays switched off exactly as before. Ground paint and the tree, plant and rock brushes are not in this menu and
+-- are unchanged (owner decision 1: not gated).
+local TERRAIN_CARRIED = { "terrain_raise_tool.res", "terrain_lower_tool.res", "terrain_flatten_tool.res", "terrain_smooth_tool.res",
+	"terrain_heightmap_tool.res" }
 
 function X.terrainCarried(id)
 	if id:sub(-4) == ".tab" or id:sub(-10) == ".indicator" then return true end
@@ -7775,7 +7777,7 @@ function X.terrainShareOn(N)
 	for id in pairs(G.terrainOff or {}) do
 		if X.terrainCarried(id) and pcall(api.gui.byId.setEnabled, id, nil, true) then G.terrainOff[id] = nil end
 	end
-	natSay("terrain: height edits are shared (raise, lower, flatten, smooth); Roughen stays off")
+	natSay("terrain: height edits are shared (raise, lower, flatten, smooth, roughen)")
 	if not G.terrainSharedTold then
 		G.terrainSharedTold = true
 		pcall(X.noticeLocal, "terrain_shared")

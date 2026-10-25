@@ -1,5 +1,5 @@
-//! Terrain height edits in a session (owner decisions of 2026-10-25, step 2 of the terrain design: raise, lower, flatten and smooth;
-//! not Roughen, ground paint or trees). Lockstep like every build: no game applies an edit at the click, every game (the originator's
+//! Terrain height edits in a session (owner decisions of 2026-10-25, step 2 of the terrain design: raise, lower, flatten, smooth and
+//! Roughen; not ground paint or trees). Lockstep like every build: no game applies an edit at the click, every game (the originator's
 //! included) applies the same cells at the same stamp.
 //!
 //! 1. The originator: a terrain tool's command reaches the command list's `Add` (a script's own send from the simulation state never
@@ -84,6 +84,8 @@ pub struct Grid {
     pub head: Header,
     /// The cells' block.
     pub begin: usize,
+    /// Where the grid starts in the terrain member.
+    pub off: usize,
 }
 
 impl Grid {
@@ -120,7 +122,7 @@ pub fn find_grid(mem: &dyn Mem, payload: usize) -> Result<Option<Grid>, String> 
                 "the terrain member holds more than one grid: an edit of a kind this module does not carry".into()
             );
         }
-        found = Some(Grid { head, begin: b as usize });
+        found = Some(Grid { head, begin: b as usize, off });
     }
     Ok(found)
 }
@@ -172,8 +174,27 @@ pub fn decode(text: &str) -> Result<(Header, Vec<u8>), String> {
 }
 
 /// The originator: the grid and a copy of its cells; `None` when the command edits no heights.
+///
+/// Only the grid travels; the carrier on every game is a new Proposal with nothing but that grid. So a tool's command is carried only
+/// when its terrain member holds NOTHING beyond the grid: every other byte of it must be zero, which is what a Proposal's terrain
+/// member holds when it carries no edit (all zero in every tool build dumped, `docs/research/SPIKE_NATIVE_COMMAND.md` 0x2d8 row).
+/// Whatever a tool might put beside the cells (a seed, a noise setting, paint, trees: none of it is known) is never guessed: such an
+/// edit is refused, with the bytes in the reason. This is what makes the Roughen tool safe to share as well: the cells it carries are
+/// copied as they are, and the engine's apply on every game sees exactly the same command.
 pub fn capture(mem: &dyn Mem, payload: usize) -> Result<Option<(Header, Vec<u8>)>, String> {
     let Some(grid) = find_grid(mem, payload)? else { return Ok(None) };
+    let block = mem.read(payload + TERRAIN_OFF, TERRAIN_LEN).ok_or("the command's terrain member cannot be read")?;
+    let beside: Vec<String> = (0..TERRAIN_LEN)
+        .step_by(8)
+        .filter(|&o| !(grid.off..grid.off + GRID_LEN).contains(&o) && u64_at(&block, o) != 0)
+        .map(|o| format!("+{o:#x}={:016x}", u64_at(&block, o)))
+        .collect();
+    if !beside.is_empty() {
+        return Err(format!(
+            "the terrain edit carries more than its height grid ({}): not carried, the carrier could not reproduce it",
+            beside.join(" ")
+        ));
+    }
     if grid.head.cells() > MAX_CELLS {
         return Err(format!(
             "an edit of {}x{} cells is over the bound of {MAX_CELLS} cells: refused",
@@ -380,6 +401,10 @@ mod tests {
         let two = arena.add(&bytes);
         assert!(find_grid(&arena, two).unwrap_err().contains("more than one grid"));
         let big = Header { x0: 0, y0: 0, w: 200, h: 200 };
+        let mut seeded = arena.read(tool, crate::dump::PAYLOAD_SIZE).unwrap();
+        seeded[TERRAIN_OFF + 0x70] = 7; // anything beside the grid (a seed, say): never guessed, refused
+        let seeded = arena.add(&seeded);
+        assert!(capture(&arena, seeded).unwrap_err().contains("+0x70=0000000000000007"));
         let huge = payload(&arena, big, 0x08, &vec![0u8; (big.cells() * CELL_BYTES) as usize]);
         assert!(capture(&arena, huge).unwrap_err().contains("over the bound"));
     }
