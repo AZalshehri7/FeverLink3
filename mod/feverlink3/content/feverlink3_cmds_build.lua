@@ -3852,7 +3852,42 @@ local function decodeBuildUnsafe(body, ctx)
 	return args
 end
 
+-- A shared terrain height edit (owner decisions 2026-10-25; the bridge's X.shipTerrain, native terrain.rs): no proposal travels, only the
+-- grid's header and the originator's cells as the module wrote them. Every game sends the documented carrier
+-- makeWorldBuildProposalCmd(Proposal with terrain.baseHeightMod = GridVec2f.new(x0, y0, w, h), Context{player}, false, true)
+-- (api/tealdef: Proposal.new, Terrain.baseHeightMod, GridVec2f.new(x0, y0, w, h[, value]), Context.new; MPFever (MIT) sends the same
+-- carrier). A script cannot write the grid's cells, so the inject order (`inject.terrain`) has the module write them into the carrier
+-- and read them back; without it the carrier would flatten the ground, so a game whose module cannot carry terrain refuses the edit
+-- (nothing applied there; the host sees the verdicts differ and repairs).
+M.TERRAIN_MAX_CELLS = 28000   -- the module's own sanity bound (terrain.rs MAX_CELLS)
+
+function M.decodeTerrain(body, ctx)
+	local t = body.terrain
+	local x0, y0, w, h = t.x0, t.y0, t.w, t.h
+	for _, v in ipairs({ x0, y0, w, h }) do
+		if type(v) ~= "number" or v ~= math.floor(v) or math.abs(v) > 1e9 then return nil, "a terrain edit with a malformed grid" end
+	end
+	if w < 1 or h < 1 or w * h > M.TERRAIN_MAX_CELLS then return nil, "a terrain edit of " .. w .. "x" .. h .. " cells is outside the bound" end
+	if type(t.cells) ~= "string" or t.cells == "" then return nil, "a terrain edit without its cells" end
+	if not (ctx and ctx.canTerrain) then
+		return nil, "inject_refused: this game's native module cannot write terrain cells (nothing is applied here)"
+	end
+	local p = api.type.Proposal.new()
+	local terrain = p.terrain   -- a member read is a copy (MPFever): changed, then written back
+	terrain.baseHeightMod = api.type.GridVec2f.new(x0, y0, w, h)
+	p.terrain = terrain
+	local c = api.type.Context.new()
+	c.player = ctx.player or A.player()
+	log("build terrain: " .. w .. "x" .. h .. " cells at " .. x0 .. "," .. y0 .. ": the carrier, the module writes the originator's cells into it")
+	return { n = 4, p, c, false, true, inject = { text = t.cells, terrain = { x0 = x0, y0 = y0, w = w, h = h } } }
+end
+
 local function decodeBuild(body, ctx)
+	if type(body) == "table" and type(body.terrain) == "table" then
+		local okT, args, whyT = pcall(M.decodeTerrain, body, ctx)
+		if okT then return args, whyT end
+		return nil, "the terrain record could not be read: " .. tostring(args)
+	end
 	local ok, args, why = pcall(decodeBuildUnsafe, body, ctx)
 	if ok then return args, why end
 	return nil, "the build record could not be read: " .. tostring(args)

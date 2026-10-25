@@ -6,6 +6,11 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## Unreleased
+
+### Added
+- Terrain height edits are shared in a session: raise, lower, flatten and smooth work again and every game, yours included, applies the same ground change at the same moment (a short moment after your click). Roughen stays off, and ground paint and the tree brushes work as before (not shared yet). If the ground ends up different on two games, the host repairs it. Not yet seen in the game.
+
 ## 0.2.6 (2026-10-24)
 
 ### Added
