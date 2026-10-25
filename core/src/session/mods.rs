@@ -69,6 +69,10 @@ pub struct ModFingerprint {
     /// player reads it. Such a game has no build hold and no determinism patches, so it cannot play together; empty: known.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub unsupported: String,
+    /// Set when the native module found the game build's addresses by search (not in its table): the build and a hash of every
+    /// address it found. Host and player must have found the same; empty: the build is in the table.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub searched: String,
     pub mods: Vec<ModEntry>,
     /// The game could not list its mods (`mods` is empty and means nothing): nothing is compared, it is said instead.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -87,6 +91,9 @@ pub struct ModTags {
     /// [`ModFingerprint::unsupported`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub unsupported: String,
+    /// [`ModFingerprint::searched`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub searched: String,
     #[serde(default)]
     pub tags: String,
     /// The player has more mods than the join can name.
@@ -139,6 +146,7 @@ impl ModFingerprint {
         self.feverlink3 = clip(&self.feverlink3);
         self.native = clip(&self.native);
         self.unsupported = clip(&self.unsupported);
+        self.searched = clip(&self.searched);
         let mut seen = BTreeMap::new();
         for mut e in self.mods {
             e.id = clip(&e.id);
@@ -163,6 +171,7 @@ impl ModFingerprint {
             feverlink3: self.feverlink3.clone(),
             native: self.native.clone(),
             unsupported: self.unsupported.clone(),
+            searched: self.searched.clone(),
             tags: STANDARD.encode(bytes),
             more: self.mods.len() > MAX_JOIN_MODS,
             unread: self.unread,
@@ -187,6 +196,14 @@ impl ModFingerprint {
             out.push(format!(
                 "game build {} of the player is not supported by the player's FeverLink3 (its native module is off)",
                 clip(&guest.unsupported)
+            ));
+        }
+        // a build found by search: both games must have found the same addresses (empty on both: the build is in the table)
+        if self.searched != guest.searched {
+            out.push(format!(
+                "game build found by search: host {}, player {}",
+                shown(&self.searched),
+                shown(&clip(&guest.searched))
             ));
         }
         out
@@ -300,6 +317,9 @@ pub fn diff(host: &ModFingerprint, mine: &ModFingerprint) -> Vec<ModDifference> 
     }
     if !mine.unsupported.is_empty() {
         add(true, super::notices::game_unsupported(&mine.unsupported));
+    }
+    if host.searched != mine.searched {
+        add(true, super::notices::searched_differ(&host.searched, &mine.searched));
     }
     let builds = [
         ("the game", &host.game, &mine.game),

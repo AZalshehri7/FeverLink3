@@ -5,12 +5,17 @@ pub struct Section {
     pub name: String,
     pub rva: u32,
     pub size: u32,
+    /// Where the section's bytes sit in the file and how many there are (`PointerToRawData`, `SizeOfRawData`).
+    pub raw_ptr: u32,
+    pub raw_size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headers {
     pub timestamp: u32,
     pub size_of_headers: u32,
+    /// The preferred load address (`ImageBase`): what the absolute pointers in a file's data are relative to.
+    pub image_base: u64,
     pub sections: Vec<Section>,
 }
 
@@ -46,6 +51,7 @@ pub fn parse(image: &[u8]) -> Option<Headers> {
         return None; // PE32+ only: the game is 64-bit
     }
     let size_of_headers = u32_at(image, opt + 60)?;
+    let image_base = u64::from(u32_at(image, opt + 24)?) | (u64::from(u32_at(image, opt + 28)?) << 32);
     let mut out = Vec::with_capacity(sections);
     let mut at = opt + opt_size;
     for _ in 0..sections {
@@ -53,10 +59,16 @@ pub fn parse(image: &[u8]) -> Option<Headers> {
         let raw = &image[at..at + 8];
         let end = raw.iter().position(|&c| c == 0).unwrap_or(8);
         let name = String::from_utf8_lossy(&raw[..end]).into_owned();
-        out.push(Section { name, size: u32_at(image, at + 8)?, rva: u32_at(image, at + 12)? });
+        out.push(Section {
+            name,
+            size: u32_at(image, at + 8)?,
+            rva: u32_at(image, at + 12)?,
+            raw_size: u32_at(image, at + 16)?,
+            raw_ptr: u32_at(image, at + 20)?,
+        });
         at += 40;
     }
-    Some(Headers { timestamp, size_of_headers, sections: out })
+    Some(Headers { timestamp, size_of_headers, image_base, sections: out })
 }
 
 /// The game's own build number in its read-only data: `transportfever3`, `64-bit` and the digits follow each other there, each

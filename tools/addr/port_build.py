@@ -2,6 +2,7 @@
 """port_build.py: carries a build table row from one TransportFever3.exe to the next.
 
     python -I port_build.py <OLD TransportFever3.exe> <NEW TransportFever3.exe> [--out DIR]
+    python -I port_build.py <OLD TransportFever3.exe> --export-proof FILE   (the proof native/src/search.rs repeats at game start)
 
 Both executables are read as data, never run. The old one must be a build whose sites this tool lists (`OLD_SITES`, keyed
 by PE timestamp: the row of `native/src/build_table.rs` and the engine functions of `EngineFns`). For every site the tool
@@ -119,10 +120,58 @@ OLD_SITES: dict[int, list[S]] = {
             0x4C6640, 0x4C6870, 0x48E220, 0x4CED30, 0x4C78C0, 0x4BDA90, 0x4C31A0, 0x4BEC80, 0x4C1DF0, 0x4BC770, 0x4BD1F0,
             0x4C5FA0, 0x63C10, 0x4BD430, 0x4C2250, 0x284FC0, 0x4BC8D0, 0xDF480, 0x4BE210, 0x10C6750, 0x10C6020, 0x9E2900]],
     ],
+    # build 40425 (PE timestamp 0x6ad9ce10): the row of native/src/build_table.rs, as this tool carried it over from 40420
+    # (out/port-6ac50427-6ad9ce10.txt); the same sites in the same order
+    0x6AD9CE10: [
+        S("command_list_add", "func", 0x9D9140, 18, rust="HookSite"),
+        S("apply_command", "func", 0x9E84B0, 14, rust="HookSite"),
+        S("town_seed", "func", 0x8D9380, 20, rust="HookSite"),
+        S("town_develop", "func", 0x8E31C0, 15, rust="HookSite"),
+        S("script_convert", "func", 0x10CD5A0, 14, rust="HookSite"),
+        S("convert_update", "func", 0x10CCE70, 14, rust="HookSite"),
+        S("preview_event", "func", 0xF4BA50, 14, rust="HookSite"),
+        S("preview_owner", "call", 0x64D9C1, 15, callee=0x643C40, rust="CallPatchSite",
+          offsets={"y_a": 0x18, "y_b": 0xC8, "r_c": 0x18, "r_dispatcher": 0x1D8, "ui_e": 0xDC0}),
+        S("town_update_size", "func", 0x9E63B0, 15, rust="HookSite"),
+        S("town_candidates", "func", 0x96C8C0, 14, rust="HookSite"),
+        S("town_edges", "func", 0x962200, 14, rust="HookSite"),
+        S("town_sort_call", "call", 0x96CD16, 16, callee=0x96B250, rust="CallPatchSite"),
+        S("town_pick_call", "call", 0x962727, 16, callee=0x306AFC0, rust="CallPatchSite"),
+        S("town_field_call", "call", 0x96E72E, 18, callee=0x2B81850, rust="CallPatchSite"),
+        S("batch_pace", "call", 0x11F456, 16, callee=0x11F6A0, rust="CallPatchSite"),
+        S("free_order", "call", 0x2BC1A23, 18, callee=0x2BBDBC0, rust="CallPatchSite"),
+        S("game_time_getter", "func", 0x2A96E0, 14, rust="CallSite"),
+        S("tick_count_getter", "func", 0x2A9620, 27, rust="PatchSite"),
+        S("script_pool", "inside", 0xAB528C, 22, rust="PatchSite"),
+        S("lua_makeseed", "func", 0x2FDE370, 26, rust="PatchSite"),
+        S("command_move", "func", 0x9D5530, 16, rust="CallSite"),
+        S("command_destroy", "func", 0x9D5770, 16, rust="CallSite"),
+        S("handle_destroy", "func", 0x30563E0, 18, rust="CallSite"),
+        *[S(f"ui_add_sites[{i}]", "ret", r, rust="Rva") for i, r in enumerate([
+            0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
+            0x28AA534, 0x28AAD81])],
+        S("fire_done_calls[0]", "slot", 0x4D9690, host=0x4D479F, rust="Rva"),
+        S("fire_done_calls[1]", "slot", 0x58CEC0, host=0x589FC4, rust="Rva"),
+        S("fire_done_calls[2]", "slot", 0x597880, host=0x5956ED, rust="Rva"),
+        S("proposal_ctor", "func", 0x4C76A0, 23, rust="Engine"),
+        S("proposal_dtor", "func", 0x48F050, 20, rust="Engine"),
+        S("proposal_copy", "func", 0x4C7470, 24, rust="Engine"),
+        S("proposal_assign", "func", 0x4CFB60, 24, rust="Engine"),
+        S("engine_new", "func", 0x31A1C80, 11, rust="Engine"),
+        S("engine_delete", "func", 0x31A1CBC, 5, rust="Engine"),
+        S("refund_insert", "func", 0x4BF040, 0xEA, rust="Engine"),
+        S("add_entity", "func", 0x2BC0260, 15, rust="Engine"),
+        S("remove_entity", "func", 0x2BC4020, 15, rust="Engine"),
+        S("game_time_advance", "func", 0xBB2970, 16, rust="Engine"),
+        S("component_lookup", "func", 0x1445D0, 15, rust="Engine"),
+        *[S(f"layout:{r:#x}", "func", r, rust="Witness") for r in [
+            0x4C7470, 0x4C76A0, 0x48F050, 0x4CFB60, 0x4C86F0, 0x4BE8C0, 0x4C3FD0, 0x4BFAB0, 0x4C2C20, 0x4BD5A0, 0x4BE020,
+            0x4C6DD0, 0x63C20, 0x4BE260, 0x4C3080, 0x284FD0, 0x4BD700, 0xDF490, 0x4BF040, 0x10CD5A0, 0x10CCE70, 0x9E7A00]],
+    ],
 }
 
 # the portable layout table each old build uses (native/src/portable.rs LAYOUT_BUILD)
-OLD_LAYOUT = {0x6AC50427: "40420"}
+OLD_LAYOUT = {0x6AC50427: "40420", 0x6AD9CE10: "40420"}
 
 
 # --------------------------------------------------------------------------- patterns of code
@@ -355,15 +404,211 @@ def rust_bytes(b: bytes) -> str:
     return "&[" + ", ".join(f"0x{x:02X}" for x in b) + "]"
 
 
+# --------------------------------------------------------------------------- the proof for the runtime search
+
+PROOF_MAGIC = b"FL3PROOF"
+PROOF_VERSION = 1
+SITE_KIND = {"func": 0, "inside": 1, "ret": 2, "call": 3, "slot": 4, "witness": 5}
+NO_PATTERN = 0xFFFF
+PROOF_SMALL = 0x400        # functions up to this size get neighbours even when unique in the reference
+PROOF_NEIGHBOURS = 3       # neighbours kept per side
+
+
+class Proof:
+    """What `native/src/search.rs` needs to repeat this tool's proof on an unknown build at game start, without a disassembler:
+    every pattern this tool would search for (the whole function, relink fields wildcarded; `shape` with every 32-bit
+    displacement wildcarded too), where the module's sites sit in them, the callees' first bytes, and the neighbour functions
+    that single out one of several copies. Written by `--export-proof`; the format is described in `write`."""
+
+    def __init__(self, ref: Image):
+        self.ref = ref
+        self.P = Porter(ref, ref)   # hits in the reference itself: which functions exist in several copies
+        self.pats: list[tuple] = []
+        self.index: dict[tuple[int, bool], int] = {}
+        self.sites: list[bytes] = []
+
+    def pattern(self, begin: int, shape: bool = False, neighbours: bool = True, calls: bool = False) -> int:
+        key = (begin, shape)
+        if key in self.index:
+            i = self.index[key]
+            if calls and not self.pats[i][4]:
+                self.pats[i] = self.pats[i][:4] + (self.calls(begin),) + self.pats[i][5:]
+            return i
+        ext = extent(self.ref, begin)
+        if ext is None or ext[0] != begin:
+            raise SystemExit(f"proof: no function starts at {begin:#x}")
+        insns = decode(self.ref, *ext)
+        if insns is None:
+            raise SystemExit(f"proof: the function at {begin:#x} does not decode")
+        f = self.ref.func_containing(begin)
+        at_start = f is not None and f.begin == begin
+        cells = pattern_of(insns, shape)
+        i = len(self.pats)
+        self.index[key] = i
+        self.pats.append((begin, at_start, shape, cells, [], [], []))
+        if calls:
+            self.pats[i] = self.pats[i][:4] + (self.calls(begin),) + self.pats[i][5:]
+        # the neighbours that single out one of several copies (Porter.neighbours): for a function with copies in the reference,
+        # and for every small one, which may have copies in the target although it has none here (40425 -> 40420: a 0xb5-byte
+        # layout witness, unique in 40425, has four copies in 40420). A side keeps the first PROOF_NEIGHBOURS of its NEIGHBOURS
+        # nearest functions that are unique in the reference and small (the proof stays small); the module takes the first that
+        # is unique in the target.
+        if neighbours and ((not shape and len(cells) <= PROOF_SMALL) or len(self.P.hits(begin, shape)[0]) > 1):
+            starts = self.ref._func_starts
+            k = bisect.bisect_left(starts, begin)
+            sides = []
+            for rng in (range(k - 1, max(-1, k - 1 - NEIGHBOURS), -1), range(k + 1, min(len(starts), k + 1 + NEIGHBOURS))):
+                side = []
+                for j in rng:
+                    small = (ext := extent(self.ref, starts[j])) is not None and ext[1] - ext[0] <= PROOF_SMALL
+                    if len(side) < PROOF_NEIGHBOURS and small and len(self.P.hits(starts[j], False)[0]) == 1:
+                        side.append(self.pattern(starts[j], False, neighbours=False))
+                sides.append(side)
+            self.pats[i] = self.pats[i][:5] + (sides[0], sides[1])
+        return i
+
+    def calls(self, begin: int) -> list[tuple[int, list]]:
+        """(offset, the callee's first CALLEE_PROBE cells) of every `call rel32` in the function: Porter.callees_agree."""
+        out = []
+        for ins in decode(self.ref, *extent(self.ref, begin)):
+            if ins.mnemonic == "call" and ins.bytes[0] == 0xE8:
+                at = ins.address - self.ref.image_base
+                t = call_target(self.ref, at)
+                probe = [c for i in self.ref.disasm(t, CALLEE_PROBE + 16) for c in reloc_cells(i)][:CALLEE_PROBE]
+                out.append((at - begin, probe + [None] * (CALLEE_PROBE - len(probe))))
+        return out
+
+    def lea_vtable(self, begin: int, want_slot: int | None = None) -> tuple[int, int]:
+        """(where the displacement sits, where the instruction ends), both as offsets in the function, of the one `lea r,[rip+d]`
+        that loads a `std::function` vtable (or the one whose slot 2 is `want_slot`)."""
+        vt = [v for v in vtables(self.ref, begin, extent(self.ref, begin)[1]) if want_slot is None or v[2] == want_slot]
+        if len(vt) != 1:
+            raise SystemExit(f"proof: the function at {begin:#x} loads {len(vt)} matching vtables (expected one)")
+        ins = self.ref.disasm(begin + vt[0][0], 16)[0]
+        return vt[0][0] + disp_at(ins), vt[0][0] + ins.size
+
+    def disp_positions(self, begin: int, value: int) -> list[tuple[int, int]]:
+        """(offset in the function, size) of each memory displacement equal to `value` (Porter's `any_disp` pairs)."""
+        out = []
+        for ins in decode(self.ref, *extent(self.ref, begin)):
+            if any_disp(ins) == value:
+                at = ins.address - self.ref.image_base - begin
+                if ins.disp_size == 4 or not -128 <= value <= 127:
+                    out.append((at + disp_at(ins), 4))
+                else:
+                    out.append((at + ins.disp_offset, 1))
+                    assert ins.bytes[ins.disp_offset] == value & 0xFF
+        if not out:
+            raise SystemExit(f"proof: no displacement {value:#x} in the function at {begin:#x}")
+        return out
+
+    def emits(self, begin: int) -> list[int]:
+        return [ins.address - self.ref.image_base - begin for ins in decode(self.ref, *extent(self.ref, begin))
+                if ins.mnemonic == "call" and ins.bytes[0] == 0xE8]
+
+    def add_site(self, s: S) -> None:
+        ref = self.ref
+        u16, u32 = (lambda v: struct.pack("<H", v)), (lambda v: struct.pack("<I", v))
+        kind = "witness" if s.rust == "Witness" else s.kind
+        name = s.field.encode()
+        out = bytes([len(name)]) + name + bytes([SITE_KIND[kind]])
+        if kind in ("func", "witness"):
+            out += u16(self.pattern(s.rva, calls=True)) + u16(NO_PATTERN) + u32(0) + u32(s.n)
+        else:
+            at = s.rva - 5 if s.kind == "ret" else (s.host - 5 if s.kind == "slot" else s.rva)
+            f = ref.func_containing(at)
+            # a shape match only where the module merely calls through (the hold list, the callbacks' tool functions, the
+            # preview listener's construction): never for a patch region or another patched call
+            shape = s.kind in ("ret", "slot") or s.field == "preview_owner"
+            out += u16(self.pattern(f.begin)) + u16(self.pattern(f.begin, True) if shape else NO_PATTERN)
+            out += u32(0 if s.kind == "slot" else at - f.begin) + u32(s.n)
+            if s.kind == "call":
+                out += u16(self.pattern(s.callee))
+                if s.offsets:
+                    d, e = self.lea_vtable(s.callee)
+                    listener = qword(ref, s.callee + e + struct.unpack_from("<i", ref.text_at(s.callee + d, 4))[0] + 16) - ref.image_base
+                    out += b"\x01" + u32(d) + u32(e) + u16(self.pattern(listener)) + u16(self.pattern(listener, True))
+                    out += bytes([len(s.offsets)])
+                    for k, v in s.offsets.items():
+                        pos = self.disp_positions(listener, v)
+                        out += bytes([len(k)]) + k.encode() + bytes([len(pos)]) + b"".join(u32(p) + bytes([z]) for p, z in pos)
+                    em = self.emits(listener)
+                    out += bytes([len(em)]) + b"".join(u32(x) for x in em)
+                else:
+                    out += b"\x00"
+            elif s.kind == "slot":
+                d, e = self.lea_vtable(f.begin, s.rva)
+                out += u32(d) + u32(e) + u16(self.pattern(s.rva))
+        self.sites.append(out)
+
+    def write(self, path: str) -> None:
+        """Little-endian:
+            magic "FL3PROOF", u32 version (1), u32 reference PE timestamp, u32 pattern count, the patterns, u32 site count, the sites
+            pattern: u32 rva in the reference, u8 flags (1: starts at an unwind-table entry, 2: shape, 4: the bytes are those of
+              an earlier pattern), u32 length n, n bytes (flag 4: u16 index of that pattern instead),
+              (n+7)/8 mask bytes (bit i, low bit first: cell i is fixed), u8 + u16 indices of the neighbours below (nearest first),
+              u8 + u16 indices above, u16 call count + per call (u32 offset, 32 bytes, 4 mask bytes of the callee's start)
+            site: u8 + name, u8 kind (0 func, 1 inside, 2 ret, 3 call, 4 slot, 5 witness), u16 exact pattern of the function (or of
+              the host), u16 shape pattern of the host (0xffff: none), u32 offset of the site in the host, u32 bytes recorded;
+              call: u16 callee pattern, u8 listener (0/1); listener: u32 + u32 the vtable lea's displacement and end in the callee,
+                u16 + u16 the listener's exact and shape patterns, u8 offset count + per offset (u8 + name, u8 count + per
+                place (u32 offset in the listener, u8 size 1 or 4)), u8 count + u32 offsets of the listener's `call rel32`s
+              slot: u32 + u32 the vtable lea's displacement and end in the host, u16 the callback's pattern"""
+        u16, u32 = (lambda v: struct.pack("<H", v)), (lambda v: struct.pack("<I", v))
+
+        def cells(cs: list) -> bytes:
+            mask = bytearray((len(cs) + 7) // 8)
+            for k, c in enumerate(cs):
+                if c is not None:
+                    mask[k >> 3] |= 1 << (k & 7)
+            return bytes(0 if c is None else c for c in cs) + bytes(mask)
+
+        out = bytearray(PROOF_MAGIC + u32(PROOF_VERSION) + u32(self.ref.timestamp) + u32(len(self.pats)))
+        for begin, at_start, shape, cs, calls, left, right in self.pats:
+            flags = (1 if at_start else 0) | (2 if shape else 0)
+            same = self.index.get((begin, False)) if shape else None
+            if same is not None:
+                # a shape pattern only wildcards more cells of the exact one: its bytes are the exact pattern's
+                out += u32(begin) + bytes([flags | 4]) + u32(len(cs)) + u16(same) + cells(cs)[len(cs):]
+            else:
+                out += u32(begin) + bytes([flags]) + u32(len(cs)) + cells(cs)
+            for side in (left, right):
+                out += bytes([len(side)]) + b"".join(u16(j) for j in side)
+            out += u16(len(calls)) + b"".join(u32(o) + cells(p) for o, p in calls)
+        out += u32(len(self.sites)) + b"".join(self.sites)
+        with open(path, "wb") as fh:
+            fh.write(out)
+
+
+def export_proof(ref: Image, path: str) -> int:
+    sites = OLD_SITES.get(ref.timestamp)
+    if sites is None:
+        sys.exit(f"the executable (timestamp {ref.timestamp:#x}) is not a build this tool has the sites of")
+    pr = Proof(ref)
+    for s in sites:
+        pr.add_site(s)
+    pr.write(path)
+    print(f"proof of {ref.timestamp:#010x} ({ref.build_string()}): {len(pr.pats)} patterns, {len(pr.sites)} sites, "
+          f"{os.path.getsize(path)} bytes -> {path}")
+    return 0
+
+
 # --------------------------------------------------------------------------- main
 
 def main() -> int:
     global IMAGE_SIZE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("old")
-    ap.add_argument("new")
+    ap.add_argument("new", nargs="?")
     ap.add_argument("--out", help="also write the report to <DIR>/port-<old>-<new>.txt")
+    ap.add_argument("--export-proof", metavar="FILE", help="write the proof of the OLD build for native/src/search.rs and stop")
     a = ap.parse_args()
+    if a.export_proof:
+        ref = Image(a.old)
+        IMAGE_SIZE = ref.pe.OPTIONAL_HEADER.SizeOfImage
+        return export_proof(ref, a.export_proof)
+    if not a.new:
+        ap.error("the NEW executable is needed (or --export-proof)")
     old, new = Image(a.old), Image(a.new)
     IMAGE_SIZE = min(old.pe.OPTIONAL_HEADER.SizeOfImage, new.pe.OPTIONAL_HEADER.SizeOfImage)
     sites = OLD_SITES.get(old.timestamp)

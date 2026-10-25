@@ -58,6 +58,8 @@ pub fn from_params(params: &Value, user_dirs: &[PathBuf], game_dir: Option<&Path
         native,
         // set by the controller for a game its native module does not support (live.rs)
         unsupported: String::new(),
+        // the build's addresses found by search (native/src/search.rs): host and player must have found the same
+        searched: crate::live::searched_game_tag(),
         mods,
         unread,
     };

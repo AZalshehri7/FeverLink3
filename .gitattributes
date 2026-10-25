@@ -2,3 +2,4 @@
 *.bat text eol=crlf
 *.png binary
 *.tga binary
+*.bin binary

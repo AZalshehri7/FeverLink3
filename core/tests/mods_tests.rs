@@ -18,6 +18,7 @@ fn game(mods: Vec<ModEntry>) -> ModFingerprint {
         feverlink3: "0.2.0".into(),
         native: "ab12".into(),
         unsupported: String::new(),
+        searched: String::new(),
         mods,
         unread: false,
     }
@@ -114,12 +115,14 @@ fn cosmetic_differences_unknown_files_and_lists_that_cannot_be_read_warn_and_do_
 
 #[test]
 fn another_game_build_feverlink3_or_native_module_refuses_at_join() {
-    for change in 0..3 {
+    for change in 0..4 {
         let mut guest = game(host_mods());
         match change {
             0 => guest.game = "1.4.3".into(),
             1 => guest.feverlink3 = "0.1.9".into(),
-            _ => guest.native = "cd34".into(),
+            2 => guest.native = "cd34".into(),
+            // a build found by search (native/src/search.rs) whose addresses the host's game did not find the same way
+            _ => guest.searched = "40426:0123abcd".into(),
         }
         let mut h = Harness::with(HostOptions { mods: Some(game(host_mods())), ..HostOptions::default() });
         let c = h.connect_with_mods("Pat", Some(guest));

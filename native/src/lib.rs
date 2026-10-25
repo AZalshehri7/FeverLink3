@@ -39,6 +39,7 @@ pub mod plan;
 pub mod portable;
 pub mod rebuild;
 pub mod scan;
+pub mod search;
 pub mod townseed;
 
 #[cfg(windows)]
@@ -142,9 +143,23 @@ mod entry {
                     }
                 }
                 match game_build() {
-                    Some(ts) => match build_table::select(ts) {
-                        Some(b) => {
-                            log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name));
+                    Some(ts) => match build_table::select(ts).map(|b| (b, false)).or_else(|| searched_build(ts)) {
+                        Some((b, searched)) => {
+                            if searched {
+                                // not in the table, but every site proven by the address tool's proof (search.rs); the window
+                                // says it is not yet confirmed, and a join compares the found addresses
+                                let hash = search::row_hash(b);
+                                log::line(&format!(
+                                    "game build {} (timestamp {ts:#x}) is not in the build table: FOUND BY SEARCH (proof of                                      build {}), not yet confirmed; addresses {hash}; hooks available",
+                                    b.name,
+                                    search::Proof::parse(search::PROOF).map(|p| p.timestamp).unwrap_or(0)
+                                ));
+                                if live {
+                                    feverlink3_launcher::live::set_searched_game(b.name.to_owned(), hash);
+                                }
+                            } else {
+                                log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name));
+                            }
                             // hooks, hold, pool patch and seed pin are on unless their variable says 0; done here, in the quiet
                             // moment before the game runs the code that is patched
                             let link = match &launched {
@@ -207,6 +222,38 @@ mod entry {
             let rdata = pe::read_headers(base)?.section(".rdata")?.clone();
             pe::build_number(core::slice::from_raw_parts(base.add(rdata.rva as usize), rdata.size as usize))
         }
+    }
+
+    /// The row of a build the table does not know, found by repeating the address tool's proof on the mapped image
+    /// (`search.rs`); `None` when anything is not proven, or `FEVERLINK3_BUILD_SEARCH=0`. Runs here, under the loader lock,
+    /// because the hooks must be written before the game runs: a full search once per build, then the cache is checked.
+    fn searched_build(ts: u32) -> Option<(&'static build_table::BuildAddrs, bool)> {
+        if std::env::var("FEVERLINK3_BUILD_SEARCH").is_ok_and(|v| v == "0") {
+            log::line("build search off (FEVERLINK3_BUILD_SEARCH=0)");
+            return None;
+        }
+        // SAFETY: as in `game_build`: the image's headers; the sections are then copied with the guarded reader
+        let (base, headers) = unsafe {
+            let base = GetModuleHandleW(core::ptr::null()) as usize;
+            if base == 0 {
+                return None;
+            }
+            (base, pe::read_headers(base as *const u8)?)
+        };
+        let img = search::Image::from_sections(&headers, base as u64, |s| {
+            let mut v = vec![0u8; s.size as usize];
+            for (k, chunk) in v.chunks_mut(16 << 20).enumerate() {
+                memguard::read_into(base + s.rva as usize + (k << 24), chunk).ok()?;
+            }
+            Some(v)
+        })?;
+        debug_assert_eq!(img.timestamp, ts);
+        let dir = std::env::var_os("LOCALAPPDATA").map(|b| std::path::PathBuf::from(b).join("FeverLink3"));
+        let found = search::find(&img, dir.as_deref(), log::line);
+        if found.is_none() {
+            log::line("build search: not every site is proven; the build stays unsupported");
+        }
+        found.map(|b| (b, true))
     }
 
     /// The link timestamp of the running executable, which identifies the game build.

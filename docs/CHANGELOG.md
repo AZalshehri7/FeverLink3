@@ -6,6 +6,11 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## Unreleased
+
+### Added
+- A Transport Fever 3 update that FeverLink3 does not know yet no longer always switches its multiplayer part off: at game start FeverLink3 looks for every place it needs in the new game build with the same whole-function proof its address tool uses, and only when every place is proven does the game play with it (otherwise it stays off as before). The window then says the build was found by search and is not yet confirmed, and only players whose games found exactly the same places can play together. Checked on the executables of builds 40420 and 40425; not yet seen in the game.
+
 ## 0.2.6 (2026-10-24)
 
 ### Added

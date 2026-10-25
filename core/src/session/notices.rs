@@ -85,6 +85,37 @@ pub fn game_unsupported(build: &str) -> String {
     )
 }
 
+/// This game runs a build the installed FeverLink3 does not know, but its native module found every address by repeating the
+/// address tool's proof (`native/src/search.rs`). It plays, and says that the build is not yet confirmed.
+pub fn game_found_by_search(build: &str) -> String {
+    format!(
+        "Transport Fever 3 was updated (build {build}). FeverLink3 found this build by search: it is not yet confirmed.          Play only with players who have the same game build; report anything odd."
+    )
+}
+
+/// A join between two games whose builds were not both found by the same search (one from the table, or other addresses).
+pub fn searched_differ(host: &str, mine: &str) -> String {
+    let build = |s: &str| s.split(':').next().unwrap_or("").to_owned();
+    let say = |s: &str| {
+        if s.is_empty() {
+            "a build FeverLink3 knows".to_owned()
+        } else {
+            format!("build {}, found by search", build(s))
+        }
+    };
+    if !host.is_empty() && build(host) == build(mine) {
+        return format!(
+            "You and the host both play build {} found by search, but the searches did not agree.",
+            build(mine)
+        );
+    }
+    format!(
+        "The game builds do not match: the host plays {}, you play {}. Both need the same game build.",
+        say(host),
+        say(mine)
+    )
+}
+
 /// What the host's window shows when such a game asked to join (it was refused).
 pub fn player_game_unsupported(who: &str, build: &str) -> String {
     format!(
@@ -116,6 +147,9 @@ mod tests {
             report_busy("Pat"),
             game_unsupported("40423"),
             player_game_unsupported("Pat", "40423"),
+            game_found_by_search("40426"),
+            searched_differ("", "40426:0123"),
+            searched_differ("40426:0123", "40426:4567"),
         ];
         for text in &all {
             for word in INTERNAL {

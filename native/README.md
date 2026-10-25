@@ -27,7 +27,7 @@ Toolchain: stable Rust. Either `x86_64-pc-windows-msvc` (needs the Visual Studio
 
 ## Activation
 
-The module is inert unless the launcher started the game with `FEVERLINK3_SESSION_DIR` set, or the game itself hosts the session (live mode). Then it logs to `native.log`, reads the game's PE timestamp and looks it up in `build_table::BUILDS`. Unknown build: hooks off, logged, mod runs degraded.
+The module is inert unless the launcher started the game with `FEVERLINK3_SESSION_DIR` set, or the game itself hosts the session (live mode). Then it logs to `native.log`, reads the game's PE timestamp and looks it up in `build_table::BUILDS`. Unknown build: the build search below; when it does not prove every site, hooks off, logged, mod runs degraded.
 
 On a known build four pieces are ON by default (hooks, hold, pool patch, Lua seed pin; `=0` turns one off, each is fail-open: an unknown build or other bytes at the site install nothing). The diagnostic pieces are off unless the environment sets them to exactly `1`:
 
@@ -62,8 +62,21 @@ compares the old and the new one.
    added this way (`tools/addr/out/port-6ac50427-6ad0e4e5.txt`), and 40425 the same way from 40420
    (`tools/addr/out/port-6ac50427-6ad9ce10.txt`; its code sits at the same places as 40423's).
 
-A game build that is not in the table runs with every hook off; the in-game window says so, hosting is refused and a join is
-refused by the host with the reason (`docs/LIVE_CONTROL.md`).
+A game build that is not in the table is first searched (`search.rs`): the module repeats `port_build.py`'s proof on the
+running game's image, from the proof of build 40425 embedded in the DLL (`tools/addr/out/proof-6ad9ce10.bin`, written by
+`port_build.py <40425 exe> --export-proof`). Every function of the row must match exactly once at a function start of the
+image's unwind table (or one copy at the neighbours' shift), its callees must start with the same code, all 22 layout witnesses
+must match exactly, and the preview listener's offsets are read from the matched listener; shape matches only where
+`port_build.py` allows them. Anything not proven: the whole row is refused, nothing is hooked. The result is cached by PE
+timestamp in `%LOCALAPPDATA%\FeverLink3\build-search-<timestamp>.txt`; the cache is checked against the proof at every start and
+deleted when it no longer matches. `FEVERLINK3_BUILD_SEARCH=0` turns the search off. A found build plays, the window says it was
+found by search and is not yet confirmed, and a join carries `build:hash` of the found row (`searched`), which host and player
+must share. Run on the real executables (read as data), the 40425 proof gives the 40420 row exactly and the 40420 proof the
+40425 row (`search::tests::the_search_reproduces_the_rows_of_40420_and_40425`, ignored: the executables are not in the
+repository); about 0.3 s for 57 MB of `.text` in a release build. Not yet run in the game.
+
+When the search does not prove the build either, it runs with every hook off; the in-game window says so, hosting is refused
+and a join is refused by the host with the reason (`docs/LIVE_CONTROL.md`).
 
 ## Size
 

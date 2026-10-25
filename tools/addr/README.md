@@ -152,9 +152,27 @@ bytes (567 displacements above `0x4b0` moved in its constructor, one or a few in
 preview listener's `ui_e` from `0xb98` to `0xdc0`; all 22 layout witnesses are unchanged; the refund insert's two call
 displacements moved (the module follows them instead of comparing them).
 
-A runtime search of an unknown build at game start was considered and left out: the proof above needs the previous
-executable, the unwind table and the call graph; at start only signatures are available, and a signature can match a
-function whose body a game update changed, which is exactly what a bug-fix update does.
+### The same proof at game start: `--export-proof`
+
+```
+.venv\Scripts\python -I port_build.py <TransportFever3.exe of a build in OLD_SITES> --export-proof out\proof-<timestamp>.bin
+```
+
+writes what the proof above takes from the old executable, so that the native module can repeat it on a build it does not
+know, at game start, without the old executable and without a disassembler (`native/src/search.rs`, which embeds
+`out/proof-6ad9ce10.bin`, the proof of 40425, about 200 KB). For every site: the whole function as bytes and a mask (relink
+fields wildcarded exactly as above; a shape mask only for the hold-list tool functions, the callbacks' tool functions and
+the preview listener's construction and call operator), the site's offset in it, the first 32 bytes of every callee, the
+neighbour functions for the copy rule (for every function with copies in this build and every function of up to 0x400
+bytes, which may have copies in the next: a 0xb5-byte witness unique in 40425 has four copies in 40420; three small
+neighbours unique here per side), the 22 layout witnesses, the vtable loads of the callbacks and the listener, and where the
+listener reads each `PreviewOwnerSite` offset. The format is in `Proof.write`.
+
+What it does not carry over: a human reading the port report. A build found this way plays, but the window says it is not
+yet confirmed; the row still goes into the table the usual way. An earlier version of this README left a runtime search out
+because only signatures were thought available at start; the proof file is what makes the whole-function comparison
+possible there. Checked on the real executables: the 40425 proof run on 40420 gives the 40420 row field for field (`ui_e`
+0xb98), the 40420 proof on 40425 the 40425 row (`ui_e` 0xdc0). Not yet run in a game.
 
 ## Adding a build
 
