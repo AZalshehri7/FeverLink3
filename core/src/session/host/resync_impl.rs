@@ -1016,12 +1016,19 @@ impl HostSession {
             }
             VerdictOutcome::Differ { applied, refused } => {
                 let names = |ids: Vec<u16>| ids.into_iter().map(|g| self.name(g)).collect::<Vec<_>>().join(", ");
-                let first = refused.first().map(|(_, d)| clip(d, 160)).unwrap_or_default();
-                let applied = names(applied);
-                let refused = names(refused.into_iter().map(|(g, _)| g).collect());
-                self.log(format!(
-                    "action {key}: applied on {applied}, refused on {refused} ({first}): the worlds forked at this action"
-                ));
+                if refused.is_empty() {
+                    self.log(format!(
+                        "action {key}: applied on {} with different results (a terrain edit's heights differ): the worlds forked at this action",
+                        names(applied)
+                    ));
+                } else {
+                    let first = refused.first().map(|(_, d)| clip(d, 160)).unwrap_or_default();
+                    let applied = names(applied);
+                    let refused = names(refused.into_iter().map(|(g, _)| g).collect());
+                    self.log(format!(
+                        "action {key}: applied on {applied}, refused on {refused} ({first}): the worlds forked at this action"
+                    ));
+                }
                 let now = self.now();
                 let waited = self.policy.pending().is_some();
                 let decision = self.policy.on_verdicts_differ(now, &key);

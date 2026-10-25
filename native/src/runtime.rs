@@ -38,6 +38,7 @@ use crate::rebuild;
 mod cmd_patch;
 mod inject;
 mod native_copy;
+mod terrain;
 
 /// The unhooked `apply` function of the simulation: (simulation, command) -> whatever it returns. A C++ function,
 /// so declared as one that may unwind.
@@ -112,6 +113,8 @@ pub struct Runtime {
     /// would refuse the same text, so the mod fails the held command and ships nothing (`inject::text_refusal`).
     refused_text: crate::input::InputOut,
     inject: crate::inject::State,
+    /// Terrain height edits shared at the stamp (`terrain.rs`): the tools' commands noted at `Add`, the carriers' orders.
+    terrain: crate::terrain::State,
     inject_settings: OnceLock<portable::Settings>,
     inject_dir_path: Mutex<Option<std::path::PathBuf>>,
     /// The commands the command list's `Add` carried an order out on (the interface half's script commands), by the order's number,
@@ -235,6 +238,7 @@ impl Runtime {
             text: crate::input::InputOut::with_prefix("native_text_"),
             refused_text: crate::input::InputOut::with_prefix("native_refused_"),
             inject: Default::default(),
+            terrain: Default::default(),
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
             added: Mutex::new(Default::default()),
@@ -756,6 +760,9 @@ impl Runtime {
             hook_names.push("defer".to_string()); // and `defer` + `inject_next {held}`: the deferred completion of a held command
             hook_names.push("fail".to_string()); // and `fail` + `complete_next`: a deferred command never waits for the age limit
         }
+        if self.terrain_ready() {
+            hook_names.push(crate::terrain::READY_NAME.to_string()); // `terrain_share` and `terrain_apply`: height edits at the stamp
+        }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
             version: self.version.to_string(),
@@ -839,6 +846,10 @@ impl Runtime {
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
+                Ok(crate::link::CtlMessage::TerrainApply { key, x0, y0, w, h, ttl }) => {
+                    self.terrain_arm(key, crate::terrain::Header { x0, y0, w, h }, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::TerrainShare { on }) => self.terrain_share(on),
                 _ => rest.push(line),
             }
         }
@@ -856,6 +867,14 @@ impl Runtime {
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
+                Ok(crate::link::CtlMessage::TerrainApply { key, x0, y0, w, h, ttl }) => {
+                    self.terrain_arm(key, crate::terrain::Header { x0, y0, w, h }, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::TerrainShare { on }) => self.terrain_share(on),
+                Ok(crate::link::CtlMessage::HoldOff) => {
+                    self.terrain_share(false); // the session's end (or a resync load): the tools apply as they are again
+                    machine.handle(&crate::link::CtlMessage::HoldOff, now)
+                }
                 Ok(crate::link::CtlMessage::Pace { permille }) => {
                     crate::pace::PACER.set(permille, crate::pace::clock_ms());
                     // the mod speaks: what is held keeps its liveness as with any other line
@@ -877,6 +896,7 @@ impl Runtime {
             machine.error("ctl", e, now);
         }
         if poll.gone {
+            self.terrain_share(false);
             machine.ctl_gone(now);
         }
     }
@@ -922,6 +942,7 @@ impl Runtime {
             events.push(Event::Applied { id, ok });
         }
         events.extend(self.patch.drain_events(now));
+        self.terrain_expire(now);
         events.extend(self.inject.drain_events(now));
         for id in self.watch.expire(now) {
             events.push(Event::Error {
@@ -1106,6 +1127,7 @@ impl Runtime {
         if plan.held_here {
             return args.out;
         }
+        self.terrain_note_add(&args);
         // both call the engine when an order is carried out: they guard their own bookkeeping
         if self.inject.enabled() {
             self.inject_on_add(&args, caller);
@@ -1309,7 +1331,9 @@ impl Runtime {
         .flatten();
         // the orders of `inject_next` / `patch_next`: the script's command passes here, not the command list's `Add` (see apply_orders)
         let mut used = None;
-        if self.inject.enabled() || self.patch.enabled() {
+        // a terrain tool's command, a carrier of a shared edit: this module's alone (calls the engine when it empties one)
+        let terrain = claimed.is_none() && self.terrain_on_apply(cmd);
+        if !terrain && (self.inject.enabled() || self.patch.enabled()) {
             let mine = crate::log::guarded("apply hook (orders)", || {
                 let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
                 // SAFETY: only readable memory is read.
