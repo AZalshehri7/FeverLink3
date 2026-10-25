@@ -1808,6 +1808,21 @@ function X.simVerdict(st, it, now, injects)
 		injects = (injects and #injects > 0) and injects or nil, proof = it.proof }
 end
 
+-- The first few builds of each reason that could not be shipped leave the raw proposal in raw_builds.txt, to see the real shapes
+-- (members of engine objects). A terrain tool's command emptied by the native module ("nothing to build") is not one of them: the owner's
+-- run terrain-owner-20261025 spent all four dumps on those, and the tree brush's self-check failures were never dumped.
+function X.rawDump(st, proposal, now, why)
+	local reason = tostring(why):sub(1, 60)
+	if reason == "nothing to build" then return end
+	st.rawDumped = type(st.rawDumped) == "table" and st.rawDumped or {}
+	st.rawDumped[reason] = (st.rawDumped[reason] or 0) + 1
+	if st.rawDumped[reason] > 3 or not (Build.adapter and Build.adapter.dump) then return end
+	pcall(function()
+		local text = C.serialize(Build.adapter.dump(proposal))
+		C.dump("raw_builds.txt", "==== t=" .. now .. " why: " .. tostring(why) .. "\n" .. text:sub(1, 200000) .. "\n")
+	end)
+end
+
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
 	local st = simState(state)
 	local now = engine.gameTime()
@@ -1868,13 +1883,7 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, d
 		logSim("a native build at t=" .. now .. " is not replicated: " .. tostring(why))
 		simNote(st, now, "a native build at t=" .. now .. " was not replicated (" .. tostring(why) .. ")")
 		-- the first few failures leave the raw proposal in a file, to see the real shapes (members of engine objects)
-		st.rawDumped = (st.rawDumped or 0) + 1
-		if st.rawDumped <= 4 and Build.adapter and Build.adapter.dump then
-			pcall(function()
-				local text = C.serialize(Build.adapter.dump(proposal))
-				C.dump("raw_builds.txt", "==== t=" .. now .. " why: " .. tostring(why) .. "\n" .. text:sub(1, 60000) .. "\n")
-			end)
-		end
+		X.rawDump(st, proposal, now, why)
 		state:set(st)
 		return
 	end
@@ -1923,6 +1932,7 @@ local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, d
 		else
 			unbuildable = tostring(whyC)
 			logSim("native build self-check FAILED: " .. unbuildable .. "; its record is NOT shipped (no other game could rebuild it either)")
+			X.rawDump(st, proposal, now, "self-check: " .. unbuildable)
 		end
 	end
 	st.out = st.out or {}
