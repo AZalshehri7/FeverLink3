@@ -82,7 +82,7 @@ so it is not in `winhttp.dll`.
 | Line | Where it comes from |
 |---|---|
 | Steam, Transport Fever 3 | `steam::discover` (registry, library folders), as `doctor` |
-| Game build | the PE link timestamp of `TransportFever3.exe`, looked up in a copy of the builds of `native/src/build_table.rs` (`KNOWN_BUILDS`; the native crate links the launcher, so the launcher cannot link it. A test reads `build_table.rs` and fails when the two lists differ). An unknown build means the mod runs in reduced mode, and the line says so |
+| Game build | the PE link timestamp of `TransportFever3.exe`, looked up in the generated list of verified builds, `tools/addr/out/verified-builds.txt`, which the native module embeds as well. A build not in it may still be found by the native module's search at game start (it then plays as not yet confirmed); the line says it is unknown |
 | Game running | `process::any_game_running` |
 | FeverLink3 | `winhttp.dll` ours (marker), the mod in every Steam user folder, and which version put them there (below) |
 | This folder | `mod/feverlink3` and `winhttp.dll` beside the exe, and not running from inside a zip file (`Temp1_*.zip`, WinRAR, 7-Zip) or `%TEMP%`, where `feverlink3_path.txt` would record a path Windows deletes |

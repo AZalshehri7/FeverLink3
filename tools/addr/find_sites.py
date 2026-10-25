@@ -701,32 +701,15 @@ def rust_bytes(b: bytes) -> str:
 
 
 # The interface's construction tools whose `CommandList::Add` calls the hold path may hold, as the RVA of the byte
-# after the `call` (the return address the hook sees). From MPFever's native/mpfever_native.cpp UI_SITES_40420
-# (MIT, dkdknight), who played with them in the game; the terrain tool's call is left out on purpose (holding its
-# edit crashed the tool). The tool verifies that every entry is a direct call to `command_list_add`.
-UI_ADD_SITES_KNOWN: dict[int, list[int]] = {
-    0x6AC50427: [
-        0x4D396F,   # UI::Bulldozer::Apply
-        0x51B56C,   # UI::ConstructionBuilder::MousePressed
-        0x528504,   # a tool without a source-file string
-        0x537EE5, 0x538649, 0x5387CD,   # UI::LaneModifier::Apply
-        0x542EBA,   # UI::ModuleBuilder::MousePressed
-        0x5891B4,   # UI::StreetBuilder::UpdateEngine
-        0x5948DD,   # a street-terminal tool (stops, signals, waypoints) without a source-file string
-        0x5BF08D,   # UI::TrackModifier::Build
-        0x28A3024, 0x28A3871,   # the entity window's builtins
-    ],
-    # build 40423: the same twelve calls, carried over by port_build.py (same tool functions, same offsets inside them)
-    0x6AD0E4E5: [
-        0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
-        0x28AA534, 0x28AAD81,
-    ],
-    # build 40425: the same twelve calls at the same places as 40423, carried over by port_build.py
-    0x6AD9CE10: [
-        0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
-        0x28AA534, 0x28AAD81,
-    ],
-}
+# after the `call` (the return address the hook sees). The first list was MPFever's native/mpfever_native.cpp UI_SITES_40420
+# (MIT, dkdknight), who played with them in the game; the terrain tool's call is left out on purpose (holding its edit
+# crashed the tool). The lists are data: the `ui_add_sites` of a committed port report naming the build (port_build.py
+# `known_sites`). The tool verifies that every entry is a direct call to `command_list_add`.
+def ui_add_sites_known(ts: int) -> list[int] | None:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from port_build import known_sites  # noqa: E402 (port_build imports this module)
+    known = known_sites(ts)
+    return None if known is None else [s.rva for s in known.sites if s.kind == "ret"]
 
 # The command kind the hold path is about, found by the string its handler references.
 KIND_ANCHORS: dict[str, str] = {"build_proposal": "WorldBuildProposal"}
@@ -845,7 +828,7 @@ def report_callers(img: Image, located: dict[str, int], ts: int) -> tuple[list[s
     add = located.get("command_list_add")
     if add is None:
         return ["callers of command_list_add: not located"], [], False
-    known = UI_ADD_SITES_KNOWN.get(ts)
+    known = ui_add_sites_known(ts)
     rets = img.direct_callers(add)
     lines = [f"direct callers of command_list_add: {len(rets)} (the hold list marks the interface's construction tools)"]
     for r in rets:

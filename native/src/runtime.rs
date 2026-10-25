@@ -1492,7 +1492,7 @@ mod tests {
     /// interface's listener captures, the way the listener computes them; a getter outside the game's image is never called.
     #[test]
     fn the_preview_arguments_come_from_the_game_interface_before_any_tool_preview() {
-        let site = crate::build_table::select(0x6ac5_0427).unwrap().preview_owner.as_ref().unwrap();
+        let site = crate::build_table::fixture().preview_owner.as_ref().unwrap();
         let mut ui = vec![0u64; 0xc00 / 8];
         ui[0xb98 / 8] = 0xE;
         let mut y = vec![0u64; 0x100 / 8];

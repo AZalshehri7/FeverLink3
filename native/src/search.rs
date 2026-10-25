@@ -1,4 +1,4 @@
-//! The build table's row of a game build the table does not know, found at game start by repeating the address tool's proof.
+//! The row of the running game build, found at every game start by repeating the address tool's proof (no row is in the code).
 //!
 //! `tools/addr/port_build.py` carries a row from one executable to the next by comparing whole functions. Its `--export-proof`
 //! writes everything that comparison needs from the reference build (here 40425, `tools/addr/out/proof-6ad9ce10.bin`, embedded
@@ -11,22 +11,20 @@
 //! must pick one copy; callees must start with the same code; all witnesses must match exactly. Any failure is `None`: the
 //! game stays degraded exactly as an unknown build always did (no partial row, nothing guessed).
 //!
-//! What the search does NOT prove that the table does: a human looked at the port report, and the owner played the build.
-//! The window says the build was found by search and is not yet confirmed; a host and a player must have found the same
-//! addresses ([`row_hash`], carried by the join).
+//! What the search does not prove: a human looked at the port report, and the owner played the build. That is the generated
+//! verified list (`bt::VERIFIED`, [`confirmed`]); any other proven build plays and the window says it is not yet confirmed. A
+//! host and a player must have found the same addresses ([`row_hash`], carried by the join).
 //!
 //! The format (little-endian) is documented in `Proof.write` of `port_build.py`.
 
-use crate::build_table::{
-    self as bt, BuildAddrs, CallPatchSite, CallSite, EngineFns, HookSite, PatchSite, PreviewOwnerSite, Rva,
-};
+use crate::build_table::{self as bt, BuildAddrs};
 use crate::pe;
 use std::collections::HashMap;
 
 /// The proof of the reference build, written by `port_build.py --export-proof`.
 pub const PROOF: &[u8] = include_bytes!("../../tools/addr/out/proof-6ad9ce10.bin");
 const MAGIC: &[u8; 8] = b"FL3PROOF";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Bytes compared at the start of each callee (`port_build.CALLEE_PROBE`).
 pub const PROBE: usize = 32;
 const NO_PATTERN: u16 = 0xFFFF;
@@ -85,8 +83,10 @@ struct Site {
 
 /// A parsed proof.
 pub struct Proof {
-    /// The PE timestamp of the reference build (its row is in [`bt::BUILDS`]).
+    /// The PE timestamp and name of the reference build, and the layout table its witnesses were read from.
     pub timestamp: u32,
+    pub name: String,
+    pub layout: String,
     pats: Vec<Pattern>,
     sites: Vec<Site>,
 }
@@ -128,6 +128,7 @@ impl Proof {
             return None;
         }
         let timestamp = r.u32()?;
+        let (name, layout) = (r.name()?, r.name()?);
         let n = r.u32()? as usize;
         let mut pats: Vec<Pattern> = Vec::with_capacity(n.min(1 << 16));
         for _ in 0..n {
@@ -207,7 +208,7 @@ impl Proof {
             }
             sites.push(Site { name, kind, exact, shape, offset, n });
         }
-        (r.at == b.len()).then_some(Proof { timestamp, pats, sites })
+        (r.at == b.len()).then_some(Proof { timestamp, name, layout, pats, sites })
     }
 }
 
@@ -425,12 +426,7 @@ impl Run<'_> {
     }
 }
 
-#[derive(Default)]
-struct Found {
-    rva: HashMap<String, u32>,
-    bytes: HashMap<String, Vec<u8>>,
-    offsets: HashMap<String, usize>,
-}
+type Found = bt::Parts;
 
 /// Every site in the proof's order; the first that is not proven is named.
 fn run_sites(run: &mut Run) -> Result<Found, String> {
@@ -518,123 +514,17 @@ fn one_site(run: &mut Run, f: &mut Found, s: &Site) -> Option<()> {
     Some(())
 }
 
-fn leak(b: &[u8]) -> &'static [u8] {
-    Box::leak(b.to_vec().into_boxed_slice())
-}
-
-/// The new row: the reference row with every searched field replaced; `None` when any field is missing.
-fn row(reference: &BuildAddrs, img: &Image, f: &Found) -> Option<BuildAddrs> {
-    let rva = |k: &str| f.rva.get(k).copied();
-    let bytes = |k: &str| f.bytes.get(k).map(|b| leak(b));
-    let hook = |k: &str| Some(HookSite { rva: rva(k)?, prologue: bytes(k)? });
-    let call = |k: &str| Some(CallSite { rva: rva(k)?, prologue: bytes(k)? });
-    let call_patch = |k: &str| {
-        let c = format!("{k}.callee");
-        Some(CallPatchSite {
-            rva: rva(k)?,
-            expected: bytes(k)?,
-            callee: CallSite { rva: rva(&c)?, prologue: bytes(&c)? },
-        })
-    };
-    let patch = |k: &str, like: &Option<PatchSite>| {
-        let r = like.as_ref()?;
-        let expected = bytes(k)?;
-        (expected.len() == r.expected.len()).then_some(PatchSite { rva: rva(k)?, expected, replacement: r.replacement })
-    };
-    let list = |group: &str, len: usize| -> Option<&'static [Rva]> {
-        let v = (0..len).map(|i| rva(&format!("{group}[{i}]"))).collect::<Option<Vec<_>>>()?;
-        if f.rva.contains_key(&format!("{group}[{len}]")) {
-            return None;
-        }
-        Some(Box::leak(v.into_boxed_slice()))
-    };
-    // the tickCount getter becomes the updateCount getter by its one displacement byte, as in every build so far
-    let tick = {
-        let expected = bytes("tick_count_getter")?;
-        if expected.len() != 27 || expected[bt::TICK_GETTER_DISP_AT] != bt::TICK_COUNT_OFFSET {
-            return None;
-        }
-        let mut replacement = expected.to_vec();
-        replacement[bt::TICK_GETTER_DISP_AT] = bt::UPDATE_COUNT_OFFSET;
-        PatchSite { rva: rva("tick_count_getter")?, expected, replacement: leak(&replacement) }
-    };
-    let po = reference.preview_owner.as_ref()?;
-    let off = |k: &str| f.offsets.get(k).copied();
-    // an engine function that is not found fails the row too (`Some(None)` is never produced)
-    let e = |k: &str| rva(k).map(Some);
-    Some(BuildAddrs {
-        timestamp: img.timestamp,
-        name: Box::leak(img.build.clone().unwrap_or_else(|| format!("{:#x}", img.timestamp)).into_boxed_str()),
-        command_list_add: Some(hook("command_list_add")?),
-        script_convert: Some(hook("script_convert")?),
-        convert_update: Some(hook("convert_update")?),
-        preview_event: Some(hook("preview_event")?),
-        preview_owner: Some(PreviewOwnerSite {
-            call: call_patch("preview_owner")?,
-            y_a: off("y_a")?,
-            y_b: off("y_b")?,
-            z_getter_slot: po.z_getter_slot,
-            r_c: off("r_c")?,
-            r_dispatcher: off("r_dispatcher")?,
-            ui_e: off("ui_e")?,
-        }),
-        apply_command: Some(hook("apply_command")?),
-        script_pool: Some(patch("script_pool", &reference.script_pool)?),
-        town_seed: Some(hook("town_seed")?),
-        town_develop: Some(hook("town_develop")?),
-        town_update_size: Some(hook("town_update_size")?),
-        town_candidates: Some(hook("town_candidates")?),
-        town_edges: Some(hook("town_edges")?),
-        town_sort_call: Some(call_patch("town_sort_call")?),
-        town_pick_call: Some(call_patch("town_pick_call")?),
-        town_field_call: Some(call_patch("town_field_call")?),
-        batch_pace: Some(call_patch("batch_pace")?),
-        free_order: Some(call_patch("free_order")?),
-        game_time_getter: Some(call("game_time_getter")?),
-        tick_count_getter: Some(tick),
-        lua_makeseed: Some(patch("lua_makeseed", &reference.lua_makeseed)?),
-        command_move: Some(call("command_move")?),
-        command_destroy: Some(call("command_destroy")?),
-        handle_destroy: Some(call("handle_destroy")?),
-        ui_add_sites: list("ui_add_sites", reference.ui_add_sites.len())?,
-        fire_done_calls: list("fire_done_calls", reference.fire_done_calls.len())?,
-        // read by command_list_add and the dispatcher, both matched exactly
-        kind_offset: reference.kind_offset,
-        kinds: reference.kinds,
-        engine: EngineFns {
-            proposal_ctor: e("proposal_ctor")?,
-            proposal_dtor: e("proposal_dtor")?,
-            proposal_copy: e("proposal_copy")?,
-            proposal_assign: e("proposal_assign")?,
-            engine_new: e("engine_new")?,
-            engine_delete: e("engine_delete")?,
-            refund_insert: e("refund_insert")?,
-            add_entity: e("add_entity")?,
-            remove_entity: e("remove_entity")?,
-            game_time_advance: e("game_time_advance")?,
-            component_lookup: e("component_lookup")?,
-        },
-        // every witness matched exactly (a site that is not found fails the whole search)
-        layout: reference.layout,
-    })
-}
-
 /// The searched row and the mapping the cache keeps; `cache`: check that mapping instead of searching.
 pub fn search(proof: &Proof, img: &Image, cache: Option<&Mapping>) -> Result<(BuildAddrs, Mapping), String> {
-    let reference = bt::select(proof.timestamp).ok_or("the proof's reference build is not in the table")?;
     let mut run = Run { p: proof, img, hits: None, cache, mapped: HashMap::new() };
     let found = run_sites(&mut run).map_err(|site| format!("site {site} is not proven"))?;
-    let row = row(reference, img, &found).ok_or("the proof does not give every field of the row")?;
+    let name = img.build.clone().unwrap_or_else(|| format!("{:#x}", img.timestamp));
+    let row = bt::assemble(&found, img.timestamp, &name, &proof.layout)
+        .ok_or("the proof does not give every field of the row")?;
     Ok((row, run.mapped))
 }
 
-/// FNV-1a 64 of the row's every field: two games that found the same addresses have the same value (the join compares it).
-pub fn row_hash(b: &BuildAddrs) -> String {
-    let h = format!("{b:?}")
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, c| (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3));
-    format!("{h:016x}")
-}
+pub use bt::row_hash;
 
 fn proof_id() -> String {
     let h = PROOF.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3));
@@ -694,14 +584,24 @@ pub fn find(img: &Image, dir: Option<&std::path::Path>, log: fn(&str)) -> Option
     Some(Box::leak(Box::new(b)))
 }
 
+/// The row was played and checked: its build and hash are in the verified list (`bt::VERIFIED`).
+pub fn confirmed(b: &BuildAddrs) -> bool {
+    let hash = row_hash(b);
+    bt::verified().any(|(_, ts, h)| ts == b.timestamp && h == hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_embedded_proof_parses_and_belongs_to_a_known_row() {
+    fn the_embedded_proof_parses() {
         let p = Proof::parse(PROOF).expect("proof");
-        assert!(bt::select(p.timestamp).is_some());
+        assert!(
+            bt::verified().any(|(name, ts, _)| ts == p.timestamp && name == p.name),
+            "the reference build is verified"
+        );
+        assert_eq!(p.layout, bt::LAYOUT_FACTS.name);
         assert_eq!(p.sites.iter().filter(|s| matches!(s.kind, Kind::Witness)).count(), 22);
     }
 
@@ -734,33 +634,26 @@ mod tests {
         assert_eq!(search(&p, &changed, None).err().as_deref(), Some("site command_list_add is not proven"));
     }
 
-    /// The real executables (read as data, never run; not in the repository): `FEVERLINK3_EXE_40420` and `FEVERLINK3_EXE_40425`.
-    /// The embedded 40425 proof run on 40420 must give the 40420 row exactly, and the 40420 proof (`FEVERLINK3_PROOF_40420`,
-    /// `port_build.py <40420 exe> --export-proof`) run on 40425 the 40425 row. Prints the search time.
+    /// The real executables (read as data, never run; not in the repository): `FEVERLINK3_EXE_40420`, `FEVERLINK3_EXE_40425`. The
+    /// embedded proof must give, on each, the row of its committed port report exactly, with the hash of the verified list,
+    /// and the cached mapping must give it again. Prints the search time.
     #[test]
     #[ignore]
-    fn the_search_reproduces_the_rows_of_40420_and_40425() {
-        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
-        let exe = |k: &str| Image::from_file(&std::fs::read(var(k)).unwrap()).unwrap();
-        let cases = [
-            (PROOF.to_vec(), exe("FEVERLINK3_EXE_40420"), 0x6ac5_0427),
-            (std::fs::read(var("FEVERLINK3_PROOF_40420")).unwrap(), exe("FEVERLINK3_EXE_40425"), 0x6ad9_ce10),
-        ];
-        for (proof, img, want) in cases {
-            let proof = Proof::parse(&proof).unwrap();
+    fn the_search_reproduces_the_committed_port_reports_and_the_verified_hashes() {
+        let proof = Proof::parse(PROOF).unwrap();
+        for (var, report) in [
+            ("FEVERLINK3_EXE_40420", include_str!("../../tools/addr/out/port-6ad9ce10-6ac50427.txt")),
+            ("FEVERLINK3_EXE_40425", include_str!("../../tools/addr/out/port-6ac50427-6ad9ce10.txt")),
+        ] {
+            let path = std::env::var(var).unwrap_or_else(|_| panic!("{var} is not set"));
+            let img = Image::from_file(&std::fs::read(path).unwrap()).unwrap();
             let t = std::time::Instant::now();
             let (b, mapped) = search(&proof, &img, None).unwrap();
-            println!(
-                "proof {:#x} on {want:#x}: {} ms over {} MB .text",
-                proof.timestamp,
-                t.elapsed().as_millis(),
-                img.text.len() >> 20
-            );
-            assert_eq!(&b, bt::select(want).unwrap());
-            let t = std::time::Instant::now();
+            println!("{var}: {} ms over {} MB .text", t.elapsed().as_millis(), img.text.len() >> 20);
+            assert_eq!(b, bt::parse_report(report).unwrap());
+            assert!(confirmed(&b), "{} {}: not the verified hash", b.name, row_hash(&b));
             let cache = parse_cache(&cache_text(&mapped)).unwrap();
-            assert_eq!(&search(&proof, &img, Some(&cache)).unwrap().0, bt::select(want).unwrap());
-            println!("  the cached mapping checked again in {} ms", t.elapsed().as_millis());
+            assert_eq!(search(&proof, &img, Some(&cache)).unwrap().0, b);
         }
     }
 }

@@ -85,8 +85,8 @@ pub fn game_unsupported(build: &str) -> String {
     )
 }
 
-/// This game runs a build the installed FeverLink3 does not know, but its native module found every address by repeating the
-/// address tool's proof (`native/src/search.rs`). It plays, and says that the build is not yet confirmed.
+/// This game runs a build that is not in FeverLink3's verified list, but its native module found every address by repeating
+/// the address tool's proof (`native/src/search.rs`). It plays, and says that the build is not yet confirmed.
 pub fn game_found_by_search(build: &str) -> String {
     format!(
         "Transport Fever 3 was updated (build {build}). FeverLink3 found this build by search: it is not yet confirmed.          Play only with players who have the same game build; report anything odd."
@@ -98,7 +98,7 @@ pub fn searched_differ(host: &str, mine: &str) -> String {
     let build = |s: &str| s.split(':').next().unwrap_or("").to_owned();
     let say = |s: &str| {
         if s.is_empty() {
-            "a build FeverLink3 knows".to_owned()
+            "a build FeverLink3 could not find its places in".to_owned()
         } else {
             format!("build {}, found by search", build(s))
         }

@@ -20,11 +20,6 @@ use crate::portable::{self, Elem, Header, Settings, Ty, F, PAYLOAD};
 pub const REBUILD_VAR: &str = "FEVERLINK3_PORTABLE_REBUILD";
 pub const REBUILD_FILE: &str = "native_rebuild.log";
 
-/// The first bytes of `operator new(size_t)` (its place: `build_table::EngineFns::engine_new`), compared before it is ever called.
-pub const ENGINE_NEW_PROLOGUE: [u8; 11] = [0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xeb, 0x0f];
-/// `operator delete(void*)` (a `jmp` to the CRT's free, 0x3c bytes after `operator new` in 40420 and 40423, so the same bytes).
-pub const ENGINE_DELETE_BYTES: [u8; 5] = [0xe9, 0xff, 0x06, 0x00, 0x00];
-
 /// Where the rebuild gets memory and puts bytes. Methods take `&self`: the real one calls the game, the test one is an arena.
 pub trait Alloc {
     /// `n` bytes (at least 1) or `None`.
@@ -923,8 +918,10 @@ pub struct EngineAlloc {
 impl EngineAlloc {
     /// `None` (with the reason) unless both functions are where the build table has them and start with the expected bytes.
     pub fn at(base: usize, engine: &crate::build_table::EngineFns) -> Result<EngineAlloc, String> {
-        let check = |rva: Option<u32>, want: &[u8], what: &str| -> Result<usize, String> {
+        // `operator new(size_t)` and `operator delete(void*)`, compared with the bytes the build search recorded there
+        let check = |rva: Option<u32>, name: &str, what: &str| -> Result<usize, String> {
             let rva = crate::build_table::engine_rva(rva, what)?;
+            let want = engine.prologue(name)?;
             let got = crate::dump::LiveMem
                 .read(base + rva as usize, want.len())
                 .ok_or_else(|| format!("{rva:#x} is not readable"))?;
@@ -932,8 +929,8 @@ impl EngineAlloc {
                 .then_some(base + rva as usize)
                 .ok_or_else(|| format!("{rva:#x} does not hold the expected bytes"))
         };
-        let new_at = check(engine.engine_new, &ENGINE_NEW_PROLOGUE, "operator new")?;
-        let delete_at = check(engine.engine_delete, &ENGINE_DELETE_BYTES, "operator delete")?;
+        let new_at = check(engine.engine_new, "engine_new", "operator new")?;
+        let delete_at = check(engine.engine_delete, "engine_delete", "operator delete")?;
         // SAFETY: both addresses were just compared with the bytes of `operator new(size_t)` and `operator delete(void*)`.
         unsafe {
             Ok(EngineAlloc {
@@ -1328,16 +1325,16 @@ mod tests {
         #[test]
         fn the_functions_are_used_only_where_the_expected_bytes_are() {
             let mut image = vec![0u8; 0x400];
-            let engine = &crate::build_table::select(0x6ac5_0427).unwrap().engine;
+            let engine = &crate::build_table::fixture().engine;
             let (new, delete) = (engine.engine_new.unwrap(), engine.engine_delete.unwrap());
             let base = (image.as_mut_ptr() as usize).wrapping_sub(new as usize);
             // the delete function is a few bytes above operator new in the real image; put both into one buffer
             let delete_at = (delete - new) as usize;
             assert!(delete_at + 5 < image.len());
             assert!(EngineAlloc::at(base, engine).is_err(), "zeroes are not operator new");
-            image[..11].copy_from_slice(&ENGINE_NEW_PROLOGUE);
+            image[..11].copy_from_slice(engine.prologue("engine_new").unwrap());
             assert!(EngineAlloc::at(base, engine).is_err(), "operator delete is still missing");
-            image[delete_at..delete_at + 5].copy_from_slice(&ENGINE_DELETE_BYTES);
+            image[delete_at..delete_at + 5].copy_from_slice(engine.prologue("engine_delete").unwrap());
             assert!(EngineAlloc::at(base, engine).is_ok());
             assert!(EngineAlloc::at(base, &crate::build_table::EngineFns::NONE).is_err(), "no place, no allocator");
             image[3] ^= 1;

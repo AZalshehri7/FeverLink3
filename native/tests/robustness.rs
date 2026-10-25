@@ -4,7 +4,6 @@
 //!
 //! Seeded; `FEVERLINK3_FUZZ_SCALE=50` runs everything 50 times longer, `FEVERLINK3_FUZZ_SEED=n` changes the seeds.
 
-use feverlink3_native::build_table;
 use feverlink3_native::detour::{check_prologue, patch_bytes, trampoline_bytes, JMP_ABS_LEN};
 use feverlink3_native::pe;
 use feverlink3_native::scan::Pattern;
@@ -203,19 +202,5 @@ fn detour_arithmetic_holds_for_any_prologue() {
         let tramp = trampoline_bytes(&expected, target);
         assert_eq!(&tramp[..expected.len()], &expected[..]);
         assert_eq!(tramp[expected.len()..], feverlink3_native::detour::jmp_abs(target + expected.len() as u64));
-    }
-}
-
-#[test]
-fn the_build_table_answers_for_every_timestamp() {
-    let mut r = rng(6);
-    for _ in 0..iters(20_000) {
-        let stamp: u32 = r.gen();
-        if let Some(build) = build_table::select(stamp) {
-            assert_eq!(build.timestamp, stamp);
-        }
-    }
-    for build in build_table::BUILDS {
-        assert_eq!(build_table::select(build.timestamp).map(|b| b.name), Some(build.name));
     }
 }

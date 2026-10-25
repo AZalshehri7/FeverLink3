@@ -1,6 +1,7 @@
 # tools/addr: the address tool
 
-Turns a `TransportFever3.exe` into a `build_table::BuildAddrs` row for `native/src/build_table.rs`. The
+Reads a `TransportFever3.exe` and writes the reports, the proof file and the verified-builds line the native module's
+build search (`native/src/search.rs`) is made from and checked against; no build's addresses are written into code. The
 executable is read as data and never executed, modified or copied into the repository.
 
 Hook sites located with findings from MPFever (MIT, dkdknight): the per-build RVAs for game builds 40408 and
@@ -122,14 +123,16 @@ import list of 40420 is exactly the 14 functions `proxy.rs` relays.
 
 Helpers of 40420, all high: `command_move` `0x9d0430`, `command_destroy` `0x9d0670`, `handle_destroy`
 `0x3040c90`. Kind byte offset `0x9b8` (two functions agree), sizeof(Command) `0x38`, `build_proposal` is kind
-52, and all 12 hold-list entries are direct calls to `command_list_add`. `native/src/build_table.rs` has a
-test that parses the committed report and compares its row with the table.
+52, and all 12 hold-list entries are direct calls to `command_list_add`. The hold list itself is data: the `ui_add_sites`
+of a committed port report naming the build (`ui_add_sites_known`).
 
 ## port_build.py: the whole row, from the previous build
 
 `find_sites.py` knows six sites. The row has many more (the preview hooks, the convert hooks, the determinism patches,
 the callbacks the hold fires, the growth logs, the engine functions of the native transport). `port_build.py` carries
-every one of them from a build the table knows to the next:
+every one of them from a build to the next. It keeps no addresses of its own: the old build's sites are read from a
+committed report that names it as its old or new build (`out/port-<old>-<new>.txt`, `known_sites`), so after each port the
+new build can be the old one of the next:
 
 ```
 .venv\Scripts\python -I port_build.py <old TransportFever3.exe> <new TransportFever3.exe> --out out
@@ -152,14 +155,16 @@ bytes (567 displacements above `0x4b0` moved in its constructor, one or a few in
 preview listener's `ui_e` from `0xb98` to `0xdc0`; all 22 layout witnesses are unchanged; the refund insert's two call
 displacements moved (the module follows them instead of comparing them).
 
+40425 to 40420 (`out/port-6ad9ce10-6ac50427.txt`, made with the sites read from the 40420 to 40425 report): every site
+back at its 40420 place, the same row as the first port's old side.
+
 ### The same proof at game start: `--export-proof`
 
 ```
-.venv\Scripts\python -I port_build.py <TransportFever3.exe of a build in OLD_SITES> --export-proof out\proof-<timestamp>.bin
+.venv\Scripts\python -I port_build.py <TransportFever3.exe of a build with a committed port report> --export-proof out\proof-<timestamp>.bin
 ```
 
-writes what the proof above takes from the old executable, so that the native module can repeat it on a build it does not
-know, at game start, without the old executable and without a disassembler (`native/src/search.rs`, which embeds
+writes what the proof above takes from the old executable, so that the native module repeats it at every game start, without the old executable and without a disassembler (`native/src/search.rs`, which embeds
 `out/proof-6ad9ce10.bin`, the proof of 40425, about 200 KB). For every site: the whole function as bytes and a mask (relink
 fields wildcarded exactly as above; a shape mask only for the hold-list tool functions, the callbacks' tool functions and
 the preview listener's construction and call operator), the site's offset in it, the first 32 bytes of every callee, the
@@ -168,19 +173,25 @@ bytes, which may have copies in the next: a 0xb5-byte witness unique in 40425 ha
 neighbours unique here per side), the 22 layout witnesses, the vtable loads of the callbacks and the listener, and where the
 listener reads each `PreviewOwnerSite` offset. The format is in `Proof.write`.
 
-What it does not carry over: a human reading the port report. A build found this way plays, but the window says it is not
-yet confirmed; the row still goes into the table the usual way. An earlier version of this README left a runtime search out
-because only signatures were thought available at start; the proof file is what makes the whole-function comparison
-possible there. Checked on the real executables: the 40425 proof run on 40420 gives the 40420 row field for field (`ui_e`
-0xb98), the 40420 proof on 40425 the 40425 row (`ui_e` 0xdc0). Not yet run in a game.
+The module has no table of rows any more: every row, of every build, is found this way. What the search does not carry
+over is a human reading the port report and a real game test; `out/verified-builds.txt` (name, PE timestamp, row hash; a line
+printed by `cargo run --release -p feverlink3_native --example verified_line -- <exe or port report>`) lists the builds that had
+both, and any other build the search proves plays with a "not yet confirmed" notice. An earlier version of this README left a
+runtime search out because only signatures were thought available at start; the proof file is what makes the whole-function
+comparison possible there. Checked on the real executables: the 40425 proof run on 40420 gives the 40420 row field for field
+(`ui_e` 0xb98) and on 40425 the 40425 row (`ui_e` 0xdc0), each equal to its committed report with the verified hash; the
+40420 proof run on 40425 gave the 40425 row as well. Not yet run in a game.
 
 ## Adding a build
 
-0. Run `port_build.py` from the previous build first (above); paste its row.
-1. Run the tool against the new executable with `--out out` and commit the report.
-2. If every site is high or medium, paste the literal into `build_table::BUILDS`.
-3. Paste the derived signatures into `SITES[..].signature` in `find_sites.py` with `signature_from` set to
+0. Nothing is needed to play a new build the embedded proof covers: the module finds it at start (not yet confirmed).
+1. After a real test, run `port_build.py` from the last verified build with `--out out` and commit the report (the data the
+   next port and the tests read).
+2. Run `find_sites.py` against the new executable with `--out out` and commit the report (the independent check).
+3. Add the build's line to `out/verified-builds.txt` with the `verified_line` example (above); never type it.
+4. Paste the derived signatures into `SITES[..].signature` in `find_sites.py` with `signature_from` set to
    the new timestamp, so the build after that can be found by signature as well.
-4. If a site is not located: compare the report's notes with the previous build's report, find the function
-   by hand (the anchors above are the starting points), and only then extend the tool. Do not type an RVA
-   into the table by hand.
+5. If the search no longer proves a build (a hooked function changed): port to it from the last build that still has the
+   old code, compare the reports, find the function by hand (the anchors above are the starting points), extend the tool,
+   then export a new proof from a build whose report exists and point `native/src/search.rs` (`PROOF`) at it. Never type an
+   RVA into the code.

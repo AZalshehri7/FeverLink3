@@ -380,8 +380,9 @@ pub struct Controller {
     reporter: report::Reporter,
     /// The game build this game's native module does not support ([`set_unsupported_game`]); `None`: supported.
     unsupported: Option<String>,
-    /// The game build the native module found by search ([`set_searched_game`]): `(build, hash of the found addresses)`.
-    searched: Option<(String, String)>,
+    /// The game build the native module found by search ([`set_searched_game`]): `(build, hash of the found addresses,
+    /// confirmed)`.
+    searched: Option<(String, String, bool)>,
 }
 
 /// The game build the native module of this process does not support, set once by the module before it starts the controller.
@@ -393,18 +394,20 @@ pub fn set_unsupported_game(build: String) {
     let _ = UNSUPPORTED_GAME.set(build);
 }
 
-/// The game build the native module of this process found by search (not in its table), and a hash of the addresses it found.
-static SEARCHED_GAME: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+/// The game build the native module of this process found by search, the hash of the addresses it found, and whether that
+/// row is in the verified list.
+static SEARCHED_GAME: std::sync::OnceLock<(String, String, bool)> = std::sync::OnceLock::new();
 
-/// Called by the native module when it found the running build's addresses by search (`native/src/search.rs`): the window's
-/// start screen says the build is not yet confirmed, and every fingerprint carries `build:hash`, so host and player must agree.
-pub fn set_searched_game(build: String, hash: String) {
-    let _ = SEARCHED_GAME.set((build, hash));
+/// Called by the native module once it found the running build's addresses (`native/src/search.rs`): every fingerprint carries
+/// `build:hash`, so host and player must have found the same; a build that is not `confirmed` (not in the verified list) is
+/// said on the window's start screen.
+pub fn set_searched_game(build: String, hash: String, confirmed: bool) {
+    let _ = SEARCHED_GAME.set((build, hash, confirmed));
 }
 
-/// `build:hash` of [`set_searched_game`], empty for a build of the table (what a join's fingerprint carries).
+/// `build:hash` of [`set_searched_game`], empty when the module found nothing (what a join's fingerprint carries).
 pub fn searched_game_tag() -> String {
-    SEARCHED_GAME.get().map(|(b, h)| format!("{b}:{h}")).unwrap_or_default()
+    SEARCHED_GAME.get().map(|(b, h, _)| format!("{b}:{h}")).unwrap_or_default()
 }
 
 impl Controller {
@@ -1470,7 +1473,7 @@ impl Controller {
             }
             v["unsupportedGame"] = json!(build);
         }
-        if let Some((build, _)) = &self.searched {
+        if let Some((build, _, false)) = &self.searched {
             // in sight like the unsupported notice: the build plays, but nobody has confirmed it yet
             if v["notice"].is_null() {
                 v["notice"] = json!(notices::game_found_by_search(build));

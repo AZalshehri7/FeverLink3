@@ -731,7 +731,7 @@ fn plan_preview_owner(build: &BuildAddrs, image: &dyn Image, p: &mut Plan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_table::{select, CallSite, HookSite, PatchSite};
+    use crate::build_table::{fixture, CallSite, HookSite, PatchSite};
 
     fn cfg(hooks: bool, hold: bool, poolpatch: bool) -> HookConfig {
         HookConfig { hooks, hold, poolpatch, ..Default::default() }
@@ -739,7 +739,7 @@ mod tests {
 
     /// An image holding exactly the bytes the 40420 row expects, at the row's addresses.
     fn image_of_40420() -> BytesImage {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
         for s in [
             &b.command_list_add,
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn the_town_seed_is_planned_only_on_request_and_only_when_the_bytes_match() {
-        let (b, mut img) = (select(0x6ac5_0427).unwrap(), image_of_40420());
+        let (b, mut img) = (fixture(), image_of_40420());
         let on = HookConfig { town_seed: true, ..Default::default() };
         let p = plan(b, on, &img);
         assert_eq!(names(&p), ["town_seed"], "{:?}", p.report());
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn nothing_is_planned_by_default() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let p = plan(b, HookConfig::default(), &image_of_40420());
         assert_eq!(p, Plan::default());
         assert!(p.report().is_empty());
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn the_counters_alone_are_one_detour_on_the_apply_function() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let p = plan(b, cfg(true, false, false), &image_of_40420());
         assert_eq!(names(&p), ["apply_command"]);
         assert!(p.has(Feature::Counters) && !p.has(Feature::Hold) && !p.has(Feature::PoolPatch));
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn hold_adds_the_command_list_hook_after_the_counters() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let p = plan(b, cfg(true, true, false), &image_of_40420());
         assert_eq!(names(&p), ["apply_command", "command_list_add", "preview_event", "preview_owner"]);
         assert_eq!(
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn the_report_lines_are_the_ones_the_docs_quote() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let p = plan(b, cfg(true, true, true), &image_of_40420());
         assert_eq!(
             p.report(),
@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn hold_without_hooks_does_nothing_and_says_so() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let p = plan(b, cfg(false, true, false), &image_of_40420());
         assert!(p.steps.is_empty());
         assert_eq!(p.notes.len(), 1);
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn the_pool_patch_is_independent_of_the_hooks() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let p = plan(b, cfg(false, false, true), &image_of_40420());
         assert_eq!(names(&p), ["script_pool"]);
         match &p.steps[0] {
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn a_wrong_byte_skips_only_that_piece_and_says_which() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let mut img = image_of_40420();
         let apply = b.apply_command.as_ref().unwrap();
         img.write(apply.rva + 3, &[0x90]);
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn a_changed_engine_helper_keeps_the_hold_hook_off_but_not_the_counters() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         for helper in [&b.command_move, &b.command_destroy, &b.handle_destroy] {
             let mut img = image_of_40420();
             let site = helper.as_ref().unwrap();
@@ -1045,7 +1045,7 @@ mod tests {
 
     #[test]
     fn growth_is_planned_with_its_game_time_pieces_and_degrades_without_them() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let on = HookConfig { growth: Settings { log: true, ..Default::default() }, ..Default::default() };
         assert!(on.any());
         let p = plan(b, on, &image_of_40420());
@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn the_deep_log_adds_two_wraps_each_checked_on_its_own() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let deep = HookConfig::from_lookup(env_pairs(&[("FEVERLINK3_LOG_GROWTH_DEEP", "1")]));
         assert!(deep.any() && deep.growth.deep);
         let deep = HookConfig {
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn a_changed_pool_region_is_not_patched() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let mut img = image_of_40420();
         img.write(0xab00fc + 21, &[0x03]);
         let p = plan(b, cfg(false, false, true), &img);
@@ -1160,7 +1160,7 @@ mod tests {
     #[test]
     fn another_executable_installs_nothing() {
         // every address of the 40420 row pointing into bytes of some other program
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let mut img = BytesImage::zeroed(0, 0x0400_0000);
         for (i, byte) in img.bytes.iter_mut().enumerate() {
             *byte = (i.wrapping_mul(2654435761) >> 7) as u8;
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn an_image_that_is_too_small_is_not_readable_rather_than_a_panic() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let tiny = BytesImage::zeroed(0, 0x1000);
         let p = plan(b, cfg(true, true, true), &tiny);
         assert!(p.steps.is_empty());
@@ -1182,7 +1182,7 @@ mod tests {
 
     #[test]
     fn the_convert_hook_is_planned_with_the_inject_or_the_patch_switch_and_a_matching_prologue() {
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let image = image_of_40420();
         let off = HookConfig { hooks: true, ..Default::default() };
         assert!(!plan(b, off, &image).has(Feature::Convert));
@@ -1313,7 +1313,7 @@ mod tests {
     #[test]
     fn the_seed_pin_is_planned_only_when_asked_and_verified() {
         let img = image_of_40420();
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let on = HookConfig { luaseed: true, ..Default::default() };
         let p = plan(b, on, &img);
         assert_eq!(names(&p), ["lua_makeseed"]);
@@ -1357,7 +1357,7 @@ mod tests {
     #[test]
     fn the_step_seed_is_planned_only_when_asked_and_verified() {
         let img = image_of_40420();
-        let b = select(0x6ac5_0427).unwrap();
+        let b = fixture();
         let on = HookConfig { step_seed: true, ..Default::default() };
         let p = plan(b, on, &img);
         assert_eq!(names(&p), ["tick_count_getter"]);
@@ -1394,7 +1394,7 @@ mod tests {
         }
         let on = HookConfig { free_order: true, ..Default::default() };
         assert!(on.any(), "the free order alone makes the module touch the game's code");
-        let (b, img) = (select(0x6ac5_0427).unwrap(), image_of_40420());
+        let (b, img) = (fixture(), image_of_40420());
         let p = plan(b, on, &img);
         assert_eq!(names(&p), ["free_order"], "{:?}", p.report());
         let Step::CallPatch { feature, rva, callee, .. } = &p.steps[0] else { panic!("not a call patch") };

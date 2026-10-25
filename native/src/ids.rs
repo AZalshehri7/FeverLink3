@@ -53,16 +53,6 @@ pub const STEP: u64 = feverlink3_core::session::Lockstep::STEP as u64;
 /// The free-id deque's place in `ecs::Engine` (build 40420: `lea rcx,[r13+0xd8]` before the insert at `0x2bba103`).
 pub const FREE_QUEUE_OFFSET: u64 = 0xd8;
 
-/// The game-time advance `(ecs::Engine*, world entity, delta) -> void` (40420 `0xbad780`; its place: `build_table::EngineFns`) and
-/// its pushes, up to `sub rsp,50h` (16 bytes, no rip-relative operand). The bytes of this and the next three functions are the
-/// same in 40420 and 40423.
-pub const GAME_TIME_ADVANCE_PROLOGUE: [u8; 16] =
-    [0x48, 0x89, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
-/// The component lookup `(ecs::Engine*, entity) -> GameTime*` (40420 `0x1445c0`) the advance and the game-time getters call;
-/// its first bytes are compared before it is ever called.
-pub const COMPONENT_LOOKUP_PROLOGUE: [u8; 15] =
-    [0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20];
-
 /// The checksum's `freeq` part of this game ([`crate::idorder::EngineOrder::check_part`] of the engine that worked last), `None`
 /// when the order trace is off, `FEVERLINK3_FREEQ_CHECK=0`, or no engine has a checkpoint yet. Read by the session controller when
 /// it forwards a checksum report (`feverlink3_launcher::session::set_checksum_part`); never called from a hook.
@@ -84,13 +74,6 @@ pub const FREEQ_CHECK_VAR: &str = "FEVERLINK3_FREEQ_CHECK";
 
 /// The switch.
 pub const ID_TRACE_VAR: &str = "FEVERLINK3_ID_TRACE";
-
-/// `ecs::Engine::AddEntity(Engine*, Entity* out) -> Entity*` (40420 `0x2bb8940`) and its first three instructions.
-pub const ADD_ENTITY_PROLOGUE: [u8; 15] =
-    [0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18];
-/// `ecs::Engine::RemoveEntity(Engine*, Entity, bool)` (40420 `0x2bbc700`) and its first instructions.
-pub const REMOVE_ENTITY_PROLOGUE: [u8; 15] =
-    [0x48, 0x89, 0x5C, 0x24, 0x10, 0x44, 0x88, 0x44, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54];
 
 #[cfg(windows)]
 mod imp {
@@ -480,8 +463,14 @@ mod imp {
         };
         let lookup = base + lookup_rva as usize;
         // SAFETY: a read of the image's code, checked readable first.
-        match unsafe { crate::mem::read(lookup as *const u8, COMPONENT_LOOKUP_PROLOGUE.len()) } {
-            Ok(b) if b == COMPONENT_LOOKUP_PROLOGUE => {}
+        // the bytes the build search recorded at the lookup and the advance (it proved both functions there)
+        let (Ok(lookup_bytes), Ok(advance_bytes)) =
+            (engine.prologue("component_lookup"), engine.prologue("game_time_advance"))
+        else {
+            return log("id order trace: the step is not read (no recorded bytes for this build): s=?");
+        };
+        match unsafe { crate::mem::read(lookup as *const u8, lookup_bytes.len()) } {
+            Ok(b) if b == lookup_bytes => {}
             _ => {
                 return log(
                     "id order trace: the step is not read (the component lookup does not have the expected bytes): s=?",
@@ -489,7 +478,7 @@ mod imp {
             }
         }
         // SAFETY: called from DllMain before the game runs; the prologue is checked against the bytes in memory.
-        match unsafe { Detour::prepare((base + advance_rva as usize) as *mut u8, &GAME_TIME_ADVANCE_PROLOGUE) } {
+        match unsafe { Detour::prepare((base + advance_rva as usize) as *mut u8, advance_bytes) } {
             Ok(mut d) => {
                 ADVANCE_ORIGINAL.store(d.original() as usize, Ordering::Release);
                 LOOKUP.store(lookup, Ordering::Release);
@@ -570,10 +559,14 @@ mod imp {
             return;
         }
         BASE.store(base, Ordering::Release);
-        for (name, rva, pro, hook, slot) in [
-            ("add_entity", add_rva, &ADD_ENTITY_PROLOGUE, add_hook as *const () as usize, &ADD_ORIGINAL),
-            ("remove_entity", remove_rva, &REMOVE_ENTITY_PROLOGUE, remove_hook as *const () as usize, &REMOVE_ORIGINAL),
+        for (name, rva, hook, slot) in [
+            ("add_entity", add_rva, add_hook as *const () as usize, &ADD_ORIGINAL),
+            ("remove_entity", remove_rva, remove_hook as *const () as usize, &REMOVE_ORIGINAL),
         ] {
+            let Ok(pro) = engine.prologue(name) else {
+                log(&format!("id trace: {name} has no recorded bytes for this build; not hooked"));
+                continue;
+            };
             // SAFETY: called from DllMain before the game runs; the prologue is checked against the bytes in memory.
             match unsafe { Detour::prepare((base + rva as usize) as *mut u8, pro) } {
                 Ok(mut d) => {

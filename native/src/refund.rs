@@ -69,27 +69,6 @@ pub fn set_window(poke: &dyn Poke, payload: usize, window: f32) -> Result<(), St
     }
 }
 
-/// The first 0xea bytes of `std::_Hash<...refundableEntities...>::_Insert_range_unchecked(this, first, last)` (build 40420 `0x4be210`,
-/// 40423 `0x4bf040`: `build_table::EngineFns::refund_insert`), compared before it is called, apart from the displacements of its two
-/// calls, which a relink moves and which are followed instead ([`INSERT_CALLS`]): the
-/// prologue, the loop over the source (`lea rdx,[rbx+0x10]`, the hasher call), the bucket walk comparing the key's two words at +0x10
-/// and +0x14, the size limit, `mov ecx,0x28; call operator new` and the copy of the 24-byte entry into the new node at +0x10.
-pub const INSERT_RANGE_BYTES: [u8; 0xea] = [
-    0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x4c, 0x24,
-    0x08, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x40, 0x49, 0x8b, 0xf8, 0x48, 0x8b,
-    0xda, 0x4c, 0x8b, 0xc1, 0x48, 0x3b, 0xd7, 0x0f, 0x84, 0x19, 0x02, 0x00, 0x00, 0x4c, 0x8d, 0x71, 0x08, 0x66, 0x0f,
-    0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x53, 0x10, 0x49, 0x8b, 0xc8, 0xe8, 0x04, 0xc0, 0xd6, 0xff,
-    0x4c, 0x8b, 0xe8, 0x4c, 0x8b, 0x44, 0x24, 0x70, 0x49, 0x23, 0x40, 0x30, 0x48, 0x03, 0xc0, 0x49, 0x8b, 0x48, 0x18,
-    0x48, 0x8b, 0x74, 0xc1, 0x08, 0x4d, 0x8b, 0x26, 0x49, 0x3b, 0xf4, 0x75, 0x08, 0x49, 0x8b, 0xf4, 0x49, 0x8b, 0xec,
-    0xeb, 0x2e, 0x48, 0x8b, 0x0c, 0xc1, 0x8b, 0x53, 0x10, 0x0f, 0x1f, 0x44, 0x00, 0x00, 0x3b, 0x56, 0x10, 0x75, 0x0c,
-    0x8b, 0x46, 0x14, 0x39, 0x43, 0x14, 0x0f, 0x84, 0xaf, 0x01, 0x00, 0x00, 0x48, 0x3b, 0xf1, 0x74, 0x06, 0x48, 0x8b,
-    0x76, 0x08, 0xeb, 0xe4, 0x4c, 0x8b, 0xe6, 0x48, 0x8b, 0xee, 0x48, 0xb8, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-    0x06, 0x49, 0x39, 0x40, 0x10, 0x0f, 0x84, 0xb4, 0x01, 0x00, 0x00, 0x4c, 0x89, 0x74, 0x24, 0x30, 0x48, 0xc7, 0x44,
-    0x24, 0x38, 0x00, 0x00, 0x00, 0x00, 0xb9, 0x28, 0x00, 0x00, 0x00, 0xe8, 0x52, 0xe2, 0xcc, 0x02, 0x4c, 0x8b, 0xf0,
-    0x48, 0x89, 0x44, 0x24, 0x38, 0xc5, 0xf8, 0x10, 0x43, 0x10, 0xc5, 0xf8, 0x11, 0x40, 0x10, 0xc5, 0xfb, 0x10, 0x4b,
-    0x20, 0xc5, 0xfb, 0x11, 0x48, 0x20,
-];
-
 /// `void _Insert_range_unchecked(this, first, last)`: `this` the container, `first` the first source node, `last` the end (a node
 /// address that is never read as an entry).
 pub type InsertRangeFn = unsafe extern "system-unwind" fn(*mut u8, *const u8, *const u8);
@@ -100,20 +79,16 @@ pub struct RefundFns {
     pub insert: InsertRangeFn,
 }
 
-/// The two `call rel32` in [`INSERT_RANGE_BYTES`] (where their `E8` is): the key hasher and `operator new(0x28)`. Their displacements
-/// are not compared; where they lead is: the first must reach code that starts with [`HASHER_BYTES`], the second the build table's
-/// `engine_new`.
+/// The two `call rel32` in the first 0xea bytes of `std::_Hash<...refundableEntities...>::_Insert_range_unchecked(this, first,
+/// last)` (`build_table::EngineFns::refund_insert`, whose bytes the build search recorded after proving the whole function and the
+/// start of every callee): the key hasher and `operator new(0x28)`. Their displacements are not compared; the second must lead
+/// to the row's `engine_new`. Offsets in the reference build's code, which the search proved unchanged.
 pub const INSERT_CALLS: [usize; 2] = [0x47, 0xc9];
 
-/// The first bytes of the key hasher, an FNV-1a over the key (`mov [rsp+8],rbx ; mov r8d,[rdx] ; mov rbx,0x100000001b3`), the
-/// same in 40420 (`0x22a260`) and 40423 (`0x22a270`).
-pub const HASHER_BYTES: [u8; 16] =
-    [0x48, 0x89, 0x5c, 0x24, 0x08, 0x44, 0x8b, 0x02, 0x48, 0xbb, 0xb3, 0x01, 0x00, 0x00, 0x00, 0x01];
-
-/// True when `got` is [`INSERT_RANGE_BYTES`] outside the displacements of [`INSERT_CALLS`].
-pub fn same_code(got: &[u8]) -> bool {
-    got.len() == INSERT_RANGE_BYTES.len()
-        && (0..got.len()).all(|i| got[i] == INSERT_RANGE_BYTES[i] || INSERT_CALLS.iter().any(|&c| i > c && i <= c + 4))
+/// True when `got` is `want` outside the displacements of [`INSERT_CALLS`].
+pub fn same_code(want: &[u8], got: &[u8]) -> bool {
+    got.len() == want.len()
+        && (0..got.len()).all(|i| got[i] == want[i] || INSERT_CALLS.iter().any(|&c| i > c && i <= c + 4))
 }
 
 /// Where the `call rel32` at offset `call` of `code` (which starts at RVA `at`) leads.
@@ -123,21 +98,19 @@ pub fn call_target(code: &[u8], call: usize, at: u32) -> u32 {
 }
 
 impl RefundFns {
-    /// The function of the running game, after its bytes are compared with [`INSERT_RANGE_BYTES`] and its two calls followed.
+    /// The function of the running game, after its bytes are compared with the recorded ones and its `operator new` call followed.
     pub fn at(base: usize, engine: &crate::build_table::EngineFns) -> Result<RefundFns, String> {
         let rva = crate::build_table::engine_rva(engine.refund_insert, "the refund list's insert function")?;
         let new = crate::build_table::engine_rva(engine.engine_new, "operator new")?;
-        let got = crate::dump::LiveMem
-            .read(base + rva as usize, INSERT_RANGE_BYTES.len())
-            .ok_or_else(|| format!("the refund list's insert function at {rva:#x} is not readable"))?;
-        if !same_code(&got) {
-            return Err(format!("the refund list's insert function at {rva:#x} does not have the expected bytes"));
+        let want = engine.prologue("refund_insert")?;
+        if want.len() <= INSERT_CALLS[1] + 4 {
+            return Err("the refund list's insert function has too few recorded bytes".to_owned());
         }
-        let hasher = call_target(&got, INSERT_CALLS[0], rva);
-        if crate::dump::LiveMem.read(base + hasher as usize, HASHER_BYTES.len()).as_deref() != Some(&HASHER_BYTES[..]) {
-            return Err(format!(
-                "the refund list's insert function at {rva:#x} calls {hasher:#x}, which is not the key hasher"
-            ));
+        let got = crate::dump::LiveMem
+            .read(base + rva as usize, want.len())
+            .ok_or_else(|| format!("the refund list's insert function at {rva:#x} is not readable"))?;
+        if !same_code(want, &got) {
+            return Err(format!("the refund list's insert function at {rva:#x} does not have the expected bytes"));
         }
         if call_target(&got, INSERT_CALLS[1], rva) != new {
             return Err(format!(
@@ -377,16 +350,17 @@ pub(crate) mod tests {
 
     #[test]
     fn the_insert_is_compared_outside_its_two_call_displacements_which_are_followed() {
-        assert!(same_code(&INSERT_RANGE_BYTES));
-        // build 40420 at 0x4be210: the hasher 0x22a260 and operator new 0x318c530 (40423 moves both, the code stays)
-        assert_eq!(call_target(&INSERT_RANGE_BYTES, INSERT_CALLS[0], 0x4be210), 0x22a260);
-        assert_eq!(call_target(&INSERT_RANGE_BYTES, INSERT_CALLS[1], 0x4be210), 0x318c530);
-        let mut moved = INSERT_RANGE_BYTES;
+        let engine = &crate::build_table::fixture().engine;
+        let code = engine.prologue("refund_insert").unwrap();
+        assert!(same_code(code, code));
+        // the second call is operator new
+        assert_eq!(call_target(code, INSERT_CALLS[1], engine.refund_insert.unwrap()), engine.engine_new.unwrap());
+        let mut moved = code.to_vec();
         moved[INSERT_CALLS[1] + 1] ^= 0x55;
-        assert!(same_code(&moved), "a displacement may differ");
+        assert!(same_code(code, &moved), "a displacement may differ");
         moved[INSERT_CALLS[1]] = 0x90;
-        assert!(!same_code(&moved), "the call itself may not");
-        assert!(!same_code(&INSERT_RANGE_BYTES[1..]));
+        assert!(!same_code(code, &moved), "the call itself may not");
+        assert!(!same_code(code, &code[1..]));
     }
 
     /// A synthetic engine container in Rust memory, laid out as the engine's (`std::unordered_map`, 0x40 bytes at payload+0x370):

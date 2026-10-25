@@ -18,10 +18,18 @@ pub(super) enum BuildCheck {
     Unknown { timestamp: u32 },
 }
 
-/// Game builds the native module has hook addresses for: the PE link timestamp and the game's own build number.
-/// The launcher cannot link the native crate (the native crate links the launcher), so the list is copied from
-/// `native/src/build_table.rs`; the test `known_builds_match_the_native_build_table` fails when they drift apart.
-const KNOWN_BUILDS: &[(u32, &str)] = &[(0x6ac5_0427, "40420"), (0x6ad0_e4e5, "40423"), (0x6ad9_ce10, "40425")];
+/// The game builds that were played and checked (the native module finds the places of other builds too, unconfirmed): the
+/// generated list the native module reads as well (`build_table::VERIFIED`; the launcher cannot link the native crate, which
+/// links the launcher). Lines `name timestamp hash`, `#` comments.
+const VERIFIED: &str = include_str!("../../../tools/addr/out/verified-builds.txt");
+
+fn known_builds() -> impl Iterator<Item = (u32, &'static str)> {
+    VERIFIED.lines().filter(|l| !l.starts_with('#')).filter_map(|l| {
+        let mut w = l.split_whitespace();
+        let name = w.next()?;
+        Some((u32::from_str_radix(w.next()?.strip_prefix("0x")?, 16).ok()?, name))
+    })
+}
 /// Where the version of a launcher can be read without running it: this text sits in every launcher's data, the
 /// version after the prefix and a NUL after the version. `feverlink3_path.txt` names the launcher that installed
 /// FeverLink3; if that file still exists, its marker says which version put the files there.
@@ -62,8 +70,14 @@ fn pe_timestamp(image: &[u8]) -> Option<u32> {
     Some(timestamp)
 }
 
+/// The timestamp of the first verified build (tests: a game executable the wizard knows).
+#[cfg(test)]
+pub(super) fn first_known_build() -> u32 {
+    known_builds().next().expect("a verified build").0
+}
+
 fn classify_build(timestamp: u32) -> BuildCheck {
-    match KNOWN_BUILDS.iter().find(|(known, _)| *known == timestamp) {
+    match known_builds().find(|(known, _)| *known == timestamp) {
         Some((_, name)) => BuildCheck::Known { name },
         None => BuildCheck::Unknown { timestamp },
     }
@@ -165,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_link_timestamp_is_read_from_a_64_bit_pe_header() {
-        assert_eq!(pe_timestamp(&pe_image(0x6ac5_0427)), Some(0x6ac5_0427));
+        assert_eq!(pe_timestamp(&pe_image(0x1234_0427)), Some(0x1234_0427));
         assert_eq!(pe_timestamp(&pe_image(0)), Some(0));
         assert_eq!(pe_timestamp(b""), None);
         assert_eq!(pe_timestamp(b"MZ"), None);
@@ -185,8 +199,9 @@ mod tests {
 
     #[test]
     fn a_build_is_known_when_the_native_module_has_addresses_for_it() {
-        assert_eq!(classify_build(0x6ac5_0427), BuildCheck::Known { name: "40420" });
-        assert_eq!(classify_build(0x6ac5_0428), BuildCheck::Unknown { timestamp: 0x6ac5_0428 });
+        let (ts, name) = known_builds().next().expect("a verified build");
+        assert_eq!(classify_build(ts), BuildCheck::Known { name });
+        assert_eq!(classify_build(ts + 1), BuildCheck::Unknown { timestamp: ts + 1 });
         assert_eq!(classify_build(0), BuildCheck::Unknown { timestamp: 0 });
     }
 
@@ -197,61 +212,11 @@ mod tests {
         assert!(matches!(check_build(Some(dir.path())), BuildCheck::Unreadable(_)), "no executable");
         fs::write(dir.path().join(GAME_EXE), b"not a program").unwrap();
         assert!(matches!(check_build(Some(dir.path())), BuildCheck::Unreadable(why) if why.contains("64-bit")));
-        fs::write(dir.path().join(GAME_EXE), pe_image(0x6ac5_0427)).unwrap();
-        assert_eq!(check_build(Some(dir.path())), BuildCheck::Known { name: "40420" });
+        let (ts, name) = known_builds().next().unwrap();
+        fs::write(dir.path().join(GAME_EXE), pe_image(ts)).unwrap();
+        assert_eq!(check_build(Some(dir.path())), BuildCheck::Known { name });
         fs::write(dir.path().join(GAME_EXE), pe_image(0x1234_5678)).unwrap();
         assert_eq!(check_build(Some(dir.path())), BuildCheck::Unknown { timestamp: 0x1234_5678 });
-    }
-
-    /// The `(timestamp, name)` rows of the `BUILDS` table in `native/src/build_table.rs`, read as text.
-    fn native_table_rows(source: &str) -> Vec<(u32, String)> {
-        let start = source.find("pub const BUILDS").expect("the BUILDS table");
-        let end = source[start..].find("pub fn select(").map_or(source.len(), |at| start + at);
-        let mut rest = &source[start..end];
-        let mut rows = Vec::new();
-        while let Some((_, after)) = rest.split_once("timestamp:") {
-            let hex: String = after
-                .trim_start()
-                .strip_prefix("0x")
-                .expect("a hexadecimal timestamp")
-                .chars()
-                .take_while(|c| c.is_ascii_hexdigit() || *c == '_')
-                .filter(|c| *c != '_')
-                .collect();
-            let (_, after_name) = after.split_once("name:").expect("a name after the timestamp");
-            let name = after_name.trim_start().strip_prefix('"').expect("a quoted name").split('"').next().unwrap();
-            rows.push((u32::from_str_radix(&hex, 16).unwrap(), name.to_owned()));
-            rest = after_name;
-        }
-        rows
-    }
-
-    #[test]
-    fn known_builds_match_the_native_build_table() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("native").join("src").join("build_table.rs");
-        let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let mut native = native_table_rows(&source);
-        let mut ours: Vec<(u32, String)> = KNOWN_BUILDS.iter().map(|(ts, name)| (*ts, (*name).to_owned())).collect();
-        native.sort();
-        ours.sort();
-        assert!(!native.is_empty(), "the table was not found");
-        assert_eq!(
-            ours, native,
-            "KNOWN_BUILDS in launcher/src/wizard.rs must list exactly the builds of native/src/build_table.rs; \
-             add or remove the row there too"
-        );
-    }
-
-    #[test]
-    fn the_table_reader_reads_rows_and_stops_before_the_test_table() {
-        let source = "pub struct BuildAddrs { timestamp: u32, name: &'static str }\n\
-                      pub const BUILDS: &[BuildAddrs] = &[\n\
-                      // build 1: PE timestamp 0x10, linked then.\n\
-                      BuildAddrs { timestamp: 0x6ac5_0427, name: \"40420\" },\n\
-                      BuildAddrs {\n    timestamp: 0xdead_beef,\n    name: \"99\",\n    x: 1 },\n];\n\
-                      pub fn select(t: u32) {}\n\
-                      mod tests { static FAKE: &[BuildAddrs] = &[BuildAddrs { timestamp: 0x1234, name: \"test\" }]; }\n";
-        assert_eq!(native_table_rows(source), vec![(0x6ac5_0427, "40420".to_owned()), (0xdead_beef, "99".to_owned())]);
     }
 
     // -----------------------------------------------------------------------------------------------------------

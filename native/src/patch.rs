@@ -173,12 +173,9 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_patch_of_every_known_build_is_a_valid_site() {
-        for b in crate::build_table::BUILDS {
-            if let Some(p) = &b.script_pool {
-                assert_eq!(check_site(p.expected, p.replacement), Ok(()), "{}", b.name);
-            }
-        }
+    fn the_pool_patch_of_a_real_row_is_a_valid_site() {
+        let p = crate::build_table::fixture().script_pool.as_ref().unwrap();
+        assert_eq!(check_site(p.expected, p.replacement), Ok(()));
     }
 }
 
@@ -186,12 +183,12 @@ mod tests {
 #[cfg(all(test, windows))]
 mod on_memory {
     use super::*;
-    use crate::build_table::select;
+    use crate::build_table::fixture;
     use crate::mem::pages::Pages;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, PAGE_READONLY};
 
     fn site() -> (&'static [u8], &'static [u8]) {
-        let p = select(0x6ac5_0427).unwrap().script_pool.as_ref().unwrap();
+        let p = fixture().script_pool.as_ref().unwrap();
         (p.expected, p.replacement)
     }
 

@@ -143,22 +143,18 @@ mod entry {
                     }
                 }
                 match game_build() {
-                    Some(ts) => match build_table::select(ts).map(|b| (b, false)).or_else(|| searched_build(ts)) {
-                        Some((b, searched)) => {
-                            if searched {
-                                // not in the table, but every site proven by the address tool's proof (search.rs); the window
-                                // says it is not yet confirmed, and a join compares the found addresses
-                                let hash = search::row_hash(b);
-                                log::line(&format!(
-                                    "game build {} (timestamp {ts:#x}) is not in the build table: FOUND BY SEARCH (proof of                                      build {}), not yet confirmed; addresses {hash}; hooks available",
-                                    b.name,
-                                    search::Proof::parse(search::PROOF).map(|p| p.timestamp).unwrap_or(0)
-                                ));
-                                if live {
-                                    feverlink3_launcher::live::set_searched_game(b.name.to_owned(), hash);
-                                }
-                            } else {
-                                log::line(&format!("game build {} (timestamp {ts:#x}): hooks available", b.name));
+                    Some(ts) => match searched_build(ts) {
+                        Some(b) => {
+                            // every row is found by the search (search.rs); a build of the verified list whose row has the
+                            // listed hash is confirmed, any other proven build plays and the window says it is not confirmed
+                            let (hash, confirmed) = (search::row_hash(b), search::confirmed(b));
+                            log::line(&format!(
+                                "game build {} (timestamp {ts:#x}): every site found by search, addresses {hash}, {}; hooks available",
+                                b.name,
+                                if confirmed { "a verified build" } else { "NOT YET CONFIRMED (not in the verified list)" }
+                            ));
+                            if live {
+                                feverlink3_launcher::live::set_searched_game(b.name.to_owned(), hash, confirmed);
                             }
                             // hooks, hold, pool patch and seed pin are on unless their variable says 0; done here, in the quiet
                             // moment before the game runs the code that is patched
@@ -177,9 +173,10 @@ mod entry {
                             // window's start screen, and a join it sends makes the host refuse it in words.
                             let build = game_build_number().unwrap_or_else(|| format!("{ts:#x}"));
                             log::line(&format!(
-                                "UNSUPPORTED GAME BUILD {build} (timestamp {ts:#x}): this FeverLink3 knows only {}; hooks off, \
-                                 hosting refused, joins refused by the host. An update of FeverLink3 is needed.",
-                                build_table::BUILDS.iter().map(|b| b.name).collect::<Vec<_>>().join(", ")
+                                "UNSUPPORTED GAME BUILD {build} (timestamp {ts:#x}): the build search did not prove every \
+                                 site (verified builds: {}); hooks off, hosting refused, joins refused by the host. An update \
+                                 of FeverLink3 is needed.",
+                                build_table::verified().map(|(name, _, _)| name).collect::<Vec<_>>().join(", ")
                             ));
                             if live {
                                 feverlink3_launcher::live::set_unsupported_game(build);
@@ -224,10 +221,10 @@ mod entry {
         }
     }
 
-    /// The row of a build the table does not know, found by repeating the address tool's proof on the mapped image
-    /// (`search.rs`); `None` when anything is not proven, or `FEVERLINK3_BUILD_SEARCH=0`. Runs here, under the loader lock,
-    /// because the hooks must be written before the game runs: a full search once per build, then the cache is checked.
-    fn searched_build(ts: u32) -> Option<(&'static build_table::BuildAddrs, bool)> {
+    /// The row of the running build, found by repeating the address tool's proof on the mapped image (`search.rs`); `None`
+    /// when anything is not proven, or `FEVERLINK3_BUILD_SEARCH=0`. Runs here, under the loader lock, because the hooks must be
+    /// written before the game runs: a full search once per build (about 0.3 s), then the cache is checked.
+    fn searched_build(ts: u32) -> Option<&'static build_table::BuildAddrs> {
         if std::env::var("FEVERLINK3_BUILD_SEARCH").is_ok_and(|v| v == "0") {
             log::line("build search off (FEVERLINK3_BUILD_SEARCH=0)");
             return None;
@@ -253,7 +250,7 @@ mod entry {
         if found.is_none() {
             log::line("build search: not every site is proven; the build stays unsupported");
         }
-        found.map(|b| (b, true))
+        found
     }
 
     /// The link timestamp of the running executable, which identifies the game build.

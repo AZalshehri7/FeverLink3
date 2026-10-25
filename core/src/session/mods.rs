@@ -69,8 +69,8 @@ pub struct ModFingerprint {
     /// player reads it. Such a game has no build hold and no determinism patches, so it cannot play together; empty: known.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub unsupported: String,
-    /// Set when the native module found the game build's addresses by search (not in its table): the build and a hash of every
-    /// address it found. Host and player must have found the same; empty: the build is in the table.
+    /// The game build and a hash of every address the native module's search found for it (`native/src/search.rs`). Host and
+    /// player must have found the same; empty: no native module, or one that proved nothing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub searched: String,
     pub mods: Vec<ModEntry>,
@@ -198,7 +198,7 @@ impl ModFingerprint {
                 clip(&guest.unsupported)
             ));
         }
-        // a build found by search: both games must have found the same addresses (empty on both: the build is in the table)
+        // both games must have found the same addresses (empty: no native module, or one that proved nothing)
         if self.searched != guest.searched {
             out.push(format!(
                 "game build found by search: host {}, player {}",

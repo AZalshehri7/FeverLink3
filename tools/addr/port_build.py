@@ -4,8 +4,8 @@
     python -I port_build.py <OLD TransportFever3.exe> <NEW TransportFever3.exe> [--out DIR]
     python -I port_build.py <OLD TransportFever3.exe> --export-proof FILE   (the proof native/src/search.rs repeats at game start)
 
-Both executables are read as data, never run. The old one must be a build whose sites this tool lists (`OLD_SITES`, keyed
-by PE timestamp: the row of `native/src/build_table.rs` and the engine functions of `EngineFns`). For every site the tool
+Both executables are read as data, never run. The old one must be a build a committed port report (`out/port-*.txt`) names
+as its old or new build: its sites are read from that report (`known_sites`), this tool keeps no addresses of its own. For every site the tool
 takes the function that holds it in the old executable (its unwind-table entry, or for a leaf function the code up to its
 first `ret`/`jmp`), turns the whole function into a pattern and searches the new `.text` for it.
 
@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import os
+import re
 import struct
 import sys
 from collections import Counter
@@ -70,108 +71,75 @@ class S:
     offsets: dict[str, int] = field(default_factory=dict)  # `call` only: offsets read through the callee's lambda
 
 
-# build 40420 (PE timestamp 0x6ac50427)
-OLD_SITES: dict[int, list[S]] = {
-    0x6AC50427: [
-        S("command_list_add", "func", 0x9D4040, 18, rust="HookSite"),
-        S("apply_command", "func", 0x9E33B0, 14, rust="HookSite"),
-        S("town_seed", "func", 0x8D4270, 20, rust="HookSite"),
-        S("town_develop", "func", 0x8DE0B0, 15, rust="HookSite"),
-        S("script_convert", "func", 0x10C6750, 14, rust="HookSite"),
-        S("convert_update", "func", 0x10C6020, 14, rust="HookSite"),
-        S("preview_event", "func", 0xF44C00, 14, rust="HookSite"),
-        S("preview_owner", "call", 0x64CB41, 15, callee=0x642DC0, rust="CallPatchSite",
-          offsets={"y_a": 0x18, "y_b": 0xC8, "r_c": 0x18, "r_dispatcher": 0x1D8, "ui_e": 0xB98}),
-        S("town_update_size", "func", 0x9E12B0, 15, rust="HookSite"),
-        S("town_candidates", "func", 0x9677C0, 14, rust="HookSite"),
-        S("town_edges", "func", 0x95D100, 14, rust="HookSite"),
-        S("town_sort_call", "call", 0x967C16, 16, callee=0x966150, rust="CallPatchSite"),
-        S("town_pick_call", "call", 0x95D627, 16, callee=0x3055870, rust="CallPatchSite"),
-        S("town_field_call", "call", 0x96962E, 18, callee=0x2B7A1B0, rust="CallPatchSite"),
-        S("batch_pace", "call", 0x11F446, 16, callee=0x11F690, rust="CallPatchSite"),
-        S("free_order", "call", 0x2BBA103, 18, callee=0x2BB62A0, rust="CallPatchSite"),
-        S("game_time_getter", "func", 0x2A96C0, 14, rust="CallSite"),
-        S("tick_count_getter", "func", 0x2A9600, 27, rust="PatchSite"),
-        S("script_pool", "inside", 0xAB00FC, 22, rust="PatchSite"),
-        S("lua_makeseed", "func", 0x2FC8FE0, 26, rust="PatchSite"),
-        S("command_move", "func", 0x9D0430, 16, rust="CallSite"),
-        S("command_destroy", "func", 0x9D0670, 16, rust="CallSite"),
-        S("handle_destroy", "func", 0x3040C90, 18, rust="CallSite"),
-        *[S(f"ui_add_sites[{i}]", "ret", r, rust="Rva") for i, r in enumerate([
-            0x4D396F, 0x51B56C, 0x528504, 0x537EE5, 0x538649, 0x5387CD, 0x542EBA, 0x5891B4, 0x5948DD, 0x5BF08D,
-            0x28A3024, 0x28A3871])],
-        S("fire_done_calls[0]", "slot", 0x4D8860, host=0x4D396F, rust="Rva"),   # the bulldozer's
-        S("fire_done_calls[1]", "slot", 0x58C0B0, host=0x5891B4, rust="Rva"),   # the street tool's
-        S("fire_done_calls[2]", "slot", 0x596A70, host=0x5948DD, rust="Rva"),   # the stop tool's
-        # EngineFns: called or hooked by the id trace, the native transport and the refund list
-        S("proposal_ctor", "func", 0x4C6870, 23, rust="Engine"),
-        S("proposal_dtor", "func", 0x48E220, 20, rust="Engine"),
-        S("proposal_copy", "func", 0x4C6640, 24, rust="Engine"),
-        S("proposal_assign", "func", 0x4CED30, 24, rust="Engine"),
-        S("engine_new", "func", 0x318C530, 11, rust="Engine"),
-        S("engine_delete", "func", 0x318C56C, 5, rust="Engine"),
-        S("refund_insert", "func", 0x4BE210, 0xEA, rust="Engine"),
-        S("add_entity", "func", 0x2BB8940, 15, rust="Engine"),
-        S("remove_entity", "func", 0x2BBC700, 15, rust="Engine"),
-        S("game_time_advance", "func", 0xBAD780, 16, rust="Engine"),
-        S("component_lookup", "func", 0x1445C0, 15, rust="Engine"),
-        # layout witnesses: the engine functions the portable layout table (native/src/portable.rs) was read from
-        *[S(f"layout:{r:#x}", "func", r, rust="Witness") for r in [
-            0x4C6640, 0x4C6870, 0x48E220, 0x4CED30, 0x4C78C0, 0x4BDA90, 0x4C31A0, 0x4BEC80, 0x4C1DF0, 0x4BC770, 0x4BD1F0,
-            0x4C5FA0, 0x63C10, 0x4BD430, 0x4C2250, 0x284FC0, 0x4BC8D0, 0xDF480, 0x4BE210, 0x10C6750, 0x10C6020, 0x9E2900]],
-    ],
-    # build 40425 (PE timestamp 0x6ad9ce10): the row of native/src/build_table.rs, as this tool carried it over from 40420
-    # (out/port-6ac50427-6ad9ce10.txt); the same sites in the same order
-    0x6AD9CE10: [
-        S("command_list_add", "func", 0x9D9140, 18, rust="HookSite"),
-        S("apply_command", "func", 0x9E84B0, 14, rust="HookSite"),
-        S("town_seed", "func", 0x8D9380, 20, rust="HookSite"),
-        S("town_develop", "func", 0x8E31C0, 15, rust="HookSite"),
-        S("script_convert", "func", 0x10CD5A0, 14, rust="HookSite"),
-        S("convert_update", "func", 0x10CCE70, 14, rust="HookSite"),
-        S("preview_event", "func", 0xF4BA50, 14, rust="HookSite"),
-        S("preview_owner", "call", 0x64D9C1, 15, callee=0x643C40, rust="CallPatchSite",
-          offsets={"y_a": 0x18, "y_b": 0xC8, "r_c": 0x18, "r_dispatcher": 0x1D8, "ui_e": 0xDC0}),
-        S("town_update_size", "func", 0x9E63B0, 15, rust="HookSite"),
-        S("town_candidates", "func", 0x96C8C0, 14, rust="HookSite"),
-        S("town_edges", "func", 0x962200, 14, rust="HookSite"),
-        S("town_sort_call", "call", 0x96CD16, 16, callee=0x96B250, rust="CallPatchSite"),
-        S("town_pick_call", "call", 0x962727, 16, callee=0x306AFC0, rust="CallPatchSite"),
-        S("town_field_call", "call", 0x96E72E, 18, callee=0x2B81850, rust="CallPatchSite"),
-        S("batch_pace", "call", 0x11F456, 16, callee=0x11F6A0, rust="CallPatchSite"),
-        S("free_order", "call", 0x2BC1A23, 18, callee=0x2BBDBC0, rust="CallPatchSite"),
-        S("game_time_getter", "func", 0x2A96E0, 14, rust="CallSite"),
-        S("tick_count_getter", "func", 0x2A9620, 27, rust="PatchSite"),
-        S("script_pool", "inside", 0xAB528C, 22, rust="PatchSite"),
-        S("lua_makeseed", "func", 0x2FDE370, 26, rust="PatchSite"),
-        S("command_move", "func", 0x9D5530, 16, rust="CallSite"),
-        S("command_destroy", "func", 0x9D5770, 16, rust="CallSite"),
-        S("handle_destroy", "func", 0x30563E0, 18, rust="CallSite"),
-        *[S(f"ui_add_sites[{i}]", "ret", r, rust="Rva") for i, r in enumerate([
-            0x4D479F, 0x51C3AC, 0x529334, 0x538D15, 0x539479, 0x5395FD, 0x543CEA, 0x589FC4, 0x5956ED, 0x5BFE9D,
-            0x28AA534, 0x28AAD81])],
-        S("fire_done_calls[0]", "slot", 0x4D9690, host=0x4D479F, rust="Rva"),
-        S("fire_done_calls[1]", "slot", 0x58CEC0, host=0x589FC4, rust="Rva"),
-        S("fire_done_calls[2]", "slot", 0x597880, host=0x5956ED, rust="Rva"),
-        S("proposal_ctor", "func", 0x4C76A0, 23, rust="Engine"),
-        S("proposal_dtor", "func", 0x48F050, 20, rust="Engine"),
-        S("proposal_copy", "func", 0x4C7470, 24, rust="Engine"),
-        S("proposal_assign", "func", 0x4CFB60, 24, rust="Engine"),
-        S("engine_new", "func", 0x31A1C80, 11, rust="Engine"),
-        S("engine_delete", "func", 0x31A1CBC, 5, rust="Engine"),
-        S("refund_insert", "func", 0x4BF040, 0xEA, rust="Engine"),
-        S("add_entity", "func", 0x2BC0260, 15, rust="Engine"),
-        S("remove_entity", "func", 0x2BC4020, 15, rust="Engine"),
-        S("game_time_advance", "func", 0xBB2970, 16, rust="Engine"),
-        S("component_lookup", "func", 0x1445D0, 15, rust="Engine"),
-        *[S(f"layout:{r:#x}", "func", r, rust="Witness") for r in [
-            0x4C7470, 0x4C76A0, 0x48F050, 0x4CFB60, 0x4C86F0, 0x4BE8C0, 0x4C3FD0, 0x4BFAB0, 0x4C2C20, 0x4BD5A0, 0x4BE020,
-            0x4C6DD0, 0x63C20, 0x4BE260, 0x4C3080, 0x284FD0, 0x4BD700, 0xDF490, 0x4BF040, 0x10CD5A0, 0x10CCE70, 0x9E7A00]],
-    ],
+# the Rust type of each field of the row (the schema of `build_table::BuildAddrs`, the same for every build)
+RUST_OF = {
+    **{f: "HookSite" for f in ("command_list_add", "apply_command", "town_seed", "town_develop", "script_convert",
+                               "convert_update", "preview_event", "town_update_size", "town_candidates", "town_edges")},
+    **{f: "CallSite" for f in ("game_time_getter", "command_move", "command_destroy", "handle_destroy")},
+    **{f: "PatchSite" for f in ("tick_count_getter", "script_pool", "lua_makeseed")},
+    **{f: "Engine" for f in ("proposal_ctor", "proposal_dtor", "proposal_copy", "proposal_assign", "engine_new",
+                             "engine_delete", "refund_insert", "add_entity", "remove_entity", "game_time_advance",
+                             "component_lookup")},
 }
+REPORTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
-# the portable layout table each old build uses (native/src/portable.rs LAYOUT_BUILD)
-OLD_LAYOUT = {0x6AC50427: "40420", 0x6AD9CE10: "40420"}
+
+@dataclass
+class Known:
+    name: str
+    layout: str
+    sites: list[S]
+
+
+def sites_from_report(text: str, side: str) -> Known:
+    """The sites of one side (`old` or `new`) of a committed port report: the report is the data, this tool keeps no
+    addresses of its own. A slot's host (the hold-list site whose tool function loads its vtable) is filled in later from the
+    executable (`fill_hosts`)."""
+    head = re.search(r"old 0x([0-9a-f]+) build (\S+)  ->  new 0x([0-9a-f]+) build (\S+)", text)
+    lay = re.search(r"uses the layout table of (\S+)", text)
+    if not head or not lay or "all sites located" not in text:
+        raise SystemExit("port report: not a complete report")
+    name = head.group(2) if side == "old" else head.group(4)
+    sites = []
+    for blk in text.split("=" * 100)[1:]:
+        m = re.match(r"\n(\S+)  \[(\w+)\]  old (0x[0-9a-f]+)", blk)
+        if not m:
+            continue
+        fld, kind, old = m.group(1), m.group(2), int(m.group(3), 16)
+        new = int(re.search(r"\n  new (0x[0-9a-f]+)", blk).group(1), 16)
+        n = re.search(r"bytes \((\d+)\)", blk)
+        callee = re.search(r"callee: old (0x[0-9a-f]+), the new call leads to (0x[0-9a-f]+)", blk)
+        offs = {k: int(o if side == "old" else v, 16) for k, o, v in re.findall(r"offset (\w+): (0x[0-9a-f]+) -> (0x[0-9a-f]+)", blk)}
+        rust = ("Witness" if fld.startswith("layout:") else "Rva" if kind in ("ret", "slot")
+                else "CallPatchSite" if kind == "call" else RUST_OF[fld])
+        sites.append(S(fld, kind, old if side == "old" else new, int(n.group(1)) if n else 0,
+                       callee=int(callee.group(1 if side == "old" else 2), 16) if callee else 0, rust=rust, offsets=offs))
+    return Known(name, lay.group(1), sites)
+
+
+def known_sites(timestamp: int) -> Known | None:
+    """The sites of a build some committed port report names (as its old or its new build)."""
+    for fn in sorted(os.listdir(REPORTS)):
+        m = re.fullmatch(r"port-([0-9a-f]{8})-([0-9a-f]{8})\.txt", fn)
+        if m and timestamp in (int(m.group(1), 16), int(m.group(2), 16)):
+            with open(os.path.join(REPORTS, fn), encoding="utf-8") as fh:
+                return sites_from_report(fh.read(), "old" if int(m.group(1), 16) == timestamp else "new")
+    return None
+
+
+def fill_hosts(img: Image, sites: list[S]) -> None:
+    """A slot's host: the one hold-list site whose tool function loads a vtable whose slot 2 is the callback."""
+    rets = [s for s in sites if s.kind == "ret"]
+    for s in sites:
+        if s.kind == "slot":
+            hosts = []
+            for r in rets:
+                f = img.func_containing(r.rva - 5)
+                if f and any(v[2] == s.rva for v in vtables(img, f.begin, f.end)):
+                    hosts.append(r.rva)
+            if len(set(img.func_containing(h - 5).begin for h in hosts)) != 1:
+                raise SystemExit(f"{s.field}: {len(hosts)} hold-list tool functions load its vtable (expected one)")
+            s.host = hosts[0]
 
 
 # --------------------------------------------------------------------------- patterns of code
@@ -407,7 +375,7 @@ def rust_bytes(b: bytes) -> str:
 # --------------------------------------------------------------------------- the proof for the runtime search
 
 PROOF_MAGIC = b"FL3PROOF"
-PROOF_VERSION = 1
+PROOF_VERSION = 2
 SITE_KIND = {"func": 0, "inside": 1, "ret": 2, "call": 3, "slot": 4, "witness": 5}
 NO_PATTERN = 0xFFFF
 PROOF_SMALL = 0x400        # functions up to this size get neighbours even when unique in the reference
@@ -420,8 +388,8 @@ class Proof:
     displacement wildcarded too), where the module's sites sit in them, the callees' first bytes, and the neighbour functions
     that single out one of several copies. Written by `--export-proof`; the format is described in `write`."""
 
-    def __init__(self, ref: Image):
-        self.ref = ref
+    def __init__(self, ref: Image, known: Known):
+        self.ref, self.known = ref, known
         self.P = Porter(ref, ref)   # hits in the reference itself: which functions exist in several copies
         self.pats: list[tuple] = []
         self.index: dict[tuple[int, bool], int] = {}
@@ -543,7 +511,8 @@ class Proof:
 
     def write(self, path: str) -> None:
         """Little-endian:
-            magic "FL3PROOF", u32 version (1), u32 reference PE timestamp, u32 pattern count, the patterns, u32 site count, the sites
+            magic "FL3PROOF", u32 version (2), u32 reference PE timestamp, u8 + the reference build's name, u8 + the name of the
+              portable layout table its witnesses were read from, u32 pattern count, the patterns, u32 site count, the sites
             pattern: u32 rva in the reference, u8 flags (1: starts at an unwind-table entry, 2: shape, 4: the bytes are those of
               an earlier pattern), u32 length n, n bytes (flag 4: u16 index of that pattern instead),
               (n+7)/8 mask bytes (bit i, low bit first: cell i is fixed), u8 + u16 indices of the neighbours below (nearest first),
@@ -563,7 +532,9 @@ class Proof:
                     mask[k >> 3] |= 1 << (k & 7)
             return bytes(0 if c is None else c for c in cs) + bytes(mask)
 
-        out = bytearray(PROOF_MAGIC + u32(PROOF_VERSION) + u32(self.ref.timestamp) + u32(len(self.pats)))
+        name, layout = self.known.name.encode(), self.known.layout.encode()
+        out = bytearray(PROOF_MAGIC + u32(PROOF_VERSION) + u32(self.ref.timestamp) + bytes([len(name)]) + name
+                        + bytes([len(layout)]) + layout + u32(len(self.pats)))
         for begin, at_start, shape, cs, calls, left, right in self.pats:
             flags = (1 if at_start else 0) | (2 if shape else 0)
             same = self.index.get((begin, False)) if shape else None
@@ -581,10 +552,12 @@ class Proof:
 
 
 def export_proof(ref: Image, path: str) -> int:
-    sites = OLD_SITES.get(ref.timestamp)
-    if sites is None:
-        sys.exit(f"the executable (timestamp {ref.timestamp:#x}) is not a build this tool has the sites of")
-    pr = Proof(ref)
+    known = known_sites(ref.timestamp)
+    if known is None:
+        sys.exit(f"the executable (timestamp {ref.timestamp:#x}) is in no committed port report")
+    sites = known.sites
+    fill_hosts(ref, sites)
+    pr = Proof(ref, known)
     for s in sites:
         pr.add_site(s)
     pr.write(path)
@@ -611,9 +584,11 @@ def main() -> int:
         ap.error("the NEW executable is needed (or --export-proof)")
     old, new = Image(a.old), Image(a.new)
     IMAGE_SIZE = min(old.pe.OPTIONAL_HEADER.SizeOfImage, new.pe.OPTIONAL_HEADER.SizeOfImage)
-    sites = OLD_SITES.get(old.timestamp)
-    if sites is None:
-        sys.exit(f"the old executable (timestamp {old.timestamp:#x}) is not a build this tool has the sites of")
+    known = known_sites(old.timestamp)
+    if known is None:
+        sys.exit(f"the old executable (timestamp {old.timestamp:#x}) is in no committed port report (out/port-*.txt)")
+    sites = known.sites
+    fill_hosts(old, sites)
     P = Porter(old, new)
     out: list[str] = []
     p = out.append
@@ -734,7 +709,7 @@ def main() -> int:
 
     wit = [s for s in sites if s.rust == "Witness"]
     nwit = sum(s.field in found for s in wit)
-    layout = OLD_LAYOUT.get(old.timestamp) if nwit == len(wit) else None
+    layout = known.layout if nwit == len(wit) else None
     p("=" * 100)
     p(f"layout witnesses: {nwit} of {len(wit)} exact -> "
       + (f"the new build uses the layout table of {layout}" if layout else "the layout table does NOT carry over (layout: None)"))

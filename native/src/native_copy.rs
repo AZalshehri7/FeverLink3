@@ -32,25 +32,6 @@ use crate::rebuild::{self, Alloc};
 pub const NATIVE_COPY_VAR: &str = "FEVERLINK3_NATIVE_COPY";
 pub const NATIVE_COPY_FILE: &str = "native_copy.log";
 
-/// The first bytes of the four `Proposal` functions (their places: `build_table::EngineFns`), the same in 40420 and 40423.
-pub const PROPOSAL_CTOR_BYTES: [u8; 23] = [
-    0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec,
-    0x30, 0x48, 0x8b, 0xf9,
-];
-pub const PROPOSAL_DTOR_BYTES: [u8; 20] = [
-    0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xf9, 0x48, 0x81, 0xc1, 0xd8, 0x02, 0x00,
-    0x00,
-];
-pub const PROPOSAL_COPY_BYTES: [u8; 24] = [
-    0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x48, 0x89, 0x4c, 0x24, 0x08, 0x56, 0x57, 0x41, 0x54,
-    0x41, 0x56, 0x41, 0x57, 0x48,
-];
-
-pub const PROPOSAL_ASSIGN_BYTES: [u8; 24] = [
-    0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20, 0x48,
-    0x8b, 0xf2, 0x48, 0x8b, 0xf9,
-];
-
 /// Size of the `Proposal` object inside a payload (the Context starts after it).
 pub const PROPOSAL_SIZE: usize = 0x358;
 
@@ -72,8 +53,10 @@ impl ProposalFns {
     /// The functions of the running game at the build table's places, after their first bytes are compared.
     #[cfg(windows)]
     pub fn at(base: usize, engine: &crate::build_table::EngineFns) -> Result<ProposalFns, String> {
-        let check = |rva: Option<u32>, want: &[u8], what: &str| -> Result<usize, String> {
+        // the bytes the build search recorded at each place (it proved the whole function there)
+        let check = |rva: Option<u32>, name: &str, what: &str| -> Result<usize, String> {
             let rva = crate::build_table::engine_rva(rva, what)?;
+            let want = engine.prologue(name)?;
             let got = crate::dump::LiveMem
                 .read(base + rva as usize, want.len())
                 .ok_or_else(|| format!("{what} at {rva:#x} is not readable"))?;
@@ -81,10 +64,10 @@ impl ProposalFns {
                 .then_some(base + rva as usize)
                 .ok_or_else(|| format!("{what} at {rva:#x} does not have the expected bytes"))
         };
-        let ctor = check(engine.proposal_ctor, &PROPOSAL_CTOR_BYTES, "Proposal::Proposal()")?;
-        let dtor = check(engine.proposal_dtor, &PROPOSAL_DTOR_BYTES, "Proposal::~Proposal()")?;
-        let copy = check(engine.proposal_copy, &PROPOSAL_COPY_BYTES, "Proposal::Proposal(const Proposal&)")?;
-        let assign = check(engine.proposal_assign, &PROPOSAL_ASSIGN_BYTES, "Proposal::operator=(const Proposal&)")?;
+        let ctor = check(engine.proposal_ctor, "proposal_ctor", "Proposal::Proposal()")?;
+        let dtor = check(engine.proposal_dtor, "proposal_dtor", "Proposal::~Proposal()")?;
+        let copy = check(engine.proposal_copy, "proposal_copy", "Proposal::Proposal(const Proposal&)")?;
+        let assign = check(engine.proposal_assign, "proposal_assign", "Proposal::operator=(const Proposal&)")?;
         // SAFETY: the four addresses were just compared with the prologues of the engine functions of those signatures.
         unsafe {
             Ok(ProposalFns {
@@ -1002,16 +985,14 @@ mod tests {
     fn the_engine_functions_are_used_only_where_the_expected_bytes_are() {
         let mut image = vec![0u8; 0x80];
         // all three prologues in one buffer at their RVA distances is impossible; check the refusal and the byte tables
-        let engine = &crate::build_table::select(0x6ac5_0427).unwrap().engine;
+        let engine = &crate::build_table::fixture().engine;
         let base = (image.as_mut_ptr() as usize).wrapping_sub(engine.proposal_ctor.unwrap() as usize);
         assert!(ProposalFns::at(base, engine).is_err(), "zeroes are not the constructor");
         assert!(ProposalFns::at(base, &crate::build_table::EngineFns::NONE)
             .err()
             .unwrap()
             .contains("not in the build table"));
-        assert_eq!(PROPOSAL_CTOR_BYTES.len(), 23);
-        assert_eq!(PROPOSAL_DTOR_BYTES.len(), 20);
-        assert_eq!(PROPOSAL_COPY_BYTES.len(), 24);
+        assert_eq!(engine.prologue("proposal_ctor").map(<[u8]>::len), Ok(23));
     }
 
     /// An engine copy that, like the real one, leaves the unconstructed bytes 0x1a0..0x1c0 (the gap) alone.

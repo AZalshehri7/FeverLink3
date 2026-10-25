@@ -27,7 +27,7 @@ Toolchain: stable Rust. Either `x86_64-pc-windows-msvc` (needs the Visual Studio
 
 ## Activation
 
-The module is inert unless the launcher started the game with `FEVERLINK3_SESSION_DIR` set, or the game itself hosts the session (live mode). Then it logs to `native.log`, reads the game's PE timestamp and looks it up in `build_table::BUILDS`. Unknown build: the build search below; when it does not prove every site, hooks off, logged, mod runs degraded.
+The module is inert unless the launcher started the game with `FEVERLINK3_SESSION_DIR` set, or the game itself hosts the session (live mode). Then it logs to `native.log`, reads the game's PE timestamp and finds the build's places by search (below); when the search does not prove every site: hooks off, logged, mod runs degraded.
 
 On a known build four pieces are ON by default (hooks, hold, pool patch, Lua seed pin; `=0` turns one off, each is fail-open: an unknown build or other bytes at the site install nothing). The diagnostic pieces are off unless the environment sets them to exactly `1`:
 
@@ -46,37 +46,45 @@ On a known build four pieces are ON by default (hooks, hold, pool patch, Lua see
 
 Each piece is checked against the bytes in memory first, installed all-or-none from `DllMain`, preceded by a self-test of the detour machinery in the shipped binary, and logged line by line to `native.log`; anything in doubt leaves the game as shipped. `docs/NATIVE_LINK.md` is the design, the control-file protocol and the list of what still needs a running game.
 
-## Adding a game build
+## How a game build is found
 
-Keep a copy of the executable of every supported build outside the repository before Steam updates the game: the port tool
-compares the old and the new one.
-
-1. Run the port tool (`tools/addr/port_build.py OLD.exe NEW.exe --out tools/addr/out`, see its README). It carries every site
-   of the old row over by comparing whole functions (relocations wildcarded, callees checked one level deep), finds the
-   hold list and the callbacks in the same tool functions, carries the offsets the preview listener reads, and checks the
-   layout witnesses of the portable form. A site it cannot prove stays `None` and its feature stays off.
-2. Run the address tool (`tools/addr/find_sites.py NEW.exe --out tools/addr/out`) as the independent check of the hold sites,
-   the command kinds and the WinHTTP import list (add any new import to `proxy.rs`).
-3. Write the row into `build_table::BUILDS` from the port report, add the build to `KNOWN_BUILDS` in
-   `launcher/src/wizard/versions.rs`, and extend the row test in `build_table.rs` to the new report. Game build 40423 was
-   added this way (`tools/addr/out/port-6ac50427-6ad0e4e5.txt`), and 40425 the same way from 40420
-   (`tools/addr/out/port-6ac50427-6ad9ce10.txt`; its code sits at the same places as 40423's).
-
-A game build that is not in the table is first searched (`search.rs`): the module repeats `port_build.py`'s proof on the
-running game's image, from the proof of build 40425 embedded in the DLL (`tools/addr/out/proof-6ad9ce10.bin`, written by
-`port_build.py <40425 exe> --export-proof`). Every function of the row must match exactly once at a function start of the
+No game build is written in the module's code. At every start `search.rs` repeats the address tool's proof on the running
+game's image, from a generated proof file embedded in the DLL (`tools/addr/out/proof-6ad9ce10.bin`, build 40425, written by
+`tools/addr/port_build.py <exe> --export-proof`). Every function of the row must match exactly once at a function start of the
 image's unwind table (or one copy at the neighbours' shift), its callees must start with the same code, all 22 layout witnesses
 must match exactly, and the preview listener's offsets are read from the matched listener; shape matches only where
-`port_build.py` allows them. Anything not proven: the whole row is refused, nothing is hooked. The result is cached by PE
-timestamp in `%LOCALAPPDATA%\FeverLink3\build-search-<timestamp>.txt`; the cache is checked against the proof at every start and
-deleted when it no longer matches. `FEVERLINK3_BUILD_SEARCH=0` turns the search off. A found build plays, the window says it was
-found by search and is not yet confirmed, and a join carries `build:hash` of the found row (`searched`), which host and player
-must share. Run on the real executables (read as data), the 40425 proof gives the 40420 row exactly and the 40420 proof the
-40425 row (`search::tests::the_search_reproduces_the_rows_of_40420_and_40425`, ignored: the executables are not in the
-repository); about 0.3 s for 57 MB of `.text` in a release build. Not yet run in the game.
+`port_build.py` allows them. Anything not proven: the whole row is refused, nothing is hooked, the game runs degraded (the
+in-game window says so, hosting is refused and a join is refused by the host with the reason, `docs/LIVE_CONTROL.md`).
 
-When the search does not prove the build either, it runs with every hook off; the in-game window says so, hosting is refused
-and a join is refused by the host with the reason (`docs/LIVE_CONTROL.md`).
+The result is cached by PE timestamp in `%LOCALAPPDATA%\FeverLink3\build-search-<timestamp>.txt`; the cache is checked against
+the proof at every start and deleted when it no longer matches. `FEVERLINK3_BUILD_SEARCH=0` turns the search off. A full search
+takes about 0.3 s for 57 MB of `.text` (release build), the cached check under a millisecond.
+
+`tools/addr/out/verified-builds.txt` (generated, embedded) lists the builds that were played and checked: name, PE timestamp and
+the hash of the row (`build_table::row_hash`). A build whose search gives that hash is confirmed; any other proven build plays
+and the window says it was found by search and is not yet confirmed. Every join carries `build:hash` (`searched`), which host and
+player must share. Checked on the real executables (read as data): the embedded proof gives on 40420 and 40425 exactly the rows of
+the committed port reports, with the verified hashes (`search::tests::the_search_reproduces_the_committed_port_reports_and_the_verified_hashes`,
+ignored: the executables are not in the repository). Not yet run in the game.
+
+Left in the code as facts of the reference code, which the search proves unchanged before they are used: the portable layout
+table (`portable.rs`, named 40420) with `build_table::LAYOUT_FACTS` (kind byte offset, build-proposal kind, the listener's getter
+slot) and the two call offsets inside the refund insert (`refund::INSERT_CALLS`). A build whose witnesses differ gets no row.
+
+## Adding a game build
+
+Keep a copy of the executable of every verified build outside the repository before Steam updates the game.
+
+1. Start the game: if the search proves the new build, it plays as "not yet confirmed". Nothing else is needed to play.
+2. To confirm it after a real test, run the port tool from the last verified build
+   (`tools/addr/port_build.py OLD.exe NEW.exe --out tools/addr/out`, see its README) and commit the report: the reports are the
+   data the tests and the next port read. Run `tools/addr/find_sites.py NEW.exe --out tools/addr/out` as the independent check
+   of the hold sites, the command kinds and the WinHTTP import list (add any new import to `proxy.rs`).
+3. Add the build's line to `verified-builds.txt`, printed by
+   `cargo run --release -p feverlink3_native --example verified_line -- NEW.exe` (the module's own search on the executable).
+   The launcher reads the same file.
+4. When the search no longer proves a new build (the code of a hooked function changed), make a new proof from a build whose
+   port report exists: `port_build.py <exe> --export-proof tools/addr/out/proof-<timestamp>.bin`, and point `search::PROOF` at it.
 
 ## Size
 
@@ -84,4 +92,4 @@ The module links Rust's `std` for `Vec`, `String`, threads and file logging, and
 
 ## Status
 
-Implemented and tested without the game, off by default, **not yet run in the game**: the counters, the hold/release hook, the control link, the single-worker script pool. Nothing from the build table has been installed in a running game yet; `docs/NATIVE_LINK.md` section 8 is the checklist, with the log lines to look for, in the order to try them. See `docs/ROADMAP.md` stage 0.3.
+Implemented and tested without the game, off by default, **not yet run in the game**: the counters, the hold/release hook, the control link, the single-worker script pool. Nothing the build search finds has been installed in a running game yet; `docs/NATIVE_LINK.md` section 8 is the checklist, with the log lines to look for, in the order to try them. See `docs/ROADMAP.md` stage 0.3.

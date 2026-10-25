@@ -719,7 +719,7 @@ fn expected_bytes(b: &BuildAddrs) -> Vec<(Rva, &'static [u8])> {
 #[test]
 fn a_plan_only_ever_contains_what_the_image_confirms() {
     let mut r = rng(16);
-    for build in build_table::BUILDS {
+    for build in [build_table::fixture()] {
         let wanted = expected_bytes(build);
         let (mut with_steps, mut with_skips) = (0, 0);
         for _ in 0..iters(2_000) {

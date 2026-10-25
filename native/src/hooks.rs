@@ -2566,7 +2566,7 @@ mod tests {
     #[test]
     fn the_real_build_row_finds_nothing_to_install_in_another_program() {
         // this test executable is not the game: whatever the 40420 row says, no byte matches, so nothing is planned
-        let build = crate::build_table::select(0x6ac5_0427).unwrap();
+        let build = crate::build_table::fixture();
         let base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
         let plan = plan_for_process(build, everything(), base, quiet);
         assert!(plan.steps.is_empty(), "{:?}", plan.steps);

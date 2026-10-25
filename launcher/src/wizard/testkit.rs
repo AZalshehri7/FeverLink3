@@ -106,7 +106,8 @@ impl Pc {
         let steam = root.path().join("Steam");
         let game = steam.join("steamapps").join("common").join("Transport Fever 3");
         fs::create_dir_all(&game).unwrap();
-        fs::write(game.join(GAME_EXE), pe_image(0x6ac5_0427)).unwrap();
+        // a verified build, so the wizard knows it
+        fs::write(game.join(GAME_EXE), pe_image(super::versions::first_known_build())).unwrap();
         fs::write(steam.join("steam.exe"), b"steam").unwrap();
         let user = steam.join("userdata").join("1").join(APP_ID).join("local");
         fs::create_dir_all(&user).unwrap();
