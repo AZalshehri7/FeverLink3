@@ -66,6 +66,12 @@ T.MSG = {
 	-- terrain tools are switched off for the session
 	terrain_off = { "info",
 		"Terrain tools are off during a session: terrain changes cannot be shared with the other players yet." },
+	-- raise, lower, flatten and smooth are shared (native terrain.rs); new and not yet tried much in a real game
+	terrain_shared = { "info",
+		"Raise, lower, flatten, smooth and roughen now work in a session and are shared with the other players. This is new: tell us if the ground looks different for someone." },
+	-- a terrain change that could not be shared was applied nowhere
+	terrain_refused = { "warn",
+		"A terrain change could not be shared with the other players, so it was not applied. Try again, or with a smaller brush." },
 	-- the game cannot stay in sync for the rest of this game run (a part of FeverLink3 is missing)
 	game_cannot_sync = { "error",
 		"Your game cannot stay in sync with the other players. Leave the session and restart the game.",

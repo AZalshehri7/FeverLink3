@@ -964,6 +964,7 @@ local function simCtx(st, it)
 	local caps = type(st.caps) == "table" and st.caps or {}
 	ctx.canInject = NATIVE_INJECT and caps.inject == true
 	ctx.canPatch = NATIVE_PATCH and caps.patch == true
+	ctx.canTerrain = caps.terrain == true
 	return ctx
 end
 
@@ -1751,6 +1752,19 @@ local function sendInjectOrder(inj, key, held, tm, refuse)
 	-- the refundable entities this game resolved (the decode's inject path): native_refund_<n>.txt, one entry per line (entity, key integer,
 	-- three revision integers, value integer), and the order says how many; the module inserts them into the command's own Context
 	-- refundableEntities with the engine's insert (refund.rs) and refuses the order when it cannot (the build is applied nowhere here)
+	if type(inj.terrain) == "table" then
+		-- a shared terrain height edit (native terrain.rs): the cells go to native_terrain_in_<n>.txt, then `terrain_apply`; the module writes
+		-- them into the carrier this game sends next and answers under the same key as an inject order (injected / inject_refused)
+		local t = inj.terrain
+		local okT, errT = pcall(function()
+			if not C.writeFile(C.path("native_terrain_in_" .. C.integerText(n) .. ".txt"), inj.text) then error("cannot write the cells file", 0) end
+			local sent, why = X.ctlSend("terrain_apply", { key = n, x0 = t.x0, y0 = t.y0, w = t.w, h = t.h })
+			if not sent then error(why, 0) end
+		end)
+		traceSim("build.inject", string.format("%s terrain_apply key=%s %dx%d cells at %d,%d (%d bytes of text) %s", tostring(key), C.integerText(n), t.w, t.h, t.x0, t.y0,
+			#inj.text, X.ctlWritten(okT, errT)))
+		return okT, errT, n
+	end
 	local refund = type(inj.refund) == "table" and #inj.refund > 0 and inj.refund or nil
 	local ok, err = pcall(function()
 		if not C.writeFile(C.path("native_inject_" .. C.integerText(n) .. ".txt"), inj.text) then error("cannot write the text file", 0) end
@@ -1791,7 +1805,7 @@ end
 function X.simVerdict(st, it, now, injects)
 	if not (it.body and it.body.fn == "makeWorldBuildProposalCmd") then return end
 	st.results[#st.results + 1] = { key = it.key .. "#verdict", of = it.key, from = it.from, seq = it.seq, at = now, success = true, verdict = true,
-		injects = (injects and #injects > 0) and injects or nil }
+		injects = (injects and #injects > 0) and injects or nil, proof = it.proof }
 end
 
 local function simCaptureBuild(state, param, post, deferredBefore, deferredIe, deferredPre)
@@ -2349,6 +2363,7 @@ local function simApplyAction(st, it, now)
 				if okM then okS, errS = pcall(simSendCommand, it.body.fn, a, sending) else okS, errS = false, money0 end
 				X.sendDone(open, it.key)
 				if not okS then error(errS, 0) end
+				if a.inject and a.inject.terrain then it.proof = X.terrainProof(a.inject.terrain, it.key, logSim) end
 				if refundN > 0 then X.watchRefund(st, it.key, refundN, money0, ctx, now) end
 				if isBuild then takeBackEvents(st, SIM.state) end
 			end)
@@ -3140,7 +3155,7 @@ function handleEvent(userParams, state, src, id, name, param)
 			markReplay(st, engine.gameTime(), nil, type(param) == "table" and type(param.key) == "string" and param.key or nil)
 		elseif name == "nativecaps" and type(param) == "table" then
 			-- into the game-script state: this event reaches one simulation state, every state's stamps decode with them (simCtx)
-			st.caps = { patch = param.patch == true, inject = param.inject == true, wall0 = type(param.wall0) == "number" and param.wall0 or nil }
+			st.caps = { patch = param.patch == true, inject = param.inject == true, terrain = param.terrain == true, wall0 = type(param.wall0) == "number" and param.wall0 or nil }
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = C.clock() }
@@ -3577,6 +3592,7 @@ local function guiCtx(it)
 	local ctx = actionCtx(it, G.co, function(key) return L.resolveKey(G.bind, key) end)
 	ctx.canPatch = NATIVE_PATCH and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.patch == true
 	ctx.canInject = NATIVE_INJECT and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.inject == true
+	ctx.canTerrain = G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.terrain == true
 	return ctx
 end
 
@@ -3820,6 +3836,7 @@ local function guiApplyNow(it, now)
 			bres({ verdict = success and "sent" or "refused", class = "engine", detail = (not success) and ("the engine refused it" .. refusalWhy(data)) or nil, b0 = bresB0 },
 				okD and changes or nil, "callback")
 			verdict.injects = (#injects > 0) and injects or nil
+			if success and verdict.terrain then verdict.proof = X.terrainProof(verdict.terrain, it.key, logGui) end
 			if success then pcall(X.verdictOf, verdict) else pcall(X.sendVerdict, verdict, false, "the engine refused it" .. refusalWhy(data), "engine") end
 		end
 		if X.engineHas then X.engineHas[it.key] = nil end
@@ -3885,6 +3902,7 @@ local function guiApplyNow(it, now)
 			-- result. (The pause path used to send the record's donor command alone: another build than on a running game.)
 			if a.patch then X.sendPatchOrder(a.patch, it.key) end
 			local open = nil   -- the order of this send, closed by send_done once the send returned or threw (X.sendDone)
+			if a.inject and a.inject.terrain then verdict.terrain = a.inject.terrain end
 			if a.inject then
 				local okO, errO, nO = X.sendInjectOrder(a.inject, it.key, it.deferId, isBuild and X.timingText(it, now) or nil, nil)
 				if okO and nO then
@@ -4788,6 +4806,7 @@ function natSend(kind, payload)
 	if not N then return false end
 	-- this load's own control file and writer (X.ctlWriter): no other writer shares the file, nothing is re-read per line
 	local ok, err, w = X.ctlSend(kind, payload)
+	if kind == "hold_off" then pcall(X.terrainShareOff) end   -- the module stops sharing terrain edits with it (terrain.rs)
 	if ok then
 		N.lastWrite = C.clock()
 	else
@@ -5955,7 +5974,8 @@ end
 -- the others from it (ActionRefusedMessage.partial)
 function X.sendVerdict(r, applied, detail, class, partial)
 	if r.from == nil or r.seq == nil then return end
-	local p = { seq = r.seq, from = r.from, detail = applied and "" or tostring(detail or ""):sub(1, 300), class = (not applied) and class or nil,
+	-- an applied terrain edit names its height proof (X.terrainProof): the host takes two applied verdicts with different details for a fork
+	local p = { seq = r.seq, from = r.from, detail = applied and (r.proof and ("terrain heights " .. tostring(r.proof)) or "") or tostring(detail or ""):sub(1, 300), class = (not applied) and class or nil,
 		partial = (not applied and partial) and true or nil }
 	send(applied and "action_applied" or "action_refused", p)
 	traceGui("build.verdict", string.format("%s %s%s", tostring(r.of or r.key), applied and "applied" or "refused",
@@ -6126,7 +6146,7 @@ local function natEvent(N, rec, p, history)
 		local w, c = tonumber(detail:match("wall=(%d+)")), tonumber(detail:match("clock=(%-?%d+)"))
 		if w and c then
 			X.WALL0 = w - c
-			pcall(toSim, "nativecaps", { patch = N.ready and N.ready.patch, inject = N.ready and N.ready.inject, wall0 = X.WALL0 })
+			pcall(toSim, "nativecaps", { patch = N.ready and N.ready.patch, inject = N.ready and N.ready.inject, terrain = N.ready and N.ready.terrain, wall0 = X.WALL0 })
 			traceGui("build.timing", string.format("clock wall0=%.0f (native wall=%.0f clock=%.0f; this script's C.clock()=%.3f -> wall %.0f)", X.WALL0, w, c, C.clock(), X.wallNow()))
 		end
 		return
@@ -6140,8 +6160,9 @@ local function natEvent(N, rec, p, history)
 			if h == "inject_next" then N.ready.inject = true end
 			if h == "defer" then N.ready.defer = true end
 			if h == "batch_pace" then N.ready.pace = true end   -- native pace.rs: `pace` lines stretch the batch interval
+			if h == "terrain_apply" then N.ready.terrain = true end   -- native terrain.rs: `terrain_share` and `terrain_apply`
 		end
-		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, wall0 = X.WALL0 })
+		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, terrain = N.ready.terrain, wall0 = X.WALL0 })
 		N.hookOk = false
 		for _, h in ipairs(hooks) do
 			if h == "command_list_add" then N.hookOk = true end
@@ -6166,10 +6187,12 @@ local function natEvent(N, rec, p, history)
 			if N.holdSent and not history and not N.active then
 				N.active, N.activeSince = true, now
 				natSay("mode ON (the native module holds build commands; hold_on confirmed)")
+				X.terrainShareOn(N)
 			elseif p.reason == "resume" and not history and not N.holdSent and not N.gaveUp then
 				-- the module held again on this game's first line after a silence (the pause menu stops every script): same as a confirmed hold_on
 				N.holdSent, N.holdAt, N.active, N.activeSince, N.retryAt = true, now, true, now, nil
 				natSay("mode ON again (the native module resumed holding after a silence: the game's scripts had stopped, e.g. the pause menu)")
+				X.terrainShareOn(N)
 			end
 		elseif p.on == false and not history and p.reason ~= "hold_off" then
 			-- the module switched holding off by itself (silence, control file gone): ours to notice, and to try again later
@@ -6190,6 +6213,11 @@ local function natEvent(N, rec, p, history)
 		return   -- held / released / dropped / audit of an earlier run of this script: not news
 	elseif kind == "held" then
 		natOnHeld(N, p)
+	elseif kind == "terrain" then
+		pcall(X.shipTerrain, p)
+	elseif kind == "terrain_refused" then
+		natSay("terrain: an edit was refused by the native module: " .. tostring(p.reason))
+		pcall(X.noticeLocal, "terrain_refused")
 	elseif kind == "injected" or kind == "inject_refused" then
 		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
 		if kind == "inject_refused" then X.onInjectRefused(p) elseif tonumber(p.key) then X.injectAnswered(tonumber(p.key), false) end
@@ -7639,7 +7667,7 @@ local function guiUpdate(userParams, state, guiState)
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
-	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject, wall0 = X.WALL0 }) end
+	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject or G.nat.ready.terrain) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject, terrain = G.nat.ready.terrain, wall0 = X.WALL0 }) end
 	local ok, err = pcall(function()
 		pcall(X.frameStart)
 		readLink()
@@ -7703,8 +7731,31 @@ local seenOtherEvents, seenOtherN = {}, 0
 -- it, and enabled again at the end of the session. Official API: api.gui.byId.setEnabled(idOrTag, enabled, idOnly?), "nil sets to
 -- enabled and removes the rule" (tf3-docs reference/api/api/gui.html, Gui.ById; the base game's mission_sim.script.tl uses it the same
 -- way). Nothing changes outside a session (guiHandleEvent returns before this when no session runs). The player is told once.
+--
+-- Height edits are shared since 2026-10-25 (owner decisions, TERRAIN_DESIGN step 2) when the native module says it can carry them
+-- (`terrain_apply` in its hooks) and has been told to (X.terrainShareOn, once holding is on): raise, lower, flatten, smooth and Roughen
+-- (terrain_heightmap_tool, owner 2026-10-25: its result cells travel as data, so its randomness, if any, runs on the originator only; the
+-- module refuses an edit that carries anything beside its height grid), with the menu's own tab and indicator, then stay usable; anything
+-- else the menu may hold stays switched off exactly as before. Ground paint and the tree, plant and rock brushes are not in this menu and
+-- are unchanged (owner decision 1: not gated).
+local TERRAIN_CARRIED = { "terrain_raise_tool.res", "terrain_lower_tool.res", "terrain_flatten_tool.res", "terrain_smooth_tool.res",
+	"terrain_heightmap_tool.res" }
+
+function X.terrainCarried(id)
+	if id:sub(-4) == ".tab" or id:sub(-10) == ".indicator" then return true end
+	for _, name in ipairs(TERRAIN_CARRIED) do
+		if id:find("/" .. name, 1, true) then return true end
+	end
+	return false
+end
+
 function X.terrainGate(id)
 	if type(id) ~= "string" or not id:find("landscaping_terrain", 1, true) then return end
+	if G.terrainShared and X.terrainCarried(id) then
+		G.terrainSeen = G.terrainSeen or {}
+		G.terrainSeen[id] = true
+		return
+	end
 	G.terrainOff = G.terrainOff or {}
 	if G.terrainOff[id] then return end
 	api.gui.byId.setEnabled(id, false, true)
@@ -7716,6 +7767,82 @@ function X.terrainGate(id)
 	end
 end
 
+-- Holding is on (hold_on confirmed) and the module can carry height edits: it is told to share them (`terrain_share {on = true}`: a
+-- terrain tool's own command is emptied at its apply and its cells come back as a `terrain` event, X.shipTerrain), and the carried tools
+-- this session switched off are enabled again. Said once per session to the player.
+function X.terrainShareOn(N)
+	if not (C.ACTIVE and N and N.ready and N.ready.terrain) then return end
+	if not natSend("terrain_share", { on = true }) then return end
+	G.terrainShared = true
+	for id in pairs(G.terrainOff or {}) do
+		if X.terrainCarried(id) and pcall(api.gui.byId.setEnabled, id, nil, true) then G.terrainOff[id] = nil end
+	end
+	natSay("terrain: height edits are shared (raise, lower, flatten, smooth, roughen)")
+	if not G.terrainSharedTold then
+		G.terrainSharedTold = true
+		pcall(X.noticeLocal, "terrain_shared")
+	end
+end
+
+-- hold_off (a fault, a resync load, the session's end): the module stops sharing by itself (terrain.rs), so the carried tools are switched
+-- off again where an event names them, never left to apply on this game alone
+function X.terrainShareOff()
+	if not G.terrainShared then return end
+	G.terrainShared = nil
+	for id in pairs(G.terrainSeen or {}) do pcall(X.terrainGate, id) end
+	G.terrainSeen = nil
+	natSay("terrain: height edits are not shared any more (holding is off): the terrain tools are switched off again")
+end
+
+-- The originator: the module took a terrain tool's height edit out of its command (applied nowhere yet) and wrote its cells
+-- (native_terrain_out_<id>.txt). It is stamped and shipped like every action, and queued on this game too: every game, this one
+-- included, applies the same cells at the same stamp (the carrier, Build: decodeTerrain), never at the click (that forks). The stamp is
+-- the shortest the pacing allows (stampAfterFastest, as a window command: no veto wait). An edit that cannot be shipped is applied
+-- nowhere and the player is told. Every edit's size is logged for the lab (owner: the size cap is set after a run measures strokes).
+function X.shipTerrain(p)
+	local id, w, h, x0, y0 = tonumber(p.id), tonumber(p.w), tonumber(p.h), tonumber(p.x0), tonumber(p.y0)
+	local function refuse(why)
+		logGui(string.format("terrain edit %s (%sx%s cells) NOT shared: %s; it is applied on no game", tostring(id), tostring(w), tostring(h), why))
+		pcall(X.noticeLocal, "terrain_refused")
+	end
+	if not (id and w and h and x0 and y0 and w >= 1 and h >= 1) then return refuse("the module's event is incomplete") end
+	if not C.ACTIVE then return refuse("no session runs") end
+	local okT, text = pcall(C.readFile, C.path("native_terrain_out_" .. C.integerText(id) .. ".txt"))
+	if not okT or type(text) ~= "string" or text == "" then return refuse("its cells file cannot be read") end
+	if not L.permitted(G.perms, "build") then return refuse("this player may not build") end
+	local body = { fn = "makeWorldBuildProposalCmd", args = { n = 4 }, terrain = { x0 = x0, y0 = y0, w = w, h = h, cells = text }, category = "build" }
+	local wire = C.serialize(body)
+	if #wire > ACTION_BODY_MAX then return refuse(string.format("its record (%d bytes) is over the %d bytes an action may have", #wire, ACTION_BODY_MAX)) end
+	local now = engine.gameTime()
+	local at = stampAfterFastest(now)
+	G.seq = G.seq + 1
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.hostStamps(at) or nil }
+	send("action", { stamp = at, seq = G.seq, body = wire, category = "build", pause = it.pause })
+	logGui(string.format("terrain edit %d: %dx%d = %d cells at %d,%d (%d bytes of cells, %d of record) %s stamped %s (now %s, %s step(s) ahead): applied at the stamp on every game, this one too",
+		id, w, h, w * h, x0, y0, #text, #wire, it.key, C.integerText(at), C.integerText(now), tostring((at - now) / STEP)))
+	X.routeOwn(it)
+end
+
+-- The proof of a terrain height edit after its apply, the same on every game with the same world: the documented
+-- api.engine.terrain.getBaseHeightAt(Vec2f) at the centre of every edited cell (4 m cells, x = (x0 + i + 0.5) * 4: the grid's
+-- resolution as TerrainTileHeightmap documents it; the exact centre is not proven, but every game samples the same points), hashed.
+-- It goes with this game's applied verdict, and the host takes two applied verdicts with different proofs for a fork (core
+-- VerdictBook): the repair follows, nothing is corrected after the fact.
+function X.terrainProof(t, key, say)
+	local ok, proof = pcall(function()
+		local parts = {}
+		for j = 0, t.h - 1 do
+			for i = 0, t.w - 1 do
+				parts[#parts + 1] = string.format("%.4f", api.engine.terrain.getBaseHeightAt(api.type.Vec2f.new((t.x0 + i + 0.5) * 4, (t.y0 + j + 0.5) * 4)))
+			end
+		end
+		return string.format("%d:%08x", t.w * t.h, C.fnv1a(table.concat(parts, ",")))
+	end)
+	if not ok then proof = "unreadable (" .. tostring(proof):sub(1, 80) .. ")" end
+	if say then say(string.format("terrain edit %s: %dx%d cells at %d,%d applied at the stamp, heights proof %s", tostring(key), t.w, t.h, t.x0, t.y0, proof)) end
+	return proof
+end
+
 -- The end of a session: every terrain tool switched off by X.terrainGate is enabled again (the rule removed).
 function X.terrainRestore()
 	local n = 0
@@ -7724,7 +7851,7 @@ function X.terrainRestore()
 		if ok then n = n + 1 else logGui("terrain tools: " .. id .. " could not be switched on again: " .. tostring(err)) end
 	end
 	if n > 0 then logGui("terrain tools: " .. n .. " switched on again (the session ended)") end
-	G.terrainOff, G.terrainTold = nil, nil
+	G.terrainOff, G.terrainTold, G.terrainShared, G.terrainSharedTold, G.terrainSeen = nil, nil, nil, nil, nil
 end
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the `builder.*` event names are the tools' own; the docs
 -- list no GUI event names.

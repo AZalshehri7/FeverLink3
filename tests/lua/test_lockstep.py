@@ -758,7 +758,8 @@ class Relay:
         by = self.verdicts.setdefault(key, {})
         by[g.id] = (applied, str(p.detail or ""))
         n_applied = sum(1 for a, _ in by.values() if a)
-        if 0 < n_applied < len(by):
+        results = set(d for a, d in by.values() if a)   # an applied verdict's result (a terrain edit's height proof): two differ = a fork
+        if 0 < n_applied < len(by) or len(results) > 1:
             self.verdict_resyncs.append("verdicts of %d:%d differ" % key)
             del self.verdicts[key]
         elif len(by) == len(self.games):

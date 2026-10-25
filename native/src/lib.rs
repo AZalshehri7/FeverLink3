@@ -40,6 +40,7 @@ pub mod portable;
 pub mod rebuild;
 pub mod scan;
 pub mod search;
+pub mod terrain;
 pub mod townseed;
 
 #[cfg(windows)]

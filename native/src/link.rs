@@ -80,8 +80,13 @@ pub enum CtlMessage {
     /// The script `build_proposal` that builds what deferred command `held` builds (its place or constructions) is this game's stamp
     /// apply of it, built from the record (not injected): the held command takes that command's result, as with `inject_next {held}`.
     CompleteNext { held: u64, ttl: u64, tm: String },
-    /// Apply the staged terrain edit `id` at `stamp` (stage 0.4: parsed, not acted on).
-    TerrainApply { id: u64, stamp: u64 },
+    /// `terrain.rs`: the NEXT script `build_proposal` whose terrain height grid has exactly this header (`x0, y0, w, h`: the mod's carrier,
+    /// `GridVec2f.new(x0, y0, w, h)`) gets the cells of `native_terrain_in_<key>.txt` written into it before the simulation applies it.
+    /// Answered `injected {key}` or `inject_refused {key}` (the carrier then applies nothing). Expires after `ttl` ms (0: default).
+    TerrainApply { key: u64, x0: i32, y0: i32, w: i32, h: i32, ttl: u64 },
+    /// `terrain.rs`: share terrain height edits (`on`): a terrain tool's own command is emptied at its apply and its cells are written
+    /// for the mod (`terrain` event); off: the tool's command applies as it is. The mod says it once holding is on and at the session's end.
+    TerrainShare { on: bool },
     /// Liveness; answered with `pong`. `paused` (optional, absent: false): the session's game time stands still right now (the session
     /// stands at its pause, or its speed is 0): what is held does not age meanwhile (`hold.rs`). Every ping says it, and the mod pings
     /// at once when it changes, so a lost line is corrected by the next ping.
@@ -191,6 +196,21 @@ fn required(p: &Value, key: &str, why: &'static str) -> Result<u64, CtlError> {
     p.get(key).and_then(whole).ok_or(CtlError::BadPayload(why))
 }
 
+/// A whole number that fits an `i32` (grid coordinates may be negative: the map's origin is its centre).
+fn signed(p: &Value, key: &str, why: &'static str) -> Result<i32, CtlError> {
+    let v = p.get(key).ok_or(CtlError::BadPayload(why))?;
+    let n = v.as_i64().or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && f.abs() < 1e10).map(|f| f as i64));
+    n.and_then(|n| i32::try_from(n).ok()).ok_or(CtlError::BadPayload(why))
+}
+
+fn positive(n: i32, why: &'static str) -> Result<i32, CtlError> {
+    if n >= 1 {
+        Ok(n)
+    } else {
+        Err(CtlError::BadPayload(why))
+    }
+}
+
 fn optional(p: &Value, key: &str, why: &'static str) -> Result<u64, CtlError> {
     match p.get(key) {
         None => Ok(0),
@@ -230,8 +250,18 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             tm: timing_text(&p)?,
         }),
         "terrain_apply" => Ok(CtlMessage::TerrainApply {
-            id: required(&p, "id", "terrain_apply needs a numeric id")?,
-            stamp: optional(&p, "stamp", "stamp must be a game time")?,
+            key: required(&p, "key", "terrain_apply needs a numeric key")?,
+            x0: signed(&p, "x0", "terrain_apply needs a whole x0")?,
+            y0: signed(&p, "y0", "terrain_apply needs a whole y0")?,
+            w: signed(&p, "w", "terrain_apply needs a whole w").and_then(|w| positive(w, "w must be at least 1"))?,
+            h: signed(&p, "h", "terrain_apply needs a whole h").and_then(|h| positive(h, "h must be at least 1"))?,
+            ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
+        }),
+        "terrain_share" => Ok(CtlMessage::TerrainShare {
+            on: p
+                .get("on")
+                .and_then(Value::as_bool)
+                .ok_or(CtlError::BadPayload("terrain_share needs on = true or false"))?,
         }),
         "patch_next" => {
             let mut at = Vec::new();
@@ -911,6 +941,20 @@ pub enum Event {
     ConvertDump {
         text: String,
     },
+    /// `terrain.rs`, the originator: a terrain tool's height edit was taken out of its own command at the apply (the command applied
+    /// nothing) and its cells written as `native_terrain_out_<id>.txt`, for the mod to ship; every game applies them at the stamp.
+    Terrain {
+        id: u64,
+        x0: i32,
+        y0: i32,
+        w: i32,
+        h: i32,
+        bytes: u64,
+    },
+    /// `terrain.rs`, the originator: a terrain tool's edit was emptied at its apply but cannot be shipped (`reason`): it is applied nowhere.
+    TerrainRefused {
+        reason: String,
+    },
     /// `inject_next` was carried out: the command now holds the engine Proposal built from the text of `key`.
     Injected {
         key: u64,
@@ -970,6 +1014,8 @@ impl Event {
             Event::Patched { .. } => "patched",
             Event::PatchRefused { .. } => "patch_refused",
             Event::PatchSkipped { .. } => "patch_skipped",
+            Event::Terrain { .. } => "terrain",
+            Event::TerrainRefused { .. } => "terrain_refused",
             Event::Injected { .. } => "injected",
             Event::InjectRefused { .. } => "inject_refused",
             Event::ConvertDump { .. } => "convert_dump",
@@ -1017,6 +1063,10 @@ impl Event {
             }
             Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
             Event::ConvertDump { text } => format!("event convert_dump: {text}"),
+            Event::Terrain { id, x0, y0, w, h, bytes } => {
+                format!("event terrain: edit {id}: {w}x{h} cells at {x0},{y0} ({bytes} bytes of text)")
+            }
+            Event::TerrainRefused { reason } => format!("event terrain_refused: {reason}"),
             Event::Injected { key, nodes, segments, constructions } => format!(
                 "event injected: key {key}: {nodes} nodes, {segments} segments, {constructions} construction(s)"
             ),
@@ -1122,6 +1172,15 @@ impl Event {
             ]),
             Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::ConvertDump { text } => Lua::map([("text", Lua::str(text))]),
+            Event::Terrain { id, x0, y0, w, h, bytes } => Lua::map([
+                ("bytes", Lua::uint(*bytes)),
+                ("h", Lua::Int(i64::from(*h))),
+                ("id", Lua::uint(*id)),
+                ("w", Lua::Int(i64::from(*w))),
+                ("x0", Lua::Int(i64::from(*x0))),
+                ("y0", Lua::Int(i64::from(*y0))),
+            ]),
+            Event::TerrainRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::Injected { key, nodes, segments, constructions } => Lua::map([
                 ("constructions", Lua::uint(*constructions)),
                 ("key", Lua::uint(*key)),
@@ -1350,9 +1409,10 @@ mod tests {
         assert_eq!(parse("release", r#"{["at"]=12000,["id"]=3}"#), Ok(CtlMessage::Release { id: 3, at: 12000 }));
         assert_eq!(parse("cancel", r#"{["id"]=7}"#), Ok(CtlMessage::Cancel { id: 7 }));
         assert_eq!(
-            parse("terrain_apply", r#"{["id"]=2,["stamp"]=400}"#),
-            Ok(CtlMessage::TerrainApply { id: 2, stamp: 400 })
+            parse("terrain_apply", r#"{["h"]=15,["key"]=2,["w"]=15,["x0"]=-311,["y0"]=137}"#),
+            Ok(CtlMessage::TerrainApply { key: 2, x0: -311, y0: 137, w: 15, h: 15, ttl: 0 })
         );
+        assert_eq!(parse("terrain_share", r#"{["on"]=true}"#), Ok(CtlMessage::TerrainShare { on: true }));
         assert_eq!(parse("ping", r#"{["n"]=-4}"#), Ok(CtlMessage::Ping { n: -4, paused: false }));
         assert_eq!(parse("ping", r#"{["n"]=5,["paused"]=true}"#), Ok(CtlMessage::Ping { n: 5, paused: true }));
         assert!(matches!(parse("ping", r#"{["n"]=5,["paused"]=1}"#), Err(CtlError::BadPayload(_))));
@@ -1371,10 +1431,10 @@ mod tests {
     #[test]
     fn lines_written_by_the_mods_own_writer_parse() {
         // The bytes feverlink3_common.lua produces: C.newWriter(path, 1), then C.writerSend for each kind with
-        // {kinds={"build_proposal"}}, {n=3}, {id=3, at=12400}, {id=7}, {} and {id=2, stamp=400}.
+        // {kinds={"build_proposal"}}, {n=3}, {id=3, at=12400}, {id=7}, {} and {on=false}.
         let file = "hold_on\t1\t{[\"kinds\"]={[1]=\"build_proposal\"}}\nping\t1\t{[\"n\"]=3}\n\
                     release\t1\t{[\"at\"]=12400,[\"id\"]=3}\ncancel\t1\t{[\"id\"]=7}\nhold_off\t1\t{}\n\
-                    terrain_apply\t1\t{[\"id\"]=2,[\"stamp\"]=400}\n";
+                    terrain_share\t1\t{[\"on\"]=false}\n";
         let dir = TempDir::new("mod-writer");
         let path = dir.path().join("native_ctl.gui.s1.log");
         fs::write(&path, file).unwrap();
@@ -1387,7 +1447,7 @@ mod tests {
                 CtlMessage::Release { id: 3, at: 12400 },
                 CtlMessage::Cancel { id: 7 },
                 CtlMessage::HoldOff,
-                CtlMessage::TerrainApply { id: 2, stamp: 400 },
+                CtlMessage::TerrainShare { on: false },
             ]
         );
     }
@@ -1421,6 +1481,8 @@ mod tests {
             ("release", r#"{["id"]=1e300}"#),
             ("cancel", r#"{["id"]=true}"#),
             ("terrain_apply", "{}"),
+            ("terrain_apply", r#"{["key"]=1,["x0"]=0,["y0"]=0,["w"]=0,["h"]=3}"#),
+            ("terrain_share", "{}"),
             ("ping", r#"{["n"]="x"}"#),
         ] {
             assert!(matches!(parse(kind, payload), Err(CtlError::BadPayload(_))), "{kind} {payload}");

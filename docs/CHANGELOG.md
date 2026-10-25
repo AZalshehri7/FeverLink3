@@ -10,6 +10,7 @@ The changes of each version that matter to a player or tester. Earlier test buil
 
 ### Added
 - FeverLink3 now finds the places it needs in the game at every start, with the same whole-function proof its address tool uses, instead of reading them from a list built into it. A Transport Fever 3 update therefore no longer always switches the multiplayer part off: when every place is proven the game plays, and only when not, it stays off as before. A build that was not yet played and checked (builds 40420, 40423 and 40425 were) shows "found by search, not yet confirmed" in the window, and only players whose games found exactly the same places can play together. The first start on a build takes about a third of a second longer; later starts reuse the result. Checked on the executables of builds 40420 and 40425; not yet seen in the game.
+- Terrain height edits are shared in a session: raise, lower, flatten, smooth and roughen work again and every game, yours included, applies the same ground change at the same moment (a short moment after your click). Ground paint and the tree brushes work as before (not shared yet). If the ground ends up different on two games, the host repairs it. Not yet seen in the game.
 
 ## 0.2.6 (2026-10-24)
 

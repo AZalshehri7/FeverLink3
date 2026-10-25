@@ -54,7 +54,12 @@ impl VerdictBook {
         let by = self.open.entry(action).or_default();
         by.insert(game, verdict);
         let applied = by.values().filter(|v| v.applied).count();
-        let differ = applied > 0 && applied < by.len();
+        // An applied verdict's detail is its result where the mod has one to compare (a terrain height edit's proof of the heights after
+        // it): two games that both applied an action with different results have forked as much as one that refused it.
+        let mut results = by.values().filter(|v| v.applied).map(|v| &v.detail);
+        let first = results.next();
+        let results_differ = first.is_some_and(|f| results.any(|d| d != f));
+        let differ = (applied > 0 && applied < by.len()) || results_differ;
         let complete = expected.iter().all(|g| by.contains_key(g));
         if !differ && !complete {
             return VerdictOutcome::Waiting;
@@ -118,6 +123,22 @@ mod tests {
         let out = b.record((1, 3), 0, refused("gone"), &[0, 1, 2]);
         assert_eq!(VerdictOutcome::Differ { applied: vec![1], refused: vec![(0, "gone".to_owned())] }, out);
         assert!(b.is_empty(), "said once per action");
+    }
+
+    #[test]
+    fn two_games_that_applied_with_different_results_have_forked() {
+        let mut b = VerdictBook::new();
+        let with = |d: &str| Verdict { applied: true, detail: d.to_owned() };
+        b.record((0, 1), 0, with("terrain heights 225:1a"), &[0, 1]);
+        assert_eq!(
+            VerdictOutcome::Agreed { applied: true },
+            b.record((0, 1), 1, with("terrain heights 225:1a"), &[0, 1])
+        );
+        b.record((0, 2), 0, with("terrain heights 225:1a"), &[0, 1]);
+        assert_eq!(
+            VerdictOutcome::Differ { applied: vec![0, 1], refused: vec![] },
+            b.record((0, 2), 1, with("terrain heights 225:2b"), &[0, 1])
+        );
     }
 
     #[test]

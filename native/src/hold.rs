@@ -376,9 +376,6 @@ impl<H> HoldMachine<H> {
                 }
                 None => self.error("defer", format!("no held command {id}"), now),
             },
-            CtlMessage::TerrainApply { id, .. } => {
-                self.error("terrain_apply", format!("edit {id}: terrain edits are not copied by this build"), now)
-            }
             CtlMessage::Ping { n, paused } => {
                 self.session_paused(*paused, now);
                 self.push_event(Event::Pong { n: *n });
@@ -387,7 +384,9 @@ impl<H> HoldMachine<H> {
             | CtlMessage::InjectNext { .. }
             | CtlMessage::CompleteNext { .. }
             | CtlMessage::SendDone { .. }
-            | CtlMessage::Pace { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, pace.rs)
+            | CtlMessage::TerrainApply { .. }
+            | CtlMessage::TerrainShare { .. }
+            | CtlMessage::Pace { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, terrain.rs, pace.rs)
         }
     }
 
@@ -1183,13 +1182,6 @@ mod tests {
         let mut idle = machine();
         idle.ctl_gone(5);
         assert!(idle.drain_events().is_empty(), "nothing held and not holding: nothing to say");
-    }
-
-    #[test]
-    fn terrain_apply_is_refused_politely() {
-        let mut m = machine();
-        m.handle(&CtlMessage::TerrainApply { id: 1, stamp: 400 }, 0);
-        assert!(matches!(&m.drain_events()[..], [Event::Error { place, .. }] if place == "terrain_apply"));
     }
 
     #[test]

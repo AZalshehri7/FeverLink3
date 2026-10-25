@@ -132,7 +132,7 @@ const CTL_TEMPLATES: &[(&str, &str)] = &[
     ("hold_off", "{}"),
     ("release", r#"{["at"]=12000,["id"]=3}"#),
     ("cancel", r#"{["id"]=7}"#),
-    ("terrain_apply", r#"{["id"]=2,["stamp"]=400}"#),
+    ("terrain_apply", r#"{["h"]=15,["key"]=2,["w"]=15,["x0"]=-3,["y0"]=4}"#),
     ("ping", r#"{["n"]=-4}"#),
 ];
 
@@ -165,10 +165,13 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     CtlMessage::Cancel { id } | CtlMessage::Defer { id } | CtlMessage::Fail { id } => {
                         assert!(id <= 1 << 53, "{line:?}")
                     }
-                    CtlMessage::TerrainApply { id, stamp } => assert!(id <= 1 << 53 && stamp <= 1 << 53, "{line:?}"),
+                    CtlMessage::TerrainApply { key, w, h, ttl, .. } => {
+                        assert!(key <= 1 << 53 && ttl <= 1 << 53 && w >= 1 && h >= 1, "{line:?}")
+                    }
                     CtlMessage::Pace { permille } => assert!((1000..=2000).contains(&permille), "{line:?}"),
                     CtlMessage::SendDone { key, held } => assert!(key != 0 || held != 0, "{line:?}"),
                     CtlMessage::HoldOff
+                    | CtlMessage::TerrainShare { .. }
                     | CtlMessage::Ping { .. }
                     | CtlMessage::PatchNext { .. }
                     | CtlMessage::InjectNext { .. }
@@ -380,7 +383,7 @@ fn random_ctl(r: &mut StdRng, max_id: u64) -> CtlMessage {
         1 => CtlMessage::HoldOff,
         2 => CtlMessage::Release { id: id(r), at: if r.gen_bool(0.5) { 0 } else { r.gen_range(0..3000) } },
         3 => CtlMessage::Cancel { id: id(r) },
-        4 => CtlMessage::TerrainApply { id: id(r), stamp: r.gen_range(0..1u64 << 53) },
+        4 => CtlMessage::TerrainApply { key: id(r), x0: r.gen(), y0: r.gen(), w: 3, h: 3, ttl: 0 },
         _ => CtlMessage::Ping { n: r.gen(), paused: r.gen() },
     }
 }
