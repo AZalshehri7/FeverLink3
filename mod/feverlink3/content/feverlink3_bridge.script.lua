@@ -7785,12 +7785,20 @@ local seenOtherEvents, seenOtherN = {}, 0
 -- (`terrain_apply` in its hooks) and has been told to (X.terrainShareOn, once holding is on): raise, lower, flatten, smooth and Roughen
 -- (terrain_heightmap_tool, owner 2026-10-25: its result cells travel as data, so its randomness, if any, runs on the originator only; the
 -- module refuses an edit that carries anything beside its height grid), with the menu's own tab and indicator, then stay usable; anything
--- else the menu may hold stays switched off exactly as before. Ground paint and the tree, plant and rock brushes are not in this menu and
--- are unchanged (owner decision 1: not gated).
+-- else the menu may hold stays switched off exactly as before. Ground paint is shared by its own carrier (not in this menu).
+-- The vegetation menu (`landscaping_vegetation`: vegetation_eraser_tool, mixed_trees/rocks/plants_tool) is switched off the same way (the
+-- docs already said trees and rocks are off). GitHub issue #3 (2026-10-25, build 40425): the first free-id difference of both forked load
+-- epochs is the step of a host "a native build at t=926400 / 978800 is not replicated: construction N is not in the world" (t / 200 = the
+-- fork steps 4632 / 4894 of freed_id_diff); ~25 such builds in 2.5 min, none held by the native module (no `held` record), four during a
+-- pause (no town grows) 6 s after the vegetation menu opened; their entities were freed and new ones made on the host alone, and the
+-- `freeq` repairs followed. That they came from the vegetation tools is inferred from that timing, not seen in the game.
+-- (owner 2026-10-25: MPFever rebuilds brush trees with its own construction on the other games, so the worlds differ; off until shared)
+X.LANDSCAPING_OFF = { "landscaping_terrain", "landscaping_vegetation" }
 local TERRAIN_CARRIED = { "terrain_raise_tool.res", "terrain_lower_tool.res", "terrain_flatten_tool.res", "terrain_smooth_tool.res",
 	"terrain_heightmap_tool.res" }
 
 function X.terrainCarried(id)
+	if not id:find("landscaping_terrain", 1, true) then return false end
 	if id:sub(-4) == ".tab" or id:sub(-10) == ".indicator" then return true end
 	for _, name in ipairs(TERRAIN_CARRIED) do
 		if id:find("/" .. name, 1, true) then return true end
@@ -7799,7 +7807,12 @@ function X.terrainCarried(id)
 end
 
 function X.terrainGate(id)
-	if type(id) ~= "string" or not id:find("landscaping_terrain", 1, true) then return end
+	if type(id) ~= "string" then return end
+	local off = false
+	for _, tab in ipairs(X.LANDSCAPING_OFF) do
+		if id:find(tab, 1, true) then off = true end
+	end
+	if not off then return end
 	if G.terrainShared and X.terrainCarried(id) then
 		G.terrainSeen = G.terrainSeen or {}
 		G.terrainSeen[id] = true
@@ -7809,7 +7822,7 @@ function X.terrainGate(id)
 	if G.terrainOff[id] then return end
 	api.gui.byId.setEnabled(id, false, true)
 	G.terrainOff[id] = true
-	logGui("terrain tools: " .. id .. " switched off for this session (terrain edits are not copied to the other games yet)")
+	logGui("terrain tools: " .. id .. " switched off for this session (terrain and vegetation edits are not copied to the other games yet)")
 	if not G.terrainTold then
 		G.terrainTold = true
 		X.noticeLocal("terrain_off")

@@ -625,15 +625,18 @@ class StrictOnTest(StrictTest):
         self.B.L.execute("GUI_API.gui = GUI_API.gui or {}; ENABLED = {}; GUI_API.gui.byId = { setEnabled = function(id, on, only) "
                          "ENABLED[#ENABLED + 1] = tostring(id) .. '=' .. tostring(on) .. '/' .. tostring(only) end }")
         raise_ = "menu.construction.landscaping.landscaping_terrain.::/gui/construction/tools/terrain_raise_tool.res"
-        for name in ("idAdded", "visibilityChange"):
-            self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, '%s', '%s', {})" % (raise_, name))
+        # issue #3 (2026-10-25): the vegetation menu's tools made unheld, uncapturable builds on the host alone (free-id forks)
+        eraser = "menu.construction.landscaping.landscaping_vegetation.::/gui/construction/tools/vegetation_eraser_tool.res"
+        for tool in (raise_, eraser):
+            for name in ("idAdded", "visibilityChange"):
+                self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, '%s', '%s', {})" % (tool, name))
         self.B.L.execute("GUI.guiHandleEvent(nil, STATE, GSTATE, 0, 'menu.construction.road', 'idAdded', {})")
         calls = lambda: list(self.B.L.eval("ENABLED").values())
-        self.assertEqual(calls(), [raise_ + "=false/true"], "switched off once; other tools untouched")
+        self.assertEqual(calls(), [raise_ + "=false/true", eraser + "=false/true"], "each switched off once; other tools untouched")
         self.assertIn("terrain tools: " + raise_ + " switched off for this session", self.B.log())
         self.end_session_of_b()
         self.frames(30)
-        self.assertEqual(calls(), [raise_ + "=false/true", raise_ + "=nil/true"], "the rule is removed at the session's end")
+        self.assertEqual(sorted(calls()[2:]), sorted([raise_ + "=nil/true", eraser + "=nil/true"]), "the rules are removed at the session's end")
 
     def test_a_held_command_is_paired_with_the_preview_of_its_own_tool_only(self):
         def held_event_first():

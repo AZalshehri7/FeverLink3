@@ -63,9 +63,9 @@ T.MSG = {
 	-- stations and depots: they travel, but are still experimental
 	constructions_experimental = { "info",
 		"Stations and depots are still experimental in a session: one you build may not appear for the other players." },
-	-- terrain tools are switched off for the session
+	-- terrain and vegetation tools are switched off for the session
 	terrain_off = { "info",
-		"Terrain tools are off during a session: terrain changes cannot be shared with the other players yet." },
+		"Landscaping tools that cannot be shared yet (such as trees, plants and rocks) are grayed out during a session." },
 	-- raise, lower, flatten and smooth are shared (native terrain.rs); new and not yet tried much in a real game
 	terrain_shared = { "info",
 		"Raise, lower, flatten, smooth and roughen now work in a session and are shared with the other players. This is new: tell us if the ground looks different for someone." },
