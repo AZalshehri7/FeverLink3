@@ -50,7 +50,7 @@ The mod does nothing until you host or join. In a session every game loads the h
 Yes. Without a session the game plays as it always does.
 
 **Are terrain editing, ground paint and trees shared?**
-Terrain heights are, since the next version: raise, lower, flatten, smooth and roughen are shared with the other players. This is new and not yet proven in a real game. Ground paint and trees are not shared yet. Everything else in the game works as usual.
+Terrain heights are, since the next version: raise, lower, flatten, smooth and roughen are shared with the other players. Heights were seen working in two windows; ground paint is shared too since the next version (not yet seen in the game). Trees, plants and rocks are not shared yet: a tree stroke changes only your own game until the host syncs everyone. Everything else in the game works as usual.
 
 **What happens when the game updates?**
 Every player in a session needs the same game version. On a game build FeverLink3 does not know yet, it switches its hooks off instead of risking your game, and the FeverLink3 window says that an update of FeverLink3 is needed; hosting is refused, and a host refuses such a player with the reason. An update of FeverLink3 follows (builds 40420, 40423 and 40425 are supported). If the game does not start at all after an update, delete `winhttp.dll` from the game folder.

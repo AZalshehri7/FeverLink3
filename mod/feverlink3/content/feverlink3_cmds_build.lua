@@ -3867,19 +3867,26 @@ function M.decodeTerrain(body, ctx)
 	for _, v in ipairs({ x0, y0, w, h }) do
 		if type(v) ~= "number" or v ~= math.floor(v) or math.abs(v) > 1e9 then return nil, "a terrain edit with a malformed grid" end
 	end
-	if w < 1 or h < 1 or w * h > M.TERRAIN_MAX_CELLS then return nil, "a terrain edit of " .. w .. "x" .. h .. " cells is outside the bound" end
+	-- w = h = 0: a ground paint edit without heights (the module's terrain.rs): its carrier is an empty Proposal, the module makes the
+	-- paint grids in it with the game's allocator
+	local heights = w >= 1 and h >= 1
+	if not heights and not (w == 0 and h == 0 and t.paint == true) then return nil, "a terrain edit with a malformed grid" end
+	if heights and w * h > M.TERRAIN_MAX_CELLS then return nil, "a terrain edit of " .. w .. "x" .. h .. " cells is outside the bound" end
 	if type(t.cells) ~= "string" or t.cells == "" then return nil, "a terrain edit without its cells" end
 	if not (ctx and ctx.canTerrain) then
 		return nil, "inject_refused: this game's native module cannot write terrain cells (nothing is applied here)"
 	end
 	local p = api.type.Proposal.new()
-	local terrain = p.terrain   -- a member read is a copy (MPFever): changed, then written back
-	terrain.baseHeightMod = api.type.GridVec2f.new(x0, y0, w, h)
-	p.terrain = terrain
+	if heights then
+		local terrain = p.terrain   -- a member read is a copy (MPFever): changed, then written back
+		terrain.baseHeightMod = api.type.GridVec2f.new(x0, y0, w, h)
+		p.terrain = terrain
+	end
 	local c = api.type.Context.new()
 	c.player = ctx.player or A.player()
-	log("build terrain: " .. w .. "x" .. h .. " cells at " .. x0 .. "," .. y0 .. ": the carrier, the module writes the originator's cells into it")
-	return { n = 4, p, c, false, true, inject = { text = t.cells, terrain = { x0 = x0, y0 = y0, w = w, h = h } } }
+	log("build terrain: " .. (heights and (w .. "x" .. h .. " height cells at " .. x0 .. "," .. y0) or "no heights") .. (t.paint and ", ground paint" or "")
+		.. ": the carrier, the module writes the originator's edit into it")
+	return { n = 4, p, c, false, true, inject = { text = t.cells, terrain = { x0 = x0, y0 = y0, w = w, h = h, paint = t.paint == true } } }
 end
 
 local function decodeBuild(body, ctx)

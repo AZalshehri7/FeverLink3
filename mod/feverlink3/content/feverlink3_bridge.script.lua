@@ -7815,12 +7815,14 @@ function X.shipTerrain(p)
 		logGui(string.format("terrain edit %s (%sx%s cells) NOT shared: %s; it is applied on no game", tostring(id), tostring(w), tostring(h), why))
 		pcall(X.noticeLocal, "terrain_refused")
 	end
-	if not (id and w and h and x0 and y0 and w >= 1 and h >= 1) then return refuse("the module's event is incomplete") end
+	-- w = h = 0 with `paint`: a ground paint edit without heights (terrain.rs)
+	local paint = p.paint == true
+	if not (id and w and h and x0 and y0 and ((w >= 1 and h >= 1) or (w == 0 and h == 0 and paint))) then return refuse("the module's event is incomplete") end
 	if not C.ACTIVE then return refuse("no session runs") end
 	local okT, text = pcall(C.readFile, C.path("native_terrain_out_" .. C.integerText(id) .. ".txt"))
 	if not okT or type(text) ~= "string" or text == "" then return refuse("its cells file cannot be read") end
 	if not L.permitted(G.perms, "build") then return refuse("this player may not build") end
-	local body = { fn = "makeWorldBuildProposalCmd", args = { n = 4 }, terrain = { x0 = x0, y0 = y0, w = w, h = h, cells = text }, category = "build" }
+	local body = { fn = "makeWorldBuildProposalCmd", args = { n = 4 }, terrain = { x0 = x0, y0 = y0, w = w, h = h, paint = paint or nil, cells = text }, category = "build" }
 	local wire = C.serialize(body)
 	if #wire > ACTION_BODY_MAX then return refuse(string.format("its record (%d bytes) is over the %d bytes an action may have", #wire, ACTION_BODY_MAX)) end
 	local now = engine.gameTime()
@@ -7828,8 +7830,8 @@ function X.shipTerrain(p)
 	G.seq = G.seq + 1
 	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.hostStamps(at) or nil }
 	send("action", { stamp = at, seq = G.seq, body = wire, category = "build", pause = it.pause })
-	logGui(string.format("terrain edit %d: %dx%d = %d cells at %d,%d (%d bytes of cells, %d of record) %s stamped %s (now %s, %s step(s) ahead): applied at the stamp on every game, this one too",
-		id, w, h, w * h, x0, y0, #text, #wire, it.key, C.integerText(at), C.integerText(now), tostring((at - now) / STEP)))
+	logGui(string.format("terrain edit %d: %dx%d = %d height cells at %d,%d%s (%d bytes of text, %d of record) %s stamped %s (now %s, %s step(s) ahead): applied at the stamp on every game, this one too",
+		id, w, h, w * h, x0, y0, paint and ", ground paint" or "", #text, #wire, it.key, C.integerText(at), C.integerText(now), tostring((at - now) / STEP)))
 	X.routeOwn(it)
 end
 
@@ -7838,7 +7840,15 @@ end
 -- resolution as TerrainTileHeightmap documents it; the exact centre is not proven, but every game samples the same points), hashed.
 -- It goes with this game's applied verdict, and the host takes two applied verdicts with different proofs for a fork (core
 -- VerdictBook): the repair follows, nothing is corrected after the fact.
+--
+-- Ground paint has no documented getter (the API reference lists none for the ground texture), so a paint edit has no proof of the
+-- world after it: its verdict says "paint" alike on every game, and only the module's read-back of what it wrote (equal to the text) stands
+-- for it. Said, not hidden: the checksums do not cover the ground paint either.
 function X.terrainProof(t, key, say)
+	if not (t.w and t.w >= 1) then
+		if say then say(string.format("terrain edit %s: ground paint applied at the stamp (no documented read of the paint: no proof after it)", tostring(key))) end
+		return "paint"
+	end
 	local ok, proof = pcall(function()
 		local parts = {}
 		for j = 0, t.h - 1 do
@@ -7849,6 +7859,7 @@ function X.terrainProof(t, key, say)
 		return string.format("%d:%08x", t.w * t.h, C.fnv1a(table.concat(parts, ",")))
 	end)
 	if not ok then proof = "unreadable (" .. tostring(proof):sub(1, 80) .. ")" end
+	if t.paint then proof = proof .. ";paint" end
 	if say then say(string.format("terrain edit %s: %dx%d cells at %d,%d applied at the stamp, heights proof %s", tostring(key), t.w, t.h, t.x0, t.y0, proof)) end
 	return proof
 end

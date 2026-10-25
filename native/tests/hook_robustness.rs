@@ -166,7 +166,7 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                         assert!(id <= 1 << 53, "{line:?}")
                     }
                     CtlMessage::TerrainApply { key, w, h, ttl, .. } => {
-                        assert!(key <= 1 << 53 && ttl <= 1 << 53 && w >= 1 && h >= 1, "{line:?}")
+                        assert!(key <= 1 << 53 && ttl <= 1 << 53 && w >= 0 && h >= 0, "{line:?}")
                     }
                     CtlMessage::Pace { permille } => assert!((1000..=2000).contains(&permille), "{line:?}"),
                     CtlMessage::SendDone { key, held } => assert!(key != 0 || held != 0, "{line:?}"),

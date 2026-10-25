@@ -126,7 +126,7 @@ class TerrainShareTest(I.InjectTest):
             self.assertEqual(self.heights(self.A, -3, 7, 3, 2), heights)
             self.assertEqual(self.heights(self.B, -3, 7, 3, 2), heights, "the originator applies the same cells at the stamp")
             self.assertEqual((self.A.native.terrain_orders, self.B.native.terrain_orders), ([], []), "every order taken by its carrier")
-            self.assertIn("terrain edit 1: 3x2 = 6 cells at -3,7", self.B.log())
+            self.assertIn("terrain edit 1: 3x2 = 6 height cells at -3,7", self.B.log())
             self.assertEqual((self.relay.replay_failed, self.relay.verdict_resyncs), ([], []), "the proofs agree: no repair")
 
         def heights_differ():

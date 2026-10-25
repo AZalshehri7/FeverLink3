@@ -204,7 +204,7 @@ fn signed(p: &Value, key: &str, why: &'static str) -> Result<i32, CtlError> {
 }
 
 fn positive(n: i32, why: &'static str) -> Result<i32, CtlError> {
-    if n >= 1 {
+    if n >= 0 {
         Ok(n)
     } else {
         Err(CtlError::BadPayload(why))
@@ -253,8 +253,8 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             key: required(&p, "key", "terrain_apply needs a numeric key")?,
             x0: signed(&p, "x0", "terrain_apply needs a whole x0")?,
             y0: signed(&p, "y0", "terrain_apply needs a whole y0")?,
-            w: signed(&p, "w", "terrain_apply needs a whole w").and_then(|w| positive(w, "w must be at least 1"))?,
-            h: signed(&p, "h", "terrain_apply needs a whole h").and_then(|h| positive(h, "h must be at least 1"))?,
+            w: signed(&p, "w", "terrain_apply needs a whole w").and_then(|w| positive(w, "w must not be negative"))?,
+            h: signed(&p, "h", "terrain_apply needs a whole h").and_then(|h| positive(h, "h must not be negative"))?,
             ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
         }),
         "terrain_share" => Ok(CtlMessage::TerrainShare {
@@ -943,12 +943,14 @@ pub enum Event {
     },
     /// `terrain.rs`, the originator: a terrain tool's height edit was taken out of its own command at the apply (the command applied
     /// nothing) and its cells written as `native_terrain_out_<id>.txt`, for the mod to ship; every game applies them at the stamp.
+    /// `x0, y0, w, h`: its height grid (`w = h = 0`: none, a paint-only edit); `paint`: it paints the ground.
     Terrain {
         id: u64,
         x0: i32,
         y0: i32,
         w: i32,
         h: i32,
+        paint: bool,
         bytes: u64,
     },
     /// `terrain.rs`, the originator: a terrain tool's edit was emptied at its apply but cannot be shipped (`reason`): it is applied nowhere.
@@ -1063,8 +1065,8 @@ impl Event {
             }
             Event::PatchRefused { reason } => format!("event patch_refused: {reason}"),
             Event::ConvertDump { text } => format!("event convert_dump: {text}"),
-            Event::Terrain { id, x0, y0, w, h, bytes } => {
-                format!("event terrain: edit {id}: {w}x{h} cells at {x0},{y0} ({bytes} bytes of text)")
+            Event::Terrain { id, x0, y0, w, h, paint, bytes } => {
+                format!("event terrain: edit {id}: heights {w}x{h} at {x0},{y0}, paint {paint} ({bytes} bytes of text)")
             }
             Event::TerrainRefused { reason } => format!("event terrain_refused: {reason}"),
             Event::Injected { key, nodes, segments, constructions } => format!(
@@ -1172,10 +1174,11 @@ impl Event {
             ]),
             Event::PatchRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::ConvertDump { text } => Lua::map([("text", Lua::str(text))]),
-            Event::Terrain { id, x0, y0, w, h, bytes } => Lua::map([
+            Event::Terrain { id, x0, y0, w, h, paint, bytes } => Lua::map([
                 ("bytes", Lua::uint(*bytes)),
                 ("h", Lua::Int(i64::from(*h))),
                 ("id", Lua::uint(*id)),
+                ("paint", Lua::Bool(*paint)),
                 ("w", Lua::Int(i64::from(*w))),
                 ("x0", Lua::Int(i64::from(*x0))),
                 ("y0", Lua::Int(i64::from(*y0))),
@@ -1481,7 +1484,7 @@ mod tests {
             ("release", r#"{["id"]=1e300}"#),
             ("cancel", r#"{["id"]=true}"#),
             ("terrain_apply", "{}"),
-            ("terrain_apply", r#"{["key"]=1,["x0"]=0,["y0"]=0,["w"]=0,["h"]=3}"#),
+            ("terrain_apply", r#"{["key"]=1,["x0"]=0,["y0"]=0,["w"]=-1,["h"]=3}"#),
             ("terrain_share", "{}"),
             ("ping", r#"{["n"]="x"}"#),
         ] {
