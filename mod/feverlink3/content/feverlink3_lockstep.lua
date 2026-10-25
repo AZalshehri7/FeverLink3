@@ -246,10 +246,14 @@ end
 -- A peer that sends no promise (an older mod) is paced as before. A peer that leaves (player_left, away or gone) is removed with its
 -- promise: the barrier is released by the session's own disconnect and timeout path.
 
--- The steps of its own a promise adds on top of the lead, so that a receiver (which keeps marginTarget of the promise to itself)
--- can still run up to the sender's clock plus the lead: with less, two games would wait for each other's clocks most of the time.
+-- The steps of its own a promise adds on top of the lead: one engine batch (the speed's steps). Every build's stamp is held to the
+-- promise, so these steps are delay on every build. Until 2026-10-25 it was the whole marginTarget (batch + 2), so a receiver could run
+-- up to the sender's clock plus the lead; the owner traded that room for time (owner's two-window run terrain-owner-20261025: every
+-- terrain stroke landed 6 steps, 1.2 s at x1, after its release; now 4 steps, 0.8 s). The receiver still keeps marginTarget of every
+-- promise to itself (L.barrier), so the barrier is exactly as safe as before: it only stands a receiver 2 steps earlier (more waits at
+-- its barrier, smoothed by the pacing), never lets an item come late.
 function L.barrierExtra(speed)
-	return L.marginTarget(speed)
+	return math.max(1, math.min(4, speed or 1))
 end
 
 -- The promise this game reports with its clock at `now`, its new floor (the largest promise it made outside a pause; no stamp it

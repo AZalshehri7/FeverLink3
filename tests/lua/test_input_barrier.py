@@ -246,19 +246,19 @@ class PureBarrierTest(unittest.TestCase):
         K = self.K
         s = self.session(speed=1, lead=600)
         safe, floor, pause = K.promise(s, 1000, None)
-        self.assertEqual((safe, floor, pause), (1600 + 3 * STEP, 2200, False), "now + lead rounded up + marginTarget(1) steps")
+        self.assertEqual((safe, floor, pause), (1600 + 1 * STEP, 1800, False), "now + lead rounded up + one batch (1 step at x1)")
         # the lead shrinks: the promise never goes back
         K.applySession(s, self.L.table_from({"started": True, "speed": 1, "lead": 200}))
         safe, floor, _ = K.promise(s, 1200, floor)
-        self.assertEqual((safe, floor), (2200, 2200))
-        self.assertEqual(K.clampStamp(s, 1200, 1400, floor), 2200, "a stamp is held to the promise")
+        self.assertEqual((safe, floor), (1800, 1800))
+        self.assertEqual(K.clampStamp(s, 1200, 1400, floor), 1800, "a stamp is held to the promise")
         self.assertEqual(K.clampStamp(s, 1200, 3000, floor), 3000)
         # stopped at a pause: the pause stop is promised, flagged, and the pause stamps stay
         K.applySession(s, self.L.table_from({"started": True, "speed": 1, "lead": 200, "pauseAt": 1400}))
         safe, floor2, pause = K.promise(s, 1400, floor)
-        self.assertEqual((safe, floor2, pause), (1400, 2200, True))
+        self.assertEqual((safe, floor2, pause), (1400, 1800, True))
         self.assertEqual(K.clampStamp(s, 1400, 1400, floor2), 1400, "at the pause the stamp is the pause time")
-        self.assertEqual(K.clampStamp(s, 1200, 1400, floor2), 2200, "before reaching the pause it is held to the promise")
+        self.assertEqual(K.clampStamp(s, 1200, 1400, floor2), 1800, "before reaching the pause it is held to the promise")
         # the barrier: the smallest promise of the peers less the receiver's margin, a batch ends on it, a pause stop exactly
         L = self.L
         s = self.session(speed=4, lead=800)
