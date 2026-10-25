@@ -78,10 +78,13 @@ impl Runtime {
             edit.as_ref().err().map(|e| format!(" (REFUSED, its carrier will be emptied: {e})")).unwrap_or_default()
         ));
         if let Some(old) = self.terrain.arm(Order { key, head, edit, armed_ms: now, ttl_ms }) {
+            // `nothing`: a carrier that took no order applied nothing of the edit (an empty Proposal; a height carrier without its
+            // order is emptied as an orphan), so this game's verdict is a refusal and the host repairs (lab run 2026-10-25, guest:
+            // a paint carrier passed before its order was read, the edit was missing there and the verdict said applied)
             self.inject.refuse(
                 old.key,
                 0,
-                Outcome::NoCommand,
+                Outcome::Nothing,
                 format!("terrain order {}: too many orders wait", old.key),
             );
         }
@@ -93,8 +96,11 @@ impl Runtime {
             self.inject.refuse(
                 o.key,
                 0,
-                Outcome::NoCommand,
-                format!("terrain order {}: no carrier came within {} ms", o.key, o.ttl_ms),
+                Outcome::Nothing,
+                format!(
+                    "terrain order {}: no carrier came within {} ms: the edit is not applied here",
+                    o.key, o.ttl_ms
+                ),
             );
         }
     }
@@ -162,6 +168,10 @@ impl Runtime {
             // SAFETY: only readable memory is read.
             let player = unsafe { engine::build_flags(payload) }.is_some_and(|f| f.player_initiated);
             let empty = zero && crate::portable::proposal_is_empty(&LiveMem, payload) == Some(true);
+            if zero && empty && player && !self.terrain.pending() {
+                // a paint-only edit's carrier comes right after its order: the order may still be in the file (lab run 2026-10-25)
+                self.ingest_patch_order(self.now_ms());
+            }
             if zero && !(empty && player && self.terrain.pending()) {
                 return None; // no terrain edit, and not a paint carrier: nothing of this module's
             }
