@@ -85,7 +85,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 
 - Not a finished multiplayer game: this build tests the Steam connection only, and everything under "Not verified yet" above.
 - The native hooks are switched off (only a developer can turn them on) and have never run in the real game, so construction commands are not held back to the same moment on every game yet.
-- Only game builds 40420, 40423 and 40425 are known. On another build the FeverLink3 window says that an update of FeverLink3 is needed; hosting is refused and a host refuses that player's join. If a game update changes the web functions the game imports, the game may fail to start while `winhttp.dll` is installed; uninstalling fixes it.
+- Game builds 40420, 40423 and 40425 are confirmed; on another build FeverLink3 searches for its places at start. When it cannot prove them the FeverLink3 window says that an update of FeverLink3 is needed; hosting is refused and a host refuses that player's join. If a game update changes the web functions the game imports, the game may fail to start while `winhttp.dll` is installed; uninstalling fixes it.
 - Not code-signed: SmartScreen and some antivirus programs warn. Windows 11 Smart App Control in its "On" setting may block the unsigned DLL; this has not been tested.
 - Another mod's `winhttp.dll` conflicts with ours; the installer refuses to overwrite it.
 - The window is English only. A bug in the native module can crash the game (it aborts on an internal error).
@@ -109,7 +109,7 @@ Close the game and run `feverlink3 uninstall` (add `--dry-run` to see the plan).
 
 **Can I play on my own with it installed?** Yes, by design: without a session the game plays as it always does.
 
-**Which game version?** Builds 40420, 40423 and 40425 for now. After a game update the module may need an update; if the game fails to start, run `feverlink3 uninstall` and tell us your build.
+**Which game version?** Builds 40420, 40423 and 40425 are confirmed, and a new build is searched at start. After a game update the module may still need an update; if the game fails to start, run `feverlink3 uninstall` and tell us your build.
 
 **Consoles, Mac, Linux, Epic or GOG?** No. The native part is a Windows DLL and the installer finds the game through Steam.
 

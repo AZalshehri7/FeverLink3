@@ -34,7 +34,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [size=4][b]Not yet[/b][/size]
 
 [list]
-[*]Terrain editing, ground paint and trees are not shared. The terrain tools are switched off during a session.
+[*]Trees, plants and rocks are not shared yet; those tools are grayed out during a session. Terrain heights and ground paint are shared.
 [*]Mods that change the world on their own (for example an automatic line namer) cause extra syncs. FeverLink3 names them in a warning; turn their automatic changes off while playing together.
 [*]Coming back after a short drop without a reload, and separate companies for each player, are planned.
 [/list]
@@ -48,7 +48,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [list]
 [*]Transport Fever 3 on Steam, Windows 10 or 11 (64-bit). Not for Mac, Linux or consoles.
 [*]Steam running and logged in.
-[*]Every player needs the same game version and the same FeverLink3 version (an older FeverLink3 is told to update). Made for game builds 40420, 40423 and 40425; on a game build it does not know yet, FeverLink3 switches its hooks off instead of risking your game, says so in the FeverLink3 window, does not host, and the host refuses that player with the reason. A FeverLink3 update follows.
+[*]Every player needs the same game version and the same FeverLink3 version (an older FeverLink3 is told to update). Confirmed on game builds 40420, 40423 and 40425; on a new game build FeverLink3 searches for its places at start, and when it cannot prove them it switches its hooks off instead of risking your game, says so in the FeverLink3 window, does not host, and the host refuses that player with the reason. A FeverLink3 update follows.
 [*]Not compatible with other mods that put their own [b]winhttp.dll[/b] in the game folder.
 [/list]
 

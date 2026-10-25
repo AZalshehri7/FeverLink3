@@ -4,7 +4,7 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-23, version 0.2.5 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
+Last updated 2026-10-26, version 0.2.7 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
 
 This page keeps three things apart: what has been seen working in the real game, what has only been tested automatically, and the known gaps.
 
@@ -31,6 +31,9 @@ These are covered by the automatic tests (about 1,600 on every change) or by two
 - Every game keeps its world details when a sync starts (two game windows on one PC).
 - Game build 40423 (two game windows on one PC: hooks on, builds equal, no automatic sync).
 - Roundabouts, and re-laying a street that has a bus stop on it (two game windows on one PC, 0.2.5).
+- Terrain heights (raise, lower, flatten, smooth, roughen) and ground paint shared (two game windows on one PC, 0.2.7: 12 height and 8 paint strokes, the heights proven equal on both games, the paint equal to the eye).
+- FeverLink3 finding its places in game build 40425 by itself at start (two game windows on one PC, 0.2.7).
+- Industry names left out of the world comparison, player station names kept (one PC, 0.2.7); two different game languages not yet seen.
 - The mod comparison for every join, a Steam invite too (two game windows on one PC, 0.2.5; not yet a real invite join).
 - A repair needed right after a sync waits and starts by itself; a change made while paused goes through the pause order (0.2.5, automatic tests only).
 - Other mods that change the world on their own (Auto Line Namer, Auto Color Lines): the host's copy makes the change and both games apply it at the same step (two game windows on one PC, new lines made by hand). A setting changed in such a mod's own window is not yet seen.
@@ -40,8 +43,8 @@ These are covered by the automatic tests (about 1,600 on every change) or by two
 
 ## Known gaps
 
-- **After a Transport Fever 3 update, FeverLink3 needs an update too.** 0.2.4 knows game builds 40420 and 40423; on a newer build the FeverLink3 window says so and hosting is refused until FeverLink3 is updated.
-- Terrain editing, ground paint and trees are not shared yet; the terrain tools are switched off during a session.
+- **After a Transport Fever 3 update** FeverLink3 searches the new game build for its places at start. When it cannot prove every place, the multiplayer part stays off, the window says so and hosting is refused until FeverLink3 is updated.
+- Trees, plants, rocks and the vegetation eraser are not shared yet; those tools are grayed out during a session. Terrain heights and ground paint are shared.
 - Some extra repair syncs: the game sometimes orders its internal object ids differently on two PCs. FeverLink3 finds this within seconds and repairs it automatically; the cause is being traced.
 - Mods that change the world on their own with a kind of change FeverLink3 cannot share yet still cause extra repair syncs; FeverLink3 names such a mod in a warning.
 - Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).

@@ -65,7 +65,7 @@ the hash of the row (`build_table::row_hash`). A build whose search gives that h
 and the window says it was found by search and is not yet confirmed. Every join carries `build:hash` (`searched`), which host and
 player must share. Checked on the real executables (read as data): the embedded proof gives on 40420 and 40425 exactly the rows of
 the committed port reports, with the verified hashes (`search::tests::the_search_reproduces_the_committed_port_reports_and_the_verified_hashes`,
-ignored: the executables are not in the repository). Not yet run in the game.
+ignored: the executables are not in the repository). Seen in two game windows on build 40425 ("every site found by search", a verified build).
 
 Left in the code as facts of the reference code, which the search proves unchanged before they are used: the portable layout
 table (`portable.rs`, named 40420) with `build_table::LAYOUT_FACTS` (kind byte offset, build-proposal kind, the listener's getter

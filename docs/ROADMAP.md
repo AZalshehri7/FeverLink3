@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-23. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
+Status as of 2026-10-26. The project started on 2026-10-09. What changed in each version is in the [changelog](CHANGELOG.html); what has been seen working in the real game is on the [status page](site/status.html).
 
 ## Done
 
@@ -21,12 +21,16 @@ Not yet seen in the real game at that time: joining from a Steam invite by itsel
 
 **0.2.5 (2026-10-23): fixes from the friend sessions.** Roundabouts and streets with a bus stop build in a session; a repair needed right after a sync is no longer dropped; a change made while paused no longer forces a sync; the host learns when a build stood on one game only; mods compared for Steam invite joins; text margins in the window; a Save and quit button after an update. Roundabouts, bus stops, mods and margins seen with two games on one PC.
 
+**0.2.6 (2026-10-24): game build 40425.** Support for the game's update of 2026-10-22. Seen working with two games on one PC.
+
+**0.2.7: terrain editing, partly.** Terrain heights (raise, lower, flatten, smooth, roughen) and ground paint are shared: every game applies the same change at the same moment. FeverLink3 finds its places in the game by itself at every start, so a game update no longer always needs a FeverLink3 update. Builds land sooner (0.8 s at x1). Fixes from issue #3: no repair sync for industry names in different languages; the tree, plant and rock tools are grayed out in a session. Seen with two games on one PC.
+
 ## Next
 
 - Find the cause of the object id order differences, so these repair syncs stop.
 - See other mods' shared changes and settings between two PCs, and make line edits apply faster.
 - Separate companies for each player.
-- Share terrain editing, ground paint and trees (the terrain tools are off during a session).
+- Terrain editing: partly done. Heights and ground paint are shared since 0.2.7; trees, plants, rocks and the eraser are next (grayed out during a session until then).
 - Code signing of the files at 1.0.0 (releases are unsigned until then).
 
 ## Later

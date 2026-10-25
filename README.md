@@ -53,7 +53,7 @@ Measured with two games on one PC (internet numbers follow):
 
 - Coming back after a short drop without a reload
 - Separate companies for each player
-- Sharing terrain editing, ground paint and trees
+- Sharing trees, plants and rocks (terrain heights and ground paint are shared since 0.2.7)
 
 FeverLink3 is in beta: keep backups of the saves you play with.
 

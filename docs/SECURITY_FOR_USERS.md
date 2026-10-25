@@ -34,7 +34,7 @@ When Windows loads the DLL, its start routine does this and nothing else:
 
 1. It checks two things: whether the environment variable `FEVERLINK3_SESSION_DIR` is set (only the developers' command-line program sets it; it is not part of the release), and whether the program that loaded the DLL is `TransportFever3.exe`.
 2. If neither is true, it returns at once. In any other program the DLL is only the pass-through of step 1.
-3. Otherwise it creates the folder `%LOCALAPPDATA%\FeverLink3\` (or the session folder, when the developers' program started the game) and appends lines to `native.log` there: that it loaded, the game's build timestamp, and whether that build is one the module knows. The build is identified from the game's own program headers in memory (the link timestamp). Build 40420 is the only known build.
+3. Otherwise it creates the folder `%LOCALAPPDATA%\FeverLink3\` (or the session folder, when the developers' program started the game) and appends lines to `native.log` there: that it loaded, the game's build timestamp, and whether the module found and proved its places in that build. The build is identified from the game's own program headers in memory (the link timestamp); the places are searched in the game's code in memory at every start (read only) and the result is kept in `build-search-<timestamp>.txt`. Builds 40420, 40423 and 40425 are confirmed.
 4. Inside the game, if an earlier game run downloaded an update, it finishes it now (renames files in the game folder, before the game reads its mods) or puts the previous version back ("Automatic updates" below).
 5. Inside the game it starts one thread named `feverlink3-live` and one named `feverlink3-update` (the update check, once, then it ends).
 
@@ -84,10 +84,11 @@ The release zip holds `winhttp.dll`, the mod folder `mods\release\feverlink3` an
 | `<game folder>\winhttp.dll` | the DLL | you, when you install; the automatic update | delete it |
 | `<game folder>\mods\release\feverlink3\` | the mod (Lua game scripts and the window) | you, when you install; the automatic update | delete it |
 | `%LOCALAPPDATA%\FeverLink3\native.log` | the DLL's text log | the DLL | optional: delete the folder |
-| `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`; emptied at every game start | the DLL and the mod | optional: delete the folder |
+| `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`, `world_mods.txt` (the mods active in the world); emptied at every game start | the DLL and the mod | optional: delete the folder |
 | `<Steam>\userdata\<id>\3493540\local\save\feverlink3-resync-<number>.sav` | the host's world while it is synced to the players. These are ordinary game saves and can be large | the game and the DLL | optional: delete them |
 | `<game folder>\feverlink3_update\` | the automatic update: `state.json` (what the next start must finish), `<version>\` (the checked new files), `backup-<version>\` (the previous mod, until the new version started well), `download\` (during a download) | the DLL | delete it (only while the game is closed) |
 | `<game folder>\winhttp.dll.old-<version>`, `winhttp.dll.failed-<version>`, `feverlink3_update_skip.txt` | the previous DLL until the new one started well; a DLL that failed and was taken back; versions not to offer again | the DLL | delete them |
+| `%LOCALAPPDATA%\FeverLink3\build-search-<timestamp>.txt` | where FeverLink3 found its places in that game build, so the next start only checks them | the DLL | optional: delete the folder |
 | `%LOCALAPPDATA%\FeverLink3\settings.txt` | `autoupdate=off` when you turned automatic updates off | the DLL, when you click the switch | optional: delete the folder |
 
 `<game folder>` is `<Steam library>\steamapps\common\Transport Fever 3\`. To open it: in Steam, right-click Transport Fever 3, Manage, Browse local files.
