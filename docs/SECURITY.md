@@ -134,8 +134,8 @@ native control link), Steam's structures.
    an offset and a length without checking for overflow; and, on the hook side, `AppliedWatch::arm` took `usize::MAX`
    (the marker of a slot being filled) as a payload, which would have held the slot for good. Run the suites longer in
    a debug build, which is the one that checks arithmetic: `FEVERLINK3_FUZZ_SCALE=50 cargo test -p feverlink3_core
-   --test robustness_tests` (and `-p feverlink3_launcher --test robustness`, `-p feverlink3_native --test robustness
-   --test hook_robustness`); another seed with `FEVERLINK3_FUZZ_SEED=n`. Ten times the default, with four other seeds,
+   --test all robustness_tests::` (and `-p feverlink3_launcher --test all robustness::`, `-p feverlink3_native --test
+   robustness --test hook_robustness`); another seed with `FEVERLINK3_FUZZ_SEED=n`. Ten times the default, with four other seeds,
    ran clean on the merged tree.
 4. A panic leaves its message in `%LOCALAPPDATA%\FeverLink3\native.log` before anything else happens
    (`native::log::install_panic_hook`), whatever the panic strategy.

@@ -87,6 +87,12 @@ pub enum CtlMessage {
     /// `terrain.rs`: share terrain height edits (`on`): a terrain tool's own command is emptied at its apply and its cells are written
     /// for the mod (`terrain` event); off: the tool's command applies as it is. The mod says it once holding is on and at the session's end.
     TerrainShare { on: bool },
+    /// `assets.rs`: the NEXT script `build_proposal` that only removes exactly the entities `ids`, in this order (this game's own ids of the
+    /// asset groups the tick replaces, the mod resolved them), with `o2n` entries in its `old2new`, and adds nothing (the mod's carrier of
+    /// a shared tree, plant or rock brush tick or asset eraser tick) gets the asset groups of `native_assets_in_<key>.txt` built into its
+    /// `toAdd` before the simulation applies it. Answered `injected {key}` or `inject_refused {key}` (the carrier then applies nothing).
+    /// Expires after `ttl` ms (0: default). Sharing follows `terrain_share`.
+    AssetsApply { key: u64, ids: Vec<u32>, o2n: u64, ttl: u64 },
     /// Liveness; answered with `pong`. `paused` (optional, absent: false): the session's game time stands still right now (the session
     /// stands at its pause, or its speed is 0): what is held does not age meanwhile (`hold.rs`). Every ping says it, and the mod pings
     /// at once when it changes, so a lost line is corrected by the next ping.
@@ -257,6 +263,28 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             h: signed(&p, "h", "terrain_apply needs a whole h").and_then(|h| positive(h, "h must not be negative"))?,
             ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
         }),
+        "assets_apply" => {
+            let mut ids = Vec::new();
+            // a tick that removes nothing (a brush on open ground) sends `ids = {}`: an empty Lua table reads as an empty object, not a
+            // list (quick lab trees-speed2 2026-10-26: "assets_apply: bad payload: ids must be a list" on both games, the brush's tick
+            // applied on no game)
+            if let Some(v) = p.get("ids").filter(|v| !v.as_object().is_some_and(|o| o.is_empty())) {
+                let list = v.as_array().ok_or(CtlError::BadPayload("ids must be a list"))?;
+                if list.len() > crate::assets::MAX_REMOVE {
+                    return Err(CtlError::BadPayload("ids must hold at most 256 entities"));
+                }
+                for item in list {
+                    let n = whole(item).and_then(|n| u32::try_from(n).ok());
+                    ids.push(n.ok_or(CtlError::BadPayload("an id is not a whole number"))?);
+                }
+            }
+            Ok(CtlMessage::AssetsApply {
+                key: required(&p, "key", "assets_apply needs a numeric key")?,
+                ids,
+                o2n: optional(&p, "o2n", "o2n must be a count")?,
+                ttl: optional(&p, "ttl", "ttl must be a number of milliseconds")?,
+            })
+        }
         "terrain_share" => Ok(CtlMessage::TerrainShare {
             on: p
                 .get("on")
@@ -957,6 +985,20 @@ pub enum Event {
     TerrainRefused {
         reason: String,
     },
+    /// `assets.rs`, the originator: a tree, plant or rock brush tick or an asset eraser tick was taken out of its own command at the apply
+    /// (the command applied nothing) and written as `native_assets_out_<id>.txt`: it replaces `remove` asset groups and adds `groups`
+    /// groups of `models` models in all. The mod ships it; every game applies it at the stamp.
+    Assets {
+        id: u64,
+        remove: u64,
+        groups: u64,
+        models: u64,
+        bytes: u64,
+    },
+    /// `assets.rs`, the originator: an asset tool's tick was emptied at its apply but cannot be shipped (`reason`): it is applied nowhere.
+    AssetsRefused {
+        reason: String,
+    },
     /// `inject_next` was carried out: the command now holds the engine Proposal built from the text of `key`.
     Injected {
         key: u64,
@@ -1018,6 +1060,8 @@ impl Event {
             Event::PatchSkipped { .. } => "patch_skipped",
             Event::Terrain { .. } => "terrain",
             Event::TerrainRefused { .. } => "terrain_refused",
+            Event::Assets { .. } => "assets",
+            Event::AssetsRefused { .. } => "assets_refused",
             Event::Injected { .. } => "injected",
             Event::InjectRefused { .. } => "inject_refused",
             Event::ConvertDump { .. } => "convert_dump",
@@ -1069,6 +1113,10 @@ impl Event {
                 format!("event terrain: edit {id}: heights {w}x{h} at {x0},{y0}, paint {paint} ({bytes} bytes of text)")
             }
             Event::TerrainRefused { reason } => format!("event terrain_refused: {reason}"),
+            Event::Assets { id, remove, groups, models, bytes } => format!(
+                "event assets: tick {id}: removes {remove} asset group(s), adds {groups} group(s) of {models} model(s) ({bytes} bytes of text)"
+            ),
+            Event::AssetsRefused { reason } => format!("event assets_refused: {reason}"),
             Event::Injected { key, nodes, segments, constructions } => format!(
                 "event injected: key {key}: {nodes} nodes, {segments} segments, {constructions} construction(s)"
             ),
@@ -1184,6 +1232,14 @@ impl Event {
                 ("y0", Lua::Int(i64::from(*y0))),
             ]),
             Event::TerrainRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
+            Event::Assets { id, remove, groups, models, bytes } => Lua::map([
+                ("bytes", Lua::uint(*bytes)),
+                ("groups", Lua::uint(*groups)),
+                ("id", Lua::uint(*id)),
+                ("models", Lua::uint(*models)),
+                ("remove", Lua::uint(*remove)),
+            ]),
+            Event::AssetsRefused { reason } => Lua::map([("reason", Lua::str(reason))]),
             Event::Injected { key, nodes, segments, constructions } => Lua::map([
                 ("constructions", Lua::uint(*constructions)),
                 ("key", Lua::uint(*key)),
@@ -1416,6 +1472,16 @@ mod tests {
             Ok(CtlMessage::TerrainApply { key: 2, x0: -311, y0: 137, w: 15, h: 15, ttl: 0 })
         );
         assert_eq!(parse("terrain_share", r#"{["on"]=true}"#), Ok(CtlMessage::TerrainShare { on: true }));
+        assert_eq!(
+            parse("assets_apply", r#"{["ids"]={[1]=9001,[2]=9002},["key"]=3,["o2n"]=1}"#),
+            Ok(CtlMessage::AssetsApply { key: 3, ids: vec![9001, 9002], o2n: 1, ttl: 0 })
+        );
+        assert_eq!(
+            parse("assets_apply", r#"{["ids"]={},["key"]=4,["o2n"]=0}"#),
+            Ok(CtlMessage::AssetsApply { key: 4, ids: vec![], o2n: 0, ttl: 0 }),
+            "a brush tick removes nothing: the mod's empty table is an empty list"
+        );
+        assert!(matches!(parse("assets_apply", r#"{["ids"]={["a"]=1},["key"]=4}"#), Err(CtlError::BadPayload(_))));
         assert_eq!(parse("ping", r#"{["n"]=-4}"#), Ok(CtlMessage::Ping { n: -4, paused: false }));
         assert_eq!(parse("ping", r#"{["n"]=5,["paused"]=true}"#), Ok(CtlMessage::Ping { n: 5, paused: true }));
         assert!(matches!(parse("ping", r#"{["n"]=5,["paused"]=1}"#), Err(CtlError::BadPayload(_))));

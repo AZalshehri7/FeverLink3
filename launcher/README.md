@@ -236,7 +236,7 @@ Rules that follow from `docs/PROTOCOL.md` and `mod/README.md`:
 
 ## Loopback self-test
 
-`feverlink3 selftest` and `cargo test -p feverlink3_launcher --test selftest` run the same code
+`feverlink3 selftest` and `cargo test -p feverlink3_launcher --test all selftest::` run the same code
 (`src/selftest.rs`): on `127.0.0.1` with an ephemeral port, a host with a fake game thread (it appends to
 `from_game.log` and reads `to_game.log` exactly as the mod does) and two players with fake games; the command
 prints every check that passed and how long it took. It asserts: both players are welcomed with distinct ids; the host's session state reaches all three

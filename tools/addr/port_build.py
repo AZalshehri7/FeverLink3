@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from find_sites import Image, Pattern, is_relative_branch, is_rip_relative, fmt_ins  # noqa: E402
+from asset_sites import FIELDS as ASSET_FIELDS, NotFound, derive as derive_assets  # noqa: E402
 from capstone.x86 import X86_OP_MEM, X86_REG_RIP  # noqa: E402
 
 CALLEE_PROBE = 32     # bytes compared at the start of each callee
@@ -79,7 +80,7 @@ RUST_OF = {
     **{f: "PatchSite" for f in ("tick_count_getter", "script_pool", "lua_makeseed")},
     **{f: "Engine" for f in ("proposal_ctor", "proposal_dtor", "proposal_copy", "proposal_assign", "engine_new",
                              "engine_delete", "refund_insert", "add_entity", "remove_entity", "game_time_advance",
-                             "component_lookup")},
+                             "component_lookup", *ASSET_FIELDS)},
 }
 REPORTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
@@ -125,6 +126,23 @@ def known_sites(timestamp: int) -> Known | None:
             with open(os.path.join(REPORTS, fn), encoding="utf-8") as fh:
                 return sites_from_report(fh.read(), "old" if int(m.group(1), 16) == timestamp else "new")
     return None
+
+
+def add_derived(img: Image, known: Known) -> list[str]:
+    """The engine functions of the shared asset brush (`asset_sites.py`) that the old build's report does not have yet, found in its
+    executable by their anchors and added before the layout witnesses (the first port that carries them; after it every report names
+    them and they are carried like any other site). Returns the fields added."""
+    have = {s.field for s in known.sites}
+    missing = [f for f in ASSET_FIELDS if f not in have]
+    if not missing:
+        return []
+    try:
+        found = derive_assets(img)
+    except NotFound as e:
+        raise SystemExit(f"asset sites: {e}")
+    at = next((i for i, s in enumerate(known.sites) if s.rust == "Witness"), len(known.sites))
+    known.sites[at:at] = [S(f, "func", found[f][0], found[f][1], rust="Engine") for f in missing]
+    return missing
 
 
 def fill_hosts(img: Image, sites: list[S]) -> None:
@@ -555,6 +573,7 @@ def export_proof(ref: Image, path: str) -> int:
     known = known_sites(ref.timestamp)
     if known is None:
         sys.exit(f"the executable (timestamp {ref.timestamp:#x}) is in no committed port report")
+    add_derived(ref, known)
     sites = known.sites
     fill_hosts(ref, sites)
     pr = Proof(ref, known)
@@ -587,6 +606,7 @@ def main() -> int:
     known = known_sites(old.timestamp)
     if known is None:
         sys.exit(f"the old executable (timestamp {old.timestamp:#x}) is in no committed port report (out/port-*.txt)")
+    derived = add_derived(old, known)
     sites = known.sites
     fill_hosts(old, sites)
     P = Porter(old, new)
@@ -594,6 +614,8 @@ def main() -> int:
     p = out.append
     p("FeverLink3 port tool: tools/addr/port_build.py")
     p(f"old {old.timestamp:#010x} build {old.build_string()}  ->  new {new.timestamp:#010x} build {new.build_string()}")
+    if derived:
+        p("found in the old executable by the anchors of asset_sites.py (no committed report had them yet): " + ", ".join(derived))
     found: dict[str, int] = {}
     data: dict[str, bytes] = {}
     offs: dict[str, dict[str, int]] = {}

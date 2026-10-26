@@ -1,5 +1,6 @@
 FeverLink3 port tool: tools/addr/port_build.py
 old 0x6ad9ce10 build 40425  ->  new 0x6ac50427 build 40420
+found in the old executable by the anchors of asset_sites.py (no committed report had them yet): asset_con_ctor, asset_con_copy, asset_con_dtor, asset_con_insert, asset_subcon_resize, asset_elem_push, asset_models_assign, asset_remover, asset_builder
 ====================================================================================================
 command_list_add  [func]  old 0x9d9140
   whole function exact (0x35d bytes), one match
@@ -300,6 +301,60 @@ component_lookup  [func]  old 0x1445d0
   new 0x1445c0  (shift -0x10)
   bytes (15): 48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20  same as the old outside relocations
 ====================================================================================================
+asset_con_ctor  [func]  old 0x50d220
+  whole function exact (0xe8 bytes), one match
+  - 2 call(s) checked one level deep: every callee starts with the same code
+  new 0x50c3e0  (shift -0xe40)
+  bytes (19): 40 53 48 83 EC 70 48 8B D9 48 89 4C 24 20 E8 FD F7 FF FF  same as the old outside relocations
+====================================================================================================
+asset_con_copy  [func]  old 0x50d060
+  whole function exact (0x1bd bytes), one match
+  - 3 call(s) checked one level deep: every callee starts with the same code
+  new 0x50c220  (shift -0xe40)
+  bytes (20): 48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 48 89 4C 24 08  same as the old outside relocations
+====================================================================================================
+asset_con_dtor  [func]  old 0x48e450
+  whole function exact (0x175 bytes), one match
+  - 8 call(s) checked one level deep: every callee starts with the same code
+  new 0x48d620  (shift -0xe30)
+  bytes (17): 48 89 5C 24 08 57 48 83 EC 20 48 8B 91 30 0E 00 00  same as the old outside relocations
+====================================================================================================
+asset_con_insert  [func]  old 0x507cc0
+  whole function exact (0x1fb bytes), one match
+  - 8 call(s) checked one level deep: every callee starts with the same code
+  new 0x506e80  (shift -0xe40)
+  bytes (17): 4C 89 44 24 18 48 89 4C 24 08 53 56 57 41 54 41 55  same as the old outside relocations
+====================================================================================================
+asset_subcon_resize  [func]  old 0x5241c0
+  whole function exact (0xfa bytes), one match
+  - 2 call(s) checked one level deep: every callee starts with the same code
+  new 0x523380  (shift -0xe40)
+  bytes (16): 48 89 5C 24 18 48 89 7C 24 20 41 56 48 83 EC 20  same as the old outside relocations
+====================================================================================================
+asset_elem_push  [func]  old 0x7b7a20
+  whole function exact (0x7f bytes), one match
+  - 0 call(s) checked one level deep: every callee starts with the same code
+  new 0x7b2aa0  (shift -0x4f80)
+  bytes (16): 4C 8B 49 08 4C 8B C2 4C 8B D1 4C 3B 49 10 74 6F  same as the old outside relocations
+====================================================================================================
+asset_models_assign  [func]  old 0x4bc8f0
+  whole function exact (0x2e3 bytes), one match
+  - 11 call(s) checked one level deep: every callee starts with the same code
+  new 0x4bbac0  (shift -0xe30)
+  bytes (20): 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20  same as the old outside relocations
+====================================================================================================
+asset_remover  [func]  old 0x7b6870
+  whole function exact (0x4e6 bytes), one match
+  - 18 call(s) checked one level deep: every callee starts with the same code
+  new 0x7b18f0  (shift -0x4f80)
+  bytes (16): 48 8B C4 48 89 58 18 48 89 70 20 57 41 54 41 55  same as the old outside relocations
+====================================================================================================
+asset_builder  [func]  old 0x7b58f0
+  whole function exact (0xf79 bytes), one match
+  - 54 call(s) checked one level deep: every callee starts with the same code
+  new 0x7b0970  (shift -0x4f80)
+  bytes (16): 48 8B C4 48 89 58 18 48 89 70 20 57 41 54 41 55  same as the old outside relocations
+====================================================================================================
 layout:0x4c6640  [func]  old 0x4c7470
   whole function exact (0x22b bytes), one match
   - 14 call(s) checked one level deep: every callee starts with the same code
@@ -438,7 +493,7 @@ Rust for native/src/build_table.rs (new build):
   handle_destroy: Some(CallSite { rva: 0x3040c90, prologue: &[0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x19, 0x48, 0x85, 0xDB, 0x74, 0x30, 0x48, 0x8B, 0x4B, 0x08] })
   ui_add_sites: &[0x4d396f, 0x51b56c, 0x528504, 0x537ee5, 0x538649, 0x5387cd, 0x542eba, 0x5891b4, 0x5948dd, 0x5bf08d, 0x28a3024, 0x28a3871]
   fire_done_calls: &[0x4d8860, 0x58c0b0, 0x596a70]
-  engine: EngineFns { proposal_ctor: Some(0x4c6870), proposal_dtor: Some(0x48e220), proposal_copy: Some(0x4c6640), proposal_assign: Some(0x4ced30), engine_new: Some(0x318c530), engine_delete: Some(0x318c56c), refund_insert: Some(0x4be210), add_entity: Some(0x2bb8940), remove_entity: Some(0x2bbc700), game_time_advance: Some(0xbad780), component_lookup: Some(0x1445c0) }
+  engine: EngineFns { proposal_ctor: Some(0x4c6870), proposal_dtor: Some(0x48e220), proposal_copy: Some(0x4c6640), proposal_assign: Some(0x4ced30), engine_new: Some(0x318c530), engine_delete: Some(0x318c56c), refund_insert: Some(0x4be210), add_entity: Some(0x2bb8940), remove_entity: Some(0x2bbc700), game_time_advance: Some(0xbad780), component_lookup: Some(0x1445c0), asset_con_ctor: Some(0x50c3e0), asset_con_copy: Some(0x50c220), asset_con_dtor: Some(0x48d620), asset_con_insert: Some(0x506e80), asset_subcon_resize: Some(0x523380), asset_elem_push: Some(0x7b2aa0), asset_models_assign: Some(0x4bbac0), asset_remover: Some(0x7b18f0), asset_builder: Some(0x7b0970) }
   layout: Some("40420")
 
 all sites located

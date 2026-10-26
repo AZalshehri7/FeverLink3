@@ -2535,7 +2535,7 @@ class PureBuildTest(unittest.TestCase):
                 ("rec.segs[1].lanes = 'x'", "nil|segment 1: bad lanes"),
                 ("rec.segs[1].owner = 'root'", "nil|segment 1: bad owner"),
                 ("rec.cons = { { file = 'a.con', transf = {1} } }", "nil|construction 1: bad transform"),
-                ("rec.rem = { 54 }", "nil|removed construction 1: bad reference"),
+                ("rec.rem = { 54 }", "nil|removed entity 1: bad reference"),
                 ("rec.segs[1].c.deco = { f = print }", "nil|segment 1: bad decorations"),
                 ("local deep = {}; local t = deep; for i = 1, 20 do t.x = {}; t = t.x end; rec.cons = { { file = 'a.con', transf = { 1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1 }, params = deep } }",
                  "nil|construction 1: bad parameters"),

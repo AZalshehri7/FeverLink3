@@ -279,17 +279,35 @@ fn run(seed: u64, steps: usize) -> BTreeMap<&'static str, u32> {
     m.steps
 }
 
-/// 20 sessions of 200 steps in the normal run; `FEVERLINK3_MODEL_SEEDS=500 cargo test -p feverlink3_core --test
-/// model_tests` runs more of them, for a deeper search.
+/// 20 sessions of 200 steps in the normal run; `FEVERLINK3_MODEL_SEEDS=500 cargo test -p feverlink3_core --test all
+/// model_tests` runs more of them, for a deeper search. The sessions are independent (each its own seed and model), so
+/// they run on a few threads at once: 7 s on one thread was the slowest test of the core (2026-10-26).
 #[test]
 fn random_sessions_keep_their_invariants() {
     let seeds = std::env::var("FEVERLINK3_MODEL_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(20u64);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8) as u64;
     let mut totals: BTreeMap<&str, u32> = BTreeMap::new();
-    for seed in 1..=seeds {
-        for (what, n) in run(seed, 200) {
-            *totals.entry(what).or_default() += n;
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                s.spawn(move || {
+                    let mut part: BTreeMap<&'static str, u32> = BTreeMap::new();
+                    for seed in (1..=seeds).filter(|seed| seed % threads == t) {
+                        for (what, n) in run(seed, 200) {
+                            *part.entry(what).or_default() += n;
+                        }
+                    }
+                    part
+                })
+            })
+            .collect();
+        for w in workers {
+            // a failed invariant panics in its worker: join() hands that panic on, with the seed and step in its text
+            for (what, n) in w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)) {
+                *totals.entry(what).or_default() += n;
+            }
         }
-    }
+    });
     // the run really did exercise everything
     for what in ["join", "lose", "cut", "return", "leave", "kick", "time", "talk", "host"] {
         assert!(totals.get(what).copied().unwrap_or(0) > 100, "{what}: {totals:?}");

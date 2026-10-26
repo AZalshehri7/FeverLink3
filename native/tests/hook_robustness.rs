@@ -168,6 +168,9 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     CtlMessage::TerrainApply { key, w, h, ttl, .. } => {
                         assert!(key <= 1 << 53 && ttl <= 1 << 53 && w >= 0 && h >= 0, "{line:?}")
                     }
+                    CtlMessage::AssetsApply { key, ids, o2n, ttl } => {
+                        assert!(key <= 1 << 53 && ids.len() <= 256 && o2n <= 1 << 53 && ttl <= 1 << 53, "{line:?}")
+                    }
                     CtlMessage::Pace { permille } => assert!((1000..=2000).contains(&permille), "{line:?}"),
                     CtlMessage::SendDone { key, held } => assert!(key != 0 || held != 0, "{line:?}"),
                     CtlMessage::HoldOff

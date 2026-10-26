@@ -263,13 +263,26 @@ pub struct EngineFns {
     pub remove_entity: Option<Rva>,
     pub game_time_advance: Option<Rva>,
     pub component_lookup: Option<Rva>,
+    /// The shared asset brush (`assets.rs`): `ConstructionEntity::ConstructionEntity()`, its copy constructor, its destructor,
+    /// `std::vector<ConstructionEntity>::_Emplace_reallocate`, the resize of its subconstructions, `emplace_back` of a subconstruction's
+    /// 0x48-byte element, the models' `assign(first, count)`; and the two builders whose code proves the offsets the module writes
+    /// (`UI::AssetGroupRecycler::MakeRemoveAssetsProposal`, `MakeBuildAssetsProposal`; found by `tools/addr/asset_sites.py`).
+    pub asset_con_ctor: Option<Rva>,
+    pub asset_con_copy: Option<Rva>,
+    pub asset_con_dtor: Option<Rva>,
+    pub asset_con_insert: Option<Rva>,
+    pub asset_subcon_resize: Option<Rva>,
+    pub asset_elem_push: Option<Rva>,
+    pub asset_models_assign: Option<Rva>,
+    pub asset_remover: Option<Rva>,
+    pub asset_builder: Option<Rva>,
     /// The first bytes of each of them as the search recorded them (`port_build.py`'s byte counts), by field name: what a module
     /// compares with memory before it calls or hooks one.
     pub prologues: &'static [(&'static str, &'static [u8])],
 }
 
 /// The engine functions of [`EngineFns`], by field name.
-pub const ENGINE_NAMES: [&str; 11] = [
+pub const ENGINE_NAMES: [&str; 20] = [
     "proposal_ctor",
     "proposal_dtor",
     "proposal_copy",
@@ -281,6 +294,15 @@ pub const ENGINE_NAMES: [&str; 11] = [
     "remove_entity",
     "game_time_advance",
     "component_lookup",
+    "asset_con_ctor",
+    "asset_con_copy",
+    "asset_con_dtor",
+    "asset_con_insert",
+    "asset_subcon_resize",
+    "asset_elem_push",
+    "asset_models_assign",
+    "asset_remover",
+    "asset_builder",
 ];
 
 impl EngineFns {
@@ -305,6 +327,15 @@ impl EngineFns {
         remove_entity: None,
         game_time_advance: None,
         component_lookup: None,
+        asset_con_ctor: None,
+        asset_con_copy: None,
+        asset_con_dtor: None,
+        asset_con_insert: None,
+        asset_subcon_resize: None,
+        asset_elem_push: None,
+        asset_models_assign: None,
+        asset_remover: None,
+        asset_builder: None,
         prologues: &[],
     };
 }
@@ -452,6 +483,15 @@ pub fn assemble(p: &Parts, timestamp: u32, name: &str, layout: &str) -> Option<B
             remove_entity: e("remove_entity")?,
             game_time_advance: e("game_time_advance")?,
             component_lookup: e("component_lookup")?,
+            asset_con_ctor: e("asset_con_ctor")?,
+            asset_con_copy: e("asset_con_copy")?,
+            asset_con_dtor: e("asset_con_dtor")?,
+            asset_con_insert: e("asset_con_insert")?,
+            asset_subcon_resize: e("asset_subcon_resize")?,
+            asset_elem_push: e("asset_elem_push")?,
+            asset_models_assign: e("asset_models_assign")?,
+            asset_remover: e("asset_remover")?,
+            asset_builder: e("asset_builder")?,
             prologues: Box::leak(
                 ENGINE_NAMES.iter().map(|&n| Some((n, bytes(n)?))).collect::<Option<Vec<_>>>()?.into_boxed_slice(),
             ),

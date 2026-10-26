@@ -4,7 +4,7 @@ title: FeverLink3 status
 
 # Status
 
-Last updated 2026-10-26, version 0.2.7 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
+Last updated 2026-10-26, version 0.2.8 (beta). [Back to the start page](../index.html) · [Roadmap](../ROADMAP.html) · [Changelog](../CHANGELOG.html)
 
 This page keeps three things apart: what has been seen working in the real game, what has only been tested automatically, and the known gaps.
 
@@ -44,7 +44,7 @@ These are covered by the automatic tests (about 1,600 on every change) or by two
 ## Known gaps
 
 - **After a Transport Fever 3 update** FeverLink3 searches the new game build for its places at start. When it cannot prove every place, the multiplayer part stays off, the window says so and hosting is refused until FeverLink3 is updated.
-- Trees, plants, rocks and the vegetation eraser are not shared yet; those tools are grayed out during a session. Terrain heights and ground paint are shared.
+- Trees, plants, rocks and the vegetation eraser are shared in a session since 0.2.8. This is new: seen in an automated test with two game windows on one PC, not yet between two PCs; tell us if the trees look different for someone. Terrain heights and ground paint are shared since 0.2.7.
 - Some extra repair syncs: the game sometimes orders its internal object ids differently on two PCs. FeverLink3 finds this within seconds and repairs it automatically; the cause is being traced.
 - Mods that change the world on their own with a kind of change FeverLink3 cannot share yet still cause extra repair syncs; FeverLink3 names such a mod in a warning.
 - Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).

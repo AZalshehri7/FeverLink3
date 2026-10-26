@@ -1,5 +1,7 @@
 # Game builds that were played and checked: name, PE timestamp, hash of the row the search finds (build_table::row_hash).
 # Generated, never typed: cargo run --release -p feverlink3_native --example verified_line -- <TransportFever3.exe or port report>
-40420 0x6ac50427 6a5ce7a09a6bfcaa
-40423 0x6ad0e4e5 1d7adb39f85df807
-40425 0x6ad9ce10 b07d832cf3c0aca0
+# 2026-10-26: every row grew by the asset brush's engine functions (EngineFns asset_*, tools/addr/asset_sites.py), so the three
+# lines were generated again from the same builds; the earlier fields are unchanged, the new ones have not been played yet.
+40420 0x6ac50427 82d6ef67a5d1854f
+40423 0x6ad0e4e5 4d10b3ff53e0e012
+40425 0x6ad9ce10 4e3b823bde1b76db

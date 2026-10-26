@@ -306,6 +306,39 @@ function A.conInfo(e)
 	return { file = get(c, "fileName"), p = { x = m[13], y = m[14], z = m[15] } }
 end
 
+-- An asset group (trees, plants, rocks): an entity with ASSET_GROUP and a MODEL_INSTANCE_LIST and no CONSTRUCTION (lab run trees1,
+-- 2026-10-25: a tree brush tick's toRemove named three such groups, and the capture refused it with "construction 39569 is not in the
+-- world"). It has no file and no place of its own (its models carry the places), so it travels by key and by a fingerprint of what the
+-- documented API reads of it (api/tealdef: ModelInstanceList.thinInstances {modelId, pos, rot, scale} and fatInstances {modelId,
+-- transf}): every model's name (api.res.modelRep.getName; a model id is the game's own number, which need not be the same on two PCs, the
+-- name is), place, rotation and scale, sorted and hashed. Equal worlds give equal prints; a group that changed between the click and the
+-- stamp gives another one on every game alike. Nil when the entity is not such a group or a model cannot be read.
+function A.assetGroup(e)
+	if A.comp(e, "CONSTRUCTION") ~= nil or A.comp(e, "ASSET_GROUP") == nil then return nil end
+	local list = A.comp(e, "MODEL_INSTANCE_LIST")
+	if list == nil then return nil end
+	local function name(id)
+		local ok, n = pcall(function() return api.res.modelRep.getName(id) end)
+		if ok and type(n) == "string" and n ~= "" then return n end
+	end
+	local parts = {}
+	for _, m in ipairs(A.list(list, "thinInstances")) do
+		local p, n = A.xyz(get(m, "pos")), name(get(m, "modelId"))
+		local rot, scale = get(m, "rot"), get(m, "scale")
+		if not (p and n and type(rot) == "number" and type(scale) == "number") then return nil end
+		parts[#parts + 1] = string.format("t|%s|%.3f,%.3f,%.3f|%.4f|%.4f", n, p.x, p.y, p.z, rot, scale)
+	end
+	for _, m in ipairs(A.list(list, "fatInstances")) do
+		local t, n = A.mat16(get(m, "transf")), name(get(m, "modelId"))
+		if not (t and n) then return nil end
+		for i = 1, 16 do t[i] = string.format("%.4f", t[i]) end
+		parts[#parts + 1] = "f|" .. n .. "|" .. table.concat(t, ",")
+	end
+	if #parts == 0 then return nil end
+	table.sort(parts)
+	return { n = #parts, fp = string.format("%d:%08x", #parts, C.fnv1a(table.concat(parts, ";"))) }
+end
+
 -- the {object entity, kind} pairs a segment carries, in the engine's order
 function A.objectsOf(e)
 	local c = A.comp(e, "BASE_EDGE")
@@ -685,6 +718,7 @@ local function describe(ref)
 	if ref.__ref == "edge" then return "segment " .. (ref.p0 and pkey(ref.p0) or "?") .. " - " .. (ref.p1 and pkey(ref.p1) or "?") end
 	if ref.__ref == "con" then return "construction " .. tostring(ref.file) .. " at " .. (ref.p and pkey(ref.p) or "?") end
 	if ref.__ref == "obj" then return "object " .. tostring(ref.i) .. " of " .. describe(ref.edge) end
+	if ref.__ref == "grp" then return "asset group " .. tostring(ref.key) .. " (" .. tostring(ref.fp) .. ")" end
 	return tostring(ref.__ref) .. " " .. tostring(ref.key)
 end
 
@@ -833,6 +867,23 @@ local function newResolver(ctx)
 	function R.node(ref) return must("node", ref, resolveNode) end
 	function R.edge(ref) return must("segment", ref, resolveEdge) end
 	function R.con(ref) return must("construction", ref, resolveCon) end
+	-- An asset group by its key, and only if its fingerprint (A.assetGroup) is the reference's: a group has no place to search by, and one
+	-- that changed since the click (models added or taken away by another tick) is not the group the tick was made for.
+	function R.grp(ref)
+		return must("asset group", ref, function(r)
+			local e = r.key and ctx.resolve(r.key)
+			if e == nil then return nil end
+			local g = A.assetGroup(e)
+			if g == nil then fail("asset group " .. tostring(r.key) .. " is not in the world (entity " .. tostring(e) .. " is no asset group here)") end
+			if g.fp ~= r.fp then fail("asset group " .. tostring(r.key) .. " changed since the click (fingerprint " .. g.fp .. " here, " .. tostring(r.fp) .. " there)") end
+			return e
+		end)
+	end
+	-- an entity a build removes: a construction, or an asset group
+	function R.rem(ref)
+		if type(ref) == "table" and ref.__ref == "grp" then return R.grp(ref) end
+		return R.con(ref)
+	end
 	function R.obj(ref)
 		local edge = R.edge(ref.edge)
 		local o = A.objectsOf(edge)[ref.i]
@@ -936,6 +987,24 @@ local function newCapture(ctx, opts)
 		m = { __ref = "con", key = cap.keyOf and cap.keyOf(id) or nil, file = info.file, p = copyXYZ(info.p) }
 		cap.memo["c" .. id] = m
 		return m
+	end
+
+	-- an asset group (A.assetGroup): its key and fingerprint
+	function cap.grp(id)
+		if type(id) ~= "number" or id < 0 then fail("an asset group reference is not an entity id") end
+		local m = cap.memo["g" .. id]
+		if m then return m end
+		local g = A.assetGroup(id)
+		if not g then fail("asset group " .. id .. " is not in the world") end
+		m = { __ref = "grp", key = cap.keyOf and cap.keyOf(id) or ("s:" .. id), fp = g.fp }
+		cap.memo["g" .. id] = m
+		return m
+	end
+
+	-- an entity a proposal removes: a construction, or an entity without a CONSTRUCTION component that is an asset group
+	function cap.rem(id)
+		if type(id) == "number" and id >= 0 and not A.conInfo(id) and not cap.known.cons[id] and A.assetGroup(id) then return cap.grp(id) end
+		return cap.con(id)
 	end
 
 	-- an existing edge object is named by the segment that carries it and its rank there (object ids differ
@@ -1278,7 +1347,7 @@ local function captureRecord(proposal, cap)
 
 	for i, ce in ipairs(A.list(proposal, consKey)) do rec.cons[i] = readConstruction(ce, cap) end
 	local remIds = A.list(proposal, remKey)
-	for i, e in ipairs(remIds) do rec.rem[i] = cap.con(removedId(e)) end
+	for i, e in ipairs(remIds) do rec.rem[i] = cap.rem(removedId(e)) end
 	cap.hasCons = #rec.cons + #rec.rem > 0
 	-- old2new maps a removed construction to what replaces it; as a table keyed by entity ids it cannot travel, so it
 	-- travels as pairs of ranks in the remove list
@@ -2133,7 +2202,7 @@ local function constructionLists(rec, R)
 	for i, c in ipairs(rec.cons) do cons[i] = newConstructionEntity(c, R) end
 	local trace = C.tracer("build")
 	for i, ref in ipairs(rec.rem) do
-		rem[i] = R.con(ref)
+		rem[i] = R.rem(ref)
 		trace("build.removal", string.format("%d of %d: key=%s file=%s -> entity %s", i, #rec.rem, tostring(ref.key), tostring(ref.file), tostring(rem[i])))
 	end
 	for _, pair in ipairs(rec.old2new) do
@@ -2574,6 +2643,7 @@ local function okRef(r, kind)
 		return okPos(r.p0) and okPos(r.p1) and (r.t0 == nil or okPos(r.t0)) and (r.t1 == nil or okPos(r.t1))
 	end
 	if kind == "con" then return okText(r.file) and okPos(r.p) end
+	if kind == "grp" then return okText(r.key, 120) and okText(r.fp, 40) end
 	if kind == "obj" then return okRef(r.edge, "edge") and isNum(r.i) and r.i >= 1 end
 	return false
 end
@@ -2679,7 +2749,7 @@ local function normalise(rec)
 		if c.params ~= nil and not plainDepth(c.params, 0, budget) then return nil, "construction " .. i .. ": bad parameters" end
 		if not okOwner(c.owner) then return nil, "construction " .. i .. ": bad owner" end
 	end
-	for i, r in ipairs(rec.rem) do if not okRef(r, "con") then return nil, "removed construction " .. i .. ": bad reference" end end
+	for i, r in ipairs(rec.rem) do if not (okRef(r, "con") or okRef(r, "grp")) then return nil, "removed entity " .. i .. ": bad reference" end end
 	for i, p in ipairs(rec.old2new) do
 		if type(p) ~= "table" or not isNum(p[1]) or p[1] < 1 or p[1] > #rec.rem or not plainDepth(p[2], 0, budget) then return nil, "old2new " .. i .. ": bad entry" end
 	end
@@ -3889,7 +3959,78 @@ function M.decodeTerrain(body, ctx)
 	return { n = 4, p, c, false, true, inject = { text = t.cells, terrain = { x0 = x0, y0 = y0, w = w, h = h, paint = t.paint == true } } }
 end
 
+-- A shared tree, plant or rock tick (owner decision 2026-10-26, option A of DESIGN_DECISIONS; the bridge's X.shipAssets, native
+-- assets.rs): the asset groups it removes travel as references (key and fingerprint, checked here against this game's own world: a group
+-- that changed since the click refuses the tick on every game alike), the groups it adds as the module's text, never read or rebuilt by
+-- a script. Every game sends the documented carrier makeWorldBuildProposalCmd(Proposal{toRemove, old2new}, Context{player},
+-- ignoreErrors, true) (api/tealdef: Proposal.new, toRemove : {Entity}, old2new : {Entity : integer}, Context.new; the flag as the tool's
+-- own command had it). The Proposal's ConstructionEntity has no constructor in the API (a SimpleProposal construction needs a file), so
+-- the inject order (`inject.assets`) has the module build the groups into the carrier's toAdd with the engine's own functions and read
+-- them back; a game whose module cannot refuses the tick (nothing applied there; the host sees the verdicts differ and repairs).
+M.ASSETS_MAX_REMOVE = 256   -- the module's own bound (assets.rs MAX_REMOVE)
+
+function M.decodeAssets(body, ctx)
+	local a = body.assets
+	if type(a.text) ~= "string" or a.text == "" or #a.text > LIMIT.bytes then return nil, "a tick without its groups" end
+	if type(a.rem) ~= "table" or #a.rem > M.ASSETS_MAX_REMOVE or type(a.o2n) ~= "table" or #a.o2n > #a.rem then return nil, "a tick with malformed removals" end
+	if not (ctx and ctx.canAssets) then
+		return nil, "inject_refused: this game's native module cannot build asset groups (nothing is applied here)"
+	end
+	local R = newResolver(ctx)
+	local ids, seen = {}, {}
+	for i, ref in ipairs(a.rem) do
+		if not okRef(ref, "grp") then return nil, "removed asset group " .. i .. ": bad reference" end
+		ids[i] = R.grp(ref)
+		if seen[ids[i]] then return nil, "removed asset group " .. i .. " is named twice" end
+		seen[ids[i]] = true
+	end
+	local map = {}
+	for i, pair in ipairs(a.o2n) do
+		local rank, index = type(pair) == "table" and pair[1], type(pair) == "table" and pair[2]
+		if not (isNum(rank) and isNum(index) and ids[rank] and index >= 0 and index == floor(index)) then return nil, "old2new " .. i .. ": bad entry" end
+		map[ids[rank]] = index
+	end
+	local p = api.type.Proposal.new()
+	p.toRemove = ids
+	p.old2new = map
+	local c = api.type.Context.new()
+	c.player = ctx.player or A.player()
+	log("build assets: " .. #ids .. " asset group(s) removed, " .. #a.o2n .. " old2new: the carrier, the module builds the originator's groups into it")
+	return { n = 4, p, c, a.ie == true, true, inject = { text = a.text, assets = { ids = ids, o2n = #a.o2n } } }
+end
+
+-- The originator: the module's text of a tick (assets.rs `encode`: `flags`, `remove`, `old2new` lines and the groups) as the record
+-- that travels: the removed groups as references of this game's world (cap.grp, the same reference kind every build uses for an
+-- asset group), old2new as (rank in the removals, index of the added group), the tool's ignoreErrors, and the text itself.
+function M.assetRecord(text, keyOf)
+	local ie = text:match("\nflags [01] ([01]) [01]\n")
+	local rm = text:match("\nremove (%d+)[^\n]*\n")
+	if not ie or not rm then return nil, "the tick's text has no flags or remove line" end
+	local ids = {}
+	for v in (text:match("\nremove %d+ ([%d ]+)\n") or ""):gmatch("%d+") do ids[#ids + 1] = tonumber(v) end
+	if #ids ~= tonumber(rm) or #ids > M.ASSETS_MAX_REMOVE then return nil, "the tick's remove line does not hold its count" end
+	local cap = newCapture({ keyOf = keyOf }, {})
+	local rank, refs = {}, {}
+	for i, e in ipairs(ids) do
+		refs[i] = cap.grp(e)
+		rank[e] = i
+	end
+	local o2n = {}
+	for k, v in (text:match("\nold2new %d+ ([%d: ]+)\n") or ""):gmatch("(%d+):(%d+)") do
+		local r = rank[tonumber(k)]
+		if not r then return nil, "old2new names " .. k .. ", which the tick does not remove" end
+		o2n[#o2n + 1] = { r, tonumber(v) }
+	end
+	table.sort(o2n, function(x, y) return x[1] < y[1] end)
+	return { rem = refs, o2n = o2n, ie = ie == "1", text = text }
+end
+
 local function decodeBuild(body, ctx)
+	if type(body) == "table" and type(body.assets) == "table" then
+		local okA, args, whyA = pcall(M.decodeAssets, body, ctx)
+		if okA then return args, whyA end
+		return nil, "the asset record could not be read: " .. tostring(args)
+	end
 	if type(body) == "table" and type(body.terrain) == "table" then
 		local okT, args, whyT = pcall(M.decodeTerrain, body, ctx)
 		if okT then return args, whyT end

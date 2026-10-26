@@ -386,6 +386,7 @@ impl<H> HoldMachine<H> {
             | CtlMessage::SendDone { .. }
             | CtlMessage::TerrainApply { .. }
             | CtlMessage::TerrainShare { .. }
+            | CtlMessage::AssetsApply { .. }
             | CtlMessage::Pace { .. } => {} // taken by the runtime before the machine (cmd_patch.rs, inject, terrain.rs, pace.rs)
         }
     }

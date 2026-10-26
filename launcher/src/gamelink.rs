@@ -222,6 +222,10 @@ pub struct GenWriter {
     /// Lines written again at the top of every new generation (for a reader that starts there; one that comes
     /// through the rotation skips them, see the module documentation).
     header: String,
+    /// Lines a failed append could not write (a full disk, lab trees-speed3 2026-10-26: "cannot write to_game.log ... os error 112"
+    /// while the clocks after it got through, so the guest ran past the stamp of an action it never received and drifted). They stay
+    /// here, in order, and go first at the next append: a later line (a clock, an action) never overtakes one that was not written.
+    pending: String,
 }
 
 impl GenWriter {
@@ -237,6 +241,7 @@ impl GenWriter {
             rotate_bytes: ROTATE_BYTES,
             keep: KEEP_GENERATIONS,
             header: String::new(),
+            pending: String::new(),
         })
     }
 
@@ -271,14 +276,33 @@ impl GenWriter {
         self.header = text;
     }
 
-    /// Appends complete lines with one `write`. A full generation is ended first.
+    /// Appends complete lines with one `write`. A full generation is ended first. On an error nothing is lost: the lines stay
+    /// pending (a partly written tail is cut off again) and are written, before anything newer, by the next append.
     pub fn append(&mut self, text: &str) -> io::Result<()> {
+        self.pending.push_str(text);
         if self.size > 0 && self.size >= self.rotate_bytes {
             self.rotate()?;
         }
-        OpenOptions::new().create(true).append(true).open(self.path())?.write_all(text.as_bytes())?;
-        self.size += text.len() as u64;
+        let written = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path())
+            .and_then(|mut f| f.write_all(self.pending.as_bytes()));
+        if let Err(e) = written {
+            // a reader must never see half a line that is written again whole later
+            if let Ok(f) = OpenOptions::new().write(true).open(self.path()) {
+                let _ = f.set_len(self.size);
+            }
+            return Err(e);
+        }
+        self.size += self.pending.len() as u64;
+        self.pending.clear();
         Ok(())
+    }
+
+    /// Bytes of lines not yet written (see [`GenWriter::append`]).
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.len()
     }
 
     /// Ends the current generation and starts the next. The header goes into the next file first, so a reader that
@@ -765,6 +789,49 @@ mod tests {
         assert!(parts[1].parse::<u64>().is_ok());
         assert_eq!(parts[2].len(), 8);
         assert_eq!(sessions_root().file_name().unwrap(), "feverlink3");
+    }
+
+    #[test]
+    fn a_failed_append_keeps_its_lines_and_writes_them_first_later() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("to_game.log");
+        let mut w = GenWriter::open(base.clone(), "0").unwrap();
+        fs::create_dir(&base).unwrap(); // the file cannot be opened: as a full disk, every append fails
+        assert!(w
+            .append(
+                "action	1	build
+"
+            )
+            .is_err());
+        assert!(w
+            .append(
+                "clock	1	2
+"
+            )
+            .is_err());
+        assert_eq!(
+            w.pending_bytes(),
+            "action	1	build
+clock	1	2
+"
+            .len()
+        );
+        fs::remove_dir(&base).unwrap();
+        w.append(
+            "clock	1	3
+",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&base).unwrap(),
+            "action	1	build
+clock	1	2
+clock	1	3
+",
+            "nothing lost, nothing overtaken"
+        );
+        assert_eq!(w.pending_bytes(), 0);
+        assert_eq!(w.end(), Pos { gen: 1, offset: fs::metadata(&base).unwrap().len() });
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::link::{parse_ctl_line, CtlReader, Event, EventWriter};
 use crate::portable;
 use crate::rebuild;
 
+mod assets;
 mod cmd_patch;
 mod inject;
 mod native_copy;
@@ -115,6 +116,8 @@ pub struct Runtime {
     inject: crate::inject::State,
     /// Terrain height edits shared at the stamp (`terrain.rs`): the tools' commands noted at `Add`, the carriers' orders.
     terrain: crate::terrain::State,
+    /// Tree, plant and rock ticks shared at the stamp (`assets.rs`): the tools' commands noted at `Add`, the carriers' orders.
+    assets: crate::assets::State,
     inject_settings: OnceLock<portable::Settings>,
     inject_dir_path: Mutex<Option<std::path::PathBuf>>,
     /// The commands the command list's `Add` carried an order out on (the interface half's script commands), by the order's number,
@@ -239,6 +242,7 @@ impl Runtime {
             refused_text: crate::input::InputOut::with_prefix("native_refused_"),
             inject: Default::default(),
             terrain: Default::default(),
+            assets: Default::default(),
             inject_settings: OnceLock::new(),
             inject_dir_path: Mutex::new(None),
             added: Mutex::new(Default::default()),
@@ -763,6 +767,9 @@ impl Runtime {
         if self.terrain_ready() {
             hook_names.push(crate::terrain::READY_NAME.to_string()); // `terrain_share` and `terrain_apply`: height edits at the stamp
         }
+        if self.assets_ready() {
+            hook_names.push(crate::assets::READY_NAME.to_string()); // `assets_apply`: tree, plant and rock ticks at the stamp
+        }
         let ready = Event::Ready {
             build: self.build.name.to_string(),
             version: self.version.to_string(),
@@ -849,6 +856,9 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::TerrainApply { key, x0, y0, w, h, ttl }) => {
                     self.terrain_arm(key, crate::terrain::Header { x0, y0, w, h }, ttl, now)
                 }
+                Ok(crate::link::CtlMessage::AssetsApply { key, ids, o2n, ttl }) => {
+                    self.assets_arm(key, ids, o2n, ttl, now)
+                }
                 Ok(crate::link::CtlMessage::TerrainShare { on }) => self.terrain_share(on),
                 _ => rest.push(line),
             }
@@ -869,6 +879,9 @@ impl Runtime {
                 Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
                 Ok(crate::link::CtlMessage::TerrainApply { key, x0, y0, w, h, ttl }) => {
                     self.terrain_arm(key, crate::terrain::Header { x0, y0, w, h }, ttl, now)
+                }
+                Ok(crate::link::CtlMessage::AssetsApply { key, ids, o2n, ttl }) => {
+                    self.assets_arm(key, ids, o2n, ttl, now)
                 }
                 Ok(crate::link::CtlMessage::TerrainShare { on }) => self.terrain_share(on),
                 Ok(crate::link::CtlMessage::HoldOff) => {
@@ -943,6 +956,7 @@ impl Runtime {
         }
         events.extend(self.patch.drain_events(now));
         self.terrain_expire(now);
+        self.assets_expire(now);
         events.extend(self.inject.drain_events(now));
         for id in self.watch.expire(now) {
             events.push(Event::Error {
@@ -1038,6 +1052,7 @@ impl Runtime {
             dump: None,
             preview: None,
             tool: false,
+            asset_tick: false,
             passed: None,
         };
         let hold = match crate::log::guarded("add hook", || self.plan_add(&args, caller, add.is_some(), &mut plan)) {
@@ -1128,6 +1143,7 @@ impl Runtime {
             return args.out;
         }
         self.terrain_note_add(&args);
+        self.assets_note_add(&args, plan.tool && !plan.asset_tick);
         // both call the engine when an order is carried out: they guard their own bookkeeping
         if self.inject.enabled() {
             self.inject_on_add(&args, caller);
@@ -1180,7 +1196,9 @@ impl Runtime {
         self.ingest(&mut machine, now);
         plan.due = machine.take_due(self.game_time(), now);
 
-        if let (Some(rva), Some(_)) = (site, tool) {
+        // a tree, plant or rock placed by a tool on the hold list goes the brush's way, not held (runtime/assets.rs)
+        plan.asset_tick = tool.is_some() && self.assets_tool_tick(args);
+        if let (Some(rva), Some(_), false) = (site, tool, plan.asset_tick) {
             // SAFETY: the kind is read only from readable memory.
             if let Some(kind) = unsafe { engine::command_kind(args.cmd, engine.kind_offset) } {
                 let admit = machine.admit(kind, now);
@@ -1331,8 +1349,9 @@ impl Runtime {
         .flatten();
         // the orders of `inject_next` / `patch_next`: the script's command passes here, not the command list's `Add` (see apply_orders)
         let mut used = None;
-        // a terrain tool's command, a carrier of a shared edit: this module's alone (calls the engine when it empties one)
-        let terrain = claimed.is_none() && self.terrain_on_apply(cmd);
+        // a terrain or asset tool's command, a carrier of a shared edit or tick: this module's alone (calls the engine when it empties one
+        // or builds a carrier's asset groups)
+        let terrain = claimed.is_none() && (self.assets_on_apply(cmd) || self.terrain_on_apply(cmd));
         if !terrain && (self.inject.enabled() || self.patch.enabled()) {
             let mine = crate::log::guarded("apply hook (orders)", || {
                 let kind_offset = self.build.kind_offset.unwrap_or(0) as usize;
@@ -1455,6 +1474,8 @@ struct AddPlan {
     preview: Option<(crate::hold::HoldId, usize)>,
     /// The command comes from a construction tool's call site (known before anything can fail).
     tool: bool,
+    /// The tool's command is an asset tick ([`Runtime::assets_tool_tick`]): not held, it goes the brush's way.
+    asset_tick: bool,
     /// Why a tool's command that holding should have taken goes to the engine at the click (a fault, `failsafe.rs`).
     passed: Option<&'static str>,
 }

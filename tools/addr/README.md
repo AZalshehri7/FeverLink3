@@ -158,6 +158,19 @@ displacements moved (the module follows them instead of comparing them).
 40425 to 40420 (`out/port-6ad9ce10-6ac50427.txt`, made with the sites read from the 40420 to 40425 report): every site
 back at its 40420 place, the same row as the first port's old side.
 
+### Sites with no earlier report: `asset_sites.py`
+
+A site the committed reports do not have yet cannot be carried from them. The engine functions of the shared asset brush
+(`EngineFns asset_*`: `ConstructionEntity()` and its copy, destructor and reallocating insert, the subconstructions' resize, the
+element's `emplace_back`, the models' `assign`, and the two builders whose code proves the offsets the module writes) are found in the
+old executable by `asset_sites.py`: the assertion texts `UI::AssetGroupRecycler::MakeRemoveAssetsProposal` /
+`MakeBuildAssetsProposal` name the two builders, and inside the remover each function is the one call the code around it singles out
+(the `+0x4b1` flag after the constructor, the resize of `+0xa30` to one, the calls after `add rcx,0x210` / `add rcx,0x140`, the copy
+followed by `end += 0xe48`, ...); every rule must hold exactly once. `port_build.py` adds what is missing before the layout witnesses
+and says so in the report's second line; from then on the reports carry them like any other site. 2026-10-26: derived in 40420, 40423
+and 40425 (the 40425 values are those of `docs/research/TREES_NATIVE_RESEARCH_20261026.md`), every port exact, the three reports, the
+proof and the verified lines generated again (the earlier fields unchanged; the new functions not yet played).
+
 ### The same proof at game start: `--export-proof`
 
 ```

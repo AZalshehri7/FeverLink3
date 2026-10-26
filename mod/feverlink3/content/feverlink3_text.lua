@@ -65,10 +65,16 @@ T.MSG = {
 		"Stations and depots are still experimental in a session: one you build may not appear for the other players." },
 	-- terrain and vegetation tools are switched off for the session
 	terrain_off = { "info",
-		"Landscaping tools that cannot be shared yet (such as trees, plants and rocks) are grayed out during a session." },
+		"Landscaping tools that cannot be shared right now are grayed out for a moment (for example while the world is being reloaded)." },
 	-- raise, lower, flatten and smooth are shared (native terrain.rs); new and not yet tried much in a real game
 	terrain_shared = { "info",
 		"Raise, lower, flatten, smooth and roughen now work in a session and are shared with the other players. This is new: tell us if the ground looks different for someone." },
+	-- tree, plant and rock brushes and the eraser are shared (native assets.rs); new and not yet tried in a real game
+	assets_shared = { "info",
+		"Trees, plants, rocks and the vegetation eraser now work in a session and are shared with the other players. This is new: tell us if the trees look different for someone." },
+	-- a tree, plant or rock change that could not be shared was applied nowhere
+	assets_refused = { "warn",
+		"A tree, plant or rock change could not be shared with the other players, so it was not applied. Try again." },
 	-- a terrain change that could not be shared was applied nowhere
 	terrain_refused = { "warn",
 		"A terrain change could not be shared with the other players, so it was not applied. Try again, or with a smaller brush." },

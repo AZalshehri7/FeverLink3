@@ -29,7 +29,10 @@ cargo test -p feverlink3_native -- --test-threads=1 --include-ignored
 $env:FEVERLINK3_FULL_TESTS = '1'; python -I -m unittest discover -s tests/lua -p "test_*.py"
 ```
 
-A tight wall-clock test of the full set can fail on a busy PC; run it again alone before taking it for a regression.
+A tight wall-clock test of the full set can fail on a busy PC; run it again alone before taking it for a regression. For the
+same reason the full lupa set runs in one process, while the essential set runs on every core (`python -I
+tests/lua/run_parallel.py`, as CI does; the same tests as `discover`). `tools/check.ps1` runs every suite with a summary
+table (`-Full` for the full set).
 
 ## The signing key
 

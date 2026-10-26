@@ -92,4 +92,4 @@ The module links Rust's `std` for `Vec`, `String`, threads and file logging, and
 
 ## Status
 
-Implemented and tested without the game, off by default, **not yet run in the game**: the counters, the hold/release hook, the control link, the single-worker script pool. Nothing the build search finds has been installed in a running game yet; `docs/NATIVE_LINK.md` section 8 is the checklist, with the log lines to look for, in the order to try them. See `docs/ROADMAP.md` stage 0.3.
+Running in the real game in every session: the counters, the hold/release hook, the control link and the single-worker script pool (played over Steam between two PCs, and on builds 40423 and 40425 in two game windows on one PC). Since 0.2.7 the build search finds their places at start (seen on 40425 in two game windows: "every site found by search"). The tree, plant and rock carrier (`assets.rs`, 0.2.8) has run only in the lab's two game windows on one PC so far. Not run in the game: the diagnostic and experimental pieces in the table above (town seed, growth log and growth seed). `docs/NATIVE_LINK.md` section 8 lists the log lines to look for. See `docs/ROADMAP.md`.

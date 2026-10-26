@@ -36,6 +36,8 @@ impl Runtime {
     }
 
     pub(super) fn terrain_share(&self, on: bool) {
+        // one switch for the landscaping tools the module carries: the asset brushes follow it where the module can carry them
+        self.assets_share(on);
         if self.terrain.set_share(on) {
             self.say(&format!(
                 "terrain: sharing height edits {}",
@@ -296,7 +298,7 @@ impl Runtime {
     }
 
     /// Empties the command's Proposal with the engine's own functions (`inject::neutralise`). False when it could not.
-    fn terrain_empty(&self, payload: usize, what: &str) -> bool {
+    pub(super) fn terrain_empty(&self, payload: usize, what: &str) -> bool {
         let sane = crate::log::guarded("terrain: check", || inj::is_proposal(&LiveMem, payload))
             .unwrap_or_else(|| Err("a panic".into()));
         let fns = nc::ProposalFns::at(self.base, &self.build.engine);

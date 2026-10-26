@@ -24,7 +24,7 @@
 //!         +0x78 = `w * h`). [The lab run landscape-probe-20261025 run3, ground paint tool, 3 strokes: e.g. header -575,-500 130x120,
 //!         15600 cell bytes (0xff where untouched), 1952 mask bytes (488 words), bit count 15600; the height grid zero.]
 //! Any other shape is refused with its bytes in the reason, never guessed (the tree, plant and rock brushes do not use this member:
-//! their commands add constructions, which this module does not carry).
+//! their commands remove and add asset groups, which `assets.rs` carries).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

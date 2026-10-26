@@ -4,7 +4,7 @@ title: FeverLink3 FAQ
 
 # Frequently asked questions
 
-Last updated 2026-10-22, for version 0.2.1. [Back to the start page](../index.html)
+Last updated 2026-10-26, for version 0.2.8. [Back to the start page](../index.html)
 
 ## The project
 
@@ -56,7 +56,7 @@ Yes. The game names a new industry in each player's own language (for example "C
 Yes. Without a session the game plays as it always does.
 
 **Are terrain editing, ground paint and trees shared?**
-Terrain heights and ground paint are, since 0.2.7: raise, lower, flatten, smooth, roughen and the ground paint are shared with the other players (seen in two game windows on one PC). Trees, plants, rocks and the vegetation eraser are not shared yet, so they are grayed out during a session. Everything else in the game works as usual.
+Terrain heights and ground paint are, since 0.2.7: raise, lower, flatten, smooth, roughen and the ground paint are shared with the other players (seen in two game windows on one PC). Trees, plants, rocks and the vegetation eraser are shared too, since 0.2.8. This is new: seen in an automated test with two game windows on one PC, not yet between two PCs, so tell us if the trees look different for someone. Everything else in the game works as usual.
 
 **What happens when the game updates?**
 Every player in a session needs the same game version. On a game build FeverLink3 does not know yet, it switches its hooks off instead of risking your game, and the FeverLink3 window says that an update of FeverLink3 is needed; hosting is refused, and a host refuses such a player with the reason. Since 0.2.7 FeverLink3 searches a new game build for the places it needs at every start, so it often keeps working after a game update; only when it cannot prove every place does it stay off until an update of FeverLink3 (builds 40420, 40423 and 40425 are confirmed). If the game does not start at all after an update, delete `winhttp.dll` from the game folder.

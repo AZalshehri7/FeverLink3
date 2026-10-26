@@ -34,7 +34,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 [size=4][b]Not yet[/b][/size]
 
 [list]
-[*]Trees, plants and rocks are not shared yet; those tools are grayed out during a session. Terrain heights and ground paint are shared.
+[*]Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone. Terrain heights and ground paint are shared since 0.2.7.
 [*]Mods that change the world on their own (for example an automatic line namer) cause extra syncs. FeverLink3 names them in a warning; turn their automatic changes off while playing together.
 [*]Coming back after a short drop without a reload, and separate companies for each player, are planned.
 [/list]

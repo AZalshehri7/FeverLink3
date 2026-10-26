@@ -3,7 +3,7 @@ resolver = "2"
 members = ["core", "native", "launcher", "tools/release"]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 publish = false

@@ -556,7 +556,7 @@ fn write_to_game(link: &mut gamelink::Session, shared: &Shared, kind: MessageKin
     match to_game_line(kind, payload) {
         Some((name, from, lua)) => {
             if let Err(e) = link.send(name, &from, &lua) {
-                shared.log(format!("cannot write to_game.log: {e}"));
+                shared.log(format!("cannot write to_game.log: {e}; the line is kept and written first at the next try (nothing later overtakes it, the game waits)"));
             }
         }
         None => shared.log(format!(

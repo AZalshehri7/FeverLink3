@@ -989,6 +989,7 @@ local function simCtx(st, it)
 	ctx.canInject = NATIVE_INJECT and caps.inject == true
 	ctx.canPatch = NATIVE_PATCH and caps.patch == true
 	ctx.canTerrain = caps.terrain == true
+	ctx.canAssets = caps.assets == true
 	return ctx
 end
 
@@ -1788,6 +1789,20 @@ local function sendInjectOrder(inj, key, held, tm, refuse)
 		traceSim("build.inject", string.format("%s terrain_apply key=%s %dx%d cells at %d,%d (%d bytes of text) %s", tostring(key), C.integerText(n), t.w, t.h, t.x0, t.y0,
 			#inj.text, X.ctlWritten(okT, errT)))
 		return okT, errT, n
+	end
+	if type(inj.assets) == "table" then
+		-- a shared tree, plant or rock tick (native assets.rs): the module's text goes to native_assets_in_<n>.txt, then `assets_apply`; the
+		-- module builds its groups into the carrier this game sends next and answers under the same key (injected / inject_refused)
+		local a = inj.assets
+		local okA, errA = pcall(function()
+			if not C.writeFile(C.path("native_assets_in_" .. C.integerText(n) .. ".txt"), inj.text) then error("cannot write the tick's file", 0) end
+			-- the carrier is told apart from every other build by exactly these ids (this game's own, as the decode resolved them)
+			local sent, why = X.ctlSend("assets_apply", { key = n, ids = a.ids, o2n = a.o2n })
+			if not sent then error(why, 0) end
+		end)
+		traceSim("build.inject", string.format("%s assets_apply key=%s ids=%s o2n=%d (%d bytes of text) %s", tostring(key), C.integerText(n), table.concat(a.ids, ","), a.o2n,
+			#inj.text, X.ctlWritten(okA, errA)))
+		return okA, errA, n
 	end
 	local refund = type(inj.refund) == "table" and #inj.refund > 0 and inj.refund or nil
 	local ok, err = pcall(function()
@@ -3189,7 +3204,7 @@ function handleEvent(userParams, state, src, id, name, param)
 			markReplay(st, engine.gameTime(), nil, type(param) == "table" and type(param.key) == "string" and param.key or nil)
 		elseif name == "nativecaps" and type(param) == "table" then
 			-- into the game-script state: this event reaches one simulation state, every state's stamps decode with them (simCtx)
-			st.caps = { patch = param.patch == true, inject = param.inject == true, terrain = param.terrain == true, wall0 = type(param.wall0) == "number" and param.wall0 or nil }
+			st.caps = { patch = param.patch == true, inject = param.inject == true, terrain = param.terrain == true, assets = param.assets == true, wall0 = type(param.wall0) == "number" and param.wall0 or nil }
 		elseif name == "heldinput" and type(param) == "table" and type(param.text) == "string" then
 			-- the input-level text of a held command whose record is read after the build ran (the interface half cannot capture it)
 			st.heldInput = { text = param.text, wall = C.clock() }
@@ -3627,6 +3642,7 @@ local function guiCtx(it)
 	ctx.canPatch = NATIVE_PATCH and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.patch == true
 	ctx.canInject = NATIVE_INJECT and G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.inject == true
 	ctx.canTerrain = G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.terrain == true
+	ctx.canAssets = G.nat ~= nil and G.nat.ready ~= nil and G.nat.ready.assets == true
 	return ctx
 end
 
@@ -6180,7 +6196,7 @@ local function natEvent(N, rec, p, history)
 		local w, c = tonumber(detail:match("wall=(%d+)")), tonumber(detail:match("clock=(%-?%d+)"))
 		if w and c then
 			X.WALL0 = w - c
-			pcall(toSim, "nativecaps", { patch = N.ready and N.ready.patch, inject = N.ready and N.ready.inject, terrain = N.ready and N.ready.terrain, wall0 = X.WALL0 })
+			pcall(toSim, "nativecaps", { patch = N.ready and N.ready.patch, inject = N.ready and N.ready.inject, terrain = N.ready and N.ready.terrain, assets = N.ready and N.ready.assets, wall0 = X.WALL0 })
 			traceGui("build.timing", string.format("clock wall0=%.0f (native wall=%.0f clock=%.0f; this script's C.clock()=%.3f -> wall %.0f)", X.WALL0, w, c, C.clock(), X.wallNow()))
 		end
 		return
@@ -6195,8 +6211,9 @@ local function natEvent(N, rec, p, history)
 			if h == "defer" then N.ready.defer = true end
 			if h == "batch_pace" then N.ready.pace = true end   -- native pace.rs: `pace` lines stretch the batch interval
 			if h == "terrain_apply" then N.ready.terrain = true end   -- native terrain.rs: `terrain_share` and `terrain_apply`
+			if h == "assets_apply" then N.ready.assets = true end   -- native assets.rs: tree, plant and rock ticks (follow `terrain_share`)
 		end
-		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, terrain = N.ready.terrain, wall0 = X.WALL0 })
+		pcall(toSim, "nativecaps", { patch = N.ready.patch, inject = N.ready.inject, terrain = N.ready.terrain, assets = N.ready.assets, wall0 = X.WALL0 })
 		N.hookOk = false
 		for _, h in ipairs(hooks) do
 			if h == "command_list_add" then N.hookOk = true end
@@ -6252,6 +6269,11 @@ local function natEvent(N, rec, p, history)
 	elseif kind == "terrain_refused" then
 		natSay("terrain: an edit was refused by the native module: " .. tostring(p.reason))
 		pcall(X.noticeLocal, "terrain_refused")
+	elseif kind == "assets" then
+		pcall(X.shipAssets, p)
+	elseif kind == "assets_refused" then
+		natSay("assets: a tick was refused by the native module: " .. tostring(p.reason))
+		pcall(X.noticeLocal, "assets_refused")
 	elseif kind == "injected" or kind == "inject_refused" then
 		traceGui("build.inject", kind .. " " .. tostring(pcall(C.serialize, p) and C.serialize(p) or "?"))
 		if kind == "inject_refused" then X.onInjectRefused(p) elseif tonumber(p.key) then X.injectAnswered(tonumber(p.key), false) end
@@ -7716,7 +7738,7 @@ local function guiUpdate(userParams, state, guiState)
 		logGui("started: player " .. tostring(C.PLAYER_ID) .. " (" .. C.PLAYER_NAME .. ") dir " .. C.DIR)
 	end
 	if G.frames % 20 == 0 then devPoll("gui") end
-	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject or G.nat.ready.terrain) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject, terrain = G.nat.ready.terrain, wall0 = X.WALL0 }) end
+	if G.frames % 60 == 0 and G.nat and G.nat.ready and (G.nat.ready.patch or G.nat.ready.inject or G.nat.ready.terrain) then pcall(toSim, "nativecaps", { patch = G.nat.ready.patch, inject = G.nat.ready.inject, terrain = G.nat.ready.terrain, assets = G.nat.ready.assets, wall0 = X.WALL0 }) end
 	local ok, err = pcall(function()
 		pcall(X.frameStart)
 		readLink()
@@ -7793,14 +7815,29 @@ local seenOtherEvents, seenOtherN = {}, 0
 -- pause (no town grows) 6 s after the vegetation menu opened; their entities were freed and new ones made on the host alone, and the
 -- `freeq` repairs followed. That they came from the vegetation tools is inferred from that timing, not seen in the game.
 -- (owner 2026-10-25: MPFever rebuilds brush trees with its own construction on the other games, so the worlds differ; off until shared)
+-- Since 2026-10-26 (owner decision, option A) the vegetation tools are enabled too while the share is on, but only where the native
+-- module says it can build their ticks (`assets_apply` in its hooks: native assets.rs builds the groups with the engine's own functions);
+-- a game whose module cannot keeps them switched off as before.
 X.LANDSCAPING_OFF = { "landscaping_terrain", "landscaping_vegetation" }
 local TERRAIN_CARRIED = { "terrain_raise_tool.res", "terrain_lower_tool.res", "terrain_flatten_tool.res", "terrain_smooth_tool.res",
 	"terrain_heightmap_tool.res" }
+local ASSETS_CARRIED = { "mixed_trees_tool.res", "mixed_plants_tool.res", "mixed_rocks_tool.res", "vegetation_eraser_tool.res" }
 
 function X.terrainCarried(id)
-	if not id:find("landscaping_terrain", 1, true) then return false end
+	local names
+	if id:find("landscaping_terrain", 1, true) then
+		names = TERRAIN_CARRIED
+	elseif id:find("landscaping_vegetation", 1, true) and G.assetsShared then
+		names = ASSETS_CARRIED
+	else
+		return false
+	end
 	if id:sub(-4) == ".tab" or id:sub(-10) == ".indicator" then return true end
-	for _, name in ipairs(TERRAIN_CARRIED) do
+	-- the vegetation menu's model tiles (`landscaping_vegetation.::/assets/.../x.mdl`: the tree, plant or rock a brush places); they
+	-- pick what the carried brushes plant, and were switched off with the share on (lab v028-trees-drag 2026-10-26: no plant or rock
+	-- brush could be picked)
+	if names == ASSETS_CARRIED and id:find(".::/assets/", 1, true) then return true end
+	for _, name in ipairs(names) do
 		if id:find("/" .. name, 1, true) then return true end
 	end
 	return false
@@ -7836,13 +7873,18 @@ function X.terrainShareOn(N)
 	if not (C.ACTIVE and N and N.ready and N.ready.terrain) then return end
 	if not natSend("terrain_share", { on = true }) then return end
 	G.terrainShared = true
+	G.assetsShared = N.ready.assets == true or nil   -- the module shares asset ticks with the same switch where it can (assets.rs)
 	for id in pairs(G.terrainOff or {}) do
 		if X.terrainCarried(id) and pcall(api.gui.byId.setEnabled, id, nil, true) then G.terrainOff[id] = nil end
 	end
-	natSay("terrain: height edits are shared (raise, lower, flatten, smooth, roughen)")
+	natSay("terrain: height edits are shared (raise, lower, flatten, smooth, roughen)" .. (G.assetsShared and "; tree, plant and rock ticks too" or ""))
 	if not G.terrainSharedTold then
 		G.terrainSharedTold = true
 		pcall(X.noticeLocal, "terrain_shared")
+	end
+	if G.assetsShared and not G.assetsSharedTold then
+		G.assetsSharedTold = true
+		pcall(X.noticeLocal, "assets_shared")
 	end
 end
 
@@ -7850,7 +7892,7 @@ end
 -- off again where an event names them, never left to apply on this game alone
 function X.terrainShareOff()
 	if not G.terrainShared then return end
-	G.terrainShared = nil
+	G.terrainShared, G.assetsShared = nil, nil
 	for id in pairs(G.terrainSeen or {}) do pcall(X.terrainGate, id) end
 	G.terrainSeen = nil
 	natSay("terrain: height edits are not shared any more (holding is off): the terrain tools are switched off again")
@@ -7884,6 +7926,39 @@ function X.shipTerrain(p)
 	send("action", { stamp = at, seq = G.seq, body = wire, category = "build", pause = it.pause })
 	logGui(string.format("terrain edit %d: %dx%d = %d height cells at %d,%d%s (%d bytes of text, %d of record) %s stamped %s (now %s, %s step(s) ahead): applied at the stamp on every game, this one too",
 		id, w, h, w * h, x0, y0, paint and ", ground paint" or "", #text, #wire, it.key, C.integerText(at), C.integerText(now), tostring((at - now) / STEP)))
+	X.routeOwn(it)
+end
+
+-- The originator: the module took a tree, plant or rock tick out of its tool's command (applied nowhere yet) and wrote it
+-- (native_assets_out_<id>.txt: the tool's flags, the ids of the asset groups it removes, old2new, the groups it adds). The removed groups
+-- become references of this game's world (Build.assetRecord: key and fingerprint, checked again at the stamp on every game); the tick is
+-- stamped and shipped like every action and queued on this game too: every game, this one included, builds the same groups at the same
+-- stamp (the carrier, Build.decodeAssets), never at the click. A tick that cannot be shipped is applied nowhere and the player is told.
+-- No proof follows the apply: the module's read-back of the carrier stands for it, and the checksums decide the rest (said, not hidden).
+function X.shipAssets(p)
+	local id = tonumber(p.id)
+	local function refuse(why)
+		logGui(string.format("asset tick %s NOT shared: %s; it is applied on no game", tostring(id), why))
+		pcall(X.noticeLocal, "assets_refused")
+	end
+	if not id then return refuse("the module's event is incomplete") end
+	if not C.ACTIVE then return refuse("no session runs") end
+	local okT, text = pcall(C.readFile, C.path("native_assets_out_" .. C.integerText(id) .. ".txt"))
+	if not okT or type(text) ~= "string" or text == "" then return refuse("its file cannot be read") end
+	if not L.permitted(G.perms, "build") then return refuse("this player may not build") end
+	local okR, assets, why = pcall(Build.assetRecord, text, function(e) return L.keyFor(G.rev or {}, e) end)
+	if not okR then assets, why = nil, tostring(assets) end
+	if not assets then return refuse(tostring(why)) end
+	local body = { fn = "makeWorldBuildProposalCmd", args = { n = 4 }, assets = assets, category = "build" }
+	local wire = C.serialize(body)
+	if #wire > ACTION_BODY_MAX then return refuse(string.format("its record (%d bytes) is over the %d bytes an action may have", #wire, ACTION_BODY_MAX)) end
+	local now = engine.gameTime()
+	local at = stampAfterFastest(now)
+	G.seq = G.seq + 1
+	local it = { kind = "action", at = at, from = C.PLAYER_ID, seq = G.seq, body = body, key = L.itemKey(C.PLAYER_ID, G.seq), pause = X.hostStamps(at) or nil }
+	send("action", { stamp = at, seq = G.seq, body = wire, category = "build", pause = it.pause })
+	logGui(string.format("asset tick %d: removes %d group(s) (%d old2new), adds %s group(s) of %s model(s) (%d bytes of text, %d of record) %s stamped %s (now %s, %s step(s) ahead): applied at the stamp on every game, this one too",
+		id, #assets.rem, #assets.o2n, tostring(p.groups), tostring(p.models), #text, #wire, it.key, C.integerText(at), C.integerText(now), tostring((at - now) / STEP)))
 	X.routeOwn(it)
 end
 
@@ -7925,6 +8000,7 @@ function X.terrainRestore()
 	end
 	if n > 0 then logGui("terrain tools: " .. n .. " switched on again (the session ended)") end
 	G.terrainOff, G.terrainTold, G.terrainShared, G.terrainSharedTold, G.terrainSeen = nil, nil, nil, nil, nil
+	G.assetsShared, G.assetsSharedTold = nil, nil
 end
 -- UNDOCUMENTED API (docs/ARCHITECTURE.md section 2, "Undocumented API uses and why"): the `builder.*` event names are the tools' own; the docs
 -- list no GUI event names.

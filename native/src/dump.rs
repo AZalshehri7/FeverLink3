@@ -275,19 +275,18 @@ pub fn element_field(elem: &str, off: usize) -> Option<&'static str> {
         ],
         "ConstructionEntity" => &[
             (0, "desc"),
-            // the construction component is embedded at +0xa18 (0x280 bytes up to transf); its members are those of the
-            // engine's Construction component (binding at 0x1885d30, offsets added to 0xa18): inferred from the size match
-            (0xa18, "construction"),
-            (0xa18 + 0x40, "construction.params"),
-            (0xa18 + 0x58, "construction.transf"),
-            (0xa18 + 0xa0, "construction.frozenNodes"),
-            (0xa18 + 0xb8, "construction.frozenEdges"),
-            (0xa18 + 0xd0, "construction.depots"),
-            (0xa18 + 0xe8, "construction.stations"),
-            (0xa18 + 0x100, "construction.industries"),
-            (0xa18 + 0x118, "construction.townBuildings"),
-            (0xa18 + 0x130, "construction.subconstructions"),
-            (0xa18 + 0x148, "construction.persistentMetadata"),
+            (0x4b1, "desc.autoRemovable"),
+            // +0xa18 is a ConstructionResult (the binding of ConstructionEntity names `construction` there, and the binding of
+            // ConstructionResult gives its members; static research of build 40425, TREES_NATIVE_RESEARCH_20261026 section 2), not the
+            // ecs Construction component this table named before: the subconstructions vector sits at +0xa30 (the 0x318-byte vector of
+            // the trees1 dump), and the old `construction.subconstructions` label at +0xb48 was on two placeholder words
+            (0xa18, "construction.params"),
+            (0xa18 + 0x18, "construction.subconstructions"),
+            (0xa18 + 0x90, "construction.streetTerminal"),
+            (0xa18 + 0x110, "construction.metadata"),
+            (0xa18 + 0x128, "construction.cost"),
+            (0xa18 + 0x138, "construction.maintenanceCost"),
+            (0xa18 + 0x140, "construction.maintenanceCarrier"),
             (0xc98, "transf"),
             (0xcd8, "frozenNodes"),
             (0xcf0, "segmentsBefore"),
@@ -295,9 +294,56 @@ pub fn element_field(elem: &str, off: usize) -> Option<&'static str> {
             (0xe38, "playerEntity"),
             (0xe3c, "setAsHeadquarterHack"),
         ],
+        // the binding of Subconstruction (same research): a tree group's subconstruction holds its models at +0x140 and one 0x48-byte
+        // element at +0x210
+        "Subconstruction" => &[
+            (0x28, "station"),
+            (0x80, "depot"),
+            (0x140, "models"),
+            (0x158, "laneLists"),
+            (0x210, "element(0x48)"),
+            (0x240, "colliders"),
+        ],
+        "TransformedModel" => &[(0, "id"), (0x40, "tag"), (0x60, "transf"), (0xa0, "thin")],
         _ => return None,
     };
+    let off = element_stride(elem).map_or(off, |s| off % s);
     table.iter().find(|(o, _)| *o == off).map(|(_, n)| *n)
+}
+
+/// The stride of an element type whose blocks hold several elements (so that each element's members are named), when it is proven
+/// (`assets.rs`: the remover's `add [rbx+8], 0xe48`, the resize's 0x318, the division by 0xa8).
+fn element_stride(elem: &str) -> Option<usize> {
+    match elem {
+        "ConstructionEntity" => Some(0xe48),
+        "Subconstruction" => Some(0x318),
+        "TransformedModel" => Some(0xa8),
+        _ => None,
+    }
+}
+
+/// The vectors inside an element that the dump follows typed, so that a tree group's models are reached before the text cap (the
+/// trees1 probe of 2026-10-25 spent the cap on the description's blocks and never showed them): the member's offset in the element and
+/// the vector's own element type.
+const ELEMENT_VECS: &[(&str, Field)] = &[
+    (
+        "ConstructionEntity",
+        Field {
+            off: 0xa30,
+            name: "construction.subconstructions",
+            shape: Shape::Vec { elem: "Subconstruction", min: 0x318, big: true },
+        },
+    ),
+    (
+        "Subconstruction",
+        Field { off: 0x140, name: "models", shape: Shape::Vec { elem: "TransformedModel", min: 0xa8, big: true } },
+    ),
+];
+
+/// The typed vector member that starts at `off` of an element block of `elem`.
+fn element_vec(elem: &str, off: usize) -> Option<&'static Field> {
+    let off = element_stride(elem).map_or(off, |s| off % s);
+    ELEMENT_VECS.iter().find(|(e, f)| *e == elem && f.off == off).map(|(_, f)| f)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -427,7 +473,14 @@ impl Decoder<'_> {
         let number = self.next;
         self.next += 1;
         self.seen.insert(addr, number);
-        self.queue.push_back(Pending { number, addr, len, depth, ctx, from });
+        // a tree group's subconstructions and models before everything else that waits (the description's many blocks)
+        let first = matches!(ctx.elem, Some("Subconstruction" | "TransformedModel"));
+        let p = Pending { number, addr, len, depth, ctx, from };
+        if first {
+            self.queue.push_front(p);
+        } else {
+            self.queue.push_back(p);
+        }
         Some(number)
     }
 
@@ -556,7 +609,12 @@ impl Decoder<'_> {
                             }
                         }
                     }
-                    (None, Some(e)) => names.extend(element_field(e, at)),
+                    (None, Some(e)) => {
+                        names.extend(element_field(e, at));
+                        if at == off {
+                            head = head.or(element_vec(e, at));
+                        }
+                    }
                     _ => {}
                 }
             }

@@ -53,7 +53,6 @@ Measured with two games on one PC (internet numbers follow):
 
 - Coming back after a short drop without a reload
 - Separate companies for each player
-- Sharing trees, plants and rocks (terrain heights and ground paint are shared since 0.2.7)
 
 FeverLink3 is in beta: keep backups of the saves you play with.
 
@@ -81,6 +80,7 @@ cargo test --workspace --exclude feverlink3_native
 cargo test -p feverlink3_native -- --test-threads=1
 cargo build --release -p feverlink3_native      # target/release/feverlink3_native.dll -> ship as winhttp.dll
 pip install lupa && python -I -m unittest discover -s tests/lua -p "test_*.py"
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\check.ps1   # all of CI's checks at once, a table, exit code 0 = all passed
 ```
 
 Issues and pull requests are welcome. Bug reports: [GitHub issues](https://github.com/AZalshehri7/FeverLink3/issues) (use **Report a problem** in the game to make the zip); Discord: `azalshehri`.

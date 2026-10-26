@@ -1,4 +1,4 @@
-# mod.io / in-game Mod Hub listing (0.2.5)
+# mod.io / in-game Mod Hub listing (0.2.8)
 
 Written 2026-10-22. Transport Fever 3's official mod browser (the in-game Mod Hub) is hosted by mod.io (https://mod.io/g/transportfever3). **Nothing has been uploaded.** Read the "Decision" and "Risks" sections before uploading anything.
 
@@ -63,8 +63,11 @@ The current `modinfo.json` summary ("Co-op multiplayer (needs the FeverLink3 nat
 
 **Tags:** `Script Mod`.
 
-**Version / changelog:** version `0.2.5`; `mod.json` revision: raise it at every Hub update (currently `1`; the release workflow does not change it). Changelog:
+**Version / changelog:** version `0.2.8`; `mod.json` revision: raise it at every Hub update (currently `1`; the release workflow does not change it). Changelog:
 ```
+0.2.8: trees, plants, rocks and the vegetation eraser shared in a session (new).
+0.2.7: terrain heights and ground paint shared; builds stand sooner; finds its places in a new game build by itself; players with different game languages no longer resync on new industries; trees, plants and rocks grayed out in a session.
+0.2.6: game build 40425 supported.
 0.2.5: roundabouts and streets with bus stops build in a session; repairs no longer dropped; text margins; Save and quit after an update.
 0.2.4: game build 40423 supported; other mods' own changes stay in sync.
 0.2.3: no false "could not be built" notice on roads that join a road; station configure right after a sync works; every game keeps its world details at a sync.
@@ -92,13 +95,13 @@ Nothing else: no `winhttp.dll`, no README/LICENSE (the Hub asks for essential fi
 
 ## Build it from the release zip (PowerShell)
 
-Download `FeverLink3-0.2.5.zip` from the GitHub release into `Downloads` first. Then run, in Windows PowerShell, from the repository folder (`Documents\AI\FeverLink3`):
+Download `FeverLink3-0.2.8.zip` from the GitHub release into `Downloads` first. Then run, in Windows PowerShell, from the repository folder (`Documents\AI\FeverLink3`):
 
 ```powershell
-$zip = "$env:USERPROFILE\Downloads\FeverLink3-0.2.5.zip"; $work = Join-Path $env:TEMP 'fl3-modio'; if (Test-Path $work) { Remove-Item $work -Recurse -Force }; Expand-Archive -LiteralPath $zip -DestinationPath "$work\release"; $mod = Get-ChildItem "$work\release" -Recurse -Directory -Filter feverlink3 | Where-Object { Test-Path (Join-Path $_.FullName 'mod.json') } | Select-Object -First 1; if (-not $mod) { throw 'mod folder not found in the zip' }; $pkg = (New-Item -ItemType Directory "$work\pkg").FullName; Copy-Item $mod.FullName "$pkg\feverlink3" -Recurse; Copy-Item 'docs\nexus\modio-description.html' "$pkg\feverlink3\_metadata\description.html"; Copy-Item 'docs\nexus\media\cover-1920x1080.png' "$pkg\feverlink3\_metadata\0.png" -Force; Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem; $out = "$env:USERPROFILE\Desktop\feverlink3-modio-0.2.5.zip"; if (Test-Path $out) { Remove-Item $out }; $za = [System.IO.Compression.ZipFile]::Open($out, 'Create'); Get-ChildItem "$pkg\feverlink3" -Recurse -File | ForEach-Object { $rel = $_.FullName.Substring($pkg.Length + 1).Replace('\', '/'); [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($za, $_.FullName, $rel, 'Optimal'); $rel }; $za.Dispose()
+$zip = "$env:USERPROFILE\Downloads\FeverLink3-0.2.8.zip"; $work = Join-Path $env:TEMP 'fl3-modio'; if (Test-Path $work) { Remove-Item $work -Recurse -Force }; Expand-Archive -LiteralPath $zip -DestinationPath "$work\release"; $mod = Get-ChildItem "$work\release" -Recurse -Directory -Filter feverlink3 | Where-Object { Test-Path (Join-Path $_.FullName 'mod.json') } | Select-Object -First 1; if (-not $mod) { throw 'mod folder not found in the zip' }; $pkg = (New-Item -ItemType Directory "$work\pkg").FullName; Copy-Item $mod.FullName "$pkg\feverlink3" -Recurse; Copy-Item 'docs\nexus\modio-description.html' "$pkg\feverlink3\_metadata\description.html"; Copy-Item 'docs\nexus\media\cover-1920x1080.png' "$pkg\feverlink3\_metadata\0.png" -Force; Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem; $out = "$env:USERPROFILE\Desktop\feverlink3-modio-0.2.8.zip"; if (Test-Path $out) { Remove-Item $out }; $za = [System.IO.Compression.ZipFile]::Open($out, 'Create'); Get-ChildItem "$pkg\feverlink3" -Recurse -File | ForEach-Object { $rel = $_.FullName.Substring($pkg.Length + 1).Replace('\', '/'); [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($za, $_.FullName, $rel, 'Optimal'); $rel }; $za.Dispose()
 ```
 
-It prints every file in the package (`mod.json`, `_content.json`, `_metadata/` with `0.png`, `description.html`, `modinfo.json`, and `content/`) and writes `feverlink3-modio-0.2.5.zip` (top folder `feverlink3/`) to the Desktop, for a website upload. The zip entries use forward slashes on purpose: Windows PowerShell 5.1's `Compress-Archive` / `CreateFromDirectory` write backslashes, which other tools may misread. (Tested on 2026-10-22 against the 0.2.0-pre7 zip, which has the same layout.) For the **in-game upload** (recommended: it runs the game's own validation), copy the folder into the staging area instead:
+It prints every file in the package (`mod.json`, `_content.json`, `_metadata/` with `0.png`, `description.html`, `modinfo.json`, and `content/`) and writes `feverlink3-modio-0.2.8.zip` (top folder `feverlink3/`) to the Desktop, for a website upload. The zip entries use forward slashes on purpose: Windows PowerShell 5.1's `Compress-Archive` / `CreateFromDirectory` write backslashes, which other tools may misread. (Tested on 2026-10-22 against the 0.2.0-pre7 zip, which has the same layout.) For the **in-game upload** (recommended: it runs the game's own validation), copy the folder into the staging area instead:
 
 ```powershell
 $staging = Get-ChildItem "${env:ProgramFiles(x86)}\Steam\userdata\*\3493540\local\staging_area" -Directory | Select-Object -First 1; if (-not $staging) { throw 'staging_area not found: create it under Steam\userdata\<id>\3493540\local\' }; Copy-Item (Join-Path $env:TEMP 'fl3-modio\pkg\feverlink3') $staging.FullName -Recurse

@@ -6,6 +6,18 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.8 (2026-10-26)
+
+### Added
+- Trees, plants and rocks are shared in a session: the tree, plant and rock brushes and the vegetation eraser are no longer grayed out, and every game, yours included, builds the same groups of trees at the same moment (a short moment after your click). Where a game cannot carry them the tools stay grayed out as before. A brush tick whose trees changed between your click and that moment is refused on every game alike (a notice says so). Overlapping ticks of one fast stroke may be refused (one tick's trees change the groups the next one was made from). This is new: seen only in an automated test with two game windows on one PC (the tree and rock brushes and the eraser were seen there, also in long strokes and with both players; a tick whose trees were already gone was refused alike on both games; the plant brush uses the same tool but its tiles did not show in our test worlds), not yet between two PCs. Tell us if the trees look different for someone. Placing a single tree, plant or rock (not with the brush) is shared the same way (seen in the two-window test). During a stroke your trees vanish for a moment and appear again: the brush's preview ends when the tick leaves your game, and its trees appear when every game plants them together (about a second at speed x1, less when faster). Ticks travel in a compact form (about 2.4 times smaller than in the first tests); only a huge brush held down long can make a tick too large to send; it is refused on every game alike and a notice says so.
+
+### Fixed
+- A build that removes trees, plants or rocks no longer fails to travel with "construction N is not in the world": such groups are now named by their own kind of reference, checked on every game. Not yet seen in the game.
+- A session message the game could not be given (for example on a full disk) is no longer dropped: it is kept and goes first at the next try, so a game waits instead of running past another player's build (seen in the two-window test, where a full disk had let one street exist on one game only).
+
+### Changed
+- For developers: the automatic tests run in about half the time, and `tools/check.ps1` runs all of CI's checks at once.
+
 ## 0.2.7 (2026-10-26)
 
 ### Fixed

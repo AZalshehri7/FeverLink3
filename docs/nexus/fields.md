@@ -1,6 +1,6 @@
-# Nexus Mods page: the form fields (0.2.5)
+# Nexus Mods page: the form fields (0.2.8)
 
-Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-23, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.5.
+Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-26, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.8.
 
 ## Name
 
@@ -21,7 +21,7 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 ## Version
 
 ```
-0.2.5
+0.2.8
 ```
 
 ## Category, tags, flags
@@ -33,13 +33,13 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 
 ## Main file
 
-- Upload: `FeverLink3-0.2.5.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.5.zip.sha256` on the release page.
-- Name on Nexus: `FeverLink3 0.2.5`
-- Category: Main files. Version: 0.2.5.
+- Upload: `FeverLink3-0.2.8.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.8.zip.sha256` on the release page.
+- Name on Nexus: `FeverLink3 0.2.8`
+- Category: Main files. Version: 0.2.8.
 - File description (under 255 characters):
 
 ```
-Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.5. Updates itself (can be turned off).
+Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.8. Updates itself (can be turned off).
 ```
 
 (200 characters.)
@@ -88,6 +88,19 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Changelog tab
 
 ```
+0.2.8
+- New: trees, plants, rocks and the vegetation eraser are shared in a session (they were grayed out). Tell us if the trees look different for someone.
+
+0.2.7
+- Terrain heights (raise, lower, flatten, smooth, roughen) and ground paint are shared in a session.
+- FeverLink3 finds its places in a new game build by itself at start, so it often keeps working after a game update.
+- Players with different game languages no longer get a repair sync when a new industry appears.
+- Trees, plants, rocks and the vegetation eraser are grayed out during a session (not shared yet).
+- Builds stand a little sooner on every game.
+
+0.2.6
+- Supports Transport Fever 3 build 40425 (the game update of 2026-10-22); 40420 and 40423 stay supported.
+
 0.2.5
 - Roundabouts and streets with a bus stop on them now build in a session.
 - A repair needed right after a sync is no longer dropped; it starts by itself.
@@ -96,7 +109,7 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 - A friend who joins through a Steam invite has their mods compared.
 
 0.2.4
-- Supports Transport Fever 3 build 40425 (the game update of 2026-10-22); 40420 and 40423 stay supported; on a game build FeverLink3 does not know, the window says so.
+- Supports Transport Fever 3 build 40423 (the game's Second Stability Update of 2026-10-22); 40420 stays supported; on a game build FeverLink3 does not know, the window says so.
 - Other mods that change the world on their own (Auto Line Namer, Auto Color Lines, Auto Assign Terminals) stay in sync: the host's copy makes the change, every game applies it at the same moment.
 - The warning about such a mod names it.
 
@@ -122,10 +135,10 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues in 0.2.5
-- Terrain editing, ground paint and trees are not shared; the terrain tools are off during a session.
+Known issues in 0.2.8
+- Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone.
 - A mod change FeverLink3 cannot share yet causes extra syncs (FeverLink3 names the mod in a warning).
-- After a Transport Fever 3 update, FeverLink3 needs an update too (the window says so).
+- After a Transport Fever 3 update, FeverLink3 searches the new build by itself; if it cannot find every place, it needs an update (the window says so).
 - About one automatic repair (about 15 s) every 40 minutes in a long session over the internet.
 - winhttp.dll is not code-signed until 1.0.0; antivirus software may warn. Compare the SHA-256 with the GitHub release.
 - Not compatible with other mods that use their own winhttp.dll.

@@ -7,9 +7,15 @@ license.workspace = true
 publish.workspace = true
 authors.workspace = true
 repository.workspace = true
+# The integration tests are ONE binary, tests/all.rs (it says why, and fails when a file in tests/ is not in it).
+autotests = false
 
 [lib]
 crate-type = ["rlib"]
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
 
 [dependencies]
 # Without default features: the crate's own `os_rng` would pull getrandom 0.4, whose raw-dylib import of
