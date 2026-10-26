@@ -24,6 +24,9 @@
 --   * another mod's own script event (its window sends a setting to its game script, makeScriptingSendEventCmd): no schema of ours
 --     knows it, but when its parameter is plain data it is shipped and held like the above (L.markForeignEvent), so every game's
 --     copy of that mod gets it at the stamp. Told apart by where the calling code lies (C.callerOf), never by a list of mods.
+--   * a player's build another mod's tool or window sends (makeWorldBuildProposalCmd): recorded with the build codec and held the same
+--     way (the API layer); one the codec cannot record is left to the native module's hold at the command list (the safety net), or
+--     refused when that is not on (handle).
 --   * anything else (no schema, or an event no game replicates), and everything while no session is on: untouched.
 -- Entity ids never travel; the keys of entities created in the session come from binds.txt, which the bridge writes.
 --
@@ -293,6 +296,10 @@ local function answers()
 			local entities = type(p.entities) == "table" and p.entities or (e and { { e } } or {})
 			local okR, list = pcall(C.resultEntities, entities)
 			if okR then entities = list end
+			-- a build's callback gets WorldBuildProposalCommandData (tf3-docs api/cmd; the bridge's X.buildCmdData, the same fields)
+			if h.name == "makeWorldBuildProposalCmd" and type(h.args) == "table" then
+				res = { proposal = h.args[1], context = h.args[2], ignoreErrors = h.args[3] == true, doDust = h.args[5], resultEntities = entities }
+			end
 			log("command " .. h.name .. " #" .. id .. " " .. (success and "applied" or "REFUSED") .. " at its stamp" .. (p.key and (" (" .. tostring(p.key) .. ")") or "")
 				.. (e and (", created " .. tostring(e)) or "") .. (p.detail and (": " .. tostring(p.detail)) or "") .. "; its callback runs now")
 			local okT, line = pcall(timingLine, id, h, p)
@@ -328,6 +335,7 @@ function M.sessionSpeed()
 			U.sessText = text
 			local okR, m = pcall(function() return Hud.fromSnapshot(C.parse(text or "")) end)
 			U.sess = okR and m and m.session or nil
+			U.nativeHolds = okR and m and m.nativeHolds == true
 		end
 	end
 	local s = U.sess
@@ -412,8 +420,15 @@ local function handle(tag, cmd, cb, progress, t0)
 		send("speed", { n = n, sid = C.SESSION })
 		return true
 	end
-	-- builds are captured where the engine applies them (the bridge's onPreBuildProposal), whoever issued them
-	if tag.name == "makeWorldBuildProposalCmd" then return false end
+	-- A build a script of this state sends (real session 2026-10-26: the bus and truck bay mod's upgrade tool, a react recipe calling
+	-- api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(proposal, ctx, false, true), cb), was applied here at the click and on the
+	-- others at the stamp: a free-id fork and a resync, twice). Two layers, the official API first (docs/ARCHITECTURE.md): a player's
+	-- build is recorded with the build codec and held here like every window command; every game, this one included, rebuilds it with
+	-- makeWorldBuildProposalCmd at the stamp and its callback gets that apply's result (answers). One the codec cannot record goes on to
+	-- the engine's command list only while the native module holds builds there (the safety net: it holds the command and the bridge
+	-- ships it from the command's own proposal and text); without it, it is refused. A build the script marks as not the player's
+	-- (playerInitiated false) is the script's own business, as the engine treats it: untouched.
+	if tag.name == "makeWorldBuildProposalCmd" and tag.args[4] ~= true then return false end
 	local spec = L.COMMANDS[tag.name]
 	if not spec or spec.virtual then return false end
 	-- another mod's own event (its window sends its settings to its game script): shipped like a window command, delivered at the stamp
@@ -446,6 +461,13 @@ local function handle(tag, cmd, cb, progress, t0)
 	for i = 1, (tag.args and tag.args.n) or 0 do parts[i] = ctx.argMs[i] and string.format("%.1f", ctx.argMs[i]) or "-" end
 	tm.detail = string.format("binds=%.1f args=[%s] objects=[%s] world_searches=%d (%.0f ms)", (tm.r - tm.p) * 1000, table.concat(parts, " "),
 		table.concat(ctx.objMs, "; "), n1 - n0, ms1 - ms0)
+	if not body and tag.name == "makeWorldBuildProposalCmd" then
+		M.sessionSpeed()   -- the snapshot, read at most every SESSION_READ_S
+		if U.nativeHolds then
+			log("command " .. tag.name .. " cannot be recorded through the API (" .. tostring(why) .. "): handed to the native safety net at the command list")
+			return false
+		end
+	end
 	if not body then return refuse(tag, cb, why) end
 	local okS, text = pcall(C.serialize, body)
 	if not okS then return refuse(tag, cb, text) end
@@ -456,7 +478,7 @@ local function handle(tag, cmd, cb, progress, t0)
 	-- apply's, decided alike on every game from the same world, and reaches the callback through the bridge's answer. `progress`
 	-- is kept with the command but never called: the engine never had this command, so it has no progress of its own to report.
 	inbox()   -- opened before the record leaves, so its answer lies after the place this state starts reading from
-	U.held[id] = { cb = cb, progress = progress, name = tag.name, spec = spec, at = C.clock(), tm = tm }
+	U.held[id] = { cb = cb, progress = progress, name = tag.name, spec = spec, at = C.clock(), tm = tm, args = tag.args }
 	-- `sid`: the bridge acts only on records of its own session (the file outlives sessions). `grp`: the records of one group are
 	-- one order (M.poll); `t`: the click and the end of the encode, for the bridge's part of the timing line.
 	local sent = send("cmd", { id = id, body = text, category = category, sid = C.SESSION, grp = tm.grp, t = { c = tm.c, e = tm.e } })
@@ -471,7 +493,8 @@ local function handle(tag, cmd, cb, progress, t0)
 		return true
 	end
 	U.stats.shipped = U.stats.shipped + 1
-	log("command " .. tag.name .. " #" .. id .. " recorded (" .. #text .. " bytes, " .. category .. "): held until its stamp; group " .. tm.grp
+	log("command " .. tag.name .. " #" .. id .. " recorded (" .. #text .. " bytes, " .. category .. "): held until its stamp"
+		.. (tag.name == "makeWorldBuildProposalCmd" and " (a build: held by the API layer)" or "") .. "; group " .. tm.grp
 		.. string.format(", %.1f ms in the hook (encode %.1f: %s)", (tm.s - (tm.c or tm.p)) * 1000, (tm.e - tm.p) * 1000, tm.detail or "") .. (tm.exit and (", " .. ms(tm.exit, tm.c) .. " ms in the window since its previous command") or ""))
 	U.exitAt = C.clock()
 	return true

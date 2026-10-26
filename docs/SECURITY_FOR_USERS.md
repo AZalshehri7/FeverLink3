@@ -1,6 +1,6 @@
 # What is in winhttp.dll, and how to check it
 
-For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-10-26 (version 0.2.8). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
+For players, and for anyone reading an antivirus report about FeverLink3. Last updated 2026-10-27 (version 0.2.9). Everything here can be checked against the source code in this repository (public, under the PolyForm Noncommercial License 1.0.0: free for noncommercial use), and where something has not been verified this page says so. If a build you downloaded behaves differently from what is written here, that is a bug in the build or in this page: please tell us (Discord `azalshehri`, or https://github.com/AZalshehri7/FeverLink3/issues).
 
 ## The short version
 
@@ -84,7 +84,7 @@ The release zip holds `winhttp.dll`, the mod folder `mods\release\feverlink3` an
 | `<game folder>\winhttp.dll` | the DLL | you, when you install; the automatic update | delete it |
 | `<game folder>\mods\release\feverlink3\` | the mod (Lua game scripts and the window) | you, when you install; the automatic update | delete it |
 | `%LOCALAPPDATA%\FeverLink3\native.log` | the DLL's text log | the DLL | optional: delete the folder |
-| `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`, `world_mods.txt` (the mods active in the world); emptied at every game start | the DLL and the mod | optional: delete the folder |
+| `%LOCALAPPDATA%\FeverLink3\live\` | session files: `ctl_cmd.log`, `ctl_status.txt`, `identity.txt`, `to_game.log`, `from_game.log`, `mod.log`, `hud_state.txt`, `ui_out.log`, `resync_cursor.txt`, `action_seq.txt` (your last action number, kept over a resync), `world_mods.txt` (the mods active in the world); emptied at every game start | the DLL and the mod | optional: delete the folder |
 | `<Steam>\userdata\<id>\3493540\local\save\feverlink3-resync-<number>.sav` | the host's world while it is synced to the players. These are ordinary game saves and can be large | the game and the DLL | optional: delete them |
 | `<game folder>\feverlink3_update\` | the automatic update: `state.json` (what the next start must finish), `<version>\` (the checked new files), `backup-<version>\` (the previous mod, until the new version started well), `download\` (during a download) | the DLL | delete it (only while the game is closed) |
 | `<game folder>\winhttp.dll.old-<version>`, `winhttp.dll.failed-<version>`, `feverlink3_update_skip.txt` | the previous DLL until the new one started well; a DLL that failed and was taken back; versions not to offer again | the DLL | delete them |
@@ -150,8 +150,8 @@ Each release has these files: `FeverLink3-<version>.zip`, `FeverLink3-<version>.
 In PowerShell, in the folder with the downloaded files:
 
 ```powershell
-(Get-FileHash .\FeverLink3-0.2.8.zip -Algorithm SHA256).Hash.ToLower()
-Get-Content .\FeverLink3-0.2.8.zip.sha256
+(Get-FileHash .\FeverLink3-0.2.9.zip -Algorithm SHA256).Hash.ToLower()
+Get-Content .\FeverLink3-0.2.9.zip.sha256
 
 # the DLL you installed against the manifest (your game folder: Steam, right-click Transport Fever 3, Manage, Browse local files)
 $m = Get-Content .\manifest.json -Raw | ConvertFrom-Json

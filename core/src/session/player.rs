@@ -10,6 +10,7 @@ use super::messages::{
 };
 use super::mods::ModFingerprint;
 use super::names::Names;
+use super::parts::{self, Reassembly};
 use super::report::{PlayerReportEvent, ReportAskMessage, ReportBusyMessage, ReportLimits, ReportRequestMessage};
 use super::resume::Outbox;
 use super::resync::IncomingSave;
@@ -108,6 +109,8 @@ pub struct PlayerSession {
     /// What this player's game sent and the host has not acknowledged yet (its pings' `ack`), resent after a resume that catches
     /// up (`resume.rs`); while a returning session waits for its welcome, what the game sends is kept here unsealed.
     outbox: Outbox,
+    /// The host's message in parts on its way (`parts.rs`).
+    parts: Reassembly,
     roster: BTreeMap<u16, RosterEntry>,
     now: Box<dyn Fn() -> f64 + Send>,
     /// The wall clock (ms since 1970) a pong carries for the host's offset estimate ([PlayerSession::set_wall_clock]). Logs only.
@@ -191,6 +194,7 @@ impl PlayerSession {
             host_floor: 0,
             host_last: None,
             outbox: Outbox::default(),
+            parts: Reassembly::default(),
             roster: BTreeMap::new(),
             now,
             wall: None,
@@ -381,6 +385,25 @@ impl PlayerSession {
             return;
         }
         self.host_last = Some(frame.header.counter);
+        // a message in parts is handled once whole, as if it had come in one frame; a whole frame between its parts ends it
+        let (kind, plain) = if kind == MessageKind::Part {
+            match self.parts.accept(&plain, (self.now)()) {
+                Ok(Some((inner, payload))) => {
+                    self.log(format!("parts: {inner:?} of {} bytes from the host is whole", payload.len()));
+                    (inner, payload)
+                }
+                Ok(None) => return,
+                Err(why) => {
+                    self.drop(kind_byte, why);
+                    return;
+                }
+            }
+        } else {
+            if let Some(lost) = self.parts.interrupted() {
+                self.drop(kind_byte, format!("it came between the parts of a message; {lost} dropped"));
+            }
+            (kind, plain)
+        };
         match kind {
             MessageKind::Session => {
                 if let Some(s) = codec::try_decode::<SessionState>(&plain) {
@@ -580,12 +603,30 @@ impl PlayerSession {
     /// Seals a message of the game, keeps it until the host acknowledges it, and sends it.
     fn seal_and_send(&mut self, kind: MessageKind, payload: &[u8]) {
         let Some(sealer) = self.sealer.as_mut() else { return };
-        match sealer.try_seal(kind.into(), payload) {
-            Ok(frame) => {
-                if Outbox::replayable_from_player(kind) {
-                    self.outbox.push(Some(frame.header.counter), kind, payload, true);
+        // a message longer than one frame goes in parts, sealed and sent in a row (parts.rs); it is kept under the last part's counter,
+        // so a resume resends it whole unless the host had every part
+        let sealed = match parts::split(kind, payload) {
+            Ok(None) => sealer.try_seal(kind.into(), payload).map(|f| vec![f]).map_err(|e| e.to_string()),
+            Ok(Some(pieces)) => pieces
+                .iter()
+                .map(|p| sealer.try_seal(MessageKind::Part.into(), p))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string()),
+            Err(why) => Err(why),
+        };
+        match sealed {
+            Ok(frames) => {
+                if let Some(last) = frames.last().filter(|_| Outbox::replayable_from_player(kind)) {
+                    self.outbox.push(Some(last.header.counter), kind, payload, true);
                 }
-                self.out.push(PlayerOutput::SendToHost(frame));
+                if frames.len() > 1 {
+                    self.log(format!(
+                        "parts: {kind:?} of {} bytes to the host in {} parts",
+                        payload.len(),
+                        frames.len()
+                    ));
+                }
+                self.out.extend(frames.into_iter().map(PlayerOutput::SendToHost));
             }
             Err(e) => self.drop(kind.into(), format!("not sent: {e}")),
         }

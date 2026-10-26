@@ -87,17 +87,22 @@ impl HostSession {
             return;
         }
         let ready: Vec<u16> = self.players.values().filter(|p| p.ready).map(|p| p.id).collect();
-        let silent = |c: &PlayerClock| t - c.at >= timeout;
+        // a game still sending a message in parts is not silent: its clock lines are queued behind that message on its connection
+        // (one ordered stream), and its action stamped before the proxy would be refused on every game (a 3 MB build takes some 3 s
+        // at the 1 MB/s of one Steam connection)
+        let receiving: BTreeMap<u16, f64> =
+            self.connections.values().filter_map(|c| Some((c.player?, c.parts.receiving_since()?))).collect();
+        let silent = |id: &u16, c: &PlayerClock| t - receiving.get(id).map_or(c.at, |&r| r.max(c.at)) >= timeout;
         // nothing to run on for when no game is heard from (the host itself was away: its own STALL_SECONDS)
         let anyone_heard =
-            ready.iter().any(|id| !self.stalls.contains_key(id) && self.clocks.get(id).is_some_and(|c| !silent(c)));
+            ready.iter().any(|id| !self.stalls.contains_key(id) && self.clocks.get(id).is_some_and(|c| !silent(id, c)));
         if !anyone_heard {
             return;
         }
         let newly: Vec<u16> = ready
             .iter()
             .copied()
-            .filter(|id| !self.stalls.contains_key(id) && self.clocks.get(id).is_some_and(silent))
+            .filter(|id| !self.stalls.contains_key(id) && self.clocks.get(id).is_some_and(|c| silent(id, c)))
             .collect();
         for id in newly {
             let Some(c) = self.clocks.get(&id).copied() else { continue };
@@ -120,7 +125,7 @@ impl HostSession {
         // a game that had caught up and falls silent again: its proxy follows the others again
         let ids: Vec<u16> = self.stalls.keys().copied().collect();
         for id in ids {
-            let quiet = self.clocks.get(&id).is_some_and(silent);
+            let quiet = self.clocks.get(&id).is_some_and(|c| silent(&id, c));
             if let Some(s) = self.stalls.get_mut(&id) {
                 if quiet && (s.back.is_some() || s.caught) {
                     s.back = None;

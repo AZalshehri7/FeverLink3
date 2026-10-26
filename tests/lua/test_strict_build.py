@@ -693,6 +693,19 @@ class StrictOnTest(StrictTest):
             self.assertIn("held 1 (site 0x537ee5) REFUSED", self.B.log(), "named by its site")
             self.assertSameWorld()
 
+        def script_build_never_takes_a_preview():
+            # real session 2026-10-26: a mod's tool sent its street upgrade with api.cmd.sendCommand; the native module now holds such a
+            # build at site 0 (no tool site). Only its own proposal can be its record, never the street tool's newest preview.
+            self.start()
+            self.B.tool(self.road(300, 0, 400, 0), add=False)             # a fresh preview of the street tool, never clicked
+            self.B.native.site = 0
+            self.B.L.execute("TOOL_ADD(%d, true)" % 1)
+            self.tick(14)
+            self.assertEqual((self.B.native.released, self.B.native.dropped), ([], [1]), "no record of its own: refused, never given back")
+            self.assertNotIn("matched the capture", self.B.log())
+            self.assertSameWorld()
+            self.assertEqual((self.A.builds_applied(), self.B.builds_applied()), (0, 0))
+
         def other_tools_preview():
             self.start()
             self.B.native.site = 0x4D396F                                  # the bulldozer's site; the preview is the street tool's
@@ -746,7 +759,8 @@ class StrictOnTest(StrictTest):
 
         self.cases([("the held event before the tool event", {}, held_event_first), ("two commands held at once", {}, two_held_at_once),
                     ("a preview that gets no held command", {}, preview_without_command), ("a tool build the module did not hold", {}, not_held),
-                    ("a site without a preview", {}, site_without_preview), ("a preview of another tool", {}, other_tools_preview),
+                    ("a site without a preview", {}, site_without_preview), ("a script's build", {}, script_build_never_takes_a_preview),
+                    ("a preview of another tool", {}, other_tools_preview),
                     ("a newer preview that cannot be captured", {}, newer_preview_uncapturable), ("no capture", {}, no_capture),
                     ("both players at once", {}, both_players_at_once)])
 

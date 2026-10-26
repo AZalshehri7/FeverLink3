@@ -25,9 +25,10 @@ use serde_json::{Map, Number, Value};
 /// Deepest nesting either direction accepts.
 pub const MAX_DEPTH: usize = 48;
 
-/// Longest text either direction looks at, in bytes. The wire carries at most 1 MiB of JSON per message and JSON
-/// grows by at most a factor of four as Lua text (`\ddd` for a control character), so nothing real is longer.
-pub const MAX_INPUT: usize = 4 << 20;
+/// Longest text either direction looks at, in bytes. The wire carries at most 8 MiB of JSON per message (core
+/// `session::parts::MAX_MESSAGE`) and JSON grows by at most a factor of four as Lua text (`\ddd` for a control
+/// character), so nothing real is longer.
+pub const MAX_INPUT: usize = 4 * feverlink3_core::session::parts::MAX_MESSAGE;
 
 /// Most values (numbers, strings, booleans, nil and tables, table keys included) one text may hold. A real
 /// payload has a few hundred. A parsed value takes about a hundred bytes per node, so this bounds the memory one

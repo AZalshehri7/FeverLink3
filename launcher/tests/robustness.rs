@@ -388,8 +388,13 @@ fn a_tail_given_endless_noise_without_a_newline_holds_a_bounded_amount() {
     let mut tail = Tail::new(path.clone());
     let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
     let mut total = 0usize;
-    for i in 0..iters(300) {
-        let mut noise = random_bytes(&mut r, 100_000);
+    // at least more noise than the line limit, so the line it would be is over it and dropped whole
+    let mut i = 0;
+    while i < iters(300) || total <= gamelink::MAX_LINE_BYTES {
+        i += 1;
+        // past the usual rounds, bigger pieces up to the limit (it is above what one poll reads)
+        let size = if i <= iters(300) { 100_000 } else { 4 << 20 };
+        let mut noise = random_bytes(&mut r, size);
         noise.retain(|b| *b != b'\n');
         total += noise.len();
         file.write_all(&noise).unwrap();
@@ -397,7 +402,7 @@ fn a_tail_given_endless_noise_without_a_newline_holds_a_bounded_amount() {
         let (lines, peak) = peak_of(|| tail.poll().unwrap());
         assert!(lines.is_empty());
         // at most one line (the limit) plus what one poll brought, and a copy of it
-        assert!(peak <= 2 * (gamelink::MAX_LINE_BYTES + 100_000) + MIB, "iteration {i}: {peak} after {total} bytes");
+        assert!(peak <= 2 * (gamelink::MAX_LINE_BYTES + size) + MIB, "iteration {i}: {peak} after {total} bytes");
     }
     // the noise ends, a real line follows: it is read
     file.write_all(b"\n").unwrap();

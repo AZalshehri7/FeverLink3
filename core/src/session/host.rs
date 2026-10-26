@@ -20,6 +20,7 @@ use super::messages::{
 use super::mods::{ModFingerprint, ModTags};
 use super::names::Names;
 use super::notices;
+use super::parts::{self, Reassembly};
 use super::policy::{ChecksumPolicy, ChecksumPolicyConfig};
 use super::report::{HostReportEvent, ReportRound};
 use super::resume::{Missed, Outbox};
@@ -231,6 +232,8 @@ struct Connection {
     /// The byte budget: a frame costs its header and body, so a few large frames cannot do what many small ones are
     /// stopped from doing.
     bytes: RateLimiter,
+    /// The message in parts arriving on it (`parts.rs`).
+    parts: Reassembly,
 }
 
 /// What the host keeps of a joined player beyond its connection: the secret that lets it come back as itself, and how
@@ -400,12 +403,6 @@ impl HostSession {
     /// Connections waiting to introduce themselves at once. The next one is closed on arrival, so a flood of
     /// connections cannot grow the host's tables.
     pub const MAX_PENDING: usize = 32;
-    /// Longest `body` of an Action a player may send (bytes): what fits one Steam message (512 KiB, `steam_core::MAX_MESSAGE`) with
-    /// room for the frame header, the sealed channel's tag and the action's other fields. A build carries the engine's own command as
-    /// text: a modular station is about 150 KB, a module added to one via Configure 298 KB (run c10b 2026-10-14: dropped at the old
-    /// 256 KiB, the other game never built it and a resync followed). The limit still keeps one player from making the host relay
-    /// and write megabytes for everyone, repeatedly.
-    pub const MAX_ACTION_BODY: usize = 480 * 1024;
     /// Messages and drop reasons logged once are remembered up to this many; then the memory is cleared.
     const MAX_REMEMBERED: usize = 1024;
 
@@ -547,7 +544,16 @@ impl HostSession {
         let bytes = RateLimiter::new(self.options.max_bytes_per_second, self.options.byte_burst, now);
         self.connections.insert(
             connection,
-            Connection { id: connection, nonce, player: None, opened: now, last_heard: now, limiter, bytes },
+            Connection {
+                id: connection,
+                nonce,
+                player: None,
+                opened: now,
+                last_heard: now,
+                limiter,
+                bytes,
+                parts: Reassembly::default(),
+            },
         );
         let challenge = ChallengeMessage {
             nonce: nonce.to_vec(),
@@ -634,7 +640,7 @@ impl HostSession {
                             if let Some(i) = self.identities.get_mut(&player) {
                                 i.heard = i.heard.max(frame.header.counter);
                             }
-                            self.handle_message(player, k, &plain);
+                            self.whole_message(connection, player, k, plain, now);
                         }
                         Some(_) => self.drop(connection, kind_byte, "host only".to_owned()),
                         None => self.drop(connection, kind_byte, "unknown kind".to_owned()),
@@ -643,6 +649,29 @@ impl HostSession {
             }
         }
         self.drain()
+    }
+
+    /// An opened frame of a joined player: handled, or, a part, kept until its message is whole (`parts.rs`). A frame that is
+    /// no part ends a message still in parts (its sender never puts anything between them): that message is dropped and logged.
+    fn whole_message(&mut self, connection: ConnectionId, player: u16, kind: MessageKind, plain: Vec<u8>, now: f64) {
+        let Some(c) = self.connections.get_mut(&connection) else { return };
+        if kind != MessageKind::Part {
+            if let Some(lost) = c.parts.interrupted() {
+                self.drop(connection, kind.into(), format!("it came between the parts of a message; {lost} dropped"));
+            }
+            self.handle_message(player, kind, &plain);
+            return;
+        }
+        match c.parts.accept(&plain, now) {
+            Ok(None) => {}
+            Ok(Some((inner, payload))) if inner.allowed_from_player() => {
+                let who = self.name(player);
+                self.log(format!("parts: {inner:?} of {} bytes from {who} is whole", payload.len()));
+                self.handle_message(player, inner, &payload);
+            }
+            Ok(Some((inner, _))) => self.drop(connection, inner.into(), "host only, in parts".to_owned()),
+            Err(why) => self.drop(connection, kind.into(), why),
+        }
     }
 
     fn handle_join(&mut self, connection: ConnectionId, frame: &Frame) {
@@ -1144,17 +1173,8 @@ impl HostSession {
             }
 
             MessageKind::Action => {
-                let decoded = codec::try_decode::<ActionMessage>(payload);
-                if decoded.as_ref().is_some_and(|m| m.body.len() > Self::MAX_ACTION_BODY) {
-                    self.dropped += 1;
-                    if self.first_time(format!("bigaction/{from}")) {
-                        self.log(format!(
-                            "action of {} dropped (body over {} bytes)",
-                            self.name(from),
-                            Self::MAX_ACTION_BODY
-                        ));
-                    }
-                } else if let Some(mut m) = decoded {
+                // no limit of its own: an action of any size travels in parts (parts.rs), up to the message cap, checked below
+                if let Some(mut m) = codec::try_decode::<ActionMessage>(payload) {
                     m.from = from;
                     m.category = m.normalized_category().to_owned();
                     m.allowed = self.permissions.allows_action(&m.category, from);
@@ -1174,8 +1194,22 @@ impl HostSession {
                         self.pause_held.push(PauseItem::Action(m));
                         self.flush_pause();
                     } else if !self.refuse_stalled(from, m.seq, m.stamp, "action") {
-                        self.broadcast(MessageKind::Action, &codec::encode(&m), Some(from));
-                        self.actions_relayed += 1;
+                        let relayed = codec::encode(&m);
+                        if relayed.len() > parts::MAX_MESSAGE {
+                            // the fields the host adds took it over the cap: applied nowhere rather than on the host's game alone
+                            self.dropped += 1;
+                            let who = self.name(from);
+                            self.log(format!(
+                                "action {}:{} of {who} dropped: {} bytes relayed, over the {} bytes a message may have",
+                                from,
+                                m.seq,
+                                relayed.len(),
+                                parts::MAX_MESSAGE
+                            ));
+                        } else {
+                            self.broadcast(MessageKind::Action, &relayed, Some(from));
+                            self.actions_relayed += 1;
+                        }
                     }
                 }
             }
@@ -2195,9 +2229,22 @@ impl HostSession {
                 return None;
             }
         }
-        match self.sealer.try_seal(kind.into(), payload) {
-            Ok(frame) => {
-                let counter = frame.header.counter;
+        // a message longer than one frame goes in parts, sealed and sent in a row (parts.rs); its counter is the last part's, so a
+        // resume resends it whole unless the player had every part
+        let pieces = match parts::split(kind, payload) {
+            Ok(None) => self.sealer.try_seal(kind.into(), payload).map(|f| vec![f]),
+            Ok(Some(pieces)) => pieces.iter().map(|p| self.sealer.try_seal(MessageKind::Part.into(), p)).collect(),
+            Err(why) => {
+                self.dropped += 1;
+                if self.first_time(format!("toolong/{kind:?}")) {
+                    self.log(format!("{kind:?} not sent to connection {connection}: {why}"));
+                }
+                return None;
+            }
+        };
+        match pieces {
+            Ok(frames) => {
+                let counter = frames.last().map_or(0, |f| f.header.counter);
                 // kept until the player shows it has it, so a drop on the way can be caught up (resume.rs)
                 let grace = self.options.resume_grace_seconds > 0.0;
                 if let Some(i) = to.and_then(|id| self.identities.get_mut(&id)).filter(|_| grace) {
@@ -2205,7 +2252,14 @@ impl HostSession {
                         i.log.push(Some(counter), kind, payload, false);
                     }
                 }
-                self.out.push(HostOutput::SendToConnection { connection, frame });
+                if frames.len() > 1 {
+                    self.log(format!(
+                        "parts: {kind:?} of {} bytes to connection {connection} in {} parts",
+                        payload.len(),
+                        frames.len()
+                    ));
+                }
+                self.out.extend(frames.into_iter().map(|frame| HostOutput::SendToConnection { connection, frame }));
                 Some(counter)
             }
             // a relayed message that grew past the frame limit when the host added its fields, say

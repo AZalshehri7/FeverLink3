@@ -367,6 +367,26 @@ class InjectFailClosedTest(InjectTest):
             self.assertNotIn("inject_refused", self.log())
             self.assertInjectedOnBoth()
 
+        def bigger_than_one_steam_message():
+            # real session 2026-10-26: a 3-track station's record (618781 bytes) was refused as "over the 491520 bytes an action may
+            # have", one Steam message; the session now carries a message of any size in parts, so such a build ships and applies
+            pad = "\n".join("proposal.pad[%d].note\tn:0" % i for i in range(24000))
+            self.build_on_b(road_text() + "\n" + pad)
+            self.assertNotIn("an action may have", self.log())
+            self.assertInjectedOnBoth()
+
+        def input_text_unreadable():
+            # real session 2026-10-26 (0:577..0:579, advanced_track_patterns branch_junction): the module wrote the held command's native
+            # text (47005 bytes), but the record went without it (12653 bytes, hold-and-release): the guest rebuilt the junction from the
+            # record, its own track a second time ("duplicate base nodes"), vetoed it or took other free ids. The diagnostic input-level
+            # text must never decide whether the native text ships.
+            self.start()
+            self.strict_on(self.A, self.B)
+            self.texts(road_text(), "a line the input parser cannot read")
+            self.B.tool(self.road(300, 0, 400, 0), make="NATIVE_ROAD")
+            self.tick(30)
+            self.assertInjectedOnBoth()
+
         def no_command(applies):
             # two-window run 2026-10-22 (x4, build 0:77): the module's identity check missed the mod's own command on both games, the
             # order closed as no_command and the command applied as it was: the road stood everywhere, yet the host's player was told
@@ -412,6 +432,8 @@ class InjectFailClosedTest(InjectTest):
             self.assertEqual(self.relay.verdict_resyncs, ["verdicts of 1:1 differ"], self.log())
 
         self.cases([("the happy path", {}, happy_path), ("a segment ending away from its existing node", {}, segment_away_from_its_node),
+                    ("a build bigger than one Steam message", {}, bigger_than_one_steam_message),
+                    ("an input-level text that cannot be read", {}, input_text_unreadable),
                     ("refused as no_command, the command applied", {}, lambda: no_command("pass")),
                     ("refused as no_command, nothing applied", {}, lambda: no_command("emptied")),
                     ("no_command and applied on the originator only", {}, no_command_applied_on_the_originator_only)])

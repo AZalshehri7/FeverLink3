@@ -54,10 +54,10 @@ pub const FROM_GAME: &str = "from_game.log";
 /// Name of the identity file.
 pub const IDENTITY: &str = "identity.txt";
 
-/// Longest line a reader accepts, in bytes, newline included. A payload is at most 1 MiB of JSON, which is at most
-/// four times that as Lua text; a longer line is somebody's mistake, and one without a newline must not make the
-/// reader keep everything it has read.
-pub const MAX_LINE_BYTES: usize = 4 << 20;
+/// Longest line a reader accepts, in bytes, newline included. A message is at most 8 MiB of JSON (core
+/// `session::parts::MAX_MESSAGE`; it travels in parts), which is at most four times that as Lua text; a longer line is
+/// somebody's mistake, and one without a newline must not make the reader keep everything it has read.
+pub const MAX_LINE_BYTES: usize = 4 * feverlink3_core::session::parts::MAX_MESSAGE;
 
 /// Most bytes one [`Tail::poll`] reads. A file that grew by more is read over several polls.
 const MAX_READ_PER_POLL: u64 = 8 << 20;
@@ -1105,23 +1105,31 @@ clock	1	3
         let root = TempDir::new().unwrap();
         let path = root.path().join(FROM_GAME);
         let mut tail = Tail::new(path.clone());
+        // the limit is above what one poll reads: polls until the file is read
+        let poll = |tail: &mut Tail| {
+            let mut got = Vec::new();
+            for _ in 0..=MAX_LINE_BYTES / MAX_READ_PER_POLL as usize + 1 {
+                got.extend(tail.poll().unwrap());
+            }
+            got
+        };
         let mut f = File::create(&path).unwrap();
         f.write_all(format_line(&line("before")).as_bytes()).unwrap();
         // the start of a line that never ends, in pieces bigger than the limit
         f.write_all(b"action\t1\t").unwrap();
         f.write_all(&vec![b'x'; MAX_LINE_BYTES + 10]).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line("before")]);
+        assert_eq!(poll(&mut tail), vec![line("before")]);
         assert!(tail.pending.is_empty(), "the reader does not keep what it is skipping");
         f.write_all(&vec![b'y'; MAX_LINE_BYTES]).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![]);
+        assert_eq!(poll(&mut tail), vec![]);
         assert!(tail.pending.is_empty());
         // its newline ends the skipping; the next line is read normally
         f.write_all(b"tail of the long line\n").unwrap();
         f.write_all(format_line(&line("after")).as_bytes()).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line("after")]);
+        assert_eq!(poll(&mut tail), vec![line("after")]);
 
         // a whole line over the limit that arrives in one poll is dropped too
         let mut huge = b"action\t1\t".to_vec();
@@ -1130,7 +1138,7 @@ clock	1	3
         f.write_all(&huge).unwrap();
         f.write_all(format_line(&line("five")).as_bytes()).unwrap();
         f.flush().unwrap();
-        assert_eq!(tail.poll().unwrap(), vec![line("five")]);
+        assert_eq!(poll(&mut tail), vec![line("five")]);
     }
 
     #[test]

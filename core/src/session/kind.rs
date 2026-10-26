@@ -61,12 +61,17 @@ pub enum MessageKind {
     /// The originator of a held strict build in a PAUSED game tells the others to apply it now: it waited a real-time grace for
     /// vetoes first, and nobody applies the build before this arrives. Carries the stamp to apply it at.
     BuildCommit = 53,
+
+    // ---- both ways, sealed
+    /// One part of a message longer than one frame (`parts.rs`): the receiver's session layer puts the message together and handles
+    /// it as if it had come whole. Its payload names the whole message's kind.
+    Part = 60,
 }
 
 impl MessageKind {
     /// What a player may send. The host drops anything else, so a player can never pass itself off as the host
     /// (session state, checksum requests, authority values, resynchronisation).
-    pub const FROM_PLAYER: [MessageKind; 16] = [
+    pub const FROM_PLAYER: [MessageKind; 17] = [
         MessageKind::Hello,
         MessageKind::Clock,
         MessageKind::SpeedRequest,
@@ -83,6 +88,7 @@ impl MessageKind {
         MessageKind::Chat,
         MessageKind::BuildVeto,
         MessageKind::BuildCommit,
+        MessageKind::Part,
     ];
 
     /// The kind for a header byte; `None` for a value this build does not know.
@@ -124,6 +130,7 @@ impl MessageKind {
             51 => Chat,
             52 => BuildVeto,
             53 => BuildCommit,
+            60 => Part,
             _ => return None,
         })
     }

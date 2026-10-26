@@ -32,7 +32,7 @@ fn every_kind_number_maps_back_to_itself_and_nothing_else_does() {
     assert_eq!(
         vec![
             1, 2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37,
-            38, 39, 40, 41, 50, 51, 52, 53
+            38, 39, 40, 41, 50, 51, 52, 53, 60
         ],
         known
     );
@@ -47,7 +47,7 @@ fn a_player_may_pong_and_leave_but_not_ping_or_kick() {
     assert!(MessageKind::Leave.allowed_from_player());
     assert!(!MessageKind::Ping.allowed_from_player());
     assert!(!MessageKind::Kicked.allowed_from_player());
-    assert_eq!(16, MessageKind::FROM_PLAYER.len());
+    assert_eq!(17, MessageKind::FROM_PLAYER.len());
     assert!(MessageKind::ReportRequest.allowed_from_player() && MessageKind::ReportPart.allowed_from_player());
     assert!(!MessageKind::ReportAsk.allowed_from_player() && !MessageKind::ReportBundle.allowed_from_player());
     assert!(MessageKind::FROM_PLAYER.iter().all(|k| !k.is_unsealed()));

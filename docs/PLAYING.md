@@ -110,6 +110,7 @@ A friend who does not own the game can take part with the small program `feverli
 - Terrain heights and ground paint are shared since 0.2.7. Trees, plants, rocks and the vegetation eraser are shared in a session since 0.2.8. This is new: seen in an automated test with two game windows on one PC, not yet between two PCs; tell us if the trees look different for someone.
 - Some extra repair syncs: the game sometimes orders its internal object ids differently on two PCs. FeverLink3 finds this within seconds and repairs it automatically.
 - Mods that change the world on their own (for example an automatic line namer) cause extra repair syncs. Turn their automatic changes off while playing together. Every player needs the same mods as the host.
+- Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
 - Two players building at the same spot within about a second: one of the two builds can be refused (the worlds stay equal).
 - All players share one company; separate companies and a dedicated server are planned.
 

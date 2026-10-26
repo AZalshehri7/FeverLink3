@@ -108,6 +108,9 @@ T.REPORT = {
 -- Short sentences (at most ~45 characters each): the window and the pop-up wrap long lines at a word (Hud.wrapLines), but a
 -- short line reads at a glance (real game 2026-10-22: the old texts were cut at the pop-up's edge).
 T.UPDATE = {
+	-- the host refused this game and runs a newer FeverLink3 ({version}): the module checks now, or cannot (turned off)
+	checking = "Your FeverLink3 is older than the host's ({version}). Checking for an update now...",
+	behind = "Your FeverLink3 is older than the host's ({version}). Download the new version from GitHub or Nexus.",
 	downloading = "Downloading FeverLink3 {version}.",
 	ready = "Updated to {version}. Restart the game to finish.",
 	updated = "FeverLink3 is now {version}.",
@@ -188,12 +191,13 @@ end
 -- The window's line for the automatic update (ctl.update): text and level, or nil when there is nothing to say.
 function T.updateLine(u)
 	if type(u) ~= "table" or type(T.UPDATE[u.state]) ~= "string" then return nil end
-	if u.state ~= "downloading" and u.state ~= "ready" and u.state ~= "updated" and u.state ~= "failed" then return nil end
+	local shown = { checking = true, behind = true, downloading = true, ready = true, updated = true, failed = true }
+	if not shown[u.state] then return nil end
 	local text = fill(T.UPDATE[u.state], {
 		version = u.version or "", current = u.current or "", reason = (u.reason and u.reason ~= "") and u.reason or "unknown problem",
 	})
 	if u.restart then text = text .. " " .. T.UPDATE.restart end
-	return text, (u.state == "failed" or u.restart) and "warn" or "info"
+	return text, (u.state == "failed" or u.state == "behind" or u.restart) and "warn" or "info"
 end
 
 return T

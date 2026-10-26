@@ -46,6 +46,29 @@ use crate::link::{CtlMessage, Event};
 
 pub type HoldId = u64;
 
+/// How long an `own_next` waits for its command: the mod writes it and sends the command in the same Lua call.
+pub const OWN_NEXT_MS: u64 = 2_000;
+
+/// The mod's `own_next`: the next player build a script sends through the command list is FeverLink3's own send (the interface half's
+/// apply of a stamped build during a pause), not a new build to hold. One-shot: the first script build after it takes it, and it lapses
+/// after [`OWN_NEXT_MS`]. Every other player build a script sends is held like a tool's (`Runtime::plan_add`). An atomic, because the
+/// order is armed while the control file's reader is locked (`Runtime::arm_orders`), before the machine's lock is taken.
+#[derive(Debug, Default)]
+pub struct OwnSend(std::sync::atomic::AtomicU64);
+
+impl OwnSend {
+    /// `own_next` read at `now` (ms).
+    pub fn arm(&self, now: u64) {
+        self.0.store(now.saturating_add(OWN_NEXT_MS).max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The script build arriving at `now` is the mod's own send: true once per `own_next`, while it has not lapsed.
+    pub fn take(&self, now: u64) -> bool {
+        let until = self.0.swap(0, std::sync::atomic::Ordering::SeqCst);
+        until != 0 && now <= until
+    }
+}
+
 /// The limits of the ring and of the mod's silence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HoldConfig {
@@ -384,6 +407,7 @@ impl<H> HoldMachine<H> {
             | CtlMessage::InjectNext { .. }
             | CtlMessage::CompleteNext { .. }
             | CtlMessage::SendDone { .. }
+            | CtlMessage::OwnNext
             | CtlMessage::TerrainApply { .. }
             | CtlMessage::TerrainShare { .. }
             | CtlMessage::AssetsApply { .. }
@@ -1276,5 +1300,17 @@ mod tests {
             total += held_ids.len();
         }
         assert!(total > 300, "the random runs held too little to mean anything ({total})");
+    }
+
+    #[test]
+    fn an_own_next_is_taken_once_and_lapses() {
+        let own = OwnSend::default();
+        assert!(!own.take(5), "nothing armed: a script build is not the mod's");
+        own.arm(100);
+        assert!(own.take(100 + OWN_NEXT_MS), "the first script build after it is the mod's own send");
+        assert!(!own.take(101), "one-shot: the next one is held again");
+        own.arm(100);
+        assert!(!own.take(101 + OWN_NEXT_MS), "lapsed: a later script build is held");
+        assert!(!own.take(102), "and the lapsed order is gone");
     }
 }

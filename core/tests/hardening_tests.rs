@@ -139,18 +139,32 @@ fn clocks_that_are_not_game_times_are_dropped() {
 }
 
 #[test]
-fn an_action_body_over_the_limit_is_not_relayed_and_one_at_the_limit_is() {
+fn an_action_of_any_size_up_to_the_message_cap_crosses_in_parts_in_order_and_a_longer_one_goes_nowhere() {
     let (mut h, ids) = Harness::running(2, 1, HostOptions::default());
     let (sender, other) = (ids[0], ids[1]);
-    let at_limit = ActionMessage::new(30_000, 1, &"x".repeat(HostSession::MAX_ACTION_BODY));
-    h.player_game(sender, MessageKind::Action, &json(&at_limit));
+    // a 3-track station's build was 618 781 bytes (real session 2026-10-26); 1.5 MB is more than twice that
+    let big = ActionMessage::new(30_000, 1, &"x".repeat(1_500_000));
+    h.player_game(sender, MessageKind::Action, &json(&big));
+    h.player_game(sender, MessageKind::Chat, &json(&ChatMessage { text: "after".into(), from: 0, name: None, level: None }));
     assert_eq!(h.host.actions_relayed(), 1);
-    assert_eq!(h.p(other).count(MessageKind::Action), 1);
-    let over = ActionMessage::new(30_200, 2, &"x".repeat(HostSession::MAX_ACTION_BODY + 1));
+    for game in [&h.host_game, &h.p(other).game] {
+        let kinds: Vec<MessageKind> =
+            game.iter().map(|g| g.0).filter(|k| matches!(k, MessageKind::Action | MessageKind::Chat)).collect();
+        assert_eq!(kinds, [MessageKind::Action, MessageKind::Chat], "whole, and before what was sent after it");
+    }
+    assert_eq!(h.p(other).last::<ActionMessage>(MessageKind::Action).body.len(), 1_500_000);
+    // every frame on the wire fits one Steam message: the parts were sealed and sent one by one
+    let largest = h.events.iter().filter_map(|e| match e {
+        HostOutput::SendToConnection { frame, .. } => Some(frame.body.len()),
+        _ => None,
+    });
+    assert!(largest.max().unwrap() <= parts::MAX_FRAME_PAYLOAD + Sealer::TAG_SIZE);
+    assert!(h.host_log.iter().any(|l| l.contains("parts: Action of")), "{:?}", h.host_log);
+    // over the cap: not sent at all, so applied nowhere
+    let over = ActionMessage::new(30_200, 2, &"x".repeat(parts::MAX_MESSAGE));
     h.player_game(sender, MessageKind::Action, &json(&over));
     assert_eq!(h.host.actions_relayed(), 1);
-    assert_eq!(h.p(other).count(MessageKind::Action), 1);
-    assert!(h.host_log.iter().any(|l| l.contains("body over")));
+    assert!(h.p(sender).log.iter().any(|l| l.contains("Action dropped (not sent:")), "{:?}", h.p(sender).log);
 }
 
 #[test]

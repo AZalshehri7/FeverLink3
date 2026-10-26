@@ -1988,13 +1988,13 @@ class BuildTest(unittest.TestCase):
             self.B.issue("NATIVE_TERRAIN(10, 20, 12, 12)")
             self.tick(14)
             self.assertEqual(self.A.applied(), [])
-            # the map editor's terrain command cannot be replicated: refused on the sender too, never applied there alone; the tool's
-            # terrain build goes the build path (applied at the click, the simulation half says why it cannot ship it)
-            self.assertEqual(len(self.B.applied()), 1)
+            # the map editor's terrain command cannot be replicated: refused on the sender too, never applied there alone; so is a script's
+            # terrain build the API layer cannot record while no native module holds builds (2026-10-26: it applied at the click before)
+            self.assertEqual(self.B.applied(), [])
             self.assertEqual(self.B.shipped(), [])
             self.assertIn("makeWorldReplaceTerrainCmd REFUSED: it cannot be replicated", self.B.log())
             self.assertIn("terrain cells cannot be read or written from a script", self.B.log())
-            self.assertIn("a terrain edit: its cells cannot be read from a script", self.B.log())
+            self.assertIn("makeWorldBuildProposalCmd REFUSED: it cannot be replicated", self.B.log())
 
         def terrain_with_a_road():
             self.B.issue("(function() local P = NATIVE_ROAD{ a = { x = 300, y = 0, z = 0 }, b = { x = 400, y = 0, z = 0 } }; "
@@ -2008,7 +2008,7 @@ class BuildTest(unittest.TestCase):
             self.tick(14)
             self.assertIn("an edge object has no model", self.B.log())
             self.assertEqual(self.A.lua("#BUILD_LOG"), 0, "not shipped: the model is only known after the build")
-            self.assertEqual(self.B.lua("#BUILD_LOG"), 1, "the player's own build went through natively")
+            self.assertEqual(self.B.lua("#BUILD_LOG"), 0, "refused on its own game too: no native module holds builds here")
 
         self.cases([("terrain edit", terrain_edit), ("terrain with a road", terrain_with_a_road), ("signal before its build", signal_before_its_build)])
 

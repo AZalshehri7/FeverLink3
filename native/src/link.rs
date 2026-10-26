@@ -117,6 +117,9 @@ pub enum CtlMessage {
     /// returned (owner decision B, 2026-10-21: the order is the mod's own send's, not a guess by content). The order is armed only
     /// between its line and this one; an order still waiting now was used by no command during its send and is refused at once.
     SendDone { key: u64, held: u64 },
+    /// The NEXT player `build_proposal` a script sends through the command list is the mod's own send (its interface half's apply of a
+    /// stamped build during a pause): not held. Every other one is held like a tool's command (`Runtime::plan_add`, `hold::OwnSend`).
+    OwnNext,
     /// Smooth pacing (`pace.rs`): scale the engine's batch interval by `permille` / 1000 (500 to 2000, held to that range). The mod
     /// sends it when the factor changes and every second while it is not 1; one not refreshed for `pace::STALE_MS` goes back to 1.
     Pace { permille: u32 },
@@ -340,6 +343,7 @@ pub fn parse_ctl_line(line: &Line) -> Result<CtlMessage, CtlError> {
             refuse: short_text(&p, "refuse")?,
             refund: optional(&p, "refund", "refund must be a number of entries")?,
         }),
+        "own_next" => Ok(CtlMessage::OwnNext),
         "send_done" => {
             let (key, held) = (
                 optional(&p, "key", "key must be an inject order's key")?,
@@ -905,6 +909,7 @@ pub enum Event {
     Held {
         id: u64,
         kind: u8,
+        /// The RVA of the tool's call site; 0 for a player's build a script sent (no tool site).
         site: u32,
         ms: u64,
         /// Cancelling this command fires the tool's own completion callback first (`FEVERLINK3_STRICT_FIRE_DONE=1` and a callback that
@@ -1088,7 +1093,13 @@ impl Event {
                     Some(None) => ", refundable entities unreadable".to_string(),
                     None => String::new(),
                 };
-                format!("event held: command {id}, kind {kind}, from tool site {site:#x}{refund}")
+                // site 0: no tool's call site, a script's sendCommand (Runtime::plan_add)
+                let from = if *site == 0 {
+                    "a script's sendCommand: held by the native safety net".to_string()
+                } else {
+                    format!("tool site {site:#x}")
+                };
+                format!("event held: command {id}, kind {kind}, from {from}{refund}")
             }
             Event::Released { id, reason, .. } => format!("event released: command {id} ({reason})"),
             Event::Dropped { id, reason } => format!("event dropped: command {id} ({reason})"),
@@ -1435,6 +1446,7 @@ mod tests {
         assert_eq!(parse("send_done", r#"{["key"]=3}"#), Ok(CtlMessage::SendDone { key: 3, held: 0 }));
         assert_eq!(parse("send_done", r#"{["held"]=7}"#), Ok(CtlMessage::SendDone { key: 0, held: 7 }));
         assert!(matches!(parse("send_done", "{}"), Err(CtlError::BadPayload(_))), "it names its order");
+        assert_eq!(parse("own_next", "{}"), Ok(CtlMessage::OwnNext));
         assert_eq!(parse("defer", r#"{["id"]=4}"#), Ok(CtlMessage::Defer { id: 4 }));
         assert_eq!(parse("fail", r#"{["id"]=4}"#), Ok(CtlMessage::Fail { id: 4 }));
         assert_eq!(

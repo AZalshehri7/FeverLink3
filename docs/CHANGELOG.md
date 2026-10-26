@@ -6,6 +6,17 @@ title: FeverLink3 changelog
 
 The changes of each version that matter to a player or tester. Earlier test builds were folded into these versions.
 
+## 0.2.9 (2026-10-27)
+
+### Fixed
+- A build another mod's tool or window sends (for example the bus and truck bay upgrade tool, or the crossing window) is now applied at the same moment on every game, yours included; before, it ran on your game at once and on the others a moment later, which made the worlds differ and caused a resync. If it cannot be carried to the other games it is refused with a notice, never built on one game alone. Seen with two game windows on one PC (the bus bay upgrade and the crossing window), not yet between two PCs.
+- Big builds such as 3-track stations and station configurations are no longer refused as too big: a build now travels in parts and is applied on every game at the same moment, up to 3 MB of build (before: about 480 KB; a 3-track station is about 620 KB). The other games wait a moment for a very big build (about a second per MB). Seen with two game windows on one PC (builds of 620 KB and 1.23 MB applied on both games), not yet between two PCs.
+- After a resync your builds no longer reuse numbers of builds you made before it, which could mix up a build made after the resync with one made before. Seen with two game windows on one PC over a resync (builds before and after it kept going up, the worlds stayed equal).
+- A construction from a mod that brings its own track (for example the Advanced Track Patterns junctions) now travels as the game's exact command, like every other build: before, the other games could refuse it ("Construction Not Possible") or the worlds drifted apart. Seen with two game windows on one PC (the worlds stayed equal), not yet between two PCs. Known issue: the game log says RESULT DIFFERS for these builds, because the mod's pattern stands as plain track; the worlds stay equal.
+
+### Changed
+- When a host refuses you because its FeverLink3 is newer, your game looks for the update right away (from 30 s after the game start) instead of waiting 2 minutes, and the window says so: "Your FeverLink3 is older than the host's. Checking for an update now...", then downloading and "Restart the game to finish" as before. With automatic updates off it says to download the new version from GitHub or Nexus (issue #4). Seen with two game windows on one PC (a refused player started its update at once).
+
 ## 0.2.8 (2026-10-26)
 
 ### Added

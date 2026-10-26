@@ -26,7 +26,11 @@ class UpdateLine(unittest.TestCase):
                          line(state="failed", version="0.2.1", current="0.2.0", reason="GitHub could not be reached"))
         text, level = line(state="failed", version="0.2.1", current="0.2.0", reason="x", restart=True)
         self.assertTrue(text.endswith("Restart the game before you play together.") and level == "warn", text)
-        for quiet in (line(state=""), line(state="checking"), T.updateLine(None)):
+        self.assertEqual(("Your FeverLink3 is older than the host's (0.2.8). Checking for an update now...", "info"),
+                         line(state="checking", version="0.2.8"))
+        self.assertEqual(("Your FeverLink3 is older than the host's (0.2.8). Download the new version from GitHub or Nexus.",
+                          "warn"), line(state="behind", version="0.2.8"))
+        for quiet in (line(state=""), line(state="other"), T.updateLine(None)):
             self.assertIsNone(quiet)
         self.assertEqual("Automatic updates: on", T.UPDATE.on)
         self.assertEqual("Automatic updates: off", T.UPDATE.off)

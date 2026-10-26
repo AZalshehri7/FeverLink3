@@ -279,6 +279,41 @@ fn a_session_runs_end_to_end_over_steam() {
 }
 
 #[test]
+fn a_build_of_one_and_a_half_megabytes_crosses_steam_in_parts_whole_and_in_order() {
+    // a 3-track station's build was 618 781 bytes and refused (real session 2026-10-26): one Steam message holds 512 KiB
+    let mut table = Table::new(HostOptions::default(), Vec::new());
+    let (mut alice, mut bob) = (table.player("Alice"), table.player("Bob"));
+    for p in [&alice, &bob] {
+        assert!(p.handle.wait_for(WAIT, |s| s.connected && s.my_id.is_some()), "{:?}", p.handle.logs());
+    }
+    assert!(table.handle.wait_for(WAIT, |s| s.players.len() == 3));
+    // the body is a Lua literal, as the mod's is: here one string of 1.5 MB
+    let body = "x".repeat(1_500_000);
+    alice.game.write("action", &format!("{{[\"body\"]=\"\\\"{body}\\\"\",[\"seq\"]=1,[\"stamp\"]=2400}}"));
+    alice.game.write("chat", "{[\"text\"]=\"after the build\"}");
+    assert!(
+        wait(WAIT, || {
+            table.game.step();
+            bob.game.step();
+            [&table.game, &bob.game].iter().all(|g| g.saw("chat", "after the build"))
+        }),
+        "host: {:?}
+bob: {:?}",
+        table.handle.logs(),
+        bob.handle.logs()
+    );
+    for g in [&table.game, &bob.game] {
+        let action = g.index_of("action", &body).expect("the build arrived whole");
+        assert!(action < g.index_of("chat", "after the build").unwrap(), "nothing sent after it overtakes it");
+    }
+    assert!(alice.handle.logs().iter().any(|l| l.contains("parts: Action of")), "{:?}", alice.handle.logs());
+    assert!(table.handle.logs().iter().any(|l| l.contains("parts: Action of")), "{:?}", table.handle.logs());
+    alice.handle.stop();
+    bob.handle.stop();
+    table.handle.stop();
+}
+
+#[test]
 fn a_rejected_player_learns_why_even_with_a_slow_wire() {
     let table = Table::new(HostOptions::default(), Vec::new());
     // the reject frame is still on its way when the host closes the connection: the close must wait for it

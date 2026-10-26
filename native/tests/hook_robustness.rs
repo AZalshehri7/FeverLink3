@@ -178,7 +178,8 @@ fn control_lines_of_any_shape_are_read_or_refused() {
                     | CtlMessage::Ping { .. }
                     | CtlMessage::PatchNext { .. }
                     | CtlMessage::InjectNext { .. }
-                    | CtlMessage::CompleteNext { .. } => {}
+                    | CtlMessage::CompleteNext { .. }
+                    | CtlMessage::OwnNext => {}
                 }
             }
             Err(e) => {

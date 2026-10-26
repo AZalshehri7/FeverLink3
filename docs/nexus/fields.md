@@ -1,6 +1,6 @@
-# Nexus Mods page: the form fields (0.2.8)
+# Nexus Mods page: the form fields (0.2.9)
 
-Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-26, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.8.
+Paste-ready text for each field, in the order of the upload form. The long description is `description.bbcode.txt`. Nexus does not publish most field limits; the texts are kept under conservative limits, and the form itself is the final word. Facts as of 2026-10-27, release https://github.com/AZalshehri7/FeverLink3/releases/tag/v0.2.9.
 
 ## Name
 
@@ -21,7 +21,7 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 ## Version
 
 ```
-0.2.8
+0.2.9
 ```
 
 ## Category, tags, flags
@@ -33,13 +33,13 @@ Play Transport Fever 3 together: build, run lines and grow towns in one shared w
 
 ## Main file
 
-- Upload: `FeverLink3-0.2.8.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.8.zip.sha256` on the release page.
-- Name on Nexus: `FeverLink3 0.2.8`
-- Category: Main files. Version: 0.2.8.
+- Upload: `FeverLink3-0.2.9.zip` exactly as downloaded from the GitHub release. Do not repack it: players compare its SHA-256 with `FeverLink3-0.2.9.zip.sha256` on the release page.
+- Name on Nexus: `FeverLink3 0.2.9`
+- Category: Main files. Version: 0.2.9.
 - File description (under 255 characters):
 
 ```
-Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.8. Updates itself (can be turned off).
+Copy winhttp.dll and the mods folder into the game folder (next to TransportFever3.exe). Windows, Steam. Unsigned until 1.0.0; SHA-256 on the GitHub release v0.2.9. Updates itself (can be turned off).
 ```
 
 (200 characters.)
@@ -88,6 +88,14 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Changelog tab
 
 ```
+0.2.9
+- Builds from other mods' tools and windows (for example the bus and truck bay upgrade, the crossing window) are applied at the same moment on every game.
+- Big builds such as 3-track stations are no longer refused as too big (up to 3 MB of build).
+- Constructions from mods with their own track (Advanced Track Patterns) build alike on every game.
+- After a resync your builds keep their own numbers.
+- When a newer host refuses you, your game looks for the update right away (issue #4).
+(The first three seen with two game windows on one PC, not yet between two PCs; the last two in automated tests only.)
+
 0.2.8
 - New: trees, plants, rocks and the vegetation eraser are shared in a session (they were grayed out). Tell us if the trees look different for someone.
 
@@ -135,8 +143,9 @@ Unofficial: not affiliated with or endorsed by Urban Games or Paradox Interactiv
 ## Pinned post (known issues and how to report)
 
 ```
-Known issues in 0.2.8
+Known issues in 0.2.9
 - Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone.
+- Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
 - A mod change FeverLink3 cannot share yet causes extra syncs (FeverLink3 names the mod in a warning).
 - After a Transport Fever 3 update, FeverLink3 searches the new build by itself; if it cannot find every place, it needs an update (the window says so).
 - About one automatic repair (about 15 s) every 40 minutes in a long session over the internet.

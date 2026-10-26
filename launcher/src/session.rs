@@ -1561,6 +1561,15 @@ impl PlayerLoop {
                     for (blocks, line) in &report {
                         shared.log(format!("mods: {} {line}", if *blocks { "refused:" } else { "warning:" }));
                     }
+                    // the host's FeverLink3 is newer: the update check runs now, not at its 2 minutes (issue #4)
+                    if let (Some(host), Some(mine)) = (&reject.mods, &self.config.mods) {
+                        if crate::autoupdate::check_now(&host.feverlink3, &mine.feverlink3) {
+                            shared.log(format!(
+                                "update: the host runs FeverLink3 {}, this game {}: checking for an update now",
+                                host.feverlink3, mine.feverlink3
+                            ));
+                        }
+                    }
                     shared.update(|s| {
                         s.rejected = Some(why);
                         s.mod_report = report;
@@ -1672,6 +1681,8 @@ mod tests {
             MessageKind::ReportAsk,
             MessageKind::ReportBundle,
             MessageKind::ReportBusy,
+            // a message in parts is put together by the session layer; the game sees only the whole message
+            MessageKind::Part,
         ];
         for k in MessageKind::FROM_PLAYER {
             assert_eq!(!session_layer.contains(&k), LINE_KINDS.iter().any(|r| r.kind == k && r.from_game), "{k:?}");

@@ -877,6 +877,8 @@ end
 '''
 
 BUY = 'api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s, e) %s = { s, d and d.resultVehicleEntity } end)'
+SET_LINE = ('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s) if s then '
+            'api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(d.resultVehicleEntity, %d, 0), function(_, s2) SET = s2 end) end end)')
 LINE = 'api.cmd.sendCommand(api.cmd.makeLineCreateCmd("%s", { x = 0, y = 0, z = 0 }, 7, { stops = {} }), function(d, s, e) %s = e and e[1] and e[1][1] end)'
 BUY_BODY_TEXT = '{["fn"]="makeVehicleBuyCmd",["args"]={["n"]=3,[1]={["__ref"]="player"},[2]={["__ref"]="entity",["key"]="s:55"},[3]={}}}'
 
@@ -1652,6 +1654,10 @@ class StampedEverywhereTest(LockstepTest):
         self.B.window(LINE % ("L", "LINE"))
         self.tick(40)
         line = int(self.B.L.eval("LINE"))
+        # Real session 2026-10-26: a resync load gives the game fresh Lua states, so numbers only a shipped action had used (one that
+        # leaves no binding, like this set-line) were given again (0:580 back to 0:559). 1:2 is the purchase, 1:3 the set-line.
+        self.B.window(SET_LINE % line)
+        self.tick(60)
         for g in (self.A, self.B):
             self.relay.send(g, "resync_load", 0, self.relay.ser({"id": 21, "name": "hostsave", "sha256": "00"}))
             g.frames_to_load()
@@ -1659,15 +1665,14 @@ class StampedEverywhereTest(LockstepTest):
             g.reload()
         self.relay.session()
         self.tick(10)
-        self.B.window(('api.cmd.sendCommand(api.cmd.makeVehicleBuyCmd(7, 55, { vehicles = {} }), function(d, s) if s then '
-                       'api.cmd.sendCommand(api.cmd.makeVehicleSetLineCmd(d.resultVehicleEntity, %d, 0), function(_, s2) SET = s2 end) end end)') % line)
+        self.B.window("SET = nil; " + SET_LINE % line)
         self.tick(60)
-        self.assertSameApplies(3)
+        self.assertSameApplies(5)
         self.assertTrue(self.B.L.eval("SET"), self.B.log())
-        self.assertIn("action numbers go on from 1:2", self.B.log())
+        self.assertIn("action numbers go on from 1:4", self.B.log())
         for g in (self.A, self.B):
             sets = [int(g.L.eval("GAME.applied[%d].args[2]" % (i + 1))) for i, a in enumerate(g.applied()) if a.startswith("makeVehicleSetLineCmd@")]
-            self.assertEqual(sets, [line], g.label)
+            self.assertEqual(sets, [line, line], g.label)
             self.assertNotIn("refused", g.log())
 
     def pause_both(self):

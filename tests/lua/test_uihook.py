@@ -106,10 +106,32 @@ class UiHookTest(unittest.TestCase):
         self.assertEqual((2, []), (self.sent(), self.records()), "both reach the game")
         self.runtime()
         self.lua.execute("Hook.install()")
-        # an event nobody replicates, and builds: those the bridge sees where the engine applies them
+        # an event nobody replicates, and a build the script marks as not the player's
         self.lua.execute('api.cmd.sendCommand(api.cmd.makeScriptingSendEventCmd("", "Tutorial", "Step", {}))')
-        self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({}, nil, false, true))")
+        self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({}, nil, false, false))")
         self.assertEqual((2, []), (self.sent(), self.records()))
+        with self.subTest("a player's build a mod's script sends: held by the API layer, or handed to the native net"):
+            # real session 2026-10-26: the bus and truck bay mod's upgrade tool sent its build with api.cmd.sendCommand in this state; it went
+            # to the engine at the click (applied there 3 steps before the other games: a free-id fork). Now the API layer holds it.
+            self.runtime()
+            self.fake_cmds(makeWorldBuildProposalCmd='{ category = "build", encode = function(_, args) if args[1].bad then return nil, "no model yet" end '
+                                                     'return { fn = "makeWorldBuildProposalCmd", args = { { segs = 1 }, {}, false, true } } end }')
+            self.lua.execute("Hook.install()")
+            self.lua.execute("PROPOSAL = {}; api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(PROPOSAL, 'ctx', false, true), function(d, s, e) BUILT = { d, s } end)")
+            recs = self.records()
+            self.assertEqual((0, ["cmd"]), (self.sent(), [r[0] for r in recs]), "recorded and held, not sent at the click")
+            self.answer(1, True)
+            self.lua.execute("Hook.poll()")
+            self.assertTrue(self.lua.eval("BUILT[2] == true and BUILT[1].proposal == PROPOSAL and BUILT[1].context == 'ctx'"),
+                            "the callback gets the stamp apply's result and the command data, as the engine gives it")
+            # one the API cannot record: refused without the native net, handed to the engine's command list while the module holds builds
+            self.lua.execute("api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({ bad = true }, nil, false, true), function(d, s) NO = s end)")
+            self.assertEqual((0, "notice"), (self.sent(), self.records()[-1][0]))
+            self.assertTrue(self.lua.eval("NO == false"))
+            self.lua.execute("local H = ug_require('feverlink3_hud.lua'); local h = H.new(1, 'p'); H.setNativeHolds(h, true); "
+                             "H.writeSnapshot(C, h, {}); local real = os.clock; os.clock = function() return real() + 5 end; "
+                             "api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd({ bad = true }, nil, false, true)); os.clock = real")
+            self.assertEqual(1, self.sent(), "the native safety net holds it at the command list")
 
     def test_a_window_command_waits_for_its_stamp_apply_and_hears_its_result_once(self):
         # the originator applies a window command at its stamp like every other game: not at the click (that shifted the engine's

@@ -8,7 +8,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 
 [list]
 [*][b]Fully integrated into the game, no launcher.[/b] Start Transport Fever 3 from Steam as usual. Hosting, joining, chat, syncing and updates all live in the game's bottom bar and window. There is no extra program to run.
-[*][b]Build together.[/b] Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines and vehicles: what one player builds appears in every game.
+[*][b]Build together.[/b] Roads, bridges, tunnels, rail, signals, stations, stops, depots, lines, vehicles, terrain, ground paint, trees, plants and rocks: what one player builds appears in every game.
 [*][b]Your other mods work together too.[/b] Mods that change your world by themselves, such as Auto Line Namer, Auto Color Lines or Auto Assign Terminals, stay in sync: the host's copy makes the change and every game applies it at the same moment, and what you set in such a mod's own window reaches every game (new in 0.2.4; seen with two games on one PC).
 [*][b]The full game.[/b] Towns grow, traffic flows, ratings change, exactly as in single player. Nothing is switched off.
 [*][b]Easy to join.[/b] Over Steam: no ports, no router settings, no IP addresses. The host sends a join code, the friend pastes it.
@@ -35,6 +35,7 @@ Build, run lines and grow towns together in one shared world, each player in the
 
 [list]
 [*]Trees, plants and rocks are shared since 0.2.8, new and seen only with two game windows on one PC so far: tell us if the trees look different for someone. Terrain heights and ground paint are shared since 0.2.7.
+[*]Advanced Track Patterns junctions: the game log says RESULT DIFFERS because the mod's pattern stands as plain track; the worlds stay equal.
 [*]Mods that change the world on their own (for example an automatic line namer) cause extra syncs. FeverLink3 names them in a warning; turn their automatic changes off while playing together.
 [*]Coming back after a short drop without a reload, and separate companies for each player, are planned.
 [/list]

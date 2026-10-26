@@ -63,7 +63,10 @@ only a listen socket (about 30 ms: a condition-variable wait is rounded to the 1
   it from `ResyncLimits::CHUNK_SIZE` and the widest numbers), 67 % of the limit with 174 KB to spare. A save of 31 MB
   is 119 such chunks (the end-to-end test moves 31 MiB, 125 chunks, through a resync round). The biggest frame the
   transport takes has a body of 524 272 bytes; one byte more is refused by `send` before Steam sees it, the connection
-  stays open. A test fails if a larger chunk size ever stops fitting.
+  stays open. A test fails if a larger chunk size ever stops fitting. A message longer than one frame (a big build)
+  never reaches the transport whole: the session layer sends it in parts of at most 512 000 bytes of payload, each its
+  own sealed frame of at most 512 032 bytes (`core/src/session/parts.rs`, checked against this limit at compile time;
+  `docs/PROTOCOL.md`, "Messages in parts").
 - **Backpressure.** Steam queues at most 512 KiB per connection and answers more with "limit exceeded" where a TCP
   write would block. `send` waits for room (2 ms steps, up to 30 s), so `stream_save` is paced by the link; a chunk
   that cannot be queued for 30 s closes the connection (`write failed: ...`).

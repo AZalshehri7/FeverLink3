@@ -8,6 +8,7 @@
 
 mod net;
 
+use feverlink3_core::protocol::Frame;
 use feverlink3_core::session::*;
 use net::*;
 
@@ -300,4 +301,31 @@ fn a_pause_and_a_checksum_asked_for_during_a_stall_lie_past_the_promise_the_host
     assert!(s.n.host.future_stamp() >= proxy);
     s.n.host_call(HostSession::pause);
     assert!(s.n.host.state().pause_at.unwrap() >= proxy, "no game can have passed the pause");
+}
+
+#[test]
+fn a_guest_whose_build_is_still_arriving_in_parts_is_not_stalled_and_its_build_is_applied() {
+    let mut s = Session::new(HostOptions::default());
+    s.play(5.0, true, 4);
+    let stamp = s.guest_lines().last().unwrap().safe.unwrap();
+    let mut big = codec::try_decode::<ActionMessage>(&action(stamp, 1, false)).unwrap();
+    big.body = "x".repeat(1_500_000);
+    let outs = s.n.peers.get_mut(&s.guest).unwrap().session.local_game_message(MessageKind::Action, &json(&big));
+    let frames: Vec<Frame> =
+        outs.into_iter().filter_map(|o| if let PlayerOutput::SendToHost(f) = o { Some(f) } else { None }).collect();
+    assert_eq!(frames.len(), 3, "1.5 MB in parts of at most {} bytes", parts::MAX_FRAME_PAYLOAD);
+    // a slow path: a part every 1.6 s, 4.8 s without a clock line of the guest; whatever its session sends meanwhile (pongs) would be
+    // queued behind the build on the one ordered connection, so here it is held back
+    s.n.reachable.remove(&s.guest);
+    for f in &frames {
+        s.play(1.6, false, 4);
+        assert!(s.n.host.state().stalled.is_empty(), "a game still sending a message is not silent");
+        s.n.inject(s.guest, f);
+    }
+    s.n.reachable.insert(s.guest);
+    s.play(1.0, true, 4);
+    assert!(s.n.host.state().stalled.is_empty());
+    let got: ActionMessage = s.n.host_game_all(MessageKind::Action).pop().expect("relayed whole");
+    assert_eq!((got.stamp, got.body.len()), (stamp, 1_500_000));
+    assert_barrier_exact(&s.n.host_game, s.guest_id());
 }

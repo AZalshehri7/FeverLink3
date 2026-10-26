@@ -107,6 +107,7 @@ end
 C.TO_GAME = "to_game.log"
 C.FROM_GAME = "from_game.log"
 C.CURSOR = "resync_cursor.txt" -- written before a resync load: the places in to_game.log and ui_out.log the reloaded mod resumes at
+C.SEQ = "action_seq.txt"       -- "<player> <seq> <session>": the highest action number this player shipped in the session (bridge X.seqCarry)
 
 -- ------------------------------------------------------------------ generations
 -- A log is a series of generation files: <stem>.<ext> (generation 1), <stem>.2.<ext>, <stem>.3.<ext>, ..., and <stem>.gen

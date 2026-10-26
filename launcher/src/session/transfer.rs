@@ -185,6 +185,11 @@ impl<'scope, 'env> HostIo<'scope, 'env> {
     /// Writes a frame: through the connection's outbox when it has one (in order behind what is queued), directly
     /// otherwise. A failed write closes the connection; its Closed event removes the player.
     pub(super) fn send(&mut self, conn: ConnectionId, frame: Frame) {
+        // a message in parts (a big build) takes seconds at Steam's ~1 MB/s per connection: its own writer sends it, in order, and
+        // the session thread goes on (the outbox goes once it is empty, `pump`)
+        if frame.header.kind == u8::from(MessageKind::Part) {
+            self.open_outbox(conn);
+        }
         match self.outboxes.get(&conn) {
             Some(outbox) if outbox.closed => {}
             Some(outbox) => {

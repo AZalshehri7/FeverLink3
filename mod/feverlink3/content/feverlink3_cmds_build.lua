@@ -45,7 +45,8 @@ local M = { commands = {}, VERSION = 1 }
 -- and the candidates are filtered here).
 local TOL_SAME, TOL_NODE, TOL_CON = 0.5, 1.0, 3.0
 local CON_REACH, EDGE_REACH = 200, 250
-local LIMIT = { cons = 200, nodes = 4000, segs = 4000, objs = 1000, ncfg = 2000, rem = 4000, bytes = 600000, text = 400 }
+-- bytes: the action body's own bound (the bridge's ACTION_BODY_MAX, 3 MiB: the session carries it in parts); the counts stay
+local LIMIT = { cons = 200, nodes = 4000, segs = 4000, objs = 1000, ncfg = 2000, rem = 4000, bytes = 3 * 1024 * 1024, text = 400 }
 
 -- The Context flags of a record that carries none (written by an older version, or captured where the engine's real flags could not be
 -- read). Every record of this version carries the originator's real Context; a replay of an old one is logged (decodeBuildUnsafe).

@@ -8,7 +8,7 @@
 //!    renames only: no network, no waiting.
 //! 2. **Once per start, on a thread of its own** ([`start`]), not before [`FIRST_CHECK_AFTER`] in the game: unless the
 //!    player turned it off, the module asks GitHub
-//!    for the newest full release. If it is newer, it is downloaded, checked ([`stage_update`], the trust model below)
+//!    for the newest full release (sooner, and once more, when a newer host refuses the player: [`check_now`]). If it is newer, it is downloaded, checked ([`stage_update`], the trust model below)
 //!    and staged in `<game>\feverlink3_update\<version>\`. Never while a session runs: the thread waits until the
 //!    player is out of the session before it downloads or touches a file.
 //! 3. **Still in that run**, the new `winhttp.dll` is put in place: Windows lets a loaded DLL be renamed, so the
@@ -56,7 +56,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,12 @@ pub const START_ATTEMPTS: u32 = 2;
 /// `shader_cache\pipelines.cache.tmp` failed "being used by another process" and the game showed "Internal error".
 /// The download now runs inside the process (no child inherits anything), and it also waits.
 pub const FIRST_CHECK_AFTER: Duration = Duration::from_secs(120);
+
+/// A player refused by a host whose FeverLink3 is newer ([`check_now`], issue #4: a player on 0.2.7 refused by a 0.2.8
+/// host 108 s after the start saw no update, the check waited for 120 s) checks at once, but never before this. The
+/// clash of [`FIRST_CHECK_AFTER`] came 3 s after the start, from a child process that no longer exists; 30 s is ten
+/// times that, and the same time after which a start counts as good ([`HEALTHY_AFTER`]).
+pub const EARLY_CHECK_AFTER: Duration = Duration::from_secs(30);
 
 /// A start counts as good when the game is still running this long after the module loaded.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(30);
@@ -505,7 +511,8 @@ pub fn pretend_version(game: &Path) -> Option<String> {
 /// What the window shows (`update` in `ctl_status.txt`); the words are the mod's (`feverlink3_text.lua`, `T.UPDATE`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Status {
-    /// "" (nothing to say), "downloading", "ready" (restart to finish), "updated" (this start is the new version),
+    /// "" (nothing to say), "checking" (asked by [`check_now`]), "behind" (the host is newer and no update comes:
+    /// download it by hand), "downloading", "ready" (restart to finish), "updated" (this start is the new version),
     /// "failed".
     pub state: String,
     /// The new version.
@@ -525,6 +532,73 @@ pub struct Status {
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
 static SESSION_BUSY: AtomicBool = AtomicBool::new(false);
 static SETTINGS: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Between [`check_now`] and the check thread: `armed` while the thread may still check (on, an official build, no
+/// update staged), `asked` when a check is wanted now, `used` once an ask was taken (one per start).
+struct Wake {
+    armed: bool,
+    asked: bool,
+    used: bool,
+}
+static WAKE: Mutex<Wake> = Mutex::new(Wake { armed: false, asked: false, used: false });
+static WAKE_CV: Condvar = Condvar::new();
+
+fn wake() -> std::sync::MutexGuard<'static, Wake> {
+    WAKE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// `host` when that FeverLink3 version is strictly newer than `ours`; an unreadable version is never newer.
+pub fn host_newer(host: &str, ours: &str) -> Option<String> {
+    let (Ok(h), Ok(o)) = (Version::parse(host), Version::parse(ours)) else { return None };
+    (h > o).then(|| host.trim().to_owned())
+}
+
+/// The host refused this game and runs FeverLink3 `host`, this game `ours`: when the host's is newer, the update check
+/// runs now instead of at [`FIRST_CHECK_AFTER`] (not before [`EARLY_CHECK_AFTER`], still never during a session),
+/// at most once per start, also after an earlier check of this start found nothing. True when a check was asked; the
+/// window says so, or says to download it by hand when no check comes (turned off, a developer's build, used).
+pub fn check_now(host: &str, ours: &str) -> bool {
+    let Some(newer) = host_newer(host, ours) else { return false };
+    let asked = {
+        let mut w = wake();
+        let asked = w.armed && !w.used;
+        if asked {
+            w.asked = true;
+            w.used = true;
+            WAKE_CV.notify_all();
+        }
+        asked
+    };
+    let mut s = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = s.as_mut().filter(|s| s.state.is_empty() || s.state == "behind") {
+        s.state = if asked { "checking" } else { "behind" }.into();
+        s.version = newer;
+    }
+    asked
+}
+
+/// How long the check thread still waits, `elapsed` after the load: until [`FIRST_CHECK_AFTER`] for the start's
+/// check, until [`EARLY_CHECK_AFTER`] when asked, without end (`None`) for an ask after the start's check.
+fn wait_left(elapsed: Duration, asked: bool, checked: bool) -> Option<Duration> {
+    match (asked, checked) {
+        (true, _) => Some(EARLY_CHECK_AFTER.saturating_sub(elapsed)),
+        (false, false) => Some(FIRST_CHECK_AFTER.saturating_sub(elapsed)),
+        (false, true) => None,
+    }
+}
+
+/// Waits for the thread's turn; true when an ask of [`check_now`] started it.
+fn wait_turn(loaded: std::time::Instant, checked: bool) -> bool {
+    let mut w = wake();
+    loop {
+        match wait_left(loaded.elapsed(), w.asked, checked) {
+            Some(d) if d.is_zero() => break,
+            Some(d) => w = WAKE_CV.wait_timeout(w, d).unwrap_or_else(|p| p.into_inner()).0,
+            None => w = WAKE_CV.wait(w).unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+    std::mem::take(&mut w.asked)
+}
 
 fn set_status(f: impl FnOnce(&mut Status)) {
     let mut s = STATUS.lock().unwrap_or_else(|p| p.into_inner());
@@ -615,17 +689,34 @@ fn run(paths: Paths, begun: Start, enabled: bool, loaded: std::time::Instant, lo
         return;
     }
     let compare_with = pretend.clone().unwrap_or_else(|| VERSION.to_owned());
+    wake().armed = true;
+    let mut checked = false;
+    // the start's check, then at most one more when a newer host refuses us after it (check_now)
+    while check_once(&paths, &compare_with, pretend.is_some(), loaded, checked, log) {
+        checked = true;
+    }
+    wake().armed = false;
+}
+
+/// One check: waits for its turn and for the end of a session, then asks GitHub. True when the thread should stay
+/// for an ask of [`check_now`] (nothing was staged and this check was not the asked one).
+fn check_once(
+    paths: &Paths,
+    compare_with: &str,
+    pretend: bool,
+    loaded: std::time::Instant,
+    checked: bool,
+    log: fn(&str),
+) -> bool {
     // the game first finishes starting (FIRST_CHECK_AFTER); `start` runs in DllMain, so the clock starts at the load
-    std::thread::sleep(FIRST_CHECK_AFTER.saturating_sub(loaded.elapsed()));
+    let asked = wait_turn(loaded, checked);
+    if asked {
+        log("update: checking now: the host runs a newer FeverLink3");
+    }
     while SESSION_BUSY.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(5));
     }
-    let check = Check {
-        compare_with: &compare_with,
-        running: VERSION,
-        keys: update::TRUSTED_KEYS,
-        now_unix: update::now_unix(),
-    };
+    let check = Check { compare_with, running: VERSION, keys: update::TRUSTED_KEYS, now_unix: update::now_unix() };
     let fetch = InProcess;
     let mut downloading = |v: &str| {
         log(&format!("update: downloading {v} (compared with {compare_with})"));
@@ -635,13 +726,24 @@ fn run(paths: Paths, begun: Start, enabled: bool, loaded: std::time::Instant, lo
         });
     };
     let idle = || !SESSION_BUSY.load(Ordering::Relaxed);
-    let result = stage_update(&paths, &fetch, &check, &mut downloading, &idle);
+    let result = stage_update(paths, &fetch, &check, &mut downloading, &idle);
     let _ = fs::remove_dir_all(paths.downloads());
     paths.remove_dir_if_empty();
+    // a check asked by check_now that brings nothing: the window says to download it by hand
+    let nothing = || {
+        set_status(|s| {
+            if asked && s.state == "checking" {
+                s.state = "behind".into();
+            }
+        })
+    };
     match result {
-        Ok(None) => log("update: up to date"),
+        Ok(None) => {
+            log("update: up to date");
+            nothing();
+        }
         Ok(Some(to)) => {
-            if pretend.is_some() {
+            if pretend {
                 let _ = fs::remove_file(paths.game.join(PRETEND_FILE));
             }
             log(&format!("update: {to} staged and winhttp.dll replaced; the mod is swapped at the next start"));
@@ -649,6 +751,7 @@ fn run(paths: Paths, begun: Start, enabled: bool, loaded: std::time::Instant, lo
                 s.state = "ready".into();
                 s.version = to;
             });
+            return false;
         }
         Err(r) => {
             log(&format!("update: refused or failed: {} ({})", r.plain, r.detail));
@@ -659,8 +762,10 @@ fn run(paths: Paths, begun: Start, enabled: bool, loaded: std::time::Instant, lo
                     s.reason = r.plain;
                 }
             });
+            nothing();
         }
     }
+    !asked
 }
 
 #[cfg(test)]
@@ -1023,5 +1128,36 @@ mod tests {
         write_enabled(&f, true).unwrap();
         assert!(read_enabled(&f));
         assert_eq!(fs::read_to_string(&f).unwrap(), "other=1\nautoupdate=on\n");
+    }
+
+    #[test]
+    fn a_newer_host_asks_for_one_early_check() {
+        assert_eq!(host_newer("0.2.8", "0.2.7"), Some("0.2.8".into()));
+        assert_eq!(host_newer("0.10.0", "0.9.9"), Some("0.10.0".into()), "numbers, not text");
+        for (host, ours) in
+            [("0.2.7", "0.2.8"), ("0.2.8", "0.2.8"), ("", "0.2.8"), ("dev", "0.2.8"), ("0.2.8-pre1", "0.2.8")]
+        {
+            assert_eq!(host_newer(host, ours), None, "{host} against {ours}");
+        }
+        // updates off or a developer's build: the thread never arms, nothing is asked
+        assert!(!check_now("0.2.8", "0.2.7"));
+        wake().armed = true;
+        // a refusal for other mods (same FeverLink3) or by an older host asks nothing
+        assert!(!check_now("0.2.8", "0.2.8") && !check_now("0.2.6", "0.2.7"));
+        assert!(!wake().asked);
+        assert!(check_now("0.2.8", "0.2.7"));
+        assert!(wake().asked);
+        assert!(!check_now("0.2.8", "0.2.7"), "one ask per start");
+        *wake() = Wake { armed: false, asked: false, used: false };
+    }
+
+    #[test]
+    fn an_early_check_keeps_its_floor() {
+        let s = Duration::from_secs;
+        assert_eq!(wait_left(s(10), false, false), Some(s(110)), "the start's check");
+        assert_eq!(wait_left(s(10), true, false), Some(s(20)), "asked: not before EARLY_CHECK_AFTER");
+        assert_eq!(wait_left(s(108), true, false), Some(s(0)), "asked later: at once");
+        assert_eq!(wait_left(s(200), false, true), None, "after the start's check: only an ask");
+        assert_eq!(wait_left(s(200), true, true), Some(s(0)));
     }
 }

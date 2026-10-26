@@ -36,7 +36,7 @@ pub(crate) struct Outbox {
 }
 
 impl Outbox {
-    /// At most this many payload bytes are kept: a minute of heavy building is far below it (a build is at most 480 KiB, a clock line
+    /// At most this many payload bytes are kept: a minute of heavy building is far below it (a build is at most 8 MiB and rarely over 1 MB, a clock line
     /// about 100 bytes). Beyond it the oldest go, and a peer that needs them gets the old repair (a reload) instead.
     pub const MAX_BYTES: usize = 32 << 20;
 

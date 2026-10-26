@@ -98,6 +98,8 @@ pub struct Runtime {
     orig_apply: AtomicUsize,
     /// The service thread, to wake when the hook has queued an event.
     waker: OnceLock<Thread>,
+    /// The mod's `own_next`: its next script build is its own send, not one to hold (`plan_add`).
+    own_send: crate::hold::OwnSend,
     /// Reads the game time, when this build has a way to. None for now: a scheduled release is due at once.
     clock: Option<fn() -> Option<u64>>,
     /// The dev-only dump of build commands (`FEVERLINK3_DUMP_COMMANDS`); unset in a normal run.
@@ -231,6 +233,7 @@ impl Runtime {
             orig_add: AtomicUsize::new(0),
             orig_apply: AtomicUsize::new(0),
             waker: OnceLock::new(),
+            own_send: crate::hold::OwnSend::default(),
             clock: None,
             dump: OnceLock::new(),
             portable: OnceLock::new(),
@@ -853,6 +856,7 @@ impl Runtime {
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
+                Ok(crate::link::CtlMessage::OwnNext) => self.own_send.arm(now),
                 Ok(crate::link::CtlMessage::TerrainApply { key, x0, y0, w, h, ttl }) => {
                     self.terrain_arm(key, crate::terrain::Header { x0, y0, w, h }, ttl, now)
                 }
@@ -877,6 +881,7 @@ impl Runtime {
                 }
                 Ok(crate::link::CtlMessage::CompleteNext { held, ttl, tm }) => self.inject.arm_link(held, ttl, tm, now),
                 Ok(crate::link::CtlMessage::SendDone { key, held }) => self.inject.close(key, held),
+                Ok(crate::link::CtlMessage::OwnNext) => self.own_send.arm(now),
                 Ok(crate::link::CtlMessage::TerrainApply { key, x0, y0, w, h, ttl }) => {
                     self.terrain_arm(key, crate::terrain::Header { x0, y0, w, h }, ttl, now)
                 }
@@ -1073,7 +1078,7 @@ impl Runtime {
             self.fault(
                 "add hook",
                 crate::failsafe::Action::Repair,
-                format!("a construction tool's command went to the engine at the click, not at its stamp: {why}"),
+                format!("a player's build command went to the engine at the click, not at its stamp: {why}"),
             );
         }
         if self.patch.enabled() {
@@ -1180,13 +1185,31 @@ impl Runtime {
         let now = self.now_ms();
         plan.now = now;
         plan.tool = tool.is_some();
+        // A player's build that a script sent (no tool site): another mod's tool or window calling api.cmd.sendCommand with
+        // makeWorldBuildProposalCmd from an interface Lua state. Real session 2026-10-26 (0.2.8, deadeye_tpf3_bus_bay's upgrade tool, a
+        // react recipe calling `api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(proposal, ctx, false, true), cb)`): it passed here
+        // as "another caller", the engine applied it at the click on the originator, the simulation half captured it after the apply and
+        // the others applied it at the stamp, 3 steps later: a free-id fork and a resync, twice. Such a command is held like a tool's and
+        // goes the held way (its own proposal is the record, every game applies it at the stamp, its callback gets the stamp apply's
+        // result). The game's own scripts are not caught: their builds say playerInitiated false (towns, reforestation), and a send from
+        // the simulation state never reaches this hook (b31 to b41). The terrain tool and the asset brushes have their own stamped way.
+        // FeverLink3's own sends through here (the interface half's apply during a pause) are announced by `own_next` just before; the
+        // next build of no tool site takes it, whatever its flags (a carrier, a second command with playerInitiated false), so it never
+        // lingers on to let another script's build through.
+        // SAFETY: the kind is read only from readable memory.
+        let script_any = tool.is_none()
+            && unsafe { engine::command_kind(args.cmd, engine.kind_offset) }
+                == self.build.kind_by_name("build_proposal");
+        let script_build = script_any && self.script_player_build(args);
         let mut machine = match try_lock_briefly(&self.machine) {
             Some(m) => m,
             // a tool's command may be one to hold: wait a little for the service thread rather than pass it through
-            None if plan.tool => match lock_within(&self.machine, HOOK_WAIT) {
+            None if plan.tool || script_build => match lock_within(&self.machine, HOOK_WAIT) {
                 Some(m) => m,
                 None => {
-                    plan.passed = Some("the hold state stayed busy");
+                    if plan.tool || !(script_any && self.own_send.take(now)) {
+                        plan.passed = Some("the hold state stayed busy");
+                    }
                     return None;
                 }
             },
@@ -1195,17 +1218,27 @@ impl Runtime {
         // the mod writes `release` and then sends a command to get here: look at the file now, do not wait for the pump
         self.ingest(&mut machine, now);
         plan.due = machine.take_due(self.game_time(), now);
+        let own = script_any && self.own_send.take(now);
+        let script = script_build && !own;
 
         // a tree, plant or rock placed by a tool on the hold list goes the brush's way, not held (runtime/assets.rs)
         plan.asset_tick = tool.is_some() && self.assets_tool_tick(args);
-        if let (Some(rva), Some(_), false) = (site, tool, plan.asset_tick) {
+        // the site the hold reports: the tool's, or 0 for a script's send
+        let hold_site = if tool.is_some() {
+            site
+        } else if script {
+            Some(0)
+        } else {
+            None
+        };
+        if let (Some(rva), false) = (hold_site, plan.asset_tick) {
             // SAFETY: the kind is read only from readable memory.
             if let Some(kind) = unsafe { engine::command_kind(args.cmd, engine.kind_offset) } {
                 let admit = machine.admit(kind, now);
                 if admit == Admit::Full {
                     plan.passed = Some("the hold ring is full");
                 }
-                if admit == Admit::Off {
+                if admit == Admit::Off && tool.is_some() {
                     machine.tool_while_silent(kind, now); // a tool at work while the mod is silent: not a pause menu
                     plan.due.extend(machine.take_due(self.game_time(), now)); // given back before this command passes
                 }
@@ -1231,6 +1264,24 @@ impl Runtime {
             self.wake();
         }
         None
+    }
+
+    /// A `build_proposal` whose Context says playerInitiated and that is neither a terrain edit (its terrain member is set: terrain.rs) nor
+    /// an asset tick (assets.rs): the class of a player's build a script sends ([`Runtime::plan_add`]). Only reads memory.
+    fn script_player_build(&self, args: &AddArgs) -> bool {
+        let Some(kind_offset) = self.build.kind_offset else { return false };
+        // SAFETY: only readable memory is read.
+        let kind = unsafe { engine::command_kind(args.cmd, kind_offset as usize) };
+        if kind.is_none() || self.build.kind_by_name("build_proposal") != kind {
+            return false;
+        }
+        // SAFETY: as above.
+        let Some(payload) = (unsafe { engine::payload_of(args.cmd) }) else { return false };
+        let Some(bytes) = dump::Mem::read(&LiveMem, payload, dump::PAYLOAD_SIZE) else { return false };
+        let terrain = &bytes[crate::terrain::TERRAIN_OFF..crate::terrain::TERRAIN_OFF + crate::terrain::TERRAIN_LEN];
+        bytes[crate::assets::FLAGS + 2] == 1
+            && terrain.iter().all(|&b| b == 0)
+            && !crate::assets::shape_of(&bytes).is_some_and(|(rm, add)| rm + add > 0)
     }
 
     /// Takes the command out of the engine's hands ([`engine::capture`], the engine's move constructor) and into the
@@ -1886,6 +1937,46 @@ mod tests {
         assert_eq!(calls(), ["add empty command"], "an unreadable command passes");
         rt.pump();
         assert_eq!(kinds(dir.path()), ["ready", "holding"], "nothing was held");
+    }
+
+    /// Real session 2026-10-26: a mod's tool sent its street upgrade through api.cmd.sendCommand (no tool site) and the engine applied it
+    /// at the click. A player's build from a script is held like a tool's (site 0); a game script's (playerInitiated false) and the mod's
+    /// own send announced by `own_next` pass.
+    #[test]
+    fn a_players_build_a_script_sends_is_held_and_the_mods_own_send_passes() {
+        let dir = TempDir::new("rt-script");
+        let rt = runtime(Some(dir.path()));
+        ctl(dir.path(), HOLD_ON);
+        rt.pump();
+        let player = |tag| {
+            let mut c = Call::new(52, tag);
+            c.c.payload[crate::assets::FLAGS + 2] = 1; // Context.playerInitiated
+            c
+        };
+        let mut town = Call::new(52, 1); // playerInitiated false: a town's or the game's own script build
+        unsafe { rt.on_add(town.args(), at(0x1234)) };
+        let mut modded = player(2);
+        let out = unsafe { rt.on_add(modded.args(), at(0x1234)) };
+        assert_eq!(out, modded.args().out);
+        assert_eq!(*modded.out, [0; HANDLE_SIZE], "held: the script's handle is emptied");
+        assert_eq!(calls(), ["add kind 52 tag 1"], "only the town's build reached the engine");
+        ctl(
+            dir.path(),
+            "own_next	1	{}
+",
+        );
+        let (mut own, mut next) = (player(3), player(4));
+        unsafe { rt.on_add(own.args(), at(0x1234)) };
+        unsafe { rt.on_add(next.args(), None) };
+        assert_eq!(
+            calls(),
+            ["add kind 52 tag 3"],
+            "own_next lets exactly the mod's own send through; the one after is held again"
+        );
+        rt.pump();
+        let held: Vec<String> = events(dir.path()).into_iter().filter(|(k, _)| k == "held").map(|(_, p)| p).collect();
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert!(held.iter().all(|p| p.contains("[\"site\"]=0")), "a script's hold names no tool site: {held:?}");
     }
 
     #[test]

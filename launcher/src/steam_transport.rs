@@ -9,9 +9,10 @@
 //!   message that holds anything but one whole frame (trailing bytes, a cut-off frame, a length outside the
 //!   protocol's bounds) is a protocol violation and closes that connection, as a bad frame does on TCP.
 //! - **Sizes.** Steam sends at most 512 KiB per message ([`MAX_MESSAGE`]), the protocol allows frames up to 1 MiB.
-//!   The largest frame the protocol really produces is a savegame chunk, about 350 KB (256 KiB of data, base64,
-//!   JSON, tag), so everything fits; a frame that does not is refused by `send` with an error before Steam sees it,
-//!   and the connection stays open.
+//!   The session never seals a frame longer than one Steam message: a message longer than
+//!   `core::session::parts::MAX_FRAME_PAYLOAD` goes in parts, each its own frame (a build of any size, up to the
+//!   session's 8 MiB message cap; checked at compile time below). A frame that does not fit is refused by `send` with
+//!   an error before Steam sees it, and the connection stays open.
 //! - **Backpressure.** Steam queues at most 512 KiB per connection and answers more with "limit exceeded", where a
 //!   TCP write would block. `send` therefore waits for room (up to [`SEND_TIMEOUT`]); a savegame streamed chunk by
 //!   chunk is paced by the link instead of failing.
@@ -110,6 +111,15 @@ impl FromStr for SteamEndpoint {
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
+
+// the largest frame the session seals (a part of a long message, or a message that fits one) is one Steam message
+const _: () = assert!(
+    FrameCodec::LENGTH_FIELD_SIZE
+        + feverlink3_core::protocol::FrameHeader::SIZE
+        + feverlink3_core::session::parts::MAX_FRAME_PAYLOAD
+        + feverlink3_core::crypto::Sealer::TAG_SIZE
+        <= MAX_MESSAGE
+);
 
 /// The frame as the one Steam message that carries it. Errors keep the connection open: nothing was sent.
 fn encode(frame: &Frame) -> io::Result<Vec<u8>> {

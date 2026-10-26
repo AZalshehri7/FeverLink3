@@ -94,6 +94,16 @@ function H.setBehind(h, seconds)
 	end
 end
 
+-- Whether the native module holds builds at the command list right now (the bridge's strict mode): the UI hook hands a build it cannot
+-- record to that safety net only then, and refuses it otherwise (feverlink3_uihook.lua, handle).
+function H.setNativeHolds(h, on)
+	on = on == true
+	if h.nativeHolds ~= on then
+		h.nativeHolds = on
+		touch(h)
+	end
+end
+
 -- Text typed by a player or received in a chat line: control characters out, trimmed, at most TEXT_MAX bytes.
 -- Returns nil when nothing is left.
 function H.cleanText(text)
@@ -241,7 +251,7 @@ function H.snapshot(h)
 	return {
 		version = h.version, selfId = h.selfId, selfName = h.selfName,
 		session = { started = h.session.started, speed = h.session.speed, pauseAt = h.session.pauseAt, stalled = h.session.stalled, behind = h.session.behind },
-		roster = roster, history = history, notices = notices,
+		roster = roster, history = history, notices = notices, nativeHolds = h.nativeHolds,
 	}
 end
 
@@ -269,6 +279,7 @@ function H.fromSnapshot(snap)
 		h.session = { started = snap.session.started == true, speed = tonumber(snap.session.speed) or 0, pauseAt = tonumber(snap.session.pauseAt),
 			stalled = (stalledList(snap.session)), behind = tonumber(snap.session.behind) }
 	end
+	h.nativeHolds = snap.nativeHolds == true
 	h.version = tonumber(snap.version) or 0
 	return h
 end

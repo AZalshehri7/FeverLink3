@@ -78,8 +78,11 @@ local NATIVE_INJECT = true
 pcall(function() NATIVE_INJECT = C.env("FEVERLINK3_NATIVE_INJECT") ~= "0" end)
 -- the largest native text a record released without one of its own carries (a complete text of a station is ~80 KB)
 local NATIVE_TEXT_MAX = 1024 * 1024
--- the longest action body the host relays (core HostSession::MAX_ACTION_BODY): a longer one is dropped there and reaches no other game
-local ACTION_BODY_MAX = 480 * 1024
+-- the longest action body this game ships. The session carries a message of any length up to 8 MiB, in parts (core
+-- session/parts.rs MAX_MESSAGE; real session 2026-10-26: a 3-track station's 618781 bytes were refused at the old 480 KiB, the size
+-- of one Steam message); a body is at most twice as long as JSON (every quote escaped), so 3 MiB always fits. A longer one would
+-- reach no other game, so it is refused here, before this game applies it.
+local ACTION_BODY_MAX = 3 * 1024 * 1024
 
 -- Strict mode, how the ORIGINATING game applies its own build. FEVERLINK3_STRICT_CANCEL:
 --   "0"          hold-and-release for every build (developer opt-out; was the default until 2026-10-13). The tool's command is held until the stamp and then released, so the tool gets its
@@ -3312,20 +3315,30 @@ local function originals()
 	return G.orig
 end
 
--- This player's action numbers, kept over a savegame reload: a reload runs this file again in the same Lua state, so the counter of the
--- session lives in package.loaded (as the original commands do, originals()). With the numbers the game-script state still names
--- (L.seqFloor) it is where X.seqResume numbers on from: an action number is never given twice in a world, so a key names one entity on
--- every game (friend test 2026-10-21 21:51: numbers began at 1 again after a resync, the new 1:4, a vehicle, took over the key of a line
--- made before the resync, and three set-line commands that named the line were refused on both games).
+-- This player's action numbers, kept over a savegame reload. With the numbers the game-script state still names (L.seqFloor) it is
+-- where X.seqResume numbers on from: an action number is never given twice in a world, so a key names one entity on every game (friend
+-- test 2026-10-21 21:51: numbers began at 1 again after a resync, the new 1:4, a vehicle, took over the key of a line made before the
+-- resync, and three set-line commands that named the line were refused on both games). The counter is a file of this player's live
+-- folder (C.SEQ), read when this Lua state has none: a resync load gives the game FRESH Lua states (real session 2026-10-26: every
+-- load logged `loads=1` at a new state address, and the counter kept in package.loaded came back empty, "this session shipped up to
+-- 0"), so only the numbers a binding still named were skipped and every unbound action was numbered again: the host went from 0:580
+-- back to 0:559, from 0:658 back to 0:639, the guest from 1:327 back to 1:313. package.loaded stays the cache of a reload that keeps
+-- the state.
 function X.seqCarry()
 	local ok, t = pcall(function()
 		local t = package.loaded["feverlink3_seq"]
 		if type(t) ~= "table" then t = {}; package.loaded["feverlink3_seq"] = t end
 		return t
 	end)
-	if ok then return t end
-	X.seqTable = X.seqTable or {}
-	return X.seqTable
+	if not ok then
+		X.seqTable = X.seqTable or {}
+		t = X.seqTable
+	end
+	if t.sid == nil and C.DIR then
+		local player, seq, sid = (C.readFile(C.path(C.SEQ)) or ""):match("^(%d+) (%d+) ?(%S*)")
+		if player and sid == (C.SESSION or "") and tonumber(player) == C.PLAYER_ID then t.sid, t.player, t.seq = C.SESSION, C.PLAYER_ID, tonumber(seq) end
+	end
+	return t
 end
 
 -- an action number went out (every ship of an action line passes here, before or after its own send)
@@ -3334,7 +3347,10 @@ function X.seqShipped(seq)
 	if not seq or seq <= 0 then return end
 	local t = X.seqCarry()
 	if t.sid ~= C.SESSION or t.player ~= C.PLAYER_ID then t.sid, t.player, t.seq = C.SESSION, C.PLAYER_ID, 0 end
-	if seq > (t.seq or 0) then t.seq = seq end
+	if seq > (t.seq or 0) then
+		t.seq = seq
+		if C.DIR then C.writeFile(C.path(C.SEQ), string.format("%d %d %s", C.PLAYER_ID, seq, C.SESSION or "")) end
+	end
 end
 
 -- A session begins in this Lua state (the first frame after a load included): number on after every action number this player already
@@ -3965,6 +3981,7 @@ local function guiApplyNow(it, now)
 			end
 			local okS2, errS2 = pcall(function()
 				local cmd = (O.factory[it.body.fn] or api.cmd[it.body.fn])(unpack(a, 1, a.n))
+				if isBuild then X.ownNext(it.key) end
 				X.handOver(O.sendCommand, cmd, cb, sending)
 			end)
 			X.sendDone(open, it.key)
@@ -5060,6 +5077,16 @@ function natPauseRelease(it, finish)
 	end
 end
 
+-- The interface half's own build send (guiApplyNow, a stamped build applied during a pause) passes the command list's Add, where the native
+-- module holds every player build a script sends (another mod's tool or window: real session 2026-10-26, the bus bay upgrade tool's
+-- sendCommand was applied at the click on its game only). `own_next`, written right before the send, tells the module that the next build
+-- there is this mod's own. Not written: the send is refused (the module would hold it as a new build), as an unwritten inject order is.
+function X.ownNext(key)
+	local N = G.nat
+	if not (N and N.holdSent and not N.dead) then return end   -- no holding module: nothing holds the send
+	if not X.sendHeldOrder("own_next", {}, key) then error("inject_refused: own_next could not be written; nothing is applied here", 0) end
+end
+
 -- the session switch is common.lua's (C.poll); the end of a session switches strict mode off in X.sessionOff
 function natSessionOn()
 	return C.ACTIVE == true
@@ -5173,22 +5200,30 @@ end
 -- B2.1, shadow: the record the capture made against the text the native module read from the held command (member by member), and
 -- the text goes with the record so the other games can make the same comparison. Never changes the record's meaning: the text is an
 -- extra member of the body that nothing reads yet.
+-- The native text does not depend on the input-level text: real session 2026-10-26 (0:577..0:579, a mod's track junction
+-- construction, site 0x51c3ac) the module wrote native_text_<id>.txt (47005 bytes) but the record went without it (12653 bytes): the
+-- build took hold-and-release, the guest rebuilt it from the record (its own track a second time: "duplicate base nodes"), vetoed the
+-- connected form and gave the unconnected one other free ids (a fork). Returns true when the body changed.
 local function natShadow(h, body)
+	if not (Portable and body and body.args) then return end
 	local tree = natInput(h)
-	if not (tree and Portable and body and body.args) then return end
-	body.input = h.inputText
+	local changed = false
+	if tree then
+		body.input = h.inputText
+		changed = true
+	end
 	if NATIVE_INJECT then
 		local okT, text = pcall(C.readFile, C.path("native_text_" .. h.id .. ".txt"))
 		if okT and type(text) == "string" and text ~= "" then
-			body.nativeText = text
+			body.nativeText, changed = text, true
 			traceGui("build.inject", string.format("held=%d the native module's text of the command goes with the record (%d bytes)", h.id, #text))
-			X.natRefPrints(traceGui, "held=" .. h.id, body, text)
+			pcall(X.natRefPrints, traceGui, "held=" .. h.id, body, text)
 		else
 			traceGui("build.inject", string.format("held=%d NO native text (native_text_%d.txt missing): the record path builds it", h.id, h.id))
 		end
 	end
-	shadowCompare(traceGui, "held=" .. h.id .. " side=originator", h.inputText, body.args[1])
-	return true
+	if tree then shadowCompare(traceGui, "held=" .. h.id .. " side=originator", h.inputText, body.args[1]) end
+	return changed
 end
 
 -- The originator decides (open bug 7): the native module refused the held command's own text before anything was shipped
@@ -5877,7 +5912,10 @@ local function natPair()
 	for _, h in ipairs(N.parked) do
 		local info = SITES[h.site]
 		local own = N.heldCaps[h.id]
-		if (info and next(info.tools) == nil) or (not info and own and own.raw) then
+		-- site 0: a player's build a script sent that the API layer did not hold (no tool, no preview of its own): only its own
+		-- proposal can be its record
+		if h.site == 0 then natSay("held " .. h.id .. ": a build a script sent, held by the native safety net (the API layer did not hold it)") end
+		if (info and next(info.tools) == nil) or (not info and own and own.raw) or h.site == 0 then
 			-- no preview of its tool can belong to it (or the site is unknown and its own proposal was recorded: no guess from the
 			-- newest preview of another tool); natDecideUnsafe takes the command's own record
 			natDecide(h, nil)
@@ -6704,10 +6742,10 @@ function installWrap()
 				if cb then pcall(cb, {}, false, {}) end
 				return
 			end
-			-- a build has a second way to every game: the simulation half captures it where the engine applies it
-			-- (onPreBuildProposal) and ships it from there, as the UI hook leaves every build to it
-			if tag.name == "makeWorldBuildProposalCmd" then
-				logGui("command " .. tag.name .. " goes to the engine, the simulation half ships it from its apply: " .. tostring(err))
+			-- a build the API layer cannot record has the native safety net: while the module holds builds, it holds a player's build a
+			-- script sends at the command list's Add and it goes the held way (stamped, applied at the stamp everywhere); without it, refused
+			if tag.name == "makeWorldBuildProposalCmd" and G.nat and G.nat.holdSent and not G.nat.dead then
+				logGui("command " .. tag.name .. " cannot be recorded through the API (" .. tostring(err) .. "): handed to the native safety net at the command list")
 				return O.sendCommand(cmd, cb, progress)
 			end
 			-- fail closed: applied here alone it would fork the worlds
@@ -7371,6 +7409,7 @@ function serviceWindow()
 	end
 	shipOrder()
 	if ignored > 0 then logGui("window: " .. ignored .. " record(s) of ui_out.log belong to an earlier session: ignored") end
+	pcall(Hud.setNativeHolds, G.hud, G.nat and G.nat.holdSent and not G.nat.dead)
 	Hud.writeSnapshot(C, G.hud, G.hudWritten)
 	local okC0, c0 = pcall(C.clock)
 	coGuard("page", writeCompanies)

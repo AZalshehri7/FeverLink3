@@ -11,6 +11,7 @@ pub mod messages;
 pub mod mods;
 mod names;
 pub mod notices;
+pub mod parts;
 mod player;
 mod policy;
 pub mod report;
